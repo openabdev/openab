@@ -21,6 +21,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
 
 RUN mkdir -p /home/agent/.local/share/kiro-cli /home/agent/.kiro
 ENV HOME=/home/agent
+WORKDIR /home/agent
 
 COPY --from=builder /build/target/release/agent-broker /usr/local/bin/agent-broker
 
