@@ -184,6 +184,7 @@ jobs:
           git remote set-url origin https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}
           git add charts/agent-broker/Chart.yaml charts/agent-broker/values.yaml
           git commit -m "chore: release chart ${{ steps.bump.outputs.new_version }}"
+          git pull --rebase
           git push
 
       - name: Trigger chart release
