@@ -131,8 +131,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      packages: write
-      pages: write
+      pull-requests: write
     steps:
       - name: Generate App token
         id: app-token
@@ -175,21 +174,19 @@ jobs:
           sed -i "s|repository: .*|repository: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}|" charts/agent-broker/values.yaml
           sed -i "s/tag: .*/tag: \"${SHORT_SHA}\"/" charts/agent-broker/values.yaml
 
-      - name: Commit and push
+      - name: Create bump PR
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
+          BRANCH="chore/chart-${{ steps.bump.outputs.new_version }}"
           git config user.name "openclaw-helm-bot[bot]"
           git config user.email "3185992+openclaw-helm-bot[bot]@users.noreply.github.com"
-          git remote set-url origin https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}
+          git checkout -b "$BRANCH"
           git add charts/agent-broker/Chart.yaml charts/agent-broker/values.yaml
-          git commit -m "chore: release chart ${{ steps.bump.outputs.new_version }}"
-          git pull --rebase
-          git push
-
-      - name: Trigger chart release
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          gh workflow run release.yml --repo ${{ github.repository }}
+          git commit -m "chore: bump chart to ${{ steps.bump.outputs.new_version }}"
+          git push origin "$BRANCH"
+          gh pr create \
+            --title "chore: bump chart to ${{ steps.bump.outputs.new_version }}" \
+            --body "Auto-generated chart version bump for image \`${{ github.sha }}\`." \
+            --base main --head "$BRANCH"
 
