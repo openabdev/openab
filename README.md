@@ -24,6 +24,10 @@ A Rust bridge service between Discord and any ACP-compatible coding CLI (Kiro CL
 
 ### 1. Create a Discord Bot
 
+See [docs/discord-bot-howto.md](docs/discord-bot-howto.md) for a detailed step-by-step guide.
+
+In short:
+
 1. Go to https://discord.com/developers/applications and create an application
 2. Bot tab → enable **Message Content Intent**
 3. OAuth2 → URL Generator → scope: `bot` → permissions: Send Messages, Send Messages in Threads, Create Public Threads, Read Message History, Add Reactions, Manage Messages
@@ -72,6 +76,8 @@ In your Discord channel:
 The bot creates a thread. After that, just type in the thread — no @mention needed.
 
 ## Pluggable Agent Backends
+
+> **Note:** Currently only **Kiro CLI** is supported and tested. Other ACP-compatible CLIs (Claude Code, Codex, Gemini) should work in theory but are untested. Contributions and bug reports welcome.
 
 Swap the `[agent]` block to use any ACP-compatible CLI. The `env` field supports `${VAR}` expansion from the process environment.
 
