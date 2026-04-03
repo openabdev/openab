@@ -9,6 +9,10 @@ A Rust bridge service between Discord and any ACP-compatible coding CLI (Kiro CL
 └──────────────┘               └──────────────┘               └──────────────┘
 ```
 
+## Demo
+
+![agent-broker demo](images/demo.png)
+
 ## Features
 
 - **Pluggable agent backend** — swap between Kiro CLI, Claude Code, Codex, Gemini via config
