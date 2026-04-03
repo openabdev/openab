@@ -179,8 +179,8 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          git config user.name "thepagent"
-          git config user.email "thepagent@users.noreply.github.com"
+          git config user.name "openclaw-helm-bot[bot]"
+          git config user.email "3185992+openclaw-helm-bot[bot]@users.noreply.github.com"
           git remote set-url origin https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}
           git add charts/agent-broker/Chart.yaml charts/agent-broker/values.yaml
           git commit -m "chore: release chart ${{ steps.bump.outputs.new_version }}"
@@ -191,3 +191,4 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           gh workflow run release.yml --repo ${{ github.repository }}
+
