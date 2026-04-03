@@ -1,6 +1,6 @@
 image:
   repository: ghcr.io/thepagent/agent-broker
-  tag: "1e66133"
+  tag: "7d215de"
   pullPolicy: IfNotPresent
 
 replicas: 1
