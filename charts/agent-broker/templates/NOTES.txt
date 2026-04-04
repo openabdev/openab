@@ -24,7 +24,7 @@ Authenticate Claude Code (first time only):
 
   kubectl exec -it deployment/{{ include "agent-broker.fullname" . }} -- claude setup-token
 
-Then set the token as an env var:
+Then set the token as an env var (token is valid for 1 year):
 
   helm upgrade {{ .Release.Name }} agent-broker/agent-broker --set env.CLAUDE_CODE_OAUTH_TOKEN="<token>"
 {{- else }}

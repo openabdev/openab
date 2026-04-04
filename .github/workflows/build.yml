@@ -95,9 +95,9 @@ jobs:
     strategy:
       matrix:
         variant:
-          - { suffix: "", name: "" }
-          - { suffix: "-codex", name: "-codex" }
-          - { suffix: "-claude", name: "-claude" }
+          - { suffix: "" }
+          - { suffix: "-codex" }
+          - { suffix: "-claude" }
     runs-on: ubuntu-latest
     permissions:
       contents: read
