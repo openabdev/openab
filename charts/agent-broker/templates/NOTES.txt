@@ -28,6 +28,18 @@ Authenticate Claude Code (first time only):
 Then set the token as an env var (token is valid for 1 year):
 
   helm upgrade {{ .Release.Name }} agent-broker/agent-broker --set env.CLAUDE_CODE_OAUTH_TOKEN="<token>"
+{{- else if eq $cmd "gemini" }}
+
+Authenticate Gemini CLI (first time only):
+
+  kubectl exec -it deployment/{{ include "agent-broker.fullname" . }} -- gemini
+
+  Select "Sign in with Google", open the URL in your browser, then
+  curl the localhost callback URL from within the pod.
+
+  Alternatively, set GEMINI_API_KEY:
+
+  helm upgrade {{ .Release.Name }} agent-broker/agent-broker --set env.GEMINI_API_KEY="<key>"
 {{- else }}
 
 Authenticate your agent CLI (first time only) — refer to your CLI's documentation.

@@ -1,0 +1,23 @@
+# --- Build stage ---
+FROM rust:1-bookworm AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
+COPY src/ src/
+RUN touch src/main.rs && cargo build --release
+
+# --- Runtime stage ---
+FROM node:22-bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
+
+# Install Gemini CLI (native ACP support via --acp)
+RUN npm install -g @google/gemini-cli
+
+RUN mkdir -p /home/agent && chown node:node /home/agent
+ENV HOME=/home/agent
+WORKDIR /home/agent
+
+COPY --from=builder /build/target/release/agent-broker /usr/local/bin/agent-broker
+
+ENTRYPOINT ["agent-broker"]
+CMD ["/etc/agent-broker/config.toml"]

@@ -88,6 +88,7 @@ Swap backends using the `agent.preset` Helm value or manual config. Tested backe
 | (default) | Kiro CLI | Native `kiro-cli acp` | `kiro-cli login --use-device-flow` |
 | `codex` | Codex | [@zed-industries/codex-acp](https://github.com/zed-industries/codex-acp) | `codex login --device-auth` |
 | `claude` | Claude Code | [@agentclientprotocol/claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp) | `claude setup-token` |
+| `gemini` | Gemini CLI | Native `gemini --acp` | Google OAuth or `GEMINI_API_KEY` |
 
 ### Helm Install (recommended)
 
@@ -111,6 +112,12 @@ helm install agent-broker agent-broker/agent-broker \
   --set discord.botToken="$DISCORD_BOT_TOKEN" \
   --set discord.allowedChannels[0]="YOUR_CHANNEL_ID" \
   --set agent.preset=claude
+
+# Gemini
+helm install agent-broker agent-broker/agent-broker \
+  --set discord.botToken="$DISCORD_BOT_TOKEN" \
+  --set discord.allowedChannels[0]="YOUR_CHANNEL_ID" \
+  --set agent.preset=gemini
 ```
 
 Then authenticate inside the pod (first time only):
@@ -125,6 +132,10 @@ kubectl exec -it deployment/agent-broker -- codex login --device-auth
 # Claude Code
 kubectl exec -it deployment/agent-broker -- claude setup-token
 # Then: helm upgrade agent-broker agent-broker/agent-broker --set env.CLAUDE_CODE_OAUTH_TOKEN="<token>"
+
+# Gemini (Google OAuth — open URL in browser, curl callback from pod)
+kubectl exec -it deployment/agent-broker -- gemini
+# Or use API key: helm upgrade agent-broker agent-broker/agent-broker --set env.GEMINI_API_KEY="<key>"
 ```
 
 Restart after auth: `kubectl rollout restart deployment agent-broker`
@@ -261,6 +272,9 @@ Use one of these prompts with any coding CLI (Kiro CLI, Claude Code, Codex, Gemi
 
 **Claude Code:**
 > Install agent-broker on my local k8s cluster using the Helm chart from https://thepagent.github.io/agent-broker with `--set agent.preset=claude`. My Discord bot token is in the environment variable DISCORD_BOT_TOKEN and my channel ID is <REPLACE_WITH_YOUR_CHANNEL_ID>. After install, follow the NOTES output to authenticate, then restart the deployment.
+
+**Gemini:**
+> Install agent-broker on my local k8s cluster using the Helm chart from https://thepagent.github.io/agent-broker with `--set agent.preset=gemini`. My Discord bot token is in the environment variable DISCORD_BOT_TOKEN and my channel ID is <REPLACE_WITH_YOUR_CHANNEL_ID>. After install, follow the NOTES output to authenticate, then restart the deployment.
 
 ### Build & Push
 
