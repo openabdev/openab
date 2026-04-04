@@ -56,6 +56,11 @@ spec:
               mountPath: /home/agent/.local/share/kiro-cli
               subPath: kiro-cli-data
             {{- end }}
+            {{- if .Values.agentsMd }}
+            - name: config
+              mountPath: /home/agent/AGENTS.md
+              subPath: AGENTS.md
+            {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

@@ -37,6 +37,12 @@ reactions:
   enabled: true
   removeAfterReply: false
 
+agentsMd: ""
+  # agentsMd: |
+  #   IDENTITY - your agent identity
+  #   SOUL - your agent personality
+  #   USER - how agent should address the user
+
 env: {}
 envFrom: []
 

@@ -25,3 +25,7 @@ data:
     [reactions]
     enabled = {{ .Values.reactions.enabled }}
     remove_after_reply = {{ .Values.reactions.removeAfterReply }}
+  {{- if .Values.agentsMd }}
+  AGENTS.md: |
+    {{- .Values.agentsMd | nindent 4 }}
+  {{- end }}
