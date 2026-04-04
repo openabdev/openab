@@ -3,8 +3,44 @@ use crate::format;
 use std::collections::HashSet;
 use std::sync::Arc;
 use teloxide::prelude::*;
-use teloxide::types::ParseMode;
+use teloxide::types::{MessageId, ReactionType};
 use tracing::{error, info};
+
+// ── Emoji constants (mirrors openclaw status-reactions) ──────────────────────
+const EMOJI_QUEUED: &str = "👀";
+const EMOJI_THINKING: &str = "🤔";
+const EMOJI_TOOL: &str = "🔥";
+const EMOJI_CODING: &str = "👨‍💻";
+const EMOJI_WEB: &str = "⚡";
+const EMOJI_DONE: &str = "👍";
+const EMOJI_ERROR: &str = "😱";
+
+const CODING_TOKENS: &[&str] = &["exec", "process", "read", "write", "edit", "bash", "shell"];
+const WEB_TOKENS: &[&str] = &["web_search", "web_fetch", "web-search", "web-fetch", "browser"];
+
+fn tool_emoji(name: &str) -> &'static str {
+    let n = name.to_lowercase();
+    if WEB_TOKENS.iter().any(|t| n.contains(t)) { EMOJI_WEB }
+    else if CODING_TOKENS.iter().any(|t| n.contains(t)) { EMOJI_CODING }
+    else { EMOJI_TOOL }
+}
+
+// ── Reaction helper ──────────────────────────────────────────────────────────
+
+async fn set_reaction(bot: &Bot, chat_id: ChatId, msg_id: MessageId, emoji: &str) {
+    let reaction = vec![ReactionType::Emoji { emoji: emoji.to_string() }];
+    let _ = bot.set_message_reaction(chat_id, msg_id)
+        .reaction(reaction)
+        .await;
+}
+
+async fn clear_reaction(bot: &Bot, chat_id: ChatId, msg_id: MessageId) {
+    let _ = bot.set_message_reaction(chat_id, msg_id)
+        .reaction(vec![])
+        .await;
+}
+
+// ── Main bot loop ────────────────────────────────────────────────────────────
 
 pub async fn run(pool: Arc<SessionPool>, bot_token: String, allowed_users: HashSet<i64>) {
     let bot = Bot::new(bot_token);
@@ -25,7 +61,11 @@ pub async fn run(pool: Arc<SessionPool>, bot_token: String, allowed_users: HashS
             };
 
             let chat_id = msg.chat.id;
+            let user_msg_id = msg.id;
             let thread_key = chat_id.to_string();
+
+            // 👀 queued
+            set_reaction(&bot, chat_id, user_msg_id, EMOJI_QUEUED).await;
 
             let thinking = match bot.send_message(chat_id, "...").await {
                 Ok(m) => m,
@@ -34,11 +74,31 @@ pub async fn run(pool: Arc<SessionPool>, bot_token: String, allowed_users: HashS
 
             if let Err(e) = pool.get_or_create(&thread_key).await {
                 let _ = bot.edit_message_text(chat_id, thinking.id, "⚠️ Failed to start agent.").await;
+                clear_reaction(&bot, chat_id, user_msg_id).await;
                 error!("pool error: {e}");
                 return Ok(());
             }
 
-            let result = stream_prompt(&pool, &thread_key, &prompt, &bot, chat_id, thinking.id).await;
+            // 🤔 thinking
+            set_reaction(&bot, chat_id, user_msg_id, EMOJI_THINKING).await;
+
+            let result = stream_prompt(
+                &pool, &thread_key, &prompt,
+                &bot, chat_id, thinking.id, user_msg_id,
+            ).await;
+
+            match &result {
+                Ok(()) => {
+                    set_reaction(&bot, chat_id, user_msg_id, EMOJI_DONE).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    clear_reaction(&bot, chat_id, user_msg_id).await;
+                }
+                Err(_) => {
+                    set_reaction(&bot, chat_id, user_msg_id, EMOJI_ERROR).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+                    clear_reaction(&bot, chat_id, user_msg_id).await;
+                }
+            }
 
             if let Err(e) = result {
                 let _ = bot.edit_message_text(chat_id, thinking.id, format!("⚠️ {e}")).await;
@@ -50,13 +110,16 @@ pub async fn run(pool: Arc<SessionPool>, bot_token: String, allowed_users: HashS
     .await;
 }
 
+// ── Streaming prompt with live edits ────────────────────────────────────────
+
 async fn stream_prompt(
     pool: &SessionPool,
     thread_key: &str,
     prompt: &str,
     bot: &Bot,
     chat_id: ChatId,
-    msg_id: teloxide::types::MessageId,
+    msg_id: MessageId,
+    user_msg_id: MessageId,
 ) -> anyhow::Result<()> {
     let prompt = prompt.to_string();
     let bot = bot.clone();
@@ -74,27 +137,29 @@ async fn stream_prompt(
             let mut tool_lines: Vec<String> = Vec::new();
             let mut last_sent = String::new();
             let mut current_msg_id = msg_id;
+            let mut last_edit = tokio::time::Instant::now();
 
             if reset {
                 text_buf.push_str("⚠️ _Session expired, starting fresh..._\n\n");
             }
 
-            let mut last_edit = tokio::time::Instant::now();
-
             while let Some(notification) = rx.recv().await {
-                if notification.id.is_some() {
-                    break;
-                }
+                if notification.id.is_some() { break; }
 
                 if let Some(event) = classify_notification(&notification) {
                     match event {
                         AcpEvent::Text(t) => {
                             text_buf.push_str(&t);
                         }
+                        AcpEvent::Thinking => {
+                            set_reaction(&bot, chat_id, user_msg_id, EMOJI_THINKING).await;
+                        }
                         AcpEvent::ToolStart { title, .. } if !title.is_empty() => {
+                            set_reaction(&bot, chat_id, user_msg_id, tool_emoji(&title)).await;
                             tool_lines.push(format!("🔧 `{title}`..."));
                         }
                         AcpEvent::ToolDone { title, status, .. } => {
+                            set_reaction(&bot, chat_id, user_msg_id, EMOJI_THINKING).await;
                             let icon = if status == "completed" { "✅" } else { "❌" };
                             if let Some(line) = tool_lines.iter_mut().rev().find(|l| l.contains(&title)) {
                                 *line = format!("{icon} `{title}`");
@@ -108,15 +173,7 @@ async fn stream_prompt(
                 if last_edit.elapsed().as_millis() >= 1500 {
                     let content = compose_display(&tool_lines, &text_buf);
                     if content != last_sent && !content.is_empty() {
-                        let chunks = format::split_message(&content, 4000);
-                        if let Some(first) = chunks.first() {
-                            let _ = bot.edit_message_text(chat_id, current_msg_id, first).await;
-                        }
-                        for chunk in chunks.iter().skip(1) {
-                            if let Ok(new_msg) = bot.send_message(chat_id, chunk).await {
-                                current_msg_id = new_msg.id;
-                            }
-                        }
+                        current_msg_id = send_chunks(&bot, chat_id, current_msg_id, &content).await;
                         last_sent = content;
                         last_edit = tokio::time::Instant::now();
                     }
@@ -127,20 +184,8 @@ async fn stream_prompt(
 
             // Final edit
             let final_content = compose_display(&tool_lines, &text_buf);
-            let final_content = if final_content.is_empty() {
-                "_(no response)_".to_string()
-            } else {
-                final_content
-            };
-
-            let chunks = format::split_message(&final_content, 4000);
-            for (i, chunk) in chunks.iter().enumerate() {
-                if i == 0 {
-                    let _ = bot.edit_message_text(chat_id, current_msg_id, chunk).await;
-                } else {
-                    let _ = bot.send_message(chat_id, chunk).await;
-                }
-            }
+            let final_content = if final_content.is_empty() { "_(no response)_".to_string() } else { final_content };
+            send_chunks(&bot, chat_id, current_msg_id, &final_content).await;
 
             Ok(())
         })
@@ -148,13 +193,23 @@ async fn stream_prompt(
     .await
 }
 
+async fn send_chunks(bot: &Bot, chat_id: ChatId, msg_id: MessageId, content: &str) -> MessageId {
+    let chunks = format::split_message(content, 4000);
+    let mut current = msg_id;
+    for (i, chunk) in chunks.iter().enumerate() {
+        if i == 0 {
+            let _ = bot.edit_message_text(chat_id, current, chunk).await;
+        } else if let Ok(m) = bot.send_message(chat_id, chunk).await {
+            current = m.id;
+        }
+    }
+    current
+}
+
 fn compose_display(tool_lines: &[String], text: &str) -> String {
     let mut out = String::new();
     if !tool_lines.is_empty() {
-        for line in tool_lines {
-            out.push_str(line);
-            out.push('\n');
-        }
+        for line in tool_lines { out.push_str(line); out.push('\n'); }
         out.push('\n');
     }
     out.push_str(text.trim_end());
