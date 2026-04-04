@@ -9,6 +9,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "Dockerfile"
+      - "Dockerfile.*"
   workflow_dispatch:
     inputs:
       chart_bump:
@@ -34,12 +35,14 @@ jobs:
   build-image:
     strategy:
       matrix:
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-latest
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+        variant:
+          - { suffix: "", dockerfile: "Dockerfile" }
+          - { suffix: "-codex", dockerfile: "Dockerfile.codex" }
+          - { suffix: "-claude", dockerfile: "Dockerfile.claude" }
+        platform:
+          - { os: linux/amd64, runner: ubuntu-latest }
+          - { os: linux/arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.platform.runner }}
     permissions:
       contents: read
       packages: write
@@ -58,17 +61,18 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.variant.suffix }}
 
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: ${{ matrix.platform }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ inputs.dry_run != true }}
-          cache-from: type=gha,scope=${{ matrix.platform }}
-          cache-to: type=gha,scope=${{ matrix.platform }},mode=max
+          file: ${{ matrix.variant.dockerfile }}
+          platforms: ${{ matrix.platform.os }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.variant.suffix }},push-by-digest=true,name-canonical=true,push=${{ inputs.dry_run != true }}
+          cache-from: type=gha,scope=${{ matrix.variant.suffix }}-${{ matrix.platform.os }}
+          cache-to: type=gha,scope=${{ matrix.variant.suffix }}-${{ matrix.platform.os }},mode=max
 
       - name: Export digest
         if: inputs.dry_run != true
@@ -81,13 +85,19 @@ jobs:
         if: inputs.dry_run != true
         uses: actions/upload-artifact@v4
         with:
-          name: digests-${{ matrix.runner }}
+          name: digests${{ matrix.variant.suffix }}-${{ matrix.platform.runner }}
           path: /tmp/digests/*
           retention-days: 1
 
   merge-manifests:
     needs: build-image
     if: inputs.dry_run != true
+    strategy:
+      matrix:
+        variant:
+          - { suffix: "" }
+          - { suffix: "-codex" }
+          - { suffix: "-claude" }
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -99,7 +109,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: /tmp/digests
-          pattern: digests-*
+          pattern: digests${{ matrix.variant.suffix }}-*
           merge-multiple: true
 
       - uses: docker/setup-buildx-action@v3
@@ -114,7 +124,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.variant.suffix }}
           tags: |
             type=sha,prefix=
             type=raw,value=latest
@@ -123,7 +133,7 @@ jobs:
         working-directory: /tmp/digests
         run: |
           docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.variant.suffix }}@sha256:%s ' *)
 
   bump-chart:
     needs: merge-manifests
@@ -189,4 +199,3 @@ jobs:
             --title "chore: bump chart to ${{ steps.bump.outputs.new_version }}" \
             --body "Auto-generated chart version bump for image \`${{ github.sha }}\`." \
             --base main --head "$BRANCH"
-

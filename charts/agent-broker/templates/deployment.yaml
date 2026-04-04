@@ -50,11 +50,7 @@ spec:
               readOnly: true
             {{- if .Values.persistence.enabled }}
             - name: data
-              mountPath: /home/agent/.kiro
-              subPath: dot-kiro
-            - name: data
-              mountPath: /home/agent/.local/share/kiro-cli
-              subPath: kiro-cli-data
+              mountPath: /home/agent
             {{- end }}
             {{- if .Values.agentsMd }}
             - name: config
