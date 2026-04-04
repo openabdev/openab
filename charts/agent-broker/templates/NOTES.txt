@@ -8,9 +8,29 @@ agent-broker {{ .Chart.AppVersion }} has been installed!
     --from-literal=discord-bot-token="YOUR_TOKEN"
 {{- end }}
 
+{{- if eq .Values.agent.command "kiro-cli" }}
+
 Authenticate kiro-cli (first time only):
 
   kubectl exec -it deployment/{{ include "agent-broker.fullname" . }} -- kiro-cli login --use-device-flow
+{{- else if eq .Values.agent.command "codex-acp" }}
+
+Authenticate Codex (first time only):
+
+  kubectl exec -it deployment/{{ include "agent-broker.fullname" . }} -- codex login --device-auth
+{{- else if eq .Values.agent.command "claude-agent-acp" }}
+
+Authenticate Claude Code (first time only):
+
+  kubectl exec -it deployment/{{ include "agent-broker.fullname" . }} -- claude setup-token
+
+Then set the token as an env var (token is valid for 1 year):
+
+  helm upgrade {{ .Release.Name }} agent-broker/agent-broker --set env.CLAUDE_CODE_OAUTH_TOKEN="<token>"
+{{- else }}
+
+Authenticate your agent CLI (first time only) — refer to your CLI's documentation.
+{{- end }}
 
 Then restart the pod:
 
