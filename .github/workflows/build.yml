@@ -21,6 +21,11 @@ on:
           - minor
           - major
         default: patch
+      release:
+        description: 'Stable release (no beta suffix)'
+        required: false
+        type: boolean
+        default: false
       dry_run:
         description: 'Dry run (show changes without committing)'
         required: false
@@ -164,7 +169,9 @@ jobs:
         id: bump
         run: |
           current="${{ steps.current.outputs.chart_version }}"
-          IFS='.' read -r major minor patch <<< "$current"
+          # Strip any existing pre-release suffix for base version
+          base="${current%%-*}"
+          IFS='.' read -r major minor patch <<< "$base"
           bump_type="${{ inputs.chart_bump }}"
           bump_type="${bump_type:-patch}"
           case "$bump_type" in
@@ -172,7 +179,12 @@ jobs:
             minor) minor=$((minor + 1)); patch=0 ;;
             patch) patch=$((patch + 1)) ;;
           esac
-          new_version="${major}.${minor}.${patch}"
+          # Stable release: clean version. Otherwise: beta with run number.
+          if [ "${{ inputs.release }}" = "true" ]; then
+            new_version="${major}.${minor}.${patch}"
+          else
+            new_version="${major}.${minor}.${patch}-beta.${GITHUB_RUN_NUMBER}"
+          fi
           echo "new_version=$new_version" >> "$GITHUB_OUTPUT"
 
       - name: Update Chart.yaml and values.yaml
@@ -188,14 +200,20 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          BRANCH="chore/chart-${{ steps.bump.outputs.new_version }}"
+          VERSION="${{ steps.bump.outputs.new_version }}"
+          BRANCH="chore/chart-${VERSION}"
           git config user.name "openclaw-helm-bot[bot]"
           git config user.email "3185992+openclaw-helm-bot[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
           git add charts/agent-broker/Chart.yaml charts/agent-broker/values.yaml
-          git commit -m "chore: bump chart to ${{ steps.bump.outputs.new_version }}"
+          git commit -m "chore: bump chart to ${VERSION}"
           git push origin "$BRANCH"
+          if [[ "$VERSION" == *-beta* ]]; then
+            LABEL="beta"
+          else
+            LABEL="stable"
+          fi
           gh pr create \
-            --title "chore: bump chart to ${{ steps.bump.outputs.new_version }}" \
-            --body "Auto-generated chart version bump for image \`${{ github.sha }}\`." \
+            --title "chore: bump chart to ${VERSION}" \
+            --body "Auto-generated chart version bump (${LABEL}) for image \`${{ github.sha }}\`." \
             --base main --head "$BRANCH"
