@@ -11,8 +11,8 @@ data:
     allowed_channels = [{{ range $i, $ch := .Values.discord.allowedChannels }}{{ if $i }}, {{ end }}"{{ $ch }}"{{ end }}]
 
     [agent]
-    command = "{{ .Values.agent.command }}"
-    args = [{{ range $i, $a := .Values.agent.args }}{{ if $i }}, {{ end }}"{{ $a }}"{{ end }}]
+    command = "{{ include "agent-broker.agent.command" . | trim }}"
+    args = {{ include "agent-broker.agent.args" . | trim }}
     working_dir = "{{ .Values.agent.workingDir }}"
     {{- if .Values.agent.env }}
     env = { {{ range $k, $v := .Values.agent.env }}{{ $k }} = "{{ $v }}", {{ end }} }

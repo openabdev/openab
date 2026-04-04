@@ -8,17 +8,18 @@ agent-broker {{ .Chart.AppVersion }} has been installed!
     --from-literal=discord-bot-token="YOUR_TOKEN"
 {{- end }}
 
-{{- if eq .Values.agent.command "kiro-cli" }}
+{{- $cmd := include "agent-broker.agent.command" . | trim }}
+{{- if eq $cmd "kiro-cli" }}
 
 Authenticate kiro-cli (first time only):
 
   kubectl exec -it deployment/{{ include "agent-broker.fullname" . }} -- kiro-cli login --use-device-flow
-{{- else if eq .Values.agent.command "codex-acp" }}
+{{- else if eq $cmd "codex-acp" }}
 
 Authenticate Codex (first time only):
 
   kubectl exec -it deployment/{{ include "agent-broker.fullname" . }} -- codex login --device-auth
-{{- else if eq .Values.agent.command "claude-agent-acp" }}
+{{- else if eq $cmd "claude-agent-acp" }}
 
 Authenticate Claude Code (first time only):
 

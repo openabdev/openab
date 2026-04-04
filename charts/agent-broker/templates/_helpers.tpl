@@ -32,3 +32,41 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 app.kubernetes.io/name: {{ include "agent-broker.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
+
+{{/*
+Resolve agent preset → image repository
+*/}}
+{{- define "agent-broker.image.repository" -}}
+{{- if .Values.agent.preset }}
+  {{- if eq .Values.agent.preset "codex" }}ghcr.io/thepagent/agent-broker-codex
+  {{- else if eq .Values.agent.preset "claude" }}ghcr.io/thepagent/agent-broker-claude
+  {{- else }}{{ .Values.image.repository }}
+  {{- end }}
+{{- else }}{{ .Values.image.repository }}
+{{- end }}
+{{- end }}
+
+{{/*
+Resolve agent preset → command
+*/}}
+{{- define "agent-broker.agent.command" -}}
+{{- if .Values.agent.preset }}
+  {{- if eq .Values.agent.preset "codex" }}codex-acp
+  {{- else if eq .Values.agent.preset "claude" }}claude-agent-acp
+  {{- else }}{{ .Values.agent.command }}
+  {{- end }}
+{{- else }}{{ .Values.agent.command }}
+{{- end }}
+{{- end }}
+
+{{/*
+Resolve agent preset → args
+*/}}
+{{- define "agent-broker.agent.args" -}}
+{{- if .Values.agent.preset }}
+  {{- if or (eq .Values.agent.preset "codex") (eq .Values.agent.preset "claude") }}[]
+  {{- else }}{{ .Values.agent.args | toJson }}
+  {{- end }}
+{{- else }}{{ .Values.agent.args | toJson }}
+{{- end }}
+{{- end }}

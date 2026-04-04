@@ -21,6 +21,7 @@ discord:
     - "YOUR_CHANNEL_ID"
 
 agent:
+  preset: ""              # kiro (default), codex, or claude — auto-configures image + command
   command: kiro-cli
   args:
     - acp
