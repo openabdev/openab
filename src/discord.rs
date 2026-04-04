@@ -37,10 +37,21 @@ impl EventHandler for Handler {
 
         let in_thread = if !in_allowed_channel {
             match msg.channel_id.to_channel(&ctx.http).await {
-                Ok(serenity::model::channel::Channel::Guild(gc)) => gc
-                    .parent_id
-                    .map_or(false, |pid| self.allowed_channels.contains(&pid.get())),
-                _ => false,
+                Ok(serenity::model::channel::Channel::Guild(gc)) => {
+                    let result = gc
+                        .parent_id
+                        .map_or(false, |pid| self.allowed_channels.contains(&pid.get()));
+                    tracing::debug!(channel_id = %msg.channel_id, parent_id = ?gc.parent_id, result, "thread check");
+                    result
+                }
+                Ok(other) => {
+                    tracing::debug!(channel_id = %msg.channel_id, kind = ?other, "not a guild channel");
+                    false
+                }
+                Err(e) => {
+                    tracing::debug!(channel_id = %msg.channel_id, error = %e, "to_channel failed");
+                    false
+                }
             }
         } else {
             false
