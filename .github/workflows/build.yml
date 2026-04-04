@@ -36,9 +36,9 @@ jobs:
     strategy:
       matrix:
         variant:
-          - { suffix: "", dockerfile: "Dockerfile" }
-          - { suffix: "-codex", dockerfile: "Dockerfile.codex" }
-          - { suffix: "-claude", dockerfile: "Dockerfile.claude" }
+          - { suffix: "", dockerfile: "Dockerfile", artifact: "default" }
+          - { suffix: "-codex", dockerfile: "Dockerfile.codex", artifact: "codex" }
+          - { suffix: "-claude", dockerfile: "Dockerfile.claude", artifact: "claude" }
         platform:
           - { os: linux/amd64, runner: ubuntu-latest }
           - { os: linux/arm64, runner: ubuntu-24.04-arm }
@@ -85,7 +85,7 @@ jobs:
         if: inputs.dry_run != true
         uses: actions/upload-artifact@v4
         with:
-          name: digests${{ matrix.variant.suffix }}-${{ matrix.platform.runner }}
+          name: digests-${{ matrix.variant.artifact }}-${{ matrix.platform.runner }}
           path: /tmp/digests/*
           retention-days: 1
 
@@ -95,9 +95,9 @@ jobs:
     strategy:
       matrix:
         variant:
-          - { suffix: "" }
-          - { suffix: "-codex" }
-          - { suffix: "-claude" }
+          - { suffix: "", artifact: "default" }
+          - { suffix: "-codex", artifact: "codex" }
+          - { suffix: "-claude", artifact: "claude" }
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -109,7 +109,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: /tmp/digests
-          pattern: digests${{ matrix.variant.suffix }}-*
+          pattern: digests-${{ matrix.variant.artifact }}-*
           merge-multiple: true
 
       - uses: docker/setup-buildx-action@v3
