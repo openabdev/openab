@@ -10,7 +10,7 @@ serde_json = "1"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "rustls_backend", "cache"] }
+teloxide = { version = "0.13", features = ["macros"] }
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
 anyhow = "1"

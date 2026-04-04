@@ -5,7 +5,7 @@ use std::path::Path;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    pub discord: DiscordConfig,
+    pub telegram: TelegramConfig,
     pub agent: AgentConfig,
     #[serde(default)]
     pub pool: PoolConfig,
@@ -14,10 +14,10 @@ pub struct Config {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct DiscordConfig {
+pub struct TelegramConfig {
     pub bot_token: String,
     #[serde(default)]
-    pub allowed_channels: Vec<String>,
+    pub allowed_users: Vec<i64>,
 }
 
 #[derive(Debug, Deserialize)]
