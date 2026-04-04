@@ -2,6 +2,7 @@ use crate::acp::connection::AcpConnection;
 use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 use tracing::{info, warn};
@@ -48,16 +49,21 @@ impl SessionPool {
             return Err(anyhow!("pool exhausted ({} sessions)", self.max_sessions));
         }
 
+        // Create a per-thread working directory so concurrent sessions don't interfere
+        let thread_dir: PathBuf = [&self.config.working_dir, "sessions", thread_id].iter().collect();
+        tokio::fs::create_dir_all(&thread_dir).await?;
+        let thread_dir_str = thread_dir.to_string_lossy().to_string();
+
         let mut conn = AcpConnection::spawn(
             &self.config.command,
             &self.config.args,
-            &self.config.working_dir,
+            &thread_dir_str,
             &self.config.env,
         )
         .await?;
 
         conn.initialize().await?;
-        conn.session_new(&self.config.working_dir).await?;
+        conn.session_new(&thread_dir_str).await?;
 
         let is_rebuild = conns.contains_key(thread_id);
         if is_rebuild {
@@ -92,6 +98,14 @@ impl SessionPool {
             info!(thread_id = %key, "cleaning up idle session");
             conns.remove(&key);
             // Child process killed via kill_on_drop when AcpConnection drops
+
+            // Clean up the per-thread working directory
+            let thread_dir: PathBuf = [&self.config.working_dir, "sessions", &key].iter().collect();
+            if thread_dir.exists() {
+                if let Err(e) = tokio::fs::remove_dir_all(&thread_dir).await {
+                    warn!(thread_id = %key, error = %e, "failed to remove session directory");
+                }
+            }
         }
     }
 
