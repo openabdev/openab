@@ -2,5 +2,5 @@ apiVersion: v2
 name: agent-broker
 description: Discord ↔ ACP coding CLI bridge (Kiro CLI, Claude Code, Codex, Gemini)
 type: application
-version: 0.1.11
-appVersion: "c9bb6ee"
+version: 0.1.12
+appVersion: "7a6fe69"
