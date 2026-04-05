@@ -21,11 +21,11 @@ spec:
           image: agent-broker:latest
           imagePullPolicy: Never
           env:
-            - name: DISCORD_BOT_TOKEN
+            - name: TELEGRAM_BOT_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: agent-broker-secret
-                  key: discord-bot-token
+                  key: telegram-bot-token
             - name: HOME
               value: /home/agent
           volumeMounts:
