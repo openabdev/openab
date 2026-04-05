@@ -192,7 +192,13 @@ impl SessionPool {
             let prompt_rx = {
                 let mut conns = self.connections.write().await;
                 if let Some(conn) = conns.get_mut(key) {
-                    match conn.session_prompt(COMPACT_PROMPT).await {
+                    // Carry forward prior session context so compaction includes legacy history.
+                    let prompt = if let Some(ref prior) = conn.prior_context {
+                        format!("{prior}\n\n{COMPACT_PROMPT}")
+                    } else {
+                        COMPACT_PROMPT.to_string()
+                    };
+                    match conn.session_prompt(&prompt).await {
                         Ok((rx, _)) => Some(rx),
                         Err(e) => { warn!(thread_id = %key, "compaction prompt failed: {e}"); None }
                     }

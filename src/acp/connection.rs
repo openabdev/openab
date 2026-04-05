@@ -32,6 +32,8 @@ pub struct AcpConnection {
     pub is_streaming: bool,
     pub supports_load_session: bool,
     pub pending_context: Option<String>,
+    /// The context injected at session resume — carried forward into the next compaction.
+    pub prior_context: Option<String>,
     _reader_handle: JoinHandle<()>,
 }
 
@@ -169,6 +171,7 @@ impl AcpConnection {
             is_streaming: false,
             supports_load_session: false,
             pending_context: None,
+            prior_context: None,
             _reader_handle: reader_handle,
         })
     }
@@ -287,6 +290,7 @@ impl AcpConnection {
 
         // Prepend any pending context (e.g. compacted memory summary) to the first prompt.
         let full_prompt = if let Some(ctx) = self.pending_context.take() {
+            self.prior_context = Some(ctx.clone());
             format!("{ctx}\n\n{prompt}")
         } else {
             prompt.to_string()
