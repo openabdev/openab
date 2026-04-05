@@ -146,8 +146,8 @@ pub async fn run(pool: Arc<SessionPool>, bot_token: String, allowed_users: HashS
 
     // Idle session cleanup loop — 1 min interval for testing (switch to 5 min in prod).
     // TTL: 2 min for testing (switch to 30 min in prod).
-    const CLEANUP_INTERVAL_SECS: u64 = 60;   // TODO: revert to 900 after Alice test
-    const SESSION_TTL_SECS: u64 = 120;      // TODO: revert to 7200 after Alice test
+    const CLEANUP_INTERVAL_SECS: u64 = 900;
+    const SESSION_TTL_SECS: u64 = 7200;
     {
         let pool2 = pool.clone();
         tokio::spawn(async move {
