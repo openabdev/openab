@@ -34,42 +34,45 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
-Resolve agent preset → image repository
+Validate activeAgent and return the agent config dict.
+Fails with a clear error if activeAgent is not found in .Values.agents.
+*/}}
+{{- define "agent-broker.activeAgent" -}}
+{{- $agent := index .Values.agents .Values.activeAgent -}}
+{{- if not $agent -}}
+  {{- fail (printf "activeAgent '%s' not found in .Values.agents — valid options: %s" .Values.activeAgent (keys .Values.agents | sortAlpha | join ", ")) -}}
+{{- end -}}
+{{- $agent | toJson -}}
+{{- end }}
+
+{{/*
+Resolve active agent image repository
 */}}
 {{- define "agent-broker.image.repository" -}}
-{{- if .Values.agent.preset }}
-  {{- if eq .Values.agent.preset "codex" }}ghcr.io/thepagent/agent-broker-codex
-  {{- else if eq .Values.agent.preset "claude" }}ghcr.io/thepagent/agent-broker-claude
-  {{- else if eq .Values.agent.preset "gemini" }}ghcr.io/thepagent/agent-broker-gemini
-  {{- else }}{{ .Values.image.repository }}
-  {{- end }}
-{{- else }}{{ .Values.image.repository }}
-{{- end }}
+{{- $agent := include "agent-broker.activeAgent" . | fromJson -}}
+{{- $agent.image.repository -}}
 {{- end }}
 
 {{/*
-Resolve agent preset → command
+Resolve active agent image tag (falls back to .Chart.AppVersion)
+*/}}
+{{- define "agent-broker.image.tag" -}}
+{{- $agent := include "agent-broker.activeAgent" . | fromJson -}}
+{{- $agent.image.tag | default .Chart.AppVersion -}}
+{{- end }}
+
+{{/*
+Resolve active agent command
 */}}
 {{- define "agent-broker.agent.command" -}}
-{{- if .Values.agent.preset }}
-  {{- if eq .Values.agent.preset "codex" }}codex-acp
-  {{- else if eq .Values.agent.preset "claude" }}claude-agent-acp
-  {{- else if eq .Values.agent.preset "gemini" }}gemini
-  {{- else }}{{ .Values.agent.command }}
-  {{- end }}
-{{- else }}{{ .Values.agent.command }}
-{{- end }}
+{{- $agent := include "agent-broker.activeAgent" . | fromJson -}}
+{{- $agent.command -}}
 {{- end }}
 
 {{/*
-Resolve agent preset → args
+Resolve active agent args as JSON array
 */}}
 {{- define "agent-broker.agent.args" -}}
-{{- if .Values.agent.preset }}
-  {{- if or (eq .Values.agent.preset "codex") (eq .Values.agent.preset "claude") }}[]
-  {{- else if eq .Values.agent.preset "gemini" }}["--acp"]
-  {{- else }}{{ .Values.agent.args | toJson }}
-  {{- end }}
-{{- else }}{{ .Values.agent.args | toJson }}
-{{- end }}
+{{- $agent := include "agent-broker.activeAgent" . | fromJson -}}
+{{- $agent.args | toJson -}}
 {{- end }}

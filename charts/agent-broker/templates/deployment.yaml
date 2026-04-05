@@ -22,7 +22,7 @@ spec:
     spec:
       containers:
         - name: agent-broker
-          image: "{{ include "agent-broker.image.repository" . | trim }}:{{ .Values.image.tag }}"
+          image: "{{ include "agent-broker.image.repository" . }}:{{ include "agent-broker.image.tag" . }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
             - name: DISCORD_BOT_TOKEN

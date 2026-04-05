@@ -1,6 +1,4 @@
 image:
-  repository: ghcr.io/thepagent/agent-broker
-  tag: "afad7f9"
   pullPolicy: IfNotPresent
 
 replicas: 1
@@ -20,12 +18,45 @@ discord:
   allowedChannels:
     - "YOUR_CHANNEL_ID"
 
+# Select which agent to use. Must match a key in the `agents` map below.
+activeAgent: kiro
+
+# Agent definitions. Each entry configures a different CLI agent.
+# You can override any field or add your own custom agent.
+agents:
+  kiro:
+    image:
+      repository: ghcr.io/thepagent/agent-broker
+      tag: ""             # defaults to .Chart.AppVersion
+    command: kiro-cli
+    args:
+      - acp
+      - --trust-all-tools
+
+  codex:
+    image:
+      repository: ghcr.io/thepagent/agent-broker-codex
+      tag: ""
+    command: codex-acp
+    args: []
+
+  claude:
+    image:
+      repository: ghcr.io/thepagent/agent-broker-claude
+      tag: ""
+    command: claude-agent-acp
+    args: []
+
+  gemini:
+    image:
+      repository: ghcr.io/thepagent/agent-broker-gemini
+      tag: ""
+    command: gemini
+    args:
+      - --acp
+
+# Shared agent settings (apply to all agents)
 agent:
-  preset: ""              # kiro (default), codex, or claude — auto-configures image + command
-  command: kiro-cli
-  args:
-    - acp
-    - --trust-all-tools
   workingDir: /home/agent
   env: {}
     # ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"

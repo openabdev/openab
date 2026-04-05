@@ -8,7 +8,7 @@ agent-broker {{ .Chart.AppVersion }} has been installed!
     --from-literal=discord-bot-token="YOUR_TOKEN"
 {{- end }}
 
-{{- $cmd := include "agent-broker.agent.command" . | trim }}
+{{- $cmd := include "agent-broker.agent.command" . }}
 {{- if eq $cmd "kiro-cli" }}
 
 Authenticate kiro-cli (first time only):
