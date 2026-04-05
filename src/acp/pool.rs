@@ -6,19 +6,45 @@ use tokio::sync::RwLock;
 use tokio::time::Instant;
 use tracing::{info, warn};
 
+/// Minimal chat context needed to notify the user when a session is evicted.
+#[derive(Clone)]
+pub struct SessionMeta {
+    pub chat_id: i64,
+    pub thread_id: Option<i32>,
+}
+
+/// Callback invoked by cleanup_idle for each evicted session.
+pub type EvictNotifier = Arc<dyn Fn(SessionMeta) + Send + Sync>;
+
+use std::sync::Arc;
+
 pub struct SessionPool {
     connections: RwLock<HashMap<String, AcpConnection>>,
+    meta: RwLock<HashMap<String, SessionMeta>>,
     config: AgentConfig,
     max_sessions: usize,
+    pub evict_notifier: Option<EvictNotifier>,
 }
 
 impl SessionPool {
     pub fn new(config: AgentConfig, max_sessions: usize) -> Self {
         Self {
             connections: RwLock::new(HashMap::new()),
+            meta: RwLock::new(HashMap::new()),
             config,
             max_sessions,
+            evict_notifier: None,
         }
+    }
+
+    pub fn with_evict_notifier(mut self, f: EvictNotifier) -> Self {
+        self.evict_notifier = Some(f);
+        self
+    }
+
+    /// Store chat context for a session so cleanup can notify the user.
+    pub async fn register_meta(&self, session_key: &str, meta: SessionMeta) {
+        self.meta.write().await.insert(session_key.to_string(), meta);
     }
 
     pub async fn get_or_create(&self, thread_id: &str) -> Result<()> {
@@ -88,23 +114,33 @@ impl SessionPool {
 
     pub async fn cleanup_idle(&self, ttl_secs: u64) {
         let cutoff = Instant::now() - std::time::Duration::from_secs(ttl_secs);
+        let stale: Vec<(String, Option<SessionMeta>)> = {
+            let conns = self.connections.read().await;
+            let meta = self.meta.read().await;
+            conns
+                .iter()
+                .filter(|(_, c)| !c.is_streaming && (c.last_active < cutoff || !c.alive()))
+                .map(|(k, _)| (k.clone(), meta.get(k).cloned()))
+                .collect()
+        };
+        if stale.is_empty() { return; }
         let mut conns = self.connections.write().await;
-        let stale: Vec<String> = conns
-            .iter()
-            .filter(|(_, c)| c.last_active < cutoff || !c.alive())
-            .map(|(k, _)| k.clone())
-            .collect();
-        for key in stale {
+        let mut meta = self.meta.write().await;
+        for (key, session_meta) in stale {
             info!(thread_id = %key, "cleaning up idle session");
             conns.remove(&key);
-            // Child process killed via kill_on_drop when AcpConnection drops
+            meta.remove(&key);
+            if let (Some(notifier), Some(m)) = (&self.evict_notifier, session_meta) {
+                notifier(m);
+            }
         }
     }
 
     pub async fn shutdown(&self) {
         let mut conns = self.connections.write().await;
         let count = conns.len();
-        conns.clear(); // kill_on_drop handles process cleanup
+        conns.clear();
+        self.meta.write().await.clear();
         info!(count, "pool shutdown complete");
     }
 }

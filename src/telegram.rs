@@ -1,4 +1,4 @@
-use crate::acp::{classify_notification, AcpEvent, SessionPool};
+use crate::acp::{classify_notification, AcpEvent, SessionPool, SessionMeta};
 use crate::format;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -116,9 +116,48 @@ async fn get_or_create_thread(bot: &Bot, msg: &Message) -> anyhow::Result<Thread
 
 // ── Main bot loop ────────────────────────────────────────────────────────────
 
-pub async fn run(pool: Arc<SessionPool>, bot_token: String, allowed_users: HashSet<i64>) {
+pub async fn run(mut pool: Arc<SessionPool>, bot_token: String, allowed_users: HashSet<i64>) {
     let bot = Bot::new(bot_token);
     info!("telegram bot starting");
+
+    // Wire eviction notifier so cleanup_idle can message users when their session expires.
+    {
+        let bot2 = bot.clone();
+        let notifier: crate::acp::EvictNotifier = Arc::new(move |meta: SessionMeta| {
+            let bot3 = bot2.clone();
+            tokio::spawn(async move {
+                let chat_id = ChatId(meta.chat_id);
+                let mut req = bot3.send_message(
+                    chat_id,
+                    "⏱ Your session was closed due to inactivity. Send any message to resume.",
+                );
+                if let Some(tid) = meta.thread_id {
+                    req = req.message_thread_id(ThreadId(MessageId(tid)));
+                }
+                let _ = req.await;
+            });
+        });
+        // Safety: pool has no other Arc clones yet at this point.
+        Arc::get_mut(&mut pool).unwrap().evict_notifier = Some(notifier);
+    }
+
+    // Idle session cleanup loop — 1 min interval for testing (switch to 5 min in prod).
+    // TTL: 2 min for testing (switch to 30 min in prod).
+    const CLEANUP_INTERVAL_SECS: u64 = 60;
+    const SESSION_TTL_SECS: u64 = 120;
+    {
+        let pool2 = pool.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(
+                std::time::Duration::from_secs(CLEANUP_INTERVAL_SECS)
+            );
+            interval.tick().await; // skip immediate first tick
+            loop {
+                interval.tick().await;
+                pool2.cleanup_idle(SESSION_TTL_SECS).await;
+            }
+        });
+    }
 
     teloxide::repl(bot, move |bot: Bot, msg: Message| {
         let pool = pool.clone();
@@ -178,6 +217,11 @@ pub async fn run(pool: Arc<SessionPool>, bot_token: String, allowed_users: HashS
                 error!("pool error: {e}");
                 return Ok(());
             }
+
+            pool.register_meta(&ctx.session_key, SessionMeta {
+                chat_id: chat_id.0,
+                thread_id: ctx.thread_id.map(|t| t.0 .0),
+            }).await;
 
             set_reaction(&bot, chat_id, user_msg_id, EMOJI_THINKING).await;
 

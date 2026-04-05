@@ -31,18 +31,8 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions));
-    let ttl_secs = cfg.pool.session_ttl_hours * 3600;
 
     let allowed_users: HashSet<i64> = cfg.telegram.allowed_users.iter().cloned().collect();
-
-    // Spawn cleanup task
-    let cleanup_pool = pool.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            cleanup_pool.cleanup_idle(ttl_secs).await;
-        }
-    });
 
     telegram::run(pool.clone(), cfg.telegram.bot_token, allowed_users).await;
 

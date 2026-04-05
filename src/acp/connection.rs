@@ -29,6 +29,7 @@ pub struct AcpConnection {
     pub acp_session_id: Option<String>,
     pub last_active: Instant,
     pub session_reset: bool,
+    pub is_streaming: bool,
     _reader_handle: JoinHandle<()>,
 }
 
@@ -163,6 +164,7 @@ impl AcpConnection {
             acp_session_id: None,
             last_active: Instant::now(),
             session_reset: false,
+            is_streaming: false,
             _reader_handle: reader_handle,
         })
     }
@@ -249,6 +251,7 @@ impl AcpConnection {
         prompt: &str,
     ) -> Result<(mpsc::UnboundedReceiver<JsonRpcMessage>, u64)> {
         self.last_active = Instant::now();
+        self.is_streaming = true;
 
         let session_id = self
             .acp_session_id
@@ -279,6 +282,7 @@ impl AcpConnection {
     /// Call after prompt streaming is done to clean up subscriber.
     pub async fn prompt_done(&mut self) {
         *self.notify_tx.lock().await = None;
+        self.is_streaming = false;
         self.last_active = Instant::now();
     }
 
