@@ -31,6 +31,7 @@ pub struct AcpConnection {
     pub session_reset: bool,
     pub is_streaming: bool,
     pub supports_load_session: bool,
+    pub pending_context: Option<String>,
     _reader_handle: JoinHandle<()>,
 }
 
@@ -167,6 +168,7 @@ impl AcpConnection {
             session_reset: false,
             is_streaming: false,
             supports_load_session: false,
+            pending_context: None,
             _reader_handle: reader_handle,
         })
     }
@@ -283,6 +285,13 @@ impl AcpConnection {
             .as_ref()
             .ok_or_else(|| anyhow!("no session"))?;
 
+        // Prepend any pending context (e.g. compacted memory summary) to the first prompt.
+        let full_prompt = if let Some(ctx) = self.pending_context.take() {
+            format!("{ctx}\n\n{prompt}")
+        } else {
+            prompt.to_string()
+        };
+
         let (tx, rx) = mpsc::unbounded_channel();
         *self.notify_tx.lock().await = Some(tx);
 
@@ -292,7 +301,7 @@ impl AcpConnection {
             "session/prompt",
             Some(json!({
                 "sessionId": session_id,
-                "prompt": [{"type": "text", "text": prompt}],
+                "prompt": [{"type": "text", "text": full_prompt}],
             })),
         );
         let data = serde_json::to_string(&req)?;
