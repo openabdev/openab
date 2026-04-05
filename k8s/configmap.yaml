@@ -4,9 +4,9 @@ metadata:
   name: agent-broker-config
 data:
   config.toml: |
-    [discord]
-    bot_token = "${DISCORD_BOT_TOKEN}"
-    allowed_channels = ["YOUR_CHANNEL_ID"]
+    [telegram]
+    bot_token = "${TELEGRAM_BOT_TOKEN}"
+    allowed_users = [123456789]          # replace with your Telegram user ID
 
     [agent]
     command = "kiro-cli"
@@ -15,8 +15,3 @@ data:
 
     [pool]
     max_sessions = 10
-    session_ttl_hours = 24
-
-    [reactions]
-    enabled = true
-    remove_after_reply = false
