@@ -66,10 +66,14 @@ async fn get_or_create_thread(bot: &Bot, msg: &Message) -> anyhow::Result<Thread
         ChatKind::Public(p) if matches!(&p.kind, PublicChatKind::Supergroup(s) if s.is_forum)
     );
 
+    tracing::info!(chat_id = %chat_id, is_forum, thread_id = ?msg.thread_id, chat_kind = ?std::mem::discriminant(&msg.chat.kind), "incoming message");
+
     if is_forum {
-        // Group forum or private chat with topics enabled.
-        // If the message is already inside a topic, reuse it.
-        if let Some(thread_id) = msg.thread_id {
+        // thread_id=1 is the #General topic — treat it like no topic (create a new one).
+        let in_real_topic = msg.thread_id.map_or(false, |t| t.0 != MessageId(1));
+
+        if in_real_topic {
+            let thread_id = msg.thread_id.unwrap();
             return Ok(ThreadCtx {
                 chat_id,
                 thread_id: Some(thread_id),
