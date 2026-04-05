@@ -127,14 +127,19 @@ pub async fn run(mut pool: Arc<SessionPool>, bot_token: String, allowed_users: H
             let bot3 = bot2.clone();
             tokio::spawn(async move {
                 let chat_id = ChatId(meta.chat_id);
-                let mut req = bot3.send_message(
-                    chat_id,
-                    "⏱ Your session was closed due to inactivity. Send any message to resume.",
-                );
-                if let Some(tid) = meta.thread_id {
-                    req = req.message_thread_id(ThreadId(MessageId(tid)));
+                const MSG: &str =
+                    "⏱ Your session was closed due to inactivity. Send any message to resume.";
+                let sent = if let Some(tid) = meta.thread_id {
+                    bot3.send_message(chat_id, MSG)
+                        .message_thread_id(ThreadId(MessageId(tid)))
+                        .await
+                } else {
+                    bot3.send_message(chat_id, MSG).await
+                };
+                // If the topic was deleted, fall back to the main chat.
+                if sent.is_err() && meta.thread_id.is_some() {
+                    let _ = bot3.send_message(chat_id, MSG).await;
                 }
-                let _ = req.await;
             });
         });
         // Safety: pool has no other Arc clones yet at this point.
