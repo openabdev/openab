@@ -38,11 +38,6 @@ impl SessionPool {
         }
     }
 
-    pub fn with_evict_notifier(self, f: EvictNotifier) -> Self {
-        *self.evict_notifier.lock().unwrap() = Some(f);
-        self
-    }
-
     /// Store chat context for a session so cleanup can notify the user.
     pub async fn register_meta(&self, session_key: &str, meta: SessionMeta) {
         self.meta.write().await.insert(session_key.to_string(), meta);

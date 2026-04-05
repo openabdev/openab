@@ -46,7 +46,6 @@ async fn clear_reaction(bot: &Bot, chat_id: ChatId, msg_id: MessageId) {
 /// Represents where the bot should send/edit messages for a conversation.
 #[derive(Clone)]
 struct ThreadCtx {
-    chat_id: ChatId,
     /// The forum topic thread ID (if using forum topics).
     thread_id: Option<ThreadId>,
     /// Session key for the ACP pool.
@@ -77,7 +76,6 @@ async fn get_or_create_thread(bot: &Bot, msg: &Message) -> anyhow::Result<Thread
         if in_real_topic {
             let thread_id = msg.thread_id.unwrap();
             return Ok(ThreadCtx {
-                chat_id,
                 thread_id: Some(thread_id),
                 session_key: format!("{}:{}", chat_id, thread_id),
                 is_new_topic: false,
@@ -85,7 +83,8 @@ async fn get_or_create_thread(bot: &Bot, msg: &Message) -> anyhow::Result<Thread
         }
 
         // Create a new topic named after the user + first words of prompt.
-        let user_name = msg.from()
+        let user_name = msg.from
+            .as_ref()
             .map(|u| u.first_name.clone())
             .unwrap_or_else(|| "User".to_string());
         let prompt_preview: String = msg.text().unwrap_or("").chars().take(30).collect();
@@ -96,7 +95,6 @@ async fn get_or_create_thread(bot: &Bot, msg: &Message) -> anyhow::Result<Thread
             .await?;
         let thread_id = topic.thread_id;
         Ok(ThreadCtx {
-            chat_id,
             thread_id: Some(thread_id),
             session_key: format!("{}:{}", chat_id, thread_id),
             is_new_topic: true,
@@ -107,16 +105,16 @@ async fn get_or_create_thread(bot: &Bot, msg: &Message) -> anyhow::Result<Thread
         let session_key = if msg.chat.is_private() {
             chat_id.to_string()
         } else {
-            let user_id = msg.from().map(|u| u.id.0).unwrap_or(0);
+            let user_id = msg.from.as_ref().map(|u| u.id.0).unwrap_or(0);
             format!("{}:{}", chat_id, user_id)
         };
-        Ok(ThreadCtx { chat_id, thread_id: None, session_key, is_new_topic: false })
+        Ok(ThreadCtx { thread_id: None, session_key, is_new_topic: false })
     }
 }
 
 // ── Main bot loop ────────────────────────────────────────────────────────────
 
-pub async fn run(mut pool: Arc<SessionPool>, bot_token: String, allowed_users: HashSet<i64>) {
+pub async fn run(pool: Arc<SessionPool>, bot_token: String, allowed_users: HashSet<i64>) {
     let bot = Bot::new(bot_token);
     info!("telegram bot starting");
 
@@ -168,7 +166,7 @@ pub async fn run(mut pool: Arc<SessionPool>, bot_token: String, allowed_users: H
         let pool = pool.clone();
         let allowed_users = allowed_users.clone();
         async move {
-            let user_id = msg.from().map(|u| u.id.0 as i64).unwrap_or(0);
+            let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
             tracing::info!(chat_id = %msg.chat.id, user_id, thread_id = ?msg.thread_id, text = ?msg.text(), "raw message received");
 
             // Auth check
