@@ -138,7 +138,7 @@ pub async fn run(mut pool: Arc<SessionPool>, bot_token: String, allowed_users: H
             });
         });
         // Safety: pool has no other Arc clones yet at this point.
-        Arc::get_mut(&mut pool).unwrap().evict_notifier = Some(notifier);
+        *pool.evict_notifier.lock().unwrap() = Some(notifier);
     }
 
     // Idle session cleanup loop — 1 min interval for testing (switch to 5 min in prod).

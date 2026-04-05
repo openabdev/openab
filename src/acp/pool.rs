@@ -2,6 +2,7 @@ use crate::acp::connection::AcpConnection;
 use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
+use std::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 use tracing::{info, warn};
@@ -23,7 +24,7 @@ pub struct SessionPool {
     meta: RwLock<HashMap<String, SessionMeta>>,
     config: AgentConfig,
     max_sessions: usize,
-    pub evict_notifier: Option<EvictNotifier>,
+    pub evict_notifier: Mutex<Option<EvictNotifier>>,
 }
 
 impl SessionPool {
@@ -33,12 +34,12 @@ impl SessionPool {
             meta: RwLock::new(HashMap::new()),
             config,
             max_sessions,
-            evict_notifier: None,
+            evict_notifier: Mutex::new(None),
         }
     }
 
-    pub fn with_evict_notifier(mut self, f: EvictNotifier) -> Self {
-        self.evict_notifier = Some(f);
+    pub fn with_evict_notifier(self, f: EvictNotifier) -> Self {
+        *self.evict_notifier.lock().unwrap() = Some(f);
         self
     }
 
@@ -130,7 +131,7 @@ impl SessionPool {
             info!(thread_id = %key, "cleaning up idle session");
             conns.remove(&key);
             meta.remove(&key);
-            if let (Some(notifier), Some(m)) = (&self.evict_notifier, session_meta) {
+            if let (Some(notifier), Some(m)) = (self.evict_notifier.lock().unwrap().as_ref().cloned(), session_meta) {
                 notifier(m);
             }
         }
