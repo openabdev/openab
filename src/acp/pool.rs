@@ -79,9 +79,19 @@ impl SessionPool {
         tokio::fs::create_dir_all(&session_dir).await
             .map_err(|e| anyhow!("failed to create session dir {session_dir}: {e}"))?;
 
+        // If this thread had a prior session, pass --resume so kiro reloads its history.
+        let has_prev = self.prev_session_ids.read().await.contains_key(thread_id);
+        let spawn_args: Vec<String> = if has_prev {
+            let mut a = self.config.args.clone();
+            a.push("--resume".into());
+            a
+        } else {
+            self.config.args.clone()
+        };
+
         let mut conn = AcpConnection::spawn(
             &self.config.command,
-            &self.config.args,
+            &spawn_args,
             &session_dir,
             &self.config.env,
         )
@@ -101,7 +111,7 @@ impl SessionPool {
                         true
                     }
                     Err(e) => {
-                        warn!(thread_id, "session/load failed ({e}), falling back to session/new");
+                        warn!(thread_id, "session/load failed ({e}), falling back to --resume");
                         false
                     }
                 }
@@ -114,23 +124,8 @@ impl SessionPool {
 
         if !resumed {
             conn.session_new(&session_dir).await?;
-
-            // Fallback: if there was a previous session, inject history as context.
-            if let Some(ref sid) = prev_sid {
-                if let Some(history) = load_history_summary(&session_dir, sid).await {
-                    // Mark for the caller that this is a resumed-with-history session.
-                    conn.session_reset = false; // not a cold reset
-                    // Inject history as a silent first prompt so the agent has context.
-                    let (mut rx, _) = conn.session_prompt(&history).await?;
-                    while let Some(msg) = rx.recv().await {
-                        if msg.id.is_some() { break; }
-                    }
-                    conn.prompt_done().await;
-                    info!(thread_id, "history injected via fallback prompt");
-                    self.prev_session_ids.write().await.remove(thread_id);
-                } else {
-                    conn.session_reset = true;
-                }
+            if prev_sid.is_some() {
+                self.prev_session_ids.write().await.remove(thread_id);
             }
         }
 
@@ -187,50 +182,4 @@ impl SessionPool {
     }
 }
 
-/// Read the last N turns from kiro's session JSONL and return a compact history prompt.
-/// Returns None if the file doesn't exist or has no usable content.
-async fn load_history_summary(_session_dir: &str, session_id: &str) -> Option<String> {
-    // Kiro stores sessions in ~/.kiro/sessions/cli/<session_id>.jsonl
-    let home = std::env::var("HOME").ok()?;
-    let path = format!("{home}/.kiro/sessions/cli/{session_id}.jsonl");
-    let content = tokio::fs::read_to_string(&path).await.ok()?;
 
-    let mut turns: Vec<(String, String)> = Vec::new(); // (role, text)
-    for line in content.lines() {
-        let v: serde_json::Value = serde_json::from_str(line).ok()?;
-        let kind = v.get("kind")?.as_str()?;
-        let role = match kind {
-            "Prompt" => "user",
-            "AssistantMessage" => "assistant",
-            _ => continue,
-        };
-        let text = v.get("data")
-            .and_then(|d| d.get("content"))
-            .and_then(|c| c.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|item| item.get("data"))
-            .and_then(|d| d.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        if !text.is_empty() {
-            turns.push((role.to_string(), text));
-        }
-    }
-
-    if turns.is_empty() {
-        return None;
-    }
-
-    // Keep last 10 turns to stay within context limits
-    let recent = if turns.len() > 10 { &turns[turns.len() - 10..] } else { &turns[..] };
-    let mut summary = String::from(
-        "[Resuming previous session. Conversation history for context:]\n"
-    );
-    for (role, text) in recent {
-        let preview: String = text.chars().take(500).collect();
-        summary.push_str(&format!("{}: {}\n", role, preview));
-    }
-    summary.push_str("[End of history. Continue from here.]\n");
-    Some(summary)
-}
