@@ -22,6 +22,8 @@ use std::sync::Arc;
 pub struct SessionPool {
     connections: RwLock<HashMap<String, AcpConnection>>,
     meta: RwLock<HashMap<String, SessionMeta>>,
+    /// Persists the last ACP session ID for each thread key across evictions.
+    prev_session_ids: RwLock<HashMap<String, String>>,
     config: AgentConfig,
     max_sessions: usize,
     pub evict_notifier: Mutex<Option<EvictNotifier>>,
@@ -32,6 +34,7 @@ impl SessionPool {
         Self {
             connections: RwLock::new(HashMap::new()),
             meta: RwLock::new(HashMap::new()),
+            prev_session_ids: RwLock::new(HashMap::new()),
             config,
             max_sessions,
             evict_notifier: Mutex::new(None),
@@ -85,11 +88,50 @@ impl SessionPool {
         .await?;
 
         conn.initialize().await?;
-        conn.session_new(&session_dir).await?;
 
-        let is_rebuild = conns.contains_key(thread_id);
-        if is_rebuild {
-            conn.session_reset = true;
+        // Look up any previously evicted session ID for this thread.
+        let prev_sid = self.prev_session_ids.read().await.get(thread_id).cloned();
+
+        let resumed = if let Some(ref sid) = prev_sid {
+            if conn.supports_load_session {
+                match conn.session_load(&session_dir, sid).await {
+                    Ok(_) => {
+                        info!(thread_id, session_id = %sid, "true resume via session/load");
+                        self.prev_session_ids.write().await.remove(thread_id);
+                        true
+                    }
+                    Err(e) => {
+                        warn!(thread_id, "session/load failed ({e}), falling back to session/new");
+                        false
+                    }
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !resumed {
+            conn.session_new(&session_dir).await?;
+
+            // Fallback: if there was a previous session, inject history as context.
+            if let Some(ref sid) = prev_sid {
+                if let Some(history) = load_history_summary(&session_dir, sid).await {
+                    // Mark for the caller that this is a resumed-with-history session.
+                    conn.session_reset = false; // not a cold reset
+                    // Inject history as a silent first prompt so the agent has context.
+                    let (mut rx, _) = conn.session_prompt(&history).await?;
+                    while let Some(msg) = rx.recv().await {
+                        if msg.id.is_some() { break; }
+                    }
+                    conn.prompt_done().await;
+                    info!(thread_id, "history injected via fallback prompt");
+                    self.prev_session_ids.write().await.remove(thread_id);
+                } else {
+                    conn.session_reset = true;
+                }
+            }
         }
 
         conns.insert(thread_id.to_string(), conn);
@@ -110,22 +152,26 @@ impl SessionPool {
 
     pub async fn cleanup_idle(&self, ttl_secs: u64) {
         let cutoff = Instant::now() - std::time::Duration::from_secs(ttl_secs);
-        let stale: Vec<(String, Option<SessionMeta>)> = {
+        let stale: Vec<(String, Option<SessionMeta>, Option<String>)> = {
             let conns = self.connections.read().await;
             let meta = self.meta.read().await;
             conns
                 .iter()
                 .filter(|(_, c)| !c.is_streaming && (c.last_active < cutoff || !c.alive()))
-                .map(|(k, _)| (k.clone(), meta.get(k).cloned()))
+                .map(|(k, c)| (k.clone(), meta.get(k).cloned(), c.acp_session_id.clone()))
                 .collect()
         };
         if stale.is_empty() { return; }
         let mut conns = self.connections.write().await;
         let mut meta = self.meta.write().await;
-        for (key, session_meta) in stale {
+        let mut prev = self.prev_session_ids.write().await;
+        for (key, session_meta, acp_session_id) in stale {
             info!(thread_id = %key, "cleaning up idle session");
             conns.remove(&key);
             meta.remove(&key);
+            if let Some(sid) = acp_session_id {
+                prev.insert(key.clone(), sid);
+            }
             if let (Some(notifier), Some(m)) = (self.evict_notifier.lock().unwrap().as_ref().cloned(), session_meta) {
                 notifier(m);
             }
@@ -139,4 +185,52 @@ impl SessionPool {
         self.meta.write().await.clear();
         info!(count, "pool shutdown complete");
     }
+}
+
+/// Read the last N turns from kiro's session JSONL and return a compact history prompt.
+/// Returns None if the file doesn't exist or has no usable content.
+async fn load_history_summary(_session_dir: &str, session_id: &str) -> Option<String> {
+    // Kiro stores sessions in ~/.kiro/sessions/cli/<session_id>.jsonl
+    let home = std::env::var("HOME").ok()?;
+    let path = format!("{home}/.kiro/sessions/cli/{session_id}.jsonl");
+    let content = tokio::fs::read_to_string(&path).await.ok()?;
+
+    let mut turns: Vec<(String, String)> = Vec::new(); // (role, text)
+    for line in content.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+        let kind = v.get("kind")?.as_str()?;
+        let role = match kind {
+            "Prompt" => "user",
+            "AssistantMessage" => "assistant",
+            _ => continue,
+        };
+        let text = v.get("data")
+            .and_then(|d| d.get("content"))
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|item| item.get("data"))
+            .and_then(|d| d.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !text.is_empty() {
+            turns.push((role.to_string(), text));
+        }
+    }
+
+    if turns.is_empty() {
+        return None;
+    }
+
+    // Keep last 10 turns to stay within context limits
+    let recent = if turns.len() > 10 { &turns[turns.len() - 10..] } else { &turns[..] };
+    let mut summary = String::from(
+        "[Resuming previous session. Conversation history for context:]\n"
+    );
+    for (role, text) in recent {
+        let preview: String = text.chars().take(500).collect();
+        summary.push_str(&format!("{}: {}\n", role, preview));
+    }
+    summary.push_str("[End of history. Continue from here.]\n");
+    Some(summary)
 }
