@@ -3,14 +3,16 @@ use crate::config::ReactionsConfig;
 use crate::format;
 use crate::reactions::StatusReactionController;
 use serenity::async_trait;
+use serenity::builder::{CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage};
+use serenity::model::application::Interaction;
 use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
-use serenity::model::id::{ChannelId, MessageId};
+use serenity::model::id::{ChannelId, GuildId, MessageId};
 use serenity::prelude::*;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::watch;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub struct Handler {
     pub pool: Arc<SessionPool>,
@@ -151,8 +153,56 @@ impl EventHandler for Handler {
         }
     }
 
-    async fn ready(&self, _ctx: Context, ready: Ready) {
+    async fn ready(&self, ctx: Context, ready: Ready) {
         info!(user = %ready.user.name, "discord bot connected");
+
+        // Register /close as a guild command (instant propagation, no global rate limits).
+        let command = CreateCommand::new("close")
+            .description("Close the current coding session and clean up the working directory");
+        for guild in &ready.guilds {
+            let guild_id = guild.id;
+            match guild_id.create_command(&ctx.http, command.clone()).await {
+                Ok(_) => info!(%guild_id, "registered /close guild command"),
+                Err(e) => warn!(%guild_id, error = %e, "failed to register /close guild command"),
+            }
+        }
+    }
+
+    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        let Interaction::Command(ref cmd) = interaction else {
+            return;
+        };
+        if cmd.data.name != "close" {
+            return;
+        }
+
+        let channel_id = cmd.channel_id;
+
+        // Only works inside threads
+        let in_thread = match channel_id.to_channel(&ctx.http).await {
+            Ok(serenity::model::channel::Channel::Guild(gc)) => gc.thread_metadata.is_some(),
+            _ => false,
+        };
+
+        let content = if in_thread {
+            let thread_key = channel_id.get().to_string();
+            if self.pool.close_session(&thread_key).await {
+                "✅ Session closed. Working directory cleaned up.".to_string()
+            } else {
+                "ℹ️ No active session in this thread.".to_string()
+            }
+        } else {
+            "⚠️ `/close` can only be used inside a thread.".to_string()
+        };
+
+        let response = CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content(content)
+                .ephemeral(true),
+        );
+        if let Err(e) = cmd.create_response(&ctx.http, response).await {
+            error!(error = %e, "failed to respond to /close interaction");
+        }
     }
 }
 

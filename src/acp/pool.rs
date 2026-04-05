@@ -137,6 +137,27 @@ impl SessionPool {
         }
     }
 
+    /// Manually close a session: kill the ACP process and clean up the working directory.
+    pub async fn close_session(&self, thread_id: &str) -> bool {
+        let removed = {
+            let mut conns = self.connections.write().await;
+            conns.remove(thread_id).is_some()
+            // Child process killed via kill_on_drop when AcpConnection drops
+        }; // write lock released before async I/O
+
+        let dir = self.thread_dir(thread_id);
+        match tokio::fs::remove_dir_all(&dir).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(thread_id, error = %e, "failed to remove session directory"),
+        }
+
+        if removed {
+            info!(thread_id, "session manually closed");
+        }
+        removed
+    }
+
     pub async fn shutdown(&self) {
         let dirs_to_remove: Vec<(String, PathBuf)>;
         let count: usize;
