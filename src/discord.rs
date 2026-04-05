@@ -169,133 +169,145 @@ async fn stream_prompt(
     msg_id: MessageId,
     reactions: Arc<StatusReactionController>,
 ) -> anyhow::Result<()> {
-    let prompt = prompt.to_string();
-    let reactions = reactions.clone();
+    // Get per-connection lock — does NOT hold the pool lock during streaming.
+    // Other sessions remain fully accessible.
+    let conn_arc = pool.get_connection(thread_key).await?;
+    let mut conn = conn_arc.lock().await;
 
-    pool.with_connection(thread_key, |conn| {
-        let prompt = prompt.clone();
+    let reset = conn.session_reset;
+    conn.session_reset = false;
+
+    let (mut rx, _) = conn.session_prompt(prompt).await?;
+    reactions.set_thinking().await;
+
+    let initial = if reset {
+        "⚠️ _Session expired, starting fresh..._\n\n...".to_string()
+    } else {
+        "...".to_string()
+    };
+    let (buf_tx, buf_rx) = watch::channel(initial);
+
+    let mut text_buf = String::new();
+    let mut tool_lines: Vec<String> = Vec::new();
+    let current_msg_id = msg_id;
+
+    if reset {
+        text_buf.push_str("⚠️ _Session expired, starting fresh..._\n\n");
+    }
+
+    // Spawn edit-streaming task
+    let edit_handle = {
         let ctx = ctx.clone();
-        let reactions = reactions.clone();
-        Box::pin(async move {
-            let reset = conn.session_reset;
-            conn.session_reset = false;
-
-            let (mut rx, _) = conn.session_prompt(&prompt).await?;
-            reactions.set_thinking().await;
-
-            let initial = if reset {
-                "⚠️ _Session expired, starting fresh..._\n\n...".to_string()
-            } else {
-                "...".to_string()
-            };
-            let (buf_tx, buf_rx) = watch::channel(initial);
-
-            let mut text_buf = String::new();
-            let mut tool_lines: Vec<String> = Vec::new();
-            let current_msg_id = msg_id;
-
-            if reset {
-                text_buf.push_str("⚠️ _Session expired, starting fresh..._\n\n");
-            }
-
-            // Spawn edit-streaming task
-            let edit_handle = {
-                let ctx = ctx.clone();
-                let mut buf_rx = buf_rx.clone();
-                tokio::spawn(async move {
-                    let mut last_content = String::new();
-                    let mut current_edit_msg = msg_id;
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                        if buf_rx.has_changed().unwrap_or(false) {
-                            let content = buf_rx.borrow_and_update().clone();
-                            if content != last_content {
-                                if content.len() > 1900 {
-                                    let chunks = format::split_message(&content, 1900);
-                                    if let Some(first) = chunks.first() {
-                                        let _ = edit(&ctx, channel, current_edit_msg, first).await;
-                                    }
-                                    for chunk in chunks.iter().skip(1) {
-                                        if let Ok(new_msg) = channel.say(&ctx.http, chunk).await {
-                                            current_edit_msg = new_msg.id;
-                                        }
-                                    }
-                                } else {
-                                    let _ = edit(&ctx, channel, current_edit_msg, &content).await;
-                                }
-                                last_content = content;
+        let mut buf_rx = buf_rx.clone();
+        tokio::spawn(async move {
+            let mut last_content = String::new();
+            let mut current_edit_msg = msg_id;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                if buf_rx.has_changed().unwrap_or(false) {
+                    let content = buf_rx.borrow_and_update().clone();
+                    if content != last_content {
+                        if content.len() > 1900 {
+                            let chunks = format::split_message(&content, 1900);
+                            if let Some(first) = chunks.first() {
+                                let _ = edit(&ctx, channel, current_edit_msg, first).await;
                             }
+                            for chunk in chunks.iter().skip(1) {
+                                if let Ok(new_msg) = channel.say(&ctx.http, chunk).await {
+                                    current_edit_msg = new_msg.id;
+                                }
+                            }
+                        } else {
+                            let _ = edit(&ctx, channel, current_edit_msg, &content).await;
                         }
-                        if buf_rx.has_changed().is_err() {
-                            break;
-                        }
+                        last_content = content;
                     }
-                })
-            };
-
-            // Process ACP notifications
-            let mut got_first_text = false;
-            while let Some(notification) = rx.recv().await {
-                if notification.id.is_some() {
+                }
+                if buf_rx.has_changed().is_err() {
                     break;
                 }
-
-                if let Some(event) = classify_notification(&notification) {
-                    match event {
-                        AcpEvent::Text(t) => {
-                            if !got_first_text {
-                                got_first_text = true;
-                                // Reaction: back to thinking after tools
-                            }
-                            text_buf.push_str(&t);
-                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
-                        }
-                        AcpEvent::Thinking => {
-                            reactions.set_thinking().await;
-                        }
-                        AcpEvent::ToolStart { title, .. } if !title.is_empty() => {
-                            reactions.set_tool(&title).await;
-                            tool_lines.push(format!("🔧 `{title}`..."));
-                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
-                        }
-                        AcpEvent::ToolDone { title, status, .. } => {
-                            reactions.set_thinking().await;
-                            let icon = if status == "completed" { "✅" } else { "❌" };
-                            if let Some(line) = tool_lines.iter_mut().rev().find(|l| l.contains(&title)) {
-                                *line = format!("{icon} `{title}`");
-                            }
-                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
-                        }
-                        _ => {}
-                    }
-                }
             }
-
-            conn.prompt_done().await;
-            drop(buf_tx);
-            let _ = edit_handle.await;
-
-            // Final edit
-            let final_content = compose_display(&tool_lines, &text_buf);
-            let final_content = if final_content.is_empty() {
-                "_(no response)_".to_string()
-            } else {
-                final_content
-            };
-
-            let chunks = format::split_message(&final_content, 2000);
-            for (i, chunk) in chunks.iter().enumerate() {
-                if i == 0 {
-                    let _ = edit(&ctx, channel, current_msg_id, chunk).await;
-                } else {
-                    let _ = channel.say(&ctx.http, chunk).await;
-                }
-            }
-
-            Ok(())
         })
-    })
-    .await
+    };
+
+    // Process ACP notifications.
+    // Instead of blocking forever on rx.recv(), periodically check if the
+    // agent process is still alive. Long tool calls (e.g. flutter test,
+    // git clone) send no notifications for minutes — that's normal as long
+    // as the process is running. Only break if the process has died.
+    let mut got_first_text = false;
+    loop {
+        let notification = tokio::select! {
+            msg = rx.recv() => match msg {
+                Some(n) => n,
+                None => break,
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                if !conn.alive() {
+                    tracing::warn!("agent process died during prompt");
+                    break;
+                }
+                continue;
+            }
+        };
+
+        if notification.id.is_some() {
+            break;
+        }
+
+        if let Some(event) = classify_notification(&notification) {
+            match event {
+                AcpEvent::Text(t) => {
+                    if !got_first_text {
+                        got_first_text = true;
+                    }
+                    text_buf.push_str(&t);
+                    let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
+                }
+                AcpEvent::Thinking => {
+                    reactions.set_thinking().await;
+                }
+                AcpEvent::ToolStart { title, .. } if !title.is_empty() => {
+                    reactions.set_tool(&title).await;
+                    tool_lines.push(format!("🔧 `{title}`..."));
+                    let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
+                }
+                AcpEvent::ToolDone { title, status, .. } => {
+                    reactions.set_thinking().await;
+                    let icon = if status == "completed" { "✅" } else { "❌" };
+                    if let Some(line) = tool_lines.iter_mut().rev().find(|l| l.contains(&title)) {
+                        *line = format!("{icon} `{title}`");
+                    }
+                    let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    conn.prompt_done().await;
+    drop(conn); // release per-connection lock immediately
+    drop(buf_tx);
+    let _ = edit_handle.await;
+
+    // Final edit
+    let final_content = compose_display(&tool_lines, &text_buf);
+    let final_content = if final_content.is_empty() {
+        "_(no response)_".to_string()
+    } else {
+        final_content
+    };
+
+    let chunks = format::split_message(&final_content, 2000);
+    for (i, chunk) in chunks.iter().enumerate() {
+        if i == 0 {
+            let _ = edit(&ctx, channel, current_msg_id, chunk).await;
+        } else {
+            let _ = channel.say(&ctx.http, chunk).await;
+        }
+    }
+
+    Ok(())
 }
 
 fn compose_display(tool_lines: &[String], text: &str) -> String {
