@@ -30,6 +30,7 @@ pub struct AcpConnection {
     pub last_active: Instant,
     pub session_reset: bool,
     pub is_streaming: bool,
+    pub supports_load_session: bool,
     _reader_handle: JoinHandle<()>,
 }
 
@@ -165,6 +166,7 @@ impl AcpConnection {
             last_active: Instant::now(),
             session_reset: false,
             is_streaming: false,
+            supports_load_session: false,
             _reader_handle: reader_handle,
         })
     }
@@ -221,8 +223,31 @@ impl AcpConnection {
             .and_then(|a| a.get("name"))
             .and_then(|n| n.as_str())
             .unwrap_or("unknown");
-        info!(agent = agent_name, "initialized");
+        self.supports_load_session = resp.result.as_ref()
+            .and_then(|r| r.get("agentCapabilities"))
+            .and_then(|c| c.get("loadSession"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        info!(agent = agent_name, load_session = self.supports_load_session, "initialized");
         Ok(())
+    }
+
+    pub async fn session_load(&mut self, cwd: &str, session_id: &str) -> Result<String> {
+        let resp = self
+            .send_request(
+                "session/load",
+                Some(json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []})),
+            )
+            .await?;
+        // session/load reuses the same sessionId
+        let sid = resp.result.as_ref()
+            .and_then(|r| r.get("sessionId"))
+            .and_then(|s| s.as_str())
+            .unwrap_or(session_id)
+            .to_string();
+        info!(session_id = %sid, "session loaded (resumed)");
+        self.acp_session_id = Some(sid.clone());
+        Ok(sid)
     }
 
     pub async fn session_new(&mut self, cwd: &str) -> Result<String> {
