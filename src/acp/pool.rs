@@ -48,16 +48,22 @@ impl SessionPool {
             return Err(anyhow!("pool exhausted ({} sessions)", self.max_sessions));
         }
 
+        // Sanitize session key into a safe directory name
+        let safe_key = thread_id.replace(|c: char| !c.is_alphanumeric() && c != '-', "_");
+        let session_dir = format!("{}/session-{}", self.config.working_dir, safe_key);
+        tokio::fs::create_dir_all(&session_dir).await
+            .map_err(|e| anyhow!("failed to create session dir {session_dir}: {e}"))?;
+
         let mut conn = AcpConnection::spawn(
             &self.config.command,
             &self.config.args,
-            &self.config.working_dir,
+            &session_dir,
             &self.config.env,
         )
         .await?;
 
         conn.initialize().await?;
-        conn.session_new(&self.config.working_dir).await?;
+        conn.session_new(&session_dir).await?;
 
         let is_rebuild = conns.contains_key(thread_id);
         if is_rebuild {
