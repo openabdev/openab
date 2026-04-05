@@ -146,8 +146,8 @@ pub async fn run(pool: Arc<SessionPool>, bot_token: String, allowed_users: HashS
 
     // Idle session cleanup loop — 1 min interval for testing (switch to 5 min in prod).
     // TTL: 2 min for testing (switch to 30 min in prod).
-    const CLEANUP_INTERVAL_SECS: u64 = 300;  // 5 min
-    const SESSION_TTL_SECS: u64 = 1800;      // 30 min
+    const CLEANUP_INTERVAL_SECS: u64 = 60;   // TODO: revert to 900 after Alice test
+    const SESSION_TTL_SECS: u64 = 120;      // TODO: revert to 7200 after Alice test
     {
         let pool2 = pool.clone();
         tokio::spawn(async move {
@@ -178,12 +178,39 @@ pub async fn run(pool: Arc<SessionPool>, bot_token: String, allowed_users: HashS
                 Some(t) if !t.is_empty() => t.to_string(),
                 _ => return Ok(()),
             };
-
-            let chat_id = msg.chat.id;
             let user_msg_id = msg.id;
 
-            // 👀 queued reaction on user's message
-            set_reaction(&bot, chat_id, user_msg_id, EMOJI_QUEUED).await;
+            // ── Bot commands ─────────────────────────────────────────────────
+            if prompt.starts_with('!') {
+                let ctx = match get_or_create_thread(&bot, &msg).await {
+                    Ok(c) => c,
+                    Err(_) => return Ok(()),
+                };
+                let reply = match prompt.trim() {
+                    "!status" => pool.session_status(&ctx.session_key).await,
+                    "!stop" => {
+                        pool.remove_session(&ctx.session_key).await;
+                        "✅ Session stopped.".to_string()
+                    }
+                    "!restart" => {
+                        pool.remove_session(&ctx.session_key).await;
+                        "♻️ Session cleared. Send a message to start fresh.".to_string()
+                    }
+                    _ => return Ok(()),
+                };
+                let chat_id = msg.chat.id;
+                let mut req = bot.send_message(chat_id, reply);
+                if let Some(tid) = ctx.thread_id {
+                    req = req.message_thread_id(tid);
+                } else {
+                    req = req.reply_parameters(ReplyParameters::new(msg.id));
+                }
+                let _ = req.await;
+                return Ok(());
+            }
+            // ─────────────────────────────────────────────────────────────────
+
+            let chat_id = msg.chat.id;
 
             // Resolve thread context
             let ctx = match get_or_create_thread(&bot, &msg).await {

@@ -145,6 +145,27 @@ impl SessionPool {
         f(conn).await
     }
 
+    /// Forcibly remove a session (used by !stop / !restart).
+    pub async fn remove_session(&self, session_key: &str) {
+        self.connections.write().await.remove(session_key);
+        self.meta.write().await.remove(session_key);
+        self.prev_session_ids.write().await.remove(session_key);
+    }
+
+    /// Return a human-readable status string for a session.
+    pub async fn session_status(&self, session_key: &str) -> String {
+        let conns = self.connections.read().await;
+        match conns.get(session_key) {
+            None => "No active session.".to_string(),
+            Some(c) => {
+                let state = if c.is_streaming { "streaming" } else if c.alive() { "idle" } else { "dead" };
+                let secs = c.last_active.elapsed().as_secs();
+                let sid = c.acp_session_id.as_deref().unwrap_or("unknown");
+                format!("Session `{sid}`\nState: {state}\nLast active: {secs}s ago")
+            }
+        }
+    }
+
     pub async fn cleanup_idle(&self, ttl_secs: u64) {
         let cutoff = Instant::now() - std::time::Duration::from_secs(ttl_secs);
         let stale: Vec<(String, Option<SessionMeta>, Option<String>)> = {
