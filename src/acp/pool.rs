@@ -24,6 +24,8 @@ pub struct SessionPool {
     meta: RwLock<HashMap<String, SessionMeta>>,
     /// Persists the last ACP session ID for each thread key across evictions.
     prev_session_ids: RwLock<HashMap<String, String>>,
+    /// Compacted memory summaries to inject on next resume.
+    summaries: RwLock<HashMap<String, String>>,
     config: AgentConfig,
     max_sessions: usize,
     pub evict_notifier: Mutex<Option<EvictNotifier>>,
@@ -35,6 +37,7 @@ impl SessionPool {
             connections: RwLock::new(HashMap::new()),
             meta: RwLock::new(HashMap::new()),
             prev_session_ids: RwLock::new(HashMap::new()),
+            summaries: RwLock::new(HashMap::new()),
             config,
             max_sessions,
             evict_notifier: Mutex::new(None),
@@ -79,15 +82,7 @@ impl SessionPool {
         tokio::fs::create_dir_all(&session_dir).await
             .map_err(|e| anyhow!("failed to create session dir {session_dir}: {e}"))?;
 
-        // If this thread had a prior session, pass --resume so kiro reloads its history.
-        let has_prev = self.prev_session_ids.read().await.contains_key(thread_id);
-        let spawn_args: Vec<String> = if has_prev {
-            let mut a = self.config.args.clone();
-            a.push("--resume".into());
-            a
-        } else {
-            self.config.args.clone()
-        };
+        let spawn_args: Vec<String> = self.config.args.clone();
 
         let mut conn = AcpConnection::spawn(
             &self.config.command,
@@ -129,6 +124,14 @@ impl SessionPool {
             }
         }
 
+        // Inject compacted memory summary if one exists for this thread.
+        // Store it on the connection so stream_prompt prepends it to the first real prompt.
+        let summary = self.summaries.write().await.remove(thread_id);
+        if let Some(s) = summary {
+            info!(thread_id, "injecting compacted memory summary");
+            conn.pending_context = Some(format!("[Context from previous session]: {s}"));
+        }
+
         conns.insert(thread_id.to_string(), conn);
         Ok(())
     }
@@ -150,6 +153,7 @@ impl SessionPool {
         self.connections.write().await.remove(session_key);
         self.meta.write().await.remove(session_key);
         self.prev_session_ids.write().await.remove(session_key);
+        self.summaries.write().await.remove(session_key);
     }
 
     /// Return a human-readable status string for a session.
@@ -178,6 +182,47 @@ impl SessionPool {
                 .collect()
         };
         if stale.is_empty() { return; }
+
+        // Compact memory for each stale session before evicting.
+        // Important: do NOT hold the connections write lock while awaiting the prompt
+        // response — that would deadlock any concurrent message handler.
+        const COMPACT_PROMPT: &str = "Summarize this conversation in 3rd person, capturing all key facts about the user and topics discussed. Be concise. Reply with only the summary.";
+        for (key, _, _) in &stale {
+            // Start the prompt while holding the write lock briefly, then drop it.
+            let prompt_rx = {
+                let mut conns = self.connections.write().await;
+                if let Some(conn) = conns.get_mut(key) {
+                    match conn.session_prompt(COMPACT_PROMPT).await {
+                        Ok((rx, _)) => Some(rx),
+                        Err(e) => { warn!(thread_id = %key, "compaction prompt failed: {e}"); None }
+                    }
+                } else {
+                    None
+                }
+            }; // write lock released here
+
+            if let Some(mut rx) = prompt_rx {
+                let mut summary = String::new();
+                while let Some(msg) = rx.recv().await {
+                    if msg.id.is_some() { break; }
+                    if let Some(crate::acp::protocol::AcpEvent::Text(t)) = crate::acp::protocol::classify_notification(&msg) {
+                        summary.push_str(&t);
+                    }
+                }
+                // Re-acquire briefly to call prompt_done and store summary.
+                {
+                    let mut conns = self.connections.write().await;
+                    if let Some(conn) = conns.get_mut(key) {
+                        conn.prompt_done().await;
+                    }
+                }
+                if !summary.is_empty() {
+                    info!(thread_id = %key, "compacted memory summary stored");
+                    self.summaries.write().await.insert(key.clone(), summary);
+                }
+            }
+        }
+
         let mut conns = self.connections.write().await;
         let mut meta = self.meta.write().await;
         let mut prev = self.prev_session_ids.write().await;
