@@ -49,14 +49,16 @@ Authenticate Gemini CLI (first time only):
 
 Authenticate GitHub Copilot CLI (first time only):
 
-  kubectl exec -it deployment/{{ include "agent-broker.fullname" . }} -- copilot
+  kubectl exec -it deployment/{{ include "agent-broker.fullname" . }} -- \
+    sh -lc 'cd {{ .Values.agent.workingDir }} && copilot'
 
   Choose "Always trust" for {{ .Values.agent.workingDir }} so ACP can start
   without an interactive prompt, then run:
 
     /login
 
-  Or skip interactive auth entirely with a fine-grained PAT (Copilot Requests permission):
+  Or use a fine-grained PAT to skip /login only (the first trust step is
+  still required):
 
   helm upgrade {{ .Release.Name }} agent-broker/agent-broker --set env.COPILOT_GITHUB_TOKEN="<token>"
 {{- else }}

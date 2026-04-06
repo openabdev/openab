@@ -89,9 +89,10 @@ Swap backends using the `agent.preset` Helm value or manual config. Supported ba
 | `codex` | Codex | [@zed-industries/codex-acp](https://github.com/zed-industries/codex-acp) | `codex login --device-auth` |
 | `claude` | Claude Code | [@agentclientprotocol/claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp) | `claude setup-token` |
 | `gemini` | Gemini CLI | Native `gemini --acp` | Google OAuth or `GEMINI_API_KEY` |
-| `copilot` | GitHub Copilot CLI | Native `copilot --acp --stdio` | `copilot` then `/login`, or `COPILOT_GITHUB_TOKEN` |
+| `copilot` | GitHub Copilot CLI | Native `copilot --acp --stdio` | Trust the working dir once, then `/login` or `COPILOT_GITHUB_TOKEN` |
 
 > GitHub Copilot CLI ACP support is currently in public preview.
+> `COPILOT_GITHUB_TOKEN` skips `/login`, but it does not bypass the initial persistent trust step for the configured working directory.
 
 ### Helm Install (recommended)
 
@@ -147,9 +148,10 @@ kubectl exec -it deployment/agent-broker -- gemini
 # Or use API key: helm upgrade agent-broker agent-broker/agent-broker --set env.GEMINI_API_KEY="<key>"
 
 # GitHub Copilot CLI
-kubectl exec -it deployment/agent-broker -- copilot
-# Choose "Always trust" for /home/agent so ACP starts without interactive prompt, then run /login
-# Or skip interactive auth — use a PAT with Copilot Requests permission:
+kubectl exec -it deployment/agent-broker -- sh -lc 'cd /home/agent && copilot'
+# If you changed agent.workingDir, replace /home/agent with that path.
+# Choose "Always trust" for /home/agent, then run /login
+# Or use a PAT to skip /login only; the first trust step is still required:
 # helm upgrade agent-broker agent-broker/agent-broker --set env.COPILOT_GITHUB_TOKEN="<token>"
 ```
 
@@ -341,9 +343,10 @@ The PVC persists CLI auth and settings across pod restarts.
 kubectl exec -it deployment/agent-broker -- kiro-cli login --use-device-flow
 
 # GitHub Copilot CLI
-kubectl exec -it deployment/agent-broker -- copilot
-# Choose "Always trust" for /home/agent so ACP starts without interactive prompt, then run /login
-# Or skip interactive auth — inject a PAT:
+kubectl exec -it deployment/agent-broker -- sh -lc 'cd /home/agent && copilot'
+# If you changed working_dir, replace /home/agent with that path.
+# Choose "Always trust" for /home/agent, then run /login
+# Or use a PAT to skip /login only; the first trust step is still required:
 # kubectl set env deployment/agent-broker COPILOT_GITHUB_TOKEN="<token>"
 ```
 
