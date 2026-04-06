@@ -20,11 +20,14 @@ RUN ARCH=$(dpkg --print-architecture) && \
     chmod +x /usr/local/bin/kiro-cli* && \
     rm -rf /tmp/kirocli /tmp/kirocli.zip
 
-RUN mkdir -p /home/agent/.local/share/kiro-cli /home/agent/.kiro
+RUN useradd -m -s /bin/bash agent
+RUN mkdir -p /home/agent/.local/share/kiro-cli /home/agent/.kiro && \
+    chown -R agent:agent /home/agent
 ENV HOME=/home/agent
 WORKDIR /home/agent
 
 COPY --from=builder /build/target/release/agent-broker /usr/local/bin/agent-broker
 
+USER agent
 ENTRYPOINT ["agent-broker"]
 CMD ["/etc/agent-broker/config.toml"]
