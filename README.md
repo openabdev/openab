@@ -2,11 +2,10 @@
 
 A Rust bridge service between Telegram and any ACP-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, etc.) using the [Agent Client Protocol](https://github.com/anthropics/agent-protocol) over stdio JSON-RPC.
 
-```
-┌──────────────┐  Bot API      ┌──────────────┐  ACP stdio    ┌──────────────┐
-│   Telegram   │◄─────────────►│ agent-broker │──────────────►│  coding CLI  │
-│   User       │               │   (Rust)     │◄── JSON-RPC ──│  (acp mode)  │
-└──────────────┘               └──────────────┘               └──────────────┘
+```mermaid
+graph LR
+    U(["👤 Telegram User"]) <-->|Bot API| AB["agent-broker (Rust)"]
+    AB <-->|"ACP stdio JSON-RPC"| CLI["coding CLI\n(kiro-cli / claude / codex / gemini)"]
 ```
 
 ## Features
@@ -24,30 +23,25 @@ A Rust bridge service between Telegram and any ACP-compatible coding CLI (Kiro C
 
 ## Session Lifecycle
 
-```
-User message
-      │
-      ▼
-get_or_create ──► spawn CLI ──► session/new (or session/load)
-      │                                │
-      │                         pending_context?
-      │                                │
-      │                         prepend summary to first prompt
-      ▼
-stream_prompt ──► live-edit message every 1.5s
-      │
-      ▼
-prompt_done ──► update last_active
-      │
-      ▼
-cleanup_idle (every 15 min)
-      │
-      ├─ streaming? ──► skip
-      │
-      └─ idle > 2hr? ──► compact ──► evict ──► notify user
-                              │
-                        summary stored
-                        injected on next resume
+```mermaid
+flowchart TD
+    M([User message]) --> GC[get_or_create session]
+    GC --> SP[spawn CLI]
+    SP --> SN["session/new or session/load"]
+    SN --> PC{pending_context?}
+    PC -->|yes| PP[prepend summary to prompt]
+    PC -->|no| ST
+    PP --> ST[stream_prompt\nlive-edit every 1.5s]
+    ST --> PD[prompt_done\nupdate last_active]
+    PD --> CI[cleanup_idle every 15 min]
+    CI --> IS{streaming?}
+    IS -->|yes| SK[skip]
+    IS -->|no| IT{idle > 2hr?}
+    IT -->|no| SK
+    IT -->|yes| CO[compact]
+    CO --> EV[evict + notify user]
+    EV --> SS[summary stored]
+    SS --> NR[injected on next resume]
 ```
 
 ## Quick Start
@@ -190,30 +184,20 @@ max_sessions = 10                    # max concurrent sessions
 
 ### Pod Architecture
 
-```
-┌─ Kubernetes Pod ──────────────────────────────────────────────────┐
-│                                                                   │
-│  ┌──────────────────────────────────────────────────────────┐     │
-│  │  agent-broker (PID 1)                                    │     │
-│  │                                                          │     │
-│  │  ┌─────────────────┐   ┌──────────────┐                  │     │
-│  │  │ Telegram Bot API│   │ Session Pool │                  │     │
-│  │  │ (long polling)  │   │ (per topic)  │                  │     │
-│  │  └────────┬────────┘   └──────┬───────┘                  │     │
-│  │           │                   │ spawn + stdio ACP         │     │
-│  └───────────┼───────────────────┼──────────────────────────┘     │
-│              │                   ▼                                │
-│              │      ┌────────────────────────────┐               │
-│              │      │  kiro-cli acp (child proc) │               │
-│              │      │  stdin  ◄── JSON-RPC req   │               │
-│              │      │  stdout ──► JSON-RPC resp  │               │
-│              │      └────────────────────────────┘               │
-│                                                                   │
-│  ┌─ PVC (/data) ────────────────────────────────────────────┐     │
-│  │  ~/.kiro/                  ← settings, sessions          │     │
-│  │  ~/.local/share/kiro-cli/  ← OAuth tokens                │     │
-│  └──────────────────────────────────────────────────────────┘     │
-└───────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph pod["Kubernetes Pod"]
+        subgraph ab["agent-broker (PID 1)"]
+            TG["Telegram Bot API\n(long polling)"]
+            SP["Session Pool\n(per topic)"]
+        end
+        TG <-->|messages| SP
+        SP <-->|"spawn + stdio ACP\n(JSON-RPC)"| KC["kiro-cli acp\n(child process)"]
+        subgraph pvc["PVC /data"]
+            K1["~/.kiro/\nsettings, sessions"]
+            K2["~/.local/share/kiro-cli/\nOAuth tokens"]
+        end
+    end
 ```
 
 ### Deploy
