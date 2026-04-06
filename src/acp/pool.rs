@@ -19,22 +19,24 @@ pub type EvictNotifier = Arc<dyn Fn(SessionMeta) + Send + Sync>;
 
 use std::sync::Arc;
 
-/// A model entry returned by kiro-cli in session/new.
+/// A selectable option for a slash command (e.g. a model or agent).
 #[derive(Clone, Debug)]
-pub struct ModelInfo {
-    pub model_id: String,
+pub struct SlashOption {
+    pub id: String,
     pub name: String,
+    pub current: bool,
 }
+
+/// Available slash commands with their selectable options, keyed by command name (e.g. "/model").
+pub type SlashCommands = HashMap<String, Vec<SlashOption>>;
 
 pub struct SessionPool {
     connections: RwLock<HashMap<String, AcpConnection>>,
     meta: RwLock<HashMap<String, SessionMeta>>,
     prev_session_ids: RwLock<HashMap<String, String>>,
     summaries: RwLock<HashMap<String, String>>,
-    /// Available models per session key (populated from session/new response).
-    available_models: RwLock<HashMap<String, Vec<ModelInfo>>>,
-    /// Current model ID per session key (set by !model command).
-    model_overrides: RwLock<HashMap<String, String>>,
+    /// Slash command options per session key (populated from session/new response).
+    slash_commands: RwLock<HashMap<String, SlashCommands>>,
     config: AgentConfig,
     max_sessions: usize,
     pub evict_notifier: Mutex<Option<EvictNotifier>>,
@@ -47,27 +49,20 @@ impl SessionPool {
             meta: RwLock::new(HashMap::new()),
             prev_session_ids: RwLock::new(HashMap::new()),
             summaries: RwLock::new(HashMap::new()),
-            available_models: RwLock::new(HashMap::new()),
-            model_overrides: RwLock::new(HashMap::new()),
+            slash_commands: RwLock::new(HashMap::new()),
             config,
             max_sessions,
             evict_notifier: Mutex::new(None),
         }
     }
 
-    /// Get available models for a session (populated after session/new).
-    pub async fn get_models(&self, session_key: &str) -> Vec<ModelInfo> {
-        self.available_models.read().await.get(session_key).cloned().unwrap_or_default()
-    }
-
-    /// Set the model override for a session key. Takes effect on next session spawn.
-    pub async fn set_model_override(&self, session_key: &str, model_id: String) {
-        self.model_overrides.write().await.insert(session_key.to_string(), model_id);
-    }
-
-    /// Get the current model override for a session key.
-    pub async fn get_model_override(&self, session_key: &str) -> Option<String> {
-        self.model_overrides.read().await.get(session_key).cloned()
+    /// Get selectable options for a slash command (e.g. "/model", "/agent").
+    pub async fn get_slash_options(&self, session_key: &str, cmd: &str) -> Vec<SlashOption> {
+        self.slash_commands.read().await
+            .get(session_key)
+            .and_then(|cmds| cmds.get(cmd))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Store chat context for a session so cleanup can notify the user.
@@ -108,12 +103,7 @@ impl SessionPool {
         tokio::fs::create_dir_all(&session_dir).await
             .map_err(|e| anyhow!("failed to create session dir {session_dir}: {e}"))?;
 
-        let model_override = self.model_overrides.read().await.get(thread_id).cloned();
-        let mut spawn_args: Vec<String> = self.config.args.clone();
-        if let Some(ref model) = model_override {
-            spawn_args.push("--model".to_string());
-            spawn_args.push(model.clone());
-        }
+        let spawn_args: Vec<String> = self.config.args.clone();
 
         let mut conn = AcpConnection::spawn(
             &self.config.command,
@@ -149,9 +139,9 @@ impl SessionPool {
         };
 
         if !resumed {
-            let (_, models) = conn.session_new(&session_dir).await?;
-            if !models.is_empty() {
-                self.available_models.write().await.insert(thread_id.to_string(), models);
+            let (_, slash_cmds) = conn.session_new(&session_dir).await?;
+            if !slash_cmds.is_empty() {
+                self.slash_commands.write().await.insert(thread_id.to_string(), slash_cmds);
             }
             if prev_sid.is_some() {
                 self.prev_session_ids.write().await.remove(thread_id);
@@ -188,7 +178,7 @@ impl SessionPool {
         self.meta.write().await.remove(session_key);
         self.prev_session_ids.write().await.remove(session_key);
         self.summaries.write().await.remove(session_key);
-        self.available_models.write().await.remove(session_key);
+        self.slash_commands.write().await.remove(session_key);
     }
 
     /// Return a human-readable status string for a session.

@@ -255,7 +255,7 @@ impl AcpConnection {
         Ok(sid)
     }
 
-    pub async fn session_new(&mut self, cwd: &str) -> Result<(String, Vec<crate::acp::pool::ModelInfo>)> {
+    pub async fn session_new(&mut self, cwd: &str) -> Result<(String, crate::acp::pool::SlashCommands)> {
         let resp = self
             .send_request(
                 "session/new",
@@ -263,27 +263,46 @@ impl AcpConnection {
             )
             .await?;
 
-        let session_id = resp.result.as_ref()
-            .and_then(|r| r.get("sessionId"))
+        let result = resp.result.as_ref().ok_or_else(|| anyhow!("no result in session/new"))?;
+
+        let session_id = result.get("sessionId")
             .and_then(|s| s.as_str())
             .ok_or_else(|| anyhow!("no sessionId in session/new response"))?
             .to_string();
 
-        let models: Vec<crate::acp::pool::ModelInfo> = resp.result.as_ref()
-            .and_then(|r| r.get("models"))
-            .and_then(|m| m.get("availableModels"))
-            .and_then(|a| a.as_array())
-            .map(|arr| arr.iter().filter_map(|v| {
-                Some(crate::acp::pool::ModelInfo {
-                    model_id: v.get("modelId")?.as_str()?.to_string(),
-                    name: v.get("name")?.as_str()?.to_string(),
-                })
-            }).collect())
-            .unwrap_or_default();
+        let mut cmds = crate::acp::pool::SlashCommands::new();
 
-        info!(session_id = %session_id, model_count = models.len(), "session created");
+        // /model options
+        if let Some(models) = result.get("models").and_then(|m| m.get("availableModels")).and_then(|a| a.as_array()) {
+            let current = result.get("models").and_then(|m| m.get("currentModelId")).and_then(|v| v.as_str()).unwrap_or("");
+            let opts: Vec<crate::acp::pool::SlashOption> = models.iter().filter_map(|v| {
+                let id = v.get("modelId")?.as_str()?.to_string();
+                Some(crate::acp::pool::SlashOption {
+                    current: id == current,
+                    name: v.get("name").and_then(|n| n.as_str()).unwrap_or(&id).to_string(),
+                    id,
+                })
+            }).collect();
+            if !opts.is_empty() { cmds.insert("/model".to_string(), opts); }
+        }
+
+        // /agent options
+        if let Some(modes) = result.get("modes").and_then(|m| m.get("availableModes")).and_then(|a| a.as_array()) {
+            let current = result.get("modes").and_then(|m| m.get("currentModeId")).and_then(|v| v.as_str()).unwrap_or("");
+            let opts: Vec<crate::acp::pool::SlashOption> = modes.iter().filter_map(|v| {
+                let id = v.get("id")?.as_str()?.to_string();
+                Some(crate::acp::pool::SlashOption {
+                    current: id == current,
+                    name: v.get("name").and_then(|n| n.as_str()).unwrap_or(&id).to_string(),
+                    id,
+                })
+            }).collect();
+            if !opts.is_empty() { cmds.insert("/agent".to_string(), opts); }
+        }
+
+        info!(session_id = %session_id, slash_cmds = cmds.len(), "session created");
         self.acp_session_id = Some(session_id.clone());
-        Ok((session_id, models))
+        Ok((session_id, cmds))
     }
 
     /// Send a prompt and return a receiver for streaming notifications.

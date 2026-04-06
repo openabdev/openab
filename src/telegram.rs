@@ -245,61 +245,55 @@ async fn handle_message(
                     Err(_) => return Ok(()),
                 };
 
-                // !model — show inline keyboard or set model directly
-                if prompt.trim() == "!model" || prompt.starts_with("!model ") {
-                    let arg = prompt.trim_start_matches("!model").trim().to_string();
+                // !cmd /model or !cmd /agent — generic slash command bridge
+                if prompt.trim() == "!cmd" || prompt.starts_with("!cmd ") {
+                    let arg = prompt.trim_start_matches("!cmd").trim().to_string();
                     let chat_id = msg.chat.id;
 
-                    // Ensure session exists so we have a model list
+                    // Ensure session exists so we have options
                     let _ = pool.get_or_create(&ctx.session_key).await;
-                    let models = pool.get_models(&ctx.session_key).await;
 
-                    if arg.is_empty() {
+                    // Parse: "!cmd /model" or "!cmd /model claude-sonnet-4"
+                    let mut parts = arg.splitn(2, ' ');
+                    let slash_cmd = parts.next().unwrap_or("").to_string();
+                    let value = parts.next().unwrap_or("").trim().to_string();
+
+                    if slash_cmd.is_empty() || !slash_cmd.starts_with('/') {
+                        let mut req = bot.send_message(chat_id, "Usage: `!cmd /model` or `!cmd /agent`");
+                        if let Some(tid) = ctx.thread_id { req = req.message_thread_id(tid); }
+                        else { req = req.reply_parameters(ReplyParameters::new(msg.id)); }
+                        let _ = req.await;
+                        return Ok(());
+                    }
+
+                    let options = pool.get_slash_options(&ctx.session_key, &slash_cmd).await;
+
+                    if value.is_empty() {
                         // Show inline keyboard
-                        if models.is_empty() {
-                            let mut req = bot.send_message(chat_id, "No models available.");
+                        if options.is_empty() {
+                            let mut req = bot.send_message(chat_id, format!("No options available for `{slash_cmd}`."));
                             if let Some(tid) = ctx.thread_id { req = req.message_thread_id(tid); }
                             else { req = req.reply_parameters(ReplyParameters::new(msg.id)); }
                             let _ = req.await;
                         } else {
-                            let current = pool.get_model_override(&ctx.session_key).await
-                                .unwrap_or_else(|| "auto".to_string());
-                            let buttons: Vec<Vec<InlineKeyboardButton>> = models.iter().map(|m| {
-                                let label = if m.model_id == current {
-                                    format!("✓ {}", m.name)
-                                } else {
-                                    m.name.clone()
-                                };
+                            let buttons: Vec<Vec<InlineKeyboardButton>> = options.iter().map(|o| {
+                                let label = if o.current { format!("✓ {}", o.name) } else { o.name.clone() };
                                 vec![InlineKeyboardButton::callback(
                                     label,
-                                    format!("model:{}:{}", ctx.session_key, m.model_id),
+                                    format!("cmd:{}:{}:{}", ctx.session_key, slash_cmd, o.id),
                                 )]
                             }).collect();
-                            let keyboard = InlineKeyboardMarkup::new(buttons);
-                            let mut req = bot.send_message(chat_id, "Select a model:");
+                            let mut req = bot.send_message(chat_id, format!("Select for `{slash_cmd}`:"))
+                                .reply_markup(InlineKeyboardMarkup::new(buttons));
                             if let Some(tid) = ctx.thread_id { req = req.message_thread_id(tid); }
                             else { req = req.reply_parameters(ReplyParameters::new(msg.id)); }
-                            let _ = req.reply_markup(keyboard).await;
+                            let _ = req.await;
                         }
                     } else {
-                        // Direct selection: !model <id>
-                        let matched = models.iter().find(|m| {
-                            m.model_id.to_lowercase().contains(&arg.to_lowercase())
-                                || m.name.to_lowercase().contains(&arg.to_lowercase())
-                        });
-                        let (model_id, reply) = if let Some(m) = matched {
-                            (m.model_id.clone(), format!("✅ Model set to `{}`. Restart session to apply: `!restart`", m.name))
-                        } else {
-                            return {
-                                let mut req = bot.send_message(chat_id, format!("Model '{}' not found.", arg));
-                                if let Some(tid) = ctx.thread_id { req = req.message_thread_id(tid); }
-                                else { req = req.reply_parameters(ReplyParameters::new(msg.id)); }
-                                let _ = req.await;
-                                Ok(())
-                            };
-                        };
-                        pool.set_model_override(&ctx.session_key, model_id).await;
-                        let mut req = bot.send_message(chat_id, reply);
+                        // Direct: !cmd /model claude-sonnet-4 → send as silent prompt
+                        let prompt_text = format!("{slash_cmd} {value}");
+                        let _ = silent_prompt(&pool, &ctx.session_key, &prompt_text).await;
+                        let mut req = bot.send_message(chat_id, format!("✅ Sent: `{prompt_text}`"));
                         if let Some(tid) = ctx.thread_id { req = req.message_thread_id(tid); }
                         else { req = req.reply_parameters(ReplyParameters::new(msg.id)); }
                         let _ = req.await;
@@ -486,47 +480,46 @@ async fn handle_callback(
     pool: Arc<SessionPool>,
 ) -> ResponseResult<()> {
     let data = match q.data.as_deref() {
-        Some(d) if d.starts_with("model:") => d,
+        Some(d) if d.starts_with("cmd:") => d,
         _ => {
             let _ = bot.answer_callback_query(&q.id).await;
             return Ok(());
         }
     };
 
-    // Format: "model:<session_key>:<model_id>"
-    // session_key may contain ':', so split at most 3 parts
-    let parts: Vec<&str> = data.splitn(3, ':').collect();
-    if parts.len() != 3 {
+    // Format: "cmd:<session_key>:<slash_cmd>:<value>"
+    // session_key may contain ':', so split into exactly 4 parts from the right
+    let parts: Vec<&str> = data.splitn(4, ':').collect();
+    if parts.len() != 4 {
         let _ = bot.answer_callback_query(&q.id).await;
         return Ok(());
     }
     let session_key = parts[1];
-    let model_id = parts[2];
+    let slash_cmd = parts[2];
+    let value = parts[3];
 
-    pool.set_model_override(session_key, model_id.to_string()).await;
+    let prompt_text = format!("{slash_cmd} {value}");
+    let _ = silent_prompt(&pool, session_key, &prompt_text).await;
 
-    // Update the keyboard message to show the new selection
+    // Update keyboard to reflect new selection
     if let Some(msg) = &q.message {
-        let models = pool.get_models(session_key).await;
-        let buttons: Vec<Vec<InlineKeyboardButton>> = models.iter().map(|m| {
-            let label = if m.model_id == model_id {
-                format!("✓ {}", m.name)
-            } else {
-                m.name.clone()
-            };
-            vec![InlineKeyboardButton::callback(
-                label,
-                format!("model:{}:{}", session_key, m.model_id),
-            )]
-        }).collect();
-        let keyboard = InlineKeyboardMarkup::new(buttons);
-        let _ = bot.edit_message_reply_markup(msg.chat().id, msg.id())
-            .reply_markup(keyboard)
-            .await;
+        let options = pool.get_slash_options(session_key, slash_cmd).await;
+        if !options.is_empty() {
+            let buttons: Vec<Vec<InlineKeyboardButton>> = options.iter().map(|o| {
+                let label = if o.id == value { format!("✓ {}", o.name) } else { o.name.clone() };
+                vec![InlineKeyboardButton::callback(
+                    label,
+                    format!("cmd:{}:{}:{}", session_key, slash_cmd, o.id),
+                )]
+            }).collect();
+            let _ = bot.edit_message_reply_markup(msg.chat().id, msg.id())
+                .reply_markup(InlineKeyboardMarkup::new(buttons))
+                .await;
+        }
     }
 
     let _ = bot.answer_callback_query(&q.id)
-        .text(format!("✅ Model set to {}. Use !restart to apply.", model_id))
+        .text(format!("✅ {slash_cmd} → {value}"))
         .await;
 
     Ok(())
