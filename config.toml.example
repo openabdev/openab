@@ -15,9 +15,13 @@ allowed_channels = ["1234567890"]
 # #     Best for: single user or private bot usage.
 # #
 # #   team:
-# #     Only `!kiro <prompt>` creates a topic (anyone in allowed_users,
-# #     or restricted to topic_creator_id if set).
-# #     Inside topics, Kiro listens silently (👀) and only replies when @mentioned.
+# #     In #general/All:
+# #       - plain messages → Kiro listens silently (👀), buffers context, no reply.
+# #       - @mention → Kiro replies in-place (no topic created).
+# #       - `!kiro <prompt>` → creates a new topic (restricted to topic_creator_id if set).
+# #     Inside topics:
+# #       - plain messages → Kiro listens silently (👀), buffers context, no reply.
+# #       - @mention → Kiro replies directly.
 # #     Best for: community/team group chats with multiple users.
 # #
 # mode = "personal"

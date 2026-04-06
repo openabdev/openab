@@ -85,7 +85,14 @@ async fn get_or_create_thread(bot: &Bot, msg: &Message, is_kiro_cmd: bool) -> an
 
         // In #General / no topic: only spawn a new topic for `!kiro` commands.
         if !is_kiro_cmd {
-            anyhow::bail!("not a !kiro command in general — skip");
+            // For silent buffering or @mention replies, use a per-user session key
+            // without creating a topic.
+            let user_id = msg.from.as_ref().map(|u| u.id.0).unwrap_or(0);
+            return Ok(ThreadCtx {
+                thread_id: None,
+                session_key: format!("{}:general:{}", chat_id, user_id),
+                is_new_topic: false,
+            });
         }
 
         let user_name = msg.from
@@ -251,19 +258,22 @@ pub async fn run(pool: Arc<SessionPool>, bot_token: String, allowed_users: HashS
                     silent_mode = false;
                 }
                 ChatMode::Team => {
+                    let is_mentioned = bot_username.as_deref().map_or(true, |name| {
+                        prompt.to_lowercase().contains(&format!("@{}", name))
+                    });
                     if is_group && !in_real_topic {
                         if is_kiro_cmd {
                             if let Some(creator) = topic_creator_id {
                                 if user_id != creator { return Ok(()); }
                             }
+                            silent_mode = false;
                         } else {
-                            return Ok(());
+                            // plain message or @mention in #general → buffer silently (no topic)
+                            silent_mode = !is_mentioned;
                         }
+                    } else {
+                        silent_mode = in_real_topic && !is_mentioned;
                     }
-                    let is_mentioned = bot_username.as_deref().map_or(true, |name| {
-                        prompt.to_lowercase().contains(&format!("@{}", name))
-                    });
-                    silent_mode = in_real_topic && !is_mentioned;
                 }
             }
             // ─────────────────────────────────────────────────────────────────
@@ -388,24 +398,28 @@ async fn rename_topic(
         "Reply with ONLY a short topic title (max 40 chars, no quotes) for this message: {}",
         original_prompt
     );
-    let title = pool.with_connection(session_key, |conn| {
+    let rx = pool.with_connection(session_key, |conn| {
         let p = title_prompt.clone();
         Box::pin(async move {
-            let (mut rx, _) = conn.session_prompt(&p).await?;
-            let mut text = String::new();
-            while let Some(msg) = rx.recv().await {
-                if msg.id.is_some() { break; }
-                if let Some(crate::acp::AcpEvent::Text(t)) = crate::acp::classify_notification(&msg) {
-                    text.push_str(&t);
-                }
-            }
-            conn.prompt_done().await;
-            Ok(text)
+            let (rx, _) = conn.session_prompt(&p).await?;
+            Ok(rx)
         })
     }).await;
 
-    if let Ok(raw) = title {
-        let name = format!("🤖 {}", raw.trim().chars().take(40).collect::<String>());
+    if let Ok(mut rx) = rx {
+        let mut text = String::new();
+        while let Some(msg) = rx.recv().await {
+            if msg.id.is_some() { break; }
+            if let Some(crate::acp::AcpEvent::Text(t)) = crate::acp::classify_notification(&msg) {
+                text.push_str(&t);
+            }
+        }
+        let _ = pool.with_connection(session_key, |conn| Box::pin(async move {
+            conn.prompt_done().await;
+            Ok(())
+        })).await;
+
+        let name = format!("🤖 {}", text.trim().chars().take(40).collect::<String>());
         let _ = bot.edit_forum_topic(chat_id, thread_id).name(name).await;
     }
 }
@@ -413,22 +427,31 @@ async fn rename_topic(
 // ── Silent prompt — run Kiro, buffer reply, no message sent ──────────────────
 
 async fn silent_prompt(pool: &SessionPool, session_key: &str, prompt: &str) -> anyhow::Result<String> {
+    // Start the prompt (briefly holds write lock), then drain outside the lock.
     let prompt = prompt.to_string();
-    pool.with_connection(session_key, |conn| {
+    let rx = pool.with_connection(session_key, |conn| {
         let prompt = prompt.clone();
         Box::pin(async move {
-            let (mut rx, _) = conn.session_prompt(&prompt).await?;
-            let mut text = String::new();
-            while let Some(msg) = rx.recv().await {
-                if msg.id.is_some() { break; }
-                if let Some(AcpEvent::Text(t)) = classify_notification(&msg) {
-                    text.push_str(&t);
-                }
-            }
-            conn.prompt_done().await;
-            Ok(text)
+            let (rx, _) = conn.session_prompt(&prompt).await?;
+            Ok(rx)
         })
-    }).await
+    }).await?;
+
+    let mut rx = rx;
+    let mut text = String::new();
+    while let Some(msg) = rx.recv().await {
+        if msg.id.is_some() { break; }
+        if let Some(AcpEvent::Text(t)) = classify_notification(&msg) {
+            text.push_str(&t);
+        }
+    }
+
+    pool.with_connection(session_key, |conn| Box::pin(async move {
+        conn.prompt_done().await;
+        Ok(())
+    })).await?;
+
+    Ok(text)
 }
 
 // ── Streaming prompt with live edits ─────────────────────────────────────────

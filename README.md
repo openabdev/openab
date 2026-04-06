@@ -110,7 +110,26 @@ cargo build --release
 
 ### 6. Use
 
-Send any message in the forum group — the bot creates a topic and responds. Follow-up messages in the same topic continue the conversation.
+**Personal mode** (default) — single user / private bot:
+- Send any message in `#general` → bot auto-creates a topic and responds
+- Follow-up messages in the same topic continue the conversation
+
+**Team mode** — community / multi-user group:
+
+| Where | What you send | Result |
+|---|---|---|
+| `#general` | plain message | Kiro listens silently 👀, buffers context |
+| `#general` | `@botname` | Kiro replies in-place (no topic created) |
+| `#general` | `!kiro <prompt>` | Creates a new topic |
+| topic | plain message | Kiro listens silently 👀, buffers context |
+| topic | `@botname` | Kiro replies directly |
+
+Switch modes in `config.toml`:
+```toml
+[telegram]
+mode = "team"              # or "personal"
+topic_creator_id = 123456789  # team only: who can run !kiro
+```
 
 Bot commands (send in any topic):
 - `!status` — show session state and last active time

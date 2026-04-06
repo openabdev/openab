@@ -17,8 +17,9 @@ pub enum ChatMode {
     /// Personal mode (original): any message in #general/All creates a new topic.
     /// Inside topics, all messages get a reply directly — no @mention needed.
     Personal,
-    /// Team mode: only `!kiro <prompt>` creates a new topic (restricted to topic_creator_id).
-    /// Inside topics, Kiro listens silently to all messages but only replies when @mentioned.
+    /// Team mode: in #general, plain messages are buffered silently; @mention replies in-place;
+    /// `!kiro` creates a topic (restricted to topic_creator_id if set).
+    /// Inside topics, Kiro listens silently and only replies when @mentioned.
     Team,
 }
 
