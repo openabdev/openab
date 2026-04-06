@@ -1,4 +1,5 @@
 use crate::acp::{classify_notification, AcpEvent, SessionPool, SessionMeta};
+use crate::config::ChatMode;
 use crate::format;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -55,12 +56,12 @@ struct ThreadCtx {
 }
 
 /// Determine the thread context for an incoming message.
-/// 
+///
 /// Strategy:
-/// - If the chat is a forum supergroup (`is_forum`): use/create a forum topic per user.
-/// - If it's a private chat with forum topics enabled: use/create a topic per conversation.
-/// - Otherwise: use reply chains, session key = chat_id (DM) or chat_id:user_id (group).
-async fn get_or_create_thread(bot: &Bot, msg: &Message) -> anyhow::Result<ThreadCtx> {
+/// - Forum supergroup, in a real topic (not #General): reuse that topic's session.
+/// - Forum supergroup, in #General or no topic: only create a new topic if `is_kiro_cmd` is true.
+/// - Otherwise (DM / plain group): use reply chains.
+async fn get_or_create_thread(bot: &Bot, msg: &Message, is_kiro_cmd: bool) -> anyhow::Result<ThreadCtx> {
     let chat_id = msg.chat.id;
     let is_forum = matches!(
         &msg.chat.kind,
@@ -70,7 +71,7 @@ async fn get_or_create_thread(bot: &Bot, msg: &Message) -> anyhow::Result<Thread
     tracing::info!(chat_id = %chat_id, is_forum, thread_id = ?msg.thread_id, chat_kind = ?std::mem::discriminant(&msg.chat.kind), "incoming message");
 
     if is_forum {
-        // thread_id=1 is the #General topic — treat it like no topic (create a new one).
+        // thread_id=1 is the #General topic — treat it like no topic.
         let in_real_topic = msg.thread_id.map_or(false, |t| t.0 != MessageId(1));
 
         if in_real_topic {
@@ -82,17 +83,19 @@ async fn get_or_create_thread(bot: &Bot, msg: &Message) -> anyhow::Result<Thread
             });
         }
 
-        // Create a new topic named after the user + first words of prompt.
+        // In #General / no topic: only spawn a new topic for `!kiro` commands.
+        if !is_kiro_cmd {
+            anyhow::bail!("not a !kiro command in general — skip");
+        }
+
         let user_name = msg.from
             .as_ref()
             .map(|u| u.first_name.clone())
             .unwrap_or_else(|| "User".to_string());
         let prompt_preview: String = msg.text().unwrap_or("").chars().take(30).collect();
-        let topic_name = format!("{}: {}", user_name, prompt_preview);
-        let topic_name: String = topic_name.chars().take(128).collect();
+        let topic_name: String = format!("{}: {}", user_name, prompt_preview).chars().take(128).collect();
 
-        let topic = bot.create_forum_topic(chat_id, topic_name, 0x6FB9F0u32, "")
-            .await?;
+        let topic = bot.create_forum_topic(chat_id, topic_name, 0x6FB9F0u32, "").await?;
         let thread_id = topic.thread_id;
         Ok(ThreadCtx {
             thread_id: Some(thread_id),
@@ -101,7 +104,6 @@ async fn get_or_create_thread(bot: &Bot, msg: &Message) -> anyhow::Result<Thread
         })
     } else {
         // Plain DM or regular group — use reply chains.
-        // Session key: chat_id for DMs, chat_id:user_id for groups.
         let session_key = if msg.chat.is_private() {
             chat_id.to_string()
         } else {
@@ -114,9 +116,15 @@ async fn get_or_create_thread(bot: &Bot, msg: &Message) -> anyhow::Result<Thread
 
 // ── Main bot loop ────────────────────────────────────────────────────────────
 
-pub async fn run(pool: Arc<SessionPool>, bot_token: String, allowed_users: HashSet<i64>) {
+pub async fn run(pool: Arc<SessionPool>, bot_token: String, allowed_users: HashSet<i64>, topic_creator_id: Option<i64>, mode: ChatMode) {
     let bot = Bot::new(bot_token);
     info!("telegram bot starting");
+
+    // Fetch bot's own username for @mention detection.
+    let bot_username: Option<String> = bot.get_me().await.ok().map(|me| {
+        me.username().to_lowercase()
+    });
+    info!(bot_username = ?bot_username, "bot identity resolved");
 
     // Wire eviction notifier so cleanup_idle can message users when their session expires.
     {
@@ -165,6 +173,8 @@ pub async fn run(pool: Arc<SessionPool>, bot_token: String, allowed_users: HashS
     teloxide::repl(bot, move |bot: Bot, msg: Message| {
         let pool = pool.clone();
         let allowed_users = allowed_users.clone();
+        let bot_username = bot_username.clone();
+        let mode = mode.clone();
         async move {
             let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
             tracing::info!(chat_id = %msg.chat.id, user_id, thread_id = ?msg.thread_id, text = ?msg.text(), "raw message received");
@@ -180,9 +190,16 @@ pub async fn run(pool: Arc<SessionPool>, bot_token: String, allowed_users: HashS
             };
             let user_msg_id = msg.id;
 
+            let is_forum = matches!(
+                &msg.chat.kind,
+                ChatKind::Public(p) if matches!(&p.kind, PublicChatKind::Supergroup(s) if s.is_forum)
+            );
+            let in_real_topic = is_forum && msg.thread_id.map_or(false, |t| t.0 != MessageId(1));
+            let is_group = !msg.chat.is_private();
+
             // ── Bot commands ─────────────────────────────────────────────────
-            if prompt.starts_with('!') {
-                let ctx = match get_or_create_thread(&bot, &msg).await {
+            if prompt.starts_with('!') && !prompt.starts_with("!kiro") {
+                let ctx = match get_or_create_thread(&bot, &msg, false).await {
                     Ok(c) => c,
                     Err(_) => return Ok(()),
                 };
@@ -210,25 +227,105 @@ pub async fn run(pool: Arc<SessionPool>, bot_token: String, allowed_users: HashS
             }
             // ─────────────────────────────────────────────────────────────────
 
+            // Strip `!kiro` prefix if present.
+            let is_kiro_cmd = prompt.starts_with("!kiro");
+            let prompt = if is_kiro_cmd {
+                prompt.trim_start_matches("!kiro").trim().to_string()
+            } else {
+                prompt
+            };
+            if prompt.is_empty() { return Ok(()); }
+
+            // ── Group chat gate ───────────────────────────────────────────────
+            // In a group (not inside a real topic):
+            //   - `!kiro` → only allowed by topic_creator_id; creates a new topic.
+            //   - plain message → must @mention the bot; responds in-place (no topic).
+            // ── Mode-based routing ────────────────────────────────────────────
+            // Personal: any message in #general/All → new topic; inside topic → always reply.
+            // Team:     only !kiro creates topics; inside topic → silent unless @mentioned.
+            let silent_mode;
+            match mode {
+                ChatMode::Personal => {
+                    // Outside a topic in a group: any message triggers topic creation.
+                    // (is_kiro_cmd is irrelevant here — fall through for all messages)
+                    silent_mode = false;
+                }
+                ChatMode::Team => {
+                    if is_group && !in_real_topic {
+                        if is_kiro_cmd {
+                            if let Some(creator) = topic_creator_id {
+                                if user_id != creator { return Ok(()); }
+                            }
+                        } else {
+                            return Ok(());
+                        }
+                    }
+                    let is_mentioned = bot_username.as_deref().map_or(true, |name| {
+                        prompt.to_lowercase().contains(&format!("@{}", name))
+                    });
+                    silent_mode = in_real_topic && !is_mentioned;
+                }
+            }
+            // ─────────────────────────────────────────────────────────────────
+
             let chat_id = msg.chat.id;
 
+            // In personal mode every message can create a topic; in team mode only !kiro.
+            let may_create_topic = is_kiro_cmd || mode == ChatMode::Personal;
+
             // Resolve thread context
-            let ctx = match get_or_create_thread(&bot, &msg).await {
+            let ctx = match get_or_create_thread(&bot, &msg, may_create_topic).await {
                 Ok(c) => c,
                 Err(e) => {
-                    error!("thread setup failed: {e}");
-                    clear_reaction(&bot, chat_id, user_msg_id).await;
+                    if is_kiro_cmd {
+                        error!("topic creation failed: {e}");
+                        let _ = bot.send_message(chat_id, format!("⚠️ Failed to create topic: {e}"))
+                            .reply_parameters(ReplyParameters::new(user_msg_id))
+                            .await;
+                    } else {
+                        tracing::debug!("thread setup skipped: {e}");
+                    }
                     return Ok(());
                 }
             };
 
-            // Send initial "..." in the right thread/topic
+            if let Err(e) = pool.get_or_create(&ctx.session_key).await {
+                if !silent_mode {
+                    let _ = bot.send_message(chat_id, format!("⚠️ {e}"))
+                        .reply_parameters(ReplyParameters::new(user_msg_id))
+                        .await;
+                }
+                error!("pool error: {e}");
+                return Ok(());
+            }
+
+            pool.register_meta(&ctx.session_key, SessionMeta {
+                chat_id: chat_id.0,
+                thread_id: ctx.thread_id.map(|t| t.0 .0),
+            }).await;
+
+            // Prefix with sender name in shared topics.
+            let name = msg.from.as_ref().map(|u| u.first_name.as_str()).unwrap_or("User");
+            let attributed_prompt = if in_real_topic {
+                format!("[{}]: {}", name, prompt)
+            } else {
+                prompt.clone()
+            };
+
+            if silent_mode {
+                // React 👀, run Kiro for context awareness, discard the reply.
+                set_reaction(&bot, chat_id, user_msg_id, EMOJI_QUEUED).await;
+                let _ = silent_prompt(&pool, &ctx.session_key, &attributed_prompt).await;
+                clear_reaction(&bot, chat_id, user_msg_id).await;
+                return Ok(());
+            }
+
+            // Send initial "..." placeholder.
             let thinking = {
                 let mut req = bot.send_message(chat_id, "...");
                 if let Some(tid) = ctx.thread_id {
                     req = req.message_thread_id(tid);
                 } else {
-                    // Reply to user's message for visual threading
                     req = req.reply_parameters(ReplyParameters::new(user_msg_id));
                 }
                 match req.await {
@@ -241,22 +338,10 @@ pub async fn run(pool: Arc<SessionPool>, bot_token: String, allowed_users: HashS
                 }
             };
 
-            if let Err(e) = pool.get_or_create(&ctx.session_key).await {
-                let _ = bot.edit_message_text(chat_id, thinking.id, "⚠️ Failed to start agent.").await;
-                clear_reaction(&bot, chat_id, user_msg_id).await;
-                error!("pool error: {e}");
-                return Ok(());
-            }
-
-            pool.register_meta(&ctx.session_key, SessionMeta {
-                chat_id: chat_id.0,
-                thread_id: ctx.thread_id.map(|t| t.0 .0),
-            }).await;
-
             set_reaction(&bot, chat_id, user_msg_id, EMOJI_THINKING).await;
 
             let result = stream_prompt(
-                &pool, &ctx.session_key, &prompt,
+                &pool, &ctx.session_key, &attributed_prompt,
                 &bot, chat_id, thinking.id, user_msg_id, ctx.thread_id,
             ).await;
 
@@ -323,6 +408,27 @@ async fn rename_topic(
         let name = format!("🤖 {}", raw.trim().chars().take(40).collect::<String>());
         let _ = bot.edit_forum_topic(chat_id, thread_id).name(name).await;
     }
+}
+
+// ── Silent prompt — run Kiro, buffer reply, no message sent ──────────────────
+
+async fn silent_prompt(pool: &SessionPool, session_key: &str, prompt: &str) -> anyhow::Result<String> {
+    let prompt = prompt.to_string();
+    pool.with_connection(session_key, |conn| {
+        let prompt = prompt.clone();
+        Box::pin(async move {
+            let (mut rx, _) = conn.session_prompt(&prompt).await?;
+            let mut text = String::new();
+            while let Some(msg) = rx.recv().await {
+                if msg.id.is_some() { break; }
+                if let Some(AcpEvent::Text(t)) = classify_notification(&msg) {
+                    text.push_str(&t);
+                }
+            }
+            conn.prompt_done().await;
+            Ok(text)
+        })
+    }).await
 }
 
 // ── Streaming prompt with live edits ─────────────────────────────────────────

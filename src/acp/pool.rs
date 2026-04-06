@@ -22,9 +22,7 @@ use std::sync::Arc;
 pub struct SessionPool {
     connections: RwLock<HashMap<String, AcpConnection>>,
     meta: RwLock<HashMap<String, SessionMeta>>,
-    /// Persists the last ACP session ID for each thread key across evictions.
     prev_session_ids: RwLock<HashMap<String, String>>,
-    /// Compacted memory summaries to inject on next resume.
     summaries: RwLock<HashMap<String, String>>,
     config: AgentConfig,
     max_sessions: usize,

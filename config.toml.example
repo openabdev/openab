@@ -2,6 +2,27 @@
 bot_token = "${DISCORD_BOT_TOKEN}"
 allowed_channels = ["1234567890"]
 
+# ── Telegram (alternative to Discord) ───────────────────────────────────────
+# [telegram]
+# bot_token = "${TELEGRAM_BOT_TOKEN}"
+# allowed_users = [123456789]
+#
+# # Chat mode — choose one:
+# #
+# #   personal (default):
+# #     Any message in #general/All auto-creates a new topic.
+# #     Inside topics, Kiro replies to every message directly.
+# #     Best for: single user or private bot usage.
+# #
+# #   team:
+# #     Only `!kiro <prompt>` creates a topic (anyone in allowed_users,
+# #     or restricted to topic_creator_id if set).
+# #     Inside topics, Kiro listens silently (👀) and only replies when @mentioned.
+# #     Best for: community/team group chats with multiple users.
+# #
+# mode = "personal"
+# topic_creator_id = 123456789   # team mode only: who can run !kiro
+
 [agent]
 command = "kiro-cli"
 args = ["acp", "--trust-all-tools"]

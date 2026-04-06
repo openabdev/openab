@@ -11,11 +11,31 @@ pub struct Config {
     pub pool: PoolConfig,
 }
 
+#[derive(Debug, Deserialize, PartialEq, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatMode {
+    /// Personal mode (original): any message in #general/All creates a new topic.
+    /// Inside topics, all messages get a reply directly — no @mention needed.
+    Personal,
+    /// Team mode: only `!kiro <prompt>` creates a new topic (restricted to topic_creator_id).
+    /// Inside topics, Kiro listens silently to all messages but only replies when @mentioned.
+    Team,
+}
+
+impl Default for ChatMode {
+    fn default() -> Self { ChatMode::Personal }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct TelegramConfig {
     pub bot_token: String,
     #[serde(default)]
     pub allowed_users: Vec<i64>,
+    /// If set, only this user ID can trigger `!kiro` topic creation (team mode).
+    pub topic_creator_id: Option<i64>,
+    /// `personal` (default) or `team`. See ChatMode for details.
+    #[serde(default)]
+    pub mode: ChatMode,
 }
 
 #[derive(Debug, Deserialize)]
