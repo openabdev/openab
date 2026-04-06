@@ -19,5 +19,6 @@ WORKDIR /home/agent
 
 COPY --from=builder /build/target/release/agent-broker /usr/local/bin/agent-broker
 
+USER node
 ENTRYPOINT ["agent-broker"]
 CMD ["/etc/agent-broker/config.toml"]
