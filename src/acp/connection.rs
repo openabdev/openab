@@ -255,7 +255,7 @@ impl AcpConnection {
         Ok(sid)
     }
 
-    pub async fn session_new(&mut self, cwd: &str) -> Result<String> {
+    pub async fn session_new(&mut self, cwd: &str) -> Result<(String, Vec<crate::acp::pool::ModelInfo>)> {
         let resp = self
             .send_request(
                 "session/new",
@@ -269,9 +269,21 @@ impl AcpConnection {
             .ok_or_else(|| anyhow!("no sessionId in session/new response"))?
             .to_string();
 
-        info!(session_id = %session_id, "session created");
+        let models: Vec<crate::acp::pool::ModelInfo> = resp.result.as_ref()
+            .and_then(|r| r.get("models"))
+            .and_then(|m| m.get("availableModels"))
+            .and_then(|a| a.as_array())
+            .map(|arr| arr.iter().filter_map(|v| {
+                Some(crate::acp::pool::ModelInfo {
+                    model_id: v.get("modelId")?.as_str()?.to_string(),
+                    name: v.get("name")?.as_str()?.to_string(),
+                })
+            }).collect())
+            .unwrap_or_default();
+
+        info!(session_id = %session_id, model_count = models.len(), "session created");
         self.acp_session_id = Some(session_id.clone());
-        Ok(session_id)
+        Ok((session_id, models))
     }
 
     /// Send a prompt and return a receiver for streaming notifications.

@@ -4,8 +4,10 @@ use crate::format;
 use std::collections::HashSet;
 use std::sync::Arc;
 use teloxide::prelude::*;
+use teloxide::dispatching::UpdateFilterExt;
 use teloxide::types::{
-    ChatKind, MessageId, PublicChatKind, ReactionType, ReplyParameters, ThreadId,
+    ChatKind, InlineKeyboardButton, InlineKeyboardMarkup, MessageId, PublicChatKind, ReactionType,
+    ReplyParameters, ThreadId,
 };
 use tracing::{error, info};
 
@@ -177,12 +179,44 @@ pub async fn run(pool: Arc<SessionPool>, bot_token: String, allowed_users: HashS
         });
     }
 
-    teloxide::repl(bot, move |bot: Bot, msg: Message| {
-        let pool = pool.clone();
-        let allowed_users = allowed_users.clone();
-        let bot_username = bot_username.clone();
-        let mode = mode.clone();
-        async move {
+    let pool_cb = pool.clone();
+    let bot2 = bot.clone();
+
+    let handler = dptree::entry()
+        .branch(
+            Update::filter_message().endpoint(move |bot: Bot, msg: Message| {
+                let pool = pool.clone();
+                let allowed_users = allowed_users.clone();
+                let bot_username = bot_username.clone();
+                let mode = mode.clone();
+                async move {
+                    handle_message(bot, msg, pool, allowed_users, bot_username, mode, topic_creator_id).await
+                }
+            })
+        )
+        .branch(
+            Update::filter_callback_query().endpoint(move |bot: Bot, q: CallbackQuery| {
+                let pool = pool_cb.clone();
+                async move { handle_callback(bot, q, pool).await }
+            })
+        );
+
+    Dispatcher::builder(bot2, handler)
+        .enable_ctrlc_handler()
+        .build()
+        .dispatch()
+        .await;
+}
+
+async fn handle_message(
+    bot: Bot,
+    msg: Message,
+    pool: Arc<SessionPool>,
+    allowed_users: HashSet<i64>,
+    bot_username: Option<String>,
+    mode: ChatMode,
+    topic_creator_id: Option<i64>,
+) -> ResponseResult<()> {
             let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
             tracing::info!(chat_id = %msg.chat.id, user_id, thread_id = ?msg.thread_id, text = ?msg.text(), "raw message received");
 
@@ -210,6 +244,69 @@ pub async fn run(pool: Arc<SessionPool>, bot_token: String, allowed_users: HashS
                     Ok(c) => c,
                     Err(_) => return Ok(()),
                 };
+
+                // !model — show inline keyboard or set model directly
+                if prompt.trim() == "!model" || prompt.starts_with("!model ") {
+                    let arg = prompt.trim_start_matches("!model").trim().to_string();
+                    let chat_id = msg.chat.id;
+
+                    // Ensure session exists so we have a model list
+                    let _ = pool.get_or_create(&ctx.session_key).await;
+                    let models = pool.get_models(&ctx.session_key).await;
+
+                    if arg.is_empty() {
+                        // Show inline keyboard
+                        if models.is_empty() {
+                            let mut req = bot.send_message(chat_id, "No models available.");
+                            if let Some(tid) = ctx.thread_id { req = req.message_thread_id(tid); }
+                            else { req = req.reply_parameters(ReplyParameters::new(msg.id)); }
+                            let _ = req.await;
+                        } else {
+                            let current = pool.get_model_override(&ctx.session_key).await
+                                .unwrap_or_else(|| "auto".to_string());
+                            let buttons: Vec<Vec<InlineKeyboardButton>> = models.iter().map(|m| {
+                                let label = if m.model_id == current {
+                                    format!("✓ {}", m.name)
+                                } else {
+                                    m.name.clone()
+                                };
+                                vec![InlineKeyboardButton::callback(
+                                    label,
+                                    format!("model:{}:{}", ctx.session_key, m.model_id),
+                                )]
+                            }).collect();
+                            let keyboard = InlineKeyboardMarkup::new(buttons);
+                            let mut req = bot.send_message(chat_id, "Select a model:");
+                            if let Some(tid) = ctx.thread_id { req = req.message_thread_id(tid); }
+                            else { req = req.reply_parameters(ReplyParameters::new(msg.id)); }
+                            let _ = req.reply_markup(keyboard).await;
+                        }
+                    } else {
+                        // Direct selection: !model <id>
+                        let matched = models.iter().find(|m| {
+                            m.model_id.to_lowercase().contains(&arg.to_lowercase())
+                                || m.name.to_lowercase().contains(&arg.to_lowercase())
+                        });
+                        let (model_id, reply) = if let Some(m) = matched {
+                            (m.model_id.clone(), format!("✅ Model set to `{}`. Restart session to apply: `!restart`", m.name))
+                        } else {
+                            return {
+                                let mut req = bot.send_message(chat_id, format!("Model '{}' not found.", arg));
+                                if let Some(tid) = ctx.thread_id { req = req.message_thread_id(tid); }
+                                else { req = req.reply_parameters(ReplyParameters::new(msg.id)); }
+                                let _ = req.await;
+                                Ok(())
+                            };
+                        };
+                        pool.set_model_override(&ctx.session_key, model_id).await;
+                        let mut req = bot.send_message(chat_id, reply);
+                        if let Some(tid) = ctx.thread_id { req = req.message_thread_id(tid); }
+                        else { req = req.reply_parameters(ReplyParameters::new(msg.id)); }
+                        let _ = req.await;
+                    }
+                    return Ok(());
+                }
+
                 let reply = match prompt.trim() {
                     "!status" => pool.session_status(&ctx.session_key).await,
                     "!stop" => {
@@ -379,9 +476,60 @@ pub async fn run(pool: Arc<SessionPool>, bot_token: String, allowed_users: HashS
             }
 
             Ok(())
+}
+
+// ── Callback query handler (inline keyboard) ─────────────────────────────────
+
+async fn handle_callback(
+    bot: Bot,
+    q: CallbackQuery,
+    pool: Arc<SessionPool>,
+) -> ResponseResult<()> {
+    let data = match q.data.as_deref() {
+        Some(d) if d.starts_with("model:") => d,
+        _ => {
+            let _ = bot.answer_callback_query(&q.id).await;
+            return Ok(());
         }
-    })
-    .await;
+    };
+
+    // Format: "model:<session_key>:<model_id>"
+    // session_key may contain ':', so split at most 3 parts
+    let parts: Vec<&str> = data.splitn(3, ':').collect();
+    if parts.len() != 3 {
+        let _ = bot.answer_callback_query(&q.id).await;
+        return Ok(());
+    }
+    let session_key = parts[1];
+    let model_id = parts[2];
+
+    pool.set_model_override(session_key, model_id.to_string()).await;
+
+    // Update the keyboard message to show the new selection
+    if let Some(msg) = &q.message {
+        let models = pool.get_models(session_key).await;
+        let buttons: Vec<Vec<InlineKeyboardButton>> = models.iter().map(|m| {
+            let label = if m.model_id == model_id {
+                format!("✓ {}", m.name)
+            } else {
+                m.name.clone()
+            };
+            vec![InlineKeyboardButton::callback(
+                label,
+                format!("model:{}:{}", session_key, m.model_id),
+            )]
+        }).collect();
+        let keyboard = InlineKeyboardMarkup::new(buttons);
+        let _ = bot.edit_message_reply_markup(msg.chat().id, msg.id())
+            .reply_markup(keyboard)
+            .await;
+    }
+
+    let _ = bot.answer_callback_query(&q.id)
+        .text(format!("✅ Model set to {}. Use !restart to apply.", model_id))
+        .await;
+
+    Ok(())
 }
 
 // ── Topic rename ─────────────────────────────────────────────────────────────
