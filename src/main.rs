@@ -2,12 +2,15 @@ mod acp;
 mod config;
 mod discord;
 mod format;
+mod management;
 mod reactions;
 
 use serenity::prelude::*;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use tokio::time::Instant;
 use tracing::info;
 
 #[tokio::main]
@@ -43,10 +46,13 @@ async fn main() -> anyhow::Result<()> {
         .filter_map(|s| s.parse().ok())
         .collect();
 
+    let discord_connected = Arc::new(AtomicBool::new(false));
+
     let handler = discord::Handler {
         pool: pool.clone(),
         allowed_channels,
         reactions_config: cfg.reactions,
+        discord_connected: discord_connected.clone(),
     };
 
     let intents = GatewayIntents::GUILD_MESSAGES
@@ -56,6 +62,14 @@ async fn main() -> anyhow::Result<()> {
     let mut client = Client::builder(&cfg.discord.bot_token, intents)
         .event_handler(handler)
         .await?;
+
+    // Spawn management server
+    let started = Instant::now();
+    if cfg.management.enabled {
+        let mgmt_pool = pool.clone();
+        let mgmt_dc = discord_connected.clone();
+        tokio::spawn(management::serve(cfg.management.bind, mgmt_pool, started, mgmt_dc));
+    }
 
     // Spawn cleanup task
     let cleanup_pool = pool.clone();

@@ -36,6 +36,10 @@ pool:
   maxSessions: 10
   sessionTtlHours: 24
 
+management:
+  enabled: false
+  bind: "0.0.0.0:8090"
+
 reactions:
   enabled: true
   removeAfterReply: false

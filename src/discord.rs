@@ -8,6 +8,7 @@ use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId};
 use serenity::prelude::*;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::{error, info};
@@ -16,6 +17,7 @@ pub struct Handler {
     pub pool: Arc<SessionPool>,
     pub allowed_channels: HashSet<u64>,
     pub reactions_config: ReactionsConfig,
+    pub discord_connected: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -171,6 +173,7 @@ impl EventHandler for Handler {
     }
 
     async fn ready(&self, _ctx: Context, ready: Ready) {
+        self.discord_connected.store(true, Ordering::Relaxed);
         info!(user = %ready.user.name, "discord bot connected");
     }
 }

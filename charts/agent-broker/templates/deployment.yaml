@@ -44,6 +44,24 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          {{- if .Values.management.enabled }}
+          ports:
+            - name: management
+              containerPort: 8090
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: management
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: management
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          {{- end }}
           volumeMounts:
             - name: config
               mountPath: /etc/agent-broker

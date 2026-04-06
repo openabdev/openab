@@ -11,7 +11,25 @@ pub struct Config {
     pub pool: PoolConfig,
     #[serde(default)]
     pub reactions: ReactionsConfig,
+    #[serde(default)]
+    pub management: ManagementConfig,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct ManagementConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_management_bind")]
+    pub bind: String,
+}
+
+impl Default for ManagementConfig {
+    fn default() -> Self {
+        Self { enabled: false, bind: default_management_bind() }
+    }
+}
+
+fn default_management_bind() -> String { "0.0.0.0:8090".into() }
 
 #[derive(Debug, Deserialize)]
 pub struct DiscordConfig {

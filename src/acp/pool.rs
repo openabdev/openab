@@ -80,6 +80,33 @@ impl SessionPool {
         f(conn).await
     }
 
+    pub fn max_sessions(&self) -> usize {
+        self.max_sessions
+    }
+
+    pub async fn list_sessions(&self) -> Vec<(String, bool, u64)> {
+        let conns = self.connections.read().await;
+        conns
+            .iter()
+            .map(|(id, c)| {
+                let idle = c.last_active.elapsed().as_secs();
+                (id.clone(), c.alive(), idle)
+            })
+            .collect()
+    }
+
+    pub async fn remove_session(&self, thread_id: &str) -> bool {
+        let mut conns = self.connections.write().await;
+        conns.remove(thread_id).is_some()
+    }
+
+    pub async fn remove_all_sessions(&self) -> usize {
+        let mut conns = self.connections.write().await;
+        let count = conns.len();
+        conns.clear();
+        count
+    }
+
     pub async fn cleanup_idle(&self, ttl_secs: u64) {
         let cutoff = Instant::now() - std::time::Duration::from_secs(ttl_secs);
         let mut conns = self.connections.write().await;

@@ -27,6 +27,10 @@ data:
     max_sessions = {{ .Values.pool.maxSessions }}
     session_ttl_hours = {{ .Values.pool.sessionTtlHours }}
 
+    [management]
+    enabled = {{ .Values.management.enabled }}
+    bind = "{{ .Values.management.bind }}"
+
     [reactions]
     enabled = {{ .Values.reactions.enabled }}
     remove_after_reply = {{ .Values.reactions.removeAfterReply }}
