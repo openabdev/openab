@@ -17,7 +17,7 @@ Users running `helm install` only see stable versions. Beta versions require `--
         ▼
   ┌─────────────┐     ┌──────────────────┐     ┌─────────────────────┐
   │ CI: Build   │────>│ CI: Bump PR      │────>│ Merge bump PR       │
-  │ 3 images    │     │ 0.2.1-beta.12345 │     │ → publishes beta    │
+  │ 5 images    │     │ 0.2.1-beta.12345 │     │ → publishes beta    │
   └─────────────┘     └──────────────────┘     └─────────────────────┘
                                                         │
         ┌───────────────────────────────────────────────┘
@@ -35,7 +35,7 @@ Users running `helm install` only see stable versions. Beta versions require `--
         ▼
   ┌─────────────┐     ┌──────────────────┐     ┌─────────────────────┐
   │ CI: Build   │────>│ CI: Bump PR      │────>│ Merge bump PR       │
-  │ 3 images    │     │ 0.2.1            │     │ → publishes stable  │
+  │ 5 images    │     │ 0.2.1            │     │ → publishes stable  │
   └─────────────┘     └──────────────────┘     └─────────────────────┘
                                                         │
         ┌───────────────────────────────────────────────┘
@@ -45,12 +45,14 @@ Users running `helm install` only see stable versions. Beta versions require `--
 
 ## Image Tags
 
-Each build produces three multi-arch images tagged with the git short SHA:
+Each build produces five multi-arch images tagged with the git short SHA:
 
 ```
 ghcr.io/thepagent/agent-broker:<sha>        # kiro-cli
 ghcr.io/thepagent/agent-broker-codex:<sha>   # codex
 ghcr.io/thepagent/agent-broker-claude:<sha>  # claude
+ghcr.io/thepagent/agent-broker-gemini:<sha>  # gemini
+ghcr.io/thepagent/agent-broker-copilot:<sha> # copilot
 ```
 
 The `latest` tag always points to the most recent build.

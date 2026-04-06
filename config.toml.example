@@ -8,14 +8,14 @@ args = ["acp", "--trust-all-tools"]
 working_dir = "/home/agent"
 
 # [agent]
-# command = "claude"
-# args = ["--acp"]
+# command = "claude-agent-acp"
+# args = []
 # working_dir = "/home/agent"
 # env = { ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}" }
 
 # [agent]
-# command = "codex"
-# args = ["--acp"]
+# command = "codex-acp"
+# args = []
 # working_dir = "/home/agent"
 # env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
 
@@ -24,6 +24,12 @@ working_dir = "/home/agent"
 # args = ["--acp"]
 # working_dir = "/home/agent"
 # env = { GEMINI_API_KEY = "${GEMINI_API_KEY}" }
+
+# [agent]
+# command = "copilot"
+# args = ["--acp", "--stdio"]
+# working_dir = "/home/agent"
+# env = { COPILOT_GITHUB_TOKEN = "${COPILOT_GITHUB_TOKEN}" }
 
 [pool]
 max_sessions = 10

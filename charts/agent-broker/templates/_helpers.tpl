@@ -41,6 +41,7 @@ Resolve agent preset → image repository
   {{- if eq .Values.agent.preset "codex" }}ghcr.io/thepagent/agent-broker-codex
   {{- else if eq .Values.agent.preset "claude" }}ghcr.io/thepagent/agent-broker-claude
   {{- else if eq .Values.agent.preset "gemini" }}ghcr.io/thepagent/agent-broker-gemini
+  {{- else if eq .Values.agent.preset "copilot" }}ghcr.io/thepagent/agent-broker-copilot
   {{- else }}{{ .Values.image.repository }}
   {{- end }}
 {{- else }}{{ .Values.image.repository }}
@@ -55,6 +56,7 @@ Resolve agent preset → command
   {{- if eq .Values.agent.preset "codex" }}codex-acp
   {{- else if eq .Values.agent.preset "claude" }}claude-agent-acp
   {{- else if eq .Values.agent.preset "gemini" }}gemini
+  {{- else if eq .Values.agent.preset "copilot" }}copilot
   {{- else }}{{ .Values.agent.command }}
   {{- end }}
 {{- else }}{{ .Values.agent.command }}
@@ -68,6 +70,7 @@ Resolve agent preset → args
 {{- if .Values.agent.preset }}
   {{- if or (eq .Values.agent.preset "codex") (eq .Values.agent.preset "claude") }}[]
   {{- else if eq .Values.agent.preset "gemini" }}["--acp"]
+  {{- else if eq .Values.agent.preset "copilot" }}["--acp", "--stdio"]
   {{- else }}{{ .Values.agent.args | toJson }}
   {{- end }}
 {{- else }}{{ .Values.agent.args | toJson }}

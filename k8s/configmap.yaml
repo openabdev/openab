@@ -13,6 +13,12 @@ data:
     args = ["acp", "--trust-all-tools"]
     working_dir = "/home/agent"
 
+    # GitHub Copilot CLI
+    # [agent]
+    # command = "copilot"
+    # args = ["--acp", "--stdio"]
+    # working_dir = "/home/agent"
+
     [pool]
     max_sessions = 10
     session_ttl_hours = 24

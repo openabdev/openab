@@ -32,6 +32,10 @@ spec:
             - name: config
               mountPath: /etc/agent-broker
               readOnly: true
+            # Default mounts for Kiro CLI. For other backends, replace
+            # these subPath entries or mount the whole home directory:
+            #   - name: data
+            #     mountPath: /home/agent
             - name: data
               mountPath: /home/agent/.kiro
               subPath: dot-kiro

@@ -1,6 +1,6 @@
 # agent-broker
 
-A Rust bridge service between Discord and any ACP-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, etc.) using the [Agent Client Protocol](https://github.com/anthropics/agent-protocol) over stdio JSON-RPC.
+A Rust bridge service between Discord and any ACP-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, GitHub Copilot CLI, etc.) using the [Agent Client Protocol](https://github.com/anthropics/agent-protocol) over stdio JSON-RPC.
 
 ```
 ┌──────────────┐  Gateway WS   ┌──────────────┐  ACP stdio    ┌──────────────┐
@@ -15,7 +15,7 @@ A Rust bridge service between Discord and any ACP-compatible coding CLI (Kiro CL
 
 ## Features
 
-- **Pluggable agent backend** — swap between Kiro CLI, Claude Code, Codex, Gemini via config
+- **Pluggable agent backend** — swap between Kiro CLI, Claude Code, Codex, Gemini, GitHub Copilot CLI via config
 - **@mention trigger** — mention the bot in an allowed channel to start a conversation
 - **Thread-based multi-turn** — auto-creates threads; no @mention needed for follow-ups
 - **Edit-streaming** — live-updates the Discord message every 1.5s as tokens arrive
@@ -81,7 +81,7 @@ The bot creates a thread. After that, just type in the thread — no @mention ne
 
 ## Pluggable Agent Backends
 
-Swap backends using the `agent.preset` Helm value or manual config. Tested backends:
+Swap backends using the `agent.preset` Helm value or manual config. Supported backends:
 
 | Preset | CLI | ACP Adapter | Auth |
 |--------|-----|-------------|------|
@@ -89,6 +89,9 @@ Swap backends using the `agent.preset` Helm value or manual config. Tested backe
 | `codex` | Codex | [@zed-industries/codex-acp](https://github.com/zed-industries/codex-acp) | `codex login --device-auth` |
 | `claude` | Claude Code | [@agentclientprotocol/claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp) | `claude setup-token` |
 | `gemini` | Gemini CLI | Native `gemini --acp` | Google OAuth or `GEMINI_API_KEY` |
+| `copilot` | GitHub Copilot CLI | Native `copilot --acp --stdio` | `copilot` then `/login`, or `COPILOT_GITHUB_TOKEN` |
+
+> GitHub Copilot CLI ACP support is currently in public preview.
 
 ### Helm Install (recommended)
 
@@ -118,6 +121,12 @@ helm install agent-broker agent-broker/agent-broker \
   --set discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string discord.allowedChannels[0]="YOUR_CHANNEL_ID" \
   --set agent.preset=gemini
+
+# GitHub Copilot CLI
+helm install agent-broker agent-broker/agent-broker \
+  --set discord.botToken="$DISCORD_BOT_TOKEN" \
+  --set-string discord.allowedChannels[0]="YOUR_CHANNEL_ID" \
+  --set agent.preset=copilot
 ```
 
 Then authenticate inside the pod (first time only):
@@ -136,6 +145,12 @@ kubectl exec -it deployment/agent-broker -- claude setup-token
 # Gemini (Google OAuth — open URL in browser, curl callback from pod)
 kubectl exec -it deployment/agent-broker -- gemini
 # Or use API key: helm upgrade agent-broker agent-broker/agent-broker --set env.GEMINI_API_KEY="<key>"
+
+# GitHub Copilot CLI
+kubectl exec -it deployment/agent-broker -- copilot
+# Choose "Always trust" for /home/agent so ACP starts without interactive prompt, then run /login
+# Or skip interactive auth — use a PAT with Copilot Requests permission:
+# helm upgrade agent-broker agent-broker/agent-broker --set env.COPILOT_GITHUB_TOKEN="<token>"
 ```
 
 Restart after auth: `kubectl rollout restart deployment agent-broker`
@@ -169,6 +184,13 @@ command = "gemini"
 args = ["--acp"]
 working_dir = "/tmp"
 env = { GEMINI_API_KEY = "${GEMINI_API_KEY}" }
+
+# GitHub Copilot CLI
+[agent]
+command = "copilot"
+args = ["--acp", "--stdio"]
+working_dir = "/tmp"
+# Optional: env = { COPILOT_GITHUB_TOKEN = "${COPILOT_GITHUB_TOKEN}" }
 ```
 
 ## Configuration Reference
@@ -211,7 +233,7 @@ error_hold_ms = 2500                  # keep error emoji for 2.5s
 
 ## Kubernetes Deployment
 
-The Docker image bundles both `agent-broker` and `kiro-cli` in a single container (agent-broker spawns kiro-cli as a child process).
+Each runtime image bundles both `agent-broker` and a selected coding CLI in a single container (agent-broker spawns the CLI as a child process).
 
 ### Pod Architecture
 
@@ -233,16 +255,18 @@ The Docker image bundles both `agent-broker` and `kiro-cli` in a single containe
 │            │                  │                                  │
 │            ▼                  ▼                                  │
 │  ┌──────────────────────────────────────────────────────────┐    │
-│  │  kiro-cli acp --trust-all-tools  (child process)         │    │
+│  │  selected ACP CLI (for example: kiro-cli acp,           │    │
+│  │  copilot --acp --stdio, gemini --acp)                   │    │
 │  │                                                          │    │
 │  │  stdin  ◄── JSON-RPC requests  (session/new, prompt)     │    │
 │  │  stdout ──► JSON-RPC responses (text, tool_call, done)   │    │
 │  │  stderr ──► (ignored)                                    │    │
 │  └──────────────────────────────────────────────────────────┘    │
 │                                                                  │
-│  ┌─ PVC Mount (/data) ──────────────────────────────────────┐    │
-│  │  ~/.kiro/              ← settings, skills, sessions      │    │
-│  │  ~/.local/share/kiro-cli/ ← OAuth tokens (data.sqlite3)  │    │
+│  ┌─ PVC Mount (/home/agent) ────────────────────────────────┐    │
+│  │  CLI-specific state under the agent home directory       │    │
+│  │  (for example ~/.kiro, ~/.local/share/kiro-cli,          │    │
+│  │   ~/.copilot)                                            │    │
 │  └──────────────────────────────────────────────────────────┘    │
 │                                                                  │
 └──────────────────────────────────────────────────────────────────┘
@@ -255,14 +279,14 @@ The Docker image bundles both `agent-broker` and `kiro-cli` in a single containe
 └──────────────────┘         └──────────────┘
 ```
 
-- **Single container** — agent-broker is PID 1, spawns kiro-cli as a child process
+- **Single container** — agent-broker is PID 1, spawns the configured CLI as a child process
 - **stdio JSON-RPC** — ACP communication over stdin/stdout, no network ports needed
-- **Session pool** — one kiro-cli process per Discord thread, up to `max_sessions`
-- **PVC** — persists OAuth tokens and settings across pod restarts
+- **Session pool** — one ACP CLI process per Discord thread, up to `max_sessions`
+- **PVC** — persists CLI auth tokens and settings across pod restarts
 
 ### Install with Your Coding CLI
 
-Use one of these prompts with any coding CLI (Kiro CLI, Claude Code, Codex, Gemini, etc.) on the host that has `helm` and `kubectl` access to your cluster:
+Use one of these prompts with any coding CLI (Kiro CLI, Claude Code, Codex, Gemini, GitHub Copilot CLI, etc.) on the host that has `helm` and `kubectl` access to your cluster:
 
 **Kiro CLI (default):**
 > Install agent-broker on my local k8s cluster using the Helm chart from https://thepagent.github.io/agent-broker. My Discord bot token is in the environment variable DISCORD_BOT_TOKEN and my channel ID is <REPLACE_WITH_YOUR_CHANNEL_ID>. After install, follow the NOTES output to authenticate, then restart the deployment.
@@ -276,12 +300,21 @@ Use one of these prompts with any coding CLI (Kiro CLI, Claude Code, Codex, Gemi
 **Gemini:**
 > Install agent-broker on my local k8s cluster using the Helm chart from https://thepagent.github.io/agent-broker with `--set agent.preset=gemini`. My Discord bot token is in the environment variable DISCORD_BOT_TOKEN and my channel ID is <REPLACE_WITH_YOUR_CHANNEL_ID>. After install, follow the NOTES output to authenticate, then restart the deployment.
 
+**GitHub Copilot CLI:**
+> Install agent-broker on my local k8s cluster using the Helm chart from https://thepagent.github.io/agent-broker with `--set agent.preset=copilot`. My Discord bot token is in the environment variable DISCORD_BOT_TOKEN and my channel ID is <REPLACE_WITH_YOUR_CHANNEL_ID>. After install, follow the NOTES output to authenticate, then restart the deployment.
+
 ### Build & Push
 
 ```bash
+# Kiro CLI (default)
 docker build -t agent-broker:latest .
 docker tag agent-broker:latest <your-registry>/agent-broker:latest
 docker push <your-registry>/agent-broker:latest
+
+# GitHub Copilot CLI
+docker build -f Dockerfile.copilot -t agent-broker-copilot:latest .
+docker tag agent-broker-copilot:latest <your-registry>/agent-broker-copilot:latest
+docker push <your-registry>/agent-broker-copilot:latest
 ```
 
 ### Deploy
@@ -297,15 +330,24 @@ kubectl apply -f k8s/pvc.yaml
 kubectl apply -f k8s/deployment.yaml
 ```
 
-### Authenticate kiro-cli (first time only)
+For non-default CLIs, update `k8s/configmap.yaml` and the image in `k8s/deployment.yaml` to the matching runtime image and ACP command. You may also need to adjust the PVC volume mounts — the default manifests use Kiro-specific subPath mounts; see the comments in `k8s/deployment.yaml` for how to switch to a whole-home mount for other backends.
 
-kiro-cli requires a one-time OAuth login. The PVC persists the tokens across pod restarts.
+### Authenticate the selected CLI (first time only)
+
+The PVC persists CLI auth and settings across pod restarts.
 
 ```bash
+# Kiro CLI (default manifests)
 kubectl exec -it deployment/agent-broker -- kiro-cli login --use-device-flow
+
+# GitHub Copilot CLI
+kubectl exec -it deployment/agent-broker -- copilot
+# Choose "Always trust" for /home/agent so ACP starts without interactive prompt, then run /login
+# Or skip interactive auth — inject a PAT:
+# kubectl set env deployment/agent-broker COPILOT_GITHUB_TOKEN="<token>"
 ```
 
-Follow the device code flow in your browser, then restart the pod:
+Follow the device/browser flow as needed, then restart the pod:
 
 ```bash
 kubectl rollout restart deployment agent-broker
@@ -320,14 +362,12 @@ kubectl rollout restart deployment agent-broker
 | `k8s/secret.yaml` | `DISCORD_BOT_TOKEN` injected as env var |
 | `k8s/pvc.yaml` | Persistent storage for auth + settings |
 
-The PVC persists two paths via `subPath`:
-- `~/.kiro` — settings, skills, sessions
-- `~/.local/share/kiro-cli` — OAuth tokens (`data.sqlite3` → `auth_kv` table), conversation history
+The default raw manifests use Kiro-specific subPath mounts on the PVC (`~/.kiro`, `~/.local/share/kiro-cli`). For other backends, replace the subPath entries with a single `/home/agent` mount — see the comments in `k8s/deployment.yaml`. The Helm chart's `deployment.yaml` already mounts `/home/agent` directly.
 
 ## Project Structure
 
 ```
-├── Dockerfile          # multi-stage: rust build + debian-slim runtime with kiro-cli
+├── Dockerfile*         # runtime variants for Kiro, Codex, Claude, Gemini, and Copilot
 ├── config.toml.example # example config with all agent backends
 ├── k8s/                # Kubernetes manifests
 │   ├── deployment.yaml

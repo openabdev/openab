@@ -45,6 +45,20 @@ Authenticate Gemini CLI (first time only):
   Alternatively, set GEMINI_API_KEY:
 
   helm upgrade {{ .Release.Name }} agent-broker/agent-broker --set env.GEMINI_API_KEY="<key>"
+{{- else if eq $cmd "copilot" }}
+
+Authenticate GitHub Copilot CLI (first time only):
+
+  kubectl exec -it deployment/{{ include "agent-broker.fullname" . }} -- copilot
+
+  Choose "Always trust" for {{ .Values.agent.workingDir }} so ACP can start
+  without an interactive prompt, then run:
+
+    /login
+
+  Or skip interactive auth entirely with a fine-grained PAT (Copilot Requests permission):
+
+  helm upgrade {{ .Release.Name }} agent-broker/agent-broker --set env.COPILOT_GITHUB_TOKEN="<token>"
 {{- else }}
 
 Authenticate your agent CLI (first time only) — refer to your CLI's documentation.

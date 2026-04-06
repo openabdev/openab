@@ -83,4 +83,4 @@ The bot should create a thread and respond. After that, just type in the thread 
 
 - **Bot doesn't respond** — check that the channel ID is correct and the bot has permissions in that channel
 - **"Sent invalid authentication"** — the bot token is wrong or expired, reset it in the Developer Portal
-- **"Failed to start agent"** — kiro-cli isn't authenticated, run `kiro-cli login --use-device-flow` inside the container
+- **"Failed to start agent"** — the selected CLI isn't installed or authenticated; run the matching login flow inside the container (for example, `kiro-cli login --use-device-flow` or `copilot` then `/login`)
