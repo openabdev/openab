@@ -155,8 +155,32 @@ fn expand_env_vars(raw: &str) -> String {
 pub fn load_config(path: &Path) -> anyhow::Result<Config> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
-    let expanded = expand_env_vars(&raw);
+    parse_config(&raw, path.display().to_string().as_str())
+}
+
+pub async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to fetch remote config from {url}: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("remote config request to {url} returned HTTP {status}");
+    }
+    let raw = resp
+        .text()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to read response body from {url}: {e}"))?;
+    parse_config(&raw, url)
+}
+
+fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
+    let expanded = expand_env_vars(raw);
     let config: Config = toml::from_str(&expanded)
-        .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", path.display()))?;
+        .map_err(|e| anyhow::anyhow!("failed to parse config from {source}: {e}"))?;
     Ok(config)
 }

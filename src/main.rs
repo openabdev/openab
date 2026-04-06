@@ -20,12 +20,16 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let config_path = std::env::args()
+    let config_source = std::env::args()
         .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("config.toml"));
+        .unwrap_or_else(|| "config.toml".into());
 
-    let cfg = config::load_config(&config_path)?;
+    let cfg = if config_source.starts_with("http://") || config_source.starts_with("https://") {
+        info!(url = %config_source, "fetching remote config");
+        config::load_config_from_url(&config_source).await?
+    } else {
+        config::load_config(&PathBuf::from(&config_source))?
+    };
     info!(
         agent_cmd = %cfg.agent.command,
         pool_max = cfg.pool.max_sessions,
