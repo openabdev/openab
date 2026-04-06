@@ -49,7 +49,7 @@ jobs:
           NAME=$(grep '^name:' ${CHART}/Chart.yaml | awk '{print $2}')
           VERSION=$(grep '^version:' ${CHART}/Chart.yaml | awk '{print $2}')
           helm package ${CHART}
-          helm push ${NAME}-${VERSION}.tgz oci://ghcr.io/${{ github.repository_owner }}
+          helm push ${NAME}-${VERSION}.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
 
       - name: Append OCI install instructions to release notes
         env:
@@ -85,7 +85,7 @@ jobs:
 
           ### OCI Registry
           \`\`\`bash
-          helm install agent-broker oci://ghcr.io/${OWNER}/agent-broker --version ${VERSION}
+          helm install agent-broker oci://ghcr.io/${OWNER}/charts/agent-broker --version ${VERSION}
           \`\`\`
           EOF
 

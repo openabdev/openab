@@ -189,33 +189,34 @@ jobs:
           fi
           echo "new_version=$new_version" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve image SHA
+        id: image-sha
+        run: |
+          # Use the commit SHA that triggered this build — this is the SHA
+          # that merge-manifests tagged the Docker image with (type=sha,prefix=).
+          # We capture it here explicitly so it survives the bump commit.
+          IMAGE_SHA="${{ github.sha }}"
+          IMAGE_SHA="${IMAGE_SHA:0:7}"
+          echo "sha=${IMAGE_SHA}" >> "$GITHUB_OUTPUT"
+
       - name: Update Chart.yaml and values.yaml
         run: |
-          SHORT_SHA="${{ github.sha }}"
-          SHORT_SHA="${SHORT_SHA:0:7}"
+          IMAGE_SHA="${{ steps.image-sha.outputs.sha }}"
           sed -i "s/^version: .*/version: ${{ steps.bump.outputs.new_version }}/" charts/agent-broker/Chart.yaml
-          sed -i "s/^appVersion: .*/appVersion: \"${SHORT_SHA}\"/" charts/agent-broker/Chart.yaml
+          sed -i "s/^appVersion: .*/appVersion: \"${IMAGE_SHA}\"/" charts/agent-broker/Chart.yaml
           sed -i "s|repository: .*|repository: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}|" charts/agent-broker/values.yaml
-          sed -i "s/tag: .*/tag: \"${SHORT_SHA}\"/" charts/agent-broker/values.yaml
+          sed -i "s/tag: .*/tag: \"${IMAGE_SHA}\"/" charts/agent-broker/values.yaml
 
-      - name: Create bump PR
+      - name: Push chart bump directly to main
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           VERSION="${{ steps.bump.outputs.new_version }}"
-          BRANCH="chore/chart-${VERSION}"
+          IMAGE_SHA="${{ steps.image-sha.outputs.sha }}"
           git config user.name "openclaw-helm-bot[bot]"
           git config user.email "3185992+openclaw-helm-bot[bot]@users.noreply.github.com"
-          git checkout -b "$BRANCH"
           git add charts/agent-broker/Chart.yaml charts/agent-broker/values.yaml
-          git commit -m "chore: bump chart to ${VERSION}"
-          git push origin "$BRANCH"
-          if [[ "$VERSION" == *-beta* ]]; then
-            LABEL="beta"
-          else
-            LABEL="stable"
-          fi
-          gh pr create \
-            --title "chore: bump chart to ${VERSION}" \
-            --body "Auto-generated chart version bump (${LABEL}) for image \`${{ github.sha }}\`." \
-            --base main --head "$BRANCH"
+          git commit -m "chore: bump chart to ${VERSION} [skip ci]
+
+          image: ${IMAGE_SHA}"
+          git push origin main
