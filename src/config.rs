@@ -184,3 +184,84 @@ fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
         .map_err(|e| anyhow::anyhow!("failed to parse config from {source}: {e}"))?;
     Ok(config)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    const MINIMAL_TOML: &str = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+"#;
+
+    #[test]
+    fn parse_minimal_config() {
+        let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
+        assert_eq!(cfg.discord.bot_token, "test-token");
+        assert_eq!(cfg.agent.command, "echo");
+        assert_eq!(cfg.pool.max_sessions, 10);
+        assert!(cfg.reactions.enabled);
+    }
+
+    #[test]
+    fn expand_env_vars_replaces_known_var() {
+        std::env::set_var("AB_TEST_VAR", "hello");
+        let result = expand_env_vars("token=${AB_TEST_VAR}");
+        assert_eq!(result, "token=hello");
+        std::env::remove_var("AB_TEST_VAR");
+    }
+
+    #[test]
+    fn expand_env_vars_unknown_becomes_empty() {
+        let result = expand_env_vars("token=${AB_NONEXISTENT_12345}");
+        assert_eq!(result, "token=");
+    }
+
+    #[test]
+    fn expand_env_vars_in_config() {
+        std::env::set_var("AB_TEST_TOKEN", "secret-bot-token");
+        let toml = r#"
+[discord]
+bot_token = "${AB_TEST_TOKEN}"
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(cfg.discord.bot_token, "secret-bot-token");
+        std::env::remove_var("AB_TEST_TOKEN");
+    }
+
+    #[test]
+    fn parse_invalid_toml_returns_error() {
+        let result = parse_config("not valid toml {{{}}", "test");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("failed to parse config from test"));
+    }
+
+    #[test]
+    fn load_config_missing_file_returns_error() {
+        let result = load_config(Path::new("/tmp/agent-broker-nonexistent.toml"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("failed to read"));
+    }
+
+    #[test]
+    fn load_config_from_file() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(tmp, "{}", MINIMAL_TOML).unwrap();
+        let cfg = load_config(tmp.path()).unwrap();
+        assert_eq!(cfg.discord.bot_token, "test-token");
+    }
+
+    #[tokio::test]
+    async fn load_config_from_url_invalid_host() {
+        let result = load_config_from_url("https://invalid.test.example/config.toml").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("failed to fetch remote config"));
+    }
+}
