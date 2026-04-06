@@ -26,11 +26,6 @@ spec:
                 secretKeyRef:
                   name: agent-broker-secret
                   key: discord-bot-token
-            - name: GH_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: agent-broker-secret
-                  key: gh-token
             - name: HOME
               value: /home/agent
           volumeMounts:

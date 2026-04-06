@@ -21,47 +21,37 @@ Agents sometimes need to interact with GitHub — push branches, open PRs, comme
      - Workflows: Read and write (if the agent needs to modify workflows)
 4. Click **Generate token** and copy it immediately
 
-## 2. Store the Token in Kubernetes Secret
+## 2. Store the Token in a Kubernetes Secret
 
-Add the token to `k8s/secret.yaml`:
-
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: agent-broker-secret
-type: Opaque
-stringData:
-  discord-bot-token: "your-discord-bot-token"
-  gh-token: "github_pat_xxxxxxxxxxxx"
-```
-
-Apply it:
+Create a dedicated secret for the GitHub token:
 
 ```bash
-kubectl apply -f k8s/secret.yaml
-```
-
-Or create it directly:
-
-```bash
-kubectl create secret generic agent-broker-secret \
-  --from-literal=discord-bot-token="your-discord-token" \
+kubectl create secret generic gh-token-secret \
   --from-literal=gh-token="github_pat_xxxxxxxxxxxx"
 ```
 
-## 3. Inject as Environment Variable
+## 3. Inject via Helm Chart
 
-In `k8s/deployment.yaml`, the `GH_TOKEN` env var is already configured:
+Use `envFrom` in your Helm values to inject the token as `GH_TOKEN`:
 
 ```yaml
+# values.yaml
+envFrom:
+  - secretRef:
+      name: gh-token-secret
+
 env:
-  - name: GH_TOKEN
-    valueFrom:
-      secretKeyRef:
-        name: agent-broker-secret
-        key: gh-token
+  GH_TOKEN: ""   # or use envFrom above
 ```
+
+Or pass it directly during install:
+
+```bash
+helm install agent-broker charts/agent-broker \
+  --set env.GH_TOKEN="github_pat_xxxxxxxxxxxx"
+```
+
+> **Recommended**: Use `envFrom` with a separate secret rather than `--set`, so the token doesn't appear in shell history.
 
 The `gh` CLI automatically picks up `GH_TOKEN` — no additional auth setup needed.
 
