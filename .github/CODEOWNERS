@@ -1,0 +1,7 @@
+# Default code owner for all files
+* @thepagent
+
+# Explicitly protect the CODEOWNERS file itself. While the wildcard above
+# already covers it, this ensures ownership is preserved even if more
+# specific patterns are added later (CODEOWNERS uses last-match-wins).
+/.github/CODEOWNERS @thepagent
