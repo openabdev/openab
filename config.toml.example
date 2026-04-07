@@ -25,6 +25,13 @@ working_dir = "/home/agent"
 # working_dir = "/home/agent"
 # env = { GEMINI_API_KEY = "${GEMINI_API_KEY}" }
 
+# [agent]
+# command = "ollama-acp"
+# args = []
+# working_dir = "/home/agent"
+# env = { OLLAMA_BASE_URL = "http://localhost:11434/v1", OLLAMA_MODEL = "gemma4:26b" }
+# Note: ollama-acp is a Rust binary — build with: cd adapters/ollama-acp && cargo build --release
+
 [pool]
 max_sessions = 10
 session_ttl_hours = 24
