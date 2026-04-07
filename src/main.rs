@@ -23,6 +23,14 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| PathBuf::from("config.toml"));
 
     let cfg = config::load_config(&config_path)?;
+
+    if cfg.telegram.allowed_users.is_empty() {
+        anyhow::bail!(
+            "Oops! You haven't added any users to allowed_users in config.toml.\n\
+             The bot won't talk to anyone until you do — add your Telegram user ID to get started."
+        );
+    }
+
     info!(
         agent_cmd = %cfg.agent.command,
         pool_max = cfg.pool.max_sessions,

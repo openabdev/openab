@@ -5,7 +5,7 @@ allowed_channels = ["1234567890"]
 # ── Telegram (alternative to Discord) ───────────────────────────────────────
 # [telegram]
 # bot_token = "${TELEGRAM_BOT_TOKEN}"
-# allowed_users = [123456789]
+# allowed_users = [123456789]          # required: your Telegram user ID (bot won't start without this)
 #
 # # Chat mode — choose one:
 # #
