@@ -73,3 +73,12 @@ Resolve agent preset → args
 {{- else }}{{ .Values.agent.args | toJson }}
 {{- end }}
 {{- end }}
+
+{{/*
+Resolve agent preset → home directory
+*/}}
+{{- define "openab.agent.home" -}}
+{{- if and .Values.agent.preset (or (eq .Values.agent.preset "codex") (eq .Values.agent.preset "claude") (eq .Values.agent.preset "gemini")) }}/home/node
+{{- else }}/home/agent
+{{- end }}
+{{- end }}

@@ -18,7 +18,7 @@ data:
     [agent]
     command = "{{ include "openab.agent.command" . | trim }}"
     args = {{ include "openab.agent.args" . | trim }}
-    working_dir = "{{ .Values.agent.workingDir }}"
+    working_dir = "{{ include "openab.agent.home" . | trim }}"
     {{- if .Values.agent.env }}
     env = { {{ range $k, $v := .Values.agent.env }}{{ $k }} = "{{ $v }}", {{ end }} }
     {{- end }}

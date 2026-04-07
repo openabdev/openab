@@ -20,10 +20,18 @@ spec:
       labels:
         {{- include "openab.selectorLabels" . | nindent 8 }}
     spec:
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: openab
           image: "{{ include "openab.image.repository" . | trim }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           env:
             - name: DISCORD_BOT_TOKEN
               valueFrom:
@@ -31,7 +39,7 @@ spec:
                   name: {{ include "openab.fullname" . }}
                   key: discord-bot-token
             - name: HOME
-              value: /home/agent
+              value: {{ include "openab.agent.home" . | trim }}
             {{- range $key, $value := .Values.env }}
             - name: {{ $key }}
               value: {{ $value | quote }}
@@ -50,11 +58,11 @@ spec:
               readOnly: true
             {{- if .Values.persistence.enabled }}
             - name: data
-              mountPath: /home/agent
+              mountPath: {{ include "openab.agent.home" . | trim }}
             {{- end }}
             {{- if .Values.agentsMd }}
             - name: config
-              mountPath: /home/agent/AGENTS.md
+              mountPath: {{ include "openab.agent.home" . | trim }}/AGENTS.md
               subPath: AGENTS.md
             {{- end }}
       {{- with .Values.nodeSelector }}

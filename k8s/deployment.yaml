@@ -16,10 +16,20 @@ spec:
       labels:
         app: openab
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
       containers:
         - name: openab
           image: openab:latest
           imagePullPolicy: Never
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           env:
             - name: DISCORD_BOT_TOKEN
               valueFrom:
