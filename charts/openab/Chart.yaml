@@ -2,5 +2,5 @@ apiVersion: v2
 name: openab
 description: Discord ↔ ACP coding CLI bridge (Kiro CLI, Claude Code, Codex, Gemini)
 type: application
-version: 0.4.0-beta.30
-appVersion: "59d052f"
+version: 0.5.0
+appVersion: "9c70cdd"
