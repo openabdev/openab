@@ -6,7 +6,7 @@ on:
     branches:
       - main
     paths:
-      - "charts/agent-broker/Chart.yaml"
+      - "charts/openab/Chart.yaml"
 
 jobs:
   release:
@@ -45,7 +45,7 @@ jobs:
 
       - name: Push chart to OCI registry
         run: |
-          CHART=charts/agent-broker
+          CHART=charts/openab
           NAME=$(grep '^name:' ${CHART}/Chart.yaml | awk '{print $2}')
           VERSION=$(grep '^version:' ${CHART}/Chart.yaml | awk '{print $2}')
           helm package ${CHART}
@@ -57,7 +57,7 @@ jobs:
         run: |
           OWNER="${{ github.repository_owner }}"
           REPO="${{ github.event.repository.name }}"
-          CHART=charts/agent-broker
+          CHART=charts/openab
           NAME=$(grep '^name:' ${CHART}/Chart.yaml | awk '{print $2}')
           VERSION=$(grep '^version:' ${CHART}/Chart.yaml | awk '{print $2}')
           APP_VERSION=$(grep '^appVersion:' ${CHART}/Chart.yaml | awk '{print $2}' | tr -d '"')
@@ -78,14 +78,14 @@ jobs:
 
           ### Helm Repository (GitHub Pages)
           \`\`\`bash
-          helm repo add agent-broker https://${OWNER}.github.io/${REPO}
+          helm repo add openab https://${OWNER}.github.io/${REPO}
           helm repo update
-          helm install agent-broker agent-broker/agent-broker --version ${VERSION}
+          helm install openab openab/openab --version ${VERSION}
           \`\`\`
 
           ### OCI Registry
           \`\`\`bash
-          helm install agent-broker oci://ghcr.io/${OWNER}/charts/agent-broker --version ${VERSION}
+          helm install openab oci://ghcr.io/${OWNER}/charts/openab --version ${VERSION}
           \`\`\`
           EOF
 

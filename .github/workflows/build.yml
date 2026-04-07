@@ -164,7 +164,7 @@ jobs:
       - name: Get current chart version
         id: current
         run: |
-          chart_version=$(grep '^version:' charts/agent-broker/Chart.yaml | awk '{print $2}')
+          chart_version=$(grep '^version:' charts/openab/Chart.yaml | awk '{print $2}')
           echo "chart_version=$chart_version" >> "$GITHUB_OUTPUT"
 
       - name: Bump chart version
@@ -202,10 +202,10 @@ jobs:
       - name: Update Chart.yaml and values.yaml
         run: |
           IMAGE_SHA="${{ steps.image-sha.outputs.sha }}"
-          sed -i "s/^version: .*/version: ${{ steps.bump.outputs.new_version }}/" charts/agent-broker/Chart.yaml
-          sed -i "s/^appVersion: .*/appVersion: \"${IMAGE_SHA}\"/" charts/agent-broker/Chart.yaml
-          sed -i "s|repository: .*|repository: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}|" charts/agent-broker/values.yaml
-          sed -i "s/tag: .*/tag: \"${IMAGE_SHA}\"/" charts/agent-broker/values.yaml
+          sed -i "s/^version: .*/version: ${{ steps.bump.outputs.new_version }}/" charts/openab/Chart.yaml
+          sed -i "s/^appVersion: .*/appVersion: \"${IMAGE_SHA}\"/" charts/openab/Chart.yaml
+          sed -i "s|repository: .*|repository: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}|" charts/openab/values.yaml
+          sed -i "s/tag: .*/tag: \"${IMAGE_SHA}\"/" charts/openab/values.yaml
 
       - name: Create and auto-merge bump PR
         env:
@@ -217,7 +217,7 @@ jobs:
           git config user.name "openclaw-helm-bot[bot]"
           git config user.email "3185992+openclaw-helm-bot[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
-          git add charts/agent-broker/Chart.yaml charts/agent-broker/values.yaml
+          git add charts/openab/Chart.yaml charts/openab/values.yaml
           git commit -m "chore: bump chart to ${VERSION}
 
           image: ${IMAGE_SHA}"
