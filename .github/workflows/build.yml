@@ -226,4 +226,4 @@ jobs:
             --title "chore: bump chart to ${VERSION}" \
             --body "Auto-generated chart version bump for image \`${IMAGE_SHA}\`." \
             --base main --head "$BRANCH")
-          gh pr merge "$PR_URL" --squash --auto --delete-branch
+          gh pr merge "$PR_URL" --squash --delete-branch
