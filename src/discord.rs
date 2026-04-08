@@ -357,7 +357,7 @@ async fn get_or_create_thread(ctx: &Context, msg: &Message, prompt: &str) -> any
 
     let thread_name = shorten_thread_name(prompt);
 
-    let thread = msg
+    let thread = match msg
         .channel_id
         .create_thread_from_message(
             &ctx.http,
@@ -365,7 +365,25 @@ async fn get_or_create_thread(ctx: &Context, msg: &Message, prompt: &str) -> any
             serenity::builder::CreateThread::new(thread_name)
                 .auto_archive_duration(serenity::model::channel::AutoArchiveDuration::OneDay),
         )
-        .await?;
+        .await
+    {
+        Ok(t) => t,
+        Err(serenity::Error::Http(err)) => {
+            // Thread already exists for this message — query the channel to get the existing thread ID
+            if let Some(code) = err.status_code() {
+                if code.as_u16() == 500 {
+                    let channel = msg.channel_id.to_channel(&ctx.http).await?;
+                    if let serenity::model::channel::Channel::Guild(gc) = channel {
+                        if gc.thread_metadata.is_some() {
+                            return Ok(gc.id.get());
+                        }
+                    }
+                }
+            }
+            return Err(anyhow::anyhow!("failed to create thread: {err}"));
+        }
+        Err(e) => return Err(anyhow::anyhow!("failed to create thread: {e}")),
+    };
 
     Ok(thread.id.get())
 }
