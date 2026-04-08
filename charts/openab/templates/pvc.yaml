@@ -1,4 +1,5 @@
 {{- range $name, $cfg := .Values.agents }}
+{{- if ne (include "openab.agentEnabled" $cfg) "false" }}
 {{- if not (eq (include "openab.persistenceEnabled" $cfg) "false") }}
 {{- $d := dict "ctx" $ "agent" $name "cfg" $cfg }}
 ---
@@ -17,5 +18,6 @@ spec:
   resources:
     requests:
       storage: {{ (and $cfg.persistence $cfg.persistence.size) | default "1Gi" }}
+{{- end }}
 {{- end }}
 {{- end }}

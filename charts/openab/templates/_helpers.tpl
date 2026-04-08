@@ -56,6 +56,11 @@ app.kubernetes.io/component: {{ .agent }}
 {{- .ctx.Values.image.pullPolicy }}
 {{- end }}
 
+{{/* Agent enabled: default true unless explicitly set to false */}}
+{{- define "openab.agentEnabled" -}}
+{{- if eq (.enabled | toString) "false" }}false{{ else }}true{{ end }}
+{{- end }}
+
 {{/* Persistence enabled: default true unless explicitly set to false */}}
 {{- define "openab.persistenceEnabled" -}}
 {{- if and . .persistence (eq (.persistence.enabled | toString) "false") }}false{{ else }}true{{ end }}

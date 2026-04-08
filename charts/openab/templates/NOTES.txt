@@ -4,6 +4,7 @@ openab {{ .Chart.AppVersion }} has been installed!
 
 Agents deployed:
 {{- range $name, $cfg := .Values.agents }}
+{{- if ne (include "openab.agentEnabled" $cfg) "false" }}
   • {{ $name }} ({{ $cfg.command }})
 {{- if not $cfg.discord.botToken }}
     ⚠️  No bot token provided. Create the secret manually:
@@ -27,4 +28,5 @@ Agents deployed:
 
     Restart after auth:
     kubectl rollout restart deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }}
+{{- end }}
 {{- end }}

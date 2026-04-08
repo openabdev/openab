@@ -18,6 +18,7 @@ containerSecurityContext:
 
 agents:
   kiro:
+    enabled: true    # set to false to skip creating resources for this agent
     # To add a second agent, uncomment and fill in the block below:
     # claude:
     #   command: claude-agent-acp
