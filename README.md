@@ -89,6 +89,7 @@ Swap backends using the `agent.preset` Helm value or manual config. Tested backe
 | `codex` | Codex | [@zed-industries/codex-acp](https://github.com/zed-industries/codex-acp) | `codex login --device-auth` |
 | `claude` | Claude Code | [@agentclientprotocol/claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp) | `claude setup-token` |
 | `gemini` | Gemini CLI | Native `gemini --acp` | Google OAuth or `GEMINI_API_KEY` |
+| `local-ai` | [local-ai-acp](https://github.com/BlakeHung/local-ai-acp) | Rust BYOCLI | No auth needed (local) |
 
 ### Helm Install (recommended)
 
@@ -169,7 +170,47 @@ command = "gemini"
 args = ["--acp"]
 working_dir = "/tmp"
 env = { GEMINI_API_KEY = "${GEMINI_API_KEY}" }
+
+# Local AI (Ollama, LocalAI, vLLM, llama.cpp, LM Studio)
+# Install: cargo install --git https://github.com/BlakeHung/local-ai-acp
+[agent]
+command = "local-ai-acp"
+args = []
+working_dir = "/tmp"
+env = { LLM_BASE_URL = "http://localhost:11434/v1", LLM_MODEL = "gemma4:26b" }
 ```
+
+### Local AI (BYOCLI)
+
+Use any local LLM as your agent backend with [local-ai-acp](https://github.com/BlakeHung/local-ai-acp) — a Rust single-binary ACP adapter that bridges any OpenAI-compatible API to ACP.
+
+```bash
+# 1. Install local-ai-acp
+cargo install --git https://github.com/BlakeHung/local-ai-acp
+
+# 2. Make sure your local AI server is running (e.g. Ollama)
+ollama serve
+ollama pull gemma4:26b
+
+# 3. Configure openab
+cat > config.toml <<EOF
+[discord]
+bot_token = "${DISCORD_BOT_TOKEN}"
+allowed_channels = ["YOUR_CHANNEL_ID"]
+
+[agent]
+command = "local-ai-acp"
+args = []
+working_dir = "/path/to/your/project"
+env = { LLM_BASE_URL = "http://localhost:11434/v1", LLM_MODEL = "gemma4:26b" }
+EOF
+
+# 4. Run
+export DISCORD_BOT_TOKEN="your-token"
+./target/release/openab config.toml
+```
+
+Supported backends: Ollama, LocalAI, vLLM, llama.cpp, LM Studio, Jan.ai, and any service exposing `/v1/chat/completions` with SSE streaming. See [local-ai-acp README](https://github.com/BlakeHung/local-ai-acp) for details.
 
 ## Configuration Reference
 
