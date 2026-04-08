@@ -4,6 +4,7 @@ set -euo pipefail
 DISCORD_BOT_TOKEN="${DISCORD_BOT_TOKEN:-replace_with_your_discord_bot_token}"
 DISCORD_CHANNEL_ID="${DISCORD_CHANNEL_ID:-replace_with_your_discord_channel_id}"
 GEMINI_API_KEY="${GEMINI_API_KEY:-replace_with_your_gemini_api_key}"
+OPENAB_REF="${OPENAB_REF:-main}"
 
 APP_USER="openab"
 APP_GROUP="openab"
@@ -55,15 +56,23 @@ fi
 mkdir -p "${APP_DIR}" "${ETC_DIR}"
 chown -R "${APP_USER}:${APP_GROUP}" "${APP_DIR}" "${APP_HOME}"
 
-rm -rf "${SRC_DIR}"
-git clone --depth=1 https://github.com/Joseph19820124/openab "${SRC_DIR}"
+if [[ -d "${SRC_DIR}/.git" ]]; then
+  git -C "${SRC_DIR}" fetch --depth=1 origin "${OPENAB_REF}"
+else
+  rm -rf "${SRC_DIR}"
+  git clone --depth=1 --branch "${OPENAB_REF}" https://github.com/Joseph19820124/openab "${SRC_DIR}"
+fi
+
+git -C "${SRC_DIR}" checkout -f FETCH_HEAD 2>/dev/null || git -C "${SRC_DIR}" checkout -f "${OPENAB_REF}"
 
 cd "${SRC_DIR}"
 cargo build --release
 
 install -o "${APP_USER}" -g "${APP_GROUP}" -m 0755 target/release/openab "${APP_DIR}/openab"
 
-npm install -g @google/gemini-cli
+if ! command -v gemini >/dev/null 2>&1; then
+  npm install -g @google/gemini-cli
+fi
 
 cat > "${ETC_DIR}/config.toml" <<CFG
 [discord]
@@ -124,6 +133,7 @@ systemctl enable --now openab
 
 echo
 echo "Installation completed"
+echo "Installed ref: ${OPENAB_REF}"
 echo "Check status: systemctl status openab"
 echo "View logs: journalctl -u openab -f"
 echo "Test Gemini CLI: sudo -u ${APP_USER} -H gemini --help"

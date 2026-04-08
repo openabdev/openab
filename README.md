@@ -169,6 +169,16 @@ GEMINI_API_KEY=... \
 sudo -E ./scripts/install-openab-gemini.sh
 ```
 
+To install a specific branch or tag, also pass `OPENAB_REF`:
+
+```bash
+DISCORD_BOT_TOKEN=... \
+DISCORD_CHANNEL_ID=... \
+GEMINI_API_KEY=... \
+OPENAB_REF=v0.2.1 \
+sudo -E ./scripts/install-openab-gemini.sh
+```
+
 Then verify the service:
 
 ```bash
@@ -180,6 +190,7 @@ Notes:
 - `allowed_channels` is required; the bot only responds in listed Discord channels.
 - Using `GEMINI_API_KEY` is the simplest VM setup; no interactive OAuth step is required.
 - The script creates an `openab` user and uses `/home/openab` as the runtime working directory.
+- Re-running the script reuses `/tmp/openab-src` and skips reinstalling Gemini CLI if `gemini` is already in `PATH`.
 
 ## Configuration Reference
 
