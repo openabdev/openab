@@ -131,8 +131,9 @@ impl EventHandler for Handler {
                 let _ = edit(&ctx, progress_channel, progress_msg_id, status).await;
             }
         }).await {
-            let _ = edit(&ctx, thread_channel, thinking_msg.id, &format!("⚠️ Failed to start agent: {e}")).await;
             error!("pool error: {e}");
+            let user_msg = sanitize_pool_error(&e);
+            let _ = edit(&ctx, thread_channel, thinking_msg.id, &format!("⚠️ Failed to start agent: {user_msg}")).await;
             return;
         }
 
@@ -341,6 +342,24 @@ fn compose_display(tool_lines: &[String], text: &str) -> String {
     }
     out.push_str(text.trim_end());
     out
+}
+
+fn sanitize_pool_error(e: &anyhow::Error) -> String {
+    let msg = e.to_string();
+    // Match known safe patterns; fall back to generic message
+    let safe_patterns = [
+        "timeout",
+        "connection closed",
+        "pool exhausted",
+        "No such file or directory",
+        "auth",
+        "session",
+    ];
+    if safe_patterns.iter().any(|p| msg.to_lowercase().contains(&p.to_lowercase())) {
+        msg
+    } else {
+        "unexpected error (check server logs)".to_string()
+    }
 }
 
 fn strip_mention(content: &str) -> String {
