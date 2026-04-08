@@ -133,6 +133,45 @@ working_dir = "/home/agent"
 env = { GEMINI_API_KEY = "${GEMINI_API_KEY}" }
 ```
 
+### VM + systemd (Gemini example)
+
+If you do not want to run Kubernetes, you can deploy `openab` directly on a VM with `systemd`.
+
+Minimum `config.toml`:
+
+```toml
+[discord]
+bot_token = "${DISCORD_BOT_TOKEN}"
+allowed_channels = ["YOUR_CHANNEL_ID"]
+
+[agent]
+command = "gemini"
+args = ["--acp"]
+working_dir = "/home/openab"
+env = { GEMINI_API_KEY = "${GEMINI_API_KEY}" }
+```
+
+The repository includes a bootstrap script that installs system dependencies, builds `openab`, installs Gemini CLI, writes `/etc/openab/config.toml`, and creates a `systemd` service:
+
+```bash
+git clone https://github.com/Joseph19820124/openab
+cd openab
+edit scripts/install-openab-gemini.sh   # set DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID, GEMINI_API_KEY
+sudo ./scripts/install-openab-gemini.sh
+```
+
+Then verify the service:
+
+```bash
+systemctl status openab
+journalctl -u openab -f
+```
+
+Notes:
+- `allowed_channels` is required; the bot only responds in listed Discord channels.
+- Using `GEMINI_API_KEY` is the simplest VM setup; no interactive OAuth step is required.
+- The script creates an `openab` user and uses `/home/openab` as the runtime working directory.
+
 ## Configuration Reference
 
 ```toml
