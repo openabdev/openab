@@ -28,7 +28,7 @@ working_dir = "/home/agent"
 # [agent]
 # command = "qwen"
 # args = ["--acp"]
-# working_dir = "/home/agent"
+# working_dir = "/home/node"
 # env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
 
 [pool]
