@@ -4,7 +4,7 @@ A lightweight, secure, cloud-native ACP harness that bridges Discord and any [Ag
 
 ```
 ┌──────────────┐  Gateway WS   ┌──────────────┐  ACP stdio    ┌──────────────┐
-│   Discord    │◄─────────────►│ openab │──────────────►│  coding CLI  │
+│   Discord    │◄─────────────►│ openab       │──────────────►│  coding CLI  │
 │   User       │               │   (Rust)     │◄── JSON-RPC ──│  (acp mode)  │
 └──────────────┘               └──────────────┘               └──────────────┘
 ```
@@ -181,7 +181,7 @@ The Docker image bundles both `openab` and `kiro-cli` in a single container (ope
 ┌─ Kubernetes Pod ─────────────────────────────────────────────────┐
 │                                                                  │
 │  ┌─────────────────────────────────────────────────────────┐     │
-│  │  openab (main process, PID 1)                     │     │
+│  │  openab (main process, PID 1)                           │     │
 │  │                                                         │     │
 │  │  ┌──────────────┐   ┌──────────────┐   ┌───────────┐    │     │
 │  │  │ Discord      │   │ Session Pool │   │ Reaction  │    │     │
