@@ -97,10 +97,33 @@ See the **[Helm chart docs](https://openabdev.github.io/openab)** for full insta
 ```bash
 helm repo add openab https://openabdev.github.io/openab
 helm repo update
+
+# Kiro CLI only (default)
 helm install openab openab/openab \
   --set agents.kiro.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.kiro.discord.allowedChannels[0]=YOUR_CHANNEL_ID'
+
+# Claude Code only (disable default kiro)
+helm install openab openab/openab \
+  --set agents.kiro.enabled=false \
+  --set agents.claude.discord.botToken="$DISCORD_BOT_TOKEN" \
+  --set-string 'agents.claude.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
+  --set agents.claude.image=ghcr.io/openabdev/openab-claude:78f8d2c \
+  --set agents.claude.command=claude-agent-acp \
+  --set agents.claude.workingDir=/home/node
+
+# Multi-agent (kiro + claude in one release)
+helm install openab openab/openab \
+  --set agents.kiro.discord.botToken="$KIRO_BOT_TOKEN" \
+  --set-string 'agents.kiro.discord.allowedChannels[0]=KIRO_CHANNEL_ID' \
+  --set agents.claude.discord.botToken="$CLAUDE_BOT_TOKEN" \
+  --set-string 'agents.claude.discord.allowedChannels[0]=CLAUDE_CHANNEL_ID' \
+  --set agents.claude.image=ghcr.io/openabdev/openab-claude:78f8d2c \
+  --set agents.claude.command=claude-agent-acp \
+  --set agents.claude.workingDir=/home/node
 ```
+
+Each agent key in `agents` map creates its own Deployment, ConfigMap, Secret, and PVC. Set `agents.<name>.enabled: false` to skip creating resources for an agent.
 
 ### Manual config.toml
 
@@ -117,19 +140,19 @@ working_dir = "/home/agent"
 [agent]
 command = "codex-acp"
 args = []
-working_dir = "/home/agent"
+working_dir = "/home/node"
 
 # Claude Code (requires claude-agent-acp in PATH)
 [agent]
 command = "claude-agent-acp"
 args = []
-working_dir = "/home/agent"
+working_dir = "/home/node"
 
 # Gemini
 [agent]
 command = "gemini"
 args = ["--acp"]
-working_dir = "/home/agent"
+working_dir = "/home/node"
 env = { GEMINI_API_KEY = "${GEMINI_API_KEY}" }
 ```
 

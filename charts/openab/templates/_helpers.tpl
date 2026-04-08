@@ -41,11 +41,27 @@ app.kubernetes.io/component: {{ .agent }}
 {{- printf "%s-%s" (include "openab.fullname" .ctx) .agent | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
-{{/* Resolve image: agent-level override → global default */}}
+{{/* Resolve image: agent-level string override → global default (repository:tag, tag defaults to appVersion) */}}
 {{- define "openab.agentImage" -}}
-{{- $repo := .ctx.Values.image.repository }}
-{{- $tag := .ctx.Values.image.tag }}
-{{- if and .cfg.image .cfg.image.repository (ne .cfg.image.repository "") }}{{ $repo = .cfg.image.repository }}{{ end }}
-{{- if and .cfg.image .cfg.image.tag (ne .cfg.image.tag "") }}{{ $tag = .cfg.image.tag }}{{ end }}
-{{- printf "%s:%s" $repo $tag }}
+{{- if and .cfg.image (kindIs "string" .cfg.image) (ne .cfg.image "") }}
+{{- .cfg.image }}
+{{- else }}
+{{- $tag := default .ctx.Chart.AppVersion .ctx.Values.image.tag }}
+{{- printf "%s:%s" .ctx.Values.image.repository $tag }}
+{{- end }}
+{{- end }}
+
+{{/* Resolve imagePullPolicy: global default (per-agent image string has no pullPolicy) */}}
+{{- define "openab.agentImagePullPolicy" -}}
+{{- .ctx.Values.image.pullPolicy }}
+{{- end }}
+
+{{/* Agent enabled: default true unless explicitly set to false */}}
+{{- define "openab.agentEnabled" -}}
+{{- if eq (.enabled | toString) "false" }}false{{ else }}true{{ end }}
+{{- end }}
+
+{{/* Persistence enabled: default true unless explicitly set to false */}}
+{{- define "openab.persistenceEnabled" -}}
+{{- if and . .persistence (eq (.persistence.enabled | toString) "false") }}false{{ else }}true{{ end }}
 {{- end }}

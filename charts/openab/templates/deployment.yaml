@@ -1,6 +1,7 @@
 {{- range $name, $cfg := .Values.agents }}
+{{- if ne (include "openab.agentEnabled" $cfg) "false" }}
 {{- $d := dict "ctx" $ "agent" $name "cfg" $cfg }}
-{{- $pvcEnabled := and $cfg.persistence $cfg.persistence.enabled }}
+{{- $pvcEnabled := not (eq (include "openab.persistenceEnabled" $cfg) "false") }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -31,7 +32,7 @@ spec:
       containers:
         - name: openab
           image: {{ include "openab.agentImage" $d | quote }}
-          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          imagePullPolicy: {{ include "openab.agentImagePullPolicy" $d }}
           {{- with $.Values.containerSecurityContext }}
           securityContext:
             {{- toYaml . | nindent 12 }}
@@ -92,4 +93,5 @@ spec:
           persistentVolumeClaim:
             claimName: {{ include "openab.agentFullname" $d }}
         {{- end }}
+{{- end }}
 {{- end }}

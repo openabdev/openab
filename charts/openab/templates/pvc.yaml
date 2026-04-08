@@ -1,5 +1,6 @@
 {{- range $name, $cfg := .Values.agents }}
-{{- if and $cfg.persistence $cfg.persistence.enabled }}
+{{- if ne (include "openab.agentEnabled" $cfg) "false" }}
+{{- if not (eq (include "openab.persistenceEnabled" $cfg) "false") }}
 {{- $d := dict "ctx" $ "agent" $name "cfg" $cfg }}
 ---
 apiVersion: v1
@@ -11,11 +12,12 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
-  {{- if $cfg.persistence.storageClass }}
+  {{- if and $cfg.persistence $cfg.persistence.storageClass }}
   storageClassName: {{ $cfg.persistence.storageClass }}
   {{- end }}
   resources:
     requests:
-      storage: {{ $cfg.persistence.size }}
+      storage: {{ (and $cfg.persistence $cfg.persistence.size) | default "1Gi" }}
+{{- end }}
 {{- end }}
 {{- end }}

@@ -1,6 +1,7 @@
 image:
   repository: ghcr.io/openabdev/openab
-  tag: "78f8d2c"
+  # tag defaults to .Chart.AppVersion
+  tag: ""
   pullPolicy: IfNotPresent
 
 podSecurityContext:
@@ -17,6 +18,7 @@ containerSecurityContext:
 
 agents:
   kiro:
+    enabled: true    # set to false to skip creating resources for this agent
     # To add a second agent, uncomment and fill in the block below:
     # claude:
     #   command: claude-agent-acp
@@ -44,9 +46,8 @@ agents:
     #   nodeSelector: {}
     #   tolerations: []
     #   affinity: {}
-    image:
-      repository: ""
-      tag: ""
+    #   image: "ghcr.io/openabdev/openab-claude:latest"
+    image: ""
     command: kiro-cli
     args:
       - acp
@@ -68,7 +69,7 @@ agents:
     persistence:
       enabled: true
       storageClass: ""
-      size: 1Gi
+      size: 1Gi  # defaults to 1Gi if not set
     agentsMd: ""
     resources: {}
     nodeSelector: {}
