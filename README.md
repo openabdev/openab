@@ -81,7 +81,7 @@ The bot creates a thread. After that, just type in the thread — no @mention ne
 
 ## Pluggable Agent Backends
 
-Each agent is defined as an entry in the `agents` map. One Helm release can run multiple agents simultaneously — each gets its own Deployment, ConfigMap, Secret, and PVC.
+Supports Kiro CLI, Claude Code, Codex, Gemini, and any ACP-compatible CLI.
 
 | Agent key | CLI | ACP Adapter | Auth |
 |-----------|-----|-------------|------|
@@ -92,79 +92,14 @@ Each agent is defined as an entry in the `agents` map. One Helm release can run 
 
 ### Helm Install (recommended)
 
+See the **[Helm chart docs](https://openabdev.github.io/openab)** for full installation instructions, values reference, and multi-agent examples.
+
 ```bash
 helm repo add openab https://openabdev.github.io/openab
 helm repo update
-
-# Kiro CLI (single agent)
 helm install openab openab/openab \
   --set agents.kiro.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.kiro.discord.allowedChannels[0]=YOUR_CHANNEL_ID'
-
-# Codex
-helm install openab openab/openab \
-  --set agents.codex.command=codex-acp \
-  --set agents.codex.discord.botToken="$DISCORD_BOT_TOKEN" \
-  --set-string 'agents.codex.discord.allowedChannels[0]=YOUR_CHANNEL_ID'
-
-# Claude Code
-helm install openab openab/openab \
-  --set agents.claude.command=claude-agent-acp \
-  --set agents.claude.discord.botToken="$DISCORD_BOT_TOKEN" \
-  --set-string 'agents.claude.discord.allowedChannels[0]=YOUR_CHANNEL_ID'
-
-# Gemini
-helm install openab openab/openab \
-  --set agents.gemini.command=gemini \
-  --set 'agents.gemini.args[0]=--acp' \
-  --set agents.gemini.discord.botToken="$DISCORD_BOT_TOKEN" \
-  --set-string 'agents.gemini.discord.allowedChannels[0]=YOUR_CHANNEL_ID'
-```
-
-> ⚠️ Always use `--set-string` for channel IDs to avoid float64 precision loss.
-
-Then authenticate inside the pod (first time only):
-
-```bash
-# Kiro CLI
-kubectl exec -it deployment/openab-kiro -- kiro-cli login --use-device-flow
-
-# Codex
-kubectl exec -it deployment/openab-codex -- codex login --device-auth
-
-# Claude Code
-kubectl exec -it deployment/openab-claude -- claude setup-token
-# Then: helm upgrade openab openab/openab --set agents.claude.env.CLAUDE_CODE_OAUTH_TOKEN="<token>"
-
-# Gemini (Google OAuth — open URL in browser, curl callback from pod)
-kubectl exec -it deployment/openab-gemini -- gemini
-# Or use API key: helm upgrade openab openab/openab --set agents.gemini.env.GEMINI_API_KEY="<key>"
-```
-
-Restart after auth: `kubectl rollout restart deployment/openab-<agent>`
-
-### Multi-agent example (values.yaml)
-
-Run Kiro CLI and Claude Code from a single Helm release:
-
-```yaml
-agents:
-  kiro:
-    command: kiro-cli
-    args: [acp, --trust-all-tools]
-    discord:
-      botToken: "${DISCORD_BOT_TOKEN}"
-      allowedChannels: ["YOUR_KIRO_CHANNEL_ID"]
-    persistence:
-      enabled: true
-  claude:
-    command: claude-agent-acp
-    args: []
-    discord:
-      botToken: "${DISCORD_BOT_TOKEN}"
-      allowedChannels: ["YOUR_CLAUDE_CHANNEL_ID"]
-    persistence:
-      enabled: true
 ```
 
 ### Manual config.toml
@@ -289,19 +224,7 @@ The Docker image bundles both `openab` and `kiro-cli` in a single container (ope
 
 ### Install with Your Coding CLI
 
-Use one of these prompts with any coding CLI (Kiro CLI, Claude Code, Codex, Gemini, etc.) on the host that has `helm` and `kubectl` access to your cluster:
-
-**Kiro CLI (default):**
-> Install openab on my local k8s cluster using the Helm chart from https://openabdev.github.io/openab. My Discord bot token is in the environment variable DISCORD_BOT_TOKEN and my channel ID is <REPLACE_WITH_YOUR_CHANNEL_ID>. After install, follow the NOTES output to authenticate, then restart the deployment.
-
-**Codex:**
-> Install openab on my local k8s cluster using the Helm chart from https://openabdev.github.io/openab with `--set agents.codex.command=codex-acp`. My Discord bot token is in the environment variable DISCORD_BOT_TOKEN and my channel ID is <REPLACE_WITH_YOUR_CHANNEL_ID>. After install, follow the NOTES output to authenticate, then restart the deployment.
-
-**Claude Code:**
-> Install openab on my local k8s cluster using the Helm chart from https://openabdev.github.io/openab with `--set agents.claude.command=claude-agent-acp`. My Discord bot token is in the environment variable DISCORD_BOT_TOKEN and my channel ID is <REPLACE_WITH_YOUR_CHANNEL_ID>. After install, follow the NOTES output to authenticate, then restart the deployment.
-
-**Gemini:**
-> Install openab on my local k8s cluster using the Helm chart from https://openabdev.github.io/openab with `--set agents.gemini.command=gemini --set 'agents.gemini.args[0]=--acp'`. My Discord bot token is in the environment variable DISCORD_BOT_TOKEN and my channel ID is <REPLACE_WITH_YOUR_CHANNEL_ID>. After install, follow the NOTES output to authenticate, then restart the deployment.
+See the **[Helm chart docs](https://openabdev.github.io/openab)** for per-agent install commands (Kiro CLI, Claude Code, Codex, Gemini) and values reference.
 
 ### Build & Push
 
