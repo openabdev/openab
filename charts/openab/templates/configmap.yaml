@@ -1,36 +1,40 @@
+{{- range $name, $cfg := .Values.agents }}
+{{- $d := dict "ctx" $ "agent" $name "cfg" $cfg }}
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "openab.fullname" . }}
+  name: {{ include "openab.agentFullname" $d }}
   labels:
-    {{- include "openab.labels" . | nindent 4 }}
+    {{- include "openab.labels" $d | nindent 4 }}
 data:
   config.toml: |
     [discord]
     bot_token = "${DISCORD_BOT_TOKEN}"
-    {{- range .Values.discord.allowedChannels }}
+    {{- range $cfg.discord.allowedChannels }}
     {{- if regexMatch "e\\+|E\\+" (toString .) }}
     {{- fail (printf "discord.allowedChannels contains a mangled ID: %s — use --set-string instead of --set for channel IDs" (toString .)) }}
     {{- end }}
     {{- end }}
-    allowed_channels = [{{ range $i, $ch := .Values.discord.allowedChannels }}{{ if $i }}, {{ end }}"{{ $ch }}"{{ end }}]
+    allowed_channels = [{{ range $i, $ch := $cfg.discord.allowedChannels }}{{ if $i }}, {{ end }}"{{ $ch }}"{{ end }}]
 
     [agent]
-    command = "{{ include "openab.agent.command" . | trim }}"
-    args = {{ include "openab.agent.args" . | trim }}
-    working_dir = "{{ include "openab.agent.home" . | trim }}"
-    {{- if .Values.agent.env }}
-    env = { {{ range $k, $v := .Values.agent.env }}{{ $k }} = "{{ $v }}", {{ end }} }
+    command = "{{ $cfg.command }}"
+    args = {{ if $cfg.args }}{{ $cfg.args | toJson }}{{ else }}[]{{ end }}
+    working_dir = "{{ $cfg.workingDir | default "/home/agent" }}"
+    {{- if $cfg.env }}
+    env = { {{ range $k, $v := $cfg.env }}{{ $k }} = "{{ $v }}", {{ end }} }
     {{- end }}
 
     [pool]
-    max_sessions = {{ .Values.pool.maxSessions }}
-    session_ttl_hours = {{ .Values.pool.sessionTtlHours }}
+    max_sessions = {{ ($cfg.pool).maxSessions | default 10 }}
+    session_ttl_hours = {{ ($cfg.pool).sessionTtlHours | default 24 }}
 
     [reactions]
-    enabled = {{ .Values.reactions.enabled }}
-    remove_after_reply = {{ .Values.reactions.removeAfterReply }}
-  {{- if .Values.agentsMd }}
+    enabled = {{ ($cfg.reactions).enabled | default true }}
+    remove_after_reply = {{ ($cfg.reactions).removeAfterReply | default false }}
+  {{- if $cfg.agentsMd }}
   AGENTS.md: |
-    {{- .Values.agentsMd | nindent 4 }}
+    {{- $cfg.agentsMd | nindent 4 }}
   {{- end }}
+{{- end }}

@@ -1,17 +1,21 @@
-{{- if .Values.persistence.enabled }}
+{{- range $name, $cfg := .Values.agents }}
+{{- if and $cfg.persistence $cfg.persistence.enabled }}
+{{- $d := dict "ctx" $ "agent" $name "cfg" $cfg }}
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "openab.fullname" . }}
+  name: {{ include "openab.agentFullname" $d }}
   labels:
-    {{- include "openab.labels" . | nindent 4 }}
+    {{- include "openab.labels" $d | nindent 4 }}
 spec:
   accessModes:
     - ReadWriteOnce
-  {{- if .Values.persistence.storageClass }}
-  storageClassName: {{ .Values.persistence.storageClass }}
+  {{- if $cfg.persistence.storageClass }}
+  storageClassName: {{ $cfg.persistence.storageClass }}
   {{- end }}
   resources:
     requests:
-      storage: {{ .Values.persistence.size }}
+      storage: {{ $cfg.persistence.size }}
+{{- end }}
 {{- end }}

@@ -1,54 +1,60 @@
+{{- range $name, $cfg := .Values.agents }}
+{{- $d := dict "ctx" $ "agent" $name "cfg" $cfg }}
+{{- $pvcEnabled := and $cfg.persistence $cfg.persistence.enabled }}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "openab.fullname" . }}
+  name: {{ include "openab.agentFullname" $d }}
   labels:
-    {{- include "openab.labels" . | nindent 4 }}
+    {{- include "openab.labels" $d | nindent 4 }}
 spec:
-  replicas: {{ .Values.replicas }}
-  {{- with .Values.strategy }}
+  # Hardcoded for PVC-backed agents: RWO volumes can't be shared across pods,
+  # so rolling updates and multiple replicas are not supported.
+  replicas: 1
   strategy:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
+    type: Recreate
   selector:
     matchLabels:
-      {{- include "openab.selectorLabels" . | nindent 6 }}
+      {{- include "openab.selectorLabels" $d | nindent 6 }}
   template:
     metadata:
       annotations:
-        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/config: {{ $cfg | toJson | sha256sum }}
       labels:
-        {{- include "openab.selectorLabels" . | nindent 8 }}
+        {{- include "openab.selectorLabels" $d | nindent 8 }}
     spec:
-      {{- with .Values.podSecurityContext }}
+      {{- with $.Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
         - name: openab
-          image: "{{ include "openab.image.repository" . | trim }}:{{ .Values.image.tag }}"
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          {{- with .Values.containerSecurityContext }}
+          image: {{ include "openab.agentImage" $d | quote }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          {{- with $.Values.containerSecurityContext }}
           securityContext:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           env:
+            {{- if $cfg.discord.botToken }}
             - name: DISCORD_BOT_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "openab.fullname" . }}
+                  name: {{ include "openab.agentFullname" $d }}
                   key: discord-bot-token
-            - name: HOME
-              value: {{ include "openab.agent.home" . | trim }}
-            {{- range $key, $value := .Values.env }}
-            - name: {{ $key }}
-              value: {{ $value | quote }}
             {{- end }}
-          {{- with .Values.envFrom }}
+            - name: HOME
+              value: {{ $cfg.workingDir | default "/home/agent" }}
+            {{- range $k, $v := $cfg.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          {{- with $cfg.envFrom }}
           envFrom:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- with .Values.resources }}
+          {{- with $cfg.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
@@ -56,33 +62,34 @@ spec:
             - name: config
               mountPath: /etc/openab
               readOnly: true
-            {{- if .Values.persistence.enabled }}
+            {{- if $pvcEnabled }}
             - name: data
-              mountPath: {{ include "openab.agent.home" . | trim }}
+              mountPath: {{ $cfg.workingDir | default "/home/agent" }}
             {{- end }}
-            {{- if .Values.agentsMd }}
+            {{- if $cfg.agentsMd }}
             - name: config
-              mountPath: {{ include "openab.agent.home" . | trim }}/AGENTS.md
+              mountPath: {{ $cfg.workingDir | default "/home/agent" }}/AGENTS.md
               subPath: AGENTS.md
             {{- end }}
-      {{- with .Values.nodeSelector }}
+      {{- with $cfg.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- with $cfg.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.tolerations }}
+      {{- with $cfg.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       volumes:
         - name: config
           configMap:
-            name: {{ include "openab.fullname" . }}
-        {{- if .Values.persistence.enabled }}
+            name: {{ include "openab.agentFullname" $d }}
+        {{- if $pvcEnabled }}
         - name: data
           persistentVolumeClaim:
-            claimName: {{ include "openab.fullname" . }}
+            claimName: {{ include "openab.agentFullname" $d }}
         {{- end }}
+{{- end }}

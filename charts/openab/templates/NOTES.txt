@@ -1,55 +1,30 @@
 openab {{ .Chart.AppVersion }} has been installed!
 
-⚠️  Discord channel IDs must be set with --set-string (not --set) to avoid float64 precision loss:
+⚠️  Discord channel IDs must be set with --set-string (not --set) to avoid float64 precision loss.
 
-  helm upgrade {{ .Release.Name }} openab/openab \
-    --set-string discord.allowedChannels[0]="<YOUR_CHANNEL_ID>"
-
-{{- if not .Values.discord.botToken }}
-
-⚠️  No bot token was provided. Create the secret manually:
-
-  kubectl create secret generic {{ include "openab.fullname" . }} \
-    --from-literal=discord-bot-token="YOUR_TOKEN"
+Agents deployed:
+{{- range $name, $cfg := .Values.agents }}
+  • {{ $name }} ({{ $cfg.command }})
+{{- if not $cfg.discord.botToken }}
+    ⚠️  No bot token provided. Create the secret manually:
+    kubectl create secret generic {{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} \
+      --from-literal=discord-bot-token="YOUR_TOKEN"
 {{- end }}
 
-{{- $cmd := include "openab.agent.command" . | trim }}
-{{- if eq $cmd "kiro-cli" }}
-
-Authenticate kiro-cli (first time only):
-
-  kubectl exec -it deployment/{{ include "openab.fullname" . }} -- kiro-cli login --use-device-flow
-{{- else if eq $cmd "codex-acp" }}
-
-Authenticate Codex (first time only):
-
-  kubectl exec -it deployment/{{ include "openab.fullname" . }} -- codex login --device-auth
-{{- else if eq $cmd "claude-agent-acp" }}
-
-Authenticate Claude Code (first time only):
-
-  kubectl exec -it deployment/{{ include "openab.fullname" . }} -- claude setup-token
-
-Then set the token as an env var (token is valid for 1 year):
-
-  helm upgrade {{ .Release.Name }} openab/openab --set env.CLAUDE_CODE_OAUTH_TOKEN="<token>"
-{{- else if eq $cmd "gemini" }}
-
-Authenticate Gemini CLI (first time only):
-
-  kubectl exec -it deployment/{{ include "openab.fullname" . }} -- gemini
-
-  Select "Sign in with Google", open the URL in your browser, then
-  curl the localhost callback URL from within the pod.
-
-  Alternatively, set GEMINI_API_KEY:
-
-  helm upgrade {{ .Release.Name }} openab/openab --set env.GEMINI_API_KEY="<key>"
-{{- else }}
-
-Authenticate your agent CLI (first time only) — refer to your CLI's documentation.
+{{- if eq $cfg.command "kiro-cli" }}
+    Authenticate:
+    kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- kiro-cli login --use-device-flow
+{{- else if eq $cfg.command "codex-acp" }}
+    Authenticate:
+    kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- codex login --device-auth
+{{- else if eq $cfg.command "claude-agent-acp" }}
+    Authenticate:
+    kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- claude setup-token
+{{- else if eq $cfg.command "gemini" }}
+    Authenticate:
+    kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- gemini
 {{- end }}
 
-Then restart the pod:
-
-  kubectl rollout restart deployment/{{ include "openab.fullname" . }}
+    Restart after auth:
+    kubectl rollout restart deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }}
+{{- end }}

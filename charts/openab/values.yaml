@@ -3,13 +3,6 @@ image:
   tag: "78f8d2c"
   pullPolicy: IfNotPresent
 
-replicas: 1
-
-strategy:
-  type: Recreate
-
-resources: {}
-
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 1000
@@ -22,45 +15,62 @@ containerSecurityContext:
     drop:
       - ALL
 
-persistence:
-  enabled: true
-  storageClass: ""
-  size: 1Gi
-
-discord:
-  botToken: ""            # set via --set or external secret
-  # ⚠️ Use --set-string for channel IDs to avoid float64 precision loss:
-  #   helm install ... --set-string discord.allowedChannels[0]="<CHANNEL_ID>"
-  allowedChannels:
-    - "YOUR_CHANNEL_ID"
-
-agent:
-  preset: ""              # kiro (default), codex, or claude — auto-configures image + command
-  command: kiro-cli
-  args:
-    - acp
-    - --trust-all-tools
-  workingDir: /home/agent
-  env: {}
-    # ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
-
-pool:
-  maxSessions: 10
-  sessionTtlHours: 24
-
-reactions:
-  enabled: true
-  removeAfterReply: false
-
-agentsMd: ""
-  # agentsMd: |
-  #   IDENTITY - your agent identity
-  #   SOUL - your agent personality
-  #   USER - how agent should address the user
-
-env: {}
-envFrom: []
-
-nodeSelector: {}
-tolerations: []
-affinity: {}
+agents:
+  kiro:
+    # To add a second agent, uncomment and fill in the block below:
+    # claude:
+    #   command: claude-agent-acp
+    #   args: []
+    #   discord:
+    #     botToken: ""
+    #     # ⚠️ Use --set-string for channel IDs to avoid float64 precision loss
+    #     allowedChannels:
+    #       - "YOUR_CHANNEL_ID"
+    #   workingDir: /home/agent
+    #   env: {}
+    #   envFrom: []
+    #   pool:
+    #     maxSessions: 10
+    #     sessionTtlHours: 24
+    #   reactions:
+    #     enabled: true
+    #     removeAfterReply: false
+    #   persistence:
+    #     enabled: true
+    #     storageClass: ""
+    #     size: 1Gi
+    #   agentsMd: ""
+    #   resources: {}
+    #   nodeSelector: {}
+    #   tolerations: []
+    #   affinity: {}
+    image:
+      repository: ""
+      tag: ""
+    command: kiro-cli
+    args:
+      - acp
+      - --trust-all-tools
+    discord:
+      botToken: ""
+      # ⚠️ Use --set-string for channel IDs to avoid float64 precision loss
+      allowedChannels:
+        - "YOUR_CHANNEL_ID"
+    workingDir: /home/agent
+    env: {}
+    envFrom: []
+    pool:
+      maxSessions: 10
+      sessionTtlHours: 24
+    reactions:
+      enabled: true
+      removeAfterReply: false
+    persistence:
+      enabled: true
+      storageClass: ""
+      size: 1Gi
+    agentsMd: ""
+    resources: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
