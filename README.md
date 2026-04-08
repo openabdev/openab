@@ -26,7 +26,7 @@ helm repo update
 # Kiro CLI (single agent)
 helm install openab openab/openab \
   --set agents.kiro.discord.botToken="$DISCORD_BOT_TOKEN" \
-  --set-string agents.kiro.discord.allowedChannels[0]="YOUR_CHANNEL_ID"
+  --set-string 'agents.kiro.discord.allowedChannels[0]=YOUR_CHANNEL_ID'
 ```
 
 > ⚠️ Always use `--set-string` for channel IDs to avoid float64 precision loss.
@@ -40,20 +40,20 @@ One Helm release can run multiple agents simultaneously — each gets its own De
 helm install openab openab/openab \
   --set agents.codex.command=codex-acp \
   --set agents.codex.discord.botToken="$DISCORD_BOT_TOKEN" \
-  --set-string agents.codex.discord.allowedChannels[0]="YOUR_CHANNEL_ID"
+  --set-string 'agents.codex.discord.allowedChannels[0]=YOUR_CHANNEL_ID'
 
 # Claude Code
 helm install openab openab/openab \
   --set agents.claude.command=claude-agent-acp \
   --set agents.claude.discord.botToken="$DISCORD_BOT_TOKEN" \
-  --set-string agents.claude.discord.allowedChannels[0]="YOUR_CHANNEL_ID"
+  --set-string 'agents.claude.discord.allowedChannels[0]=YOUR_CHANNEL_ID'
 
 # Gemini
 helm install openab openab/openab \
   --set agents.gemini.command=gemini \
   --set 'agents.gemini.args[0]=--acp' \
   --set agents.gemini.discord.botToken="$DISCORD_BOT_TOKEN" \
-  --set-string agents.gemini.discord.allowedChannels[0]="YOUR_CHANNEL_ID"
+  --set-string 'agents.gemini.discord.allowedChannels[0]=YOUR_CHANNEL_ID'
 ```
 
 ## Upgrade
