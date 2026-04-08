@@ -97,27 +97,10 @@ Each agent is configured under `agents.<name>`:
 ```yaml
 agents:
   kiro:
-    command: kiro-cli
-    args: [acp, --trust-all-tools]
     discord:
       botToken: ""  # set via --set or external secret
       allowedChannels:
-        - "1234567890123456789"
-    workingDir: /home/agent
-    pool:
-      maxSessions: 10
-      sessionTtlHours: 24
-    reactions:
-      enabled: true
-      removeAfterReply: false
-    persistence:
-      enabled: true
-      storageClass: ""
-      size: 1Gi
-    agentsMd: |
-      IDENTITY - your agent identity
-      SOUL - your agent personality
-      USER - how agent should address the user
+        - "YOUR_CHANNEL_ID"
 ```
 
 ## Multi-Agent Example (values.yaml)
@@ -125,22 +108,18 @@ agents:
 ```yaml
 agents:
   kiro:
-    command: kiro-cli
-    args: [acp, --trust-all-tools]
     discord:
       botToken: "${DISCORD_BOT_TOKEN}"
-      allowedChannels: ["YOUR_KIRO_CHANNEL_ID"]
-    persistence:
-      enabled: true
+      allowedChannels:
+        - "YOUR_KIRO_CHANNEL_ID"
   claude:
-    image: "ghcr.io/openabdev/openab-claude:latest"
+    image: ghcr.io/openabdev/openab-claude:latest
     command: claude-agent-acp
-    args: []
+    workingDir: /home/node
     discord:
       botToken: "${DISCORD_BOT_TOKEN}"
-      allowedChannels: ["YOUR_CLAUDE_CHANNEL_ID"]
-    persistence:
-      enabled: true
+      allowedChannels:
+        - "YOUR_CLAUDE_CHANNEL_ID"
 ```
 
 ## Post-Install: Authenticate
