@@ -119,6 +119,7 @@ impl EventHandler for Handler {
 
         let thread_key = thread_id.to_string();
         let progress_ctx = ctx.clone();
+        // ChannelId is Copy, so this doesn't move thread_channel
         let progress_channel = thread_channel;
         let progress_msg_id = thinking_msg.id;
         if let Err(e) = self.pool.get_or_create(&thread_key, |stage| {
@@ -126,6 +127,7 @@ impl EventHandler for Handler {
             async move {
                 let status = match stage {
                     PoolProgress::Spawning => "⏳ Starting agent...",
+                    PoolProgress::Initializing => "⏳ Initializing...",
                     PoolProgress::CreatingSession => "⏳ Creating session...",
                 };
                 let _ = edit(&ctx, progress_channel, progress_msg_id, status).await;
@@ -346,16 +348,18 @@ fn compose_display(tool_lines: &[String], text: &str) -> String {
 
 fn sanitize_pool_error(e: &anyhow::Error) -> String {
     let msg = e.to_string();
-    // Match known safe patterns; fall back to generic message
-    let safe_patterns = [
-        "timeout",
+    let lower = msg.to_lowercase();
+    // Only pass through known safe complete phrases
+    let safe_phrases = [
+        "timeout waiting for",
         "connection closed",
         "pool exhausted",
-        "No such file or directory",
-        "auth",
-        "session",
+        "no such file or directory",
+        "failed to spawn",
+        "auth expired",
+        "json-rpc error",
     ];
-    if safe_patterns.iter().any(|p| msg.to_lowercase().contains(&p.to_lowercase())) {
+    if safe_phrases.iter().any(|p| lower.contains(p)) {
         msg
     } else {
         "unexpected error (check server logs)".to_string()

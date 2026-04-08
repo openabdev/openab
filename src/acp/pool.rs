@@ -9,6 +9,7 @@ use tracing::{info, warn};
 #[derive(Debug, Clone, Copy)]
 pub enum PoolProgress {
     Spawning,
+    Initializing,
     CreatingSession,
 }
 
@@ -45,17 +46,20 @@ impl SessionPool {
         // Brief write lock: validate capacity and clean stale entry
         let is_rebuild = {
             let mut conns = self.connections.write().await;
-            if let Some(conn) = conns.get(thread_id) {
+            let rebuilding = if let Some(conn) = conns.get(thread_id) {
                 if conn.alive() {
                     return Ok(());
                 }
                 warn!(thread_id, "stale connection, rebuilding");
                 conns.remove(thread_id);
-            }
+                true
+            } else {
+                false
+            };
             if conns.len() >= self.max_sessions {
                 return Err(anyhow!("pool exhausted ({} sessions)", self.max_sessions));
             }
-            conns.contains_key(thread_id)
+            rebuilding
         }; // write lock dropped here
 
         // Spawn and initialize outside of lock
@@ -68,6 +72,8 @@ impl SessionPool {
             &self.config.env,
         )
         .await?;
+
+        on_progress(PoolProgress::Initializing).await;
 
         conn.initialize().await?;
 
