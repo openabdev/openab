@@ -1,4 +1,5 @@
 use crate::acp::{classify_notification, AcpEvent, SessionPool};
+use crate::acp::pool::PoolProgress;
 use crate::config::ReactionsConfig;
 use crate::format;
 use crate::reactions::StatusReactionController;
@@ -120,9 +121,13 @@ impl EventHandler for Handler {
         let progress_ctx = ctx.clone();
         let progress_channel = thread_channel;
         let progress_msg_id = thinking_msg.id;
-        if let Err(e) = self.pool.get_or_create(&thread_key, |status| {
+        if let Err(e) = self.pool.get_or_create(&thread_key, |stage| {
             let ctx = progress_ctx.clone();
             async move {
+                let status = match stage {
+                    PoolProgress::Spawning => "⏳ Starting agent...",
+                    PoolProgress::CreatingSession => "⏳ Creating session...",
+                };
                 let _ = edit(&ctx, progress_channel, progress_msg_id, status).await;
             }
         }).await {

@@ -6,6 +6,12 @@ use tokio::sync::RwLock;
 use tokio::time::Instant;
 use tracing::{info, warn};
 
+#[derive(Debug, Clone, Copy)]
+pub enum PoolProgress {
+    Spawning,
+    CreatingSession,
+}
+
 pub struct SessionPool {
     connections: RwLock<HashMap<String, AcpConnection>>,
     config: AgentConfig,
@@ -23,7 +29,7 @@ impl SessionPool {
 
     pub async fn get_or_create<F, Fut>(&self, thread_id: &str, on_progress: F) -> Result<()>
     where
-        F: Fn(&str) -> Fut,
+        F: Fn(PoolProgress) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
         // Check if alive connection exists
@@ -36,23 +42,24 @@ impl SessionPool {
             }
         }
 
-        // Need to create or rebuild
-        let mut conns = self.connections.write().await;
-
-        // Double-check after acquiring write lock
-        if let Some(conn) = conns.get(thread_id) {
-            if conn.alive() {
-                return Ok(());
+        // Brief write lock: validate capacity and clean stale entry
+        let is_rebuild = {
+            let mut conns = self.connections.write().await;
+            if let Some(conn) = conns.get(thread_id) {
+                if conn.alive() {
+                    return Ok(());
+                }
+                warn!(thread_id, "stale connection, rebuilding");
+                conns.remove(thread_id);
             }
-            warn!(thread_id, "stale connection, rebuilding");
-            conns.remove(thread_id);
-        }
+            if conns.len() >= self.max_sessions {
+                return Err(anyhow!("pool exhausted ({} sessions)", self.max_sessions));
+            }
+            conns.contains_key(thread_id)
+        }; // write lock dropped here
 
-        if conns.len() >= self.max_sessions {
-            return Err(anyhow!("pool exhausted ({} sessions)", self.max_sessions));
-        }
-
-        on_progress("⏳ 正在啟動 agent...").await;
+        // Spawn and initialize outside of lock
+        on_progress(PoolProgress::Spawning).await;
 
         let mut conn = AcpConnection::spawn(
             &self.config.command,
@@ -64,15 +71,16 @@ impl SessionPool {
 
         conn.initialize().await?;
 
-        on_progress("⏳ 正在建立 session...").await;
+        on_progress(PoolProgress::CreatingSession).await;
 
         conn.session_new(&self.config.working_dir).await?;
 
-        let is_rebuild = conns.contains_key(thread_id);
         if is_rebuild {
             conn.session_reset = true;
         }
 
+        // Re-acquire write lock only to insert
+        let mut conns = self.connections.write().await;
         conns.insert(thread_id.to_string(), conn);
         Ok(())
     }
