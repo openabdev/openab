@@ -1,6 +1,6 @@
 {{- range $name, $cfg := .Values.agents }}
 {{- $d := dict "ctx" $ "agent" $name "cfg" $cfg }}
-{{- $pvcEnabled := and $cfg.persistence $cfg.persistence.enabled }}
+{{- $pvcEnabled := not (eq (include "openab.persistenceEnabled" $cfg) "false") }}
 ---
 apiVersion: apps/v1
 kind: Deployment
