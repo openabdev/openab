@@ -140,6 +140,35 @@ kubectl exec -it deployment/openab -- gemini
 
 Restart after auth: `kubectl rollout restart deployment openab`
 
+### OCI Install (alternative)
+
+If you prefer OCI registry install (no `helm repo add` needed):
+
+```bash
+# Kiro CLI (default)
+helm install openab oci://ghcr.io/openabdev/charts/openab \
+  --set discord.botToken="$DISCORD_BOT_TOKEN" \
+  --set-string discord.allowedChannels[0]="YOUR_CHANNEL_ID"
+
+# Codex
+helm install openab oci://ghcr.io/openabdev/charts/openab \
+  --set discord.botToken="$DISCORD_BOT_TOKEN" \
+  --set-string discord.allowedChannels[0]="YOUR_CHANNEL_ID" \
+  --set agent.preset=codex
+
+# Claude Code
+helm install openab oci://ghcr.io/openabdev/charts/openab \
+  --set discord.botToken="$DISCORD_BOT_TOKEN" \
+  --set-string discord.allowedChannels[0]="YOUR_CHANNEL_ID" \
+  --set agent.preset=claude
+
+# Gemini
+helm install openab oci://ghcr.io/openabdev/charts/openab \
+  --set discord.botToken="$DISCORD_BOT_TOKEN" \
+  --set-string discord.allowedChannels[0]="YOUR_CHANNEL_ID" \
+  --set agent.preset=gemini
+```
+
 ### Manual config.toml
 
 For non-Helm deployments, swap the `[agent]` block:
