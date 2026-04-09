@@ -115,7 +115,8 @@ impl EventHandler for Handler {
         });
         let prompt_with_sender = format!(
             "<sender_context>\n{}\n</sender_context>\n\n{}",
-            serde_json::to_string(&sender_ctx).unwrap(),
+            serde_json::to_string(&sender_ctx)
+                .expect("sender_ctx is built from a serde_json::json! literal and cannot fail to serialize"),
             prompt
         );
 
@@ -500,7 +501,7 @@ fn compose_display(tool_lines: &[String], text: &str) -> String {
 }
 
 static MENTION_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"<@[!&]?\d+>").unwrap()
+    regex::Regex::new(r"<@[!&]?\d+>").expect("mention regex literal is valid")
 });
 
 fn strip_mention(content: &str) -> String {
@@ -509,7 +510,8 @@ fn strip_mention(content: &str) -> String {
 
 fn shorten_thread_name(prompt: &str) -> String {
     // Shorten GitHub URLs: https://github.com/owner/repo/issues/123 → owner/repo#123
-    let re = regex::Regex::new(r"https?://github\.com/([^/]+/[^/]+)/(issues|pull)/(\d+)").unwrap();
+    let re = regex::Regex::new(r"https?://github\.com/([^/]+/[^/]+)/(issues|pull)/(\d+)")
+        .expect("github url regex literal is valid");
     let shortened = re.replace_all(prompt, "$1#$3");
     let name: String = shortened.chars().take(40).collect();
     if name.len() < shortened.len() {

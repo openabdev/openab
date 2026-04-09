@@ -145,7 +145,7 @@ impl Default for ReactionTiming {
 // --- loading ---
 
 fn expand_env_vars(raw: &str) -> String {
-    let re = Regex::new(r"\$\{(\w+)\}").unwrap();
+    let re = Regex::new(r"\$\{(\w+)\}").expect("env var regex literal is valid");
     re.replace_all(raw, |caps: &regex::Captures| {
         std::env::var(&caps[1]).unwrap_or_default()
     })
