@@ -39,6 +39,7 @@ agents:
     #     removeAfterReply: false
     #   persistence:
     #     enabled: true
+    #     existingClaim: ""  # set to reuse an existing PVC (skips PVC creation)
     #     storageClass: ""
     #     size: 1Gi
     #   agentsMd: ""
@@ -68,6 +69,7 @@ agents:
       removeAfterReply: false
     persistence:
       enabled: true
+      existingClaim: ""  # set to reuse an existing PVC (skips PVC creation)
       storageClass: ""
       size: 1Gi  # defaults to 1Gi if not set
     agentsMd: ""
