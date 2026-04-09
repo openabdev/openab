@@ -28,6 +28,7 @@ agents:
     #     # ⚠️ Use --set-string for channel IDs to avoid float64 precision loss
     #     allowedChannels:
     #       - "YOUR_CHANNEL_ID"
+    #     allowedUsers: []
     #   workingDir: /home/agent
     #   env: {}
     #   envFrom: []
@@ -57,6 +58,8 @@ agents:
       # ⚠️ Use --set-string for channel IDs to avoid float64 precision loss
       allowedChannels:
         - "YOUR_CHANNEL_ID"
+      # ⚠️ Use --set-string for user IDs to avoid float64 precision loss
+      allowedUsers: []  # empty = allow all users (default)
     workingDir: /home/agent
     env: {}
     envFrom: []

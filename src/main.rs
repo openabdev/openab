@@ -29,6 +29,7 @@ async fn main() -> anyhow::Result<()> {
         agent_cmd = %cfg.agent.command,
         pool_max = cfg.pool.max_sessions,
         channels = ?cfg.discord.allowed_channels,
+        users = ?cfg.discord.allowed_users,
         reactions = cfg.reactions.enabled,
         "config loaded"
     );
@@ -36,16 +37,14 @@ async fn main() -> anyhow::Result<()> {
     let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions));
     let ttl_secs = cfg.pool.session_ttl_hours * 3600;
 
-    let allowed_channels: HashSet<u64> = cfg
-        .discord
-        .allowed_channels
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
+    let allowed_channels = parse_id_set(&cfg.discord.allowed_channels, "allowed_channels")?;
+    let allowed_users = parse_id_set(&cfg.discord.allowed_users, "allowed_users")?;
+    info!(channels = allowed_channels.len(), users = allowed_users.len(), "parsed allowlists");
 
     let handler = discord::Handler {
         pool: pool.clone(),
         allowed_channels,
+        allowed_users,
         reactions_config: cfg.reactions,
     };
 
@@ -83,4 +82,21 @@ async fn main() -> anyhow::Result<()> {
     shutdown_pool.shutdown().await;
     info!("openab shut down");
     Ok(())
+}
+
+fn parse_id_set(raw: &[String], label: &str) -> anyhow::Result<HashSet<u64>> {
+    let set: HashSet<u64> = raw
+        .iter()
+        .filter_map(|s| match s.parse() {
+            Ok(id) => Some(id),
+            Err(_) => {
+                tracing::warn!(value = %s, label = label, "ignoring invalid entry");
+                None
+            }
+        })
+        .collect();
+    if !raw.is_empty() && set.is_empty() {
+        anyhow::bail!("all {label} entries failed to parse — refusing to start with an empty allowlist");
+    }
+    Ok(set)
 }

@@ -18,6 +18,8 @@ pub struct DiscordConfig {
     pub bot_token: String,
     #[serde(default)]
     pub allowed_channels: Vec<String>,
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]

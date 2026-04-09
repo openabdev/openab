@@ -50,6 +50,7 @@ Edit `config.toml`:
 [discord]
 bot_token = "${DISCORD_BOT_TOKEN}"
 allowed_channels = ["YOUR_CHANNEL_ID"]
+# allowed_users = ["YOUR_USER_ID"]  # optional: restrict who can use the bot
 
 [agent]
 command = "kiro-cli"
@@ -164,6 +165,7 @@ env = { GEMINI_API_KEY = "${GEMINI_API_KEY}" }
 [discord]
 bot_token = "${DISCORD_BOT_TOKEN}"   # supports env var expansion
 allowed_channels = ["123456789"]      # channel ID allowlist
+# allowed_users = ["987654321"]       # user ID allowlist (empty = all users)
 
 [agent]
 command = "kiro-cli"                  # CLI command

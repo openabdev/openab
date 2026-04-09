@@ -1,6 +1,7 @@
 [discord]
 bot_token = "${DISCORD_BOT_TOKEN}"
 allowed_channels = ["1234567890"]
+# allowed_users = ["<YOUR_DISCORD_USER_ID>"]  # empty or omitted = allow all users
 
 [agent]
 command = "kiro-cli"

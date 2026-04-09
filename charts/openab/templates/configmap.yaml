@@ -17,7 +17,13 @@ data:
     {{- fail (printf "discord.allowedChannels contains a mangled ID: %s — use --set-string instead of --set for channel IDs" (toString .)) }}
     {{- end }}
     {{- end }}
-    allowed_channels = [{{ range $i, $ch := $cfg.discord.allowedChannels }}{{ if $i }}, {{ end }}"{{ $ch }}"{{ end }}]
+    allowed_channels = {{ $cfg.discord.allowedChannels | default list | toJson }}
+    {{- range $cfg.discord.allowedUsers }}
+    {{- if regexMatch "e\\+|E\\+" (toString .) }}
+    {{- fail (printf "discord.allowedUsers contains a mangled ID: %s — use --set-string instead of --set for user IDs" (toString .)) }}
+    {{- end }}
+    {{- end }}
+    allowed_users = {{ $cfg.discord.allowedUsers | default list | toJson }}
 
     [agent]
     command = "{{ $cfg.command }}"
