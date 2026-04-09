@@ -7,10 +7,11 @@ use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId};
 use serenity::prelude::*;
+use serenity::model::channel::Attachment;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::watch;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub struct Handler {
     pub pool: Arc<SessionPool>,
@@ -69,7 +70,8 @@ impl EventHandler for Handler {
         } else {
             msg.content.trim().to_string()
         };
-        if prompt.is_empty() {
+        let has_attachments = !msg.attachments.is_empty();
+        if prompt.is_empty() && !has_attachments {
             return;
         }
 
@@ -133,6 +135,18 @@ impl EventHandler for Handler {
             self.reactions_config.timing.clone(),
         ));
         reactions.set_queued().await;
+
+        // Download Discord attachments to local temp dir and append paths to prompt
+        let prompt_with_sender = if has_attachments {
+            let attachment_lines = download_attachments(&msg.attachments, &thread_key).await;
+            if attachment_lines.is_empty() {
+                prompt_with_sender
+            } else {
+                format!("{}\n\nAttached files:\n{}", prompt_with_sender, attachment_lines.join("\n"))
+            }
+        } else {
+            prompt_with_sender
+        };
 
         // Stream prompt with live edits
         let result = stream_prompt(
@@ -368,4 +382,63 @@ async fn get_or_create_thread(ctx: &Context, msg: &Message, prompt: &str) -> any
         .await?;
 
     Ok(thread.id.get())
+}
+
+/// Max file size for attachment downloads (25 MB).
+const MAX_ATTACHMENT_SIZE: u64 = 25 * 1024 * 1024;
+/// Max number of attachments to download per message.
+const MAX_ATTACHMENTS: usize = 5;
+
+/// Download Discord message attachments to a local temp directory.
+///
+/// Returns a list of human-readable lines describing each downloaded file,
+/// e.g. `- /tmp/openab_attachments/123456/paper.pdf (application/pdf, 2.3 MB)`.
+/// On download failure the original Discord CDN URL is included as a fallback.
+async fn download_attachments(attachments: &[Attachment], thread_id: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let download_dir = format!("/tmp/openab_attachments/{}", thread_id);
+
+    for (i, att) in attachments.iter().enumerate() {
+        if i >= MAX_ATTACHMENTS {
+            lines.push(format!("- (skipped {} more attachments, limit is {})", attachments.len() - i, MAX_ATTACHMENTS));
+            break;
+        }
+        if u64::from(att.size) > MAX_ATTACHMENT_SIZE {
+            warn!(filename = %att.filename, size = att.size, "attachment too large, skipping");
+            lines.push(format!("- {} (SKIPPED: {:.1} MB exceeds 25 MB limit)", att.filename, att.size as f64 / 1_048_576.0));
+            continue;
+        }
+
+        // Sanitize filename: keep only alphanumeric, dots, hyphens, underscores
+        let safe_name: String = att.filename.chars()
+            .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+
+        let file_path = format!("{}/{}", download_dir, safe_name);
+
+        match download_file(&att.url, &download_dir, &file_path).await {
+            Ok(()) => {
+                let content_type = att.content_type.as_deref().unwrap_or("unknown");
+                let size_mb = att.size as f64 / 1_048_576.0;
+                info!(filename = %safe_name, content_type, size_mb, "attachment downloaded");
+                lines.push(format!("- {} ({}, {:.1} MB)", file_path, content_type, size_mb));
+            }
+            Err(e) => {
+                warn!(filename = %att.filename, error = %e, "attachment download failed, using URL fallback");
+                let content_type = att.content_type.as_deref().unwrap_or("unknown");
+                let size_mb = att.size as f64 / 1_048_576.0;
+                lines.push(format!("- URL: {} ({}, {:.1} MB) [download failed: {}]", att.url, content_type, size_mb, e));
+            }
+        }
+    }
+
+    lines
+}
+
+/// Download a single file from a URL to a local path.
+async fn download_file(url: &str, dir: &str, path: &str) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let bytes = reqwest::get(url).await?.bytes().await?;
+    std::fs::write(path, &bytes)?;
+    Ok(())
 }

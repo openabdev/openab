@@ -92,6 +92,14 @@ impl SessionPool {
             info!(thread_id = %key, "cleaning up idle session");
             conns.remove(&key);
             // Child process killed via kill_on_drop when AcpConnection drops
+
+            // Clean up any downloaded attachments for this thread
+            let attach_dir = format!("/tmp/openab_attachments/{}", key);
+            if let Err(e) = std::fs::remove_dir_all(&attach_dir) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!(thread_id = %key, "failed to clean attachment dir: {e}");
+                }
+            }
         }
     }
 
