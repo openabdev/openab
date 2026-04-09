@@ -62,6 +62,7 @@ jobs:
 
   build-image:
     needs: resolve-tag
+    if: ${{ needs.resolve-tag.outputs.is_beta == 'true' }}
     strategy:
       matrix:
         variant:
@@ -121,7 +122,7 @@ jobs:
 
   merge-manifests:
     needs: [resolve-tag, build-image]
-    if: inputs.dry_run != true
+    if: ${{ inputs.dry_run != true && needs.resolve-tag.outputs.is_beta == 'true' }}
     strategy:
       matrix:
         variant:
@@ -157,14 +158,57 @@ jobs:
           tags: |
             type=sha,prefix=
             type=semver,pattern={{version}},value=${{ needs.resolve-tag.outputs.tag }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.resolve-tag.outputs.tag }}
-            type=raw,value=latest,enable=${{ needs.resolve-tag.outputs.is_beta == 'false' }}
 
       - name: Create manifest list
         working-directory: /tmp/digests
         run: |
           docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.variant.suffix }}@sha256:%s ' *)
+
+  promote-stable:
+    needs: resolve-tag
+    if: ${{ inputs.dry_run != true && needs.resolve-tag.outputs.is_beta == 'false' }}
+    strategy:
+      matrix:
+        variant:
+          - { suffix: "" }
+          - { suffix: "-codex" }
+          - { suffix: "-claude" }
+          - { suffix: "-gemini" }
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify beta image exists
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.variant.suffix }}"
+          IMAGE_SHA="${{ needs.resolve-tag.outputs.image_sha }}"
+          echo "Checking ${IMAGE}:${IMAGE_SHA} ..."
+          docker buildx imagetools inspect "${IMAGE}:${IMAGE_SHA}" || \
+            { echo "::error::Image ${IMAGE}:${IMAGE_SHA} not found — build a beta on this commit first"; exit 1; }
+
+      - name: Promote to stable tags
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.variant.suffix }}"
+          IMAGE_SHA="${{ needs.resolve-tag.outputs.image_sha }}"
+          CHART_VERSION="${{ needs.resolve-tag.outputs.chart_version }}"
+          MAJOR_MINOR="${CHART_VERSION%.*}"
+
+          echo "Promoting ${IMAGE}:${IMAGE_SHA} → ${CHART_VERSION}, ${MAJOR_MINOR}, latest"
+          docker buildx imagetools create \
+            -t "${IMAGE}:${CHART_VERSION}" \
+            -t "${IMAGE}:${MAJOR_MINOR}" \
+            -t "${IMAGE}:latest" \
+            "${IMAGE}:${IMAGE_SHA}"
 
   release-chart-beta:
     needs: [resolve-tag, merge-manifests]
@@ -199,7 +243,7 @@ jobs:
           helm push openab-${CHART_VERSION}.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
 
   bump-chart-stable:
-    needs: [resolve-tag, merge-manifests]
+    needs: [resolve-tag, promote-stable]
     if: ${{ inputs.dry_run != true && needs.resolve-tag.outputs.is_beta == 'false' }}
     runs-on: ubuntu-latest
     permissions:
