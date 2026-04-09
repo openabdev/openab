@@ -1,6 +1,9 @@
 {{- range $name, $cfg := .Values.agents }}
 {{- if ne (include "openab.agentEnabled" $cfg) "false" }}
 {{- $d := dict "ctx" $ "agent" $name "cfg" $cfg }}
+{{- $command := include "openab.agentCommand" $d | trim }}
+{{- $args := include "openab.agentArgs" $d | trim }}
+{{- $workingDir := include "openab.agentWorkingDir" $d | trim }}
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -26,9 +29,9 @@ data:
     allowed_users = {{ $cfg.discord.allowedUsers | default list | toJson }}
 
     [agent]
-    command = "{{ $cfg.command }}"
-    args = {{ if $cfg.args }}{{ $cfg.args | toJson }}{{ else }}[]{{ end }}
-    working_dir = "{{ $cfg.workingDir | default "/home/agent" }}"
+    command = "{{ $command }}"
+    args = {{ $args }}
+    working_dir = "{{ $workingDir }}"
     {{- if $cfg.env }}
     env = { {{ range $k, $v := $cfg.env }}{{ $k }} = "{{ $v }}", {{ end }} }
     {{- end }}

@@ -2,6 +2,7 @@
 {{- if ne (include "openab.agentEnabled" $cfg) "false" }}
 {{- $d := dict "ctx" $ "agent" $name "cfg" $cfg }}
 {{- $pvcEnabled := not (eq (include "openab.persistenceEnabled" $cfg) "false") }}
+{{- $workingDir := include "openab.agentWorkingDir" $d | trim }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -46,7 +47,7 @@ spec:
                   key: discord-bot-token
             {{- end }}
             - name: HOME
-              value: {{ $cfg.workingDir | default "/home/agent" }}
+              value: {{ $workingDir | quote }}
             {{- range $k, $v := $cfg.env }}
             - name: {{ $k }}
               value: {{ $v | quote }}
@@ -65,11 +66,11 @@ spec:
               readOnly: true
             {{- if $pvcEnabled }}
             - name: data
-              mountPath: {{ $cfg.workingDir | default "/home/agent" }}
+              mountPath: {{ $workingDir | quote }}
             {{- end }}
             {{- if $cfg.agentsMd }}
             - name: config
-              mountPath: {{ $cfg.workingDir | default "/home/agent" }}/AGENTS.md
+              mountPath: {{ printf "%s/AGENTS.md" $workingDir | quote }}
               subPath: AGENTS.md
             {{- end }}
       {{- with $cfg.nodeSelector }}
