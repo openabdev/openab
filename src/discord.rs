@@ -223,25 +223,22 @@ async fn stream_prompt(
                 let mut buf_rx = buf_rx.clone();
                 tokio::spawn(async move {
                     let mut last_content = String::new();
-                    let mut current_edit_msg = msg_id;
+                    let current_edit_msg = msg_id;
                     loop {
                         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
                         if buf_rx.has_changed().unwrap_or(false) {
                             let content = buf_rx.borrow_and_update().clone();
                             if content != last_content {
-                                if content.len() > 1900 {
-                                    let chunks = format::split_message(&content, 1900);
-                                    if let Some(first) = chunks.first() {
-                                        let _ = edit(&ctx, channel, current_edit_msg, first).await;
-                                    }
-                                    for chunk in chunks.iter().skip(1) {
-                                        if let Ok(new_msg) = channel.say(&ctx.http, chunk).await {
-                                            current_edit_msg = new_msg.id;
-                                        }
-                                    }
+                                // During streaming, only edit the single placeholder message.
+                                // If content exceeds 1900 chars, truncate with ellipsis —
+                                // this is a live preview, not the final output.
+                                // The final edit after streaming handles proper multi-message splitting.
+                                let display = if content.len() > 1900 {
+                                    format!("{}…", &content[..1900])
                                 } else {
-                                    let _ = edit(&ctx, channel, current_edit_msg, &content).await;
-                                }
+                                    content.clone()
+                                };
+                                let _ = edit(&ctx, channel, current_edit_msg, &display).await;
                                 last_content = content;
                             }
                         }
