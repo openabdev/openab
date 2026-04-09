@@ -11,13 +11,51 @@ pub struct Config {
     pub pool: PoolConfig,
     #[serde(default)]
     pub reactions: ReactionsConfig,
+    /// Platform-specific settings. Each platform has its own message_limit.
+    /// Reference values: Discord=2000, Telegram=4096, Slack=39000, Signal=8000.
+    #[serde(default)]
+    pub platforms: PlatformsConfig,
 }
 
+/// Discord auth config (separate from platform settings).
 #[derive(Debug, Deserialize)]
 pub struct DiscordConfig {
     pub bot_token: String,
     #[serde(default)]
     pub allowed_channels: Vec<String>,
+}
+
+/// Per-platform settings. Add new platforms here as they are implemented.
+#[derive(Debug, Deserialize)]
+pub struct PlatformsConfig {
+    #[serde(default)]
+    pub discord: PlatformSettings,
+    /// Telegram (not yet implemented).
+    #[serde(default)]
+    pub telegram: PlatformSettings,
+}
+
+/// Platform-specific settings.
+#[derive(Debug, Deserialize)]
+pub struct PlatformSettings {
+    #[serde(default = "default_message_limit")]
+    pub message_limit: usize,
+}
+
+impl Default for PlatformSettings {
+    fn default() -> Self {
+        Self { message_limit: default_message_limit() }
+    }
+}
+
+/// Default message limits per platform.
+/// Must match the defaults in `PlatformsConfig::default()`.
+pub fn default_limit_for_platform(platform: &str) -> usize {
+    match platform {
+        "discord" => 2000,
+        "telegram" => 4096,
+        _ => default_message_limit(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +127,7 @@ fn default_working_dir() -> String { "/tmp".into() }
 fn default_max_sessions() -> usize { 10 }
 fn default_ttl_hours() -> u64 { 24 }
 fn default_true() -> bool { true }
+fn default_message_limit() -> usize { 2000 }
 
 fn emoji_queued() -> String { "👀".into() }
 fn emoji_thinking() -> String { "🤔".into() }
@@ -136,6 +175,19 @@ impl Default for ReactionTiming {
             debounce_ms: default_debounce_ms(), stall_soft_ms: default_stall_soft_ms(),
             stall_hard_ms: default_stall_hard_ms(), done_hold_ms: default_done_hold_ms(),
             error_hold_ms: default_error_hold_ms(),
+        }
+    }
+}
+
+impl Default for PlatformsConfig {
+    fn default() -> Self {
+        Self {
+            discord: PlatformSettings {
+                message_limit: default_limit_for_platform("discord"),
+            },
+            telegram: PlatformSettings {
+                message_limit: default_limit_for_platform("telegram"),
+            },
         }
     }
 }

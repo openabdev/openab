@@ -47,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
         pool: pool.clone(),
         allowed_channels,
         reactions_config: cfg.reactions,
+        message_limit: cfg.platforms.discord.message_limit,
     };
 
     let intents = GatewayIntents::GUILD_MESSAGES

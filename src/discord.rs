@@ -16,6 +16,7 @@ pub struct Handler {
     pub pool: Arc<SessionPool>,
     pub allowed_channels: HashSet<u64>,
     pub reactions_config: ReactionsConfig,
+    pub message_limit: usize,
 }
 
 #[async_trait]
@@ -143,6 +144,7 @@ impl EventHandler for Handler {
             thread_channel,
             thinking_msg.id,
             reactions.clone(),
+            self.message_limit,
         )
         .await;
 
@@ -187,6 +189,7 @@ async fn stream_prompt(
     channel: ChannelId,
     msg_id: MessageId,
     reactions: Arc<StatusReactionController>,
+    message_limit: usize,
 ) -> anyhow::Result<()> {
     let prompt = prompt.to_string();
     let reactions = reactions.clone();
@@ -196,6 +199,7 @@ async fn stream_prompt(
         let ctx = ctx.clone();
         let reactions = reactions.clone();
         Box::pin(async move {
+            let streaming_limit = message_limit.saturating_sub(100);
             let reset = conn.session_reset;
             conn.session_reset = false;
 
@@ -229,8 +233,8 @@ async fn stream_prompt(
                         if buf_rx.has_changed().unwrap_or(false) {
                             let content = buf_rx.borrow_and_update().clone();
                             if content != last_content {
-                                if content.len() > 1900 {
-                                    let chunks = format::split_message(&content, 1900);
+                                if content.len() > streaming_limit {
+                                    let chunks = format::split_message(&content, streaming_limit, false);
                                     if let Some(first) = chunks.first() {
                                         let _ = edit(&ctx, channel, current_edit_msg, first).await;
                                     }
@@ -302,7 +306,7 @@ async fn stream_prompt(
                 final_content
             };
 
-            let chunks = format::split_message(&final_content, 2000);
+            let chunks = format::split_message(&final_content, message_limit, true);
             for (i, chunk) in chunks.iter().enumerate() {
                 if i == 0 {
                     let _ = edit(&ctx, channel, current_msg_id, chunk).await;
