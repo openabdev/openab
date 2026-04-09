@@ -2,9 +2,11 @@
 
 A lightweight, secure, cloud-native ACP harness that bridges Discord and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, etc.) over stdio JSON-RPC — delivering the next-generation development experience.
 
+🪼 **Join our community!** Come say hi on Discord — we'd love to have you: **[🪼 OpenAB — Official](https://discord.gg/YNksK9M6)** 🎉
+
 ```
 ┌──────────────┐  Gateway WS   ┌──────────────┐  ACP stdio    ┌──────────────┐
-│   Discord    │◄─────────────►│ openab │──────────────►│  coding CLI  │
+│   Discord    │◄─────────────►│ openab       │──────────────►│  coding CLI  │
 │   User       │               │   (Rust)     │◄── JSON-RPC ──│  (acp mode)  │
 └──────────────┘               └──────────────┘               └──────────────┘
 ```
@@ -81,93 +83,78 @@ The bot creates a thread. After that, just type in the thread — no @mention ne
 
 ## Pluggable Agent Backends
 
-Swap backends using the `agent.preset` Helm value or manual config. Tested backends:
+Supports Kiro CLI, Claude Code, Codex, Gemini, and any ACP-compatible CLI.
 
-| Preset | CLI | ACP Adapter | Auth |
-|--------|-----|-------------|------|
-| (default) | Kiro CLI | Native `kiro-cli acp` | `kiro-cli login --use-device-flow` |
+| Agent key | CLI | ACP Adapter | Auth |
+|-----------|-----|-------------|------|
+| `kiro` (default) | Kiro CLI | Native `kiro-cli acp` | `kiro-cli login --use-device-flow` |
 | `codex` | Codex | [@zed-industries/codex-acp](https://github.com/zed-industries/codex-acp) | `codex login --device-auth` |
 | `claude` | Claude Code | [@agentclientprotocol/claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp) | `claude setup-token` |
 | `gemini` | Gemini CLI | Native `gemini --acp` | Google OAuth or `GEMINI_API_KEY` |
 
 ### Helm Install (recommended)
 
+See the **[Helm chart docs](https://openabdev.github.io/openab)** for full installation instructions, values reference, and multi-agent examples.
+
 ```bash
 helm repo add openab https://openabdev.github.io/openab
 helm repo update
 
-# Kiro CLI (default)
+# Kiro CLI only (default)
 helm install openab openab/openab \
-  --set discord.botToken="$DISCORD_BOT_TOKEN" \
-  --set-string discord.allowedChannels[0]="YOUR_CHANNEL_ID"
+  --set agents.kiro.discord.botToken="$DISCORD_BOT_TOKEN" \
+  --set-string 'agents.kiro.discord.allowedChannels[0]=YOUR_CHANNEL_ID'
 
-# Codex
+# Claude Code only (disable default kiro)
 helm install openab openab/openab \
-  --set discord.botToken="$DISCORD_BOT_TOKEN" \
-  --set-string discord.allowedChannels[0]="YOUR_CHANNEL_ID" \
-  --set agent.preset=codex
+  --set agents.kiro.enabled=false \
+  --set agents.claude.discord.botToken="$DISCORD_BOT_TOKEN" \
+  --set-string 'agents.claude.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
+  --set agents.claude.image=ghcr.io/openabdev/openab-claude:78f8d2c \
+  --set agents.claude.command=claude-agent-acp \
+  --set agents.claude.workingDir=/home/node
 
-# Claude Code
+# Multi-agent (kiro + claude in one release)
 helm install openab openab/openab \
-  --set discord.botToken="$DISCORD_BOT_TOKEN" \
-  --set-string discord.allowedChannels[0]="YOUR_CHANNEL_ID" \
-  --set agent.preset=claude
-
-# Gemini
-helm install openab openab/openab \
-  --set discord.botToken="$DISCORD_BOT_TOKEN" \
-  --set-string discord.allowedChannels[0]="YOUR_CHANNEL_ID" \
-  --set agent.preset=gemini
+  --set agents.kiro.discord.botToken="$KIRO_BOT_TOKEN" \
+  --set-string 'agents.kiro.discord.allowedChannels[0]=KIRO_CHANNEL_ID' \
+  --set agents.claude.discord.botToken="$CLAUDE_BOT_TOKEN" \
+  --set-string 'agents.claude.discord.allowedChannels[0]=CLAUDE_CHANNEL_ID' \
+  --set agents.claude.image=ghcr.io/openabdev/openab-claude:78f8d2c \
+  --set agents.claude.command=claude-agent-acp \
+  --set agents.claude.workingDir=/home/node
 ```
 
-Then authenticate inside the pod (first time only):
-
-```bash
-# Kiro CLI
-kubectl exec -it deployment/openab -- kiro-cli login --use-device-flow
-
-# Codex
-kubectl exec -it deployment/openab -- codex login --device-auth
-
-# Claude Code
-kubectl exec -it deployment/openab -- claude setup-token
-# Then: helm upgrade openab openab/openab --set env.CLAUDE_CODE_OAUTH_TOKEN="<token>"
-
-# Gemini (Google OAuth — open URL in browser, curl callback from pod)
-kubectl exec -it deployment/openab -- gemini
-# Or use API key: helm upgrade openab openab/openab --set env.GEMINI_API_KEY="<key>"
-```
-
-Restart after auth: `kubectl rollout restart deployment openab`
+Each agent key in `agents` map creates its own Deployment, ConfigMap, Secret, and PVC. Set `agents.<name>.enabled: false` to skip creating resources for an agent.
 
 ### Manual config.toml
 
-For non-Helm deployments, swap the `[agent]` block:
+For non-Helm deployments, configure the `[agent]` block per CLI:
 
 ```toml
 # Kiro CLI (default)
 [agent]
 command = "kiro-cli"
 args = ["acp", "--trust-all-tools"]
-working_dir = "/tmp"
+working_dir = "/home/agent"
 
 # Codex (requires codex-acp in PATH)
 [agent]
 command = "codex-acp"
 args = []
-working_dir = "/tmp"
+working_dir = "/home/node"
 
 # Claude Code (requires claude-agent-acp in PATH)
 [agent]
 command = "claude-agent-acp"
 args = []
-working_dir = "/tmp"
+working_dir = "/home/node"
 
 # Gemini
 [agent]
 command = "gemini"
 args = ["--acp"]
-working_dir = "/tmp"
+working_dir = "/home/node"
 env = { GEMINI_API_KEY = "${GEMINI_API_KEY}" }
 ```
 
@@ -219,7 +206,7 @@ The Docker image bundles both `openab` and `kiro-cli` in a single container (ope
 ┌─ Kubernetes Pod ─────────────────────────────────────────────────┐
 │                                                                  │
 │  ┌─────────────────────────────────────────────────────────┐     │
-│  │  openab (main process, PID 1)                     │     │
+│  │  openab (main process, PID 1)                           │     │
 │  │                                                         │     │
 │  │  ┌──────────────┐   ┌──────────────┐   ┌───────────┐    │     │
 │  │  │ Discord      │   │ Session Pool │   │ Reaction  │    │     │
@@ -262,19 +249,7 @@ The Docker image bundles both `openab` and `kiro-cli` in a single container (ope
 
 ### Install with Your Coding CLI
 
-Use one of these prompts with any coding CLI (Kiro CLI, Claude Code, Codex, Gemini, etc.) on the host that has `helm` and `kubectl` access to your cluster:
-
-**Kiro CLI (default):**
-> Install openab on my local k8s cluster using the Helm chart from https://openabdev.github.io/openab. My Discord bot token is in the environment variable DISCORD_BOT_TOKEN and my channel ID is <REPLACE_WITH_YOUR_CHANNEL_ID>. After install, follow the NOTES output to authenticate, then restart the deployment.
-
-**Codex:**
-> Install openab on my local k8s cluster using the Helm chart from https://openabdev.github.io/openab with `--set agent.preset=codex`. My Discord bot token is in the environment variable DISCORD_BOT_TOKEN and my channel ID is <REPLACE_WITH_YOUR_CHANNEL_ID>. After install, follow the NOTES output to authenticate, then restart the deployment.
-
-**Claude Code:**
-> Install openab on my local k8s cluster using the Helm chart from https://openabdev.github.io/openab with `--set agent.preset=claude`. My Discord bot token is in the environment variable DISCORD_BOT_TOKEN and my channel ID is <REPLACE_WITH_YOUR_CHANNEL_ID>. After install, follow the NOTES output to authenticate, then restart the deployment.
-
-**Gemini:**
-> Install openab on my local k8s cluster using the Helm chart from https://openabdev.github.io/openab with `--set agent.preset=gemini`. My Discord bot token is in the environment variable DISCORD_BOT_TOKEN and my channel ID is <REPLACE_WITH_YOUR_CHANNEL_ID>. After install, follow the NOTES output to authenticate, then restart the deployment.
+See the **[Helm chart docs](https://openabdev.github.io/openab)** for per-agent install commands (Kiro CLI, Claude Code, Codex, Gemini) and values reference.
 
 ### Build & Push
 
@@ -302,13 +277,13 @@ kubectl apply -f k8s/deployment.yaml
 kiro-cli requires a one-time OAuth login. The PVC persists the tokens across pod restarts.
 
 ```bash
-kubectl exec -it deployment/openab -- kiro-cli login --use-device-flow
+kubectl exec -it deployment/openab-kiro -- kiro-cli login --use-device-flow
 ```
 
 Follow the device code flow in your browser, then restart the pod:
 
 ```bash
-kubectl rollout restart deployment openab
+kubectl rollout restart deployment/openab-kiro
 ```
 
 ### Manifests

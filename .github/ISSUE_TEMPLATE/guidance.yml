@@ -1,0 +1,10 @@
+name: Guidance
+description: Ask a question or request guidance
+labels: [guidance, needs-triage]
+body:
+  - type: textarea
+    attributes:
+      label: Question
+      description: What do you need help with?
+    validations:
+      required: true

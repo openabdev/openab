@@ -20,65 +20,48 @@
 {{- end }}
 
 {{- define "openab.labels" -}}
-helm.sh/chart: {{ include "openab.chart" . }}
-{{ include "openab.selectorLabels" . }}
-{{- if .Chart.AppVersion }}
-app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+helm.sh/chart: {{ include "openab.chart" .ctx }}
+app.kubernetes.io/name: {{ include "openab.name" .ctx }}
+app.kubernetes.io/instance: {{ .ctx.Release.Name }}
+app.kubernetes.io/component: {{ .agent }}
+{{- if .ctx.Chart.AppVersion }}
+app.kubernetes.io/version: {{ .ctx.Chart.AppVersion | quote }}
 {{- end }}
-app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/managed-by: {{ .ctx.Release.Service }}
 {{- end }}
 
 {{- define "openab.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "openab.name" . }}
-app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/name: {{ include "openab.name" .ctx }}
+app.kubernetes.io/instance: {{ .ctx.Release.Name }}
+app.kubernetes.io/component: {{ .agent }}
 {{- end }}
 
-{{/*
-Resolve agent preset → image repository
-*/}}
-{{- define "openab.image.repository" -}}
-{{- if .Values.agent.preset }}
-  {{- if eq .Values.agent.preset "codex" }}ghcr.io/openabdev/openab-codex
-  {{- else if eq .Values.agent.preset "claude" }}ghcr.io/openabdev/openab-claude
-  {{- else if eq .Values.agent.preset "gemini" }}ghcr.io/openabdev/openab-gemini
-  {{- else }}{{ .Values.image.repository }}
-  {{- end }}
-{{- else }}{{ .Values.image.repository }}
-{{- end }}
+{{/* Per-agent resource name: <fullname>-<agentKey> */}}
+{{- define "openab.agentFullname" -}}
+{{- printf "%s-%s" (include "openab.fullname" .ctx) .agent | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
-{{/*
-Resolve agent preset → command
-*/}}
-{{- define "openab.agent.command" -}}
-{{- if .Values.agent.preset }}
-  {{- if eq .Values.agent.preset "codex" }}codex-acp
-  {{- else if eq .Values.agent.preset "claude" }}claude-agent-acp
-  {{- else if eq .Values.agent.preset "gemini" }}gemini
-  {{- else }}{{ .Values.agent.command }}
-  {{- end }}
-{{- else }}{{ .Values.agent.command }}
+{{/* Resolve image: agent-level string override → global default (repository:tag, tag defaults to appVersion) */}}
+{{- define "openab.agentImage" -}}
+{{- if and .cfg.image (kindIs "string" .cfg.image) (ne .cfg.image "") }}
+{{- .cfg.image }}
+{{- else }}
+{{- $tag := default .ctx.Chart.AppVersion .ctx.Values.image.tag }}
+{{- printf "%s:%s" .ctx.Values.image.repository $tag }}
 {{- end }}
 {{- end }}
 
-{{/*
-Resolve agent preset → args
-*/}}
-{{- define "openab.agent.args" -}}
-{{- if .Values.agent.preset }}
-  {{- if or (eq .Values.agent.preset "codex") (eq .Values.agent.preset "claude") }}[]
-  {{- else if eq .Values.agent.preset "gemini" }}["--acp"]
-  {{- else }}{{ .Values.agent.args | toJson }}
-  {{- end }}
-{{- else }}{{ .Values.agent.args | toJson }}
-{{- end }}
+{{/* Resolve imagePullPolicy: global default (per-agent image string has no pullPolicy) */}}
+{{- define "openab.agentImagePullPolicy" -}}
+{{- .ctx.Values.image.pullPolicy }}
 {{- end }}
 
-{{/*
-Resolve agent preset → home directory
-*/}}
-{{- define "openab.agent.home" -}}
-{{- if and .Values.agent.preset (or (eq .Values.agent.preset "codex") (eq .Values.agent.preset "claude") (eq .Values.agent.preset "gemini")) }}/home/node
-{{- else }}/home/agent
+{{/* Agent enabled: default true unless explicitly set to false */}}
+{{- define "openab.agentEnabled" -}}
+{{- if eq (.enabled | toString) "false" }}false{{ else }}true{{ end }}
 {{- end }}
+
+{{/* Persistence enabled: default true unless explicitly set to false */}}
+{{- define "openab.persistenceEnabled" -}}
+{{- if and . .persistence (eq (.persistence.enabled | toString) "false") }}false{{ else }}true{{ end }}
 {{- end }}
