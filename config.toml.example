@@ -93,6 +93,22 @@ working_dir = "/home/agent"
 # working_dir = "/home/agent"
 # env = {}  # Auth via: kubectl exec -it <pod> -- cursor-agent login
 
+# SSH sandbox — run agent inside an isolated VM or container (local deployments)
+# SSH is a transparent byte pipe over stdio; no changes to ACP protocol needed.
+# See docs/ssh-sandbox.md for setup guide and known limitations.
+# [agent]
+# command = "ssh"
+# args = [
+#   "-T",                                     # no PTY — required, PTY corrupts JSON-RPC
+#   "-o", "BatchMode=yes",                    # fail-fast, no interactive prompts
+#   "-o", "ServerAliveInterval=30",           # keep-alive for long sessions
+#   "-o", "ServerAliveCountMax=3",
+#   "-o", "StrictHostKeyChecking=accept-new", # daemon has no terminal for prompts
+#   "user@sandbox-host",
+#   "claude", "--acp"
+# ]
+# working_dir = "/tmp"                        # local cwd for the SSH process, not the remote agent's workdir
+
 [pool]
 max_sessions = 10
 session_ttl_hours = 24

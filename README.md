@@ -168,6 +168,27 @@ This is useful for containerized or multi-node deployments where config is hoste
 
 > **Security best practice:** Never hardcode secrets in remote config files. Use environment variable references like `bot_token = "${DISCORD_BOT_TOKEN}"` and inject the actual values via local environment variables or Kubernetes Secrets. OpenAB expands `${VAR}` identically for both local and remote config.
 
+### SSH Sandbox (Local Deployments)
+
+For local deployments, you can run the agent inside an isolated VM or container using SSH as a transparent stdio transport — no changes to OpenAB are needed. SSH is a byte pipe over stdin/stdout, which is exactly how `AcpConnection` communicates with agents.
+
+```toml
+[agent]
+command = "ssh"
+args = [
+  "-T",                                     # no PTY — required, PTY corrupts JSON-RPC
+  "-o", "BatchMode=yes",                    # fail-fast, no interactive prompts
+  "-o", "ServerAliveInterval=30",           # keep-alive for long sessions
+  "-o", "ServerAliveCountMax=3",
+  "-o", "StrictHostKeyChecking=accept-new", # daemon has no terminal for prompts
+  "user@sandbox-host",
+  "claude", "--acp"
+]
+working_dir = "/tmp"
+```
+
+See [docs/ssh-sandbox.md](docs/ssh-sandbox.md) for setup details, MCP server access patterns, and known limitations.
+
 ## Configuration Reference
 
 > 📖 Full reference with all options, defaults, and Helm mapping: [docs/config-reference.md](docs/config-reference.md)
