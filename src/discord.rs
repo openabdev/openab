@@ -263,8 +263,13 @@ async fn stream_prompt(
 
             // Process ACP notifications
             let mut got_first_text = false;
+            let mut response_error: Option<String> = None;
             while let Some(notification) = rx.recv().await {
                 if notification.id.is_some() {
+                    // Capture error from ACP response to display in Discord
+                    if let Some(ref err) = notification.error {
+                        response_error = Some(format_error(err.code, &err.message));
+                    }
                     break;
                 }
 
@@ -306,7 +311,13 @@ async fn stream_prompt(
             // Final edit
             let final_content = compose_display(&tool_lines, &text_buf);
             let final_content = if final_content.is_empty() {
-                "_(no response)_".to_string()
+                if let Some(err) = response_error {
+                    format!("⚠️ {}", err)
+                } else {
+                    "_(no response)_".to_string()
+                }
+            } else if let Some(err) = response_error {
+                format!("⚠️ {}\n\n{}", err, final_content)
             } else {
                 final_content
             };
@@ -337,6 +348,36 @@ fn compose_display(tool_lines: &[String], text: &str) -> String {
     }
     out.push_str(text.trim_end());
     out
+}
+
+/// Format error from ACP agent for display in Discord.
+///
+/// Provider-agnostic: error codes are protocol-level (JSON-RPC), not provider-specific.
+/// Only the message text (which comes from the upstream agent) is passed through verbatim.
+fn format_error(code: i64, message: &str) -> String {
+    let prefix = match code {
+        400 => "**Bad Request**",
+        401 => "**Unauthorized**",
+        403 => "**Forbidden**",
+        404 => "**Not Found**",
+        408 => "**Request Timeout**",
+        429 => "**Rate Limited**",
+        500 => "**Internal Server Error**",
+        502 => "**Bad Gateway**",
+        503 => "**Service Unavailable**",
+        504 => "**Gateway Timeout**",
+        -32600 => "**Invalid Request**",
+        -32601 => "**Method Not Found**",
+        -32602 => "**Invalid Params**",
+        -32603 => "**Internal Error**",
+        -32000 => "**Connection Error**",
+        _ => "**Error**",
+    };
+    if message.is_empty() {
+        format!("{} (code: {})", prefix, code)
+    } else {
+        format!("{} (code: {})\n{}", prefix, code, message)
+    }
 }
 
 fn strip_mention(content: &str) -> String {
