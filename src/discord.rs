@@ -1,7 +1,10 @@
-use crate::acp::{classify_notification, AcpEvent, SessionPool};
+use crate::acp::connection::ContentBlock;
+use crate::acp::pool::SessionPool;
 use crate::config::ReactionsConfig;
 use crate::format;
 use crate::reactions::StatusReactionController;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use serenity::async_trait;
 use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
@@ -10,7 +13,7 @@ use serenity::prelude::*;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::watch;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 pub struct Handler {
     pub pool: Arc<SessionPool>,
@@ -69,9 +72,9 @@ impl EventHandler for Handler {
         } else {
             msg.content.trim().to_string()
         };
-        if prompt.is_empty() {
-            return;
-        }
+
+        // Build content blocks: text + image attachments
+        let mut content_blocks = vec![];
 
         // Inject structured sender context so the downstream CLI can identify who sent the message
         let display_name = msg.member.as_ref()
@@ -92,7 +95,38 @@ impl EventHandler for Handler {
             prompt
         );
 
-        tracing::debug!(prompt = %prompt_with_sender, in_thread, "processing");
+        // Add text block (always, even if empty, we still send for sender context)
+        content_blocks.push(ContentBlock::Text {
+            text: prompt_with_sender.clone(),
+        });
+
+        // Add image attachments
+        if !msg.attachments.is_empty() {
+            for attachment in &msg.attachments {
+                if let Some(content_block) = download_and_encode_image(attachment).await {
+                    debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
+                    content_blocks.push(content_block);
+                } else {
+                    error!(
+                        url = %attachment.url,
+                        filename = %attachment.filename,
+                        "failed to download image attachment"
+                    );
+                }
+            }
+        }
+
+        tracing::debug!(
+            text_len = prompt_with_sender.len(),
+            num_attachments = msg.attachments.len(),
+            in_thread,
+            "processing"
+        );
+
+        // If prompt is empty and no attachments, skip
+        if prompt_with_sender.trim().is_empty() && msg.attachments.is_empty() {
+            return;
+        }
 
         let thread_id = if in_thread {
             msg.channel_id.get()
@@ -134,11 +168,11 @@ impl EventHandler for Handler {
         ));
         reactions.set_queued().await;
 
-        // Stream prompt with live edits
+        // Stream prompt with live edits (pass content blocks instead of just text)
         let result = stream_prompt(
             &self.pool,
             &thread_key,
-            &prompt_with_sender,
+            content_blocks,
             &ctx,
             thread_channel,
             thinking_msg.id,
@@ -175,6 +209,83 @@ impl EventHandler for Handler {
     }
 }
 
+/// Download a Discord image attachment and encode it as an ACP image content block.
+/// Downloads a Discord image attachment and encodes it as base64.
+///
+/// Discord attachment URLs are temporary and expire, so we must download
+/// and encode the image data immediately. The ACP ImageContent schema
+/// requires `{ data: base64_string, mimeType: "image/..." }`.
+async fn download_and_encode_image(attachment: &serenity::model::channel::Attachment) -> Option<ContentBlock> {
+    let url = &attachment.url;
+
+    // Skip if no URL
+    if url.is_empty() {
+        return None;
+    }
+
+    // Determine media type from filename or content_type
+    let media_type = attachment
+        .content_type
+        .clone()
+        .or_else(|| {
+            let ext = attachment
+                .filename
+                .rsplit('.')
+                .next()
+                .unwrap_or("")
+                .to_lowercase();
+            match ext.as_str() {
+                "png" => Some("image/png".to_string()),
+                "jpg" | "jpeg" => Some("image/jpeg".to_string()),
+                "gif" => Some("image/gif".to_string()),
+                "webp" => Some("image/webp".to_string()),
+                _ => None,
+            }
+        })
+        .unwrap_or_else(|| "image/png".to_string());
+
+    // Download the image
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            error!("failed to build HTTP client: {}", e);
+            return None;
+        }
+    };
+
+    let response = match client.get(url).send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            error!("failed to download image {}: {}", url, e);
+            return None;
+        }
+    };
+
+    if !response.status().is_success() {
+        error!("HTTP error downloading image {}: {}", url, response.status());
+        return None;
+    }
+
+    let bytes = match response.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            error!("failed to read image bytes from {}: {}", url, e);
+            return None;
+        }
+    };
+
+    // Encode as base64
+    let encoded = BASE64.encode(bytes.as_ref());
+
+    Some(ContentBlock::Image {
+        media_type,
+        data: encoded,
+    })
+}
+
 async fn edit(ctx: &Context, ch: ChannelId, msg_id: MessageId, content: &str) -> serenity::Result<Message> {
     ch.edit_message(&ctx.http, msg_id, serenity::builder::EditMessage::new().content(content)).await
 }
@@ -182,24 +293,23 @@ async fn edit(ctx: &Context, ch: ChannelId, msg_id: MessageId, content: &str) ->
 async fn stream_prompt(
     pool: &SessionPool,
     thread_key: &str,
-    prompt: &str,
+    content_blocks: Vec<ContentBlock>,
     ctx: &Context,
     channel: ChannelId,
     msg_id: MessageId,
     reactions: Arc<StatusReactionController>,
 ) -> anyhow::Result<()> {
-    let prompt = prompt.to_string();
     let reactions = reactions.clone();
 
     pool.with_connection(thread_key, |conn| {
-        let prompt = prompt.clone();
+        let content_blocks = content_blocks.clone();
         let ctx = ctx.clone();
         let reactions = reactions.clone();
         Box::pin(async move {
             let reset = conn.session_reset;
             conn.session_reset = false;
 
-            let (mut rx, _) = conn.session_prompt(&prompt).await?;
+            let (mut rx, _): (_, _) = conn.session_prompt(content_blocks).await?;
             reactions.set_thinking().await;
 
             let initial = if reset {
@@ -259,9 +369,9 @@ async fn stream_prompt(
                     break;
                 }
 
-                if let Some(event) = classify_notification(&notification) {
+                if let Some(event) = crate::acp::classify_notification(&notification) {
                     match event {
-                        AcpEvent::Text(t) => {
+                        crate::acp::AcpEvent::Text(t) => {
                             if !got_first_text {
                                 got_first_text = true;
                                 // Reaction: back to thinking after tools
@@ -269,15 +379,15 @@ async fn stream_prompt(
                             text_buf.push_str(&t);
                             let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
                         }
-                        AcpEvent::Thinking => {
+                        crate::acp::AcpEvent::Thinking => {
                             reactions.set_thinking().await;
                         }
-                        AcpEvent::ToolStart { title, .. } if !title.is_empty() => {
+                        crate::acp::AcpEvent::ToolStart { title, .. } if !title.is_empty() => {
                             reactions.set_tool(&title).await;
                             tool_lines.push(format!("🔧 `{title}`..."));
                             let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
                         }
-                        AcpEvent::ToolDone { title, status, .. } => {
+                        crate::acp::AcpEvent::ToolDone { title, status, .. } => {
                             reactions.set_thinking().await;
                             let icon = if status == "completed" { "✅" } else { "❌" };
                             if let Some(line) = tool_lines.iter_mut().rev().find(|l| l.contains(&title)) {

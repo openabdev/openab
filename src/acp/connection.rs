@@ -20,6 +20,29 @@ fn expand_env(val: &str) -> String {
 }
 use tokio::time::Instant;
 
+/// A content block for the ACP prompt — either text or image.
+#[derive(Debug, Clone)]
+pub enum ContentBlock {
+    Text { text: String },
+    Image { media_type: String, data: String },
+}
+
+impl ContentBlock {
+    pub fn to_json(&self) -> Value {
+        match self {
+            ContentBlock::Text { text } => json!({
+                "type": "text",
+                "text": text
+            }),
+            ContentBlock::Image { media_type, data } => json!({
+                "type": "image",
+                "data": data,
+                "mimeType": media_type
+            }),
+        }
+    }
+}
+
 pub struct AcpConnection {
     _proc: Child,
     stdin: Arc<Mutex<ChildStdin>>,
@@ -242,11 +265,12 @@ impl AcpConnection {
         Ok(session_id)
     }
 
-    /// Send a prompt and return a receiver for streaming notifications.
-    /// The final message on the channel will have id set (the prompt response).
+    /// Send a prompt with content blocks (text and/or images) and return a receiver
+    /// for streaming notifications. The final message on the channel will have id set
+    /// (the prompt response).
     pub async fn session_prompt(
         &mut self,
-        prompt: &str,
+        content_blocks: Vec<ContentBlock>,
     ) -> Result<(mpsc::UnboundedReceiver<JsonRpcMessage>, u64)> {
         self.last_active = Instant::now();
 
@@ -259,12 +283,19 @@ impl AcpConnection {
         *self.notify_tx.lock().await = Some(tx);
 
         let id = self.next_id();
+
+        // Convert content blocks to JSON
+        let prompt_json: Vec<Value> = content_blocks
+            .iter()
+            .map(|b| b.to_json())
+            .collect();
+
         let req = JsonRpcRequest::new(
             id,
             "session/prompt",
             Some(json!({
                 "sessionId": session_id,
-                "prompt": [{"type": "text", "text": prompt}],
+                "prompt": prompt_json,
             })),
         );
         let data = serde_json::to_string(&req)?;
