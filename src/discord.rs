@@ -217,30 +217,32 @@ async fn stream_prompt(
                 text_buf.push_str("⚠️ _Session expired, starting fresh..._\n\n");
             }
 
-            // Spawn edit-streaming task
+            // Spawn edit-streaming task — tracks posted messages so overflow
+            // chunks are only sent once, and only the last message is edited
+            // as new content arrives. Returns the list of message IDs used.
             let edit_handle = {
                 let ctx = ctx.clone();
                 let mut buf_rx = buf_rx.clone();
                 tokio::spawn(async move {
                     let mut last_content = String::new();
-                    let mut current_edit_msg = msg_id;
+                    let mut msg_ids: Vec<MessageId> = vec![msg_id];
                     loop {
                         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
                         if buf_rx.has_changed().unwrap_or(false) {
                             let content = buf_rx.borrow_and_update().clone();
                             if content != last_content {
-                                if content.len() > 1900 {
-                                    let chunks = format::split_message(&content, 1900);
-                                    if let Some(first) = chunks.first() {
-                                        let _ = edit(&ctx, channel, current_edit_msg, first).await;
-                                    }
-                                    for chunk in chunks.iter().skip(1) {
+                                let chunks = format::split_message(&content, 1900);
+                                for (i, chunk) in chunks.iter().enumerate() {
+                                    if i < msg_ids.len() {
+                                        // Only edit the last known message (where content is growing)
+                                        // or earlier messages whose content changed due to re-split.
+                                        let _ = edit(&ctx, channel, msg_ids[i], chunk).await;
+                                    } else {
+                                        // New overflow chunk — post once and remember its ID
                                         if let Ok(new_msg) = channel.say(&ctx.http, chunk).await {
-                                            current_edit_msg = new_msg.id;
+                                            msg_ids.push(new_msg.id);
                                         }
                                     }
-                                } else {
-                                    let _ = edit(&ctx, channel, current_edit_msg, &content).await;
                                 }
                                 last_content = content;
                             }
@@ -249,6 +251,7 @@ async fn stream_prompt(
                             break;
                         }
                     }
+                    msg_ids
                 })
             };
 
@@ -292,9 +295,9 @@ async fn stream_prompt(
 
             conn.prompt_done().await;
             drop(buf_tx);
-            let _ = edit_handle.await;
+            let msg_ids = edit_handle.await.unwrap_or_else(|_| vec![current_msg_id]);
 
-            // Final edit
+            // Final edit — reuse message IDs from streaming, only say() truly new chunks
             let final_content = compose_display(&tool_lines, &text_buf);
             let final_content = if final_content.is_empty() {
                 "_(no response)_".to_string()
@@ -304,8 +307,8 @@ async fn stream_prompt(
 
             let chunks = format::split_message(&final_content, 2000);
             for (i, chunk) in chunks.iter().enumerate() {
-                if i == 0 {
-                    let _ = edit(&ctx, channel, current_msg_id, chunk).await;
+                if i < msg_ids.len() {
+                    let _ = edit(&ctx, channel, msg_ids[i], chunk).await;
                 } else {
                     let _ = channel.say(&ctx.http, chunk).await;
                 }
