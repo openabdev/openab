@@ -82,6 +82,70 @@ impl EventHandler for Handler {
             return;
         }
 
+        // Handle !model command (intercept before normal prompt flow)
+        if prompt.starts_with("!model") {
+            let arg = prompt[6..].trim().to_string();
+            let thread_key = msg.channel_id.get().to_string();
+
+            // Ensure session exists so we have available_models populated
+            if let Err(e) = self.pool.get_or_create(&thread_key).await {
+                let _ = msg.channel_id.say(&ctx.http, format!("⚠️ Failed to start agent: {e}")).await;
+                return;
+            }
+
+            let reply = self
+                .pool
+                .with_connection(&thread_key, |conn| {
+                    let arg = arg.clone();
+                    Box::pin(async move {
+                        if arg.is_empty() {
+                            // List models
+                            if conn.available_models.is_empty() {
+                                return Ok::<String, anyhow::Error>(
+                                    "_(no models reported by agent — backend may not support model switching)_".to_string(),
+                                );
+                            }
+                            let mut out = String::from("**Available models:**\n");
+                            for m in &conn.available_models {
+                                let marker = if m.model_id == conn.current_model { "**▶**" } else { "•" };
+                                out.push_str(&format!(
+                                    "{} `{}` — {}\n",
+                                    marker, m.model_id, m.name
+                                ));
+                            }
+                            out.push_str(&format!("\nCurrent: `{}`\n", conn.current_model));
+                            out.push_str("\nAliases: `opus`, `sonnet`, `haiku`, `auto`");
+                            Ok(out)
+                        } else {
+                            match conn.resolve_model_alias(&arg) {
+                                Some(model_id) => {
+                                    match conn.session_set_model(&model_id).await {
+                                        Ok(()) => Ok(format!("✅ Switched to `{model_id}`")),
+                                        Err(e) => Ok(format!("⚠️ Failed to set model: {e}")),
+                                    }
+                                }
+                                None => {
+                                    let mut out = format!("❌ Unknown model: `{arg}`\n\n**Available:**\n");
+                                    for m in &conn.available_models {
+                                        out.push_str(&format!("• `{}`\n", m.model_id));
+                                    }
+                                    out.push_str("\nAliases: `opus`, `sonnet`, `haiku`, `auto`");
+                                    Ok(out)
+                                }
+                            }
+                        }
+                    })
+                })
+                .await;
+
+            let text = match reply {
+                Ok(t) => t,
+                Err(e) => format!("⚠️ {e}"),
+            };
+            let _ = msg.channel_id.say(&ctx.http, text).await;
+            return;
+        }
+
         // Inject structured sender context so the downstream CLI can identify who sent the message
         let display_name = msg.member.as_ref()
             .and_then(|m| m.nick.as_ref())
