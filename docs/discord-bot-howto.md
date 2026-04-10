@@ -104,3 +104,4 @@ The bot should create a thread and respond. After that, just type in the thread 
 - **Bot doesn't respond** — check that the channel ID is correct and the bot has permissions in that channel
 - **"Sent invalid authentication"** — the bot token is wrong or expired, reset it in the Developer Portal
 - **"Failed to start agent"** — kiro-cli isn't authenticated, run `kiro-cli login --use-device-flow` inside the container
+- **`gh` commands fail with 401** — the agent needs GitHub CLI authentication. See [gh auth device flow guide](gh-auth-device-flow.md) for how to authenticate in a headless container
