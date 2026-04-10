@@ -1,5 +1,4 @@
-use crate::acp::connection::ContentBlock;
-use crate::acp::{classify_notification, AcpEvent, SessionPool};
+use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
 use crate::config::ReactionsConfig;
 use crate::format;
 use crate::reactions::StatusReactionController;
