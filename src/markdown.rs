@@ -1,6 +1,7 @@
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use serde::Deserialize;
 use std::fmt;
+use unicode_width::UnicodeWidthStr;
 
 /// How to render markdown tables for a given channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -141,6 +142,24 @@ fn parse_segments(markdown: &str) -> Vec<Segment> {
                 cell_buf.push_str(&t);
                 cell_buf.push('`');
             }
+            // Inline markup inside cells: collect text, ignore tags
+            Event::SoftBreak if in_table => {
+                cell_buf.push(' ');
+            }
+            Event::HardBreak if in_table => {
+                cell_buf.push(' ');
+            }
+            // Start/End of inline tags (bold, italic, link, etc.) — skip the
+            // tag markers but keep processing their child text events above.
+            Event::Start(Tag::Emphasis)
+            | Event::Start(Tag::Strong)
+            | Event::Start(Tag::Strikethrough)
+            | Event::Start(Tag::Link { .. })
+            | Event::End(TagEnd::Emphasis)
+            | Event::End(TagEnd::Strong)
+            | Event::End(TagEnd::Strikethrough)
+            | Event::End(TagEnd::Link)
+                if in_table => {}
             _ => {}
         }
     }
@@ -176,15 +195,15 @@ fn render_table_code(table: &Table, out: &mut String) {
         return;
     }
 
-    // Compute column widths
+    // Compute column widths (using display width for CJK/emoji)
     let mut widths = vec![0usize; col_count];
     for (i, h) in table.headers.iter().enumerate() {
-        widths[i] = widths[i].max(h.len());
+        widths[i] = widths[i].max(UnicodeWidthStr::width(h.as_str()));
     }
     for row in &table.rows {
         for (i, cell) in row.iter().enumerate() {
             if i < col_count {
-                widths[i] = widths[i].max(cell.len());
+                widths[i] = widths[i].max(UnicodeWidthStr::width(cell.as_str()));
             }
         }
     }
@@ -221,7 +240,8 @@ fn write_row(out: &mut String, cells: &[String], widths: &[usize], col_count: us
         out.push(' ');
         let cell = cells.get(i).map(|s| s.as_str()).unwrap_or("");
         out.push_str(cell);
-        let pad = widths[i] - cell.len();
+        let display_width = UnicodeWidthStr::width(cell);
+        let pad = widths[i].saturating_sub(display_width);
         for _ in 0..pad {
             out.push(' ');
         }
@@ -232,7 +252,7 @@ fn write_row(out: &mut String, cells: &[String], widths: &[usize], col_count: us
 
 /// Render table as bullet points: `• header: value` per cell.
 fn render_table_bullets(table: &Table, out: &mut String) {
-    for row in &table.rows {
+    for (row_idx, row) in table.rows.iter().enumerate() {
         for (i, cell) in row.iter().enumerate() {
             if cell.is_empty() {
                 continue;
@@ -247,7 +267,10 @@ fn render_table_bullets(table: &Table, out: &mut String) {
             out.push_str(cell);
             out.push('\n');
         }
-        out.push('\n');
+        // Blank line between rows, but not after the last one
+        if row_idx + 1 < table.rows.len() {
+            out.push('\n');
+        }
     }
 }
 

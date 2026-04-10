@@ -16,3 +16,4 @@ regex = "1"
 anyhow = "1"
 rand = "0.8"
 pulldown-cmark = { version = "0.13", default-features = false }
+unicode-width = "0.2"
