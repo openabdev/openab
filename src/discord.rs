@@ -311,6 +311,10 @@ async fn stream_prompt(
 
             // Final edit
             let final_content = compose_display(&tool_lines, &text_buf);
+            // If ACP returned both an error and partial text, show both.
+            // This can happen when the agent started producing content before hitting an error
+            // (e.g. context length limit, rate limit mid-stream). Showing both gives users
+            // full context rather than hiding the partial response.
             let final_content = if final_content.is_empty() {
                 if let Some(err) = response_error {
                     format!("⚠️ {}", err)
@@ -374,11 +378,7 @@ pub fn format_user_error(message: &str) -> String {
         return "**Connection Lost**\nThe connection to the agent was lost, please try again.".to_string();
     }
     if msg_lower.contains("failed to spawn") || msg_lower.contains("no such file") {
-        let cmd = message
-            .split_whitespace()
-            .find(|w| w.contains("claude") || w.contains("agent"))
-            .unwrap_or("the agent");
-        return format!("**Agent Not Found**\nCould not start {} — please check your configuration.", cmd);
+        return "**Agent Not Found**\nCould not start the agent — please check your configuration.".to_string();
     }
     if msg_lower.contains("pool exhausted") {
         return "**Service Busy**\nAll agent sessions are in use, please try again shortly.".to_string();
@@ -397,7 +397,8 @@ pub fn format_user_error(message: &str) -> String {
 
 /// Format coded error from ACP agent for display in Discord.
 /// Used for response errors that have a JSON-RPC or HTTP status code.
-fn format_coded_error(code: i64, message: &str) -> String {
+/// Public for reuse by other adapters (e.g. Slack).
+pub fn format_coded_error(code: i64, message: &str) -> String {
     let prefix = match code {
         400 => "**Bad Request**",
         401 => "**Unauthorized**",
@@ -461,4 +462,130 @@ async fn get_or_create_thread(ctx: &Context, msg: &Message, prompt: &str) -> any
         .await?;
 
     Ok(thread.id.get())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── format_user_error tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_format_user_error_timeout() {
+        let result = format_user_error("timeout waiting for session/new response");
+        assert!(result.contains("Request Timeout"));
+        assert!(result.contains("session/new"));
+    }
+
+    #[test]
+    fn test_format_user_error_connection_closed() {
+        let result = format_user_error("connection closed");
+        assert!(result.contains("Connection Lost"));
+    }
+
+    #[test]
+    fn test_format_user_error_channel_closed() {
+        let result = format_user_error("channel closed");
+        assert!(result.contains("Connection Lost"));
+    }
+
+    #[test]
+    fn test_format_user_error_failed_to_spawn() {
+        let result = format_user_error("failed to spawn /some/path: No such file");
+        assert!(result.contains("Agent Not Found"));
+        assert!(result.contains("the agent")); // generic, no provider name
+    }
+
+    #[test]
+    fn test_format_user_error_no_such_file() {
+        let result = format_user_error("binary /usr/bin/nonexistent: no such file");
+        assert!(result.contains("Agent Not Found"));
+    }
+
+    #[test]
+    fn test_format_user_error_pool_exhausted() {
+        let result = format_user_error("pool exhausted (5 sessions)");
+        assert!(result.contains("Service Busy"));
+    }
+
+    #[test]
+    fn test_format_user_error_invalid_api_key() {
+        let result = format_user_error("invalid api key");
+        assert!(result.contains("Unauthorized"));
+    }
+
+    #[test]
+    fn test_format_user_error_unauthorized() {
+        let result = format_user_error("unauthorized: token rejected");
+        assert!(result.contains("Unauthorized"));
+    }
+
+    #[test]
+    fn test_format_user_error_unknown() {
+        let result = format_user_error("something went wrong");
+        assert!(result.contains("Error"));
+        assert!(result.contains("something went wrong"));
+    }
+
+    #[test]
+    fn test_format_user_error_empty() {
+        let result = format_user_error("");
+        assert!(result.contains("Error"));
+        assert!(result.contains("unknown"));
+    }
+
+    #[test]
+    fn test_format_user_error_case_insensitive() {
+        assert!(format_user_error("TIMEOUT WAITING FOR foo").contains("Timeout"));
+        assert!(format_user_error("CONNECTION CLOSED").contains("Connection"));
+        assert!(format_user_error("POOL EXHAUSTED").contains("Busy"));
+    }
+
+    // ─── format_coded_error tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_format_coded_error_401() {
+        let result = format_coded_error(401, "invalid token");
+        assert!(result.contains("Unauthorized"));
+        assert!(result.contains("401"));
+        assert!(result.contains("invalid token"));
+    }
+
+    #[test]
+    fn test_format_coded_error_429() {
+        let result = format_coded_error(429, "");
+        assert!(result.contains("Rate Limited"));
+        assert!(result.contains("429"));
+        assert!(!result.contains("\n")); // no message, no newline
+    }
+
+    #[test]
+    fn test_format_coded_error_503() {
+        let result = format_coded_error(503, "service unavailable");
+        assert!(result.contains("Service Unavailable"));
+        assert!(result.contains("503"));
+        assert!(result.contains("service unavailable"));
+    }
+
+    #[test]
+    fn test_format_coded_error_json_rpc() {
+        let result = format_coded_error(-32602, "missing required parameter");
+        assert!(result.contains("Invalid Params"));
+        assert!(result.contains("-32602"));
+    }
+
+    #[test]
+    fn test_format_coded_error_connection_error() {
+        let result = format_coded_error(-32000, "connection refused");
+        assert!(result.contains("Connection Error"));
+        assert!(result.contains("-32000"));
+    }
+
+    #[test]
+    fn test_format_coded_error_unknown_code() {
+        let result = format_coded_error(999, "something happened");
+        assert!(result.contains("Error"));
+        assert!(result.contains("999"));
+        assert!(result.contains("something happened"));
+    }
 }
