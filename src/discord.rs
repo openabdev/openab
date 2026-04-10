@@ -219,7 +219,18 @@ async fn stream_prompt(
             let (buf_tx, buf_rx) = watch::channel(initial);
 
             let mut text_buf = String::new();
-            let mut tool_lines: Vec<String> = Vec::new();
+            // Accumulated thinking content from agent_thought_chunk events.
+            // Rendered above tool_lines + text as a blockquote so users can
+            // see the bot's reasoning before / alongside its actions.
+            let mut thought_buf = String::new();
+            // Tool calls indexed by toolCallId. Vec preserves first-seen
+            // order. We store id + title + state separately so a ToolDone
+            // event that arrives without a refreshed title (claude-agent-acp's
+            // update events don't always re-send the title field) can still
+            // reuse the title we already learned from a prior
+            // tool_call_update — only the icon flips 🔧 → ✅ / ❌. Rendering
+            // happens on the fly in compose_display().
+            let mut tool_lines: Vec<ToolEntry> = Vec::new();
             let current_msg_id = msg_id;
 
             if reset {
@@ -276,23 +287,79 @@ async fn stream_prompt(
                                 // Reaction: back to thinking after tools
                             }
                             text_buf.push_str(&t);
-                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
+                            let _ = buf_tx.send(compose_display(&tool_lines, &thought_buf, &text_buf));
                         }
-                        AcpEvent::Thinking => {
+                        AcpEvent::Thinking(t) => {
                             reactions.set_thinking().await;
-                        }
-                        AcpEvent::ToolStart { title, .. } if !title.is_empty() => {
-                            reactions.set_tool(&title).await;
-                            tool_lines.push(format!("🔧 `{title}`..."));
-                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
-                        }
-                        AcpEvent::ToolDone { title, status, .. } => {
-                            reactions.set_thinking().await;
-                            let icon = if status == "completed" { "✅" } else { "❌" };
-                            if let Some(line) = tool_lines.iter_mut().rev().find(|l| l.contains(&title)) {
-                                *line = format!("{icon} `{title}`");
+                            if !t.is_empty() {
+                                // claude-agent-acp emits both `thinking`
+                                // (new block) and `thinking_delta`
+                                // (continuation) events as the same
+                                // `agent_thought_chunk` shape, so we can't
+                                // tell block boundaries from the protocol
+                                // alone. Heuristic: if the previous chunk
+                                // ended with sentence-ending punctuation
+                                // and the new one starts with a letter
+                                // (no leading whitespace), it's almost
+                                // certainly a new thinking block — insert
+                                // a paragraph break so they don't visually
+                                // run together as ".There's".
+                                if needs_thinking_separator(&thought_buf, &t) {
+                                    thought_buf.push_str("\n\n");
+                                }
+                                thought_buf.push_str(&t);
+                                let _ = buf_tx.send(compose_display(&tool_lines, &thought_buf, &text_buf));
                             }
-                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
+                        }
+                        AcpEvent::ToolStart { id, title } if !title.is_empty() => {
+                            reactions.set_tool(&title).await;
+                            let title = sanitize_title(&title);
+                            // Dedupe by toolCallId: replace if we've already
+                            // seen this id, otherwise append a new entry.
+                            // claude-agent-acp emits a placeholder title
+                            // ("Terminal", "Edit", etc.) on the first event
+                            // and refines it via tool_call_update; without
+                            // dedup the placeholder and refined version
+                            // appear as two separate orphaned lines.
+                            if let Some(slot) = tool_lines.iter_mut().find(|e| e.id == id) {
+                                slot.title = title;
+                                slot.state = ToolState::Running;
+                            } else {
+                                tool_lines.push(ToolEntry {
+                                    id,
+                                    title,
+                                    state: ToolState::Running,
+                                });
+                            }
+                            let _ = buf_tx.send(compose_display(&tool_lines, &thought_buf, &text_buf));
+                        }
+                        AcpEvent::ToolDone { id, title, status } => {
+                            reactions.set_thinking().await;
+                            let new_state = if status == "completed" {
+                                ToolState::Completed
+                            } else {
+                                ToolState::Failed
+                            };
+                            // Find by id (the title is unreliable — substring
+                            // match against the placeholder "Terminal" would
+                            // never find the refined entry). Preserve the
+                            // existing title if the Done event omits it.
+                            if let Some(slot) = tool_lines.iter_mut().find(|e| e.id == id) {
+                                if !title.is_empty() {
+                                    slot.title = sanitize_title(&title);
+                                }
+                                slot.state = new_state;
+                            } else if !title.is_empty() {
+                                // Done arrived without a prior Start (rare
+                                // race) — record it so we still show
+                                // something.
+                                tool_lines.push(ToolEntry {
+                                    id,
+                                    title: sanitize_title(&title),
+                                    state: new_state,
+                                });
+                            }
+                            let _ = buf_tx.send(compose_display(&tool_lines, &thought_buf, &text_buf));
                         }
                         _ => {}
                     }
@@ -304,7 +371,7 @@ async fn stream_prompt(
             let _ = edit_handle.await;
 
             // Final edit
-            let final_content = compose_display(&tool_lines, &text_buf);
+            let final_content = compose_display(&tool_lines, &thought_buf, &text_buf);
             let final_content = if final_content.is_empty() {
                 "_(no response)_".to_string()
             } else {
@@ -326,11 +393,80 @@ async fn stream_prompt(
     .await
 }
 
-fn compose_display(tool_lines: &[String], text: &str) -> String {
+/// Flatten a tool-call title into a single line that's safe to render
+/// inside Discord inline-code spans. Discord renders single-backtick
+/// code on a single line only, so multi-line shell commands (heredocs,
+/// `&&`-chained commands split across lines) appear truncated; we
+/// collapse newlines to ` ; ` and rewrite embedded backticks so they
+/// don't break the wrapping span.
+fn sanitize_title(title: &str) -> String {
+    title.replace('\r', "").replace('\n', " ; ").replace('`', "'")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolState {
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolEntry {
+    pub id: String,
+    pub title: String,
+    pub state: ToolState,
+}
+
+impl ToolEntry {
+    fn render(&self) -> String {
+        let icon = match self.state {
+            ToolState::Running => "🔧",
+            ToolState::Completed => "✅",
+            ToolState::Failed => "❌",
+        };
+        let suffix = if self.state == ToolState::Running { "..." } else { "" };
+        format!("{icon} `{}`{}", self.title, suffix)
+    }
+}
+
+/// Heuristic for detecting a thinking block boundary in a stream of
+/// `agent_thought_chunk` deltas. claude-agent-acp doesn't tag the first
+/// delta of a new block, so we infer it: if the previous chunk ended in
+/// sentence-ending punctuation (`. ! ? 。 ! ?`) and the new chunk starts
+/// with a letter (no leading whitespace), they're almost certainly two
+/// separate thoughts that need a paragraph break.
+fn needs_thinking_separator(prev: &str, new: &str) -> bool {
+    if prev.is_empty() || new.is_empty() {
+        return false;
+    }
+    let last = match prev.chars().last() {
+        Some(c) => c,
+        None => return false,
+    };
+    let first = match new.chars().next() {
+        Some(c) => c,
+        None => return false,
+    };
+    let sentence_end = matches!(last, '.' | '!' | '?' | '。' | '！' | '？');
+    let starts_word = first.is_alphabetic();
+    sentence_end && starts_word
+}
+
+fn compose_display(tool_lines: &[ToolEntry], thought: &str, text: &str) -> String {
     let mut out = String::new();
-    if !tool_lines.is_empty() {
-        for line in tool_lines {
+    let trimmed_thought = thought.trim();
+    if !trimmed_thought.is_empty() {
+        out.push_str("> 🤔 _Thinking_\n");
+        for line in trimmed_thought.lines() {
+            out.push_str("> ");
             out.push_str(line);
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    if !tool_lines.is_empty() {
+        for entry in tool_lines {
+            out.push_str(&entry.render());
             out.push('\n');
         }
         out.push('\n');
