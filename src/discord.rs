@@ -442,3 +442,188 @@ async fn get_or_create_thread(ctx: &Context, msg: &Message, prompt: &str) -> any
 
     Ok(thread.id.get())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::MultiAgentConfig;
+
+    fn test_config(max_turns: u32, cooldown: u64) -> MultiAgentConfig {
+        MultiAgentConfig {
+            allow_delegation: true,
+            max_ping_pong_turns: max_turns,
+            cooldown_secs: cooldown,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ThreadTracker: max_ping_pong_turns (inspired by CrewAI max_iter tests)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_new_thread_always_allowed() {
+        let tracker = ThreadTracker::new();
+        let config = test_config(5, 0);
+        assert!(tracker.should_respond("thread-1", &config));
+    }
+
+    #[test]
+    fn test_max_turns_blocks_after_limit() {
+        let mut tracker = ThreadTracker::new();
+        let config = test_config(3, 0);
+
+        // Record 3 turns
+        for _ in 0..3 {
+            assert!(tracker.should_respond("thread-1", &config));
+            tracker.record("thread-1");
+        }
+
+        // 4th should be blocked
+        assert!(!tracker.should_respond("thread-1", &config));
+    }
+
+    #[test]
+    fn test_zero_turns_fire_and_forget() {
+        let mut tracker = ThreadTracker::new();
+        let config = test_config(0, 0); // fire-and-forget
+
+        // First message in a new thread is allowed (no entry yet)
+        assert!(tracker.should_respond("thread-1", &config));
+
+        // After one record, should block (0 >= 0)
+        tracker.record("thread-1");
+        assert!(!tracker.should_respond("thread-1", &config));
+    }
+
+    #[test]
+    fn test_different_threads_independent() {
+        let mut tracker = ThreadTracker::new();
+        let config = test_config(2, 0);
+
+        tracker.record("thread-a");
+        tracker.record("thread-a");
+
+        // thread-a blocked
+        assert!(!tracker.should_respond("thread-a", &config));
+        // thread-b still allowed
+        assert!(tracker.should_respond("thread-b", &config));
+    }
+
+    // -----------------------------------------------------------------------
+    // ThreadTracker: human reset (inspired by CrewAI delegation reset)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reset_clears_turn_count() {
+        let mut tracker = ThreadTracker::new();
+        let config = test_config(2, 0);
+
+        tracker.record("thread-1");
+        tracker.record("thread-1");
+        assert!(!tracker.should_respond("thread-1", &config));
+
+        // Human intervenes — reset
+        tracker.reset("thread-1");
+        assert!(tracker.should_respond("thread-1", &config));
+    }
+
+    #[test]
+    fn test_reset_nonexistent_thread_is_noop() {
+        let mut tracker = ThreadTracker::new();
+        tracker.reset("does-not-exist"); // should not panic
+    }
+
+    // -----------------------------------------------------------------------
+    // ThreadTracker: cooldown
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cooldown_blocks_rapid_responses() {
+        let mut tracker = ThreadTracker::new();
+        let config = test_config(10, 60); // 60 second cooldown
+
+        tracker.record("thread-1");
+
+        // Immediately after — should be blocked by cooldown
+        assert!(!tracker.should_respond("thread-1", &config));
+    }
+
+    #[test]
+    fn test_no_cooldown_allows_immediate() {
+        let mut tracker = ThreadTracker::new();
+        let config = test_config(10, 0); // no cooldown
+
+        tracker.record("thread-1");
+        assert!(tracker.should_respond("thread-1", &config));
+    }
+
+    // -----------------------------------------------------------------------
+    // REPLY_SKIP detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reply_skip_exact_match() {
+        assert_eq!("REPLY_SKIP".trim(), REPLY_SKIP);
+    }
+
+    #[test]
+    fn test_reply_skip_with_whitespace() {
+        assert_eq!("  REPLY_SKIP  ".trim(), REPLY_SKIP);
+    }
+
+    #[test]
+    fn test_reply_skip_not_substring() {
+        assert_ne!("I will REPLY_SKIP this".trim(), REPLY_SKIP);
+    }
+
+    #[test]
+    fn test_normal_response_not_skip() {
+        assert_ne!("這是正常的回覆".trim(), REPLY_SKIP);
+    }
+
+    // -----------------------------------------------------------------------
+    // MultiAgentConfig defaults
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_default_config() {
+        let config = MultiAgentConfig::default();
+        assert!(config.allow_delegation);
+        assert_eq!(config.max_ping_pong_turns, 5);
+        assert_eq!(config.cooldown_secs, 10);
+    }
+
+    // -----------------------------------------------------------------------
+    // Config parsing (toml)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_omitted_uses_defaults() {
+        let toml_str = "";
+        let config: MultiAgentConfig = toml::from_str(toml_str).unwrap_or_default();
+        assert!(config.allow_delegation);
+        assert_eq!(config.max_ping_pong_turns, 5);
+    }
+
+    #[test]
+    fn test_config_leaf_agent() {
+        let toml_str = r#"
+            allow_delegation = false
+            max_ping_pong_turns = 1
+            cooldown_secs = 0
+        "#;
+        let config: MultiAgentConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.allow_delegation);
+        assert_eq!(config.max_ping_pong_turns, 1);
+        assert_eq!(config.cooldown_secs, 0);
+    }
+
+    #[test]
+    fn test_config_fire_and_forget() {
+        let toml_str = r#"
+            max_ping_pong_turns = 0
+        "#;
+        let config: MultiAgentConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.max_ping_pong_turns, 0);
+    }
+}
