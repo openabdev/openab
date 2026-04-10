@@ -11,7 +11,42 @@ pub struct Config {
     pub pool: PoolConfig,
     #[serde(default)]
     pub reactions: ReactionsConfig,
+    #[serde(default)]
+    pub multi_agent: MultiAgentConfig,
 }
+
+/// Multi-agent interaction rules (inspired by OpenClaw + CrewAI).
+///
+/// Controls how this agent participates in agent-to-agent conversations.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MultiAgentConfig {
+    /// Whether this agent is allowed to delegate to other agents.
+    /// Set to false for leaf/executor agents (e.g., coders).
+    #[serde(default = "default_true")]
+    pub allow_delegation: bool,
+
+    /// Max ping-pong turns in a thread before this agent stops responding.
+    /// 0 = fire-and-forget (respond once, never follow up).
+    #[serde(default = "default_max_turns")]
+    pub max_ping_pong_turns: u32,
+
+    /// Cooldown in seconds before responding to the same thread again.
+    #[serde(default = "default_cooldown")]
+    pub cooldown_secs: u64,
+}
+
+impl Default for MultiAgentConfig {
+    fn default() -> Self {
+        Self {
+            allow_delegation: true,
+            max_ping_pong_turns: default_max_turns(),
+            cooldown_secs: default_cooldown(),
+        }
+    }
+}
+
+fn default_max_turns() -> u32 { 5 }
+fn default_cooldown() -> u64 { 10 }
 
 #[derive(Debug, Deserialize)]
 pub struct DiscordConfig {
@@ -20,6 +55,8 @@ pub struct DiscordConfig {
     pub allowed_channels: Vec<String>,
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    #[serde(default)]
+    pub respond_without_mention: bool,
 }
 
 #[derive(Debug, Deserialize)]

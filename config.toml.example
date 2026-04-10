@@ -30,6 +30,13 @@ working_dir = "/home/agent"
 max_sessions = 10
 session_ttl_hours = 24
 
+# Multi-agent interaction rules (inspired by OpenClaw + CrewAI)
+# Controls how this agent participates in agent-to-agent conversations
+[multi_agent]
+allow_delegation = true    # set false for leaf agents (coders) to prevent delegation chains
+max_ping_pong_turns = 5    # max back-and-forth turns per thread (0 = fire-and-forget)
+cooldown_secs = 10         # seconds before responding to the same thread again
+
 [reactions]
 enabled = true
 remove_after_reply = false

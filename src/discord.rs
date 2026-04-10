@@ -1,5 +1,5 @@
 use crate::acp::{classify_notification, AcpEvent, SessionPool};
-use crate::config::ReactionsConfig;
+use crate::config::{MultiAgentConfig, ReactionsConfig};
 use crate::format;
 use crate::reactions::StatusReactionController;
 use serenity::async_trait;
@@ -7,16 +7,58 @@ use serenity::model::channel::{Message, ReactionType};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId};
 use serenity::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::watch;
+use std::time::Instant;
+use tokio::sync::{watch, RwLock};
 use tracing::{error, info};
+
+/// Tracks per-thread turn counts and cooldowns for multi-agent loop prevention.
+pub struct ThreadTracker {
+    /// thread_key -> (turn_count, last_response_time)
+    threads: HashMap<String, (u32, Instant)>,
+}
+
+impl ThreadTracker {
+    pub fn new() -> Self {
+        Self { threads: HashMap::new() }
+    }
+
+    pub fn should_respond(&self, thread_key: &str, config: &MultiAgentConfig) -> bool {
+        if let Some((turns, last_time)) = self.threads.get(thread_key) {
+            if *turns >= config.max_ping_pong_turns {
+                return false;
+            }
+            if last_time.elapsed().as_secs() < config.cooldown_secs {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn record(&mut self, thread_key: &str) {
+        let entry = self.threads.entry(thread_key.to_string()).or_insert((0, Instant::now()));
+        entry.0 += 1;
+        entry.1 = Instant::now();
+    }
+
+    #[allow(dead_code)]
+    pub fn reset(&mut self, thread_key: &str) {
+        self.threads.remove(thread_key);
+    }
+}
+
+/// Agent response content after processing, used to detect REPLY_SKIP.
+const REPLY_SKIP: &str = "REPLY_SKIP";
 
 pub struct Handler {
     pub pool: Arc<SessionPool>,
     pub allowed_channels: HashSet<u64>,
     pub allowed_users: HashSet<u64>,
     pub reactions_config: ReactionsConfig,
+    pub respond_without_mention: bool,
+    pub multi_agent: MultiAgentConfig,
+    pub thread_tracker: Arc<RwLock<ThreadTracker>>,
 }
 
 #[async_trait]
@@ -61,8 +103,18 @@ impl EventHandler for Handler {
         if !in_allowed_channel && !in_thread {
             return;
         }
-        if !in_thread && !is_mentioned {
+        if !in_thread && !is_mentioned && !self.respond_without_mention {
             return;
+        }
+
+        // Multi-agent: check thread turn limit and cooldown
+        if in_thread {
+            let thread_key = msg.channel_id.get().to_string();
+            let tracker = self.thread_tracker.read().await;
+            if !tracker.should_respond(&thread_key, &self.multi_agent) {
+                tracing::debug!(thread = %thread_key, "blocked by turn limit or cooldown");
+                return;
+            }
         }
 
         if !self.allowed_users.is_empty() && !self.allowed_users.contains(&msg.author.id.get()) {
@@ -155,8 +207,20 @@ impl EventHandler for Handler {
         )
         .await;
 
+        // Multi-agent: track turns and detect REPLY_SKIP
         match &result {
-            Ok(()) => reactions.set_done().await,
+            Ok(response_text) => {
+                if response_text.trim() == REPLY_SKIP {
+                    // Agent voluntarily skipped — delete the placeholder message
+                    let _ = thread_channel.delete_message(&ctx.http, thinking_msg.id).await;
+                    tracing::info!(thread = %thread_key, "agent replied REPLY_SKIP, suppressing");
+                } else {
+                    // Record the turn
+                    let mut tracker = self.thread_tracker.write().await;
+                    tracker.record(&thread_key);
+                }
+                reactions.set_done().await;
+            }
             Err(_) => reactions.set_error().await,
         }
 
@@ -196,7 +260,7 @@ async fn stream_prompt(
     channel: ChannelId,
     msg_id: MessageId,
     reactions: Arc<StatusReactionController>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let prompt = prompt.to_string();
     let reactions = reactions.clone();
 
@@ -320,7 +384,7 @@ async fn stream_prompt(
                 }
             }
 
-            Ok(())
+            Ok(text_buf)
         })
     })
     .await

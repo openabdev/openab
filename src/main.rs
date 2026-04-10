@@ -41,11 +41,21 @@ async fn main() -> anyhow::Result<()> {
     let allowed_users = parse_id_set(&cfg.discord.allowed_users, "allowed_users")?;
     info!(channels = allowed_channels.len(), users = allowed_users.len(), "parsed allowlists");
 
+    info!(
+        allow_delegation = cfg.multi_agent.allow_delegation,
+        max_turns = cfg.multi_agent.max_ping_pong_turns,
+        cooldown = cfg.multi_agent.cooldown_secs,
+        "multi-agent config"
+    );
+
     let handler = discord::Handler {
         pool: pool.clone(),
         allowed_channels,
         allowed_users,
         reactions_config: cfg.reactions,
+        respond_without_mention: cfg.discord.respond_without_mention,
+        multi_agent: cfg.multi_agent,
+        thread_tracker: Arc::new(tokio::sync::RwLock::new(discord::ThreadTracker::new())),
     };
 
     let intents = GatewayIntents::GUILD_MESSAGES
