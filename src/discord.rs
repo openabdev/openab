@@ -261,6 +261,9 @@ async fn download_and_encode_image(attachment: &serenity::model::channel::Attach
         debug!(filename = %attachment.filename, "skipping non-image attachment (no matching content-type or extension)");
         return None;
     };
+    // Strip MIME type parameters (e.g. "image/jpeg; charset=utf-8" → "image/jpeg")
+    // Downstream LLM APIs (Claude, OpenAI, Gemini) reject MIME types with parameters
+    let mime = mime.split(';').next().unwrap_or(mime).trim();
     if !mime.starts_with("image/") {
         debug!(filename = %attachment.filename, mime = %mime, "skipping non-image attachment");
         return None;
