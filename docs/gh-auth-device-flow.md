@@ -67,11 +67,24 @@ gh auth status
 
 ## Steering / prompt snippet
 
-If you want your agent to always handle `gh login` correctly, add this to your agent's steering config:
+To make your agent always handle `gh login` correctly, create `~/.kiro/steering/gh.md`:
 
-```
-When asked to "gh login", always use:
+```bash
+mkdir -p ~/.kiro/steering
+cat > ~/.kiro/steering/gh.md << 'EOF'
+# GitHub CLI
+
+## Device Flow Login
+
+When asked to "gh login", always use nohup + background + read log:
+
+```bash
 nohup gh auth login --hostname github.com --git-protocol https -p https -w > /tmp/gh-login.log 2>&1 &
 sleep 3 && cat /tmp/gh-login.log
-Never use timeout. Always use nohup + background + read log.
 ```
+
+Never use `timeout`. The shell tool is synchronous — it blocks until the command finishes, so stdout won't be visible until then. `nohup` runs it in the background, `sleep 3 && cat` grabs the code immediately.
+EOF
+```
+
+Kiro CLI automatically picks up `~/.kiro/steering/*.md` files as persistent context, so the agent will remember this across all sessions.
