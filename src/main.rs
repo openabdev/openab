@@ -1,6 +1,7 @@
 mod acp;
 mod config;
 mod discord;
+mod error_display;
 mod format;
 mod reactions;
 

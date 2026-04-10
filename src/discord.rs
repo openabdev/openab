@@ -1,5 +1,6 @@
 use crate::acp::{classify_notification, AcpEvent, SessionPool};
 use crate::config::ReactionsConfig;
+use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
 use crate::reactions::StatusReactionController;
 use serenity::async_trait;
@@ -8,6 +9,7 @@ use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId};
 use serenity::prelude::*;
 use std::collections::HashSet;
+use std::sync::LazyLock;
 use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::{error, info};
@@ -127,7 +129,8 @@ impl EventHandler for Handler {
 
         let thread_key = thread_id.to_string();
         if let Err(e) = self.pool.get_or_create(&thread_key).await {
-            let _ = edit(&ctx, thread_channel, thinking_msg.id, "⚠️ Failed to start agent.").await;
+            let msg = format_user_error(&e.to_string());
+            let _ = edit(&ctx, thread_channel, thinking_msg.id, &format!("⚠️ {}", msg)).await;
             error!("pool error: {e}");
             return;
         }
@@ -263,8 +266,13 @@ async fn stream_prompt(
 
             // Process ACP notifications
             let mut got_first_text = false;
+            let mut response_error: Option<String> = None;
             while let Some(notification) = rx.recv().await {
                 if notification.id.is_some() {
+                    // Capture error from ACP response to display in Discord
+                    if let Some(ref err) = notification.error {
+                        response_error = Some(format_coded_error(err.code, &err.message));
+                    }
                     break;
                 }
 
@@ -305,8 +313,18 @@ async fn stream_prompt(
 
             // Final edit
             let final_content = compose_display(&tool_lines, &text_buf);
+            // If ACP returned both an error and partial text, show both.
+            // This can happen when the agent started producing content before hitting an error
+            // (e.g. context length limit, rate limit mid-stream). Showing both gives users
+            // full context rather than hiding the partial response.
             let final_content = if final_content.is_empty() {
-                "_(no response)_".to_string()
+                if let Some(err) = response_error {
+                    format!("⚠️ {}", err)
+                } else {
+                    "_(no response)_".to_string()
+                }
+            } else if let Some(err) = response_error {
+                format!("⚠️ {}\n\n{}", err, final_content)
             } else {
                 final_content
             };
@@ -339,9 +357,12 @@ fn compose_display(tool_lines: &[String], text: &str) -> String {
     out
 }
 
+static MENTION_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"<@[!&]?\d+>").unwrap()
+});
+
 fn strip_mention(content: &str) -> String {
-    let re = regex::Regex::new(r"<@[!&]?\d+>").unwrap();
-    re.replace_all(content, "").trim().to_string()
+    MENTION_RE.replace_all(content, "").trim().to_string()
 }
 
 fn shorten_thread_name(prompt: &str) -> String {
@@ -378,3 +399,4 @@ async fn get_or_create_thread(ctx: &Context, msg: &Message, prompt: &str) -> any
 
     Ok(thread.id.get())
 }
+
