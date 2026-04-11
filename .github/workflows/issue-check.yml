@@ -26,7 +26,39 @@ jobs:
             };
 
             const type = Object.keys(rules).find(k => labels.includes(k));
-            if (!type) return;
+
+            // Find old check comment
+            const comments = await github.rest.issues.listComments({
+              ...context.repo,
+              issue_number: issue.number
+            });
+            const old = comments.data.find(c => c.body.includes(marker));
+
+            if (!type) {
+              // No template label — likely created via API/CLI bypassing templates
+              const msg = `${marker}\n⚠️ This issue was not created using an issue template. Please use one of the available templates to ensure your issue is processed.\n\nAvailable templates: Bug Report, Feature Request, Documentation, Guidance`;
+
+              if (old) {
+                await github.rest.issues.deleteComment({
+                  ...context.repo,
+                  comment_id: old.id
+                });
+              }
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: issue.number,
+                body: msg
+              });
+
+              if (!labels.includes('incomplete')) {
+                await github.rest.issues.addLabels({
+                  ...context.repo,
+                  issue_number: issue.number,
+                  labels: ['incomplete']
+                });
+              }
+              return;
+            }
 
             const missing = rules[type].filter(field => {
               const regex = new RegExp(
@@ -37,13 +69,6 @@ jobs:
               const content = match[1].trim();
               return !content || content === '_No response_';
             });
-
-            // Find old check comment
-            const comments = await github.rest.issues.listComments({
-              ...context.repo,
-              issue_number: issue.number
-            });
-            const old = comments.data.find(c => c.body.includes(marker));
 
             if (missing.length > 0) {
               const list = missing.map(f => `- [ ] **${f}**`).join('\n');
