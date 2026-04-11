@@ -20,6 +20,48 @@ pub struct DiscordConfig {
     pub allowed_channels: Vec<String>,
     #[serde(default = "default_auto_archive_duration")]
     pub auto_archive_duration: u32,
+    #[serde(default = "default_true")]
+    pub require_mention: bool,
+    #[serde(default)]
+    pub ignore_other_mentions: bool,
+    #[serde(default = "default_thread_name_mode")]
+    pub thread_name_mode: String,
+    #[serde(default)]
+    pub channels: HashMap<String, ChannelConfig>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct ChannelConfig {
+    pub auto_archive_duration: Option<u32>,
+    pub require_mention: Option<bool>,
+    pub ignore_other_mentions: Option<bool>,
+    pub thread_name_mode: Option<String>,
+}
+
+impl DiscordConfig {
+    pub fn effective_archive_duration(&self, channel_id: &str) -> u32 {
+        self.channels.get(channel_id)
+            .and_then(|c| c.auto_archive_duration)
+            .unwrap_or(self.auto_archive_duration)
+    }
+
+    pub fn effective_require_mention(&self, channel_id: &str) -> bool {
+        self.channels.get(channel_id)
+            .and_then(|c| c.require_mention)
+            .unwrap_or(self.require_mention)
+    }
+
+    pub fn effective_ignore_other_mentions(&self, channel_id: &str) -> bool {
+        self.channels.get(channel_id)
+            .and_then(|c| c.ignore_other_mentions)
+            .unwrap_or(self.ignore_other_mentions)
+    }
+
+    pub fn effective_thread_name_mode(&self, channel_id: &str) -> &str {
+        self.channels.get(channel_id)
+            .and_then(|c| c.thread_name_mode.as_deref())
+            .unwrap_or(&self.thread_name_mode)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,6 +130,7 @@ pub struct ReactionTiming {
 // --- defaults ---
 
 fn default_auto_archive_duration() -> u32 { 1440 }
+fn default_thread_name_mode() -> String { "truncate".into() }
 fn default_working_dir() -> String { "/tmp".into() }
 fn default_max_sessions() -> usize { 10 }
 fn default_ttl_hours() -> u64 { 24 }
@@ -165,6 +208,17 @@ pub fn load_config(path: &Path) -> anyhow::Result<Config> {
             "invalid auto_archive_duration: {}. Must be one of: 60 (1h), 1440 (1d), 4320 (3d), 10080 (1w)",
             config.discord.auto_archive_duration
         );
+    }
+    for (channel_id, channel_cfg) in &config.discord.channels {
+        if let Some(duration) = channel_cfg.auto_archive_duration {
+            if !VALID_ARCHIVE_DURATIONS.contains(&duration) {
+                anyhow::bail!(
+                    "invalid auto_archive_duration for channel {}: {}. Must be one of: 60 (1h), 1440 (1d), 4320 (3d), 10080 (1w)",
+                    channel_id,
+                    duration
+                );
+            }
+        }
     }
     Ok(config)
 }

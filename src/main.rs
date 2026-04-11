@@ -48,6 +48,9 @@ async fn main() -> anyhow::Result<()> {
         allowed_channels,
         reactions_config: cfg.reactions,
         auto_archive_duration: cfg.discord.auto_archive_duration,
+        require_mention: cfg.discord.require_mention,
+        ignore_other_mentions: cfg.discord.ignore_other_mentions,
+        channels: cfg.discord.channels.clone(),
     };
 
     let intents = GatewayIntents::GUILD_MESSAGES

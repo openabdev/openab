@@ -1,5 +1,5 @@
 use crate::acp::{classify_notification, AcpEvent, SessionPool};
-use crate::config::ReactionsConfig;
+use crate::config::{ChannelConfig, ReactionsConfig};
 use crate::format;
 use crate::reactions::StatusReactionController;
 use serenity::async_trait;
@@ -7,7 +7,7 @@ use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId};
 use serenity::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::{error, info};
@@ -17,6 +17,9 @@ pub struct Handler {
     pub allowed_channels: HashSet<u64>,
     pub reactions_config: ReactionsConfig,
     pub auto_archive_duration: u32,
+    pub require_mention: bool,
+    pub ignore_other_mentions: bool,
+    pub channels: HashMap<String, ChannelConfig>,
 }
 
 #[async_trait]
@@ -61,8 +64,29 @@ impl EventHandler for Handler {
         if !in_allowed_channel && !in_thread {
             return;
         }
-        if !in_thread && !is_mentioned {
-            return;
+
+        // Resolve per-channel settings (use parent channel for threads)
+        let effective_channel_id = channel_id.to_string();
+        let require_mention = self.channels.get(&effective_channel_id)
+            .and_then(|c| c.require_mention)
+            .unwrap_or(self.require_mention);
+        let ignore_other_mentions = self.channels.get(&effective_channel_id)
+            .and_then(|c| c.ignore_other_mentions)
+            .unwrap_or(self.ignore_other_mentions);
+        let effective_archive_duration = self.channels.get(&effective_channel_id)
+            .and_then(|c| c.auto_archive_duration)
+            .unwrap_or(self.auto_archive_duration);
+
+        if !in_thread {
+            // When ignore_other_mentions is enabled, skip messages that mention
+            // other users/bots but do NOT mention this bot
+            if ignore_other_mentions && !is_mentioned && !msg.mentions.is_empty() {
+                return;
+            }
+
+            if require_mention && !is_mentioned {
+                return;
+            }
         }
 
         let prompt = if is_mentioned {
@@ -98,7 +122,7 @@ impl EventHandler for Handler {
         let thread_id = if in_thread {
             msg.channel_id.get()
         } else {
-            match get_or_create_thread(&ctx, &msg, &prompt, self.auto_archive_duration).await {
+            match get_or_create_thread(&ctx, &msg, &prompt, effective_archive_duration).await {
                 Ok(id) => id,
                 Err(e) => {
                     error!("failed to create thread: {e}");
