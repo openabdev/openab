@@ -29,6 +29,19 @@ const sdkPromise = import('file:///' + SDK_PATH);
 // → cheap model; terminal copilot-cli keeps its own config-level default.
 const DEFAULT_MODEL = process.env.COPILOT_DEFAULT_MODEL || 'gpt-5-mini';
 
+// System message appended to every new session. Enforces response language
+// preferences + Discord-aware formatting hints. Override via
+// COPILOT_APPEND_SYSTEM env var.
+const DEFAULT_APPEND_SYSTEM =
+  process.env.COPILOT_APPEND_SYSTEM ||
+  [
+    'Always respond in **Traditional Chinese (zh-TW / 繁體中文)**. Never use Simplified Chinese.',
+    'Use 台灣 conventions (e.g. 軟體 not 软件, 檔案 not 文件, 程式 not 程序).',
+    'Technical terms may remain in English.',
+    'You are running inside a Discord bot, so format replies for Discord Markdown (no tables — use bullet points).',
+    'Keep responses concise unless the user asks for depth.',
+  ].join('\n');
+
 // ---- stdio JSON-RPC plumbing ---------------------------------------
 
 let stdinBuf = '';
@@ -237,6 +250,10 @@ async function handleSessionNew(params) {
   const session = await c.createSession({
     cwd,
     onPermissionRequest: sdk.approveAll || (async () => ({ kind: 'approved' })),
+    systemMessage: {
+      mode: 'append',
+      content: DEFAULT_APPEND_SYSTEM,
+    },
   });
 
   const state = { session, lastUsage: null, turnInProgress: null };
@@ -302,6 +319,10 @@ async function handleSessionLoad(params) {
     const session = await c.resumeSession(sessionId, {
       onPermissionRequest:
         sdk.approveAll || (async () => ({ kind: 'approved' })),
+      systemMessage: {
+        mode: 'append',
+        content: DEFAULT_APPEND_SYSTEM,
+      },
     });
 
     const state = { session, lastUsage: null, turnInProgress: null };
