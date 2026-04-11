@@ -32,6 +32,8 @@ specify --version
 ```
 
 > 如果希望每次部署都自帶，可以把上述步驟加到 Dockerfile 裡。
+>
+> 上述指令 pin 在 `v0.6.0`，請至 [spec-kit releases](https://github.com/github/spec-kit/releases) 確認最新版本。
 
 ### 2. 安裝 SDD Skill / Command
 
@@ -60,7 +62,31 @@ cp docs/skills/speckit-sdd.md codex-skills/speckit-sdd/SKILL.md
 
 #### Gemini CLI
 
-需要轉成 TOML 格式，或直接將內容貼入 `.gemini/commands/speckit.sdd.toml` 的 `prompt` 欄位。
+```bash
+mkdir -p .gemini/commands
+```
+
+建立 `.gemini/commands/speckit.sdd.toml`：
+
+```toml
+description = "使用 Spec-Kit 進行 Spec-Driven Development (SDD) 的完整流程"
+
+prompt = """
+當使用者要求進行 Spec-Driven Development 時，依照以下流程執行。
+
+觸發條件：使用者提到「SDD」、「spec-kit」、「寫規格」、「specify」等意圖時啟動。
+
+Phase 0: Init        → specify init . --ai gemini（建立 .specify/ 目錄）
+Phase 1: Constitution → specify constitution（建立專案原則）
+Phase 2: Specify      → specify specify "<描述>"（撰寫功能規格）
+Phase 3: Plan         → specify plan "<技術指引>"（產生技術實作計畫）
+Phase 4: Tasks        → specify tasks（拆解為可執行任務）
+Phase 5: Implement    → specify implement（逐一實作任務）
+
+每個 phase 結束都要跟使用者確認，不要自動跳到下一個。
+如果 specify CLI 不可用，手動建立 .specify/ 下的 markdown 檔案也可以。
+"""
+```
 
 ### 3. 初始化 Spec-Kit 專案（可選）
 

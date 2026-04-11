@@ -1,6 +1,10 @@
 ---
 name: speckit-sdd
 description: 使用 Spec-Kit 進行 Spec-Driven Development (SDD) 的完整流程。當使用者提到「SDD」、「spec-kit」、「寫規格」、「specify」、「建立 spec」時使用。
+compatibility: >
+  此 frontmatter 使用 YAML 格式，與 Kiro CLI (.kiro/skills/*/SKILL.md) 和
+  Codex (codex-skills/*/SKILL.md) 原生相容。Claude Code (.claude/commands/) 會忽略
+  未知的 frontmatter key。Gemini CLI 需轉為 TOML 格式，參見 docs/speckit-integration.md。
 ---
 
 # Skill: Spec-Driven Development with Spec-Kit
