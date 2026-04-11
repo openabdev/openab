@@ -183,6 +183,13 @@ pub fn load_config(path: &Path) -> anyhow::Result<Config> {
             config.discord.auto_archive_duration
         );
     }
+    const VALID_THREAD_NAME_MODES: &[&str] = &["truncate", "generated"];
+    if !VALID_THREAD_NAME_MODES.contains(&config.discord.thread_name_mode.as_str()) {
+        anyhow::bail!(
+            "invalid thread_name_mode: \"{}\". Must be one of: truncate, generated",
+            config.discord.thread_name_mode
+        );
+    }
     for (channel_id, channel_cfg) in &config.discord.channels {
         if let Some(duration) = channel_cfg.auto_archive_duration {
             if !VALID_ARCHIVE_DURATIONS.contains(&duration) {
@@ -190,6 +197,15 @@ pub fn load_config(path: &Path) -> anyhow::Result<Config> {
                     "invalid auto_archive_duration for channel {}: {}. Must be one of: 60 (1h), 1440 (1d), 4320 (3d), 10080 (1w)",
                     channel_id,
                     duration
+                );
+            }
+        }
+        if let Some(ref mode) = channel_cfg.thread_name_mode {
+            if !VALID_THREAD_NAME_MODES.contains(&mode.as_str()) {
+                anyhow::bail!(
+                    "invalid thread_name_mode for channel {}: \"{}\". Must be one of: truncate, generated",
+                    channel_id,
+                    mode
                 );
             }
         }

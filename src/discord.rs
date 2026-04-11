@@ -19,6 +19,7 @@ pub struct Handler {
     pub auto_archive_duration: u32,
     pub require_mention: bool,
     pub ignore_other_mentions: bool,
+    pub thread_name_mode: String,
     pub channels: HashMap<String, ChannelConfig>,
 }
 
@@ -152,6 +153,17 @@ impl EventHandler for Handler {
             let _ = edit(&ctx, thread_channel, thinking_msg.id, "⚠️ Failed to start agent.").await;
             error!("pool error: {e}");
             return;
+        }
+
+        // Generate a better thread name via LLM if configured
+        let thread_name_mode = channel_override
+            .and_then(|c| c.thread_name_mode.as_deref())
+            .unwrap_or(&self.thread_name_mode);
+
+        if !in_thread && thread_name_mode == "generated" {
+            if let Err(e) = generate_thread_name(&self.pool, &thread_key, &prompt, &ctx, thread_channel).await {
+                tracing::warn!("failed to generate thread name: {e}");
+            }
         }
 
         // Create reaction controller on the user's original message
@@ -343,6 +355,69 @@ async fn stream_prompt(
             }
 
             Ok(())
+        })
+    })
+    .await
+}
+
+async fn generate_thread_name(
+    pool: &SessionPool,
+    thread_key: &str,
+    prompt: &str,
+    ctx: &Context,
+    thread_channel: ChannelId,
+) -> anyhow::Result<()> {
+    let naming_prompt = format!(
+        "Generate a short title (max 6 words) for the following message. Reply with ONLY the title, nothing else:\n\n{}",
+        prompt.chars().take(500).collect::<String>()
+    );
+
+    let name = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        request_thread_name(pool, thread_key, &naming_prompt),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("naming request timed out"))??;
+
+    let name = name.chars().take(100).collect::<String>().trim().to_string();
+    if !name.is_empty() {
+        thread_channel
+            .edit_thread(
+                &ctx.http,
+                serenity::builder::EditThread::new().name(&name),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+async fn request_thread_name(
+    pool: &SessionPool,
+    thread_key: &str,
+    naming_prompt: &str,
+) -> anyhow::Result<String> {
+    let naming_prompt = naming_prompt.to_string();
+    pool.with_connection(thread_key, |conn| {
+        let naming_prompt = naming_prompt.clone();
+        Box::pin(async move {
+            let (mut rx, _) = conn.session_prompt(&naming_prompt).await?;
+
+            let mut text_buf = String::new();
+            while let Some(notification) = rx.recv().await {
+                // A message with id set signals the prompt response is complete
+                if notification.id.is_some() {
+                    break;
+                }
+                if let Some(event) = classify_notification(&notification) {
+                    if let AcpEvent::Text(t) = event {
+                        text_buf.push_str(&t);
+                    }
+                    // Ignore tool calls, thinking, etc.
+                }
+            }
+
+            conn.prompt_done().await;
+            Ok(text_buf)
         })
     })
     .await

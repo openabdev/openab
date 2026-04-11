@@ -50,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
         auto_archive_duration: cfg.discord.auto_archive_duration,
         require_mention: cfg.discord.require_mention,
         ignore_other_mentions: cfg.discord.ignore_other_mentions,
+        thread_name_mode: cfg.discord.thread_name_mode.clone(),
         channels: cfg.discord.channels.clone(),
     };
 
