@@ -165,7 +165,7 @@ async fn refresh_copilot_models(pool: &Arc<acp::SessionPool>) {
             })
         })
         .collect();
-    tracing::debug!(count = models.len(), "refreshed pool cached_models");
+    tracing::info!(count = models.len(), "[refresh] pool cached_models updated");
     pool.set_cached_models(models).await;
 }
 
@@ -214,7 +214,7 @@ async fn refresh_copilot_list_cache(
             .iter()
             .filter_map(|i| i.get(name_key).and_then(|n| n.as_str()).map(String::from))
             .collect();
-        tracing::debug!(rpc = %rpc, count = names.len(), "refreshed copilot list cache");
+        tracing::info!(rpc = %rpc, count = names.len(), "[refresh] list cache updated");
         cache.write().await.insert((*rpc).to_string(), names);
     }
 }

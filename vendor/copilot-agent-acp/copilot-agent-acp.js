@@ -83,13 +83,57 @@ const sessions = new Map(); // sessionId -> { session, lastUsage, turnInProgress
 
 // ---- lifecycle ------------------------------------------------------
 
+/// Map from sessionId → raw `session.create` RPC response body. Populated
+/// by the monkey-patched `connection.sendRequest` below. Used to extract
+/// the session-scoped configOptions (including the filtered model list)
+/// which the SDK's CopilotClient.createSession() discards.
+const rawSessionCreateResponses = new Map();
+
 async function ensureClient() {
   if (client) return client;
   sdk = await sdkPromise;
   client = new sdk.CopilotClient();
   await client.start();
   logInfo('CopilotClient started');
+
+  // Monkey-patch connection.sendRequest to capture session.create responses.
+  // The SDK's high-level createSession() reads only workspacePath + capabilities
+  // from the response and drops configOptions — which is exactly where the
+  // user-accessible model list (filtered by plan/entitlements) lives.
+  try {
+    const conn = client.connection;
+    if (conn && typeof conn.sendRequest === 'function') {
+      const origSend = conn.sendRequest.bind(conn);
+      conn.sendRequest = async function (method, ...args) {
+        const resp = await origSend(method, ...args);
+        if (method === 'session.create' && resp && resp.sessionId) {
+          rawSessionCreateResponses.set(resp.sessionId, resp);
+        }
+        return resp;
+      };
+      logInfo('connection.sendRequest monkey-patched for configOptions capture');
+    } else {
+      logError('client.connection.sendRequest not accessible — cannot capture configOptions');
+    }
+  } catch (e) {
+    logError('failed to patch sendRequest: ' + e.message);
+  }
+
   return client;
+}
+
+/// Extract the session-scoped model list from a captured session.create response.
+/// Falls back to client.listModels() (unfiltered) if configOptions isn't available.
+function extractSessionModels(sessionId) {
+  const raw = rawSessionCreateResponses.get(sessionId);
+  if (!raw || !Array.isArray(raw.configOptions)) return null;
+  const modelOpt = raw.configOptions.find(o => o.id === 'model');
+  if (!modelOpt || !Array.isArray(modelOpt.options)) return null;
+  return modelOpt.options.map(o => ({
+    modelId: o.value,
+    name: o.name || o.value,
+    description: o.description || o.name || '',
+  }));
 }
 
 // ---- request dispatch ----------------------------------------------
@@ -146,6 +190,9 @@ async function handleMessage(msg) {
 
       case '_meta/ping':
         return sendResponse(id, { pong: true, ts: Date.now(), sessions: sessions.size });
+
+      case '_meta/getSessionModels':
+        return sendResponse(id, handleGetSessionModels(params));
 
       default:
         return sendError(id, -32601, `Method not found: ${method}`);
@@ -213,18 +260,24 @@ async function handleSessionNew(params) {
     logError(`default model switch failed (${DEFAULT_MODEL}): ${e.message}`);
   }
 
-  // Extract models + mode info from session for ACP initial response.
+  // Extract models from the captured session.create response (filtered by
+  // user entitlements) — falls back to the unfiltered client.listModels()
+  // if the capture failed.
   let models = null;
   try {
     const cur = await session.rpc.model.getCurrent().catch(() => ({}));
-    const listed = await c.listModels();
-    models = {
-      currentModelId: appliedDefault ? DEFAULT_MODEL : (cur?.modelId || 'default'),
-      availableModels: (listed || []).map(m => ({
+    let sessionModels = extractSessionModels(session.sessionId);
+    if (!sessionModels) {
+      const listed = await c.listModels();
+      sessionModels = (listed || []).map(m => ({
         modelId: m.id || m.modelId,
         name: m.name || m.id,
         description: m.description || m.name || '',
-      })),
+      }));
+    }
+    models = {
+      currentModelId: appliedDefault ? DEFAULT_MODEL : (cur?.modelId || 'default'),
+      availableModels: sessionModels,
     };
   } catch (_) {}
 
@@ -492,6 +545,20 @@ function handleGetRecentPermissions(params) {
   return {
     permissions: state.recentPermissions || [],
     count: (state.recentPermissions || []).length,
+  };
+}
+
+/// Handle _meta/getSessionModels — return the session-scoped model list
+/// (filtered by user plan/entitlements), extracted from the captured
+/// session.create RPC response. Falls back to client.listModels() if
+/// the capture isn't available for this sessionId.
+function handleGetSessionModels(params) {
+  const { sessionId } = params || {};
+  if (!sessionId) throw new Error('sessionId required');
+  const sessionModels = extractSessionModels(sessionId);
+  return {
+    models: sessionModels || [],
+    fallback: !sessionModels,
   };
 }
 

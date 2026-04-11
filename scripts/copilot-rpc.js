@@ -61,8 +61,22 @@ async function dispatch(client, sdk, sub, args) {
     }
 
     case 'models': {
+      // SDK's client.listModels() returns the full catalog (11 items including
+      // models the user can't actually access like Claude Sonnet 4.5 / Opus 4.5).
+      // The TUI-visible filtered list (8 items for our test account) lives in
+      // `configOptions` which is only exposed via the ACP protocol layer, not
+      // via SDK's session.create response.
+      //
+      // Workaround: spawn `copilot --acp` as a subprocess, send initialize +
+      // session/new, parse the session.create response's models.availableModels.
+      // This is slower (~5s subprocess spawn) but returns the correct list.
+      const acpModels = await fetchAcpFilteredModels();
+      if (acpModels && acpModels.length) {
+        return ok('models', { models: acpModels.map(m => ({ ...m, source: 'acp' })) });
+      }
+      // Fallback: unfiltered full catalog
       const models = await client.listModels();
-      return ok('models', { models });
+      return ok('models', { models: (models || []).map(m => ({ ...m, source: 'catalog' })) });
     }
 
     case 'auth': {
@@ -210,6 +224,93 @@ async function callSession(session, sub, args = []) {
 
 function ok(kind, data) {
   return { ok: true, kind, data, ts: new Date().toISOString() };
+}
+
+/// Spawn `copilot --acp` as a subprocess, walk the ACP protocol to get a
+/// session/new response (which includes configOptions with the user-filtered
+/// model list), then kill the subprocess. Returns an array of `{id, name}`
+/// or null on failure. Times out after 15 seconds.
+async function fetchAcpFilteredModels() {
+  return new Promise(resolve => {
+    const { spawn } = require('child_process');
+    const proc = spawn(
+      'C:/Users/Administrator/AppData/Local/Microsoft/WinGet/Links/copilot.exe',
+      ['--acp'],
+      { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
+    );
+
+    let buf = '';
+    let done = false;
+
+    const finish = result => {
+      if (done) return;
+      done = true;
+      try { proc.kill(); } catch (_) {}
+      resolve(result);
+    };
+
+    proc.stdout.on('data', chunk => {
+      buf += chunk.toString();
+      let idx;
+      while ((idx = buf.indexOf('\n')) !== -1) {
+        const line = buf.substring(0, idx).trim();
+        buf = buf.substring(idx + 1);
+        if (!line) continue;
+        try {
+          const msg = JSON.parse(line);
+          if (msg.id === 2 && msg.result) {
+            // session/new response
+            const avail = msg.result.models?.availableModels;
+            if (Array.isArray(avail)) {
+              finish(
+                avail.map(m => ({
+                  id: m.modelId || m.id,
+                  name: m.name || m.modelId || m.id,
+                  description: m.description || '',
+                }))
+              );
+              return;
+            }
+            finish(null);
+            return;
+          }
+        } catch (_) {}
+      }
+    });
+
+    proc.on('error', () => finish(null));
+    proc.on('exit', () => { if (!done) finish(null); });
+
+    // initialize
+    proc.stdin.write(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: 1,
+          clientCapabilities: {
+            fs: { readTextFile: false, writeTextFile: false },
+            terminal: false,
+          },
+          clientInfo: { name: 'copilot-rpc', version: '0.1' },
+        },
+      }) + '\n'
+    );
+    setTimeout(() => {
+      if (done) return;
+      proc.stdin.write(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 2,
+          method: 'session/new',
+          params: { cwd: 'C:/Users/Administrator', mcpServers: [] },
+        }) + '\n'
+      );
+    }, 1500);
+
+    setTimeout(() => finish(null), 15000);
+  });
 }
 
 function fail(msg) {
