@@ -392,87 +392,228 @@ async function handleSessionPrompt(params) {
   return { stopReason: 'end_turn' };
 }
 
+// ---- Slash command registry ----------------------------------------
+//
+// A single table of all bridge-handled slash commands. Each entry maps a
+// command name → RPC call (or literal function). Adding a new slash
+// command is now one-line.
+//
+// arg spec:
+//   'none'            — no args
+//   'single'          — exactly one word
+//   'optional_single' — zero or one word
+//   'rest'            — all remaining text as a single string
+//
+// Example:
+//   { name:'foo', desc:'do foo', args:'single',
+//     call: (s, a) => s.session.rpc.foo.bar({x: a[0]}),
+//     format: r => `✅ foo=${r.foo}` }
+//
+// The dispatcher catches errors and returns `⚠️ /foo failed: <msg>`.
+// Return null (or undefined) from `call` to fall through to LLM.
+
+const SLASH_REGISTRY = [
+  // ---- Client-level (no session) ----
+  { name: 'usage', desc: 'Account quota (premium requests)', args: 'none',
+    call: async () => (await client.rpc.account.getQuota()).quotaSnapshots,
+    format: (q) => {
+      const p = q.premium_interactions;
+      return p
+        ? `📊 **Usage** — Premium **${p.remainingPercentage}%** remaining (${p.usedRequests}/${p.entitlementRequests}). Resets ${p.resetDate}`
+        : '⚠️ No quota data';
+    } },
+
+  { name: 'tokens', desc: 'Session context-window token usage', args: 'none',
+    call: async (s) => s.lastUsage,
+    format: (u) => {
+      if (!u) return '_(no usage captured yet — send a regular message first)_';
+      const pct = u.tokenLimit ? Math.round((u.currentTokens / u.tokenLimit) * 100) : 0;
+      return `🧮 **Tokens** (${pct}% full)\n` +
+        `Used ${(u.currentTokens / 1000).toFixed(1)}k / ${(u.tokenLimit / 1000).toFixed(0)}k · ` +
+        `sys ${(u.systemTokens / 1000).toFixed(1)}k · ` +
+        `tools ${(u.toolDefinitionsTokens / 1000).toFixed(1)}k · ` +
+        `conv ${(u.conversationTokens / 1000).toFixed(1)}k`;
+    } },
+
+  { name: 'models', desc: 'List catalog-available models', args: 'none',
+    call: async () => client.listModels(),
+    format: (arr) => `🤖 **Models** (${(arr || []).length})\n` +
+      (arr || []).slice(0, 20).map(m => `• \`${m.id}\` — ${m.name}`).join('\n') },
+
+  { name: 'auth', desc: 'GitHub authentication status', args: 'none',
+    call: async () => client.getAuthStatus(),
+    format: (a) => a?.isAuthenticated
+      ? `✅ Authenticated as **${a.login}** via ${a.authType}`
+      : `❌ Not authenticated` },
+
+  { name: 'ping', desc: 'Ping the Copilot CLI server', args: 'none',
+    call: async () => client.ping('bridge-ping') },
+
+  // ---- Session: model ----
+  { name: 'model', desc: 'Get or switch session model', args: 'optional_single',
+    call: async (s, a) => a[0]
+      ? (await s.session.rpc.model.switchTo({ modelId: a[0] }), { switched: a[0] })
+      : s.session.rpc.model.getCurrent(),
+    format: (r) => r.switched ? `✅ Switched to \`${r.switched}\`` : `🤖 Current: \`${r?.modelId || 'default'}\`` },
+
+  // ---- Session: mode ----
+  { name: 'mode', desc: 'Get or set session mode (agent/plan/autopilot)', args: 'optional_single',
+    call: async (s, a) => a[0]
+      ? (await s.session.rpc.mode.set({ modeId: a[0] }), { set: a[0] })
+      : s.session.rpc.mode.get(),
+    format: (r) => r.set ? `✅ Mode → \`${r.set}\`` : `🔀 Current mode: \`${r?.modeId || 'default'}\`` },
+
+  // ---- Session: plan ----
+  { name: 'plan', desc: 'Read session plan.md', args: 'none',
+    call: async (s) => s.session.rpc.plan.read(),
+    format: (p) => `📋 **Plan**\n\`\`\`\n${(p?.content || '(empty)').slice(0, 1500)}\n\`\`\`` },
+
+  { name: 'plan-update', desc: 'Replace session plan content', args: 'rest',
+    call: async (s, a) => (await s.session.rpc.plan.update({ content: a[0] || '' }), true),
+    format: () => '✅ Plan updated' },
+
+  { name: 'plan-delete', desc: 'Delete session plan', args: 'none',
+    call: async (s) => (await s.session.rpc.plan.delete(), true),
+    format: () => '✅ Plan deleted' },
+
+  // ---- Session: workspace ----
+  { name: 'files', desc: 'List workspace files', args: 'none',
+    call: async (s) => s.session.rpc.workspace.listFiles(),
+    format: (r) => {
+      const arr = r?.files || [];
+      return `📁 **Files** (${arr.length})\n` + arr.slice(0, 30).map(f => `• \`${f.path || f}\``).join('\n');
+    } },
+
+  { name: 'read', desc: 'Read a file from workspace', args: 'single',
+    call: async (s, a) => s.session.rpc.workspace.readFile({ path: a[0] }),
+    format: (r) => `\`\`\`\n${(r?.content || '').slice(0, 1800)}\n\`\`\`` },
+
+  // ---- Session: agents ----
+  { name: 'agents', desc: 'List session agents', args: 'none',
+    call: async (s) => s.session.rpc.agent.list(),
+    format: (r) => `🤖 **Agents** (${r?.agents?.length || 0})\n` +
+      (r?.agents || []).slice(0, 25).map(a => `• ${a.name}`).join('\n') },
+
+  { name: 'agent', desc: 'Get current or select agent', args: 'optional_single',
+    call: async (s, a) => a[0]
+      ? (await s.session.rpc.agent.select({ name: a[0] }), { selected: a[0] })
+      : s.session.rpc.agent.getCurrent(),
+    format: (r) => r.selected ? `✅ Agent → \`${r.selected}\`` : `🤖 Current agent: \`${r?.name || '(none)'}\`` },
+
+  { name: 'agent-deselect', desc: 'Clear agent selection', args: 'none',
+    call: async (s) => (await s.session.rpc.agent.deselect(), true),
+    format: () => '✅ Agent deselected' },
+
+  { name: 'agent-reload', desc: 'Reload agents registry', args: 'none',
+    call: async (s) => (await s.session.rpc.agent.reload(), true),
+    format: () => '✅ Agents reloaded' },
+
+  // ---- Session: skills ----
+  { name: 'skills', desc: 'List session skills', args: 'none',
+    call: async (s) => s.session.rpc.skills.list(),
+    format: (r) => `⚡ **Skills** (${r?.skills?.length || 0}, showing 25)\n` +
+      (r?.skills || []).slice(0, 25).map(x => `• ${x.name}`).join('\n') },
+
+  { name: 'skill-on', desc: 'Enable a skill', args: 'single',
+    call: async (s, a) => (await s.session.rpc.skills.enable({ name: a[0] }), { enabled: a[0] }),
+    format: (r) => `✅ Skill \`${r.enabled}\` enabled` },
+
+  { name: 'skill-off', desc: 'Disable a skill', args: 'single',
+    call: async (s, a) => (await s.session.rpc.skills.disable({ name: a[0] }), { disabled: a[0] }),
+    format: (r) => `✅ Skill \`${r.disabled}\` disabled` },
+
+  // ---- Session: mcp ----
+  { name: 'mcp', desc: 'List MCP servers', args: 'none',
+    call: async (s) => s.session.rpc.mcp.list(),
+    format: (r) => `🔌 **MCP Servers** (${r?.servers?.length || 0})\n` +
+      (r?.servers || []).map(x => `• ${x.name}`).join('\n') },
+
+  { name: 'mcp-on', desc: 'Enable an MCP server', args: 'single',
+    call: async (s, a) => (await s.session.rpc.mcp.enable({ name: a[0] }), { enabled: a[0] }),
+    format: (r) => `✅ MCP \`${r.enabled}\` enabled` },
+
+  { name: 'mcp-off', desc: 'Disable an MCP server', args: 'single',
+    call: async (s, a) => (await s.session.rpc.mcp.disable({ name: a[0] }), { disabled: a[0] }),
+    format: (r) => `✅ MCP \`${r.disabled}\` disabled` },
+
+  // ---- Session: plugins / extensions ----
+  { name: 'plugins', desc: 'List installed plugins', args: 'none',
+    call: async (s) => s.session.rpc.plugins.list(),
+    format: (r) => `🧩 **Plugins** (${r?.plugins?.length || 0})\n` +
+      (r?.plugins || []).map(x => `• ${x.name}`).join('\n') },
+
+  { name: 'extensions', desc: 'List extensions', args: 'none',
+    call: async (s) => s.session.rpc.extensions.list(),
+    format: (r) => `🧬 **Extensions** (${r?.extensions?.length || 0})\n` +
+      (r?.extensions || []).map(x => `• ${x.name}`).join('\n') },
+
+  // ---- Session: lifecycle ----
+  { name: 'compact', desc: 'LLM-compact session history', args: 'none',
+    call: async (s) => s.session.rpc.compaction.compact(),
+    format: (r) => `✅ Compacted — ${r?.tokensRemoved || 0} tokens removed` },
+
+  { name: 'fleet', desc: 'Start parallel subagents', args: 'rest',
+    call: async (s, a) => s.session.rpc.fleet.start({ prompt: a[0] || '' }),
+    format: (r) => `🚀 Fleet started\n\`\`\`json\n${JSON.stringify(r, null, 2).slice(0, 1500)}\n\`\`\`` },
+
+  // ---- Session: shell (owner-only, allowlist enforced at OpenAB layer) ----
+  { name: 'shell', desc: 'Execute a shell command directly', args: 'rest',
+    call: async (s, a) => s.session.rpc.shell.exec({ command: a[0] || '' }),
+    format: (r) => {
+      const out = r?.output || r?.stdout || JSON.stringify(r, null, 2);
+      const trunc = String(out).slice(0, 1800);
+      return `\`\`\`\n${trunc}\n\`\`\`${String(out).length > 1800 ? '\n_(output truncated)_' : ''}`;
+    } },
+
+  // ---- Meta ----
+  { name: 'help', desc: 'List all bridge slash commands', args: 'none',
+    call: async () => SLASH_REGISTRY,
+    format: (reg) => {
+      const lines = reg
+        .filter(e => e.name !== 'help')
+        .map(e => `• \`/${e.name}\` — ${e.desc}`);
+      return `🛠 **Bridge slash commands** (${lines.length})\n${lines.join('\n')}\n\n_Unknown slash commands fall through to the LLM._`;
+    } },
+];
+
+/// Parse raw args array according to an arg-spec string.
+function parseSlashArgs(spec, raw) {
+  if (!spec || spec === 'none') return [];
+  if (spec === 'single') return [raw[0] || ''];
+  if (spec === 'optional_single') return raw[0] ? [raw[0]] : [];
+  if (spec === 'rest') return [raw.join(' ')];
+  // Array spec — positional with last as rest
+  if (Array.isArray(spec)) {
+    const out = [];
+    for (let i = 0; i < spec.length; i++) {
+      if (spec[i] === 'rest') {
+        out.push(raw.slice(i).join(' '));
+        break;
+      }
+      out.push(raw[i] || '');
+    }
+    return out;
+  }
+  return raw;
+}
+
 /// Try to handle a slash command typed as prompt text. Returns a string to
 /// display to the user, or null if the command isn't recognized (so the
 /// caller falls back to normal LLM processing).
 async function handleSlashCommand(sessionId, state, raw) {
-  // Parse: "/cmd arg1 arg2..." → ["cmd", "arg1", "arg2", ...]
   const parts = raw.slice(1).trim().split(/\s+/);
   const cmd = parts[0]?.toLowerCase();
   const args = parts.slice(1);
   if (!cmd) return null;
 
-  const session = state.session;
-  const rpc = session.rpc;
+  const entry = SLASH_REGISTRY.find(e => e.name === cmd);
+  if (!entry) return null; // unknown — fall through to LLM
 
   try {
-    switch (cmd) {
-      case 'usage':
-      case 'quota': {
-        const q = await client.rpc.account.getQuota();
-        const p = q.quotaSnapshots?.premium_interactions;
-        if (!p) return '⚠️ No quota data available';
-        return `📊 **Copilot Usage**\n` +
-          `Premium remaining: **${p.remainingPercentage}%** (used ${p.usedRequests}/${p.entitlementRequests})\n` +
-          `Resets: ${p.resetDate}`;
-      }
-      case 'tokens': {
-        const u = state.lastUsage;
-        if (!u) return '_(no usage captured yet — send a regular message first)_';
-        const pct = u.tokenLimit ? Math.round((u.currentTokens / u.tokenLimit) * 100) : 0;
-        return `🧮 **Session Tokens** (${pct}% full)\n` +
-          `Used: ${(u.currentTokens / 1000).toFixed(1)}k / ${(u.tokenLimit / 1000).toFixed(0)}k\n` +
-          `System: ${(u.systemTokens / 1000).toFixed(1)}k · ` +
-          `Tools: ${(u.toolDefinitionsTokens / 1000).toFixed(1)}k · ` +
-          `Conversation: ${(u.conversationTokens / 1000).toFixed(1)}k`;
-      }
-      case 'model': {
-        if (args.length === 0) {
-          const cur = await rpc.model.getCurrent();
-          return `🤖 Current model: \`${cur?.modelId || 'default'}\``;
-        }
-        await rpc.model.switchTo({ modelId: args[0] });
-        return `✅ Switched to \`${args[0]}\``;
-      }
-      case 'mode': {
-        if (args.length === 0) {
-          const cur = await rpc.mode.get();
-          return `🔀 Current mode: \`${cur?.modeId || 'default'}\``;
-        }
-        await rpc.mode.set({ modeId: args[0] });
-        return `✅ Mode set to \`${args[0]}\``;
-      }
-      case 'agents': {
-        const list = await rpc.agent.list();
-        const names = (list.agents || []).map(a => `• ${a.name}`).join('\n');
-        return `🤖 **Agents** (${list.agents?.length || 0})\n${names || '_(none)_'}`;
-      }
-      case 'skills': {
-        const list = await rpc.skills.list();
-        const names = (list.skills || []).slice(0, 25).map(s => `• ${s.name}`).join('\n');
-        return `⚡ **Skills** (${list.skills?.length || 0}, showing 25)\n${names || '_(none)_'}`;
-      }
-      case 'mcp': {
-        const list = await rpc.mcp.list();
-        const names = (list.servers || []).map(s => `• ${s.name}`).join('\n');
-        return `🔌 **MCP Servers** (${list.servers?.length || 0})\n${names || '_(none)_'}`;
-      }
-      case 'plan': {
-        const p = await rpc.plan.read();
-        return `📋 **Plan**\n\`\`\`\n${(p?.content || '(empty)').slice(0, 1500)}\n\`\`\``;
-      }
-      case 'compact': {
-        const r = await rpc.compaction.compact();
-        return `✅ Compacted (${r?.tokensRemoved || 0} tokens removed)`;
-      }
-      case 'help': {
-        return `🛠 **Bridge slash commands**\n` +
-          `/usage /tokens /model [id] /mode [id] /agents /skills /mcp /plan /compact /help\n` +
-          `(Type without args to show current value; unknown commands fall through to LLM.)`;
-      }
-      default:
-        return null; // Unknown — let LLM handle it
-    }
+    const parsedArgs = parseSlashArgs(entry.args, args);
+    const result = await entry.call(state, parsedArgs);
+    if (entry.format) return entry.format(result);
+    return '```json\n' + JSON.stringify(result, null, 2).slice(0, 1800) + '\n```';
   } catch (e) {
     return `⚠️ /${cmd} failed: ${e.message}`;
   }
