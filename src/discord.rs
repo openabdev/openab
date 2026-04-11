@@ -307,6 +307,11 @@ async fn download_and_encode_image(attachment: &serenity::model::channel::Attach
     let (output_bytes, output_mime) = match resize_and_compress(&bytes) {
         Ok(result) => result,
         Err(e) => {
+            // Fallback: use original bytes but reject if too large for transport
+            if bytes.len() > 1024 * 1024 {
+                error!(filename = %attachment.filename, error = %e, size = bytes.len(), "resize failed and original too large, skipping");
+                return None;
+            }
             debug!(filename = %attachment.filename, error = %e, "resize failed, using original");
             (bytes.to_vec(), mime.to_string())
         }
@@ -343,13 +348,13 @@ fn resize_and_compress(raw: &[u8]) -> Result<(Vec<u8>, String), image::ImageErro
     let img = reader.decode()?;
     let (w, h) = (img.width(), img.height());
 
-    // Resize if either dimension exceeds the limit
+    // Resize preserving aspect ratio: scale so longest side = 1200px
     let img = if w > IMAGE_MAX_DIMENSION_PX || h > IMAGE_MAX_DIMENSION_PX {
-        img.resize(
-            IMAGE_MAX_DIMENSION_PX,
-            IMAGE_MAX_DIMENSION_PX,
-            image::imageops::FilterType::Lanczos3,
-        )
+        let max_side = std::cmp::max(w, h);
+        let ratio = f64::from(IMAGE_MAX_DIMENSION_PX) / f64::from(max_side);
+        let new_w = (f64::from(w) * ratio) as u32;
+        let new_h = (f64::from(h) * ratio) as u32;
+        img.resize(new_w, new_h, image::imageops::FilterType::Lanczos3)
     } else {
         img
     };
@@ -614,8 +619,8 @@ mod tests {
         let (compressed, _) = resize_and_compress(&png).unwrap();
 
         let result = image::load_from_memory(&compressed).unwrap();
-        assert_eq!(result.width(), IMAGE_MAX_DIMENSION_PX);
-        assert_eq!(result.height(), 600); // 2000 * (1200/4000)
+        assert_eq!(result.width(), 1200);
+        assert_eq!(result.height(), 600);
     }
 
     #[test]
@@ -624,8 +629,8 @@ mod tests {
         let (compressed, _) = resize_and_compress(&png).unwrap();
 
         let result = image::load_from_memory(&compressed).unwrap();
-        assert_eq!(result.height(), IMAGE_MAX_DIMENSION_PX);
-        assert_eq!(result.width(), 600); // 2000 * (1200/4000)
+        assert_eq!(result.width(), 600);
+        assert_eq!(result.height(), 1200);
     }
 
     #[test]
