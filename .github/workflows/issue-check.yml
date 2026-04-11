@@ -54,7 +54,7 @@ jobs:
                 await github.rest.issues.addLabels({
                   ...context.repo,
                   issue_number: issue.number,
-                  labels: ['incomplete']
+                  labels: ['incomplete', 'needs-triage']
                 });
               }
               return;
@@ -91,7 +91,7 @@ jobs:
                 await github.rest.issues.addLabels({
                   ...context.repo,
                   issue_number: issue.number,
-                  labels: ['incomplete']
+                  labels: ['incomplete', 'needs-triage']
                 });
               }
             } else {
