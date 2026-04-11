@@ -1,0 +1,35 @@
+{
+  "firstLaunchAt": "2026-04-08T18:53:32.210Z",
+  "banner": "never",
+  "model": "gpt-5.3-codex",
+  "effortLevel": "xhigh",
+  "trusted_folders": [
+    "C:\\Users\\Administrator"
+  ],
+  "asked_setup_terminals": [
+    "windows-terminal"
+  ],
+  "installed_plugins": [
+    {
+      "name": "pua",
+      "marketplace": "pua-skills",
+      "version": "2.9.0",
+      "installed_at": "2026-04-08T20:03:40.764Z",
+      "enabled": true,
+      "cache_path": "C:\\Users\\Administrator\\.copilot\\installed-plugins\\pua-skills\\pua"
+    }
+  ],
+  "last_logged_in_user": {
+    "host": "https://github.com",
+    "login": "XIE-FENG-JIA"
+  },
+  "logged_in_users": [
+    {
+      "host": "https://github.com",
+      "login": "XIE-FENG-JIA"
+    }
+  ],
+  "enabledPlugins": {
+    "pua@pua-skills": true
+  }
+}
