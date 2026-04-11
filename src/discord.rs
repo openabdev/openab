@@ -5,6 +5,8 @@ use crate::format;
 use crate::reactions::StatusReactionController;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use image::ImageReader;
+use std::io::Cursor;
 use std::sync::LazyLock;
 use serenity::async_trait;
 use serenity::builder::{
@@ -1480,14 +1482,20 @@ fn build_usage_embed(results: &[crate::usage::RunnerResult]) -> CreateEmbed {
     embed
 }
 
-/// Download a Discord image attachment and encode it as an ACP image content block.
+/// Maximum dimension (width or height) for resized images.
+/// Matches OpenClaw's DEFAULT_IMAGE_MAX_DIMENSION_PX.
+const IMAGE_MAX_DIMENSION_PX: u32 = 1200;
+
+/// JPEG quality for compressed output (OpenClaw uses progressive 85→35;
+/// we start at 75 which is a good balance of quality vs size).
+const IMAGE_JPEG_QUALITY: u8 = 75;
+
+/// Download a Discord image attachment, resize/compress it, then base64-encode
+/// as an ACP image content block.
 ///
-/// Discord attachment URLs are temporary and expire, so we must download
-/// and encode the image data immediately. The ACP ImageContent schema
-/// requires `{ data: base64_string, mimeType: "image/..." }`.
-///
-/// Security: rejects non-image attachments (by content-type or extension)
-/// and files larger than 10MB to prevent OOM/abuse.
+/// Large images are resized so the longest side is at most 1200px and
+/// re-encoded as JPEG at quality 75. This keeps the base64 payload well
+/// under typical JSON-RPC transport limits (~200-400KB after encoding).
 async fn download_and_encode_image(attachment: &serenity::model::channel::Attachment) -> Option<ContentBlock> {
     const MAX_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
 
@@ -1514,67 +1522,102 @@ async fn download_and_encode_image(attachment: &serenity::model::channel::Attach
                 })
         });
 
-    // Validate that it's actually an image
     let Some(mime) = media_type else {
-        debug!(filename = %attachment.filename, "skipping non-image attachment (no matching content-type or extension)");
+        debug!(filename = %attachment.filename, "skipping non-image attachment");
         return None;
     };
-    // Strip MIME type parameters (e.g. "image/jpeg; charset=utf-8" → "image/jpeg")
-    // Downstream LLM APIs (Claude, OpenAI, Gemini) reject MIME types with parameters
     let mime = mime.split(';').next().unwrap_or(mime).trim();
     if !mime.starts_with("image/") {
         debug!(filename = %attachment.filename, mime = %mime, "skipping non-image attachment");
         return None;
     }
 
-    // Size check before downloading
     if u64::from(attachment.size) > MAX_SIZE {
-        error!(
-            filename = %attachment.filename,
-            size = attachment.size,
-            max = MAX_SIZE,
-            "image attachment exceeds 10MB limit"
-        );
+        error!(filename = %attachment.filename, size = attachment.size, "image exceeds 10MB limit");
         return None;
     }
 
-    // Download using the static reusable client
     let response = match HTTP_CLIENT.get(url).send().await {
         Ok(resp) => resp,
-        Err(e) => {
-            error!("failed to download image {}: {}", url, e);
-            return None;
-        }
+        Err(e) => { error!(url = %url, error = %e, "download failed"); return None; }
     };
-
     if !response.status().is_success() {
-        error!("HTTP error downloading image {}: {}", url, response.status());
+        error!(url = %url, status = %response.status(), "HTTP error downloading image");
         return None;
     }
-
     let bytes = match response.bytes().await {
         Ok(b) => b,
-        Err(e) => {
-            error!("failed to read image bytes from {}: {}", url, e);
-            return None;
-        }
+        Err(e) => { error!(url = %url, error = %e, "read failed"); return None; }
     };
 
-    // Final size check after download (defense in depth)
+    // Defense-in-depth: verify actual download size
     if bytes.len() as u64 > MAX_SIZE {
-        error!(
-            filename = %attachment.filename,
-            size = bytes.len(),
-            "downloaded image exceeds 10MB limit after decode"
-        );
+        error!(filename = %attachment.filename, size = bytes.len(), "downloaded image exceeds limit");
         return None;
     }
 
-    let encoded = BASE64.encode(bytes.as_ref());
+    // Resize and compress
+    let (output_bytes, output_mime) = match resize_and_compress(&bytes) {
+        Ok(result) => result,
+        Err(e) => {
+            // Fallback: use original bytes but reject if too large for transport
+            if bytes.len() > 1024 * 1024 {
+                error!(filename = %attachment.filename, error = %e, size = bytes.len(), "resize failed and original too large, skipping");
+                return None;
+            }
+            debug!(filename = %attachment.filename, error = %e, "resize failed, using original");
+            (bytes.to_vec(), mime.to_string())
+        }
+    };
+
+    debug!(
+        filename = %attachment.filename,
+        original_size = bytes.len(),
+        compressed_size = output_bytes.len(),
+        "image processed"
+    );
+
+    let encoded = BASE64.encode(&output_bytes);
     Some(ContentBlock::Image {
-        media_type: mime.to_string(),
+        media_type: output_mime,
         data: encoded,
     })
+}
+
+/// Resize image so longest side ≤ IMAGE_MAX_DIMENSION_PX, then encode as JPEG.
+/// Returns (compressed_bytes, mime_type). GIFs are passed through unchanged
+/// to preserve animation.
+fn resize_and_compress(raw: &[u8]) -> Result<(Vec<u8>, String), image::ImageError> {
+    let reader = ImageReader::new(Cursor::new(raw))
+        .with_guessed_format()?;
+
+    let format = reader.format();
+
+    // Pass through GIFs unchanged to preserve animation
+    if format == Some(image::ImageFormat::Gif) {
+        return Ok((raw.to_vec(), "image/gif".to_string()));
+    }
+
+    let img = reader.decode()?;
+    let (w, h) = (img.width(), img.height());
+
+    // Resize preserving aspect ratio: scale so longest side = 1200px
+    let img = if w > IMAGE_MAX_DIMENSION_PX || h > IMAGE_MAX_DIMENSION_PX {
+        let max_side = std::cmp::max(w, h);
+        let ratio = f64::from(IMAGE_MAX_DIMENSION_PX) / f64::from(max_side);
+        let new_w = (f64::from(w) * ratio) as u32;
+        let new_h = (f64::from(h) * ratio) as u32;
+        img.resize(new_w, new_h, image::imageops::FilterType::Lanczos3)
+    } else {
+        img
+    };
+
+    // Encode as JPEG
+    let mut buf = Cursor::new(Vec::new());
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, IMAGE_JPEG_QUALITY);
+    img.write_with_encoder(encoder)?;
+
+    Ok((buf.into_inner(), "image/jpeg".to_string()))
 }
 
 async fn edit(ctx: &Context, ch: ChannelId, msg_id: MessageId, content: &str) -> serenity::Result<Message> {
@@ -1789,3 +1832,87 @@ async fn get_or_create_thread(ctx: &Context, msg: &Message, prompt: &str) -> any
     Ok(thread.id.get())
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_png(width: u32, height: u32) -> Vec<u8> {
+        let img = image::RgbImage::new(width, height);
+        let mut buf = Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        buf.into_inner()
+    }
+
+    #[test]
+    fn large_image_resized_to_max_dimension() {
+        let png = make_png(3000, 2000);
+        let (compressed, mime) = resize_and_compress(&png).unwrap();
+
+        assert_eq!(mime, "image/jpeg");
+        let result = image::load_from_memory(&compressed).unwrap();
+        assert!(result.width() <= IMAGE_MAX_DIMENSION_PX);
+        assert!(result.height() <= IMAGE_MAX_DIMENSION_PX);
+    }
+
+    #[test]
+    fn small_image_keeps_original_dimensions() {
+        let png = make_png(800, 600);
+        let (compressed, mime) = resize_and_compress(&png).unwrap();
+
+        assert_eq!(mime, "image/jpeg");
+        let result = image::load_from_memory(&compressed).unwrap();
+        assert_eq!(result.width(), 800);
+        assert_eq!(result.height(), 600);
+    }
+
+    #[test]
+    fn landscape_image_respects_aspect_ratio() {
+        let png = make_png(4000, 2000);
+        let (compressed, _) = resize_and_compress(&png).unwrap();
+
+        let result = image::load_from_memory(&compressed).unwrap();
+        assert_eq!(result.width(), 1200);
+        assert_eq!(result.height(), 600);
+    }
+
+    #[test]
+    fn portrait_image_respects_aspect_ratio() {
+        let png = make_png(2000, 4000);
+        let (compressed, _) = resize_and_compress(&png).unwrap();
+
+        let result = image::load_from_memory(&compressed).unwrap();
+        assert_eq!(result.width(), 600);
+        assert_eq!(result.height(), 1200);
+    }
+
+    #[test]
+    fn compressed_output_is_smaller_than_original() {
+        let png = make_png(3000, 2000);
+        let (compressed, _) = resize_and_compress(&png).unwrap();
+
+        assert!(compressed.len() < png.len(), "compressed {} should be < original {}", compressed.len(), png.len());
+    }
+
+    #[test]
+    fn gif_passes_through_unchanged() {
+        // Minimal valid GIF89a (1x1 pixel)
+        let gif: Vec<u8> = vec![
+            0x47, 0x49, 0x46, 0x38, 0x39, 0x61, // GIF89a
+            0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, // logical screen descriptor
+            0x2C, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, // image descriptor
+            0x02, 0x02, 0x44, 0x01, 0x00, // image data
+            0x3B, // trailer
+        ];
+        let (output, mime) = resize_and_compress(&gif).unwrap();
+
+        assert_eq!(mime, "image/gif");
+        assert_eq!(output, gif);
+    }
+
+    #[test]
+    fn invalid_data_returns_error() {
+        let garbage = vec![0x00, 0x01, 0x02, 0x03];
+        assert!(resize_and_compress(&garbage).is_err());
+    }
+}

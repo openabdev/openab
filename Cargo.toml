@@ -1,6 +1,6 @@
 [package]
 name = "openab"
-version = "0.6.4"
+version = "0.6.5"
 edition = "2021"
 
 [dependencies]
@@ -18,3 +18,4 @@ rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 base64 = "0.22"
 futures = "0.3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
