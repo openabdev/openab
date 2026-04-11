@@ -25,6 +25,7 @@ A lightweight, secure, cloud-native ACP harness that bridges Discord and any [Ag
 - **Session pool** — one CLI process per thread, auto-managed lifecycle
 - **ACP protocol** — JSON-RPC over stdio with tool call, thinking, and permission auto-reply support
 - **Kubernetes-ready** — Dockerfile + k8s manifests with PVC for auth persistence
+- **Voice message STT** — auto-transcribes Discord voice messages via Groq, OpenAI, or local Whisper server ([docs/stt.md](docs/stt.md))
 
 ## Quick Start
 

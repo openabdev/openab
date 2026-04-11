@@ -40,6 +40,17 @@ data:
     [reactions]
     enabled = {{ ($cfg.reactions).enabled | default true }}
     remove_after_reply = {{ ($cfg.reactions).removeAfterReply | default false }}
+    {{- if ($cfg.stt).enabled }}
+    {{- if not ($cfg.stt).apiKey }}
+    {{ fail (printf "agents.%s.stt.apiKey is required when stt.enabled=true" $name) }}
+    {{- end }}
+
+    [stt]
+    enabled = true
+    api_key = "${STT_API_KEY}"
+    model = "{{ ($cfg.stt).model | default "whisper-large-v3-turbo" }}"
+    base_url = "{{ ($cfg.stt).baseUrl | default "https://api.groq.com/openai/v1" }}"
+    {{- end }}
   {{- if $cfg.agentsMd }}
   AGENTS.md: |
     {{- $cfg.agentsMd | nindent 4 }}

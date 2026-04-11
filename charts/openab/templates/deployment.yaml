@@ -45,6 +45,13 @@ spec:
                   name: {{ include "openab.agentFullname" $d }}
                   key: discord-bot-token
             {{- end }}
+            {{- if and ($cfg.stt).enabled ($cfg.stt).apiKey }}
+            - name: STT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: stt-api-key
+            {{- end }}
             - name: HOME
               value: {{ $cfg.workingDir | default "/home/agent" }}
             {{- range $k, $v := $cfg.env }}

@@ -125,6 +125,26 @@ base_url = "http://192.168.1.100:8080/v1"
 
 - **Ollama** — does not expose an `/audio/transcriptions` endpoint.
 
+## Helm Chart (Kubernetes)
+
+When deploying via the openab Helm chart, STT is a first-class config block — no manual configmap patching needed:
+
+```bash
+helm upgrade openab openab/openab \
+  --set agents.kiro.stt.enabled=true \
+  --set agents.kiro.stt.apiKey=gsk_xxx
+```
+
+The API key is stored in a K8s Secret and injected as an env var (never in plaintext in the configmap). You can also customize model and endpoint:
+
+```bash
+helm upgrade openab openab/openab \
+  --set agents.kiro.stt.enabled=true \
+  --set agents.kiro.stt.apiKey=gsk_xxx \
+  --set agents.kiro.stt.model=whisper-large-v3-turbo \
+  --set agents.kiro.stt.baseUrl=https://api.groq.com/openai/v1
+```
+
 ## Disabling STT
 
 Omit the `[stt]` section entirely, or set:
