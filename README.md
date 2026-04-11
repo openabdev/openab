@@ -111,7 +111,7 @@ helm install openab openab/openab \
   --set agents.kiro.enabled=false \
   --set agents.claude.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.claude.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
-  --set agents.claude.image=ghcr.io/openabdev/openab-claude:78f8d2c \
+  --set agents.claude.image=ghcr.io/openabdev/openab-claude:latest \
   --set agents.claude.command=claude-agent-acp \
   --set agents.claude.workingDir=/home/node
 
@@ -121,7 +121,7 @@ helm install openab openab/openab \
   --set-string 'agents.kiro.discord.allowedChannels[0]=KIRO_CHANNEL_ID' \
   --set agents.claude.discord.botToken="$CLAUDE_BOT_TOKEN" \
   --set-string 'agents.claude.discord.allowedChannels[0]=CLAUDE_CHANNEL_ID' \
-  --set agents.claude.image=ghcr.io/openabdev/openab-claude:78f8d2c \
+  --set agents.claude.image=ghcr.io/openabdev/openab-claude:latest \
   --set agents.claude.command=claude-agent-acp \
   --set agents.claude.workingDir=/home/node
 ```
