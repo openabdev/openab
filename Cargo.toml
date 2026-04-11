@@ -1,6 +1,6 @@
 [package]
 name = "openab"
-version = "0.6.0"
+version = "0.6.3"
 edition = "2021"
 
 [dependencies]
