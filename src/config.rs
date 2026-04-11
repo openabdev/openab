@@ -22,8 +22,6 @@ pub struct DiscordConfig {
     pub allowed_users: Vec<String>,
     #[serde(default)]
     pub monitored_bot_ids: Vec<String>,
-    #[serde(default)]
-    pub auto_respond_from_bots: bool,
 }
 
 #[derive(Debug, Deserialize)]
