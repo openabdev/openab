@@ -155,16 +155,13 @@ impl EventHandler for Handler {
             return;
         }
 
-        // Generate a better thread name via LLM if configured
-        let thread_name_mode = channel_override
-            .and_then(|c| c.thread_name_mode.as_deref())
-            .unwrap_or(&self.thread_name_mode);
-
-        if !in_thread && thread_name_mode == "generated" {
-            if let Err(e) = generate_thread_name(&self.pool, &thread_key, &prompt, &ctx, thread_channel).await {
-                tracing::warn!("failed to generate thread name: {e}");
-            }
-        }
+        // Resolve thread_name_mode for potential background rename
+        let should_generate_name = !in_thread && {
+            let mode = channel_override
+                .and_then(|c| c.thread_name_mode.as_deref())
+                .unwrap_or(&self.thread_name_mode);
+            mode == "generated"
+        };
 
         // Create reaction controller on the user's original message
         let reactions = Arc::new(StatusReactionController::new(
@@ -210,6 +207,20 @@ impl EventHandler for Handler {
 
         if let Err(e) = result {
             let _ = edit(&ctx, thread_channel, thinking_msg.id, &format!("⚠️ {e}")).await;
+        }
+
+        // Generate a better thread name in the background after the main prompt completes.
+        // This avoids blocking the user's response and holding the pool write-lock during naming.
+        if should_generate_name {
+            let pool = self.pool.clone();
+            let ctx = ctx.clone();
+            let prompt = prompt.clone();
+            let thread_key = thread_key.clone();
+            tokio::spawn(async move {
+                if let Err(e) = generate_thread_name(&pool, &thread_key, &prompt, &ctx, thread_channel).await {
+                    tracing::warn!("failed to generate thread name: {e}");
+                }
+            });
         }
     }
 
@@ -361,14 +372,14 @@ async fn stream_prompt(
 }
 
 async fn generate_thread_name(
-    pool: &SessionPool,
+    pool: &Arc<SessionPool>,
     thread_key: &str,
     prompt: &str,
     ctx: &Context,
     thread_channel: ChannelId,
 ) -> anyhow::Result<()> {
     let naming_prompt = format!(
-        "Generate a short title (max 6 words) for the following message. Reply with ONLY the title, nothing else:\n\n{}",
+        "Generate a short title (max 6 words) for the following message. Do not use any tools. Reply with ONLY the title text, nothing else:\n\n{}",
         prompt.chars().take(500).collect::<String>()
     );
 
@@ -379,7 +390,8 @@ async fn generate_thread_name(
     .await
     .map_err(|_| anyhow::anyhow!("naming request timed out"))??;
 
-    let name = name.chars().take(100).collect::<String>().trim().to_string();
+    let name = name.trim().trim_matches(|c| c == '"' || c == '\'' || c == '*' || c == '`')
+        .chars().take(100).collect::<String>();
     if !name.is_empty() {
         thread_channel
             .edit_thread(
@@ -392,7 +404,7 @@ async fn generate_thread_name(
 }
 
 async fn request_thread_name(
-    pool: &SessionPool,
+    pool: &Arc<SessionPool>,
     thread_key: &str,
     naming_prompt: &str,
 ) -> anyhow::Result<String> {
