@@ -1,0 +1,57 @@
+# PR Review Guide for openabdev/openab
+
+## Severity Levels
+
+Use emoji + color to classify each review comment:
+
+| Level | Emoji | Meaning | Action Required |
+|-------|-------|---------|-----------------|
+| 🔴 Critical | `## 🔴 Critical:` | Correctness bug, security issue, data loss risk | Must fix before merge |
+| 🟡 Minor | `## 🟡 Minor:` | Style inconsistency, missing defense-in-depth, non-blocking improvement | Should fix, doesn't block merge |
+| 🟢 Info | `## 🟢 Info:` | Knowledge sharing, future consideration, design tradeoff note | No action needed |
+
+## Comment Format
+
+Each review comment should include:
+
+1. **What's wrong** — describe the issue clearly
+2. **Where** — file path and line number
+3. **Why it matters** — what breaks or what risk it introduces
+4. **Fix** — provide a concrete code suggestion
+
+### Example (from PR #210)
+
+```
+## 🔴 Critical: resize() distorts aspect ratio
+
+**File:** `src/discord.rs`, line ~320
+
+`image::Image::resize(w, h, filter)` resizes the image to the exact
+given dimensions — it does not preserve aspect ratio automatically.
+A 4000×2000 landscape image gets squashed into 1200×1200.
+
+### Fix
+
+​```rust
+let ratio = f64::from(IMAGE_MAX_DIMENSION_PX) / f64::max(w, h);
+let new_w = (f64::from(w) * ratio) as u32;
+let new_h = (f64::from(h) * ratio) as u32;
+img.resize(new_w, new_h, image::imageops::FilterType::Lanczos3)
+​```
+```
+
+## Self-Review Checklist (before opening PR)
+
+Authors should check these before requesting review:
+
+- [ ] **API behavior verified** — read the docs for any new library/function used
+- [ ] **Safety checks preserved** — if refactoring, confirm all original validation/security checks are still present
+- [ ] **Code style consistent** — logging, error handling, naming match the existing codebase
+- [ ] **Tests test the right thing** — assertions reflect actual expected behavior, not just "passes"
+
+## Review Etiquette
+
+- **Be specific** — "this is wrong" is not helpful; show what's wrong and how to fix it
+- **Classify severity** — not everything is a blocker; use 🔴🟡🟢 so the author knows what to prioritize
+- **Acknowledge good work** — if something is well done, say so
+- **One round if possible** — batch all feedback in one review pass to avoid back-and-forth
