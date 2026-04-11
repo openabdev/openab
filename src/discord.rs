@@ -12,7 +12,6 @@ use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId};
 use serenity::prelude::*;
 use std::collections::HashSet;
-use std::sync::LazyLock;
 use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::{debug, error, info};
