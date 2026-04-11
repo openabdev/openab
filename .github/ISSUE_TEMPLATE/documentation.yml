@@ -1,0 +1,16 @@
+name: Documentation
+description: Report a documentation issue or request new documentation
+labels: [documentation, needs-triage]
+body:
+  - type: textarea
+    attributes:
+      label: Description
+      description: What's wrong or missing in the documentation?
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Suggested Change
+      description: How do you think it should be improved?
+    validations:
+      required: false

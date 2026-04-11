@@ -1,0 +1,87 @@
+name: Issue Completeness Check
+
+on:
+  issues:
+    types: [opened, edited]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const body = issue.body || '';
+            const labels = issue.labels.map(l => l.name);
+            const marker = '<!-- openab-issue-check -->';
+
+            const rules = {
+              bug: ['Description', 'Steps to Reproduce', 'Expected Behavior'],
+              feature: ['Description', 'Use Case'],
+              documentation: ['Description'],
+              guidance: ['Question']
+            };
+
+            const type = Object.keys(rules).find(k => labels.includes(k));
+            if (!type) return;
+
+            const missing = rules[type].filter(field => {
+              const regex = new RegExp(
+                `###\\s*${field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\n([\\s\\S]*?)(?=###|$)`
+              );
+              const match = body.match(regex);
+              if (!match) return true;
+              const content = match[1].trim();
+              return !content || content === '_No response_';
+            });
+
+            // Find old check comment
+            const comments = await github.rest.issues.listComments({
+              ...context.repo,
+              issue_number: issue.number
+            });
+            const old = comments.data.find(c => c.body.includes(marker));
+
+            if (missing.length > 0) {
+              const list = missing.map(f => `- [ ] **${f}**`).join('\n');
+              const msg = `${marker}\n⚠️ This issue is missing the following required information and will not be processed until completed:\n\n${list}\n\nPlease edit this issue to fill in the missing fields. Thank you!`;
+
+              // Delete old, create new (so user gets notified)
+              if (old) {
+                await github.rest.issues.deleteComment({
+                  ...context.repo,
+                  comment_id: old.id
+                });
+              }
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: issue.number,
+                body: msg
+              });
+
+              if (!labels.includes('incomplete')) {
+                await github.rest.issues.addLabels({
+                  ...context.repo,
+                  issue_number: issue.number,
+                  labels: ['incomplete']
+                });
+              }
+            } else {
+              // All filled: remove comment + label
+              if (old) {
+                await github.rest.issues.deleteComment({
+                  ...context.repo,
+                  comment_id: old.id
+                });
+              }
+              if (labels.includes('incomplete')) {
+                await github.rest.issues.removeLabel({
+                  ...context.repo,
+                  issue_number: issue.number,
+                  name: 'incomplete'
+                });
+              }
+            }
