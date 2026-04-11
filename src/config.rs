@@ -11,7 +11,40 @@ pub struct Config {
     pub pool: PoolConfig,
     #[serde(default)]
     pub reactions: ReactionsConfig,
+    #[serde(default)]
+    pub usage: Option<UsageConfig>,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsageConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_usage_timeout")]
+    pub timeout_secs: u64,
+    #[serde(default)]
+    pub runners: Vec<UsageRunnerConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsageRunnerConfig {
+    pub name: String,
+    pub label: String,
+    #[serde(default = "default_usage_color")]
+    pub color: u32,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub template: String,
+    #[serde(default)]
+    pub progress_fields: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub working_dir: Option<String>,
+}
+
+fn default_usage_timeout() -> u64 { 30 }
+fn default_usage_color() -> u32 { 0x5865F2 }
 
 #[derive(Debug, Deserialize)]
 pub struct DiscordConfig {

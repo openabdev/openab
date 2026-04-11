@@ -4,6 +4,7 @@ mod discord;
 mod error_display;
 mod format;
 mod reactions;
+mod usage;
 
 use serenity::prelude::*;
 use std::collections::HashSet;
@@ -47,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
         allowed_channels,
         allowed_users,
         reactions_config: cfg.reactions,
+        usage_config: cfg.usage,
     };
 
     let intents = GatewayIntents::GUILD_MESSAGES
