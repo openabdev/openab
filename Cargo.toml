@@ -16,3 +16,4 @@ regex = "1"
 anyhow = "1"
 rand = "0.8"
 base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }

@@ -250,7 +250,9 @@ async fn handle_message(
             }
 
             // Accept text messages or photos (with optional caption).
-            let (prompt, image) = if let Some(photos) = msg.photo() {
+            // raw_image carries raw bytes to be resolved inside stream_prompt
+            // where conn.current_model_id is available for the vision gate.
+            let (prompt, raw_image) = if let Some(photos) = msg.photo() {
                 let caption = msg.caption().unwrap_or("").to_string();
                 let photo = match photos.iter().max_by_key(|p| p.width * p.height) {
                     Some(p) => p,
@@ -440,7 +442,7 @@ async fn handle_message(
                         } else {
                             // plain message or @mention in #general → buffer silently (no topic)
                             // Exception: photos always get a topic so the model can describe them.
-                            silent_mode = image.is_none() && !is_mentioned;
+                            silent_mode = raw_image.is_none() && !is_mentioned;
                         }
                     } else {
                         silent_mode = in_real_topic && !is_mentioned;
@@ -452,7 +454,7 @@ async fn handle_message(
             let chat_id = msg.chat.id;
 
             // In personal mode every message can create a topic; in team mode only !kiro or photos.
-            let may_create_topic = is_kiro_cmd || mode == ChatMode::Personal || image.is_some();
+            let may_create_topic = is_kiro_cmd || mode == ChatMode::Personal || raw_image.is_some();
 
             // Resolve thread context
             let ctx = match get_or_create_thread(&bot, &msg, may_create_topic).await {
@@ -527,7 +529,7 @@ async fn handle_message(
 
             pool.record_user_message(&ctx.session_key, &attributed_prompt).await;
             let result = stream_prompt(
-                &pool, &ctx.session_key, &attributed_prompt, image,
+                &pool, &ctx.session_key, &attributed_prompt, raw_image,
                 &bot, chat_id, thinking.id, user_msg_id, ctx.thread_id,
             ).await;
 
@@ -627,7 +629,7 @@ async fn rename_topic(
     let rx = pool.with_connection(session_key, |conn| {
         let p = title_prompt.clone();
         Box::pin(async move {
-            let (rx, _) = conn.session_prompt(&p, None).await?;
+            let (rx, _) = conn.session_prompt(&p, vec![]).await?;
             Ok(rx)
         })
     }).await;
@@ -658,7 +660,7 @@ async fn silent_prompt(pool: &SessionPool, session_key: &str, prompt: &str) -> a
     let rx = pool.with_connection(session_key, |conn| {
         let prompt = prompt.clone();
         Box::pin(async move {
-            let (rx, _) = conn.session_prompt(&prompt, None).await?;
+            let (rx, _) = conn.session_prompt(&prompt, vec![]).await?;
             Ok(rx)
         })
     }).await?;
@@ -707,7 +709,18 @@ async fn stream_prompt(
             let reset = conn.session_reset;
             conn.session_reset = false;
 
-            let (mut rx, _) = conn.session_prompt(&prompt, image).await?;
+            // Resolve image bytes → ContentBlock with model gate applied here
+            // where conn.current_model_id is available.
+            let extra_blocks = if let Some((bytes, mime)) = image {
+                crate::media::resolve(
+                    crate::media::MediaInput::Image { bytes, mime },
+                    conn.current_model_id.as_deref(),
+                )
+            } else {
+                vec![]
+            };
+
+            let (mut rx, _) = conn.session_prompt(&prompt, extra_blocks).await?;
 
             let mut text_buf = String::new();
             let mut tool_lines: Vec<String> = Vec::new();

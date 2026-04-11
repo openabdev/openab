@@ -1,5 +1,6 @@
 mod acp;
 mod config;
+mod media;
 mod telegram;
 mod format;
 

@@ -58,6 +58,8 @@ pub struct AcpConnection {
     pub pending_context: Option<String>,
     /// The context injected at session resume — carried forward into the next compaction.
     pub prior_context: Option<String>,
+    /// The current model ID (from session/new). Used to gate vision support.
+    pub current_model_id: Option<String>,
     _reader_handle: JoinHandle<()>,
 }
 
@@ -196,6 +198,7 @@ impl AcpConnection {
             supports_load_session: false,
             pending_context: None,
             prior_context: None,
+            current_model_id: None,
             _reader_handle: reader_handle,
         })
     }
@@ -326,16 +329,19 @@ impl AcpConnection {
 
         info!(session_id = %session_id, slash_cmds = cmds.len(), "session created");
         self.acp_session_id = Some(session_id.clone());
+        self.current_model_id = result.get("models")
+            .and_then(|m| m.get("currentModelId"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         Ok((session_id, cmds))
     }
 
-    /// Send a prompt and return a receiver for streaming notifications.
+    /// Send a prompt with content blocks and return a receiver for streaming notifications.
     /// The final message on the channel will have id set (the prompt response).
-    /// Pass `image` as `Some((bytes, mime_type))` to include an image content block.
     pub async fn session_prompt(
         &mut self,
         prompt: &str,
-        image: Option<(Vec<u8>, String)>,
+        extra_blocks: Vec<ContentBlock>,
     ) -> Result<(mpsc::UnboundedReceiver<JsonRpcMessage>, u64)> {
         self.last_active = Instant::now();
         self.is_streaming = true;
@@ -353,11 +359,9 @@ impl AcpConnection {
             prompt.to_string()
         };
 
-        let mut parts = vec![json!({"type": "text", "text": full_prompt})];
-        if let Some((bytes, mime)) = image {
-            use base64::Engine;
-            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            parts.push(json!({"type": "image", "mimeType": mime, "data": data}));
+        let mut parts = vec![ContentBlock::Text { text: full_prompt }.to_json()];
+        for block in &extra_blocks {
+            parts.push(block.to_json());
         }
 
         let (tx, rx) = mpsc::unbounded_channel();
