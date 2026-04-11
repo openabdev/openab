@@ -249,10 +249,10 @@ async fn handle_message(
                 return Ok(());
             }
 
-            // Accept text messages or photos (with optional caption).
-            // raw_image carries raw bytes to be resolved inside stream_prompt
-            // where conn.current_model_id is available for the vision gate.
-            let (prompt, raw_image) = if let Some(photos) = msg.photo() {
+            // Accept text, photos, and documents.
+            // raw_image: raw bytes for images — model gate applied inside stream_prompt.
+            // extra_blocks: pre-resolved ContentBlocks for documents (markitdown runs here).
+            let (prompt, raw_image, extra_blocks) = if let Some(photos) = msg.photo() {
                 let caption = msg.caption().unwrap_or("").to_string();
                 let photo = match photos.iter().max_by_key(|p| p.width * p.height) {
                     Some(p) => p,
@@ -276,10 +276,36 @@ async fn handle_message(
                         .await;
                     return Ok(());
                 }
-                (caption, Some((bytes, "image/jpeg".to_string())))
+                (caption, Some((bytes, "image/jpeg".to_string())), vec![])
+            } else if let Some(doc) = msg.document() {
+                let caption = msg.caption().unwrap_or("").to_string();
+                let filename = doc.file_name.clone().unwrap_or_else(|| "document".to_string());
+                let file = match bot.get_file(&doc.file.id).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        error!("get_file failed: {e}");
+                        let _ = bot.send_message(msg.chat.id, "⚠️ Failed to retrieve file.")
+                            .reply_parameters(ReplyParameters::new(msg.id))
+                            .await;
+                        return Ok(());
+                    }
+                };
+                let mut bytes: Vec<u8> = Vec::new();
+                if let Err(e) = bot.download_file(&file.path, &mut bytes).await {
+                    error!("download_file failed: {e}");
+                    let _ = bot.send_message(msg.chat.id, "⚠️ Failed to download file.")
+                        .reply_parameters(ReplyParameters::new(msg.id))
+                        .await;
+                    return Ok(());
+                }
+                let blocks = crate::media::resolve(
+                    crate::media::MediaInput::Document { bytes, filename },
+                    None,
+                ).await;
+                (caption, None, blocks)
             } else {
                 match msg.text() {
-                    Some(t) if !t.is_empty() => (t.to_string(), None),
+                    Some(t) if !t.is_empty() => (t.to_string(), None, vec![]),
                     _ => return Ok(()),
                 }
             };
@@ -413,7 +439,7 @@ async fn handle_message(
             } else {
                 prompt
             };
-            if prompt.is_empty() && raw_image.is_none() { return Ok(()); }
+            if prompt.is_empty() && raw_image.is_none() && extra_blocks.is_empty() { return Ok(()); }
 
             // ── Group chat gate ───────────────────────────────────────────────
             // In a group (not inside a real topic):
@@ -442,7 +468,7 @@ async fn handle_message(
                         } else {
                             // plain message or @mention in #general → buffer silently (no topic)
                             // Exception: photos always get a topic so the model can describe them.
-                            silent_mode = raw_image.is_none() && !is_mentioned;
+                            silent_mode = raw_image.is_none() && extra_blocks.is_empty() && !is_mentioned;
                         }
                     } else {
                         silent_mode = in_real_topic && !is_mentioned;
@@ -454,7 +480,7 @@ async fn handle_message(
             let chat_id = msg.chat.id;
 
             // In personal mode every message can create a topic; in team mode only !kiro or photos.
-            let may_create_topic = is_kiro_cmd || mode == ChatMode::Personal || raw_image.is_some();
+            let may_create_topic = is_kiro_cmd || mode == ChatMode::Personal || raw_image.is_some() || !extra_blocks.is_empty();
 
             // Resolve thread context
             let ctx = match get_or_create_thread(&bot, &msg, may_create_topic).await {
@@ -497,6 +523,8 @@ async fn handle_message(
             let name = msg.from.as_ref().map(|u| u.first_name.as_str()).unwrap_or("User");
             let effective_prompt = if prompt.is_empty() && raw_image.is_some() {
                 "[image]".to_string()
+            } else if prompt.is_empty() && !extra_blocks.is_empty() {
+                "[file]".to_string()
             } else {
                 prompt.clone()
             };
@@ -536,7 +564,7 @@ async fn handle_message(
 
             pool.record_user_message(&ctx.session_key, &attributed_prompt).await;
             let result = stream_prompt(
-                &pool, &ctx.session_key, &attributed_prompt, raw_image,
+                &pool, &ctx.session_key, &attributed_prompt, raw_image, extra_blocks,
                 &bot, chat_id, thinking.id, user_msg_id, ctx.thread_id,
             ).await;
 
@@ -696,6 +724,7 @@ async fn stream_prompt(
     session_key: &str,
     prompt: &str,
     image: Option<(Vec<u8>, String)>,
+    doc_blocks: Vec<crate::acp::ContentBlock>,
     bot: &Bot,
     chat_id: ChatId,
     msg_id: MessageId,
@@ -706,24 +735,22 @@ async fn stream_prompt(
     let bot = bot.clone();
     let session_key = session_key.to_string();
 
-    // Run the stream inside with_connection, return abnormal exit info after lock is released.
     let (_final_content, timed_out, agent_died, partial_summary) = pool.with_connection(&session_key, |conn| {
         let prompt = prompt.clone();
         let bot = bot.clone();
         let session_key = session_key.clone();
         let image = image;
+        let doc_blocks = doc_blocks;
         Box::pin(async move {
             let reset = conn.session_reset;
             conn.session_reset = false;
 
-            // Resolve image bytes → ContentBlock with model gate applied here
-            // where conn.current_model_id is available.
-            let extra_blocks = if let Some((bytes, mime)) = image {
+            // Resolve image → ContentBlock with model gate, then append any doc blocks
+            let mut extra_blocks = if let Some((bytes, mime)) = image {
                 let blocks = crate::media::resolve(
                     crate::media::MediaInput::Image { bytes, mime },
                     conn.current_model_id.as_deref(),
-                );
-                // Warn user if image was dropped due to non-vision model
+                ).await;
                 if blocks.is_empty() {
                     let model = conn.current_model_id.as_deref().unwrap_or("current model");
                     let _ = bot.edit_message_text(
@@ -735,6 +762,7 @@ async fn stream_prompt(
             } else {
                 vec![]
             };
+            extra_blocks.extend(doc_blocks);
 
             let (mut rx, _) = conn.session_prompt(&prompt, extra_blocks).await?;
 

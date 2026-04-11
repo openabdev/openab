@@ -20,6 +20,7 @@ dependencies = [
  "serde",
  "serde_json",
  "teloxide",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",
