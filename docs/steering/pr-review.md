@@ -1,5 +1,14 @@
 # PR Review Guide for openabdev/openab
 
+## Review Framework
+
+When reviewing a PR, always address these four questions:
+
+1. **他解決什麼問題或需求** — 這個 PR 要解決什麼痛點或滿足什麼需求？用白話說明背景。
+2. **他用什麼方式解決** — 具體的技術做法、架構設計、關鍵實作細節。
+3. **他考慮過其他方式嗎** — 從 PR 描述、討論、commit history 中找出被考慮過但沒採用的替代方案，以及為什麼被否決。
+4. **這是目前最好的方式嗎** — 評估現有做法是否最佳，指出可以改進的地方和潛在風險。
+
 ## Severity Levels
 
 Use emoji + color to classify each review comment:
