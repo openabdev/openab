@@ -7,29 +7,34 @@ pub fn split_message(text: &str, limit: usize) -> Vec<String> {
 
     let mut chunks = Vec::new();
     let mut current = String::new();
+    let mut current_len: usize = 0;
 
     for line in text.split('\n') {
         let line_chars = line.chars().count();
-        let current_chars = current.chars().count();
         // +1 for the newline
-        if !current.is_empty() && current_chars + line_chars + 1 > limit {
+        if !current.is_empty() && current_len + line_chars + 1 > limit {
             chunks.push(current);
             current = String::new();
+            current_len = 0;
         }
         if !current.is_empty() {
             current.push('\n');
+            current_len += 1;
         }
         // If a single line exceeds limit, hard-split on char boundaries
         if line_chars > limit {
             for ch in line.chars() {
-                if current.chars().count() + 1 > limit {
+                if current_len + 1 > limit {
                     chunks.push(current);
                     current = String::new();
+                    current_len = 0;
                 }
                 current.push(ch);
+                current_len += 1;
             }
         } else {
             current.push_str(line);
+            current_len += line_chars;
         }
     }
     if !current.is_empty() {
