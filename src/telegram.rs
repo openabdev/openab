@@ -120,8 +120,9 @@ async fn get_or_create_thread(bot: &Bot, msg: &Message, is_kiro_cmd: bool) -> an
             .map(|u| u.first_name.clone())
             .unwrap_or_else(|| "User".to_string());
         let prompt_preview: String = msg.text().unwrap_or("").chars().take(30).collect();
+        let has_doc = msg.document().is_some();
         let topic_name: String = if prompt_preview.is_empty() {
-            format!("📷 {}", user_name)
+            if has_doc { format!("📄 {}", user_name) } else { format!("📷 {}", user_name) }
         } else {
             format!("{}: {}", user_name, prompt_preview)
         }.chars().take(128).collect();
@@ -574,7 +575,7 @@ async fn handle_message(
                     // Rename new topics with a Kiro-generated title
                     if ctx.is_new_topic {
                         if let Some(tid) = ctx.thread_id {
-                            rename_topic(&pool, &ctx.session_key, &prompt, &bot, chat_id, tid).await;
+                            rename_topic(&pool, &ctx.session_key, &effective_prompt, &bot, chat_id, tid).await;
                         }
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
