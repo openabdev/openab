@@ -340,31 +340,32 @@ async function handleSessionPrompt(params) {
   const state = sessions.get(sessionId);
   if (!state) throw new Error(`unknown sessionId: ${sessionId}`);
 
-  // Extract text from prompt content blocks.
+  // Extract text + attachments from prompt content blocks.
   const text = extractPromptText(prompt);
-  if (!text) {
+  const attachments = extractPromptAttachments(prompt);
+
+  // If neither text nor attachments — skip
+  if (!text && attachments.length === 0) {
     return { stopReason: 'end_turn' };
   }
 
-  // Slash-command interception: prompt text starting with "/" is routed
-  // directly to the corresponding SDK RPC, bypassing the LLM entirely.
-  // This matches the claude-agent-acp behavior where `/cost`, `/status`
-  // etc. can be typed as regular chat messages.
-  const trimmed = text.trim();
-  if (trimmed.startsWith('/')) {
-    const slashResult = await handleSlashCommand(sessionId, state, trimmed);
-    if (slashResult) {
-      sendNotification('session/update', {
-        sessionId,
-        update: {
-          sessionUpdate: 'agent_message_chunk',
-          content: { type: 'text', text: slashResult },
-        },
-      });
-      return { stopReason: 'end_turn' };
+  // Slash-command interception (text only — skip if attachments present so
+  // the LLM sees the image alongside the slash-looking text).
+  if (text && attachments.length === 0) {
+    const trimmed = text.trim();
+    if (trimmed.startsWith('/')) {
+      const slashResult = await handleSlashCommand(sessionId, state, trimmed);
+      if (slashResult) {
+        sendNotification('session/update', {
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: slashResult },
+          },
+        });
+        return { stopReason: 'end_turn' };
+      }
     }
-    // If handleSlashCommand returns null, the command wasn't recognized —
-    // fall through to normal LLM processing (LLM will see the "/xxx" text).
   }
 
   // Create a promise that resolves when the assistant turn ends.
@@ -372,8 +373,15 @@ async function handleSessionPrompt(params) {
   const turnPromise = new Promise(res => (resolveTurn = res));
   state.turnInProgress = { resolveTurn, sessionId };
 
+  // Send with attachments if any were present.
+  const sendOpts = { prompt: text || '(see attached image)' };
+  if (attachments.length > 0) {
+    sendOpts.attachments = attachments;
+    logInfo(`session/prompt with ${attachments.length} attachment(s)`);
+  }
+
   try {
-    await state.session.send({ prompt: text });
+    await state.session.send(sendOpts);
   } catch (err) {
     state.turnInProgress = null;
     throw err;
@@ -744,6 +752,41 @@ function extractPromptText(prompt) {
       .join('\n');
   }
   return '';
+}
+
+/// Extract image/file attachments from an ACP content-block array and
+/// convert them to Copilot SDK MessageOptions.attachments shape
+/// (type: "blob" with base64 data + mimeType).
+/// Returns [] if no attachments present.
+function extractPromptAttachments(prompt) {
+  if (!Array.isArray(prompt)) return [];
+  const out = [];
+  let imgCount = 0;
+  for (const b of prompt) {
+    if (!b || typeof b !== 'object') continue;
+    if (b.type === 'image' && typeof b.data === 'string') {
+      // ACP ImageContent: { type: 'image', data: base64, mimeType: 'image/...' }
+      imgCount += 1;
+      out.push({
+        type: 'blob',
+        data: b.data,
+        mimeType: b.mimeType || b.media_type || 'image/png',
+        displayName: `discord-image-${imgCount}.${(b.mimeType || 'image/png').split('/')[1] || 'png'}`,
+      });
+    } else if (b.type === 'resource' && b.resource) {
+      // ACP EmbeddedContext resource — best-effort forward as blob
+      const r = b.resource;
+      if (r.blob) {
+        out.push({
+          type: 'blob',
+          data: r.blob,
+          mimeType: r.mimeType || 'application/octet-stream',
+          displayName: r.uri || 'resource',
+        });
+      }
+    }
+  }
+  return out;
 }
 
 function classifyToolKind(name) {
