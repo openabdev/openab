@@ -4,6 +4,10 @@ on:
   issues:
     types: [opened, edited]
 
+concurrency:
+  group: issue-check-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -35,8 +39,10 @@ jobs:
             const old = comments.data.find(c => c.body.includes(marker));
 
             if (!type) {
-              // No template label — likely created via API/CLI bypassing templates
-              const msg = `${marker}\n⚠️ This issue was not created using an issue template. Please use one of the available templates to ensure your issue is processed.\n\nAvailable templates: Bug Report, Feature Request, Documentation, Guidance`;
+              // No template label — skip if already flagged
+              if (old && labels.includes('incomplete')) return;
+
+              const msg = `${marker}\n⚠️ Could not detect an issue template. Please make sure this issue was created using one of the available templates and that the corresponding label (\`bug\`, \`feature\`, \`documentation\`, \`guidance\`) is present.\n\nAvailable templates: Bug Report, Feature Request, Documentation, Guidance`;
 
               if (old) {
                 await github.rest.issues.deleteComment({
