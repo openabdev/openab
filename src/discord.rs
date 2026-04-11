@@ -54,7 +54,7 @@ impl EventHandler for Handler {
                 Ok(serenity::model::channel::Channel::Guild(gc)) => {
                     let result = gc
                         .parent_id
-                        .map_or(false, |pid| self.allowed_channels.contains(&pid.get()));
+                        .is_some_and(|pid| self.allowed_channels.contains(&pid.get()));
                     tracing::debug!(channel_id = %msg.channel_id, parent_id = ?gc.parent_id, result, "thread check");
                     result
                 }
