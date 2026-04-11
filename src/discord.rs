@@ -24,7 +24,17 @@ pub struct Handler {
 #[async_trait]
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
+        info!(
+            msg_id = %msg.id,
+            channel = %msg.channel_id,
+            author = %msg.author.id,
+            is_bot = msg.author.bot,
+            content_len = msg.content.len(),
+            content_bytes = ?msg.content.as_bytes(),
+            "DIAG: message() entered"
+        );
         if msg.author.bot {
+            info!(msg_id = %msg.id, "DIAG: skipping bot author");
             return;
         }
 
@@ -44,15 +54,15 @@ impl EventHandler for Handler {
                     let result = gc
                         .parent_id
                         .map_or(false, |pid| self.allowed_channels.contains(&pid.get()));
-                    tracing::debug!(channel_id = %msg.channel_id, parent_id = ?gc.parent_id, result, "thread check");
+                    tracing::info!(channel_id = %msg.channel_id, parent_id = ?gc.parent_id, result, "thread check");
                     result
                 }
                 Ok(other) => {
-                    tracing::debug!(channel_id = %msg.channel_id, kind = ?other, "not a guild channel");
+                    tracing::info!(channel_id = %msg.channel_id, kind = ?other, "not a guild channel");
                     false
                 }
                 Err(e) => {
-                    tracing::debug!(channel_id = %msg.channel_id, error = %e, "to_channel failed");
+                    tracing::info!(channel_id = %msg.channel_id, error = %e, "to_channel failed");
                     false
                 }
             }
@@ -84,6 +94,80 @@ impl EventHandler for Handler {
             return;
         }
 
+        info!(
+            msg_id = %msg.id,
+            prompt = %prompt,
+            prompt_bytes = ?prompt.as_bytes(),
+            starts_with_bang_model = prompt.starts_with("!model"),
+            "DIAG: pre-intercept prompt parsed"
+        );
+
+        // Handle !model command (intercept before normal prompt flow)
+        if prompt.starts_with("!model") {
+            info!(msg_id = %msg.id, "DIAG: !model intercept fired");
+            let arg = prompt[6..].trim().to_string();
+            let thread_key = msg.channel_id.get().to_string();
+
+            // Ensure session exists so we have available_models populated
+            if let Err(e) = self.pool.get_or_create(&thread_key).await {
+                let _ = msg.channel_id.say(&ctx.http, format!("⚠️ Failed to start agent: {e}")).await;
+                return;
+            }
+
+            let reply = self
+                .pool
+                .with_connection(&thread_key, |conn| {
+                    let arg = arg.clone();
+                    Box::pin(async move {
+                        if arg.is_empty() {
+                            // List models
+                            if conn.available_models.is_empty() {
+                                return Ok::<String, anyhow::Error>(
+                                    "_(no models reported by agent — backend may not support model switching)_".to_string(),
+                                );
+                            }
+                            let mut out = String::from("**Available models:**\n");
+                            for m in &conn.available_models {
+                                let marker = if m.model_id == conn.current_model { "**▶**" } else { "•" };
+                                out.push_str(&format!(
+                                    "{} `{}` — {}\n",
+                                    marker, m.model_id, m.name
+                                ));
+                            }
+                            out.push_str(&format!("\nCurrent: `{}`\n", conn.current_model));
+                            out.push_str("\nAliases: `opus`, `sonnet`, `haiku`, `auto`");
+                            Ok(out)
+                        } else {
+                            match conn.resolve_model_alias(&arg) {
+                                Some(model_id) => {
+                                    match conn.session_set_model(&model_id).await {
+                                        Ok(()) => Ok(format!("✅ Switched to `{model_id}`")),
+                                        Err(e) => Ok(format!("⚠️ Failed to set model: {e}")),
+                                    }
+                                }
+                                None => {
+                                    let mut out = format!("❌ Unknown model: `{arg}`\n\n**Available:**\n");
+                                    for m in &conn.available_models {
+                                        out.push_str(&format!("• `{}`\n", m.model_id));
+                                    }
+                                    out.push_str("\nAliases: `opus`, `sonnet`, `haiku`, `auto`");
+                                    Ok(out)
+                                }
+                            }
+                        }
+                    })
+                })
+                .await;
+
+            let text = match reply {
+                Ok(t) => t,
+                Err(e) => format!("⚠️ {e}"),
+            };
+            let _ = msg.channel_id.say(&ctx.http, text).await;
+            info!(msg_id = %msg.id, "DIAG: !model intercept returning");
+            return;
+        }
+
         // Inject structured sender context so the downstream CLI can identify who sent the message
         let display_name = msg.member.as_ref()
             .and_then(|m| m.nick.as_ref())
@@ -103,7 +187,7 @@ impl EventHandler for Handler {
             prompt
         );
 
-        tracing::debug!(prompt = %prompt_with_sender, in_thread, "processing");
+        tracing::info!(prompt = %prompt_with_sender, in_thread, "processing");
 
         let thread_id = if in_thread {
             msg.channel_id.get()
@@ -145,6 +229,8 @@ impl EventHandler for Handler {
             self.reactions_config.timing.clone(),
         ));
         reactions.set_queued().await;
+
+        info!(msg_id = %msg.id, thread_key = %thread_key, "DIAG: about to call stream_prompt (NOT !model path)");
 
         // Stream prompt with live edits
         let result = stream_prompt(
