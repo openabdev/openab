@@ -1815,38 +1815,39 @@ async fn stream_prompt(
             let (buf_tx, buf_rx) = watch::channel(initial);
 
             let mut text_buf = String::new();
-            let mut tool_lines: Vec<String> = Vec::new();
+            // Tool calls indexed by toolCallId. Vec preserves first-seen
+            // order. We store id + title + state separately so a ToolDone
+            // event that arrives without a refreshed title (claude-agent-acp's
+            // update events don't always re-send the title field) can still
+            // reuse the title we already learned from a prior
+            // tool_call_update — only the icon flips 🔧 → ✅ / ❌. Rendering
+            // happens on the fly in compose_display().
+            let mut tool_lines: Vec<ToolEntry> = Vec::new();
             let current_msg_id = msg_id;
 
             if reset {
                 text_buf.push_str("⚠️ _Session expired, starting fresh..._\n\n");
             }
 
-            // Spawn edit-streaming task
+            // Spawn edit-streaming task — only edits the single message, never sends new ones.
+            // Long content is truncated during streaming; final multi-message split happens after.
             let edit_handle = {
                 let ctx = ctx.clone();
                 let mut buf_rx = buf_rx.clone();
                 tokio::spawn(async move {
                     let mut last_content = String::new();
-                    let mut current_edit_msg = msg_id;
                     loop {
                         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
                         if buf_rx.has_changed().unwrap_or(false) {
                             let content = buf_rx.borrow_and_update().clone();
                             if content != last_content {
-                                if content.len() > 1900 {
-                                    let chunks = format::split_message(&content, 1900);
-                                    if let Some(first) = chunks.first() {
-                                        let _ = edit(&ctx, channel, current_edit_msg, first).await;
-                                    }
-                                    for chunk in chunks.iter().skip(1) {
-                                        if let Ok(new_msg) = channel.say(&ctx.http, chunk).await {
-                                            current_edit_msg = new_msg.id;
-                                        }
-                                    }
+                                let display = if content.chars().count() > 1900 {
+                                    let truncated = format::truncate_chars(&content, 1900);
+                                    format!("{truncated}…")
                                 } else {
-                                    let _ = edit(&ctx, channel, current_edit_msg, &content).await;
-                                }
+                                    content.clone()
+                                };
+                                let _ = edit(&ctx, channel, msg_id, &display).await;
                                 last_content = content;
                             }
                         }
@@ -1882,16 +1883,53 @@ async fn stream_prompt(
                         AcpEvent::Thinking => {
                             reactions.set_thinking().await;
                         }
-                        AcpEvent::ToolStart { title, .. } if !title.is_empty() => {
+                        AcpEvent::ToolStart { id, title } if !title.is_empty() => {
                             reactions.set_tool(&title).await;
-                            tool_lines.push(format!("🔧 `{title}`..."));
+                            let title = sanitize_title(&title);
+                            // Dedupe by toolCallId: replace if we've already
+                            // seen this id, otherwise append a new entry.
+                            // claude-agent-acp emits a placeholder title
+                            // ("Terminal", "Edit", etc.) on the first event
+                            // and refines it via tool_call_update; without
+                            // dedup the placeholder and refined version
+                            // appear as two separate orphaned lines.
+                            if let Some(slot) = tool_lines.iter_mut().find(|e| e.id == id) {
+                                slot.title = title;
+                                slot.state = ToolState::Running;
+                            } else {
+                                tool_lines.push(ToolEntry {
+                                    id,
+                                    title,
+                                    state: ToolState::Running,
+                                });
+                            }
                             let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
                         }
-                        AcpEvent::ToolDone { title, status, .. } => {
+                        AcpEvent::ToolDone { id, title, status } => {
                             reactions.set_thinking().await;
-                            let icon = if status == "completed" { "✅" } else { "❌" };
-                            if let Some(line) = tool_lines.iter_mut().rev().find(|l| l.contains(&title)) {
-                                *line = format!("{icon} `{title}`");
+                            let new_state = if status == "completed" {
+                                ToolState::Completed
+                            } else {
+                                ToolState::Failed
+                            };
+                            // Find by id (the title is unreliable — substring
+                            // match against the placeholder "Terminal" would
+                            // never find the refined entry). Preserve the
+                            // existing title if the Done event omits it.
+                            if let Some(slot) = tool_lines.iter_mut().find(|e| e.id == id) {
+                                if !title.is_empty() {
+                                    slot.title = sanitize_title(&title);
+                                }
+                                slot.state = new_state;
+                            } else if !title.is_empty() {
+                                // Done arrived without a prior Start (rare
+                                // race) — record it so we still show
+                                // something.
+                                tool_lines.push(ToolEntry {
+                                    id,
+                                    title: sanitize_title(&title),
+                                    state: new_state,
+                                });
                             }
                             let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
                         }
@@ -1937,11 +1975,47 @@ async fn stream_prompt(
     .await
 }
 
-fn compose_display(tool_lines: &[String], text: &str) -> String {
+/// Flatten a tool-call title into a single line that's safe to render
+/// inside Discord inline-code spans. Discord renders single-backtick
+/// code on a single line only, so multi-line shell commands (heredocs,
+/// `&&`-chained commands split across lines) appear truncated; we
+/// collapse newlines to ` ; ` and rewrite embedded backticks so they
+/// don't break the wrapping span.
+fn sanitize_title(title: &str) -> String {
+    title.replace('\r', "").replace('\n', " ; ").replace('`', "'")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolState {
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+struct ToolEntry {
+    id: String,
+    title: String,
+    state: ToolState,
+}
+
+impl ToolEntry {
+    fn render(&self) -> String {
+        let icon = match self.state {
+            ToolState::Running => "🔧",
+            ToolState::Completed => "✅",
+            ToolState::Failed => "❌",
+        };
+        let suffix = if self.state == ToolState::Running { "..." } else { "" };
+        format!("{icon} `{}`{}", self.title, suffix)
+    }
+}
+
+fn compose_display(tool_lines: &[ToolEntry], text: &str) -> String {
     let mut out = String::new();
     if !tool_lines.is_empty() {
-        for line in tool_lines {
-            out.push_str(line);
+        for entry in tool_lines {
+            out.push_str(&entry.render());
             out.push('\n');
         }
         out.push('\n');

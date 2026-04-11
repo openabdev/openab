@@ -60,8 +60,8 @@ impl std::fmt::Display for JsonRpcError {
 pub enum AcpEvent {
     Text(String),
     Thinking,
-    ToolStart { title: String },
-    ToolDone { title: String, status: String },
+    ToolStart { id: String, title: String },
+    ToolDone { id: String, title: String, status: String },
     Status,
 }
 
@@ -69,6 +69,19 @@ pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
     let params = msg.params.as_ref()?;
     let update = params.get("update")?;
     let session_update = update.get("sessionUpdate")?.as_str()?;
+
+    // toolCallId is the stable identity across tool_call → tool_call_update
+    // events for the same tool invocation. claude-agent-acp emits the first
+    // event before the input fields are streamed in (so the title falls back
+    // to "Terminal" / "Edit" / etc.) and refines them in a later
+    // tool_call_update; without the id we can't tell those events belong to
+    // the same call and end up rendering placeholder + refined as two
+    // separate lines.
+    let tool_id = update
+        .get("toolCallId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     match session_update {
         "agent_message_chunk" => {
@@ -80,15 +93,15 @@ pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
         }
         "tool_call" => {
             let title = update.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            Some(AcpEvent::ToolStart { title })
+            Some(AcpEvent::ToolStart { id: tool_id, title })
         }
         "tool_call_update" => {
             let title = update.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let status = update.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
             if status == "completed" || status == "failed" {
-                Some(AcpEvent::ToolDone { title, status })
+                Some(AcpEvent::ToolDone { id: tool_id, title, status })
             } else {
-                Some(AcpEvent::ToolStart { title })
+                Some(AcpEvent::ToolStart { id: tool_id, title })
             }
         }
         "plan" => Some(AcpEvent::Status),
