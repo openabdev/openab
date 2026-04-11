@@ -413,7 +413,7 @@ async fn handle_message(
             } else {
                 prompt
             };
-            if prompt.is_empty() { return Ok(()); }
+            if prompt.is_empty() && raw_image.is_none() { return Ok(()); }
 
             // ── Group chat gate ───────────────────────────────────────────────
             // In a group (not inside a real topic):
@@ -492,11 +492,18 @@ async fn handle_message(
             }).await;
 
             // Prefix with sender name in shared topics.
+            // For image-only messages (no caption), use "[image]" as placeholder prompt
+            // so kiro knows media was sent even if caption is empty.
             let name = msg.from.as_ref().map(|u| u.first_name.as_str()).unwrap_or("User");
-            let attributed_prompt = if in_real_topic {
-                format!("[{}]: {}", name, prompt)
+            let effective_prompt = if prompt.is_empty() && raw_image.is_some() {
+                "[image]".to_string()
             } else {
                 prompt.clone()
+            };
+            let attributed_prompt = if in_real_topic {
+                format!("[{}]: {}", name, effective_prompt)
+            } else {
+                effective_prompt.clone()
             };
 
             if silent_mode {
@@ -712,10 +719,19 @@ async fn stream_prompt(
             // Resolve image bytes → ContentBlock with model gate applied here
             // where conn.current_model_id is available.
             let extra_blocks = if let Some((bytes, mime)) = image {
-                crate::media::resolve(
+                let blocks = crate::media::resolve(
                     crate::media::MediaInput::Image { bytes, mime },
                     conn.current_model_id.as_deref(),
-                )
+                );
+                // Warn user if image was dropped due to non-vision model
+                if blocks.is_empty() {
+                    let model = conn.current_model_id.as_deref().unwrap_or("current model");
+                    let _ = bot.edit_message_text(
+                        chat_id, msg_id,
+                        format!("⚠️ `{model}` doesn't support images. Use `!model` to switch to Claude. Responding to caption only.")
+                    ).await;
+                }
+                blocks
             } else {
                 vec![]
             };
