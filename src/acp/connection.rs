@@ -335,37 +335,29 @@ impl AcpConnection {
     }
 
     pub fn resolve_model_alias(&self, input: &str) -> Option<String> {
+        // Aliases disabled: accept only exact model IDs.
+        // Case-insensitive match against available_models.
         let lower = input.to_lowercase();
-        if self.available_models.iter().any(|m| m.model_id == lower) {
-            return Some(lower);
-        }
-        // Alias table: user-friendly short names → backend modelIds.
-        // Covers both Kiro (claude-*) and Copilot (gpt-*) backends.
-        let candidate = match lower.as_str() {
-            "auto" => "auto",
-            "opus" => "claude-opus-4.6",
-            "sonnet" => "claude-sonnet-4.6",
-            "haiku" => {
-                // Prefer Copilot's claude-haiku-4.5 if present, else Kiro's
-                if self.available_models.iter().any(|m| m.model_id == "claude-haiku-4.5") {
-                    "claude-haiku-4.5"
-                } else {
-                    "claude-haiku-4.5"
-                }
-            }
-            "codex" => "gpt-5.3-codex",
-            "gpt5" | "gpt-5" => "gpt-5.2",
-            "mini" => "gpt-5.4-mini",
-            "4.1" | "gpt4" => "gpt-4.1",
-            other => other,
-        };
-        if candidate == "auto"
-            || self.available_models.iter().any(|m| m.model_id == candidate)
-        {
-            Some(candidate.to_string())
-        } else {
-            None
-        }
+        self.available_models
+            .iter()
+            .find(|m| m.model_id.to_lowercase() == lower)
+            .map(|m| m.model_id.clone())
+    }
+
+    /// Query the bridge's `_meta/getUsage` extension to get session token usage
+    /// and account quota. Only works with agents that implement this custom method
+    /// (e.g. our copilot-agent-acp bridge). Returns the raw JSON result for the
+    /// caller to parse / render.
+    pub async fn session_get_usage(&self) -> Result<Value> {
+        let session_id = self
+            .acp_session_id
+            .as_ref()
+            .ok_or_else(|| anyhow!("no active session"))?
+            .clone();
+        let resp = self
+            .send_request("_meta/getUsage", Some(json!({ "sessionId": session_id })))
+            .await?;
+        Ok(resp.result.unwrap_or(Value::Null))
     }
 
     /// Send a prompt with content blocks (text and/or images) and return a receiver
