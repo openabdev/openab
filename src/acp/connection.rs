@@ -307,9 +307,11 @@ impl AcpConnection {
 
     /// Send a prompt and return a receiver for streaming notifications.
     /// The final message on the channel will have id set (the prompt response).
+    /// Pass `image` as `Some((bytes, mime_type))` to include an image content block.
     pub async fn session_prompt(
         &mut self,
         prompt: &str,
+        image: Option<(Vec<u8>, String)>,
     ) -> Result<(mpsc::UnboundedReceiver<JsonRpcMessage>, u64)> {
         self.last_active = Instant::now();
         self.is_streaming = true;
@@ -327,6 +329,13 @@ impl AcpConnection {
             prompt.to_string()
         };
 
+        let mut parts = vec![json!({"type": "text", "text": full_prompt})];
+        if let Some((bytes, mime)) = image {
+            use base64::Engine;
+            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            parts.push(json!({"type": "image", "mimeType": mime, "data": data}));
+        }
+
         let (tx, rx) = mpsc::unbounded_channel();
         *self.notify_tx.lock().await = Some(tx);
 
@@ -336,7 +345,7 @@ impl AcpConnection {
             "session/prompt",
             Some(json!({
                 "sessionId": session_id,
-                "prompt": [{"type": "text", "text": full_prompt}],
+                "prompt": parts,
             })),
         );
         let data = serde_json::to_string(&req)?;

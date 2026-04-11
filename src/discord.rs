@@ -180,7 +180,7 @@ async fn stream_prompt(
             let reset = conn.session_reset;
             conn.session_reset = false;
 
-            let (mut rx, _) = conn.session_prompt(&prompt).await?;
+            let (mut rx, _) = conn.session_prompt(&prompt, None).await?;
             reactions.set_thinking().await;
 
             let initial = if reset {

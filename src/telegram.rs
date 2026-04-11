@@ -4,6 +4,7 @@ use crate::format;
 use std::collections::HashSet;
 use std::sync::Arc;
 use teloxide::prelude::*;
+use teloxide::net::Download;
 use teloxide::dispatching::UpdateFilterExt;
 use teloxide::types::{
     ChatKind, InlineKeyboardButton, InlineKeyboardMarkup, MessageId, PublicChatKind, ReactionType,
@@ -244,9 +245,21 @@ async fn handle_message(
                 return Ok(());
             }
 
-            let prompt = match msg.text() {
-                Some(t) if !t.is_empty() => t.to_string(),
-                _ => return Ok(()),
+            // Accept text messages or photos (with optional caption).
+            let (prompt, image) = if let Some(photos) = msg.photo() {
+                let caption = msg.caption().unwrap_or("").to_string();
+                // Pick the largest photo size.
+                let photo = photos.iter().max_by_key(|p| p.width * p.height)
+                    .expect("photo array non-empty");
+                let file = bot.get_file(&photo.file.id).await?;
+                let mut bytes: Vec<u8> = Vec::new();
+                bot.download_file(&file.path, &mut bytes).await?;
+                (caption, Some((bytes, "image/jpeg".to_string())))
+            } else {
+                match msg.text() {
+                    Some(t) if !t.is_empty() => (t.to_string(), None),
+                    _ => return Ok(()),
+                }
             };
             let user_msg_id = msg.id;
 
@@ -493,7 +506,7 @@ async fn handle_message(
 
             pool.record_user_message(&ctx.session_key, &attributed_prompt).await;
             let result = stream_prompt(
-                &pool, &ctx.session_key, &attributed_prompt,
+                &pool, &ctx.session_key, &attributed_prompt, image,
                 &bot, chat_id, thinking.id, user_msg_id, ctx.thread_id,
             ).await;
 
@@ -593,7 +606,7 @@ async fn rename_topic(
     let rx = pool.with_connection(session_key, |conn| {
         let p = title_prompt.clone();
         Box::pin(async move {
-            let (rx, _) = conn.session_prompt(&p).await?;
+            let (rx, _) = conn.session_prompt(&p, None).await?;
             Ok(rx)
         })
     }).await;
@@ -624,7 +637,7 @@ async fn silent_prompt(pool: &SessionPool, session_key: &str, prompt: &str) -> a
     let rx = pool.with_connection(session_key, |conn| {
         let prompt = prompt.clone();
         Box::pin(async move {
-            let (rx, _) = conn.session_prompt(&prompt).await?;
+            let (rx, _) = conn.session_prompt(&prompt, None).await?;
             Ok(rx)
         })
     }).await?;
@@ -652,6 +665,7 @@ async fn stream_prompt(
     pool: &SessionPool,
     session_key: &str,
     prompt: &str,
+    image: Option<(Vec<u8>, String)>,
     bot: &Bot,
     chat_id: ChatId,
     msg_id: MessageId,
@@ -667,11 +681,12 @@ async fn stream_prompt(
         let prompt = prompt.clone();
         let bot = bot.clone();
         let session_key = session_key.clone();
+        let image = image;
         Box::pin(async move {
             let reset = conn.session_reset;
             conn.session_reset = false;
 
-            let (mut rx, _) = conn.session_prompt(&prompt).await?;
+            let (mut rx, _) = conn.session_prompt(&prompt, image).await?;
 
             let mut text_buf = String::new();
             let mut tool_lines: Vec<String> = Vec::new();

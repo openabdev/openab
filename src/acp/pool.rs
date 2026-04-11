@@ -256,7 +256,7 @@ impl SessionPool {
                     } else {
                         COMPACT_PROMPT.to_string()
                     };
-                    match conn.session_prompt(&prompt).await {
+                    match conn.session_prompt(&prompt, None).await {
                         Ok((rx, _)) => Some(rx),
                         Err(e) => { warn!(thread_id = %key, "compaction prompt failed: {e}"); None }
                     }
