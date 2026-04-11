@@ -40,13 +40,17 @@ async fn main() -> anyhow::Result<()> {
 
     let allowed_channels = parse_id_set(&cfg.discord.allowed_channels, "allowed_channels")?;
     let allowed_users = parse_id_set(&cfg.discord.allowed_users, "allowed_users")?;
-    info!(channels = allowed_channels.len(), users = allowed_users.len(), "parsed allowlists");
+    let monitored_bot_ids = parse_id_set(&cfg.discord.monitored_bot_ids, "monitored_bot_ids")?;
+    let auto_respond_from_bots = cfg.discord.auto_respond_from_bots;
+    info!(channels = allowed_channels.len(), users = allowed_users.len(), monitored_bots = monitored_bot_ids.len(), auto_respond = auto_respond_from_bots, "parsed allowlists");
 
     let handler = discord::Handler {
         pool: pool.clone(),
         allowed_channels,
         allowed_users,
         reactions_config: cfg.reactions,
+        monitored_bot_ids,
+        auto_respond_from_bots,
     };
 
     let intents = GatewayIntents::GUILD_MESSAGES

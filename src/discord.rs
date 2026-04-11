@@ -19,12 +19,20 @@ pub struct Handler {
     pub allowed_channels: HashSet<u64>,
     pub allowed_users: HashSet<u64>,
     pub reactions_config: ReactionsConfig,
+    pub monitored_bot_ids: HashSet<u64>,
+    pub auto_respond_from_bots: bool,
 }
 
 #[async_trait]
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
-        if msg.author.bot {
+        // Allow monitored bots to trigger without mention only when feature is enabled
+        let is_monitored_bot = self.auto_respond_from_bots
+            && msg.author.bot
+            && self.monitored_bot_ids.contains(&msg.author.id.get());
+
+        // Skip bot messages unless from a monitored bot (when feature is enabled)
+        if msg.author.bot && !is_monitored_bot {
             return;
         }
 
@@ -63,7 +71,8 @@ impl EventHandler for Handler {
         if !in_allowed_channel && !in_thread {
             return;
         }
-        if !in_thread && !is_mentioned {
+        // Require mention unless in thread or from a monitored bot
+        if !in_thread && !is_mentioned && !is_monitored_bot {
             return;
         }
 
