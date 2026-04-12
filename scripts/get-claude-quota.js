@@ -1,83 +1,74 @@
 #!/usr/bin/env node
-// Drive Claude Code interactive mode via node-pty to run /usage and capture output.
-// Prints JSON with parsed usage data.
+// Get Claude Code usage from local stats-cache.json — no PTY needed.
+// Reads ~/.claude/stats-cache.json for token usage and session stats.
 
-const pty = require('C:/Users/Administrator/AppData/Roaming/npm/node_modules/node-pty');
+const fs = require('fs');
+const path = require('path');
 
-const TIMEOUT_MS = 45000;
-const CLAUDE_PATH = 'C:/Users/Administrator/AppData/Roaming/npm/claude.cmd';
+const STATS_PATH = path.join(process.env.USERPROFILE || 'C:/Users/Administrator', '.claude', 'stats-cache.json');
 
-const p = pty.spawn(CLAUDE_PATH, ['--add-dir', 'C:/Users/Administrator'], {
-  name: 'xterm-color',
-  cols: 200,
-  rows: 60,
-  cwd: 'C:/Users/Administrator',
-  env: process.env
-});
+try {
+  const raw = fs.readFileSync(STATS_PATH, 'utf8');
+  const stats = JSON.parse(raw);
 
-let buf = '';
-let done = false;
+  // Today and this week's token usage
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  const weekAgo = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
 
-p.onData(d => {
-  buf += d;
-
-  if (done) return;
-
-  // Once we see Esc to cancel (end of usage panel) after /usage, parse and exit
-  if (buf.includes('/usage') && buf.match(/Esc to cancel[\s\S]*Esc to cancel/) === null && buf.match(/Usage Stats/)) {
-    // Wait a bit more for full rendering
-    if (!done && buf.match(/Current week.*%.*used/s)) {
-      done = true;
-      setTimeout(() => {
-        parseAndExit();
-      }, 1500);
+  // Weekly tokens by model
+  let weekOpus = 0, weekSonnet = 0, weekHaiku = 0, weekTotal = 0;
+  for (const day of (stats.dailyModelTokens || [])) {
+    if (day.date >= weekAgo) {
+      const t = day.tokensByModel || {};
+      for (const [model, tokens] of Object.entries(t)) {
+        weekTotal += tokens;
+        if (model.includes('opus')) weekOpus += tokens;
+        else if (model.includes('sonnet')) weekSonnet += tokens;
+        else if (model.includes('haiku')) weekHaiku += tokens;
+      }
     }
   }
-});
 
-function parseAndExit() {
-  const clean = buf.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
+  // Today's activity
+  const todayActivity = (stats.dailyActivity || []).find(d => d.date === today);
+  const todayMessages = todayActivity?.messageCount || 0;
+  const todaySessions = todayActivity?.sessionCount || 0;
+  const todayTools = todayActivity?.toolCallCount || 0;
 
-  // Parse percentages
-  const session = clean.match(/Current session\s*[█▌_\s]*(\d+)%\s*used/);
-  const weekAll = clean.match(/Current week\s*\(all models\)\s*[█▌_\s]*(\d+)%\s*used/);
-  const weekSonnet = clean.match(/Current week\s*\(Sonnet only\)\s*(\d+)%\s*used/);
+  // Lifetime stats
+  const totalSessions = stats.totalSessions || 0;
+  const totalMessages = stats.totalMessages || 0;
 
-  // Reset lines: use lazy match + stop at "Current" OR "Extra" OR EOL to avoid
-  // the session_reset regex greedily swallowing into the next section.
-  const sessionReset = clean.match(/Current session[\s\S]*?Resets?\s+([^\n]+?)(?=\s*Current|\s*Extra|$)/);
-  const weekReset = clean.match(/Current week \(all models\)[\s\S]*?Resets?\s+([^\n]+?)(?=\s*Current|\s*Extra|$)/);
+  // Model usage totals
+  const opusUsage = stats.modelUsage?.['claude-opus-4-6'] || {};
+  const sonnetUsage = stats.modelUsage?.['claude-sonnet-4-6'] || {};
+  const haikuUsage = stats.modelUsage?.['claude-haiku-4-5-20251001'] || {};
 
-  const result = {
+  // Claude Max doesn't have hard quota %, but we can show activity level
+  // Calculate a "session intensity" as a proxy
+  const weekActivity = (stats.dailyActivity || [])
+    .filter(d => d.date >= weekAgo)
+    .reduce((sum, d) => sum + d.messageCount, 0);
+
+  console.log(JSON.stringify({
     ok: true,
-    session_pct: session ? parseInt(session[1]) : null,
-    week_all_pct: weekAll ? parseInt(weekAll[1]) : null,
-    week_sonnet_pct: weekSonnet ? parseInt(weekSonnet[1]) : null,
-    session_reset: sessionReset ? sessionReset[1].trim() : null,
-    week_reset: weekReset ? weekReset[1].trim() : null,
-    ts: new Date().toISOString()
-  };
-
-  console.log(JSON.stringify(result));
-  p.kill();
-  process.exit(0);
+    // Today
+    today_messages: todayMessages,
+    today_sessions: todaySessions,
+    today_tools: todayTools,
+    // This week tokens
+    week_opus: weekOpus,
+    week_sonnet: weekSonnet,
+    week_haiku: weekHaiku,
+    week_total: weekTotal,
+    // Lifetime
+    total_sessions: totalSessions,
+    total_messages: totalMessages,
+    // Plan info
+    tier: 'Claude Max (Opus 4.6)',
+    ts: new Date().toISOString(),
+  }));
+} catch (e) {
+  console.log(JSON.stringify({ ok: false, error: e.message }));
+  process.exit(1);
 }
-
-// Press Enter to accept trust dialog (option 1 is default), then send /usage
-setTimeout(() => p.write('\r'), 4000);
-setTimeout(() => p.write('/usage\r'), 8000);
-
-setTimeout(() => {
-  if (!done) {
-    const clean = buf.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
-    // Try parsing whatever we got
-    const session = clean.match(/Current session\s*[█▌_\s]*(\d+)%\s*used/);
-    if (session) {
-      parseAndExit();
-    } else {
-      console.log(JSON.stringify({ok: false, error: 'timeout', ts: new Date().toISOString()}));
-      p.kill();
-      process.exit(1);
-    }
-  }
-}, TIMEOUT_MS);
