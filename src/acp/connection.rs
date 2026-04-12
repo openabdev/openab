@@ -136,23 +136,14 @@ impl AcpConnection {
                         continue;
                     }
 
-                    // Capture usage_update for context window tracking
-                    if msg.method.as_deref() == Some("session/update") {
-                        if let Some(upd) = msg.params.as_ref()
-                            .and_then(|p| p.get("update"))
-                        {
-                            if upd.get("sessionUpdate").and_then(|v| v.as_str()) == Some("usage_update") {
-                                let used = upd.get("used")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
-                                ctx_used.store(used, Ordering::Relaxed);
-
-                                let size = upd.get("size")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
-                                ctx_size.store(size, Ordering::Relaxed);
-                            }
-                        }
+                    // Capture usage_update for context window tracking.
+                    // Reuses the shared classify_notification parser so the
+                    // logic stays in one place (protocol.rs).
+                    if let Some(crate::acp::protocol::AcpEvent::UsageUpdate { used, size }) =
+                        crate::acp::protocol::classify_notification(&msg)
+                    {
+                        ctx_used.store(used, Ordering::Relaxed);
+                        ctx_size.store(size, Ordering::Relaxed);
                     }
 
                     // Response (has id) → resolve pending AND forward to subscriber
