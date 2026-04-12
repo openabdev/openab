@@ -646,7 +646,7 @@ impl ToolEntry {
         let suffix = if self.state == ToolState::Running { "..." } else { "" };
         let title = match display {
             ToolDisplay::Compact => compact_title(&self.title),
-            _ => self.title.clone(),
+            ToolDisplay::Full | ToolDisplay::None => self.title.clone(),
         };
         format!("{icon} `{}`{}", title, suffix)
     }
