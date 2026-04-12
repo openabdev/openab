@@ -4,6 +4,7 @@ mod discord;
 mod error_display;
 mod format;
 mod reactions;
+mod stt;
 mod usage;
 
 use serenity::prelude::*;
@@ -26,7 +27,7 @@ async fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("config.toml"));
 
-    let cfg = config::load_config(&config_path)?;
+    let mut cfg = config::load_config(&config_path)?;
     info!(
         agent_cmd = %cfg.agent.command,
         pool_max = cfg.pool.max_sessions,
@@ -48,6 +49,22 @@ async fn main() -> anyhow::Result<()> {
 
     let copilot_list_cache = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
 
+    // Resolve STT config before constructing handler (auto-detect mutates cfg.stt)
+    if cfg.stt.enabled {
+        if cfg.stt.api_key.is_empty() && cfg.stt.base_url.contains("groq.com") {
+            if let Ok(key) = std::env::var("GROQ_API_KEY") {
+                if !key.is_empty() {
+                    info!("stt.api_key not set, using GROQ_API_KEY from environment");
+                    cfg.stt.api_key = key;
+                }
+            }
+        }
+        if cfg.stt.api_key.is_empty() {
+            anyhow::bail!("stt.enabled = true but no API key found — set stt.api_key in config or export GROQ_API_KEY");
+        }
+        info!(model = %cfg.stt.model, base_url = %cfg.stt.base_url, "STT enabled");
+    }
+
     let handler = discord::Handler {
         pool: pool.clone(),
         allowed_channels,
@@ -56,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         usage_config: cfg.usage,
         backend,
         copilot_list_cache: copilot_list_cache.clone(),
+        stt_config: cfg.stt.clone(),
     };
 
     let intents = GatewayIntents::GUILD_MESSAGES
