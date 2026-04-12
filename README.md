@@ -1,6 +1,6 @@
 # OpenAB — Open Agent Broker
 
-A lightweight, secure, cloud-native ACP harness that bridges Discord and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, Copilot CLI, etc.) over stdio JSON-RPC — delivering the next-generation development experience.
+A lightweight, secure, cloud-native ACP harness that bridges Discord and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, OpenCode, Copilot CLI, etc.) over stdio JSON-RPC — delivering the next-generation development experience.
 
 🪼 **Join our community!** Come say hi on Discord — we'd love to have you: **[🪼 OpenAB — Official](https://discord.gg/YNksK9M6)** 🎉
 
@@ -17,7 +17,7 @@ A lightweight, secure, cloud-native ACP harness that bridges Discord and any [Ag
 
 ## Features
 
-- **Pluggable agent backend** — swap between Kiro CLI, Claude Code, Codex, Gemini, Copilot CLI via config
+- **Pluggable agent backend** — swap between Kiro CLI, Claude Code, Codex, Gemini, OpenCode, Copilot CLI via config
 - **@mention trigger** — mention the bot in an allowed channel to start a conversation
 - **Thread-based multi-turn** — auto-creates threads; no @mention needed for follow-ups
 - **Edit-streaming** — live-updates the Discord message every 1.5s as tokens arrive
@@ -68,6 +68,7 @@ The bot creates a thread. After that, just type in the thread — no @mention ne
 | Claude Code | `claude-agent-acp` | [@agentclientprotocol/claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp) | [docs/claude-code.md](docs/claude-code.md) |
 | Codex | `codex-acp` | [@zed-industries/codex-acp](https://github.com/zed-industries/codex-acp) | [docs/codex.md](docs/codex.md) |
 | Gemini | `gemini --acp` | Native | [docs/gemini.md](docs/gemini.md) |
+| OpenCode | `opencode acp` | Native | [docs/opencode.md](docs/opencode.md) |
 | Copilot CLI ⚠️ | `copilot --acp --stdio` | Native | [docs/copilot.md](docs/copilot.md) |
 
 > 🔧 Running multiple agents? See [docs/multi-agent.md](docs/multi-agent.md)
