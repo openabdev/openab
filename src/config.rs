@@ -69,6 +69,15 @@ pub struct PoolConfig {
     pub session_ttl_hours: u64,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolDisplay {
+    Full,
+    #[default]
+    Compact,
+    None,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ReactionsConfig {
     #[serde(default = "default_true")]
@@ -79,6 +88,8 @@ pub struct ReactionsConfig {
     pub emojis: ReactionEmojis,
     #[serde(default)]
     pub timing: ReactionTiming,
+    #[serde(default)]
+    pub tool_display: ToolDisplay,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -147,6 +158,7 @@ impl Default for ReactionsConfig {
             remove_after_reply: false,
             emojis: ReactionEmojis::default(),
             timing: ReactionTiming::default(),
+            tool_display: ToolDisplay::default(),
         }
     }
 }
