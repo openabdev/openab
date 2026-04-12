@@ -4,7 +4,7 @@
 
 const pty = require('C:/Users/Administrator/AppData/Roaming/npm/node_modules/node-pty');
 
-const TIMEOUT_MS = 25000;
+const TIMEOUT_MS = 45000;
 const CLAUDE_PATH = 'C:/Users/Administrator/AppData/Roaming/npm/claude.cmd';
 
 const p = pty.spawn(CLAUDE_PATH, ['--add-dir', 'C:/Users/Administrator'], {
