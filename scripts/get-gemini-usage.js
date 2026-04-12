@@ -38,8 +38,8 @@ child.stdout.on('data', chunk => {
           ok: true,
           current_model: current,
           available_models: available,
-          tier: 'Google AI (Free)',
-          rate_limit: '15 RPM',
+          tier: 'Google Gemini Pro',
+          rate_limit: '1000 RPM',
           status_pct: 100,
           ts: new Date().toISOString(),
         }));

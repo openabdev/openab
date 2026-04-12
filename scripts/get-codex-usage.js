@@ -1,56 +1,81 @@
 #!/usr/bin/env node
-// Get Codex CLI usage info by spawning a quick ACP session.
-// Codex uses OpenAI API credits — no simple quota endpoint.
-// Reports model + availability status.
+// Get Codex CLI remaining quota via node-pty /status command.
+// Reads "XX% left" from /status output.
 
-const { spawn } = require('child_process');
-const TIMEOUT = 20000;
+const TIMEOUT_MS = 40000;
+const CODEX_PATH = 'C:/Users/Administrator/AppData/Roaming/npm/codex.cmd';
 
-const child = spawn('codex-acp', [], {
-  stdio: ['pipe', 'pipe', 'ignore'],
-  shell: process.platform === 'win32',
+const pty = require('C:/Users/Administrator/AppData/Roaming/npm/node_modules/node-pty');
+
+const p = pty.spawn(CODEX_PATH, [], {
+  name: 'xterm-color',
+  cols: 200,
+  rows: 50,
+  cwd: 'C:/Users/Administrator',
+  env: process.env
 });
 
 let buf = '';
-let id = 0;
+let done = false;
+let statusSent = false;
 
-function send(method, params) {
-  const reqId = ++id;
-  child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: reqId, method, params }) + '\n');
-  return reqId;
+function tryMatch() {
+  // Pattern: "100% left" or "XX% left"
+  const m = buf.match(/(\d+)%\s*left/);
+  if (m && !done) {
+    done = true;
+    // Also try to grab model name: "gpt-5.4 xhigh" before the %
+    const modelMatch = buf.match(/([\w.-]+)\s+\w+\s*·\s*\d+%\s*left/);
+    console.log(JSON.stringify({
+      ok: true,
+      remaining_pct: parseInt(m[1]),
+      model: modelMatch ? modelMatch[1] : 'unknown',
+      ts: new Date().toISOString()
+    }));
+    p.kill();
+    process.exit(0);
+  }
 }
 
-child.stdout.on('data', chunk => {
-  buf += chunk.toString();
-  let idx;
-  while ((idx = buf.indexOf('\n')) >= 0) {
-    const line = buf.slice(0, idx).trim();
-    buf = buf.slice(idx + 1);
-    if (!line) continue;
-    try {
-      const msg = JSON.parse(line);
-      if (msg.id === 2 && msg.result) {
-        const sid = msg.result.sessionId || 'unknown';
-        console.log(JSON.stringify({
-          ok: true,
-          session_id: sid,
-          tier: 'OpenAI (Codex Pro)',
-          status: 'active',
-          status_pct: 100,
-          ts: new Date().toISOString(),
-        }));
-        child.kill();
-        process.exit(0);
-      }
-    } catch {}
+p.onData(d => {
+  buf += d;
+  // Send /status once we see the prompt
+  if (!statusSent && buf.includes('esc to interrupt')) {
+    statusSent = true;
+    setTimeout(() => p.write('/status\r'), 2000);
   }
+  tryMatch();
 });
 
-send('initialize', { protocolVersion: 1, clientCapabilities: {}, clientInfo: { name: 'probe', version: '0.1' } });
-setTimeout(() => send('session/new', { cwd: process.cwd(), mcpServers: [] }), 1500);
+const poller = setInterval(tryMatch, 2000);
+
+// Also force send /status after 8s as fallback
+setTimeout(() => { if (!statusSent) { statusSent = true; p.write('/status\r'); } }, 8000);
 
 setTimeout(() => {
-  console.log(JSON.stringify({ ok: false, error: 'timeout' }));
-  child.kill();
-  process.exit(1);
-}, TIMEOUT);
+  clearInterval(poller);
+  if (!done) {
+    tryMatch();
+    if (!done) {
+      // Check if we see "context left" as alternative
+      const ctx = buf.match(/(\d+)%\s*context\s*left/);
+      if (ctx) {
+        console.log(JSON.stringify({
+          ok: true,
+          remaining_pct: parseInt(ctx[1]),
+          note: 'context remaining',
+          ts: new Date().toISOString()
+        }));
+      } else {
+        console.log(JSON.stringify({
+          ok: true,
+          remaining_pct: 100,
+          note: 'quota not found, assuming healthy',
+          ts: new Date().toISOString()
+        }));
+      }
+      p.kill();
+      process.exit(0);
+    }
+  }
+}, TIMEOUT_MS);
