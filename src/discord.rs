@@ -1143,23 +1143,45 @@ impl Handler {
 
             match usage {
                 Ok(v) => {
-                    if let Some(input) = v.get("inputTokens").and_then(|n| n.as_u64()) {
+                    // Session-level token stats (top-level or nested under session_usage)
+                    let session = v.get("session_usage").unwrap_or(&v);
+                    if let Some(input) = session.get("inputTokens").and_then(|n| n.as_u64()) {
                         report.push_str(&format!("**Input tokens:** {input}\n"));
                     }
-                    if let Some(output) = v.get("outputTokens").and_then(|n| n.as_u64()) {
+                    if let Some(output) = session.get("outputTokens").and_then(|n| n.as_u64()) {
                         report.push_str(&format!("**Output tokens:** {output}\n"));
                     }
-                    if let Some(total) = v.get("totalTokens").and_then(|n| n.as_u64()) {
+                    if let Some(total) = session.get("totalTokens").and_then(|n| n.as_u64()) {
                         report.push_str(&format!("**Total tokens:** {total}\n"));
                     }
-                    if let Some(turns) = v.get("turns").and_then(|n| n.as_u64()) {
+                    if let Some(turns) = session.get("turns").and_then(|n| n.as_u64()) {
                         report.push_str(&format!("**Turns:** {turns}\n"));
                     }
-                    if let Some(cost) = v.get("cost").and_then(|n| n.as_f64()) {
+                    if let Some(cost) = v.get("cost").or_else(|| v.get("cost_totals")).and_then(|n| n.as_f64()) {
                         report.push_str(&format!("**Estimated cost:** ${cost:.4}\n"));
                     }
+
+                    // Account-level quota (from copilot-agent-acp bridge)
+                    if let Some(aq) = v.get("account_quota") {
+                        for key in ["premium_interactions", "chat", "completions"] {
+                            if let Some(q) = aq.pointer(&format!("/quotaSnapshots/{key}")) {
+                                let pct = q.get("remainingPercentage").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                let used = q.get("usedRequests").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let total = q.get("entitlementRequests").and_then(|v| v.as_u64()).unwrap_or(0);
+                                if total > 0 {
+                                    let label = match key {
+                                        "premium_interactions" => "🔥 Premium",
+                                        "chat" => "💬 Chat",
+                                        "completions" => "⚡ Completions",
+                                        _ => key,
+                                    };
+                                    report.push_str(&format!("**{label}:** {pct:.1}% remaining ({used}/{total})\n"));
+                                }
+                            }
+                        }
+                    }
+
                     if report.is_empty() {
-                        // Dump raw JSON if structure unknown
                         report.push_str(&format!("```json\n{}\n```", serde_json::to_string_pretty(&v).unwrap_or_default()));
                     }
                 }
@@ -1430,17 +1452,26 @@ impl Handler {
                         let usage = conn.session_get_usage().await.ok();
                         let mut lines = vec![format!("**Model:** `{model}` • **Age:** {elapsed}s")];
                         if let Some(v) = usage {
-                            if let Some(input) = v.get("inputTokens").and_then(|n| n.as_u64()) {
-                                if let Some(output) = v.get("outputTokens").and_then(|n| n.as_u64()) {
+                            let session = v.get("session_usage").unwrap_or(&v);
+                            if let Some(input) = session.get("inputTokens").and_then(|n| n.as_u64()) {
+                                if let Some(output) = session.get("outputTokens").and_then(|n| n.as_u64()) {
                                     let total = input + output;
                                     lines.push(format!("**Tokens:** {total} (↑{input} ↓{output})"));
                                 }
                             }
-                            if let Some(turns) = v.get("turns").and_then(|n| n.as_u64()) {
+                            if let Some(turns) = session.get("turns").and_then(|n| n.as_u64()) {
                                 lines.push(format!("**Turns:** {turns}"));
                             }
-                            if let Some(cost) = v.get("cost").and_then(|n| n.as_f64()) {
+                            if let Some(cost) = v.get("cost").or_else(|| v.get("cost_totals")).and_then(|n| n.as_f64()) {
                                 lines.push(format!("**Cost:** ${cost:.4}"));
+                            }
+                            // Account quota from copilot-agent-acp bridge
+                            if let Some(premium) = v.pointer("/account_quota/quotaSnapshots/premium_interactions") {
+                                if let Some(pct) = premium.get("remainingPercentage").and_then(|v| v.as_f64()) {
+                                    let used = premium.get("usedRequests").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let total = premium.get("entitlementRequests").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    lines.push(format!("🔥 **Premium:** {pct:.1}% ({used}/{total})"));
+                                }
                             }
                         }
                         Ok(lines.join("\n"))
