@@ -35,7 +35,7 @@
 - `session/request_permission` must always get a response (auto-allow or forwarded)
 - `session/update` notifications must not be consumed — forward to subscriber after capture
 - `usage_update`, `available_commands_update`, `tool_call`, `agent_message_chunk` must be classified correctly
-- Timeout values: initialize=90s, session/new=120s, others=30s (Gemini cold-start is slow)
+- Timeout values: session/new=120s, all other methods (including initialize)=30s
 
 ### Discord API
 - Messages >2000 chars will be rejected — truncate or split
