@@ -635,22 +635,26 @@ struct ToolEntry {
 }
 
 impl ToolEntry {
-    fn render(&self) -> String {
+    fn render(&self, display: ToolDisplay) -> String {
         let icon = match self.state {
             ToolState::Running => "🔧",
             ToolState::Completed => "✅",
             ToolState::Failed => "❌",
         };
         let suffix = if self.state == ToolState::Running { "..." } else { "" };
-        format!("{icon} `{}`{}", self.title, suffix)
+        let title = match display {
+            ToolDisplay::Compact => compact_title(&self.title),
+            _ => self.title.clone(),
+        };
+        format!("{icon} `{}`{}", title, suffix)
     }
 }
 
-fn compose_display(tool_lines: &[ToolEntry], text: &str) -> String {
+fn compose_display(tool_lines: &[ToolEntry], text: &str, display: ToolDisplay) -> String {
     let mut out = String::new();
-    if !tool_lines.is_empty() {
+    if !matches!(display, ToolDisplay::None) && !tool_lines.is_empty() {
         for entry in tool_lines {
-            out.push_str(&entry.render());
+            out.push_str(&entry.render(display));
             out.push('\n');
         }
         out.push('\n');
@@ -793,5 +797,41 @@ mod tests {
         assert_eq!(compact_title("Read file: /etc/passwd"), "Read file");
         assert_eq!(compact_title("Terminal"), "Terminal");
         assert_eq!(compact_title("  Running:  curl  "), "Running");
+    }
+
+    fn make_tool(title: &str, state: ToolState) -> ToolEntry {
+        ToolEntry { id: "1".into(), title: title.into(), state }
+    }
+
+    #[test]
+    fn compose_display_full_shows_complete_title() {
+        let tools = vec![make_tool("Running: curl -s https://example.com | python3 -c 'import sys'", ToolState::Completed)];
+        let out = compose_display(&tools, "done", ToolDisplay::Full);
+        assert!(out.contains("Running: curl -s https://example.com"), "full mode must show complete title");
+        assert!(out.contains("done"));
+    }
+
+    #[test]
+    fn compose_display_compact_shows_only_prefix() {
+        let tools = vec![make_tool("Running: curl -s https://example.com | python3 -c 'import sys'", ToolState::Completed)];
+        let out = compose_display(&tools, "done", ToolDisplay::Compact);
+        assert!(out.contains("Running"), "compact mode must include prefix");
+        assert!(!out.contains("curl"), "compact mode must not include args");
+        assert!(out.contains("done"));
+    }
+
+    #[test]
+    fn compose_display_none_hides_all_tool_lines() {
+        let tools = vec![make_tool("Running: curl -s url", ToolState::Completed)];
+        let out = compose_display(&tools, "done", ToolDisplay::None);
+        assert!(!out.contains("Running"), "none mode must hide tool lines");
+        assert!(!out.contains("✅"), "none mode must hide icons");
+        assert!(out.contains("done"), "none mode must still show text");
+    }
+
+    #[test]
+    fn compose_display_empty_tools_no_blank_line() {
+        let out = compose_display(&[], "hello", ToolDisplay::Compact);
+        assert_eq!(out, "hello");
     }
 }
