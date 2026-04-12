@@ -9,6 +9,8 @@ metadata:
   name: {{ include "openab.agentFullname" $d }}
   labels:
     {{- include "openab.labels" $d | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
 spec:
   accessModes:
     - ReadWriteOnce
