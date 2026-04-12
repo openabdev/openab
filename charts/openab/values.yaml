@@ -69,6 +69,7 @@ agents:
     reactions:
       enabled: true
       removeAfterReply: false
+      toolDisplay: "compact"   # full | compact | none
     stt:
       enabled: false
       apiKey: ""

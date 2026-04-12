@@ -33,6 +33,7 @@ session_ttl_hours = 24
 [reactions]
 enabled = true
 remove_after_reply = false
+tool_display = "compact"   # full (complete command) | compact (name only) | none (hide tool lines)
 
 [reactions.emojis]
 queued = "👀"

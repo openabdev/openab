@@ -40,6 +40,7 @@ data:
     [reactions]
     enabled = {{ ($cfg.reactions).enabled | default true }}
     remove_after_reply = {{ ($cfg.reactions).removeAfterReply | default false }}
+    tool_display = "{{ ($cfg.reactions).toolDisplay | default "compact" }}"
     {{- if ($cfg.stt).enabled }}
     {{- if not ($cfg.stt).apiKey }}
     {{ fail (printf "agents.%s.stt.apiKey is required when stt.enabled=true" $name) }}
