@@ -11,9 +11,9 @@
 - **Language**: Rust 2021 edition, single binary
 - **Async runtime**: tokio (full features)
 - **Discord**: serenity 0.12 (gateway + cache)
-- **Error handling**: `anyhow::Result` everywhere, no `unwrap()` in production paths
+- **Error handling**: Prefer `anyhow::Result`; avoid `unwrap()` in production paths as a target, though some existing code may still use it
 - **Serialization**: serde + serde_json for ACP JSON-RPC, toml for config
-- **Key modules**: `acp/connection.rs` (ACP stdio bridge), `acp/pool.rs` (session pool), `discord.rs` (Discord event handler), `config.rs` (TOML config), `usage.rs` (pluggable quota runners), `reactions.rs` (emoji reactions), `stt.rs` (speech-to-text)
+- **Key modules**: `acp/connection.rs` (ACP stdio bridge), `acp/pool.rs` (session pool), `discord.rs` (Discord event handler), `config.rs` (TOML config), `reactions.rs` (emoji reactions), `stt.rs` (speech-to-text)
 
 ## Priority Areas (Review These)
 
@@ -35,11 +35,11 @@
 - `session/request_permission` must always get a response (auto-allow or forwarded)
 - `session/update` notifications must not be consumed — forward to subscriber after capture
 - `usage_update`, `available_commands_update`, `tool_call`, `agent_message_chunk` must be classified correctly
-- Timeout values: initialize=90s, session/new=120s, others=30s (Gemini cold-start is slow)
+- Timeout values: initialize=30s, session/new=120s, others=30s
 
 ### Discord API
 - Messages >2000 chars will be rejected — truncate or split
-- Slash command registration is per-guild, max 100 per bot
+- Guild slash command registration limits are per application per guild; global command limits are separate
 - Autocomplete responses must return within 3s (no heavy I/O)
 - Ephemeral messages for errors, regular messages for results
 
@@ -62,6 +62,6 @@
 - Import ordering
 
 ## Response Format
-1. State the problem (1 sentence)
-2. Why it matters (1 sentence, only if not obvious)
-3. Suggested fix (code snippet or specific action)
+- Default to a single concise sentence that states the problem and, when obvious, implies the fix
+- Add one brief sentence explaining why it matters only when the impact is not obvious
+- Include a code snippet or specific action only when it materially helps the author fix the issue
