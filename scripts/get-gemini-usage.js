@@ -4,11 +4,11 @@
 // hard quota — it has per-minute rate limits (15 RPM free, 1000 RPM paid).
 
 const { spawn } = require('child_process');
-const TIMEOUT = 30000;
+const TIMEOUT = 50000;
 
-const child = spawn('cmd', ['/c', 'gemini', '--acp'], {
+const child = spawn('gemini', ['--acp'], {
   stdio: ['pipe', 'pipe', 'ignore'],
-  shell: false,
+  shell: true,
 });
 
 let buf = '';
