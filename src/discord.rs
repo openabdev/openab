@@ -209,6 +209,7 @@ impl EventHandler for Handler {
             thread_channel,
             thinking_msg.id,
             reactions.clone(),
+            self.reactions_config.tool_display,
         )
         .await;
 
@@ -422,6 +423,7 @@ async fn stream_prompt(
     channel: ChannelId,
     msg_id: MessageId,
     reactions: Arc<StatusReactionController>,
+    tool_display: ToolDisplay,
 ) -> anyhow::Result<()> {
     let reactions = reactions.clone();
 
@@ -507,7 +509,7 @@ async fn stream_prompt(
                                 // Reaction: back to thinking after tools
                             }
                             text_buf.push_str(&t);
-                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
+                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf, tool_display));
                         }
                         AcpEvent::Thinking => {
                             reactions.set_thinking().await;
@@ -532,7 +534,7 @@ async fn stream_prompt(
                                     state: ToolState::Running,
                                 });
                             }
-                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
+                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf, tool_display));
                         }
                         AcpEvent::ToolDone { id, title, status } => {
                             reactions.set_thinking().await;
@@ -560,7 +562,7 @@ async fn stream_prompt(
                                     state: new_state,
                                 });
                             }
-                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
+                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf, tool_display));
                         }
                         _ => {}
                     }
@@ -572,7 +574,7 @@ async fn stream_prompt(
             let _ = edit_handle.await;
 
             // Final edit
-            let final_content = compose_display(&tool_lines, &text_buf);
+            let final_content = compose_display(&tool_lines, &text_buf, tool_display);
             // If ACP returned both an error and partial text, show both.
             // This can happen when the agent started producing content before hitting an error
             // (e.g. context length limit, rate limit mid-stream). Showing both gives users
