@@ -14,10 +14,9 @@ jobs:
     permissions:
       contents: write
       pages: write
-      packages: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -29,13 +28,6 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@v4
 
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Run chart-releaser
         uses: helm/chart-releaser-action@v1.6.0
         with:
@@ -43,15 +35,7 @@ jobs:
         env:
           CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push chart to OCI registry
-        run: |
-          CHART=charts/openab
-          NAME=$(grep '^name:' ${CHART}/Chart.yaml | awk '{print $2}')
-          VERSION=$(grep '^version:' ${CHART}/Chart.yaml | awk '{print $2}')
-          helm package ${CHART}
-          helm push ${NAME}-${VERSION}.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
-
-      - name: Append OCI install instructions to release notes
+      - name: Append install instructions to release notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

@@ -1,0 +1,92 @@
+name: Release PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version (leave empty for auto bump, or specify e.g. 0.8.0-beta.1)"
+        required: false
+        type: string
+      bump:
+        description: "Auto bump type (ignored when version is specified)"
+        required: false
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+
+jobs:
+  create-release-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Generate App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v6
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            CURRENT=$(grep '^version:' charts/openab/Chart.yaml | awk '{print $2}')
+            BASE="${CURRENT%%-*}"
+            if [[ "$CURRENT" == *-beta.* ]]; then
+              BETA_NUM="${CURRENT##*-beta.}"
+              VERSION="${BASE}-beta.$((BETA_NUM + 1))"
+            else
+              IFS='.' read -r major minor patch <<< "$BASE"
+              case "${{ inputs.bump }}" in
+                major) major=$((major + 1)); minor=0; patch=0 ;;
+                minor) minor=$((minor + 1)); patch=0 ;;
+                patch) patch=$((patch + 1)) ;;
+              esac
+              VERSION="${major}.${minor}.${patch}-beta.1"
+            fi
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Release version: ${VERSION}"
+
+          # Determine stable version (strip pre-release suffix)
+          STABLE="${VERSION%%-*}"
+          echo "stable=${STABLE}" >> "$GITHUB_OUTPUT"
+
+      - name: Update version files
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          STABLE="${{ steps.version.outputs.stable }}"
+          # Chart.yaml always gets the full version (beta or stable)
+          sed -i "s/^version: .*/version: ${VERSION}/" charts/openab/Chart.yaml
+          sed -i "s/^appVersion: .*/appVersion: \"${VERSION}\"/" charts/openab/Chart.yaml
+          # Cargo.toml only gets stable version (main stays clean)
+          sed -i "s/^version = .*/version = \"${STABLE}\"/" Cargo.toml
+
+      - name: Create release PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          BRANCH="release/v${VERSION}"
+          git config user.name "openab-app[bot]"
+          git config user.email "274185012+openab-app[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add -A
+          git commit -m "release: v${VERSION}"
+          git push origin "$BRANCH"
+          gh pr create \
+            --title "release: v${VERSION}" \
+            --body "Merge this PR to tag \`v${VERSION}\` and trigger the build pipeline." \
+            --base main --head "$BRANCH"

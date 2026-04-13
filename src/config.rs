@@ -1,4 +1,3 @@
-use crate::markdown::TableMode;
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -14,8 +13,6 @@ pub struct Config {
     pub reactions: ReactionsConfig,
     #[serde(default)]
     pub stt: SttConfig,
-    #[serde(default)]
-    pub markdown: MarkdownConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,18 +48,6 @@ pub struct DiscordConfig {
     pub allowed_channels: Vec<String>,
     #[serde(default)]
     pub allowed_users: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct MarkdownConfig {
-    #[serde(default)]
-    pub tables: TableMode,
-}
-
-impl Default for MarkdownConfig {
-    fn default() -> Self {
-        Self { tables: TableMode::default() }
-    }
 }
 
 #[derive(Debug, Deserialize)]
