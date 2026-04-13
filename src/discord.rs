@@ -33,7 +33,6 @@ pub struct Handler {
     pub store: Arc<SessionStore>,
     pub allowed_channels: HashSet<u64>,
     pub allowed_users: HashSet<u64>,
-    pub allow_dms: bool,
     pub reactions_config: ReactionsConfig,
     pub stt_config: SttConfig,
 }
@@ -47,78 +46,55 @@ impl EventHandler for Handler {
 
         let bot_id = ctx.cache.current_user().id;
 
-        // ── Detect DM (Private channel) ──────────────────────────────────────
-        let is_dm = matches!(
-            msg.channel_id.to_channel(&ctx.http).await,
-            Ok(serenity::model::channel::Channel::Private(_))
-        );
+        let channel_id = msg.channel_id.get();
+        let in_allowed_channel =
+            self.allowed_channels.is_empty() || self.allowed_channels.contains(&channel_id);
 
-        if is_dm {
-            if !self.allow_dms {
-                return;
-            }
-            if !self.allowed_users.is_empty()
-                && !self.allowed_users.contains(&msg.author.id.get())
-            {
-                tracing::info!(user_id = %msg.author.id, "denied DM user, ignoring");
-                return;
+        let is_mentioned = msg.mentions_user_id(bot_id)
+            || msg.content.contains(&format!("<@{}>", bot_id))
+            || msg.mention_roles.iter().any(|r| msg.content.contains(&format!("<@&{}>", r)));
+
+        let in_thread = if !in_allowed_channel {
+            match msg.channel_id.to_channel(&ctx.http).await {
+                Ok(serenity::model::channel::Channel::Guild(gc)) => {
+                    let result = gc
+                        .parent_id
+                        .is_some_and(|pid| self.allowed_channels.contains(&pid.get()));
+                    tracing::debug!(channel_id = %msg.channel_id, parent_id = ?gc.parent_id, result, "thread check");
+                    result
+                }
+                Ok(other) => {
+                    tracing::debug!(channel_id = %msg.channel_id, kind = ?other, "not a guild channel");
+                    false
+                }
+                Err(e) => {
+                    tracing::debug!(channel_id = %msg.channel_id, error = %e, "to_channel failed");
+                    false
+                }
             }
         } else {
-            // ── Guild channel / thread gate ───────────────────────────────────
-            let channel_id = msg.channel_id.get();
-            let in_allowed_channel =
-                self.allowed_channels.is_empty() || self.allowed_channels.contains(&channel_id);
+            false
+        };
 
-            let is_mentioned = msg.mentions_user_id(bot_id)
-                || msg.content.contains(&format!("<@{}>", bot_id))
-                || msg.mention_roles.iter().any(|r| msg.content.contains(&format!("<@&{}>", r)));
-
-            let in_thread = if !in_allowed_channel {
-                match msg.channel_id.to_channel(&ctx.http).await {
-                    Ok(serenity::model::channel::Channel::Guild(gc)) => {
-                        let result = gc
-                            .parent_id
-                            .is_some_and(|pid| self.allowed_channels.contains(&pid.get()));
-                        tracing::debug!(channel_id = %msg.channel_id, parent_id = ?gc.parent_id, result, "thread check");
-                        result
-                    }
-                    Ok(other) => {
-                        tracing::debug!(channel_id = %msg.channel_id, kind = ?other, "not a guild channel");
-                        false
-                    }
-                    Err(e) => {
-                        tracing::debug!(channel_id = %msg.channel_id, error = %e, "to_channel failed");
-                        false
-                    }
-                }
-            } else {
-                false
-            };
-
-            if !in_allowed_channel && !in_thread {
-                return;
-            }
-            if !in_thread && !is_mentioned {
-                return;
-            }
-
-            if !self.allowed_users.is_empty()
-                && !self.allowed_users.contains(&msg.author.id.get())
-            {
-                tracing::info!(user_id = %msg.author.id, "denied user, ignoring");
-                if let Err(e) = msg.react(&ctx.http, ReactionType::Unicode("🚫".into())).await {
-                    tracing::warn!(error = %e, "failed to react with 🚫");
-                }
-                return;
-            }
+        if !in_allowed_channel && !in_thread {
+            return;
+        }
+        if !in_thread && !is_mentioned {
+            return;
         }
 
-        let prompt = if is_dm {
-            msg.content.trim().to_string()
+        if !self.allowed_users.is_empty() && !self.allowed_users.contains(&msg.author.id.get()) {
+            tracing::info!(user_id = %msg.author.id, "denied user, ignoring");
+            if let Err(e) = msg.react(&ctx.http, ReactionType::Unicode("🚫".into())).await {
+                tracing::warn!(error = %e, "failed to react with 🚫");
+            }
+            return;
+        }
+
+        let prompt = if is_mentioned {
+            strip_mention(&msg.content)
         } else {
-            let is_mentioned = msg.mentions_user_id(bot_id)
-                || msg.content.contains(&format!("<@{}>", bot_id));
-            if is_mentioned { strip_mention(&msg.content) } else { msg.content.trim().to_string() }
+            msg.content.trim().to_string()
         };
 
         // No text and no image attachments → skip to avoid wasting session slots
@@ -185,31 +161,19 @@ impl EventHandler for Handler {
         // prompt_with_sender always includes the non-empty sender_context XML.
         // The guard above (prompt.is_empty() && no attachments) handles stickers/embeds.
 
-        // ── DM: reply directly in the DM channel, session per user ──────────
-        // ── Guild: create/reuse a thread, session per thread ─────────────────
-        let (reply_channel, session_key) = if is_dm {
-            let key = format!("discord:dm:{}", msg.author.id.get());
-            (msg.channel_id, key)
+        let thread_id = if in_thread {
+            msg.channel_id.get()
         } else {
-            let in_thread = matches!(
-                msg.channel_id.to_channel(&ctx.http).await,
-                Ok(serenity::model::channel::Channel::Guild(ref gc)) if gc.thread_metadata.is_some()
-            );
-            let thread_id = if in_thread {
-                msg.channel_id.get()
-            } else {
-                match get_or_create_thread(&ctx, &msg, &prompt).await {
-                    Ok(id) => id,
-                    Err(e) => {
-                        error!("failed to create thread: {e}");
-                        return;
-                    }
+            match get_or_create_thread(&ctx, &msg, &prompt).await {
+                Ok(id) => id,
+                Err(e) => {
+                    error!("failed to create thread: {e}");
+                    return;
                 }
-            };
-            (ChannelId::new(thread_id), SessionKey::discord(thread_id).to_string())
+            }
         };
 
-        let thread_channel = reply_channel;
+        let thread_channel = ChannelId::new(thread_id);
 
         let thinking_msg = match thread_channel.say(&ctx.http, "...").await {
             Ok(m) => m,
@@ -219,7 +183,7 @@ impl EventHandler for Handler {
             }
         };
 
-        let session_key = session_key;
+        let session_key = SessionKey::discord(thread_id).to_string();
         if let Err(e) = self.pool.get_or_create(&session_key).await {
             let msg = format_user_error(&e.to_string());
             let _ = edit(&ctx, thread_channel, thinking_msg.id, &format!("⚠️ {}", msg)).await;

@@ -50,10 +50,6 @@ pub struct DiscordConfig {
     pub allowed_channels: Vec<String>,
     #[serde(default)]
     pub allowed_users: Vec<String>,
-    /// Allow users to interact with the bot via Direct Messages.
-    /// When combined with allowed_users, only whitelisted users can DM the bot.
-    #[serde(default)]
-    pub allow_dms: bool,
 }
 
 #[derive(Debug, Deserialize)]
