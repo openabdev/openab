@@ -55,7 +55,7 @@ cursor-agent login
 kubectl rollout restart deployment/openab-cursor
 ```
 
-The auth token is stored under `~/.cursor-agent/` and persisted across pod restarts via PVC.
+The auth token is stored under `~/.cursor/` and persisted across pod restarts via PVC.
 
 ## Helm Install
 

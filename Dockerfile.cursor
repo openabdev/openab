@@ -16,10 +16,11 @@ RUN ARCH=$(dpkg --print-architecture) && \
     if [ "$ARCH" = "arm64" ]; then ARCH=arm64; else ARCH=x64; fi && \
     curl -fSL "https://downloads.cursor.com/lab/${CURSOR_VERSION}/linux/${ARCH}/agent-cli-package.tar.gz" \
       -o /tmp/cursor.tar.gz && \
-    mkdir -p /opt/cursor-agent && \
-    tar xzf /tmp/cursor.tar.gz -C /opt/cursor-agent && \
-    ln -s /opt/cursor-agent/cursor-agent /usr/local/bin/cursor-agent && \
-    rm /tmp/cursor.tar.gz
+    mkdir -p /tmp/cursor-agent && \
+    tar xzf /tmp/cursor.tar.gz -C /tmp/cursor-agent && \
+    cp /tmp/cursor-agent/cursor-agent /usr/local/bin/ && \
+    chmod +x /usr/local/bin/cursor-agent && \
+    rm -rf /tmp/cursor-agent /tmp/cursor.tar.gz
 
 # Install gh CLI (for auth and token management)
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -29,13 +30,15 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     apt-get update && apt-get install -y --no-install-recommends gh && \
     rm -rf /var/lib/apt/lists/*
 
-RUN useradd -m -s /bin/bash -u 1000 node
-ENV HOME=/home/node
-WORKDIR /home/node
+RUN useradd -m -s /bin/bash -u 1000 agent
+RUN mkdir -p /home/agent/.cursor && \
+    chown -R agent:agent /home/agent
+ENV HOME=/home/agent
+WORKDIR /home/agent
 
-COPY --from=builder --chown=node:node /build/target/release/openab /usr/local/bin/openab
+COPY --from=builder --chown=agent:agent /build/target/release/openab /usr/local/bin/openab
 
-USER node
+USER agent
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD pgrep -x openab || exit 1
 ENTRYPOINT ["openab"]
