@@ -1,7 +1,7 @@
 image:
   repository: ghcr.io/openabdev/openab
   # tag defaults to .Chart.AppVersion
-  tag: ""
+  tag: "920ae7e"
   pullPolicy: IfNotPresent
 
 podSecurityContext:
