@@ -44,13 +44,18 @@ jobs:
           else
             CURRENT=$(grep '^version:' charts/openab/Chart.yaml | awk '{print $2}')
             BASE="${CURRENT%%-*}"
-            IFS='.' read -r major minor patch <<< "$BASE"
-            case "${{ inputs.bump }}" in
-              major) major=$((major + 1)); minor=0; patch=0 ;;
-              minor) minor=$((minor + 1)); patch=0 ;;
-              patch) patch=$((patch + 1)) ;;
-            esac
-            VERSION="${major}.${minor}.${patch}-beta.1"
+            if [[ "$CURRENT" == *-beta.* ]]; then
+              BETA_NUM="${CURRENT##*-beta.}"
+              VERSION="${BASE}-beta.$((BETA_NUM + 1))"
+            else
+              IFS='.' read -r major minor patch <<< "$BASE"
+              case "${{ inputs.bump }}" in
+                major) major=$((major + 1)); minor=0; patch=0 ;;
+                minor) minor=$((minor + 1)); patch=0 ;;
+                patch) patch=$((patch + 1)) ;;
+              esac
+              VERSION="${major}.${minor}.${patch}-beta.1"
+            fi
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "::notice::Release version: ${VERSION}"
