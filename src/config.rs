@@ -117,7 +117,7 @@ pub struct ReactionTiming {
 
 fn default_working_dir() -> String { "/tmp".into() }
 fn default_max_sessions() -> usize { 10 }
-fn default_ttl_hours() -> u64 { 24 }
+fn default_ttl_hours() -> u64 { 4 }
 fn default_true() -> bool { true }
 
 fn emoji_queued() -> String { "👀".into() }
