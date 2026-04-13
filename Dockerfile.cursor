@@ -31,8 +31,6 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m -s /bin/bash -u 1000 agent
-RUN mkdir -p /home/agent/.cursor && \
-    chown -R agent:agent /home/agent
 ENV HOME=/home/agent
 WORKDIR /home/agent
 
