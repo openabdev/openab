@@ -55,7 +55,3 @@ stall_soft_ms = 10000
 stall_hard_ms = 30000
 done_hold_ms = 1500
 error_hold_ms = 2500
-
-[markdown]
-# How to render markdown tables: "code" (fenced code block), "bullets", or "off"
-tables = "code"

@@ -1,8 +1,7 @@
 use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
-use crate::config::{MarkdownConfig, ReactionsConfig, SttConfig};
+use crate::config::{ReactionsConfig, SttConfig};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
-use crate::markdown;
 use crate::reactions::StatusReactionController;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -34,7 +33,6 @@ pub struct Handler {
     pub allowed_users: HashSet<u64>,
     pub reactions_config: ReactionsConfig,
     pub stt_config: SttConfig,
-    pub markdown_config: MarkdownConfig,
 }
 
 #[async_trait]
@@ -211,7 +209,6 @@ impl EventHandler for Handler {
             thread_channel,
             thinking_msg.id,
             reactions.clone(),
-            self.markdown_config.tables,
         )
         .await;
 
@@ -425,7 +422,6 @@ async fn stream_prompt(
     channel: ChannelId,
     msg_id: MessageId,
     reactions: Arc<StatusReactionController>,
-    table_mode: markdown::TableMode,
 ) -> anyhow::Result<()> {
     let reactions = reactions.clone();
 
@@ -577,7 +573,6 @@ async fn stream_prompt(
 
             // Final edit
             let final_content = compose_display(&tool_lines, &text_buf);
-            let final_content = markdown::convert_tables(&final_content, table_mode);
             // If ACP returned both an error and partial text, show both.
             // This can happen when the agent started producing content before hitting an error
             // (e.g. context length limit, rate limit mid-stream). Showing both gives users
