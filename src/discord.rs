@@ -589,24 +589,31 @@ async fn stream_prompt(
                 final_content
             };
 
-            // Append context window usage footer if available.
-            // Skip when the message is already near the 2000-char Discord limit
-            // to avoid the footer splitting into a separate message.
+            // Build context usage footer (empty string if no data).
             let ctx_size = conn.context_size.load(std::sync::atomic::Ordering::Relaxed);
-            let final_content = if ctx_size > 0 && final_content.len() < 1900 {
+            let ctx_footer = if ctx_size > 0 {
                 let ctx_used = conn.context_used.load(std::sync::atomic::Ordering::Relaxed);
                 let pct = (ctx_used as f64 / ctx_size as f64 * 100.0).round() as u64;
-                format!("{final_content}\n-# 📊 {ctx_used}/{ctx_size} tokens ({pct}%)")
+                format!("\n-# 📊 {ctx_used}/{ctx_size} tokens ({pct}%)")
             } else {
-                final_content
+                String::new()
             };
 
             let chunks = format::split_message(&final_content, 2000);
+            let last_idx = chunks.len().saturating_sub(1);
             for (i, chunk) in chunks.iter().enumerate() {
-                if i == 0 {
-                    let _ = edit(&ctx, channel, current_msg_id, chunk).await;
+                // Append context footer to the last chunk if it fits.
+                let content = if i == last_idx && !ctx_footer.is_empty()
+                    && chunk.len() + ctx_footer.len() < 2000
+                {
+                    format!("{chunk}{ctx_footer}")
                 } else {
-                    let _ = channel.say(&ctx.http, chunk).await;
+                    chunk.to_string()
+                };
+                if i == 0 {
+                    let _ = edit(&ctx, channel, current_msg_id, &content).await;
+                } else {
+                    let _ = channel.say(&ctx.http, &content).await;
                 }
             }
 
