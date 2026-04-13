@@ -30,11 +30,13 @@ Each agent lives under `agents.<name>`.
 ### Override generated names
 
 ```bash
-helm install my-openab openab/openab \
+helm install prod openab/openab \
   --set fullnameOverride=my-openab \
   --set agents.kiro.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.kiro.discord.allowedChannels[0]=YOUR_CHANNEL_ID'
 ```
+
+This makes generated resource names use `my-openab` (for example `my-openab-kiro`) instead of the default `prod-openab`.
 
 ### Load credentials with `envFrom`
 
