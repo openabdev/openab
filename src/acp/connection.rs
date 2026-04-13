@@ -419,17 +419,15 @@ impl AcpConnection {
         Ok(())
     }
 
-    /// Kill the entire process group: stdin close → SIGTERM → SIGKILL.
+    /// Kill the entire process group: SIGTERM → SIGKILL.
     fn kill_process_group(&mut self) {
         let pid = self.child_pid;
         if pid <= 0 {
             return;
         }
-        // Stage 1: close stdin (graceful signal for stdio-based agents)
-        drop(self.stdin.clone()); // triggers ChildStdin drop on last Arc ref eventually
-        // Stage 2: SIGTERM the process group
+        // Stage 1: SIGTERM the process group
         unsafe { libc::kill(-pid, libc::SIGTERM); }
-        // Stage 3: SIGKILL after brief grace (best-effort, non-blocking)
+        // Stage 2: SIGKILL after brief grace (best-effort, non-blocking)
         let pid_copy = pid;
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
