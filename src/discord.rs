@@ -11,6 +11,7 @@ use std::sync::LazyLock;
 use serenity::async_trait;
 use serenity::model::channel::{Message, ReactionType};
 use serenity::model::gateway::Ready;
+use serenity::model::guild::Guild;
 use serenity::model::id::{ChannelId, MessageId};
 use serenity::prelude::*;
 use std::collections::HashSet;
@@ -33,6 +34,10 @@ pub struct Handler {
     pub allowed_users: HashSet<u64>,
     pub reactions_config: ReactionsConfig,
     pub stt_config: SttConfig,
+    /// Cached bot role IDs across all guilds. Populated from `guild_create` events
+    /// (not `ready`, which only has `UnavailableGuild` stubs for larger guilds).
+    /// Discord Role IDs are globally unique, so a flat set is safe.
+    pub bot_role_ids: Arc<tokio::sync::RwLock<HashSet<u64>>>,
 }
 
 #[async_trait]
@@ -48,9 +53,20 @@ impl EventHandler for Handler {
         let in_allowed_channel =
             self.allowed_channels.is_empty() || self.allowed_channels.contains(&channel_id);
 
-        let is_mentioned = msg.mentions_user_id(bot_id)
-            || msg.content.contains(&format!("<@{}>", bot_id))
-            || msg.mention_roles.iter().any(|r| msg.content.contains(&format!("<@&{}>", r)));
+        // Check direct user mention
+        let is_user_mentioned = msg.mentions_user_id(bot_id)
+            || msg.content.contains(&format!("<@{}>", bot_id));
+
+        // Check role mention — only match THIS bot's cached roles, not all roles
+        // in the message (prevents cross-bot triggering in multi-bot guilds).
+        let is_role_mentioned = if !msg.mention_roles.is_empty() {
+            let cached_roles = self.bot_role_ids.read().await;
+            msg.mention_roles.iter().any(|r| cached_roles.contains(&r.get()))
+        } else {
+            false
+        };
+
+        let is_mentioned = is_user_mentioned || is_role_mentioned;
 
         let in_thread = if !in_allowed_channel {
             match msg.channel_id.to_channel(&ctx.http).await {
@@ -237,7 +253,27 @@ impl EventHandler for Handler {
     }
 
     async fn ready(&self, _ctx: Context, ready: Ready) {
-        info!(user = %ready.user.name, "discord bot connected");
+        info!(user = %ready.user.name, guilds = ready.guilds.len(), "discord bot connected");
+        // Role cache is populated by guild_create events (fired after ready),
+        // which have complete guild data even for larger guilds.
+    }
+
+    /// Fired per guild after ready. Guild data is complete here (unlike ready.guilds
+    /// which only has UnavailableGuild stubs for larger guilds).
+    async fn guild_create(&self, ctx: Context, guild: Guild, _is_new: Option<bool>) {
+        let bot_id = ctx.cache.current_user().id;
+        match guild.id.member(&ctx.http, bot_id).await {
+            Ok(member) => {
+                let mut roles = self.bot_role_ids.write().await;
+                for role in &member.roles {
+                    roles.insert(role.get());
+                }
+                info!(guild_id = %guild.id, role_count = member.roles.len(), "cached bot roles from guild_create");
+            }
+            Err(e) => {
+                tracing::warn!(guild_id = %guild.id, error = %e, "failed to cache bot roles in guild_create");
+            }
+        }
     }
 }
 

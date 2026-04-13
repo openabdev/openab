@@ -65,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
         allowed_users,
         reactions_config: cfg.reactions,
         stt_config: cfg.stt.clone(),
+        bot_role_ids: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
     };
 
     let intents = GatewayIntents::GUILD_MESSAGES
