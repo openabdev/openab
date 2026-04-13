@@ -93,6 +93,7 @@ Supports Kiro CLI, Claude Code, Codex, Gemini, and any ACP-compatible CLI.
 | `codex` | Codex | [@zed-industries/codex-acp](https://github.com/zed-industries/codex-acp) | `codex login --device-auth` |
 | `claude` | Claude Code | [@agentclientprotocol/claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp) | `claude setup-token` |
 | `gemini` | Gemini CLI | Native `gemini --acp` | Google OAuth or `GEMINI_API_KEY` |
+| `copilot` | GitHub Copilot CLI | Native `copilot --acp` | `gh auth login` or `copilot auth` |
 
 ### Helm Install (recommended)
 
@@ -115,6 +116,16 @@ helm install openab openab/openab \
   --set agents.claude.image=ghcr.io/openabdev/openab-claude:latest \
   --set agents.claude.command=claude-agent-acp \
   --set agents.claude.workingDir=/home/node
+
+# Copilot only (native --acp mode)
+helm install openab openab/openab \
+  --set agents.kiro.enabled=false \
+  --set agents.copilot.discord.botToken="$DISCORD_BOT_TOKEN" \
+  --set-string 'agents.copilot.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
+  --set agents.copilot.image=ghcr.io/openabdev/openab-copilot:latest \
+  --set agents.copilot.command=copilot \
+  --set 'agents.copilot.args={--acp}' \
+  --set agents.copilot.workingDir=/home/node
 
 # Multi-agent (kiro + claude in one release)
 helm install openab openab/openab \
@@ -155,6 +166,11 @@ working_dir = "/home/node"
 # Gemini
 [agent]
 command = "gemini"
+args = ["--acp"]
+
+# GitHub Copilot (native ACP — requires copilot CLI in PATH)
+[agent]
+command = "copilot"
 args = ["--acp"]
 working_dir = "/home/node"
 env = { GEMINI_API_KEY = "${GEMINI_API_KEY}" }
