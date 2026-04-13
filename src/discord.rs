@@ -589,6 +589,16 @@ async fn stream_prompt(
                 final_content
             };
 
+            // Append context window usage footer if available.
+            let ctx_size = conn.context_size.load(std::sync::atomic::Ordering::Relaxed);
+            let final_content = if ctx_size > 0 {
+                let ctx_used = conn.context_used.load(std::sync::atomic::Ordering::Relaxed);
+                let pct = (ctx_used as f64 / ctx_size as f64 * 100.0).round() as u64;
+                format!("{final_content}\n-# 📊 Context: {ctx_used}/{ctx_size} tokens ({pct}%)")
+            } else {
+                final_content
+            };
+
             let chunks = format::split_message(&final_content, 2000);
             for (i, chunk) in chunks.iter().enumerate() {
                 if i == 0 {
