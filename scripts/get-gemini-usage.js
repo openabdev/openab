@@ -1,61 +1,15 @@
 #!/usr/bin/env node
-// Get Gemini CLI usage info by spawning a quick ACP session.
-// Reports: model, rate limit tier. Gemini AI Studio free tier has no
-// hard quota — it has per-minute rate limits (15 RPM free, 1000 RPM paid).
-
-const { spawn } = require('child_process');
-const TIMEOUT = 50000;
-
-const child = spawn('gemini', ['--acp'], {
-  stdio: ['pipe', 'pipe', 'ignore'],
-  shell: true,
-});
-
-let buf = '';
-let id = 0;
-
-function send(method, params) {
-  const reqId = ++id;
-  child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: reqId, method, params }) + '\n');
-  return reqId;
-}
-
-child.stdout.on('data', chunk => {
-  buf += chunk.toString();
-  let idx;
-  while ((idx = buf.indexOf('\n')) >= 0) {
-    const line = buf.slice(0, idx).trim();
-    buf = buf.slice(idx + 1);
-    if (!line) continue;
-    try {
-      const msg = JSON.parse(line);
-      if (msg.id === 2 && msg.result) {
-        // session/new response
-        const models = msg.result.models;
-        const current = models?.currentModelId || 'unknown';
-        const available = models?.availableModels?.length || 0;
-        console.log(JSON.stringify({
-          ok: true,
-          current_model: current,
-          available_models: available,
-          tier: 'Google One AI Premium',
-          rate_limit: '1000 RPM',
-          account: 'xsx042388@gmail.com',
-          status_pct: 100,
-          ts: new Date().toISOString(),
-        }));
-        child.kill();
-        process.exit(0);
-      }
-    } catch {}
-  }
-});
-
-send('initialize', { protocolVersion: 1, clientCapabilities: {}, clientInfo: { name: 'probe', version: '0.1' } });
-setTimeout(() => send('session/new', { cwd: process.cwd(), mcpServers: [] }), 2000);
-
-setTimeout(() => {
-  console.log(JSON.stringify({ ok: false, error: 'timeout' }));
-  child.kill();
-  process.exit(1);
-}, TIMEOUT);
+// Get Gemini quota from Cloud AI Companion API with OAuth auto-refresh.
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const CREDS_PATH = path.join(process.env.USERPROFILE || 'C:/Users/Administrator', '.gemini', 'oauth_creds.json');
+const API_URL = 'https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota';
+const CLIENT_ID = 'REDACTED_GEMINI_CLIENT_ID';
+const CLIENT_SECRET = 'REDACTED_GEMINI_CLIENT_SECRET';
+function fmtCD(rt) { const d=new Date(rt)-new Date(); if(d<=0)return'resetting...'; const h=Math.floor(d/3600000),m=Math.floor((d%3600000)/60000); return h>0?`${h}h${m}m`:`${m}m`; }
+function shortName(id) { return id.replace('gemini-','').replace('-preview',''); }
+function fetchQuota(token) { return new Promise((res,rej)=>{ const body=JSON.stringify({project:'administrator'}); const u=new URL(API_URL); const req=https.request({hostname:u.hostname,path:u.pathname,method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token,'Content-Length':Buffer.byteLength(body)}},r=>{let d='';r.on('data',c=>d+=c);r.on('end',()=>{if(r.statusCode===401)return rej(new Error('TOKEN_EXPIRED'));if(r.statusCode!==200)return rej(new Error('API '+r.statusCode));res(JSON.parse(d));});}); req.on('error',rej); req.setTimeout(10000,()=>{req.destroy();rej(new Error('timeout'));}); req.write(body); req.end(); }); }
+function refreshToken(rt) { return new Promise((res,rej)=>{ const p=new URLSearchParams({client_id:CLIENT_ID,client_secret:CLIENT_SECRET,refresh_token:rt,grant_type:'refresh_token'}); const body=p.toString(); const req=https.request({hostname:'oauth2.googleapis.com',path:'/token',method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','Content-Length':Buffer.byteLength(body)}},r=>{let d='';r.on('data',c=>d+=c);r.on('end',()=>{if(r.statusCode!==200)return rej(new Error('refresh '+r.statusCode));res(JSON.parse(d).access_token);});}); req.on('error',rej); req.write(body); req.end(); }); }
+function output(resp) { const buckets=resp.buckets||[]; const lines=[]; let low=100; for(const b of buckets){const pct=Math.round((b.remainingFraction||1)*100);const n=shortName(b.modelId||'?');const r=b.resetTime?fmtCD(b.resetTime):'?';lines.push(`${n}: ${pct}% (${r})`);if(pct<low)low=pct;} console.log(JSON.stringify({ok:true,remaining_pct:low,quota_lines:lines.join('\n'),models_count:buckets.length,tier:'Google One AI Premium',ts:new Date().toISOString()})); }
+(async()=>{ try { const creds=JSON.parse(fs.readFileSync(CREDS_PATH,'utf8')); let token=creds.access_token; try { const r=await fetchQuota(token); output(r); } catch(e) { if(e.message==='TOKEN_EXPIRED'&&creds.refresh_token){ token=await refreshToken(creds.refresh_token); creds.access_token=token; creds.expiry_date=Date.now()+3600000; fs.writeFileSync(CREDS_PATH,JSON.stringify(creds,null,2)); const r=await fetchQuota(token); output(r); } else throw e; } } catch(e) { console.log(JSON.stringify({ok:false,error:e.message})); process.exit(1); } })();
