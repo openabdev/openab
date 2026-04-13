@@ -1,0 +1,90 @@
+[discord]
+bot_token = "${DISCORD_BOT_TOKEN}"
+allowed_channels = []
+allowed_users = ["844236700611379200"]   # xisx7876 — owner lockdown
+
+[agent]
+command = "cmd"
+args = ["/c", "copilot", "--acp"]
+working_dir = "C:\\Users\\Administrator"
+
+[pool]
+max_sessions = 5
+session_ttl_hours = 24
+
+[reactions]
+enabled = true
+remove_after_reply = false
+
+[reactions.emojis]
+queued = "👀"
+thinking = "🤔"
+tool = "🔥"
+coding = "👨‍💻"
+web = "⚡"
+done = "🆗"
+error = "😱"
+
+[reactions.timing]
+debounce_ms = 700
+stall_soft_ms = 10000
+stall_hard_ms = 30000
+done_hold_ms = 1500
+error_hold_ms = 2500
+
+# ----- /usage slash command -----
+[usage]
+enabled = true
+timeout_secs = 60
+
+[[usage.runners]]
+name = "claude"
+label = "🤖 Claude Code (Max)"
+color = 0xD97757
+command = "node"
+args = ["C:\\Users\\Administrator\\openab\\scripts\\get-claude-quota.js"]
+progress_fields = ["session_5h_remaining", "week_7d_remaining"]
+template = """
+**5h Window:** {{ session_5h_remaining }} (resets {{ session_5h_reset }})
+**7d Window:** {{ week_7d_remaining }} (resets {{ week_7d_reset }})
+**Week tokens:** {{ week_total }} (Opus {{ week_opus }} · Sonnet {{ week_sonnet }} · Haiku {{ week_haiku }})
+**Lifetime:** {{ total_sessions }} sessions · {{ total_messages }} msgs
+"""
+
+[[usage.runners]]
+name = "copilot"
+label = "⚡ GitHub Copilot (Pro)"
+color = 0x24292F
+command = "node"
+args = ["C:\\Users\\Administrator\\openab\\scripts\\get-copilot-quota.js"]
+progress_fields = ["remaining_pct"]
+template = """
+**Remaining:** {{ remaining_pct }}
+**Used:** {{ used }}/{{ total }} reqs · _Resets {{ reset_date }}_
+"""
+
+[[usage.runners]]
+name = "gemini"
+label = "💎 Google Gemini CLI"
+color = 0x4285F4
+command = "node"
+args = ["C:\\Users\\Administrator\\openab\\scripts\\get-gemini-usage.js"]
+progress_fields = ["remaining_pct"]
+template = """
+**Lowest:** {{ remaining_pct }} · {{ tier }}
+{{ quota_lines }}
+"""
+
+[[usage.runners]]
+name = "codex"
+label = "🟢 OpenAI Codex CLI"
+color = 0x10A37F
+command = "node"
+args = ["--experimental-sqlite", "C:\\Users\\Administrator\\openab\\scripts\\get-codex-usage.js"]
+progress_fields = ["h5_remaining", "wk_remaining"]
+template = """
+**5h Window:** {{ h5_remaining }} (resets {{ h5_reset }})
+**Weekly:** {{ wk_remaining }} (resets {{ wk_reset }})
+**Model:** {{ current_model }} ({{ effort }}) · {{ plan }}
+**Usage:** {{ total_tokens }} tokens · {{ thread_count }} threads
+"""

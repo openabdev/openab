@@ -35,7 +35,8 @@ $bots = @(
     @{ Name="CICX";    Config="config.toml";         LogDir="logs";         Bat="run-openab-claude.bat";  NodeMatch="claude-agent" },
     @{ Name="GITX";    Config="config-copilot.toml"; LogDir="logs-copilot"; Bat="run-openab-copilot.bat"; NodeMatch="copilot-agent" },
     @{ Name="GIMINIX"; Config="config-gemini.toml";  LogDir="logs-gemini";  Bat="run-openab-gemini.bat";  NodeMatch="gemini" },
-    @{ Name="CODEX";   Config="config-codex.toml";   LogDir="logs-codex";   Bat="run-openab-codex.bat";   NodeMatch="codex-acp" }
+    @{ Name="CODEX";   Config="config-codex.toml";   LogDir="logs-codex";   Bat="run-openab-codex.bat";   NodeMatch="codex-acp" },
+    @{ Name="COPILX";  Config="config-copilot-native.toml"; LogDir="logs-copilot-native"; Bat="run-openab-copilot-native.bat"; NodeMatch="copilot" }
 )
 
 foreach ($bot in $bots) {
@@ -50,25 +51,17 @@ foreach ($bot in $bots) {
         Remove-Item $markerPath -Force
     }
 
-    # Find openab.exe for this bot
-    $proc = Get-CimInstance Win32_Process -Filter "Name='openab.exe'" |
+    # Find openab.exe or openab-upstream.exe for this bot
+    $proc = Get-CimInstance Win32_Process -Filter "Name='openab.exe' OR Name='openab-upstream.exe'" |
         Where-Object { $_.CommandLine -match $configMatch }
 
     $needsRestart = $false
     $reason = ""
 
     if (-not $proc) {
-        # Process dead — check if bat loop will handle it
-        $batMatch = [regex]::Escape($bot.Bat)
-        $batLoop = Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" |
-            Where-Object { $_.CommandLine -match $batMatch }
-        if (-not $batLoop) {
-            $needsRestart = $true
-            $reason = "process_dead+no_bat"
-        } else {
-            # Bat loop alive, it'll restart openab — skip
-            continue
-        }
+        # Process dead — always restart (kill stale bat loops too)
+        $needsRestart = $true
+        $reason = "process_dead"
     } else {
         # Process alive — check TCP connections (zombie detection)
         $procId = $proc.ProcessId
