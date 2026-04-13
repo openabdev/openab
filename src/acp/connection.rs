@@ -10,6 +10,68 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info};
 
+/// Pick the most permissive selectable permission option from ACP options.
+fn pick_best_option(options: &[Value]) -> Option<String> {
+    let mut fallback: Option<&Value> = None;
+
+    for kind in ["allow_always", "allow_once"] {
+        if let Some(option) = options
+            .iter()
+            .find(|option| option.get("kind").and_then(|k| k.as_str()) == Some(kind))
+        {
+            return option
+                .get("optionId")
+                .and_then(|id| id.as_str())
+                .map(str::to_owned);
+        }
+    }
+
+    for option in options {
+        let kind = option.get("kind").and_then(|k| k.as_str());
+        if kind == Some("reject_once") || kind == Some("reject_always") {
+            continue;
+        }
+        fallback = Some(option);
+        break;
+    }
+
+    fallback
+        .and_then(|option| option.get("optionId"))
+        .and_then(|id| id.as_str())
+        .map(str::to_owned)
+}
+
+/// Build a spec-compliant permission response with backward-compatible fallback.
+fn build_permission_response(params: Option<&Value>) -> Value {
+    match params
+        .and_then(|p| p.get("options"))
+        .and_then(|options| options.as_array())
+    {
+        None => json!({
+            "outcome": {
+                "outcome": "selected",
+                "optionId": "allow_always"
+            }
+        }),
+        Some(options) => {
+            if let Some(option_id) = pick_best_option(options) {
+                json!({
+                    "outcome": {
+                        "outcome": "selected",
+                        "optionId": option_id
+                    }
+                })
+            } else {
+                json!({
+                    "outcome": {
+                        "outcome": "cancelled"
+                    }
+                })
+            }
+        }
+    }
+}
+
 fn expand_env(val: &str) -> String {
     if val.starts_with("${") && val.ends_with('}') {
         let key = &val[2..val.len() - 1];
@@ -113,13 +175,17 @@ impl AcpConnection {
                     // Auto-reply session/request_permission
                     if msg.method.as_deref() == Some("session/request_permission") {
                         if let Some(id) = msg.id {
-                            let title = msg.params.as_ref()
+                            let title = msg
+                                .params
+                                .as_ref()
                                 .and_then(|p| p.get("toolCall"))
                                 .and_then(|t| t.get("title"))
                                 .and_then(|t| t.as_str())
                                 .unwrap_or("?");
-                            info!(title, "auto-allow permission");
-                            let reply = JsonRpcResponse::new(id, json!({"optionId": "allow_always"}));
+
+                            let outcome = build_permission_response(msg.params.as_ref());
+                            info!(title, %outcome, "auto-respond permission");
+                            let reply = JsonRpcResponse::new(id, outcome);
                             if let Ok(data) = serde_json::to_string(&reply) {
                                 let mut w = stdin_clone.lock().await;
                                 let _ = w.write_all(format!("{data}\n").as_bytes()).await;
@@ -315,5 +381,102 @@ impl AcpConnection {
 
     pub fn alive(&self) -> bool {
         !self._reader_handle.is_finished()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_permission_response, pick_best_option};
+    use serde_json::json;
+
+    #[test]
+    fn picks_allow_always_over_other_options() {
+        let options = vec![
+            json!({"kind": "allow_once", "optionId": "once"}),
+            json!({"kind": "allow_always", "optionId": "always"}),
+            json!({"kind": "reject_once", "optionId": "reject"}),
+        ];
+
+        assert_eq!(pick_best_option(&options), Some("always".to_string()));
+    }
+
+    #[test]
+    fn falls_back_to_first_unknown_non_reject_kind() {
+        let options = vec![
+            json!({"kind": "reject_once", "optionId": "reject"}),
+            json!({"kind": "workspace_write", "optionId": "workspace-write"}),
+        ];
+
+        assert_eq!(
+            pick_best_option(&options),
+            Some("workspace-write".to_string())
+        );
+    }
+
+    #[test]
+    fn selects_bypass_permissions_for_exit_plan_mode() {
+        let options = vec![
+            json!({"optionId": "bypassPermissions", "kind": "allow_always"}),
+            json!({"optionId": "acceptEdits", "kind": "allow_always"}),
+            json!({"optionId": "default", "kind": "allow_once"}),
+            json!({"optionId": "plan", "kind": "reject_once"}),
+        ];
+
+        assert_eq!(
+            pick_best_option(&options),
+            Some("bypassPermissions".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_none_when_only_reject_options_exist() {
+        let options = vec![
+            json!({"kind": "reject_once", "optionId": "reject-once"}),
+            json!({"kind": "reject_always", "optionId": "reject-always"}),
+        ];
+
+        assert_eq!(pick_best_option(&options), None);
+    }
+
+    #[test]
+    fn builds_cancelled_outcome_when_no_selectable_option_exists() {
+        let response = build_permission_response(Some(&json!({
+            "options": [
+                {"kind": "reject_once", "optionId": "reject-once"}
+            ]
+        })));
+
+        assert_eq!(response, json!({"outcome": {"outcome": "cancelled"}}));
+    }
+
+    #[test]
+    fn builds_cancelled_when_options_array_is_empty() {
+        let response = build_permission_response(Some(&json!({
+            "options": []
+        })));
+
+        assert_eq!(response, json!({"outcome": {"outcome": "cancelled"}}));
+    }
+
+    #[test]
+    fn falls_back_to_allow_always_when_options_are_missing() {
+        let response = build_permission_response(Some(&json!({
+            "toolCall": {"title": "legacy"}
+        })));
+
+        assert_eq!(
+            response,
+            json!({"outcome": {"outcome": "selected", "optionId": "allow_always"}})
+        );
+    }
+
+    #[test]
+    fn falls_back_to_allow_always_when_params_is_none() {
+        let response = build_permission_response(None);
+
+        assert_eq!(
+            response,
+            json!({"outcome": {"outcome": "selected", "optionId": "allow_always"}})
+        );
     }
 }
