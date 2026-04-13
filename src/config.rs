@@ -13,14 +13,44 @@ pub struct Config {
     #[serde(default)]
     pub reactions: ReactionsConfig,
     #[serde(default)]
+    pub stt: SttConfig,
+    #[serde(default)]
     pub markdown: MarkdownConfig,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SttConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_stt_model")]
+    pub model: String,
+    #[serde(default = "default_stt_base_url")]
+    pub base_url: String,
+}
+
+impl Default for SttConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: String::new(),
+            model: default_stt_model(),
+            base_url: default_stt_base_url(),
+        }
+    }
+}
+
+fn default_stt_model() -> String { "whisper-large-v3-turbo".into() }
+fn default_stt_base_url() -> String { "https://api.groq.com/openai/v1".into() }
 
 #[derive(Debug, Deserialize)]
 pub struct DiscordConfig {
     pub bot_token: String,
     #[serde(default)]
     pub allowed_channels: Vec<String>,
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

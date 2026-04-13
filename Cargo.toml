@@ -1,6 +1,6 @@
 [package]
 name = "openab"
-version = "0.1.0"
+version = "0.7.2"
 edition = "2021"
 
 [dependencies]
@@ -15,5 +15,8 @@ uuid = { version = "1", features = ["v4"] }
 regex = "1"
 anyhow = "1"
 rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "multipart", "json"] }
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 pulldown-cmark = { version = "0.13", default-features = false }
 unicode-width = "0.2"

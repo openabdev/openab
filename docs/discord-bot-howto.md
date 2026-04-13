@@ -47,7 +47,14 @@ Step-by-step guide to create and configure a Discord bot for openab.
 3. Click **Copy Channel ID**
 4. Use this ID in `allowed_channels` in your config
 
-## 7. Configure openab
+## 7. Get Your User ID (optional)
+
+1. Make sure **Developer Mode** is enabled (see step 6)
+2. Right-click your own username (in a message or the member list)
+3. Click **Copy User ID**
+4. Use this ID in `allowed_users` to restrict who can interact with the bot
+
+## 8. Configure openab
 
 Set the bot token and channel ID:
 
@@ -61,7 +68,20 @@ In `config.toml`:
 [discord]
 bot_token = "${DISCORD_BOT_TOKEN}"
 allowed_channels = ["your-channel-id-from-step-6"]
+# allowed_users = ["your-user-id-from-step-7"]  # optional: restrict who can use the bot
 ```
+
+### Access control behavior
+
+| `allowed_channels` | `allowed_users` | Result |
+|---|---|---|
+| empty | empty | All users, all channels (default) |
+| set | empty | Only these channels, all users |
+| empty | set | All channels, only these users |
+| set | set | **AND** — must be in allowed channel AND allowed user |
+
+- Empty `allowed_users` (default) = no user filtering, fully backward compatible
+- Denied users get a 🚫 reaction and no reply
 
 For Kubernetes:
 ```bash
@@ -69,7 +89,7 @@ kubectl create secret generic openab-secret \
   --from-literal=discord-bot-token="your-token-from-step-3"
 ```
 
-## 8. Test
+## 9. Test
 
 In the allowed channel, mention the bot:
 
@@ -84,3 +104,4 @@ The bot should create a thread and respond. After that, just type in the thread 
 - **Bot doesn't respond** — check that the channel ID is correct and the bot has permissions in that channel
 - **"Sent invalid authentication"** — the bot token is wrong or expired, reset it in the Developer Portal
 - **"Failed to start agent"** — kiro-cli isn't authenticated, run `kiro-cli login --use-device-flow` inside the container
+- **`gh` commands fail with 401** — the agent needs GitHub CLI authentication. See [gh auth device flow guide](gh-auth-device-flow.md) for how to authenticate in a headless container
