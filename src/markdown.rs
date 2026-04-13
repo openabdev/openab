@@ -54,7 +54,7 @@ pub fn convert_tables(markdown: &str, mode: TableMode) -> String {
         return markdown.to_string();
     }
 
-    let segments = parse_segments(markdown);
+    let segments = parse_segments(markdown, mode);
 
     let mut out = String::with_capacity(markdown.len());
     for seg in segments {
@@ -74,7 +74,7 @@ pub fn convert_tables(markdown: &str, mode: TableMode) -> String {
 
 /// Walk the markdown source with pulldown-cmark and split it into
 /// text segments and parsed Table segments.
-fn parse_segments(markdown: &str) -> Vec<Segment> {
+fn parse_segments(markdown: &str, mode: TableMode) -> Vec<Segment> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
 
@@ -138,9 +138,15 @@ fn parse_segments(markdown: &str) -> Vec<Segment> {
                 cell_buf.push_str(&t);
             }
             Event::Code(t) if in_table => {
-                cell_buf.push('`');
+                // In Code mode the table is already inside a fenced code block,
+                // so backticks would render as literal characters. Strip them.
+                if mode != TableMode::Code {
+                    cell_buf.push('`');
+                }
                 cell_buf.push_str(&t);
-                cell_buf.push('`');
+                if mode != TableMode::Code {
+                    cell_buf.push('`');
+                }
             }
             // Inline markup inside cells: collect text, ignore tags
             Event::SoftBreak if in_table => {
@@ -319,5 +325,28 @@ Some text after.
         let plain = "Hello world\nNo tables here.";
         let result = convert_tables(plain, TableMode::Code);
         assert_eq!(result, plain);
+    }
+
+    #[test]
+    fn code_mode_strips_backticks_from_code_cells() {
+        let md = "| col |\n|-----|\n| `value` |\n";
+        let result = convert_tables(md, TableMode::Code);
+        // The table is inside a ``` block — backtick wrapping must be stripped.
+        assert!(result.contains("value"), "cell content should be present");
+        // Only the fence markers themselves should contain backticks.
+        let inner = result
+            .trim_start_matches("```\n")
+            .trim_end_matches("```\n");
+        assert!(
+            !inner.contains('`'),
+            "no backticks should appear inside the code fence: {result:?}"
+        );
+    }
+
+    #[test]
+    fn bullets_mode_keeps_backticks_in_code_cells() {
+        let md = "| col |\n|-----|\n| `value` |\n";
+        let result = convert_tables(md, TableMode::Bullets);
+        assert!(result.contains("`value`"), "backticks should be kept in bullets mode");
     }
 }
