@@ -107,11 +107,13 @@ impl ContentBlock {
 
 pub struct AcpConnection {
     _proc: Child,
+    child_pid: i32,
     stdin: Arc<Mutex<ChildStdin>>,
     next_id: AtomicU64,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
     notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
     pub acp_session_id: Option<String>,
+    pub supports_load_session: bool,
     pub last_active: Instant,
     pub session_reset: bool,
     _reader_handle: JoinHandle<()>,
@@ -131,14 +133,22 @@ impl AcpConnection {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .current_dir(working_dir)
-            .kill_on_drop(true);
+            .current_dir(working_dir);
+        // Create a new process group so we can kill the entire tree.
+        // SAFETY: setpgid is async-signal-safe and called before exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
         for (k, v) in env {
             cmd.env(k, expand_env(v));
         }
         let mut proc = cmd
             .spawn()
             .map_err(|e| anyhow!("failed to spawn {command}: {e}"))?;
+        let child_pid = proc.id().unwrap_or(0) as i32;
 
         let stdout = proc.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         let stdin = proc.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
@@ -245,11 +255,13 @@ impl AcpConnection {
 
         Ok(Self {
             _proc: proc,
+            child_pid,
             stdin,
             next_id: AtomicU64::new(1),
             pending,
             notify_tx,
             acp_session_id: None,
+            supports_load_session: false,
             last_active: Instant::now(),
             session_reset: false,
             _reader_handle: reader_handle,
@@ -303,12 +315,18 @@ impl AcpConnection {
             )
             .await?;
 
-        let agent_name = resp.result.as_ref()
+        let result = resp.result.as_ref();
+        let agent_name = result
             .and_then(|r| r.get("agentInfo"))
             .and_then(|a| a.get("name"))
             .and_then(|n| n.as_str())
             .unwrap_or("unknown");
-        info!(agent = agent_name, "initialized");
+        self.supports_load_session = result
+            .and_then(|r| r.get("agentCapabilities"))
+            .and_then(|c| c.get("loadSession"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        info!(agent = agent_name, load_session = self.supports_load_session, "initialized");
         Ok(())
     }
 
@@ -381,6 +399,48 @@ impl AcpConnection {
 
     pub fn alive(&self) -> bool {
         !self._reader_handle.is_finished()
+    }
+
+    /// Resume a previous session by ID. Returns Ok(()) if the agent accepted
+    /// the load, or an error if it failed (caller should fall back to session/new).
+    pub async fn session_load(&mut self, session_id: &str, cwd: &str) -> Result<()> {
+        let resp = self
+            .send_request(
+                "session/load",
+                Some(json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []})),
+            )
+            .await?;
+        // Accept any non-error response as success
+        if resp.error.is_some() {
+            return Err(anyhow!("session/load rejected"));
+        }
+        info!(session_id, "session loaded");
+        self.acp_session_id = Some(session_id.to_string());
+        Ok(())
+    }
+
+    /// Kill the entire process group: stdin close → SIGTERM → SIGKILL.
+    fn kill_process_group(&mut self) {
+        let pid = self.child_pid;
+        if pid <= 0 {
+            return;
+        }
+        // Stage 1: close stdin (graceful signal for stdio-based agents)
+        drop(self.stdin.clone()); // triggers ChildStdin drop on last Arc ref eventually
+        // Stage 2: SIGTERM the process group
+        unsafe { libc::kill(-pid, libc::SIGTERM); }
+        // Stage 3: SIGKILL after brief grace (best-effort, non-blocking)
+        let pid_copy = pid;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            unsafe { libc::kill(-pid_copy, libc::SIGKILL); }
+        });
+    }
+}
+
+impl Drop for AcpConnection {
+    fn drop(&mut self) {
+        self.kill_process_group();
     }
 }
 
