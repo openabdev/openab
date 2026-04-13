@@ -71,13 +71,15 @@ async fn main() -> anyhow::Result<()> {
         store: store.clone(),
         allowed_channels,
         allowed_users,
+        allow_dms: cfg.discord.allow_dms,
         reactions_config: cfg.reactions,
         stt_config: cfg.stt.clone(),
     };
 
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT
-        | GatewayIntents::GUILDS;
+        | GatewayIntents::GUILDS
+        | GatewayIntents::DIRECT_MESSAGES;
 
     let mut client = Client::builder(&cfg.discord.bot_token, intents)
         .event_handler(handler)

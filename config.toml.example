@@ -2,6 +2,7 @@
 bot_token = "${DISCORD_BOT_TOKEN}"
 allowed_channels = ["1234567890"]
 # allowed_users = ["<YOUR_DISCORD_USER_ID>"]  # empty or omitted = allow all users
+# allow_dms = true  # allow users to interact via Direct Messages (recommend pairing with allowed_users)
 
 [agent]
 command = "kiro-cli"
