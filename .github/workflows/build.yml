@@ -69,6 +69,7 @@ jobs:
           - { suffix: "-codex", dockerfile: "Dockerfile.codex", artifact: "codex" }
           - { suffix: "-claude", dockerfile: "Dockerfile.claude", artifact: "claude" }
           - { suffix: "-gemini", dockerfile: "Dockerfile.gemini", artifact: "gemini" }
+          - { suffix: "-copilot", dockerfile: "Dockerfile.copilot", artifact: "copilot" }
         platform:
           - { os: linux/amd64, runner: ubuntu-latest }
           - { os: linux/arm64, runner: ubuntu-24.04-arm }
@@ -129,6 +130,7 @@ jobs:
           - { suffix: "-codex", artifact: "codex" }
           - { suffix: "-claude", artifact: "claude" }
           - { suffix: "-gemini", artifact: "gemini" }
+          - { suffix: "-copilot", artifact: "copilot" }
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -176,6 +178,7 @@ jobs:
           - { suffix: "-codex" }
           - { suffix: "-claude" }
           - { suffix: "-gemini" }
+          - { suffix: "-copilot" }
     runs-on: ubuntu-latest
     permissions:
       contents: read

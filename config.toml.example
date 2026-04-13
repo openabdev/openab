@@ -26,6 +26,12 @@ working_dir = "/home/agent"
 # working_dir = "/home/agent"
 # env = { GEMINI_API_KEY = "${GEMINI_API_KEY}" }
 
+# [agent]
+# command = "copilot"
+# args = ["--acp", "--stdio"]
+# working_dir = "/home/agent"
+# env = {}  # Auth via: kubectl exec -it <pod> -- gh auth login -p https -w
+
 [pool]
 max_sessions = 10
 session_ttl_hours = 24
