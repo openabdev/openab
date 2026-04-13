@@ -292,9 +292,11 @@ async function handleSessionNew(params) {
         description: m.description || m.name || '',
       }));
     }
+    // Filter out Claude models — Copilot Pro doesn't include them
+    const filteredModels = sessionModels.filter(m => !m.modelId?.startsWith('claude-'));
     models = {
       currentModelId: appliedDefault ? DEFAULT_MODEL : (cur?.modelId || 'default'),
-      availableModels: sessionModels,
+      availableModels: filteredModels,
     };
   } catch (_) {}
 

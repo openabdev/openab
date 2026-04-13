@@ -102,7 +102,10 @@ const COPILOT_RELOAD_KINDS: &[(&str, &str, &str)] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendType {
     Claude,
-    Copilot,
+    /// Custom copilot-agent-acp bridge (supports SDK RPCs like _meta/getUsage)
+    CopilotBridge,
+    /// Native `copilot --acp` (no SDK RPCs — standard ACP only)
+    CopilotNative,
     Gemini,
     Codex,
     Other,
@@ -112,8 +115,10 @@ impl BackendType {
     /// Infer backend from the agent command + args strings.
     pub fn from_agent_config(command: &str, args: &[String]) -> Self {
         let joined = format!("{} {}", command, args.join(" ")).to_lowercase();
-        if joined.contains("copilot") {
-            BackendType::Copilot
+        if joined.contains("copilot-agent-acp") {
+            BackendType::CopilotBridge
+        } else if joined.contains("copilot") {
+            BackendType::CopilotNative
         } else if joined.contains("claude") {
             BackendType::Claude
         } else if joined.contains("gemini") {
@@ -125,9 +130,17 @@ impl BackendType {
         }
     }
 
-    /// Does this backend support Copilot SDK RPCs?
+    /// Does this backend support Copilot SDK RPCs (copilot-rpc.js)?
+    /// Only the custom bridge has these — native `copilot --acp` does not.
     pub fn has_copilot_rpc(&self) -> bool {
-        *self == BackendType::Copilot
+        *self == BackendType::CopilotBridge
+    }
+
+    /// Does this backend support _meta/* RPC methods?
+    /// Only claude-agent-acp and copilot-agent-acp bridges support these.
+    /// Native CLI backends (copilot --acp, gemini --acp, codex-acp) do not.
+    pub fn has_meta_rpc(&self) -> bool {
+        matches!(self, BackendType::Claude | BackendType::CopilotBridge)
     }
 }
 
@@ -436,17 +449,17 @@ impl EventHandler for Handler {
                 .description("Reset the current thread's agent session completely"),
         );
 
-        // /tokens — show current thread's session token usage (bridge-only)
-        commands.push(
-            CreateCommand::new("tokens")
-                .description("Show current thread's context window token usage"),
-        );
-
-        // /permissions — recent tool permission audit log (bridge-only)
-        commands.push(
-            CreateCommand::new("permissions")
-                .description("Show recent tool permission requests in this thread"),
-        );
+        // /tokens and /permissions — only for backends with _meta RPC support
+        if self.backend.has_meta_rpc() {
+            commands.push(
+                CreateCommand::new("tokens")
+                    .description("Show current thread's context window token usage"),
+            );
+            commands.push(
+                CreateCommand::new("permissions")
+                    .description("Show recent tool permission requests in this thread"),
+            );
+        }
 
         // Only register /usage if the user has configured it.
         if self.usage_config.as_ref().is_some_and(|u| u.enabled && !u.runners.is_empty()) {
