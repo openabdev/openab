@@ -88,3 +88,29 @@ args = ["scripts/usage/daily-report.js", "--tz", "Asia/Taipei"]
 template = "📅 今日訊息 {{ messages }}\nToken: {{ tokens }}\n成本: ${{ cost }}"
 env = { REPORT_SCOPE = "daily" }
 working_dir = "."
+
+# Minimal runnable example (no external scripts required):
+#
+# [usage]
+# enabled = true
+# timeout_secs = 5
+#
+# [[usage.runners]]
+# name = "ping"
+# label = "簡易檢查"
+# color = 5763719
+# command = "node"
+# args = ["-e", "console.log('{\"ok\":true,\"status\":\"ok\",\"value\":100,\"note\":\"no external script needed\"}')"]
+# template = "status={{ status }} value={{ value }} note={{ note }}"
+#
+# [cusage]
+# enabled = true
+# timeout_secs = 5
+#
+# [[cusage.runners]]
+# name = "ping"
+# label = "簡易回報"
+# color = 4286946
+# command = "node"
+# args = ["-e", "console.log('{\"ok\":true,\"items\":[1,2,3],\"label\":\"hello\"}')"]
+# template = "label={{ label }} items={{ items }}"
