@@ -29,9 +29,22 @@ A lightweight, secure, cloud-native ACP harness that bridges Discord and any [Ag
 
 ## Quick Start
 
-### 1. Create a Discord Bot
+### Prerequisites
+
+Before running openab, enable these in the [Discord Developer Portal](https://discord.com/developers/applications):
+
+1. **Bot → Privileged Gateway Intents**:
+   - ✅ Message Content Intent
+   - ✅ Server Members Intent
+2. **OAuth2 → URL Generator → Bot Permissions**:
+   - Send Messages, Embed Links, Attach Files
+   - Read Message History, Add Reactions
 
 See [docs/discord-bot-howto.md](docs/discord-bot-howto.md) for a detailed step-by-step guide.
+
+### 1. Create a Discord Bot
+
+Follow the [prerequisites](#prerequisites) above, then create your bot.
 
 ### 2. Install with Helm (Kiro CLI — default)
 

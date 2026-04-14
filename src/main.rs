@@ -6,11 +6,12 @@ mod format;
 mod reactions;
 mod stt;
 
+use serenity::gateway::GatewayError;
 use serenity::prelude::*;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{error, info};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -98,7 +99,25 @@ async fn main() -> anyhow::Result<()> {
     });
 
     info!("starting discord bot");
-    client.start().await?;
+    match client.start().await {
+        Err(serenity::Error::Gateway(GatewayError::DisallowedGatewayIntents)) => {
+            error!(
+                "Discord rejected privileged intents. \
+                 Enable MESSAGE CONTENT INTENT at: \
+                 https://discord.com/developers/applications → Bot → Privileged Gateway Intents"
+            );
+            std::process::exit(1);
+        }
+        Err(serenity::Error::Gateway(GatewayError::InvalidAuthentication)) => {
+            error!(
+                "Discord rejected bot token. \
+                 Verify your bot_token in config.toml is correct and has not been reset."
+            );
+            std::process::exit(1);
+        }
+        Err(e) => return Err(e.into()),
+        Ok(_) => {}
+    }
 
     // Cleanup
     cleanup_handle.abort();
