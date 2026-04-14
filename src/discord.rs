@@ -1089,7 +1089,19 @@ impl Handler {
             } else {
                 ""
             };
-            let label = format!("{}{marker}", m.model_id);
+            let detail = if !m.description.is_empty() {
+                m.description.clone()
+            } else if m.name != m.model_id {
+                m.name.clone()
+            } else {
+                String::new()
+            };
+            let label = if detail.is_empty() {
+                format!("{}{marker}", m.model_id)
+            } else {
+                let detail = detail.chars().take(60).collect::<String>();
+                format!("{}{marker} — {}", m.model_id, detail)
+            };
             choices.push(AutocompleteChoice::new(label, m.model_id.clone()));
         }
 
@@ -1886,10 +1898,15 @@ impl Handler {
                                 } else {
                                     "•"
                                 };
-                                out.push_str(&format!(
-                                    "{} `{}` — {}\n",
-                                    marker, m.model_id, m.name
-                                ));
+                                out.push_str(&format!("{} `{}` — {}", marker, m.model_id, m.name));
+                                if !m.description.is_empty() {
+                                    out.push_str(&format!(
+                                        "\n  {}\n",
+                                        m.description.chars().take(120).collect::<String>()
+                                    ));
+                                } else {
+                                    out.push('\n');
+                                }
                             }
                             out.push_str(&format!("\nCurrent: `{}`", conn.current_model));
                             Ok(out)

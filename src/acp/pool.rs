@@ -62,14 +62,6 @@ impl SessionPool {
         matches!(state.active.get(thread_id), Some(conn) if conn.alive())
     }
 
-    /// Replace the cached model list. Used by the background refresh task
-    /// in `main.rs` to keep `/model` autocomplete in sync with upstream.
-    pub async fn set_cached_models(&self, models: Vec<ModelInfo>) {
-        if !models.is_empty() {
-            *self.cached_models.write().await = models;
-        }
-    }
-
     pub async fn get_or_create(
         &self,
         thread_id: &str,
