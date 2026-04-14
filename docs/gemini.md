@@ -25,6 +25,20 @@ helm install openab openab/openab \
 
 > Set `agents.kiro.enabled=false` to disable the default Kiro agent.
 
+## First-Run Workaround
+
+Gemini CLI needs `~/.gemini/projects.json` to exist before the first ACP session starts. In ephemeral containers, the file may not be created yet, which can surface as `ENOENT` or `Unexpected end of JSON input` during the first run.
+
+If you control the container startup command, seed the directory before launching `openab`:
+
+```bash
+mkdir -p /home/node/.gemini && echo '{}' > /home/node/.gemini/projects.json && exec openab /etc/openab/config.toml
+```
+
+For Kubernetes or Helm deployments, use the same idea with an init container and a shared volume mounted at `/home/node/.gemini`.
+
+The current chart does not expose `extraInitContainers`, `extraVolumes`, or `extraVolumeMounts`, so the workaround is easiest to apply in a custom manifest or wrapper image until those values are added.
+
 ## Manual config.toml
 
 ```toml
