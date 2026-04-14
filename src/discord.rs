@@ -1764,6 +1764,9 @@ impl Handler {
 
     /// Handle the `/soul` slash command: display the bot's persona file or show emoji preset picker.
     async fn handle_soul_command(&self, ctx: &Context, cmd: &CommandInteraction) {
+        if !self.copilot_guard_ok(ctx, cmd).await {
+            return;
+        }
         use serenity::all::{
             CreateActionRow, CreateEmbed, CreateSelectMenu, CreateSelectMenuKind,
             CreateSelectMenuOption,
@@ -2469,6 +2472,9 @@ impl Handler {
 
     /// Handle `/cusage` — custom usage breakdown (daily/weekly/monthly).
     async fn handle_cusage_command(&self, ctx: &Context, cmd: &CommandInteraction) {
+        if !self.copilot_guard_ok(ctx, cmd).await {
+            return;
+        }
         let Some(cusage_cfg) = self.cusage_config.as_ref() else {
             let _ = cmd
                 .create_response(

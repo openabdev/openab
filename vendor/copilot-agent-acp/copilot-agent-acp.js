@@ -307,10 +307,15 @@ async function handleSessionNew(params) {
       content: DEFAULT_APPEND_SYSTEM,
     },
   };
-  // Inject MCP servers + configDir so SDK picks up mcp-config.json
-  if (Object.keys(SESSION_MCP_SERVERS).length > 0) {
-    sessionOpts.mcpServers = SESSION_MCP_SERVERS;
-    logInfo(`session/new injecting ${Object.keys(SESSION_MCP_SERVERS).length} MCP server(s) via mcpServers`);
+  // Merge MCP servers: file-based (SESSION_MCP_SERVERS) + ACP request params
+  const fileMcp = Object.keys(SESSION_MCP_SERVERS).length > 0 ? SESSION_MCP_SERVERS : {};
+  const requestMcp = Array.isArray(params?.mcpServers)
+    ? params.mcpServers.reduce((acc, s) => { if (s.name) { const {name, ...cfg} = s; acc[name] = cfg; } return acc; }, {})
+    : {};
+  const mergedMcp = { ...fileMcp, ...requestMcp };
+  if (Object.keys(mergedMcp).length > 0) {
+    sessionOpts.mcpServers = mergedMcp;
+    logInfo(`session/new injecting ${Object.keys(mergedMcp).length} MCP server(s) via mcpServers`);
   }
   // Also pass configDir so SDK can find mcp-config.json, skills, etc.
   sessionOpts.configDir = path.join(
