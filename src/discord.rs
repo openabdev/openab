@@ -1,5 +1,5 @@
 use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
-use crate::config::{ReactionsConfig, SttConfig};
+use crate::config::{AllowBots, ReactionsConfig, SttConfig};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
 use crate::reactions::StatusReactionController;
@@ -18,6 +18,11 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::{debug, error, info};
 
+/// Hard cap on consecutive bot-to-bot turns per thread/channel.
+/// Prevents infinite loops when `allow_bot_messages = "all"`.
+/// Inspired by OpenClaw's `session.agentToAgent.maxPingPongTurns`.
+const MAX_BOT_TURNS_PER_THREAD: usize = 10;
+
 /// Reusable HTTP client for downloading Discord attachments.
 /// Built once with a 30s timeout and rustls TLS (no native-tls deps).
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -33,16 +38,19 @@ pub struct Handler {
     pub allowed_users: HashSet<u64>,
     pub reactions_config: ReactionsConfig,
     pub stt_config: SttConfig,
+    pub allow_bot_messages: AllowBots,
+    pub trusted_bot_ids: HashSet<u64>,
 }
 
 #[async_trait]
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
-        if msg.author.bot {
+        let bot_id = ctx.cache.current_user().id;
+
+        // Always ignore own messages
+        if msg.author.id == bot_id {
             return;
         }
-
-        let bot_id = ctx.cache.current_user().id;
 
         let channel_id = msg.channel_id.get();
         let in_allowed_channel =
@@ -51,6 +59,39 @@ impl EventHandler for Handler {
         let is_mentioned = msg.mentions_user_id(bot_id)
             || msg.content.contains(&format!("<@{}>", bot_id))
             || msg.mention_roles.iter().any(|r| msg.content.contains(&format!("<@&{}>", r)));
+
+        // Bot message gating — runs after self-ignore but before channel/user
+        // allowlist checks. This ordering is intentional: channel checks below
+        // apply uniformly to both human and bot messages, so a bot mention in
+        // a non-allowed channel is still rejected by the channel check.
+        if msg.author.bot {
+            match self.allow_bot_messages {
+                AllowBots::Off => return,
+                AllowBots::Mentions => if !is_mentioned { return; },
+                AllowBots::All => {
+                    // Safety net: cap consecutive bot messages to prevent
+                    // infinite loops when two bots both use "all" mode.
+                    if let Ok(history) = msg.channel_id
+                        .messages(&ctx.http, serenity::builder::GetMessages::new().before(msg.id).limit(MAX_BOT_TURNS_PER_THREAD as u8))
+                        .await
+                    {
+                        let consecutive_bot = history.iter()
+                            .take_while(|m| m.author.bot && m.author.id != bot_id)
+                            .count();
+                        if consecutive_bot >= MAX_BOT_TURNS_PER_THREAD {
+                            tracing::warn!(channel_id = %msg.channel_id, cap = MAX_BOT_TURNS_PER_THREAD, "bot turn cap reached, ignoring");
+                            return;
+                        }
+                    }
+                },
+            }
+
+            // If trusted_bot_ids is set, only allow bots on the list
+            if !self.trusted_bot_ids.is_empty() && !self.trusted_bot_ids.contains(&msg.author.id.get()) {
+                tracing::debug!(bot_id = %msg.author.id, "bot not in trusted_bot_ids, ignoring");
+                return;
+            }
+        }
 
         let in_thread = if !in_allowed_channel {
             match msg.channel_id.to_channel(&ctx.http).await {
