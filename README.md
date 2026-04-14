@@ -44,6 +44,19 @@ A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**,
 
 ## Quick Start
 
+### Prerequisites
+
+Before running openab, enable these in the [Discord Developer Portal](https://discord.com/developers/applications):
+
+1. **Bot → Privileged Gateway Intents**:
+   - ✅ Message Content Intent
+   - ✅ Server Members Intent
+2. **OAuth2 → URL Generator → Bot Permissions**:
+   - Send Messages, Embed Links, Attach Files
+   - Read Message History, Add Reactions
+
+See [docs/discord.md](docs/discord.md) for a detailed step-by-step guide.
+
 ### 1. Create a Bot
 
 <details>
