@@ -104,6 +104,7 @@ impl AcpConnection {
             cmd.env(k, expand_env(v));
         }
         let mut proc = cmd
+            .kill_on_drop(true)
             .spawn()
             .map_err(|e| anyhow!("failed to spawn {command}: {e}"))?;
         let child_pgid = proc.id().and_then(|pid| i32::try_from(pid).ok());
@@ -153,9 +154,21 @@ impl AcpConnection {
                                 .and_then(|t| t.get("title"))
                                 .and_then(|t| t.as_str())
                                 .unwrap_or("?");
-                            info!(title, "auto-allow permission");
-                            let reply =
-                                JsonRpcResponse::new(id, json!({"optionId": "allow_always"}));
+                            // Pick the first option from the backend's advertised list
+                            let option_id = msg
+                                .params
+                                .as_ref()
+                                .and_then(|p| p.get("options"))
+                                .and_then(|o| o.as_array())
+                                .and_then(|arr| arr.first())
+                                .and_then(|opt| opt.get("id"))
+                                .and_then(|id| id.as_str())
+                                .unwrap_or("allow_always");
+                            info!(title, option_id, "auto-allow permission");
+                            let reply = JsonRpcResponse::new(
+                                id,
+                                json!({"outcome": {"selected": option_id}}),
+                            );
                             if let Ok(data) = serde_json::to_string(&reply) {
                                 let mut w = stdin_clone.lock().await;
                                 let _ = w.write_all(format!("{data}\n").as_bytes()).await;

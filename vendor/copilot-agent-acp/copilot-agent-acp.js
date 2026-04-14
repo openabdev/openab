@@ -22,9 +22,31 @@
 const fs = require('fs');
 const path = require('path');
 
-const SDK_PATH =
-  'C:/Users/Administrator/AppData/Local/copilot/pkg/win32-x64/1.0.21/copilot-sdk/index.js';
+// Dynamically resolve Copilot SDK path — searches the standard install location
+// for the newest version available on this machine.
+function findCopilotSdk() {
+  const localApp = process.env.LOCALAPPDATA || path.join(process.env.USERPROFILE || process.env.HOME || '', 'AppData', 'Local');
+  const pkgDir = path.join(localApp, 'copilot', 'pkg');
+  // Try platform dirs (win32-x64, win32-arm64, darwin-*, linux-*)
+  try {
+    const platforms = fs.readdirSync(pkgDir).filter(d => fs.statSync(path.join(pkgDir, d)).isDirectory());
+    for (const platform of platforms) {
+      const versions = fs.readdirSync(path.join(pkgDir, platform))
+        .filter(d => fs.statSync(path.join(pkgDir, platform, d)).isDirectory())
+        .sort()
+        .reverse(); // newest first
+      for (const ver of versions) {
+        const sdkPath = path.join(pkgDir, platform, ver, 'copilot-sdk', 'index.js');
+        if (fs.existsSync(sdkPath)) return sdkPath;
+      }
+    }
+  } catch {}
+  // Fallback: env override
+  if (process.env.COPILOT_SDK_PATH) return process.env.COPILOT_SDK_PATH;
+  throw new Error(`Copilot SDK not found in ${pkgDir}. Set COPILOT_SDK_PATH env var.`);
+}
 
+const SDK_PATH = findCopilotSdk();
 const sdkPromise = import('file:///' + SDK_PATH);
 
 // Default model applied to every new session the bridge creates. Override
