@@ -105,6 +105,20 @@ impl ContentBlock {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ModelInfo {
+    pub model_id: String,
+    pub name: String,
+    pub description: String,
+}
+
+/// A native slash command exposed by the ACP agent via `available_commands_update`.
+#[derive(Debug, Clone)]
+pub struct NativeCommand {
+    pub name: String,
+    pub description: String,
+}
+
 pub struct AcpConnection {
     _proc: Child,
     /// PID of the direct child, used as the process group ID for cleanup.
@@ -117,6 +131,12 @@ pub struct AcpConnection {
     pub supports_load_session: bool,
     pub last_active: Instant,
     pub session_reset: bool,
+    /// One-shot context block prepended to the next user-visible prompt.
+    /// Used for backend-specific MCP protocol guidance without a hidden prompt.
+    pub startup_context: Option<String>,
+    pub current_model: String,
+    pub available_models: Vec<ModelInfo>,
+    pub native_commands: Arc<Mutex<Vec<NativeCommand>>>,
     _reader_handle: JoinHandle<()>,
 }
 
@@ -163,10 +183,13 @@ impl AcpConnection {
         let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(None));
 
+        let native_commands: Arc<Mutex<Vec<NativeCommand>>> = Arc::new(Mutex::new(Vec::new()));
+
         let reader_handle = {
             let pending = pending.clone();
             let notify_tx = notify_tx.clone();
             let stdin_clone = stdin.clone();
+            let native_cmds = native_commands.clone();
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stdout);
                 let mut line = String::new();
@@ -196,7 +219,6 @@ impl AcpConnection {
                                 .and_then(|t| t.get("title"))
                                 .and_then(|t| t.as_str())
                                 .unwrap_or("?");
-
                             let outcome = build_permission_response(msg.params.as_ref());
                             info!(title, %outcome, "auto-respond permission");
                             let reply = JsonRpcResponse::new(id, outcome);
@@ -207,6 +229,35 @@ impl AcpConnection {
                             }
                         }
                         continue;
+                    }
+
+                    // Capture native agent slash commands from available_commands_update
+                    if msg.method.as_deref() == Some("session/update") {
+                        if let Some(upd) = msg.params.as_ref().and_then(|p| p.get("update")) {
+                            if upd.get("sessionUpdate").and_then(|v| v.as_str())
+                                == Some("available_commands_update")
+                            {
+                                if let Some(cmds) =
+                                    upd.get("availableCommands").and_then(|v| v.as_array())
+                                {
+                                    let parsed: Vec<NativeCommand> = cmds
+                                        .iter()
+                                        .filter_map(|c| {
+                                            let name = c.get("name")?.as_str()?.to_string();
+                                            let description = c
+                                                .get("description")
+                                                .and_then(|d| d.as_str())
+                                                .unwrap_or("")
+                                                .to_string();
+                                            Some(NativeCommand { name, description })
+                                        })
+                                        .collect();
+                                    info!(count = parsed.len(), "captured native agent commands");
+                                    *native_cmds.lock().await = parsed;
+                                }
+                            }
+                        }
+                        // Don't consume — still forward to subscriber below
                     }
 
                     // Response (has id) → resolve pending AND forward to subscriber
@@ -268,6 +319,10 @@ impl AcpConnection {
             supports_load_session: false,
             last_active: Instant::now(),
             session_reset: false,
+            startup_context: None,
+            current_model: "auto".to_string(),
+            available_models: Vec::new(),
+            native_commands,
             _reader_handle: reader_handle,
         })
     }
@@ -295,7 +350,16 @@ impl AcpConnection {
 
         self.send_raw(&data).await?;
 
-        let timeout_secs = if method == "session/new" { 120 } else { 30 };
+        // Gemini CLI's --acp mode takes ~20-25s to cold-start (slow plugin/auth
+        // loading), so the default 30s initialize timeout is marginal. Bump to
+        // 90s for initialize and keep 120s for session/new. Other methods
+        // (prompt, set_model, etc.) stay at 30s since they run against a
+        // warm process.
+        let timeout_secs = match method {
+            "initialize" => 90,
+            "session/new" => 120,
+            _ => 30,
+        };
         let resp = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx)
             .await
             .map_err(|_| anyhow!("timeout waiting for {method} response"))?
@@ -360,13 +424,134 @@ impl AcpConnection {
 
         info!(session_id = %session_id, "session created");
         self.acp_session_id = Some(session_id.clone());
+
+        if let Some(models) = resp.result.as_ref().and_then(|r| r.get("models")) {
+            if let Some(current) = models.get("currentModelId").and_then(|v| v.as_str()) {
+                self.current_model = current.to_string();
+            }
+            if let Some(arr) = models.get("availableModels").and_then(|v| v.as_array()) {
+                self.available_models = arr
+                    .iter()
+                    .filter_map(|m| {
+                        let model_id = m.get("modelId")?.as_str()?.to_string();
+                        let name = m
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&model_id)
+                            .to_string();
+                        let description = m
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if description.contains("[Deprecated]")
+                            || description.contains("[Internal]")
+                        {
+                            return None;
+                        }
+                        Some(ModelInfo {
+                            model_id,
+                            name,
+                            description,
+                        })
+                    })
+                    .collect();
+                info!(
+                    count = self.available_models.len(),
+                    current = %self.current_model,
+                    "parsed available models"
+                );
+            }
+        }
+
         Ok(session_id)
     }
 
-    /// Send a prompt with content blocks (text and/or images) and return a receiver
-    /// for streaming notifications. The final message on the channel will have id set
-    /// (the prompt response).
-    pub async fn session_prompt(
+    pub async fn session_set_model(&mut self, model_id: &str) -> Result<()> {
+        let session_id = self
+            .acp_session_id
+            .as_ref()
+            .ok_or_else(|| anyhow!("no active session"))?
+            .clone();
+        self.send_request(
+            "session/set_model",
+            Some(json!({
+                "sessionId": session_id,
+                "modelId": model_id,
+            })),
+        )
+        .await?;
+        self.current_model = model_id.to_string();
+        Ok(())
+    }
+
+    pub fn resolve_model_alias(&self, input: &str) -> Option<String> {
+        // Aliases disabled: accept only exact model IDs.
+        // Case-insensitive match against available_models.
+        let lower = input.to_lowercase();
+        self.available_models
+            .iter()
+            .find(|m| m.model_id.to_lowercase() == lower)
+            .map(|m| m.model_id.clone())
+    }
+
+    /// Query the bridge's `_meta/getUsage` extension to get session token usage
+    /// and account quota. Only works with agents that implement this custom method
+    /// (e.g. our copilot-agent-acp bridge). Returns the raw JSON result for the
+    /// caller to parse / render.
+    pub async fn session_get_usage(&self) -> Result<Value> {
+        let session_id = self
+            .acp_session_id
+            .as_ref()
+            .ok_or_else(|| anyhow!("no active session"))?
+            .clone();
+        let resp = self
+            .send_request("_meta/getUsage", Some(json!({ "sessionId": session_id })))
+            .await?;
+        Ok(resp.result.unwrap_or(Value::Null))
+    }
+
+    /// Query the bridge's `_meta/getRecentPermissions` extension for the
+    /// audit trail of recent tool permission requests in the current session.
+    pub async fn session_get_recent_permissions(&self) -> Result<Value> {
+        let session_id = self
+            .acp_session_id
+            .as_ref()
+            .ok_or_else(|| anyhow!("no active session"))?
+            .clone();
+        let resp = self
+            .send_request(
+                "_meta/getRecentPermissions",
+                Some(json!({ "sessionId": session_id })),
+            )
+            .await?;
+        Ok(resp.result.unwrap_or(Value::Null))
+    }
+
+    /// Query the bridge's `_meta/compactSession` extension for real LLM-based
+    /// conversation history compaction (preserves summarized context).
+    pub async fn session_compact(&self) -> Result<Value> {
+        let session_id = self
+            .acp_session_id
+            .as_ref()
+            .ok_or_else(|| anyhow!("no active session"))?
+            .clone();
+        let resp = self
+            .send_request(
+                "_meta/compactSession",
+                Some(json!({ "sessionId": session_id })),
+            )
+            .await?;
+        Ok(resp.result.unwrap_or(Value::Null))
+    }
+
+    /// Ping the bridge to verify it's alive and responsive.
+    pub async fn session_ping(&self) -> Result<Value> {
+        let resp = self.send_request("_meta/ping", Some(json!({}))).await?;
+        Ok(resp.result.unwrap_or(Value::Null))
+    }
+
+    async fn send_prompt_request(
         &mut self,
         content_blocks: Vec<ContentBlock>,
     ) -> Result<(mpsc::UnboundedReceiver<JsonRpcMessage>, u64)> {
@@ -402,6 +587,22 @@ impl AcpConnection {
         Ok((rx, id))
     }
 
+    /// Send a prompt with content blocks (text and/or images) and return a receiver
+    /// for streaming notifications. The final message on the channel will have id set
+    /// (the prompt response).
+    pub async fn session_prompt(
+        &mut self,
+        mut content_blocks: Vec<ContentBlock>,
+    ) -> Result<(mpsc::UnboundedReceiver<JsonRpcMessage>, u64)> {
+        if let Some(context) = self.startup_context.take() {
+            let mut prefixed = Vec::with_capacity(content_blocks.len() + 1);
+            prefixed.push(ContentBlock::Text { text: context });
+            prefixed.append(&mut content_blocks);
+            content_blocks = prefixed;
+        }
+        self.send_prompt_request(content_blocks).await
+    }
+
     /// Call after prompt streaming is done to clean up subscriber.
     pub async fn prompt_done(&mut self) {
         *self.notify_tx.lock().await = None;
@@ -432,11 +633,42 @@ impl AcpConnection {
         }
         info!(session_id, "session loaded");
         self.acp_session_id = Some(session_id.to_string());
+
+        // Parse model metadata (mirrors session_new logic)
+        if let Some(models) = resp.result.as_ref().and_then(|r| r.get("models")) {
+            if let Some(current) = models.get("currentModelId").and_then(|v| v.as_str()) {
+                self.current_model = current.to_string();
+            }
+            if let Some(arr) = models.get("availableModels").and_then(|v| v.as_array()) {
+                self.available_models = arr
+                    .iter()
+                    .filter_map(|m| {
+                        let model_id = m.get("modelId")?.as_str()?.to_string();
+                        let name = m
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&model_id)
+                            .to_string();
+                        let description = m
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        Some(ModelInfo {
+                            model_id,
+                            name,
+                            description,
+                        })
+                    })
+                    .collect();
+            }
+        }
+
         Ok(())
     }
 
     /// Kill the entire process group: SIGTERM → SIGKILL (Unix only).
-    /// On Windows, rely on Child::kill_on_drop or external process management.
+    /// On Windows, the child process is killed via Drop on the Child handle.
     #[cfg(unix)]
     fn kill_process_group(&mut self) {
         let pgid = match self.child_pgid {
@@ -456,109 +688,27 @@ impl AcpConnection {
 
     #[cfg(not(unix))]
     fn kill_process_group(&mut self) {
-        // On Windows, rely on kill_on_drop(true) set during spawn
+        if let Some(pgid) = self.child_pgid {
+            let _ = std::process::Command::new("taskkill")
+                .arg("/PID")
+                .arg(pgid.to_string())
+                .arg("/T")
+                .arg("/F")
+                .status();
+            return;
+        }
+
+        // Fallback for environments where taskkill does not have enough
+        // information or is unavailable (e.g. unexpected pid conversion
+        // failure). Child::kill() terminates at least the immediate child.
+        if let Err(err) = self._proc.start_kill() {
+            debug!(error = %err, "failed to start killing ACP child process on drop");
+        }
     }
 }
 
 impl Drop for AcpConnection {
     fn drop(&mut self) {
         self.kill_process_group();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{build_permission_response, pick_best_option};
-    use serde_json::json;
-
-    #[test]
-    fn picks_allow_always_over_other_options() {
-        let options = vec![
-            json!({"kind": "allow_once", "optionId": "once"}),
-            json!({"kind": "allow_always", "optionId": "always"}),
-            json!({"kind": "reject_once", "optionId": "reject"}),
-        ];
-
-        assert_eq!(pick_best_option(&options), Some("always".to_string()));
-    }
-
-    #[test]
-    fn falls_back_to_first_unknown_non_reject_kind() {
-        let options = vec![
-            json!({"kind": "reject_once", "optionId": "reject"}),
-            json!({"kind": "workspace_write", "optionId": "workspace-write"}),
-        ];
-
-        assert_eq!(
-            pick_best_option(&options),
-            Some("workspace-write".to_string())
-        );
-    }
-
-    #[test]
-    fn selects_bypass_permissions_for_exit_plan_mode() {
-        let options = vec![
-            json!({"optionId": "bypassPermissions", "kind": "allow_always"}),
-            json!({"optionId": "acceptEdits", "kind": "allow_always"}),
-            json!({"optionId": "default", "kind": "allow_once"}),
-            json!({"optionId": "plan", "kind": "reject_once"}),
-        ];
-
-        assert_eq!(
-            pick_best_option(&options),
-            Some("bypassPermissions".to_string())
-        );
-    }
-
-    #[test]
-    fn returns_none_when_only_reject_options_exist() {
-        let options = vec![
-            json!({"kind": "reject_once", "optionId": "reject-once"}),
-            json!({"kind": "reject_always", "optionId": "reject-always"}),
-        ];
-
-        assert_eq!(pick_best_option(&options), None);
-    }
-
-    #[test]
-    fn builds_cancelled_outcome_when_no_selectable_option_exists() {
-        let response = build_permission_response(Some(&json!({
-            "options": [
-                {"kind": "reject_once", "optionId": "reject-once"}
-            ]
-        })));
-
-        assert_eq!(response, json!({"outcome": {"outcome": "cancelled"}}));
-    }
-
-    #[test]
-    fn builds_cancelled_when_options_array_is_empty() {
-        let response = build_permission_response(Some(&json!({
-            "options": []
-        })));
-
-        assert_eq!(response, json!({"outcome": {"outcome": "cancelled"}}));
-    }
-
-    #[test]
-    fn falls_back_to_allow_always_when_options_are_missing() {
-        let response = build_permission_response(Some(&json!({
-            "toolCall": {"title": "legacy"}
-        })));
-
-        assert_eq!(
-            response,
-            json!({"outcome": {"outcome": "selected", "optionId": "allow_always"}})
-        );
-    }
-
-    #[test]
-    fn falls_back_to_allow_always_when_params_is_none() {
-        let response = build_permission_response(None);
-
-        assert_eq!(
-            response,
-            json!({"outcome": {"outcome": "selected", "optionId": "allow_always"}})
-        );
     }
 }

@@ -1,7 +1,10 @@
-use crate::acp::connection::AcpConnection;
+use super::mcp_prefetch::prefetch_mempalace_context;
+use crate::acp::connection::{AcpConnection, ModelInfo, NativeCommand};
 use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
+use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 use tracing::{info, warn};
@@ -20,6 +23,11 @@ pub struct SessionPool {
     state: RwLock<PoolState>,
     config: AgentConfig,
     max_sessions: usize,
+    /// Snapshot of available models for slash command autocomplete.
+    cached_models: RwLock<Vec<ModelInfo>>,
+    cached_current_model: RwLock<String>,
+    /// Native slash commands reported by the agent via `available_commands_update`.
+    cached_native_commands: Arc<RwLock<Vec<NativeCommand>>>,
 }
 
 impl SessionPool {
@@ -31,6 +39,34 @@ impl SessionPool {
             }),
             config,
             max_sessions,
+            cached_models: RwLock::new(Vec::new()),
+            cached_current_model: RwLock::new("auto".to_string()),
+            cached_native_commands: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
+    pub async fn cached_models(&self) -> Vec<ModelInfo> {
+        self.cached_models.read().await.clone()
+    }
+
+    pub async fn cached_current_model(&self) -> String {
+        self.cached_current_model.read().await.clone()
+    }
+
+    pub async fn cached_native_commands(&self) -> Vec<NativeCommand> {
+        self.cached_native_commands.read().await.clone()
+    }
+
+    pub async fn has_active_session(&self, thread_id: &str) -> bool {
+        let state = self.state.read().await;
+        matches!(state.active.get(thread_id), Some(conn) if conn.alive())
+    }
+
+    /// Replace the cached model list. Used by the background refresh task
+    /// in `main.rs` to keep `/model` autocomplete in sync with upstream.
+    pub async fn set_cached_models(&self, models: Vec<ModelInfo>) {
+        if !models.is_empty() {
+            *self.cached_models.write().await = models;
         }
     }
 
@@ -49,7 +85,11 @@ impl SessionPool {
             }
         }
 
-        // Need to create or rebuild
+        // Need to create or rebuild.
+        let startup_context =
+            startup_context_for_backend(&self.config.command, &self.config.args, mcp_servers).await;
+
+        // Need to create or rebuild.
         let mut state = self.state.write().await;
 
         // Double-check after acquiring write lock
@@ -109,12 +149,35 @@ impl SessionPool {
         if !resumed {
             conn.session_new(&self.config.working_dir, mcp_servers)
                 .await?;
+            conn.startup_context = startup_context;
             if saved_session_id.is_some() {
                 conn.session_reset = true;
             }
         }
 
+        // Refresh model cache snapshot for slash command autocomplete.
+        if !conn.available_models.is_empty() {
+            *self.cached_models.write().await = conn.available_models.clone();
+        }
+        *self.cached_current_model.write().await = conn.current_model.clone();
+
+        // Insert conn into pool and release the write lock immediately.
+        let native_cmds_handle = conn.native_commands.clone();
         state.active.insert(thread_id.to_string(), conn);
+        drop(state); // Release write lock — no more blocking other threads
+
+        // Snapshot native agent commands asynchronously — don't block the caller.
+        // The 2s delay gives slower backends time to push available_commands_update.
+        let cached_cmds = self.cached_native_commands.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+            let cmds = native_cmds_handle.lock().await.clone();
+            if !cmds.is_empty() {
+                info!(count = cmds.len(), "caching native agent commands (async)");
+                *cached_cmds.write().await = cmds;
+            }
+        });
+
         Ok(())
     }
 
@@ -132,6 +195,14 @@ impl SessionPool {
             .get_mut(thread_id)
             .ok_or_else(|| anyhow!("no connection for thread {thread_id}"))?;
         f(conn).await
+    }
+
+    /// Drop a session for a specific thread. Returns true if one was removed.
+    pub async fn drop_session(&self, thread_id: &str) -> bool {
+        let mut state = self.state.write().await;
+        let existed = state.active.remove(thread_id).is_some();
+        state.suspended.remove(thread_id);
+        existed
     }
 
     pub async fn cleanup_idle(&self, ttl_secs: u64) {
@@ -158,6 +229,40 @@ impl SessionPool {
     }
 }
 
+async fn startup_context_for_backend(
+    command: &str,
+    args: &[String],
+    mcp_servers: &[Value],
+) -> Option<String> {
+    if !backend_needs_mempalace_prefetch(command, args) {
+        return None;
+    }
+
+    let server = find_mempalace_server(mcp_servers)?;
+    match prefetch_mempalace_context(server).await {
+        Ok(context) => context,
+        Err(error) => {
+            warn!(error = %error, "mempalace protocol prefetch failed");
+            None
+        }
+    }
+}
+
+fn backend_needs_mempalace_prefetch(command: &str, args: &[String]) -> bool {
+    let joined = format!("{} {}", command, args.join(" ")).to_lowercase();
+    (joined.contains("copilot") || joined.contains("gemini") || joined.contains("codex"))
+        && !joined.contains("claude")
+}
+
+fn find_mempalace_server(mcp_servers: &[Value]) -> Option<&Value> {
+    mcp_servers.iter().find(|server| {
+        server
+            .get("name")
+            .and_then(|name| name.as_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("mempalace"))
+    })
+}
+
 /// Suspend a connection: save its sessionId to the suspended map and remove
 /// from active. The connection is dropped, triggering process group kill.
 fn suspend_entry(state: &mut PoolState, thread_id: &str) {
@@ -167,5 +272,33 @@ fn suspend_entry(state: &mut PoolState, thread_id: &str) {
             state.suspended.insert(thread_id.to_string(), sid.clone());
         }
         // conn dropped here → Drop impl kills process group
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn flags_codex_for_mempalace_prefetch() {
+        assert!(backend_needs_mempalace_prefetch("codex-acp", &[]));
+    }
+
+    #[test]
+    fn skips_mempalace_prefetch_for_claude() {
+        assert!(!backend_needs_mempalace_prefetch("claude-agent-acp", &[]));
+    }
+
+    #[test]
+    fn finds_mempalace_server_when_present() {
+        let servers = [
+            json!({"name": "github"}),
+            json!({"name": "mempalace", "type": "http", "url": "http://127.0.0.1:18793/mcp"}),
+        ];
+        let server = find_mempalace_server(&servers);
+
+        assert!(server.is_some());
+        assert_eq!(server.unwrap()["name"], "mempalace");
     }
 }

@@ -1,4 +1,5 @@
 pub mod connection;
+mod mcp_prefetch;
 pub mod pool;
 pub mod protocol;
 
