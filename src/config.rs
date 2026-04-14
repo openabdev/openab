@@ -77,12 +77,46 @@ pub struct Config {
     pub reactions: ReactionsConfig,
     #[serde(default)]
     pub stt: SttConfig,
+    /// Optional usage dashboard command config (`/usage`).
+    #[serde(default)]
+    pub usage: Option<UsageConfig>,
+    /// Optional custom usage dashboard config (`/cusage`).
+    #[serde(default)]
+    pub cusage: Option<UsageConfig>,
     /// Optional path to a soul/persona text file shown via `/soul`.
     #[serde(default)]
     pub soul_file: Option<String>,
     /// Directory for per-user MCP profiles.
     #[serde(default)]
     pub mcp_profiles_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsageConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_usage_timeout")]
+    pub timeout_secs: u64,
+    #[serde(default)]
+    pub runners: Vec<UsageRunnerConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsageRunnerConfig {
+    pub name: String,
+    pub label: String,
+    #[serde(default = "default_usage_color")]
+    pub color: u32,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub template: String,
+    #[serde(default)]
+    pub progress_fields: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub working_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -162,6 +196,14 @@ pub struct ReactionsConfig {
     pub emojis: ReactionEmojis,
     #[serde(default)]
     pub timing: ReactionTiming,
+    #[serde(default)]
+    pub presets: Vec<EmojiPreset>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmojiPreset {
+    pub name: String,
+    pub emojis: ReactionEmojis,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -209,6 +251,12 @@ fn default_ttl_hours() -> u64 {
 }
 fn default_true() -> bool {
     true
+}
+fn default_usage_timeout() -> u64 {
+    30
+}
+fn default_usage_color() -> u32 {
+    0x5865F2
 }
 
 fn emoji_queued() -> String {
@@ -265,6 +313,7 @@ impl Default for ReactionsConfig {
             remove_after_reply: false,
             emojis: ReactionEmojis::default(),
             timing: ReactionTiming::default(),
+            presets: Vec::new(),
         }
     }
 }

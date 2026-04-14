@@ -6,6 +6,7 @@ mod format;
 mod reactions;
 mod setup;
 mod stt;
+mod usage;
 
 use clap::Parser;
 use serenity::prelude::*;
@@ -71,6 +72,8 @@ async fn main() -> anyhow::Result<()> {
                 "config loaded"
             );
 
+            let backend =
+                discord::BackendType::from_agent_config(&cfg.agent.command, &cfg.agent.args);
             let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions));
             let ttl_secs = cfg.pool.session_ttl_hours * 3600;
 
@@ -95,14 +98,24 @@ async fn main() -> anyhow::Result<()> {
                 info!(model = %cfg.stt.model, base_url = %cfg.stt.base_url, "STT enabled");
             }
 
+            let reaction_config = cfg.reactions;
+            let emoji_presets = reaction_config.presets.clone();
             let handler = discord::Handler {
                 pool: pool.clone(),
                 allowed_channels,
                 allowed_users,
-                reactions_config: cfg.reactions,
+                reactions_config: Arc::new(tokio::sync::RwLock::new(reaction_config)),
+                emoji_presets,
+                usage_config: cfg.usage,
+                cusage_config: cfg.cusage,
+                backend,
+                copilot_list_cache: Arc::new(tokio::sync::RwLock::new(
+                    std::collections::HashMap::new(),
+                )),
                 stt_config: cfg.stt.clone(),
                 allow_bot_messages: cfg.discord.allow_bot_messages,
                 trusted_bot_ids,
+                soul_file: cfg.soul_file,
                 mcp_profiles_dir: cfg.mcp_profiles_dir.clone(),
             };
 
