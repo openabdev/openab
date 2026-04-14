@@ -7,7 +7,29 @@
 // Expected output format: {"ok": true, "kind": "<subcommand>", "data": {...}}
 //                      or {"ok": false, "error": "..."}
 
-const SDK_PATH = 'C:/Users/Administrator/AppData/Local/copilot/pkg/win32-x64/1.0.21/copilot-sdk/index.js';
+const fs = require('fs');
+const path = require('path');
+
+// Dynamically find the Copilot SDK — same logic as copilot-agent-acp.js
+function findSdkPath() {
+  const localApp = process.env.LOCALAPPDATA || path.join(process.env.USERPROFILE || process.env.HOME || '', 'AppData', 'Local');
+  const pkgDir = path.join(localApp, 'copilot', 'pkg');
+  try {
+    for (const platform of fs.readdirSync(pkgDir)) {
+      const platDir = path.join(pkgDir, platform);
+      if (!fs.statSync(platDir).isDirectory()) continue;
+      const versions = fs.readdirSync(platDir).filter(d => fs.statSync(path.join(platDir, d)).isDirectory()).sort().reverse();
+      for (const ver of versions) {
+        const p = path.join(platDir, ver, 'copilot-sdk', 'index.js');
+        if (fs.existsSync(p)) return p;
+      }
+    }
+  } catch {}
+  if (process.env.COPILOT_SDK_PATH) return process.env.COPILOT_SDK_PATH;
+  throw new Error(`Copilot SDK not found in ${pkgDir}. Set COPILOT_SDK_PATH env var.`);
+}
+
+const SDK_PATH = findSdkPath();
 
 async function main() {
   const [, , sub, ...args] = process.argv;
@@ -234,7 +256,7 @@ async function fetchAcpFilteredModels() {
   return new Promise(resolve => {
     const { spawn } = require('child_process');
     const proc = spawn(
-      'C:/Users/Administrator/AppData/Local/Microsoft/WinGet/Links/copilot.exe',
+      process.env.COPILOT_CLI_PATH || path.join(process.env.LOCALAPPDATA || '', 'Microsoft', 'WinGet', 'Links', 'copilot.exe'),
       ['--acp'],
       { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
     );

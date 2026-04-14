@@ -1665,7 +1665,8 @@ impl Handler {
         }
 
         let thread_key = cmd.channel_id.get().to_string();
-        if let Err(e) = self.pool.get_or_create(&thread_key, &[]).await {
+        let mcp = self.mcp_servers_for_user(cmd.user.id.get());
+        if let Err(e) = self.pool.get_or_create(&thread_key, &mcp).await {
             let _ = cmd
                 .edit_response(
                     &ctx.http,

@@ -10,6 +10,68 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info};
 
+/// Pick the most permissive selectable permission option from ACP options.
+fn pick_best_option(options: &[Value]) -> Option<String> {
+    let mut fallback: Option<&Value> = None;
+
+    for kind in ["allow_always", "allow_once"] {
+        if let Some(option) = options
+            .iter()
+            .find(|option| option.get("kind").and_then(|k| k.as_str()) == Some(kind))
+        {
+            return option
+                .get("optionId")
+                .and_then(|id| id.as_str())
+                .map(str::to_owned);
+        }
+    }
+
+    for option in options {
+        let kind = option.get("kind").and_then(|k| k.as_str());
+        if kind == Some("reject_once") || kind == Some("reject_always") {
+            continue;
+        }
+        fallback = Some(option);
+        break;
+    }
+
+    fallback
+        .and_then(|option| option.get("optionId"))
+        .and_then(|id| id.as_str())
+        .map(str::to_owned)
+}
+
+/// Build a spec-compliant permission response with backward-compatible fallback.
+fn build_permission_response(params: Option<&Value>) -> Value {
+    match params
+        .and_then(|p| p.get("options"))
+        .and_then(|options| options.as_array())
+    {
+        None => json!({
+            "outcome": {
+                "outcome": "selected",
+                "optionId": "allow_always"
+            }
+        }),
+        Some(options) => {
+            if let Some(option_id) = pick_best_option(options) {
+                json!({
+                    "outcome": {
+                        "outcome": "selected",
+                        "optionId": option_id
+                    }
+                })
+            } else {
+                json!({
+                    "outcome": {
+                        "outcome": "cancelled"
+                    }
+                })
+            }
+        }
+    }
+}
+
 fn expand_env(val: &str) -> String {
     if val.starts_with("${") && val.ends_with('}') {
         let key = &val[2..val.len() - 1];
@@ -154,21 +216,9 @@ impl AcpConnection {
                                 .and_then(|t| t.get("title"))
                                 .and_then(|t| t.as_str())
                                 .unwrap_or("?");
-                            // Pick the first option from the backend's advertised list
-                            let option_id = msg
-                                .params
-                                .as_ref()
-                                .and_then(|p| p.get("options"))
-                                .and_then(|o| o.as_array())
-                                .and_then(|arr| arr.first())
-                                .and_then(|opt| opt.get("id"))
-                                .and_then(|id| id.as_str())
-                                .unwrap_or("allow_always");
-                            info!(title, option_id, "auto-allow permission");
-                            let reply = JsonRpcResponse::new(
-                                id,
-                                json!({"outcome": {"selected": option_id}}),
-                            );
+                            let outcome = build_permission_response(msg.params.as_ref());
+                            info!(title, %outcome, "auto-respond permission");
+                            let reply = JsonRpcResponse::new(id, outcome);
                             if let Ok(data) = serde_json::to_string(&reply) {
                                 let mut w = stdin_clone.lock().await;
                                 let _ = w.write_all(format!("{data}\n").as_bytes()).await;

@@ -149,8 +149,8 @@ impl SessionPool {
         *self.cached_current_model.write().await = conn.current_model.clone();
 
         // Snapshot native agent commands (arrives async via available_commands_update).
-        // Give the agent a moment to push the notification after session/new.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Give slower backends time to push the notification after session/new.
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
         let cmds = conn.native_commands.lock().await.clone();
         if !cmds.is_empty() {
             info!(count = cmds.len(), "caching native agent commands");
