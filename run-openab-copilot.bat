@@ -1,7 +1,8 @@
 @echo off
 setlocal EnableDelayedExpansion
 set DISCORD_BOT_TOKEN=REDACTED_GITX_TOKEN
-set /p COPILOT_APPEND_SYSTEM=<C:\Users\Administrator\openab\gitx-system-prompt.txt
+rem COPILOT_APPEND_SYSTEM now loaded by copilot-agent-acp.js via fs.readFileSync
+rem (set /p had 1023-char truncation bug — prompt is 1239 chars)
 set PATH=%LOCALAPPDATA%\Microsoft\WinGet\Links;%APPDATA%\npm;%PATH%
 cd /d C:\Users\Administrator\openab
 
@@ -14,7 +15,15 @@ if exist "%LOGDIR%\openab.log.2" ren "%LOGDIR%\openab.log.2" "openab.log.3" 2>nu
 if exist "%LOGDIR%\openab.log.1" ren "%LOGDIR%\openab.log.1" "openab.log.2" 2>nul
 if exist "%LOGDIR%\openab.log"   ren "%LOGDIR%\openab.log"   "openab.log.1" 2>nul
 
-:loop
-"C:\Users\Administrator\openab\target\release\openab.exe" config-copilot.toml >> "%LOGDIR%\openab.log" 2>&1
-timeout /t 5 /nobreak > nul
-goto loop
+rem ---- mutex: only one bat loop per bot ----
+set LOCKFILE=%LOGDIR%\loop.lock
+2>nul (
+  9>"%LOCKFILE%" (
+    :loop
+    "C:\Users\Administrator\openab\target\release\openab.exe" config-copilot.toml >> "%LOGDIR%\openab.log" 2>&1
+    %SYSTEMROOT%\System32\timeout.exe /t 5 /nobreak > nul
+    goto loop
+  )
+) || (
+  exit /b 0
+)

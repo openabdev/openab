@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 // Get Copilot quota via copilot-agent-acp bridge's _meta/getUsage RPC.
-// Returns real premium_interactions remainingPercentage.
+// Also reads live session cost_totals from disk for per-model breakdown.
 
 const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 const TIMEOUT = 45000;
 const BRIDGE = 'C:/Users/Administrator/openab/vendor/copilot-agent-acp/copilot-agent-acp.js';
 
@@ -42,12 +44,43 @@ child.stdout.on('data', c => {
         const quota = r.account_quota?.quotaSnapshots?.premium_interactions;
         if (quota) {
           const resetDate = quota.resetDate ? new Date(quota.resetDate).toLocaleDateString('zh-TW') : '';
+          const used = quota.usedRequests || 0;
+          const overage = quota.overage || 0;
+
+          // Read live session cost_totals from disk
+          let session_lines = '';
+          try {
+            const dir = path.join(process.env.APPDATA || 'C:/Users/Administrator/AppData/Roaming', 'openab');
+            const files = fs.readdirSync(dir).filter(f => f.startsWith('cost-totals-'));
+            // Pick the most recently modified file
+            let best = null, bestMtime = 0;
+            for (const f of files) {
+              const fp = path.join(dir, f);
+              const st = fs.statSync(fp);
+              if (st.mtimeMs > bestMtime) { bestMtime = st.mtimeMs; best = fp; }
+            }
+            if (best && Date.now() - bestMtime < 86400000) {
+              const ct = JSON.parse(fs.readFileSync(best, 'utf8'));
+              const parts = [];
+              for (const [m, d] of Object.entries(ct.perModel || {})) {
+                const input = d.inputTokens ? `${(d.inputTokens/1000).toFixed(1)}k in` : '';
+                const output = d.outputTokens ? `${(d.outputTokens/1000).toFixed(1)}k out` : '';
+                const cached = d.cacheReadTokens ? `${(d.cacheReadTokens/1000).toFixed(1)}k cached` : '';
+                const tokens = [input, output, cached].filter(Boolean).join(' · ');
+                const turnLabel = d.turns === 1 ? 'turn' : 'turns';
+                parts.push(`${d.turns} ${turnLabel} **${m}** (${tokens})`);
+              }
+              if (parts.length) session_lines = parts.join('\n');
+            }
+          } catch {}
+
           console.log(JSON.stringify({
             ok: true,
             remaining_pct: quota.remainingPercentage,
-            used: quota.usedRequests,
-            total: quota.entitlementRequests,
+            used: used,
+            overage: overage,
             reset_date: resetDate,
+            session_breakdown: session_lines,
             ts: new Date().toISOString(),
           }));
         } else {

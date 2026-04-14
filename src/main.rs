@@ -69,11 +69,15 @@ async fn main() -> anyhow::Result<()> {
         pool: pool.clone(),
         allowed_channels,
         allowed_users,
-        reactions_config: cfg.reactions,
+        emoji_presets: cfg.reactions.presets.clone(),
+        reactions_config: Arc::new(tokio::sync::RwLock::new(cfg.reactions)),
         usage_config: cfg.usage,
+        cusage_config: cfg.cusage,
         backend,
         copilot_list_cache: copilot_list_cache.clone(),
         stt_config: cfg.stt.clone(),
+        soul_file: cfg.soul_file.clone(),
+        mcp_profiles_dir: cfg.mcp_profiles_dir.clone(),
     };
 
     let intents = GatewayIntents::GUILD_MESSAGES

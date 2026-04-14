@@ -8,6 +8,21 @@ $baseDir = "C:\Users\Administrator\openab"
 $logFile = "$baseDir\logs\healthcheck.log"
 $vbsPath = "$baseDir\run-hidden.vbs"
 $cooldownMin = 3
+$maintenanceLock = "$baseDir\healthcheck-maintenance.lock"
+
+# ---- Maintenance Lock ----
+# If lock file exists, skip all checks (build in progress).
+# Auto-expire after 10 minutes to prevent forgotten locks.
+if (Test-Path $maintenanceLock) {
+    $lockAge = (Get-Date) - (Get-Item $maintenanceLock).LastWriteTime
+    if ($lockAge.TotalMinutes -lt 10) {
+        exit 0
+    }
+    # Lock expired — remove and continue
+    Remove-Item $maintenanceLock -Force
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Add-Content -Path $logFile -Value "$ts [MAINTENANCE] expired lock removed (>10min)"
+}
 
 # ---- VBS Self-Heal ----
 if (-not (Test-Path $vbsPath)) {
@@ -84,7 +99,7 @@ foreach ($bot in $bots) {
         Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
     }
 
-    # Kill bat loop
+    # Kill ALL bat loops for this bot — match by bat name in CommandLine
     $batMatch = [regex]::Escape($bot.Bat)
     Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" |
         Where-Object { $_.CommandLine -match $batMatch } |

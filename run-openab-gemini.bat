@@ -14,7 +14,15 @@ if exist "%LOGDIR%\openab.log.2" ren "%LOGDIR%\openab.log.2" "openab.log.3" 2>nu
 if exist "%LOGDIR%\openab.log.1" ren "%LOGDIR%\openab.log.1" "openab.log.2" 2>nul
 if exist "%LOGDIR%\openab.log"   ren "%LOGDIR%\openab.log"   "openab.log.1" 2>nul
 
-:loop
-"C:\Users\Administrator\openab\target\release\openab.exe" config-gemini.toml >> "%LOGDIR%\openab.log" 2>&1
-timeout /t 5 /nobreak > nul
-goto loop
+rem ---- mutex: only one bat loop per bot ----
+set LOCKFILE=%LOGDIR%\loop.lock
+2>nul (
+  9>"%LOCKFILE%" (
+    :loop
+    "C:\Users\Administrator\openab\target\release\openab.exe" config-gemini.toml >> "%LOGDIR%\openab.log" 2>&1
+    %SYSTEMROOT%\System32\timeout.exe /t 5 /nobreak > nul
+    goto loop
+  )
+) || (
+  exit /b 0
+)

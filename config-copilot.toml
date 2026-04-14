@@ -1,6 +1,9 @@
+soul_file = "C:\\Users\\Administrator\\openab\\gitx-system-prompt.txt"
+mcp_profiles_dir = "C:\\Users\\Administrator\\openab\\data\\mcp-profiles\\gitx"
+
 [discord]
 bot_token = "${DISCORD_BOT_TOKEN}"
-allowed_channels = []           # empty = any channel/thread in any guild
+allowed_channels = ["1492871819500191825"]   # github-copilot channel only
 allowed_users = ["844236700611379200"]   # xisx7876 — owner lockdown (shell.exec safety)
 
 [agent]
@@ -24,6 +27,28 @@ coding = "👨‍💻"
 web = "⚡"
 done = "🆗"
 error = "😱"
+
+[[reactions.presets]]
+name = "預設"
+[reactions.presets.emojis]
+queued = "👀"
+thinking = "🤔"
+tool = "🔥"
+coding = "👨‍💻"
+web = "⚡"
+done = "🆗"
+error = "😱"
+
+[[reactions.presets]]
+name = "七海建人"
+[reactions.presets.emojis]
+queued = "👓"
+thinking = "🤵"
+tool = "🔨"
+coding = "📊"
+web = "🔍"
+done = "👔"
+error = "💀"
 
 [reactions.timing]
 debounce_ms = 700
@@ -60,7 +85,8 @@ args = ["C:\\Users\\Administrator\\openab\\scripts\\get-copilot-quota.js"]
 progress_fields = ["remaining_pct"]
 template = """
 **Remaining:** {{ remaining_pct }}
-**Used:** {{ used }}/{{ total }} reqs · _Resets {{ reset_date }}_
+{{ session_breakdown }}
+_Resets {{ reset_date }}_
 """
 
 [[usage.runners]]

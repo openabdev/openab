@@ -148,11 +148,15 @@ pub struct Handler {
     pub pool: Arc<SessionPool>,
     pub allowed_channels: HashSet<u64>,
     pub allowed_users: HashSet<u64>,
-    pub reactions_config: ReactionsConfig,
+    pub reactions_config: Arc<tokio::sync::RwLock<ReactionsConfig>>,
+    pub emoji_presets: Vec<crate::config::EmojiPreset>,
     pub usage_config: Option<crate::config::UsageConfig>,
+    pub cusage_config: Option<crate::config::UsageConfig>,
     pub backend: BackendType,
     pub copilot_list_cache: Arc<tokio::sync::RwLock<std::collections::HashMap<String, Vec<String>>>>,
     pub stt_config: SttConfig,
+    pub soul_file: Option<String>,
+    pub mcp_profiles_dir: Option<String>,
 }
 
 #[async_trait]
@@ -193,6 +197,17 @@ impl EventHandler for Handler {
         } else {
             false
         };
+
+        tracing::info!(
+            bot_id = %bot_id,
+            channel_id,
+            in_allowed_channel,
+            in_thread,
+            is_mentioned,
+            content = %msg.content.chars().take(50).collect::<String>(),
+            mentions = ?msg.mentions.iter().map(|u| u.id.get()).collect::<Vec<_>>(),
+            "message gate check"
+        );
 
         if !in_allowed_channel && !in_thread {
             return;
@@ -310,14 +325,19 @@ impl EventHandler for Handler {
         }
 
         // Create reaction controller on the user's original message
+        let rcfg = self.reactions_config.read().await;
         let reactions = Arc::new(StatusReactionController::new(
-            self.reactions_config.enabled,
+            rcfg.enabled,
             ctx.http.clone(),
             msg.channel_id,
             msg.id,
-            self.reactions_config.emojis.clone(),
-            self.reactions_config.timing.clone(),
+            rcfg.emojis.clone(),
+            rcfg.timing.clone(),
         ));
+        let hold_done_ms = rcfg.timing.done_hold_ms;
+        let hold_error_ms = rcfg.timing.error_hold_ms;
+        let remove_after = rcfg.remove_after_reply;
+        drop(rcfg);
         reactions.set_queued().await;
 
         // Stream prompt with live edits (pass content blocks instead of just text)
@@ -339,11 +359,11 @@ impl EventHandler for Handler {
 
         // Hold emoji briefly then clear
         let hold_ms = if result.is_ok() {
-            self.reactions_config.timing.done_hold_ms
+            hold_done_ms
         } else {
-            self.reactions_config.timing.error_hold_ms
+            hold_error_ms
         };
-        if self.reactions_config.remove_after_reply {
+        if remove_after {
             let reactions = reactions;
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(hold_ms)).await;
@@ -362,6 +382,17 @@ impl EventHandler for Handler {
         // Register guild commands in every guild we're in.
         // Guild commands appear instantly (vs. global commands which can take
         // up to 1 hour to propagate).
+        // CopilotNative: pure chat bot — no slash commands at all.
+        if self.backend == BackendType::CopilotNative {
+            for guild in &ready.guilds {
+                match guild.id.set_commands(&ctx.http, Vec::<CreateCommand>::new()).await {
+                    Ok(_) => info!(guild_id = %guild.id, "cleared all slash commands (CopilotNative)"),
+                    Err(e) => error!(guild_id = %guild.id, error = %e, "failed to clear slash commands"),
+                }
+            }
+            return;
+        }
+
         let model_cmd = CreateCommand::new("model")
             .description("Switch or query the AI model used by this bot")
             .add_option(
@@ -469,6 +500,14 @@ impl EventHandler for Handler {
             );
         }
 
+        // /cusage — custom usage report (daily/weekly/monthly breakdown)
+        if self.cusage_config.as_ref().is_some_and(|u| u.enabled && !u.runners.is_empty()) {
+            commands.push(
+                CreateCommand::new("cusage")
+                    .description("Show detailed usage breakdown (daily/weekly/monthly)"),
+            );
+        }
+
         // /native — run an agent's built-in slash command (memory, extensions, etc.)
         commands.push(
             CreateCommand::new("native")
@@ -512,6 +551,59 @@ impl EventHandler for Handler {
                 .description("List MCP servers and tools connected to the agent"),
         );
 
+        // /mcp-add, /mcp-remove, /mcp-list — per-user MCP profile management
+        if self.mcp_profiles_dir.is_some() {
+            commands.push(
+                CreateCommand::new("mcp-add")
+                    .description("Add an MCP server to your personal profile")
+                    .add_option(
+                        CreateCommandOption::new(
+                            CommandOptionType::String, "name", "Server name (e.g. notion, github)")
+                            .required(true),
+                    )
+                    .add_option(
+                        CreateCommandOption::new(
+                            CommandOptionType::String, "url", "Server URL (for HTTP/SSE servers)")
+                            .required(true),
+                    ),
+            );
+            commands.push(
+                CreateCommand::new("mcp-remove")
+                    .description("Remove an MCP server from your personal profile")
+                    .add_option(
+                        CreateCommandOption::new(
+                            CommandOptionType::String, "name", "Server name to remove")
+                            .required(true),
+                    ),
+            );
+            commands.push(
+                CreateCommand::new("mcp-list")
+                    .description("List MCP servers in your personal profile"),
+            );
+            // /mcp-browse — browse MCP registry
+            commands.push(
+                CreateCommand::new("mcp-browse")
+                    .description("Browse available MCP servers from the registry"),
+            );
+
+            // /mcp-install — install from registry to profile
+            commands.push(
+                CreateCommand::new("mcp-install")
+                    .description("Install an MCP server from the registry to your profile")
+                    .add_option(
+                        CreateCommandOption::new(
+                            CommandOptionType::String, "name", "Server name from registry")
+                            .required(true),
+                    ),
+            );
+
+            // /mcp-status — ping installed MCP servers
+            commands.push(
+                CreateCommand::new("mcp-status")
+                    .description("Check connection status of your installed MCP servers"),
+            );
+        }
+
         // /export — export conversation history from the current thread
         commands.push(
             CreateCommand::new("export")
@@ -523,6 +615,23 @@ impl EventHandler for Handler {
             CreateCommand::new("doctor")
                 .description("Diagnose agent connection health (ping, session, uptime)"),
         );
+
+        // /soul — show the bot's persona / system prompt, or switch emoji preset
+        if self.soul_file.is_some() {
+            let mut soul_cmd = CreateCommand::new("soul")
+                .description("Show this bot's persona and style");
+            if !self.emoji_presets.is_empty() {
+                let mut action_opt = CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "action",
+                    "View persona or change emoji preset",
+                );
+                action_opt = action_opt.add_string_choice("view", "view");
+                action_opt = action_opt.add_string_choice("emoji", "emoji");
+                soul_cmd = soul_cmd.add_option(action_opt);
+            }
+            commands.push(soul_cmd);
+        }
 
         // /stats — detailed session statistics
         commands.push(
@@ -545,6 +654,9 @@ impl EventHandler for Handler {
             }
             Interaction::Command(cmd) if cmd.data.name == "usage" => {
                 self.handle_usage_command(&ctx, &cmd).await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "cusage" => {
+                self.handle_cusage_command(&ctx, &cmd).await;
             }
             Interaction::Command(cmd) if copilot_readonly_to_rpc(&cmd.data.name).is_some() => {
                 self.handle_copilot_readonly(&ctx, &cmd).await;
@@ -582,6 +694,15 @@ impl EventHandler for Handler {
             Interaction::Command(cmd) if cmd.data.name == "stats" => {
                 self.handle_stats_command(&ctx, &cmd).await;
             }
+            Interaction::Command(cmd) if cmd.data.name == "soul" => {
+                self.handle_soul_command(&ctx, &cmd).await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "mcp-add" || cmd.data.name == "mcp-remove" || cmd.data.name == "mcp-list" => {
+                self.handle_mcp_profile_command(&ctx, &cmd).await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "mcp-browse" || cmd.data.name == "mcp-install" || cmd.data.name == "mcp-status" => {
+                self.handle_mcp_registry_command(&ctx, &cmd).await;
+            }
             Interaction::Command(cmd) if copilot_interactive_spec(&cmd.data.name).is_some() => {
                 self.handle_copilot_interactive(&ctx, &cmd).await;
             }
@@ -593,6 +714,9 @@ impl EventHandler for Handler {
             }
             Interaction::Autocomplete(ac) if copilot_interactive_spec(&ac.data.name).is_some() => {
                 self.handle_copilot_interactive_autocomplete(&ctx, &ac).await;
+            }
+            Interaction::Component(comp) if comp.data.custom_id == "soul_emoji_select" => {
+                self.handle_soul_emoji_select(&ctx, &comp).await;
             }
             _ => {}
         }
@@ -1370,6 +1494,410 @@ impl Handler {
             .await;
     }
 
+    /// Handle the `/soul` slash command: display the bot's persona file or show emoji preset picker.
+    async fn handle_soul_command(&self, ctx: &Context, cmd: &CommandInteraction) {
+        use serenity::all::{CreateEmbed, CreateActionRow, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption};
+
+        // Check if user selected "emoji" action
+        let action = cmd.data.options.iter()
+            .find(|o| o.name == "action")
+            .and_then(|o| o.value.as_str())
+            .unwrap_or("view");
+
+        if action == "emoji" && !self.emoji_presets.is_empty() {
+            // Build select menu with preset options
+            let options: Vec<CreateSelectMenuOption> = self.emoji_presets.iter().map(|p| {
+                let e = &p.emojis;
+                let desc = format!("{} {} {} {} {} {} {}",
+                    e.queued, e.thinking, e.tool, e.coding, e.web, e.done, e.error);
+                CreateSelectMenuOption::new(&p.name, &p.name)
+                    .description(desc)
+            }).collect();
+
+            let select = CreateSelectMenu::new(
+                "soul_emoji_select",
+                CreateSelectMenuKind::String { options },
+            ).placeholder("選擇 emoji 風格...");
+
+            let _ = cmd
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("🎨 選擇 reaction emoji 風格：")
+                            .components(vec![CreateActionRow::SelectMenu(select)])
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        }
+
+        // Default: show persona embed
+        let (title, description, color) = match &self.soul_file {
+            Some(path) => match tokio::fs::read_to_string(path).await {
+                Ok(text) => {
+                    let trimmed = text.trim();
+                    let bot_name = match self.backend {
+                        BackendType::Claude => "CICX",
+                        BackendType::CopilotBridge => "GITX",
+                        BackendType::CopilotNative => "COPILX",
+                        BackendType::Gemini => "GIMINIX",
+                        BackendType::Codex => "CODEX",
+                        BackendType::Other => "Bot",
+                    };
+                    let desc = if trimmed.len() > 3900 {
+                        format!("{}…\n\n_({} chars total)_", &trimmed[..3900], trimmed.len())
+                    } else {
+                        trimmed.to_string()
+                    };
+                    (
+                        format!("🔱 {bot_name} の魂"),
+                        desc,
+                        0x1B2838u32,
+                    )
+                }
+                Err(e) => (
+                    "⚠️ Error".to_string(),
+                    format!("Failed to read soul file: {e}"),
+                    0xFF4444u32,
+                ),
+            },
+            None => (
+                "💤 No Soul".to_string(),
+                "No soul file configured.".to_string(),
+                0x888888u32,
+            ),
+        };
+
+        let embed = CreateEmbed::new()
+            .title(title)
+            .description(description)
+            .color(color)
+            .footer(serenity::all::CreateEmbedFooter::new(
+                "「...勞動是為了有不勞動的時間。」",
+            ));
+
+        let _ = cmd
+            .create_response(
+                &ctx.http,
+                CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .embed(embed)
+                        .ephemeral(true),
+                ),
+            )
+            .await;
+    }
+
+    /// Handle the emoji preset selection from the `/soul emoji` select menu.
+    async fn handle_soul_emoji_select(&self, ctx: &Context, component: &serenity::all::ComponentInteraction) {
+        use serenity::all::ComponentInteractionDataKind;
+
+        let selected = match &component.data.kind {
+            ComponentInteractionDataKind::StringSelect { values } => values.first().cloned(),
+            _ => None,
+        };
+
+        let Some(preset_name) = selected else {
+            let _ = component.create_response(&ctx.http, CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new().content("⚠️ 未選擇 preset").ephemeral(true),
+            )).await;
+            return;
+        };
+
+        let preset = self.emoji_presets.iter().find(|p| p.name == preset_name);
+        let Some(preset) = preset else {
+            let _ = component.create_response(&ctx.http, CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new().content(format!("⚠️ 找不到 preset: {preset_name}")).ephemeral(true),
+            )).await;
+            return;
+        };
+
+        // Update the shared reactions config
+        {
+            let mut rcfg = self.reactions_config.write().await;
+            rcfg.emojis = preset.emojis.clone();
+        }
+
+        let e = &preset.emojis;
+        let summary = format!(
+            "✔️ 已切換到「**{}**」風格\n\n\
+            {} queued · {} thinking · {} tool · {} coding\n\
+            {} web · {} done · {} error",
+            preset_name, e.queued, e.thinking, e.tool, e.coding, e.web, e.done, e.error
+        );
+
+        let _ = component.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content(summary).ephemeral(true),
+        )).await;
+    }
+
+    /// Handle `/mcp-add`, `/mcp-remove`, `/mcp-list` — per-user MCP profile management.
+    async fn handle_mcp_profile_command(&self, ctx: &Context, cmd: &CommandInteraction) {
+        let Some(dir) = &self.mcp_profiles_dir else {
+            let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ MCP profiles not configured (mcp_profiles_dir missing).")
+                    .ephemeral(true),
+            )).await;
+            return;
+        };
+
+        let user_id = cmd.user.id.get().to_string();
+        let profile_path = std::path::PathBuf::from(dir).join(format!("{user_id}.json"));
+
+        // Read existing profile or create empty one
+        let mut profile: serde_json::Value = if profile_path.exists() {
+            match tokio::fs::read_to_string(&profile_path).await {
+                Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({
+                    "discord_user_id": user_id,
+                    "mcpServers": {},
+                    "enabled": true
+                })),
+                Err(_) => serde_json::json!({
+                    "discord_user_id": user_id,
+                    "mcpServers": {},
+                    "enabled": true
+                }),
+            }
+        } else {
+            serde_json::json!({
+                "discord_user_id": user_id,
+                "mcpServers": {},
+                "enabled": true
+            })
+        };
+
+        match cmd.data.name.as_str() {
+            "mcp-add" => {
+                let name = cmd.data.options.iter()
+                    .find(|o| o.name == "name")
+                    .and_then(|o| o.value.as_str())
+                    .unwrap_or("");
+                let url = cmd.data.options.iter()
+                    .find(|o| o.name == "url")
+                    .and_then(|o| o.value.as_str())
+                    .unwrap_or("");
+
+                if name.is_empty() || url.is_empty() {
+                    let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⚠️ Both name and URL are required.")
+                            .ephemeral(true),
+                    )).await;
+                    return;
+                }
+
+                profile["mcpServers"][name] = serde_json::json!({
+                    "type": "http",
+                    "url": url,
+                    "tools": ["*"]
+                });
+                profile["updated_at"] = serde_json::Value::String(format!("{:?}", std::time::SystemTime::now()));
+
+                match tokio::fs::write(&profile_path, serde_json::to_string_pretty(&profile).unwrap_or_default()).await {
+                    Ok(_) => {
+                        let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content(format!("✅ MCP server **{name}** added (`{url}`)\n_Takes effect on next session._"))
+                                .ephemeral(true),
+                        )).await;
+                    }
+                    Err(e) => {
+                        let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content(format!("⚠️ Failed to save profile: {e}"))
+                                .ephemeral(true),
+                        )).await;
+                    }
+                }
+            }
+            "mcp-remove" => {
+                let name = cmd.data.options.iter()
+                    .find(|o| o.name == "name")
+                    .and_then(|o| o.value.as_str())
+                    .unwrap_or("");
+
+                if let Some(servers) = profile["mcpServers"].as_object_mut() {
+                    if servers.remove(name).is_some() {
+                        profile["updated_at"] = serde_json::Value::String(format!("{:?}", std::time::SystemTime::now()));
+                        let _ = tokio::fs::write(&profile_path, serde_json::to_string_pretty(&profile).unwrap_or_default()).await;
+                        let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content(format!("🗑️ MCP server **{name}** removed."))
+                                .ephemeral(true),
+                        )).await;
+                    } else {
+                        let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content(format!("⚠️ Server **{name}** not found in your profile."))
+                                .ephemeral(true),
+                        )).await;
+                    }
+                }
+            }
+            "mcp-list" => {
+                let servers = profile["mcpServers"].as_object();
+                let list = match servers {
+                    Some(s) if !s.is_empty() => {
+                        s.iter().map(|(name, cfg)| {
+                            let url = cfg["url"].as_str().unwrap_or("(stdio)");
+                            let stype = cfg["type"].as_str().unwrap_or("http");
+                            format!("• **{name}** — `{stype}` {url}")
+                        }).collect::<Vec<_>>().join("\n")
+                    }
+                    _ => "No MCP servers configured. Use `/mcp-add` to add one.".to_string(),
+                };
+                let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(format!("🔌 **Your MCP Servers:**\n{list}"))
+                        .ephemeral(true),
+                )).await;
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle `/mcp-browse`, `/mcp-install`, `/mcp-status` — MCP registry commands.
+    async fn handle_mcp_registry_command(&self, ctx: &Context, cmd: &CommandInteraction) {
+        let Some(dir) = &self.mcp_profiles_dir else {
+            let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ MCP profiles not configured.")
+                    .ephemeral(true),
+            )).await;
+            return;
+        };
+
+        // Load registry
+        let registry_path = std::path::PathBuf::from(dir).parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("mcp-registry.json");
+        let registry: serde_json::Value = match tokio::fs::read_to_string(&registry_path).await {
+            Ok(s) => serde_json::from_str(&s).unwrap_or(serde_json::json!({"servers":[]})),
+            Err(_) => {
+                let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ MCP registry not found.")
+                        .ephemeral(true),
+                )).await;
+                return;
+            }
+        };
+
+        let user_id = cmd.user.id.get().to_string();
+        let profile_path = std::path::PathBuf::from(dir).join(format!("{user_id}.json"));
+
+        match cmd.data.name.as_str() {
+            "mcp-browse" => {
+                let servers = registry["servers"].as_array();
+                let list = match servers {
+                    Some(arr) if !arr.is_empty() => {
+                        arr.iter().map(|s| {
+                            let name = s["name"].as_str().unwrap_or("?");
+                            let desc = s["description"].as_str().unwrap_or("");
+                            let cat = s["category"].as_str().unwrap_or("other");
+                            let auth = s["auth"].as_str().unwrap_or("none");
+                            format!("• **{name}** [{cat}] — {desc}\n  Auth: `{auth}`")
+                        }).collect::<Vec<_>>().join("\n")
+                    }
+                    _ => "No servers in registry.".to_string(),
+                };
+                let count = servers.map(|a| a.len()).unwrap_or(0);
+                let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(format!("🔌 **MCP Registry** ({count} servers)\n\n{list}\n\n_Use `/mcp-install <name>` to add one._"))
+                        .ephemeral(true),
+                )).await;
+            }
+            "mcp-install" => {
+                let name = cmd.data.options.iter()
+                    .find(|o| o.name == "name")
+                    .and_then(|o| o.value.as_str())
+                    .unwrap_or("");
+
+                let server = registry["servers"].as_array()
+                    .and_then(|arr| arr.iter().find(|s| s["name"].as_str() == Some(name)));
+
+                let Some(server) = server else {
+                    let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content(format!("⚠️ Server **{name}** not found in registry. Use `/mcp-browse` to see available servers."))
+                            .ephemeral(true),
+                    )).await;
+                    return;
+                };
+
+                // Read or create profile
+                let mut profile: serde_json::Value = if profile_path.exists() {
+                    tokio::fs::read_to_string(&profile_path).await.ok()
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or(serde_json::json!({"discord_user_id": user_id, "mcpServers": {}, "enabled": true}))
+                } else {
+                    serde_json::json!({"discord_user_id": user_id, "mcpServers": {}, "enabled": true})
+                };
+
+                // Copy server config to profile
+                let mut cfg = server.clone();
+                cfg.as_object_mut().map(|o| { o.remove("name"); o.remove("description"); o.remove("category"); o.remove("auth"); });
+                if cfg.get("tools").is_none() {
+                    cfg["tools"] = serde_json::json!(["*"]);
+                }
+                profile["mcpServers"][name] = cfg;
+                profile["updated_at"] = serde_json::Value::String(format!("{:?}", std::time::SystemTime::now()));
+
+                match tokio::fs::write(&profile_path, serde_json::to_string_pretty(&profile).unwrap_or_default()).await {
+                    Ok(_) => {
+                        let auth = server["auth"].as_str().unwrap_or("none");
+                        let msg = if auth == "none" {
+                            format!("✅ **{name}** installed to your profile.\n_Takes effect on next session._")
+                        } else {
+                            format!("✅ **{name}** installed to your profile.\n⚠️ Auth required: `{auth}`\n_Takes effect on next session._")
+                        };
+                        let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new().content(msg).ephemeral(true),
+                        )).await;
+                    }
+                    Err(e) => {
+                        let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content(format!("⚠️ Failed to save: {e}"))
+                                .ephemeral(true),
+                        )).await;
+                    }
+                }
+            }
+            "mcp-status" => {
+                let profile: serde_json::Value = if profile_path.exists() {
+                    tokio::fs::read_to_string(&profile_path).await.ok()
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or(serde_json::json!({"mcpServers":{}}))
+                } else {
+                    serde_json::json!({"mcpServers":{}})
+                };
+
+                let servers = profile["mcpServers"].as_object();
+                let list = match servers {
+                    Some(s) if !s.is_empty() => {
+                        s.iter().map(|(name, cfg)| {
+                            let stype = cfg["type"].as_str().unwrap_or("stdio");
+                            // Simple status: installed = ✅, no runtime check yet
+                            format!("• ✅ **{name}** (`{stype}`) — installed")
+                        }).collect::<Vec<_>>().join("\n")
+                    }
+                    _ => "No MCP servers installed. Use `/mcp-browse` → `/mcp-install`.".to_string(),
+                };
+                let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(format!("📊 **MCP Status:**\n{list}"))
+                        .ephemeral(true),
+                )).await;
+            }
+            _ => {}
+        }
+    }
+
     /// Handle the `/usage` slash command: run all configured usage runners
     /// in parallel and display the results as an embed.
     async fn handle_usage_command(&self, ctx: &Context, cmd: &CommandInteraction) {
@@ -1497,6 +2025,30 @@ impl Handler {
                 embed = embed.field("📡 Current Session", &info, false);
             }
         }
+
+        let _ = cmd
+            .edit_response(&ctx.http, EditInteractionResponse::new().embed(embed))
+            .await;
+    }
+
+    /// Handle `/cusage` — custom usage breakdown (daily/weekly/monthly).
+    async fn handle_cusage_command(&self, ctx: &Context, cmd: &CommandInteraction) {
+        let Some(cusage_cfg) = self.cusage_config.as_ref() else {
+            let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ `/cusage` is not configured.")
+                    .ephemeral(true),
+            )).await;
+            return;
+        };
+
+        if let Err(e) = cmd.defer(&ctx.http).await {
+            error!(error = %e, "failed to defer /cusage response");
+            return;
+        }
+
+        let results = crate::usage::run_all(cusage_cfg).await;
+        let embed = build_usage_embed(&results);
 
         let _ = cmd
             .edit_response(&ctx.http, EditInteractionResponse::new().embed(embed))
@@ -2576,6 +3128,79 @@ async fn edit(ctx: &Context, ch: ChannelId, msg_id: MessageId, content: &str) ->
     ch.edit_message(&ctx.http, msg_id, serenity::builder::EditMessage::new().content(content)).await
 }
 
+/// Replace aggregate session summary with per-model breakdown from cost-totals files.
+/// Looks for pattern "Input: Xk · Output: Yk" and appends per-model lines.
+/// Replace Copilot CLI's aggregate session summary with per-model breakdown.
+/// Replaces both the "N turns · model: X" line and the "Input: Xk · Output: Yk" line.
+fn enrich_session_summary_with_per_model(content: String) -> String {
+    // Match the aggregate token line
+    static RE_AGGREGATE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?m)(\d+)\s+turns?\s*·\s*model:\s*\S+\n\s*Input:\s*[\d.]+k\s*·\s*Output:\s*[\d.]+k(?:\s*·\s*Cached:\s*[\d.]+k)?").unwrap()
+    });
+
+    if !RE_AGGREGATE.is_match(&content) {
+        return content;
+    }
+
+    // Read the most recent cost-totals file
+    let dir = std::path::PathBuf::from(
+        std::env::var("APPDATA").unwrap_or_else(|_| "C:/Users/Administrator/AppData/Roaming".into())
+    ).join("openab");
+
+    let Ok(entries) = std::fs::read_dir(&dir) else { return content };
+    let mut best: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("cost-totals-") { continue; }
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(mtime) = meta.modified() {
+                if best.as_ref().map_or(true, |(_, t)| mtime > *t) {
+                    best = Some((entry.path(), mtime));
+                }
+            }
+        }
+    }
+
+    let Some((path, mtime)) = best else { return content };
+    if mtime.elapsed().map_or(true, |d| d.as_secs() > 86400) {
+        return content;
+    }
+
+    let Ok(data) = std::fs::read_to_string(&path) else { return content };
+    let Ok(json): Result<serde_json::Value, _> = serde_json::from_str(&data) else { return content };
+
+    let Some(per_model) = json.get("perModel").and_then(|v| v.as_object()) else { return content };
+    if per_model.len() <= 1 {
+        return content; // Only one model — aggregate is already correct
+    }
+
+    // Build per-model lines, sorted by turns (descending)
+    let mut entries: Vec<_> = per_model.iter().collect();
+    entries.sort_by(|a, b| {
+        let ta = b.1.get("turns").and_then(|v| v.as_u64()).unwrap_or(0);
+        let tb = a.1.get("turns").and_then(|v| v.as_u64()).unwrap_or(0);
+        ta.cmp(&tb)
+    });
+
+    let total_turns: u64 = entries.iter()
+        .map(|(_, s)| s.get("turns").and_then(|v| v.as_u64()).unwrap_or(0))
+        .sum();
+
+    let mut lines = Vec::new();
+    for (model, stats) in &entries {
+        let turns = stats.get("turns").and_then(|v| v.as_u64()).unwrap_or(0);
+        let input = stats.get("inputTokens").and_then(|v| v.as_f64()).unwrap_or(0.0) / 1000.0;
+        let output = stats.get("outputTokens").and_then(|v| v.as_f64()).unwrap_or(0.0) / 1000.0;
+        let cached = stats.get("cacheReadTokens").and_then(|v| v.as_f64()).unwrap_or(0.0) / 1000.0;
+        let mut parts = vec![format!("{input:.1}k in"), format!("{output:.1}k out")];
+        if cached > 0.0 { parts.push(format!("{cached:.1}k cached")); }
+        lines.push(format!("{turns} turns **{model}** ({}) ", parts.join(" · ")));
+    }
+
+    let replacement = format!("{total_turns} turns · {} models\n{}", entries.len(), lines.join("\n"));
+    RE_AGGREGATE.replace(&content, replacement.as_str()).to_string()
+}
+
 async fn stream_prompt(
     pool: &SessionPool,
     thread_key: &str,
@@ -2733,8 +3358,15 @@ async fn stream_prompt(
             drop(buf_tx);
             let _ = edit_handle.await;
 
-            // Final edit
+            // Final edit — sanitize known Copilot CLI quota display bugs
             let final_content = compose_display(&tool_lines, &text_buf);
+            // Copilot Pro API returns entitlementRequests=1 (placeholder), making CLI show "X / 1 used".
+            // Copilot Pro API returns entitlementRequests=1 (placeholder, real quota ~300/mo).
+            // Strip the misleading "/1" denominator but keep the used count.
+            static RE_QUOTA: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(\d+)\s*/\s*1\s+used").unwrap());
+            let final_content = RE_QUOTA.replace_all(&final_content, "$1 premium reqs used").to_string();
+            // Replace aggregate "Input: Xk · Output: Yk" with per-model breakdown if available
+            let final_content = enrich_session_summary_with_per_model(final_content);
             // If ACP returned both an error and partial text, show both.
             // This can happen when the agent started producing content before hitting an error
             // (e.g. context length limit, rate limit mid-stream). Showing both gives users

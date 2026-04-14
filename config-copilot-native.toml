@@ -1,11 +1,11 @@
 [discord]
 bot_token = "${DISCORD_BOT_TOKEN}"
-allowed_channels = []
+allowed_channels = []   # allow all channels
 allowed_users = ["844236700611379200"]   # xisx7876 — owner lockdown
 
 [agent]
 command = "cmd"
-args = ["/c", "copilot", "--acp"]
+args = ["/c", "copilot", "--acp", "--enable-all-github-mcp-tools"]
 working_dir = "C:\\Users\\Administrator"
 
 [pool]
@@ -60,7 +60,8 @@ args = ["C:\\Users\\Administrator\\openab\\scripts\\get-copilot-quota.js"]
 progress_fields = ["remaining_pct"]
 template = """
 **Remaining:** {{ remaining_pct }}
-**Used:** {{ used }}/{{ total }} reqs · _Resets {{ reset_date }}_
+{{ session_breakdown }}
+_Resets {{ reset_date }}_
 """
 
 [[usage.runners]]

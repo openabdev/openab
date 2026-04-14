@@ -140,6 +140,15 @@ fn render_template(tpl: &str, data: &Value, progress_fields: &[String]) -> Strin
         out = out.replace(&placeholder, &replacement);
     }
 
+    // Strip any remaining unresolved {{ field }} placeholders
+    while let Some(start) = out.find("{{ ") {
+        if let Some(end) = out[start..].find(" }}") {
+            out.replace_range(start..start + end + 3, "N/A");
+        } else {
+            break;
+        }
+    }
+
     out
 }
 
@@ -180,6 +189,13 @@ mod tests {
         let data: Value = serde_json::from_str(r#"{"pct": 42, "name": "test"}"#).unwrap();
         let out = render_template("value={{ pct }}% name={{ name }}", &data, &[]);
         assert_eq!(out, "value=42% name=test");
+    }
+
+    #[test]
+    fn test_render_unresolved_stripped() {
+        let data: Value = serde_json::from_str(r#"{"name": "test"}"#).unwrap();
+        let out = render_template("hi {{ name }} miss {{ gone }}", &data, &[]);
+        assert_eq!(out, "hi test miss N/A");
     }
 
     #[test]

@@ -204,13 +204,13 @@ impl StatusReactionController {
                 let mut inner = ctrl.lock().await;
                 if inner.finished { return; }
                 let old = inner.current.clone();
-                inner.current = "🥱".to_string();
+                inner.current = "⏰".to_string();
                 let http = inner.http.clone();
                 let ch = inner.channel;
                 let msg = inner.message;
                 drop(inner);
-                let _ = add_reaction(&http, ch, msg, "🥱").await;
-                if !old.is_empty() && old != "🥱" {
+                let _ = add_reaction(&http, ch, msg, "⏰").await;
+                if !old.is_empty() && old != "⏰" {
                     let _ = remove_reaction(&http, ch, msg, &old).await;
                 }
             }
@@ -221,13 +221,13 @@ impl StatusReactionController {
             let mut inner = ctrl.lock().await;
             if inner.finished { return; }
             let old = inner.current.clone();
-            inner.current = "😨".to_string();
+            inner.current = "🕐".to_string();
             let http = inner.http.clone();
             let ch = inner.channel;
             let msg = inner.message;
             drop(inner);
-            let _ = add_reaction(&http, ch, msg, "😨").await;
-            if !old.is_empty() && old != "😨" {
+            let _ = add_reaction(&http, ch, msg, "🕐").await;
+            if !old.is_empty() && old != "🕐" {
                 let _ = remove_reaction(&http, ch, msg, &old).await;
             }
         }));

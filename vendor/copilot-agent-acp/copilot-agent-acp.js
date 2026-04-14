@@ -19,6 +19,9 @@
 
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
+
 const SDK_PATH =
   'C:/Users/Administrator/AppData/Local/copilot/pkg/win32-x64/1.0.21/copilot-sdk/index.js';
 
@@ -29,18 +32,43 @@ const sdkPromise = import('file:///' + SDK_PATH);
 // → cheap model; terminal copilot-cli keeps its own config-level default.
 const DEFAULT_MODEL = process.env.COPILOT_DEFAULT_MODEL || 'gpt-5-mini';
 
-// System message appended to every new session. Enforces response language
-// preferences + Discord-aware formatting hints. Override via
-// COPILOT_APPEND_SYSTEM env var.
+// MCP servers injected into every session via SDK's SessionConfig.mcpServers.
+// Reads from ~/.copilot/mcp-config.json (same file as `copilot mcp` CLI).
+const MCP_CONFIG_PATH = path.join(
+  process.env.USERPROFILE || process.env.HOME || 'C:/Users/Administrator',
+  '.copilot', 'mcp-config.json'
+);
+let SESSION_MCP_SERVERS = {};
+try {
+  const raw = JSON.parse(fs.readFileSync(MCP_CONFIG_PATH, 'utf8'));
+  if (raw.mcpServers && typeof raw.mcpServers === 'object') {
+    // Convert our config format to SDK format (add tools: ["*"] default)
+    for (const [name, cfg] of Object.entries(raw.mcpServers)) {
+      SESSION_MCP_SERVERS[name] = { tools: ['*'], ...cfg };
+    }
+  }
+} catch {}
+const mcpCount = Object.keys(SESSION_MCP_SERVERS).length;
+if (mcpCount > 0) {
+  process.stderr.write(`[bridge] loaded ${mcpCount} MCP server(s) from ${MCP_CONFIG_PATH}\n`);
+}
+
+// System message appended to every new session. Loads persona from
+// gitx-system-prompt.txt (七海建人 style), falls back to basic language rules.
+// Override via COPILOT_APPEND_SYSTEM env var.
+const PROMPT_FILE = path.resolve(__dirname, '../../gitx-system-prompt.txt');
+let loadedPrompt = '';
+try { loadedPrompt = fs.readFileSync(PROMPT_FILE, 'utf8').trim(); } catch {}
+
 const DEFAULT_APPEND_SYSTEM =
   process.env.COPILOT_APPEND_SYSTEM ||
-  [
+  (loadedPrompt || [
     'Always respond in **Traditional Chinese (zh-TW / 繁體中文)**. Never use Simplified Chinese.',
     'Use 台灣 conventions (e.g. 軟體 not 软件, 檔案 not 文件, 程式 not 程序).',
     'Technical terms may remain in English.',
     'You are running inside a Discord bot, so format replies for Discord Markdown (no tables — use bullet points).',
     'Keep responses concise unless the user asks for depth.',
-  ].join('\n');
+  ].join('\n'));
 
 // ---- stdio JSON-RPC plumbing ---------------------------------------
 
@@ -105,7 +133,9 @@ const rawSessionCreateResponses = new Map();
 async function ensureClient() {
   if (client) return client;
   sdk = await sdkPromise;
-  client = new sdk.CopilotClient();
+  client = new sdk.CopilotClient({
+    cliArgs: ['--enable-all-github-mcp-tools'],
+  });
   await client.start();
   logInfo('CopilotClient started');
 
@@ -247,14 +277,26 @@ async function handleInitialize(params) {
 async function handleSessionNew(params) {
   const c = await ensureClient();
   const cwd = params?.cwd || process.cwd();
-  const session = await c.createSession({
+  const sessionOpts = {
     cwd,
     onPermissionRequest: sdk.approveAll || (async () => ({ kind: 'approved' })),
     systemMessage: {
       mode: 'append',
       content: DEFAULT_APPEND_SYSTEM,
     },
-  });
+  };
+  // Inject MCP servers + configDir so SDK picks up mcp-config.json
+  if (Object.keys(SESSION_MCP_SERVERS).length > 0) {
+    sessionOpts.mcpServers = SESSION_MCP_SERVERS;
+    logInfo(`session/new injecting ${Object.keys(SESSION_MCP_SERVERS).length} MCP server(s) via mcpServers`);
+  }
+  // Also pass configDir so SDK can find mcp-config.json, skills, etc.
+  sessionOpts.configDir = path.join(
+    process.env.USERPROFILE || process.env.HOME || 'C:/Users/Administrator',
+    '.copilot'
+  );
+  logInfo(`session/new configDir=${sessionOpts.configDir}`);
+  const session = await c.createSession(sessionOpts);
 
   const state = { session, lastUsage: null, turnInProgress: null };
   sessions.set(session.sessionId, state);
@@ -318,14 +360,22 @@ async function handleSessionLoad(params) {
   // Attempt real SDK session resume. Falls back to new session on error
   // (e.g. expired / non-existent session).
   try {
-    const session = await c.resumeSession(sessionId, {
+    const resumeOpts = {
       onPermissionRequest:
         sdk.approveAll || (async () => ({ kind: 'approved' })),
       systemMessage: {
         mode: 'append',
         content: DEFAULT_APPEND_SYSTEM,
       },
-    });
+    };
+    if (Object.keys(SESSION_MCP_SERVERS).length > 0) {
+      resumeOpts.mcpServers = SESSION_MCP_SERVERS;
+    }
+    resumeOpts.configDir = path.join(
+      process.env.USERPROFILE || process.env.HOME || 'C:/Users/Administrator',
+      '.copilot'
+    );
+    const session = await c.resumeSession(sessionId, resumeOpts);
 
     const state = { session, lastUsage: null, turnInProgress: null };
     sessions.set(session.sessionId, state);
@@ -791,14 +841,32 @@ async function handleSessionEvent(sessionId, ev) {
         cacheWriteTokens: 0,
         cost: 0,
         lastModel: null,
+        perModel: {},
       };
+      const model = u.model || 'unknown';
       state.costTotals.turns += 1;
       state.costTotals.inputTokens += u.inputTokens || 0;
       state.costTotals.outputTokens += u.outputTokens || 0;
       state.costTotals.cacheReadTokens += u.cacheReadTokens || 0;
       state.costTotals.cacheWriteTokens += u.cacheWriteTokens || 0;
       state.costTotals.cost += Number(u.cost) || 0;
-      state.costTotals.lastModel = u.model || state.costTotals.lastModel;
+      state.costTotals.lastModel = model;
+      // Per-model breakdown
+      const pm = state.costTotals.perModel[model] = state.costTotals.perModel[model] || {
+        turns: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
+      };
+      pm.turns += 1;
+      pm.inputTokens += u.inputTokens || 0;
+      pm.outputTokens += u.outputTokens || 0;
+      pm.cacheReadTokens += u.cacheReadTokens || 0;
+      // Persist cost_totals to disk for /usage probe
+      try {
+        const fs = require('fs');
+        const path = require('path');
+        const dir = path.join(process.env.APPDATA || 'C:/Users/Administrator/AppData/Roaming', 'openab');
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, `cost-totals-${sessionId}.json`), JSON.stringify(state.costTotals));
+      } catch {}
       break;
     }
 

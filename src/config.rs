@@ -15,6 +15,15 @@ pub struct Config {
     pub usage: Option<UsageConfig>,
     #[serde(default)]
     pub stt: SttConfig,
+    /// Optional path to a soul/persona text file shown via `/soul`.
+    #[serde(default)]
+    pub soul_file: Option<String>,
+    /// Directory for per-user MCP profiles (Phase 2).
+    #[serde(default)]
+    pub mcp_profiles_dir: Option<String>,
+    /// Optional custom usage command (`/cusage`), same schema as `[usage]`.
+    #[serde(default)]
+    pub cusage: Option<UsageConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -112,6 +121,14 @@ pub struct ReactionsConfig {
     pub emojis: ReactionEmojis,
     #[serde(default)]
     pub timing: ReactionTiming,
+    #[serde(default)]
+    pub presets: Vec<EmojiPreset>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmojiPreset {
+    pub name: String,
+    pub emojis: ReactionEmojis,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -180,6 +197,7 @@ impl Default for ReactionsConfig {
             remove_after_reply: false,
             emojis: ReactionEmojis::default(),
             timing: ReactionTiming::default(),
+            presets: Vec::new(),
         }
     }
 }
