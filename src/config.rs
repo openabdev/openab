@@ -3,6 +3,34 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Controls whether the bot processes messages from other Discord bots.
+///
+/// Inspired by Hermes Agent's `DISCORD_ALLOW_BOTS` 3-value design:
+/// - `Off` (default): ignore all bot messages (safe default, no behavior change)
+/// - `Mentions`: only process bot messages that @mention this bot (natural loop breaker)
+/// - `All`: process all bot messages (capped at `MAX_CONSECUTIVE_BOT_TURNS`)
+///
+/// The bot's own messages are always ignored regardless of this setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AllowBots {
+    #[default]
+    Off,
+    Mentions,
+    All,
+}
+
+impl<'de> Deserialize<'de> for AllowBots {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "off" | "none" | "false" => Ok(Self::Off),
+            "mentions" => Ok(Self::Mentions),
+            "all" | "true" => Ok(Self::All),
+            other => Err(serde::de::Error::unknown_variant(other, &["off", "mentions", "all"])),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub discord: DiscordConfig,
@@ -48,6 +76,15 @@ pub struct DiscordConfig {
     pub allowed_channels: Vec<String>,
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    #[serde(default)]
+    pub allow_bot_messages: AllowBots,
+    /// When non-empty, only bot messages from these IDs pass the bot gate.
+    /// Combines with `allow_bot_messages`: the mode check runs first, then
+    /// the allowlist filters further. Empty = allow any bot (mode permitting).
+    /// Only relevant when `allow_bot_messages` is `"mentions"` or `"all"`;
+    /// ignored when `"off"` since all bot messages are rejected before this check.
+    #[serde(default)]
+    pub trusted_bot_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]

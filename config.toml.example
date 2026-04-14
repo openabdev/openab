@@ -2,6 +2,9 @@
 bot_token = "${DISCORD_BOT_TOKEN}"
 allowed_channels = ["1234567890"]
 # allowed_users = ["<YOUR_DISCORD_USER_ID>"]  # empty or omitted = allow all users
+# allow_bot_messages = "off"  # "off" (default) | "mentions" | "all"
+                               # "mentions" is recommended for multi-agent collaboration
+# trusted_bot_ids = []         # empty = any bot (mode permitting); set to restrict
 
 [agent]
 command = "kiro-cli"
