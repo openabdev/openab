@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MCP User Profile",
+  "type": "object",
+  "required": ["discord_user_id"],
+  "properties": {
+    "discord_user_id": {
+      "type": "string",
+      "description": "Discord user ID"
+    },
+    "mcpServers": {
+      "type": "object",
+      "description": "Per-user MCP server configurations",
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": ["type", "url"],
+            "properties": {
+              "type": { "enum": ["http", "sse"] },
+              "url": { "type": "string" },
+              "headers": { "type": "object" },
+              "tools": { "type": "array", "items": { "type": "string" }, "default": ["*"] },
+              "timeout": { "type": "number" }
+            }
+          },
+          {
+            "type": "object",
+            "required": ["command"],
+            "properties": {
+              "type": { "enum": ["stdio", "local"] },
+              "command": { "type": "string" },
+              "args": { "type": "array", "items": { "type": "string" } },
+              "env": { "type": "object" },
+              "cwd": { "type": "string" },
+              "tools": { "type": "array", "items": { "type": "string" }, "default": ["*"] },
+              "timeout": { "type": "number" }
+            }
+          }
+        ]
+      }
+    },
+    "enabled": {
+      "type": "boolean",
+      "default": true
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}
