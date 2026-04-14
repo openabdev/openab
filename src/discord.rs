@@ -31,6 +31,7 @@ pub struct Handler {
     pub pool: Arc<SessionPool>,
     pub allowed_channels: HashSet<u64>,
     pub allowed_users: HashSet<u64>,
+    pub trusted_bot_ids: HashSet<u64>,
     pub reactions_config: ReactionsConfig,
     pub stt_config: SttConfig,
 }
@@ -38,7 +39,7 @@ pub struct Handler {
 #[async_trait]
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
-        if msg.author.bot {
+        if msg.author.bot && !self.trusted_bot_ids.contains(&msg.author.id.get()) {
             return;
         }
 

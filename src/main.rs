@@ -41,7 +41,8 @@ async fn main() -> anyhow::Result<()> {
 
     let allowed_channels = parse_id_set(&cfg.discord.allowed_channels, "allowed_channels")?;
     let allowed_users = parse_id_set(&cfg.discord.allowed_users, "allowed_users")?;
-    info!(channels = allowed_channels.len(), users = allowed_users.len(), "parsed allowlists");
+    let trusted_bot_ids = parse_id_set(&cfg.discord.trusted_bot_ids, "trusted_bot_ids")?;
+    info!(channels = allowed_channels.len(), users = allowed_users.len(), trusted_bots = trusted_bot_ids.len(), "parsed allowlists");
 
     // Resolve STT config before constructing handler (auto-detect mutates cfg.stt)
     if cfg.stt.enabled {
@@ -63,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
         pool: pool.clone(),
         allowed_channels,
         allowed_users,
+        trusted_bot_ids,
         reactions_config: cfg.reactions,
         stt_config: cfg.stt.clone(),
     };
