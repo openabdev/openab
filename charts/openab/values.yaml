@@ -4,6 +4,12 @@ image:
   tag: ""
   pullPolicy: IfNotPresent
 
+# Override the chart name used in generated resource names.
+nameOverride: ""
+
+# Override the full release name used in generated resource names.
+fullnameOverride: ""
+
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 1000
@@ -36,6 +42,7 @@ agents:
     #     trustedBotIds: []
     #   workingDir: /home/agent
     #   env: {}
+    #   # Load env vars from existing Secrets or ConfigMaps, e.g. GH_TOKEN.
     #   envFrom: []
     #   pool:
     #     maxSessions: 10
@@ -47,6 +54,7 @@ agents:
     #     enabled: true
     #     storageClass: ""
     #     size: 1Gi
+    #   # Mount a custom AGENTS.md file. Useful with --set-file.
     #   agentsMd: ""
     #   resources: {}
     #   nodeSelector: {}
@@ -72,6 +80,7 @@ agents:
       trustedBotIds: []
     workingDir: /home/agent
     env: {}
+    # Load env vars from existing Secrets or ConfigMaps, e.g. GH_TOKEN.
     envFrom: []
     pool:
       maxSessions: 10
@@ -88,6 +97,7 @@ agents:
       enabled: true
       storageClass: ""
       size: 1Gi  # defaults to 1Gi if not set
+    # Mount a custom AGENTS.md file. Useful with --set-file.
     agentsMd: ""
     resources: {}
     nodeSelector: {}

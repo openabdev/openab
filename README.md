@@ -44,6 +44,8 @@ helm install openab openab/openab \
   --set-string 'agents.kiro.discord.allowedChannels[0]=YOUR_CHANNEL_ID'
 ```
 
+For additional Helm values such as `fullnameOverride`, `nameOverride`, `envFrom`, and `agentsMd`, see [charts/openab/README.md](charts/openab/README.md).
+
 ### 3. Authenticate (first time only)
 
 ```bash
