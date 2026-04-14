@@ -10,7 +10,10 @@ pub async fn transcribe(
     filename: String,
     mime_type: &str,
 ) -> Option<String> {
-    let url = format!("{}/audio/transcriptions", cfg.base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/audio/transcriptions",
+        cfg.base_url.trim_end_matches('/')
+    );
 
     let file_part = multipart::Part::bytes(audio_bytes)
         .file_name(filename)

@@ -106,8 +106,7 @@ impl AcpConnection {
         let mut proc = cmd
             .spawn()
             .map_err(|e| anyhow!("failed to spawn {command}: {e}"))?;
-        let child_pgid = proc.id()
-            .and_then(|pid| i32::try_from(pid).ok());
+        let child_pgid = proc.id().and_then(|pid| i32::try_from(pid).ok());
 
         let stdout = proc.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         let stdin = proc.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
@@ -147,13 +146,16 @@ impl AcpConnection {
                     // Auto-reply session/request_permission
                     if msg.method.as_deref() == Some("session/request_permission") {
                         if let Some(id) = msg.id {
-                            let title = msg.params.as_ref()
+                            let title = msg
+                                .params
+                                .as_ref()
                                 .and_then(|p| p.get("toolCall"))
                                 .and_then(|t| t.get("title"))
                                 .and_then(|t| t.as_str())
                                 .unwrap_or("?");
                             info!(title, "auto-allow permission");
-                            let reply = JsonRpcResponse::new(id, json!({"optionId": "allow_always"}));
+                            let reply =
+                                JsonRpcResponse::new(id, json!({"optionId": "allow_always"}));
                             if let Ok(data) = serde_json::to_string(&reply) {
                                 let mut w = stdin_clone.lock().await;
                                 let _ = w.write_all(format!("{data}\n").as_bytes()).await;
@@ -165,16 +167,25 @@ impl AcpConnection {
 
                     // Capture native agent slash commands from available_commands_update
                     if msg.method.as_deref() == Some("session/update") {
-                        if let Some(upd) = msg.params.as_ref()
-                            .and_then(|p| p.get("update"))
-                        {
-                            if upd.get("sessionUpdate").and_then(|v| v.as_str()) == Some("available_commands_update") {
-                                if let Some(cmds) = upd.get("availableCommands").and_then(|v| v.as_array()) {
-                                    let parsed: Vec<NativeCommand> = cmds.iter().filter_map(|c| {
-                                        let name = c.get("name")?.as_str()?.to_string();
-                                        let description = c.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string();
-                                        Some(NativeCommand { name, description })
-                                    }).collect();
+                        if let Some(upd) = msg.params.as_ref().and_then(|p| p.get("update")) {
+                            if upd.get("sessionUpdate").and_then(|v| v.as_str())
+                                == Some("available_commands_update")
+                            {
+                                if let Some(cmds) =
+                                    upd.get("availableCommands").and_then(|v| v.as_array())
+                                {
+                                    let parsed: Vec<NativeCommand> = cmds
+                                        .iter()
+                                        .filter_map(|c| {
+                                            let name = c.get("name")?.as_str()?.to_string();
+                                            let description = c
+                                                .get("description")
+                                                .and_then(|d| d.as_str())
+                                                .unwrap_or("")
+                                                .to_string();
+                                            Some(NativeCommand { name, description })
+                                        })
+                                        .collect();
                                     info!(count = parsed.len(), "captured native agent commands");
                                     *native_cmds.lock().await = parsed;
                                 }
@@ -316,11 +327,19 @@ impl AcpConnection {
             .and_then(|c| c.get("loadSession"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        info!(agent = agent_name, load_session = self.supports_load_session, "initialized");
+        info!(
+            agent = agent_name,
+            load_session = self.supports_load_session,
+            "initialized"
+        );
         Ok(())
     }
 
-    pub async fn session_new(&mut self, cwd: &str, mcp_servers: &[serde_json::Value]) -> Result<String> {
+    pub async fn session_new(
+        &mut self,
+        cwd: &str,
+        mcp_servers: &[serde_json::Value],
+    ) -> Result<String> {
         let resp = self
             .send_request(
                 "session/new",
@@ -328,7 +347,9 @@ impl AcpConnection {
             )
             .await?;
 
-        let session_id = resp.result.as_ref()
+        let session_id = resp
+            .result
+            .as_ref()
             .and_then(|r| r.get("sessionId"))
             .and_then(|s| s.as_str())
             .ok_or_else(|| anyhow!("no sessionId in session/new response"))?
@@ -483,10 +504,7 @@ impl AcpConnection {
         let id = self.next_id();
 
         // Convert content blocks to JSON
-        let prompt_json: Vec<Value> = content_blocks
-            .iter()
-            .map(|b| b.to_json())
-            .collect();
+        let prompt_json: Vec<Value> = content_blocks.iter().map(|b| b.to_json()).collect();
 
         let req = JsonRpcRequest::new(
             id,
@@ -517,7 +535,12 @@ impl AcpConnection {
 
     /// Resume a previous session by ID. Returns Ok(()) if the agent accepted
     /// the load, or an error if it failed (caller should fall back to session/new).
-    pub async fn session_load(&mut self, session_id: &str, cwd: &str, mcp_servers: &[serde_json::Value]) -> Result<()> {
+    pub async fn session_load(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        mcp_servers: &[serde_json::Value],
+    ) -> Result<()> {
         let resp = self
             .send_request(
                 "session/load",
@@ -541,10 +564,14 @@ impl AcpConnection {
             Some(pid) if pid > 0 => pid,
             _ => return,
         };
-        unsafe { libc::kill(-pgid, libc::SIGTERM); }
+        unsafe {
+            libc::kill(-pgid, libc::SIGTERM);
+        }
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(1500));
-            unsafe { libc::kill(-pgid, libc::SIGKILL); }
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
         });
     }
 

@@ -90,8 +90,12 @@ pub struct UsageRunnerConfig {
     pub working_dir: Option<String>,
 }
 
-fn default_usage_timeout() -> u64 { 30 }
-fn default_usage_color() -> u32 { 0x5865F2 }
+fn default_usage_timeout() -> u64 {
+    30
+}
+fn default_usage_color() -> u32 {
+    0x5865F2
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SttConfig {
@@ -116,8 +120,12 @@ impl Default for SttConfig {
     }
 }
 
-fn default_stt_model() -> String { "whisper-large-v3-turbo".into() }
-fn default_stt_base_url() -> String { "https://api.groq.com/openai/v1".into() }
+fn default_stt_model() -> String {
+    "whisper-large-v3-turbo".into()
+}
+fn default_stt_base_url() -> String {
+    "https://api.groq.com/openai/v1".into()
+}
 
 #[derive(Debug, Deserialize)]
 pub struct DiscordConfig {
@@ -201,28 +209,63 @@ pub struct ReactionTiming {
 
 // --- defaults ---
 
-fn default_working_dir() -> String { "/tmp".into() }
-fn default_max_sessions() -> usize { 10 }
-fn default_ttl_hours() -> u64 { 4 }
-fn default_true() -> bool { true }
+fn default_working_dir() -> String {
+    "/tmp".into()
+}
+fn default_max_sessions() -> usize {
+    10
+}
+fn default_ttl_hours() -> u64 {
+    4
+}
+fn default_true() -> bool {
+    true
+}
 
-fn emoji_queued() -> String { "👀".into() }
-fn emoji_thinking() -> String { "🤔".into() }
-fn emoji_tool() -> String { "🔥".into() }
-fn emoji_coding() -> String { "👨‍💻".into() }
-fn emoji_web() -> String { "⚡".into() }
-fn emoji_done() -> String { "🆗".into() }
-fn emoji_error() -> String { "😱".into() }
+fn emoji_queued() -> String {
+    "👀".into()
+}
+fn emoji_thinking() -> String {
+    "🤔".into()
+}
+fn emoji_tool() -> String {
+    "🔥".into()
+}
+fn emoji_coding() -> String {
+    "👨‍💻".into()
+}
+fn emoji_web() -> String {
+    "⚡".into()
+}
+fn emoji_done() -> String {
+    "🆗".into()
+}
+fn emoji_error() -> String {
+    "😱".into()
+}
 
-fn default_debounce_ms() -> u64 { 700 }
-fn default_stall_soft_ms() -> u64 { 10_000 }
-fn default_stall_hard_ms() -> u64 { 30_000 }
-fn default_done_hold_ms() -> u64 { 1_500 }
-fn default_error_hold_ms() -> u64 { 2_500 }
+fn default_debounce_ms() -> u64 {
+    700
+}
+fn default_stall_soft_ms() -> u64 {
+    10_000
+}
+fn default_stall_hard_ms() -> u64 {
+    30_000
+}
+fn default_done_hold_ms() -> u64 {
+    1_500
+}
+fn default_error_hold_ms() -> u64 {
+    2_500
+}
 
 impl Default for PoolConfig {
     fn default() -> Self {
-        Self { max_sessions: default_max_sessions(), session_ttl_hours: default_ttl_hours() }
+        Self {
+            max_sessions: default_max_sessions(),
+            session_ttl_hours: default_ttl_hours(),
+        }
     }
 }
 
@@ -241,8 +284,13 @@ impl Default for ReactionsConfig {
 impl Default for ReactionEmojis {
     fn default() -> Self {
         Self {
-            queued: emoji_queued(), thinking: emoji_thinking(), tool: emoji_tool(),
-            coding: emoji_coding(), web: emoji_web(), done: emoji_done(), error: emoji_error(),
+            queued: emoji_queued(),
+            thinking: emoji_thinking(),
+            tool: emoji_tool(),
+            coding: emoji_coding(),
+            web: emoji_web(),
+            done: emoji_done(),
+            error: emoji_error(),
         }
     }
 }
@@ -250,8 +298,10 @@ impl Default for ReactionEmojis {
 impl Default for ReactionTiming {
     fn default() -> Self {
         Self {
-            debounce_ms: default_debounce_ms(), stall_soft_ms: default_stall_soft_ms(),
-            stall_hard_ms: default_stall_hard_ms(), done_hold_ms: default_done_hold_ms(),
+            debounce_ms: default_debounce_ms(),
+            stall_soft_ms: default_stall_soft_ms(),
+            stall_hard_ms: default_stall_hard_ms(),
+            done_hold_ms: default_done_hold_ms(),
             error_hold_ms: default_error_hold_ms(),
         }
     }

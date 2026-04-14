@@ -7,7 +7,13 @@ use tokio::sync::Mutex;
 use tokio::time::Duration;
 
 const CODING_TOKENS: &[&str] = &["exec", "process", "read", "write", "edit", "bash", "shell"];
-const WEB_TOKENS: &[&str] = &["web_search", "web_fetch", "web-search", "web-fetch", "browser"];
+const WEB_TOKENS: &[&str] = &[
+    "web_search",
+    "web_fetch",
+    "web-search",
+    "web-fetch",
+    "browser",
+];
 
 fn classify_tool<'a>(name: &str, emojis: &'a ReactionEmojis) -> &'a str {
     let n = name.to_lowercase();
@@ -65,19 +71,25 @@ impl StatusReactionController {
     }
 
     pub async fn set_queued(&self) {
-        if !self.enabled { return; }
+        if !self.enabled {
+            return;
+        }
         let emoji = { self.inner.lock().await.emojis.queued.clone() };
         self.apply_immediate(&emoji).await;
     }
 
     pub async fn set_thinking(&self) {
-        if !self.enabled { return; }
+        if !self.enabled {
+            return;
+        }
         let emoji = { self.inner.lock().await.emojis.thinking.clone() };
         self.schedule_debounced(&emoji).await;
     }
 
     pub async fn set_tool(&self, tool_name: &str) {
-        if !self.enabled { return; }
+        if !self.enabled {
+            return;
+        }
         let emoji = {
             let inner = self.inner.lock().await;
             classify_tool(tool_name, &inner.emojis).to_string()
@@ -86,7 +98,9 @@ impl StatusReactionController {
     }
 
     pub async fn set_done(&self) {
-        if !self.enabled { return; }
+        if !self.enabled {
+            return;
+        }
         let emoji = { self.inner.lock().await.emojis.done.clone() };
         self.finish(&emoji).await;
         // Add a random mood face
@@ -97,13 +111,17 @@ impl StatusReactionController {
     }
 
     pub async fn set_error(&self) {
-        if !self.enabled { return; }
+        if !self.enabled {
+            return;
+        }
         let emoji = { self.inner.lock().await.emojis.error.clone() };
         self.finish(&emoji).await;
     }
 
     pub async fn clear(&self) {
-        if !self.enabled { return; }
+        if !self.enabled {
+            return;
+        }
         let mut inner = self.inner.lock().await;
         cancel_timers(&mut inner);
         let current = inner.current.clone();
@@ -148,7 +166,9 @@ impl StatusReactionController {
         inner.debounce_handle = Some(tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(debounce_ms)).await;
             let mut inner = ctrl.lock().await;
-            if inner.finished { return; }
+            if inner.finished {
+                return;
+            }
             let old = inner.current.clone();
             inner.current = emoji.clone();
             let http = inner.http.clone();
@@ -166,7 +186,9 @@ impl StatusReactionController {
 
     async fn finish(&self, emoji: &str) {
         let mut inner = self.inner.lock().await;
-        if inner.finished { return; }
+        if inner.finished {
+            return;
+        }
         inner.finished = true;
         cancel_timers(&mut inner);
 
@@ -190,8 +212,12 @@ impl StatusReactionController {
     }
 
     fn reset_stall_timers_inner(&self, inner: &mut Inner) {
-        if let Some(h) = inner.stall_soft_handle.take() { h.abort(); }
-        if let Some(h) = inner.stall_hard_handle.take() { h.abort(); }
+        if let Some(h) = inner.stall_soft_handle.take() {
+            h.abort();
+        }
+        if let Some(h) = inner.stall_hard_handle.take() {
+            h.abort();
+        }
 
         let soft_ms = inner.timing.stall_soft_ms;
         let hard_ms = inner.timing.stall_hard_ms;
@@ -202,7 +228,9 @@ impl StatusReactionController {
             async move {
                 tokio::time::sleep(Duration::from_millis(soft_ms)).await;
                 let mut inner = ctrl.lock().await;
-                if inner.finished { return; }
+                if inner.finished {
+                    return;
+                }
                 let old = inner.current.clone();
                 inner.current = "⏰".to_string();
                 let http = inner.http.clone();
@@ -219,7 +247,9 @@ impl StatusReactionController {
         inner.stall_hard_handle = Some(tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(hard_ms)).await;
             let mut inner = ctrl.lock().await;
-            if inner.finished { return; }
+            if inner.finished {
+                return;
+            }
             let old = inner.current.clone();
             inner.current = "🕐".to_string();
             let http = inner.http.clone();
@@ -235,21 +265,39 @@ impl StatusReactionController {
 }
 
 fn cancel_debounce(inner: &mut Inner) {
-    if let Some(h) = inner.debounce_handle.take() { h.abort(); }
+    if let Some(h) = inner.debounce_handle.take() {
+        h.abort();
+    }
 }
 
 fn cancel_timers(inner: &mut Inner) {
-    if let Some(h) = inner.debounce_handle.take() { h.abort(); }
-    if let Some(h) = inner.stall_soft_handle.take() { h.abort(); }
-    if let Some(h) = inner.stall_hard_handle.take() { h.abort(); }
+    if let Some(h) = inner.debounce_handle.take() {
+        h.abort();
+    }
+    if let Some(h) = inner.stall_soft_handle.take() {
+        h.abort();
+    }
+    if let Some(h) = inner.stall_hard_handle.take() {
+        h.abort();
+    }
 }
 
-async fn add_reaction(http: &Http, ch: ChannelId, msg: MessageId, emoji: &str) -> serenity::Result<()> {
+async fn add_reaction(
+    http: &Http,
+    ch: ChannelId,
+    msg: MessageId,
+    emoji: &str,
+) -> serenity::Result<()> {
     let reaction = ReactionType::Unicode(emoji.to_string());
     http.create_reaction(ch, msg, &reaction).await
 }
 
-async fn remove_reaction(http: &Http, ch: ChannelId, msg: MessageId, emoji: &str) -> serenity::Result<()> {
+async fn remove_reaction(
+    http: &Http,
+    ch: ChannelId,
+    msg: MessageId,
+    emoji: &str,
+) -> serenity::Result<()> {
     let reaction = ReactionType::Unicode(emoji.to_string());
     http.delete_reaction_me(ch, msg, &reaction).await
 }

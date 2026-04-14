@@ -45,7 +45,11 @@ async fn main() -> anyhow::Result<()> {
 
     let allowed_channels = parse_id_set(&cfg.discord.allowed_channels, "allowed_channels")?;
     let allowed_users = parse_id_set(&cfg.discord.allowed_users, "allowed_users")?;
-    info!(channels = allowed_channels.len(), users = allowed_users.len(), "parsed allowlists");
+    info!(
+        channels = allowed_channels.len(),
+        users = allowed_users.len(),
+        "parsed allowlists"
+    );
 
     let copilot_list_cache = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
 
@@ -80,9 +84,8 @@ async fn main() -> anyhow::Result<()> {
         mcp_profiles_dir: cfg.mcp_profiles_dir.clone(),
     };
 
-    let intents = GatewayIntents::GUILD_MESSAGES
-        | GatewayIntents::MESSAGE_CONTENT
-        | GatewayIntents::GUILDS;
+    let intents =
+        GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT | GatewayIntents::GUILDS;
 
     let mut client = Client::builder(&cfg.discord.bot_token, intents)
         .event_handler(handler)
@@ -209,9 +212,9 @@ async fn refresh_copilot_list_cache(
     let script = r"C:\Users\Administrator\openab\scripts\copilot-rpc.js";
     let lists: &[(&str, &str, &str)] = &[
         // (rpc_subcommand, json_array_key, item_name_field)
-        ("agents",     "agents",     "name"),
-        ("skills",     "skills",     "name"),
-        ("mcp-list",   "servers",    "name"),
+        ("agents", "agents", "name"),
+        ("skills", "skills", "name"),
+        ("mcp-list", "servers", "name"),
         ("extensions", "extensions", "name"),
     ];
 
@@ -235,7 +238,9 @@ async fn refresh_copilot_list_cache(
         let Ok(v) = serde_json::from_str::<serde_json::Value>(json_line.trim()) else {
             continue;
         };
-        let Some(arr) = v.pointer(&format!("/data/{array_key}")).and_then(|a| a.as_array())
+        let Some(arr) = v
+            .pointer(&format!("/data/{array_key}"))
+            .and_then(|a| a.as_array())
         else {
             continue;
         };
@@ -260,7 +265,9 @@ fn parse_id_set(raw: &[String], label: &str) -> anyhow::Result<HashSet<u64>> {
         })
         .collect();
     if !raw.is_empty() && set.is_empty() {
-        anyhow::bail!("all {label} entries failed to parse — refusing to start with an empty allowlist");
+        anyhow::bail!(
+            "all {label} entries failed to parse — refusing to start with an empty allowlist"
+        );
     }
     Ok(set)
 }

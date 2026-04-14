@@ -52,12 +52,7 @@ async fn run_one(runner: &UsageRunnerConfig, timeout_secs: u64) -> RunnerResult 
         cmd.output().await
     };
 
-    let out = match tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        exec,
-    )
-    .await
-    {
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), exec).await {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => return err(runner, format!("spawn failed: {e}")),
         Err(_) => return err(runner, format!("timeout after {timeout_secs}s")),
@@ -65,8 +60,15 @@ async fn run_one(runner: &UsageRunnerConfig, timeout_secs: u64) -> RunnerResult 
 
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let exit = out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into());
-        let reason = format!("exit {exit}: {}", stderr.trim().chars().take(200).collect::<String>());
+        let exit = out
+            .status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".into());
+        let reason = format!(
+            "exit {exit}: {}",
+            stderr.trim().chars().take(200).collect::<String>()
+        );
         return err(runner, reason);
     }
 
@@ -81,7 +83,10 @@ async fn run_one(runner: &UsageRunnerConfig, timeout_secs: u64) -> RunnerResult 
         Err(e) => {
             return err(
                 runner,
-                format!("invalid JSON: {e} (got: {})", first_line.chars().take(120).collect::<String>()),
+                format!(
+                    "invalid JSON: {e} (got: {})",
+                    first_line.chars().take(120).collect::<String>()
+                ),
             );
         }
     };

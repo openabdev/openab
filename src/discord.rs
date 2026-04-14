@@ -6,8 +6,6 @@ use crate::reactions::StatusReactionController;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use image::ImageReader;
-use std::io::Cursor;
-use std::sync::LazyLock;
 use serenity::async_trait;
 use serenity::builder::{
     AutocompleteChoice, CreateAutocompleteResponse, CreateCommand, CreateCommandOption,
@@ -22,7 +20,9 @@ use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId};
 use serenity::prelude::*;
 use std::collections::HashSet;
+use std::io::Cursor;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
@@ -40,22 +40,22 @@ const MODEL_ALIASES: &[(&str, &str)] = &[];
 
 /// Read-only top-level slash commands (no args, just display).
 const COPILOT_READONLY_COMMANDS: &[(&str, &str)] = &[
-    ("status",      "Show Copilot CLI version, auth, and model count"),
-    ("plugins",     "List installed Copilot plugins"),
-    ("plan",        "Read the current session plan.md"),
-    ("files",       "List files in the session workspace"),
-    ("auth",        "Show Copilot GitHub auth status"),
+    ("status", "Show Copilot CLI version, auth, and model count"),
+    ("plugins", "List installed Copilot plugins"),
+    ("plan", "Read the current session plan.md"),
+    ("files", "List files in the session workspace"),
+    ("auth", "Show Copilot GitHub auth status"),
 ];
 
 /// Map read-only command name → copilot-rpc.js subcommand.
 fn copilot_readonly_to_rpc(name: &str) -> Option<&'static str> {
     match name {
-        "status"      => Some("status"),
-        "plugins"     => Some("plugins"),
-        "plan"        => Some("plan-read"),
-        "files"       => Some("files"),
-        "auth"        => Some("auth"),
-        _             => None,
+        "status" => Some("status"),
+        "plugins" => Some("plugins"),
+        "plan" => Some("plan-read"),
+        "files" => Some("files"),
+        "auth" => Some("auth"),
+        _ => None,
     }
 }
 
@@ -63,17 +63,68 @@ fn copilot_readonly_to_rpc(name: &str) -> Option<&'static str> {
 /// Tuple: (discord_cmd, description, list_rpc_for_autocomplete, action_rpc,
 ///         autocomplete_data_key, autocomplete_name_key)
 const COPILOT_INTERACTIVE_COMMANDS: &[(&str, &str, &str, &str, &str, &str)] = &[
-    ("agent",       "Select an agent by name",         "agents",     "agent-select",    "agents",  "name"),
-    ("skill-on",    "Enable a skill by name",          "skills",     "skill-enable",    "skills",  "name"),
-    ("skill-off",   "Disable a skill by name",         "skills",     "skill-disable",   "skills",  "name"),
-    ("mcp-on",      "Enable an MCP server by name",    "mcp-list",   "mcp-enable",      "servers", "name"),
-    ("mcp-off",     "Disable an MCP server by name",   "mcp-list",   "mcp-disable",     "servers", "name"),
-    ("ext-on",      "Enable an extension by name",     "extensions", "extension-enable","extensions","name"),
-    ("ext-off",     "Disable an extension by name",    "extensions", "extension-disable","extensions","name"),
+    (
+        "agent",
+        "Select an agent by name",
+        "agents",
+        "agent-select",
+        "agents",
+        "name",
+    ),
+    (
+        "skill-on",
+        "Enable a skill by name",
+        "skills",
+        "skill-enable",
+        "skills",
+        "name",
+    ),
+    (
+        "skill-off",
+        "Disable a skill by name",
+        "skills",
+        "skill-disable",
+        "skills",
+        "name",
+    ),
+    (
+        "mcp-on",
+        "Enable an MCP server by name",
+        "mcp-list",
+        "mcp-enable",
+        "servers",
+        "name",
+    ),
+    (
+        "mcp-off",
+        "Disable an MCP server by name",
+        "mcp-list",
+        "mcp-disable",
+        "servers",
+        "name",
+    ),
+    (
+        "ext-on",
+        "Enable an extension by name",
+        "extensions",
+        "extension-enable",
+        "extensions",
+        "name",
+    ),
+    (
+        "ext-off",
+        "Disable an extension by name",
+        "extensions",
+        "extension-disable",
+        "extensions",
+        "name",
+    ),
 ];
 
 /// Map interactive command name → (list_rpc, action_rpc, data_key, name_key).
-fn copilot_interactive_spec(name: &str) -> Option<(&'static str, &'static str, &'static str, &'static str)> {
+fn copilot_interactive_spec(
+    name: &str,
+) -> Option<(&'static str, &'static str, &'static str, &'static str)> {
     for (cmd, _, list_rpc, action_rpc, data_key, name_key) in COPILOT_INTERACTIVE_COMMANDS {
         if *cmd == name {
             return Some((list_rpc, action_rpc, data_key, name_key));
@@ -84,17 +135,26 @@ fn copilot_interactive_spec(name: &str) -> Option<(&'static str, &'static str, &
 
 /// Static mode choices (Copilot has 6 fixed modes).
 const COPILOT_MODES: &[(&str, &str)] = &[
-    ("https://agentclientprotocol.com/protocol/session-modes#agent",     "Agent (default)"),
-    ("https://agentclientprotocol.com/protocol/session-modes#plan",      "Plan Mode"),
-    ("https://agentclientprotocol.com/protocol/session-modes#autopilot", "Autopilot"),
+    (
+        "https://agentclientprotocol.com/protocol/session-modes#agent",
+        "Agent (default)",
+    ),
+    (
+        "https://agentclientprotocol.com/protocol/session-modes#plan",
+        "Plan Mode",
+    ),
+    (
+        "https://agentclientprotocol.com/protocol/session-modes#autopilot",
+        "Autopilot",
+    ),
 ];
 
 /// Static choices for /reload <kind>.
 /// Each tuple: (discord_value, copilot_rpc_subcommand, label)
 const COPILOT_RELOAD_KINDS: &[(&str, &str, &str)] = &[
-    ("agents",     "agent-reload",     "Agents"),
-    ("skills",     "skill-reload",     "Skills"),
-    ("mcp",        "mcp-reload",       "MCP servers"),
+    ("agents", "agent-reload", "Agents"),
+    ("skills", "skill-reload", "Skills"),
+    ("mcp", "mcp-reload", "MCP servers"),
     ("extensions", "extension-reload", "Extensions"),
 ];
 
@@ -153,7 +213,8 @@ pub struct Handler {
     pub usage_config: Option<crate::config::UsageConfig>,
     pub cusage_config: Option<crate::config::UsageConfig>,
     pub backend: BackendType,
-    pub copilot_list_cache: Arc<tokio::sync::RwLock<std::collections::HashMap<String, Vec<String>>>>,
+    pub copilot_list_cache:
+        Arc<tokio::sync::RwLock<std::collections::HashMap<String, Vec<String>>>>,
     pub stt_config: SttConfig,
     pub soul_file: Option<String>,
     pub mcp_profiles_dir: Option<String>,
@@ -162,10 +223,18 @@ pub struct Handler {
 impl Handler {
     /// Build the mcpServers JSON array for a Discord user from their profile.
     fn mcp_servers_for_user(&self, user_id: u64) -> Vec<serde_json::Value> {
-        let Some(ref dir) = self.mcp_profiles_dir else { return vec![] };
+        let Some(ref dir) = self.mcp_profiles_dir else {
+            return vec![];
+        };
         let entries = read_mcp_profile(dir, &user_id.to_string());
-        if entries.is_empty() { return vec![] }
-        tracing::info!(user_id, count = entries.len(), "injecting MCP servers from profile");
+        if entries.is_empty() {
+            return vec![];
+        }
+        tracing::info!(
+            user_id,
+            count = entries.len(),
+            "injecting MCP servers from profile"
+        );
         entries
             .into_iter()
             .map(|e| {
@@ -194,7 +263,10 @@ impl EventHandler for Handler {
 
         let is_mentioned = msg.mentions_user_id(bot_id)
             || msg.content.contains(&format!("<@{}>", bot_id))
-            || msg.mention_roles.iter().any(|r| msg.content.contains(&format!("<@&{}>", r)));
+            || msg
+                .mention_roles
+                .iter()
+                .any(|r| msg.content.contains(&format!("<@&{}>", r)));
 
         let in_thread = if !in_allowed_channel {
             match msg.channel_id.to_channel(&ctx.http).await {
@@ -238,7 +310,10 @@ impl EventHandler for Handler {
 
         if !self.allowed_users.is_empty() && !self.allowed_users.contains(&msg.author.id.get()) {
             tracing::info!(user_id = %msg.author.id, "denied user, ignoring");
-            if let Err(e) = msg.react(&ctx.http, ReactionType::Unicode("🚫".into())).await {
+            if let Err(e) = msg
+                .react(&ctx.http, ReactionType::Unicode("🚫".into()))
+                .await
+            {
                 tracing::warn!(error = %e, "failed to react with 🚫");
             }
             return;
@@ -259,7 +334,9 @@ impl EventHandler for Handler {
         let mut content_blocks = vec![];
 
         // Inject structured sender context so the downstream CLI can identify who sent the message
-        let display_name = msg.member.as_ref()
+        let display_name = msg
+            .member
+            .as_ref()
             .and_then(|m| m.nick.as_ref())
             .unwrap_or(&msg.author.name);
         let sender_ctx = serde_json::json!({
@@ -287,11 +364,16 @@ impl EventHandler for Handler {
             for attachment in &msg.attachments {
                 if is_audio_attachment(attachment) {
                     if self.stt_config.enabled {
-                        if let Some(transcript) = download_and_transcribe(attachment, &self.stt_config).await {
+                        if let Some(transcript) =
+                            download_and_transcribe(attachment, &self.stt_config).await
+                        {
                             debug!(filename = %attachment.filename, chars = transcript.len(), "voice transcript injected");
-                            content_blocks.insert(0, ContentBlock::Text {
-                                text: format!("[Voice message transcript]: {transcript}"),
-                            });
+                            content_blocks.insert(
+                                0,
+                                ContentBlock::Text {
+                                    text: format!("[Voice message transcript]: {transcript}"),
+                                },
+                            );
                         }
                     } else {
                         debug!(filename = %attachment.filename, "skipping audio attachment (STT disabled)");
@@ -340,7 +422,13 @@ impl EventHandler for Handler {
         let mcp_servers = self.mcp_servers_for_user(msg.author.id.get());
         if let Err(e) = self.pool.get_or_create(&thread_key, &mcp_servers).await {
             let msg = format_user_error(&e.to_string());
-            let _ = edit(&ctx, thread_channel, thinking_msg.id, &format!("⚠️ {}", msg)).await;
+            let _ = edit(
+                &ctx,
+                thread_channel,
+                thinking_msg.id,
+                &format!("⚠️ {}", msg),
+            )
+            .await;
             error!("pool error: {e}");
             return;
         }
@@ -406,9 +494,17 @@ impl EventHandler for Handler {
         // CopilotNative: pure chat bot — no slash commands at all.
         if self.backend == BackendType::CopilotNative {
             for guild in &ready.guilds {
-                match guild.id.set_commands(&ctx.http, Vec::<CreateCommand>::new()).await {
-                    Ok(_) => info!(guild_id = %guild.id, "cleared all slash commands (CopilotNative)"),
-                    Err(e) => error!(guild_id = %guild.id, error = %e, "failed to clear slash commands"),
+                match guild
+                    .id
+                    .set_commands(&ctx.http, Vec::<CreateCommand>::new())
+                    .await
+                {
+                    Ok(_) => {
+                        info!(guild_id = %guild.id, "cleared all slash commands (CopilotNative)")
+                    }
+                    Err(e) => {
+                        error!(guild_id = %guild.id, error = %e, "failed to clear slash commands")
+                    }
                 }
             }
             return;
@@ -438,28 +534,23 @@ impl EventHandler for Handler {
             // Interactive commands with <name> arg + autocomplete
             for (name, desc, _list, _action, _dk, _nk) in COPILOT_INTERACTIVE_COMMANDS {
                 commands.push(
-                    CreateCommand::new(*name)
-                        .description(*desc)
-                        .add_option(
-                            CreateCommandOption::new(
-                                CommandOptionType::String,
-                                "name",
-                                "Name (autocomplete)",
-                            )
-                            .required(true)
-                            .set_autocomplete(true),
-                        ),
+                    CreateCommand::new(*name).description(*desc).add_option(
+                        CreateCommandOption::new(
+                            CommandOptionType::String,
+                            "name",
+                            "Name (autocomplete)",
+                        )
+                        .required(true)
+                        .set_autocomplete(true),
+                    ),
                 );
             }
 
             // /mode with static choices (Discord renders as dropdown)
             let mode_cmd = {
-                let mut opt = CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "mode",
-                    "Session mode",
-                )
-                .required(true);
+                let mut opt =
+                    CreateCommandOption::new(CommandOptionType::String, "mode", "Session mode")
+                        .required(true);
                 for (value, label) in COPILOT_MODES {
                     opt = opt.add_string_choice(*label, *value);
                 }
@@ -472,28 +563,26 @@ impl EventHandler for Handler {
 
         // /reload <kind> — reload agents/skills/mcp/extensions (Copilot-only)
         if self.backend.has_copilot_rpc() {
-        let reload_cmd = {
-            let mut opt = CreateCommandOption::new(
-                CommandOptionType::String,
-                "kind",
-                "What to reload",
-            )
-            .required(true);
-            for (value, _rpc, label) in COPILOT_RELOAD_KINDS {
-                opt = opt.add_string_choice(*label, *value);
-            }
-            CreateCommand::new("reload")
-                .description("Reload Copilot agents/skills/mcp/extensions without restarting the bot")
-                .add_option(opt)
-        };
-        commands.push(reload_cmd);
+            let reload_cmd = {
+                let mut opt =
+                    CreateCommandOption::new(CommandOptionType::String, "kind", "What to reload")
+                        .required(true);
+                for (value, _rpc, label) in COPILOT_RELOAD_KINDS {
+                    opt = opt.add_string_choice(*label, *value);
+                }
+                CreateCommand::new("reload")
+                    .description(
+                        "Reload Copilot agents/skills/mcp/extensions without restarting the bot",
+                    )
+                    .add_option(opt)
+            };
+            commands.push(reload_cmd);
         } // end Copilot-only reload
 
         // /compact — reset the current Discord thread's agent session
-        commands.push(
-            CreateCommand::new("compact")
-                .description("Compact the current thread's agent session (frees tokens by starting fresh)"),
-        );
+        commands.push(CreateCommand::new("compact").description(
+            "Compact the current thread's agent session (frees tokens by starting fresh)",
+        ));
 
         // /new-session — explicit reset (alias semantic for compact with different wording)
         commands.push(
@@ -514,7 +603,11 @@ impl EventHandler for Handler {
         }
 
         // Only register /usage if the user has configured it.
-        if self.usage_config.as_ref().is_some_and(|u| u.enabled && !u.runners.is_empty()) {
+        if self
+            .usage_config
+            .as_ref()
+            .is_some_and(|u| u.enabled && !u.runners.is_empty())
+        {
             commands.push(
                 CreateCommand::new("usage")
                     .description("Show usage quotas for configured backends"),
@@ -522,7 +615,11 @@ impl EventHandler for Handler {
         }
 
         // /cusage — custom usage report (daily/weekly/monthly breakdown)
-        if self.cusage_config.as_ref().is_some_and(|u| u.enabled && !u.runners.is_empty()) {
+        if self
+            .cusage_config
+            .as_ref()
+            .is_some_and(|u| u.enabled && !u.runners.is_empty())
+        {
             commands.push(
                 CreateCommand::new("cusage")
                     .description("Show detailed usage breakdown (daily/weekly/monthly)"),
@@ -579,13 +676,19 @@ impl EventHandler for Handler {
                     .description("Add an MCP server to your personal profile")
                     .add_option(
                         CreateCommandOption::new(
-                            CommandOptionType::String, "name", "Server name (e.g. notion, github)")
-                            .required(true),
+                            CommandOptionType::String,
+                            "name",
+                            "Server name (e.g. notion, github)",
+                        )
+                        .required(true),
                     )
                     .add_option(
                         CreateCommandOption::new(
-                            CommandOptionType::String, "url", "Server URL (for HTTP/SSE servers)")
-                            .required(true),
+                            CommandOptionType::String,
+                            "url",
+                            "Server URL (for HTTP/SSE servers)",
+                        )
+                        .required(true),
                     ),
             );
             commands.push(
@@ -593,8 +696,11 @@ impl EventHandler for Handler {
                     .description("Remove an MCP server from your personal profile")
                     .add_option(
                         CreateCommandOption::new(
-                            CommandOptionType::String, "name", "Server name to remove")
-                            .required(true),
+                            CommandOptionType::String,
+                            "name",
+                            "Server name to remove",
+                        )
+                        .required(true),
                     ),
             );
             commands.push(
@@ -613,8 +719,11 @@ impl EventHandler for Handler {
                     .description("Install an MCP server from the registry to your profile")
                     .add_option(
                         CreateCommandOption::new(
-                            CommandOptionType::String, "name", "Server name from registry")
-                            .required(true),
+                            CommandOptionType::String,
+                            "name",
+                            "Server name from registry",
+                        )
+                        .required(true),
                     ),
             );
 
@@ -639,8 +748,8 @@ impl EventHandler for Handler {
 
         // /soul — show the bot's persona / system prompt, or switch emoji preset
         if self.soul_file.is_some() {
-            let mut soul_cmd = CreateCommand::new("soul")
-                .description("Show this bot's persona and style");
+            let mut soul_cmd =
+                CreateCommand::new("soul").description("Show this bot's persona and style");
             if !self.emoji_presets.is_empty() {
                 let mut action_opt = CreateCommandOption::new(
                     CommandOptionType::String,
@@ -656,14 +765,19 @@ impl EventHandler for Handler {
 
         // /stats — detailed session statistics
         commands.push(
-            CreateCommand::new("stats")
-                .description("Show detailed session statistics (uptime, messages, native commands)"),
+            CreateCommand::new("stats").description(
+                "Show detailed session statistics (uptime, messages, native commands)",
+            ),
         );
 
         for guild in &ready.guilds {
             match guild.id.set_commands(&ctx.http, commands.clone()).await {
-                Ok(cmds) => info!(guild_id = %guild.id, count = cmds.len(), "registered slash commands"),
-                Err(e) => error!(guild_id = %guild.id, error = %e, "failed to register slash commands"),
+                Ok(cmds) => {
+                    info!(guild_id = %guild.id, count = cmds.len(), "registered slash commands")
+                }
+                Err(e) => {
+                    error!(guild_id = %guild.id, error = %e, "failed to register slash commands")
+                }
             }
         }
     }
@@ -688,7 +802,9 @@ impl EventHandler for Handler {
             Interaction::Command(cmd) if cmd.data.name == "reload" => {
                 self.handle_copilot_reload(&ctx, &cmd).await;
             }
-            Interaction::Command(cmd) if cmd.data.name == "compact" || cmd.data.name == "new-session" => {
+            Interaction::Command(cmd)
+                if cmd.data.name == "compact" || cmd.data.name == "new-session" =>
+            {
                 self.handle_reset_session(&ctx, &cmd).await;
             }
             Interaction::Command(cmd) if cmd.data.name == "tokens" => {
@@ -718,10 +834,18 @@ impl EventHandler for Handler {
             Interaction::Command(cmd) if cmd.data.name == "soul" => {
                 self.handle_soul_command(&ctx, &cmd).await;
             }
-            Interaction::Command(cmd) if cmd.data.name == "mcp-add" || cmd.data.name == "mcp-remove" || cmd.data.name == "mcp-list" => {
+            Interaction::Command(cmd)
+                if cmd.data.name == "mcp-add"
+                    || cmd.data.name == "mcp-remove"
+                    || cmd.data.name == "mcp-list" =>
+            {
                 self.handle_mcp_profile_command(&ctx, &cmd).await;
             }
-            Interaction::Command(cmd) if cmd.data.name == "mcp-browse" || cmd.data.name == "mcp-install" || cmd.data.name == "mcp-status" => {
+            Interaction::Command(cmd)
+                if cmd.data.name == "mcp-browse"
+                    || cmd.data.name == "mcp-install"
+                    || cmd.data.name == "mcp-status" =>
+            {
                 self.handle_mcp_registry_command(&ctx, &cmd).await;
             }
             Interaction::Command(cmd) if copilot_interactive_spec(&cmd.data.name).is_some() => {
@@ -734,7 +858,8 @@ impl EventHandler for Handler {
                 self.handle_native_autocomplete(&ctx, &ac).await;
             }
             Interaction::Autocomplete(ac) if copilot_interactive_spec(&ac.data.name).is_some() => {
-                self.handle_copilot_interactive_autocomplete(&ctx, &ac).await;
+                self.handle_copilot_interactive_autocomplete(&ctx, &ac)
+                    .await;
             }
             Interaction::Component(comp) if comp.data.custom_id == "soul_emoji_select" => {
                 self.handle_soul_emoji_select(&ctx, &comp).await;
@@ -794,7 +919,11 @@ impl Handler {
             if !partial.is_empty() && !m.model_id.to_lowercase().contains(&partial) {
                 continue;
             }
-            let marker = if m.model_id == current { " (current)" } else { "" };
+            let marker = if m.model_id == current {
+                " (current)"
+            } else {
+                ""
+            };
             let label = format!("{}{marker}", m.model_id);
             choices.push(AutocompleteChoice::new(label, m.model_id.clone()));
         }
@@ -833,7 +962,11 @@ impl Handler {
             let label = if c.description.is_empty() {
                 c.name.clone()
             } else {
-                format!("{} — {}", c.name, c.description.chars().take(60).collect::<String>())
+                format!(
+                    "{} — {}",
+                    c.name,
+                    c.description.chars().take(60).collect::<String>()
+                )
             };
             choices.push(AutocompleteChoice::new(label, c.name.clone()));
         }
@@ -848,20 +981,18 @@ impl Handler {
     /// Handle /native <command> [args] — send as prompt to the agent which parses it.
     async fn handle_native_command(&self, ctx: &Context, cmd: &CommandInteraction) {
         // Allowlist: user
-        if !self.allowed_users.is_empty() {
-            if !self.allowed_users.contains(&cmd.user.id.get()) {
-                let _ = cmd
-                    .create_response(
-                        &ctx.http,
-                        CreateInteractionResponse::Message(
-                            CreateInteractionResponseMessage::new()
-                                .content("⛔ Not authorized")
-                                .ephemeral(true),
-                        ),
-                    )
-                    .await;
-                return;
-            }
+        if !self.allowed_users.is_empty() && !self.allowed_users.contains(&cmd.user.id.get()) {
+            let _ = cmd
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⛔ Not authorized")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
         }
 
         let command_name = cmd
@@ -913,8 +1044,7 @@ impl Handler {
             .create_response(
                 &ctx.http,
                 CreateInteractionResponse::Message(
-                    CreateInteractionResponseMessage::new()
-                        .content(format!("⚡ `{prompt_text}`")),
+                    CreateInteractionResponseMessage::new().content(format!("⚡ `{prompt_text}`")),
                 ),
             )
             .await;
@@ -951,7 +1081,9 @@ impl Handler {
                                 if let Some(content) = result.get("content") {
                                     if let Some(arr) = content.as_array() {
                                         for block in arr {
-                                            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                            if let Some(text) =
+                                                block.get("text").and_then(|t| t.as_str())
+                                            {
                                                 reply.push_str(text);
                                             }
                                         }
@@ -985,7 +1117,10 @@ impl Handler {
 
         match result {
             Ok(reply) if reply.is_empty() => {
-                let _ = cmd.channel_id.say(&ctx.http, "✅ Command executed (no output)").await;
+                let _ = cmd
+                    .channel_id
+                    .say(&ctx.http, "✅ Command executed (no output)")
+                    .await;
             }
             Ok(reply) => {
                 // Discord message limit is 2000 chars
@@ -997,10 +1132,7 @@ impl Handler {
                 let _ = cmd.channel_id.say(&ctx.http, &truncated).await;
             }
             Err(e) => {
-                let _ = cmd
-                    .channel_id
-                    .say(&ctx.http, format!("⚠️ {e}"))
-                    .await;
+                let _ = cmd.channel_id.say(&ctx.http, format!("⚠️ {e}")).await;
             }
         }
     }
@@ -1027,8 +1159,7 @@ impl Handler {
             .create_response(
                 &ctx.http,
                 CreateInteractionResponse::Message(
-                    CreateInteractionResponseMessage::new()
-                        .content(format!("📋 `{prompt_text}`")),
+                    CreateInteractionResponseMessage::new().content(format!("📋 `{prompt_text}`")),
                 ),
             )
             .await;
@@ -1046,7 +1177,9 @@ impl Handler {
             .with_connection(&thread_id, |conn| {
                 let pt = prompt_text.clone();
                 Box::pin(async move {
-                    let (mut rx, _) = conn.session_prompt(vec![ContentBlock::Text { text: pt }]).await?;
+                    let (mut rx, _) = conn
+                        .session_prompt(vec![ContentBlock::Text { text: pt }])
+                        .await?;
                     let mut reply = String::new();
                     while let Some(msg) = rx.recv().await {
                         if msg.id.is_some() {
@@ -1063,8 +1196,14 @@ impl Handler {
                         }
                         if let Some(params) = &msg.params {
                             if let Some(upd) = params.get("update") {
-                                if upd.get("sessionUpdate").and_then(|v| v.as_str()) == Some("agent_message_chunk") {
-                                    if let Some(t) = upd.get("content").and_then(|c| c.get("text")).and_then(|t| t.as_str()) {
+                                if upd.get("sessionUpdate").and_then(|v| v.as_str())
+                                    == Some("agent_message_chunk")
+                                {
+                                    if let Some(t) = upd
+                                        .get("content")
+                                        .and_then(|c| c.get("text"))
+                                        .and_then(|t| t.as_str())
+                                    {
                                         reply.push_str(t);
                                     }
                                 }
@@ -1078,12 +1217,23 @@ impl Handler {
             .await;
 
         match result {
-            Ok(r) if r.is_empty() => { let _ = cmd.channel_id.say(&ctx.http, "✅ Plan mode activated (no output)").await; }
+            Ok(r) if r.is_empty() => {
+                let _ = cmd
+                    .channel_id
+                    .say(&ctx.http, "✅ Plan mode activated (no output)")
+                    .await;
+            }
             Ok(r) => {
-                let truncated = if r.len() > 1900 { format!("{}…\n*(truncated)*", &r[..1900]) } else { r };
+                let truncated = if r.len() > 1900 {
+                    format!("{}…\n*(truncated)*", &r[..1900])
+                } else {
+                    r
+                };
                 let _ = cmd.channel_id.say(&ctx.http, &truncated).await;
             }
-            Err(e) => { let _ = cmd.channel_id.say(&ctx.http, format!("⚠️ {e}")).await; }
+            Err(e) => {
+                let _ = cmd.channel_id.say(&ctx.http, format!("⚠️ {e}")).await;
+            }
         }
     }
 
@@ -1113,21 +1263,37 @@ impl Handler {
             .pool
             .with_connection(&thread_id, |conn| {
                 Box::pin(async move {
-                    let (mut rx, _) = conn.session_prompt(vec![ContentBlock::Text { text: "/mcp".to_string() }]).await?;
+                    let (mut rx, _) = conn
+                        .session_prompt(vec![ContentBlock::Text {
+                            text: "/mcp".to_string(),
+                        }])
+                        .await?;
                     let mut reply = String::new();
                     while let Some(msg) = rx.recv().await {
                         if msg.id.is_some() {
                             if let Some(r) = &msg.result {
                                 if let Some(arr) = r.get("content").and_then(|c| c.as_array()) {
-                                    for b in arr { if let Some(t) = b.get("text").and_then(|t| t.as_str()) { reply.push_str(t); } }
+                                    for b in arr {
+                                        if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                                            reply.push_str(t);
+                                        }
+                                    }
                                 }
                             }
                             break;
                         }
                         if let Some(params) = &msg.params {
                             if let Some(upd) = params.get("update") {
-                                if upd.get("sessionUpdate").and_then(|v| v.as_str()) == Some("agent_message_chunk") {
-                                    if let Some(t) = upd.get("content").and_then(|c| c.get("text")).and_then(|t| t.as_str()) { reply.push_str(t); }
+                                if upd.get("sessionUpdate").and_then(|v| v.as_str())
+                                    == Some("agent_message_chunk")
+                                {
+                                    if let Some(t) = upd
+                                        .get("content")
+                                        .and_then(|c| c.get("text"))
+                                        .and_then(|t| t.as_str())
+                                    {
+                                        reply.push_str(t);
+                                    }
                                 }
                             }
                         }
@@ -1139,12 +1305,23 @@ impl Handler {
             .await;
 
         match result {
-            Ok(r) if r.is_empty() => { let _ = cmd.channel_id.say(&ctx.http, "ℹ️ No MCP information returned.").await; }
+            Ok(r) if r.is_empty() => {
+                let _ = cmd
+                    .channel_id
+                    .say(&ctx.http, "ℹ️ No MCP information returned.")
+                    .await;
+            }
             Ok(r) => {
-                let truncated = if r.len() > 1900 { format!("{}…\n*(truncated)*", &r[..1900]) } else { r };
+                let truncated = if r.len() > 1900 {
+                    format!("{}…\n*(truncated)*", &r[..1900])
+                } else {
+                    r
+                };
                 let _ = cmd.channel_id.say(&ctx.http, &truncated).await;
             }
-            Err(e) => { let _ = cmd.channel_id.say(&ctx.http, format!("⚠️ {e}")).await; }
+            Err(e) => {
+                let _ = cmd.channel_id.say(&ctx.http, format!("⚠️ {e}")).await;
+            }
         }
     }
 
@@ -1170,7 +1347,8 @@ impl Handler {
                 let _ = cmd
                     .edit_response(
                         &ctx.http,
-                        EditInteractionResponse::new().content(format!("⚠️ Failed to fetch messages: {e}")),
+                        EditInteractionResponse::new()
+                            .content(format!("⚠️ Failed to fetch messages: {e}")),
                     )
                     .await;
                 return;
@@ -1198,7 +1376,10 @@ impl Handler {
 
         let export = lines.join("\n");
         let truncated = if export.len() > 1900 {
-            format!("```\n{}…\n```\n*(truncated to 100 messages)*", &export[..1800])
+            format!(
+                "```\n{}…\n```\n*(truncated to 100 messages)*",
+                &export[..1800]
+            )
         } else {
             format!("```\n{export}\n```")
         };
@@ -1228,7 +1409,14 @@ impl Handler {
 
         // 1. Check if a session exists for this thread
         let session_exists = self.pool.get_or_create(&thread_key, &[]).await.is_ok();
-        report.push_str(&format!("**Session:** {}\n", if session_exists { "✅ active" } else { "❌ failed to create" }));
+        report.push_str(&format!(
+            "**Session:** {}\n",
+            if session_exists {
+                "✅ active"
+            } else {
+                "❌ failed to create"
+            }
+        ));
 
         if session_exists {
             // 2. Ping the agent
@@ -1320,7 +1508,11 @@ impl Handler {
                     if let Some(turns) = session.get("turns").and_then(|n| n.as_u64()) {
                         report.push_str(&format!("**Turns:** {turns}\n"));
                     }
-                    if let Some(cost) = v.get("cost").or_else(|| v.get("cost_totals")).and_then(|n| n.as_f64()) {
+                    if let Some(cost) = v
+                        .get("cost")
+                        .or_else(|| v.get("cost_totals"))
+                        .and_then(|n| n.as_f64())
+                    {
                         report.push_str(&format!("**Estimated cost:** ${cost:.4}\n"));
                     }
 
@@ -1328,9 +1520,16 @@ impl Handler {
                     if let Some(aq) = v.get("account_quota") {
                         for key in ["premium_interactions", "chat", "completions"] {
                             if let Some(q) = aq.pointer(&format!("/quotaSnapshots/{key}")) {
-                                let pct = q.get("remainingPercentage").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                let used = q.get("usedRequests").and_then(|v| v.as_u64()).unwrap_or(0);
-                                let total = q.get("entitlementRequests").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let pct = q
+                                    .get("remainingPercentage")
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(0.0);
+                                let used =
+                                    q.get("usedRequests").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let total = q
+                                    .get("entitlementRequests")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
                                 if total > 0 {
                                     let label = match key {
                                         "premium_interactions" => "🔥 Premium",
@@ -1338,14 +1537,19 @@ impl Handler {
                                         "completions" => "⚡ Completions",
                                         _ => key,
                                     };
-                                    report.push_str(&format!("**{label}:** {pct:.1}% remaining ({used}/{total})\n"));
+                                    report.push_str(&format!(
+                                        "**{label}:** {pct:.1}% remaining ({used}/{total})\n"
+                                    ));
                                 }
                             }
                         }
                     }
 
                     if report.is_empty() {
-                        report.push_str(&format!("```json\n{}\n```", serde_json::to_string_pretty(&v).unwrap_or_default()));
+                        report.push_str(&format!(
+                            "```json\n{}\n```",
+                            serde_json::to_string_pretty(&v).unwrap_or_default()
+                        ));
                     }
                 }
                 Err(_) => {
@@ -1378,7 +1582,10 @@ impl Handler {
         // Native commands summary
         let native = self.pool.cached_native_commands().await;
         if !native.is_empty() {
-            report.push_str(&format!("\n**Native commands:** {} available via `/native`\n", native.len()));
+            report.push_str(&format!(
+                "\n**Native commands:** {} available via `/native`\n",
+                native.len()
+            ));
         }
 
         let embed = CreateEmbed::new()
@@ -1402,7 +1609,7 @@ impl Handler {
             match cmd.channel_id.to_channel(&ctx.http).await {
                 Ok(serenity::model::channel::Channel::Guild(gc)) => gc
                     .parent_id
-                    .map_or(false, |pid| self.allowed_channels.contains(&pid.get())),
+                    .is_some_and(|pid| self.allowed_channels.contains(&pid.get())),
                 _ => false,
             }
         } else {
@@ -1520,28 +1727,40 @@ impl Handler {
 
     /// Handle the `/soul` slash command: display the bot's persona file or show emoji preset picker.
     async fn handle_soul_command(&self, ctx: &Context, cmd: &CommandInteraction) {
-        use serenity::all::{CreateEmbed, CreateActionRow, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption};
+        use serenity::all::{
+            CreateActionRow, CreateEmbed, CreateSelectMenu, CreateSelectMenuKind,
+            CreateSelectMenuOption,
+        };
 
         // Check if user selected "emoji" action
-        let action = cmd.data.options.iter()
+        let action = cmd
+            .data
+            .options
+            .iter()
             .find(|o| o.name == "action")
             .and_then(|o| o.value.as_str())
             .unwrap_or("view");
 
         if action == "emoji" && !self.emoji_presets.is_empty() {
             // Build select menu with preset options
-            let options: Vec<CreateSelectMenuOption> = self.emoji_presets.iter().map(|p| {
-                let e = &p.emojis;
-                let desc = format!("{} {} {} {} {} {} {}",
-                    e.queued, e.thinking, e.tool, e.coding, e.web, e.done, e.error);
-                CreateSelectMenuOption::new(&p.name, &p.name)
-                    .description(desc)
-            }).collect();
+            let options: Vec<CreateSelectMenuOption> = self
+                .emoji_presets
+                .iter()
+                .map(|p| {
+                    let e = &p.emojis;
+                    let desc = format!(
+                        "{} {} {} {} {} {} {}",
+                        e.queued, e.thinking, e.tool, e.coding, e.web, e.done, e.error
+                    );
+                    CreateSelectMenuOption::new(&p.name, &p.name).description(desc)
+                })
+                .collect();
 
             let select = CreateSelectMenu::new(
                 "soul_emoji_select",
                 CreateSelectMenuKind::String { options },
-            ).placeholder("選擇 emoji 風格...");
+            )
+            .placeholder("選擇 emoji 風格...");
 
             let _ = cmd
                 .create_response(
@@ -1575,11 +1794,7 @@ impl Handler {
                     } else {
                         trimmed.to_string()
                     };
-                    (
-                        format!("🔱 {bot_name} の魂"),
-                        desc,
-                        0x1B2838u32,
-                    )
+                    (format!("🔱 {bot_name} の魂"), desc, 0x1B2838u32)
                 }
                 Err(e) => (
                     "⚠️ Error".to_string(),
@@ -1615,7 +1830,11 @@ impl Handler {
     }
 
     /// Handle the emoji preset selection from the `/soul emoji` select menu.
-    async fn handle_soul_emoji_select(&self, ctx: &Context, component: &serenity::all::ComponentInteraction) {
+    async fn handle_soul_emoji_select(
+        &self,
+        ctx: &Context,
+        component: &serenity::all::ComponentInteraction,
+    ) {
         use serenity::all::ComponentInteractionDataKind;
 
         let selected = match &component.data.kind {
@@ -1624,17 +1843,31 @@ impl Handler {
         };
 
         let Some(preset_name) = selected else {
-            let _ = component.create_response(&ctx.http, CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new().content("⚠️ 未選擇 preset").ephemeral(true),
-            )).await;
+            let _ = component
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⚠️ 未選擇 preset")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
             return;
         };
 
         let preset = self.emoji_presets.iter().find(|p| p.name == preset_name);
         let Some(preset) = preset else {
-            let _ = component.create_response(&ctx.http, CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new().content(format!("⚠️ 找不到 preset: {preset_name}")).ephemeral(true),
-            )).await;
+            let _ = component
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content(format!("⚠️ 找不到 preset: {preset_name}"))
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
             return;
         };
 
@@ -1652,19 +1885,31 @@ impl Handler {
             preset_name, e.queued, e.thinking, e.tool, e.coding, e.web, e.done, e.error
         );
 
-        let _ = component.create_response(&ctx.http, CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new().content(summary).ephemeral(true),
-        )).await;
+        let _ = component
+            .create_response(
+                &ctx.http,
+                CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(summary)
+                        .ephemeral(true),
+                ),
+            )
+            .await;
     }
 
     /// Handle `/mcp-add`, `/mcp-remove`, `/mcp-list` — per-user MCP profile management.
     async fn handle_mcp_profile_command(&self, ctx: &Context, cmd: &CommandInteraction) {
         let Some(dir) = &self.mcp_profiles_dir else {
-            let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content("⚠️ MCP profiles not configured (mcp_profiles_dir missing).")
-                    .ephemeral(true),
-            )).await;
+            let _ = cmd
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⚠️ MCP profiles not configured (mcp_profiles_dir missing).")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
             return;
         };
 
@@ -1674,11 +1919,13 @@ impl Handler {
         // Read existing profile or create empty one
         let mut profile: serde_json::Value = if profile_path.exists() {
             match tokio::fs::read_to_string(&profile_path).await {
-                Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({
-                    "discord_user_id": user_id,
-                    "mcpServers": {},
-                    "enabled": true
-                })),
+                Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| {
+                    serde_json::json!({
+                        "discord_user_id": user_id,
+                        "mcpServers": {},
+                        "enabled": true
+                    })
+                }),
                 Err(_) => serde_json::json!({
                     "discord_user_id": user_id,
                     "mcpServers": {},
@@ -1695,21 +1942,32 @@ impl Handler {
 
         match cmd.data.name.as_str() {
             "mcp-add" => {
-                let name = cmd.data.options.iter()
+                let name = cmd
+                    .data
+                    .options
+                    .iter()
                     .find(|o| o.name == "name")
                     .and_then(|o| o.value.as_str())
                     .unwrap_or("");
-                let url = cmd.data.options.iter()
+                let url = cmd
+                    .data
+                    .options
+                    .iter()
                     .find(|o| o.name == "url")
                     .and_then(|o| o.value.as_str())
                     .unwrap_or("");
 
                 if name.is_empty() || url.is_empty() {
-                    let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new()
-                            .content("⚠️ Both name and URL are required.")
-                            .ephemeral(true),
-                    )).await;
+                    let _ = cmd
+                        .create_response(
+                            &ctx.http,
+                            CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content("⚠️ Both name and URL are required.")
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await;
                     return;
                 }
 
@@ -1718,9 +1976,15 @@ impl Handler {
                     "url": url,
                     "tools": ["*"]
                 });
-                profile["updated_at"] = serde_json::Value::String(format!("{:?}", std::time::SystemTime::now()));
+                profile["updated_at"] =
+                    serde_json::Value::String(format!("{:?}", std::time::SystemTime::now()));
 
-                match tokio::fs::write(&profile_path, serde_json::to_string_pretty(&profile).unwrap_or_default()).await {
+                match tokio::fs::write(
+                    &profile_path,
+                    serde_json::to_string_pretty(&profile).unwrap_or_default(),
+                )
+                .await
+                {
                     Ok(_) => {
                         let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
                             CreateInteractionResponseMessage::new()
@@ -1729,55 +1993,84 @@ impl Handler {
                         )).await;
                     }
                     Err(e) => {
-                        let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-                            CreateInteractionResponseMessage::new()
-                                .content(format!("⚠️ Failed to save profile: {e}"))
-                                .ephemeral(true),
-                        )).await;
+                        let _ = cmd
+                            .create_response(
+                                &ctx.http,
+                                CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content(format!("⚠️ Failed to save profile: {e}"))
+                                        .ephemeral(true),
+                                ),
+                            )
+                            .await;
                     }
                 }
             }
             "mcp-remove" => {
-                let name = cmd.data.options.iter()
+                let name = cmd
+                    .data
+                    .options
+                    .iter()
                     .find(|o| o.name == "name")
                     .and_then(|o| o.value.as_str())
                     .unwrap_or("");
 
                 if let Some(servers) = profile["mcpServers"].as_object_mut() {
                     if servers.remove(name).is_some() {
-                        profile["updated_at"] = serde_json::Value::String(format!("{:?}", std::time::SystemTime::now()));
-                        let _ = tokio::fs::write(&profile_path, serde_json::to_string_pretty(&profile).unwrap_or_default()).await;
+                        profile["updated_at"] = serde_json::Value::String(format!(
+                            "{:?}",
+                            std::time::SystemTime::now()
+                        ));
+                        let _ = tokio::fs::write(
+                            &profile_path,
+                            serde_json::to_string_pretty(&profile).unwrap_or_default(),
+                        )
+                        .await;
                         let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
                             CreateInteractionResponseMessage::new()
                                 .content(format!("🗑️ MCP server **{name}** removed.\n_Takes effect on next session. Use `/new-session` to apply now._"))
                                 .ephemeral(true),
                         )).await;
                     } else {
-                        let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-                            CreateInteractionResponseMessage::new()
-                                .content(format!("⚠️ Server **{name}** not found in your profile."))
-                                .ephemeral(true),
-                        )).await;
+                        let _ = cmd
+                            .create_response(
+                                &ctx.http,
+                                CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content(format!(
+                                            "⚠️ Server **{name}** not found in your profile."
+                                        ))
+                                        .ephemeral(true),
+                                ),
+                            )
+                            .await;
                     }
                 }
             }
             "mcp-list" => {
                 let servers = profile["mcpServers"].as_object();
                 let list = match servers {
-                    Some(s) if !s.is_empty() => {
-                        s.iter().map(|(name, cfg)| {
+                    Some(s) if !s.is_empty() => s
+                        .iter()
+                        .map(|(name, cfg)| {
                             let url = cfg["url"].as_str().unwrap_or("(stdio)");
                             let stype = cfg["type"].as_str().unwrap_or("http");
                             format!("• **{name}** — `{stype}` {url}")
-                        }).collect::<Vec<_>>().join("\n")
-                    }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
                     _ => "No MCP servers configured. Use `/mcp-add` to add one.".to_string(),
                 };
-                let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-                    CreateInteractionResponseMessage::new()
-                        .content(format!("🔌 **Your MCP Servers:**\n{list}"))
-                        .ephemeral(true),
-                )).await;
+                let _ = cmd
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content(format!("🔌 **Your MCP Servers:**\n{list}"))
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
             }
             _ => {}
         }
@@ -1786,26 +2079,37 @@ impl Handler {
     /// Handle `/mcp-browse`, `/mcp-install`, `/mcp-status` — MCP registry commands.
     async fn handle_mcp_registry_command(&self, ctx: &Context, cmd: &CommandInteraction) {
         let Some(dir) = &self.mcp_profiles_dir else {
-            let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content("⚠️ MCP profiles not configured.")
-                    .ephemeral(true),
-            )).await;
+            let _ = cmd
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⚠️ MCP profiles not configured.")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
             return;
         };
 
         // Load registry
-        let registry_path = std::path::PathBuf::from(dir).parent()
+        let registry_path = std::path::PathBuf::from(dir)
+            .parent()
             .unwrap_or(std::path::Path::new("."))
             .join("mcp-registry.json");
         let registry: serde_json::Value = match tokio::fs::read_to_string(&registry_path).await {
             Ok(s) => serde_json::from_str(&s).unwrap_or(serde_json::json!({"servers":[]})),
             Err(_) => {
-                let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-                    CreateInteractionResponseMessage::new()
-                        .content("⚠️ MCP registry not found.")
-                        .ephemeral(true),
-                )).await;
+                let _ = cmd
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("⚠️ MCP registry not found.")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
                 return;
             }
         };
@@ -1817,15 +2121,17 @@ impl Handler {
             "mcp-browse" => {
                 let servers = registry["servers"].as_array();
                 let list = match servers {
-                    Some(arr) if !arr.is_empty() => {
-                        arr.iter().map(|s| {
+                    Some(arr) if !arr.is_empty() => arr
+                        .iter()
+                        .map(|s| {
                             let name = s["name"].as_str().unwrap_or("?");
                             let desc = s["description"].as_str().unwrap_or("");
                             let cat = s["category"].as_str().unwrap_or("other");
                             let auth = s["auth"].as_str().unwrap_or("none");
                             format!("• **{name}** [{cat}] — {desc}\n  Auth: `{auth}`")
-                        }).collect::<Vec<_>>().join("\n")
-                    }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
                     _ => "No servers in registry.".to_string(),
                 };
                 let count = servers.map(|a| a.len()).unwrap_or(0);
@@ -1836,12 +2142,16 @@ impl Handler {
                 )).await;
             }
             "mcp-install" => {
-                let name = cmd.data.options.iter()
+                let name = cmd
+                    .data
+                    .options
+                    .iter()
                     .find(|o| o.name == "name")
                     .and_then(|o| o.value.as_str())
                     .unwrap_or("");
 
-                let server = registry["servers"].as_array()
+                let server = registry["servers"]
+                    .as_array()
                     .and_then(|arr| arr.iter().find(|s| s["name"].as_str() == Some(name)));
 
                 let Some(server) = server else {
@@ -1864,14 +2174,25 @@ impl Handler {
 
                 // Copy server config to profile
                 let mut cfg = server.clone();
-                cfg.as_object_mut().map(|o| { o.remove("name"); o.remove("description"); o.remove("category"); o.remove("auth"); });
+                cfg.as_object_mut().map(|o| {
+                    o.remove("name");
+                    o.remove("description");
+                    o.remove("category");
+                    o.remove("auth");
+                });
                 if cfg.get("tools").is_none() {
                     cfg["tools"] = serde_json::json!(["*"]);
                 }
                 profile["mcpServers"][name] = cfg;
-                profile["updated_at"] = serde_json::Value::String(format!("{:?}", std::time::SystemTime::now()));
+                profile["updated_at"] =
+                    serde_json::Value::String(format!("{:?}", std::time::SystemTime::now()));
 
-                match tokio::fs::write(&profile_path, serde_json::to_string_pretty(&profile).unwrap_or_default()).await {
+                match tokio::fs::write(
+                    &profile_path,
+                    serde_json::to_string_pretty(&profile).unwrap_or_default(),
+                )
+                .await
+                {
                     Ok(_) => {
                         let auth = server["auth"].as_str().unwrap_or("none");
                         let msg = if auth == "none" {
@@ -1879,22 +2200,36 @@ impl Handler {
                         } else {
                             format!("✅ **{name}** installed to your profile.\n⚠️ Auth required: `{auth}`\n_Takes effect on next session. Use `/new-session` to apply now._")
                         };
-                        let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-                            CreateInteractionResponseMessage::new().content(msg).ephemeral(true),
-                        )).await;
+                        let _ = cmd
+                            .create_response(
+                                &ctx.http,
+                                CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content(msg)
+                                        .ephemeral(true),
+                                ),
+                            )
+                            .await;
                     }
                     Err(e) => {
-                        let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-                            CreateInteractionResponseMessage::new()
-                                .content(format!("⚠️ Failed to save: {e}"))
-                                .ephemeral(true),
-                        )).await;
+                        let _ = cmd
+                            .create_response(
+                                &ctx.http,
+                                CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content(format!("⚠️ Failed to save: {e}"))
+                                        .ephemeral(true),
+                                ),
+                            )
+                            .await;
                     }
                 }
             }
             "mcp-status" => {
                 let profile: serde_json::Value = if profile_path.exists() {
-                    tokio::fs::read_to_string(&profile_path).await.ok()
+                    tokio::fs::read_to_string(&profile_path)
+                        .await
+                        .ok()
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or(serde_json::json!({"mcpServers":{}}))
                 } else {
@@ -1904,19 +2239,29 @@ impl Handler {
                 let servers = profile["mcpServers"].as_object();
                 let list = match servers {
                     Some(s) if !s.is_empty() => {
-                        s.iter().map(|(name, cfg)| {
-                            let stype = cfg["type"].as_str().unwrap_or("stdio");
-                            // Simple status: installed = ✅, no runtime check yet
-                            format!("• ✅ **{name}** (`{stype}`) — installed")
-                        }).collect::<Vec<_>>().join("\n")
+                        s.iter()
+                            .map(|(name, cfg)| {
+                                let stype = cfg["type"].as_str().unwrap_or("stdio");
+                                // Simple status: installed = ✅, no runtime check yet
+                                format!("• ✅ **{name}** (`{stype}`) — installed")
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
                     }
-                    _ => "No MCP servers installed. Use `/mcp-browse` → `/mcp-install`.".to_string(),
+                    _ => {
+                        "No MCP servers installed. Use `/mcp-browse` → `/mcp-install`.".to_string()
+                    }
                 };
-                let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-                    CreateInteractionResponseMessage::new()
-                        .content(format!("📊 **MCP Status:**\n{list}"))
-                        .ephemeral(true),
-                )).await;
+                let _ = cmd
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content(format!("📊 **MCP Status:**\n{list}"))
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
             }
             _ => {}
         }
@@ -1934,7 +2279,7 @@ impl Handler {
             match cmd.channel_id.to_channel(&ctx.http).await {
                 Ok(serenity::model::channel::Channel::Guild(gc)) => gc
                     .parent_id
-                    .map_or(false, |pid| self.allowed_channels.contains(&pid.get())),
+                    .is_some_and(|pid| self.allowed_channels.contains(&pid.get())),
                 _ => false,
             }
         } else {
@@ -2020,8 +2365,11 @@ impl Handler {
                         let mut lines = vec![format!("**Model:** `{model}` • **Age:** {elapsed}s")];
                         if let Some(v) = usage {
                             let session = v.get("session_usage").unwrap_or(&v);
-                            if let Some(input) = session.get("inputTokens").and_then(|n| n.as_u64()) {
-                                if let Some(output) = session.get("outputTokens").and_then(|n| n.as_u64()) {
+                            if let Some(input) = session.get("inputTokens").and_then(|n| n.as_u64())
+                            {
+                                if let Some(output) =
+                                    session.get("outputTokens").and_then(|n| n.as_u64())
+                                {
                                     let total = input + output;
                                     lines.push(format!("**Tokens:** {total} (↑{input} ↓{output})"));
                                 }
@@ -2029,15 +2377,31 @@ impl Handler {
                             if let Some(turns) = session.get("turns").and_then(|n| n.as_u64()) {
                                 lines.push(format!("**Turns:** {turns}"));
                             }
-                            if let Some(cost) = v.get("cost").or_else(|| v.get("cost_totals")).and_then(|n| n.as_f64()) {
+                            if let Some(cost) = v
+                                .get("cost")
+                                .or_else(|| v.get("cost_totals"))
+                                .and_then(|n| n.as_f64())
+                            {
                                 lines.push(format!("**Cost:** ${cost:.4}"));
                             }
                             // Account quota from copilot-agent-acp bridge
-                            if let Some(premium) = v.pointer("/account_quota/quotaSnapshots/premium_interactions") {
-                                if let Some(pct) = premium.get("remainingPercentage").and_then(|v| v.as_f64()) {
-                                    let used = premium.get("usedRequests").and_then(|v| v.as_u64()).unwrap_or(0);
-                                    let total = premium.get("entitlementRequests").and_then(|v| v.as_u64()).unwrap_or(0);
-                                    lines.push(format!("🔥 **Premium:** {pct:.1}% ({used}/{total})"));
+                            if let Some(premium) =
+                                v.pointer("/account_quota/quotaSnapshots/premium_interactions")
+                            {
+                                if let Some(pct) =
+                                    premium.get("remainingPercentage").and_then(|v| v.as_f64())
+                                {
+                                    let used = premium
+                                        .get("usedRequests")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    let total = premium
+                                        .get("entitlementRequests")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    lines.push(format!(
+                                        "🔥 **Premium:** {pct:.1}% ({used}/{total})"
+                                    ));
                                 }
                             }
                         }
@@ -2058,11 +2422,16 @@ impl Handler {
     /// Handle `/cusage` — custom usage breakdown (daily/weekly/monthly).
     async fn handle_cusage_command(&self, ctx: &Context, cmd: &CommandInteraction) {
         let Some(cusage_cfg) = self.cusage_config.as_ref() else {
-            let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content("⚠️ `/cusage` is not configured.")
-                    .ephemeral(true),
-            )).await;
+            let _ = cmd
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⚠️ `/cusage` is not configured.")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
             return;
         };
 
@@ -2095,26 +2464,36 @@ impl Handler {
             match cmd.channel_id.to_channel(&ctx.http).await {
                 Ok(serenity::model::channel::Channel::Guild(gc)) => gc
                     .parent_id
-                    .map_or(false, |pid| self.allowed_channels.contains(&pid.get())),
+                    .is_some_and(|pid| self.allowed_channels.contains(&pid.get())),
                 _ => false,
             }
         } else {
             false
         };
         if !in_allowed_channel && !in_thread {
-            let _ = cmd.create_response(&ctx.http,
-                CreateInteractionResponse::Message(
-                    CreateInteractionResponseMessage::new()
-                        .content("⚠️ This channel is not allowlisted.")
-                        .ephemeral(true))).await;
+            let _ = cmd
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⚠️ This channel is not allowlisted.")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
             return;
         }
         if !self.allowed_users.is_empty() && !self.allowed_users.contains(&cmd.user.id.get()) {
-            let _ = cmd.create_response(&ctx.http,
-                CreateInteractionResponse::Message(
-                    CreateInteractionResponseMessage::new()
-                        .content("🚫 You are not authorized to use this command.")
-                        .ephemeral(true))).await;
+            let _ = cmd
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("🚫 You are not authorized to use this command.")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
             return;
         }
 
@@ -2148,7 +2527,11 @@ impl Handler {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 CreateEmbed::new()
                     .title(format!("⚠️ /{display_name}"))
-                    .description(format!("exit {}: ```{}```", out.status, stderr.chars().take(500).collect::<String>()))
+                    .description(format!(
+                        "exit {}: ```{}```",
+                        out.status,
+                        stderr.chars().take(500).collect::<String>()
+                    ))
                     .color(0xED4245)
             }
             Ok(Err(e)) => CreateEmbed::new()
@@ -2187,7 +2570,9 @@ impl Handler {
         }
 
         let embed = run_copilot_rpc_action("mode", "mode-set", &mode_id).await;
-        let _ = cmd.edit_response(&ctx.http, EditInteractionResponse::new().embed(embed)).await;
+        let _ = cmd
+            .edit_response(&ctx.http, EditInteractionResponse::new().embed(embed))
+            .await;
     }
 
     /// Handle /reload <kind> — reload a Copilot config category via SDK RPC.
@@ -2252,15 +2637,19 @@ impl Handler {
                     .trim();
                 let parsed: Result<serde_json::Value, _> = serde_json::from_str(json_line);
                 match parsed {
-                    Ok(v) if v.get("ok").and_then(|b| b.as_bool()) == Some(true) => CreateEmbed::new()
-                        .title("✅ /reload")
-                        .description(format!("Reloaded: **{kind}**"))
-                        .color(0x2ECC71),
+                    Ok(v) if v.get("ok").and_then(|b| b.as_bool()) == Some(true) => {
+                        CreateEmbed::new()
+                            .title("✅ /reload")
+                            .description(format!("Reloaded: **{kind}**"))
+                            .color(0x2ECC71)
+                    }
                     Ok(v) => CreateEmbed::new()
                         .title("⚠️ /reload")
                         .description(format!(
                             "```{}```",
-                            v.get("error").and_then(|s| s.as_str()).unwrap_or("unknown error")
+                            v.get("error")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("unknown error")
                         ))
                         .color(0xED4245),
                     Err(e) => CreateEmbed::new()
@@ -2274,7 +2663,10 @@ impl Handler {
                 .description(format!(
                     "exit {}: ```{}```",
                     out.status,
-                    String::from_utf8_lossy(&out.stderr).chars().take(400).collect::<String>()
+                    String::from_utf8_lossy(&out.stderr)
+                        .chars()
+                        .take(400)
+                        .collect::<String>()
                 ))
                 .color(0xED4245),
             Ok(Err(e)) => CreateEmbed::new()
@@ -2287,7 +2679,9 @@ impl Handler {
                 .color(0xED4245),
         };
 
-        let _ = cmd.edit_response(&ctx.http, EditInteractionResponse::new().embed(embed)).await;
+        let _ = cmd
+            .edit_response(&ctx.http, EditInteractionResponse::new().embed(embed))
+            .await;
     }
 
     /// Handle /compact and /new-session — drop the current thread's AcpConnection.
@@ -2344,7 +2738,11 @@ impl Handler {
                 Err(e) => {
                     // Fall back to drop-session
                     let dropped = self.pool.drop_session(&thread_key).await;
-                    let note = if dropped { "Session dropped (history cleared)." } else { "No active session." };
+                    let note = if dropped {
+                        "Session dropped (history cleared)."
+                    } else {
+                        "No active session."
+                    };
                     CreateEmbed::new()
                         .title("ℹ️ /compact (fallback)")
                         .description(format!("Bridge compaction unavailable: {e}\n\n{note}"))
@@ -2370,12 +2768,16 @@ impl Handler {
         } else {
             (
                 format!("ℹ️ /{cmd_name}"),
-                "No active session to reset. Your next message will start fresh anyway.".to_string(),
+                "No active session to reset. Your next message will start fresh anyway."
+                    .to_string(),
                 0x5865F2,
             )
         };
 
-        let embed = CreateEmbed::new().title(title).description(body).color(color);
+        let embed = CreateEmbed::new()
+            .title(title)
+            .description(body)
+            .color(color);
         let _ = cmd
             .create_response(
                 &ctx.http,
@@ -2517,7 +2919,9 @@ impl Handler {
         }
 
         let embed = run_copilot_rpc_action(&cmd_name, action_rpc, &name_arg).await;
-        let _ = cmd.edit_response(&ctx.http, EditInteractionResponse::new().embed(embed)).await;
+        let _ = cmd
+            .edit_response(&ctx.http, EditInteractionResponse::new().embed(embed))
+            .await;
     }
 
     /// Autocomplete handler for interactive commands: fetches the list RPC
@@ -2527,7 +2931,8 @@ impl Handler {
         ctx: &Context,
         ac: &CommandInteraction,
     ) {
-        let Some((list_rpc, _, data_key, name_key)) = copilot_interactive_spec(&ac.data.name) else {
+        let Some((list_rpc, _, data_key, name_key)) = copilot_interactive_spec(&ac.data.name)
+        else {
             return;
         };
 
@@ -2581,7 +2986,7 @@ impl Handler {
             match cmd.channel_id.to_channel(&ctx.http).await {
                 Ok(serenity::model::channel::Channel::Guild(gc)) => gc
                     .parent_id
-                    .map_or(false, |pid| self.allowed_channels.contains(&pid.get())),
+                    .is_some_and(|pid| self.allowed_channels.contains(&pid.get())),
                 _ => false,
             }
         } else {
@@ -2641,14 +3046,15 @@ async fn run_copilot_rpc_action(display_name: &str, rpc_sub: &str, arg: &str) ->
                 .trim();
             let parsed: Result<serde_json::Value, _> = serde_json::from_str(json_line);
             match parsed {
-                Ok(v) if v.get("ok").and_then(|b| b.as_bool()) == Some(true) => {
-                    CreateEmbed::new()
-                        .title(format!("✅ /{display_name}"))
-                        .description(format!("Applied: `{arg}`"))
-                        .color(0x2ECC71)
-                }
+                Ok(v) if v.get("ok").and_then(|b| b.as_bool()) == Some(true) => CreateEmbed::new()
+                    .title(format!("✅ /{display_name}"))
+                    .description(format!("Applied: `{arg}`"))
+                    .color(0x2ECC71),
                 Ok(v) => {
-                    let err = v.get("error").and_then(|s| s.as_str()).unwrap_or("unknown error");
+                    let err = v
+                        .get("error")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("unknown error");
                     CreateEmbed::new()
                         .title(format!("⚠️ /{display_name}"))
                         .description(format!("```{err}```"))
@@ -2664,7 +3070,11 @@ async fn run_copilot_rpc_action(display_name: &str, rpc_sub: &str, arg: &str) ->
             let stderr = String::from_utf8_lossy(&out.stderr);
             CreateEmbed::new()
                 .title(format!("⚠️ /{display_name}"))
-                .description(format!("exit {}: ```{}```", out.status, stderr.chars().take(400).collect::<String>()))
+                .description(format!(
+                    "exit {}: ```{}```",
+                    out.status,
+                    stderr.chars().take(400).collect::<String>()
+                ))
                 .color(0xED4245)
         }
         Ok(Err(e)) => CreateEmbed::new()
@@ -2719,7 +3129,8 @@ fn build_copilot_embed(display_name: &str, rpc_sub: &str, json_line: &str) -> Cr
         "mcp-list" => render_list(&title, &data, "servers", "name"),
         "files" => render_list(&title, &data, "files", "path"),
         _ => {
-            let pretty = serde_json::to_string_pretty(&data).unwrap_or_else(|_| format!("{data:?}"));
+            let pretty =
+                serde_json::to_string_pretty(&data).unwrap_or_else(|_| format!("{data:?}"));
             let body = pretty.chars().take(3800).collect::<String>();
             CreateEmbed::new()
                 .title(title)
@@ -2735,7 +3146,7 @@ fn render_permissions(data: &serde_json::Value) -> CreateEmbed {
     let perms = data.get("permissions").and_then(|v| v.as_array());
     let count = data.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
 
-    let mut embed = CreateEmbed::new()
+    let embed = CreateEmbed::new()
         .title(format!("🔐 Recent Tool Permissions ({count})"))
         .color(0x24292F);
 
@@ -2744,7 +3155,8 @@ fn render_permissions(data: &serde_json::Value) -> CreateEmbed {
     };
 
     if arr.is_empty() {
-        return embed.description("_(no permissions requested yet — send a message that triggers a tool)_");
+        return embed
+            .description("_(no permissions requested yet — send a message that triggers a tool)_");
     }
 
     // Show the most recent 10 entries (bridge stores 50, embed space is limited)
@@ -2789,14 +3201,23 @@ fn render_session_tokens(data: &serde_json::Value) -> CreateEmbed {
     // Session-level token info
     if let Some(su) = session_usage.filter(|v| !v.is_null()) {
         let token_limit = su.get("tokenLimit").and_then(|v| v.as_u64()).unwrap_or(0);
-        let current = su.get("currentTokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        let current = su
+            .get("currentTokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         let system_t = su.get("systemTokens").and_then(|v| v.as_u64()).unwrap_or(0);
-        let conv_t = su.get("conversationTokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        let conv_t = su
+            .get("conversationTokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         let tools_t = su
             .get("toolDefinitionsTokens")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        let msgs = su.get("messagesLength").and_then(|v| v.as_u64()).unwrap_or(0);
+        let msgs = su
+            .get("messagesLength")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
 
         let pct = if token_limit > 0 {
             (current as f64 / token_limit as f64 * 100.0).round() as i64
@@ -2832,7 +3253,10 @@ fn render_session_tokens(data: &serde_json::Value) -> CreateEmbed {
         let turns = ct.get("turns").and_then(|v| v.as_u64()).unwrap_or(0);
         let in_t = ct.get("inputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
         let out_t = ct.get("outputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
-        let cache_r = ct.get("cacheReadTokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        let cache_r = ct
+            .get("cacheReadTokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         let cost = ct.get("cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let model = ct.get("lastModel").and_then(|v| v.as_str()).unwrap_or("?");
         let body = format!(
@@ -2853,7 +3277,10 @@ fn render_session_tokens(data: &serde_json::Value) -> CreateEmbed {
                 .get("remainingPercentage")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0);
-            let used = premium.get("usedRequests").and_then(|v| v.as_u64()).unwrap_or(0);
+            let used = premium
+                .get("usedRequests")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             let entitled = premium
                 .get("entitlementRequests")
                 .and_then(|v| v.as_u64())
@@ -2861,7 +3288,10 @@ fn render_session_tokens(data: &serde_json::Value) -> CreateEmbed {
             let bar = progress_bar(pct as u32);
             embed = embed.field(
                 "🔥 Premium monthly",
-                format!("{bar} `{:>3}%`\n**{used}** / {entitled} used", pct.round() as i64),
+                format!(
+                    "{bar} `{:>3}%`\n**{used}** / {entitled} used",
+                    pct.round() as i64
+                ),
                 false,
             );
         }
@@ -2878,9 +3308,15 @@ fn render_usage(data: &serde_json::Value) -> CreateEmbed {
 
     for key in ["premium_interactions", "chat", "completions"] {
         if let Some(q) = snap.and_then(|s| s.get(key)) {
-            let pct = q.get("remainingPercentage").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let pct = q
+                .get("remainingPercentage")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
             let used = q.get("usedRequests").and_then(|v| v.as_u64()).unwrap_or(0);
-            let entitled = q.get("entitlementRequests").and_then(|v| v.as_u64()).unwrap_or(0);
+            let entitled = q
+                .get("entitlementRequests")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             let reset = q.get("resetDate").and_then(|v| v.as_str()).unwrap_or("?");
             let bar = progress_bar(pct as u32);
             let pretty_key = match key {
@@ -2900,29 +3336,66 @@ fn render_usage(data: &serde_json::Value) -> CreateEmbed {
 }
 
 fn render_status(data: &serde_json::Value) -> CreateEmbed {
-    let cli_ver = data.pointer("/cli/version").and_then(|v| v.as_str()).unwrap_or("?");
-    let proto_ver = data.pointer("/cli/protocolVersion").and_then(|v| v.as_u64()).unwrap_or(0);
-    let auth_user = data.pointer("/auth/login").and_then(|v| v.as_str()).unwrap_or("?");
-    let auth_type = data.pointer("/auth/authType").and_then(|v| v.as_str()).unwrap_or("?");
-    let auth_ok = data.pointer("/auth/isAuthenticated").and_then(|v| v.as_bool()).unwrap_or(false);
-    let model_count = data.pointer("/model_count").and_then(|v| v.as_u64()).unwrap_or(0);
+    let cli_ver = data
+        .pointer("/cli/version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let proto_ver = data
+        .pointer("/cli/protocolVersion")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let auth_user = data
+        .pointer("/auth/login")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let auth_type = data
+        .pointer("/auth/authType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let auth_ok = data
+        .pointer("/auth/isAuthenticated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let model_count = data
+        .pointer("/model_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
     CreateEmbed::new()
         .title("⚡ Copilot Status")
         .color(0x24292F)
         .field("CLI", format!("v{cli_ver} (protocol {proto_ver})"), true)
-        .field("Auth", if auth_ok { format!("✅ {auth_user} ({auth_type})") } else { "❌ not authenticated".into() }, true)
+        .field(
+            "Auth",
+            if auth_ok {
+                format!("✅ {auth_user} ({auth_type})")
+            } else {
+                "❌ not authenticated".into()
+            },
+            true,
+        )
         .field("Models", format!("{model_count} available"), true)
 }
 
-fn render_list(title: &str, data: &serde_json::Value, array_key: &str, name_key: &str) -> CreateEmbed {
+fn render_list(
+    title: &str,
+    data: &serde_json::Value,
+    array_key: &str,
+    name_key: &str,
+) -> CreateEmbed {
     let arr = data.get(array_key).and_then(|v| v.as_array());
     let count = arr.map(|a| a.len()).unwrap_or(0);
     let items: Vec<String> = arr
-        .map(|a| a.iter().take(25).enumerate().map(|(i, item)| {
-            let name = item.get(name_key).and_then(|v| v.as_str()).unwrap_or("?");
-            format!("`{:>2}.` {name}", i + 1)
-        }).collect())
+        .map(|a| {
+            a.iter()
+                .take(25)
+                .enumerate()
+                .map(|(i, item)| {
+                    let name = item.get(name_key).and_then(|v| v.as_str()).unwrap_or("?");
+                    format!("`{:>2}.` {name}", i + 1)
+                })
+                .collect()
+        })
         .unwrap_or_default();
     let body = if items.is_empty() {
         "_(empty)_".to_string()
@@ -2958,15 +3431,18 @@ fn build_usage_embed(results: &[crate::usage::RunnerResult]) -> CreateEmbed {
     }
 
     // Pick the first successful runner's color for the embed bar
-    if let Some(crate::usage::RunnerResult::Ok { color, .. }) =
-        results.iter().find(|r| matches!(r, crate::usage::RunnerResult::Ok { .. }))
+    if let Some(crate::usage::RunnerResult::Ok { color, .. }) = results
+        .iter()
+        .find(|r| matches!(r, crate::usage::RunnerResult::Ok { .. }))
     {
         embed = embed.color(*color);
     }
 
     for r in results {
         match r {
-            crate::usage::RunnerResult::Ok { label, rendered, .. } => {
+            crate::usage::RunnerResult::Ok {
+                label, rendered, ..
+            } => {
                 let body = rendered.trim();
                 let body = if body.is_empty() { "_(empty)_" } else { body };
                 embed = embed.field(label, body, false);
@@ -3008,7 +3484,14 @@ async fn download_and_transcribe(
     let mime_type = attachment.content_type.as_deref().unwrap_or("audio/ogg");
     let mime_type = mime_type.split(';').next().unwrap_or(mime_type).trim();
 
-    crate::stt::transcribe(&HTTP_CLIENT, stt_config, bytes, attachment.filename.clone(), mime_type).await
+    crate::stt::transcribe(
+        &HTTP_CLIENT,
+        stt_config,
+        bytes,
+        attachment.filename.clone(),
+        mime_type,
+    )
+    .await
 }
 
 /// Maximum dimension (width or height) for resized images.
@@ -3025,7 +3508,9 @@ const IMAGE_JPEG_QUALITY: u8 = 75;
 /// Large images are resized so the longest side is at most 1200px and
 /// re-encoded as JPEG at quality 75. This keeps the base64 payload well
 /// under typical JSON-RPC transport limits (~200-400KB after encoding).
-async fn download_and_encode_image(attachment: &serenity::model::channel::Attachment) -> Option<ContentBlock> {
+async fn download_and_encode_image(
+    attachment: &serenity::model::channel::Attachment,
+) -> Option<ContentBlock> {
     const MAX_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
 
     let url = &attachment.url;
@@ -3034,21 +3519,17 @@ async fn download_and_encode_image(attachment: &serenity::model::channel::Attach
     }
 
     // Determine media type — prefer content-type header, fallback to extension
-    let media_type = attachment
-        .content_type
-        .as_deref()
-        .or_else(|| {
-            attachment
-                .filename
-                .rsplit('.')
-                .next()
-                .and_then(|ext| match ext.to_lowercase().as_str() {
+    let media_type =
+        attachment.content_type.as_deref().or_else(|| {
+            attachment.filename.rsplit('.').next().and_then(|ext| {
+                match ext.to_lowercase().as_str() {
                     "png" => Some("image/png"),
                     "jpg" | "jpeg" => Some("image/jpeg"),
                     "gif" => Some("image/gif"),
                     "webp" => Some("image/webp"),
                     _ => None,
-                })
+                }
+            })
         });
 
     let Some(mime) = media_type else {
@@ -3068,7 +3549,10 @@ async fn download_and_encode_image(attachment: &serenity::model::channel::Attach
 
     let response = match HTTP_CLIENT.get(url).send().await {
         Ok(resp) => resp,
-        Err(e) => { error!(url = %url, error = %e, "download failed"); return None; }
+        Err(e) => {
+            error!(url = %url, error = %e, "download failed");
+            return None;
+        }
     };
     if !response.status().is_success() {
         error!(url = %url, status = %response.status(), "HTTP error downloading image");
@@ -3076,7 +3560,10 @@ async fn download_and_encode_image(attachment: &serenity::model::channel::Attach
     }
     let bytes = match response.bytes().await {
         Ok(b) => b,
-        Err(e) => { error!(url = %url, error = %e, "read failed"); return None; }
+        Err(e) => {
+            error!(url = %url, error = %e, "read failed");
+            return None;
+        }
     };
 
     // Defense-in-depth: verify actual download size
@@ -3117,8 +3604,7 @@ async fn download_and_encode_image(attachment: &serenity::model::channel::Attach
 /// Returns (compressed_bytes, mime_type). GIFs are passed through unchanged
 /// to preserve animation.
 fn resize_and_compress(raw: &[u8]) -> Result<(Vec<u8>, String), image::ImageError> {
-    let reader = ImageReader::new(Cursor::new(raw))
-        .with_guessed_format()?;
+    let reader = ImageReader::new(Cursor::new(raw)).with_guessed_format()?;
 
     let format = reader.format();
 
@@ -3149,8 +3635,18 @@ fn resize_and_compress(raw: &[u8]) -> Result<(Vec<u8>, String), image::ImageErro
     Ok((buf.into_inner(), "image/jpeg".to_string()))
 }
 
-async fn edit(ctx: &Context, ch: ChannelId, msg_id: MessageId, content: &str) -> serenity::Result<Message> {
-    ch.edit_message(&ctx.http, msg_id, serenity::builder::EditMessage::new().content(content)).await
+async fn edit(
+    ctx: &Context,
+    ch: ChannelId,
+    msg_id: MessageId,
+    content: &str,
+) -> serenity::Result<Message> {
+    ch.edit_message(
+        &ctx.http,
+        msg_id,
+        serenity::builder::EditMessage::new().content(content),
+    )
+    .await
 }
 
 /// Replace aggregate session summary with per-model breakdown from cost-totals files.
@@ -3169,32 +3665,46 @@ fn enrich_session_summary_with_per_model(content: String) -> String {
 
     // Read the most recent cost-totals file
     let dir = std::path::PathBuf::from(
-        std::env::var("APPDATA").unwrap_or_else(|_| "C:/Users/Administrator/AppData/Roaming".into())
-    ).join("openab");
+        std::env::var("APPDATA")
+            .unwrap_or_else(|_| "C:/Users/Administrator/AppData/Roaming".into()),
+    )
+    .join("openab");
 
-    let Ok(entries) = std::fs::read_dir(&dir) else { return content };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return content;
+    };
     let mut best: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with("cost-totals-") { continue; }
+        if !name.starts_with("cost-totals-") {
+            continue;
+        }
         if let Ok(meta) = entry.metadata() {
             if let Ok(mtime) = meta.modified() {
-                if best.as_ref().map_or(true, |(_, t)| mtime > *t) {
+                if best.as_ref().is_none_or(|(_, t)| mtime > *t) {
                     best = Some((entry.path(), mtime));
                 }
             }
         }
     }
 
-    let Some((path, mtime)) = best else { return content };
+    let Some((path, mtime)) = best else {
+        return content;
+    };
     if mtime.elapsed().map_or(true, |d| d.as_secs() > 86400) {
         return content;
     }
 
-    let Ok(data) = std::fs::read_to_string(&path) else { return content };
-    let Ok(json): Result<serde_json::Value, _> = serde_json::from_str(&data) else { return content };
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return content;
+    };
+    let Ok(json): Result<serde_json::Value, _> = serde_json::from_str(&data) else {
+        return content;
+    };
 
-    let Some(per_model) = json.get("perModel").and_then(|v| v.as_object()) else { return content };
+    let Some(per_model) = json.get("perModel").and_then(|v| v.as_object()) else {
+        return content;
+    };
     if per_model.len() <= 1 {
         return content; // Only one model — aggregate is already correct
     }
@@ -3207,23 +3717,47 @@ fn enrich_session_summary_with_per_model(content: String) -> String {
         ta.cmp(&tb)
     });
 
-    let total_turns: u64 = entries.iter()
+    let total_turns: u64 = entries
+        .iter()
         .map(|(_, s)| s.get("turns").and_then(|v| v.as_u64()).unwrap_or(0))
         .sum();
 
     let mut lines = Vec::new();
     for (model, stats) in &entries {
         let turns = stats.get("turns").and_then(|v| v.as_u64()).unwrap_or(0);
-        let input = stats.get("inputTokens").and_then(|v| v.as_f64()).unwrap_or(0.0) / 1000.0;
-        let output = stats.get("outputTokens").and_then(|v| v.as_f64()).unwrap_or(0.0) / 1000.0;
-        let cached = stats.get("cacheReadTokens").and_then(|v| v.as_f64()).unwrap_or(0.0) / 1000.0;
+        let input = stats
+            .get("inputTokens")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0)
+            / 1000.0;
+        let output = stats
+            .get("outputTokens")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0)
+            / 1000.0;
+        let cached = stats
+            .get("cacheReadTokens")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0)
+            / 1000.0;
         let mut parts = vec![format!("{input:.1}k in"), format!("{output:.1}k out")];
-        if cached > 0.0 { parts.push(format!("{cached:.1}k cached")); }
-        lines.push(format!("{turns} turns **{model}** ({}) ", parts.join(" · ")));
+        if cached > 0.0 {
+            parts.push(format!("{cached:.1}k cached"));
+        }
+        lines.push(format!(
+            "{turns} turns **{model}** ({}) ",
+            parts.join(" · ")
+        ));
     }
 
-    let replacement = format!("{total_turns} turns · {} models\n{}", entries.len(), lines.join("\n"));
-    RE_AGGREGATE.replace(&content, replacement.as_str()).to_string()
+    let replacement = format!(
+        "{total_turns} turns · {} models\n{}",
+        entries.len(),
+        lines.join("\n")
+    );
+    RE_AGGREGATE
+        .replace(&content, replacement.as_str())
+        .to_string()
 }
 
 async fn stream_prompt(
@@ -3388,8 +3922,11 @@ async fn stream_prompt(
             // Copilot Pro API returns entitlementRequests=1 (placeholder), making CLI show "X / 1 used".
             // Copilot Pro API returns entitlementRequests=1 (placeholder, real quota ~300/mo).
             // Strip the misleading "/1" denominator but keep the used count.
-            static RE_QUOTA: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(\d+)\s*/\s*1\s+used").unwrap());
-            let final_content = RE_QUOTA.replace_all(&final_content, "$1 premium reqs used").to_string();
+            static RE_QUOTA: LazyLock<regex::Regex> =
+                LazyLock::new(|| regex::Regex::new(r"(\d+)\s*/\s*1\s+used").unwrap());
+            let final_content = RE_QUOTA
+                .replace_all(&final_content, "$1 premium reqs used")
+                .to_string();
             // Replace aggregate "Input: Xk · Output: Yk" with per-model breakdown if available
             let final_content = enrich_session_summary_with_per_model(final_content);
             // If ACP returned both an error and partial text, show both.
@@ -3430,7 +3967,10 @@ async fn stream_prompt(
 /// collapse newlines to ` ; ` and rewrite embedded backticks so they
 /// don't break the wrapping span.
 fn sanitize_title(title: &str) -> String {
-    title.replace('\r', "").replace('\n', " ; ").replace('`', "'")
+    title
+        .replace('\r', "")
+        .replace('\n', " ; ")
+        .replace('`', "'")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3454,7 +3994,11 @@ impl ToolEntry {
             ToolState::Completed => "✅",
             ToolState::Failed => "❌",
         };
-        let suffix = if self.state == ToolState::Running { "..." } else { "" };
+        let suffix = if self.state == ToolState::Running {
+            "..."
+        } else {
+            ""
+        };
         format!("{icon} `{}`{}", self.title, suffix)
     }
 }
@@ -3472,9 +4016,8 @@ fn compose_display(tool_lines: &[ToolEntry], text: &str) -> String {
     out
 }
 
-static MENTION_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"<@[!&]?\d+>").unwrap()
-});
+static MENTION_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"<@[!&]?\d+>").unwrap());
 
 fn strip_mention(content: &str) -> String {
     MENTION_RE.replace_all(content, "").trim().to_string()
@@ -3514,7 +4057,6 @@ async fn get_or_create_thread(ctx: &Context, msg: &Message, prompt: &str) -> any
 
     Ok(thread.id.get())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -3574,7 +4116,12 @@ mod tests {
         let png = make_png(3000, 2000);
         let (compressed, _) = resize_and_compress(&png).unwrap();
 
-        assert!(compressed.len() < png.len(), "compressed {} should be < original {}", compressed.len(), png.len());
+        assert!(
+            compressed.len() < png.len(),
+            "compressed {} should be < original {}",
+            compressed.len(),
+            png.len()
+        );
     }
 
     #[test]
