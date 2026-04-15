@@ -183,6 +183,17 @@ entries:
     version: 0.1.1
   openab:
   - apiVersion: v2
+    appVersion: 0.7.6-beta.1
+    created: "2026-04-15T13:17:49.495120511Z"
+    description: A lightweight, secure, cloud-native ACP harness that bridges Discord
+      and any ACP-compatible coding CLI.
+    digest: 0b0c5e17b4e2831ecb892a10e7de1b87867455de070158445d64b4ee4c3b0624
+    name: openab
+    type: application
+    urls:
+    - https://github.com/openabdev/openab/releases/download/openab-0.7.6-beta.1/openab-0.7.6-beta.1.tgz
+    version: 0.7.6-beta.1
+  - apiVersion: v2
     appVersion: 0.7.5
     created: "2026-04-15T00:05:50.935066809Z"
     description: Discord ↔ ACP coding CLI bridge (Kiro CLI, Claude Code, Codex, Gemini)
@@ -552,4 +563,4 @@ entries:
     urls:
     - https://github.com/openabdev/openab/releases/download/openab-0.3.3/openab-0.3.3.tgz
     version: 0.3.3
-generated: "2026-04-15T00:05:50.935464088Z"
+generated: "2026-04-15T13:17:49.495466274Z"
