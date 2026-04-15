@@ -53,6 +53,33 @@ agents:
     #   tolerations: []
     #   affinity: {}
     #   image: "ghcr.io/openabdev/openab-claude:latest"
+    # opencode:
+    #   command: opencode
+    #   args:
+    #     - acp
+    #   discord:
+    #     botToken: ""
+    #     allowedChannels:
+    #       - "YOUR_CHANNEL_ID"
+    #     allowedUsers: []
+    #     allowBotMessages: "off"
+    #     trustedBotIds: []
+    #   workingDir: /home/node
+    #   env: {}
+    #   envFrom: []
+    #   pool:
+    #     maxSessions: 10
+    #     sessionTtlHours: 24
+    #   reactions:
+    #     enabled: true
+    #     removeAfterReply: false
+    #   persistence:
+    #     enabled: true
+    #     storageClass: ""
+    #     size: 1Gi
+    #   agentsMd: ""
+    #   resources: {}
+    #   image: "ghcr.io/openabdev/openab-opencode:latest"
     image: ""
     command: kiro-cli
     args:

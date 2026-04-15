@@ -18,6 +18,7 @@ jobs:
           - { dockerfile: Dockerfile.codex, suffix: "-codex", agent: "codex-acp", agent_args: "" }
           - { dockerfile: Dockerfile.gemini, suffix: "-gemini", agent: "gemini", agent_args: "--acp" }
           - { dockerfile: Dockerfile.copilot, suffix: "-copilot", agent: "copilot", agent_args: "--acp" }
+          - { dockerfile: Dockerfile.opencode, suffix: "-opencode", agent: "opencode", agent_args: "acp" }
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

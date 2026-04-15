@@ -70,6 +70,7 @@ jobs:
           - { suffix: "-claude", dockerfile: "Dockerfile.claude", artifact: "claude" }
           - { suffix: "-gemini", dockerfile: "Dockerfile.gemini", artifact: "gemini" }
           - { suffix: "-copilot", dockerfile: "Dockerfile.copilot", artifact: "copilot" }
+          - { suffix: "-opencode", dockerfile: "Dockerfile.opencode", artifact: "opencode" }
         platform:
           - { os: linux/amd64, runner: ubuntu-latest }
           - { os: linux/arm64, runner: ubuntu-24.04-arm }
@@ -131,6 +132,7 @@ jobs:
           - { suffix: "-claude", artifact: "claude" }
           - { suffix: "-gemini", artifact: "gemini" }
           - { suffix: "-copilot", artifact: "copilot" }
+          - { suffix: "-opencode", artifact: "opencode" }
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -179,6 +181,7 @@ jobs:
           - { suffix: "-claude" }
           - { suffix: "-gemini" }
           - { suffix: "-copilot" }
+          - { suffix: "-opencode" }
     runs-on: ubuntu-latest
     permissions:
       contents: read
