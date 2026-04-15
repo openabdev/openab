@@ -47,7 +47,7 @@ agents:
     #     enabled: true
     #     storageClass: ""
     #     size: 1Gi
-    #   agentsMd: ""
+    #   agentsMd: ""  # when set, shadows any existing file at the same path on the PVC
     #   resources: {}
     #   nodeSelector: {}
     #   tolerations: []
@@ -77,7 +77,7 @@ agents:
     #     enabled: true
     #     storageClass: ""
     #     size: 1Gi
-    #   agentsMd: ""
+    #   agentsMd: ""  # when set, shadows any existing file at the same path on the PVC
     #   resources: {}
     #   image: "ghcr.io/openabdev/openab-opencode:latest"
     image: ""
@@ -115,6 +115,9 @@ agents:
       enabled: true
       storageClass: ""
       size: 1Gi  # defaults to 1Gi if not set
+    # agentsMd: when set, the ConfigMap volumeMount takes precedence over any existing file
+    # at the same path on the PVC (e.g. AGENTS.md, CLAUDE.md, GEMINI.md). The PVC file is
+    # not deleted but becomes invisible to the agent. Remove agentsMd to restore PVC files.
     agentsMd: ""
     resources: {}
     nodeSelector: {}

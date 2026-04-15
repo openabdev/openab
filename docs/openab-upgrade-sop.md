@@ -264,6 +264,12 @@ Pay special attention to:
 - Added or deprecated environment variables
 - Any migration steps
 
+> ⚠️ **`agentsMd` takes precedence over PVC files:** If you have `agentsMd` set in your Helm
+> values, the ConfigMap volumeMount will shadow any existing file at the same path on the PVC
+> (e.g. `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`). The PVC file is not deleted but becomes
+> invisible to the agent. If you rely on PVC-managed agent instruction files, either leave
+> `agentsMd` empty or migrate its content to the PVC file before upgrading.
+
 ### 3. Check Node Resources
 
 ```bash
