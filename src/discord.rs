@@ -9,7 +9,7 @@ use image::ImageReader;
 use std::io::Cursor;
 use std::sync::LazyLock;
 use serenity::async_trait;
-use serenity::model::channel::{Message, ReactionType};
+use serenity::model::channel::{Message, MessageFlags, ReactionType};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId};
 use serenity::prelude::*;
@@ -35,6 +35,8 @@ static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .build()
         .expect("static HTTP client must build")
 });
+
+const THREAD_EXISTS_MSG: &str = "A thread has already been created for this message";
 
 pub struct Handler {
     pub pool: Arc<SessionPool>,
@@ -807,6 +809,18 @@ async fn get_or_create_thread(ctx: &Context, msg: &Message, prompt: &str) -> any
         }
     }
 
+    // Discord surfaces the starter thread on the message payload when available.
+    // For message-based threads, the thread id also matches the starter message id.
+    if let Some(thread) = &msg.thread {
+        return Ok(thread.id.get());
+    }
+    if msg
+        .flags
+        .is_some_and(|flags| flags.contains(MessageFlags::HAS_THREAD))
+    {
+        return Ok(msg.id.get());
+    }
+
     let thread_name = shorten_thread_name(prompt);
 
     let thread = msg
@@ -817,9 +831,13 @@ async fn get_or_create_thread(ctx: &Context, msg: &Message, prompt: &str) -> any
             serenity::builder::CreateThread::new(thread_name)
                 .auto_archive_duration(serenity::model::channel::AutoArchiveDuration::OneDay),
         )
-        .await?;
+        .await;
 
-    Ok(thread.id.get())
+    match thread {
+        Ok(thread) => Ok(thread.id.get()),
+        Err(err) if err.to_string().contains(THREAD_EXISTS_MSG) => Ok(msg.id.get()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 
