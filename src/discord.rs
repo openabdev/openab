@@ -234,9 +234,56 @@ impl EventHandler for Handler {
 }
 
 impl Handler {
+    /// Shared allowlist check for slash command + autocomplete paths.
+    /// Returns true when the interaction should be processed.
+    async fn interaction_allowlist_ok(
+        &self,
+        ctx: &Context,
+        channel_id: ChannelId,
+        user_id: u64,
+    ) -> bool {
+        let cid = channel_id.get();
+        let in_allowed_channel =
+            self.allowed_channels.is_empty() || self.allowed_channels.contains(&cid);
+
+        let in_thread = if !in_allowed_channel {
+            match channel_id.to_channel(&ctx.http).await {
+                Ok(serenity::model::channel::Channel::Guild(gc)) => gc
+                    .parent_id
+                    .map_or(false, |pid| self.allowed_channels.contains(&pid.get())),
+                _ => false,
+            }
+        } else {
+            false
+        };
+
+        if !in_allowed_channel && !in_thread {
+            return false;
+        }
+
+        if !self.allowed_users.is_empty() && !self.allowed_users.contains(&user_id) {
+            return false;
+        }
+
+        true
+    }
+
     /// Resolve `partial` (the user's typing in the autocomplete field) to up
     /// to 25 suggestions, drawing from cached aliases + cached model ids.
     async fn handle_model_autocomplete(&self, ctx: &Context, ac: &CommandInteraction) {
+        // Silently return empty choices when the caller is not allowlisted —
+        // no point revealing available models to denied users.
+        if !self
+            .interaction_allowlist_ok(ctx, ac.channel_id, ac.user.id.get())
+            .await
+        {
+            let empty = CreateInteractionResponse::Autocomplete(
+                CreateAutocompleteResponse::new().set_choices(Vec::new()),
+            );
+            let _ = ac.create_response(&ctx.http, empty).await;
+            return;
+        }
+
         let partial = ac
             .data
             .options
@@ -298,44 +345,16 @@ impl Handler {
 
     /// Handle the actual /model command submission.
     async fn handle_model_command(&self, ctx: &Context, cmd: &CommandInteraction) {
-        // Allowlist: channel
-        let channel_id = cmd.channel_id.get();
-        let in_allowed_channel =
-            self.allowed_channels.is_empty() || self.allowed_channels.contains(&channel_id);
-
-        let in_thread = if !in_allowed_channel {
-            match cmd.channel_id.to_channel(&ctx.http).await {
-                Ok(serenity::model::channel::Channel::Guild(gc)) => gc
-                    .parent_id
-                    .map_or(false, |pid| self.allowed_channels.contains(&pid.get())),
-                _ => false,
-            }
-        } else {
-            false
-        };
-
-        if !in_allowed_channel && !in_thread {
+        if !self
+            .interaction_allowlist_ok(ctx, cmd.channel_id, cmd.user.id.get())
+            .await
+        {
             let _ = cmd
                 .create_response(
                     &ctx.http,
                     CreateInteractionResponse::Message(
                         CreateInteractionResponseMessage::new()
-                            .content("⚠️ This channel is not allowlisted.")
-                            .ephemeral(true),
-                    ),
-                )
-                .await;
-            return;
-        }
-
-        // Allowlist: user
-        if !self.allowed_users.is_empty() && !self.allowed_users.contains(&cmd.user.id.get()) {
-            let _ = cmd
-                .create_response(
-                    &ctx.http,
-                    CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new()
-                            .content("🚫 You are not authorized to use this command.")
+                            .content("🚫 You are not authorized to use this command here.")
                             .ephemeral(true),
                     ),
                 )
