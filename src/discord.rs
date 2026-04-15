@@ -233,6 +233,29 @@ impl EventHandler for Handler {
     }
 }
 
+/// Pure allowlist decision function — no Discord runtime required, fully unit-testable.
+/// `parent_channel_id` is the resolved parent of a thread (None if not a thread or
+/// lookup failed). Empty allowlists mean "allow everything".
+fn allowlist_decision(
+    allowed_channels: &HashSet<u64>,
+    allowed_users: &HashSet<u64>,
+    channel_id: u64,
+    parent_channel_id: Option<u64>,
+    user_id: u64,
+) -> bool {
+    let in_allowed_channel = allowed_channels.is_empty() || allowed_channels.contains(&channel_id);
+    let in_thread = !in_allowed_channel
+        && parent_channel_id.map_or(false, |pid| allowed_channels.contains(&pid));
+
+    if !in_allowed_channel && !in_thread {
+        return false;
+    }
+    if !allowed_users.is_empty() && !allowed_users.contains(&user_id) {
+        return false;
+    }
+    true
+}
+
 impl Handler {
     /// Shared allowlist check for slash command + autocomplete paths.
     /// Returns true when the interaction should be processed.
@@ -243,29 +266,26 @@ impl Handler {
         user_id: u64,
     ) -> bool {
         let cid = channel_id.get();
-        let in_allowed_channel =
-            self.allowed_channels.is_empty() || self.allowed_channels.contains(&cid);
 
-        let in_thread = if !in_allowed_channel {
+        // Only resolve the parent channel when the direct channel isn't already
+        // allowlisted — avoids an HTTP round-trip on the happy path and keeps
+        // autocomplete inside Discord's 3-second deadline.
+        let parent_id = if !self.allowed_channels.is_empty() && !self.allowed_channels.contains(&cid) {
             match channel_id.to_channel(&ctx.http).await {
-                Ok(serenity::model::channel::Channel::Guild(gc)) => gc
-                    .parent_id
-                    .map_or(false, |pid| self.allowed_channels.contains(&pid.get())),
-                _ => false,
+                Ok(serenity::model::channel::Channel::Guild(gc)) => gc.parent_id.map(|p| p.get()),
+                _ => None,
             }
         } else {
-            false
+            None
         };
 
-        if !in_allowed_channel && !in_thread {
-            return false;
-        }
-
-        if !self.allowed_users.is_empty() && !self.allowed_users.contains(&user_id) {
-            return false;
-        }
-
-        true
+        allowlist_decision(
+            &self.allowed_channels,
+            &self.allowed_users,
+            cid,
+            parent_id,
+            user_id,
+        )
     }
 
     /// Resolve `partial` (the user's typing in the autocomplete field) to up
@@ -636,4 +656,74 @@ async fn get_or_create_thread(ctx: &Context, msg: &Message, prompt: &str) -> any
         .await?;
 
     Ok(thread.id.get())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(ids: &[u64]) -> HashSet<u64> {
+        ids.iter().copied().collect()
+    }
+
+    #[test]
+    fn empty_allowlists_allow_everything() {
+        assert!(allowlist_decision(&set(&[]), &set(&[]), 123, None, 999));
+        assert!(allowlist_decision(&set(&[]), &set(&[]), 456, Some(789), 42));
+    }
+
+    #[test]
+    fn channel_in_allowlist_is_allowed() {
+        let ch = set(&[100, 200]);
+        assert!(allowlist_decision(&ch, &set(&[]), 100, None, 1));
+        assert!(allowlist_decision(&ch, &set(&[]), 200, None, 1));
+    }
+
+    #[test]
+    fn channel_not_in_allowlist_is_denied() {
+        let ch = set(&[100]);
+        assert!(!allowlist_decision(&ch, &set(&[]), 999, None, 1));
+    }
+
+    #[test]
+    fn thread_parent_in_allowlist_is_allowed() {
+        let ch = set(&[100]);
+        // Direct channel 555 not allowlisted, but parent 100 is.
+        assert!(allowlist_decision(&ch, &set(&[]), 555, Some(100), 1));
+    }
+
+    #[test]
+    fn thread_parent_not_in_allowlist_is_denied() {
+        let ch = set(&[100]);
+        assert!(!allowlist_decision(&ch, &set(&[]), 555, Some(222), 1));
+    }
+
+    #[test]
+    fn user_not_in_allowlist_is_denied_even_if_channel_ok() {
+        let ch = set(&[100]);
+        let users = set(&[42]);
+        assert!(!allowlist_decision(&ch, &users, 100, None, 999));
+    }
+
+    #[test]
+    fn user_in_allowlist_with_channel_ok_is_allowed() {
+        let ch = set(&[100]);
+        let users = set(&[42]);
+        assert!(allowlist_decision(&ch, &users, 100, None, 42));
+    }
+
+    #[test]
+    fn empty_channel_allowlist_still_enforces_user_allowlist() {
+        let users = set(&[42]);
+        assert!(allowlist_decision(&set(&[]), &users, 999, None, 42));
+        assert!(!allowlist_decision(&set(&[]), &users, 999, None, 7));
+    }
+
+    #[test]
+    fn thread_allowed_channel_plus_denied_user() {
+        let ch = set(&[100]);
+        let users = set(&[42]);
+        // Thread under allowed parent, but user not in allowlist.
+        assert!(!allowlist_decision(&ch, &users, 555, Some(100), 7));
+    }
 }
