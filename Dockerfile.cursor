@@ -1,0 +1,46 @@
+# --- Build stage ---
+FROM rust:1-bookworm AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
+COPY src/ src/
+RUN touch src/main.rs && cargo build --release
+
+# --- Runtime stage ---
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps && rm -rf /var/lib/apt/lists/*
+
+# Install Cursor Agent CLI (pinned version)
+# Tarball source: https://downloads.cursor.com/lab/<version>/linux/<arch>/agent-cli-package.tar.gz
+# URL scheme scraped from Cursor's official downloads page — no apt/yum package exists.
+# If Cursor changes this pattern, the build fails with curl 404. Monitor
+# https://cursor.com/cli or https://docs.cursor.com/cli for version/URL updates.
+ARG CURSOR_VERSION=2026.04.14-ee4b43a
+RUN ARCH=$(dpkg --print-architecture) && \
+    if [ "$ARCH" = "arm64" ]; then ARCH=arm64; else ARCH=x64; fi && \
+    curl -fSL "https://downloads.cursor.com/lab/${CURSOR_VERSION}/linux/${ARCH}/agent-cli-package.tar.gz" \
+      -o /tmp/cursor.tar.gz && \
+    tar xzf /tmp/cursor.tar.gz -C /opt && \
+    mv /opt/dist-package /opt/cursor-agent && \
+    ln -s /opt/cursor-agent/cursor-agent /usr/local/bin/cursor-agent && \
+    rm /tmp/cursor.tar.gz
+
+# Install gh CLI (for auth and token management)
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -s /bin/bash -u 1000 agent
+ENV HOME=/home/agent
+WORKDIR /home/agent
+
+COPY --from=builder --chown=agent:agent /build/target/release/openab /usr/local/bin/openab
+
+USER agent
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENTRYPOINT ["openab"]
+CMD ["run", "/etc/openab/config.toml"]

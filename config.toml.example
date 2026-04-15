@@ -44,6 +44,12 @@ working_dir = "/home/agent"
 # # equivalent to --trust-all-tools on other backends.
 # # Run `opencode auth login` once before starting openab.
 
+# [agent]
+# command = "cursor-agent"
+# args = ["acp", "--model", "auto", "--workspace", "/home/agent"]
+# working_dir = "/home/agent"
+# env = {}  # Auth via: kubectl exec -it <pod> -- cursor-agent login
+
 [pool]
 max_sessions = 10
 session_ttl_hours = 24

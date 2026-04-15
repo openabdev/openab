@@ -27,6 +27,9 @@ Agents deployed:
 {{- else if eq $cfg.command "opencode" }}
     Authenticate:
     kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- opencode auth login
+{{- else if eq $cfg.command "cursor-agent" }}
+    Authenticate:
+    kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- cursor-agent login
 {{- end }}
 
     Restart after auth:
