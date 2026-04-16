@@ -1,0 +1,59 @@
+suite: allowBotMessages & trustedBotIds
+templates:
+  - templates/configmap.yaml
+tests:
+  - it: renders allow_bot_messages = "mentions"
+    set:
+      agents.kiro.discord.allowBotMessages: mentions
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'allow_bot_messages = "mentions"'
+
+  - it: renders allow_bot_messages = "all"
+    set:
+      agents.kiro.discord.allowBotMessages: all
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'allow_bot_messages = "all"'
+
+  - it: renders allow_bot_messages = "off"
+    set:
+      agents.kiro.discord.allowBotMessages: "off"
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'allow_bot_messages = "off"'
+
+  - it: rejects invalid allowBotMessages value
+    set:
+      agents.kiro.discord.allowBotMessages: yolo
+    asserts:
+      - failedTemplate:
+          errorPattern: "must be one of: off, mentions, all"
+
+  - it: renders trustedBotIds as JSON array
+    set:
+      agents.kiro.discord.allowBotMessages: mentions
+      agents.kiro.discord.trustedBotIds:
+        - "123456789012345678"
+        - "987654321098765432"
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'trusted_bot_ids = \["123456789012345678","987654321098765432"\]'
+
+  - it: rejects mangled snowflake ID
+    set:
+      agents.kiro.discord.trustedBotIds:
+        - "1.234567890123457e+17"
+    asserts:
+      - failedTemplate:
+          errorPattern: mangled ID
+
+  - it: renders default allow_bot_messages = "off"
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'allow_bot_messages = "off"'

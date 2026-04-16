@@ -1,0 +1,20 @@
+name: Chart Tests
+
+on:
+  pull_request:
+    paths:
+      - "charts/**"
+
+jobs:
+  helm-unittest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: azure/setup-helm@v4
+
+      - name: Install helm-unittest
+        run: helm plugin install https://github.com/helm-unittest/helm-unittest
+
+      - name: Run chart tests
+        run: helm unittest charts/openab
