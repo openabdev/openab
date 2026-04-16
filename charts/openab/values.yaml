@@ -4,6 +4,11 @@ image:
   tag: ""
   pullPolicy: IfNotPresent
 
+imagePullSecrets: []
+
+podAnnotations: {}
+podLabels: {}
+
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 1000
@@ -110,6 +115,9 @@ agents:
     #     size: 1Gi
     #   image: "ghcr.io/openabdev/openab-cursor:latest"
     image: ""
+    imagePullPolicy: ""
+    # imagePullSecrets: unset inherits global; set to [] to opt out.
+    # imagePullSecrets: []
     command: kiro-cli
     args:
       - acp
@@ -164,6 +172,17 @@ agents:
     # The PVC file is NOT deleted but becomes invisible to the agent. Remove agentsMd to restore.
     agentsMd: ""
     resources: {}
+    serviceAccountName: ""
+    podAnnotations: {}
+    podLabels: {}
+    livenessProbe: {}
+    readinessProbe: {}
+    startupProbe: {}
+    lifecycle: {}
+    initContainers: []
+    sidecars: []
+    extraVolumes: []
+    extraVolumeMounts: []
     nodeSelector: {}
     tolerations: []
     affinity: {}

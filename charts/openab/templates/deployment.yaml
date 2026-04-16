@@ -21,12 +21,25 @@ spec:
   template:
     metadata:
       annotations:
-        checksum/config: {{ $cfg | toJson | sha256sum }}
+        {{- include "openab.agentPodAnnotations" $d | nindent 8 }}
       labels:
-        {{- include "openab.selectorLabels" $d | nindent 8 }}
+        {{- include "openab.agentPodLabels" $d | nindent 8 }}
     spec:
+      {{- $imagePullSecrets := include "openab.agentImagePullSecrets" $d | trim }}
+      {{- if $imagePullSecrets }}
+      imagePullSecrets:
+        {{- $imagePullSecrets | nindent 8 }}
+      {{- end }}
+      {{- $serviceAccountName := include "openab.agentServiceAccountName" $d | trim }}
+      {{- if $serviceAccountName }}
+      serviceAccountName: {{ $serviceAccountName }}
+      {{- end }}
       {{- with $.Values.podSecurityContext }}
       securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $cfg.initContainers }}
+      initContainers:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
@@ -80,6 +93,22 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          {{- with $cfg.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $cfg.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $cfg.startupProbe }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $cfg.lifecycle }}
+          lifecycle:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           volumeMounts:
             - name: config
               mountPath: /etc/openab
@@ -99,6 +128,12 @@ spec:
               mountPath: {{ $cfg.workingDir | default "/home/agent" }}/GEMINI.md
               subPath: AGENTS.md
             {{- end }}
+            {{- with $cfg.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        {{- with $cfg.sidecars }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- with $cfg.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -119,6 +154,9 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: {{ include "openab.agentFullname" $d }}
+        {{- end }}
+        {{- with $cfg.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
 {{- end }}
 {{- end }}

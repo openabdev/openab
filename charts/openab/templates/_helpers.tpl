@@ -51,9 +51,57 @@ app.kubernetes.io/component: {{ .agent }}
 {{- end }}
 {{- end }}
 
-{{/* Resolve imagePullPolicy: global default (per-agent image string has no pullPolicy) */}}
+{{/* Resolve imagePullPolicy: per-agent override or global default */}}
 {{- define "openab.agentImagePullPolicy" -}}
-{{- .ctx.Values.image.pullPolicy }}
+{{- default .ctx.Values.image.pullPolicy .cfg.imagePullPolicy }}
+{{- end }}
+
+{{/* Resolve imagePullSecrets: per-agent override (if explicitly set, including empty list) or global default */}}
+{{- define "openab.agentImagePullSecrets" -}}
+{{- $pullSecrets := .ctx.Values.imagePullSecrets -}}
+{{- if hasKey .cfg "imagePullSecrets" -}}
+{{- $pullSecrets = .cfg.imagePullSecrets -}}
+{{- end }}
+{{- range $pullSecrets }}
+- name: {{ . | quote }}
+{{- end }}
+{{- end }}
+
+{{/* Resolve serviceAccountName: per-agent only, empty by default (uses namespace default SA) */}}
+{{- define "openab.agentServiceAccountName" -}}
+{{- default "" .cfg.serviceAccountName }}
+{{- end }}
+
+{{/*
+Pod annotations: global baseline + per-agent override, with reserved
+chart-managed annotations (checksum/config) merged last so users cannot
+clobber them and produce duplicate YAML keys.
+*/}}
+{{- define "openab.agentPodAnnotations" -}}
+{{- $reserved := dict "checksum/config" (.cfg | toJson | sha256sum) -}}
+{{- $annotations := mergeOverwrite (dict)
+    (.ctx.Values.podAnnotations | default (dict))
+    (.cfg.podAnnotations | default (dict))
+    $reserved -}}
+{{- toYaml $annotations }}
+{{- end }}
+
+{{/*
+Pod labels: global baseline + per-agent override, with reserved selector
+labels merged last so users cannot hijack them. Hijacking would produce
+duplicate YAML keys AND break Deployment→Pod selector matching.
+*/}}
+{{- define "openab.agentPodLabels" -}}
+{{- $reserved := dict
+    "app.kubernetes.io/name" (include "openab.name" .ctx)
+    "app.kubernetes.io/instance" .ctx.Release.Name
+    "app.kubernetes.io/component" .agent
+-}}
+{{- $labels := mergeOverwrite (dict)
+    (.ctx.Values.podLabels | default (dict))
+    (.cfg.podLabels | default (dict))
+    $reserved -}}
+{{- toYaml $labels }}
 {{- end }}
 
 {{/* Agent enabled: default true unless explicitly set to false */}}
