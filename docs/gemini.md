@@ -31,27 +31,21 @@ Gemini CLI needs `~/.gemini/projects.json` to exist before the first ACP session
 
 This is a workaround for the upstream Gemini CLI issue `google-gemini/gemini-cli#22583`.
 
-If you control the container startup command, seed the directory before launching `openab`:
+The `openab-gemini` image now seeds this file automatically with the expected registry shape:
+
+```json
+{"projects":{}}
+```
+
+If you build a custom Gemini image or override the entrypoint, seed the directory before launching `openab`:
 
 ```bash
-mkdir -p /home/node/.gemini && echo '{}' > /home/node/.gemini/projects.json && exec openab /etc/openab/config.toml
+mkdir -p /home/node/.gemini && printf '{"projects":{}}\n' > /home/node/.gemini/projects.json && exec openab /etc/openab/config.toml
 ```
 
 The `exec openab /etc/openab/config.toml` part assumes the Docker image default config path.
 
-For Kubernetes or Helm deployments, use the same idea with an init container and a shared volume mounted at `/home/node/.gemini`. A minimal pattern looks like this:
-
-```yaml
-extraInitContainers:
-  - name: seed-gemini-home
-    image: busybox:1.36
-    command: ["sh", "-c", "mkdir -p /home/node/.gemini && echo '{}' > /home/node/.gemini/projects.json"]
-    volumeMounts:
-      - name: gemini-home
-        mountPath: /home/node/.gemini
-```
-
-The current chart does not expose `extraInitContainers`, `extraVolumes`, or `extraVolumeMounts`, so the workaround is easiest to apply in a custom manifest or wrapper image until those values are added. Chart support for those passthrough fields is tracked in #344.
+For Kubernetes or Helm deployments that use a custom Gemini entrypoint, use the same idea with an init container and a shared volume mounted at `/home/node/.gemini`.
 
 ## Manual config.toml
 

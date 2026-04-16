@@ -26,9 +26,11 @@ ENV HOME=/home/node
 WORKDIR /home/node
 
 COPY --from=builder --chown=node:node /build/target/release/openab /usr/local/bin/openab
+COPY --chown=node:node docker/gemini/entrypoint.sh /usr/local/bin/docker-entrypoint-gemini.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint-gemini.sh
 
 USER node
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD pgrep -x openab || exit 1
-ENTRYPOINT ["openab"]
+ENTRYPOINT ["docker-entrypoint-gemini.sh", "openab"]
 CMD ["/etc/openab/config.toml"]
