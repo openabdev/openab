@@ -83,7 +83,11 @@ spec:
               value: {{ $cfg.workingDir | default "/home/agent" }}
             {{- range $k, $v := $cfg.env }}
             - name: {{ $k }}
+              {{- if kindIs "map" $v }}
+              {{- toYaml $v | nindent 14 }}
+              {{- else }}
               value: {{ $v | quote }}
+              {{- end }}
             {{- end }}
           {{- with $cfg.envFrom }}
           envFrom:

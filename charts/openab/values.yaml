@@ -40,7 +40,14 @@ agents:
     #     # trustedBotIds: []  # empty = any bot (mode permitting)
     #     trustedBotIds: []
     #   workingDir: /home/agent
-    #   env: {}
+    #   env:
+    #     # simple key-value
+    #     MY_VAR: "hello"
+    #     # valueFrom (fieldRef, secretKeyRef, configMapKeyRef, etc.)
+    #     MY_POD_NAME:
+    #       valueFrom:
+    #         fieldRef:
+    #           fieldPath: metadata.name
     #   envFrom: []
     #   pool:
     #     maxSessions: 10

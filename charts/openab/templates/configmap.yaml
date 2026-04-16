@@ -81,8 +81,14 @@ data:
     command = "{{ $cfg.command }}"
     args = {{ if $cfg.args }}{{ $cfg.args | toJson }}{{ else }}[]{{ end }}
     working_dir = "{{ $cfg.workingDir | default "/home/agent" }}"
-    {{- if $cfg.env }}
-    env = { {{ $first := true }}{{ range $k, $v := $cfg.env }}{{ if not $first }}, {{ end }}{{ $k }} = "{{ $v }}"{{ $first = false }}{{ end }} }
+    {{- $stringEnv := dict }}
+    {{- range $k, $v := $cfg.env }}
+    {{- if not (kindIs "map" $v) }}
+    {{- $_ := set $stringEnv $k $v }}
+    {{- end }}
+    {{- end }}
+    {{- if $stringEnv }}
+    env = { {{ $first := true }}{{ range $k, $v := $stringEnv }}{{ if not $first }}, {{ end }}{{ $k }} = "{{ $v }}"{{ $first = false }}{{ end }} }
     {{- end }}
 
     [pool]
