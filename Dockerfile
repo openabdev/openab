@@ -29,6 +29,34 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     apt-get update && apt-get install -y --no-install-recommends gh && \
     rm -rf /var/lib/apt/lists/*
 
+# Install AWS CLI v2
+RUN ARCH=$(dpkg --print-architecture) && \
+    if [ "$ARCH" = "arm64" ]; then URL="https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip"; \
+    else URL="https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"; fi && \
+    curl -sSf "$URL" -o /tmp/awscli.zip && \
+    unzip -q /tmp/awscli.zip -d /tmp && \
+    /tmp/aws/install && \
+    rm -rf /tmp/aws /tmp/awscli.zip
+
+# Install Python 3.11 (apt), 3.12 (standalone binary), pip, and git
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git python3.11 python3.11-venv python3-pip && \
+    rm -rf /var/lib/apt/lists/* && \
+    ARCH=$(dpkg --print-architecture) && \
+    if [ "$ARCH" = "arm64" ]; then PY_ARCH="aarch64"; else PY_ARCH="x86_64"; fi && \
+    curl -sSfL "https://github.com/indygreg/python-build-standalone/releases/download/20241206/cpython-3.12.8+20241206-${PY_ARCH}-unknown-linux-gnu-install_only_stripped.tar.gz" \
+      -o /tmp/python3.12.tar.gz && \
+    tar -xzf /tmp/python3.12.tar.gz -C /usr/local --strip-components=1 && \
+    rm /tmp/python3.12.tar.gz && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/local/bin/python3.12 2 && \
+    ln -sf /usr/bin/python3 /usr/bin/python
+
+# Install Node.js 20 LTS (for Cloudscape frontend builds)
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
 RUN useradd -m -s /bin/bash -u 1000 agent
 RUN mkdir -p /home/agent/.local/share/kiro-cli /home/agent/.kiro && \
     chown -R agent:agent /home/agent

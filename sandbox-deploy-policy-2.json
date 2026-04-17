@@ -1,0 +1,122 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ECSFargate",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:CreateCluster", "ecs:DeleteCluster", "ecs:DescribeClusters",
+        "ecs:CreateService", "ecs:DeleteService", "ecs:UpdateService",
+        "ecs:DescribeServices", "ecs:RegisterTaskDefinition",
+        "ecs:DeregisterTaskDefinition", "ecs:DescribeTaskDefinition",
+        "ecs:DescribeTasks", "ecs:ListTasks", "ecs:TagResource", "ecs:UntagResource"
+      ],
+      "Resource": "*",
+      "Condition": { "StringEquals": { "aws:RequestedRegion": "us-west-2" } }
+    },
+    {
+      "Sid": "ECR",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:CreateRepository", "ecr:DeleteRepository", "ecr:DescribeRepositories",
+        "ecr:PutLifecyclePolicy", "ecr:PutImageScanningConfiguration",
+        "ecr:GetAuthorizationToken", "ecr:BatchCheckLayerAvailability",
+        "ecr:GetDownloadUrlForLayer", "ecr:BatchGetImage",
+        "ecr:InitiateLayerUpload", "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload", "ecr:PutImage",
+        "ecr:TagResource", "ecr:SetRepositoryPolicy"
+      ],
+      "Resource": "*",
+      "Condition": { "StringEquals": { "aws:RequestedRegion": "us-west-2" } }
+    },
+    {
+      "Sid": "IAMRolesForStack",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole", "iam:DeleteRole", "iam:GetRole", "iam:UpdateRole",
+        "iam:PutRolePolicy", "iam:DeleteRolePolicy", "iam:GetRolePolicy",
+        "iam:AttachRolePolicy", "iam:DetachRolePolicy",
+        "iam:ListAttachedRolePolicies", "iam:ListRolePolicies",
+        "iam:TagRole", "iam:UntagRole", "iam:PassRole"
+      ],
+      "Resource": "arn:aws:iam::256358067059:role/sandbox-*"
+    },
+    {
+      "Sid": "IAMServiceLinkedRoles",
+      "Effect": "Allow",
+      "Action": "iam:CreateServiceLinkedRole",
+      "Resource": "arn:aws:iam::256358067059:role/aws-service-role/*"
+    },
+    {
+      "Sid": "CodeBuild",
+      "Effect": "Allow",
+      "Action": [
+        "codebuild:CreateProject", "codebuild:DeleteProject",
+        "codebuild:UpdateProject", "codebuild:BatchGetProjects",
+        "codebuild:StartBuild", "codebuild:BatchGetBuilds"
+      ],
+      "Resource": "arn:aws:codebuild:us-west-2:256358067059:project/sandbox-*"
+    },
+    {
+      "Sid": "CodePipeline",
+      "Effect": "Allow",
+      "Action": [
+        "codepipeline:CreatePipeline", "codepipeline:DeletePipeline",
+        "codepipeline:GetPipeline", "codepipeline:GetPipelineState",
+        "codepipeline:UpdatePipeline", "codepipeline:StartPipelineExecution",
+        "codepipeline:ListPipelines"
+      ],
+      "Resource": "arn:aws:codepipeline:us-west-2:256358067059:sandbox-*"
+    },
+    {
+      "Sid": "EventBridge",
+      "Effect": "Allow",
+      "Action": [
+        "events:PutRule", "events:DeleteRule", "events:DescribeRule",
+        "events:PutTargets", "events:RemoveTargets",
+        "events:ListTargetsByRule", "events:TagResource"
+      ],
+      "Resource": "arn:aws:events:us-west-2:256358067059:rule/sandbox-*"
+    },
+    {
+      "Sid": "SNS",
+      "Effect": "Allow",
+      "Action": [
+        "sns:CreateTopic", "sns:DeleteTopic", "sns:GetTopicAttributes",
+        "sns:SetTopicAttributes", "sns:TagResource",
+        "sns:Subscribe", "sns:Unsubscribe"
+      ],
+      "Resource": "arn:aws:sns:us-west-2:256358067059:sandbox-*"
+    },
+    {
+      "Sid": "CloudWatchAlarms",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:PutMetricAlarm", "cloudwatch:DeleteAlarms",
+        "cloudwatch:DescribeAlarms", "cloudwatch:TagResource"
+      ],
+      "Resource": "arn:aws:cloudwatch:us-west-2:256358067059:alarm:sandbox-*"
+    },
+    {
+      "Sid": "CloudWatchLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup", "logs:DeleteLogGroup", "logs:DescribeLogGroups",
+        "logs:PutRetentionPolicy", "logs:TagLogGroup", "logs:TagResource",
+        "logs:CreateLogStream", "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-west-2:256358067059:log-group:/ecs/sandbox-*"
+    },
+    {
+      "Sid": "SSMParameters",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:PutParameter", "ssm:DeleteParameter", "ssm:GetParameter",
+        "ssm:GetParameters", "ssm:GetParametersByPath",
+        "ssm:DescribeParameters", "ssm:AddTagsToResource",
+        "ssm:RemoveTagsFromResource"
+      ],
+      "Resource": "arn:aws:ssm:us-west-2:256358067059:parameter/sandbox/*"
+    }
+  ]
+}
