@@ -2,7 +2,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::Serialize;
 use std::sync::Arc;
-use tokio::sync::watch;
 use tracing::error;
 
 use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
@@ -41,6 +40,10 @@ pub struct SenderContext {
     pub display_name: String,
     pub channel: String,
     pub channel_id: String,
+    /// Thread identifier, if the message is inside a thread.
+    /// Slack: thread_ts. Discord: None (threads are separate channels).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
     pub is_bot: bool,
 }
 
@@ -130,8 +133,6 @@ impl AdapterRouter {
             }
         }
 
-        let thinking_msg = adapter.send_message(thread_channel, "...").await?;
-
         let thread_key = format!(
             "{}:{}",
             adapter.platform(),
@@ -144,7 +145,7 @@ impl AdapterRouter {
         if let Err(e) = self.pool.get_or_create(&thread_key).await {
             let msg = format_user_error(&e.to_string());
             let _ = adapter
-                .edit_message(&thinking_msg, &format!("⚠️ {msg}"))
+                .send_message(thread_channel, &format!("⚠️ {msg}"))
                 .await;
             error!("pool error: {e}");
             return Err(e);
@@ -165,7 +166,6 @@ impl AdapterRouter {
                 &thread_key,
                 content_blocks,
                 thread_channel,
-                &thinking_msg,
                 reactions.clone(),
             )
             .await;
@@ -190,7 +190,7 @@ impl AdapterRouter {
 
         if let Err(ref e) = result {
             let _ = adapter
-                .edit_message(&thinking_msg, &format!("⚠️ {e}"))
+                .send_message(thread_channel, &format!("⚠️ {e}"))
                 .await;
         }
 
@@ -203,12 +203,10 @@ impl AdapterRouter {
         thread_key: &str,
         content_blocks: Vec<ContentBlock>,
         thread_channel: &ChannelRef,
-        thinking_msg: &MessageRef,
         reactions: Arc<StatusReactionController>,
     ) -> Result<()> {
         let adapter = adapter.clone();
         let thread_channel = thread_channel.clone();
-        let msg_ref = thinking_msg.clone();
         let message_limit = adapter.message_limit();
 
         self.pool
@@ -221,13 +219,6 @@ impl AdapterRouter {
                     let (mut rx, _) = conn.session_prompt(content_blocks).await?;
                     reactions.set_thinking().await;
 
-                    let initial = if reset {
-                        "⚠️ _Session expired, starting fresh..._\n\n...".to_string()
-                    } else {
-                        "...".to_string()
-                    };
-                    let (buf_tx, buf_rx) = watch::channel(initial);
-
                     let mut text_buf = String::new();
                     let mut tool_lines: Vec<ToolEntry> = Vec::new();
 
@@ -235,43 +226,7 @@ impl AdapterRouter {
                         text_buf.push_str("⚠️ _Session expired, starting fresh..._\n\n");
                     }
 
-                    // Spawn edit-streaming task — only edits the single message, never sends new ones.
-                    // Long content is truncated during streaming; final multi-message split happens after.
-                    let streaming_limit = message_limit.saturating_sub(100);
-                    let edit_handle = {
-                        let adapter = adapter.clone();
-                        let msg_ref = msg_ref.clone();
-                        let mut buf_rx = buf_rx.clone();
-                        tokio::spawn(async move {
-                            let mut last_content = String::new();
-                            loop {
-                                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                                if buf_rx.has_changed().unwrap_or(false) {
-                                    let content = buf_rx.borrow_and_update().clone();
-                                    if content != last_content {
-                                        let display = if content.chars().count() > streaming_limit {
-                                            // Tail-priority: keep the last N chars so user
-                                            // sees the most recent agent output
-                                            let total = content.chars().count();
-                                            let skip = total - streaming_limit;
-                                            let truncated: String = content.chars().skip(skip).collect();
-                                            format!("…(truncated)\n{truncated}")
-                                        } else {
-                                            content.clone()
-                                        };
-                                        let _ = adapter.edit_message(&msg_ref, &display).await;
-                                        last_content = content;
-                                    }
-                                }
-                                if buf_rx.has_changed().is_err() {
-                                    break;
-                                }
-                            }
-                        })
-                    };
-
                     // Process ACP notifications
-                    let mut got_first_text = false;
                     let mut response_error: Option<String> = None;
                     while let Some(notification) = rx.recv().await {
                         if notification.id.is_some() {
@@ -284,12 +239,7 @@ impl AdapterRouter {
                         if let Some(event) = classify_notification(&notification) {
                             match event {
                                 AcpEvent::Text(t) => {
-                                    if !got_first_text {
-                                        got_first_text = true;
-                                    }
                                     text_buf.push_str(&t);
-                                    let _ =
-                                        buf_tx.send(compose_display(&tool_lines, &text_buf, true));
                                 }
                                 AcpEvent::Thinking => {
                                     reactions.set_thinking().await;
@@ -307,8 +257,6 @@ impl AdapterRouter {
                                             state: ToolState::Running,
                                         });
                                     }
-                                    let _ =
-                                        buf_tx.send(compose_display(&tool_lines, &text_buf, true));
                                 }
                                 AcpEvent::ToolDone { id, title, status } => {
                                     reactions.set_thinking().await;
@@ -329,8 +277,6 @@ impl AdapterRouter {
                                             state: new_state,
                                         });
                                     }
-                                    let _ =
-                                        buf_tx.send(compose_display(&tool_lines, &text_buf, true));
                                 }
                                 _ => {}
                             }
@@ -338,10 +284,8 @@ impl AdapterRouter {
                     }
 
                     conn.prompt_done().await;
-                    drop(buf_tx);
-                    let _ = edit_handle.await;
 
-                    // Final edit with complete content
+                    // Send complete content as a single new message
                     let final_content = compose_display(&tool_lines, &text_buf, false);
                     let final_content = if final_content.is_empty() {
                         if let Some(err) = response_error {
@@ -356,15 +300,8 @@ impl AdapterRouter {
                     };
 
                     let chunks = format::split_message(&final_content, message_limit);
-                    let mut current_msg = msg_ref;
-                    for (i, chunk) in chunks.iter().enumerate() {
-                        if i == 0 {
-                            let _ = adapter.edit_message(&current_msg, chunk).await;
-                        } else if let Ok(new_msg) =
-                            adapter.send_message(&thread_channel, chunk).await
-                        {
-                            current_msg = new_msg;
-                        }
+                    for chunk in &chunks {
+                        let _ = adapter.send_message(&thread_channel, chunk).await;
                     }
 
                     Ok(())
