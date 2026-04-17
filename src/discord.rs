@@ -5,7 +5,7 @@ use crate::format;
 use crate::media;
 use async_trait::async_trait;
 use std::sync::LazyLock;
-use serenity::builder::{CreateThread, EditMessage};
+use serenity::builder::CreateThread;
 use serenity::http::Http;
 use serenity::model::channel::{AutoArchiveDuration, Message, ReactionType};
 use serenity::model::gateway::Ready;
@@ -54,18 +54,6 @@ impl ChatAdapter for DiscordAdapter {
         })
     }
 
-    async fn edit_message(&self, msg: &MessageRef, content: &str) -> anyhow::Result<()> {
-        let ch_id: u64 = msg.channel.channel_id.parse()?;
-        let msg_id: u64 = msg.message_id.parse()?;
-        ChannelId::new(ch_id)
-            .edit_message(
-                &self.http,
-                MessageId::new(msg_id),
-                EditMessage::new().content(content),
-            )
-            .await?;
-        Ok(())
-    }
 
     async fn create_thread(
         &self,
