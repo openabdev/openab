@@ -42,6 +42,12 @@ data:
     {{- if $cfg.discord.trustedBotIds }}
     trusted_bot_ids = {{ $cfg.discord.trustedBotIds | toJson }}
     {{- end }}
+    {{- if $cfg.discord.allowUserMessages }}
+    {{- if not (has $cfg.discord.allowUserMessages (list "involved" "mentions")) }}
+    {{- fail (printf "agents.%s.discord.allowUserMessages must be one of: involved, mentions — got: %s" $name $cfg.discord.allowUserMessages) }}
+    {{- end }}
+    allow_user_messages = "{{ $cfg.discord.allowUserMessages }}"
+    {{- end }}
     {{- end }}
 
     {{- if and ($cfg.slack).enabled }}
