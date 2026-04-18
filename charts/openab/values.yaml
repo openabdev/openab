@@ -170,3 +170,11 @@ agents:
     nodeSelector: {}
     tolerations: []
     affinity: {}
+    # extraInitContainers adds init containers to the pod (runs before the main container)
+    extraInitContainers: []
+    # extraContainers adds sidecar containers to the pod
+    extraContainers: []
+    # extraVolumeMounts adds additional volume mounts to the main container
+    extraVolumeMounts: []
+    # extraVolumes adds additional volumes to the pod
+    extraVolumes: []
