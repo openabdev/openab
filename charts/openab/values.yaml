@@ -19,6 +19,44 @@ containerSecurityContext:
     drop:
       - ALL
 
+projectScreening:
+  enabled: false
+  # Runs a one-shot screening pass that:
+  # 1. checks the Incoming project lane
+  # 2. moves the first item to PR-Screening
+  # 3. generates a Codex screening report to stdout/job logs
+  schedule: "*/30 * * * *"
+  suspend: false
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  image: ghcr.io/openabdev/openab-codex:latest
+  imagePullPolicy: IfNotPresent
+  project:
+    owner: openabdev
+    number: 1
+    incomingStatus: Incoming
+    screeningStatus: PR-Screening
+  reportToStdout: true
+  queryExtra: ""
+  # Required when enabled. This is passed through to the generated Codex prompt.
+  senderContextJson: ""
+  githubToken: ""
+  # Required when enabled. This should be the contents of ~/.codex/auth.json
+  # from a ChatGPT-authenticated Codex session.
+  codexAuthJson: ""
+  discordReport:
+    enabled: false
+    secretName: "openab-kiro-codex"
+    secretKey: "discord-bot-token"
+    channelId: "1494378525640097921"
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
 agents:
   kiro:
     enabled: true    # set to false to skip creating resources for this agent

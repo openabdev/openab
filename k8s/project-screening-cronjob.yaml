@@ -1,0 +1,90 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: openab-project-screening
+spec:
+  schedule: "*/30 * * * *"
+  suspend: false
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: project-screening
+              image: ghcr.io/openabdev/openab-codex:latest
+              imagePullPolicy: IfNotPresent
+              command:
+                - bash
+                - /opt/openab-project-screening/screen_once.sh
+              env:
+                - name: GH_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: openab-project-screening
+                      key: gh-token
+                - name: SENDER_CONTEXT_JSON
+                  value: '{"schema":"openab.sender.v1","sender_id":"196299853884686336","sender_name":"mrshroom69","display_name":"mrshroom69","channel":"discord","channel_id":"1494398610173853816","is_bot":false}'
+                - name: PROJECT_OWNER
+                  value: "openabdev"
+                - name: PROJECT_NUMBER
+                  value: "1"
+                - name: INCOMING_STATUS_NAME
+                  value: "Incoming"
+                - name: SCREENING_STATUS_NAME
+                  value: "PR-Screening"
+                - name: REPORT_TO_STDOUT
+                  value: "true"
+                - name: PROJECT_QUERY_EXTRA
+                  value: ""
+                - name: HOME
+                  value: /tmp/openab-project-screening-home
+                - name: WORK_DIR
+                  value: /tmp/openab-project-screening
+                - name: PROMPT_TEMPLATE
+                  value: /opt/openab-project-screening/screening_prompt.md
+                - name: CODEX_AUTH_JSON_SOURCE
+                  value: /opt/openab-project-screening-auth/auth.json
+                - name: DISCORD_BOT_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: openab-kiro-codex
+                      key: discord-bot-token
+                - name: DISCORD_REPORT_CHANNEL_ID
+                  value: "1494378525640097921"
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              volumeMounts:
+                - name: project-screening
+                  mountPath: /opt/openab-project-screening
+                  readOnly: true
+                - name: project-screening-auth
+                  mountPath: /opt/openab-project-screening-auth
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: project-screening
+              configMap:
+                name: openab-project-screening
+            - name: project-screening-auth
+              secret:
+                secretName: openab-project-screening
+            - name: tmp
+              emptyDir: {}

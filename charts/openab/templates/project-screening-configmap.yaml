@@ -1,0 +1,14 @@
+{{- if .Values.projectScreening.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "openab.screeningFullname" . }}
+  labels:
+    {{- include "openab.screeningLabels" . | nindent 4 }}
+data:
+  screen_once.sh: |
+    {{- .Files.Get "files/project-screening/screen_once.sh" | nindent 4 }}
+  screening_prompt.md: |
+    {{- .Files.Get "files/project-screening/screening_prompt.md" | nindent 4 }}
+{{- end }}

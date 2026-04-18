@@ -65,3 +65,24 @@ app.kubernetes.io/component: {{ .agent }}
 {{- define "openab.persistenceEnabled" -}}
 {{- if and . .persistence (eq (.persistence.enabled | toString) "false") }}false{{ else }}true{{ end }}
 {{- end }}
+
+{{- define "openab.screeningFullname" -}}
+{{- printf "%s-project-screening" (include "openab.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{- define "openab.screeningLabels" -}}
+helm.sh/chart: {{ include "openab.chart" . }}
+app.kubernetes.io/name: {{ include "openab.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: project-screening
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end }}
+
+{{- define "openab.screeningSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "openab.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: project-screening
+{{- end }}

@@ -1,0 +1,113 @@
+{{- if .Values.projectScreening.enabled }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "openab.screeningFullname" . }}
+  labels:
+    {{- include "openab.screeningLabels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.projectScreening.schedule | quote }}
+  suspend: {{ .Values.projectScreening.suspend | default false }}
+  concurrencyPolicy: {{ .Values.projectScreening.concurrencyPolicy | default "Forbid" }}
+  successfulJobsHistoryLimit: {{ .Values.projectScreening.successfulJobsHistoryLimit | default 3 }}
+  failedJobsHistoryLimit: {{ .Values.projectScreening.failedJobsHistoryLimit | default 3 }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ .Values.projectScreening.backoffLimit | default 0 }}
+      ttlSecondsAfterFinished: {{ .Values.projectScreening.ttlSecondsAfterFinished | default 86400 }}
+      template:
+        metadata:
+          annotations:
+            checksum/config: {{ print (.Files.Get "files/project-screening/screen_once.sh") (.Files.Get "files/project-screening/screening_prompt.md") (.Values.projectScreening | toJson) | sha256sum }}
+          labels:
+            {{- include "openab.screeningSelectorLabels" . | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          {{- with .Values.podSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: project-screening
+              image: {{ .Values.projectScreening.image | quote }}
+              imagePullPolicy: {{ .Values.projectScreening.imagePullPolicy | default "IfNotPresent" }}
+              command:
+                - bash
+                - /opt/openab-project-screening/screen_once.sh
+              env:
+                - name: GH_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "openab.screeningFullname" . }}
+                      key: gh-token
+                - name: SENDER_CONTEXT_JSON
+                  value: {{ required "projectScreening.senderContextJson is required when projectScreening.enabled=true" .Values.projectScreening.senderContextJson | quote }}
+                - name: PROJECT_OWNER
+                  value: {{ .Values.projectScreening.project.owner | default "openabdev" | quote }}
+                - name: PROJECT_NUMBER
+                  value: {{ .Values.projectScreening.project.number | default 1 | quote }}
+                - name: INCOMING_STATUS_NAME
+                  value: {{ .Values.projectScreening.project.incomingStatus | default "Incoming" | quote }}
+                - name: SCREENING_STATUS_NAME
+                  value: {{ .Values.projectScreening.project.screeningStatus | default "PR-Screening" | quote }}
+                - name: REPORT_TO_STDOUT
+                  value: {{ .Values.projectScreening.reportToStdout | default true | quote }}
+                - name: PROJECT_QUERY_EXTRA
+                  value: {{ .Values.projectScreening.queryExtra | default "" | quote }}
+                - name: HOME
+                  value: /tmp/openab-project-screening-home
+                - name: WORK_DIR
+                  value: /tmp/openab-project-screening
+                - name: PROMPT_TEMPLATE
+                  value: /opt/openab-project-screening/screening_prompt.md
+                - name: CODEX_AUTH_JSON_SOURCE
+                  value: /opt/openab-project-screening-auth/auth.json
+                {{- if .Values.projectScreening.discordReport.enabled }}
+                - name: DISCORD_BOT_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.projectScreening.discordReport.secretName | default "openab-kiro-codex" | quote }}
+                      key: {{ .Values.projectScreening.discordReport.secretKey | default "discord-bot-token" | quote }}
+                - name: DISCORD_REPORT_CHANNEL_ID
+                  value: {{ .Values.projectScreening.discordReport.channelId | default "1494378525640097921" | quote }}
+                {{- end }}
+              {{- with $.Values.containerSecurityContext }}
+              securityContext:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              {{- with .Values.projectScreening.resources }}
+              resources:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              volumeMounts:
+                - name: project-screening
+                  mountPath: /opt/openab-project-screening
+                  readOnly: true
+                - name: project-screening-auth
+                  mountPath: /opt/openab-project-screening-auth
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          {{- with .Values.projectScreening.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.projectScreening.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.projectScreening.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumes:
+            - name: project-screening
+              configMap:
+                name: {{ include "openab.screeningFullname" . }}
+            - name: project-screening-auth
+              secret:
+                secretName: {{ include "openab.screeningFullname" . }}
+            - name: tmp
+              emptyDir: {}
+{{- end }}
