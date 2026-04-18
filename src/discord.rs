@@ -204,11 +204,7 @@ impl EventHandler for Handler {
             self.allowed_channels.is_empty() || self.allowed_channels.contains(&channel_id);
 
         let is_mentioned = msg.mentions_user_id(bot_id)
-            || msg.content.contains(&format!("<@{}>", bot_id))
-            || msg
-                .mention_roles
-                .iter()
-                .any(|r| msg.content.contains(&format!("<@&{}>", r)));
+            || msg.content.contains(&format!("<@{}>", bot_id));
 
         // Bot message gating (from upstream #321)
         if msg.author.bot {
