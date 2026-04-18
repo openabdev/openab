@@ -54,7 +54,6 @@ impl ChatAdapter for DiscordAdapter {
         })
     }
 
-
     async fn create_thread(
         &self,
         channel: &ChannelRef,
