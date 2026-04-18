@@ -57,6 +57,12 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
 
+# Install kubectl
+RUN ARCH=$(dpkg --print-architecture) && \
+    curl -sSfL "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl" \
+      -o /usr/local/bin/kubectl && \
+    chmod +x /usr/local/bin/kubectl
+
 RUN useradd -m -s /bin/bash -u 1000 agent
 RUN mkdir -p /home/agent/.local/share/kiro-cli /home/agent/.kiro && \
     chown -R agent:agent /home/agent
