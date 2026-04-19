@@ -253,9 +253,9 @@ impl AcpConnection {
                         params: None,
                     });
                 }
-                // Signal subscriber
-                let sub = notify_tx.lock().await;
-                drop(sub);
+                // Close the notify channel so rx.recv() returns None
+                let mut sub = notify_tx.lock().await;
+                *sub = None;
             })
         };
 

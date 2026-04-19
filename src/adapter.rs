@@ -273,7 +273,16 @@ impl AdapterRouter {
 
                     // Process ACP notifications
                     let mut response_error: Option<String> = None;
-                    while let Some(notification) = rx.recv().await {
+                    let recv_timeout = std::time::Duration::from_secs(600);
+                    loop {
+                        let notification = match tokio::time::timeout(recv_timeout, rx.recv()).await {
+                            Ok(Some(n)) => n,
+                            Ok(None) => break, // channel closed
+                            Err(_) => {
+                                response_error = Some("Agent stopped responding".into());
+                                break;
+                            }
+                        };
                         if notification.id.is_some() {
                             if let Some(ref err) = notification.error {
                                 response_error = Some(format_coded_error(err.code, &err.message));
