@@ -295,12 +295,17 @@ impl SessionPool {
     pub async fn shutdown(&self) {
         let mut state = self.state.write().await;
         // Persist active sessions so they can be resumed after restart.
-        for (key, conn) in state.active.iter() {
-            if let Ok(conn) = conn.try_lock() {
-                if let Some(sid) = conn.acp_session_id.clone() {
-                    state.suspended.insert(key.clone(), sid);
-                }
-            }
+        let to_save: Vec<(String, String)> = state
+            .active
+            .iter()
+            .filter_map(|(key, conn)| {
+                let conn = conn.try_lock().ok()?;
+                let sid = conn.acp_session_id.clone()?;
+                Some((key.clone(), sid))
+            })
+            .collect();
+        for (key, sid) in to_save {
+            state.suspended.insert(key, sid);
         }
         self.save_mapping(&state.suspended);
         let count = state.active.len();
