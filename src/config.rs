@@ -153,6 +153,10 @@ pub struct SlackConfig {
     pub trusted_bot_ids: Vec<String>,
     #[serde(default)]
     pub allow_user_messages: AllowUsers,
+    /// Max consecutive bot turns (without human intervention) before throttling.
+    /// Human message resets the counter. Default: 20.
+    #[serde(default = "default_max_bot_turns")]
+    pub max_bot_turns: u32,
 }
 
 #[derive(Debug, Deserialize)]
