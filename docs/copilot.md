@@ -62,8 +62,6 @@ The OAuth token is stored under `~/.config/gh/` and persisted across pod restart
 
 ## Helm Install
 
-> **Note**: The `ghcr.io/openabdev/openab-copilot` image is not published yet. You must build it locally first with `docker build -f Dockerfile.copilot -t openab-copilot .` and push to your own registry, or use a local image.
-
 ```bash
 helm install openab openab/openab \
   --set agents.kiro.enabled=false \
