@@ -1,5 +1,5 @@
 use crate::acp::ContentBlock;
-use crate::adapter::{AdapterRouter, ChatAdapter, ChannelRef, MessageRef, SenderContext};
+use crate::adapter::{AdapterRouter, BotTurnTracker, ChatAdapter, ChannelRef, MessageRef, SenderContext, TurnResult};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::media;
 use anyhow::{anyhow, Result};
@@ -61,6 +61,8 @@ pub struct SlackAdapter {
     bot_id_cache: tokio::sync::Mutex<HashMap<String, String>>,
     /// Positive-only cache: thread_ts → cached_at for threads where bot has participated.
     participated_threads: tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>,
+    /// Positive-only cache: thread_ts → cached_at for threads where other bots have posted.
+    multibot_threads: tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>,
     /// TTL for participation cache entries (matches session_ttl_hours from config).
     session_ttl: std::time::Duration,
     /// Controls streaming behavior: Off → streaming edit, Mentions/All → send-once.
@@ -76,6 +78,7 @@ impl SlackAdapter {
             user_cache: tokio::sync::Mutex::new(HashMap::new()),
             bot_id_cache: tokio::sync::Mutex::new(HashMap::new()),
             participated_threads: tokio::sync::Mutex::new(HashMap::new()),
+            multibot_threads: tokio::sync::Mutex::new(HashMap::new()),
             session_ttl,
             allow_bot_messages,
         }
@@ -202,25 +205,31 @@ impl SlackAdapter {
     }
 
     /// Check if the bot has participated in a Slack thread.
-    /// Returns true if: parent message @mentions the bot, OR any message in thread is from the bot.
-    /// Fail-closed: returns false on API error (consistent with Discord's approach).
-    /// Only caches positive results (involved=true is irreversible).
-    async fn bot_participated_in_thread(&self, channel: &str, thread_ts: &str) -> bool {
-        // Check positive cache first
-        {
+    /// Returns `(involved, other_bot_present)`.
+    /// involved = bot has posted or been @mentioned in thread.
+    /// other_bot_present = another bot has posted in thread.
+    /// Fail-closed: returns (false, false) on API error.
+    /// Only caches positive results (irreversible state).
+    async fn bot_participated_in_thread(&self, channel: &str, thread_ts: &str) -> (bool, bool) {
+        // Check positive caches first
+        let cached_involved = {
             let cache = self.participated_threads.lock().await;
-            if let Some(cached_at) = cache.get(thread_ts) {
-                if cached_at.elapsed() < self.session_ttl {
-                    return true;
-                }
-            }
+            cache.get(thread_ts).is_some_and(|ts| ts.elapsed() < self.session_ttl)
+        };
+        let cached_multibot = {
+            let cache = self.multibot_threads.lock().await;
+            cache.get(thread_ts).is_some_and(|ts| ts.elapsed() < self.session_ttl)
+        };
+
+        if cached_involved {
+            return (true, cached_multibot);
         }
 
         let bot_id = match self.get_bot_user_id().await {
             Some(id) => id,
             None => {
                 warn!("cannot resolve bot user ID, rejecting (fail-closed)");
-                return false;
+                return (false, false);
             }
         };
 
@@ -240,10 +249,10 @@ impl SlackAdapter {
             Ok(json) => json,
             Err(e) => {
                 warn!(channel, thread_ts, error = %e, "failed to fetch thread replies, rejecting (fail-closed)");
-                return false;
+                return (false, false);
             }
         };
-        let Some(messages) = json["messages"].as_array() else { return false };
+        let Some(messages) = json["messages"].as_array() else { return (false, false) };
 
         // Check if parent message @mentions the bot
         let parent_mentions_bot = messages
@@ -254,27 +263,39 @@ impl SlackAdapter {
         // Check if any message in thread is from the bot
         let bot_posted = messages.iter().any(|m| m["user"].as_str() == Some(bot_id));
 
+        // Check if any other bot has posted in the thread
+        let other_bot_present = cached_multibot || messages.iter().any(|m| {
+            m["bot_id"].is_string() && m["user"].as_str() != Some(bot_id)
+        });
+
         let involved = parent_mentions_bot || bot_posted;
 
         if involved {
             self.cache_participation(thread_ts).await;
         }
+        if other_bot_present && !cached_multibot {
+            self.cache_multibot(thread_ts).await;
+        }
 
-        involved
+        (involved, other_bot_present)
     }
 
     /// Insert a positive participation entry, enforcing cache bounds.
     async fn cache_participation(&self, thread_ts: &str) {
-        let mut cache = self.participated_threads.lock().await;
-        let now = tokio::time::Instant::now();
+        Self::insert_cache(&mut *self.participated_threads.lock().await, thread_ts, self.session_ttl);
+    }
 
-        cache.insert(thread_ts.to_string(), now);
+    /// Insert a positive multibot entry, enforcing cache bounds.
+    async fn cache_multibot(&self, thread_ts: &str) {
+        Self::insert_cache(&mut *self.multibot_threads.lock().await, thread_ts, self.session_ttl);
+    }
+
+    fn insert_cache(cache: &mut HashMap<String, tokio::time::Instant>, thread_ts: &str, session_ttl: std::time::Duration) {
+        cache.insert(thread_ts.to_string(), tokio::time::Instant::now());
 
         if cache.len() > PARTICIPATION_CACHE_MAX {
-            // Evict expired entries first
-            cache.retain(|_, ts| ts.elapsed() < self.session_ttl);
+            cache.retain(|_, ts| ts.elapsed() < session_ttl);
 
-            // If still over, evict oldest half
             if cache.len() > PARTICIPATION_CACHE_MAX {
                 let mut entries: Vec<_> = cache.iter().map(|(k, v)| (k.clone(), *v)).collect();
                 entries.sort_by_key(|(_, ts)| *ts);
@@ -438,8 +459,6 @@ impl KeyedAsyncQueue {
 
 // --- Socket Mode event loop ---
 
-/// Hard cap on consecutive bot messages in a thread. Prevents runaway loops.
-const MAX_CONSECUTIVE_BOT_TURNS: usize = 10;
 
 /// Run the Slack adapter using Socket Mode (persistent WebSocket, no public URL needed).
 /// Reconnects automatically on disconnect.
@@ -454,12 +473,14 @@ pub async fn run_slack_adapter(
     allow_bot_messages: AllowBots,
     trusted_bot_ids: HashSet<String>,
     allow_user_messages: AllowUsers,
+    max_bot_turns: u32,
     session_ttl: std::time::Duration,
     stt_config: SttConfig,
     router: Arc<AdapterRouter>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let adapter = Arc::new(SlackAdapter::new(bot_token.clone(), session_ttl, allow_bot_messages));
+    let bot_turns = Arc::new(tokio::sync::Mutex::new(BotTurnTracker::new(max_bot_turns)));
     let queue = Arc::new(KeyedAsyncQueue::new());
 
     loop {
@@ -530,6 +551,38 @@ pub async fn run_slack_adapter(
                                                         }
                                                     }
                                                 }
+                                                let channel_id = event["channel"].as_str().unwrap_or("");
+                                                let thread_key = event["thread_ts"]
+                                                    .as_str()
+                                                    .or_else(|| event["ts"].as_str())
+                                                    .unwrap_or("")
+                                                    .to_string();
+                                                // app_mention is always a human action — reset bot turn counters
+                                                if !is_bot {
+                                                    bot_turns.lock().await.on_human_message(&thread_key);
+                                                } else {
+                                                    match bot_turns.lock().await.on_bot_message(&thread_key) {
+                                                        TurnResult::HardLimit => {
+                                                            warn!(channel_id, "hard bot turn limit reached");
+                                                            continue;
+                                                        }
+                                                        TurnResult::SoftLimit(n) => {
+                                                            info!(channel_id, turns = n, max = max_bot_turns, "soft bot turn limit reached");
+                                                            let ch = ChannelRef {
+                                                                platform: "slack".into(),
+                                                                channel_id: channel_id.to_string(),
+                                                                thread_id: event["thread_ts"].as_str().map(|s| s.to_string()),
+                                                                parent_id: None,
+                                                            };
+                                                            let _ = adapter.send_message(&ch, &format!(
+                                                                "⚠️ Bot turn limit reached ({n}/{}). A human must reply in this thread to continue bot-to-bot conversation.",
+                                                                max_bot_turns
+                                                            )).await;
+                                                            continue;
+                                                        }
+                                                        TurnResult::Ok => {}
+                                                    }
+                                                }
                                                 let event = event.clone();
                                                 let adapter = adapter.clone();
                                                 let bot_token = bot_token.clone();
@@ -538,15 +591,7 @@ pub async fn run_slack_adapter(
                                                 let stt_config = stt_config.clone();
                                                 let router = router.clone();
                                                 let queue = queue.clone();
-                                                // Queue key: thread_ts if already in a thread, otherwise ts.
-                                                // app_mention always has a channel context, so ts alone
-                                                // is unique enough (unlike message events in DMs where
-                                                // we prefix with channel_id to avoid ts collisions).
-                                                let queue_key = event["thread_ts"]
-                                                    .as_str()
-                                                    .or_else(|| event["ts"].as_str())
-                                                    .unwrap_or("")
-                                                    .to_string();
+                                                let queue_key = thread_key.clone();
                                                 tokio::spawn(async move {
                                                     let Some(_permit) = queue.acquire(&queue_key).await else { return };
                                                     handle_message(
@@ -601,6 +646,23 @@ pub async fn run_slack_adapter(
                                                 // (except in DMs where app_mention doesn't fire)
                                                 if mentions_bot && !is_dm { continue; }
 
+                                                // Early multibot detection: if this is another bot posting in a thread,
+                                                // cache it immediately so MultibotMentions can use it without an API fetch.
+                                                if is_bot && has_thread {
+                                                    if let Some(thread_ts) = event["thread_ts"].as_str() {
+                                                        adapter.cache_multibot(thread_ts).await;
+                                                    }
+                                                }
+
+                                                // --- Bot turn tracking (human resets counters) ---
+                                                let thread_key = event["thread_ts"]
+                                                    .as_str()
+                                                    .map(|s| s.to_string())
+                                                    .unwrap_or_else(|| format!("{}:{}", channel_id, event["ts"].as_str().unwrap_or("")));
+                                                if !is_bot {
+                                                    bot_turns.lock().await.on_human_message(&thread_key);
+                                                }
+
                                                 // --- Bot message gating ---
                                                 if is_bot {
                                                     let event_bot_id = event["bot_id"].as_str().unwrap_or("");
@@ -610,37 +672,27 @@ pub async fn run_slack_adapter(
                                                             if !mentions_bot { continue; }
                                                         }
                                                         AllowBots::All => {
-                                                            // Loop protection: count consecutive bot msgs (fail-closed)
-                                                            if let Some(thread_ts) = event["thread_ts"].as_str() {
-                                                                let limit_str = (MAX_CONSECUTIVE_BOT_TURNS + 1).to_string();
-                                                                match adapter.api_get(
-                                                                    "conversations.replies",
-                                                                    &[
-                                                                        ("channel", channel_id),
-                                                                        ("ts", thread_ts),
-                                                                        ("limit", &limit_str),
-                                                                        ("inclusive", "true"),
-                                                                    ],
-                                                                ).await {
-                                                                    Ok(resp) => {
-                                                                        if let Some(msgs) = resp["messages"].as_array() {
-                                                                            let consecutive = msgs.iter().rev()
-                                                                                .take_while(|m| {
-                                                                                    m["bot_id"].is_string()
-                                                                                        || m["subtype"].as_str() == Some("bot_message")
-                                                                                })
-                                                                                .count();
-                                                                            if consecutive >= MAX_CONSECUTIVE_BOT_TURNS {
-                                                                                warn!("bot turn cap reached ({MAX_CONSECUTIVE_BOT_TURNS}), ignoring");
-                                                                                continue;
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                    Err(e) => {
-                                                                        warn!(channel_id, thread_ts, error = %e, "failed to fetch thread for bot loop check, rejecting (fail-closed)");
-                                                                        continue;
-                                                                    }
+                                                            match bot_turns.lock().await.on_bot_message(&thread_key) {
+                                                                TurnResult::HardLimit => {
+                                                                    warn!(channel_id, "hard bot turn limit reached");
+                                                                    // No adapter send here — hard limit is silent to avoid more bot activity
+                                                                    continue;
                                                                 }
+                                                                TurnResult::SoftLimit(n) => {
+                                                                    info!(channel_id, turns = n, max = max_bot_turns, "soft bot turn limit reached");
+                                                                    let ch = ChannelRef {
+                                                                        platform: "slack".into(),
+                                                                        channel_id: channel_id.to_string(),
+                                                                        thread_id: event["thread_ts"].as_str().map(|s| s.to_string()),
+                                                                        parent_id: None,
+                                                                    };
+                                                                    let _ = adapter.send_message(&ch, &format!(
+                                                                        "⚠️ Bot turn limit reached ({n}/{}). A human must reply in this thread to continue bot-to-bot conversation.",
+                                                                        max_bot_turns
+                                                                    )).await;
+                                                                    continue;
+                                                                }
+                                                                TurnResult::Ok => {}
                                                             }
                                                         }
                                                     }
@@ -668,16 +720,25 @@ pub async fn run_slack_adapter(
                                                             AllowUsers::Mentions => {
                                                                 if !mentions_bot { continue; }
                                                             }
-                                                            AllowUsers::Involved | AllowUsers::MultibotMentions => {
-                                                                if !has_thread {
-                                                                    // Non-thread channel message: require mention
-                                                                    // (app_mention handles this, but DMs don't get app_mention)
+                                                            AllowUsers::Involved => {
+                                                                if !has_thread { continue; }
+                                                                let thread_ts = event["thread_ts"].as_str().unwrap_or("");
+                                                                let (involved, _) = adapter.bot_participated_in_thread(channel_id, thread_ts).await;
+                                                                if !involved {
+                                                                    debug!(channel_id, thread_ts, "bot not involved in thread, ignoring");
                                                                     continue;
                                                                 }
-                                                                // Thread message: check bot participation
+                                                            }
+                                                            AllowUsers::MultibotMentions => {
+                                                                if !has_thread { continue; }
                                                                 let thread_ts = event["thread_ts"].as_str().unwrap_or("");
-                                                                if !adapter.bot_participated_in_thread(channel_id, thread_ts).await {
+                                                                let (involved, other_bot) = adapter.bot_participated_in_thread(channel_id, thread_ts).await;
+                                                                if !involved {
                                                                     debug!(channel_id, thread_ts, "bot not involved in thread, ignoring");
+                                                                    continue;
+                                                                }
+                                                                if other_bot && !mentions_bot {
+                                                                    debug!(channel_id, thread_ts, "multibot thread, requiring @mention");
                                                                     continue;
                                                                 }
                                                             }
