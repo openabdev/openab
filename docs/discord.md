@@ -216,8 +216,12 @@ allow_bot_messages = "mentions"
 
 To prevent runaway bot-to-bot loops, OpenAB enforces two layers of protection:
 
-- **Soft limit** (`max_bot_turns`, default: 20) — consecutive bot turns without human intervention. When reached, the bot sends a warning and stops responding. A human message in the thread resets the counter.
+- **Soft limit** (`max_bot_turns`, default: 20) — total bot messages in a thread without human intervention. When reached, the bot sends a one-time warning and stops responding. A human message in the thread resets the counter.
 - **Hard limit** (100, not configurable) — absolute cap on bot turns between human interventions. When reached, bot-to-bot conversation stops until a human replies.
+
+Both limits count **all** bot messages in the thread, including the bot's own replies. In a two-bot ping-pong with `max_bot_turns = 20`, each bot sends ~10 messages before the limit triggers.
+
+Warning messages are sent exactly once (on the exact threshold hit) to prevent warnings from ping-ponging between bots.
 
 ```toml
 [discord]

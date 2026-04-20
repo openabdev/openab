@@ -228,7 +228,53 @@ impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
         let bot_id = ctx.cache.current_user().id;
 
-        // Always ignore own messages
+        // Early multibot detection: cache that another bot is present.
+        // Runs before self-check and bot gating so we always detect other bots. (#481)
+        if msg.author.bot && msg.author.id != bot_id {
+            let key = msg.channel_id.to_string();
+            let mut cache = self.multibot_threads.lock().await;
+            cache.entry(key).or_insert_with(tokio::time::Instant::now);
+        }
+
+        // Bot turn counting: runs before self-check so ALL bot messages
+        // (including own) count toward the per-thread limit. This means
+        // soft_limit=20 = 20 total bot messages in the thread (~10 per bot
+        // in a two-bot ping-pong). (#483)
+        {
+            let thread_key = msg.channel_id.to_string();
+            let mut tracker = self.bot_turns.lock().await;
+            if msg.author.bot {
+                match tracker.on_bot_message(&thread_key) {
+                    TurnResult::HardLimit => {
+                        tracing::warn!(channel_id = %msg.channel_id, "hard bot turn limit reached");
+                        if msg.author.id != bot_id {
+                            let _ = msg.channel_id.say(
+                                &ctx.http,
+                                format!("🛑 Hard bot turn limit reached ({HARD_BOT_TURN_LIMIT}). A human must reply to continue."),
+                            ).await;
+                        }
+                        return;
+                    }
+                    TurnResult::Stopped => return,
+                    TurnResult::SoftLimit(n) => {
+                        tracing::info!(channel_id = %msg.channel_id, turns = n, max = self.max_bot_turns, "soft bot turn limit reached");
+                        if msg.author.id != bot_id {
+                            let _ = msg.channel_id.say(
+                                &ctx.http,
+                                format!("⚠️ Bot turn limit reached ({n}/{}). A human must reply in this thread to continue bot-to-bot conversation.", self.max_bot_turns),
+                            ).await;
+                        }
+                        return;
+                    }
+                    TurnResult::Throttled => return,
+                    TurnResult::Ok => {}
+                }
+            } else {
+                tracker.on_human_message(&thread_key);
+            }
+        }
+
+        // Ignore own messages (after counting toward bot turns above)
         if msg.author.id == bot_id {
             return;
         }
@@ -243,15 +289,6 @@ impl EventHandler for Handler {
 
         let is_mentioned = msg.mentions_user_id(bot_id)
             || msg.content.contains(&format!("<@{}>", bot_id));
-
-        // Early multibot detection: cache that another bot is present in this
-        // channel/thread. Runs BEFORE bot message gating so we detect other
-        // bots even when their messages are filtered out. (#481)
-        if msg.author.bot && msg.author.id != bot_id {
-            let key = msg.channel_id.to_string();
-            let mut cache = self.multibot_threads.lock().await;
-            cache.entry(key).or_insert_with(tokio::time::Instant::now);
-        }
 
         // Bot message gating (from upstream #321)
         if msg.author.bot {
@@ -397,38 +434,6 @@ impl EventHandler for Handler {
         }
 
         let prompt = resolve_mentions(&msg.content, bot_id);
-
-        // Bot turn limiting: track consecutive bot turns per thread.
-        // Placed after all gating so only messages that will actually be
-        // processed count toward the limit.
-        // Human message resets both soft and hard counters.
-        {
-            let thread_key = msg.channel_id.to_string();
-            let mut tracker = self.bot_turns.lock().await;
-            if msg.author.bot {
-                match tracker.on_bot_message(&thread_key) {
-                    TurnResult::HardLimit => {
-                        tracing::warn!(channel_id = %msg.channel_id, "hard bot turn limit reached");
-                        let _ = msg.channel_id.say(
-                            &ctx.http,
-                            format!("🛑 Hard limit reached ({HARD_BOT_TURN_LIMIT}). Bot-to-bot conversation in this thread has been permanently stopped."),
-                        ).await;
-                        return;
-                    }
-                    TurnResult::SoftLimit(n) => {
-                        tracing::info!(channel_id = %msg.channel_id, turns = n, max = self.max_bot_turns, "soft bot turn limit reached");
-                        let _ = msg.channel_id.say(
-                            &ctx.http,
-                            format!("⚠️ Bot turn limit reached ({n}/{}). A human must reply in this thread to continue bot-to-bot conversation.", self.max_bot_turns),
-                        ).await;
-                        return;
-                    }
-                    TurnResult::Ok => {}
-                }
-            } else {
-                tracker.on_human_message(&thread_key);
-            }
-        }
 
         // No text and no attachments → skip
         if prompt.is_empty() && msg.attachments.is_empty() {
@@ -768,9 +773,16 @@ async fn get_or_create_thread(
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TurnResult {
+    /// Counter below limits — continue normally.
     Ok,
+    /// Counter == soft_limit — warn once, then stop.
     SoftLimit(u32),
+    /// Counter > soft_limit — silently stop (already warned).
+    Throttled,
+    /// Counter == HARD_BOT_TURN_LIMIT — warn once, then stop.
     HardLimit,
+    /// Counter > HARD_BOT_TURN_LIMIT — silently stop (already warned).
+    Stopped,
 }
 
 pub(crate) struct BotTurnTracker {
@@ -787,9 +799,13 @@ impl BotTurnTracker {
         let (soft, hard) = self.counts.entry(thread_id.to_string()).or_insert((0, 0));
         *soft += 1;
         *hard += 1;
-        if *hard >= HARD_BOT_TURN_LIMIT {
+        if *hard > HARD_BOT_TURN_LIMIT {
+            TurnResult::Stopped
+        } else if *hard == HARD_BOT_TURN_LIMIT {
             TurnResult::HardLimit
-        } else if *soft >= self.soft_limit {
+        } else if *soft > self.soft_limit {
+            TurnResult::Throttled
+        } else if *soft == self.soft_limit {
             TurnResult::SoftLimit(*soft)
         } else {
             TurnResult::Ok
@@ -930,6 +946,40 @@ mod tests {
     fn human_on_unknown_thread_is_noop() {
         let mut t = BotTurnTracker::new(5);
         t.on_human_message("unknown"); // should not panic
+    }
+
+    /// Two-bot ping-pong: both bots' messages count toward the same per-thread
+    /// limit. With soft_limit=20, the limit triggers after 20 total bot messages
+    /// (~10 per bot). This simulates what each bot's process sees when the
+    /// tracker runs before self-check — own messages are counted too. (#483)
+    #[test]
+    fn two_bot_pingpong_hits_soft_limit() {
+        let mut t = BotTurnTracker::new(20);
+        // Simulate 20 bot messages (alternating bot A and bot B,
+        // but the tracker doesn't distinguish — it just counts)
+        for i in 1..20 {
+            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok, "turn {i}");
+        }
+        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(20));
+    }
+
+    /// Human message in the middle of a ping-pong resets the counter,
+    /// allowing bots to continue.
+    #[test]
+    fn two_bot_pingpong_human_resets() {
+        let mut t = BotTurnTracker::new(20);
+        for _ in 0..15 {
+            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        }
+        t.on_human_message("t1"); // human intervenes at 15
+        for _ in 0..15 {
+            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok); // can do 15 more
+        }
+        // now at 15 again, 5 more to hit limit
+        for _ in 0..4 {
+            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        }
+        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(20));
     }
 
     // --- resolve_mentions tests ---
@@ -1077,5 +1127,35 @@ mod tests {
             true,           // involved
             false,          // other_bot_present
         ));
+    }
+
+    /// After soft limit fires once (n==20), subsequent bot messages still return
+    /// SoftLimit but with n>20. The caller warns only when n==max (exact hit),
+    /// preventing warning messages from ping-ponging between bots.
+    #[test]
+    fn soft_limit_warn_once_semantics() {
+        let mut t = BotTurnTracker::new(20);
+        for _ in 0..19 {
+            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        }
+        // n==20: exact hit — caller should send warning
+        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(20));
+        // n==21: past limit — caller should silently return (no warning)
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Throttled);
+        // n==22: still past — still silent
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Throttled);
+    }
+
+    /// Hard limit also carries count for warn-once semantics.
+    #[test]
+    fn hard_limit_warn_once_semantics() {
+        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT + 1); // soft > hard so hard fires first
+        for _ in 0..HARD_BOT_TURN_LIMIT - 1 {
+            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        }
+        // Exact hit — warn
+        assert_eq!(t.on_bot_message("t1"), TurnResult::HardLimit);
+        // Past — silent
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Stopped);
     }
 }
