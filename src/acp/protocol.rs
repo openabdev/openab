@@ -214,3 +214,125 @@ pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_standard_config_options() {
+        let result = json!({
+            "configOptions": [{
+                "id": "model",
+                "name": "Model",
+                "type": "enum",
+                "currentValue": "claude-sonnet-4",
+                "options": [
+                    {"value": "claude-sonnet-4", "name": "Sonnet 4"},
+                    {"value": "claude-opus-4", "name": "Opus 4"}
+                ]
+            }]
+        });
+        let opts = parse_config_options(&result);
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0].id, "model");
+        assert_eq!(opts[0].current_value, "claude-sonnet-4");
+        assert_eq!(opts[0].options.len(), 2);
+    }
+
+    #[test]
+    fn parse_kiro_models_fallback() {
+        let result = json!({
+            "models": {
+                "currentModelId": "m1",
+                "availableModels": [
+                    {"modelId": "m1", "name": "Model One"},
+                    {"modelId": "m2", "name": "Model Two"}
+                ]
+            }
+        });
+        let opts = parse_config_options(&result);
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0].id, "model");
+        assert_eq!(opts[0].category.as_deref(), Some("model"));
+        assert_eq!(opts[0].current_value, "m1");
+        assert_eq!(opts[0].options.len(), 2);
+    }
+
+    #[test]
+    fn parse_kiro_modes_fallback() {
+        let result = json!({
+            "modes": {
+                "currentModeId": "default",
+                "availableModes": [
+                    {"id": "default", "name": "Default"},
+                    {"id": "planner", "name": "Planner"}
+                ]
+            }
+        });
+        let opts = parse_config_options(&result);
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0].id, "agent");
+        assert_eq!(opts[0].category.as_deref(), Some("agent"));
+        assert_eq!(opts[0].current_value, "default");
+    }
+
+    #[test]
+    fn parse_kiro_models_and_modes() {
+        let result = json!({
+            "models": {
+                "currentModelId": "m1",
+                "availableModels": [{"modelId": "m1", "name": "M1"}]
+            },
+            "modes": {
+                "currentModeId": "default",
+                "availableModes": [{"id": "default", "name": "Default"}]
+            }
+        });
+        let opts = parse_config_options(&result);
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0].id, "model");
+        assert_eq!(opts[1].id, "agent");
+    }
+
+    #[test]
+    fn parse_standard_takes_precedence_over_kiro() {
+        let result = json!({
+            "configOptions": [{
+                "id": "model",
+                "name": "Model",
+                "type": "enum",
+                "currentValue": "standard",
+                "options": [{"value": "standard", "name": "Standard"}]
+            }],
+            "models": {
+                "currentModelId": "kiro",
+                "availableModels": [{"modelId": "kiro", "name": "Kiro"}]
+            }
+        });
+        let opts = parse_config_options(&result);
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0].current_value, "standard");
+    }
+
+    #[test]
+    fn parse_empty_result() {
+        let opts = parse_config_options(&json!({}));
+        assert!(opts.is_empty());
+    }
+
+    #[test]
+    fn parse_empty_config_options_falls_through_to_kiro() {
+        let result = json!({
+            "configOptions": [],
+            "models": {
+                "currentModelId": "m1",
+                "availableModels": [{"modelId": "m1", "name": "M1"}]
+            }
+        });
+        let opts = parse_config_options(&result);
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0].id, "model");
+    }
+}
