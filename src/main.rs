@@ -139,6 +139,7 @@ async fn main() -> anyhow::Result<()> {
                         slack_cfg.allow_bot_messages,
                         slack_cfg.trusted_bot_ids.into_iter().collect(),
                         slack_cfg.allow_user_messages,
+                        slack_cfg.max_bot_turns,
                         session_ttl,
                         stt,
                         router,
@@ -190,7 +191,7 @@ async fn main() -> anyhow::Result<()> {
                     multibot_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
                     session_ttl: std::time::Duration::from_secs(ttl_secs),
                     max_bot_turns: discord_cfg.max_bot_turns,
-                    bot_turns: tokio::sync::Mutex::new(discord::BotTurnTracker::new(discord_cfg.max_bot_turns)),
+                    bot_turns: tokio::sync::Mutex::new(adapter::BotTurnTracker::new(discord_cfg.max_bot_turns)),
                 };
 
                 let intents = GatewayIntents::GUILD_MESSAGES
