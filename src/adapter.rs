@@ -1,6 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::error;
 
@@ -9,6 +10,49 @@ use crate::config::ReactionsConfig;
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
 use crate::reactions::StatusReactionController;
+
+// --- Bot turn tracking ---
+
+/// Absolute per-thread cap on bot turns. Cannot be overridden by config or human intervention.
+pub const HARD_BOT_TURN_LIMIT: u32 = 100;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum TurnResult {
+    Ok,
+    SoftLimit(u32),
+    HardLimit,
+}
+
+pub struct BotTurnTracker {
+    soft_limit: u32,
+    counts: HashMap<String, (u32, u32)>,
+}
+
+impl BotTurnTracker {
+    pub fn new(soft_limit: u32) -> Self {
+        Self { soft_limit, counts: HashMap::new() }
+    }
+
+    pub fn on_bot_message(&mut self, thread_id: &str) -> TurnResult {
+        let (soft, hard) = self.counts.entry(thread_id.to_string()).or_insert((0, 0));
+        *soft += 1;
+        *hard += 1;
+        if *hard >= HARD_BOT_TURN_LIMIT {
+            TurnResult::HardLimit
+        } else if *soft >= self.soft_limit {
+            TurnResult::SoftLimit(*soft)
+        } else {
+            TurnResult::Ok
+        }
+    }
+
+    pub fn on_human_message(&mut self, thread_id: &str) {
+        if let Some((soft, hard)) = self.counts.get_mut(thread_id) {
+            *soft = 0;
+            *hard = 0;
+        }
+    }
+}
 
 // --- Platform-agnostic types ---
 
