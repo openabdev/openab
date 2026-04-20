@@ -9,19 +9,22 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
+/// A single active session: connection handle + addressing info bundled
+/// together so their lifetimes are enforced at the type level.
+struct SessionEntry {
+    conn: Arc<Mutex<AcpConnection>>,
+    channel: ChannelRef,
+    adapter: Arc<dyn ChatAdapter>,
+}
+
 /// Combined state protected by a single lock to prevent deadlocks.
 /// Lock ordering: never await a per-connection mutex while holding `state`.
 struct PoolState {
-    /// Active connections: thread_key → AcpConnection handle.
-    active: HashMap<String, Arc<Mutex<AcpConnection>>>,
+    /// Active sessions: thread_key → SessionEntry (connection + addressing).
+    sessions: HashMap<String, SessionEntry>,
     /// Lock-free cancel handles: thread_key → (stdin, session_id).
     /// Stored separately so cancel can work without locking the connection.
     cancel_handles: HashMap<String, (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String)>,
-    /// Addressing info for each active thread. Populated alongside `active`
-    /// and pruned together. Used by `begin_shutdown` so the broker can post
-    /// a notification to every live session without the adapter layer
-    /// maintaining a parallel cache. Invariant: `addresses.keys() == active.keys()`.
-    addresses: HashMap<String, (ChannelRef, Arc<dyn ChatAdapter>)>,
     /// Suspended sessions: thread_key → ACP sessionId.
     /// Saved on eviction so sessions can be resumed via `session/load`.
     suspended: HashMap<String, String>,
@@ -47,16 +50,18 @@ type EvictionCandidate = (
     Option<String>,
 );
 
-fn remove_if_same_handle<T>(
-    map: &mut HashMap<String, Arc<Mutex<T>>>,
+/// Remove a session entry only if its connection handle matches `expected`.
+/// Returns the removed connection Arc, or None if the handle was swapped.
+fn remove_if_same_conn(
+    map: &mut HashMap<String, SessionEntry>,
     key: &str,
-    expected: &Arc<Mutex<T>>,
-) -> Option<Arc<Mutex<T>>> {
+    expected: &Arc<Mutex<AcpConnection>>,
+) -> Option<Arc<Mutex<AcpConnection>>> {
     let should_remove = map
         .get(key)
-        .is_some_and(|current| Arc::ptr_eq(current, expected));
+        .is_some_and(|entry| Arc::ptr_eq(&entry.conn, expected));
     if should_remove {
-        map.remove(key)
+        map.remove(key).map(|e| e.conn)
     } else {
         None
     }
@@ -75,9 +80,8 @@ impl SessionPool {
     pub fn new(config: AgentConfig, max_sessions: usize) -> Self {
         Self {
             state: RwLock::new(PoolState {
-                active: HashMap::new(),
+                sessions: HashMap::new(),
                 cancel_handles: HashMap::new(),
-                addresses: HashMap::new(),
                 suspended: HashMap::new(),
                 creating: HashMap::new(),
             }),
@@ -105,9 +109,9 @@ impl SessionPool {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::Release);
         state
-            .addresses
+            .sessions
             .iter()
-            .map(|(k, (c, a))| (k.clone(), c.clone(), a.clone()))
+            .map(|(k, e)| (k.clone(), e.channel.clone(), e.adapter.clone()))
             .collect()
     }
 
@@ -136,7 +140,7 @@ impl SessionPool {
                 bail!("pool is shutting down");
             }
             (
-                state.active.get(thread_id).cloned(),
+                state.sessions.get(thread_id).map(|e| e.conn.clone()),
                 state.suspended.get(thread_id).cloned(),
             )
         };
@@ -152,7 +156,11 @@ impl SessionPool {
                 // we see here reflects every `begin_shutdown` that has
                 // committed. This closes the race where shutdown starts
                 // while we were waiting on `conn.lock()`.
-                let _sync = self.state.read().await;
+                //
+                // DO NOT REMOVE — this read-lock is a synchronization barrier,
+                // not a data access. Without it the `is_shutting_down()` check
+                // below can observe a stale value.
+                let _shutdown_barrier = self.state.read().await;
                 if self.is_shutting_down() {
                     bail!("pool is shutting down");
                 }
@@ -167,9 +175,9 @@ impl SessionPool {
         let snapshot: Vec<(String, Arc<Mutex<AcpConnection>>)> = {
             let state = self.state.read().await;
             state
-                .active
+                .sessions
                 .iter()
-                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .map(|(k, e)| (k.clone(), Arc::clone(&e.conn)))
                 .collect()
         };
 
@@ -245,7 +253,8 @@ impl SessionPool {
 
         // Another task may have created a healthy connection while we were
         // initializing this one.
-        if let Some(existing) = state.active.get(thread_id).cloned() {
+        if let Some(entry) = state.sessions.get(thread_id) {
+            let existing = entry.conn.clone();
             let Ok(existing) = existing.try_lock() else {
                 return Ok(());
             };
@@ -254,14 +263,12 @@ impl SessionPool {
             }
             warn!(thread_id, "stale connection, rebuilding");
             drop(existing);
-            state.active.remove(thread_id);
-            state.addresses.remove(thread_id);
+            state.sessions.remove(thread_id);
         }
 
-        if state.active.len() >= self.max_sessions {
+        if state.sessions.len() >= self.max_sessions {
             if let Some((key, expected_conn, _, sid)) = eviction_candidate {
-                if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
-                    state.addresses.remove(&key);
+                if remove_if_same_conn(&mut state.sessions, &key, &expected_conn).is_some() {
                     info!(evicted = %key, "pool full, suspending oldest idle session");
                     if let Some(sid) = sid {
                         state.suspended.insert(key, sid);
@@ -278,18 +285,19 @@ impl SessionPool {
             }
         }
 
-        if state.active.len() >= self.max_sessions {
+        if state.sessions.len() >= self.max_sessions {
             return Err(anyhow!("pool exhausted ({} sessions)", self.max_sessions));
         }
 
         state.suspended.remove(thread_id);
-        state.active.insert(thread_id.to_string(), new_conn);
+        state.sessions.insert(thread_id.to_string(), SessionEntry {
+            conn: new_conn,
+            channel: channel.clone(),
+            adapter: adapter.clone(),
+        });
         if !cancel_session_id.is_empty() {
             state.cancel_handles.insert(thread_id.to_string(), (cancel_handle, cancel_session_id));
         }
-        state
-            .addresses
-            .insert(thread_id.to_string(), (channel.clone(), adapter.clone()));
         Ok(())
     }
 
@@ -303,9 +311,9 @@ impl SessionPool {
         let conn = {
             let state = self.state.read().await;
             state
-                .active
+                .sessions
                 .get(thread_id)
-                .cloned()
+                .map(|e| e.conn.clone())
                 .ok_or_else(|| anyhow!("no connection for thread {thread_id}"))?
         };
 
@@ -316,8 +324,8 @@ impl SessionPool {
     /// Get cached configOptions for a session (e.g. available models).
     pub async fn get_config_options(&self, thread_id: &str) -> Vec<ConfigOption> {
         let state = self.state.read().await;
-        let conn = match state.active.get(thread_id) {
-            Some(c) => c.clone(),
+        let conn = match state.sessions.get(thread_id) {
+            Some(e) => e.conn.clone(),
             None => return Vec::new(),
         };
         drop(state);
@@ -335,9 +343,9 @@ impl SessionPool {
         let conn = {
             let state = self.state.read().await;
             state
-                .active
+                .sessions
                 .get(thread_id)
-                .cloned()
+                .map(|e| e.conn.clone())
                 .ok_or_else(|| anyhow!("no connection for thread {thread_id}"))?
         };
         let mut conn = conn.lock().await;
@@ -372,9 +380,9 @@ impl SessionPool {
         let snapshot: Vec<(String, Arc<Mutex<AcpConnection>>)> = {
             let state = self.state.read().await;
             state
-                .active
+                .sessions
                 .iter()
-                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .map(|(k, e)| (k.clone(), Arc::clone(&e.conn)))
                 .collect()
         };
 
@@ -397,8 +405,7 @@ impl SessionPool {
 
         let mut state = self.state.write().await;
         for (key, expected_conn, sid) in stale {
-            if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
-                state.addresses.remove(&key);
+            if remove_if_same_conn(&mut state.sessions, &key, &expected_conn).is_some() {
                 info!(thread_id = %key, "cleaning up idle session");
                 if let Some(sid) = sid {
                     state.suspended.insert(key, sid);
@@ -409,19 +416,36 @@ impl SessionPool {
 
     pub async fn shutdown(&self) {
         let mut state = self.state.write().await;
-        let count = state.active.len();
-        state.active.clear(); // Drop impl kills process groups
-        state.addresses.clear();
+        let count = state.sessions.len();
+        state.sessions.clear(); // Drop impl kills process groups
         info!(count, "pool shutdown complete");
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{get_or_insert_gate, remove_if_same_handle};
+    use super::get_or_insert_gate;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    /// The pointer-equality removal logic used by `remove_if_same_conn`.
+    /// Tested here with a simple type since `AcpConnection` cannot be
+    /// constructed in unit tests.
+    fn remove_if_same_handle<T>(
+        map: &mut HashMap<String, Arc<Mutex<T>>>,
+        key: &str,
+        expected: &Arc<Mutex<T>>,
+    ) -> Option<Arc<Mutex<T>>> {
+        let should_remove = map
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, expected));
+        if should_remove {
+            map.remove(key)
+        } else {
+            None
+        }
+    }
 
     #[test]
     fn remove_if_same_handle_removes_matching_entry() {
