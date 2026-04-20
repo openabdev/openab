@@ -639,30 +639,9 @@ impl Handler {
             c == category || aliases.contains(&c)
         })?;
 
-        // Discord caps StringSelectMenu at 25 options. When the agent returns
-        // more, keep current + `default[]` (Auto) then fill in order.
-        let selected: Vec<&crate::acp::protocol::ConfigOptionValue> = if opt.options.len() <= DISCORD_SELECT_MAX {
-            opt.options.iter().collect()
-        } else {
-            let mut picked: Vec<&crate::acp::protocol::ConfigOptionValue> = Vec::with_capacity(DISCORD_SELECT_MAX);
-            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-            for key in [opt.current_value.as_str(), "default[]"] {
-                if let Some(o) = opt.options.iter().find(|o| o.value == key) {
-                    if seen.insert(o.value.as_str()) {
-                        picked.push(o);
-                    }
-                }
-            }
-            for o in &opt.options {
-                if picked.len() >= DISCORD_SELECT_MAX {
-                    break;
-                }
-                if seen.insert(o.value.as_str()) {
-                    picked.push(o);
-                }
-            }
-            picked
-        };
+        // Discord caps StringSelectMenu at 25 options; truncate in order.
+        let selected: Vec<&crate::acp::protocol::ConfigOptionValue> =
+            opt.options.iter().take(DISCORD_SELECT_MAX).collect();
 
         let menu_options: Vec<CreateSelectMenuOption> = selected
             .iter()
