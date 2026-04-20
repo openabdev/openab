@@ -2,8 +2,12 @@
 
 [discord]
 bot_token = "${DISCORD_BOT_TOKEN}"
-allowed_channels = ["1234567890"]       # empty or omitted = allow all channels
-# allowed_users = ["<YOUR_DISCORD_USER_ID>"]  # empty or omitted = allow all users
+# allow_all_channels = true            # true = allow all channels; false = only allowed_channels
+#                                      # omitted = auto-detect from list (non-empty → false, empty → true)
+allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-detected as false
+# allow_all_users = true               # true = any user; false = only allowed_users
+#                                      # omitted = auto-detect from list (non-empty → false, empty → true)
+# allowed_users = ["<YOUR_DISCORD_USER_ID>"]  # ↑ omitted + empty/absent list → auto-detected as true
 # allow_bot_messages = "off"  # "off" (default) | "mentions" | "all"
                                # "mentions" is recommended for multi-agent collaboration
 # trusted_bot_ids = []         # empty = any bot (mode permitting); set to restrict
@@ -14,8 +18,10 @@ allowed_channels = ["1234567890"]       # empty or omitted = allow all channels
 # [slack]
 # bot_token = "${SLACK_BOT_TOKEN}"     # Bot User OAuth Token (xoxb-...)
 # app_token = "${SLACK_APP_TOKEN}"     # App-Level Token (xapp-...) for Socket Mode
-# allowed_channels = ["C0123456789"]   # empty or omitted = allow all channels
-# allowed_users = ["U0123456789"]      # empty or omitted = allow all users
+# allow_all_channels = true            # true (default) = allow all channels; false = only allowed_channels
+# allowed_channels = ["C0123456789"]   # only checked when allow_all_channels = false
+# allow_all_users = true               # true (default) = any user; false = only allowed_users
+# allowed_users = ["U0123456789"]      # only checked when allow_all_users = false
 # allow_bot_messages = "off"           # "off" (default) | "mentions" | "all"
 # trusted_bot_ids = []                 # empty = any bot (mode permitting); set to restrict
 # allow_user_messages = "involved"     # "involved" (default) | "mentions"

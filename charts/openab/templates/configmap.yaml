@@ -13,6 +13,8 @@ data:
     {{- if ($cfg.discord).enabled }}
     [discord]
     bot_token = "${DISCORD_BOT_TOKEN}"
+    allow_all_channels = {{ if and (hasKey $cfg.discord "allowAllChannels") (ne $cfg.discord.allowAllChannels nil) }}{{ $cfg.discord.allowAllChannels }}{{ else if $cfg.discord.allowedChannels }}false{{ else }}true{{ end }}
+    allow_all_users = {{ if and (hasKey $cfg.discord "allowAllUsers") (ne $cfg.discord.allowAllUsers nil) }}{{ $cfg.discord.allowAllUsers }}{{ else if $cfg.discord.allowedUsers }}false{{ else }}true{{ end }}
     {{- range $cfg.discord.allowedChannels }}
     {{- if regexMatch "e\\+|E\\+" (toString .) }}
     {{- fail (printf "discord.allowedChannels contains a mangled ID: %s — use --set-string instead of --set for channel IDs" (toString .)) }}
@@ -44,10 +46,10 @@ data:
     {{- end }}
     {{- /* allowUserMessages: controls whether the bot requires @mention in threads (Discord) */ -}}
     {{- if $cfg.discord.allowUserMessages }}
-    {{- if not (has $cfg.discord.allowUserMessages (list "involved" "mentions")) }}
-    {{- fail (printf "agents.%s.discord.allowUserMessages must be one of: involved, mentions — got: %s" $name $cfg.discord.allowUserMessages) }}
+    {{- if not (has $cfg.discord.allowUserMessages (list "involved" "mentions" "multibot-mentions")) }}
+    {{- fail (printf "agents.%s.discord.allowUserMessages must be one of: involved, mentions, multibot-mentions (use hyphen form, not underscore) — got: %s" $name $cfg.discord.allowUserMessages) }}
     {{- end }}
-    allow_user_messages = {{ $cfg.discord.allowUserMessages | toJson }}  {{- /* involved (default): respond in bot's threads without @mention | mentions: always require @mention */ -}}
+    allow_user_messages = {{ $cfg.discord.allowUserMessages | toJson }}  {{- /* involved (default): respond in bot's threads without @mention | mentions: always require @mention | multibot-mentions: require @mention only when another bot has posted in the thread */ -}}
     {{- end }}
     {{- end }}
 
@@ -55,6 +57,8 @@ data:
     [slack]
     bot_token = "${SLACK_BOT_TOKEN}"
     app_token = "${SLACK_APP_TOKEN}"
+    allow_all_channels = {{ if and (hasKey ($cfg.slack) "allowAllChannels") (ne ($cfg.slack).allowAllChannels nil) }}{{ ($cfg.slack).allowAllChannels }}{{ else if ($cfg.slack).allowedChannels }}false{{ else }}true{{ end }}
+    allow_all_users = {{ if and (hasKey ($cfg.slack) "allowAllUsers") (ne ($cfg.slack).allowAllUsers nil) }}{{ ($cfg.slack).allowAllUsers }}{{ else if ($cfg.slack).allowedUsers }}false{{ else }}true{{ end }}
     {{- range ($cfg.slack).allowedChannels }}
     {{- if regexMatch "e\\+|E\\+" (toString .) }}
     {{- fail (printf "slack.allowedChannels contains a mangled ID: %s — use --set-string instead of --set for channel IDs" (toString .)) }}
@@ -77,10 +81,10 @@ data:
     trusted_bot_ids = {{ ($cfg.slack).trustedBotIds | toJson }}
     {{- end }}
     {{- if ($cfg.slack).allowUserMessages }}
-    {{- if not (has ($cfg.slack).allowUserMessages (list "involved" "mentions")) }}
-    {{- fail (printf "agents.%s.slack.allowUserMessages must be one of: involved, mentions — got: %s" $name ($cfg.slack).allowUserMessages) }}
+    {{- if not (has ($cfg.slack).allowUserMessages (list "involved" "mentions" "multibot-mentions")) }}
+    {{- fail (printf "agents.%s.slack.allowUserMessages must be one of: involved, mentions, multibot-mentions (use hyphen form, not underscore) — got: %s" $name ($cfg.slack).allowUserMessages) }}
     {{- end }}
-    allow_user_messages = {{ ($cfg.slack).allowUserMessages | toJson }}  {{- /* involved (default): respond in bot's threads without @mention | mentions: always require @mention */ -}}
+    allow_user_messages = {{ ($cfg.slack).allowUserMessages | toJson }}  {{- /* involved (default): respond in bot's threads without @mention | mentions: always require @mention | multibot-mentions: require @mention only when another bot has posted in the thread */ -}}
     {{- end }}
     {{- end }}
 

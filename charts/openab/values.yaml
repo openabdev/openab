@@ -121,11 +121,15 @@ agents:
       enabled: true      # set to false to disable the discord adapter
       # botToken is no longer required at render time; the actual token
       # is injected at runtime via the DISCORD_BOT_TOKEN env var.
+      # allowAllChannels: true (default) = allow all channels | false = only allowedChannels
+      # If not set, auto-inferred: non-empty allowedChannels → false, empty → true
+      # allowAllUsers: true (default) = allow all users | false = only allowedUsers
+      # If not set, auto-inferred: non-empty allowedUsers → false, empty → true
       # ⚠️ Use --set-string for channel IDs to avoid float64 precision loss
       allowedChannels:
         - "YOUR_CHANNEL_ID"
       # ⚠️ Use --set-string for user IDs to avoid float64 precision loss
-      allowedUsers: []  # empty = allow all users (default)
+      allowedUsers: []  # only checked when allowAllUsers=false
       # allowBotMessages: "off" (default) | "mentions" | "all"
       # recommended for multi-agent collaboration
       allowBotMessages: "off"
@@ -135,15 +139,19 @@ agents:
       enabled: false
       botToken: ""       # Bot User OAuth Token (xoxb-...)
       appToken: ""       # App-Level Token (xapp-...) for Socket Mode
-      allowedChannels: []  # empty = allow all channels
-      allowedUsers: []     # empty = allow all users
+      # allowAllChannels/allowAllUsers: same auto-infer logic as discord
+      allowedChannels: []  # empty + no allowAllChannels → allow all (auto-inferred)
+      allowedUsers: []     # empty + no allowAllUsers → allow all (auto-inferred)
       # allowBotMessages: "off" (default) | "mentions" | "all"
       allowBotMessages: "off"
       # trustedBotIds: Bot User IDs (U...) — find via Slack UI: click bot profile → Copy member ID
       trustedBotIds: []
-      # allowUserMessages: "involved" (default) | "mentions"
+      # allowUserMessages: "involved" (default) | "mentions" | "multibot-mentions"
       # "involved" = respond to thread follow-ups without @mention if bot has participated
       # "mentions" = always require @mention
+      # "multibot-mentions" = same as "involved" in single-bot threads; require @mention
+      #                      only when another bot has also posted in the thread
+      #                      (recommended for multi-bot deployments)
       allowUserMessages: "involved"
     workingDir: /home/agent
     env: {}
@@ -170,3 +178,11 @@ agents:
     nodeSelector: {}
     tolerations: []
     affinity: {}
+    # extraInitContainers adds init containers to the pod (runs before the main container)
+    extraInitContainers: []
+    # extraContainers adds sidecar containers to the pod
+    extraContainers: []
+    # extraVolumeMounts adds additional volume mounts to the main container
+    extraVolumeMounts: []
+    # extraVolumes adds additional volumes to the pod
+    extraVolumes: []

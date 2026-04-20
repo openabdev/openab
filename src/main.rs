@@ -16,7 +16,7 @@ use serenity::prelude::*;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Parser)]
 #[command(name = "openab")]
@@ -111,7 +111,14 @@ async fn main() -> anyhow::Result<()> {
 
             // Spawn Slack adapter (background task)
             let slack_handle = if let Some(slack_cfg) = cfg.slack {
+                let allow_all_channels = config::resolve_allow_all(slack_cfg.allow_all_channels, &slack_cfg.allowed_channels);
+                let allow_all_users = config::resolve_allow_all(slack_cfg.allow_all_users, &slack_cfg.allowed_users);
+                if !allow_all_channels && slack_cfg.allowed_channels.is_empty() {
+                    warn!("allow_all_channels=false with empty allowed_channels for Slack — bot will deny all channels");
+                }
                 info!(
+                    allow_all_channels,
+                    allow_all_users,
                     channels = slack_cfg.allowed_channels.len(),
                     users = slack_cfg.allowed_users.len(),
                     allow_bot_messages = ?slack_cfg.allow_bot_messages,
@@ -125,6 +132,8 @@ async fn main() -> anyhow::Result<()> {
                     if let Err(e) = slack::run_slack_adapter(
                         slack_cfg.bot_token,
                         slack_cfg.app_token,
+                        allow_all_channels,
+                        allow_all_users,
                         slack_cfg.allowed_channels.into_iter().collect(),
                         slack_cfg.allowed_users.into_iter().collect(),
                         slack_cfg.allow_bot_messages,
@@ -146,11 +155,18 @@ async fn main() -> anyhow::Result<()> {
 
             // Run Discord adapter (foreground, blocking) or wait for ctrl_c
             if let Some(discord_cfg) = cfg.discord {
+                let allow_all_channels = config::resolve_allow_all(discord_cfg.allow_all_channels, &discord_cfg.allowed_channels);
+                let allow_all_users = config::resolve_allow_all(discord_cfg.allow_all_users, &discord_cfg.allowed_users);
                 let allowed_channels =
                     parse_id_set(&discord_cfg.allowed_channels, "discord.allowed_channels")?;
+                if !allow_all_channels && allowed_channels.is_empty() {
+                    warn!("allow_all_channels=false with empty allowed_channels for Discord — bot will deny all channels");
+                }
                 let allowed_users = parse_id_set(&discord_cfg.allowed_users, "discord.allowed_users")?;
                 let trusted_bot_ids = parse_id_set(&discord_cfg.trusted_bot_ids, "discord.trusted_bot_ids")?;
                 info!(
+                    allow_all_channels,
+                    allow_all_users,
                     channels = allowed_channels.len(),
                     users = allowed_users.len(),
                     trusted_bots = trusted_bot_ids.len(),
@@ -161,6 +177,8 @@ async fn main() -> anyhow::Result<()> {
 
                 let handler = discord::Handler {
                     router,
+                    allow_all_channels,
+                    allow_all_users,
                     allowed_channels,
                     allowed_users,
                     stt_config: cfg.stt.clone(),
@@ -169,7 +187,10 @@ async fn main() -> anyhow::Result<()> {
                     trusted_bot_ids,
                     allow_user_messages: discord_cfg.allow_user_messages,
                     participated_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+                    multibot_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
                     session_ttl: std::time::Duration::from_secs(ttl_secs),
+                    max_bot_turns: discord_cfg.max_bot_turns,
+                    bot_turns: tokio::sync::Mutex::new(discord::BotTurnTracker::new(discord_cfg.max_bot_turns)),
                 };
 
                 let intents = GatewayIntents::GUILD_MESSAGES

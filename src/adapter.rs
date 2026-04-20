@@ -103,6 +103,11 @@ impl AdapterRouter {
         }
     }
 
+    /// Access the underlying session pool (e.g. for config option queries).
+    pub fn pool(&self) -> &Arc<SessionPool> {
+        &self.pool
+    }
+
     /// Handle an incoming user message. The adapter is responsible for
     /// filtering, resolving the thread, and building the SenderContext.
     /// This method handles sender context injection, session management, and streaming.
@@ -273,7 +278,16 @@ impl AdapterRouter {
 
                     // Process ACP notifications
                     let mut response_error: Option<String> = None;
-                    while let Some(notification) = rx.recv().await {
+                    let recv_timeout = std::time::Duration::from_secs(600);
+                    loop {
+                        let notification = match tokio::time::timeout(recv_timeout, rx.recv()).await {
+                            Ok(Some(n)) => n,
+                            Ok(None) => break, // channel closed
+                            Err(_) => {
+                                response_error = Some("Agent stopped responding".into());
+                                break;
+                            }
+                        };
                         if notification.id.is_some() {
                             if let Some(ref err) = notification.error {
                                 response_error = Some(format_coded_error(err.code, &err.message));
@@ -331,6 +345,9 @@ impl AdapterRouter {
                                     if let Some(tx) = &buf_tx {
                                         let _ = tx.send(compose_display(&tool_lines, &text_buf, true));
                                     }
+                                }
+                                AcpEvent::ConfigUpdate { options } => {
+                                    conn.config_options = options;
                                 }
                                 _ => {}
                             }

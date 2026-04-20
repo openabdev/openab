@@ -29,6 +29,10 @@ spec:
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with $cfg.extraInitContainers }}
+      initContainers:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: openab
           image: {{ include "openab.agentImage" $d | quote }}
@@ -101,6 +105,12 @@ spec:
             {{- end }}
             - name: tmp
               mountPath: /tmp
+            {{- with $cfg.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      {{- with $cfg.extraContainers }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with $cfg.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -124,5 +134,8 @@ spec:
         {{- end }}
         - name: tmp
           emptyDir: {}
+        {{- with $cfg.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
 {{- end }}
 {{- end }}

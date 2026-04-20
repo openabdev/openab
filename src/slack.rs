@@ -447,6 +447,8 @@ const MAX_CONSECUTIVE_BOT_TURNS: usize = 10;
 pub async fn run_slack_adapter(
     bot_token: String,
     app_token: String,
+    allow_all_channels: bool,
+    allow_all_users: bool,
     allowed_channels: HashSet<String>,
     allowed_users: HashSet<String>,
     allow_bot_messages: AllowBots,
@@ -552,6 +554,8 @@ pub async fn run_slack_adapter(
                                                         true,
                                                         &adapter,
                                                         &bot_token,
+                                                        allow_all_channels,
+                                                        allow_all_users,
                                                         &allowed_channels,
                                                         &allowed_users,
                                                         &stt_config,
@@ -664,7 +668,7 @@ pub async fn run_slack_adapter(
                                                             AllowUsers::Mentions => {
                                                                 if !mentions_bot { continue; }
                                                             }
-                                                            AllowUsers::Involved => {
+                                                            AllowUsers::Involved | AllowUsers::MultibotMentions => {
                                                                 if !has_thread {
                                                                     // Non-thread channel message: require mention
                                                                     // (app_mention handles this, but DMs don't get app_mention)
@@ -707,6 +711,8 @@ pub async fn run_slack_adapter(
                                                         is_dm,
                                                         &adapter,
                                                         &bot_token,
+                                                        allow_all_channels,
+                                                        allow_all_users,
                                                         &allowed_channels,
                                                         &allowed_users,
                                                         &stt_config,
@@ -777,6 +783,8 @@ async fn handle_message(
     strip_mentions: bool,
     adapter: &Arc<SlackAdapter>,
     bot_token: &str,
+    allow_all_channels: bool,
+    allow_all_users: bool,
     allowed_channels: &HashSet<String>,
     allowed_users: &HashSet<String>,
     stt_config: &SttConfig,
@@ -803,13 +811,13 @@ async fn handle_message(
     };
     let thread_ts = event["thread_ts"].as_str().map(|s| s.to_string());
 
-    // Check allowed channels (empty = allow all)
-    if !allowed_channels.is_empty() && !allowed_channels.contains(&channel_id) {
+    // Check allowed channels
+    if !allow_all_channels && !allowed_channels.contains(&channel_id) {
         return;
     }
 
     // Check allowed users — skip for bot messages (they go through trusted_bot_ids instead)
-    if !is_bot_msg && !allowed_users.is_empty() && !allowed_users.contains(&user_id) {
+    if !is_bot_msg && !allow_all_users && !allowed_users.contains(&user_id) {
         tracing::info!(user_id, "denied Slack user, ignoring");
         let msg_ref = MessageRef {
             channel: ChannelRef {

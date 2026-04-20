@@ -1,4 +1,5 @@
 use crate::acp::connection::AcpConnection;
+use crate::acp::protocol::ConfigOption;
 use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -13,6 +14,9 @@ use tracing::{info, warn};
 struct PoolState {
     /// Active connections: thread_key → AcpConnection handle.
     active: HashMap<String, Arc<Mutex<AcpConnection>>>,
+    /// Lock-free cancel handles: thread_key → (stdin, session_id).
+    /// Stored separately so cancel can work without locking the connection.
+    cancel_handles: HashMap<String, (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String)>,
     /// Suspended sessions: thread_key → ACP sessionId.
     /// Saved on eviction so sessions can be resumed via `session/load`.
     suspended: HashMap<String, String>,
@@ -66,6 +70,7 @@ impl SessionPool {
         Self {
             state: RwLock::new(PoolState {
                 active: HashMap::new(),
+                cancel_handles: HashMap::new(),
                 suspended,
                 creating: HashMap::new(),
             }),
@@ -192,6 +197,8 @@ impl SessionPool {
             }
         }
 
+        let cancel_handle = new_conn.cancel_handle();
+        let cancel_session_id = new_conn.acp_session_id.clone().unwrap_or_default();
         let new_conn = Arc::new(Mutex::new(new_conn));
 
         let mut state = self.state.write().await;
@@ -236,6 +243,9 @@ impl SessionPool {
         state.suspended.remove(thread_id);
         state.active.insert(thread_id.to_string(), new_conn);
         self.save_mapping(&state.suspended);
+        if !cancel_session_id.is_empty() {
+            state.cancel_handles.insert(thread_id.to_string(), (cancel_handle, cancel_session_id));
+        }
         Ok(())
     }
 
@@ -257,6 +267,59 @@ impl SessionPool {
 
         let mut conn = conn.lock().await;
         f(&mut conn).await
+    }
+
+    /// Get cached configOptions for a session (e.g. available models).
+    pub async fn get_config_options(&self, thread_id: &str) -> Vec<ConfigOption> {
+        let state = self.state.read().await;
+        let conn = match state.active.get(thread_id) {
+            Some(c) => c.clone(),
+            None => return Vec::new(),
+        };
+        drop(state);
+        let conn = conn.lock().await;
+        conn.config_options.clone()
+    }
+
+    /// Set a config option (e.g. model) via ACP and return updated options.
+    pub async fn set_config_option(
+        &self,
+        thread_id: &str,
+        config_id: &str,
+        value: &str,
+    ) -> Result<Vec<ConfigOption>> {
+        let conn = {
+            let state = self.state.read().await;
+            state
+                .active
+                .get(thread_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("no connection for thread {thread_id}"))?
+        };
+        let mut conn = conn.lock().await;
+        conn.set_config_option(config_id, value).await
+    }
+
+    /// Cancel the current in-flight operation for a session.
+    /// Uses pre-stored cancel handles to avoid locking the connection (which is held during streaming).
+    pub async fn cancel_session(&self, thread_id: &str) -> Result<()> {
+        let (stdin, session_id) = {
+            let state = self.state.read().await;
+            state.cancel_handles.get(thread_id).cloned()
+                .ok_or_else(|| anyhow!("no session for thread {thread_id}"))?
+        };
+        let data = serde_json::to_string(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": {"sessionId": session_id}
+        }))?;
+        tracing::info!(session_id, "sending session/cancel");
+        use tokio::io::AsyncWriteExt;
+        let mut w = stdin.lock().await;
+        w.write_all(data.as_bytes()).await?;
+        w.write_all(b"\n").await?;
+        w.flush().await?;
+        Ok(())
     }
 
     pub async fn cleanup_idle(&self, ttl_secs: u64) {

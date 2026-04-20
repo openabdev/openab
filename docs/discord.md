@@ -103,6 +103,24 @@ Controls whether the bot requires @mention in threads.
 |---|---|
 | `"involved"` (default) | Respond in threads the bot owns or has participated in without @mention. Main channel always requires @mention. |
 | `"mentions"` | Always require @mention, even in the bot's own threads. |
+| `"multibot-mentions"` | Same as `involved` in single-bot threads. In threads where other bots have also posted, requires @mention — prevents all bots from responding to every message. |
+
+#### Comparison
+
+| Scenario | `involved` | `mentions` | `multibot-mentions` |
+|---|---|---|---|
+| Main channel (no @mention) | ❌ | ❌ | ❌ |
+| Main channel (with @mention) | ✅ | ✅ | ✅ |
+| Single-bot thread (no @mention) | ✅ | ❌ | ✅ |
+| Single-bot thread (with @mention) | ✅ | ✅ | ✅ |
+| Multi-bot thread (no @mention) | ✅ | ❌ | ❌ |
+| Multi-bot thread (with @mention) | ✅ | ✅ | ✅ |
+
+#### When to use which
+
+- **`involved`** — Single-bot setup, or you want all bots to respond freely in shared threads.
+- **`mentions`** — Strict control. Every message must explicitly @mention the bot. Best for high-traffic channels where accidental triggers are a concern.
+- **`multibot-mentions`** — Multi-bot setup. Natural conversation in single-bot threads, explicit @mention control in multi-bot threads. Recommended for most multi-bot deployments.
 
 ### `trusted_bot_ids`
 
@@ -126,6 +144,16 @@ Empty (default) = any bot can pass through (subject to the mode check).
 ```
 
 Role mentions are ignored because they are shared across bots and cause false positives in multi-bot setups. This is intentional since v0.7.8-beta.3 (#420, #440).
+
+### User mention UIDs
+
+When a user mentions another user (e.g. `@SomeUser`) in a message to the bot, the raw Discord mention `<@UID>` is preserved in the prompt sent to the LLM. This means:
+
+- The LLM can copy `<@UID>` into its reply to produce a clickable Discord mention
+- The bot's own mention is stripped (so the bot doesn't see itself being triggered)
+- Role mentions are replaced with `@(role)` placeholder
+
+To help the LLM know who each UID refers to, provide a UID→name mapping via system prompt or context entry (see [Multi-Bot Setup](#multi-bot-setup) below).
 
 ---
 
@@ -162,6 +190,18 @@ helm install openab openab/openab \
 - **One thread per message:** when you @mention both bots in a single message, only the first bot creates a thread. The second bot's thread creation fails and the message is dropped. Workaround: @mention each bot in separate messages.
 - **Thread ownership:** a bot only responds in threads it owns or has participated in (`involved` mode). To have Bot B respond in Bot A's thread, use `mentions` mode and explicitly @mention Bot B.
 
+### Recommended: `multibot-mentions` mode
+
+In multi-bot channels, use `multibot-mentions` to get the best of both worlds:
+
+```toml
+[discord]
+allow_user_messages = "multibot-mentions"
+```
+
+- **Single-bot threads:** natural conversation, no @mention needed (same as `involved`)
+- **Multi-bot threads:** requires @mention so only the addressed bot responds
+
 ### Bot-to-bot communication
 
 To enable bots to collaborate (e.g. code review → deploy handoff):
@@ -171,6 +211,34 @@ To enable bots to collaborate (e.g. code review → deploy handoff):
 [discord]
 allow_bot_messages = "mentions"
 ```
+
+### Bot turn limits
+
+To prevent runaway bot-to-bot loops, OpenAB enforces two layers of protection:
+
+- **Soft limit** (`max_bot_turns`, default: 20) — consecutive bot turns without human intervention. When reached, the bot sends a warning and stops responding. A human message in the thread resets the counter.
+- **Hard limit** (100, not configurable) — absolute cap on bot turns between human interventions. When reached, bot-to-bot conversation stops until a human replies.
+
+```toml
+[discord]
+max_bot_turns = 30  # default is 20
+```
+
+### Ice-breaking: teaching bots who's in the room
+
+Since user mentions are preserved as raw `<@UID>`, bots need a UID→name mapping to know who is who. Add an ice-breaking greeting to each bot's system prompt or context entry:
+
+```
+We have 3 participants in this room:
+
+MY_NICIKNAME    <@MY_NAME>
+BOT1_NICKNAME   <@BOT1>
+BOT2_NICKNAME   <@BOT2>
+
+Always use <@UID> format to mention someone in your messages.
+```
+
+This lets each bot build the mapping in its own context from the start and correctly mention others using `<@UID>`.
 
 See [multi-agent.md](multi-agent.md) for detailed examples.
 

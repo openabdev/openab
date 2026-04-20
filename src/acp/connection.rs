@@ -1,4 +1,4 @@
-use crate::acp::protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
+use crate::acp::protocol::{ConfigOption, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, parse_config_options};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -115,6 +115,7 @@ pub struct AcpConnection {
     notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
     pub acp_session_id: Option<String>,
     pub supports_load_session: bool,
+    pub config_options: Vec<ConfigOption>,
     pub last_active: Instant,
     pub session_reset: bool,
     _reader_handle: JoinHandle<()>,
@@ -253,9 +254,9 @@ impl AcpConnection {
                         params: None,
                     });
                 }
-                // Signal subscriber
-                let sub = notify_tx.lock().await;
-                drop(sub);
+                // Close the notify channel so rx.recv() returns None
+                let mut sub = notify_tx.lock().await;
+                *sub = None;
             })
         };
 
@@ -268,6 +269,7 @@ impl AcpConnection {
             notify_tx,
             acp_session_id: None,
             supports_load_session: false,
+            config_options: Vec::new(),
             last_active: Instant::now(),
             session_reset: false,
             _reader_handle: reader_handle,
@@ -278,7 +280,7 @@ impl AcpConnection {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    async fn send_raw(&self, data: &str) -> Result<()> {
+    pub(crate) async fn send_raw(&self, data: &str) -> Result<()> {
         debug!(data = data.trim(), "acp_send");
         let mut w = self.stdin.lock().await;
         w.write_all(data.as_bytes()).await?;
@@ -352,7 +354,64 @@ impl AcpConnection {
 
         info!(session_id = %session_id, "session created");
         self.acp_session_id = Some(session_id.clone());
+        if let Some(result) = resp.result.as_ref() {
+            self.config_options = parse_config_options(result);
+            if !self.config_options.is_empty() {
+                info!(count = self.config_options.len(), "parsed configOptions");
+            }
+        }
         Ok(session_id)
+    }
+
+    /// Set a config option (e.g. model, mode) via ACP session/set_config_option.
+    /// Returns the updated list of all config options.
+    pub async fn set_config_option(&mut self, config_id: &str, value: &str) -> Result<Vec<ConfigOption>> {
+        let session_id = self
+            .acp_session_id
+            .as_ref()
+            .ok_or_else(|| anyhow!("no session"))?
+            .clone();
+
+        let resp = self
+            .send_request(
+                "session/set_config_option",
+                Some(json!({
+                    "sessionId": session_id,
+                    "configId": config_id,
+                    "value": value,
+                })),
+            )
+            .await;
+
+        match resp {
+            Ok(r) => {
+                if let Some(result) = r.result.as_ref() {
+                    self.config_options = parse_config_options(result);
+                }
+                info!(config_id, value, "config option set");
+            }
+            Err(_) => {
+                // Fall back: send as a slash command (e.g. "/model claude-sonnet-4")
+                let cmd = format!("/{config_id} {value}");
+                info!(cmd, "set_config_option not supported, falling back to prompt");
+                let _resp = self
+                    .send_request(
+                        "session/prompt",
+                        Some(json!({
+                            "sessionId": session_id,
+                            "prompt": [{"type": "text", "text": cmd}],
+                        })),
+                    )
+                    .await?;
+                for opt in &mut self.config_options {
+                    if opt.id == config_id {
+                        opt.current_value = value.to_string();
+                    }
+                }
+            }
+        }
+
+        Ok(self.config_options.clone())
     }
 
     /// Send a prompt with content blocks (text and/or images) and return a receiver
@@ -403,6 +462,11 @@ impl AcpConnection {
         self.last_active = Instant::now();
     }
 
+    /// Return a clone of the stdin handle for lock-free cancel.
+    pub fn cancel_handle(&self) -> Arc<Mutex<ChildStdin>> {
+        Arc::clone(&self.stdin)
+    }
+
     pub fn alive(&self) -> bool {
         !self._reader_handle.is_finished()
     }
@@ -422,6 +486,9 @@ impl AcpConnection {
         }
         info!(session_id, "session loaded");
         self.acp_session_id = Some(session_id.to_string());
+        if let Some(result) = resp.result.as_ref() {
+            self.config_options = parse_config_options(result);
+        }
         Ok(())
     }
 
