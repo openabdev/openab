@@ -4,6 +4,7 @@ mod config;
 mod discord;
 mod error_display;
 mod format;
+mod line;
 mod media;
 mod reactions;
 mod setup;
@@ -68,12 +69,13 @@ async fn main() -> anyhow::Result<()> {
                 pool_max = cfg.pool.max_sessions,
                 discord = cfg.discord.is_some(),
                 slack = cfg.slack.is_some(),
+                line = cfg.line.is_some(),
                 reactions = cfg.reactions.enabled,
                 "config loaded"
             );
 
-            if cfg.discord.is_none() && cfg.slack.is_none() {
-                anyhow::bail!("no adapter configured — add [discord] and/or [slack] to config.toml");
+            if cfg.discord.is_none() && cfg.slack.is_none() && cfg.line.is_none() {
+                anyhow::bail!("no adapter configured — add [discord], [slack], and/or [line] to config.toml");
             }
 
             let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions));
@@ -153,6 +155,41 @@ async fn main() -> anyhow::Result<()> {
                 None
             };
 
+            // Spawn LINE adapter (background task)
+            let line_handle = if let Some(line_cfg) = cfg.line {
+                let allow_all_users = config::resolve_allow_all(line_cfg.allow_all_users, &line_cfg.allowed_users);
+                let allow_all_groups = config::resolve_allow_all(line_cfg.allow_all_groups, &line_cfg.allowed_groups);
+                info!(
+                    webhook_port = line_cfg.webhook_port,
+                    allow_all_users,
+                    allow_all_groups,
+                    users = line_cfg.allowed_users.len(),
+                    groups = line_cfg.allowed_groups.len(),
+                    "starting line adapter"
+                );
+                let router = router.clone();
+                let shutdown_rx2 = shutdown_tx.subscribe();
+                Some(tokio::spawn(async move {
+                    if let Err(e) = line::run_line_adapter(
+                        line_cfg.channel_access_token,
+                        line_cfg.channel_secret,
+                        line_cfg.webhook_port,
+                        allow_all_users,
+                        allow_all_groups,
+                        line_cfg.allowed_users.into_iter().collect(),
+                        line_cfg.allowed_groups.into_iter().collect(),
+                        router,
+                        shutdown_rx2,
+                    )
+                    .await
+                    {
+                        error!("line adapter error: {e}");
+                    }
+                }))
+            } else {
+                None
+            };
+
             // Run Discord adapter (foreground, blocking) or wait for ctrl_c
             if let Some(discord_cfg) = cfg.discord {
                 let allow_all_channels = config::resolve_allow_all(discord_cfg.allow_all_channels, &discord_cfg.allowed_channels);
@@ -223,6 +260,9 @@ async fn main() -> anyhow::Result<()> {
             // Signal Slack adapter to shut down gracefully
             let _ = shutdown_tx.send(true);
             if let Some(handle) = slack_handle {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+            }
+            if let Some(handle) = line_handle {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
             }
             let shutdown_pool = pool;

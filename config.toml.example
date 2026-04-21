@@ -28,6 +28,15 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
                                         # "involved" = reply in threads bot has participated in
                                         # "mentions" = always require @mention
 
+# [line]
+# channel_access_token = "${LINE_CHANNEL_ACCESS_TOKEN}"  # Long-lived channel access token
+# channel_secret = "${LINE_CHANNEL_SECRET}"              # Channel secret for webhook signature validation
+# webhook_port = 8080                  # Port for the webhook HTTP server (default: 8080)
+# allow_all_users = true               # true (default) = any user; false = only allowed_users
+# allowed_users = ["U0123456789abcdef0123456789abcdef"]  # LINE user IDs
+# allow_all_groups = true              # true (default) = any group/room; false = only allowed_groups
+# allowed_groups = ["C0123456789abcdef0123456789abcdef"]  # LINE group/room IDs
+
 [agent]
 command = "kiro-cli"
 args = ["acp", "--trust-all-tools"]

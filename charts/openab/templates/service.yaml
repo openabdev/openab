@@ -1,0 +1,23 @@
+{{- range $name, $cfg := .Values.agents }}
+{{- if ne (include "openab.agentEnabled" $cfg) "false" }}
+{{- if and ($cfg.line).enabled }}
+{{- $d := dict "ctx" $ "agent" $name "cfg" $cfg }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "openab.agentFullname" $d }}-line
+  labels:
+    {{- include "openab.labels" $d | nindent 4 }}
+spec:
+  type: {{ ($cfg.line).serviceType | default "ClusterIP" }}
+  ports:
+    - port: {{ ($cfg.line).webhookPort | default 8080 }}
+      targetPort: {{ ($cfg.line).webhookPort | default 8080 }}
+      protocol: TCP
+      name: line-webhook
+  selector:
+    {{- include "openab.selectorLabels" $d | nindent 4 }}
+{{- end }}
+{{- end }}
+{{- end }}

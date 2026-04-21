@@ -35,6 +35,7 @@ impl<'de> Deserialize<'de> for AllowBots {
 pub struct Config {
     pub discord: Option<DiscordConfig>,
     pub slack: Option<SlackConfig>,
+    pub line: Option<LineConfig>,
     pub agent: AgentConfig,
     #[serde(default)]
     pub pool: PoolConfig,
@@ -154,6 +155,22 @@ pub struct SlackConfig {
     #[serde(default)]
     pub allow_user_messages: AllowUsers,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct LineConfig {
+    pub channel_access_token: String,
+    pub channel_secret: String,
+    #[serde(default = "default_line_webhook_port")]
+    pub webhook_port: u16,
+    pub allow_all_users: Option<bool>,
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    pub allow_all_groups: Option<bool>,
+    #[serde(default)]
+    pub allowed_groups: Vec<String>,
+}
+
+fn default_line_webhook_port() -> u16 { 8080 }
 
 #[derive(Debug, Deserialize)]
 pub struct AgentConfig {

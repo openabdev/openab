@@ -153,6 +153,14 @@ agents:
       #                      only when another bot has also posted in the thread
       #                      (recommended for multi-bot deployments)
       allowUserMessages: "involved"
+    line:
+      enabled: false
+      channelAccessToken: ""   # LINE long-lived channel access token
+      channelSecret: ""        # LINE channel secret for webhook signature validation
+      webhookPort: 8080        # Port for the webhook HTTP server
+      # allowAllUsers/allowAllGroups: same auto-infer logic as discord/slack
+      allowedUsers: []         # LINE user IDs
+      allowedGroups: []        # LINE group/room IDs
     workingDir: /home/agent
     env: {}
     envFrom: []

@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: openab-line-webhook
+  namespace: default
+  labels:
+    app.kubernetes.io/name: openab
+    app.kubernetes.io/instance: openab-line
+    app.kubernetes.io/component: kiro
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+      name: line-webhook
+  selector:
+    app.kubernetes.io/name: openab
+    app.kubernetes.io/instance: openab-line
+    app.kubernetes.io/component: kiro
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: openab-line-ingress
+  namespace: default
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /
+    alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
+    alb.ingress.kubernetes.io/success-codes: "200"
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: openab-line-webhook
+                port:
+                  number: 8080

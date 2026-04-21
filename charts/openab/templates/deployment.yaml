@@ -70,12 +70,32 @@ spec:
                   name: {{ include "openab.agentFullname" $d }}
                   key: stt-api-key
             {{- end }}
+            {{- if and ($cfg.line).enabled ($cfg.line).channelAccessToken }}
+            - name: LINE_CHANNEL_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: line-channel-access-token
+            {{- end }}
+            {{- if and ($cfg.line).enabled ($cfg.line).channelSecret }}
+            - name: LINE_CHANNEL_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: line-channel-secret
+            {{- end }}
             - name: HOME
               value: {{ $cfg.workingDir | default "/home/agent" }}
             {{- range $k, $v := $cfg.env }}
             - name: {{ $k }}
               value: {{ $v | quote }}
             {{- end }}
+          {{- if ($cfg.line).enabled }}
+          ports:
+            - name: line-webhook
+              containerPort: {{ ($cfg.line).webhookPort | default 8080 }}
+              protocol: TCP
+          {{- end }}
           {{- with $cfg.envFrom }}
           envFrom:
             {{- toYaml . | nindent 12 }}

@@ -88,6 +88,17 @@ data:
     {{- end }}
     {{- end }}
 
+    {{- if and ($cfg.line).enabled }}
+    [line]
+    channel_access_token = "${LINE_CHANNEL_ACCESS_TOKEN}"
+    channel_secret = "${LINE_CHANNEL_SECRET}"
+    webhook_port = {{ ($cfg.line).webhookPort | default 8080 }}
+    allow_all_users = {{ if and (hasKey ($cfg.line) "allowAllUsers") (ne ($cfg.line).allowAllUsers nil) }}{{ ($cfg.line).allowAllUsers }}{{ else if ($cfg.line).allowedUsers }}false{{ else }}true{{ end }}
+    allow_all_groups = {{ if and (hasKey ($cfg.line) "allowAllGroups") (ne ($cfg.line).allowAllGroups nil) }}{{ ($cfg.line).allowAllGroups }}{{ else if ($cfg.line).allowedGroups }}false{{ else }}true{{ end }}
+    allowed_users = {{ ($cfg.line).allowedUsers | default list | toJson }}
+    allowed_groups = {{ ($cfg.line).allowedGroups | default list | toJson }}
+    {{- end }}
+
     [agent]
     command = {{ $cfg.command | toJson }}
     args = {{ if $cfg.args }}{{ $cfg.args | toJson }}{{ else }}[]{{ end }}
