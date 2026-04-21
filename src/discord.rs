@@ -458,7 +458,7 @@ impl EventHandler for Handler {
             is_bot: msg.author.bot,
         };
 
-        // Build extra content blocks from attachments (images, audio)
+        // Build extra content blocks from attachments (images, audio, text)
         let mut extra_blocks = Vec::new();
         for attachment in &msg.attachments {
             let mime = attachment.content_type.as_deref().unwrap_or("");
@@ -482,6 +482,21 @@ impl EventHandler for Handler {
                     tracing::warn!(filename = %attachment.filename, "skipping audio attachment (STT disabled)");
                     let msg_ref = discord_msg_ref(&msg);
                     let _ = adapter.add_reaction(&msg_ref, "🎤").await;
+                }
+            } else if media::is_text_mime(mime) {
+                if let Some(text) = media::download_text_attachment(
+                    &attachment.url,
+                    &attachment.filename,
+                    u64::from(attachment.size),
+                    None,
+                ).await {
+                    debug!(filename = %attachment.filename, chars = text.len(), "text attachment inlined");
+                    extra_blocks.insert(0, ContentBlock::Text {
+                        text: format!(
+                            "[Attached text: {} ({} bytes)]\n{}",
+                            attachment.filename, attachment.size, text
+                        ),
+                    });
                 }
             } else if let Some(block) = media::download_and_encode_image(
                 &attachment.url,

@@ -26,3 +26,6 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 unicode-width = "0.2"
 libc = "0.2"
 tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+
+[dev-dependencies]
+wiremock = "0.6"
