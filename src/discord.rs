@@ -344,6 +344,8 @@ impl EventHandler for Handler {
 
         // Thread detection: check if the message is in a thread whose parent
         // is an allowed channel, and whether the bot owns that thread.
+        // When in_allowed_channel is true, we still need to detect threads
+        // so that MultibotMentions/Involved modes work correctly (#504).
         let (in_thread, bot_owns_thread) = if !in_allowed_channel {
             match msg.channel_id.to_channel(&ctx.http).await {
                 Ok(serenity::model::channel::Channel::Guild(gc)) => {
@@ -371,7 +373,13 @@ impl EventHandler for Handler {
                 }
             }
         } else {
-            (false, false)
+            match msg.channel_id.to_channel(&ctx.http).await {
+                Ok(serenity::model::channel::Channel::Guild(gc)) if gc.parent_id.is_some() => {
+                    let owned = gc.owner_id.is_some_and(|oid| oid == bot_id);
+                    (true, owned)
+                }
+                _ => (false, false),
+            }
         };
 
         if !in_allowed_channel && !in_thread {
