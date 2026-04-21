@@ -6,7 +6,7 @@ use crate::format;
 use crate::media;
 use async_trait::async_trait;
 use std::sync::LazyLock;
-use serenity::builder::{CreateActionRow, CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread};
+use serenity::builder::{CreateActionRow, CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditMessage};
 use serenity::http::Http;
 use serenity::model::application::{ComponentInteractionDataKind, Interaction};
 use serenity::model::channel::{AutoArchiveDuration, Message, ReactionType};
@@ -56,6 +56,23 @@ impl ChatAdapter for DiscordAdapter {
             channel: channel.clone(),
             message_id: msg.id.to_string(),
         })
+    }
+
+    async fn edit_message(&self, msg: &MessageRef, content: &str) -> anyhow::Result<()> {
+        let ch_id: u64 = msg.channel.channel_id.parse()?;
+        let msg_id: u64 = msg.message_id.parse()?;
+        ChannelId::new(ch_id)
+            .edit_message(
+                &self.http,
+                MessageId::new(msg_id),
+                EditMessage::new().content(content),
+            )
+            .await?;
+        Ok(())
+    }
+
+    fn use_streaming(&self) -> bool {
+        true
     }
 
     async fn create_thread(
