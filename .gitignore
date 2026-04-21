@@ -2,3 +2,5 @@
 config.toml
 *.swp
 .DS_Store
+.env
+.kiro/

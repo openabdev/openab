@@ -1,15 +1,27 @@
 openab {{ .Chart.AppVersion }} has been installed!
 
-⚠️  Discord channel IDs must be set with --set-string (not --set) to avoid float64 precision loss.
+💡 Agent images without an explicit tag (no ":") auto-append {{ .Chart.AppVersion }}.
+
+⚠️  Channel/user IDs must be set with --set-string (not --set) to avoid float64 precision loss.
 
 Agents deployed:
 {{- range $name, $cfg := .Values.agents }}
 {{- if ne (include "openab.agentEnabled" $cfg) "false" }}
   • {{ $name }} ({{ $cfg.command }})
-{{- if not $cfg.discord.botToken }}
-    ⚠️  No bot token provided. Create the secret manually:
+{{- if not (or (and (ne (toString ($cfg.discord).enabled) "false") ($cfg.discord).botToken) (and ($cfg.slack).enabled ($cfg.slack).botToken)) }}
+    ⚠️  No bot token provided. Set one via Helm values or create the secret manually:
     kubectl create secret generic {{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} \
-      --from-literal=discord-bot-token="YOUR_TOKEN"
+      --from-literal=discord-bot-token="YOUR_TOKEN"   # for Discord
+    # --from-literal=slack-bot-token="YOUR_TOKEN"      # for Slack
+{{- end }}
+
+{{- if and (ne (toString ($cfg.discord).enabled) "false") ($cfg.discord).botToken }}
+    Discord: ✅ configured
+{{- end }}
+{{- if and ($cfg.slack).enabled ($cfg.slack).botToken }}
+    Slack: ✅ configured (Socket Mode)
+    Ensure your Slack app has these bot events: app_mention, message.channels, message.groups
+    Required scopes: app_mentions:read, chat:write, channels:history, groups:history, channels:read, groups:read, reactions:write, files:read
 {{- end }}
 
 {{- if eq $cfg.command "kiro-cli" }}
@@ -24,6 +36,12 @@ Agents deployed:
 {{- else if eq $cfg.command "gemini" }}
     Authenticate:
     kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- gemini
+{{- else if eq $cfg.command "opencode" }}
+    Authenticate:
+    kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- opencode auth login
+{{- else if eq $cfg.command "cursor-agent" }}
+    Authenticate:
+    kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- cursor-agent login
 {{- end }}
 
     Restart after auth:

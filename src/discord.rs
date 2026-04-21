@@ -1,89 +1,301 @@
-use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
-use crate::config::{AllowBots, ReactionsConfig, SttConfig};
-use crate::error_display::{format_coded_error, format_user_error};
+use crate::acp::ContentBlock;
+use crate::acp::protocol::ConfigOption;
+use crate::adapter::{AdapterRouter, ChatAdapter, ChannelRef, MessageRef, SenderContext};
+use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::format;
-use crate::reactions::StatusReactionController;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
-use image::ImageReader;
-use std::io::Cursor;
+use crate::media;
+use async_trait::async_trait;
 use std::sync::LazyLock;
-use serenity::async_trait;
-use serenity::model::channel::{Message, ReactionType};
+use serenity::builder::{CreateActionRow, CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread};
+use serenity::http::Http;
+use serenity::model::application::{ComponentInteractionDataKind, Interaction};
+use serenity::model::channel::{AutoArchiveDuration, Message, ReactionType};
 use serenity::model::gateway::Ready;
-use serenity::model::id::{ChannelId, MessageId};
+use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::prelude::*;
-use std::collections::HashSet;
-use std::sync::Arc;
-use tokio::sync::watch;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 use tracing::{debug, error, info};
 
-/// Hard cap on consecutive bot messages (from any other bot) in a
-/// channel or thread. When this many recent messages are all from
-/// bots other than ourselves, we stop responding to prevent runaway
-/// loops between multiple bots in "all" mode.
-///
-/// Note: must be ≤ 255 because Serenity's `GetMessages::limit()` takes `u8`.
-/// Inspired by OpenClaw's `session.agentToAgent.maxPingPongTurns`.
+/// Hard cap on consecutive bot messages in a channel or thread.
+/// Prevents runaway loops between multiple bots in "all" mode.
 const MAX_CONSECUTIVE_BOT_TURNS: u8 = 10;
 
-/// Reusable HTTP client for downloading Discord attachments.
-/// Built once with a 30s timeout and rustls TLS (no native-tls deps).
-static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("static HTTP client must build")
-});
+/// Absolute per-thread cap on bot turns. Cannot be overridden by config or human intervention.
+const HARD_BOT_TURN_LIMIT: u32 = 100;
 
-pub struct Handler {
-    pub pool: Arc<SessionPool>,
-    pub allowed_channels: HashSet<u64>,
-    pub allowed_users: HashSet<u64>,
-    pub reactions_config: ReactionsConfig,
-    pub stt_config: SttConfig,
-    pub allow_bot_messages: AllowBots,
-    pub trusted_bot_ids: HashSet<u64>,
+/// Maximum entries in the participation cache before eviction.
+const PARTICIPATION_CACHE_MAX: usize = 1000;
+
+// --- DiscordAdapter: implements ChatAdapter for Discord via serenity ---
+
+pub struct DiscordAdapter {
+    http: Arc<Http>,
+}
+
+impl DiscordAdapter {
+    pub fn new(http: Arc<Http>) -> Self {
+        Self { http }
+    }
 }
 
 #[async_trait]
+impl ChatAdapter for DiscordAdapter {
+    fn platform(&self) -> &'static str {
+        "discord"
+    }
+
+    fn message_limit(&self) -> usize {
+        2000
+    }
+
+    async fn send_message(&self, channel: &ChannelRef, content: &str) -> anyhow::Result<MessageRef> {
+        let ch_id: u64 = channel.channel_id.parse()?;
+        let msg = ChannelId::new(ch_id).say(&self.http, content).await?;
+        Ok(MessageRef {
+            channel: channel.clone(),
+            message_id: msg.id.to_string(),
+        })
+    }
+
+    async fn create_thread(
+        &self,
+        channel: &ChannelRef,
+        trigger_msg: &MessageRef,
+        title: &str,
+    ) -> anyhow::Result<ChannelRef> {
+        let ch_id: u64 = channel.channel_id.parse()?;
+        let msg_id: u64 = trigger_msg.message_id.parse()?;
+        let thread = ChannelId::new(ch_id)
+            .create_thread_from_message(
+                &self.http,
+                MessageId::new(msg_id),
+                CreateThread::new(title).auto_archive_duration(AutoArchiveDuration::OneDay),
+            )
+            .await?;
+        Ok(ChannelRef {
+            platform: "discord".into(),
+            channel_id: thread.id.to_string(),
+            thread_id: None,
+            parent_id: Some(channel.channel_id.clone()),
+        })
+    }
+
+    async fn add_reaction(&self, msg: &MessageRef, emoji: &str) -> anyhow::Result<()> {
+        let ch_id: u64 = msg.channel.channel_id.parse()?;
+        let msg_id: u64 = msg.message_id.parse()?;
+        self.http
+            .create_reaction(
+                ChannelId::new(ch_id),
+                MessageId::new(msg_id),
+                &ReactionType::Unicode(emoji.to_string()),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn remove_reaction(&self, msg: &MessageRef, emoji: &str) -> anyhow::Result<()> {
+        let ch_id: u64 = msg.channel.channel_id.parse()?;
+        let msg_id: u64 = msg.message_id.parse()?;
+        self.http
+            .delete_reaction_me(
+                ChannelId::new(ch_id),
+                MessageId::new(msg_id),
+                &ReactionType::Unicode(emoji.to_string()),
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+// --- Handler: serenity EventHandler that delegates to AdapterRouter ---
+
+pub struct Handler {
+    pub router: Arc<AdapterRouter>,
+    pub allow_all_channels: bool,
+    pub allow_all_users: bool,
+    pub allowed_channels: HashSet<u64>,
+    pub allowed_users: HashSet<u64>,
+    pub stt_config: SttConfig,
+    pub adapter: OnceLock<Arc<dyn ChatAdapter>>,
+    pub allow_bot_messages: AllowBots,
+    pub trusted_bot_ids: HashSet<u64>,
+    pub allow_user_messages: AllowUsers,
+    /// Positive-only cache: thread channel_id → cached_at for threads where bot has participated.
+    pub participated_threads: tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>,
+    /// Positive-only cache: thread channel_id → cached_at for threads where other bots have posted.
+    /// Like participation, a thread becoming multi-bot is irreversible (bot messages don't disappear).
+    pub multibot_threads: tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>,
+    /// TTL for participation cache entries (from pool.session_ttl_hours).
+    pub session_ttl: std::time::Duration,
+    /// Configurable soft limit on bot turns per thread (reset by human message).
+    pub max_bot_turns: u32,
+    /// Per-thread bot turn tracker. Both counters reset on human msg.
+    pub bot_turns: tokio::sync::Mutex<BotTurnTracker>,
+}
+
+impl Handler {
+    /// Check if the bot has participated in a Discord thread, and whether
+    /// other bots have also posted in it.
+    /// Returns `(involved, other_bot_present)`.
+    /// Fail-closed: returns `(false, false)` on API error.
+    /// Caches positive results only (both participation and multi-bot status are irreversible).
+    async fn bot_participated_in_thread(
+        &self,
+        http: &Http,
+        channel_id: ChannelId,
+        bot_id: UserId,
+    ) -> (bool, bool) {
+        let key = channel_id.to_string();
+
+        // Check positive caches
+        let cached_involved = {
+            let cache = self.participated_threads.lock().await;
+            cache.get(&key).is_some_and(|ts| ts.elapsed() < self.session_ttl)
+        };
+        let cached_multibot = {
+            let cache = self.multibot_threads.lock().await;
+            cache.get(&key).is_some_and(|ts| ts.elapsed() < self.session_ttl)
+        };
+
+        // Both cached → skip fetch entirely
+        // With early detection from msg.author, multibot_threads is populated
+        // eagerly — no need to fetch just to check for other bots.
+        if cached_involved {
+            return (true, cached_multibot);
+        }
+
+        // Fetch recent messages
+        let messages = match channel_id
+            .messages(http, serenity::builder::GetMessages::new().limit(200))
+            .await
+        {
+            Ok(msgs) => msgs,
+            Err(e) => {
+                tracing::warn!(
+                    channel_id = %channel_id,
+                    error = %e,
+                    "failed to fetch thread messages for participation check, rejecting (fail-closed)"
+                );
+                return (false, false);
+            }
+        };
+
+        let involved = cached_involved || messages.iter().any(|m| m.author.id == bot_id);
+        let other_bot_present = cached_multibot || messages.iter().any(|m| m.author.bot && m.author.id != bot_id);
+
+        if involved && !cached_involved {
+            let mut cache = self.participated_threads.lock().await;
+            cache.insert(key.clone(), tokio::time::Instant::now());
+
+            // Evict if over capacity
+            if cache.len() > PARTICIPATION_CACHE_MAX {
+                cache.retain(|_, ts| ts.elapsed() < self.session_ttl);
+                if cache.len() > PARTICIPATION_CACHE_MAX {
+                    let mut entries: Vec<_> = cache.iter().map(|(k, v)| (k.clone(), *v)).collect();
+                    entries.sort_by_key(|(_, ts)| *ts);
+                    let evict_count = entries.len() / 2;
+                    for (k, _) in entries.into_iter().take(evict_count) {
+                        cache.remove(&k);
+                    }
+                }
+            }
+        }
+
+        if other_bot_present && !cached_multibot {
+            let mut cache = self.multibot_threads.lock().await;
+            cache.insert(key, tokio::time::Instant::now());
+
+            if cache.len() > PARTICIPATION_CACHE_MAX {
+                cache.retain(|_, ts| ts.elapsed() < self.session_ttl);
+                if cache.len() > PARTICIPATION_CACHE_MAX {
+                    let mut entries: Vec<_> = cache.iter().map(|(k, v)| (k.clone(), *v)).collect();
+                    entries.sort_by_key(|(_, ts)| *ts);
+                    let evict_count = entries.len() / 2;
+                    for (k, _) in entries.into_iter().take(evict_count) {
+                        cache.remove(&k);
+                    }
+                }
+            }
+        }
+
+        (involved, other_bot_present)
+    }
+}
+
+#[serenity::async_trait]
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
         let bot_id = ctx.cache.current_user().id;
 
-        // Always ignore own messages
+        // Early multibot detection: cache that another bot is present.
+        // Runs before self-check and bot gating so we always detect other bots. (#481)
+        if msg.author.bot && msg.author.id != bot_id {
+            let key = msg.channel_id.to_string();
+            let mut cache = self.multibot_threads.lock().await;
+            cache.entry(key).or_insert_with(tokio::time::Instant::now);
+        }
+
+        // Bot turn counting: runs before self-check so ALL bot messages
+        // (including own) count toward the per-thread limit. This means
+        // soft_limit=20 = 20 total bot messages in the thread (~10 per bot
+        // in a two-bot ping-pong). (#483)
+        {
+            let thread_key = msg.channel_id.to_string();
+            let mut tracker = self.bot_turns.lock().await;
+            if msg.author.bot {
+                match tracker.on_bot_message(&thread_key) {
+                    TurnResult::HardLimit => {
+                        tracing::warn!(channel_id = %msg.channel_id, "hard bot turn limit reached");
+                        if msg.author.id != bot_id {
+                            let _ = msg.channel_id.say(
+                                &ctx.http,
+                                format!("🛑 Hard bot turn limit reached ({HARD_BOT_TURN_LIMIT}). A human must reply to continue."),
+                            ).await;
+                        }
+                        return;
+                    }
+                    TurnResult::Stopped => return,
+                    TurnResult::SoftLimit(n) => {
+                        tracing::info!(channel_id = %msg.channel_id, turns = n, max = self.max_bot_turns, "soft bot turn limit reached");
+                        if msg.author.id != bot_id {
+                            let _ = msg.channel_id.say(
+                                &ctx.http,
+                                format!("⚠️ Bot turn limit reached ({n}/{}). A human must reply in this thread to continue bot-to-bot conversation.", self.max_bot_turns),
+                            ).await;
+                        }
+                        return;
+                    }
+                    TurnResult::Throttled => return,
+                    TurnResult::Ok => {}
+                }
+            } else {
+                tracker.on_human_message(&thread_key);
+            }
+        }
+
+        // Ignore own messages (after counting toward bot turns above)
         if msg.author.id == bot_id {
             return;
         }
 
+        let adapter = self.adapter.get_or_init(|| {
+            Arc::new(DiscordAdapter::new(ctx.http.clone()))
+        }).clone();
+
         let channel_id = msg.channel_id.get();
         let in_allowed_channel =
-            self.allowed_channels.is_empty() || self.allowed_channels.contains(&channel_id);
+            self.allow_all_channels || self.allowed_channels.contains(&channel_id);
 
         let is_mentioned = msg.mentions_user_id(bot_id)
-            || msg.content.contains(&format!("<@{}>", bot_id))
-            || msg.mention_roles.iter().any(|r| msg.content.contains(&format!("<@&{}>", r)));
+            || msg.content.contains(&format!("<@{}>", bot_id));
 
-        // Bot message gating — runs after self-ignore but before channel/user
-        // allowlist checks. This ordering is intentional: channel checks below
-        // apply uniformly to both human and bot messages, so a bot mention in
-        // a non-allowed channel is still rejected by the channel check.
+        // Bot message gating (from upstream #321)
         if msg.author.bot {
             match self.allow_bot_messages {
                 AllowBots::Off => return,
                 AllowBots::Mentions => if !is_mentioned { return; },
                 AllowBots::All => {
-                    // Safety net: count consecutive messages from any bot
-                    // (excluding ourselves) in recent history. If all recent
-                    // messages are from other bots, we've likely entered a
-                    // loop. This counts *all* other-bot messages, not just
-                    // one specific bot — so 3 bots taking turns still hits
-                    // the cap (which is intentionally conservative).
-                    //
-                    // Try cache first to avoid an API call on every bot
-                    // message. Fall back to API on cache miss. If both fail,
-                    // reject the message (fail-closed) to avoid unbounded
-                    // loops during Discord API outages.
                     let cap = MAX_CONSECUTIVE_BOT_TURNS as usize;
                     let history = ctx.cache.channel_messages(msg.channel_id)
                         .map(|msgs| {
@@ -91,7 +303,7 @@ impl EventHandler for Handler {
                                 .filter(|(mid, _)| **mid < msg.id)
                                 .map(|(_, m)| m.clone())
                                 .collect();
-                            recent.sort_unstable_by(|a, b| b.id.cmp(&a.id)); // newest first
+                            recent.sort_unstable_by_key(|m| std::cmp::Reverse(m.id));
                             recent.truncate(cap);
                             recent
                         })
@@ -122,125 +334,182 @@ impl EventHandler for Handler {
                 },
             }
 
-            // If trusted_bot_ids is set, only allow bots on the list
             if !self.trusted_bot_ids.is_empty() && !self.trusted_bot_ids.contains(&msg.author.id.get()) {
                 tracing::debug!(bot_id = %msg.author.id, "bot not in trusted_bot_ids, ignoring");
                 return;
             }
         }
 
-        let in_thread = if !in_allowed_channel {
+        // Thread detection: check if the message is in a thread whose parent
+        // is an allowed channel, and whether the bot owns that thread.
+        let (in_thread, bot_owns_thread) = if !in_allowed_channel {
             match msg.channel_id.to_channel(&ctx.http).await {
                 Ok(serenity::model::channel::Channel::Guild(gc)) => {
-                    let result = gc
+                    let parent_allowed = self.allow_all_channels || gc
                         .parent_id
                         .is_some_and(|pid| self.allowed_channels.contains(&pid.get()));
-                    tracing::debug!(channel_id = %msg.channel_id, parent_id = ?gc.parent_id, result, "thread check");
-                    result
+                    let owned = gc.owner_id.is_some_and(|oid| oid == bot_id);
+                    tracing::debug!(
+                        channel_id = %msg.channel_id,
+                        parent_id = ?gc.parent_id,
+                        owner_id = ?gc.owner_id,
+                        parent_allowed,
+                        bot_owns = owned,
+                        "thread check"
+                    );
+                    (parent_allowed, owned)
                 }
                 Ok(other) => {
                     tracing::debug!(channel_id = %msg.channel_id, kind = ?other, "not a guild channel");
-                    false
+                    (false, false)
                 }
                 Err(e) => {
                     tracing::debug!(channel_id = %msg.channel_id, error = %e, "to_channel failed");
-                    false
+                    (false, false)
                 }
             }
         } else {
-            false
+            (false, false)
         };
 
         if !in_allowed_channel && !in_thread {
             return;
         }
-        if !in_thread && !is_mentioned {
-            return;
-        }
 
-        if !self.allowed_users.is_empty() && !self.allowed_users.contains(&msg.author.id.get()) {
-            tracing::info!(user_id = %msg.author.id, "denied user, ignoring");
-            if let Err(e) = msg.react(&ctx.http, ReactionType::Unicode("🚫".into())).await {
-                tracing::warn!(error = %e, "failed to react with 🚫");
-            }
-            return;
-        }
-
-        let prompt = if is_mentioned {
-            strip_mention(&msg.content)
-        } else {
-            msg.content.trim().to_string()
-        };
-
-        // No text and no image attachments → skip to avoid wasting session slots
-        if prompt.is_empty() && msg.attachments.is_empty() {
-            return;
-        }
-
-        // Build content blocks: text + image attachments
-        let mut content_blocks = vec![];
-
-        // Inject structured sender context so the downstream CLI can identify who sent the message
-        let display_name = msg.member.as_ref()
-            .and_then(|m| m.nick.as_ref())
-            .unwrap_or(&msg.author.name);
-        let sender_ctx = serde_json::json!({
-            "schema": "openab.sender.v1",
-            "sender_id": msg.author.id.to_string(),
-            "sender_name": msg.author.name,
-            "display_name": display_name,
-            "channel": "discord",
-            "channel_id": msg.channel_id.to_string(),
-            "is_bot": msg.author.bot,
-        });
-        let prompt_with_sender = format!(
-            "<sender_context>\n{}\n</sender_context>\n\n{}",
-            serde_json::to_string(&sender_ctx).unwrap(),
-            prompt
-        );
-
-        // Add text block (always, even if empty, we still send for sender context)
-        content_blocks.push(ContentBlock::Text {
-            text: prompt_with_sender.clone(),
-        });
-
-        // Process attachments: route by content type (audio → STT, image → encode)
-        if !msg.attachments.is_empty() {
-            for attachment in &msg.attachments {
-                if is_audio_attachment(attachment) {
-                    if self.stt_config.enabled {
-                        if let Some(transcript) = download_and_transcribe(attachment, &self.stt_config).await {
-                            debug!(filename = %attachment.filename, chars = transcript.len(), "voice transcript injected");
-                            content_blocks.insert(0, ContentBlock::Text {
-                                text: format!("[Voice message transcript]: {transcript}"),
-                            });
-                        }
-                    } else {
-                        debug!(filename = %attachment.filename, "skipping audio attachment (STT disabled)");
+        // User message gating (mirrors Slack's AllowUsers logic).
+        // Mentions: always require @mention, even in bot's own threads.
+        // Involved (default): skip @mention if the bot owns the thread
+        //   (Option A) OR has previously posted in it (Option B).
+        // MultibotMentions: same as Involved, but if other bots are also
+        //   in the thread, require @mention to avoid all bots responding.
+        if !is_mentioned {
+            match self.allow_user_messages {
+                AllowUsers::Mentions => return,
+                AllowUsers::Involved => {
+                    if !in_thread {
+                        return;
                     }
-                } else if let Some(content_block) = download_and_encode_image(attachment).await {
-                    debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
-                    content_blocks.push(content_block);
+                    let (involved, _) = if bot_owns_thread {
+                        (true, false) // other_bot_present not needed for Involved mode
+                    } else {
+                        self.bot_participated_in_thread(&ctx.http, msg.channel_id, bot_id)
+                            .await
+                    };
+                    if !involved {
+                        tracing::debug!(channel_id = %msg.channel_id, "bot not involved in thread, ignoring");
+                        return;
+                    }
+                }
+                AllowUsers::MultibotMentions => {
+                    if !in_thread {
+                        return;
+                    }
+                    let (involved, other_bot) = if bot_owns_thread {
+                        // Still need to check for other bots
+                        let (_, other) = self
+                            .bot_participated_in_thread(&ctx.http, msg.channel_id, bot_id)
+                            .await;
+                        (true, other)
+                    } else {
+                        self.bot_participated_in_thread(&ctx.http, msg.channel_id, bot_id)
+                            .await
+                    };
+                    if !involved {
+                        tracing::debug!(channel_id = %msg.channel_id, "bot not involved in thread, ignoring");
+                        return;
+                    }
+                    if other_bot {
+                        tracing::debug!(channel_id = %msg.channel_id, "multi-bot thread, requiring @mention");
+                        return;
+                    }
                 }
             }
         }
 
+        if !self.allow_all_users && !self.allowed_users.contains(&msg.author.id.get()) {
+            tracing::info!(user_id = %msg.author.id, "denied user, ignoring");
+            let msg_ref = discord_msg_ref(&msg);
+            let _ = adapter.add_reaction(&msg_ref, "🚫").await;
+            return;
+        }
+
+        let prompt = resolve_mentions(&msg.content, bot_id);
+
+        // No text and no attachments → skip
+        if prompt.is_empty() && msg.attachments.is_empty() {
+            return;
+        }
+
+        let display_name = msg
+            .member
+            .as_ref()
+            .and_then(|m| m.nick.as_ref())
+            .unwrap_or(&msg.author.name);
+        let sender = SenderContext {
+            schema: "openab.sender.v1".into(),
+            sender_id: msg.author.id.to_string(),
+            sender_name: msg.author.name.clone(),
+            display_name: display_name.to_string(),
+            channel: "discord".into(),
+            channel_id: msg.channel_id.to_string(),
+            thread_id: None,
+            is_bot: msg.author.bot,
+        };
+
+        // Build extra content blocks from attachments (images, audio)
+        let mut extra_blocks = Vec::new();
+        for attachment in &msg.attachments {
+            let mime = attachment.content_type.as_deref().unwrap_or("");
+            if media::is_audio_mime(mime) {
+                if self.stt_config.enabled {
+                    let mime_clean = mime.split(';').next().unwrap_or(mime).trim();
+                    if let Some(transcript) = media::download_and_transcribe(
+                        &attachment.url,
+                        &attachment.filename,
+                        mime_clean,
+                        u64::from(attachment.size),
+                        &self.stt_config,
+                        None,
+                    ).await {
+                        debug!(filename = %attachment.filename, chars = transcript.len(), "voice transcript injected");
+                        extra_blocks.insert(0, ContentBlock::Text {
+                            text: format!("[Voice message transcript]: {transcript}"),
+                        });
+                    }
+                } else {
+                    tracing::warn!(filename = %attachment.filename, "skipping audio attachment (STT disabled)");
+                    let msg_ref = discord_msg_ref(&msg);
+                    let _ = adapter.add_reaction(&msg_ref, "🎤").await;
+                }
+            } else if let Some(block) = media::download_and_encode_image(
+                &attachment.url,
+                attachment.content_type.as_deref(),
+                &attachment.filename,
+                u64::from(attachment.size),
+                None,
+            ).await {
+                debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
+                extra_blocks.push(block);
+            }
+        }
+
         tracing::debug!(
-            text_len = prompt_with_sender.len(),
+            num_extra_blocks = extra_blocks.len(),
             num_attachments = msg.attachments.len(),
             in_thread,
             "processing"
         );
 
-        // Note: image-only messages (no text) are intentionally allowed since
-        // prompt_with_sender always includes the non-empty sender_context XML.
-        // The guard above (prompt.is_empty() && no attachments) handles stickers/embeds.
-
-        let thread_id = if in_thread {
-            msg.channel_id.get()
+        let thread_channel = if in_thread {
+            ChannelRef {
+                platform: "discord".into(),
+                channel_id: msg.channel_id.get().to_string(),
+                thread_id: None,
+                parent_id: None,
+            }
         } else {
-            match get_or_create_thread(&ctx, &msg, &prompt).await {
-                Ok(id) => id,
+            match get_or_create_thread(&ctx, &adapter, &msg, &prompt).await {
+                Ok(ch) => ch,
                 Err(e) => {
                     error!("failed to create thread: {e}");
                     return;
@@ -248,761 +517,645 @@ impl EventHandler for Handler {
             }
         };
 
-        let thread_channel = ChannelId::new(thread_id);
+        let trigger_msg = discord_msg_ref(&msg);
 
-        let thinking_msg = match thread_channel.say(&ctx.http, "...").await {
-            Ok(m) => m,
-            Err(e) => {
-                error!("failed to post: {e}");
-                return;
+        let router = self.router.clone();
+        tokio::spawn(async move {
+            let sender_json = serde_json::to_string(&sender).unwrap();
+            if let Err(e) = router
+                .handle_message(&adapter, &thread_channel, &sender_json, &prompt, extra_blocks, &trigger_msg)
+                .await
+            {
+                error!("handle_message error: {e}");
             }
+        });
+    }
+
+    async fn ready(&self, ctx: Context, ready: Ready) {
+        info!(user = %ready.user.name, "discord bot connected");
+
+        // Register /model slash command to all guilds the bot is in
+        for guild in &ready.guilds {
+            let guild_id = guild.id;
+            if let Err(e) = guild_id
+                .set_commands(
+                    &ctx.http,
+                    vec![
+                        CreateCommand::new("models")
+                            .description("Select the AI model for this session"),
+                        CreateCommand::new("agents")
+                            .description("Select the agent mode for this session"),
+                        CreateCommand::new("cancel")
+                            .description("Cancel the current operation"),
+                    ],
+                )
+                .await
+            {
+                tracing::warn!(%guild_id, error = %e, "failed to register slash commands");
+            } else {
+                info!(%guild_id, "registered slash commands");
+            }
+        }
+    }
+
+    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        match interaction {
+            Interaction::Command(cmd) if cmd.data.name == "models" => {
+                self.handle_config_command(&ctx, &cmd, "model", "model").await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "agents" => {
+                self.handle_config_command(&ctx, &cmd, "agent", "agent").await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "cancel" => {
+                self.handle_cancel_command(&ctx, &cmd).await;
+            }
+            Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_config_") => {
+                self.handle_config_select(&ctx, &comp).await;
+            }
+            _ => {}
+        }
+    }
+}
+
+
+// --- Slash command & interaction handlers ---
+
+impl Handler {
+    /// Build a Discord select menu from ACP configOptions with the given category.
+    fn build_config_select(options: &[ConfigOption], category: &str) -> Option<CreateSelectMenu> {
+        let opt = options.iter().find(|o| o.category.as_deref() == Some(category))?;
+        let menu_options: Vec<CreateSelectMenuOption> = opt
+            .options
+            .iter()
+            .map(|o| {
+                let mut item = CreateSelectMenuOption::new(&o.name, &o.value);
+                if let Some(desc) = &o.description {
+                    item = item.description(desc);
+                }
+                if o.value == opt.current_value {
+                    item = item.default_selection(true);
+                }
+                item
+            })
+            .collect();
+
+        if menu_options.is_empty() {
+            return None;
+        }
+
+        Some(
+            CreateSelectMenu::new(
+                format!("acp_config_{}", opt.id),
+                CreateSelectMenuKind::String { options: menu_options },
+            )
+            .placeholder(format!("Current: {}", opt.options.iter()
+                .find(|o| o.value == opt.current_value)
+                .map(|o| o.name.as_str())
+                .unwrap_or(&opt.current_value)))
+        )
+    }
+
+    async fn handle_config_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+        category: &str,
+        label: &str,
+    ) {
+        let thread_key = format!("discord:{}", cmd.channel_id.get());
+        let config_options = self.router.pool().get_config_options(&thread_key).await;
+        let select = Self::build_config_select(&config_options, category);
+
+        let response = match select {
+            Some(menu) => CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(format!("🔧 Select a {label}:"))
+                    .components(vec![CreateActionRow::SelectMenu(menu)])
+                    .ephemeral(true),
+            ),
+            None => CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(format!("⚠️ No {label} options available. Start a conversation first by @mentioning the bot."))
+                    .ephemeral(true),
+            ),
         };
 
-        let thread_key = thread_id.to_string();
-        if let Err(e) = self.pool.get_or_create(&thread_key).await {
-            let msg = format_user_error(&e.to_string());
-            let _ = edit(&ctx, thread_channel, thinking_msg.id, &format!("⚠️ {}", msg)).await;
-            error!("pool error: {e}");
+        if let Err(e) = cmd.create_response(&ctx.http, response).await {
+            tracing::error!(error = %e, category, "failed to respond to slash command");
+        }
+    }
+
+    async fn handle_cancel_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        let thread_key = format!("discord:{}", cmd.channel_id.get());
+        let result = self.router.pool().cancel_session(&thread_key).await;
+
+        let msg = match result {
+            Ok(()) => "🛑 Cancel signal sent.".to_string(),
+            Err(e) => format!("⚠️ {e}"),
+        };
+
+        let response = CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content(msg).ephemeral(true),
+        );
+        if let Err(e) = cmd.create_response(&ctx.http, response).await {
+            tracing::error!(error = %e, "failed to respond to /cancel command");
+        }
+    }
+
+    async fn handle_config_select(
+        &self,
+        ctx: &Context,
+        comp: &serenity::model::application::ComponentInteraction,
+    ) {
+        let config_id = comp
+            .data
+            .custom_id
+            .strip_prefix("acp_config_")
+            .unwrap_or("")
+            .to_string();
+
+        if config_id.is_empty() {
             return;
         }
 
-        // Create reaction controller on the user's original message
-        let reactions = Arc::new(StatusReactionController::new(
-            self.reactions_config.enabled,
-            ctx.http.clone(),
-            msg.channel_id,
-            msg.id,
-            self.reactions_config.emojis.clone(),
-            self.reactions_config.timing.clone(),
-        ));
-        reactions.set_queued().await;
-
-        // Stream prompt with live edits (pass content blocks instead of just text)
-        let result = stream_prompt(
-            &self.pool,
-            &thread_key,
-            content_blocks,
-            &ctx,
-            thread_channel,
-            thinking_msg.id,
-            reactions.clone(),
-        )
-        .await;
-
-        match &result {
-            Ok(()) => reactions.set_done().await,
-            Err(_) => reactions.set_error().await,
-        }
-
-        // Hold emoji briefly then clear
-        let hold_ms = if result.is_ok() {
-            self.reactions_config.timing.done_hold_ms
-        } else {
-            self.reactions_config.timing.error_hold_ms
-        };
-        if self.reactions_config.remove_after_reply {
-            let reactions = reactions;
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(hold_ms)).await;
-                reactions.clear().await;
-            });
-        }
-
-        if let Err(e) = result {
-            let _ = edit(&ctx, thread_channel, thinking_msg.id, &format!("⚠️ {e}")).await;
-        }
-    }
-
-    async fn ready(&self, _ctx: Context, ready: Ready) {
-        info!(user = %ready.user.name, "discord bot connected");
-    }
-}
-
-/// Check if an attachment is an audio file (voice messages are typically audio/ogg).
-fn is_audio_attachment(attachment: &serenity::model::channel::Attachment) -> bool {
-    let mime = attachment.content_type.as_deref().unwrap_or("");
-    mime.starts_with("audio/")
-}
-
-/// Download an audio attachment and transcribe it via the configured STT provider.
-async fn download_and_transcribe(
-    attachment: &serenity::model::channel::Attachment,
-    stt_config: &SttConfig,
-) -> Option<String> {
-    const MAX_SIZE: u64 = 25 * 1024 * 1024; // 25 MB (Whisper API limit)
-
-    if u64::from(attachment.size) > MAX_SIZE {
-        error!(filename = %attachment.filename, size = attachment.size, "audio exceeds 25MB limit");
-        return None;
-    }
-
-    let resp = HTTP_CLIENT.get(&attachment.url).send().await.ok()?;
-    if !resp.status().is_success() {
-        error!(url = %attachment.url, status = %resp.status(), "audio download failed");
-        return None;
-    }
-    let bytes = resp.bytes().await.ok()?.to_vec();
-
-    let mime_type = attachment.content_type.as_deref().unwrap_or("audio/ogg");
-    let mime_type = mime_type.split(';').next().unwrap_or(mime_type).trim();
-
-    crate::stt::transcribe(&HTTP_CLIENT, stt_config, bytes, attachment.filename.clone(), mime_type).await
-}
-
-/// Maximum dimension (width or height) for resized images.
-/// Matches OpenClaw's DEFAULT_IMAGE_MAX_DIMENSION_PX.
-const IMAGE_MAX_DIMENSION_PX: u32 = 1200;
-
-/// JPEG quality for compressed output (OpenClaw uses progressive 85→35;
-/// we start at 75 which is a good balance of quality vs size).
-const IMAGE_JPEG_QUALITY: u8 = 75;
-
-/// Download a Discord image attachment, resize/compress it, then base64-encode
-/// as an ACP image content block.
-///
-/// Large images are resized so the longest side is at most 1200px and
-/// re-encoded as JPEG at quality 75. This keeps the base64 payload well
-/// under typical JSON-RPC transport limits (~200-400KB after encoding).
-async fn download_and_encode_image(attachment: &serenity::model::channel::Attachment) -> Option<ContentBlock> {
-    const MAX_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
-
-    let url = &attachment.url;
-    if url.is_empty() {
-        return None;
-    }
-
-    // Determine media type — prefer content-type header, fallback to extension
-    let media_type = attachment
-        .content_type
-        .as_deref()
-        .or_else(|| {
-            attachment
-                .filename
-                .rsplit('.')
-                .next()
-                .and_then(|ext| match ext.to_lowercase().as_str() {
-                    "png" => Some("image/png"),
-                    "jpg" | "jpeg" => Some("image/jpeg"),
-                    "gif" => Some("image/gif"),
-                    "webp" => Some("image/webp"),
-                    _ => None,
-                })
-        });
-
-    let Some(mime) = media_type else {
-        debug!(filename = %attachment.filename, "skipping non-image attachment");
-        return None;
-    };
-    let mime = mime.split(';').next().unwrap_or(mime).trim();
-    if !mime.starts_with("image/") {
-        debug!(filename = %attachment.filename, mime = %mime, "skipping non-image attachment");
-        return None;
-    }
-
-    if u64::from(attachment.size) > MAX_SIZE {
-        error!(filename = %attachment.filename, size = attachment.size, "image exceeds 10MB limit");
-        return None;
-    }
-
-    let response = match HTTP_CLIENT.get(url).send().await {
-        Ok(resp) => resp,
-        Err(e) => { error!(url = %url, error = %e, "download failed"); return None; }
-    };
-    if !response.status().is_success() {
-        error!(url = %url, status = %response.status(), "HTTP error downloading image");
-        return None;
-    }
-    let bytes = match response.bytes().await {
-        Ok(b) => b,
-        Err(e) => { error!(url = %url, error = %e, "read failed"); return None; }
-    };
-
-    // Defense-in-depth: verify actual download size
-    if bytes.len() as u64 > MAX_SIZE {
-        error!(filename = %attachment.filename, size = bytes.len(), "downloaded image exceeds limit");
-        return None;
-    }
-
-    // Resize and compress
-    let (output_bytes, output_mime) = match resize_and_compress(&bytes) {
-        Ok(result) => result,
-        Err(e) => {
-            // Fallback: use original bytes but reject if too large for transport
-            if bytes.len() > 1024 * 1024 {
-                error!(filename = %attachment.filename, error = %e, size = bytes.len(), "resize failed and original too large, skipping");
-                return None;
+        let selected_value = match &comp.data.kind {
+            ComponentInteractionDataKind::StringSelect { values } => {
+                match values.first() {
+                    Some(v) => v.clone(),
+                    None => return,
+                }
             }
-            debug!(filename = %attachment.filename, error = %e, "resize failed, using original");
-            (bytes.to_vec(), mime.to_string())
+            _ => return,
+        };
+
+        let thread_key = format!("discord:{}", comp.channel_id.get());
+
+        let result = self
+            .router
+            .pool()
+            .set_config_option(&thread_key, &config_id, &selected_value)
+            .await;
+
+        let response_msg = match result {
+            Ok(updated_options) => {
+                let display_name = updated_options
+                    .iter()
+                    .find(|o| o.id == config_id)
+                    .and_then(|o| o.options.iter().find(|v| v.value == selected_value))
+                    .map(|v| v.name.as_str())
+                    .unwrap_or(&selected_value);
+                format!("✅ Switched to **{}**", display_name)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to set config option");
+                format!("❌ Failed to switch: {}", e)
+            }
+        };
+
+        let response = CreateInteractionResponse::UpdateMessage(
+            CreateInteractionResponseMessage::new().content(response_msg).components(vec![]),
+        );
+
+        if let Err(e) = comp.create_response(&ctx.http, response).await {
+            tracing::error!(error = %e, "failed to respond to config select");
         }
-    };
-
-    debug!(
-        filename = %attachment.filename,
-        original_size = bytes.len(),
-        compressed_size = output_bytes.len(),
-        "image processed"
-    );
-
-    let encoded = BASE64.encode(&output_bytes);
-    Some(ContentBlock::Image {
-        media_type: output_mime,
-        data: encoded,
-    })
-}
-
-/// Resize image so longest side ≤ IMAGE_MAX_DIMENSION_PX, then encode as JPEG.
-/// Returns (compressed_bytes, mime_type). GIFs are passed through unchanged
-/// to preserve animation.
-fn resize_and_compress(raw: &[u8]) -> Result<(Vec<u8>, String), image::ImageError> {
-    let reader = ImageReader::new(Cursor::new(raw))
-        .with_guessed_format()?;
-
-    let format = reader.format();
-
-    // Pass through GIFs unchanged to preserve animation
-    if format == Some(image::ImageFormat::Gif) {
-        return Ok((raw.to_vec(), "image/gif".to_string()));
     }
-
-    let img = reader.decode()?;
-    let (w, h) = (img.width(), img.height());
-
-    // Resize preserving aspect ratio: scale so longest side = 1200px
-    let img = if w > IMAGE_MAX_DIMENSION_PX || h > IMAGE_MAX_DIMENSION_PX {
-        let max_side = std::cmp::max(w, h);
-        let ratio = f64::from(IMAGE_MAX_DIMENSION_PX) / f64::from(max_side);
-        let new_w = (f64::from(w) * ratio) as u32;
-        let new_h = (f64::from(h) * ratio) as u32;
-        img.resize(new_w, new_h, image::imageops::FilterType::Lanczos3)
-    } else {
-        img
-    };
-
-    // Encode as JPEG
-    let mut buf = Cursor::new(Vec::new());
-    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, IMAGE_JPEG_QUALITY);
-    img.write_with_encoder(encoder)?;
-
-    Ok((buf.into_inner(), "image/jpeg".to_string()))
 }
 
-async fn edit(ctx: &Context, ch: ChannelId, msg_id: MessageId, content: &str) -> serenity::Result<Message> {
-    ch.edit_message(&ctx.http, msg_id, serenity::builder::EditMessage::new().content(content)).await
+// --- Discord-specific helpers ---
+
+fn discord_msg_ref(msg: &Message) -> MessageRef {
+    MessageRef {
+        channel: ChannelRef {
+            platform: "discord".into(),
+            channel_id: msg.channel_id.get().to_string(),
+            thread_id: None,
+            parent_id: None,
+        },
+        message_id: msg.id.to_string(),
+    }
 }
 
-async fn stream_prompt(
-    pool: &SessionPool,
-    thread_key: &str,
-    content_blocks: Vec<ContentBlock>,
+async fn get_or_create_thread(
     ctx: &Context,
-    channel: ChannelId,
-    msg_id: MessageId,
-    reactions: Arc<StatusReactionController>,
-) -> anyhow::Result<()> {
-    let reactions = reactions.clone();
-
-    pool.with_connection(thread_key, |conn| {
-        let content_blocks = content_blocks.clone();
-        let ctx = ctx.clone();
-        let reactions = reactions.clone();
-        Box::pin(async move {
-            let reset = conn.session_reset;
-            conn.session_reset = false;
-
-            let (mut rx, _): (_, _) = conn.session_prompt(content_blocks).await?;
-            reactions.set_thinking().await;
-
-            let initial = if reset {
-                "⚠️ _Session expired, starting fresh..._\n\n...".to_string()
-            } else {
-                "...".to_string()
-            };
-            let (buf_tx, buf_rx) = watch::channel(initial);
-
-            let mut text_buf = String::new();
-            // Tool calls indexed by toolCallId. Vec preserves first-seen
-            // order. We store id + title + state separately so a ToolDone
-            // event that arrives without a refreshed title (claude-agent-acp's
-            // update events don't always re-send the title field) can still
-            // reuse the title we already learned from a prior
-            // tool_call_update — only the icon flips 🔧 → ✅ / ❌. Rendering
-            // happens on the fly in compose_display().
-            let mut tool_lines: Vec<ToolEntry> = Vec::new();
-            let current_msg_id = msg_id;
-
-            if reset {
-                text_buf.push_str("⚠️ _Session expired, starting fresh..._\n\n");
-            }
-
-            // Spawn edit-streaming task — only edits the single message, never sends new ones.
-            // Long content is truncated during streaming; final multi-message split happens after.
-            let edit_handle = {
-                let ctx = ctx.clone();
-                let mut buf_rx = buf_rx.clone();
-                tokio::spawn(async move {
-                    let mut last_content = String::new();
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                        if buf_rx.has_changed().unwrap_or(false) {
-                            let content = buf_rx.borrow_and_update().clone();
-                            if content != last_content {
-                                let display = if content.chars().count() > 1900 {
-                                    // Tail-priority: keep the last 1900 chars so the
-                                    // user always sees the most recent agent output
-                                    // (e.g. a confirmation prompt) instead of old tool lines.
-                                    let total = content.chars().count();
-                                    let skip = total - 1900;
-                                    let truncated: String = content.chars().skip(skip).collect();
-                                    format!("…(truncated)\n{truncated}")
-                                } else {
-                                    content.clone()
-                                };
-                                let _ = edit(&ctx, channel, msg_id, &display).await;
-                                last_content = content;
-                            }
-                        }
-                        if buf_rx.has_changed().is_err() {
-                            break;
-                        }
-                    }
-                })
-            };
-
-            // Process ACP notifications
-            let mut got_first_text = false;
-            let mut response_error: Option<String> = None;
-            while let Some(notification) = rx.recv().await {
-                if notification.id.is_some() {
-                    // Capture error from ACP response to display in Discord
-                    if let Some(ref err) = notification.error {
-                        response_error = Some(format_coded_error(err.code, &err.message));
-                    }
-                    break;
-                }
-
-                if let Some(event) = classify_notification(&notification) {
-                    match event {
-                        AcpEvent::Text(t) => {
-                            if !got_first_text {
-                                got_first_text = true;
-                                // Reaction: back to thinking after tools
-                            }
-                            text_buf.push_str(&t);
-                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf, true));
-                        }
-                        AcpEvent::Thinking => {
-                            reactions.set_thinking().await;
-                        }
-                        AcpEvent::ToolStart { id, title } if !title.is_empty() => {
-                            reactions.set_tool(&title).await;
-                            let title = sanitize_title(&title);
-                            // Dedupe by toolCallId: replace if we've already
-                            // seen this id, otherwise append a new entry.
-                            // claude-agent-acp emits a placeholder title
-                            // ("Terminal", "Edit", etc.) on the first event
-                            // and refines it via tool_call_update; without
-                            // dedup the placeholder and refined version
-                            // appear as two separate orphaned lines.
-                            if let Some(slot) = tool_lines.iter_mut().find(|e| e.id == id) {
-                                slot.title = title;
-                                slot.state = ToolState::Running;
-                            } else {
-                                tool_lines.push(ToolEntry {
-                                    id,
-                                    title,
-                                    state: ToolState::Running,
-                                });
-                            }
-                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf, true));
-                        }
-                        AcpEvent::ToolDone { id, title, status } => {
-                            reactions.set_thinking().await;
-                            let new_state = if status == "completed" {
-                                ToolState::Completed
-                            } else {
-                                ToolState::Failed
-                            };
-                            // Find by id (the title is unreliable — substring
-                            // match against the placeholder "Terminal" would
-                            // never find the refined entry). Preserve the
-                            // existing title if the Done event omits it.
-                            if let Some(slot) = tool_lines.iter_mut().find(|e| e.id == id) {
-                                if !title.is_empty() {
-                                    slot.title = sanitize_title(&title);
-                                }
-                                slot.state = new_state;
-                            } else if !title.is_empty() {
-                                // Done arrived without a prior Start (rare
-                                // race) — record it so we still show
-                                // something.
-                                tool_lines.push(ToolEntry {
-                                    id,
-                                    title: sanitize_title(&title),
-                                    state: new_state,
-                                });
-                            }
-                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf, true));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            conn.prompt_done().await;
-            drop(buf_tx);
-            let _ = edit_handle.await;
-
-            // Final edit
-            let final_content = compose_display(&tool_lines, &text_buf, false);
-            // If ACP returned both an error and partial text, show both.
-            // This can happen when the agent started producing content before hitting an error
-            // (e.g. context length limit, rate limit mid-stream). Showing both gives users
-            // full context rather than hiding the partial response.
-            let final_content = if final_content.is_empty() {
-                if let Some(err) = response_error {
-                    format!("⚠️ {}", err)
-                } else {
-                    "_(no response)_".to_string()
-                }
-            } else if let Some(err) = response_error {
-                format!("⚠️ {}\n\n{}", err, final_content)
-            } else {
-                final_content
-            };
-
-            let chunks = format::split_message(&final_content, 2000);
-            for (i, chunk) in chunks.iter().enumerate() {
-                if i == 0 {
-                    let _ = edit(&ctx, channel, current_msg_id, chunk).await;
-                } else {
-                    let _ = channel.say(&ctx.http, chunk).await;
-                }
-            }
-
-            Ok(())
-        })
-    })
-    .await
-}
-
-/// Flatten a tool-call title into a single line that's safe to render
-/// inside Discord inline-code spans. Discord renders single-backtick
-/// code on a single line only, so multi-line shell commands (heredocs,
-/// `&&`-chained commands split across lines) appear truncated; we
-/// collapse newlines to ` ; ` and rewrite embedded backticks so they
-/// don't break the wrapping span.
-fn sanitize_title(title: &str) -> String {
-    title.replace('\r', "").replace('\n', " ; ").replace('`', "'")
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolState {
-    Running,
-    Completed,
-    Failed,
-}
-
-#[derive(Debug, Clone)]
-struct ToolEntry {
-    id: String,
-    title: String,
-    state: ToolState,
-}
-
-impl ToolEntry {
-    fn render(&self) -> String {
-        let icon = match self.state {
-            ToolState::Running => "🔧",
-            ToolState::Completed => "✅",
-            ToolState::Failed => "❌",
-        };
-        let suffix = if self.state == ToolState::Running { "..." } else { "" };
-        format!("{icon} `{}`{}", self.title, suffix)
-    }
-}
-
-/// Maximum number of finished (or running) tool entries to show individually
-/// during streaming before collapsing into a summary line.
-///
-/// A typical tool line is 40–80 chars (icon + backtick title + suffix).
-/// At 3 lines ≈ 120–240 chars, consuming 6–13 % of the 1900-char Discord
-/// streaming budget, leaving 1660+ chars for agent text.  Beyond 3, tool
-/// titles tend to grow (full shell commands, URLs) so budget consumption
-/// rises non-linearly.  3 is also the practical "glanceable" limit.
-const TOOL_COLLAPSE_THRESHOLD: usize = 3;
-
-fn compose_display(tool_lines: &[ToolEntry], text: &str, streaming: bool) -> String {
-    let mut out = String::new();
-    if !tool_lines.is_empty() {
-        if streaming {
-            let done = tool_lines.iter().filter(|e| e.state == ToolState::Completed).count();
-            let failed = tool_lines.iter().filter(|e| e.state == ToolState::Failed).count();
-            let running: Vec<_> = tool_lines.iter().filter(|e| e.state == ToolState::Running).collect();
-            let finished = done + failed;
-
-            if finished <= TOOL_COLLAPSE_THRESHOLD {
-                for entry in tool_lines.iter().filter(|e| e.state != ToolState::Running) {
-                    out.push_str(&entry.render());
-                    out.push('\n');
-                }
-            } else {
-                let mut parts = Vec::new();
-                if done > 0 { parts.push(format!("✅ {done}")); }
-                if failed > 0 { parts.push(format!("❌ {failed}")); }
-                out.push_str(&format!("{} tool(s) completed\n", parts.join(" · ")));
-            }
-
-            if running.len() <= TOOL_COLLAPSE_THRESHOLD {
-                for entry in &running {
-                    out.push_str(&entry.render());
-                    out.push('\n');
-                }
-            } else {
-                // Parallel running tools exceed threshold — show last N + summary
-                let hidden = running.len() - TOOL_COLLAPSE_THRESHOLD;
-                out.push_str(&format!("🔧 {hidden} more running\n"));
-                for entry in running.iter().skip(hidden) {
-                    out.push_str(&entry.render());
-                    out.push('\n');
-                }
-            }
-        } else {
-            for entry in tool_lines {
-                out.push_str(&entry.render());
-                out.push('\n');
-            }
-        }
-        if !out.is_empty() { out.push('\n'); }
-    }
-    out.push_str(text.trim_end());
-    out
-}
-
-static MENTION_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"<@[!&]?\d+>").unwrap()
-});
-
-fn strip_mention(content: &str) -> String {
-    MENTION_RE.replace_all(content, "").trim().to_string()
-}
-
-fn shorten_thread_name(prompt: &str) -> String {
-    // Shorten GitHub URLs: https://github.com/owner/repo/issues/123 → owner/repo#123
-    let re = regex::Regex::new(r"https?://github\.com/([^/]+/[^/]+)/(issues|pull)/(\d+)").unwrap();
-    let shortened = re.replace_all(prompt, "$1#$3");
-    let name: String = shortened.chars().take(40).collect();
-    if name.len() < shortened.len() {
-        format!("{name}...")
-    } else {
-        name
-    }
-}
-
-async fn get_or_create_thread(ctx: &Context, msg: &Message, prompt: &str) -> anyhow::Result<u64> {
+    adapter: &Arc<dyn ChatAdapter>,
+    msg: &Message,
+    prompt: &str,
+) -> anyhow::Result<ChannelRef> {
     let channel = msg.channel_id.to_channel(&ctx.http).await?;
     if let serenity::model::channel::Channel::Guild(ref gc) = channel {
         if gc.thread_metadata.is_some() {
-            return Ok(msg.channel_id.get());
+            return Ok(ChannelRef {
+                platform: "discord".into(),
+                channel_id: msg.channel_id.get().to_string(),
+                thread_id: None,
+                parent_id: None,
+            });
         }
     }
 
-    let thread_name = shorten_thread_name(prompt);
-
-    let thread = msg
-        .channel_id
-        .create_thread_from_message(
-            &ctx.http,
-            msg.id,
-            serenity::builder::CreateThread::new(thread_name)
-                .auto_archive_duration(serenity::model::channel::AutoArchiveDuration::OneDay),
-        )
-        .await?;
-
-    Ok(thread.id.get())
+    let thread_name = format::shorten_thread_name(prompt);
+    let parent = ChannelRef {
+        platform: "discord".into(),
+        channel_id: msg.channel_id.get().to_string(),
+        thread_id: None,
+        parent_id: None,
+    };
+    let trigger_ref = discord_msg_ref(msg);
+    adapter.create_thread(&parent, &trigger_ref, &thread_name).await
 }
 
+// --- Bot turn tracking ---
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TurnResult {
+    /// Counter below limits — continue normally.
+    Ok,
+    /// Counter == soft_limit — warn once, then stop.
+    SoftLimit(u32),
+    /// Counter > soft_limit — silently stop (already warned).
+    Throttled,
+    /// Counter == HARD_BOT_TURN_LIMIT — warn once, then stop.
+    HardLimit,
+    /// Counter > HARD_BOT_TURN_LIMIT — silently stop (already warned).
+    Stopped,
+}
+
+pub(crate) struct BotTurnTracker {
+    soft_limit: u32,
+    counts: HashMap<String, (u32, u32)>,
+}
+
+impl BotTurnTracker {
+    pub fn new(soft_limit: u32) -> Self {
+        Self { soft_limit, counts: HashMap::new() }
+    }
+
+    pub fn on_bot_message(&mut self, thread_id: &str) -> TurnResult {
+        let (soft, hard) = self.counts.entry(thread_id.to_string()).or_insert((0, 0));
+        *soft += 1;
+        *hard += 1;
+        if *hard > HARD_BOT_TURN_LIMIT {
+            TurnResult::Stopped
+        } else if *hard == HARD_BOT_TURN_LIMIT {
+            TurnResult::HardLimit
+        } else if *soft > self.soft_limit {
+            TurnResult::Throttled
+        } else if *soft == self.soft_limit {
+            TurnResult::SoftLimit(*soft)
+        } else {
+            TurnResult::Ok
+        }
+    }
+
+    pub fn on_human_message(&mut self, thread_id: &str) {
+        if let Some((soft, hard)) = self.counts.get_mut(thread_id) {
+            *soft = 0;
+            *hard = 0;
+        }
+    }
+}
+
+static ROLE_MENTION_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"<@&\d+>").unwrap()
+});
+
+fn resolve_mentions(content: &str, bot_id: UserId) -> String {
+    // 1. Strip the bot's own trigger mention
+    let out = content
+        .replace(&format!("<@{}>", bot_id), "")
+        .replace(&format!("<@!{}>", bot_id), "");
+    // 2. Other user mentions: keep <@UID> as-is so the LLM can mention back
+    // 3. Fallback: replace role mentions only (user mentions are preserved)
+    let out = ROLE_MENTION_RE.replace_all(&out, "@(role)").to_string();
+    out.trim().to_string()
+}
+
+/// Pure decision function: should this message be processed or ignored?
+/// Returns `true` if the message should be processed (bot responds).
+/// Extracted from the EventHandler::message gating logic for testability.
+#[cfg(test)]
+fn should_process_user_message(
+    mode: AllowUsers,
+    is_mentioned: bool,
+    in_thread: bool,
+    involved: bool,
+    other_bot_present: bool,
+) -> bool {
+    if is_mentioned {
+        return true;
+    }
+    match mode {
+        AllowUsers::Mentions => false,
+        AllowUsers::Involved => in_thread && involved,
+        AllowUsers::MultibotMentions => {
+            if !in_thread || !involved {
+                return false;
+            }
+            !other_bot_present
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_png(width: u32, height: u32) -> Vec<u8> {
-        let img = image::RgbImage::new(width, height);
-        let mut buf = Cursor::new(Vec::new());
-        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
-        buf.into_inner()
-    }
+    // --- Bot turn tracker tests ---
 
+    /// Basic increment: bot messages below the soft limit return Ok.
     #[test]
-    fn large_image_resized_to_max_dimension() {
-        let png = make_png(3000, 2000);
-        let (compressed, mime) = resize_and_compress(&png).unwrap();
-
-        assert_eq!(mime, "image/jpeg");
-        let result = image::load_from_memory(&compressed).unwrap();
-        assert!(result.width() <= IMAGE_MAX_DIMENSION_PX);
-        assert!(result.height() <= IMAGE_MAX_DIMENSION_PX);
+    fn bot_turns_increment() {
+        let mut t = BotTurnTracker::new(5);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
     }
 
+    /// Soft limit: after N consecutive bot turns, returns SoftLimit.
     #[test]
-    fn small_image_keeps_original_dimensions() {
-        let png = make_png(800, 600);
-        let (compressed, mime) = resize_and_compress(&png).unwrap();
-
-        assert_eq!(mime, "image/jpeg");
-        let result = image::load_from_memory(&compressed).unwrap();
-        assert_eq!(result.width(), 800);
-        assert_eq!(result.height(), 600);
+    fn soft_limit_triggers() {
+        let mut t = BotTurnTracker::new(3);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(3));
     }
 
+    /// Human message resets both soft and hard counters, allowing bots to continue.
     #[test]
-    fn landscape_image_respects_aspect_ratio() {
-        let png = make_png(4000, 2000);
-        let (compressed, _) = resize_and_compress(&png).unwrap();
-
-        let result = image::load_from_memory(&compressed).unwrap();
-        assert_eq!(result.width(), 1200);
-        assert_eq!(result.height(), 600);
+    fn human_resets_both_counters() {
+        let mut t = BotTurnTracker::new(3);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        t.on_human_message("t1");
+        // Both reset — can do 2 more before soft limit
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(3));
     }
 
+    /// Hard limit: absolute cap on bot turns, triggers after HARD_BOT_TURN_LIMIT.
     #[test]
-    fn portrait_image_respects_aspect_ratio() {
-        let png = make_png(2000, 4000);
-        let (compressed, _) = resize_and_compress(&png).unwrap();
-
-        let result = image::load_from_memory(&compressed).unwrap();
-        assert_eq!(result.width(), 600);
-        assert_eq!(result.height(), 1200);
+    fn hard_limit_triggers() {
+        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT + 1);
+        for _ in 0..HARD_BOT_TURN_LIMIT - 1 {
+            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        }
+        assert_eq!(t.on_bot_message("t1"), TurnResult::HardLimit);
     }
 
+    /// Hard limit resets on human message, allowing bots to continue.
     #[test]
-    fn compressed_output_is_smaller_than_original() {
-        let png = make_png(3000, 2000);
-        let (compressed, _) = resize_and_compress(&png).unwrap();
-
-        assert!(compressed.len() < png.len(), "compressed {} should be < original {}", compressed.len(), png.len());
+    fn hard_limit_resets_on_human() {
+        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT + 1);
+        for _ in 0..HARD_BOT_TURN_LIMIT - 1 {
+            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        }
+        t.on_human_message("t1");
+        // Hard counter reset — can go again
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
     }
 
+    /// When soft and hard limits are equal, hard limit takes precedence.
     #[test]
-    fn gif_passes_through_unchanged() {
-        // Minimal valid GIF89a (1x1 pixel)
-        let gif: Vec<u8> = vec![
-            0x47, 0x49, 0x46, 0x38, 0x39, 0x61, // GIF89a
-            0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, // logical screen descriptor
-            0x2C, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, // image descriptor
-            0x02, 0x02, 0x44, 0x01, 0x00, // image data
-            0x3B, // trailer
-        ];
-        let (output, mime) = resize_and_compress(&gif).unwrap();
-
-        assert_eq!(mime, "image/gif");
-        assert_eq!(output, gif);
+    fn hard_before_soft_when_equal() {
+        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT);
+        for _ in 0..HARD_BOT_TURN_LIMIT - 1 {
+            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        }
+        // soft == hard == HARD_BOT_TURN_LIMIT → hard wins
+        assert_eq!(t.on_bot_message("t1"), TurnResult::HardLimit);
     }
 
+    /// Turn counters are per-thread — one thread hitting the limit doesn't affect others.
     #[test]
-    fn invalid_data_returns_error() {
-        let garbage = vec![0x00, 0x01, 0x02, 0x03];
-        assert!(resize_and_compress(&garbage).is_err());
+    fn threads_are_independent() {
+        let mut t = BotTurnTracker::new(3);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(3));
+        // t2 is unaffected
+        assert_eq!(t.on_bot_message("t2"), TurnResult::Ok);
     }
 
-    // --- compose_display tests ---
-
-    fn tool(id: &str, title: &str, state: ToolState) -> ToolEntry {
-        ToolEntry { id: id.to_string(), title: title.to_string(), state }
-    }
-
+    /// Human message on an unknown thread is a no-op (should not panic).
     #[test]
-    fn compose_display_at_threshold_shows_individual_lines() {
-        let tools = vec![
-            tool("1", "cmd-a", ToolState::Completed),
-            tool("2", "cmd-b", ToolState::Completed),
-            tool("3", "cmd-c", ToolState::Completed),
-        ];
-        let out = compose_display(&tools, "hello", true);
-        assert!(out.contains("✅ `cmd-a`"), "should show individual tool");
-        assert!(out.contains("✅ `cmd-b`"), "should show individual tool");
-        assert!(out.contains("✅ `cmd-c`"), "should show individual tool");
-        assert!(!out.contains("tool(s) completed"), "should not collapse at threshold");
+    fn human_on_unknown_thread_is_noop() {
+        let mut t = BotTurnTracker::new(5);
+        t.on_human_message("unknown"); // should not panic
     }
 
+    /// Two-bot ping-pong: both bots' messages count toward the same per-thread
+    /// limit. With soft_limit=20, the limit triggers after 20 total bot messages
+    /// (~10 per bot). This simulates what each bot's process sees when the
+    /// tracker runs before self-check — own messages are counted too. (#483)
     #[test]
-    fn compose_display_above_threshold_collapses() {
-        let tools = vec![
-            tool("1", "cmd-a", ToolState::Completed),
-            tool("2", "cmd-b", ToolState::Completed),
-            tool("3", "cmd-c", ToolState::Completed),
-            tool("4", "cmd-d", ToolState::Completed),
-        ];
-        let out = compose_display(&tools, "hello", true);
-        assert!(out.contains("✅ 4 tool(s) completed"), "should collapse above threshold");
-        assert!(!out.contains("`cmd-a`"), "individual tools should be hidden");
+    fn two_bot_pingpong_hits_soft_limit() {
+        let mut t = BotTurnTracker::new(20);
+        // Simulate 20 bot messages (alternating bot A and bot B,
+        // but the tracker doesn't distinguish — it just counts)
+        for i in 1..20 {
+            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok, "turn {i}");
+        }
+        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(20));
     }
 
+    /// Human message in the middle of a ping-pong resets the counter,
+    /// allowing bots to continue.
     #[test]
-    fn compose_display_mixed_completed_and_failed() {
-        let tools = vec![
-            tool("1", "ok-1", ToolState::Completed),
-            tool("2", "ok-2", ToolState::Completed),
-            tool("3", "ok-3", ToolState::Completed),
-            tool("4", "fail-1", ToolState::Failed),
-            tool("5", "fail-2", ToolState::Failed),
-        ];
-        let out = compose_display(&tools, "", true);
-        assert!(out.contains("✅ 3 · ❌ 2 tool(s) completed"));
+    fn two_bot_pingpong_human_resets() {
+        let mut t = BotTurnTracker::new(20);
+        for _ in 0..15 {
+            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        }
+        t.on_human_message("t1"); // human intervenes at 15
+        for _ in 0..15 {
+            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok); // can do 15 more
+        }
+        // now at 15 again, 5 more to hit limit
+        for _ in 0..4 {
+            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        }
+        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(20));
     }
 
+    // --- resolve_mentions tests ---
+
+    /// Bot's own <@UID> mention is stripped from the prompt.
     #[test]
-    fn compose_display_running_shown_alongside_collapsed() {
-        let tools = vec![
-            tool("1", "done-1", ToolState::Completed),
-            tool("2", "done-2", ToolState::Completed),
-            tool("3", "done-3", ToolState::Completed),
-            tool("4", "done-4", ToolState::Completed),
-            tool("5", "active", ToolState::Running),
-        ];
-        let out = compose_display(&tools, "text", true);
-        assert!(out.contains("✅ 4 tool(s) completed"));
-        assert!(out.contains("🔧 `active`..."));
-        assert!(out.contains("text"));
+    fn resolve_mentions_strips_bot_mention() {
+        let bot_id = UserId::new(111);
+        let result = resolve_mentions("hello <@111> world", bot_id);
+        assert_eq!(result, "hello  world");
     }
 
+    /// Bot's own legacy <@!UID> mention is also stripped.
     #[test]
-    fn compose_display_parallel_running_guard() {
-        let tools: Vec<_> = (0..5)
-            .map(|i| tool(&i.to_string(), &format!("run-{i}"), ToolState::Running))
-            .collect();
-        let out = compose_display(&tools, "", true);
-        assert!(out.contains("🔧 2 more running"), "should collapse excess running tools");
-        assert!(out.contains("🔧 `run-3`..."), "should show recent running");
-        assert!(out.contains("🔧 `run-4`..."), "should show recent running");
+    fn resolve_mentions_strips_bot_mention_legacy() {
+        let bot_id = UserId::new(111);
+        let result = resolve_mentions("hello <@!111> world", bot_id);
+        assert_eq!(result, "hello  world");
     }
 
+    /// Other users' <@UID> mentions are preserved so the LLM can mention them back.
     #[test]
-    fn compose_display_non_streaming_shows_all() {
-        let tools = vec![
-            tool("1", "cmd-a", ToolState::Completed),
-            tool("2", "cmd-b", ToolState::Completed),
-            tool("3", "cmd-c", ToolState::Completed),
-            tool("4", "cmd-d", ToolState::Completed),
-            tool("5", "cmd-e", ToolState::Failed),
-        ];
-        let out = compose_display(&tools, "final", false);
-        assert!(out.contains("✅ `cmd-a`"));
-        assert!(out.contains("✅ `cmd-d`"));
-        assert!(out.contains("❌ `cmd-e`"));
-        assert!(out.contains("final"));
-        assert!(!out.contains("tool(s) completed"), "non-streaming should not collapse");
+    fn resolve_mentions_preserves_other_user_mentions() {
+        let bot_id = UserId::new(111);
+        let result = resolve_mentions("<@111> say hi to <@222>", bot_id);
+        assert_eq!(result, "say hi to <@222>");
     }
 
+    /// Role mentions <@&UID> are replaced with @(role) placeholder.
     #[test]
-    fn tail_truncation_preserves_multibyte_chars() {
-        let content = "你好世界🌍abcdefghij";
-        let limit = 10;
-        let total = content.chars().count();
-        let skip = total.saturating_sub(limit);
-        let truncated: String = content.chars().skip(skip).collect();
-        assert_eq!(truncated.chars().count(), limit);
-        assert!(truncated.ends_with("abcdefghij"));
+    fn resolve_mentions_replaces_role_mentions() {
+        let bot_id = UserId::new(111);
+        let result = resolve_mentions("hello <@&999>", bot_id);
+        assert_eq!(result, "hello @(role)");
+    }
+
+    /// Message containing only the bot mention results in empty string.
+    #[test]
+    fn resolve_mentions_empty_after_strip() {
+        let bot_id = UserId::new(111);
+        let result = resolve_mentions("<@111>", bot_id);
+        assert_eq!(result, "");
+    }
+
+    // --- should_process_user_message tests (GIVEN/WHEN/THEN) ---
+    // Tests the multibot-mentions gating logic extracted from EventHandler::message.
+    // The bug in #481 was that other bots' messages were filtered by bot gating
+    // before multibot detection could run, so the bot never learned the thread
+    // was multi-bot and responded without @mention.
+
+    /// GIVEN: multibot-mentions mode, single-bot thread, bot is involved
+    /// WHEN:  human sends message without @mention
+    /// THEN:  bot responds (natural conversation)
+    #[test]
+    fn multibot_mentions_single_bot_thread_no_mention() {
+        assert!(should_process_user_message(
+            AllowUsers::MultibotMentions,
+            false,          // is_mentioned
+            true,           // in_thread
+            true,           // involved
+            false,          // other_bot_present
+        ));
+    }
+
+    /// GIVEN: multibot-mentions mode, multi-bot thread (other bot has posted)
+    /// WHEN:  human sends message without @mention
+    /// THEN:  bot does NOT respond (requires @mention in multi-bot thread)
+    /// This is the exact scenario from bug #481.
+    #[test]
+    fn multibot_mentions_multi_bot_thread_no_mention() {
+        assert!(!should_process_user_message(
+            AllowUsers::MultibotMentions,
+            false,          // is_mentioned
+            true,           // in_thread
+            true,           // involved
+            true,           // other_bot_present ← another bot posted
+        ));
+    }
+
+    /// GIVEN: multibot-mentions mode, multi-bot thread
+    /// WHEN:  human sends message WITH @mention
+    /// THEN:  bot responds (explicit @mention always works)
+    #[test]
+    fn multibot_mentions_multi_bot_thread_with_mention() {
+        assert!(should_process_user_message(
+            AllowUsers::MultibotMentions,
+            true,           // is_mentioned
+            true,           // in_thread
+            true,           // involved
+            true,           // other_bot_present
+        ));
+    }
+
+    /// GIVEN: multibot-mentions mode, not in a thread (main channel)
+    /// WHEN:  human sends message without @mention
+    /// THEN:  bot does NOT respond (main channel always requires @mention)
+    #[test]
+    fn multibot_mentions_main_channel_no_mention() {
+        assert!(!should_process_user_message(
+            AllowUsers::MultibotMentions,
+            false,          // is_mentioned
+            false,          // in_thread (main channel)
+            false,          // involved
+            false,          // other_bot_present
+        ));
+    }
+
+    /// GIVEN: multibot-mentions mode, in thread but bot is NOT involved
+    /// WHEN:  human sends message without @mention
+    /// THEN:  bot does NOT respond (not participating in this thread)
+    #[test]
+    fn multibot_mentions_not_involved() {
+        assert!(!should_process_user_message(
+            AllowUsers::MultibotMentions,
+            false,          // is_mentioned
+            true,           // in_thread
+            false,          // involved ← bot hasn't posted here
+            false,          // other_bot_present
+        ));
+    }
+
+    /// GIVEN: involved mode, multi-bot thread
+    /// WHEN:  human sends message without @mention
+    /// THEN:  bot responds (involved mode ignores multi-bot status)
+    #[test]
+    fn involved_mode_ignores_multibot() {
+        assert!(should_process_user_message(
+            AllowUsers::Involved,
+            false,          // is_mentioned
+            true,           // in_thread
+            true,           // involved
+            true,           // other_bot_present ← ignored in involved mode
+        ));
+    }
+
+    /// GIVEN: mentions mode
+    /// WHEN:  human sends message without @mention (even in own thread)
+    /// THEN:  bot does NOT respond (always requires @mention)
+    #[test]
+    fn mentions_mode_always_requires_mention() {
+        assert!(!should_process_user_message(
+            AllowUsers::Mentions,
+            false,          // is_mentioned
+            true,           // in_thread
+            true,           // involved
+            false,          // other_bot_present
+        ));
+    }
+
+    /// After soft limit fires once (n==20), subsequent bot messages still return
+    /// SoftLimit but with n>20. The caller warns only when n==max (exact hit),
+    /// preventing warning messages from ping-ponging between bots.
+    #[test]
+    fn soft_limit_warn_once_semantics() {
+        let mut t = BotTurnTracker::new(20);
+        for _ in 0..19 {
+            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        }
+        // n==20: exact hit — caller should send warning
+        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(20));
+        // n==21: past limit — caller should silently return (no warning)
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Throttled);
+        // n==22: still past — still silent
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Throttled);
+    }
+
+    /// Hard limit also carries count for warn-once semantics.
+    #[test]
+    fn hard_limit_warn_once_semantics() {
+        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT + 1); // soft > hard so hard fires first
+        for _ in 0..HARD_BOT_TURN_LIMIT - 1 {
+            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        }
+        // Exact hit — warn
+        assert_eq!(t.on_bot_message("t1"), TurnResult::HardLimit);
+        // Past — silent
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Stopped);
     }
 }

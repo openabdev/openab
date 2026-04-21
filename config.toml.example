@@ -1,10 +1,32 @@
+# Enable one or more adapters. At least one [discord] or [slack] section is required.
+
 [discord]
 bot_token = "${DISCORD_BOT_TOKEN}"
-allowed_channels = ["1234567890"]
-# allowed_users = ["<YOUR_DISCORD_USER_ID>"]  # empty or omitted = allow all users
+# allow_all_channels = true            # true = allow all channels; false = only allowed_channels
+#                                      # omitted = auto-detect from list (non-empty → false, empty → true)
+allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-detected as false
+# allow_all_users = true               # true = any user; false = only allowed_users
+#                                      # omitted = auto-detect from list (non-empty → false, empty → true)
+# allowed_users = ["<YOUR_DISCORD_USER_ID>"]  # ↑ omitted + empty/absent list → auto-detected as true
 # allow_bot_messages = "off"  # "off" (default) | "mentions" | "all"
                                # "mentions" is recommended for multi-agent collaboration
 # trusted_bot_ids = []         # empty = any bot (mode permitting); set to restrict
+# allow_user_messages = "involved"  # "involved" (default) | "mentions"
+                                     # "involved" = reply in threads bot owns or has participated in
+                                     # "mentions" = always require @mention
+
+# [slack]
+# bot_token = "${SLACK_BOT_TOKEN}"     # Bot User OAuth Token (xoxb-...)
+# app_token = "${SLACK_APP_TOKEN}"     # App-Level Token (xapp-...) for Socket Mode
+# allow_all_channels = true            # true (default) = allow all channels; false = only allowed_channels
+# allowed_channels = ["C0123456789"]   # only checked when allow_all_channels = false
+# allow_all_users = true               # true (default) = any user; false = only allowed_users
+# allowed_users = ["U0123456789"]      # only checked when allow_all_users = false
+# allow_bot_messages = "off"           # "off" (default) | "mentions" | "all"
+# trusted_bot_ids = []                 # empty = any bot (mode permitting); set to restrict
+# allow_user_messages = "involved"     # "involved" (default) | "mentions"
+                                        # "involved" = reply in threads bot has participated in
+                                        # "mentions" = always require @mention
 
 [agent]
 command = "kiro-cli"
@@ -34,6 +56,21 @@ working_dir = "/home/agent"
 # args = ["--acp", "--stdio"]
 # working_dir = "/home/agent"
 # env = {}  # Auth via: kubectl exec -it <pod> -- gh auth login -p https -w
+
+# [agent]
+# command = "opencode"
+# args = ["acp"]
+# working_dir = "/home/node"
+# # Note: opencode handles tool authorization internally and never emits
+# # session/request_permission — all tools run without user confirmation,
+# # equivalent to --trust-all-tools on other backends.
+# # Run `opencode auth login` once before starting openab.
+
+# [agent]
+# command = "cursor-agent"
+# args = ["acp", "--model", "auto", "--workspace", "/home/agent"]
+# working_dir = "/home/agent"
+# env = {}  # Auth via: kubectl exec -it <pod> -- cursor-agent login
 
 [pool]
 max_sessions = 10

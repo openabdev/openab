@@ -29,6 +29,10 @@ spec:
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with $cfg.extraInitContainers }}
+      initContainers:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: openab
           image: {{ include "openab.agentImage" $d | quote }}
@@ -38,12 +42,26 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           env:
-            {{- if $cfg.discord.botToken }}
+            {{- if and (ne (toString ($cfg.discord).enabled) "false") ($cfg.discord).botToken }}
             - name: DISCORD_BOT_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ include "openab.agentFullname" $d }}
                   key: discord-bot-token
+            {{- end }}
+            {{- if and ($cfg.slack).enabled ($cfg.slack).botToken }}
+            - name: SLACK_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: slack-bot-token
+            {{- end }}
+            {{- if and ($cfg.slack).enabled ($cfg.slack).appToken }}
+            - name: SLACK_APP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: slack-app-token
             {{- end }}
             {{- if and ($cfg.stt).enabled ($cfg.stt).apiKey }}
             - name: STT_API_KEY
@@ -78,7 +96,21 @@ spec:
             - name: config
               mountPath: {{ $cfg.workingDir | default "/home/agent" }}/AGENTS.md
               subPath: AGENTS.md
+            - name: config
+              mountPath: {{ $cfg.workingDir | default "/home/agent" }}/CLAUDE.md
+              subPath: AGENTS.md
+            - name: config
+              mountPath: {{ $cfg.workingDir | default "/home/agent" }}/GEMINI.md
+              subPath: AGENTS.md
             {{- end }}
+            - name: tmp
+              mountPath: /tmp
+            {{- with $cfg.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      {{- with $cfg.extraContainers }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with $cfg.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -99,6 +131,11 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: {{ include "openab.agentFullname" $d }}
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+        {{- with $cfg.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
 {{- end }}
 {{- end }}

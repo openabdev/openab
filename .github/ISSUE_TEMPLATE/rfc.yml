@@ -1,0 +1,10 @@
+name: RFC
+description: Propose a design or architectural change
+labels: [rfc, needs-triage]
+body:
+  - type: textarea
+    attributes:
+      label: Proposal
+      description: Describe your proposal freely
+    validations:
+      required: true

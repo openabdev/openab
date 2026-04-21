@@ -54,6 +54,107 @@ impl std::fmt::Display for JsonRpcError {
     }
 }
 
+// --- ACP configOptions (session-level configuration) ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigOptionValue {
+    pub value: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigOption {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(rename = "type")]
+    pub option_type: String,
+    pub current_value: String,
+    pub options: Vec<ConfigOptionValue>,
+}
+
+/// Extract configOptions from a JSON-RPC result value.
+/// Supports standard `configOptions` and kiro-cli's `models`/`modes` fallback.
+pub fn parse_config_options(result: &Value) -> Vec<ConfigOption> {
+    if let Some(opts) = result
+        .get("configOptions")
+        .and_then(|v| serde_json::from_value::<Vec<ConfigOption>>(v.clone()).ok())
+    {
+        if !opts.is_empty() {
+            return opts;
+        }
+    }
+
+    // Kiro-cli fallback: parse models/modes format
+    let mut options = Vec::new();
+
+    if let Some(models) = result.get("models") {
+        let current = models.get("currentModelId").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some(available) = models.get("availableModels").and_then(|v| v.as_array()) {
+            let values: Vec<ConfigOptionValue> = available
+                .iter()
+                .filter_map(|m| {
+                    let id = m.get("modelId").or_else(|| m.get("id")).and_then(|v| v.as_str())?;
+                    let name = m.get("name").and_then(|v| v.as_str()).unwrap_or(id);
+                    Some(ConfigOptionValue {
+                        value: id.to_string(),
+                        name: name.to_string(),
+                        description: m.get("description").and_then(|v| v.as_str()).map(String::from),
+                    })
+                })
+                .collect();
+            if !values.is_empty() {
+                options.push(ConfigOption {
+                    id: "model".to_string(),
+                    name: "Model".to_string(),
+                    description: Some("AI model selection".to_string()),
+                    category: Some("model".to_string()),
+                    option_type: "enum".to_string(),
+                    current_value: current.to_string(),
+                    options: values,
+                });
+            }
+        }
+    }
+
+    if let Some(modes) = result.get("modes") {
+        let current = modes.get("currentModeId").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some(available) = modes.get("availableModes").and_then(|v| v.as_array()) {
+            let values: Vec<ConfigOptionValue> = available
+                .iter()
+                .filter_map(|m| {
+                    let id = m.get("id").and_then(|v| v.as_str())?;
+                    let name = m.get("name").and_then(|v| v.as_str()).unwrap_or(id);
+                    Some(ConfigOptionValue {
+                        value: id.to_string(),
+                        name: name.to_string(),
+                        description: m.get("description").and_then(|v| v.as_str()).map(String::from),
+                    })
+                })
+                .collect();
+            if !values.is_empty() {
+                options.push(ConfigOption {
+                    id: "agent".to_string(),
+                    name: "Agent".to_string(),
+                    description: Some("Agent mode selection".to_string()),
+                    category: Some("agent".to_string()),
+                    option_type: "enum".to_string(),
+                    current_value: current.to_string(),
+                    options: values,
+                });
+            }
+        }
+    }
+
+    options
+}
+
 // --- ACP notification classification ---
 
 #[derive(Debug)]
@@ -62,6 +163,7 @@ pub enum AcpEvent {
     Thinking,
     ToolStart { id: String, title: String },
     ToolDone { id: String, title: String, status: String },
+    ConfigUpdate { options: Vec<ConfigOption> },
     Status,
 }
 
@@ -105,6 +207,132 @@ pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
             }
         }
         "plan" => Some(AcpEvent::Status),
+        "config_option_update" => {
+            let options = parse_config_options(update);
+            Some(AcpEvent::ConfigUpdate { options })
+        }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_standard_config_options() {
+        let result = json!({
+            "configOptions": [{
+                "id": "model",
+                "name": "Model",
+                "type": "enum",
+                "currentValue": "claude-sonnet-4",
+                "options": [
+                    {"value": "claude-sonnet-4", "name": "Sonnet 4"},
+                    {"value": "claude-opus-4", "name": "Opus 4"}
+                ]
+            }]
+        });
+        let opts = parse_config_options(&result);
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0].id, "model");
+        assert_eq!(opts[0].current_value, "claude-sonnet-4");
+        assert_eq!(opts[0].options.len(), 2);
+    }
+
+    #[test]
+    fn parse_kiro_models_fallback() {
+        let result = json!({
+            "models": {
+                "currentModelId": "m1",
+                "availableModels": [
+                    {"modelId": "m1", "name": "Model One"},
+                    {"modelId": "m2", "name": "Model Two"}
+                ]
+            }
+        });
+        let opts = parse_config_options(&result);
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0].id, "model");
+        assert_eq!(opts[0].category.as_deref(), Some("model"));
+        assert_eq!(opts[0].current_value, "m1");
+        assert_eq!(opts[0].options.len(), 2);
+    }
+
+    #[test]
+    fn parse_kiro_modes_fallback() {
+        let result = json!({
+            "modes": {
+                "currentModeId": "default",
+                "availableModes": [
+                    {"id": "default", "name": "Default"},
+                    {"id": "planner", "name": "Planner"}
+                ]
+            }
+        });
+        let opts = parse_config_options(&result);
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0].id, "agent");
+        assert_eq!(opts[0].category.as_deref(), Some("agent"));
+        assert_eq!(opts[0].current_value, "default");
+    }
+
+    #[test]
+    fn parse_kiro_models_and_modes() {
+        let result = json!({
+            "models": {
+                "currentModelId": "m1",
+                "availableModels": [{"modelId": "m1", "name": "M1"}]
+            },
+            "modes": {
+                "currentModeId": "default",
+                "availableModes": [{"id": "default", "name": "Default"}]
+            }
+        });
+        let opts = parse_config_options(&result);
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0].id, "model");
+        assert_eq!(opts[1].id, "agent");
+    }
+
+    #[test]
+    fn parse_standard_takes_precedence_over_kiro() {
+        let result = json!({
+            "configOptions": [{
+                "id": "model",
+                "name": "Model",
+                "type": "enum",
+                "currentValue": "standard",
+                "options": [{"value": "standard", "name": "Standard"}]
+            }],
+            "models": {
+                "currentModelId": "kiro",
+                "availableModels": [{"modelId": "kiro", "name": "Kiro"}]
+            }
+        });
+        let opts = parse_config_options(&result);
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0].current_value, "standard");
+    }
+
+    #[test]
+    fn parse_empty_result() {
+        let opts = parse_config_options(&json!({}));
+        assert!(opts.is_empty());
+    }
+
+    #[test]
+    fn parse_empty_config_options_falls_through_to_kiro() {
+        let result = json!({
+            "configOptions": [],
+            "models": {
+                "currentModelId": "m1",
+                "availableModels": [{"modelId": "m1", "name": "M1"}]
+            }
+        });
+        let opts = parse_config_options(&result);
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0].id, "model");
     }
 }

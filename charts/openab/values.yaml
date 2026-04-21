@@ -9,9 +9,12 @@ podSecurityContext:
   runAsUser: 1000
   runAsGroup: 1000
   fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
 
 containerSecurityContext:
   allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
   capabilities:
     drop:
       - ALL
@@ -24,7 +27,7 @@ agents:
     #   command: claude-agent-acp
     #   args: []
     #   discord:
-    #     botToken: ""
+    #     enabled: true
     #     # ⚠️ Use --set-string for channel IDs to avoid float64 precision loss
     #     allowedChannels:
     #       - "YOUR_CHANNEL_ID"
@@ -47,29 +50,109 @@ agents:
     #     enabled: true
     #     storageClass: ""
     #     size: 1Gi
+    #   # ⚠️ When set, this ConfigMap mount shadows any file at the same path on the PVC.
+    #   # The PVC file is NOT deleted but becomes invisible to the agent. Remove agentsMd to restore.
     #   agentsMd: ""
     #   resources: {}
     #   nodeSelector: {}
     #   tolerations: []
     #   affinity: {}
-    #   image: "ghcr.io/openabdev/openab-claude:latest"
+    #   image: "ghcr.io/openabdev/openab-claude"  # tag omitted → auto-appends appVersion
+    # opencode:
+    #   command: opencode
+    #   args:
+    #     - acp
+    #   discord:
+    #     enabled: true
+    #     allowedChannels:
+    #       - "YOUR_CHANNEL_ID"
+    #     allowedUsers: []
+    #     allowBotMessages: "off"
+    #     trustedBotIds: []
+    #   workingDir: /home/node
+    #   env: {}
+    #   envFrom: []
+    #   pool:
+    #     maxSessions: 10
+    #     sessionTtlHours: 24
+    #   reactions:
+    #     enabled: true
+    #     removeAfterReply: false
+    #   persistence:
+    #     enabled: true
+    #     storageClass: ""
+    #     size: 1Gi
+    #   agentsMd: ""
+    #   resources: {}
+    #   image: "ghcr.io/openabdev/openab-opencode:latest"
+    # cursor:
+    #   command: cursor-agent
+    #   args:
+    #     - acp
+    #     - --model
+    #     - auto
+    #     - --workspace
+    #     - /home/agent
+    #   discord:
+    #     enabled: true
+    #     allowedChannels:
+    #       - "YOUR_CHANNEL_ID"
+    #     allowedUsers: []
+    #   workingDir: /home/agent
+    #   env: {}
+    #   envFrom: []
+    #   pool:
+    #     maxSessions: 10
+    #     sessionTtlHours: 24
+    #   reactions:
+    #     enabled: true
+    #     removeAfterReply: false
+    #   persistence:
+    #     enabled: true
+    #     storageClass: ""
+    #     size: 1Gi
+    #   image: "ghcr.io/openabdev/openab-cursor:latest"
     image: ""
     command: kiro-cli
     args:
       - acp
       - --trust-all-tools
     discord:
-      botToken: ""
+      enabled: true      # set to false to disable the discord adapter
+      # botToken is no longer required at render time; the actual token
+      # is injected at runtime via the DISCORD_BOT_TOKEN env var.
+      # allowAllChannels: true (default) = allow all channels | false = only allowedChannels
+      # If not set, auto-inferred: non-empty allowedChannels → false, empty → true
+      # allowAllUsers: true (default) = allow all users | false = only allowedUsers
+      # If not set, auto-inferred: non-empty allowedUsers → false, empty → true
       # ⚠️ Use --set-string for channel IDs to avoid float64 precision loss
       allowedChannels:
         - "YOUR_CHANNEL_ID"
       # ⚠️ Use --set-string for user IDs to avoid float64 precision loss
-      allowedUsers: []  # empty = allow all users (default)
+      allowedUsers: []  # only checked when allowAllUsers=false
       # allowBotMessages: "off" (default) | "mentions" | "all"
       # recommended for multi-agent collaboration
       allowBotMessages: "off"
       # trustedBotIds: []  # empty = any bot (mode permitting); set to restrict
       trustedBotIds: []
+    slack:
+      enabled: false
+      botToken: ""       # Bot User OAuth Token (xoxb-...)
+      appToken: ""       # App-Level Token (xapp-...) for Socket Mode
+      # allowAllChannels/allowAllUsers: same auto-infer logic as discord
+      allowedChannels: []  # empty + no allowAllChannels → allow all (auto-inferred)
+      allowedUsers: []     # empty + no allowAllUsers → allow all (auto-inferred)
+      # allowBotMessages: "off" (default) | "mentions" | "all"
+      allowBotMessages: "off"
+      # trustedBotIds: Bot User IDs (U...) — find via Slack UI: click bot profile → Copy member ID
+      trustedBotIds: []
+      # allowUserMessages: "involved" (default) | "mentions" | "multibot-mentions"
+      # "involved" = respond to thread follow-ups without @mention if bot has participated
+      # "mentions" = always require @mention
+      # "multibot-mentions" = same as "involved" in single-bot threads; require @mention
+      #                      only when another bot has also posted in the thread
+      #                      (recommended for multi-bot deployments)
+      allowUserMessages: "involved"
     workingDir: /home/agent
     env: {}
     envFrom: []
@@ -88,8 +171,18 @@ agents:
       enabled: true
       storageClass: ""
       size: 1Gi  # defaults to 1Gi if not set
+    # ⚠️ When set, this ConfigMap mount shadows any file at the same path on the PVC.
+    # The PVC file is NOT deleted but becomes invisible to the agent. Remove agentsMd to restore.
     agentsMd: ""
     resources: {}
     nodeSelector: {}
     tolerations: []
     affinity: {}
+    # extraInitContainers adds init containers to the pod (runs before the main container)
+    extraInitContainers: []
+    # extraContainers adds sidecar containers to the pod
+    extraContainers: []
+    # extraVolumeMounts adds additional volume mounts to the main container
+    extraVolumeMounts: []
+    # extraVolumes adds additional volumes to the pod
+    extraVolumes: []

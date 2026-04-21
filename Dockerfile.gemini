@@ -8,10 +8,10 @@ RUN touch src/main.rs && cargo build --release
 
 # --- Runtime stage ---
 FROM node:22-bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini && rm -rf /var/lib/apt/lists/*
 
 # Install Gemini CLI (native ACP support via --acp)
-ARG GEMINI_CLI_VERSION=0.37.2
+ARG GEMINI_CLI_VERSION=0.38.1
 RUN npm install -g @google/gemini-cli@${GEMINI_CLI_VERSION} --retry 3
 
 # Install gh CLI
@@ -30,5 +30,6 @@ COPY --from=builder --chown=node:node /build/target/release/openab /usr/local/bi
 USER node
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD pgrep -x openab || exit 1
-ENTRYPOINT ["openab"]
-CMD ["run", "/etc/openab/config.toml"]
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "/etc/openab/config.toml"]
+

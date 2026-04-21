@@ -29,6 +29,9 @@ jobs:
               guidance: ['Question']
             };
 
+            // RFC is free-form — skip check entirely
+            if (labels.includes('rfc')) return;
+
             const type = Object.keys(rules).find(k => labels.includes(k));
 
             // Find old check comment
@@ -42,7 +45,7 @@ jobs:
               // No template label — skip if already flagged
               if (old && labels.includes('incomplete')) return;
 
-              const msg = `${marker}\n⚠️ Could not detect an issue template. Please make sure this issue was created using one of the available templates and that the corresponding label (\`bug\`, \`feature\`, \`documentation\`, \`guidance\`) is present.\n\nAvailable templates: Bug Report, Feature Request, Documentation, Guidance`;
+              const msg = `${marker}\nThanks for the report! It looks like this issue was created without a template and is missing some required fields. Please add one of the following labels: \`bug\`, \`feature\`, \`documentation\`, or \`guidance\`, then edit this issue to include the matching template fields — the \`incomplete\` label will be removed automatically.`;
 
               if (old) {
                 await github.rest.issues.deleteComment({

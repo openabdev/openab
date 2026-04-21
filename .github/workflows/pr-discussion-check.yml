@@ -24,6 +24,14 @@ jobs:
             const marker = '<!-- openab-pr-discussion-check -->';
             const label = 'closing-soon';
 
+            const hasDiscordUrl = /https:\/\/discord\.com\/channels\/\d+\/\d+/.test(body);
+
+            const comments = await github.rest.issues.listComments({
+              ...context.repo,
+              issue_number: pr.number
+            });
+            const old = comments.data.find(c => c.body.includes(marker));
+
             // Exempt bot-authored PRs (e.g. openab-app release PRs)
             if (pr.user.type === 'Bot') {
               console.log(`Skipping discussion check for bot PR by ${pr.user.login}`);
@@ -35,14 +43,6 @@ jobs:
               }
               return;
             }
-
-            const hasDiscordUrl = /https:\/\/discord\.com\/channels\/\d+\/\d+/.test(body);
-
-            const comments = await github.rest.issues.listComments({
-              ...context.repo,
-              issue_number: pr.number
-            });
-            const old = comments.data.find(c => c.body.includes(marker));
 
             if (!hasDiscordUrl) {
               if (!labels.includes(label)) {

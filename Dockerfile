@@ -8,7 +8,7 @@ RUN touch src/main.rs && cargo build --release
 
 # --- Runtime stage ---
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps unzip && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini unzip && rm -rf /var/lib/apt/lists/*
 
 # Install kiro-cli (auto-detect arch, copy binary directly)
 ARG KIRO_CLI_VERSION=2.0.0
@@ -74,5 +74,5 @@ COPY --from=builder --chown=agent:agent /build/target/release/openab /usr/local/
 USER agent
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD pgrep -x openab || exit 1
-ENTRYPOINT ["openab"]
-CMD ["run", "/etc/openab/config.toml"]
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "/etc/openab/config.toml"]

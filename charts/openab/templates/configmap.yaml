@@ -10,8 +10,11 @@ metadata:
     {{- include "openab.labels" $d | nindent 4 }}
 data:
   config.toml: |
+    {{- if ($cfg.discord).enabled }}
     [discord]
     bot_token = "${DISCORD_BOT_TOKEN}"
+    allow_all_channels = {{ if and (hasKey $cfg.discord "allowAllChannels") (ne $cfg.discord.allowAllChannels nil) }}{{ $cfg.discord.allowAllChannels }}{{ else if $cfg.discord.allowedChannels }}false{{ else }}true{{ end }}
+    allow_all_users = {{ if and (hasKey $cfg.discord "allowAllUsers") (ne $cfg.discord.allowAllUsers nil) }}{{ $cfg.discord.allowAllUsers }}{{ else if $cfg.discord.allowedUsers }}false{{ else }}true{{ end }}
     {{- range $cfg.discord.allowedChannels }}
     {{- if regexMatch "e\\+|E\\+" (toString .) }}
     {{- fail (printf "discord.allowedChannels contains a mangled ID: %s — use --set-string instead of --set for channel IDs" (toString .)) }}
@@ -28,7 +31,7 @@ data:
     {{- if not (has $cfg.discord.allowBotMessages (list "off" "mentions" "all")) }}
     {{- fail (printf "agents.%s.discord.allowBotMessages must be one of: off, mentions, all — got: %s" $name $cfg.discord.allowBotMessages) }}
     {{- end }}
-    allow_bot_messages = "{{ $cfg.discord.allowBotMessages }}"
+    allow_bot_messages = {{ $cfg.discord.allowBotMessages | toJson }}
     {{- end }}
     {{- range $cfg.discord.trustedBotIds }}
     {{- if regexMatch "e\\+|E\\+" (toString .) }}
@@ -41,13 +44,56 @@ data:
     {{- if $cfg.discord.trustedBotIds }}
     trusted_bot_ids = {{ $cfg.discord.trustedBotIds | toJson }}
     {{- end }}
+    {{- /* allowUserMessages: controls whether the bot requires @mention in threads (Discord) */ -}}
+    {{- if $cfg.discord.allowUserMessages }}
+    {{- if not (has $cfg.discord.allowUserMessages (list "involved" "mentions" "multibot-mentions")) }}
+    {{- fail (printf "agents.%s.discord.allowUserMessages must be one of: involved, mentions, multibot-mentions (use hyphen form, not underscore) — got: %s" $name $cfg.discord.allowUserMessages) }}
+    {{- end }}
+    allow_user_messages = {{ $cfg.discord.allowUserMessages | toJson }}  {{- /* involved (default): respond in bot's threads without @mention | mentions: always require @mention | multibot-mentions: require @mention only when another bot has posted in the thread */ -}}
+    {{- end }}
+    {{- end }}
+
+    {{- if and ($cfg.slack).enabled }}
+    [slack]
+    bot_token = "${SLACK_BOT_TOKEN}"
+    app_token = "${SLACK_APP_TOKEN}"
+    allow_all_channels = {{ if and (hasKey ($cfg.slack) "allowAllChannels") (ne ($cfg.slack).allowAllChannels nil) }}{{ ($cfg.slack).allowAllChannels }}{{ else if ($cfg.slack).allowedChannels }}false{{ else }}true{{ end }}
+    allow_all_users = {{ if and (hasKey ($cfg.slack) "allowAllUsers") (ne ($cfg.slack).allowAllUsers nil) }}{{ ($cfg.slack).allowAllUsers }}{{ else if ($cfg.slack).allowedUsers }}false{{ else }}true{{ end }}
+    {{- range ($cfg.slack).allowedChannels }}
+    {{- if regexMatch "e\\+|E\\+" (toString .) }}
+    {{- fail (printf "slack.allowedChannels contains a mangled ID: %s — use --set-string instead of --set for channel IDs" (toString .)) }}
+    {{- end }}
+    {{- end }}
+    allowed_channels = {{ ($cfg.slack).allowedChannels | default list | toJson }}
+    {{- range ($cfg.slack).allowedUsers }}
+    {{- if regexMatch "e\\+|E\\+" (toString .) }}
+    {{- fail (printf "slack.allowedUsers contains a mangled ID: %s — use --set-string instead of --set for user IDs" (toString .)) }}
+    {{- end }}
+    {{- end }}
+    allowed_users = {{ ($cfg.slack).allowedUsers | default list | toJson }}
+    {{- if ($cfg.slack).allowBotMessages }}
+    {{- if not (has ($cfg.slack).allowBotMessages (list "off" "mentions" "all")) }}
+    {{- fail (printf "agents.%s.slack.allowBotMessages must be one of: off, mentions, all — got: %s" $name ($cfg.slack).allowBotMessages) }}
+    {{- end }}
+    allow_bot_messages = {{ ($cfg.slack).allowBotMessages | toJson }}
+    {{- end }}
+    {{- if ($cfg.slack).trustedBotIds }}
+    trusted_bot_ids = {{ ($cfg.slack).trustedBotIds | toJson }}
+    {{- end }}
+    {{- if ($cfg.slack).allowUserMessages }}
+    {{- if not (has ($cfg.slack).allowUserMessages (list "involved" "mentions" "multibot-mentions")) }}
+    {{- fail (printf "agents.%s.slack.allowUserMessages must be one of: involved, mentions, multibot-mentions (use hyphen form, not underscore) — got: %s" $name ($cfg.slack).allowUserMessages) }}
+    {{- end }}
+    allow_user_messages = {{ ($cfg.slack).allowUserMessages | toJson }}  {{- /* involved (default): respond in bot's threads without @mention | mentions: always require @mention | multibot-mentions: require @mention only when another bot has posted in the thread */ -}}
+    {{- end }}
+    {{- end }}
 
     [agent]
-    command = "{{ $cfg.command }}"
+    command = {{ $cfg.command | toJson }}
     args = {{ if $cfg.args }}{{ $cfg.args | toJson }}{{ else }}[]{{ end }}
-    working_dir = "{{ $cfg.workingDir | default "/home/agent" }}"
+    working_dir = {{ $cfg.workingDir | default "/home/agent" | toJson }}
     {{- if $cfg.env }}
-    env = { {{ $first := true }}{{ range $k, $v := $cfg.env }}{{ if not $first }}, {{ end }}{{ $k }} = "{{ $v }}"{{ $first = false }}{{ end }} }
+    env = { {{ $first := true }}{{ range $k, $v := $cfg.env }}{{ if not $first }}, {{ end }}{{ $k }} = {{ $v | toJson }}{{ $first = false }}{{ end }} }
     {{- end }}
 
     [pool]
@@ -65,8 +111,8 @@ data:
     [stt]
     enabled = true
     api_key = "${STT_API_KEY}"
-    model = "{{ ($cfg.stt).model | default "whisper-large-v3-turbo" }}"
-    base_url = "{{ ($cfg.stt).baseUrl | default "https://api.groq.com/openai/v1" }}"
+    model = {{ ($cfg.stt).model | default "whisper-large-v3-turbo" | toJson }}
+    base_url = {{ ($cfg.stt).baseUrl | default "https://api.groq.com/openai/v1" | toJson }}
     {{- end }}
   {{- if $cfg.agentsMd }}
   AGENTS.md: |

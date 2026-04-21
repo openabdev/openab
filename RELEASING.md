@@ -140,13 +140,16 @@ release-pr.yml 在 Release PR 中自動更新以下檔案的版本：
 
 ## Image Variants
 
-每次 build 產出 4 個 multi-arch image (linux/amd64 + linux/arm64)：
+每次 build 產出 6 個 multi-arch image (linux/amd64 + linux/arm64)：
 
 ```
 ghcr.io/openabdev/openab          # default (kiro-cli)
 ghcr.io/openabdev/openab-codex    # codex
 ghcr.io/openabdev/openab-claude   # claude
 ghcr.io/openabdev/openab-gemini   # gemini
+ghcr.io/openabdev/openab-opencode # opencode
+ghcr.io/openabdev/openab-copilot  # copilot
+ghcr.io/openabdev/openab-cursor   # cursor
 ```
 
 Image tags 依 release 類型不同：

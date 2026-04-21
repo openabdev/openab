@@ -1,7 +1,5 @@
+use crate::adapter::{ChatAdapter, MessageRef};
 use crate::config::{ReactionEmojis, ReactionTiming};
-use serenity::http::Http;
-use serenity::model::channel::ReactionType;
-use serenity::model::id::{ChannelId, MessageId};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::Duration;
@@ -21,9 +19,8 @@ fn classify_tool<'a>(name: &str, emojis: &'a ReactionEmojis) -> &'a str {
 }
 
 struct Inner {
-    http: Arc<Http>,
-    channel: ChannelId,
-    message: MessageId,
+    adapter: Arc<dyn ChatAdapter>,
+    message: MessageRef,
     emojis: ReactionEmojis,
     timing: ReactionTiming,
     current: String,
@@ -41,16 +38,14 @@ pub struct StatusReactionController {
 impl StatusReactionController {
     pub fn new(
         enabled: bool,
-        http: Arc<Http>,
-        channel: ChannelId,
-        message: MessageId,
+        adapter: Arc<dyn ChatAdapter>,
+        message: MessageRef,
         emojis: ReactionEmojis,
         timing: ReactionTiming,
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner {
-                http,
-                channel,
+                adapter,
                 message,
                 emojis,
                 timing,
@@ -93,7 +88,7 @@ impl StatusReactionController {
         let faces = ["😊", "😎", "🫡", "🤓", "😏", "✌️", "💪", "🦾"];
         let face = faces[rand::random::<usize>() % faces.len()];
         let inner = self.inner.lock().await;
-        let _ = add_reaction(&inner.http, inner.channel, inner.message, face).await;
+        let _ = inner.adapter.add_reaction(&inner.message, face).await;
     }
 
     pub async fn set_error(&self) {
@@ -108,7 +103,7 @@ impl StatusReactionController {
         cancel_timers(&mut inner);
         let current = inner.current.clone();
         if !current.is_empty() {
-            let _ = remove_reaction(&inner.http, inner.channel, inner.message, &current).await;
+            let _ = inner.adapter.remove_reaction(&inner.message, &current).await;
             inner.current.clear();
         }
     }
@@ -121,15 +116,14 @@ impl StatusReactionController {
         cancel_debounce(&mut inner);
         let old = inner.current.clone();
         inner.current = emoji.to_string();
-        let http = inner.http.clone();
-        let ch = inner.channel;
-        let msg = inner.message;
+        let adapter = inner.adapter.clone();
+        let msg = inner.message.clone();
         let new = emoji.to_string();
         drop(inner);
 
-        let _ = add_reaction(&http, ch, msg, &new).await;
+        let _ = adapter.add_reaction(&msg, &new).await;
         if !old.is_empty() && old != new {
-            let _ = remove_reaction(&http, ch, msg, &old).await;
+            let _ = adapter.remove_reaction(&msg, &old).await;
         }
         self.reset_stall_timers().await;
     }
@@ -151,14 +145,13 @@ impl StatusReactionController {
             if inner.finished { return; }
             let old = inner.current.clone();
             inner.current = emoji.clone();
-            let http = inner.http.clone();
-            let ch = inner.channel;
-            let msg = inner.message;
+            let adapter = inner.adapter.clone();
+            let msg = inner.message.clone();
             drop(inner);
 
-            let _ = add_reaction(&http, ch, msg, &emoji).await;
+            let _ = adapter.add_reaction(&msg, &emoji).await;
             if !old.is_empty() && old != emoji {
-                let _ = remove_reaction(&http, ch, msg, &old).await;
+                let _ = adapter.remove_reaction(&msg, &old).await;
             }
         }));
         self.reset_stall_timers_inner(&mut inner);
@@ -172,15 +165,14 @@ impl StatusReactionController {
 
         let old = inner.current.clone();
         inner.current = emoji.to_string();
-        let http = inner.http.clone();
-        let ch = inner.channel;
-        let msg = inner.message;
+        let adapter = inner.adapter.clone();
+        let msg = inner.message.clone();
         let new = emoji.to_string();
         drop(inner);
 
-        let _ = add_reaction(&http, ch, msg, &new).await;
+        let _ = adapter.add_reaction(&msg, &new).await;
         if !old.is_empty() && old != new {
-            let _ = remove_reaction(&http, ch, msg, &old).await;
+            let _ = adapter.remove_reaction(&msg, &old).await;
         }
     }
 
@@ -205,13 +197,12 @@ impl StatusReactionController {
                 if inner.finished { return; }
                 let old = inner.current.clone();
                 inner.current = "🥱".to_string();
-                let http = inner.http.clone();
-                let ch = inner.channel;
-                let msg = inner.message;
+                let adapter = inner.adapter.clone();
+                let msg = inner.message.clone();
                 drop(inner);
-                let _ = add_reaction(&http, ch, msg, "🥱").await;
+                let _ = adapter.add_reaction(&msg, "🥱").await;
                 if !old.is_empty() && old != "🥱" {
-                    let _ = remove_reaction(&http, ch, msg, &old).await;
+                    let _ = adapter.remove_reaction(&msg, &old).await;
                 }
             }
         }));
@@ -222,13 +213,12 @@ impl StatusReactionController {
             if inner.finished { return; }
             let old = inner.current.clone();
             inner.current = "😨".to_string();
-            let http = inner.http.clone();
-            let ch = inner.channel;
-            let msg = inner.message;
+            let adapter = inner.adapter.clone();
+            let msg = inner.message.clone();
             drop(inner);
-            let _ = add_reaction(&http, ch, msg, "😨").await;
+            let _ = adapter.add_reaction(&msg, "😨").await;
             if !old.is_empty() && old != "😨" {
-                let _ = remove_reaction(&http, ch, msg, &old).await;
+                let _ = adapter.remove_reaction(&msg, &old).await;
             }
         }));
     }
@@ -242,14 +232,4 @@ fn cancel_timers(inner: &mut Inner) {
     if let Some(h) = inner.debounce_handle.take() { h.abort(); }
     if let Some(h) = inner.stall_soft_handle.take() { h.abort(); }
     if let Some(h) = inner.stall_hard_handle.take() { h.abort(); }
-}
-
-async fn add_reaction(http: &Http, ch: ChannelId, msg: MessageId, emoji: &str) -> serenity::Result<()> {
-    let reaction = ReactionType::Unicode(emoji.to_string());
-    http.create_reaction(ch, msg, &reaction).await
-}
-
-async fn remove_reaction(http: &Http, ch: ChannelId, msg: MessageId, emoji: &str) -> serenity::Result<()> {
-    let reaction = ReactionType::Unicode(emoji.to_string());
-    http.delete_reaction_me(ch, msg, &reaction).await
 }

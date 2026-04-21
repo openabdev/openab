@@ -33,7 +33,8 @@ impl<'de> Deserialize<'de> for AllowBots {
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    pub discord: DiscordConfig,
+    pub discord: Option<DiscordConfig>,
+    pub slack: Option<SlackConfig>,
     pub agent: AgentConfig,
     #[serde(default)]
     pub pool: PoolConfig,
@@ -72,6 +73,12 @@ fn default_stt_base_url() -> String { "https://api.groq.com/openai/v1".into() }
 #[derive(Debug, Deserialize)]
 pub struct DiscordConfig {
     pub bot_token: String,
+    /// Explicit flag: true = allow all channels, false = check allowed_channels list.
+    /// When not set, auto-detected: non-empty list → false, empty list → true.
+    pub allow_all_channels: Option<bool>,
+    /// Explicit flag: true = allow all users, false = check allowed_users list.
+    /// When not set, auto-detected: non-empty list → false, empty list → true.
+    pub allow_all_users: Option<bool>,
     #[serde(default)]
     pub allowed_channels: Vec<String>,
     #[serde(default)]
@@ -85,6 +92,67 @@ pub struct DiscordConfig {
     /// ignored when `"off"` since all bot messages are rejected before this check.
     #[serde(default)]
     pub trusted_bot_ids: Vec<String>,
+    #[serde(default)]
+    pub allow_user_messages: AllowUsers,
+    /// Max consecutive bot turns (without human intervention) before throttling.
+    /// Human message resets the counter. Default: 20.
+    #[serde(default = "default_max_bot_turns")]
+    pub max_bot_turns: u32,
+}
+
+fn default_max_bot_turns() -> u32 { 20 }
+
+/// Controls whether the bot responds to user messages in threads without @mention.
+///
+/// - `Involved` (default): respond to thread messages only if the bot has participated
+///   in the thread (posted at least one message, or the thread parent @mentions the bot).
+///   Channel/MPDM messages always require @mention. DMs always process (implicit mention).
+/// - `Mentions`: always require @mention, even in threads the bot is participating in.
+/// - `MultibotMentions`: same as `Involved` in single-bot threads; falls back to `Mentions`
+///   when other bots have also posted in the thread.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AllowUsers {
+    #[default]
+    Involved,
+    Mentions,
+    MultibotMentions,
+}
+
+impl<'de> Deserialize<'de> for AllowUsers {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().replace('-', "_").as_str() {
+            "involved" => Ok(Self::Involved),
+            "mentions" => Ok(Self::Mentions),
+            "multibot_mentions" => Ok(Self::MultibotMentions),
+            other => Err(serde::de::Error::unknown_variant(other, &["involved", "mentions", "multibot-mentions"])),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SlackConfig {
+    pub bot_token: String,
+    pub app_token: String,
+    /// Explicit flag: true = allow all channels, false = check allowed_channels list.
+    /// When not set, auto-detected: non-empty list → false, empty list → true.
+    pub allow_all_channels: Option<bool>,
+    /// Explicit flag: true = allow all users, false = check allowed_users list.
+    /// When not set, auto-detected: non-empty list → false, empty list → true.
+    pub allow_all_users: Option<bool>,
+    #[serde(default)]
+    pub allowed_channels: Vec<String>,
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    #[serde(default)]
+    pub allow_bot_messages: AllowBots,
+    /// Bot User IDs (U...) allowed to interact when allow_bot_messages is
+    /// "mentions" or "all". Find via Slack UI: click bot profile → Copy member ID.
+    /// Empty = allow any bot (mode permitting).
+    #[serde(default)]
+    pub trusted_bot_ids: Vec<String>,
+    #[serde(default)]
+    pub allow_user_messages: AllowUsers,
 }
 
 #[derive(Debug, Deserialize)]
@@ -208,6 +276,12 @@ impl Default for ReactionTiming {
 }
 
 // --- loading ---
+
+/// Resolve an allow_all flag: if explicitly set, use it; otherwise infer from the list.
+/// Non-empty list → false (respect the list), empty list → true (allow all).
+pub fn resolve_allow_all(flag: Option<bool>, list: &[String]) -> bool {
+    flag.unwrap_or(list.is_empty())
+}
 
 fn expand_env_vars(raw: &str) -> String {
     let re = Regex::new(r"\$\{(\w+)\}").unwrap();

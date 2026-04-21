@@ -1,7 +1,8 @@
 [package]
 name = "openab"
-version = "0.7.5"
+version = "0.8.0"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -14,6 +15,8 @@ serenity = { version = "0.12", default-features = false, features = ["client", "
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
 anyhow = "1"
+async-trait = "0.1"
+futures-util = "0.3"
 rand = "0.8"
 clap = { version = "4", features = ["derive"] }
 rpassword = "7"
@@ -22,3 +25,4 @@ base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 unicode-width = "0.2"
 libc = "0.2"
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
