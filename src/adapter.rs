@@ -81,9 +81,9 @@ pub trait ChatAdapter: Send + Sync + 'static {
     }
 
     /// Whether this adapter should use streaming edit (true) or send-once (false).
-    fn use_streaming(&self) -> bool {
-        false
-    }
+    /// Required: each adapter must explicitly declare its streaming capability
+    /// to prevent silent regression if the trait default changes.
+    fn use_streaming(&self) -> bool;
 }
 
 // --- AdapterRouter ---
