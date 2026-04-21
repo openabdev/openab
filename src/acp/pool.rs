@@ -3,6 +3,7 @@ use crate::acp::protocol::ConfigOption;
 use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Instant;
@@ -28,6 +29,7 @@ pub struct SessionPool {
     state: RwLock<PoolState>,
     config: AgentConfig,
     max_sessions: usize,
+    per_thread_workdir: bool,
 }
 
 type EvictionCandidate = (
@@ -62,7 +64,7 @@ fn get_or_insert_gate(
 }
 
 impl SessionPool {
-    pub fn new(config: AgentConfig, max_sessions: usize) -> Self {
+    pub fn new(config: AgentConfig, max_sessions: usize, per_thread_workdir: bool) -> Self {
         Self {
             state: RwLock::new(PoolState {
                 active: HashMap::new(),
@@ -72,7 +74,24 @@ impl SessionPool {
             }),
             config,
             max_sessions,
+            per_thread_workdir,
         }
+    }
+
+    /// Resolve the working directory for a thread. When per_thread_workdir is
+    /// enabled, returns `<working_dir>/sessions/<thread_id>/`; otherwise the
+    /// shared `working_dir`.
+    fn working_dir_for(&self, thread_id: &str) -> Result<String> {
+        if !self.per_thread_workdir {
+            return Ok(self.config.working_dir.clone());
+        }
+        if !thread_id.chars().all(|c| c.is_ascii_digit()) {
+            return Err(anyhow!("invalid thread_id: {thread_id}"));
+        }
+        let dir: PathBuf = [&self.config.working_dir, "sessions", thread_id]
+            .iter()
+            .collect();
+        Ok(dir.to_string_lossy().to_string())
     }
 
     pub async fn get_or_create(&self, thread_id: &str) -> Result<()> {
@@ -132,10 +151,14 @@ impl SessionPool {
 
         // Build the replacement connection outside the state lock so one stuck
         // initialization does not block all unrelated sessions.
+        let cwd = self.working_dir_for(thread_id)?;
+        if self.per_thread_workdir {
+            tokio::fs::create_dir_all(&cwd).await?;
+        }
         let mut new_conn = AcpConnection::spawn(
             &self.config.command,
             &self.config.args,
-            &self.config.working_dir,
+            &cwd,
             &self.config.env,
         )
         .await?;
@@ -145,7 +168,7 @@ impl SessionPool {
         let mut resumed = false;
         if let Some(ref sid) = saved_session_id {
             if new_conn.supports_load_session {
-                match new_conn.session_load(sid, &self.config.working_dir).await {
+                match new_conn.session_load(sid, &cwd).await {
                     Ok(()) => {
                         info!(thread_id, session_id = %sid, "session resumed via session/load");
                         resumed = true;
@@ -158,7 +181,7 @@ impl SessionPool {
         }
 
         if !resumed {
-            new_conn.session_new(&self.config.working_dir).await?;
+            new_conn.session_new(&cwd).await?;
             // Surface the reset banner both for restored sessions and for stale
             // live entries that died before we could recover a resumable
             // session id. In both cases the caller is continuing after an
@@ -322,21 +345,55 @@ impl SessionPool {
         }
 
         let mut state = self.state.write().await;
+        let mut dirs_to_remove = Vec::new();
         for (key, expected_conn, sid) in stale {
             if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
                 info!(thread_id = %key, "cleaning up idle session");
+                if self.per_thread_workdir {
+                    if let Ok(dir) = self.working_dir_for(&key) {
+                        dirs_to_remove.push((key.clone(), dir));
+                    }
+                }
                 if let Some(sid) = sid {
                     state.suspended.insert(key, sid);
                 }
             }
         }
+        drop(state);
+
+        for (key, dir) in dirs_to_remove {
+            match tokio::fs::remove_dir_all(&dir).await {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!(thread_id = %key, error = %e, "failed to remove session directory"),
+            }
+        }
     }
 
     pub async fn shutdown(&self) {
-        let mut state = self.state.write().await;
-        let count = state.active.len();
-        state.active.clear(); // Drop impl kills process groups
-        info!(count, "pool shutdown complete");
+        let dirs_to_remove: Vec<(String, String)> = if self.per_thread_workdir {
+            let state = self.state.read().await;
+            state.active.keys()
+                .filter_map(|k| self.working_dir_for(k).ok().map(|d| (k.clone(), d)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        {
+            let mut state = self.state.write().await;
+            let count = state.active.len();
+            state.active.clear();
+            info!(count, "pool shutdown complete");
+        }
+
+        for (key, dir) in dirs_to_remove {
+            match tokio::fs::remove_dir_all(&dir).await {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!(thread_id = %key, error = %e, "failed to remove session directory"),
+            }
+        }
     }
 }
 

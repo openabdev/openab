@@ -176,6 +176,11 @@ pub struct PoolConfig {
     pub max_sessions: usize,
     #[serde(default = "default_ttl_hours")]
     pub session_ttl_hours: u64,
+    /// When true, each thread gets its own working directory under
+    /// `<working_dir>/sessions/<thread_id>/` to prevent file conflicts.
+    /// TODO(v1.0): flip default to true
+    #[serde(default)]
+    pub per_thread_workdir: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -245,7 +250,7 @@ fn default_error_hold_ms() -> u64 { 2_500 }
 
 impl Default for PoolConfig {
     fn default() -> Self {
-        Self { max_sessions: default_max_sessions(), session_ttl_hours: default_ttl_hours() }
+        Self { max_sessions: default_max_sessions(), session_ttl_hours: default_ttl_hours(), per_thread_workdir: false }
     }
 }
 

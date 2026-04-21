@@ -87,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("no adapter configured — add [discord] and/or [slack] to config.toml");
     }
 
-    let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions));
+    let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions, cfg.pool.per_thread_workdir));
     let ttl_secs = cfg.pool.session_ttl_hours * 3600;
 
     // Resolve STT config (auto-detect GROQ_API_KEY from env)
