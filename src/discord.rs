@@ -361,9 +361,13 @@ impl EventHandler for Handler {
 
         // Thread detection: single to_channel() call for both allowed and
         // non-allowed channels. A message is "in a thread" when the channel
-        // has a parent_id AND the parent is in the allowlist (or allow_all).
+        // is a thread type (not just has parent_id — categories also have parent_id).
         let (in_thread, bot_owns_thread) = match msg.channel_id.to_channel(&ctx.http).await {
-            Ok(serenity::model::channel::Channel::Guild(gc)) if gc.parent_id.is_some() => {
+            Ok(serenity::model::channel::Channel::Guild(gc))
+                if matches!(gc.kind, serenity::model::channel::ChannelType::PublicThread
+                    | serenity::model::channel::ChannelType::PrivateThread
+                    | serenity::model::channel::ChannelType::NewsThread) =>
+            {
                 let parent_allowed = in_allowed_channel
                     || self.allow_all_channels
                     || gc.parent_id.is_some_and(|pid| self.allowed_channels.contains(&pid.get()));
