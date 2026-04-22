@@ -276,7 +276,33 @@ impl EventHandler for Handler {
                                 "soft bot turn limit reached",
                             ),
                         }
-                        if msg.author.id != bot_id {
+                        // Only post the warning if this bot is allowed in the channel/thread.
+                        // Bot turn counting intentionally runs before channel gating so ALL
+                        // bot messages are counted, but the *warning message* must respect
+                        // channel permissions — otherwise bots that never participated in a
+                        // thread will spam it with warnings.
+                        //
+                        // Must match the full thread allowlist semantics: a thread is allowed
+                        // if its own channel_id OR its parent_id is in allowed_channels.
+                        let ch = msg.channel_id.get();
+                        let mut allowed_here = self.allow_all_channels
+                            || self.allowed_channels.contains(&ch);
+                        if !allowed_here {
+                            // Thread channel_id won't be in allowed_channels directly —
+                            // check parent_id via to_channel(). Only called on the
+                            // WarnAndStop path (once per soft/hard limit hit), not on
+                            // every bot message.
+                            if let Ok(serenity::model::channel::Channel::Guild(gc)) =
+                                msg.channel_id.to_channel(&ctx.http).await
+                            {
+                                if gc.parent_id.is_some_and(|pid| {
+                                    self.allowed_channels.contains(&pid.get())
+                                }) {
+                                    allowed_here = true;
+                                }
+                            }
+                        }
+                        if msg.author.id != bot_id && allowed_here {
                             let _ = msg.channel_id.say(&ctx.http, &user_message).await;
                         }
                         return;
