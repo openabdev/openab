@@ -970,7 +970,15 @@ async fn handle_message(
         return;
     }
 
+    // Caps mirror Discord's text-file attachment flow (PR #291) so both
+    // adapters apply the same limits: 5 files or 1 MB of text per message.
+    const TEXT_TOTAL_CAP: u64 = 1024 * 1024;
+    const TEXT_FILE_COUNT_CAP: u32 = 5;
+
     let mut extra_blocks = Vec::new();
+    let mut text_file_bytes: u64 = 0;
+    let mut text_file_count: u32 = 0;
+
     if let Some(files) = files {
         for file in files {
             let mimetype = file["mimetype"].as_str().unwrap_or("");
@@ -1013,6 +1021,28 @@ async fn handle_message(
                         message_id: ts.clone(),
                     };
                     let _ = adapter.add_reaction(&msg_ref, "🎤").await;
+                }
+            } else if media::is_text_file(filename, Some(mimetype)) {
+                if text_file_count >= TEXT_FILE_COUNT_CAP {
+                    debug!(filename, count = text_file_count, "text file count cap reached, skipping");
+                    continue;
+                }
+                // Pre-check with Slack-reported size (fast path, avoids
+                // unnecessary download). Running total uses actual bytes.
+                if text_file_bytes + size > TEXT_TOTAL_CAP {
+                    debug!(filename, total = text_file_bytes, "text attachments total exceeds 1MB cap, skipping remaining");
+                    continue;
+                }
+                if let Some((block, actual_bytes)) = media::download_and_read_text_file(
+                    url,
+                    filename,
+                    size,
+                    Some(bot_token),
+                ).await {
+                    text_file_bytes += actual_bytes;
+                    text_file_count += 1;
+                    debug!(filename, "adding text file attachment");
+                    extra_blocks.push(block);
                 }
             } else if let Some(block) = media::download_and_encode_image(
                 url,
