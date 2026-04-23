@@ -168,6 +168,23 @@ Each thread gets its own agent session. Sessions are cleaned up after `session_t
 
 ---
 
+## Streaming
+
+OpenAB uses **edit-streaming** on Discord — the bot sends a placeholder message and updates it every 1.5 seconds as tokens arrive, giving a live typing effect.
+
+Streaming is decided **per-thread**, not globally:
+
+| Thread state | Streaming |
+|---|---|
+| Single bot + human | ✅ ON — live edit updates |
+| 2+ bots in thread | ❌ OFF — send-once to avoid edit interference |
+
+When a second bot posts in a thread, streaming automatically switches off for that thread. This prevents multiple bots from editing placeholder messages simultaneously, which causes visual glitches on Discord.
+
+No configuration needed — this is automatic based on multibot detection.
+
+---
+
 ## Multi-Bot Setup
 
 Multiple bots can share the same Discord channel. Each bot only responds to its own @mentions.
@@ -216,8 +233,12 @@ allow_bot_messages = "mentions"
 
 To prevent runaway bot-to-bot loops, OpenAB enforces two layers of protection:
 
-- **Soft limit** (`max_bot_turns`, default: 20) — consecutive bot turns without human intervention. When reached, the bot sends a warning and stops responding. A human message in the thread resets the counter.
+- **Soft limit** (`max_bot_turns`, default: 20) — total bot messages in a thread without human intervention. When reached, the bot sends a one-time warning and stops responding. A human message in the thread resets the counter.
 - **Hard limit** (100, not configurable) — absolute cap on bot turns between human interventions. When reached, bot-to-bot conversation stops until a human replies.
+
+Both limits count **all** bot messages in the thread, including the bot's own replies. In a two-bot ping-pong with `max_bot_turns = 20`, each bot sends ~10 messages before the limit triggers.
+
+Warning messages are sent exactly once (on the exact threshold hit) to prevent warnings from ping-ponging between bots.
 
 ```toml
 [discord]

@@ -4,3 +4,4 @@ config.toml
 .DS_Store
 .env
 .kiro/
+CLAUDE.md

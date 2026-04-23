@@ -182,6 +182,114 @@ pub fn is_audio_mime(mime: &str) -> bool {
     mime.starts_with("audio/")
 }
 
+/// Extensions recognised as text-based files that can be inlined into the prompt.
+const TEXT_EXTENSIONS: &[&str] = &[
+    "txt", "csv", "log", "md", "json", "jsonl", "yaml", "yml", "toml", "xml",
+    "rs", "py", "js", "ts", "jsx", "tsx", "go", "java", "c", "cpp", "h", "hpp",
+    "rb", "sh", "bash", "zsh", "fish", "ps1", "bat", "sql", "html", "css",
+    "scss", "less", "ini", "cfg", "conf", "env",
+];
+
+/// Exact filenames (no extension) recognised as text files.
+const TEXT_FILENAMES: &[&str] = &[
+    "dockerfile", "makefile", "justfile", "rakefile", "gemfile",
+    "procfile", "vagrantfile", ".gitignore", ".dockerignore", ".editorconfig",
+];
+
+/// MIME types recognised as text-based (beyond `text/*`).
+const TEXT_MIME_TYPES: &[&str] = &[
+    "application/json",
+    "application/xml",
+    "application/javascript",
+    "application/x-yaml",
+    "application/x-sh",
+    "application/toml",
+    "application/x-toml",
+];
+
+/// Check if a file is text-based and can be inlined into the prompt.
+pub fn is_text_file(filename: &str, content_type: Option<&str>) -> bool {
+    let mime = content_type.unwrap_or("");
+    let mime_base = mime.split(';').next().unwrap_or(mime).trim();
+    if mime_base.starts_with("text/") || TEXT_MIME_TYPES.contains(&mime_base) {
+        return true;
+    }
+    // Check extension
+    if filename.contains('.') {
+        if let Some(ext) = filename.rsplit('.').next() {
+            if TEXT_EXTENSIONS.contains(&ext.to_lowercase().as_str()) {
+                return true;
+            }
+        }
+    }
+    // Check exact filename (Dockerfile, Makefile, etc.)
+    TEXT_FILENAMES.contains(&filename.to_lowercase().as_str())
+}
+
+/// Download a text-based file and return it as a ContentBlock::Text.
+/// Files larger than 512 KB are skipped to avoid bloating the prompt.
+///
+/// Pass `auth_token` for platforms that require authentication (e.g. Slack private files).
+///
+/// Note: the caller already guards total size via a total cap; the per-file
+/// MAX_SIZE check here is intentional defense-in-depth so this function remains
+/// self-contained and safe when called from other contexts.
+pub async fn download_and_read_text_file(
+    url: &str,
+    filename: &str,
+    size: u64,
+    auth_token: Option<&str>,
+) -> Option<(ContentBlock, u64)> {
+    const MAX_SIZE: u64 = 512 * 1024; // 512 KB
+
+    if size > MAX_SIZE {
+        tracing::warn!(filename, size, "text file exceeds 512KB limit, skipping");
+        return None;
+    }
+
+    let mut req = HTTP_CLIENT.get(url);
+    if let Some(token) = auth_token {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(url, error = %e, "text file download failed");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::warn!(url, status = %resp.status(), "text file download failed");
+        return None;
+    }
+    let bytes = resp.bytes().await.ok()?;
+    let actual_size = bytes.len() as u64;
+
+    // Defense-in-depth: verify actual download size
+    if actual_size > MAX_SIZE {
+        tracing::warn!(filename, size = actual_size, "downloaded text file exceeds 512KB limit, skipping");
+        return None;
+    }
+
+    // from_utf8_lossy returns Cow::Borrowed for valid UTF-8 (zero-copy)
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+
+    // Dynamic fence: keep adding backticks until the fence doesn't appear in content
+    let mut fence = "```".to_string();
+    while text.contains(fence.as_str()) {
+        fence.push('`');
+    }
+
+    debug!(filename, bytes = text.len(), "text file inlined");
+    Some((
+        ContentBlock::Text {
+            text: format!("[File: {filename}]\n{fence}\n{text}\n{fence}"),
+        },
+        actual_size,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

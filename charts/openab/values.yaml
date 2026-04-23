@@ -38,6 +38,8 @@ agents:
     #     # trustedBotIds: []  # empty = any bot (mode permitting)
     #     trustedBotIds: []
     #   workingDir: /home/agent
+    #   # nameOverride: custom deployment name (default: <release>-<agentKey>)
+    #   nameOverride: ""
     #   env: {}
     #   envFrom: []
     #   pool:

@@ -1,5 +1,6 @@
 mod acp;
 mod adapter;
+mod bot_turns;
 mod config;
 mod discord;
 mod error_display;
@@ -128,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
                 let router = router.clone();
                 let stt = cfg.stt.clone();
                 let session_ttl = std::time::Duration::from_secs(ttl_secs);
+                let max_bot_turns = slack_cfg.max_bot_turns;
                 Some(tokio::spawn(async move {
                     if let Err(e) = slack::run_slack_adapter(
                         slack_cfg.bot_token,
@@ -139,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
                         slack_cfg.allow_bot_messages,
                         slack_cfg.trusted_bot_ids.into_iter().collect(),
                         slack_cfg.allow_user_messages,
+                        max_bot_turns,
                         session_ttl,
                         stt,
                         router,
@@ -190,7 +193,7 @@ async fn main() -> anyhow::Result<()> {
                     multibot_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
                     session_ttl: std::time::Duration::from_secs(ttl_secs),
                     max_bot_turns: discord_cfg.max_bot_turns,
-                    bot_turns: tokio::sync::Mutex::new(discord::BotTurnTracker::new(discord_cfg.max_bot_turns)),
+                    bot_turns: tokio::sync::Mutex::new(bot_turns::BotTurnTracker::new(discord_cfg.max_bot_turns)),
                 };
 
                 let intents = GatewayIntents::GUILD_MESSAGES

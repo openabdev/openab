@@ -59,8 +59,6 @@ The auth token is stored under `~/.cursor/` and persisted across pod restarts vi
 
 ## Helm Install
 
-> **Note**: The `ghcr.io/openabdev/openab-cursor` image is not published yet. You must build it locally first with `docker build -f Dockerfile.cursor -t openab-cursor .` and push to your own registry, or use a local image.
-
 ```bash
 helm install openab openab/openab \
   --set agents.kiro.enabled=false \

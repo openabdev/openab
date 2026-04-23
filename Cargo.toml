@@ -1,6 +1,6 @@
 [package]
 name = "openab"
-version = "0.7.8"
+version = "0.8.1"
 edition = "2021"
 license = "MIT"
 

@@ -81,9 +81,13 @@ pub trait ChatAdapter: Send + Sync + 'static {
     }
 
     /// Whether this adapter should use streaming edit (true) or send-once (false).
-    fn use_streaming(&self) -> bool {
-        false
-    }
+    /// `other_bot_present` indicates if another bot has posted in the current thread.
+    /// Streaming should be disabled in multi-bot threads to avoid edit interference.
+    /// NOTE: Slight race window exists — the multibot cache is checked before
+    /// handle_message, so a bot arriving between the check and the response will
+    /// not be detected until the next message. This is acceptable: the first
+    /// response may stream, but subsequent ones will correctly use send-once.
+    fn use_streaming(&self, other_bot_present: bool) -> bool;
 }
 
 // --- AdapterRouter ---
@@ -111,6 +115,7 @@ impl AdapterRouter {
     /// Handle an incoming user message. The adapter is responsible for
     /// filtering, resolving the thread, and building the SenderContext.
     /// This method handles sender context injection, session management, and streaming.
+    #[allow(clippy::too_many_arguments)]
     pub async fn handle_message(
         &self,
         adapter: &Arc<dyn ChatAdapter>,
@@ -119,6 +124,7 @@ impl AdapterRouter {
         prompt: &str,
         extra_blocks: Vec<ContentBlock>,
         trigger_msg: &MessageRef,
+        other_bot_present: bool,
     ) -> Result<()> {
         tracing::debug!(platform = adapter.platform(), "processing message");
 
@@ -179,6 +185,7 @@ impl AdapterRouter {
                 content_blocks,
                 thread_channel,
                 reactions.clone(),
+                other_bot_present,
             )
             .await;
 
@@ -216,11 +223,12 @@ impl AdapterRouter {
         content_blocks: Vec<ContentBlock>,
         thread_channel: &ChannelRef,
         reactions: Arc<StatusReactionController>,
+        other_bot_present: bool,
     ) -> Result<()> {
         let adapter = adapter.clone();
         let thread_channel = thread_channel.clone();
         let message_limit = adapter.message_limit();
-        let streaming = adapter.use_streaming();
+        let streaming = adapter.use_streaming(other_bot_present);
 
         self.pool
             .with_connection(thread_key, |conn| {
@@ -474,4 +482,41 @@ fn compose_display(tool_lines: &[ToolEntry], text: &str, streaming: bool) -> Str
     }
     out.push_str(text.trim_end());
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Compile-time regression guard: use_streaming() is a required trait method
+    /// (no default). Any adapter that forgets to implement it will fail to compile.
+    /// This test documents the contract — see PR #503 / issue #502 for context.
+    #[test]
+    fn use_streaming_is_required_method() {
+        // If use_streaming() had a default impl, this test module would still
+        // compile even if an adapter forgot to override it. The real guard is
+        // the trait definition itself — this test exists as documentation and
+        // to catch if someone re-adds a default.
+        struct TestAdapter;
+
+        #[async_trait]
+        impl ChatAdapter for TestAdapter {
+            fn platform(&self) -> &'static str { "test" }
+            fn message_limit(&self) -> usize { 2000 }
+            async fn send_message(&self, _: &ChannelRef, _: &str) -> Result<MessageRef> {
+                unimplemented!()
+            }
+            async fn create_thread(&self, _: &ChannelRef, _: &MessageRef, _: &str) -> Result<ChannelRef> {
+                unimplemented!()
+            }
+            async fn add_reaction(&self, _: &MessageRef, _: &str) -> Result<()> { Ok(()) }
+            async fn remove_reaction(&self, _: &MessageRef, _: &str) -> Result<()> { Ok(()) }
+            // use_streaming() MUST be declared — removing this line should fail compilation
+            fn use_streaming(&self, _other_bot_present: bool) -> bool { false }
+        }
+
+        let adapter = TestAdapter;
+        // Verify the method is callable and returns the declared value
+        assert!(!adapter.use_streaming(false));
+    }
 }

@@ -24,9 +24,12 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # allowed_users = ["U0123456789"]      # only checked when allow_all_users = false
 # allow_bot_messages = "off"           # "off" (default) | "mentions" | "all"
 # trusted_bot_ids = []                 # empty = any bot (mode permitting); set to restrict
-# allow_user_messages = "involved"     # "involved" (default) | "mentions"
+# allow_user_messages = "involved"     # "involved" (default) | "mentions" | "multibot-mentions"
                                         # "involved" = reply in threads bot has participated in
                                         # "mentions" = always require @mention
+                                        # "multibot-mentions" = like "involved", but require @mention
+                                        #   once another bot has posted in the thread
+# max_bot_turns = 20                   # soft cap on consecutive bot turns per thread (human msg resets)
 
 [agent]
 command = "kiro-cli"

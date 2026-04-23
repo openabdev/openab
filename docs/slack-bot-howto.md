@@ -92,6 +92,26 @@ In a channel where the bot is invited:
 
 The bot will reply in a thread. After that, just type in the thread — no @mention needed for follow-ups.
 
+## Slash commands are not supported on Slack
+
+openab supports `/models`, `/agents`, and `/cancel` on **Discord**, but **not on Slack**. If you previously configured these commands in your Slack app's **Slash Commands** page, you can safely delete them — the Slack adapter ignores both `slash_commands` and `interactive` envelope types.
+
+The root cause is a combination of three Slack-specific platform constraints, none of which is fixable from openab's side:
+
+1. **Slack blocks third-party slash commands inside threads.** Invoking `/models` from a thread's reply composer returns the Slack error `"/models is not supported in threads. Sorry!"`. This is enforced by the Slack client itself, not by any app setting — enabling Interactivity, Socket Mode, or reinstalling the app does not bypass it. Slack's built-in commands (`/remind`, `/shrug`, etc.) get special treatment that custom apps cannot.
+
+2. **Channel-level slash command payloads have no thread context.** If the user types `/models` in the channel's main composer instead of a thread, Slack delivers the command but the payload carries no `thread_ts`. Since openab keys each ACP session by thread (`slack:<thread_ts>` or `slack:<trigger_ts>`), the command cannot be routed to the right session. Sessions are never keyed by `channel_id` alone, so there's no workaround on the adapter side.
+
+3. **Most ACP agents don't expose a model-switch surface.** Even when routing succeeded, `/models` reads the session's `configOptions` from the ACP `initialize` response. Only `kiro-cli` emits these in the expected format (via its `models`/`modes` fallback). `claude-code`, `codex`, `gemini`, `cursor-agent`, and `opencode` do not, so the menu would be empty for those backends — the user would see `"⚠️ No model options available"` with no recourse.
+
+On Discord, none of these apply: slash commands work in thread-channels, the channel ID *is* the thread key, and users typically stay within a single agent per deployment anyway.
+
+### If you need to switch models or agents with a Slack deployment
+
+- **Change the agent**: edit `[agent]` in `config.toml` (or the Helm chart values) and restart the pod / process
+- **Change the Claude model** (for `claude-code`): set `ANTHROPIC_DEFAULT_MODEL` (or equivalent env var depending on your claude-code-acp version) and restart — model selection happens at process start, not at runtime
+- **Cancel an in-flight turn**: there is no built-in way on Slack currently.
+
 ## Finding Channel and User IDs
 
 - **Channel ID**: Right-click the channel name → **View channel details** → ID at the bottom (starts with `C` for public, `G` for private)
