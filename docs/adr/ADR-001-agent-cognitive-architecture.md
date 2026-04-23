@@ -1,10 +1,10 @@
 # ADR-001: Agent Cognitive Architecture Specification (ACAS)
 
 - **Status**: Proposed
-- **Spec Version**: 1.2.0
+- **Spec Version**: 1.3.0
 - **Date**: 2026-04-23
 - **Author**: pahud.hsieh
-- **Revision**: Incorporates review feedback from 周嘟嘟, 小喬, 諸葛亮, 張飛, shaun-agent screening, and Discord live review session
+- **Revision**: Incorporates review feedback from 周嘟嘟, 小喬, 諸葛亮, 張飛, shaun-agent screening, and Discord live review session. v1.3.0: Added Entry Point Discovery (§1.3 Step 0) and Entry Point Convention (§1.5) based on bootstrap gap analysis by 周嘟嘟.
 
 ## Key Words
 
@@ -53,7 +53,7 @@ Every agent MUST maintain a self-identity definition that answers: **"Who am I?"
 ### Required vs Optional Identity Fields
 
 ```yaml
-spec_version: "1.2.0"           # REQUIRED — spec version this identity conforms to
+spec_version: "1.3.0"           # REQUIRED — spec version this identity conforms to
 identity:
   name: ""                       # REQUIRED — agent's name (how it refers to itself)
   uid: ""                        # REQUIRED — unique identifier (platform-specific, e.g. Discord UID)
@@ -88,6 +88,7 @@ Matching rules:
 
 When a new agent starts for the first time:
 
+0. **Entry Point Discovery**: The agent MUST locate and read its platform-specific entry file (e.g. `AGENTS.md`, `CLAUDE.md`, `.cursorrules`) which MUST contain a reference to this specification and a pointer to the agent's `identity.yaml` path. Without this entry point, the remaining bootstrap steps will never be triggered. See §1.5 for the entry point convention.
 1. Check if `identity.yaml` exists. If not, generate one from environment config or prompt the operator.
 2. **UID Validation**: The agent MUST verify that `identity.uid` matches its actual platform `sender_id` at runtime. If they differ, the agent MUST refuse to start and log an error. This prevents identity spoofing and the "wrong UID" class of bugs where an agent claims to be someone else.
 3. Register itself in the peer registry (see §2).
@@ -97,6 +98,33 @@ When a new agent starts for the first time:
 ### 1.4 Migration Note
 
 Agents that currently store identity information in `config.toml` or system prompts MAY continue to do so. The `identity.yaml` file is the canonical source for ACAS-conformant identity. Implementors SHOULD provide a migration path or adapter that reads existing config and produces a conformant `identity.yaml`.
+
+### 1.5 Entry Point Convention
+
+Most coding CLIs automatically read a platform-specific entry file when a new session starts (e.g. `AGENTS.md` for Kiro, `CLAUDE.md` for Claude Code, `.cursorrules` for Cursor). This entry file is the only reliable mechanism to ensure a new agent discovers and follows this specification.
+
+An ACAS-conformant deployment MUST ensure that the agent's entry file contains at minimum:
+
+1. A reference to this specification (path or URL to the ADR document).
+2. A pointer to the agent's `identity.yaml` file.
+3. A directive to execute the Bootstrap Flow (§1.3).
+
+**Example entry file snippet:**
+
+```markdown
+## ACAS Bootstrap
+
+This agent follows the Agent Cognitive Architecture Specification (ACAS).
+
+- Spec: docs/adr/ADR-001-agent-cognitive-architecture.md
+- Identity: identity.yaml
+- Peers: peers.yaml
+- Knowledge DB: memory.db
+
+On startup, read the spec and execute the Bootstrap Flow (§1.3).
+```
+
+The entry file name is platform-specific and outside the scope of this specification. Implementors MUST document which entry file they use. The ACAS bootstrap section within the entry file SHOULD be clearly delimited so it can coexist with other platform-specific instructions.
 
 ---
 
@@ -443,6 +471,7 @@ Implementors MUST enforce visibility at the query layer. An agent querying `/rec
 An implementation is conformant at a given level if it satisfies all of the following for that level:
 
 ### Level 1 — Identity + Recall
+- [ ] Agent's platform entry file contains a reference to the ACAS spec and bootstrap instructions (§1.5)
 - [ ] `identity.yaml` exists with all REQUIRED fields populated
 - [ ] `identity.uid` is validated against actual platform `sender_id` at startup
 - [ ] `capabilities` field uses `<tool>:v<major>` format
