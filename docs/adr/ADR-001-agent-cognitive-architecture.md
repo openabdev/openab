@@ -158,15 +158,18 @@ OpenAB's `allow_bot_messages` defaults to ignoring bot messages. Peer discovery 
 1. **Shared registry file**: All agents read/write a shared `peers.yaml` or equivalent file on a shared filesystem or object store. On startup, an agent writes its own entry and reads others. Implementations MUST acquire a file-level lock (e.g. `peers.yaml.lock`) before writing registry entries. If the lock is held, the agent MUST wait or skip with a warning — the same semantics as `/reflect` locking (§4.3). Implementations SHOULD ignore invalid or partial updates and retain the last known valid registry state. **Note**: This mechanism requires a shared filesystem or object store and is NOT available in isolated environments (see below).
 2. **Platform API query**: Query the platform API (e.g. Discord guild members) to discover other agents, then populate the local registry.
 3. **Operator-managed static config** (RECOMMENDED): The operator maintains `peers.yaml` and deploys a copy into each agent's filesystem at provisioning time. Simplest approach, no bot-to-bot messaging or shared filesystem required. This is the RECOMMENDED default because it works in all environments, including isolated filesystems.
-4. **Mention-triggered exchange** (OPTIONAL): When an agent is @mentioned by another agent, it MAY respond with a structured capability announcement. This works under `allow_bot_messages="mentions"`.
+4. **Mention-triggered exchange** (RECOMMENDED in isolated environments): When an agent is @mentioned by another agent, it MAY respond with a structured capability announcement. This works under `allow_bot_messages="mentions"`.
 
 #### Isolated Filesystem Environments
 
 In many deployments (e.g. containerized agents, sandboxed runtimes), each agent has its own isolated filesystem and cannot read or write files belonging to other agents. In such environments:
 
 - **Shared registry file** (mechanism 1) is NOT available. Agents MUST NOT assume a shared filesystem exists.
-- **Operator-managed static config** (mechanism 3) is RECOMMENDED: the operator pre-provisions each agent's `peers.yaml` with the full peer list at deployment time. When peers change, the operator updates and redeploys.
-- **Platform API query** (mechanism 2) and **mention-triggered exchange** (mechanism 4) remain viable alternatives since they communicate through the platform, not the filesystem.
+- **Operator-managed static config** (mechanism 3) is RECOMMENDED for stable environments where the set of agents rarely changes. The operator pre-provisions each agent's `peers.yaml` at deployment time.
+- **Mention-triggered exchange** (mechanism 4) is RECOMMENDED for dynamic environments where agents may join or leave at runtime. Agents discover each other naturally through @mentions in the chat platform — no shared filesystem or operator intervention required. Upon receiving a handshake message, the agent MUST update its local `peers.yaml` with the peer's information.
+- **Platform API query** (mechanism 2) remains a viable alternative since it communicates through the platform, not the filesystem.
+
+Mechanisms 3 and 4 are complementary: static config provides a known baseline of peers at startup, while mention-triggered exchange allows the registry to grow organically as new agents appear.
 
 Implementors MUST document which discovery mechanism they use and whether their environment provides a shared filesystem.
 
