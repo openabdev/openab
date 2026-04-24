@@ -5,3 +5,4 @@ config.toml
 .env
 .kiro/
 CLAUDE.md
+gateway/target/

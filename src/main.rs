@@ -10,6 +10,7 @@ mod reactions;
 mod setup;
 mod slack;
 mod stt;
+mod gateway;
 
 use adapter::AdapterRouter;
 use clap::Parser;
@@ -83,8 +84,8 @@ async fn main() -> anyhow::Result<()> {
         "config loaded"
     );
 
-    if cfg.discord.is_none() && cfg.slack.is_none() {
-        anyhow::bail!("no adapter configured — add [discord] and/or [slack] to config.toml");
+    if cfg.discord.is_none() && cfg.slack.is_none() && cfg.gateway.is_none() {
+        anyhow::bail!("no adapter configured — add [discord], [slack], and/or [gateway] to config.toml");
     }
 
     let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions));
@@ -140,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
         let stt = cfg.stt.clone();
         let session_ttl = std::time::Duration::from_secs(ttl_secs);
         let max_bot_turns = slack_cfg.max_bot_turns;
+        let slack_shutdown_rx = shutdown_rx.clone();
         Some(tokio::spawn(async move {
             if let Err(e) = slack::run_slack_adapter(
                 slack_cfg.bot_token,
@@ -155,11 +157,25 @@ async fn main() -> anyhow::Result<()> {
                 session_ttl,
                 stt,
                 router,
-                shutdown_rx,
+                slack_shutdown_rx,
             )
             .await
             {
                 error!("slack adapter error: {e}");
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Spawn Gateway adapter (background task)
+    let gateway_handle = if let Some(gw_cfg) = cfg.gateway {
+        let router = router.clone();
+        let shutdown_rx = shutdown_rx.clone();
+        info!(url = %gw_cfg.url, "starting gateway adapter");
+        Some(tokio::spawn(async move {
+            if let Err(e) = gateway::run_gateway_adapter(gw_cfg.url, router, shutdown_rx).await {
+                error!("gateway adapter error: {e}");
             }
         }))
     } else {
@@ -236,6 +252,9 @@ async fn main() -> anyhow::Result<()> {
     // Signal Slack adapter to shut down gracefully
     let _ = shutdown_tx.send(true);
     if let Some(handle) = slack_handle {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+    if let Some(handle) = gateway_handle {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }
     let shutdown_pool = pool;
