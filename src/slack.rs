@@ -680,7 +680,9 @@ pub async fn run_slack_adapter(
                                                                     TurnSeverity::Hard => warn!(channel_id, turns, "hard bot turn limit reached"),
                                                                     TurnSeverity::Soft => info!(channel_id, turns, max = max_bot_turns, "soft bot turn limit reached"),
                                                                 }
-                                                                if !is_own_bot_msg {
+                                                                let channel_allowed = allow_all_channels
+                                                                    || allowed_channels.contains(channel_id);
+                                                                if !is_own_bot_msg && channel_allowed {
                                                                     let warn_channel = ChannelRef {
                                                                         platform: "slack".into(),
                                                                         channel_id: channel_id.to_string(),
