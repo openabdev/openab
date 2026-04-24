@@ -344,7 +344,6 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                             let emoji = &reply.content.text;
                             // Map unsupported emojis to Telegram-compatible ones
                             let tg_emoji = match emoji.as_str() {
-                                "👨\u{200d}💻" => "⚡",
                                 "🆗" => "👍",
                                 other => other,
                             };
