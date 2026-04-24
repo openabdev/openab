@@ -1,10 +1,10 @@
 # ADR-001: Agent Cognitive Architecture Specification (ACAS)
 
 - **Status**: Proposed
-- **Spec Version**: 1.3.0
+- **Spec Version**: 1.4.0
 - **Date**: 2026-04-23
 - **Author**: pahud.hsieh
-- **Revision**: Incorporates review feedback from 周嘟嘟, 小喬, 諸葛亮, 張飛, shaun-agent screening, and Discord live review session. v1.3.0: Added Entry Point Discovery (§1.3 Step 0) and Entry Point Convention (§1.5) based on bootstrap gap analysis by 周嘟嘟.
+- **Revision**: Incorporates review feedback from 周嘟嘟, 小喬, 諸葛亮, 張飛, shaun-agent screening, and Discord live review session. v1.3.0: Added Entry Point Discovery (§1.3 Step 0) and Entry Point Convention (§1.5). v1.4.0: Addressed filesystem isolation constraints — URL support in §1.5, isolated environment guidance in §2.2, shared knowledge limitations in §3.1.
 
 ## Key Words
 
@@ -53,7 +53,7 @@ Every agent MUST maintain a self-identity definition that answers: **"Who am I?"
 ### Required vs Optional Identity Fields
 
 ```yaml
-spec_version: "1.3.0"           # REQUIRED — spec version this identity conforms to
+spec_version: "1.4.0"           # REQUIRED — spec version this identity conforms to
 identity:
   name: ""                       # REQUIRED — agent's name (how it refers to itself)
   uid: ""                        # REQUIRED — unique identifier (platform-specific, e.g. Discord UID)
@@ -105,7 +105,7 @@ Most coding CLIs automatically read a platform-specific entry file when a new se
 
 An ACAS-conformant deployment MUST ensure that the agent's entry file contains at minimum:
 
-1. A reference to this specification (path or URL to the ADR document).
+1. A reference to this specification — either a **local path** or a **remote URL** (e.g. a GitHub permalink). Since agents typically run in isolated filesystem environments (see §2.2), a URL is RECOMMENDED as the default so the agent can fetch the spec without requiring it to be pre-installed locally.
 2. A pointer to the agent's `identity.yaml` file.
 3. A directive to execute the Bootstrap Flow (§1.3).
 
@@ -116,13 +116,15 @@ An ACAS-conformant deployment MUST ensure that the agent's entry file contains a
 
 This agent follows the Agent Cognitive Architecture Specification (ACAS).
 
-- Spec: docs/adr/ADR-001-agent-cognitive-architecture.md
+- Spec: https://github.com/openabdev/openab/blob/main/docs/adr/ADR-001-agent-cognitive-architecture.md
 - Identity: identity.yaml
 - Peers: peers.yaml
 - Knowledge DB: memory.db
 
 On startup, read the spec and execute the Bootstrap Flow (§1.3).
 ```
+
+If the spec is referenced by URL, the agent MUST be able to fetch and read it at bootstrap time. If network access is unavailable, the operator MUST pre-install the spec document into the agent's local filesystem.
 
 The entry file name is platform-specific and outside the scope of this specification. Implementors MUST document which entry file they use. The ACAS bootstrap section within the entry file SHOULD be clearly delimited so it can coexist with other platform-specific instructions.
 
@@ -153,10 +155,20 @@ peers:
 
 OpenAB's `allow_bot_messages` defaults to ignoring bot messages. Peer discovery MUST NOT assume that bot-to-bot broadcast messages will be received. Instead, agents MUST use one of the following discovery mechanisms:
 
-1. **Shared registry file** (RECOMMENDED): All agents read/write a shared `peers.yaml` or equivalent file on a shared filesystem or object store. On startup, an agent writes its own entry and reads others. Implementations MUST acquire a file-level lock (e.g. `peers.yaml.lock`) before writing registry entries. If the lock is held, the agent MUST wait or skip with a warning — the same semantics as `/reflect` locking (§4.3). Implementations SHOULD ignore invalid or partial updates and retain the last known valid registry state.
+1. **Shared registry file**: All agents read/write a shared `peers.yaml` or equivalent file on a shared filesystem or object store. On startup, an agent writes its own entry and reads others. Implementations MUST acquire a file-level lock (e.g. `peers.yaml.lock`) before writing registry entries. If the lock is held, the agent MUST wait or skip with a warning — the same semantics as `/reflect` locking (§4.3). Implementations SHOULD ignore invalid or partial updates and retain the last known valid registry state. **Note**: This mechanism requires a shared filesystem or object store and is NOT available in isolated environments (see below).
 2. **Platform API query**: Query the platform API (e.g. Discord guild members) to discover other agents, then populate the local registry.
-3. **Operator-managed static config**: The operator maintains `peers.yaml` manually. Simplest approach, no bot-to-bot messaging required.
+3. **Operator-managed static config** (RECOMMENDED): The operator maintains `peers.yaml` and deploys a copy into each agent's filesystem at provisioning time. Simplest approach, no bot-to-bot messaging or shared filesystem required. This is the RECOMMENDED default because it works in all environments, including isolated filesystems.
 4. **Mention-triggered exchange** (OPTIONAL): When an agent is @mentioned by another agent, it MAY respond with a structured capability announcement. This works under `allow_bot_messages="mentions"`.
+
+#### Isolated Filesystem Environments
+
+In many deployments (e.g. containerized agents, sandboxed runtimes), each agent has its own isolated filesystem and cannot read or write files belonging to other agents. In such environments:
+
+- **Shared registry file** (mechanism 1) is NOT available. Agents MUST NOT assume a shared filesystem exists.
+- **Operator-managed static config** (mechanism 3) is RECOMMENDED: the operator pre-provisions each agent's `peers.yaml` with the full peer list at deployment time. When peers change, the operator updates and redeploys.
+- **Platform API query** (mechanism 2) and **mention-triggered exchange** (mechanism 4) remain viable alternatives since they communicate through the platform, not the filesystem.
+
+Implementors MUST document which discovery mechanism they use and whether their environment provides a shared filesystem.
 
 The mention-triggered exchange format for Discord:
 
@@ -213,6 +225,16 @@ Each agent maintains its **own** knowledge base by default (per-agent). Shared k
 - **Shared** (Level 3): Multiple agents read/write a common knowledge base. REQUIRES conflict resolution (see §6.3).
 
 Implementors MUST document which mode they use.
+
+#### Filesystem Isolation Constraints
+
+In isolated filesystem environments (see §2.2), agents cannot directly share files. The "shared" mode (Level 3) therefore MUST NOT assume a shared filesystem. Implementors targeting Level 3 in isolated environments MUST use an alternative transport for knowledge sharing, such as:
+
+- **Object store** (e.g. S3): Agents read/write knowledge files to a shared bucket.
+- **Platform messages**: Agents exchange knowledge snippets via chat messages (subject to `allow_bot_messages` settings).
+- **External API**: A centralized knowledge service that agents query over HTTP.
+
+If none of these transports are available, the deployment MUST operate in per-agent mode only (Level 1 or 2). Implementors MUST NOT claim Level 3 conformance without a working shared knowledge transport.
 
 ### 3.2 Layer 1: Daily Logs (Raw Input)
 
