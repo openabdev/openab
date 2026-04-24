@@ -7,13 +7,37 @@ COPY src/ src/
 RUN touch src/main.rs && cargo build --release
 
 # --- Runtime stage ---
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini unzip && rm -rf /var/lib/apt/lists/*
+FROM amazonlinux:2023
+RUN dnf upgrade -y && \
+    dnf install -y --allowerasing ca-certificates curl procps-ng unzip git \
+      python3.12 python3.12-pip nodejs20-npm shadow-utils tar gzip && \
+    dnf clean all && \
+    ln -sf /usr/bin/python3.12 /usr/bin/python3 && \
+    ln -sf /usr/bin/python3 /usr/bin/python && \
+    python3 -m pip install --no-cache-dir --upgrade pip
+
+# Install tini
+ARG TINI_VERSION=v0.19.0
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "aarch64" ]; then TINI_ARCH="arm64"; else TINI_ARCH="amd64"; fi && \
+    curl -sSfL "https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini-${TINI_ARCH}" \
+      -o /usr/local/bin/tini && \
+    chmod +x /usr/local/bin/tini
+
+# Install ripgrep
+ARG RIPGREP_VERSION=14.1.1
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "aarch64" ]; then RG_TARGET="aarch64-unknown-linux-gnu"; else RG_TARGET="x86_64-unknown-linux-musl"; fi && \
+    curl -sSfL "https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/ripgrep-${RIPGREP_VERSION}-${RG_TARGET}.tar.gz" \
+      -o /tmp/rg.tar.gz && \
+    tar -xzf /tmp/rg.tar.gz -C /tmp && \
+    cp /tmp/ripgrep-*/rg /usr/local/bin/ && \
+    rm -rf /tmp/rg.tar.gz /tmp/ripgrep-*
 
 # Install kiro-cli (auto-detect arch, copy binary directly)
 ARG KIRO_CLI_VERSION=2.0.0
-RUN ARCH=$(dpkg --print-architecture) && \
-    if [ "$ARCH" = "arm64" ]; then URL="https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/kirocli-aarch64-linux.zip"; \
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "aarch64" ]; then URL="https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/kirocli-aarch64-linux.zip"; \
     else URL="https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/kirocli-x86_64-linux.zip"; fi && \
     curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-delay 5 "$URL" -o /tmp/kirocli.zip && \
     unzip /tmp/kirocli.zip -d /tmp && \
@@ -22,44 +46,28 @@ RUN ARCH=$(dpkg --print-architecture) && \
     rm -rf /tmp/kirocli /tmp/kirocli.zip
 
 # Install gh CLI
-RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-      > /etc/apt/sources.list.d/github-cli.list && \
-    apt-get update && apt-get install -y --no-install-recommends gh && \
-    rm -rf /var/lib/apt/lists/*
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "aarch64" ]; then GH_ARCH="linux_arm64"; else GH_ARCH="linux_amd64"; fi && \
+    GH_VERSION=$(curl -sL https://api.github.com/repos/cli/cli/releases/latest | python3 -c "import sys,json;print(json.load(sys.stdin)['tag_name'].lstrip('v'))") && \
+    curl -sSfL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_${GH_ARCH}.tar.gz" \
+      -o /tmp/gh.tar.gz && \
+    tar -xzf /tmp/gh.tar.gz -C /tmp && \
+    cp /tmp/gh_*/bin/gh /usr/local/bin/ && \
+    rm -rf /tmp/gh.tar.gz /tmp/gh_*
 
 # Install AWS CLI v2
-RUN ARCH=$(dpkg --print-architecture) && \
-    if [ "$ARCH" = "arm64" ]; then URL="https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip"; \
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "aarch64" ]; then URL="https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip"; \
     else URL="https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"; fi && \
     curl -sSf "$URL" -o /tmp/awscli.zip && \
     unzip -q /tmp/awscli.zip -d /tmp && \
     /tmp/aws/install && \
     rm -rf /tmp/aws /tmp/awscli.zip
 
-# Install Python 3.11 (apt), 3.12 (standalone binary), pip, and git
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      git python3.11 python3.11-venv python3-pip && \
-    rm -rf /var/lib/apt/lists/* && \
-    ARCH=$(dpkg --print-architecture) && \
-    if [ "$ARCH" = "arm64" ]; then PY_ARCH="aarch64"; else PY_ARCH="x86_64"; fi && \
-    curl -sSfL "https://github.com/indygreg/python-build-standalone/releases/download/20241206/cpython-3.12.8+20241206-${PY_ARCH}-unknown-linux-gnu-install_only_stripped.tar.gz" \
-      -o /tmp/python3.12.tar.gz && \
-    tar -xzf /tmp/python3.12.tar.gz -C /usr/local --strip-components=1 && \
-    rm /tmp/python3.12.tar.gz && \
-    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 && \
-    update-alternatives --install /usr/bin/python3 python3 /usr/local/bin/python3.12 2 && \
-    ln -sf /usr/bin/python3 /usr/bin/python
-
-# Install Node.js 20 LTS (for Cloudscape frontend builds)
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
-    apt-get install -y --no-install-recommends nodejs && \
-    rm -rf /var/lib/apt/lists/*
-
 # Install kubectl
-RUN ARCH=$(dpkg --print-architecture) && \
-    curl -sSfL "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl" \
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "aarch64" ]; then K8S_ARCH="arm64"; else K8S_ARCH="amd64"; fi && \
+    curl -sSfL "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/${K8S_ARCH}/kubectl" \
       -o /usr/local/bin/kubectl && \
     chmod +x /usr/local/bin/kubectl
 
