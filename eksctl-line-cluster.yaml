@@ -1,0 +1,16 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: openab-line-cluster
+  region: us-east-1
+
+managedNodeGroups:
+  - name: default
+    instanceType: t3.medium
+    desiredCapacity: 1
+    minSize: 1
+    maxSize: 4
+    volumeSize: 30
+    ssh:
+      allow: false
