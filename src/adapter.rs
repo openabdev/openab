@@ -1,8 +1,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::error;
+use tracing::{error, info, warn};
 
 use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
 use crate::config::ReactionsConfig;
@@ -32,7 +32,7 @@ pub struct MessageRef {
 }
 
 /// Sender identity injected into prompts for downstream agent context.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SenderContext {
     pub schema: String,
     pub sender_id: String,
@@ -160,11 +160,33 @@ impl AdapterRouter {
                 .unwrap_or(&thread_channel.channel_id)
         );
 
-        if let Err(e) = self.pool.get_or_create(&thread_key).await {
-            let msg = format_user_error(&e.to_string());
-            let _ = adapter
-                .send_message(thread_channel, &format!("⚠️ {msg}"))
-                .await;
+        // Session admission. The pool itself is authoritative: it rejects
+        // with an error if `begin_shutdown` has already fired, and on success
+        // stores the `ChannelRef` + adapter so `broadcast_shutdown` can reach
+        // this thread without the router keeping a parallel cache.
+        if let Err(e) = self.pool.get_or_create(&thread_key, thread_channel, adapter).await {
+            if self.pool.is_shutting_down() {
+                // Don't send the shutdown rejection back to bot-authored events.
+                // Slack (and potentially any other platform that doesn't drop
+                // the bot's own posts) would deliver our broadcast message as a
+                // new bot event, route it here during the shutdown window, and
+                // we'd reply with another bot-authored rejection — looping until
+                // the bot-turn cap trips. Human senders still get the notice.
+                let sender_is_bot = serde_json::from_str::<SenderContext>(sender_json)
+                    .map(|sender| sender.is_bot)
+                    .unwrap_or(false);
+                if !sender_is_bot {
+                    let _ = adapter
+                        .send_message(
+                            thread_channel,
+                            "⚠️ Bot is shutting down and cannot accept new messages right now.",
+                        )
+                        .await;
+                }
+                return Ok(());
+            }
+            let msg = format!("⚠️ {}", format_user_error(&e.to_string()));
+            let _ = adapter.send_message(thread_channel, &msg).await;
             error!("pool error: {e}");
             return Err(e);
         }
@@ -214,6 +236,58 @@ impl AdapterRouter {
         }
 
         result
+    }
+
+    /// Broadcast a short notification to every active thread, across all
+    /// configured adapters, before the broker shuts down. Sends happen in
+    /// parallel and are capped by `timeout`; the call returns early if the
+    /// deadline is hit so shutdown itself is never blocked by a slow platform.
+    ///
+    /// Delivery is best-effort: evicted sessions whose `ChannelRef` is still
+    /// in the cache still receive the notification, which is the behavior we
+    /// want (the user saw the thread was in flight; they deserve to know the
+    /// broker is going away).
+    pub async fn broadcast_shutdown(&self, message: &str, timeout: std::time::Duration) {
+        // The pool owns both the flag flip and the live-session snapshot and
+        // performs both atomically under its state write lock. Any message
+        // admitted before us is in the snapshot; any that comes after sees
+        // the flag inside the same lock and returns an admission error that
+        // `handle_message` surfaces inline.
+        let snapshot = self.pool.begin_shutdown().await;
+
+        if snapshot.is_empty() {
+            return;
+        }
+
+        info!(count = snapshot.len(), "broadcasting shutdown notification");
+
+        let mut set = tokio::task::JoinSet::new();
+        for (thread_key, channel, adapter) in snapshot {
+            let message = message.to_string();
+            set.spawn(async move {
+                if let Err(e) = adapter.send_message(&channel, &message).await {
+                    warn!(thread_key, error = %e, "failed to post shutdown notification");
+                }
+            });
+        }
+
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut deadline => {
+                    warn!(timeout_ms = timeout.as_millis() as u64, "shutdown broadcast timed out; remaining sends cancelled");
+                    set.shutdown().await;
+                    return;
+                }
+                next = set.join_next() => {
+                    if next.is_none() {
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     async fn stream_prompt(

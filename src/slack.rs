@@ -1120,7 +1120,15 @@ async fn handle_message(
         cache.contains_key(&thread_channel.channel_id)
     };
     if let Err(e) = router
-        .handle_message(&adapter_dyn, &thread_channel, &sender_json, &prompt, extra_blocks, &trigger_msg, other_bot_present)
+        .handle_message(
+            &adapter_dyn,
+            &thread_channel,
+            &sender_json,
+            &prompt,
+            extra_blocks,
+            &trigger_msg,
+            other_bot_present,
+        )
         .await
     {
         error!("Slack handle_message error: {e}");

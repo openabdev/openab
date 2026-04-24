@@ -19,6 +19,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+/// Neutral shutdown notification broadcast to every active thread. Wording
+/// deliberately avoids "restarting" because `helm uninstall` / final-stop
+/// can't be distinguished from a rolling restart at signal time.
+const SHUTDOWN_MSG: &str = "⚠️ Bot is shutting down. Context will reset on return.";
+
+/// Broadcast deadline. Shutdown itself must never block on a slow platform,
+/// so incomplete sends are dropped once this elapses.
+const SHUTDOWN_BROADCAST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Parser)]
 #[command(name = "openab")]
 #[command(about = "Multi-platform ACP agent broker (Discord, Slack)", long_about = None)]
@@ -179,7 +188,7 @@ async fn main() -> anyhow::Result<()> {
                 );
 
                 let handler = discord::Handler {
-                    router,
+                    router: router.clone(),
                     allow_all_channels,
                     allow_all_users,
                     allowed_channels,
@@ -204,21 +213,31 @@ async fn main() -> anyhow::Result<()> {
                     .event_handler(handler)
                     .await?;
 
-                // Graceful Discord shutdown on ctrl_c
+                // Graceful shutdown on SIGINT or SIGTERM: wait for the signal,
+                // broadcast to every active thread (Discord + Slack), then stop
+                // Discord shards. `client.start()` is the foreground blocker here,
+                // so this handler runs as a spawned task.
                 let shard_manager = client.shard_manager.clone();
+                let shutdown_router = router.clone();
                 tokio::spawn(async move {
-                    tokio::signal::ctrl_c().await.ok();
-                    info!("shutdown signal received");
+                    wait_for_shutdown_signal().await;
+                    shutdown_router
+                        .broadcast_shutdown(SHUTDOWN_MSG, SHUTDOWN_BROADCAST_TIMEOUT)
+                        .await;
                     shard_manager.shutdown_all().await;
                 });
 
                 info!("discord bot running");
                 client.start().await?;
             } else {
-                // No Discord — just wait for ctrl_c
-                info!("running without discord, press ctrl+c to stop");
-                tokio::signal::ctrl_c().await.ok();
-                info!("shutdown signal received");
+                // No Discord — this task itself blocks on the shutdown signal,
+                // then broadcasts before falling through to cleanup. Slack-only
+                // deployments need SIGTERM + broadcast just like Discord.
+                info!("running without discord, waiting for shutdown signal");
+                wait_for_shutdown_signal().await;
+                router
+                    .broadcast_shutdown(SHUTDOWN_MSG, SHUTDOWN_BROADCAST_TIMEOUT)
+                    .await;
             }
 
             // Cleanup
@@ -234,6 +253,34 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Wait for SIGINT (ctrl_c) or, on Unix, SIGTERM (systemctl stop, docker stop,
+/// kill). Without SIGTERM handling the broker would be killed outright by
+/// service managers and skip the shutdown broadcast, so both signals route
+/// here on Unix. On non-Unix targets `tokio::signal::unix` is unavailable, so
+/// we fall back to ctrl_c alone.
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        Err(e) => {
+            warn!("failed to install SIGTERM handler ({e}), falling back to ctrl_c only");
+            tokio::signal::ctrl_c().await.ok();
+        }
+    }
+    info!("shutdown signal received");
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    tokio::signal::ctrl_c().await.ok();
+    info!("shutdown signal received");
 }
 
 fn parse_id_set(raw: &[String], label: &str) -> anyhow::Result<HashSet<u64>> {
