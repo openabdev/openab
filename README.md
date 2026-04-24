@@ -66,6 +66,13 @@ See [docs/telegram.md](docs/telegram.md) for the full setup guide. Requires the 
 
 </details>
 
+<details>
+<summary><strong>LINE</strong> (via Custom Gateway)</summary>
+
+See [docs/line.md](docs/line.md) for the full setup guide. Requires the standalone [Custom Gateway](gateway/) service.
+
+</details>
+
 ### 2. Install with Helm (Kiro CLI — default)
 
 ```bash
