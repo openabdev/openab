@@ -4,10 +4,10 @@
 
 When reviewing a PR, always address these four questions:
 
-1. **他解決什麼問題或需求** — 這個 PR 要解決什麼痛點或滿足什麼需求？用白話說明背景。
-2. **他用什麼方式解決** — 具體的技術做法、架構設計、關鍵實作細節。
-3. **他考慮過其他方式嗎** — PR 描述中是否說明了為什麼選擇這個方式而非其他替代方案？如果沒有，建議作者補充。
-4. **這是目前最好的方式嗎** — 評估現有做法是否最佳，指出可以改進的地方和潛在風險。
+1. **What problem does it solve** — What pain point or requirement does this PR address? Explain the background in plain language.
+2. **How does it solve it** — The specific technical approach, architecture decisions, and key implementation details.
+3. **Were alternatives considered** — Does the PR description explain why this approach was chosen over alternatives? If not, suggest the author clarify.
+4. **Is this the best approach** — Evaluate whether the current approach is optimal. Point out areas for improvement and potential risks.
 
 ## Severity Levels
 
