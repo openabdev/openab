@@ -314,10 +314,19 @@ pub async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
     if !status.is_success() {
         anyhow::bail!("remote config request to {url} returned HTTP {status}");
     }
-    let raw = resp
-        .text()
+    let bytes = resp
+        .bytes()
         .await
         .map_err(|e| anyhow::anyhow!("failed to read response body from {url}: {e}"))?;
+    const MAX_CONFIG_BYTES: usize = 1024 * 1024; // 1 MiB
+    if bytes.len() > MAX_CONFIG_BYTES {
+        anyhow::bail!(
+            "remote config from {url} exceeds 1 MiB limit ({} bytes)",
+            bytes.len()
+        );
+    }
+    let raw = String::from_utf8(bytes.to_vec())
+        .map_err(|e| anyhow::anyhow!("remote config from {url} is not valid UTF-8: {e}"))?;
     parse_config(&raw, url)
 }
 

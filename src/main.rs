@@ -62,30 +62,41 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Commands::Run { config } => config,
-        Commands::External(args) => args.into_iter().next(),
+        Commands::External(args) => {
+            if args.len() > 1 {
+                anyhow::bail!(
+                    "unexpected extra arguments: {:?} — usage: openab [config.toml | https://...]",
+                    &args[1..]
+                );
+            }
+            args.into_iter().next()
+        }
     };
 
     // -- Run path --
     let config_source = config_arg.unwrap_or_else(|| "config.toml".into());
 
-            let mut cfg = if config_source.starts_with("http://") || config_source.starts_with("https://") {
-                info!(url = %config_source, "fetching remote config");
-                config::load_config_from_url(&config_source).await?
-            } else {
-                config::load_config(&PathBuf::from(&config_source))?
-            };
-            info!(
-                agent_cmd = %cfg.agent.command,
-                pool_max = cfg.pool.max_sessions,
-                discord = cfg.discord.is_some(),
-                slack = cfg.slack.is_some(),
-                reactions = cfg.reactions.enabled,
-                "config loaded"
-            );
+    let mut cfg = if config_source.starts_with("https://") {
+        info!(url = %config_source, "fetching remote config");
+        config::load_config_from_url(&config_source).await?
+    } else if config_source.starts_with("http://") {
+        warn!(url = %config_source, "fetching remote config over plaintext HTTP — use HTTPS in production");
+        config::load_config_from_url(&config_source).await?
+    } else {
+        config::load_config(&PathBuf::from(&config_source))?
+    };
+    info!(
+        agent_cmd = %cfg.agent.command,
+        pool_max = cfg.pool.max_sessions,
+        discord = cfg.discord.is_some(),
+        slack = cfg.slack.is_some(),
+        reactions = cfg.reactions.enabled,
+        "config loaded"
+    );
 
-            if cfg.discord.is_none() && cfg.slack.is_none() {
-                anyhow::bail!("no adapter configured — add [discord] and/or [slack] to config.toml");
-            }
+    if cfg.discord.is_none() && cfg.slack.is_none() {
+        anyhow::bail!("no adapter configured — add [discord] and/or [slack] to config.toml");
+    }
 
             let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions));
             let ttl_secs = cfg.pool.session_ttl_hours * 3600;
