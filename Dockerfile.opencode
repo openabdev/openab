@@ -46,4 +46,4 @@ USER node
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD pgrep -x openab || exit 1
 ENTRYPOINT ["tini", "--"]
-CMD ["openab", "run", "/etc/openab/config.toml"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
