@@ -1,20 +1,12 @@
-# RFC 002: Pull Request Contribution Guidelines
+# ADR: PR Contribution Guidelines
 
-| Field | Value |
-|-------|-------|
-| **RFC** | 002 |
-| **Title** | Pull Request Contribution Guidelines |
-| **Author** | @chaodu-agent |
-| **Status** | Draft |
-| **Created** | 2026-04-13 |
+- **Status:** Proposed
+- **Date:** 2026-04-13
+- **Author:** @chaodu-agent
 
 ---
 
-## Summary
-
-Establish a standard PR template requiring contributors to research prior art (at minimum OpenClaw and Hermes Agent) before proposing solutions, and to document the problem, approach, tradeoffs, and alternatives in every PR description.
-
-## Motivation
+## 1. Context & Problem Statement
 
 OpenAB is growing and accepting external contributions. Without a clear PR standard, we see PRs that:
 
@@ -23,11 +15,13 @@ OpenAB is growing and accepting external contributions. Without a clear PR stand
 - Don't justify why a particular approach was chosen over alternatives
 - Make review harder because reviewers must do the research themselves
 
-**Good example:** Issue #224 / PR #225 (voice message STT) included a thorough prior art investigation — comparing OpenClaw's `audio-transcription-runner.ts` preflight pipeline with Hermes Agent's `transcription_tools.py` local-first approach, producing a clear comparison table, and explaining why openab chose a simpler OpenAI-compatible endpoint design. This is the standard we want every PR to meet.
+This front-loads research cost onto the contributor (who understands the problem best) rather than distributing it across reviewers.
 
-**What we want to avoid:** PRs that jump straight to implementation without documenting how existing projects solve the same problem — forcing reviewers to do the research themselves during review.
+**Good example:** Issue #224 / PR #225 (voice message STT) included a thorough prior art investigation — comparing OpenClaw's `audio-transcription-runner.ts` preflight pipeline with Hermes Agent's `transcription_tools.py` local-first approach, producing a clear comparison table, and explaining why OpenAB chose a simpler OpenAI-compatible endpoint design.
 
-## Design
+## 2. Decision
+
+Establish a standard PR template requiring contributors to research prior art (at minimum OpenClaw and Hermes Agent) before proposing solutions, and to document the problem, approach, tradeoffs, and alternatives in every PR description.
 
 ### Required PR Sections
 
@@ -62,7 +56,7 @@ If neither project addresses the problem, state that explicitly with evidence.
 
 ### Research Flow
 
-```
+```text
 Contributor researches prior art
         │
         ▼
@@ -82,88 +76,45 @@ Contributor researches prior art
                               └──────────────────────────────────┘
 ```
 
-## Implementation
+## 3. Implementation
 
 | Phase | Deliverable | Description |
 |-------|-------------|-------------|
 | **1** | `.github/pull_request_template.md` | Auto-populated PR form with all required sections |
-| **2** | `CONTRIBUTING.md` | Contributor guide explaining the guidelines and linking to this RFC |
+| **2** | `CONTRIBUTING.md` | Contributor guide explaining the guidelines and linking to this ADR |
 | **3** | Review process update | Reviewers check for prior art section completeness |
 
-### PR Template
+## 4. Alternatives Considered
 
-```markdown
-## What problem does this solve?
+### Option 1: No formal template — rely on reviewer feedback
 
-<!-- Describe the pain point in plain language. Link the related issue. -->
+- Pros: zero contributor friction
+- Cons: inconsistent quality, reviewers repeat the same feedback, research burden falls on reviewers
 
-Closes #
+### Option 2: Strict mandatory template everywhere
 
-Discord Discussion URL: https://discord.com/channels/...
+- Pros: uniform quality across all PRs
+- Cons: excessive overhead for trivial/docs/small fixes; may discourage contributions
 
-## At a Glance
+### Option 3: Tiered policy by PR type (recommended follow-up)
 
-<!-- ASCII diagram showing the high-level flow or where this change fits in the system. Example:
+- Pros: full prior-art analysis for architectural changes, lighter structure for minor PRs
+- Cons: requires defining the boundary between "minor" and "architectural"
 
-┌──────────────┐     ┌───────┐     ┌───────────┐
-│ Discord User │────►│ openab│────►│ ACP Agent │
-└──────────────┘     └───┬───┘     └───────────┘
-                         │
-                         ▼
-                  ┌──────────────┐
-                  │ your change  │
-                  └──────────────┘
--->
-
-```
-(your diagram here)
-```
-
-## Prior Art & Industry Research
-
-<!-- Research how at least OpenClaw and Hermes Agent handle this problem. -->
-
-**OpenClaw:**
-<!-- How does OpenClaw solve this? Link to relevant code/docs. -->
-
-**Hermes Agent:**
-<!-- How does Hermes Agent solve this? Link to relevant code/docs. -->
-
-**Other references (optional):**
-
-## Proposed Solution
-
-<!-- Technical approach, architecture decisions, key implementation details. -->
-
-## Why This Approach
-
-<!-- Why this over the alternatives from your research? Tradeoffs? Limitations? -->
-
-## Alternatives Considered
-
-<!-- Approaches evaluated but not chosen, and why. -->
-
-## Validation
-
-<!-- How do you prove this works? Show, don't just tell. -->
-
-- [ ] `cargo check` passes
-- [ ] `cargo test` passes (including new tests)
-- [ ] Manual testing — describe the steps you took and what you observed
-- [ ] Screenshots, logs, or terminal output demonstrating the feature working end-to-end
-```
-
-## Open Questions
+## 5. Open Questions
 
 1. Should we enforce the prior art section via CI (e.g., a bot that checks for the section headers)?
 2. Should we maintain a living doc of "how OpenClaw/Hermes do X" to reduce per-PR research burden?
 3. Are there other mandatory reference projects beyond OpenClaw and Hermes?
 
----
+## Consequences
+
+- **Positive:** Higher-quality PRs, faster reviews, architectural consistency, less reinventing the wheel
+- **Negative:** Higher upfront cost for contributors; may slow down first-time contributions
+- **Mitigation:** Clear examples (PR #225), PR template auto-populates sections, consider tiered policy for trivial changes
 
 ## References
 
 - Issue #224 / PR #225 — exemplary prior art research (STT: OpenClaw vs Hermes Agent comparison)
 - [OpenClaw Channel & Messaging Deep Dive](https://avasdream.com/blog/openclaw-channels-messaging-deep-dive)
 - [Hermes Agent Messaging Gateway](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/)
-- RFC 001 — [Session Management](./001-session-management.md)
