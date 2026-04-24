@@ -164,6 +164,15 @@ pub struct SlackConfig {
 pub struct GatewayConfig {
     /// WebSocket URL of the custom gateway (e.g. ws://gateway:8080/ws)
     pub url: String,
+    /// Platform name for session key namespacing (e.g. "telegram", "line")
+    #[serde(default = "default_gateway_platform")]
+    pub platform: String,
+    /// Shared token for WebSocket authentication (optional but recommended)
+    pub token: Option<String>,
+}
+
+fn default_gateway_platform() -> String {
+    "telegram".into()
 }
 
 #[derive(Debug, Deserialize)]

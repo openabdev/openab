@@ -1,6 +1,7 @@
 use anyhow::Result;
 use axum::{
     extract::State,
+    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
@@ -128,6 +129,7 @@ struct TelegramUser {
 struct AppState {
     bot_token: String,
     secret_token: Option<String>,
+    ws_token: Option<String>,
     /// Broadcast channel: gateway → OAB (events)
     event_tx: broadcast::Sender<String>,
     /// Collected reply senders from connected OAB clients
@@ -223,8 +225,17 @@ async fn telegram_webhook(
 
 async fn ws_handler(
     State(state): State<Arc<AppState>>,
+    query: axum::extract::Query<std::collections::HashMap<String, String>>,
     ws: axum::extract::WebSocketUpgrade,
 ) -> axum::response::Response {
+    // Validate WS token if configured
+    if let Some(ref expected) = state.ws_token {
+        let provided = query.get("token").map(|s| s.as_str());
+        if provided != Some(expected.as_str()) {
+            warn!("WebSocket rejected: invalid or missing token");
+            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+        }
+    }
     ws.on_upgrade(move |socket| handle_oab_connection(state, socket))
 }
 
@@ -367,6 +378,7 @@ async fn main() -> Result<()> {
 
     let bot_token = std::env::var("TELEGRAM_BOT_TOKEN").expect("TELEGRAM_BOT_TOKEN must be set");
     let secret_token = std::env::var("TELEGRAM_SECRET_TOKEN").ok();
+    let ws_token = std::env::var("GATEWAY_WS_TOKEN").ok();
     let listen_addr = std::env::var("GATEWAY_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let webhook_path =
         std::env::var("TELEGRAM_WEBHOOK_PATH").unwrap_or_else(|_| "/webhook/telegram".into());
@@ -374,12 +386,16 @@ async fn main() -> Result<()> {
     if secret_token.is_none() {
         warn!("TELEGRAM_SECRET_TOKEN not set — webhook requests are NOT validated (insecure)");
     }
+    if ws_token.is_none() {
+        warn!("GATEWAY_WS_TOKEN not set — WebSocket connections are NOT authenticated (insecure)");
+    }
 
     let (event_tx, _) = broadcast::channel::<String>(256);
 
     let state = Arc::new(AppState {
         bot_token,
         secret_token,
+        ws_token,
         event_tx,
         reply_handlers: Mutex::new(Vec::new()),
     });

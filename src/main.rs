@@ -174,7 +174,7 @@ async fn main() -> anyhow::Result<()> {
         let shutdown_rx = shutdown_rx.clone();
         info!(url = %gw_cfg.url, "starting gateway adapter");
         Some(tokio::spawn(async move {
-            if let Err(e) = gateway::run_gateway_adapter(gw_cfg.url, router, shutdown_rx).await {
+            if let Err(e) = gateway::run_gateway_adapter(gw_cfg.url, gw_cfg.platform, gw_cfg.token, router, shutdown_rx).await {
                 error!("gateway adapter error: {e}");
             }
         }))

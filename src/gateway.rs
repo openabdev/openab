@@ -15,12 +15,14 @@ use tracing::{error, info, warn};
 struct GatewayEvent {
     #[allow(dead_code)]
     schema: String,
+    #[allow(dead_code)]
     event_id: String,
     platform: String,
     channel: GwChannel,
     sender: GwSender,
     content: GwContent,
     #[serde(default)]
+    #[allow(dead_code)]
     mentions: Vec<String>,
     message_id: String,
 }
@@ -100,6 +102,7 @@ pub struct GatewayAdapter {
         >,
     >,
     pending: PendingRequests,
+    platform_name: &'static str,
 }
 
 impl GatewayAdapter {
@@ -111,10 +114,12 @@ impl GatewayAdapter {
             Message,
         >,
         pending: PendingRequests,
+        platform_name: &'static str,
     ) -> Self {
         Self {
             ws_tx: Mutex::new(ws_tx),
             pending,
+            platform_name,
         }
     }
 }
@@ -122,7 +127,7 @@ impl GatewayAdapter {
 #[async_trait]
 impl ChatAdapter for GatewayAdapter {
     fn platform(&self) -> &'static str {
-        "gateway"
+        self.platform_name
     }
 
     fn message_limit(&self) -> usize {
@@ -146,11 +151,7 @@ impl ChatAdapter for GatewayAdapter {
             request_id: None,
         };
         let json = serde_json::to_string(&reply)?;
-        self.ws_tx
-            .lock()
-            .await
-            .send(Message::Text(json.into()))
-            .await?;
+        self.ws_tx.lock().await.send(Message::Text(json)).await?;
         Ok(MessageRef {
             channel: channel.clone(),
             message_id: "gw_sent".into(),
@@ -184,11 +185,7 @@ impl ChatAdapter for GatewayAdapter {
             request_id: Some(req_id.clone()),
         };
         let json = serde_json::to_string(&reply)?;
-        self.ws_tx
-            .lock()
-            .await
-            .send(Message::Text(json.into()))
-            .await?;
+        self.ws_tx.lock().await.send(Message::Text(json)).await?;
 
         // Wait for response (5s timeout)
         match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
@@ -227,9 +224,25 @@ impl ChatAdapter for GatewayAdapter {
 
 pub async fn run_gateway_adapter(
     gateway_url: String,
+    platform_name: String,
+    ws_token: Option<String>,
     router: Arc<AdapterRouter>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
+    // Leak the platform name for 'static lifetime — one allocation per adapter lifetime
+    let platform: &'static str = Box::leak(platform_name.into_boxed_str());
+
+    // Append auth token as query param if configured
+    let connect_url = match &ws_token {
+        Some(token) => {
+            let sep = if gateway_url.contains('?') { "&" } else { "?" };
+            format!("{gateway_url}{sep}token={token}")
+        }
+        None => {
+            warn!("gateway.token not set — WebSocket connection is NOT authenticated");
+            gateway_url.clone()
+        }
+    };
     let mut backoff_secs = 1u64;
     const MAX_BACKOFF: u64 = 30;
 
@@ -242,7 +255,7 @@ pub async fn run_gateway_adapter(
 
         info!(url = %gateway_url, "connecting to custom gateway");
 
-        let ws_stream = match tokio_tungstenite::connect_async(&gateway_url).await {
+        let ws_stream = match tokio_tungstenite::connect_async(&connect_url).await {
             Ok((stream, _)) => {
                 backoff_secs = 1; // reset on success
                 info!("connected to gateway");
@@ -261,7 +274,8 @@ pub async fn run_gateway_adapter(
 
         let (ws_tx, mut ws_rx) = ws_stream.split();
         let pending: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
-        let adapter: Arc<dyn ChatAdapter> = Arc::new(GatewayAdapter::new(ws_tx, pending.clone()));
+        let adapter: Arc<dyn ChatAdapter> =
+            Arc::new(GatewayAdapter::new(ws_tx, pending.clone(), platform));
 
         loop {
             tokio::select! {
