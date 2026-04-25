@@ -1,0 +1,71 @@
+name: Build Windows
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag (e.g. v0.8.1-beta.5)'
+        required: true
+        type: string
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        target:
+          - { triple: x86_64-pc-windows-msvc, runner: windows-latest, arch: x64 }
+          - { triple: aarch64-pc-windows-msvc, runner: windows-latest, arch: arm64 }
+    runs-on: ${{ matrix.target.runner }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target.triple }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target.triple }}
+
+      - name: Package
+        shell: bash
+        run: |
+          VERSION="${{ steps.tag.outputs.version }}"
+          ARCH="${{ matrix.target.arch }}"
+          mkdir -p dist
+          cp target/${{ matrix.target.triple }}/release/openab.exe dist/
+          cp config.toml.example dist/
+          cd dist && 7z a ../openab-${VERSION}-windows-${ARCH}.zip *
+
+      - name: Upload to release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          VERSION="${{ steps.tag.outputs.version }}"
+          ARCH="${{ matrix.target.arch }}"
+          gh release upload "$TAG" "openab-${VERSION}-windows-${ARCH}.zip" --clobber || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openab-windows-${{ matrix.target.arch }}
+          path: openab-*.zip
+          retention-days: 7
