@@ -1,0 +1,89 @@
+suite: gateway config rendering
+templates:
+  - templates/configmap.yaml
+tests:
+  - it: does not render [gateway] when gateway not configured
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: '\[gateway\]'
+
+  - it: does not render [gateway] when enabled is false
+    set:
+      agents.kiro.gateway.enabled: false
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: '\[gateway\]'
+
+  - it: renders [gateway] when enabled is true with url
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[gateway\]'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'url = "ws://openab-gateway:8080/ws"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'platform = "telegram"'
+
+  - it: fails when enabled is true but url is empty
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: ""
+    asserts:
+      - failedTemplate:
+          errorPattern: "gateway.url is required when gateway.enabled=true"
+
+  - it: renders token placeholder when token is set
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+      agents.kiro.gateway.token: "my-secret"
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'token = "\$\{GATEWAY_WS_TOKEN\}"'
+
+  - it: omits token line when token is empty
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: 'GATEWAY_WS_TOKEN'
+
+  - it: renders bot_username when set
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+      agents.kiro.gateway.botUsername: "my_bot"
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'bot_username = "my_bot"'
+
+  - it: omits bot_username when not set
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: 'bot_username'
+
+  - it: renders custom platform
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+      agents.kiro.gateway.platform: "line"
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'platform = "line"'
