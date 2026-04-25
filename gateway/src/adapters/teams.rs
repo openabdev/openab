@@ -286,6 +286,7 @@ impl TeamsAdapter {
 
         let mut body = serde_json::json!({
             "type": "message",
+            "from": { "id": &self.config.app_id },
             "text": text,
             "textFormat": "markdown",
         });
@@ -329,6 +330,7 @@ impl TeamsAdapter {
 
         let body = serde_json::json!({
             "type": "message",
+            "from": { "id": &self.config.app_id },
             "text": text,
         });
 
