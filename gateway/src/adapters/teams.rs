@@ -275,6 +275,7 @@ impl TeamsAdapter {
         service_url: &str,
         conversation_id: &str,
         text: &str,
+        reply_to_id: Option<&str>,
     ) -> anyhow::Result<String> {
         let token = self.get_token().await?;
         let url = format!(
@@ -283,10 +284,14 @@ impl TeamsAdapter {
             conversation_id
         );
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "type": "message",
             "text": text,
+            "textFormat": "markdown",
         });
+        if let Some(id) = reply_to_id {
+            body["replyToId"] = serde_json::Value::String(id.to_string());
+        }
 
         let resp = self
             .client
@@ -473,10 +478,21 @@ pub async fn handle_reply(
         std::collections::HashMap<String, (String, std::time::Instant)>,
     >,
 ) {
+    // Reactions are not supported on Teams — silently ignore
+    if reply.command.as_deref() == Some("add_reaction")
+        || reply.command.as_deref() == Some("remove_reaction")
+    {
+        return;
+    }
+
     let service_url = {
-        let urls = service_urls.lock().await;
-        match urls.get(&reply.channel.id) {
-            Some((url, _)) => url.clone(),
+        let mut urls = service_urls.lock().await;
+        match urls.get_mut(&reply.channel.id) {
+            Some((url, ts)) => {
+                // Refresh timestamp on reply to prevent TTL expiry during active conversations
+                *ts = std::time::Instant::now();
+                url.clone()
+            }
             None => {
                 error!(conversation = %reply.channel.id, "teams: no service_url for conversation");
                 return;
@@ -484,9 +500,20 @@ pub async fn handle_reply(
         }
     };
 
+    let reply_to_id = if reply.reply_to.is_empty() {
+        None
+    } else {
+        Some(reply.reply_to.as_str())
+    };
+
     info!(conversation = %reply.channel.id, "gateway → teams");
     match teams
-        .send_activity(&service_url, &reply.channel.id, &reply.content.text)
+        .send_activity(
+            &service_url,
+            &reply.channel.id,
+            &reply.content.text,
+            reply_to_id,
+        )
         .await
     {
         Ok(id) => debug!(activity_id = %id, "teams activity sent"),
