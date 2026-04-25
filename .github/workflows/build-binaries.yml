@@ -65,10 +65,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          TAG="${{ steps.tag.outputs.tag }}"
           VERSION="${{ steps.tag.outputs.version }}"
           NAME="openab-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}.${{ matrix.archive }}"
-          gh release upload "$TAG" "$NAME" --clobber || true
+          # Helm release uses openab-X.Y.Z tag, binary release uses vX.Y.Z tag
+          # Try both — one will exist
+          gh release upload "openab-${VERSION}" "$NAME" --clobber 2>/dev/null \
+            || gh release upload "${{ steps.tag.outputs.tag }}" "$NAME" --clobber \
+            || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
