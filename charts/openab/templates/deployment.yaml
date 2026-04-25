@@ -70,6 +70,13 @@ spec:
                   name: {{ include "openab.agentFullname" $d }}
                   key: stt-api-key
             {{- end }}
+            {{- if and ($cfg.gateway).enabled ($cfg.gateway).token }}
+            - name: GATEWAY_WS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: gateway-ws-token
+            {{- end }}
             - name: HOME
               value: {{ $cfg.workingDir | default "/home/agent" }}
             {{- range $k, $v := $cfg.env }}
