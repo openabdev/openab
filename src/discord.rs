@@ -16,7 +16,7 @@ use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Hard cap on consecutive bot messages in a channel or thread.
 /// Prevents runaway loops between multiple bots in "all" mode.
@@ -502,6 +502,7 @@ impl EventHandler for Handler {
 
         // Build extra content blocks from attachments (audio → STT, text → inline, image → encode)
         let mut extra_blocks = Vec::new();
+        let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
         let mut text_file_bytes: u64 = 0;
         let mut text_file_count: u32 = 0;
         const TEXT_TOTAL_CAP: u64 = 1024 * 1024; // 1 MB total for all text file attachments
@@ -512,7 +513,7 @@ impl EventHandler for Handler {
             if media::is_audio_mime(mime) {
                 if self.stt_config.enabled {
                     let mime_clean = mime.split(';').next().unwrap_or(mime).trim();
-                    if let Some(transcript) = media::download_and_transcribe(
+                    match media::download_and_transcribe(
                         &attachment.url,
                         &attachment.filename,
                         mime_clean,
@@ -520,10 +521,17 @@ impl EventHandler for Handler {
                         &self.stt_config,
                         None,
                     ).await {
-                        debug!(filename = %attachment.filename, chars = transcript.len(), "voice transcript injected");
-                        extra_blocks.insert(0, ContentBlock::Text {
-                            text: format!("[Voice message transcript]: {transcript}"),
-                        });
+                        Some(transcript) => {
+                            debug!(filename = %attachment.filename, chars = transcript.len(), "voice transcript injected");
+                            extra_blocks.insert(0, ContentBlock::Text {
+                                text: format!("[Voice message transcript]: {transcript}"),
+                            });
+                            echo_entries.push(crate::stt::EchoEntry::Success(transcript));
+                        }
+                        None => {
+                            warn!(filename = %attachment.filename, "STT failed for voice attachment");
+                            echo_entries.push(crate::stt::EchoEntry::Failed);
+                        }
                     }
                 } else {
                     tracing::warn!(filename = %attachment.filename, "skipping audio attachment (STT disabled)");
@@ -597,7 +605,11 @@ impl EventHandler for Handler {
         };
 
         let router = self.router.clone();
+        let stt_cfg = self.stt_config.clone();
         tokio::spawn(async move {
+            // Best-effort echo before the agent reply so the user can verify STT.
+            crate::stt::post_echo(&adapter, &thread_channel, &trigger_msg, &echo_entries, &stt_cfg).await;
+
             let sender_json = serde_json::to_string(&sender).unwrap();
             if let Err(e) = router
                 .handle_message(&adapter, &thread_channel, &sender_json, &prompt, extra_blocks, &trigger_msg, other_bot_present)

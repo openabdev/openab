@@ -55,6 +55,10 @@ pub struct SttConfig {
     pub model: String,
     #[serde(default = "default_stt_base_url")]
     pub base_url: String,
+    /// Echo the transcribed text back to the thread (no mentions) before
+    /// dispatching the prompt to the agent. Lets users verify STT accuracy.
+    #[serde(default = "default_echo_transcript")]
+    pub echo_transcript: bool,
 }
 
 impl Default for SttConfig {
@@ -64,12 +68,14 @@ impl Default for SttConfig {
             api_key: String::new(),
             model: default_stt_model(),
             base_url: default_stt_base_url(),
+            echo_transcript: default_echo_transcript(),
         }
     }
 }
 
 fn default_stt_model() -> String { "whisper-large-v3-turbo".into() }
 fn default_stt_base_url() -> String { "https://api.groq.com/openai/v1".into() }
+fn default_echo_transcript() -> bool { false }
 
 #[derive(Debug, Deserialize)]
 pub struct DiscordConfig {
@@ -433,5 +439,27 @@ command = "echo"
         let result = load_config_from_url("https://invalid.test.example/config.toml").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("failed to fetch remote config"));
+    }
+
+    #[test]
+    fn stt_echo_transcript_defaults_to_false() {
+        let cfg = SttConfig::default();
+        assert!(!cfg.echo_transcript, "echo_transcript should default to false");
+    }
+
+    #[test]
+    fn stt_echo_transcript_respects_explicit_false() {
+        let toml = r#"
+[agent]
+command = "echo"
+
+[stt]
+enabled = true
+api_key = "test"
+echo_transcript = false
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(cfg.stt.enabled);
+        assert!(!cfg.stt.echo_transcript);
     }
 }

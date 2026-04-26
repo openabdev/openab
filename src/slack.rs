@@ -978,6 +978,7 @@ async fn handle_message(
     const TEXT_FILE_COUNT_CAP: u32 = 5;
 
     let mut extra_blocks = Vec::new();
+    let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
     let mut text_file_bytes: u64 = 0;
     let mut text_file_count: u32 = 0;
 
@@ -996,7 +997,7 @@ async fn handle_message(
 
             if media::is_audio_mime(mimetype) {
                 if stt_config.enabled {
-                    if let Some(transcript) = media::download_and_transcribe(
+                    match media::download_and_transcribe(
                         url,
                         filename,
                         mimetype,
@@ -1004,10 +1005,17 @@ async fn handle_message(
                         stt_config,
                         Some(bot_token),
                     ).await {
-                        debug!(filename, chars = transcript.len(), "voice transcript injected");
-                        extra_blocks.insert(0, ContentBlock::Text {
-                            text: format!("[Voice message transcript]: {transcript}"),
-                        });
+                        Some(transcript) => {
+                            debug!(filename, chars = transcript.len(), "voice transcript injected");
+                            extra_blocks.insert(0, ContentBlock::Text {
+                                text: format!("[Voice message transcript]: {transcript}"),
+                            });
+                            echo_entries.push(crate::stt::EchoEntry::Success(transcript));
+                        }
+                        None => {
+                            warn!(filename, "STT failed for voice attachment");
+                            echo_entries.push(crate::stt::EchoEntry::Failed);
+                        }
                     }
                 } else {
                     debug!(filename, "skipping audio attachment (STT disabled)");
@@ -1122,6 +1130,10 @@ async fn handle_message(
         thread_channel.thread_id.as_deref()
             .is_some_and(|ts| cache.get(ts).is_some_and(|inst| inst.elapsed() < adapter.session_ttl))
     };
+
+    // Best-effort echo before the agent reply so the user can verify STT.
+    crate::stt::post_echo(&adapter_dyn, &thread_channel, &trigger_msg, &echo_entries, stt_config).await;
+
     if let Err(e) = router
         .handle_message(&adapter_dyn, &thread_channel, &sender_json, &prompt, extra_blocks, &trigger_msg, other_bot_present)
         .await

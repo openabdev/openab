@@ -50,6 +50,7 @@ enabled = true                              # default: false
 api_key = "${GROQ_API_KEY}"                 # required for cloud providers
 model = "whisper-large-v3-turbo"            # default
 base_url = "https://api.groq.com/openai/v1" # default
+echo_transcript = true                      # default: false (opt-in)
 ```
 
 | Field | Required | Default | Description |
@@ -58,6 +59,7 @@ base_url = "https://api.groq.com/openai/v1" # default
 | `api_key` | no* | — | API key for the STT provider. *Auto-detected from `GROQ_API_KEY` env var if not set. For local servers, use any non-empty string (e.g. `"not-needed"`). |
 | `model` | no | `whisper-large-v3-turbo` | Whisper model name. Varies by provider. |
 | `base_url` | no | `https://api.groq.com/openai/v1` | OpenAI-compatible API base URL. |
+| `echo_transcript` | no | `false` | When set to `true` and STT runs, post a `> 🎤 <transcript>` message to the thread before the agent reply so users can verify what was heard. Failures show `(transcription failed)` and add a ⚠️ reaction to the original message. |
 
 ## Deployment Options
 
@@ -145,6 +147,13 @@ helm upgrade openab openab/openab \
   --set agents.kiro.stt.apiKey=gsk_xxx \
   --set agents.kiro.stt.model=whisper-large-v3-turbo \
   --set agents.kiro.stt.baseUrl=https://api.groq.com/openai/v1
+```
+
+```bash
+helm upgrade openab openab/openab \
+  --set agents.kiro.stt.enabled=true \
+  --set agents.kiro.stt.apiKey=gsk_xxx \
+  --set agents.kiro.stt.echoTranscript=true    # opt in to transcript echo
 ```
 
 ## Disabling STT

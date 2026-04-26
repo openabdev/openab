@@ -113,6 +113,7 @@ data:
     api_key = "${STT_API_KEY}"
     model = {{ ($cfg.stt).model | default "whisper-large-v3-turbo" | toJson }}
     base_url = {{ ($cfg.stt).baseUrl | default "https://api.groq.com/openai/v1" | toJson }}
+    echo_transcript = {{ if hasKey ($cfg.stt | default dict) "echoTranscript" }}{{ ($cfg.stt).echoTranscript }}{{ else }}false{{ end }}
     {{- end }}
     {{- if ($cfg.gateway).enabled }}
     {{- if not ($cfg.gateway).url }}
