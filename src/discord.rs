@@ -384,8 +384,9 @@ impl EventHandler for Handler {
         // Thread detection: single to_channel() call for both allowed and
         // non-allowed channels. Uses thread_metadata (not parent_id) to
         // identify threads — see detect_thread() doc comments for rationale.
-        let (in_thread, bot_owns_thread) = match msg.channel_id.to_channel(&ctx.http).await {
+        let (in_thread, bot_owns_thread, thread_parent_id) = match msg.channel_id.to_channel(&ctx.http).await {
             Ok(serenity::model::channel::Channel::Guild(gc)) => {
+                let parent = gc.parent_id.map(|id| id.get().to_string());
                 let result = detect_thread(
                     gc.thread_metadata.is_some(),
                     gc.parent_id.map(|id| id.get()),
@@ -404,15 +405,15 @@ impl EventHandler for Handler {
                     bot_owns = ?result.1,
                     "thread check"
                 );
-                (result.0, result.1.unwrap_or(false))
+                (result.0, result.1.unwrap_or(false), if result.0 { parent } else { None })
             }
             Ok(other) => {
                 tracing::debug!(channel_id = %msg.channel_id, kind = ?other, "not a guild thread");
-                (false, false)
+                (false, false, None)
             }
             Err(e) => {
                 tracing::debug!(channel_id = %msg.channel_id, error = %e, "to_channel failed");
-                (false, false)
+                (false, false, None)
             }
         };
 
@@ -495,8 +496,8 @@ impl EventHandler for Handler {
             sender_name: msg.author.name.clone(),
             display_name: display_name.to_string(),
             channel: "discord".into(),
-            channel_id: msg.channel_id.to_string(),
-            thread_id: None,
+            channel_id: thread_parent_id.clone().unwrap_or_else(|| msg.channel_id.to_string()),
+            thread_id: if thread_parent_id.is_some() { Some(msg.channel_id.to_string()) } else { None },
             is_bot: msg.author.bot,
         };
 

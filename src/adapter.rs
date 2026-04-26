@@ -41,7 +41,7 @@ pub struct SenderContext {
     pub channel: String,
     pub channel_id: String,
     /// Thread identifier, if the message is inside a thread.
-    /// Slack: thread_ts. Discord: None (threads are separate channels).
+    /// Slack: thread_ts. Discord: thread channel ID (channel_id holds the parent).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     pub is_bot: bool,
