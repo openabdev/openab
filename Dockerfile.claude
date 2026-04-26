@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 # Without CLAUDE_CODE_EXECUTABLE the adapter uses its own bundled SDK cli.js,
 # ignoring the globally installed claude-code binary (see #418).
 ARG CLAUDE_AGENT_ACP_VERSION=0.29.2
-ARG CLAUDE_CODE_VERSION=2.1.114
+ARG CLAUDE_CODE_VERSION=2.1.116
 RUN npm install -g @agentclientprotocol/claude-agent-acp@${CLAUDE_AGENT_ACP_VERSION} @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} --retry 3
 ENV CLAUDE_CODE_EXECUTABLE=/usr/local/bin/claude
 

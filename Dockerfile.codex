@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 # Pre-install codex-acp and codex CLI globally
 ARG CODEX_ACP_VERSION=0.11.1
-ARG CODEX_VERSION=0.121.0
+ARG CODEX_VERSION=0.125.0
 RUN npm install -g @zed-industries/codex-acp@${CODEX_ACP_VERSION} @openai/codex@${CODEX_VERSION} --retry 3
 
 # Install gh CLI

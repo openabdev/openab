@@ -11,7 +11,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini unzip && rm -rf /var/lib/apt/lists/*
 
 # Install kiro-cli (auto-detect arch, copy binary directly)
-ARG KIRO_CLI_VERSION=2.0.0
+ARG KIRO_CLI_VERSION=2.1.1
 RUN ARCH=$(dpkg --print-architecture) && \
     if [ "$ARCH" = "arm64" ]; then URL="https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/kirocli-aarch64-linux.zip"; \
     else URL="https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/kirocli-x86_64-linux.zip"; fi && \
