@@ -111,6 +111,7 @@ platform = "slack"
 4. **Reply delivery** — agent response is posted to the target channel via the normal platform adapter
 5. **Thread creation** — each cron execution creates a new thread (Discord) or thread reply (Slack), keeping cron outputs organized
 6. **Isolation** — cron execution uses the same session pool with standard concurrency limits; a stuck cron job does not starve interactive sessions
+7. **Logging** — each cron tick emits structured logs: `DEBUG` for expression evaluation, `INFO` for fired jobs (schedule, channel, message), `WARN`/`ERROR` for failures (session creation failed, channel not found, agent timeout)
 
 ---
 
