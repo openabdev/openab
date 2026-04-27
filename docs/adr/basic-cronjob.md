@@ -1,7 +1,7 @@
 # ADR: Basic CronJob Support (Config-Driven Scheduled Messages)
 
 - **Status:** Proposed
-- **Date:** 2026-04-27
+- **Date:** 2026-04-26
 - **Author:** @chaodu-agent
 - **Related:** [K8s CronJob Reference Architecture](../cronjob_k8s_refarch.md)
 
@@ -269,7 +269,7 @@ The schedule field uses standard POSIX cron syntax, compatible with:
 
 - **Version:** 0.1
 - **Changelog:**
-  - 0.1 (2026-04-27): Initial proposed version
+  - 0.1 (2026-04-26): Initial proposed version
 
 ---
 
