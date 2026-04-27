@@ -403,17 +403,45 @@ mod tests {
     }
 
     // --- WhatsAppAdapter trait compliance ---
+    // WhatsAppAdapter requires a live ChildStdin so we can't construct one
+    // in unit tests. Instead we verify the trait contract via a test adapter
+    // (same pattern as adapter.rs::tests::use_streaming_is_required_method).
 
-    #[test]
-    fn adapter_platform_is_whatsapp() {
-        // Verify the platform name used for session key namespacing
-        assert_eq!("whatsapp", "whatsapp"); // compile-time contract
-    }
+    #[tokio::test]
+    async fn adapter_trait_constants() {
+        use tokio::process::Command;
+        let mut child = Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let adapter = WhatsAppAdapter::new(stdin, pending);
 
-    #[test]
-    fn adapter_message_limit() {
-        // WhatsApp has a ~65k char limit but we cap at 4096 for practical use
-        assert_eq!(4096_usize, 4096);
+        assert_eq!(adapter.platform(), "whatsapp");
+        assert_eq!(adapter.message_limit(), 4096);
+        assert!(!adapter.use_streaming(false));
+        assert!(!adapter.use_streaming(true));
+
+        // create_thread returns the same channel (WhatsApp has no threads)
+        let channel = ChannelRef {
+            platform: "whatsapp".into(),
+            channel_id: "test@s.whatsapp.net".into(),
+            thread_id: None,
+            parent_id: None,
+        };
+        let trigger = MessageRef {
+            channel: channel.clone(),
+            message_id: "msg_1".into(),
+        };
+        let result = adapter
+            .create_thread(&channel, &trigger, "title")
+            .await
+            .unwrap();
+        assert_eq!(result.channel_id, channel.channel_id);
+        assert!(result.thread_id.is_none());
+
+        let _ = child.kill().await;
     }
 
     // --- Contact allowlist logic ---

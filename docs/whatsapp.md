@@ -25,6 +25,8 @@ OAB (Rust)
 cd whatsapp && npm install
 ```
 
+This generates `package-lock.json` for reproducible builds. Commit it to your repo if you fork.
+
 ### 2. Add to config.toml
 
 ```toml
