@@ -75,6 +75,12 @@ pub async fn run_scheduler(
     // startup by validate_cronjobs(), so errors here are purely defensive.
     let jobs: Vec<(Schedule, Tz, CronJobConfig)> = cronjobs
         .into_iter()
+        .filter(|job| {
+            if !job.enabled {
+                info!(schedule = %job.schedule, channel = %job.channel, "cronjob disabled, skipping");
+            }
+            job.enabled
+        })
         .filter_map(|job| {
             let schedule = match parse_cron_expr(&job.schedule) {
                 Ok(s) => s,
@@ -349,10 +355,25 @@ message = "hello"
 "#;
         let cfg: CronJobsWrapper = toml::from_str(toml_str).unwrap();
         let job = &cfg.cronjobs[0];
+        assert_eq!(job.enabled, true);
         assert_eq!(job.platform, "discord");
         assert_eq!(job.sender_name, "openab-cron");
         assert_eq!(job.timezone, "UTC");
         assert!(job.thread_id.is_none());
+    }
+
+    #[test]
+    fn cronjob_config_disabled() {
+        let toml_str = r#"
+[[cronjobs]]
+enabled = false
+schedule = "0 9 * * 1-5"
+channel = "123"
+message = "hello"
+"#;
+        let cfg: CronJobsWrapper = toml::from_str(toml_str).unwrap();
+        let job = &cfg.cronjobs[0];
+        assert_eq!(job.enabled, false);
     }
 
     #[test]

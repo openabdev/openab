@@ -110,12 +110,13 @@ error_hold_ms = 2500
 # The agent processes it and replies to the target channel.
 
 # [[cronjobs]]
+# enabled = true                               # optional, default: true
 # schedule = "0 9 * * 1-5"                    # weekdays at 9:00 AM
 # channel = "123456789"                        # target channel/thread ID
 # message = "summarize yesterday's merged PRs" # prompt for the agent
 # platform = "discord"                         # "discord" or "slack"
 # sender_name = "DailyOps"                     # attribution (default: "openab-cron")
-# timezone = "Asia/Taipei"                     # IANA timezone (default: "UTC")
+# timezone = "America/New_York"                     # IANA timezone (default: "UTC")
 # thread_id = ""                               # optional: post to existing thread
 
 # [[cronjobs]]

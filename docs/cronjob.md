@@ -30,23 +30,25 @@ Each `[[cronjobs]]` entry supports these fields:
 
 ```toml
 [[cronjobs]]
+enabled = true                               # optional, default: true
 schedule = "0 9 * * 1-5"                    # required: cron expression
 channel = "123456789012345678"               # required: target channel ID
 message = "summarize yesterday's merged PRs" # required: prompt for the agent
 platform = "discord"                         # optional, default: "discord"
 sender_name = "DailyOps"                     # optional, default: "openab-cron"
-timezone = "Asia/Taipei"                     # optional, default: "UTC"
+timezone = "America/New_York"                     # optional, default: "UTC"
 thread_id = ""                               # optional: post to existing thread
 ```
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
+| `enabled` | | `true` | Set `false` to disable without removing the entry |
 | `schedule` | ✅ | — | 5-field POSIX cron expression |
 | `channel` | ✅ | — | Discord channel/thread ID or Slack channel ID |
 | `message` | ✅ | — | Message sent to the agent as a prompt |
 | `platform` | | `"discord"` | `"discord"` or `"slack"` |
 | `sender_name` | | `"openab-cron"` | Attribution shown in prompt context |
-| `timezone` | | `"UTC"` | IANA timezone (e.g. `"Asia/Taipei"`, `"Europe/Berlin"`) |
+| `timezone` | | `"UTC"` | IANA timezone (e.g. `"America/New_York"`, `"Europe/Berlin"`) |
 | `thread_id` | | — | Post into an existing thread instead of the channel |
 
 ## Cron Expression Format
@@ -82,10 +84,10 @@ By default, schedules are evaluated in UTC. Set `timezone` to any IANA timezone:
 schedule = "0 9 * * 1-5"
 channel = "123456789012345678"
 message = "good morning team, here's today's agenda"
-timezone = "Asia/Taipei"
+timezone = "America/New_York"
 ```
 
-This fires at 09:00 Taipei time (01:00 UTC).
+This fires at 09:00 New York time (13:00 or 14:00 UTC depending on DST).
 
 ## Multiple Jobs
 
@@ -97,7 +99,7 @@ schedule = "0 9 * * 1-5"
 channel = "123456789012345678"
 message = "summarize yesterday's merged PRs"
 sender_name = "DailyOps"
-timezone = "Asia/Taipei"
+timezone = "America/New_York"
 
 [[cronjobs]]
 schedule = "0 0 * * 0"
@@ -126,7 +128,7 @@ agents:
         message: "summarize yesterday's merged PRs"
         platform: "discord"
         senderName: "DailyOps"
-        timezone: "Asia/Taipei"
+        timezone: "America/New_York"
       - schedule: "0 0 * * 0"
         channel: "123456789012345678"
         message: "generate weekly status report"

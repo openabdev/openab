@@ -191,12 +191,13 @@ Scheduled messages — config-driven cron. Each entry sends a message to the age
 
 ```toml
 [[cronjobs]]
+enabled = true                               # optional, default: true
 schedule = "0 9 * * 1-5"                    # cron expression (5-field POSIX)
 channel = "123456789"                        # target channel/thread ID
 message = "summarize yesterday's merged PRs" # message sent to agent
 platform = "discord"                         # optional, default: "discord"
 sender_name = "DailyOps"                     # optional, default: "openab-cron"
-timezone = "Asia/Taipei"                     # optional, default: "UTC"
+timezone = "America/New_York"                     # optional, default: "UTC"
 thread_id = ""                               # optional, post to existing thread
 
 [[cronjobs]]
@@ -209,12 +210,13 @@ timezone = "UTC"
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
+| `enabled` | bool | `true` | Set `false` to disable without removing the entry. |
 | `schedule` | string | *required* | Cron expression (minute, hour, day-of-month, month, day-of-week). |
 | `channel` | string | *required* | Target Discord channel/thread ID or Slack channel ID. |
 | `message` | string | *required* | Message sent to the agent as a prompt. |
 | `platform` | string | `"discord"` | Target platform (`"discord"` or `"slack"`). |
 | `sender_name` | string | `"openab-cron"` | Sender attribution shown in the prompt context. |
-| `timezone` | string | `"UTC"` | IANA timezone for schedule evaluation (e.g. `"Asia/Taipei"`, `"Europe/Berlin"`). |
+| `timezone` | string | `"UTC"` | IANA timezone for schedule evaluation (e.g. `"America/New_York"`, `"Europe/Berlin"`). |
 | `thread_id` | string | `""` | Optional thread ID to post into an existing thread. |
 
 **Cron expression format:**
@@ -274,6 +276,7 @@ Key mapping (`values.yaml` → `config.toml`):
 | `agents.<name>.pool.sessionTtlHours` | `[pool] session_ttl_hours` |
 | `agents.<name>.reactions.enabled` | `[reactions] enabled` |
 | `agents.<name>.stt.apiKey` | `[stt] api_key` |
+| `agents.<name>.cronjobs[].enabled` | `[[cronjobs]] enabled` |
 | `agents.<name>.cronjobs[].schedule` | `[[cronjobs]] schedule` |
 | `agents.<name>.cronjobs[].channel` | `[[cronjobs]] channel` |
 | `agents.<name>.cronjobs[].message` | `[[cronjobs]] message` |

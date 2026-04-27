@@ -203,6 +203,9 @@ pub struct PoolConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CronJobConfig {
+    /// Whether this cronjob is active (default: true)
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     /// Cron expression (5-field POSIX format)
     pub schedule: String,
     /// Target channel ID
