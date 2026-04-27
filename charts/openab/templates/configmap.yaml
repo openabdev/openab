@@ -129,6 +129,19 @@ data:
     bot_username = {{ ($cfg.gateway).botUsername | toJson }}
     {{- end }}
     {{- end }}
+    {{- range ($cfg.cronjobs) }}
+
+    [[cronjobs]]
+    schedule = {{ .schedule | toJson }}
+    channel = {{ .channel | toJson }}
+    message = {{ .message | toJson }}
+    platform = {{ .platform | default "discord" | toJson }}
+    sender_name = {{ .senderName | default "openab-cron" | toJson }}
+    timezone = {{ .timezone | default "UTC" | toJson }}
+    {{- if .threadId }}
+    thread_id = {{ .threadId | toJson }}
+    {{- end }}
+    {{- end }}
   {{- if $cfg.agentsMd }}
   AGENTS.md: |
     {{- $cfg.agentsMd | nindent 4 }}

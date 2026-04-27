@@ -2,6 +2,7 @@ mod acp;
 mod adapter;
 mod bot_turns;
 mod config;
+mod cron;
 mod discord;
 mod error_display;
 mod format;
@@ -122,6 +123,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Spawn Slack adapter (background task)
+    let slack_bot_token = cfg.slack.as_ref().map(|s| (s.bot_token.clone(), s.allow_bot_messages));
     let slack_handle = if let Some(slack_cfg) = cfg.slack {
         let allow_all_channels = config::resolve_allow_all(slack_cfg.allow_all_channels, &slack_cfg.allowed_channels);
         let allow_all_users = config::resolve_allow_all(slack_cfg.allow_all_users, &slack_cfg.allowed_users);
@@ -177,6 +179,31 @@ async fn main() -> anyhow::Result<()> {
             if let Err(e) = gateway::run_gateway_adapter(gw_cfg.url, gw_cfg.platform, gw_cfg.token, gw_cfg.bot_username, router, shutdown_rx).await {
                 error!("gateway adapter error: {e}");
             }
+        }))
+    } else {
+        None
+    };
+
+    // Spawn cron scheduler (background task)
+    let cron_handle = if !cfg.cronjobs.is_empty() {
+        let shutdown_rx = shutdown_rx.clone();
+        let cronjobs = cfg.cronjobs.clone();
+        let cron_router = router.clone();
+        let mut cron_adapters: std::collections::HashMap<String, Arc<dyn adapter::ChatAdapter>> =
+            std::collections::HashMap::new();
+        if let Some(ref dc) = cfg.discord {
+            let http = Arc::new(serenity::http::Http::new(&dc.bot_token));
+            cron_adapters.insert("discord".into(), Arc::new(discord::DiscordAdapter::new(http)));
+        }
+        if let Some((ref token, allow_bots)) = slack_bot_token {
+            let session_ttl = std::time::Duration::from_secs(cfg.pool.session_ttl_hours * 3600);
+            cron_adapters.insert("slack".into(), Arc::new(slack::SlackAdapter::new(
+                token.clone(), session_ttl, allow_bots,
+            )));
+        }
+        info!(count = cronjobs.len(), "starting cron scheduler");
+        Some(tokio::spawn(async move {
+            cron::run_scheduler(cronjobs, cron_router, cron_adapters, shutdown_rx).await;
         }))
     } else {
         None

@@ -98,3 +98,21 @@ stall_soft_ms = 10000
 stall_hard_ms = 30000
 done_hold_ms = 1500
 error_hold_ms = 2500
+
+# --- Scheduled messages (config-driven cron) ---
+# Each entry sends a message to the agent at the specified schedule.
+# The agent processes it and replies to the target channel.
+
+# [[cronjobs]]
+# schedule = "0 9 * * 1-5"                    # weekdays at 9:00 AM
+# channel = "123456789"                        # target channel/thread ID
+# message = "summarize yesterday's merged PRs" # prompt for the agent
+# platform = "discord"                         # "discord" or "slack"
+# sender_name = "DailyOps"                     # attribution (default: "openab-cron")
+# timezone = "Asia/Taipei"                     # IANA timezone (default: "UTC")
+# thread_id = ""                               # optional: post to existing thread
+
+# [[cronjobs]]
+# schedule = "0 0 * * 0"
+# channel = "123456789"
+# message = "generate weekly status report"
