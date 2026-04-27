@@ -1,0 +1,19 @@
+# Dockerfile.whatsapp — Example: extend any OAB image with WhatsApp support
+#
+# Usage:
+#   docker build -f Dockerfile.whatsapp -t openab-whatsapp .
+#
+# This adds the Baileys bridge and its npm dependencies on top of an
+# existing OAB image. Pick whichever base image matches your agent:
+#
+#   --build-arg BASE_IMAGE=ghcr.io/openabdev/openab-claude:latest
+#   --build-arg BASE_IMAGE=ghcr.io/openabdev/openab-codex:latest
+#   --build-arg BASE_IMAGE=ghcr.io/openabdev/openab-gemini:latest
+
+ARG BASE_IMAGE=ghcr.io/openabdev/openab-claude:latest
+FROM ${BASE_IMAGE}
+
+USER root
+COPY whatsapp/ /app/whatsapp/
+RUN cd /app/whatsapp && npm install --production && chown -R node:node /app/whatsapp
+USER node
