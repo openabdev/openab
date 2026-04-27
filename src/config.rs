@@ -26,7 +26,10 @@ impl<'de> Deserialize<'de> for AllowBots {
             "off" | "none" | "false" => Ok(Self::Off),
             "mentions" => Ok(Self::Mentions),
             "all" | "true" => Ok(Self::All),
-            other => Err(serde::de::Error::unknown_variant(other, &["off", "mentions", "all"])),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["off", "mentions", "all"],
+            )),
         }
     }
 }
@@ -69,8 +72,12 @@ impl Default for SttConfig {
     }
 }
 
-fn default_stt_model() -> String { "whisper-large-v3-turbo".into() }
-fn default_stt_base_url() -> String { "https://api.groq.com/openai/v1".into() }
+fn default_stt_model() -> String {
+    "whisper-large-v3-turbo".into()
+}
+fn default_stt_base_url() -> String {
+    "https://api.groq.com/openai/v1".into()
+}
 
 #[derive(Debug, Deserialize)]
 pub struct DiscordConfig {
@@ -102,7 +109,9 @@ pub struct DiscordConfig {
     pub max_bot_turns: u32,
 }
 
-fn default_max_bot_turns() -> u32 { 20 }
+fn default_max_bot_turns() -> u32 {
+    20
+}
 
 /// Controls whether the bot responds to user messages in threads without @mention.
 ///
@@ -127,7 +136,10 @@ impl<'de> Deserialize<'de> for AllowUsers {
             "involved" => Ok(Self::Involved),
             "mentions" => Ok(Self::Mentions),
             "multibot_mentions" => Ok(Self::MultibotMentions),
-            other => Err(serde::de::Error::unknown_variant(other, &["involved", "mentions", "multibot-mentions"])),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["involved", "mentions", "multibot-mentions"],
+            )),
         }
     }
 }
@@ -260,28 +272,63 @@ pub struct ReactionTiming {
 
 // --- defaults ---
 
-fn default_working_dir() -> String { "/tmp".into() }
-fn default_max_sessions() -> usize { 10 }
-fn default_ttl_hours() -> u64 { 4 }
-fn default_true() -> bool { true }
+fn default_working_dir() -> String {
+    "/tmp".into()
+}
+fn default_max_sessions() -> usize {
+    10
+}
+fn default_ttl_hours() -> u64 {
+    4
+}
+fn default_true() -> bool {
+    true
+}
 
-fn emoji_queued() -> String { "👀".into() }
-fn emoji_thinking() -> String { "🤔".into() }
-fn emoji_tool() -> String { "🔥".into() }
-fn emoji_coding() -> String { "👨‍💻".into() }
-fn emoji_web() -> String { "⚡".into() }
-fn emoji_done() -> String { "🆗".into() }
-fn emoji_error() -> String { "😱".into() }
+fn emoji_queued() -> String {
+    "👀".into()
+}
+fn emoji_thinking() -> String {
+    "🤔".into()
+}
+fn emoji_tool() -> String {
+    "🔥".into()
+}
+fn emoji_coding() -> String {
+    "👨‍💻".into()
+}
+fn emoji_web() -> String {
+    "⚡".into()
+}
+fn emoji_done() -> String {
+    "🆗".into()
+}
+fn emoji_error() -> String {
+    "😱".into()
+}
 
-fn default_debounce_ms() -> u64 { 700 }
-fn default_stall_soft_ms() -> u64 { 10_000 }
-fn default_stall_hard_ms() -> u64 { 30_000 }
-fn default_done_hold_ms() -> u64 { 1_500 }
-fn default_error_hold_ms() -> u64 { 2_500 }
+fn default_debounce_ms() -> u64 {
+    700
+}
+fn default_stall_soft_ms() -> u64 {
+    10_000
+}
+fn default_stall_hard_ms() -> u64 {
+    30_000
+}
+fn default_done_hold_ms() -> u64 {
+    1_500
+}
+fn default_error_hold_ms() -> u64 {
+    2_500
+}
 
 impl Default for PoolConfig {
     fn default() -> Self {
-        Self { max_sessions: default_max_sessions(), session_ttl_hours: default_ttl_hours() }
+        Self {
+            max_sessions: default_max_sessions(),
+            session_ttl_hours: default_ttl_hours(),
+        }
     }
 }
 
@@ -299,8 +346,13 @@ impl Default for ReactionsConfig {
 impl Default for ReactionEmojis {
     fn default() -> Self {
         Self {
-            queued: emoji_queued(), thinking: emoji_thinking(), tool: emoji_tool(),
-            coding: emoji_coding(), web: emoji_web(), done: emoji_done(), error: emoji_error(),
+            queued: emoji_queued(),
+            thinking: emoji_thinking(),
+            tool: emoji_tool(),
+            coding: emoji_coding(),
+            web: emoji_web(),
+            done: emoji_done(),
+            error: emoji_error(),
         }
     }
 }
@@ -308,8 +360,10 @@ impl Default for ReactionEmojis {
 impl Default for ReactionTiming {
     fn default() -> Self {
         Self {
-            debounce_ms: default_debounce_ms(), stall_soft_ms: default_stall_soft_ms(),
-            stall_hard_ms: default_stall_hard_ms(), done_hold_ms: default_done_hold_ms(),
+            debounce_ms: default_debounce_ms(),
+            stall_soft_ms: default_stall_soft_ms(),
+            stall_hard_ms: default_stall_hard_ms(),
+            done_hold_ms: default_done_hold_ms(),
             error_hold_ms: default_error_hold_ms(),
         }
     }
@@ -428,7 +482,10 @@ command = "echo"
     fn parse_invalid_toml_returns_error() {
         let result = parse_config("not valid toml {{{}}", "test");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("failed to parse config from test"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("failed to parse config from test"));
     }
 
     #[test]
@@ -450,6 +507,48 @@ command = "echo"
     async fn load_config_from_url_invalid_host() {
         let result = load_config_from_url("https://invalid.test.example/config.toml").await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("failed to fetch remote config"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("failed to fetch remote config"));
+    }
+
+    #[test]
+    fn parse_whatsapp_config() {
+        let toml = r#"
+[whatsapp]
+bridge_script = "whatsapp/baileys-bridge.js"
+session_dir = "/data/wa-session"
+allowed_contacts = ["628111@s.whatsapp.net", "628222@s.whatsapp.net"]
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let wa = cfg.whatsapp.unwrap();
+        assert_eq!(wa.bridge_script, "whatsapp/baileys-bridge.js");
+        assert_eq!(wa.session_dir.as_deref(), Some("/data/wa-session"));
+        assert_eq!(wa.allowed_contacts.len(), 2);
+    }
+
+    #[test]
+    fn parse_whatsapp_config_defaults() {
+        let toml = r#"
+[whatsapp]
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let wa = cfg.whatsapp.unwrap();
+        assert_eq!(wa.bridge_script, "whatsapp/baileys-bridge.js");
+        assert!(wa.session_dir.is_none());
+        assert!(wa.allowed_contacts.is_empty());
+    }
+
+    #[test]
+    fn parse_config_without_whatsapp() {
+        let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
+        assert!(cfg.whatsapp.is_none());
     }
 }
