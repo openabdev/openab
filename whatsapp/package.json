@@ -1,0 +1,10 @@
+{
+  "name": "openab-whatsapp-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Baileys bridge for OpenAB WhatsApp adapter",
+  "dependencies": {
+    "@whiskeysockets/baileys": "6.7.16",
+    "@hapi/boom": "10.0.1"
+  }
+}

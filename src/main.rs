@@ -11,6 +11,7 @@ mod setup;
 mod slack;
 mod stt;
 mod gateway;
+mod whatsapp;
 
 use adapter::AdapterRouter;
 use clap::Parser;
@@ -80,12 +81,13 @@ async fn main() -> anyhow::Result<()> {
         pool_max = cfg.pool.max_sessions,
         discord = cfg.discord.is_some(),
         slack = cfg.slack.is_some(),
+        whatsapp = cfg.whatsapp.is_some(),
         reactions = cfg.reactions.enabled,
         "config loaded"
     );
 
-    if cfg.discord.is_none() && cfg.slack.is_none() && cfg.gateway.is_none() {
-        anyhow::bail!("no adapter configured — add [discord], [slack], and/or [gateway] to config.toml");
+    if cfg.discord.is_none() && cfg.slack.is_none() && cfg.gateway.is_none() && cfg.whatsapp.is_none() {
+        anyhow::bail!("no adapter configured — add [discord], [slack], [gateway], and/or [whatsapp] to config.toml");
     }
 
     let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions));
@@ -182,6 +184,26 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Spawn WhatsApp adapter (background task)
+    let whatsapp_handle = if let Some(wa_cfg) = cfg.whatsapp {
+        let router = router.clone();
+        let shutdown_rx = shutdown_rx.clone();
+        info!(script = %wa_cfg.bridge_script, "starting whatsapp adapter");
+        Some(tokio::spawn(async move {
+            if let Err(e) = whatsapp::run_whatsapp_adapter(
+                wa_cfg.bridge_script,
+                wa_cfg.session_dir,
+                wa_cfg.allowed_contacts,
+                router,
+                shutdown_rx,
+            ).await {
+                error!("whatsapp adapter error: {e}");
+            }
+        }))
+    } else {
+        None
+    };
+
     // Run Discord adapter (foreground, blocking) or wait for ctrl_c
     if let Some(discord_cfg) = cfg.discord {
         let allow_all_channels = config::resolve_allow_all(discord_cfg.allow_all_channels, &discord_cfg.allowed_channels);
@@ -255,6 +277,9 @@ async fn main() -> anyhow::Result<()> {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }
     if let Some(handle) = gateway_handle {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+    if let Some(handle) = whatsapp_handle {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }
     let shutdown_pool = pool;

@@ -36,6 +36,7 @@ pub struct Config {
     pub discord: Option<DiscordConfig>,
     pub slack: Option<SlackConfig>,
     pub gateway: Option<GatewayConfig>,
+    pub whatsapp: Option<WhatsAppConfig>,
     pub agent: AgentConfig,
     #[serde(default)]
     pub pool: PoolConfig,
@@ -175,6 +176,23 @@ pub struct GatewayConfig {
 
 fn default_gateway_platform() -> String {
     "telegram".into()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WhatsAppConfig {
+    /// Path to the baileys-bridge.js script
+    #[serde(default = "default_whatsapp_bridge_script")]
+    pub bridge_script: String,
+    /// Directory for Baileys session persistence
+    pub session_dir: Option<String>,
+    /// Allowed contact JIDs (e.g. "628123456789@s.whatsapp.net").
+    /// Empty = allow all contacts.
+    #[serde(default)]
+    pub allowed_contacts: Vec<String>,
+}
+
+fn default_whatsapp_bridge_script() -> String {
+    "whatsapp/baileys-bridge.js".into()
 }
 
 #[derive(Debug, Deserialize)]
