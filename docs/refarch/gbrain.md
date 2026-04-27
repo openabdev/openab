@@ -80,14 +80,9 @@ The integration is straightforward: each OAB agent pod runs `gbrain serve` as a 
 
 ## Deployment
 
-Two paths depending on where you are with OpenAB.
+Currently, GBrain is set up manually alongside OpenAB. The Helm chart does not include built-in GBrain support yet, but the `extra*` escape hatches make automation possible.
 
-| Path | For whom | Helm changes |
-|------|----------|-------------|
-| **Option A — Manual** | Existing OpenAB users who want GBrain now | None |
-| **Option B — Helm Integrated** | Future official support | New `gbrain.enabled` value |
-
-### Option A — Manual Setup
+### Manual Setup
 
 For existing OpenAB deployments. No Helm changes needed.
 
@@ -140,34 +135,6 @@ For existing OpenAB deployments. No Helm changes needed.
 
 Data lives on PVC — survives pod restarts when `persistence.enabled: true` (OpenAB default).
 
-### Option B — Helm Integrated
+### Future: Helm Integration
 
-> ⚠️ **Future work** — this section describes a target-state design that is not yet implemented. It is included to guide future Helm integration efforts.
-
-Target state: GBrain as a built-in OpenAB Helm component.
-
-```
-values.yaml                          What the chart does
-─────────────                        ──────────────────
-gbrain:                              ┌──────────────────────────────────┐
-  enabled: true          ──────────► │ 1. Deploy gbrain-postgres        │
-                                     │    (Deployment + Svc + PVC +     │
-  postgresql:                        │     Secret, auto-generated pw)   │
-    image: pgvector/pgvector:pg16    │                                  │
-    storage: 5Gi                     │ 2. Inject init container into    │
-                                     │    every agent pod:              │
-  # or use external:                 │    • install gbrain CLI          │
-  # external:                        │    • gbrain init --url $DB_URL   │
-  #   url: "postgresql://..."        │    • write MCP config            │
-                                     │      (auto-detect CLI type)      │
-                                     │                                  │
-                                     │ 3. Inject DATABASE_URL env       │
-                                     │    from secret into agent pods   │
-                                     └──────────────────────────────────┘
-
-MCP config auto-detection:
-  command contains "kiro"    → ~/.kiro/settings/mcp.json
-  command contains "claude"  → ~/.claude/server.json
-  command contains "copilot" → ~/.copilot/mcp-config.json
-  fallback                   → ~/.config/mcp/servers.json
-```
+The OpenAB Helm chart does not have first-class GBrain support today. For advanced users, the chart exposes `extraInitContainers`, `extraVolumes`, and `extraVolumeMounts` per agent — these can be used to automate the manual steps above at the pod level. A dedicated `gbrain.enabled` Helm value may be considered in a future release.
