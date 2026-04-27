@@ -20,6 +20,33 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+/// Wait for SIGINT (ctrl_c) or, on unix, SIGTERM. SIGTERM is what Kubernetes
+/// sends during pod termination, so handling it lets us run the full cleanup
+/// path (shard manager, ACP pool drain) instead of getting SIGKILL'd after the
+/// grace period.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "failed to install SIGTERM handler, falling back to ctrl_c only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => { info!("SIGTERM received"); }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "openab")]
 #[command(about = "Multi-platform ACP agent broker (Discord, Slack)", long_about = None)]
@@ -233,7 +260,7 @@ async fn main() -> anyhow::Result<()> {
         // Graceful Discord shutdown on ctrl_c
         let shard_manager = client.shard_manager.clone();
         tokio::spawn(async move {
-            tokio::signal::ctrl_c().await.ok();
+            shutdown_signal().await;
             info!("shutdown signal received");
             shard_manager.shutdown_all().await;
         });
@@ -241,9 +268,9 @@ async fn main() -> anyhow::Result<()> {
         info!("discord bot running");
         client.start().await?;
     } else {
-        // No Discord — just wait for ctrl_c
+        // No Discord — wait for SIGINT or SIGTERM
         info!("running without discord, press ctrl+c to stop");
-        tokio::signal::ctrl_c().await.ok();
+        shutdown_signal().await;
         info!("shutdown signal received");
     }
 
