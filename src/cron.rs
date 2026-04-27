@@ -27,6 +27,19 @@ pub fn should_fire(schedule: &Schedule, tz: Tz, tick_secs: i64) -> bool {
         .unwrap_or(false)
 }
 
+/// Validate all cronjob configs at startup (fail-fast on bad cron expressions or timezones).
+pub fn validate_cronjobs(cronjobs: &[CronJobConfig]) -> anyhow::Result<()> {
+    for (i, job) in cronjobs.iter().enumerate() {
+        parse_cron_expr(&job.schedule).map_err(|e| {
+            anyhow::anyhow!("cronjobs[{i}]: invalid cron expression {:?}: {e}", job.schedule)
+        })?;
+        job.timezone.parse::<Tz>().map_err(|e| {
+            anyhow::anyhow!("cronjobs[{i}]: invalid timezone {:?}: {e}", job.timezone)
+        })?;
+    }
+    Ok(())
+}
+
 /// Run the internal cron scheduler. Evaluates cron expressions once per minute.
 pub async fn run_scheduler(
     cronjobs: Vec<CronJobConfig>,
@@ -222,6 +235,7 @@ async fn fire_cronjob(
         .await
     {
         error!("cron handle_message error: {e}");
+        let _ = adapter.send_message(&thread_channel, &format!("⚠️ cronjob error: {e}")).await;
     }
 }
 

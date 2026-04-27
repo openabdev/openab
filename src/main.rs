@@ -150,8 +150,20 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Pre-build shared adapters for cron scheduler (avoids duplicate Http clients / rate-limit buckets)
+    let shared_discord_adapter: Option<Arc<dyn adapter::ChatAdapter>> = cfg.discord.as_ref().map(|dc| {
+        let http = Arc::new(serenity::http::Http::new(&dc.bot_token));
+        Arc::new(discord::DiscordAdapter::new(http)) as Arc<dyn adapter::ChatAdapter>
+    });
+    let session_ttl_dur = std::time::Duration::from_secs(ttl_secs);
+    let shared_slack_adapter: Option<Arc<slack::SlackAdapter>> = cfg.slack.as_ref().map(|s| {
+        Arc::new(slack::SlackAdapter::new(s.bot_token.clone(), session_ttl_dur, s.allow_bot_messages))
+    });
+
+    // Validate cronjob config at startup (fail-fast on bad cron expressions or timezones)
+    cron::validate_cronjobs(&cfg.cronjobs)?;
+
     // Spawn Slack adapter (background task)
-    let slack_bot_token = cfg.slack.as_ref().map(|s| (s.bot_token.clone(), s.allow_bot_messages));
     let slack_handle = if let Some(slack_cfg) = cfg.slack {
         let allow_all_channels = config::resolve_allow_all(slack_cfg.allow_all_channels, &slack_cfg.allowed_channels);
         let allow_all_users = config::resolve_allow_all(slack_cfg.allow_all_users, &slack_cfg.allowed_users);
@@ -169,12 +181,12 @@ async fn main() -> anyhow::Result<()> {
         );
         let router = router.clone();
         let stt = cfg.stt.clone();
-        let session_ttl = std::time::Duration::from_secs(ttl_secs);
         let max_bot_turns = slack_cfg.max_bot_turns;
         let slack_shutdown_rx = shutdown_rx.clone();
+        let adapter = shared_slack_adapter.clone().expect("shared_slack_adapter must exist when slack config is present");
         Some(tokio::spawn(async move {
             if let Err(e) = slack::run_slack_adapter(
-                slack_cfg.bot_token,
+                adapter,
                 slack_cfg.app_token,
                 allow_all_channels,
                 allow_all_users,
@@ -184,7 +196,6 @@ async fn main() -> anyhow::Result<()> {
                 slack_cfg.trusted_bot_ids.into_iter().collect(),
                 slack_cfg.allow_user_messages,
                 max_bot_turns,
-                session_ttl,
                 stt,
                 router,
                 slack_shutdown_rx,
@@ -212,22 +223,18 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Spawn cron scheduler (background task)
+    // Spawn cron scheduler (background task) — reuses shared adapters
     let cron_handle = if !cfg.cronjobs.is_empty() {
         let shutdown_rx = shutdown_rx.clone();
         let cronjobs = cfg.cronjobs.clone();
         let cron_router = router.clone();
         let mut cron_adapters: std::collections::HashMap<String, Arc<dyn adapter::ChatAdapter>> =
             std::collections::HashMap::new();
-        if let Some(ref dc) = cfg.discord {
-            let http = Arc::new(serenity::http::Http::new(&dc.bot_token));
-            cron_adapters.insert("discord".into(), Arc::new(discord::DiscordAdapter::new(http)));
+        if let Some(ref a) = shared_discord_adapter {
+            cron_adapters.insert("discord".into(), a.clone());
         }
-        if let Some((ref token, allow_bots)) = slack_bot_token {
-            let session_ttl = std::time::Duration::from_secs(cfg.pool.session_ttl_hours * 3600);
-            cron_adapters.insert("slack".into(), Arc::new(slack::SlackAdapter::new(
-                token.clone(), session_ttl, allow_bots,
-            )));
+        if let Some(ref a) = shared_slack_adapter {
+            cron_adapters.insert("slack".into(), a.clone() as Arc<dyn adapter::ChatAdapter>);
         }
         info!(count = cronjobs.len(), "starting cron scheduler");
         Some(tokio::spawn(async move {
