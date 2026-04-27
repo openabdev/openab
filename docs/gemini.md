@@ -26,7 +26,7 @@ helm install openab openab/openab \
 
 > Set `agents.kiro.enabled=false` to disable the default Kiro agent.
 > 
-> `agents.gemini.args='{--acp}'` could be `{--model,gemini-3-pro-preview,--acp}` if specific model is required. Otherwise, it will be 'Auto (Gemini 3)'. 
+>  (Optional)`agents.gemini.args='{--acp}'` could be modified as `{--model,gemini-3-pro-preview,--acp}` if specific model is required. Otherwise, the defalut value will be 'Auto (Gemini 3)'.
 
 ## Manual config.toml
 
