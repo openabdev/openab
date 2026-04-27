@@ -35,6 +35,12 @@ impl DiscordAdapter {
     pub fn new(http: Arc<Http>) -> Self {
         Self { http }
     }
+
+    /// Resolve the effective Discord channel ID from a ChannelRef.
+    /// Discord threads are channels, so prefer thread_id when set.
+    fn resolve_channel(channel: &ChannelRef) -> &str {
+        channel.thread_id.as_deref().unwrap_or(&channel.channel_id)
+    }
 }
 
 #[async_trait]
@@ -48,9 +54,7 @@ impl ChatAdapter for DiscordAdapter {
     }
 
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> anyhow::Result<MessageRef> {
-        // Discord threads are channels, so prefer thread_id when set
-        let target = channel.thread_id.as_deref().unwrap_or(&channel.channel_id);
-        let ch_id: u64 = target.parse()?;
+        let ch_id: u64 = Self::resolve_channel(channel).parse()?;
         let msg = ChannelId::new(ch_id).say(&self.http, content).await?;
         Ok(MessageRef {
             channel: channel.clone(),
@@ -59,7 +63,7 @@ impl ChatAdapter for DiscordAdapter {
     }
 
     async fn edit_message(&self, msg: &MessageRef, content: &str) -> anyhow::Result<()> {
-        let ch_id: u64 = msg.channel.channel_id.parse()?;
+        let ch_id: u64 = Self::resolve_channel(&msg.channel).parse()?;
         let msg_id: u64 = msg.message_id.parse()?;
         ChannelId::new(ch_id)
             .edit_message(
@@ -99,7 +103,7 @@ impl ChatAdapter for DiscordAdapter {
     }
 
     async fn add_reaction(&self, msg: &MessageRef, emoji: &str) -> anyhow::Result<()> {
-        let ch_id: u64 = msg.channel.channel_id.parse()?;
+        let ch_id: u64 = Self::resolve_channel(&msg.channel).parse()?;
         let msg_id: u64 = msg.message_id.parse()?;
         self.http
             .create_reaction(
@@ -112,7 +116,7 @@ impl ChatAdapter for DiscordAdapter {
     }
 
     async fn remove_reaction(&self, msg: &MessageRef, emoji: &str) -> anyhow::Result<()> {
-        let ch_id: u64 = msg.channel.channel_id.parse()?;
+        let ch_id: u64 = Self::resolve_channel(&msg.channel).parse()?;
         let msg_id: u64 = msg.message_id.parse()?;
         self.http
             .delete_reaction_me(
@@ -1425,5 +1429,29 @@ mod tests {
     fn discord_no_stream_when_other_bot_present() {
         let adapter = super::DiscordAdapter::new(Arc::new(super::Http::new("")));
         assert!(!adapter.use_streaming(true));
+    }
+
+    // --- resolve_channel tests ---
+
+    #[test]
+    fn resolve_channel_uses_channel_id_when_no_thread() {
+        let ch = ChannelRef {
+            platform: "discord".into(),
+            channel_id: "111".into(),
+            thread_id: None,
+            parent_id: None,
+        };
+        assert_eq!(DiscordAdapter::resolve_channel(&ch), "111");
+    }
+
+    #[test]
+    fn resolve_channel_prefers_thread_id_when_set() {
+        let ch = ChannelRef {
+            platform: "discord".into(),
+            channel_id: "111".into(),
+            thread_id: Some("222".into()),
+            parent_id: None,
+        };
+        assert_eq!(DiscordAdapter::resolve_channel(&ch), "222");
     }
 }
