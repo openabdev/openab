@@ -12,6 +12,11 @@
 // Outbound (Rust → stdin):
 //   { "action": "send",   "to": "...", "text": "...", "ack_id": "..." }
 
+// Polyfill: Baileys 6.x requires global crypto (Node.js 19+)
+if (!globalThis.crypto) {
+  globalThis.crypto = require('crypto').webcrypto;
+}
+
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const { Boom } = require('@hapi/boom');
@@ -29,7 +34,7 @@ function emit(type, data) {
   process.stdout.write(JSON.stringify({ type, data }) + '\n');
 }
 
-async function connect() {
+async function connect(version) {
   // Clean up previous socket if any
   if (currentSock) {
     currentSock.ev.removeAllListeners();
@@ -37,7 +42,6 @@ async function connect() {
   }
 
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-  const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
     version,
@@ -58,9 +62,11 @@ async function connect() {
         emit('ready', { id: me?.id || '', name: me?.name || '' });
       }
       if (connection === 'close') {
-        const code = (lastDisconnect?.error instanceof Boom)
-          ? lastDisconnect.error.output.statusCode
+        const err = lastDisconnect?.error;
+        const code = (err instanceof Boom)
+          ? err.output.statusCode
           : 0;
+        if (err) process.stderr.write(`bridge close: ${err.message} (code=${code})\n`);
         if (code === DisconnectReason.loggedOut) {
           emit('close', { reason: 'logged_out' });
           process.exit(1);
@@ -127,9 +133,16 @@ rl.on('close', () => {
 
 // Main loop with reconnect
 (async () => {
+  let version;
+  try {
+    ({ version } = await fetchLatestBaileysVersion());
+  } catch (e) {
+    version = [2, 3000, 1035194821]; // fallback
+    process.stderr.write(`bridge: fetchLatestBaileysVersion failed, using fallback: ${e.message}\n`);
+  }
   while (true) {
     try {
-      const result = await connect();
+      const result = await connect(version);
       if (result === 'reconnect') {
         await new Promise((r) => setTimeout(r, RECONNECT_MS));
       }
