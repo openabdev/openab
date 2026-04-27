@@ -126,7 +126,11 @@ impl AdapterRouter {
         trigger_msg: &MessageRef,
         other_bot_present: bool,
     ) -> Result<()> {
-        tracing::debug!(platform = adapter.platform(), "processing message");
+        tracing::debug!(
+            adapter_platform = adapter.platform(),
+            channel_platform = %thread_channel.platform,
+            "processing message"
+        );
 
         // Build content blocks: sender context + prompt text, then extra (images, transcripts)
         let prompt_with_sender = format!(
@@ -381,21 +385,44 @@ impl AdapterRouter {
                     };
 
                     let chunks = format::split_message(&final_content, message_limit);
+                    let mut send_attempts = 0usize;
+                    let mut send_failures = 0usize;
+                    let mut last_send_error: Option<anyhow::Error> = None;
                     if let Some(msg) = placeholder_msg {
                         // Streaming: edit first chunk into placeholder, send rest as new messages
                         if let Some(first) = chunks.first() {
-                            let _ = adapter.edit_message(&msg, first).await;
+                            send_attempts += 1;
+                            if let Err(e) = adapter.edit_message(&msg, first).await {
+                                tracing::warn!(error = %e, "edit_message failed");
+                                send_failures += 1;
+                                last_send_error = Some(e);
+                            }
                         }
                         for chunk in chunks.iter().skip(1) {
-                            let _ = adapter.send_message(&thread_channel, chunk).await;
+                            send_attempts += 1;
+                            if let Err(e) = adapter.send_message(&thread_channel, chunk).await {
+                                tracing::warn!(error = %e, "send_message failed");
+                                send_failures += 1;
+                                last_send_error = Some(e);
+                            }
                         }
                     } else {
                         // Send-once: all chunks as new messages
                         for chunk in &chunks {
-                            let _ = adapter.send_message(&thread_channel, chunk).await;
+                            send_attempts += 1;
+                            if let Err(e) = adapter.send_message(&thread_channel, chunk).await {
+                                tracing::warn!(error = %e, "send_message failed");
+                                send_failures += 1;
+                                last_send_error = Some(e);
+                            }
                         }
                     }
 
+                    // If every send attempt failed, surface as error so reactions/error path runs
+                    if send_attempts > 0 && send_failures == send_attempts {
+                        return Err(last_send_error
+                            .unwrap_or_else(|| anyhow::anyhow!("all reply chunks failed to send")));
+                    }
                     Ok(())
                 })
             })

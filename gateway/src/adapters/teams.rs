@@ -23,6 +23,7 @@ pub struct Activity {
     pub conversation: Option<ConversationAccount>,
     pub text: Option<String>,
     pub tenant: Option<TenantInfo>,
+    pub channel_data: Option<ChannelData>,
 }
 
 #[allow(dead_code)]
@@ -41,12 +42,40 @@ pub struct ConversationAccount {
     pub id: Option<String>,
     pub conversation_type: Option<String>,
     pub is_group: Option<bool>,
+    pub tenant_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TenantInfo {
     pub id: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelData {
+    pub tenant: Option<TenantInfo>,
+}
+
+impl Activity {
+    /// Resolve tenant id from any of the locations Teams may put it.
+    pub fn resolved_tenant_id(&self) -> Option<&str> {
+        self.tenant
+            .as_ref()
+            .and_then(|t| t.id.as_deref())
+            .or_else(|| {
+                self.channel_data
+                    .as_ref()
+                    .and_then(|c| c.tenant.as_ref())
+                    .and_then(|t| t.id.as_deref())
+            })
+            .or_else(|| {
+                self.conversation
+                    .as_ref()
+                    .and_then(|c| c.tenant_id.as_deref())
+            })
+    }
 }
 
 // --- OpenID configuration ---
@@ -263,9 +292,7 @@ impl TeamsAdapter {
             return true;
         }
         activity
-            .tenant
-            .as_ref()
-            .and_then(|t| t.id.as_deref())
+            .resolved_tenant_id()
             .is_some_and(|tid| self.config.allowed_tenants.iter().any(|a| a == tid))
     }
 
@@ -399,11 +426,7 @@ pub async fn webhook(
 
     // Tenant check
     if !teams.check_tenant(&activity) {
-        let tid = activity
-            .tenant
-            .as_ref()
-            .and_then(|t| t.id.as_deref())
-            .unwrap_or("unknown");
+        let tid = activity.resolved_tenant_id().unwrap_or("unknown");
         warn!(tenant = tid, "teams: tenant not in allowlist");
         return StatusCode::FORBIDDEN;
     }
@@ -461,9 +484,12 @@ pub async fn webhook(
     );
 
     let json = serde_json::to_string(&event).unwrap();
+    let tenant_id = activity.resolved_tenant_id().unwrap_or("");
     info!(
         conversation = conversation_id,
         sender = sender_name,
+        tenant = tenant_id,
+        service_url = service_url,
         "teams → gateway"
     );
     let _ = state.event_tx.send(json);
@@ -575,6 +601,7 @@ mod tests {
             tenant: tenant_id.map(|id| TenantInfo {
                 id: Some(id.into()),
             }),
+            channel_data: None,
         }
     }
 
@@ -611,6 +638,47 @@ mod tests {
         let adapter = TeamsAdapter::new(make_config(vec![]));
         let activity = make_activity_with_tenant(None);
         assert!(adapter.check_tenant(&activity));
+    }
+
+    // --- resolved_tenant_id ---
+
+    #[test]
+    fn resolved_tenant_falls_back_to_channel_data() {
+        // Teams personal/channel webhooks put tenant in channelData, not top-level
+        let json = r#"{
+            "type": "message",
+            "channelData": {"tenant": {"id": "from-channel-data"}}
+        }"#;
+        let activity: Activity = serde_json::from_str(json).unwrap();
+        assert_eq!(activity.resolved_tenant_id(), Some("from-channel-data"));
+    }
+
+    #[test]
+    fn resolved_tenant_prefers_top_level_over_channel_data() {
+        let json = r#"{
+            "type": "message",
+            "tenant": {"id": "top-level"},
+            "channelData": {"tenant": {"id": "from-channel-data"}}
+        }"#;
+        let activity: Activity = serde_json::from_str(json).unwrap();
+        assert_eq!(activity.resolved_tenant_id(), Some("top-level"));
+    }
+
+    #[test]
+    fn resolved_tenant_falls_back_to_conversation_tenant_id() {
+        let json = r#"{
+            "type": "message",
+            "conversation": {"id": "c1", "tenantId": "from-conversation"}
+        }"#;
+        let activity: Activity = serde_json::from_str(json).unwrap();
+        assert_eq!(activity.resolved_tenant_id(), Some("from-conversation"));
+    }
+
+    #[test]
+    fn resolved_tenant_returns_none_when_absent() {
+        let json = r#"{"type": "message"}"#;
+        let activity: Activity = serde_json::from_str(json).unwrap();
+        assert_eq!(activity.resolved_tenant_id(), None);
     }
 
     // --- validate_jwt error paths ---

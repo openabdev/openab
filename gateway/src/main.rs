@@ -92,7 +92,14 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                 }
 
                 match serde_json::from_str::<GatewayReply>(&*text) {
-                    Ok(reply) => match reply.platform.as_str() {
+                    Ok(reply) => {
+                        info!(
+                            platform = %reply.platform,
+                            channel = %reply.channel.id,
+                            command = ?reply.command.as_deref(),
+                            "OAB → gateway reply"
+                        );
+                        match reply.platform.as_str() {
                         "telegram" => {
                             if let Some(ref token) = state_for_recv.telegram_bot_token {
                                 adapters::telegram::handle_reply(
@@ -127,7 +134,8 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                             }
                         }
                         other => warn!(platform = other, "unknown reply platform"),
-                    },
+                        }
+                    }
                     Err(e) => warn!("invalid reply from OAB: {e}"),
                 }
             }

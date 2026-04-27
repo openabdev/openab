@@ -153,6 +153,12 @@ impl ChatAdapter for GatewayAdapter {
             request_id: None,
         };
         let json = serde_json::to_string(&reply)?;
+        info!(
+            platform = %channel.platform,
+            channel = %channel.channel_id,
+            bytes = json.len(),
+            "sending reply to gateway"
+        );
         self.ws_tx.lock().await.send(Message::Text(json)).await?;
         Ok(MessageRef {
             channel: channel.clone(),

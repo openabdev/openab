@@ -3,6 +3,10 @@ config.toml
 *.swp
 .DS_Store
 .env
+.env.example
+docker-compose.yaml
+config.toml.compose
 .kiro/
 CLAUDE.md
 gateway/target/
+data/**/*

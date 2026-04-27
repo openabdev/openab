@@ -11,7 +11,7 @@ LINE      ──POST──▶│                     │
 GitHub    ──POST──▶│   Custom Gateway    │◀──WebSocket── OAB Pod
 CI/CD     ──POST──▶│     :8080           │   (OAB connects out)
 curl/cron ──POST──▶│                     │
-                    └─────────────────────┘
+                   └─────────────────────┘
 
 Discord  ◀──WebSocket── OAB Pod  (unchanged, direct)
 Slack    ◀──WebSocket── OAB Pod  (unchanged, direct)
