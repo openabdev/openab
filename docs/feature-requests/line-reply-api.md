@@ -55,11 +55,11 @@ returns `reply_to: "evt_..."` in every `GatewayReply`.
    generated `event_id`, with a TTL of 50 seconds (conservative
    margin within LINE's 1-minute limit).
 
-2. **Zero core modification (Stateful Auto-fill)**: 
-   While the original proposal assumed OAB core sends `reply_to`, current observation shows `reply_to` is often empty in standard `send_message` calls. To maintain "Zero Core Modification", the gateway now implements a **Per-Client Last Event Tracker**:
-   - The gateway tracks the most recent `event_id` sent to each connected OAB client.
-   - When a reply arrives with an empty `reply_to`, the gateway automatically injects the last tracked `event_id` for that client before performing the cache lookup.
-   - This ensures the Reply API works seamlessly even with legacy or unmodified OAB versions.
+2. **Zero core modification**: OAB core is not modified. If OAB sends
+   a `reply_to` matching a cached `event_id`, the gateway uses the
+   Reply API. If `reply_to` is empty or not found in the cache, the
+   gateway falls back to the Push API. No auto-fill or inference is
+   performed — the gateway never guesses which event a reply belongs to.
 
 3. **Hybrid dispatch** (in the reply handler, ~line 537-551):
    - Look up `reply.reply_to` in the token cache.
@@ -70,7 +70,8 @@ returns `reply_to: "evt_..."` in every `GatewayReply`.
      logic, consumes quota).
 
 4. **Cache cleanup**: A background `tokio::spawn` task sweeps expired
-   entries every 60 seconds to prevent memory growth.
+   entries using the same `REPLY_TOKEN_TTL_SECS` constant to prevent
+   memory growth.
 
 ### Alignment with Existing Architecture
 
