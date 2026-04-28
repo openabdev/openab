@@ -227,8 +227,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Spawn cron scheduler (background task) — reuses shared adapters
-    let usercron_path = if cfg.usercron_enabled {
-        cfg.usercron_path.as_ref().map(|p| {
+    let usercron_path = if cfg.cron.usercron_enabled {
+        cfg.cron.usercron_path.as_ref().map(|p| {
             let path = std::path::PathBuf::from(p);
             if path.is_absolute() {
                 path

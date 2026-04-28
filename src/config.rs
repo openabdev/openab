@@ -48,12 +48,17 @@ pub struct Config {
     pub markdown: MarkdownConfig,
     #[serde(default)]
     pub cronjobs: Vec<CronJobConfig>,
-    /// Path to an external cronjob.toml for hot-reloadable user-managed schedules.
-    /// The scheduler checks this file every tick and reloads when modified.
-    pub usercron_path: Option<String>,
+    #[serde(default)]
+    pub cron: CronConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CronConfig {
     /// Enable usercron hot-reload (default: false). Must be explicitly set to true.
     #[serde(default)]
     pub usercron_enabled: bool,
+    /// Path to an external cronjob.toml for hot-reloadable user-managed schedules.
+    pub usercron_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

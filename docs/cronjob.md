@@ -149,6 +149,7 @@ Cronjobs defined in `config.toml` require a redeploy to change. **Usercron** let
 Add to your `config.toml`:
 
 ```toml
+[cron]
 usercron_enabled = true
 usercron_path = "cronjob.toml"
 ```
@@ -166,12 +167,12 @@ command = "kiro-cli"
 args = ["acp", "--trust-all-tools"]
 working_dir = "/home/agent"
 
-# Usercron: agent-managed schedules
+[cron]
 usercron_enabled = true
 usercron_path = "cronjob.toml"    # → $HOME/cronjob.toml
 ```
 
-> Note: `usercron_enabled` and `usercron_path` are **top-level** fields, not nested under `[agent]`. They appear after `[agent]` but belong to the root config scope.
+> Note: `usercron_enabled` and `usercron_path` live under the `[cron]` section. `[[cronjobs]]` remains a separate top-level array for baseline jobs.
 
 The path is relative to `$HOME` (e.g. `"cronjob.toml"` resolves to `$HOME/cronjob.toml`). Absolute paths are used as-is. The scheduler starts watching immediately, even if the file doesn't exist yet.
 
@@ -201,14 +202,15 @@ timezone = "Asia/Taipei"
 ```
                          config.toml                        $HOME/cronjob.toml
                     ┌──────────────────┐                 ┌──────────────────────┐
-                    │ usercron_enabled  │                 │ [[cronjobs]]         │
-                    │   = true         │                 │ schedule = "* * * *" │
-                    │ usercron_path    │                 │ channel  = "123..."  │
-                    │   = "cronjob.toml│"                │ message  = "ping"    │
-                    │                  │                 └──────────┬───────────┘
-                    │ [[cronjobs]]     │                            │
-                    │ (baseline jobs)  │                   Agent writes here
-                    └────────┬─────────┘                   anytime (mobile/CLI)
+                    │ [cron]           │                 │ [[cronjobs]]         │
+                    │ usercron_enabled │                 │ schedule = "* * * *" │
+                    │   = true         │                 │ channel  = "123..."  │
+                    │ usercron_path    │                 │ message  = "ping"    │
+                    │   = "cronjob.toml│"                └──────────┬───────────┘
+                    │                  │                            │
+                    │ [[cronjobs]]     │                   Agent writes here
+                    │ (baseline jobs)  │                   anytime (mobile/CLI)
+                    └────────┬─────────┘                           │
                              │                                     │
                     ┌────────▼─────────┐                           │
                     │  OAB Scheduler   │◄──────────────────────────┘
@@ -250,6 +252,8 @@ Mount `cronjob.toml` on a PVC so it persists across pod restarts, and set `userc
 
 ```toml
 # config.toml
+[cron]
+usercron_enabled = true
 # Relative to $HOME — resolves to $HOME/cronjob.toml
 usercron_path = "cronjob.toml"
 ```

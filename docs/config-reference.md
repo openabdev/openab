@@ -239,11 +239,12 @@ timezone = "UTC"
 
 ---
 
-## Usercron (Hot-Reload)
+## `[cron]` — Usercron (Hot-Reload)
 
 Optional hot-reloadable cronjob file. Disabled by default. When enabled, the scheduler watches an external `cronjob.toml` and reloads it automatically when modified — no restart needed.
 
 ```toml
+[cron]
 usercron_enabled = true          # default: false — must explicitly enable
 usercron_path = "cronjob.toml"   # relative to $HOME, or absolute path
 ```

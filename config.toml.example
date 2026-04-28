@@ -112,6 +112,7 @@ error_hold_ms = 2500
 # Hot-reload: point to an external cronjob.toml that can be modified at runtime.
 # The scheduler checks this file every minute and reloads when it changes.
 # Disabled by default — must explicitly enable.
+# [cron]
 # usercron_enabled = true
 # usercron_path = "cronjob.toml"
 
