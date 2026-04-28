@@ -149,8 +149,11 @@ Cronjobs defined in `config.toml` require a redeploy to change. **Usercron** let
 Add to your `config.toml`:
 
 ```toml
+usercron_enabled = true
 usercron_path = "cronjob.toml"
 ```
+
+Usercron is **disabled by default**. Both fields are required to activate it.
 
 The path is relative to `$HOME` (e.g. `"cronjob.toml"` resolves to `$HOME/cronjob.toml`). Absolute paths are used as-is. The scheduler starts watching immediately, even if the file doesn't exist yet.
 

@@ -51,6 +51,9 @@ pub struct Config {
     /// Path to an external cronjob.toml for hot-reloadable user-managed schedules.
     /// The scheduler checks this file every tick and reloads when modified.
     pub usercron_path: Option<String>,
+    /// Enable usercron hot-reload (default: false). Must be explicitly set to true.
+    #[serde(default)]
+    pub usercron_enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
