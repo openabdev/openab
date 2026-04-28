@@ -227,7 +227,9 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Spawn cron scheduler (background task) — reuses shared adapters
-    let cron_handle = if !cfg.cronjobs.is_empty() {
+    let usercron_path = cfg.usercron_path.as_ref().map(std::path::PathBuf::from);
+    let has_cron_work = !cfg.cronjobs.is_empty() || usercron_path.is_some();
+    let cron_handle = if has_cron_work {
         let shutdown_rx = shutdown_rx.clone();
         let cronjobs = cfg.cronjobs.clone();
         let cron_router = router.clone();
@@ -239,9 +241,10 @@ async fn main() -> anyhow::Result<()> {
         if let Some(ref a) = shared_slack_adapter {
             cron_adapters.insert("slack".into(), a.clone() as Arc<dyn adapter::ChatAdapter>);
         }
-        info!(count = cronjobs.len(), "starting cron scheduler");
+        let cron_platforms: Vec<String> = configured_platforms.iter().map(|s| s.to_string()).collect();
+        info!(baseline = cronjobs.len(), usercron = ?usercron_path, "starting cron scheduler");
         Some(tokio::spawn(async move {
-            cron::run_scheduler(cronjobs, cron_router, cron_adapters, shutdown_rx).await;
+            cron::run_scheduler(cronjobs, usercron_path, cron_platforms, cron_router, cron_adapters, shutdown_rx).await;
         }))
     } else {
         None

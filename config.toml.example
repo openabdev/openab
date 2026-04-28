@@ -109,6 +109,10 @@ error_hold_ms = 2500
 # Each entry sends a message to the agent at the specified schedule.
 # The agent processes it and replies to the target channel.
 
+# Hot-reload: point to an external cronjob.toml that can be modified at runtime.
+# The scheduler checks this file every minute and reloads when it changes.
+# usercron_path = "cronjob.toml"
+
 # [[cronjobs]]
 # enabled = true                               # optional, default: true
 # schedule = "0 9 * * 1-5"                    # weekdays at 9:00 AM

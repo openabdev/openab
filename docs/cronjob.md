@@ -140,6 +140,75 @@ agents:
 >   --set-string agents.kiro.cronjobs[0].channel="123456789012345678"
 > ```
 
+## Usercron — Hot-Reload with `cronjob.toml`
+
+Cronjobs defined in `config.toml` require a redeploy to change. **Usercron** lets you manage schedules in a separate `cronjob.toml` file that the scheduler hot-reloads automatically — no restart needed.
+
+### Enable Usercron
+
+Add to your `config.toml`:
+
+```toml
+usercron_path = "cronjob.toml"
+```
+
+The path is relative to the working directory (or absolute). The scheduler starts watching immediately, even if the file doesn't exist yet.
+
+### Create `cronjob.toml`
+
+Same `[[cronjobs]]` format as `config.toml`:
+
+```toml
+[[cronjobs]]
+schedule = "* * * * *"
+channel = "1490282656913559673"
+message = "ping"
+platform = "discord"
+sender_name = "usercron"
+timezone = "Asia/Taipei"
+
+[[cronjobs]]
+schedule = "0 9 * * 1-5"
+channel = "1490282656913559673"
+message = "summarize yesterday's merged PRs"
+sender_name = "DailyOps"
+timezone = "Asia/Taipei"
+```
+
+### How It Works
+
+1. Every scheduler tick (~1 minute), the file's modification time is checked
+2. If the file changed → re-parse and replace the dynamic job list
+3. `config.toml` cronjobs are the **immutable baseline**; `cronjob.toml` jobs are the **dynamic overlay**
+4. Invalid TOML or bad entries are logged and skipped — baseline jobs are never affected
+5. Deleting the file removes all dynamic jobs (baseline jobs continue)
+
+### Agent-Managed Schedules
+
+Because `cronjob.toml` is a plain file, your agent can write to it directly:
+
+```
+User: set up a cronjob that pings me every minute
+Agent: ✅ Written to cronjob.toml, takes effect within 1 minute
+```
+
+This enables mobile-friendly schedule management — talk to your agent from your phone, and it updates the cron file for you.
+
+### Kubernetes Deployment
+
+Mount `cronjob.toml` on a PVC so it persists across pod restarts:
+
+```yaml
+# values.yaml
+persistence:
+  enabled: true
+
+agents:
+  kiro:
+    env:
+      USERCRON_PATH: /data/cronjob.toml
+```
+
 ## Behaviors
 
 - **Minute-aligned**: The scheduler aligns to minute boundaries (`:00`), so `0 9 * * *` fires at exactly 09:00:00, not at whatever second the process started.
@@ -181,3 +250,5 @@ See [Kubernetes CronJob Reference Architecture](cronjob_k8s_refarch.md) for the 
 | Wrong time | Timezone mismatch | Set `timezone` explicitly (default is UTC) |
 | Job skipped | Previous execution still running | Check logs for `skipping cronjob, previous execution still running` |
 | Channel not found | Bot not in channel | Invite the bot to the target channel |
+| Usercron not reloading | File not saved / wrong path | Check logs for `usercron file changed, reloading` |
+| Usercron parse error | Invalid TOML syntax | Check logs for `failed to parse usercron file` |
