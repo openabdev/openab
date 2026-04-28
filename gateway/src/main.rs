@@ -136,6 +136,10 @@ type ReplyTokenCache = Arc<std::sync::Mutex<std::collections::HashMap<String, (S
 /// LINE tokens are valid for ~1 minute; we use 50s as a conservative margin.
 const REPLY_TOKEN_TTL_SECS: u64 = 50;
 
+/// Maximum number of cached reply tokens. Prevents unbounded memory growth
+/// if webhooks arrive faster than OAB can reply (e.g. OAB offline, spam burst).
+const REPLY_TOKEN_CACHE_MAX: usize = 10_000;
+
 struct AppState {
     bot_token: String,
     secret_token: Option<String>,
@@ -348,9 +352,13 @@ async fn line_webhook(
 
         // Cache the reply token for hybrid Reply/Push dispatch
         if let Some(ref reply_token) = event.reply_token {
-            let mut cache = state.reply_token_cache.lock().unwrap();
-            cache.insert(event_id.clone(), (reply_token.clone(), Instant::now()));
-            info!(event_id = %event_id, "cached LINE replyToken");
+            let mut cache = state.reply_token_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.len() >= REPLY_TOKEN_CACHE_MAX {
+                warn!(size = cache.len(), "reply token cache full, skipping insert");
+            } else {
+                cache.insert(event_id.clone(), (reply_token.clone(), Instant::now()));
+                info!(event_id = %event_id, "cached LINE replyToken");
+            }
         }
 
         let gateway_event = GatewayEvent {
@@ -562,7 +570,7 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                             if let Some(ref access_token) = line_access_token {
                                 // Extract token from cache (drop lock before HTTP call)
                                 let cached_token = {
-                                    let mut cache = reply_cache.lock().unwrap();
+                                    let mut cache = reply_cache.lock().unwrap_or_else(|e| e.into_inner());
                                     cache
                                         .remove(&reply.reply_to)
                                         .and_then(|(token, cached_at)| {
@@ -602,8 +610,8 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                                             // in the error body for token-specific failures.
                                             let body_lower = body.to_lowercase();
                                             let token_unusable = status.as_u16() == 400
-                                                && (body_lower.contains("invalid")
-                                                    && body_lower.contains("reply token")
+                                                && ((body_lower.contains("invalid")
+                                                    && body_lower.contains("reply token"))
                                                     || body_lower.contains("expired"));
                                             if token_unusable {
                                                 warn!(status = %status, body = %body, "LINE reply token unusable, falling back to Push");
@@ -718,7 +726,7 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(REPLY_TOKEN_TTL_SECS)).await;
-                let mut cache = cache_state.reply_token_cache.lock().unwrap();
+                let mut cache = cache_state.reply_token_cache.lock().unwrap_or_else(|e| e.into_inner());
                 let before = cache.len();
                 cache.retain(|_, (_, t)| t.elapsed().as_secs() < REPLY_TOKEN_TTL_SECS);
                 let after = cache.len();
