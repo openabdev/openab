@@ -1,8 +1,8 @@
 # ADR: LINE Messaging API Adapter
 
-- **Status:** Proposed
-- **Date:** 2026-04-22
-- **Author:** @chaodu-agent
+- **Status:** Accepted
+- **Date:** 2026-04-28
+- **Author:** @chaodu-agent, @iamninihuang
 
 ---
 
@@ -102,6 +102,43 @@ LINE is not ideal when:
    - Room    → line:{roomId}
 6. Message is routed to AdapterRouter → ACP Session Pool → kiro-cli process
 7. Agent response is sent back via LINE Reply API (free) or Push Message API (fallback)
+```
+
+### Hybrid Reply/Push Dispatch Flow
+
+```
+LINE User                    Gateway                         OAB Core
+   │                            │                               │
+   │  message + replyToken      │                               │
+   │ ─────────────────────────▶ │                               │
+   │                            │  1. Verify HMAC signature     │
+   │                            │  2. Generate event_id (UUID)  │
+   │                            │  3. Cache:                    │
+   │                            │     event_id → replyToken     │
+   │                            │     (TTL 50s, max 10k)        │
+   │                            │                               │
+   │                            │  GatewayEvent { event_id }    │
+   │                            │ ─────────────────────────────▶│
+   │                            │                               │  Store event_id in
+   │                            │                               │  ChannelRef.origin_event_id
+   │                            │                               │
+   │                            │                               │  Agent processes...
+   │                            │                               │
+   │                            │  GatewayReply {               │
+   │                            │    reply_to: event_id         │
+   │                            │  }                            │
+   │                            │ ◀─────────────────────────────│
+   │                            │                               │
+   │                            │  4. Lookup cache(event_id)    │
+   │                            │     ├─ HIT + fresh            │
+   │     Reply API (FREE) ✅    │     │  → Reply API            │
+   │ ◀──────────────────────────│     │                         │
+   │                            │     ├─ HIT + expired          │
+   │     Push API (quota) 💰    │     │  → Push API fallback    │
+   │ ◀──────────────────────────│     │                         │
+   │                            │     └─ MISS                   │
+   │     Push API (quota) 💰    │        → Push API fallback    │
+   │ ◀──────────────────────────│                               │
 ```
 
 ### Reply Strategy: Hybrid Reply/Push Messages
@@ -417,8 +454,9 @@ To ensure this ADR is followed in implementation and future changes:
 
 ## Notes
 
-- **Version:** 0.1
+- **Version:** 0.2
 - **Changelog:**
+  - 0.2 (2026-04-28): Hybrid Reply/Push strategy implemented (#608). Updated status to Accepted. Added dispatch flow diagram. Reply strategy section rewritten from Push-only to hybrid. Core propagates `event_id` via `ChannelRef.origin_event_id` (#619).
   - 0.1 (2026-04-22): Initial proposed version
 
 ---
