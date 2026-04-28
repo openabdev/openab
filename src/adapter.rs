@@ -565,4 +565,66 @@ mod tests {
         // Verify the method is callable and returns the declared value
         assert!(!adapter.use_streaming(false));
     }
+
+    #[test]
+    fn origin_event_id_excluded_from_eq() {
+        let a = ChannelRef {
+            platform: "line".into(),
+            channel_id: "U123".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: Some("evt_aaa".into()),
+        };
+        let b = ChannelRef {
+            platform: "line".into(),
+            channel_id: "U123".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: Some("evt_bbb".into()),
+        };
+        assert_eq!(a, b, "same channel with different event IDs must be equal");
+    }
+
+    #[test]
+    fn origin_event_id_excluded_from_hash() {
+        use std::collections::HashMap;
+        let a = ChannelRef {
+            platform: "line".into(),
+            channel_id: "U123".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: Some("evt_aaa".into()),
+        };
+        let b = ChannelRef {
+            platform: "line".into(),
+            channel_id: "U123".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: Some("evt_bbb".into()),
+        };
+        let mut map = HashMap::new();
+        map.insert(a, "first");
+        // b should hit the same bucket and overwrite
+        map.insert(b, "second");
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.values().next(), Some(&"second"));
+    }
+
+    #[test]
+    fn origin_event_id_survives_clone() {
+        let ch = ChannelRef {
+            platform: "line".into(),
+            channel_id: "U123".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: Some("evt_abc".into()),
+        };
+        // Simulates create_thread propagation: clone preserves origin_event_id
+        let thread_ch = ChannelRef {
+            thread_id: Some("topic_1".into()),
+            origin_event_id: ch.origin_event_id.clone(),
+            ..ch.clone()
+        };
+        assert_eq!(thread_ch.origin_event_id.as_deref(), Some("evt_abc"));
+    }
 }
