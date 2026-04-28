@@ -22,7 +22,7 @@ use crate::reactions::StatusReactionController;
 /// Compare with `SenderContext`, which is **metadata for the agent**: there
 /// `channel_id` is the parent channel and `thread_id` is the thread,
 /// matching Slack's model for cross-platform consistency.
-#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ChannelRef {
     pub platform: String,
     pub channel_id: String,
@@ -33,7 +33,29 @@ pub struct ChannelRef {
     pub parent_id: Option<String>,
     /// Originating gateway event ID, propagated back in `GatewayReply.reply_to`
     /// so the gateway can correlate replies with inbound events (e.g. LINE reply tokens).
+    /// Excluded from Hash/Eq — two ChannelRefs pointing to the same channel are
+    /// equal regardless of which event they originated from.
     pub origin_event_id: Option<String>,
+}
+
+impl PartialEq for ChannelRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.platform == other.platform
+            && self.channel_id == other.channel_id
+            && self.thread_id == other.thread_id
+            && self.parent_id == other.parent_id
+    }
+}
+
+impl Eq for ChannelRef {}
+
+impl std::hash::Hash for ChannelRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.platform.hash(state);
+        self.channel_id.hash(state);
+        self.thread_id.hash(state);
+        self.parent_id.hash(state);
+    }
 }
 
 /// Identifies a message across platforms.
