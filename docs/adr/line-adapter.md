@@ -111,10 +111,10 @@ LINE offers two reply mechanisms:
 - **Push message**: no time limit, can send to any user/group at any time (consumes quota).
 
 Historically, OpenAB relied solely on **push messages** because agent processing can exceed the 1-minute reply token window. To optimize costs for free-tier accounts, OpenAB now uses a **Hybrid Strategy** implemented at the gateway level:
-1. The gateway caches incoming `replyToken`s for 50 seconds.
-2. It tracks the last `event_id` sent to each OAB client to auto-fill the `reply_to` context.
-3. If an agent replies within the window, the gateway intercepts and routes it via the free **Reply API**.
-4. If the token is expired or missing, it gracefully falls back to the **Push API**.
+1. The gateway caches incoming `replyToken`s keyed by `event_id` with a 50-second TTL.
+2. When OAB replies with a non-empty `reply_to` that matches a cached entry, the gateway routes the message via the free **Reply API**.
+3. If the token is expired, missing, or `reply_to` is empty, the gateway falls back to the **Push API**.
+4. A background task sweeps expired cache entries to prevent memory growth.
 ---
 
 ## 3. Architectural Differences from Discord/Slack
