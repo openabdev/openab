@@ -410,7 +410,7 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
 
     info!("OAB client connected via WebSocket");
 
-    let last_event_id = Arc::new(Mutex::new(None));
+    let last_event_id: Arc<Mutex<std::collections::HashMap<String, String>>> = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
     // Forward gateway events → OAB
     let last_event_id_for_send = last_event_id.clone();
@@ -420,9 +420,9 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                 Ok(event_json) = event_rx.recv() => {
                     // Track the last event ID sent to this client
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&event_json) {
-                        if let Some(eid) = v["event_id"].as_str() {
+                        if let (Some(eid), Some(cid)) = (v["event_id"].as_str(), v["channel"]["id"].as_str()) {
                             let mut last = last_event_id_for_send.lock().await;
-                            *last = Some(eid.to_string());
+                            last.insert(cid.to_string(), eid.to_string());
                         }
                     }
 
@@ -452,7 +452,7 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                         // Auto-fill reply_to if empty using the last event sent to this client
                         if reply.reply_to.is_empty() {
                             let last = last_event_id_for_recv.lock().await;
-                            if let Some(ref eid) = *last {
+                            if let Some(eid) = last.get(&reply.channel.id) {
                                 reply.reply_to = eid.clone();
                             }
                         }
