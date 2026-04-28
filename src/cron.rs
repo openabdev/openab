@@ -231,24 +231,6 @@ async fn fire_cronjob(
         parent_id: None,
     };
 
-    let sender = SenderContext {
-        schema: "openab.sender.v1".into(),
-        sender_id: "openab-cron".into(),
-        sender_name: job.sender_name.clone(),
-        display_name: job.sender_name.clone(),
-        channel: job.platform.clone(),
-        channel_id: job.channel.clone(),
-        thread_id: job.thread_id.clone(),
-        is_bot: true,
-    };
-    let sender_json = match serde_json::to_string(&sender) {
-        Ok(j) => j,
-        Err(e) => {
-            warn!(error = %e, "failed to serialize cron sender context, skipping");
-            return;
-        }
-    };
-
     // Send visible message first so users see what triggered
     let trigger_msg = match adapter.send_message(&thread_channel, &format!("🕐 [{}]: {}", job.sender_name, job.message)).await {
         Ok(msg) => msg,
@@ -258,18 +240,38 @@ async fn fire_cronjob(
         }
     };
 
-    // Create a thread from the trigger message (matches normal Discord flow)
-    let thread_name = format::shorten_thread_name(&job.message);
+    // Mirrors get_or_create_thread() in discord.rs
     let reply_channel = if job.thread_id.is_some() {
         // Already targeting an existing thread, no need to create one
         thread_channel.clone()
     } else {
+        let thread_name = format::shorten_thread_name(&job.message);
         match adapter.create_thread(&thread_channel, &trigger_msg, &thread_name).await {
             Ok(ch) => ch,
             Err(e) => {
                 error!(channel = %job.channel, error = %e, "failed to create cron thread");
+                let _ = adapter.send_message(&thread_channel, &format!("⚠️ cronjob: failed to create thread: {e}")).await;
                 return;
             }
+        }
+    };
+
+    // Build sender context after reply_channel is known so thread_id is accurate
+    let sender = SenderContext {
+        schema: "openab.sender.v1".into(),
+        sender_id: "openab-cron".into(),
+        sender_name: job.sender_name.clone(),
+        display_name: job.sender_name.clone(),
+        channel: job.platform.clone(),
+        channel_id: reply_channel.parent_id.as_deref().unwrap_or(&reply_channel.channel_id).to_string(),
+        thread_id: reply_channel.thread_id.clone().or(Some(reply_channel.channel_id.clone())),
+        is_bot: true,
+    };
+    let sender_json = match serde_json::to_string(&sender) {
+        Ok(j) => j,
+        Err(e) => {
+            warn!(error = %e, "failed to serialize cron sender context, skipping");
+            return;
         }
     };
 
