@@ -589,11 +589,11 @@ thread_id = "789"
         // and fire_cronjob sends an error message to the thread channel.
         // The error message should go to the thread (reply_channel), not the parent.
         let error_msg = calls.iter().find(|c| matches!(c, MockCall::SendMessage { content, .. } if content.contains("⚠️ cronjob error")));
+        assert!(error_msg.is_some(), "expected error reply to be sent to thread");
         if let Some(MockCall::SendMessage { channel, .. }) = error_msg {
             // reply_channel should be the thread, not the parent
             assert_eq!(channel.channel_id, "thread-99");
             assert_eq!(channel.parent_id.as_deref(), Some("ch-100"));
         }
-        // If handle_message somehow succeeds (unlikely), that's fine too
     }
 }
