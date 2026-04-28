@@ -137,6 +137,12 @@ agents:
       allowBotMessages: "off"
       # trustedBotIds: []  # empty = any bot (mode permitting); set to restrict
       trustedBotIds: []
+      # maxBotTurns: soft cap on consecutive bot turns per thread before
+      # the bot stops auto-replying. A human message resets the counter.
+      # Default 20 (Rust-side `default_max_bot_turns()`). Raise for long
+      # multi-agent collaborations; lower to throttle runaway loops more
+      # aggressively. Hard cap remains 100 regardless (compiled-in).
+      # maxBotTurns: 20
     slack:
       enabled: false
       botToken: ""       # Bot User OAuth Token (xoxb-...)
@@ -155,6 +161,12 @@ agents:
       #                      only when another bot has also posted in the thread
       #                      (recommended for multi-bot deployments)
       allowUserMessages: "involved"
+      # maxBotTurns: soft cap on consecutive bot turns per thread before
+      # the bot stops auto-replying. A human message resets the counter.
+      # Default 20 (Rust-side `default_max_bot_turns()`). Raise for long
+      # multi-agent collaborations; lower to throttle runaway loops more
+      # aggressively. Hard cap remains 100 regardless (compiled-in).
+      # maxBotTurns: 20
     workingDir: /home/agent
     env: {}
     envFrom: []
