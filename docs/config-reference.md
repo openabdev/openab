@@ -239,6 +239,24 @@ timezone = "UTC"
 
 ---
 
+## Usercron (Hot-Reload)
+
+Optional hot-reloadable cronjob file. Disabled by default. When enabled, the scheduler watches an external `cronjob.toml` and reloads it automatically when modified — no restart needed.
+
+```toml
+usercron_enabled = true          # default: false — must explicitly enable
+usercron_path = "cronjob.toml"   # relative to $HOME, or absolute path
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `usercron_enabled` | bool | `false` | Enable usercron hot-reload. Must be explicitly set to `true`. |
+| `usercron_path` | string | — | Path to the external `cronjob.toml`. Relative paths resolve from `$HOME`. |
+
+The external `cronjob.toml` uses the same `[[cronjobs]]` format as above. See [Usercron docs](cronjob.md#usercron--hot-reload-with-cronjobtoml) for details.
+
+---
+
 ## Customizing via Helm
 
 When deploying with the Helm chart (`charts/openab`), the `config.toml` is generated from `values.yaml`. Each agent is defined under the `agents` map:
