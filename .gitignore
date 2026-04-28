@@ -3,7 +3,6 @@ config.toml
 *.swp
 .DS_Store
 .env
-secrets.env
 .kiro/
 CLAUDE.md
 gateway/target/
