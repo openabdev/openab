@@ -126,3 +126,16 @@ error_hold_ms = 2500
 # schedule = "0 0 * * 0"
 # channel = "123456789"
 # message = "generate weekly status report"
+
+# --- Outbound file attachments (agent → chat) ---
+# When enabled, agents that include `![alt](/path/to/file)` markdown in
+# their replies will have the file uploaded as a native chat attachment.
+#
+# Security: only files under ~/.oab/outgoing/ are permitted. The agent
+# must explicitly copy files there before referencing them.
+#
+# [outbound]
+# enabled = false                        # opt-in, disabled by default
+# max_file_size_mb = 25                  # 25 MB matches Discord's limit
+# max_per_message = 10                   # per agent response
+# max_per_minute_per_channel = 30        # sliding window flood guard

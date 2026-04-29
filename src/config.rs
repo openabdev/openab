@@ -48,7 +48,60 @@ pub struct Config {
     pub markdown: MarkdownConfig,
     #[serde(default)]
     pub cron: CronConfig,
+    #[serde(default)]
+    pub outbound: OutboundConfig,
 }
+
+/// Controls outbound file attachments — the `![alt](/path)` markdown marker
+/// in agent responses that instructs the bot to upload a local file as a
+/// native chat attachment. Disabled by default; operators must explicitly
+/// opt in because this opens a path from the host filesystem to the chat
+/// channel.
+///
+/// Security: only files under `~/.oab/outgoing/` are permitted. The agent
+/// must explicitly copy files there before referencing them. This eliminates
+/// path traversal and symlink escape risks by design.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OutboundConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_outbound_max_size_mb")]
+    pub max_file_size_mb: u64,
+    #[serde(default = "default_outbound_max_per_message")]
+    pub max_per_message: usize,
+    #[serde(default = "default_outbound_max_per_minute")]
+    pub max_per_minute_per_channel: usize,
+}
+
+impl Default for OutboundConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_file_size_mb: default_outbound_max_size_mb(),
+            max_per_message: default_outbound_max_per_message(),
+            max_per_minute_per_channel: default_outbound_max_per_minute(),
+        }
+    }
+}
+
+impl OutboundConfig {
+    pub fn max_size_bytes(&self) -> u64 {
+        self.max_file_size_mb.saturating_mul(1024 * 1024)
+    }
+
+    /// The single hardcoded outgoing directory. Agents must copy files here.
+    pub fn outgoing_dir() -> std::path::PathBuf {
+        std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+            .join(".oab")
+            .join("outgoing")
+    }
+}
+
+fn default_outbound_max_size_mb() -> u64 { 25 }
+fn default_outbound_max_per_message() -> usize { 10 }
+fn default_outbound_max_per_minute() -> usize { 30 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct CronConfig {

@@ -5,10 +5,11 @@ use std::sync::Arc;
 use tracing::error;
 
 use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
-use crate::config::ReactionsConfig;
+use crate::config::{OutboundConfig, ReactionsConfig};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
 use crate::markdown::{self, TableMode};
+use crate::outbound_rate::OutboundRateLimiter;
 use crate::reactions::StatusReactionController;
 
 // --- Platform-agnostic types ---
@@ -130,6 +131,16 @@ pub trait ChatAdapter: Send + Sync + 'static {
     /// not be detected until the next message. This is acceptable: the first
     /// response may stream, but subsequent ones will correctly use send-once.
     fn use_streaming(&self, other_bot_present: bool) -> bool;
+
+    /// Upload file attachments as follow-up messages. Default no-op so
+    /// adapters that don't support native file upload silently drop.
+    async fn send_file_attachments(
+        &self,
+        _channel: &ChannelRef,
+        _paths: &[std::path::PathBuf],
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 // --- AdapterRouter ---
@@ -140,14 +151,18 @@ pub struct AdapterRouter {
     pool: Arc<SessionPool>,
     reactions_config: ReactionsConfig,
     table_mode: TableMode,
+    outbound_config: OutboundConfig,
+    outbound_rate: Arc<OutboundRateLimiter>,
 }
 
 impl AdapterRouter {
-    pub fn new(pool: Arc<SessionPool>, reactions_config: ReactionsConfig, table_mode: TableMode) -> Self {
+    pub fn new(pool: Arc<SessionPool>, reactions_config: ReactionsConfig, table_mode: TableMode, outbound_config: OutboundConfig) -> Self {
         Self {
             pool,
             reactions_config,
             table_mode,
+            outbound_config,
+            outbound_rate: Arc::new(OutboundRateLimiter::new()),
         }
     }
 
@@ -274,6 +289,10 @@ impl AdapterRouter {
         let message_limit = adapter.message_limit();
         let streaming = adapter.use_streaming(other_bot_present);
         let table_mode = self.table_mode;
+        let outbound_cfg = self.outbound_config.clone();
+        let outbound_rate = Arc::clone(&self.outbound_rate);
+        let outbound_channel_key =
+            format!("{}:{}", adapter.platform(), &thread_channel.channel_id);
 
         self.pool
             .with_connection(thread_key, |conn| {
@@ -426,6 +445,29 @@ impl AdapterRouter {
                     };
 
                     let final_content = markdown::convert_tables(&final_content, table_mode);
+
+                    // Extract outbound `![alt](/path)` attachment markers.
+                    // No-op when `outbound.enabled` is false (the default).
+                    let (final_content, mut outbound_paths) =
+                        crate::media::extract_outbound_attachments(&final_content, &outbound_cfg);
+
+                    if !outbound_paths.is_empty() && outbound_cfg.enabled {
+                        let grant = outbound_rate.admit(
+                            &outbound_channel_key,
+                            outbound_paths.len(),
+                            outbound_cfg.max_per_minute_per_channel,
+                        );
+                        if grant < outbound_paths.len() {
+                            tracing::warn!(
+                                channel = outbound_channel_key,
+                                requested = outbound_paths.len(),
+                                granted = grant,
+                                "outbound: rate-limit hit, dropping excess"
+                            );
+                            outbound_paths.truncate(grant);
+                        }
+                    }
+
                     let chunks = format::split_message(&final_content, message_limit);
                     if let Some(msg) = placeholder_msg {
                         // Streaming: edit first chunk into placeholder, send rest as new messages
@@ -439,6 +481,15 @@ impl AdapterRouter {
                         // Send-once: all chunks as new messages
                         for chunk in &chunks {
                             let _ = adapter.send_message(&thread_channel, chunk).await;
+                        }
+                    }
+
+                    if !outbound_paths.is_empty() {
+                        if let Err(e) = adapter
+                            .send_file_attachments(&thread_channel, &outbound_paths)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "outbound: send_file_attachments failed");
                         }
                     }
 
