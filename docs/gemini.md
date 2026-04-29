@@ -15,6 +15,7 @@ The image installs `@google/gemini-cli` globally via npm.
 ```bash
 helm install openab openab/openab \
   --set agents.kiro.enabled=false \
+  --set agents.gemini.discord.enabled=true \
   --set agents.gemini.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.gemini.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
   --set agents.gemini.image=ghcr.io/openabdev/openab-gemini:latest \
@@ -24,6 +25,8 @@ helm install openab openab/openab \
 ```
 
 > Set `agents.kiro.enabled=false` to disable the default Kiro agent.
+> 
+>  (Optional)`agents.gemini.args='{--acp}'` could be modified as `{--model,gemini-3-pro-preview,--acp}` if specific model is required. Otherwise, the defalut value will be 'Auto (Gemini 3)'.
 
 ## Manual config.toml
 
