@@ -74,6 +74,8 @@ working_dir = "/home/agent"
 # args = ["acp", "--model", "auto", "--workspace", "/home/agent"]
 # working_dir = "/home/agent"
 # env = {}  # Auth via: kubectl exec -it <pod> -- cursor-agent login
+# # `--model auto` is load-bearing: omitting it routes all traffic through
+# # composer-2 regardless of /models selections.
 
 [pool]
 max_sessions = 10

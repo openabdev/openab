@@ -7,7 +7,7 @@ use crate::format;
 use crate::media;
 use async_trait::async_trait;
 use std::sync::LazyLock;
-use serenity::builder::{CreateActionRow, CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditMessage};
+use serenity::builder::{CreateActionRow, CreateCommand, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditInteractionResponse, EditMessage};
 use serenity::http::Http;
 use serenity::model::application::{ComponentInteractionDataKind, Interaction};
 use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, ReactionType};
@@ -667,9 +667,24 @@ impl EventHandler for Handler {
 impl Handler {
     /// Build a Discord select menu from ACP configOptions with the given category.
     fn build_config_select(options: &[ConfigOption], category: &str) -> Option<CreateSelectMenu> {
-        let opt = options.iter().find(|o| o.category.as_deref() == Some(category))?;
-        let menu_options: Vec<CreateSelectMenuOption> = opt
-            .options
+        const DISCORD_SELECT_MAX: usize = 25;
+
+        // `agent` and `mode` are aliases — kiro-cli uses "agent", cursor-agent uses "mode".
+        let aliases: &[&str] = match category {
+            "agent" => &["agent", "mode"],
+            "mode" => &["mode", "agent"],
+            _ => &[],
+        };
+        let opt = options.iter().find(|o| {
+            let c = o.category.as_deref().unwrap_or("");
+            c == category || aliases.contains(&c)
+        })?;
+
+        // Discord caps StringSelectMenu at 25 options; truncate in order.
+        let selected: Vec<&crate::acp::protocol::ConfigOptionValue> =
+            opt.options.iter().take(DISCORD_SELECT_MAX).collect();
+
+        let menu_options: Vec<CreateSelectMenuOption> = selected
             .iter()
             .map(|o| {
                 let mut item = CreateSelectMenuOption::new(&o.name, &o.value);
@@ -706,26 +721,42 @@ impl Handler {
         category: &str,
         label: &str,
     ) {
+        // Defer to buy time for the potential cold-start session spawn below.
+        if let Err(e) = cmd.defer_ephemeral(&ctx.http).await {
+            tracing::error!(error = %e, category, "failed to defer /{category}");
+            return;
+        }
+
         let thread_key = format!("discord:{}", cmd.channel_id.get());
+
+        // Pre-flight: ensure an active connection (and therefore cached
+        // configOptions) exists. Handles both missing-session (user hasn't
+        // @mentioned) and evicted-session (pool evicted to `suspended`).
+        if let Err(e) = self.router.pool().get_or_create(&thread_key).await {
+            tracing::error!(error = %e, category, "get_or_create failed in /{category}");
+            let _ = cmd
+                .edit_response(
+                    &ctx.http,
+                    EditInteractionResponse::new()
+                        .content(format!("❌ Cannot start agent session: {e}")),
+                )
+                .await;
+            return;
+        }
+
         let config_options = self.router.pool().get_config_options(&thread_key).await;
         let select = Self::build_config_select(&config_options, category);
 
-        let response = match select {
-            Some(menu) => CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content(format!("🔧 Select a {label}:"))
-                    .components(vec![CreateActionRow::SelectMenu(menu)])
-                    .ephemeral(true),
-            ),
-            None => CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content(format!("⚠️ No {label} options available. Start a conversation first by @mentioning the bot."))
-                    .ephemeral(true),
-            ),
+        let edit = match select {
+            Some(menu) => EditInteractionResponse::new()
+                .content(format!("🔧 Select a {label}:"))
+                .components(vec![CreateActionRow::SelectMenu(menu)]),
+            None => EditInteractionResponse::new()
+                .content(format!("⚠️ No {label} options available from the agent.")),
         };
 
-        if let Err(e) = cmd.create_response(&ctx.http, response).await {
-            tracing::error!(error = %e, category, "failed to respond to slash command");
+        if let Err(e) = cmd.edit_response(&ctx.http, edit).await {
+            tracing::error!(error = %e, category, "failed to edit /{category} response");
         }
     }
 
@@ -734,19 +765,23 @@ impl Handler {
         ctx: &Context,
         cmd: &serenity::model::application::CommandInteraction,
     ) {
+        if let Err(e) = cmd.defer_ephemeral(&ctx.http).await {
+            tracing::error!(error = %e, "failed to defer /cancel");
+            return;
+        }
+
         let thread_key = format!("discord:{}", cmd.channel_id.get());
         let result = self.router.pool().cancel_session(&thread_key).await;
-
         let msg = match result {
             Ok(()) => "🛑 Cancel signal sent.".to_string(),
             Err(e) => format!("⚠️ {e}"),
         };
 
-        let response = CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new().content(msg).ephemeral(true),
-        );
-        if let Err(e) = cmd.create_response(&ctx.http, response).await {
-            tracing::error!(error = %e, "failed to respond to /cancel command");
+        if let Err(e) = cmd
+            .edit_response(&ctx.http, EditInteractionResponse::new().content(msg))
+            .await
+        {
+            tracing::error!(error = %e, "failed to edit /cancel response");
         }
     }
 
@@ -776,37 +811,66 @@ impl Handler {
             _ => return,
         };
 
-        let thread_key = format!("discord:{}", comp.channel_id.get());
+        // Defer the update so we have budget for set_config_option + probe.
+        if let Err(e) = comp.defer(&ctx.http).await {
+            tracing::error!(error = %e, "failed to defer config select");
+            return;
+        }
 
-        let result = self
-            .router
-            .pool()
+        let thread_key = format!("discord:{}", comp.channel_id.get());
+        let pool = self.router.pool();
+
+        // A select can only come from an ephemeral message we already shipped,
+        // which required an active session. But the pool could have evicted it
+        // between the two interactions — re-run get_or_create to be safe.
+        if let Err(e) = pool.get_or_create(&thread_key).await {
+            tracing::error!(error = %e, "get_or_create failed in config select");
+            let _ = comp
+                .edit_response(
+                    &ctx.http,
+                    EditInteractionResponse::new()
+                        .content(format!("❌ Cannot start agent session: {e}"))
+                        .components(vec![]),
+                )
+                .await;
+            return;
+        }
+
+        let set_result = pool
             .set_config_option(&thread_key, &config_id, &selected_value)
             .await;
 
-        let response_msg = match result {
-            Ok(updated_options) => {
-                let display_name = updated_options
-                    .iter()
-                    .find(|o| o.id == config_id)
-                    .and_then(|o| o.options.iter().find(|v| v.value == selected_value))
-                    .map(|v| v.name.as_str())
-                    .unwrap_or(&selected_value);
-                format!("✅ Switched to **{}**", display_name)
-            }
+        let updated_options = match set_result {
+            Ok(opts) => opts,
             Err(e) => {
                 tracing::error!(error = %e, "failed to set config option");
-                format!("❌ Failed to switch: {}", e)
+                let _ = comp
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new()
+                            .content(format!("❌ Failed to switch: {e}"))
+                            .components(vec![]),
+                    )
+                    .await;
+                return;
             }
         };
 
-        let response = CreateInteractionResponse::UpdateMessage(
-            CreateInteractionResponseMessage::new().content(response_msg).components(vec![]),
-        );
+        let display_name = updated_options
+            .iter()
+            .find(|o| o.id == config_id)
+            .and_then(|o| o.options.iter().find(|v| v.value == selected_value))
+            .map(|v| v.name.clone())
+            .unwrap_or_else(|| selected_value.clone());
 
-        if let Err(e) = comp.create_response(&ctx.http, response).await {
-            tracing::error!(error = %e, "failed to respond to config select");
-        }
+        let _ = comp
+            .edit_response(
+                &ctx.http,
+                EditInteractionResponse::new()
+                    .content(format!("✅ Switched to **{display_name}**"))
+                    .components(vec![]),
+            )
+            .await;
     }
 }
 
