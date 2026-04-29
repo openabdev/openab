@@ -51,6 +51,10 @@ data:
     {{- end }}
     allow_user_messages = {{ $cfg.discord.allowUserMessages | toJson }}  {{- /* involved (default): respond in bot's threads without @mention | mentions: always require @mention | multibot-mentions: require @mention only when another bot has posted in the thread */ -}}
     {{- end }}
+    {{- /* maxBotTurns: soft cap on consecutive bot turns per thread (human msg resets the counter) */ -}}
+    {{- if hasKey ($cfg.discord | default dict) "maxBotTurns" }}
+    max_bot_turns = {{ ($cfg.discord).maxBotTurns | int }}
+    {{- end }}
     {{- end }}
 
     {{- if and ($cfg.slack).enabled }}
@@ -85,6 +89,10 @@ data:
     {{- fail (printf "agents.%s.slack.allowUserMessages must be one of: involved, mentions, multibot-mentions (use hyphen form, not underscore) — got: %s" $name ($cfg.slack).allowUserMessages) }}
     {{- end }}
     allow_user_messages = {{ ($cfg.slack).allowUserMessages | toJson }}  {{- /* involved (default): respond in bot's threads without @mention | mentions: always require @mention | multibot-mentions: require @mention only when another bot has posted in the thread */ -}}
+    {{- end }}
+    {{- /* maxBotTurns: soft cap on consecutive bot turns per thread (human msg resets the counter) */ -}}
+    {{- if hasKey ($cfg.slack | default dict) "maxBotTurns" }}
+    max_bot_turns = {{ ($cfg.slack).maxBotTurns | int }}
     {{- end }}
     {{- end }}
 

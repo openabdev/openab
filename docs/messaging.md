@@ -170,6 +170,28 @@ trusted_bot_ids = ["1111111111", "2222222222"]
 max_bot_turns = 10
 ```
 
+### Helm chart
+
+Same keys are settable from chart values under `agents.<name>.discord` and
+`agents.<name>.slack` using camelCase (Helm convention):
+
+```yaml
+agents:
+  claude:
+    discord:
+      allowBotMessages: "mentions"
+      trustedBotIds: ["1111111111", "2222222222"]
+      maxBotTurns: 50
+    slack:
+      allowBotMessages: "mentions"
+      trustedBotIds: ["U1111111111", "U2222222222"]
+      maxBotTurns: 50
+```
+
+When `maxBotTurns` is omitted from values, the Rust default of 20
+applies. The hard cap of 100 is compiled-in
+(`HARD_BOT_TURN_LIMIT` in `src/bot_turns.rs`) and is not chart-tunable.
+
 ---
 
 ## Quick Reference
