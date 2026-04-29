@@ -1,0 +1,35 @@
+name: Notify Discord
+
+on:
+  pull_request:
+    types: [opened, reopened]
+  issues:
+    types: [opened]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send to Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            TITLE="${{ github.event.pull_request.title }}"
+            URL="${{ github.event.pull_request.html_url }}"
+            AUTHOR="${{ github.event.pull_request.user.login }}"
+            NUM="${{ github.event.pull_request.number }}"
+            TYPE="pr_opened"
+            LABEL="PR #${NUM}"
+          else
+            TITLE="${{ github.event.issue.title }}"
+            URL="${{ github.event.issue.html_url }}"
+            AUTHOR="${{ github.event.issue.user.login }}"
+            NUM="${{ github.event.issue.number }}"
+            TYPE="issue_opened"
+            LABEL="Issue #${NUM}"
+          fi
+
+          curl -s -H "Content-Type: application/json" \
+            -d "{\"content\":\"[GH-EVENT] repo:${{ github.repository }} action:${TYPE} ${LABEL}\\n**${TITLE}**\\nby ${AUTHOR}\\n${URL}\"}" \
+            "$DISCORD_WEBHOOK_URL"
