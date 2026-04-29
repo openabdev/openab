@@ -302,7 +302,7 @@ impl EventHandler for Handler {
                             if let Ok(serenity::model::channel::Channel::Guild(gc)) =
                                 msg.channel_id.to_channel(&ctx.http).await
                             {
-                                if gc.parent_id.is_some_and(|pid| {
+                                if gc.thread_metadata.is_some() && gc.parent_id.is_some_and(|pid| {
                                     self.allowed_channels.contains(&pid.get())
                                 }) {
                                     allowed_here = true;
