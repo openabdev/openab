@@ -1,6 +1,6 @@
 {{- range $name, $cfg := .Values.agents }}
 {{- if ne (include "openab.agentEnabled" $cfg) "false" }}
-{{- if not (eq (include "openab.persistenceEnabled" $cfg) "false") }}
+{{- if and (not (eq (include "openab.persistenceEnabled" $cfg) "false")) (not (and $cfg.persistence $cfg.persistence.existingClaim)) }}
 {{- $d := dict "ctx" $ "agent" $name "cfg" $cfg }}
 ---
 apiVersion: v1
@@ -9,6 +9,8 @@ metadata:
   name: {{ include "openab.agentFullname" $d }}
   labels:
     {{- include "openab.labels" $d | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
 spec:
   accessModes:
     - ReadWriteOnce
