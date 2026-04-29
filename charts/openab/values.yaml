@@ -169,6 +169,9 @@ agents:
       apiKey: ""
       model: "whisper-large-v3-turbo"
       baseUrl: "https://api.groq.com/openai/v1"
+      # Echo the transcribed text back to the thread before the agent reply
+      # so users can verify STT accuracy. Default: false (opt-in).
+      echoTranscript: false
     gateway:
       enabled: false    # set to true + provide url to enable
       url: ""           # e.g. ws://openab-gateway:8080/ws
