@@ -7,7 +7,8 @@ use crate::format;
 use crate::media;
 use async_trait::async_trait;
 use std::sync::LazyLock;
-use serenity::builder::{CreateActionRow, CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditMessage};
+use serenity::builder::{CreateActionRow, CreateButton, CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditMessage};
+use serenity::model::application::ButtonStyle;
 use serenity::http::Http;
 use serenity::model::application::{ComponentInteractionDataKind, Interaction};
 use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, ReactionType};
@@ -24,6 +25,9 @@ const MAX_CONSECUTIVE_BOT_TURNS: u8 = 10;
 
 /// Maximum entries in the participation cache before eviction.
 const PARTICIPATION_CACHE_MAX: usize = 1000;
+
+/// Discord StringSelectMenu hard limit on options.
+const SELECT_MENU_PAGE_SIZE: usize = 25;
 
 // --- DiscordAdapter: implements ChatAdapter for Discord via serenity ---
 
@@ -662,6 +666,9 @@ impl EventHandler for Handler {
             Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_config_") => {
                 self.handle_config_select(&ctx, &comp).await;
             }
+            Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_pg:") => {
+                self.handle_pagination(&ctx, &comp).await;
+            }
             _ => {}
         }
     }
@@ -672,11 +679,14 @@ impl EventHandler for Handler {
 
 impl Handler {
     /// Build a Discord select menu from ACP configOptions with the given category.
-    fn build_config_select(options: &[ConfigOption], category: &str) -> Option<CreateSelectMenu> {
+    /// When `page` is provided, only the corresponding slice of options is shown.
+    fn build_config_select(options: &[ConfigOption], category: &str, page: usize) -> Option<CreateSelectMenu> {
         let opt = options.iter().find(|o| o.category.as_deref() == Some(category))?;
         let menu_options: Vec<CreateSelectMenuOption> = opt
             .options
             .iter()
+            .skip(page * SELECT_MENU_PAGE_SIZE)
+            .take(SELECT_MENU_PAGE_SIZE)
             .map(|o| {
                 let mut item = CreateSelectMenuOption::new(&o.name, &o.value);
                 if let Some(desc) = &o.description {
@@ -705,6 +715,40 @@ impl Handler {
         )
     }
 
+    /// Build ◀/▶ pagination buttons. Returns None when only one page exists.
+    fn build_pagination_buttons(category: &str, page: usize, total_pages: usize) -> Option<CreateActionRow> {
+        if total_pages <= 1 {
+            return None;
+        }
+        let prev = CreateButton::new(format!("acp_pg:{}:{}", category, page.saturating_sub(1)))
+            .label("◀")
+            .style(ButtonStyle::Secondary)
+            .disabled(page == 0);
+        let next = CreateButton::new(format!("acp_pg:{}:{}", category, page + 1))
+            .label("▶")
+            .style(ButtonStyle::Secondary)
+            .disabled(page + 1 >= total_pages);
+        let indicator = CreateButton::new("acp_pg_noop")
+            .label(format!("{}/{}", page + 1, total_pages))
+            .style(ButtonStyle::Secondary)
+            .disabled(true);
+        Some(CreateActionRow::Buttons(vec![prev, indicator, next]))
+    }
+
+    /// Build the full component rows (select menu + optional pagination) for a config category.
+    fn build_config_components(options: &[ConfigOption], category: &str, page: usize) -> Option<Vec<CreateActionRow>> {
+        let opt = options.iter().find(|o| o.category.as_deref() == Some(category))?;
+        let total_pages = opt.options.len().div_ceil(SELECT_MENU_PAGE_SIZE);
+        let page = page.min(total_pages.saturating_sub(1));
+
+        let select = Self::build_config_select(options, category, page)?;
+        let mut rows = vec![CreateActionRow::SelectMenu(select)];
+        if let Some(buttons) = Self::build_pagination_buttons(category, page, total_pages) {
+            rows.push(buttons);
+        }
+        Some(rows)
+    }
+
     async fn handle_config_command(
         &self,
         ctx: &Context,
@@ -714,13 +758,12 @@ impl Handler {
     ) {
         let thread_key = format!("discord:{}", cmd.channel_id.get());
         let config_options = self.router.pool().get_config_options(&thread_key).await;
-        let select = Self::build_config_select(&config_options, category);
 
-        let response = match select {
-            Some(menu) => CreateInteractionResponse::Message(
+        let response = match Self::build_config_components(&config_options, category, 0) {
+            Some(rows) => CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
                     .content(format!("🔧 Select a {label}:"))
-                    .components(vec![CreateActionRow::SelectMenu(menu)])
+                    .components(rows)
                     .ephemeral(true),
             ),
             None => CreateInteractionResponse::Message(
@@ -812,6 +855,42 @@ impl Handler {
 
         if let Err(e) = comp.create_response(&ctx.http, response).await {
             tracing::error!(error = %e, "failed to respond to config select");
+        }
+    }
+
+    async fn handle_pagination(
+        &self,
+        ctx: &Context,
+        comp: &serenity::model::application::ComponentInteraction,
+    ) {
+        // Parse custom_id format: acp_pg:{category}:{page}
+        let parts: Vec<&str> = comp.data.custom_id.splitn(3, ':').collect();
+        let (category, page) = match parts.as_slice() {
+            [_, cat, pg] => match pg.parse::<usize>() {
+                Ok(p) => (*cat, p),
+                Err(_) => return,
+            },
+            _ => return,
+        };
+
+        let thread_key = format!("discord:{}", comp.channel_id.get());
+        let config_options = self.router.pool().get_config_options(&thread_key).await;
+
+        let response = match Self::build_config_components(&config_options, category, page) {
+            Some(rows) => CreateInteractionResponse::UpdateMessage(
+                CreateInteractionResponseMessage::new()
+                    .content(format!("🔧 Select a {category}:"))
+                    .components(rows),
+            ),
+            None => CreateInteractionResponse::UpdateMessage(
+                CreateInteractionResponseMessage::new()
+                    .content(format!("⚠️ No {category} options available."))
+                    .components(vec![]),
+            ),
+        };
+
+        if let Err(e) = comp.create_response(&ctx.http, response).await {
+            tracing::error!(error = %e, category, "failed to respond to pagination");
         }
     }
 }
