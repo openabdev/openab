@@ -571,6 +571,11 @@ command = "echo"
     }
 
     #[test]
+    fn tool_display_default_is_full() {
+        assert_eq!(ToolDisplay::default(), ToolDisplay::Full);
+    }
+
+    #[test]
     fn parse_gateway_config_explicit_allow_all_overrides_list() {
         let toml = r#"
 [gateway]
