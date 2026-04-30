@@ -14,6 +14,8 @@
 OpenAB does **not** relay images from the agent to Discord — it only streams text.
 To send an image back to the user, the agent must call the Discord API directly.
 
+> For sending non-image files (PDF, CSV, logs, etc.), see [sendfiles.md](sendfiles.md).
+
 ## How It Works
 
 ```
