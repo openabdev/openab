@@ -292,19 +292,25 @@ impl EventHandler for Handler {
                         // Must match the full thread allowlist semantics: a thread is allowed
                         // if its own channel_id OR its parent_id is in allowed_channels.
                         let ch = msg.channel_id.get();
-                        let mut allowed_here = self.allow_all_channels
-                            || self.allowed_channels.contains(&ch);
+                        let in_allowed_channel = self.allowed_channels.contains(&ch);
+                        let mut allowed_here = self.allow_all_channels || in_allowed_channel;
                         if !allowed_here {
-                            // Thread channel_id won't be in allowed_channels directly —
-                            // check parent_id via to_channel(). Only called on the
-                            // WarnAndStop path (once per soft/hard limit hit), not on
-                            // every bot message.
+                            // Reuse detect_thread() for thread allowlist semantics.
+                            // Only called on the WarnAndStop path (once per soft/hard
+                            // limit hit), not on every bot message.
                             if let Ok(serenity::model::channel::Channel::Guild(gc)) =
                                 msg.channel_id.to_channel(&ctx.http).await
                             {
-                                if gc.parent_id.is_some_and(|pid| {
-                                    self.allowed_channels.contains(&pid.get())
-                                }) {
+                                let (in_thread, _) = detect_thread(
+                                    gc.thread_metadata.is_some(),
+                                    gc.parent_id.map(|id| id.get()),
+                                    gc.owner_id.map(|id| id.get()),
+                                    bot_id.get(),
+                                    &self.allowed_channels,
+                                    self.allow_all_channels,
+                                    in_allowed_channel,
+                                );
+                                if in_thread {
                                     allowed_here = true;
                                 }
                             }
@@ -1424,6 +1430,19 @@ mod tests {
             );
             assert_eq!(result, c.expect, "FAILED: {}", c.name);
         }
+    }
+
+    // --- WarnAndStop regression test (#633) ---
+    // The WarnAndStop path now delegates to detect_thread(). This test pins
+    // the exact scenario from #633: a category child channel whose category
+    // ID is in another bot's allowed_channels must NOT be treated as allowed.
+    #[test]
+    fn detect_thread_rejects_category_child_in_warn_and_stop() {
+        let category_id: u64 = 200;
+        let allowed = HashSet::from([category_id]);
+        // Category child: has parent_id (the category) but NO thread_metadata.
+        let (in_thread, _) = detect_thread(false, Some(category_id), None, 1000, &allowed, false, false);
+        assert!(!in_thread, "category child must not match allowed_channels via parent_id");
     }
 
     // --- Per-thread streaming tests (#534) ---
