@@ -182,6 +182,7 @@ agents:
     #     - schedule: "0 9 * * 1-5"
     #       channel: "123456789"
     #       message: "summarize yesterday's merged PRs"
+    #       enabled: true          # set to false to disable this job without removing it
     #       platform: "discord"
     #       senderName: "DailyOps"
     #       timezone: "Asia/Taipei"
