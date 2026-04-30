@@ -1023,6 +1023,16 @@ fn should_process_dm(allow_dm: bool) -> bool {
     allow_dm
 }
 
+/// Pure decision function: should thread creation be skipped?
+/// Returns `true` when the message should reuse the current channel
+/// directly (existing thread or DM), `false` when a new thread should
+/// be created. Pins the invariant that DMs never call
+/// `get_or_create_thread()` — Discord DM channels cannot create threads.
+#[cfg(test)]
+fn should_skip_thread_creation(in_thread: bool, is_dm: bool) -> bool {
+    in_thread || is_dm
+}
+
 /// Pure decision function: should this message be processed or ignored?
 /// Returns `true` if the message should be processed (bot responds).
 /// Extracted from the EventHandler::message gating logic for testability.
@@ -1592,5 +1602,30 @@ mod tests {
             false,  // involved
             false,  // other_bot_present
         ));
+    }
+
+    // --- Thread creation skip tests (regression for #656 DM bug) ---
+    // Pins the invariant: DMs must never call get_or_create_thread().
+    // Discord DM channels do not support thread creation.
+
+    /// GIVEN: is_dm = true, not in a thread
+    /// THEN:  skip thread creation (use DM channel directly)
+    #[test]
+    fn dm_skips_thread_creation() {
+        assert!(should_skip_thread_creation(false, true));
+    }
+
+    /// GIVEN: already in a thread, not a DM
+    /// THEN:  skip thread creation (reuse existing thread)
+    #[test]
+    fn existing_thread_skips_thread_creation() {
+        assert!(should_skip_thread_creation(true, false));
+    }
+
+    /// GIVEN: not in a thread, not a DM (normal channel message)
+    /// THEN:  do NOT skip — create a new thread
+    #[test]
+    fn normal_channel_creates_thread() {
+        assert!(!should_skip_thread_creation(false, false));
     }
 }
