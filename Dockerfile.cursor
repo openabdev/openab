@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 # URL scheme scraped from Cursor's official downloads page — no apt/yum package exists.
 # If Cursor changes this pattern, the build fails with curl 404. Monitor
 # https://cursor.com/cli or https://docs.cursor.com/cli for version/URL updates.
-ARG CURSOR_VERSION=2026.04.17-787b533
+ARG CURSOR_VERSION=2026.04.29-c83a488
 RUN ARCH=$(dpkg --print-architecture) && \
     if [ "$ARCH" = "arm64" ]; then ARCH=arm64; else ARCH=x64; fi && \
     curl -fSL "https://downloads.cursor.com/lab/${CURSOR_VERSION}/linux/${ARCH}/agent-cli-package.tar.gz" \
