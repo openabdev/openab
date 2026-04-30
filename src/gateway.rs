@@ -48,12 +48,11 @@ struct GwSender {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct GwAttachment {
-    pub url: String,
-    #[serde(rename = "contentType")]
-    pub content_type: Option<String>,
-    pub filename: Option<String>,
-    pub size: Option<u64>,
+struct GwAttachment {
+    url: String,
+    content_type: Option<String>,
+    filename: Option<String>,
+    size: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -299,7 +298,6 @@ pub async fn run_gateway_adapter(
     let allowed_channels = params.allowed_channels;
     let allow_all_users = params.allow_all_users;
     let allowed_users = params.allowed_users;
-    let stt_config = params.stt_config;
 
     let connect_url = match &params.token {
         Some(token) => {
@@ -432,7 +430,7 @@ pub async fn run_gateway_adapter(
                                     let router = router.clone();
                                     let prompt = event.content.text.clone().unwrap_or_default();
                                     let attachments = event.content.attachments.clone();
-                                    let stt_config = stt_config.clone();
+                                    let stt_config = params.stt_config.clone();
 
                                     tasks.spawn(async move {
                                         let mut extra_blocks = Vec::new();
