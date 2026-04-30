@@ -41,6 +41,7 @@ const VALID_PLATFORMS: &[&str] = &["discord", "slack"];
 /// Validate all cronjob configs (fail-fast on bad cron expressions or timezones).
 pub fn validate_cronjobs(cronjobs: &[CronJobConfig], configured_platforms: &[&str]) -> anyhow::Result<()> {
     for (i, job) in cronjobs.iter().enumerate() {
+        if !job.enabled { continue; }
         parse_cron_expr(&job.schedule).map_err(|e| {
             anyhow::anyhow!("cronjobs[{i}]: invalid cron expression {:?}: {e}", job.schedule)
         })?;
@@ -609,6 +610,26 @@ platform = "slack"
         }];
         let err = validate_cronjobs(&jobs, &["discord"]).unwrap_err();
         assert!(err.to_string().contains("not configured"));
+    }
+
+    #[test]
+    fn validate_cronjobs_disabled_with_invalid_cron_passes() {
+        let jobs = vec![CronJobConfig {
+            enabled: false, schedule: "bad".into(), channel: "123".into(),
+            message: "hi".into(), platform: "discord".into(), sender_name: "test".into(),
+            thread_id: None, timezone: "UTC".into(),
+        }];
+        assert!(validate_cronjobs(&jobs, &["discord"]).is_ok());
+    }
+
+    #[test]
+    fn validate_cronjobs_enabled_with_invalid_cron_still_fails() {
+        let jobs = vec![CronJobConfig {
+            enabled: true, schedule: "bad".into(), channel: "123".into(),
+            message: "hi".into(), platform: "discord".into(), sender_name: "test".into(),
+            thread_id: None, timezone: "UTC".into(),
+        }];
+        assert!(validate_cronjobs(&jobs, &["discord"]).is_err());
     }
 
     // --- file_mtime tests ---
