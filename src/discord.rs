@@ -512,7 +512,10 @@ impl EventHandler for Handler {
 
         // Prepend quoted/referenced message content when user replies to a message (#339)
         let prompt = match resolve_referenced_message(&msg, &ctx.http).await {
-            Some(quoted) => format_quote_context(&quoted.author.name, &quoted.content, &prompt),
+            Some(quoted) => {
+                let quoted_content = resolve_mentions(&quoted.content, bot_id);
+                format_quote_context(&quoted.author.name, &quoted_content, &prompt)
+            }
             None => prompt,
         };
 
