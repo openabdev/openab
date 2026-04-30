@@ -6,7 +6,7 @@ Control how tool calls are rendered in chat messages during agent responses.
 
 ```toml
 [reactions]
-tool_display = "compact"   # full | compact | none
+tool_display = "full"   # full | compact | none
 ```
 
 ### Helm
@@ -15,24 +15,12 @@ tool_display = "compact"   # full | compact | none
 agents:
   kiro:
     reactions:
-      toolDisplay: "compact"   # full | compact | none
+      toolDisplay: "full"   # full | compact | none
 ```
 
 ## Modes
 
-### `compact` (default)
-
-Shows a single-line count summary. No tool names, commands, or arguments are displayed.
-
-```
-✅ 3 · 🔧 1 tool(s)
-
-Agent response text here...
-```
-
-Best for: everyday use, public channels, mobile.
-
-### `full`
+### `full` (default)
 
 Shows each tool call with its complete title. When more than 3 tools finish, they collapse into a count summary automatically.
 
@@ -45,6 +33,18 @@ Agent response text here...
 ```
 
 Best for: debugging, understanding what the agent is doing step by step.
+
+### `compact`
+
+Shows a single-line count summary. No tool names, commands, or arguments are displayed.
+
+```
+✅ 3 · 🔧 1 tool(s)
+
+Agent response text here...
+```
+
+Best for: everyday use, public channels, mobile.
 
 ### `none`
 
@@ -66,6 +66,6 @@ Best for: clean output when you only care about the final answer.
 
 ## Notes
 
-- **Default changed**: `compact` is the new default. Previously, tool calls were always shown in full. If you want the old behavior, set `tool_display = "full"`.
+- **Default**: `full` shows complete tool titles. Use `tool_display = "compact"` for a cleaner count-only summary, or `"none"` to hide tools entirely.
 - **Reaction emojis are independent**: The emoji reactions on messages (👀→🤔→🔧→🆗) work regardless of `tool_display` setting.
 - **Streaming behavior**: In `compact` mode, the count updates in real-time as tools start and finish. In `full` mode, individual tool lines appear and update during streaming.
