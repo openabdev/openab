@@ -129,9 +129,17 @@ data:
     bot_username = {{ ($cfg.gateway).botUsername | toJson }}
     {{- end }}
     {{- end }}
+    {{- if or ($cfg.cronjobs) ($cfg.cron) }}
+
+    [cron]
+    usercron_enabled = {{ (($cfg.cron).usercronEnabled) | default false }}
+    {{- if (($cfg.cron).usercronPath) }}
+    usercron_path = {{ ($cfg.cron).usercronPath | toJson }}
+    {{- end }}
     {{- range ($cfg.cronjobs) }}
 
-    [[cronjobs]]
+    [[cron.jobs]]
+    enabled = {{ .enabled | default true }}
     schedule = {{ .schedule | toJson }}
     channel = {{ .channel | toJson }}
     message = {{ .message | toJson }}
@@ -140,6 +148,7 @@ data:
     timezone = {{ .timezone | default "UTC" | toJson }}
     {{- if .threadId }}
     thread_id = {{ .threadId | toJson }}
+    {{- end }}
     {{- end }}
     {{- end }}
   {{- if $cfg.agentsMd }}

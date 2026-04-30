@@ -186,6 +186,9 @@ agents:
     #       senderName: "DailyOps"
     #       timezone: "Asia/Taipei"
     #       threadId: ""
+    cron:
+      usercronEnabled: false
+      usercronPath: ""
     cronjobs: []
     persistence:
       enabled: true
