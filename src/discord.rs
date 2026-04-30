@@ -154,6 +154,8 @@ pub struct Handler {
     pub max_bot_turns: u32,
     /// Per-thread bot turn tracker. Both counters reset on human msg.
     pub bot_turns: tokio::sync::Mutex<BotTurnTracker>,
+    /// Allow the bot to respond to Discord DMs.
+    pub allow_dm: bool,
 }
 
 impl Handler {
@@ -397,7 +399,7 @@ impl EventHandler for Handler {
         // Thread detection: single to_channel() call for both allowed and
         // non-allowed channels. Uses thread_metadata (not parent_id) to
         // identify threads — see detect_thread() doc comments for rationale.
-        let (in_thread, bot_owns_thread, thread_parent_id) = match msg.channel_id.to_channel(&ctx.http).await {
+        let (in_thread, bot_owns_thread, thread_parent_id, is_dm) = match msg.channel_id.to_channel(&ctx.http).await {
             Ok(serenity::model::channel::Channel::Guild(gc)) => {
                 let parent = gc.parent_id.map(|id| id.get().to_string());
                 let result = detect_thread(
@@ -418,19 +420,29 @@ impl EventHandler for Handler {
                     bot_owns = ?result.1,
                     "thread check"
                 );
-                (result.0, result.1.unwrap_or(false), if result.0 { parent } else { None })
+                (result.0, result.1.unwrap_or(false), if result.0 { parent } else { None }, false)
+            }
+            Ok(serenity::model::channel::Channel::Private(_)) => {
+                tracing::debug!(channel_id = %msg.channel_id, "DM channel");
+                (false, false, None, true)
             }
             Ok(other) => {
                 tracing::debug!(channel_id = %msg.channel_id, kind = ?other, "not a guild thread");
-                (false, false, None)
+                (false, false, None, false)
             }
             Err(e) => {
                 tracing::debug!(channel_id = %msg.channel_id, error = %e, "to_channel failed");
-                (false, false, None)
+                (false, false, None, false)
             }
         };
 
-        if !in_allowed_channel && !in_thread {
+        // DM gating: allow_dm must be true, otherwise reject
+        if is_dm && !self.allow_dm {
+            tracing::debug!(channel_id = %msg.channel_id, "DM rejected (allow_dm=false)");
+            return;
+        }
+
+        if !is_dm && !in_allowed_channel && !in_thread {
             return;
         }
 
@@ -440,7 +452,8 @@ impl EventHandler for Handler {
         //   (Option A) OR has previously posted in it (Option B).
         // MultibotMentions: same as Involved, but if other bots are also
         //   in the thread, require @mention to avoid all bots responding.
-        if !is_mentioned {
+        // DMs are treated as implicit @mention (mirrors Slack behavior).
+        if !is_mentioned && !is_dm {
             match self.allow_user_messages {
                 AllowUsers::Mentions => return,
                 AllowUsers::Involved => {

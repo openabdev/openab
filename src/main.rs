@@ -294,6 +294,7 @@ async fn main() -> anyhow::Result<()> {
             trusted_bots = trusted_bot_ids.len(),
             allow_bot_messages = ?discord_cfg.allow_bot_messages,
             allow_user_messages = ?discord_cfg.allow_user_messages,
+            allow_dm = discord_cfg.allow_dm,
             "starting discord adapter"
         );
 
@@ -313,11 +314,13 @@ async fn main() -> anyhow::Result<()> {
             session_ttl: std::time::Duration::from_secs(ttl_secs),
             max_bot_turns: discord_cfg.max_bot_turns,
             bot_turns: tokio::sync::Mutex::new(bot_turns::BotTurnTracker::new(discord_cfg.max_bot_turns)),
+            allow_dm: discord_cfg.allow_dm,
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES
             | GatewayIntents::MESSAGE_CONTENT
-            | GatewayIntents::GUILDS;
+            | GatewayIntents::GUILDS
+            | GatewayIntents::DIRECT_MESSAGES;
 
         let mut client = Client::builder(&discord_cfg.bot_token, intents)
             .event_handler(handler)

@@ -116,6 +116,10 @@ pub struct DiscordConfig {
     /// Human message resets the counter. Default: 20.
     #[serde(default = "default_max_bot_turns")]
     pub max_bot_turns: u32,
+    /// Allow the bot to respond to Discord direct messages (DMs).
+    /// Default: false (opt-in). `allowed_users` still applies in DMs.
+    #[serde(default)]
+    pub allow_dm: bool,
 }
 
 fn default_max_bot_turns() -> u32 { 20 }
