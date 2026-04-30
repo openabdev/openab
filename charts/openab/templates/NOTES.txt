@@ -46,5 +46,15 @@ Agents deployed:
 
     Restart after auth:
     kubectl rollout restart deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }}
+{{- if not (eq (include "openab.persistenceEnabled" $cfg) "false") }}
+
+    Persistence:
+{{- if and $cfg.persistence $cfg.persistence.existingClaim }}
+    using existing PVC {{ $cfg.persistence.existingClaim }} (not managed by this chart)
+{{- else }}
+    PVC {{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} is kept on helm uninstall.
+    To delete stored auth/session data, delete the PVC manually.
+{{- end }}
+{{- end }}
 {{- end }}
 {{- end }}

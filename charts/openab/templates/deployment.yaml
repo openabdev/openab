@@ -137,7 +137,7 @@ spec:
         {{- if $pvcEnabled }}
         - name: data
           persistentVolumeClaim:
-            claimName: {{ include "openab.agentFullname" $d }}
+            claimName: {{ (and $cfg.persistence $cfg.persistence.existingClaim) | default (include "openab.agentFullname" $d) }}
         {{- end }}
         - name: tmp
           emptyDir: {}
