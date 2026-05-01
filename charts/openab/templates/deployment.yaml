@@ -77,6 +77,31 @@ spec:
                   name: {{ include "openab.agentFullname" $d }}
                   key: gateway-ws-token
             {{- end }}
+            {{- if and ($cfg.gateway).enabled (($cfg.gateway).teams).appId }}
+            - name: TEAMS_APP_ID
+              value: {{ ($cfg.gateway).teams.appId | quote }}
+            - name: TEAMS_APP_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: teams-app-secret
+            {{- if ($cfg.gateway).teams.oauthEndpoint }}
+            - name: TEAMS_OAUTH_ENDPOINT
+              value: {{ ($cfg.gateway).teams.oauthEndpoint | quote }}
+            {{- end }}
+            {{- if ($cfg.gateway).teams.openidMetadata }}
+            - name: TEAMS_OPENID_METADATA
+              value: {{ ($cfg.gateway).teams.openidMetadata | quote }}
+            {{- end }}
+            {{- if ($cfg.gateway).teams.allowedTenants }}
+            - name: TEAMS_ALLOWED_TENANTS
+              value: {{ ($cfg.gateway).teams.allowedTenants | join "," | quote }}
+            {{- end }}
+            {{- if ($cfg.gateway).teams.webhookPath }}
+            - name: TEAMS_WEBHOOK_PATH
+              value: {{ ($cfg.gateway).teams.webhookPath | quote }}
+            {{- end }}
+            {{- end }}
             - name: HOME
               value: {{ $cfg.workingDir | default "/home/agent" }}
             {{- range $k, $v := $cfg.env }}

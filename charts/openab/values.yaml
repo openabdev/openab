@@ -199,6 +199,17 @@ agents:
       platform: "telegram"  # default platform when gateway is enabled
       token: ""         # optional shared secret (injected via GATEWAY_WS_TOKEN env var)
       botUsername: ""   # optional, for @mention gating
+      # MS Teams adapter config (gateway-side env vars)
+      # See docs/msteams-enterprise.md for full setup guide
+      teams:
+        appId: ""              # Azure Entra ID application (client) ID → TEAMS_APP_ID
+        appSecret: ""          # Azure Entra ID client secret → TEAMS_APP_SECRET
+        # ⚠️ Required for Single Tenant bots — use tenant-specific endpoint
+        # Default (Multi Tenant): https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token
+        oauthEndpoint: ""      # → TEAMS_OAUTH_ENDPOINT
+        openidMetadata: ""     # Override for sovereign clouds → TEAMS_OPENID_METADATA
+        allowedTenants: []     # Comma-separated tenant IDs → TEAMS_ALLOWED_TENANTS
+        webhookPath: ""        # Default: /webhook/teams → TEAMS_WEBHOOK_PATH
     # Scheduled messages — config-driven cron (ADR: basic-cronjob)
     # Each entry sends a message to the agent at the specified schedule.
     # Example:
