@@ -63,7 +63,15 @@ When Kiro CLI starts with the built-in `kiro_default` agent, it automatically re
 | `.kiro/steering/**/*.md` | Steering docs (local and global, if exists) |
 | `AmazonQ.md` | Legacy prompt file (if exists in working dir) |
 
-> **Tip:** Place an `AGENTS.md` in the agent's working directory (default: `/home/agent`) to provide persistent context — identity, instructions, or project-specific knowledge — that the agent reads on every session start.
+> **Highly recommended:** `AGENTS.md` and `.kiro/steering/**/*.md` are the primary ways to give Kiro persistent memory. If you need Kiro to "memorize" something — best practices, guidelines, operational procedures, or project conventions — always first consider these two locations:
+>
+> - **`AGENTS.md`** — Place in the agent's working directory (default: `/home/agent`). Ideal for identity, role definition, and top-level instructions.
+> - **`.kiro/steering/**/*.md`** — Organize guidelines by topic, e.g.:
+>   - `.kiro/steering/operations/backup.md` — backup procedures
+>   - `.kiro/steering/coding/style.md` — code style rules
+>   - `.kiro/steering/security/secrets.md` — secret handling policy
+>
+> Both are read into context on every session start — no extra configuration needed.
 
 ### Customizing the Default Agent
 
