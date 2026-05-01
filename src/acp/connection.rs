@@ -154,6 +154,11 @@ impl AcpConnection {
         {
             cmd.creation_flags(0x00000200); // CREATE_NEW_PROCESS_GROUP
         }
+        // Clear inherited env to prevent credential leakage (e.g. DISCORD_BOT_TOKEN).
+        // Only [agent].env values + essential baseline vars are passed through.
+        cmd.env_clear();
+        cmd.env("HOME", working_dir);
+        cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
         for (k, v) in env {
             cmd.env(k, expand_env(v));
         }
