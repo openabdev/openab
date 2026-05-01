@@ -65,7 +65,13 @@ The definitive rules — do NOT reinvent this:
 
 ### 3. Security — Child Process Environment
 
-Agent subprocesses start with `env_clear()`. Only `HOME`, `PATH`, and explicit `[agent].env` keys are passed. Never leak `DISCORD_BOT_TOKEN` or other OAB credentials to the agent.
+Agent subprocesses start with `env_clear()`. The baseline env passed to the child is:
+- **All platforms:** `HOME`, `PATH`
+- **Unix only:** `USER`
+- **Windows only:** `USERPROFILE`, `USERNAME`, `SystemRoot`, `SystemDrive`
+- Plus any explicit `[agent].env` keys (logged with a prompt-injection warning)
+
+Never leak `DISCORD_BOT_TOKEN` or other OAB credentials to the agent.
 
 ### 4. Dockerfile Discipline
 
