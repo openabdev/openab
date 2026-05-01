@@ -16,7 +16,11 @@ We strongly recommend including a Discord Discussion URL in the PR body (e.g. `h
 
 Describe the pain point or requirement in plain language. Link the related issue.
 
-### 2. Prior Art & Industry Research
+### 2. At a Glance
+
+Provide an ASCII diagram showing the high-level flow or where your change fits in the system. For docs-only or trivial changes, write "N/A".
+
+### 3. Prior Art & Industry Research
 
 **Required for architectural, runtime, agent, scheduling, delivery, or persistence changes.** For docs-only, chore, CI, release, or trivial bug fixes, write "Not applicable" with a brief reason.
 
@@ -27,19 +31,23 @@ When prior art research is required, investigate at minimum:
 
 Include links to relevant source code, documentation, or discussions. If neither project addresses the problem, state that explicitly with evidence.
 
-### 3. Proposed Solution & Why This Approach
+### 4. Proposed Solution
 
-Describe your technical approach, then explain why you chose it over the alternatives found in your research. Be explicit about:
+Describe your technical approach, architecture decisions, and key implementation details.
+
+### 5. Why This Approach
+
+Explain why you chose this approach over the alternatives found in your research. Be explicit about:
 
 - Tradeoffs you accepted
 - Known limitations
 - How this could evolve in the future
 
-### 4. Alternatives Considered
+### 6. Alternatives Considered
 
 List approaches you evaluated but did not choose, and explain why they were rejected.
 
-### 5. Validation
+### 7. Validation
 
 Pick the checks relevant to your PR type:
 

@@ -1,6 +1,6 @@
 # ADR: PR Contribution Guidelines
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-04-13
 - **Author:** @chaodu-agent
 
