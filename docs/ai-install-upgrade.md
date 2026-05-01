@@ -216,6 +216,7 @@ rollback openab per the upgrade SOP — the upgrade to v0.7.7 failed
 **Then ask the user:**
 - Which old backups to delete (if any)
 - Whether to keep the most recent N backups as a policy going forward
+- Recommend keeping at least the latest stable backup as a safety net
 
 **Do NOT** delete anything without explicit user confirmation.
 
