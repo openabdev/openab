@@ -57,6 +57,7 @@ working_dir = "/home/agent"
 # ⚠️ SECURITY WARNING: Any env var listed here is accessible to the agent.
 # A user could trick the agent into leaking these values via prompt injection.
 # All supported backends support OAuth login — prefer that over env var API keys.
+# Note: env vars here can override baseline vars (HOME, PATH, USER) if needed.
 # env = { ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}" }
 
 # [agent]

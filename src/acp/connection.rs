@@ -157,6 +157,8 @@ impl AcpConnection {
         // Clear inherited env to prevent credential leakage (e.g. DISCORD_BOT_TOKEN).
         // Only [agent].env values + essential baseline vars are passed through.
         cmd.env_clear();
+        // HOME is intentionally set to working_dir (not the host user's home) to
+        // isolate the agent's filesystem scope. [agent].env can override if needed.
         cmd.env("HOME", working_dir);
         cmd.env("USER", std::env::var("USER").unwrap_or_else(|_| "agent".into()));
         cmd.env("PATH", std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into()));
