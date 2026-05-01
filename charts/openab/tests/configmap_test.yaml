@@ -119,3 +119,26 @@ tests:
       - matchRegex:
           path: data["config.toml"]
           pattern: 'allow_dm = false'
+
+  - it: renders discord max_bot_turns when set
+    set:
+      agents.kiro.discord.maxBotTurns: 50
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'max_bot_turns = 50'
+
+  - it: does not render discord max_bot_turns when unset
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: 'max_bot_turns'
+
+  - it: renders slack max_bot_turns when set
+    set:
+      agents.kiro.slack.enabled: true
+      agents.kiro.slack.maxBotTurns: 30
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'max_bot_turns = 30'
