@@ -699,12 +699,20 @@ impl EventHandler for Handler {
 impl Handler {
     /// Build a Discord select menu from ACP configOptions with the given category.
     /// Discord limits Select Menus to 25 options; excess options are truncated.
+    /// The currently selected option is always included (placed first if needed).
     fn build_config_select(options: &[ConfigOption], category: &str) -> Option<CreateSelectMenu> {
         let opt = options.iter().find(|o| o.category.as_deref() == Some(category))?;
-        let menu_options: Vec<CreateSelectMenuOption> = opt
-            .options
-            .iter()
+
+        // Ensure current selection is in the first 25 by placing it first,
+        // then filling remaining slots with the rest in original order.
+        let sorted: Vec<_> = opt.options.iter()
+            .filter(|o| o.value == opt.current_value)
+            .chain(opt.options.iter().filter(|o| o.value != opt.current_value))
             .take(25)
+            .collect();
+
+        let menu_options: Vec<CreateSelectMenuOption> = sorted
+            .iter()
             .map(|o| {
                 let mut item = CreateSelectMenuOption::new(&o.name, &o.value);
                 if let Some(desc) = &o.description {
@@ -801,7 +809,7 @@ impl Handler {
 
         let msg = match result {
             Ok(()) => "🔄 Session reset. Start a new conversation!".to_string(),
-            Err(e) => format!("⚠️ {e}"),
+            Err(_) => "⚠️ No active session to reset. Start a conversation first by @mentioning the bot.".to_string(),
         };
 
         let response = CreateInteractionResponse::Message(
