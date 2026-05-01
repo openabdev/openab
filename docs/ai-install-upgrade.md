@@ -41,13 +41,15 @@ rollback openab per the upgrade SOP — the upgrade to v0.7.7 failed
                              │             pass      fail
                              │               │         │
                              ▼               ▼         ▼
-                        ┌─────────┐    ┌─────────┐ ┌──────────┐
-                        │  ABORT  │    │  DONE ✅ │ │5. ROLLBACK│
-                        │         │    └─────────┘ │          │
-                        └─────────┘                │ uninstall│
-                                                   │ reinstall│
-                                                   │ restore  │
-                                                   └──────────┘
+                        ┌─────────┐    ┌──────────┐ ┌──────────┐
+                        │  ABORT  │    │6. CLEANUP│ │5. ROLLBACK│
+                        │         │    │  (ask    │ │          │
+                        └─────────┘    │  user)   │ │ uninstall│
+                                       └────┬─────┘ │ reinstall│
+                                            ▼       │ restore  │
+                                       ┌─────────┐  └──────────┘
+                                       │  DONE ✅ │
+                                       └─────────┘
 ```
 
 **Invariant:** At every point, the system is either running the current version, running the target version, or being restored to the current version. No data is lost.
@@ -181,6 +183,41 @@ rollback openab per the upgrade SOP — the upgrade to v0.7.7 failed
   │ ✅ Rollback complete
   └──────────────────────────────────────────────
 ```
+
+---
+
+## 6. Cleanup (post-upgrade)
+
+**Goal:** After a successful upgrade, evaluate old backups and let the user decide what to keep.
+
+> **[AI Instruction]** This phase is advisory. List what you find and ask the user — do NOT auto-delete anything.
+
+```
+  Local Disk
+  ┌──────────────────────────────────────────────┐
+  │  ~/openab-backups/                           │
+  │  ├── 0.7.5_20260401/  (1.2 GB)              │
+  │  ├── 0.7.6_20260415/  (1.4 GB)              │
+  │  └── 0.7.7_20260501/  (1.5 GB)  ◄── current │
+  └──────────────────────────────────────────────┘
+
+  Step ①  List all backup directories with size and date
+  Step ②  Show total disk usage
+  Step ③  Ask the user which backups to remove (if any)
+```
+
+**What to report:**
+
+| Item | Command |
+|------|---------|
+| Backup dirs | `du -sh ~/openab-backups/*/` |
+| Total size | `du -sh ~/openab-backups/` |
+
+**Then ask the user:**
+- Which old backups to delete (if any)
+- Whether to keep the most recent N backups as a policy going forward
+
+**Do NOT** delete anything without explicit user confirmation.
 
 ---
 
