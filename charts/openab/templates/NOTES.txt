@@ -53,7 +53,8 @@ Agents deployed:
     using existing PVC {{ $cfg.persistence.existingClaim }} (not managed by this chart)
 {{- else }}
     PVC {{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} is kept on helm uninstall.
-    To delete stored auth/session data, delete the PVC manually.
+    To delete stored auth/session data, delete the PVC manually:
+    kubectl delete pvc {{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }}
 {{- end }}
 {{- end }}
 {{- end }}

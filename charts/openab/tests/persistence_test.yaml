@@ -33,3 +33,19 @@ tests:
       - equal:
           path: spec.template.spec.volumes[1].persistentVolumeClaim.claimName
           value: openab-existing-kiro
+
+  - it: skips PVC when persistence is disabled
+    template: templates/pvc.yaml
+    set:
+      agents.kiro.persistence.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: skips data volume mount when persistence is disabled
+    template: templates/deployment.yaml
+    set:
+      agents.kiro.persistence.enabled: false
+    asserts:
+      - notExists:
+          path: spec.template.spec.volumes[1].persistentVolumeClaim
