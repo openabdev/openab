@@ -160,8 +160,20 @@ impl AcpConnection {
         // HOME is intentionally set to working_dir (not the host user's home) to
         // isolate the agent's filesystem scope. [agent].env can override if needed.
         cmd.env("HOME", working_dir);
-        cmd.env("USER", std::env::var("USER").unwrap_or_else(|_| "agent".into()));
         cmd.env("PATH", std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into()));
+        #[cfg(unix)]
+        {
+            cmd.env("USER", std::env::var("USER").unwrap_or_else(|_| "agent".into()));
+        }
+        #[cfg(windows)]
+        {
+            // Windows requires SystemRoot for DLL loading and basic OS functionality.
+            // USERPROFILE is the Windows equivalent of HOME.
+            cmd.env("USERPROFILE", working_dir);
+            cmd.env("USERNAME", std::env::var("USERNAME").unwrap_or_else(|_| "agent".into()));
+            if let Ok(v) = std::env::var("SystemRoot") { cmd.env("SystemRoot", v); }
+            if let Ok(v) = std::env::var("SystemDrive") { cmd.env("SystemDrive", v); }
+        }
         for (k, v) in env {
             cmd.env(k, expand_env(v));
         }
