@@ -157,13 +157,15 @@ zip openab-teams-app.zip manifest.json outline.png color.png
 ```bash
 helm install openab oci://ghcr.io/openabdev/charts/openab \
   --set agents.kiro.gateway.enabled=true \
-  --set agents.kiro.gateway.url="ws://openab-gateway:8080/ws" \
+  --set agents.kiro.gateway.url="ws://openab-kiro-gateway:8080/ws" \
   --set agents.kiro.gateway.platform="teams" \
   --set agents.kiro.gateway.teams.appId="<YOUR_TEAMS_APP_ID>" \
   --set-literal agents.kiro.gateway.teams.appSecret="<YOUR_TEAMS_APP_SECRET>" \
   --set agents.kiro.gateway.teams.oauthEndpoint="https://login.microsoftonline.com/<YOUR_TENANT_ID>/oauth2/v2.0/token" \
   --set-string agents.kiro.gateway.teams.allowedTenants[0]="<YOUR_TENANT_ID>"
 ```
+
+> The gateway Service name follows the pattern `<release>-<agent>-gateway` (e.g. `openab-kiro-gateway`). The chart automatically creates the gateway Deployment + Service when `gateway.enabled=true`.
 
 > **Single Tenant bots must set `oauthEndpoint`** to the tenant-specific endpoint. The default (`botframework.com`) only works for Multi Tenant bots and will cause `401 Unauthorized` errors.
 
@@ -176,15 +178,17 @@ agents:
   kiro:
     gateway:
       enabled: true
-      url: "ws://openab-gateway:8080/ws"
+      url: "ws://openab-kiro-gateway:8080/ws"
       platform: "teams"
+      image: "ghcr.io/openabdev/openab-gateway"  # gateway container image
+      tag: ""                    # defaults to Chart.AppVersion
       teams:
         appId: ""                    # Azure Entra ID application (client) ID
         appSecret: ""                # Azure Entra ID client secret
         oauthEndpoint: ""            # Required for Single Tenant
         openidMetadata: ""           # Override for sovereign clouds
-        allowedTenants: []           # Restrict to specific tenants
-        webhookPath: "/webhook/teams"
+        allowedTenants: []           # List of tenant IDs
+        webhookPath: ""              # Gateway default: /webhook/teams
 ```
 
 ### Ingress Configuration
@@ -212,7 +216,7 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: openab-gateway
+                name: openab-kiro-gateway  # matches Helm-generated Service name
                 port:
                   number: 8080
 ```
