@@ -17,7 +17,13 @@ src/
 ├── format.rs         # Message splitting, thread name shortening
 ├── markdown.rs       # Discord markdown rendering
 ├── reactions.rs      # Emoji status controller (debounce, stall detection)
+├── bot_turns.rs      # Bot turn tracking
+├── error_display.rs  # User-facing error formatting
 ├── stt.rs            # Speech-to-text (Whisper API)
+├── setup/            # Interactive setup wizard
+│   ├── config.rs     # Setup config helpers
+│   ├── validate.rs   # Input validation
+│   └── wizard.rs     # CLI setup flow
 └── acp/
     ├── protocol.rs   # JSON-RPC types + ACP event classification
     ├── connection.rs # Spawn CLI, stdio JSON-RPC, env_clear whitelist
@@ -86,7 +92,6 @@ Before merging any chart change:
 
 ```bash
 helm template test charts/openab
-helm template test charts/openab -f charts/openab/ci/full-values.yaml
 helm template test charts/openab --set agents.kiro.enabled=false
 ```
 
@@ -130,5 +135,6 @@ Read `docs/adr/` before implementing features in these areas:
 - Cron scheduler → `docs/adr/basic-cronjob.md`
 - Custom Gateway → `docs/adr/custom-gateway.md`
 - LINE adapter → `docs/adr/line-adapter.md`
+- Multi-platform adapters → `docs/adr/multi-platform-adapters.md`
 
 Write a new ADR if your feature introduces a new subsystem.
