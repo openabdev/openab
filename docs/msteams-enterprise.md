@@ -1,6 +1,6 @@
 # Microsoft Teams Enterprise Deployment
 
-Deploy OpenAB with MS Teams in an enterprise Kubernetes environment using Helm. This guide covers Azure Entra ID configuration, Azure Bot Service setup, Teams app packaging, and Helm-based deployment.
+Deploy OpenAB with MS Teams in an enterprise Kubernetes environment. This guide covers Azure Entra ID configuration, Azure Bot Service setup, Teams app packaging, and Kubernetes deployment.
 
 ```
 Teams Client → Bot Framework → K8s Ingress (HTTPS + TLS) → Gateway pod → OAB pod
@@ -11,12 +11,14 @@ Teams Client → Bot Framework → K8s Ingress (HTTPS + TLS) → Gateway pod →
 ## Prerequisites
 
 - An Azure subscription with permissions to create resources
-- A Microsoft 365 tenant with Teams enabled
-- A Kubernetes cluster with an Ingress controller and TLS (e.g. AKS, EKS, GKE, on-prem)
-- `kubectl` and `helm` CLI tools
+- A Microsoft 365 tenant with Teams enabled (Commercial Cloud Trial works for testing)
+- A Kubernetes cluster with an Ingress controller and TLS
+- `kubectl` CLI
 - IT admin access to Teams Admin Center (for app approval)
 
 ## Architecture Overview
+
+The deployment consists of two components:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -24,7 +26,7 @@ Teams Client → Bot Framework → K8s Ingress (HTTPS + TLS) → Gateway pod →
 │                                                             │
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
 │  │   Ingress    │───▶│   Gateway    │◀──▶│     OAB      │  │
-│  │  (HTTPS/TLS) │    │     Pod      │ WS │     Pod      │  │
+│  │  (HTTPS/TLS) │    │  (BYO deploy)│ WS │  (Helm chart)│  │
 │  └──────┬───────┘    └──────────────┘    └──────────────┘  │
 │         │                                                   │
 └─────────┼───────────────────────────────────────────────────┘
@@ -35,9 +37,10 @@ Teams Client → Bot Framework → K8s Ingress (HTTPS + TLS) → Gateway pod →
 └─────────────────────┘
 ```
 
-- **Ingress** terminates TLS and routes `/webhook/teams` to the Gateway pod
-- **Gateway pod** validates JWT, normalizes events, routes replies via Bot Framework REST API
-- **OAB pod** connects outbound to Gateway via WebSocket — no inbound ports needed
+| Component | Deployed by | Description |
+|---|---|---|
+| **Gateway** | You (K8s Deployment or Docker) | Receives Bot Framework webhooks, validates JWT, routes replies. Reads `TEAMS_*` env vars. |
+| **OAB** | Helm chart (`openab`) | Connects outbound to Gateway via WebSocket. No inbound ports needed. |
 
 ## Step 1: Register an Azure Entra ID Application
 
@@ -65,6 +68,8 @@ After creation, note from the **Overview** page:
 
 > **Security note**: Store the client secret in a Kubernetes Secret. Never commit it to source control. Set a calendar reminder to rotate before expiration.
 
+> **Note**: Multi-tenant bot creation was deprecated by Microsoft on July 31, 2025. Single Tenant is the only supported path for new bots.
+
 ## Step 2: Create an Azure Bot Resource
 
 1. Go to [Azure Portal → Create a resource](https://portal.azure.com/#create/hub) → search **Azure Bot** → **Create**
@@ -78,8 +83,6 @@ After creation, note from the **Overview** page:
    - **App tenant ID**: paste your Directory (tenant) ID
 3. Click **Review + Create** → **Create**
 
-> **Note**: Multi-tenant bot creation was deprecated by Microsoft on July 31, 2025. Single Tenant is the recommended path. Cross-tenant access is achieved via Teams App Store publishing.
-
 ### Configure the Messaging Endpoint
 
 1. Go to the Bot resource → **Configuration**
@@ -92,6 +95,10 @@ After creation, note from the **Overview** page:
 
 1. Go to **Channels** → click **Microsoft Teams**
 2. Accept the terms of service → **Save**
+
+> **Testing tip**: After enabling the Teams channel, use the **Open in Teams** link (Azure Bot → Channels → Teams) for quick testing without uploading an app package. This link only works for people who have it — it does not make the bot discoverable org-wide.
+
+> **⚠️ Do not use "Test in Web Chat"** for outbound reply testing. Azure Portal's Web Chat uses `webchat.botframework.com` which returns 403 for Single Tenant bot replies. Only real Teams clients (`smba.trafficmanager.net`) work for outbound.
 
 ## Step 3: Build a Teams App Manifest
 
@@ -150,50 +157,74 @@ Create a directory with three files:
 zip openab-teams-app.zip manifest.json outline.png color.png
 ```
 
-## Step 4: Deploy with Helm
+## Step 4: Deploy the Gateway
 
-### Install the Gateway + OAB
+The Gateway is deployed separately from the OAB Helm chart. Use a standard Kubernetes Deployment:
 
-```bash
-helm install openab oci://ghcr.io/openabdev/charts/openab \
-  --set agents.kiro.gateway.enabled=true \
-  --set agents.kiro.gateway.url="ws://openab-kiro-gateway:8080/ws" \
-  --set agents.kiro.gateway.platform="teams" \
-  --set agents.kiro.gateway.teams.appId="<YOUR_TEAMS_APP_ID>" \
-  --set-literal agents.kiro.gateway.teams.appSecret="<YOUR_TEAMS_APP_SECRET>" \
-  --set agents.kiro.gateway.teams.oauthEndpoint="https://login.microsoftonline.com/<YOUR_TENANT_ID>/oauth2/v2.0/token" \
-  --set-string agents.kiro.gateway.teams.allowedTenants[0]="<YOUR_TENANT_ID>"
-```
-
-> The gateway Service name follows the pattern `<release>-<agent>-gateway` (e.g. `openab-kiro-gateway`). The chart automatically creates the gateway Deployment + Service when `gateway.enabled=true`.
-
-> **Single Tenant bots must set `oauthEndpoint`** to the tenant-specific endpoint. The default (`botframework.com`) only works for Multi Tenant bots and will cause `401 Unauthorized` errors.
-
-> **Use `--set-literal` for `appSecret`** — the secret may contain `.` characters that Helm interprets as nested key separators.
-
-### Helm Values Reference
+### Gateway Secret
 
 ```yaml
-agents:
-  kiro:
-    gateway:
-      enabled: true
-      url: "ws://openab-kiro-gateway:8080/ws"
-      platform: "teams"
-      image: "ghcr.io/openabdev/openab-gateway"  # gateway container image
-      tag: ""                    # defaults to Chart.AppVersion
-      teams:
-        appId: ""                    # Azure Entra ID application (client) ID
-        appSecret: ""                # Azure Entra ID client secret
-        oauthEndpoint: ""            # Required for Single Tenant
-        openidMetadata: ""           # Override for sovereign clouds
-        allowedTenants: []           # List of tenant IDs
-        webhookPath: ""              # Gateway default: /webhook/teams
+apiVersion: v1
+kind: Secret
+metadata:
+  name: openab-gateway-teams
+type: Opaque
+stringData:
+  TEAMS_APP_ID: "<YOUR_APPLICATION_ID>"
+  TEAMS_APP_SECRET: "<YOUR_CLIENT_SECRET>"
+  TEAMS_OAUTH_ENDPOINT: "https://login.microsoftonline.com/<YOUR_TENANT_ID>/oauth2/v2.0/token"
 ```
 
-### Ingress Configuration
+> **⚠️ Single Tenant bots must set `TEAMS_OAUTH_ENDPOINT`** to the tenant-specific endpoint. The default (`botframework.com`) only works for Multi Tenant bots and will cause `401 Unauthorized` errors. This is the #1 setup pitfall.
 
-Route Bot Framework webhooks to the Gateway pod using your existing Ingress controller:
+### Gateway Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openab-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openab-gateway
+  template:
+    metadata:
+      labels:
+        app: openab-gateway
+    spec:
+      containers:
+        - name: gateway
+          image: ghcr.io/openabdev/openab-gateway:latest
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: openab-gateway-teams
+          env:
+            - name: RUST_LOG
+              value: "info"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openab-gateway
+spec:
+  selector:
+    app: openab-gateway
+  ports:
+    - port: 8080
+      targetPort: 8080
+```
+
+### Ingress
+
+Route Bot Framework webhooks to the Gateway using your existing Ingress controller:
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -216,14 +247,27 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: openab-kiro-gateway  # matches Helm-generated Service name
+                name: openab-gateway
                 port:
                   number: 8080
 ```
 
 > Bot Framework requires HTTPS. Your Ingress controller handles TLS termination — the Gateway pod listens on plain HTTP (:8080).
 
-## Step 5: IT Admin — Approve the Teams App
+## Step 5: Deploy OAB with Helm
+
+OAB connects outbound to the Gateway via WebSocket:
+
+```bash
+helm install openab oci://ghcr.io/openabdev/charts/openab \
+  --set agents.kiro.gateway.enabled=true \
+  --set agents.kiro.gateway.url="ws://openab-gateway:8080/ws" \
+  --set agents.kiro.gateway.platform="teams"
+```
+
+The OAB pod does not need any Teams credentials — it only needs the Gateway WebSocket URL.
+
+## Step 6: IT Admin — Approve the Teams App
 
 Enterprise tenants typically restrict custom app installation. An IT admin must approve the app.
 
@@ -248,6 +292,14 @@ To pin the app for users automatically:
 2. Edit the relevant policy → **Installed apps** → **Add apps** → select OpenAB
 3. Optionally add to **Pinned apps** for sidebar visibility
 
+### Bot Discovery Methods
+
+| Method | Who can find it | Best for |
+|---|---|---|
+| **Open in Teams link** | Only people with the link | Quick testing |
+| **Teams Admin Center upload** | Everyone in the org | Enterprise deployment |
+| **App Store publish** | Everyone worldwide | Commercial bots |
+
 ### Verify
 
 After policy propagation (may take up to 24 hours):
@@ -258,32 +310,26 @@ After policy propagation (may take up to 24 hours):
 
 ## Tenant Allowlist
 
-Restrict which Azure AD tenants can interact with the bot:
+Restrict which Azure AD tenants can interact with the bot by adding to the Gateway Secret:
 
-```bash
---set-string agents.kiro.gateway.teams.allowedTenants[0]="<TENANT_ID_1>" \
---set-string agents.kiro.gateway.teams.allowedTenants[1]="<TENANT_ID_2>"
+```yaml
+stringData:
+  TEAMS_ALLOWED_TENANTS: "<YOUR_TENANT_ID>"
 ```
 
-If not set, all tenants are allowed.
+Multiple tenants: `"<TENANT_ID_1>,<TENANT_ID_2>"`. If not set, all tenants are allowed.
 
 ## Sovereign Cloud Configuration
 
-For Azure Government or Azure China deployments:
+For Azure Government or Azure China deployments, add to the Gateway Secret:
 
-| Cloud | `oauthEndpoint` | `openidMetadata` |
+| Cloud | `TEAMS_OAUTH_ENDPOINT` | `TEAMS_OPENID_METADATA` |
 |---|---|---|
 | Public (default) | `login.microsoftonline.com/<TENANT>/...` | `login.botframework.com/...` |
 | Azure Government | `login.microsoftonline.us/<TENANT>/...` | `login.botframework.azure.us/...` |
 | Azure China (21Vianet) | `login.partner.microsoftonline.cn/<TENANT>/...` | `login.botframework.azure.cn/...` |
 
-```bash
-# Azure Government example
---set agents.kiro.gateway.teams.oauthEndpoint="https://login.microsoftonline.us/<TENANT_ID>/oauth2/v2.0/token" \
---set agents.kiro.gateway.teams.openidMetadata="https://login.botframework.azure.us/v1/.well-known/openidconfiguration"
-```
-
-## Environment Variables Reference
+## Environment Variables Reference (Gateway)
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
@@ -300,7 +346,13 @@ For Azure Government or Azure China deployments:
 
 OAuth endpoint mismatch. Single Tenant bots must use the tenant-specific endpoint.
 
-**Fix**: Verify `oauthEndpoint` is set to `https://login.microsoftonline.com/<YOUR_TENANT_ID>/oauth2/v2.0/token`
+**Fix**: Verify `TEAMS_OAUTH_ENDPOINT` is set to `https://login.microsoftonline.com/<YOUR_TENANT_ID>/oauth2/v2.0/token`
+
+### "Test in Web Chat" works but Teams doesn't reply
+
+Web Chat uses Direct Line (`webchat.botframework.com`), which has different auth than Teams (`smba.trafficmanager.net`). Web Chat may accept inbound but reject outbound for Single Tenant bots.
+
+**Fix**: Always test with a real Teams client. Do not rely on Web Chat for outbound reply testing.
 
 ### Bot doesn't appear in Teams
 
@@ -329,9 +381,9 @@ kubectl exec deployment/openab-gateway -- curl -s https://login.botframework.com
 
 ## Security Considerations
 
-- **Credentials in Kubernetes Secrets** — Helm chart stores `TEAMS_APP_SECRET` in a K8s Secret, not in ConfigMap
+- **Credentials in Kubernetes Secrets** — never in ConfigMaps or Deployment manifests
 - **Rotate client secrets** before expiration — set a reminder based on the expiration chosen in Step 1
-- **Use tenant allowlist** in production — restrict to your organization's tenant ID
+- **Use tenant allowlist** in production — restrict `TEAMS_ALLOWED_TENANTS` to your organization's tenant ID
 - **Network policies** — consider restricting Gateway pod egress to Bot Framework endpoints
 - **OAB pod has no inbound exposure** — connects outbound to Gateway only
 
