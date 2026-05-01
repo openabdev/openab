@@ -215,10 +215,6 @@ async fn main() -> Result<()> {
     info!("line adapter enabled");
     app = app.route("/webhook/line", post(adapters::line::webhook));
 
-    if telegram_bot_token.is_none() && line_access_token.is_none() {
-        warn!("no adapters configured — set TELEGRAM_BOT_TOKEN and/or LINE_CHANNEL_ACCESS_TOKEN");
-    }
-
     // Teams adapter
     let teams = adapters::teams::TeamsConfig::from_env().map(|config| {
         info!("teams adapter enabled");
