@@ -50,7 +50,7 @@ Sends a `session/cancel` JSON-RPC notification to the ACP backend. This aborts i
 
 ### `/reset`
 
-Destroys the current ACP session (kills the process) and clears all session state. The next message in the thread or DM will automatically create a fresh session via the session pool.
+Cancels any in-flight operation, then removes the session from the pool. The ACP process terminates once the last reference is released. The next message in the thread or DM will automatically create a fresh session.
 
 This is equivalent to the `sessions close` + `sessions new` pattern used by [OpenClaw ACPX](https://github.com/openclaw/acpx).
 

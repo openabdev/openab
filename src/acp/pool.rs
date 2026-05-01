@@ -292,9 +292,31 @@ impl SessionPool {
         Ok(())
     }
 
-    /// Reset a session: remove the active connection and clear suspended state.
-    /// The next message will trigger a fresh `get_or_create` with a new ACP session.
+    /// Reset a session: cancel any in-flight operation, remove the active connection,
+    /// and clear all suspended state. The ACP process will be killed once the last
+    /// Arc reference is dropped (after streaming finishes). The next message will
+    /// trigger a fresh `get_or_create` with a new ACP session.
     pub async fn reset_session(&self, thread_id: &str) -> Result<()> {
+        // Send session/cancel via the lock-free stdin handle first.
+        // This stops in-flight streaming even while with_connection() holds the
+        // connection mutex, so the old process finishes promptly.
+        if let Some((stdin, session_id)) = {
+            let state = self.state.read().await;
+            state.cancel_handles.get(thread_id).cloned()
+        } {
+            let data = serde_json::to_string(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": {"sessionId": session_id}
+            }))?;
+            tracing::info!(session_id, "reset: sending session/cancel");
+            use tokio::io::AsyncWriteExt;
+            let mut w = stdin.lock().await;
+            let _ = w.write_all(data.as_bytes()).await;
+            let _ = w.write_all(b"\n").await;
+            let _ = w.flush().await;
+        }
+
         let mut state = self.state.write().await;
         let had_active = state.active.remove(thread_id).is_some();
         state.cancel_handles.remove(thread_id);
