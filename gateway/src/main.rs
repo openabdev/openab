@@ -42,6 +42,10 @@ pub struct AppState {
     pub line_channel_secret: Option<String>,
     /// LINE channel access token for reply API
     pub line_access_token: Option<String>,
+    /// Teams adapter (None if Teams disabled)
+    pub teams: Option<adapters::teams::TeamsAdapter>,
+    /// service_url cache for Teams reply routing (conversation_id → (service_url, last_seen))
+    pub teams_service_urls: Mutex<HashMap<String, (String, Instant)>>,
     /// WebSocket authentication token
     pub ws_token: Option<String>,
     /// Broadcast channel: gateway → OAB (events from all platforms)
@@ -137,6 +141,18 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                                     warn!("reply for line but adapter not configured");
                                 }
                             }
+                            "teams" => {
+                                if let Some(ref teams) = state_for_recv.teams {
+                                    adapters::teams::handle_reply(
+                                        &reply,
+                                        teams,
+                                        &state_for_recv.teams_service_urls,
+                                    )
+                                    .await;
+                                } else {
+                                    warn!("reply for teams but adapter not configured");
+                                }
+                            }
                             other => warn!(platform = other, "unknown reply platform"),
                         }
                     }
@@ -203,11 +219,29 @@ async fn main() -> Result<()> {
         warn!("no adapters configured — set TELEGRAM_BOT_TOKEN and/or LINE_CHANNEL_ACCESS_TOKEN");
     }
 
+    // Teams adapter
+    let teams = adapters::teams::TeamsConfig::from_env().map(|config| {
+        info!("teams adapter enabled");
+        adapters::teams::TeamsAdapter::new(config)
+    });
+    if teams.is_some() {
+        let webhook_path =
+            std::env::var("TEAMS_WEBHOOK_PATH").unwrap_or_else(|_| "/webhook/teams".into());
+        info!(path = %webhook_path, "teams webhook registered");
+        app = app.route(&webhook_path, post(adapters::teams::webhook));
+    }
+
+    if telegram_bot_token.is_none() && line_access_token.is_none() && teams.is_none() {
+        warn!("no adapters configured — set TELEGRAM_BOT_TOKEN, LINE_CHANNEL_ACCESS_TOKEN, and/or TEAMS_APP_ID + TEAMS_APP_SECRET");
+    }
+
     let state = Arc::new(AppState {
         telegram_bot_token,
         telegram_secret_token,
         line_channel_secret,
         line_access_token,
+        teams,
+        teams_service_urls: Mutex::new(HashMap::new()),
         ws_token,
         event_tx,
         reply_token_cache,
@@ -231,6 +265,27 @@ async fn main() -> Result<()> {
                         removed = before - after,
                         remaining = after,
                         "reply token cache sweep"
+                    );
+                }
+            }
+        });
+    }
+
+    // Periodic cleanup of stale Teams service_url entries (TTL: 4 hours)
+    {
+        let state_for_cleanup = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                let mut urls = state_for_cleanup.teams_service_urls.lock().await;
+                let before = urls.len();
+                urls.retain(|_, (_, t)| t.elapsed().as_secs() < 4 * 3600);
+                let after = urls.len();
+                if before != after {
+                    info!(
+                        removed = before - after,
+                        remaining = after,
+                        "teams service_url cache cleanup"
                     );
                 }
             }
