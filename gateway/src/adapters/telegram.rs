@@ -7,6 +7,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
+/// Base URL for Telegram Bot API. Extracted as constant for consistency
+/// with LINE's `LINE_API_BASE` and to enable future mock testing.
+pub const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
+
 // --- Telegram types ---
 
 #[derive(Debug, Deserialize)]
@@ -140,7 +144,7 @@ pub async fn handle_reply(
     if reply.command.as_deref() == Some("create_topic") {
         let req_id = reply.request_id.clone().unwrap_or_default();
         info!(chat_id = %reply.channel.id, "creating forum topic");
-        let url = format!("https://api.telegram.org/bot{bot_token}/createForumTopic");
+        let url = format!("{TELEGRAM_API_BASE}/bot{bot_token}/createForumTopic");
         let resp = client
             .post(&url)
             .json(&serde_json::json!({"chat_id": reply.channel.id, "name": reply.content.text}))
@@ -222,7 +226,7 @@ pub async fn handle_reply(
                 })
                 .unwrap_or_default()
         };
-        let url = format!("https://api.telegram.org/bot{bot_token}/setMessageReaction");
+        let url = format!("{TELEGRAM_API_BASE}/bot{bot_token}/setMessageReaction");
         let _ = client
             .post(&url)
             .json(&serde_json::json!({
@@ -242,7 +246,7 @@ pub async fn handle_reply(
         thread_id = ?reply.channel.thread_id,
         "gateway → telegram"
     );
-    let url = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
+    let url = format!("{TELEGRAM_API_BASE}/bot{bot_token}/sendMessage");
     let _ = client
         .post(&url)
         .json(&serde_json::json!({

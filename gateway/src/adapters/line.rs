@@ -103,12 +103,32 @@ pub async fn webhook(
         let source = event.source.as_ref();
         let (channel_id, channel_type) = match source {
             Some(s) if s.source_type == "group" => {
-                (s.group_id.clone().unwrap_or_default(), "group".to_string())
+                match s.group_id.as_deref() {
+                    Some(id) if !id.is_empty() => (id.to_string(), "group".to_string()),
+                    _ => {
+                        warn!("LINE group event missing groupId, skipping");
+                        continue;
+                    }
+                }
             }
             Some(s) if s.source_type == "room" => {
-                (s.room_id.clone().unwrap_or_default(), "room".to_string())
+                match s.room_id.as_deref() {
+                    Some(id) if !id.is_empty() => (id.to_string(), "room".to_string()),
+                    _ => {
+                        warn!("LINE room event missing roomId, skipping");
+                        continue;
+                    }
+                }
             }
-            Some(s) => (s.user_id.clone().unwrap_or_default(), "user".to_string()),
+            Some(s) => {
+                match s.user_id.as_deref() {
+                    Some(id) if !id.is_empty() => (id.to_string(), "user".to_string()),
+                    _ => {
+                        warn!("LINE user event missing userId, skipping");
+                        continue;
+                    }
+                }
+            }
             None => continue,
         };
         let user_id = source
