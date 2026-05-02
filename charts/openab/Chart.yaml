@@ -2,5 +2,5 @@ apiVersion: v2
 name: openab
 description: A lightweight, secure, cloud-native ACP harness that bridges Discord and any ACP-compatible coding CLI.
 type: application
-version: 0.8.2
-appVersion: "0.8.2"
+version: 0.8.3-beta.1
+appVersion: "0.8.3-beta.1"
