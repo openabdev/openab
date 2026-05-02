@@ -683,14 +683,23 @@ async fn ws_connect_loop(
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(data))) => {
                         match WsFrame::decode(data.as_ref()) {
                             Ok(frame) => {
-                                // method=2 is data frame (events), method=1 is control
-                                if let Some(ref payload) = frame.payload {
-                                    if let Ok(text) = String::from_utf8(payload.clone()) {
-                                        handle_ws_message(
-                                            &text, bot_open_id_store, dedupe, config, event_tx,
-                                            name_cache, token_cache, client,
-                                        ).await;
+                                // method=1 is data frame (events), method=0 is control
+                                if frame.method == 1 {
+                                    if let Some(ref payload) = frame.payload {
+                                        if let Ok(text) = String::from_utf8(payload.clone()) {
+                                            handle_ws_message(
+                                                &text, bot_open_id_store, dedupe, config, event_tx,
+                                                name_cache, token_cache, client,
+                                            ).await;
+                                        }
                                     }
+                                    // Send ACK: echo frame back with {"code":200} payload
+                                    let mut ack = frame.clone();
+                                    ack.payload = Some(b"{\"code\":200}".to_vec());
+                                    let ack_bytes = ack.encode_to_vec();
+                                    let _ = ws_tx.send(
+                                        tokio_tungstenite::tungstenite::Message::Binary(ack_bytes.into())
+                                    ).await;
                                 }
                             }
                             Err(e) => {
