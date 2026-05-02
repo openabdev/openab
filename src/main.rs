@@ -51,7 +51,7 @@ async fn shutdown_signal() {
 }
 
 #[derive(Parser)]
-#[command(name = "openab")]
+#[command(name = "openab", version)]
 #[command(about = "Multi-platform ACP agent broker (Discord, Slack)", long_about = None)]
 struct Cli {
     #[command(subcommand)]
