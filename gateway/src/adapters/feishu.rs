@@ -960,8 +960,12 @@ fn split_text(text: &str, limit: usize) -> Vec<&str> {
         while !text.is_char_boundary(end) {
             end -= 1;
         }
-        // Try to break at a newline or space within the last 200 bytes
-        let search_start = if end > start + 200 { end - 200 } else { start };
+        // Try to break at a newline or space within the last 200 bytes.
+        // search_start must also be on a char boundary to avoid panic.
+        let mut search_start = if end > start + 200 { end - 200 } else { start };
+        while search_start < end && !text.is_char_boundary(search_start) {
+            search_start += 1;
+        }
         let break_at = text[search_start..end]
             .rfind('\n')
             .or_else(|| text[search_start..end].rfind(' '))
@@ -1370,6 +1374,18 @@ mod tests {
         let text = "你好世界測試飛書中文聊天消息分割安全驗證完成";
         let chunks = split_text(text, 10);
         assert!(chunks.len() > 1);
+        let reassembled: String = chunks.concat();
+        assert_eq!(reassembled, text);
+    }
+
+    #[test]
+    fn split_text_search_start_char_boundary() {
+        // Regression: search_start = end - 200 could land mid-char.
+        // 300 Chinese chars (900 bytes) with limit=500 forces search_start
+        // into the middle of multi-byte chars.
+        let text: String = "飛書".repeat(150); // 300 chars, 900 bytes
+        let chunks = split_text(&text, 500);
+        assert!(chunks.len() >= 2);
         let reassembled: String = chunks.concat();
         assert_eq!(reassembled, text);
     }
