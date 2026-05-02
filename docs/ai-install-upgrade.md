@@ -104,6 +104,13 @@ rollback openab per the upgrade SOP — the upgrade to v0.7.7 failed
 
 > **Gateway config migration (one-time, if applicable):** If you previously enabled a custom gateway by manually patching the ConfigMap (e.g. adding `[gateway]` to `config.toml` by hand), that block is not captured by `helm get values`. Before upgrading, copy the gateway settings into your `values.yaml` under `agents.<name>.gateway` and set `enabled: true` so they are preserved on every subsequent `helm upgrade`. See chart `values.yaml` for the field reference (`enabled`, `url`, `platform`, `token`, `botUsername`). After migrating, do not manually edit the ConfigMap again — manage gateway config through `values.yaml` only.
 
+> **Usercron path migration (v0.8.2+):** The usercron `cronjob.toml` path resolution changed from `$HOME/` to `$HOME/.openab/`. If you have an existing `cronjob.toml` in the agent's home directory, move it before upgrading:
+> ```
+> mkdir -p $HOME/.openab
+> mv $HOME/cronjob.toml $HOME/.openab/cronjob.toml
+> ```
+> The scheduler will not pick up the file from the old location. Hot-reload (polling every 60s) will detect the file once it is in the correct path.
+
 ---
 
 ## 3. Upgrade
@@ -142,6 +149,10 @@ rollback openab per the upgrade SOP — the upgrade to v0.7.7 failed
   │    errors in logs; verify Cloudflare tunnel URL  │
   │    is still reachable and update values.yaml if  │
   │    the URL has rotated                           │
+  │  ✓ (if usercron enabled) cronjob.toml loaded     │
+  │    — check for "loaded usercron jobs" in logs;   │
+  │    if count=0, verify file is at                 │
+  │    $HOME/.openab/cronjob.toml (not $HOME/)       │
   │                                                  │
   │  ALL PASS ──► proceed to 6. CLEANUP            │
   │  ANY FAIL ──► proceed to 5. ROLLBACK             │
