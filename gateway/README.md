@@ -49,6 +49,10 @@ url = "ws://gateway:8080/ws"
 | `TELEGRAM_WEBHOOK_PATH` | `/webhook/telegram` | Webhook endpoint path |
 | `LINE_CHANNEL_SECRET` | (optional) | LINE channel secret for webhook HMAC signature verification |
 | `LINE_CHANNEL_ACCESS_TOKEN` | (optional) | LINE channel access token for Reply/Push API |
+| `FEISHU_APP_ID` | (optional) | Feishu/Lark App ID — enables feishu adapter |
+| `FEISHU_APP_SECRET` | (optional) | Feishu/Lark App Secret |
+| `FEISHU_DOMAIN` | `feishu` | `feishu` (China) or `lark` (international) |
+| `FEISHU_CONNECTION_MODE` | `websocket` | `websocket` (recommended) or `webhook` |
 
 ### Endpoints
 
@@ -56,6 +60,7 @@ url = "ws://gateway:8080/ws"
 |---|---|
 | `POST /webhook/telegram` | Telegram webhook receiver |
 | `POST /webhook/line` | LINE webhook receiver |
+| `POST /webhook/feishu` | Feishu webhook receiver (when `FEISHU_CONNECTION_MODE=webhook`) |
 | `GET /ws` | WebSocket server (OAB connects here) |
 | `GET /health` | Health check |
 

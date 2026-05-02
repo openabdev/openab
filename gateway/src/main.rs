@@ -46,6 +46,8 @@ pub struct AppState {
     pub teams: Option<adapters::teams::TeamsAdapter>,
     /// service_url cache for Teams reply routing (conversation_id → (service_url, last_seen))
     pub teams_service_urls: Mutex<HashMap<String, (String, Instant)>>,
+    /// Feishu adapter (None if Feishu disabled)
+    pub feishu: Option<adapters::feishu::FeishuAdapter>,
     /// WebSocket authentication token
     pub ws_token: Option<String>,
     /// Broadcast channel: gateway → OAB (events from all platforms)
@@ -153,6 +155,13 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                                     warn!("reply for teams but adapter not configured");
                                 }
                             }
+                            "feishu" => {
+                                if let Some(ref feishu) = state_for_recv.feishu {
+                                    adapters::feishu::handle_reply(&reply, feishu).await;
+                                } else {
+                                    warn!("reply for feishu but adapter not configured");
+                                }
+                            }
                             other => warn!(platform = other, "unknown reply platform"),
                         }
                     }
@@ -227,8 +236,32 @@ async fn main() -> Result<()> {
         app = app.route(&webhook_path, post(adapters::teams::webhook));
     }
 
-    if telegram_bot_token.is_none() && line_access_token.is_none() && teams.is_none() {
-        warn!("no adapters configured — set TELEGRAM_BOT_TOKEN, LINE_CHANNEL_ACCESS_TOKEN, and/or TEAMS_APP_ID + TEAMS_APP_SECRET");
+    // Feishu adapter
+    let feishu_config = adapters::feishu::FeishuConfig::from_env();
+    let feishu_ws_mode = feishu_config
+        .as_ref()
+        .map(|c| c.connection_mode == adapters::feishu::ConnectionMode::Websocket)
+        .unwrap_or(false);
+    if let Some(ref config) = feishu_config {
+        match config.connection_mode {
+            adapters::feishu::ConnectionMode::Websocket => {
+                info!("feishu adapter enabled (websocket) — will connect after state init");
+            }
+            adapters::feishu::ConnectionMode::Webhook => {
+                let path = config.webhook_path.clone();
+                info!(path = %path, "feishu adapter enabled (webhook)");
+                app = app.route(&path, post(adapters::feishu::webhook));
+            }
+        }
+    }
+    let feishu = feishu_config.map(adapters::feishu::FeishuAdapter::new);
+
+    if telegram_bot_token.is_none()
+        && line_access_token.is_none()
+        && teams.is_none()
+        && feishu.is_none()
+    {
+        warn!("no adapters configured — set TELEGRAM_BOT_TOKEN, LINE_CHANNEL_ACCESS_TOKEN, TEAMS_APP_ID + TEAMS_APP_SECRET, and/or FEISHU_APP_ID + FEISHU_APP_SECRET");
     }
 
     let state = Arc::new(AppState {
@@ -238,6 +271,7 @@ async fn main() -> Result<()> {
         line_access_token,
         teams,
         teams_service_urls: Mutex::new(HashMap::new()),
+        feishu,
         ws_token,
         event_tx,
         reply_token_cache,
@@ -288,7 +322,18 @@ async fn main() -> Result<()> {
         });
     }
 
-    let app = app.with_state(state);
+    let app = app.with_state(state.clone());
+
+    // Spawn feishu WebSocket long-connection if configured
+    let (_feishu_shutdown_tx, feishu_shutdown_rx) = tokio::sync::watch::channel(false);
+    if feishu_ws_mode {
+        if let Some(ref feishu) = state.feishu {
+            match adapters::feishu::start_websocket(feishu, state.event_tx.clone(), feishu_shutdown_rx).await {
+                Ok(_handle) => info!("feishu websocket task spawned"),
+                Err(e) => tracing::error!(err = %e, "feishu websocket startup failed"),
+            }
+        }
+    }
 
     info!(addr = %listen_addr, "gateway starting");
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;

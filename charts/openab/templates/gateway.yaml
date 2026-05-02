@@ -75,6 +75,54 @@ spec:
               value: {{ ($cfg.gateway).teams.webhookPath | quote }}
             {{- end }}
             {{- end }}
+            {{- $hasFeishu := and (($cfg.gateway).feishu).appId (($cfg.gateway).feishu).appSecret }}
+            {{- if $hasFeishu }}
+            - name: FEISHU_APP_ID
+              value: {{ ($cfg.gateway).feishu.appId | quote }}
+            - name: FEISHU_APP_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: feishu-app-secret
+            {{- if ($cfg.gateway).feishu.domain }}
+            - name: FEISHU_DOMAIN
+              value: {{ ($cfg.gateway).feishu.domain | quote }}
+            {{- end }}
+            {{- if ($cfg.gateway).feishu.connectionMode }}
+            - name: FEISHU_CONNECTION_MODE
+              value: {{ ($cfg.gateway).feishu.connectionMode | quote }}
+            {{- end }}
+            {{- if ($cfg.gateway).feishu.webhookPath }}
+            - name: FEISHU_WEBHOOK_PATH
+              value: {{ ($cfg.gateway).feishu.webhookPath | quote }}
+            {{- end }}
+            {{- if ($cfg.gateway).feishu.verificationToken }}
+            - name: FEISHU_VERIFICATION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: feishu-verification-token
+            {{- end }}
+            {{- if ($cfg.gateway).feishu.encryptKey }}
+            - name: FEISHU_ENCRYPT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: feishu-encrypt-key
+            {{- end }}
+            {{- if ($cfg.gateway).feishu.allowedGroups }}
+            - name: FEISHU_ALLOWED_GROUPS
+              value: {{ ($cfg.gateway).feishu.allowedGroups | join "," | quote }}
+            {{- end }}
+            {{- if ($cfg.gateway).feishu.allowedUsers }}
+            - name: FEISHU_ALLOWED_USERS
+              value: {{ ($cfg.gateway).feishu.allowedUsers | join "," | quote }}
+            {{- end }}
+            {{- if not (($cfg.gateway).feishu).requireMention }}
+            - name: FEISHU_REQUIRE_MENTION
+              value: "false"
+            {{- end }}
+            {{- end }}
             - name: RUST_LOG
               value: {{ ($cfg.gateway).rustLog | default "info" | quote }}
           livenessProbe:
