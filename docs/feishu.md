@@ -106,33 +106,3 @@ To disable mention gating: `feishu.requireMention: false`.
 | WebSocket keeps reconnecting | Check event subscription is set to **Long Connection** mode. Check app is published and approved. |
 | Webhook verification fails | Ensure `verificationToken` and `encryptKey` match Feishu app config. |
 | Messages from Lark (international) | Set `domain: "lark"` to use `open.larksuite.com` API endpoints. |
-
-## Prior Art
-
-Design decisions were informed by two mature Feishu/Lark integrations:
-
-### [OpenClaw](https://github.com/openclaw/openclaw/blob/main/docs/channels/feishu.md)
-
-Official Lark/Feishu channel plugin (TypeScript). Key patterns:
-
-| Feature | OpenClaw | OpenAB | Notes |
-|---|---|---|---|
-| Connection mode | WS default, webhook fallback | Same | ✅ Aligned |
-| Sender name resolution | `resolveSenderNames: true` (API call) + `feishu-contacts-sync` skill (zero-call lookup table) | Lazy API call with in-memory cache | OpenClaw's contacts-sync is a future enhancement |
-| Streaming replies | Interactive cards with real-time updates | Not yet | Future enhancement |
-| Per-group config | `groups.<chat_id>.requireMention` override | Global only | Future enhancement |
-| Multi-account | `accounts.<id>` with per-account TTS/domain | Single account | Future enhancement |
-
-### [Hermes Agent](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/feishu)
-
-Nous Research's self-hosted agent (Python, 17+ platforms). Key patterns:
-
-| Feature | Hermes | OpenAB | Notes |
-|---|---|---|---|
-| Bot identity | Auto-detect on startup (both modes) | Same | ✅ Aligned |
-| Timing-safe token comparison | `constant_time_eq` | `subtle::ConstantTimeEq` | ✅ Aligned |
-| Text batching | 0.6s debounce, merges rapid-fire messages | Not yet | Future enhancement |
-| Bot-to-bot messaging | `FEISHU_ALLOW_BOTS` (none/mentions/all) | Skips all bot senders | Future enhancement |
-| Per-group ACL | 5 policies (open/allowlist/blacklist/admin_only/disabled) | Global allowlist | Future enhancement |
-| Media support | Images/audio/video/files | Text only | Future enhancement |
-| Dedup persistence | Persisted to disk, survives restarts | In-memory only | Future enhancement |
