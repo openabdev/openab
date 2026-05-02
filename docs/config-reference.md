@@ -65,12 +65,12 @@ Slack adapter using Socket Mode. Requires both a Bot User OAuth Token and an App
 
 ## `[gateway]`
 
-Custom Gateway adapter for platforms like Telegram and LINE. Connects to the gateway via WebSocket.
+Custom Gateway adapter for platforms like Telegram, LINE, and Feishu/Lark. Connects to the gateway via WebSocket.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `url` | string | *required* | WebSocket URL of the gateway (e.g. `ws://openab-gateway:8080/ws`). |
-| `platform` | string | `"telegram"` | Platform name for session key namespacing (e.g. `"telegram"`, `"line"`). |
+| `platform` | string | `"telegram"` | Platform name for session key namespacing (e.g. `"telegram"`, `"line"`, `"feishu"`). |
 | `token` | string | — | Shared token for WebSocket authentication (optional but recommended). |
 | `bot_username` | string | — | Bot username for @mention gating in groups. |
 | `allow_all_channels` | bool \| omit | auto-detect | `true` = all channels; `false` = only `allowed_channels`. Omitted = inferred from list (non-empty → false, empty → true). |

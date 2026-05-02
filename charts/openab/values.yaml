@@ -214,6 +214,19 @@ agents:
         openidMetadata: ""     # Override for sovereign clouds → TEAMS_OPENID_METADATA
         allowedTenants: []     # List of tenant IDs → TEAMS_ALLOWED_TENANTS
         webhookPath: ""        # Gateway default: /webhook/teams → TEAMS_WEBHOOK_PATH
+      # Feishu/Lark adapter config (gateway-side env vars)
+      # See docs/feishu.md for full setup guide
+      feishu:
+        appId: ""              # Feishu App ID → FEISHU_APP_ID
+        appSecret: ""          # Feishu App Secret → FEISHU_APP_SECRET (use --set-literal or external secret mgmt)
+        domain: "feishu"       # "feishu" (China) or "lark" (international) → FEISHU_DOMAIN
+        connectionMode: "websocket"  # "websocket" (default, recommended) or "webhook" → FEISHU_CONNECTION_MODE
+        webhookPath: ""        # Gateway default: /webhook/feishu → FEISHU_WEBHOOK_PATH
+        verificationToken: ""  # Webhook verification token → FEISHU_VERIFICATION_TOKEN
+        encryptKey: ""         # Webhook encrypt key → FEISHU_ENCRYPT_KEY
+        allowedGroups: []      # List of chat_id → FEISHU_ALLOWED_GROUPS
+        allowedUsers: []       # List of open_id → FEISHU_ALLOWED_USERS
+        requireMention: true   # Require @mention in groups → FEISHU_REQUIRE_MENTION
     # Scheduled messages — config-driven cron (ADR: basic-cronjob)
     # Each entry sends a message to the agent at the specified schedule.
     # Example:

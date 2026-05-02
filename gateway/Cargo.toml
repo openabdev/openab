@@ -20,6 +20,10 @@ hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
 jsonwebtoken = "9"
+aes = "0.8"
+cbc = "0.1"
+prost = "0.13"
+subtle = "2"
 
 [dev-dependencies]
 wiremock = "0.6"

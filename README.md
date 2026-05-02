@@ -4,7 +4,7 @@
 
 ![OpenAB banner](images/banner.jpg)
 
-A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**, and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, OpenCode, Copilot CLI, etc.) over stdio JSON-RPC — delivering the next-generation development experience. **Telegram, LINE**, and other webhook-based platforms are supported via the standalone [Custom Gateway](gateway/).
+A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**, and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, OpenCode, Copilot CLI, etc.) over stdio JSON-RPC — delivering the next-generation development experience. **Telegram, LINE, Feishu/Lark**, and other webhook-based platforms are supported via the standalone [Custom Gateway](gateway/).
 
 🪼 **Join our community!** Come say hi on Discord — we'd love to have you: **[🪼 OpenAB — Official](https://discord.gg/DmbhfDZjQS)** 🎉
 
@@ -21,8 +21,10 @@ A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**,
 ├──────────────┤            ▼         ▼
 │   LINE       │◄──webhook──┌──────────────────┐
 │   User       │            │  Custom Gateway  │
-└──────────────┘            │  (standalone)    │
-                            └──────────────────┘
+├──────────────┤            │  (standalone)    │
+│  Feishu/Lark │◄───WS──────│                  │
+│   User       │            └──────────────────┘
+└──────────────┘
 ```
 
 ## Demo
@@ -84,6 +86,13 @@ See [docs/telegram.md](docs/telegram.md) for the full setup guide. Requires the 
 <summary><strong>LINE</strong> (via Custom Gateway)</summary>
 
 See [docs/line.md](docs/line.md) for the full setup guide. Requires the standalone [Custom Gateway](gateway/) service.
+
+</details>
+
+<details>
+<summary><strong>Feishu/Lark</strong> (via Custom Gateway)</summary>
+
+See [docs/feishu.md](docs/feishu.md) for the full setup guide. Requires the standalone [Custom Gateway](gateway/) service. Supports WebSocket long-connection (default, no public URL needed) and HTTP webhook fallback.
 
 </details>
 
