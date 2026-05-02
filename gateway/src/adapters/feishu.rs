@@ -1688,4 +1688,148 @@ mod tests {
         let name = resolve_user_name("ou_unknown", &name_cache, &token_cache, &client, &server.uri()).await;
         assert_eq!(name, "ou_unknown");
     }
+
+    // --- extract_mentions tests ---
+
+    #[test]
+    fn extract_mentions_replacen_only_first() {
+        // If mention key appears in normal text too, only the first occurrence is removed
+        let mentions = vec![FeishuMention {
+            key: Some("@_user_1".into()),
+            id: Some(FeishuMentionId { open_id: Some("ou_bot".into()) }),
+            name: Some("Bot".into()),
+        }];
+        let env = make_envelope("group", "@_user_1 tell me about @_user_1 patterns", "ou_user1", Some(mentions));
+        let cfg = test_config();
+        let evt = parse_message_event(&env, Some("ou_bot"), &cfg).unwrap();
+        // Only first @_user_1 removed, second preserved
+        assert!(evt.content.text.contains("@_user_1"));
+    }
+
+    // --- allowed_users filtering ---
+
+    #[test]
+    fn parse_allowed_users_blocks_unlisted() {
+        let env = make_envelope("p2p", "hello", "ou_stranger", None);
+        let mut cfg = test_config();
+        cfg.allowed_users = vec!["ou_vip".into()];
+        assert!(parse_message_event(&env, Some("ou_bot"), &cfg).is_none());
+    }
+
+    #[test]
+    fn parse_allowed_users_permits_listed() {
+        let env = make_envelope("p2p", "hello", "ou_vip", None);
+        let mut cfg = test_config();
+        cfg.allowed_users = vec!["ou_vip".into()];
+        assert!(parse_message_event(&env, Some("ou_bot"), &cfg).is_some());
+    }
+
+    // --- allowed_groups filtering ---
+
+    #[test]
+    fn parse_allowed_groups_blocks_unlisted() {
+        let mentions = vec![FeishuMention {
+            key: Some("@_user_1".into()),
+            id: Some(FeishuMentionId { open_id: Some("ou_bot".into()) }),
+            name: Some("Bot".into()),
+        }];
+        let env = make_envelope("group", "@_user_1 hello", "ou_user1", Some(mentions));
+        let mut cfg = test_config();
+        cfg.allowed_groups = vec!["oc_other".into()]; // oc_chat1 not in list
+        assert!(parse_message_event(&env, Some("ou_bot"), &cfg).is_none());
+    }
+
+    #[test]
+    fn parse_allowed_groups_permits_listed() {
+        let mentions = vec![FeishuMention {
+            key: Some("@_user_1".into()),
+            id: Some(FeishuMentionId { open_id: Some("ou_bot".into()) }),
+            name: Some("Bot".into()),
+        }];
+        let env = make_envelope("group", "@_user_1 hello", "ou_user1", Some(mentions));
+        let mut cfg = test_config();
+        cfg.allowed_groups = vec!["oc_chat1".into()];
+        assert!(parse_message_event(&env, Some("ou_bot"), &cfg).is_some());
+    }
+
+    // --- Token TTL from API response ---
+
+    #[tokio::test]
+    async fn token_uses_api_expire_field() {
+        let server = MockServer::start().await;
+        // Return a short expire (10s). With 300s margin, token should be
+        // considered expired immediately on second call.
+        Mock::given(method("POST"))
+            .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-short",
+                "expire": 10
+            })))
+            .expect(2) // called twice because 10s < 300s margin → always expired
+            .mount(&server)
+            .await;
+
+        let config = test_config();
+        let cache = FeishuTokenCache::with_base(&config, &server.uri());
+        let client = reqwest::Client::new();
+
+        let t1 = cache.get_token(&client).await.unwrap();
+        assert_eq!(t1, "t-short");
+        // Second call should refresh (expire=10 < margin=300)
+        let t2 = cache.get_token(&client).await.unwrap();
+        assert_eq!(t2, "t-short");
+        // expect(2) verifies it was called twice
+    }
+
+    // --- constant_time_eq ---
+
+    #[test]
+    fn constant_time_eq_same() {
+        assert!(constant_time_eq("abc123", "abc123"));
+    }
+
+    #[test]
+    fn constant_time_eq_different() {
+        assert!(!constant_time_eq("abc123", "abc124"));
+    }
+
+    #[test]
+    fn constant_time_eq_different_length() {
+        assert!(!constant_time_eq("short", "longer_string"));
+    }
+
+    // --- Thread ID parsing ---
+
+    #[test]
+    fn parse_thread_id_from_root_id() {
+        let mut env = make_envelope("p2p", "reply", "ou_user1", None);
+        env.event.as_mut().unwrap().message.as_mut().unwrap().root_id = Some("om_root".into());
+        let cfg = test_config();
+        let evt = parse_message_event(&env, Some("ou_bot"), &cfg).unwrap();
+        assert_eq!(evt.channel.thread_id, Some("om_root".into()));
+    }
+
+    #[test]
+    fn parse_thread_id_from_parent_id() {
+        let mut env = make_envelope("p2p", "reply", "ou_user1", None);
+        env.event.as_mut().unwrap().message.as_mut().unwrap().parent_id = Some("om_parent".into());
+        let cfg = test_config();
+        let evt = parse_message_event(&env, Some("ou_bot"), &cfg).unwrap();
+        assert_eq!(evt.channel.thread_id, Some("om_parent".into()));
+    }
+
+    // --- Emoji reaction mapping ---
+
+    #[test]
+    fn emoji_mapping_known() {
+        assert_eq!(emoji_to_feishu_reaction("👍"), Some("THUMBSUP"));
+        assert_eq!(emoji_to_feishu_reaction("🔥"), Some("FIRE"));
+        assert_eq!(emoji_to_feishu_reaction("👀"), Some("EYES"));
+    }
+
+    #[test]
+    fn emoji_mapping_unknown() {
+        assert_eq!(emoji_to_feishu_reaction("🎉"), None);
+    }
 }
