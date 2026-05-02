@@ -1,9 +1,12 @@
 {{- range $name, $cfg := .Values.agents }}
 {{- if and (ne (include "openab.agentEnabled" $cfg) "false") ($cfg.gateway).enabled }}
+{{- if ne (toString (($cfg.gateway).deploy)) "false" }}
 {{- $gwCfg := omit $cfg "nameOverride" }}
 {{- $d := dict "ctx" $ "agent" (printf "%s-gateway" $name) "cfg" $gwCfg }}
 {{- $agentD := dict "ctx" $ "agent" $name "cfg" $cfg }}
 {{- $hasTeams := and (($cfg.gateway).teams).appId (($cfg.gateway).teams).appSecret }}
+{{- $hasTelegram := and (($cfg.gateway).telegram).botToken }}
+{{- $hasLine := and (($cfg.gateway).line).channelSecret }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -43,12 +46,43 @@ spec:
               protocol: TCP
           env:
             {{- if ($cfg.gateway).token }}
-            {{- $agentD := dict "ctx" $ "agent" $name "cfg" $cfg }}
             - name: GATEWAY_WS_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ include "openab.agentFullname" $agentD }}
                   key: gateway-ws-token
+            {{- end }}
+            {{- if $hasTelegram }}
+            - name: TELEGRAM_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: telegram-bot-token
+            {{- if (($cfg.gateway).telegram).secretToken }}
+            - name: TELEGRAM_SECRET_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: telegram-secret-token
+            {{- end }}
+            {{- if (($cfg.gateway).telegram).webhookPath }}
+            - name: TELEGRAM_WEBHOOK_PATH
+              value: {{ (($cfg.gateway).telegram).webhookPath | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if $hasLine }}
+            - name: LINE_CHANNEL_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: line-channel-secret
+            {{- if (($cfg.gateway).line).channelAccessToken }}
+            - name: LINE_CHANNEL_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: line-channel-access-token
+            {{- end }}
             {{- end }}
             {{- if $hasTeams }}
             - name: TEAMS_APP_ID
@@ -141,6 +175,29 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          {{- with ($cfg.gateway).extraVolumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with ($cfg.gateway).extraContainers }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with ($cfg.gateway).nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with ($cfg.gateway).affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with ($cfg.gateway).tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if ($cfg.gateway).extraVolumes }}
+      volumes:
+        {{- toYaml ($cfg.gateway).extraVolumes | nindent 8 }}
+      {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -157,5 +214,6 @@ spec:
       name: http
   selector:
     {{- include "openab.selectorLabels" $d | nindent 4 }}
+{{- end }}
 {{- end }}
 {{- end }}

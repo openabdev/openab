@@ -87,3 +87,275 @@ tests:
       - matchRegex:
           path: data["config.toml"]
           pattern: 'platform = "line"'
+
+  # --- [gateway] config still renders when deploy=false (config-only mode) ---
+  - it: renders [gateway] config when deploy is false
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.deploy: false
+      agents.kiro.gateway.url: "ws://external-gateway:8080/ws"
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[gateway\]'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'url = "ws://external-gateway:8080/ws"'
+
+---
+suite: gateway deployment rendering
+templates:
+  - templates/gateway.yaml
+tests:
+  - it: does not render when gateway not enabled
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders Deployment and Service when gateway enabled
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+    asserts:
+      - hasDocuments:
+          count: 2
+      - isKind:
+          of: Deployment
+        documentIndex: 0
+      - isKind:
+          of: Service
+        documentIndex: 1
+
+  - it: does not render Deployment when deploy is false
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.deploy: false
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: injects TELEGRAM_BOT_TOKEN when telegram.botToken is set
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+      agents.kiro.gateway.telegram.botToken: "123:ABC"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TELEGRAM_BOT_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: RELEASE-NAME-openab-kiro-gateway
+                key: telegram-bot-token
+        documentIndex: 0
+
+  - it: injects TELEGRAM_SECRET_TOKEN when set
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+      agents.kiro.gateway.telegram.botToken: "123:ABC"
+      agents.kiro.gateway.telegram.secretToken: "my-secret"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TELEGRAM_SECRET_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: RELEASE-NAME-openab-kiro-gateway
+                key: telegram-secret-token
+        documentIndex: 0
+
+  - it: injects TELEGRAM_WEBHOOK_PATH when set
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+      agents.kiro.gateway.telegram.botToken: "123:ABC"
+      agents.kiro.gateway.telegram.webhookPath: "/custom/webhook"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TELEGRAM_WEBHOOK_PATH
+            value: "/custom/webhook"
+        documentIndex: 0
+
+  - it: does not inject telegram env vars when botToken not set
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TELEGRAM_BOT_TOKEN
+          any: true
+        documentIndex: 0
+
+  - it: injects LINE_CHANNEL_SECRET when set
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+      agents.kiro.gateway.line.channelSecret: "line-secret"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: LINE_CHANNEL_SECRET
+            valueFrom:
+              secretKeyRef:
+                name: RELEASE-NAME-openab-kiro-gateway
+                key: line-channel-secret
+        documentIndex: 0
+
+  - it: injects LINE_CHANNEL_ACCESS_TOKEN when set
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+      agents.kiro.gateway.line.channelSecret: "line-secret"
+      agents.kiro.gateway.line.channelAccessToken: "line-token"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: LINE_CHANNEL_ACCESS_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: RELEASE-NAME-openab-kiro-gateway
+                key: line-channel-access-token
+        documentIndex: 0
+
+  - it: renders extraContainers as sidecars
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+      agents.kiro.gateway.extraContainers:
+        - name: cloudflared
+          image: cloudflare/cloudflared:latest
+          args: ["tunnel", "run"]
+    asserts:
+      - contains:
+          path: spec.template.spec.containers
+          content:
+            name: cloudflared
+            image: cloudflare/cloudflared:latest
+            args: ["tunnel", "run"]
+        documentIndex: 0
+
+  - it: renders extraVolumes and extraVolumeMounts
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+      agents.kiro.gateway.extraVolumeMounts:
+        - name: tunnel-creds
+          mountPath: /etc/cloudflared
+          readOnly: true
+      agents.kiro.gateway.extraVolumes:
+        - name: tunnel-creds
+          secret:
+            secretName: cloudflared-creds
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: tunnel-creds
+            mountPath: /etc/cloudflared
+            readOnly: true
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: tunnel-creds
+            secret:
+              secretName: cloudflared-creds
+        documentIndex: 0
+
+  - it: renders nodeSelector when set
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+      agents.kiro.gateway.nodeSelector:
+        kubernetes.io/arch: amd64
+    asserts:
+      - equal:
+          path: spec.template.spec.nodeSelector
+          value:
+            kubernetes.io/arch: amd64
+        documentIndex: 0
+
+---
+suite: gateway secret rendering
+templates:
+  - templates/gateway-secret.yaml
+tests:
+  - it: does not render when gateway not enabled
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: does not render when deploy is false
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.deploy: false
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+      agents.kiro.gateway.telegram.botToken: "123:ABC"
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders telegram secrets
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+      agents.kiro.gateway.telegram.botToken: "123:ABC"
+      agents.kiro.gateway.telegram.secretToken: "my-secret"
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: Secret
+      - equal:
+          path: data["telegram-bot-token"]
+          value: "MTIzOkFCQw=="
+      - equal:
+          path: data["telegram-secret-token"]
+          value: "bXktc2VjcmV0"
+
+  - it: renders LINE secrets
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+      agents.kiro.gateway.line.channelSecret: "line-secret"
+      agents.kiro.gateway.line.channelAccessToken: "line-token"
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: data["line-channel-secret"]
+          value: "bGluZS1zZWNyZXQ="
+      - equal:
+          path: data["line-channel-access-token"]
+          value: "bGluZS10b2tlbg=="
+
+  - it: renders Teams secret only
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+      agents.kiro.gateway.teams.appId: "app-id"
+      agents.kiro.gateway.teams.appSecret: "app-secret"
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: data["teams-app-secret"]
+          value: "YXBwLXNlY3JldA=="
+
+  - it: does not render when no platform secrets configured
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+    asserts:
+      - hasDocuments:
+          count: 0

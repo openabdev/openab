@@ -194,7 +194,8 @@ agents:
       model: "whisper-large-v3-turbo"
       baseUrl: "https://api.groq.com/openai/v1"
     gateway:
-      enabled: false    # set to true + provide url to enable
+      enabled: false    # set to true + provide url to enable the [gateway] config block
+      deploy: true      # set to false to skip Gateway Deployment/Service (config-only mode)
       url: ""           # e.g. ws://openab-gateway:8080/ws
       platform: "telegram"  # default platform when gateway is enabled
       token: ""         # optional shared secret (injected via GATEWAY_WS_TOKEN env var)
@@ -203,7 +204,25 @@ agents:
       tag: ""           # defaults to Chart.AppVersion
       strategy: "Recreate"  # Recreate (default, prevents concurrent WS conflicts) or RollingUpdate
       resources: {}     # e.g. { requests: { cpu: 50m, memory: 64Mi }, limits: { memory: 128Mi } }
-      rustLog: "info"  # RUST_LOG for gateway container (e.g. "openab_gateway=debug")
+      rustLog: "info"   # RUST_LOG for gateway container (e.g. "openab_gateway=debug")
+      nodeSelector: {}
+      tolerations: []
+      affinity: {}
+      # extraContainers adds sidecar containers (e.g. cloudflared tunnel)
+      extraContainers: []
+      # extraVolumeMounts adds volume mounts to the gateway container
+      extraVolumeMounts: []
+      # extraVolumes adds volumes to the gateway pod
+      extraVolumes: []
+      # Telegram adapter config (gateway-side env vars)
+      telegram:
+        botToken: ""           # → TELEGRAM_BOT_TOKEN (use --set-literal or external secret mgmt)
+        secretToken: ""        # → TELEGRAM_SECRET_TOKEN (webhook validation)
+        webhookPath: ""        # Gateway default: /webhook/telegram → TELEGRAM_WEBHOOK_PATH
+      # LINE adapter config (gateway-side env vars)
+      line:
+        channelSecret: ""      # → LINE_CHANNEL_SECRET (webhook signature validation)
+        channelAccessToken: "" # → LINE_CHANNEL_ACCESS_TOKEN (reply/push API)
       # MS Teams adapter config (gateway-side env vars)
       # See docs/msteams-enterprise.md for full setup guide
       teams:
