@@ -288,13 +288,10 @@ async fn main() -> Result<()> {
                     .ok()
             });
         let access_token = std::env::var("GOOGLE_CHAT_ACCESS_TOKEN").ok();
-        let jwt_verifier = std::env::var("GOOGLE_CHAT_AUDIENCE")
-            .or_else(|_| std::env::var("GOOGLE_CHAT_PROJECT_NUMBER"))
-            .ok()
-            .map(|aud| {
-                info!("googlechat webhook JWT verification enabled (audience={aud})");
-                adapters::googlechat::GoogleChatJwtVerifier::new(aud)
-            });
+        let jwt_verifier = std::env::var("GOOGLE_CHAT_AUDIENCE").ok().map(|aud| {
+            info!("googlechat webhook JWT verification enabled (audience={aud})");
+            adapters::googlechat::GoogleChatJwtVerifier::new(aud)
+        });
 
         let webhook_path = std::env::var("GOOGLE_CHAT_WEBHOOK_PATH")
             .unwrap_or_else(|_| "/webhook/googlechat".into());
@@ -309,7 +306,7 @@ async fn main() -> Result<()> {
             warn!("GOOGLE_CHAT_ACCESS_TOKEN / GOOGLE_CHAT_SA_KEY_JSON not set — replies will be logged but not sent");
         }
         if jwt_verifier.is_none() {
-            warn!("GOOGLE_CHAT_PROJECT_NUMBER not set — webhook requests are NOT authenticated (insecure)");
+            warn!("GOOGLE_CHAT_AUDIENCE not set — webhook requests are NOT authenticated (insecure)");
         }
 
         Some(adapters::googlechat::GoogleChatAdapter::new(token_cache, access_token, jwt_verifier))

@@ -87,7 +87,7 @@ export GOOGLE_CHAT_SA_KEY_FILE="/path/to/service-account.json"
 cargo run --release
 ```
 
-## 5. Expose the Gateway (for local dev)
+## 4. Expose the Gateway (for local dev)
 
 Google Chat requires a public HTTPS endpoint for webhooks.
 
@@ -107,7 +107,7 @@ https://xxx.trycloudflare.com/webhook/googlechat
 
 Use nginx, Caddy, or a cloud load balancer with TLS termination pointing to the gateway's `:8080`.
 
-## 6. Configure OAB
+## 5. Configure OAB
 
 ```toml
 [gateway]
@@ -145,8 +145,7 @@ working_dir = "/home/agent"
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `GOOGLE_CHAT_ENABLED` | Yes | `false` | Set to `true` or `1` to enable the adapter |
-| `GOOGLE_CHAT_AUDIENCE` | Recommended | — | JWT audience for webhook verification (your webhook URL or GCP project number, depending on Authentication Audience setting) |
-| `GOOGLE_CHAT_PROJECT_NUMBER` | No | — | GCP project number — fallback for `GOOGLE_CHAT_AUDIENCE` when using "Project Number" auth mode |
+| `GOOGLE_CHAT_AUDIENCE` | Recommended | — | JWT audience for webhook verification — set to your full webhook URL (e.g. `https://your-domain.com/webhook/googlechat`) |
 | `GOOGLE_CHAT_SA_KEY_JSON` | No | — | Service account key JSON string (enables auto-refresh) |
 | `GOOGLE_CHAT_SA_KEY_FILE` | No | — | Path to service account key JSON file (alternative to `SA_KEY_JSON`) |
 | `GOOGLE_CHAT_ACCESS_TOKEN` | No | — | Static OAuth2 access token (fallback, expires in 1 hour) |
@@ -154,29 +153,25 @@ working_dir = "/home/agent"
 
 ## Security: Webhook Verification
 
-Google Chat signs every webhook request with a JWT Bearer token (issued by `https://accounts.google.com`). The gateway verifies this token to ensure requests actually come from Google.
+Google Chat signs every webhook request with a JWT Bearer token. The gateway verifies this token to ensure requests come from Google Chat specifically (not just any Google service).
 
 **Setup:**
 
-The JWT `aud` (audience) claim depends on your Google Chat API **Authentication Audience** setting:
-
-- **HTTP Endpoint URL** (default): `aud` = your configured webhook URL → set `GOOGLE_CHAT_AUDIENCE` to the full URL
-- **Project Number**: `aud` = your GCP project number → set `GOOGLE_CHAT_PROJECT_NUMBER`
+In the Google Chat API **Configuration** page, leave **Authentication Audience** at its default — **HTTP Endpoint URL**. Then set `GOOGLE_CHAT_AUDIENCE` to your full webhook URL:
 
 ```bash
-# Option 1: HTTP Endpoint URL mode (default)
 export GOOGLE_CHAT_AUDIENCE="https://your-domain.com/webhook/googlechat"
-
-# Option 2: Project Number mode
-export GOOGLE_CHAT_PROJECT_NUMBER="123456789012"
 ```
 
 The gateway will:
 - Reject requests without a valid `Authorization: Bearer <jwt>` header
 - Verify the JWT signature against Google's public keys (JWKS, cached for 1 hour)
-- Validate `iss == https://accounts.google.com` and `aud` matches the configured audience
+- Validate `iss == https://accounts.google.com` and `aud` matches the configured webhook URL
+- Validate `email == chat@system.gserviceaccount.com` (proves the token came from Google Chat, not another Google service)
 
-If neither `GOOGLE_CHAT_AUDIENCE` nor `GOOGLE_CHAT_PROJECT_NUMBER` is set, the gateway logs a warning and accepts all requests (insecure — for local development only).
+If `GOOGLE_CHAT_AUDIENCE` is not set, the gateway logs a warning and accepts all requests (insecure — for local development only).
+
+> **Note:** The "Project Number" Authentication Audience mode is not supported. It uses a different JWT issuer (`chat@system.gserviceaccount.com`) and JWKS endpoint that this adapter does not implement. Use the default "HTTP Endpoint URL" mode.
 
 ## Troubleshooting
 

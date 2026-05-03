@@ -249,8 +249,7 @@ agents:
       # Google Chat adapter config (gateway-side env vars)
       # See docs/google-chat.md for full setup guide
       googleChat:
-        audience: ""           # JWT audience → GOOGLE_CHAT_AUDIENCE (your webhook URL, enables JWT verification)
-        projectNumber: ""      # GCP project number → GOOGLE_CHAT_PROJECT_NUMBER (fallback audience for "Project Number" auth mode)
+        audience: ""           # JWT audience → GOOGLE_CHAT_AUDIENCE (set to your webhook URL to enable JWT verification)
         saKeyJson: ""          # Service account key JSON string → GOOGLE_CHAT_SA_KEY_JSON (recommended, auto-refresh)
         accessToken: ""        # Static OAuth2 access token → GOOGLE_CHAT_ACCESS_TOKEN (fallback, 1-hour TTL)
         webhookPath: ""        # Gateway default: /webhook/googlechat → GOOGLE_CHAT_WEBHOOK_PATH

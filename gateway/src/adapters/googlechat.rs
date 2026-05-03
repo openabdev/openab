@@ -71,7 +71,24 @@ pub struct GoogleChatSpace {
 
 const GOOGLE_CHAT_ISSUER: &str = "https://accounts.google.com";
 const GOOGLE_CHAT_JWKS_URL: &str = "https://www.googleapis.com/oauth2/v3/certs";
+const GOOGLE_CHAT_SERVICE_ACCOUNT_EMAIL: &str = "chat@system.gserviceaccount.com";
 const JWKS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Verify the JWT's `email` claim equals the Google Chat service account address.
+/// Without this check, any Google-issued ID token (e.g. Sign-In) would be accepted —
+/// `iss=accounts.google.com` alone doesn't prove the request came from Google Chat.
+fn verify_email_claim(claims: &serde_json::Value) -> Result<(), String> {
+    let email = claims
+        .get("email")
+        .and_then(|v| v.as_str())
+        .ok_or("missing email claim")?;
+    if email != GOOGLE_CHAT_SERVICE_ACCOUNT_EMAIL {
+        return Err(format!(
+            "email claim mismatch: expected {GOOGLE_CHAT_SERVICE_ACCOUNT_EMAIL}, got {email}"
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Deserialize)]
 struct JwkKey {
@@ -160,8 +177,10 @@ impl GoogleChatJwtVerifier {
         validation.set_issuer(&[GOOGLE_CHAT_ISSUER]);
         validation.validate_exp = true;
 
-        decode::<serde_json::Value>(token, &decoding_key, &validation)
+        let token_data = decode::<serde_json::Value>(token, &decoding_key, &validation)
             .map_err(|e| format!("JWT validation failed: {e}"))?;
+
+        verify_email_claim(&token_data.claims)?;
 
         Ok(())
     }
@@ -809,6 +828,32 @@ mod tests {
         let verifier = GoogleChatJwtVerifier::new("123456".into());
         let result = verifier.verify("Bearer ").await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn email_claim_accepts_chat_system_account() {
+        let claims = serde_json::json!({"email": "chat@system.gserviceaccount.com"});
+        assert!(verify_email_claim(&claims).is_ok());
+    }
+
+    #[test]
+    fn email_claim_rejects_other_google_email() {
+        let claims = serde_json::json!({"email": "attacker@example.iam.gserviceaccount.com"});
+        let err = verify_email_claim(&claims).unwrap_err();
+        assert!(err.contains("email claim mismatch"));
+    }
+
+    #[test]
+    fn email_claim_rejects_missing_email() {
+        let claims = serde_json::json!({"sub": "123", "iss": "accounts.google.com"});
+        let err = verify_email_claim(&claims).unwrap_err();
+        assert!(err.contains("missing email"));
+    }
+
+    #[test]
+    fn email_claim_rejects_non_string_email() {
+        let claims = serde_json::json!({"email": 12345});
+        assert!(verify_email_claim(&claims).is_err());
     }
 
     #[test]

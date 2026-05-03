@@ -165,10 +165,6 @@ spec:
             - name: GOOGLE_CHAT_AUDIENCE
               value: {{ ($cfg.gateway).googleChat.audience | quote }}
             {{- end }}
-            {{- if (($cfg.gateway).googleChat).projectNumber }}
-            - name: GOOGLE_CHAT_PROJECT_NUMBER
-              value: {{ ($cfg.gateway).googleChat.projectNumber | quote }}
-            {{- end }}
             {{- if (($cfg.gateway).googleChat).saKeyJson }}
             - name: GOOGLE_CHAT_SA_KEY_JSON
               valueFrom:
