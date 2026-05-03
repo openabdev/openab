@@ -1,15 +1,28 @@
 # Agent-Installable Tools
 
-> **Audience:** AI agents (not humans). Feed this doc to your coding agent when it needs to install additional tools inside an OpenAB pod.
+## How to Install Extra Tools
 
-## Philosophy
+You don't need to read this doc yourself. Just ask your agent:
 
-OpenAB keeps its Docker image minimal — only the essentials ship in the Dockerfile. Everything else (AWS CLI, GitLab CLI, OpenSSH, language runtimes, etc.) is installed **at runtime by the agent** into `~/bin/`. This means:
+```
+per docs/* from OpenAB GitHub repo, how to install <TOOL_NAME> for my OAB agent
+```
 
-- **No Dockerfile changes** — the image stays lean and universal
-- **Persistent across restarts** — `~/bin/` lives on the PVC, so tools survive pod restarts
-- **One prompt to install** — tell your agent _"per docs/agent-installable-tools.md, install X for me"_ and it handles the rest
-- **Any tool, same pattern** — AWS CLI, glab, wrangler, terraform, kubectl — all follow the same flow
+Your agent will query the relevant docs under `docs/`, find the recommended approach, and guide you through the entire installation — or just do it for you. That's it. One prompt, done.
+
+## Why This Pattern
+
+OpenAB keeps its Docker image minimal — only the essentials ship in the Dockerfile. Everything else is installed **at runtime by the agent** into the home directory (`~/bin/`). This is a deliberate design choice:
+
+- **Lean image, infinite extensibility** — the Dockerfile never grows. Need AWS CLI today, Terraform tomorrow, glab next week? Same image, same pattern. No rebuild, no redeploy.
+- **Doc-driven, AI-first** — documentation is written for agents to consume. Humans just say what they need; the agent reads the docs and executes.
+- **No gatekeeping** — adding a new tool doesn't require a PR to the Dockerfile, a new Docker build, or a Helm upgrade. Any agent can install any tool at any time.
+- **Full persistence on PVC** — everything installed to `~/bin/` and `~/` lives on the Persistent Volume Claim. This means:
+  - **Pod restart** — tools are still there
+  - **Helm upgrade** — tools are still there
+  - **Migrate the PVC to a new node / new cluster** — tools, configs, credentials, SSH keys — everything moves with it. Your agent's entire environment is portable.
+  - **Upgrade a tool** — just re-run the install. The old binary is overwritten in place.
+- **No Dockerfile sprawl** — if we baked GitLab CLI into the image, we'd have no reason to reject AWS CLI, gcloud, azure CLI, wrangler, kubectl, terraform... The image would bloat endlessly. This pattern keeps the core small and lets each deployment customize itself.
 
 ## What Ships in the Image
 
@@ -169,37 +182,27 @@ export PATH="$HOME/bin:$PATH"
 kubectl version --client
 ```
 
-## Persistence
+## Persistence & Portability
 
-`~/bin/` is part of the agent's home directory, which is mounted on a PVC. This means:
+Everything under `~/` is mounted on a PVC. When you migrate your OpenAB deployment — move the PVC to a new node, a new cluster, or even a new cloud provider — your agent's entire environment comes along:
 
-- **Pod restart** — tools are still there
-- **Helm upgrade** — tools are still there (PVC is retained)
-- **New version of a tool** — just re-run the install commands to overwrite
+```
+~/bin/           → all installed tool binaries
+~/aws-cli/       → AWS CLI installation
+~/npm-global/    → npm-installed tools (wrangler, etc.)
+~/.ssh/          → SSH keys and config
+~/.config/       → tool configs (glab, wrangler, etc.)
+~/.kiro/         → agent steering docs and memory
+```
 
-The only time tools are lost is if the PVC is deleted.
+No reinstallation needed. Attach the PVC, start the pod, and everything works.
+
+The only time tools are lost is if the PVC itself is deleted.
 
 ## Adding a New Tool Doc
 
-If you're contributing a doc for a new tool (e.g., `docs/gitlab.md`, `docs/cloudflare.md`), follow this structure:
+If you're contributing a doc for a new tool (e.g., `docs/gitlab.md`, `docs/cloudflare.md`):
 
-1. **Reference this doc** — link back to `docs/agent-installable-tools.md` for the general pattern
-2. **Provide the exact install commands** — copy-paste ready, with architecture detection
-3. **Include a verification step** — `<tool> --version` or equivalent
-4. **Keep it short** — the general pattern is already documented here; your doc only needs the tool-specific bits
-
-## Prompt Pattern
-
-Users should be able to install any documented tool with a single prompt:
-
-```
-per docs/agent-installable-tools.md from OpenAB repo, install <tool> for me
-```
-
-Or for a specific tool doc:
-
-```
-per docs/gitlab.md from OpenAB repo, install GitLab CLI for me
-```
-
-The agent reads the doc, follows the steps, and the tool is ready to use.
+1. **Keep it short** — provide the install commands with architecture detection and a verification step
+2. **Reference this doc** — link back here for the general pattern and philosophy
+3. **Test the prompt** — verify that asking your agent _"per docs/your-tool.md from OpenAB repo, install X for me"_ actually works end-to-end
