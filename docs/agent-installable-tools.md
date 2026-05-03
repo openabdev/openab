@@ -123,7 +123,7 @@ Everything under `~/` is mounted on a PVC — see the migration diagram above. K
 
 ```
 ~/bin/           → all installed tool binaries
-~/aws-cli/       → AWS CLI installation
+~/.aws/          → AWS CLI config and credentials
 ~/npm-global/    → npm-installed tools (wrangler, etc.)
 ~/.ssh/          → SSH keys and config
 ~/.config/       → tool configs (glab, wrangler, etc.)
