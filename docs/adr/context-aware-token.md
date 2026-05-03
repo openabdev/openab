@@ -94,10 +94,10 @@ References:
 | Aspect | OpenClaw | Hermes Agent | OpenAB (this ADR) |
 |---|---|---|---|
 | Agent-to-platform interface | Mediated — Gateway dispatches named actions | Tool-based — LLM tools with function-calling schemas | Direct — agent calls platform API with token |
-| Security enforcement | Technical — Gateway enforces layered policy | Technical — schema gating + runtime allowlist + platform permissions | Behavioral — steering docs define allow/deny (see §4 for evolution path) |
+| Security enforcement | Technical — Gateway enforces layered policy | Technical — schema gating + runtime allowlist + platform permissions | Behavioral — steering docs define allow/deny (see §5 for evolution path) |
 | Cross-channel operations | `sessions_send` with provenance tagging | `send_message` tool with 17+ platform support | Agent uses token + `curl` |
 | Message fetching | `sessions_history` + `read` action | `discord_tool.fetch_messages` (Discord only) | Agent calls REST API directly |
-| Audit trail | Inter-session provenance tags | Tool call logs | None built-in (see §4 for planned additions) |
+| Audit trail | Inter-session provenance tags | Tool call logs | None built-in (see §5 for planned additions) |
 
 ### Why OpenAB Diverges
 
@@ -109,7 +109,7 @@ This is a deliberate tradeoff:
 2. **Agent diversity** — OAB supports 4+ different agent runtimes (Kiro CLI, Claude Code, Codex, Gemini). A mediated approach would require each runtime to integrate with OAB's tool/action system. Direct token access works with any agent that has shell access.
 3. **Pragmatism** — The pattern already works in production (超渡法師 uses `curl` + bot token for thread title updates). This ADR formalizes and hardens what's already happening.
 
-The security gap is real and acknowledged — §4 below describes the evolution path from behavioral-only to defense-in-depth.
+The security gap is real and acknowledged — §5 below describes the evolution path from behavioral-only to defense-in-depth.
 
 ---
 
@@ -131,13 +131,15 @@ Adapter responsibility             Agent autonomy
 ### How It Works
 
 1. User sets `DISCORD_CONTEXT_TOKEN` in the agent's environment (same bot token or a separate scoped token)
+
+> ⚠️ **Security note:** Using the same bot token as `DISCORD_CONTEXT_TOKEN` grants the agent full bot permissions — this is a convenience shortcut suitable only for trusted, single-operator deployments. For production or multi-tenant environments, use a separate token with minimal scopes when the platform supports it. See §5 for the security evolution path.
 2. User defines allowed operations in `tools.md` or steering docs
 3. Agent decides at runtime when to use the token — e.g., "user said 'why?' and I'm not sure what they're referring to, let me fetch the referenced message"
 4. OAB core is unaware of this — it's purely an agent-side capability
 
 ### Scope Definition (User-Controlled)
 
-The trust boundary is initially defined by the user in steering docs. **This is a documentation convention, not a security boundary** — the agent has the full token and is behaviorally constrained, not technically restricted. See §4 for the evolution path toward technical enforcement.
+The trust boundary is initially defined by the user in steering docs. **This is a documentation convention, not a security boundary** — the agent has the full token and is behaviorally constrained, not technically restricted. See §5 for the evolution path toward technical enforcement.
 
 ```markdown
 # Discord Context Tools
@@ -224,19 +226,19 @@ User: "what did Jack say about this yesterday?"
 
 ### Evolution Path: Behavioral → Defense-in-Depth
 
-The security model evolves across the rollout phases:
+The security model evolves across four maturity levels (distinct from the [Rollout Plan in §10](#10-rollout-plan), which tracks implementation milestones):
 
-**Phase 1 (Behavioral only — current):**
+**Level 1 (Behavioral only — current):**
 - Steering docs define allowed operations
 - Suitable for trusted, operator-controlled agents only
 - Acceptable risk: operator is the user AND the admin
 
-**Phase 2 (Audit logging):**
+**Level 2 (Audit logging):**
 - OAB logs all outbound HTTP calls from agent processes (network-level observation)
 - No enforcement, but provides visibility for post-incident analysis
 - Implementation: eBPF-based network monitoring or HTTP proxy with logging
 
-**Phase 3 (Proxy enforcement):**
+**Level 3 (Proxy enforcement):**
 - Agent's `DISCORD_CONTEXT_TOKEN` routes through an OAB-controlled HTTP proxy
 - Proxy validates each API call against a configured allowlist:
   ```
@@ -256,13 +258,13 @@ The security model evolves across the rollout phases:
 - Denied calls return 403 with audit log entry
 - Inspired by Hermes Agent's defense-in-depth (schema filtering + runtime allowlist + platform permissions)
 
-**Phase 4 (True scoped tokens):**
+**Level 4 (True scoped tokens):**
 - If Discord (or other platforms) introduce fine-grained token scopes, swap the token
 - The agent-side interface doesn't change — only the token's actual permissions narrow
 
 ### Comparison with Prior Art
 
-| Layer | OpenClaw | Hermes Agent | OpenAB Phase 1 | OpenAB Phase 3 |
+| Layer | OpenClaw | Hermes Agent | OpenAB Level 1 | OpenAB Level 3 |
 |---|---|---|---|---|
 | Schema/capability gating | ✅ `supportsAction` | ✅ Dynamic schema | ❌ | ❌ |
 | Runtime allowlist | ✅ Send Policy | ✅ Config allowlist | ❌ Steering docs only | ✅ Proxy allowlist |
@@ -278,7 +280,13 @@ Issue [#339](https://github.com/openabdev/openab/issues/339) requests reply/quot
 
 ### How #339 Gets Resolved
 
-**Step 1 — OAB injects reply metadata (minimal transport-layer change):**
+There are two distinct scenarios for context resolution. The token is only needed for the second.
+
+**Scenario A — Discord reply (user uses reply/quote feature):**
+
+Discord Gateway already sends `referenced_message` (full message object) and `message_reference` (with `message_id`, `channel_id`, `guild_id`) on reply messages (type 19). OAB's adapter receives this data and can passthrough it to the agent at near-zero cost.
+
+**Step 1 — OAB passthroughs reply metadata (minimal transport-layer change):**
 
 OAB already receives `referenced_message` from Discord's gateway. Instead of prepending the full quoted content (PR #527's approach), OAB injects only the metadata:
 
@@ -291,8 +299,14 @@ This costs ~20 tokens (vs ~500 for full content) and gives the agent enough info
 **Step 2 — Agent decides whether to fetch:**
 
 - If the conversation history already contains the referenced message → respond directly (zero extra cost)
-- If the agent needs the content → use `DISCORD_CONTEXT_TOKEN` to call `GET /channels/{channel_id}/messages/{message_id}` and fetch it
+- If the agent needs the full content of the referenced message → use `DISCORD_CONTEXT_TOKEN` to call `GET /channels/{channel_id}/messages/{message_id}` and fetch it
 - If no token is configured → agent responds based on available context (graceful degradation)
+
+> **Note:** Because Discord already provides `referenced_message` on reply messages, OAB could alternatively passthrough the full content directly (like PR #527). The metadata-only approach is preferred because it keeps the transport layer minimal and lets the agent decide. Either way, the token is not strictly required for this scenario.
+
+**Scenario B — Non-reply historical lookup (no `referenced_message` available):**
+
+When a user asks about past messages without using Discord's reply feature (e.g., "what did Jack say about this yesterday?"), there is no `referenced_message` in the Gateway event. This is where the context-aware token provides unique value — the agent uses it to call `GET /channels/{channel_id}/messages` and search for relevant messages.
 
 **Step 3 — Steering doc template:**
 
@@ -305,6 +319,15 @@ When you see `[Reply context: message_id=..., channel_id=..., author=...]`:
    curl -s -H "Authorization: Bot $DISCORD_CONTEXT_TOKEN" \
      "https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}"
 3. If DISCORD_CONTEXT_TOKEN is not available, respond based on available context
+
+# Historical Context Retrieval (no reply metadata)
+
+When a user references past messages without using Discord reply:
+1. Use the token to fetch recent messages from the channel:
+   curl -s -H "Authorization: Bot $DISCORD_CONTEXT_TOKEN" \
+     "https://discord.com/api/v10/channels/{channel_id}/messages?limit=50"
+2. Search the results for relevant context
+3. If DISCORD_CONTEXT_TOKEN is not available, ask the user to quote or reply to the specific message
 ```
 
 ### Acceptance Criteria for #339
@@ -322,7 +345,7 @@ When you see `[Reply context: message_id=..., channel_id=..., author=...]`:
 
 - **Reply metadata injection** (for #339): OAB adds `[Reply context: message_id=..., channel_id=..., author=...]` to the prompt when a Discord message has `referenced_message`. This is a small, targeted change in `discord.rs` (~10 lines).
 - **Token passthrough**: OAB already passes environment variables to agent processes. No change needed — user adds `DISCORD_CONTEXT_TOKEN` to their agent config.
-- **Proxy (Phase 3, optional)**: If/when proxy enforcement is added, it would be a new optional component, not a change to OAB core.
+- **Proxy (Level 3, optional)**: If/when proxy enforcement is added, it would be a new optional component, not a change to OAB core.
 
 ---
 
@@ -333,7 +356,7 @@ When you see `[Reply context: message_id=..., channel_id=..., author=...]`:
 | PR #527 (reply context) | **Superseded** — context-aware token solves the same problem more efficiently (on-demand vs always-on) |
 | Custom Gateway ADR | **Complementary** — gateway handles inbound webhooks; context-aware token handles agent-initiated outbound operations |
 | Multi-Platform Adapters ADR | **Complementary** — each platform can have its own scoped token type |
-| Steering docs | **Extended** — steering docs gain a new responsibility: defining token scope (Phase 1 only — Phase 3 moves to proxy enforcement) |
+| Steering docs | **Extended** — steering docs gain a new responsibility: defining token scope (Level 1 only — Level 3 moves to proxy enforcement) |
 
 ---
 
@@ -341,11 +364,11 @@ When you see `[Reply context: message_id=..., channel_id=..., author=...]`:
 
 | Question | Options | Notes |
 |---|---|---|
-| One token per platform or unified? | Per-platform is simpler and more secure | Start with Discord, extend later |
+| ~~One token per platform or unified?~~ | **Decided: Per-platform** — simpler and more secure | Start with Discord, extend later |
 | Should OAB inject the token automatically? | No — user configures it in agent env | Keeps OAB uninvolved |
-| Rate limiting on agent-initiated calls? | Phase 1: rely on platform rate limits; Phase 3: proxy-level rate limiting | Proxy can enforce per-agent rate limits |
+| Rate limiting on agent-initiated calls? | Level 1: rely on platform rate limits; Level 3: proxy-level rate limiting | Proxy can enforce per-agent rate limits |
 | How to handle platforms without API tokens? | N/A until needed | LINE, Telegram have different auth models |
-| Should OAB provide a proxy from Phase 1? | No — start with behavioral constraints for trusted operators, add proxy when multi-tenant or untrusted agents are needed | Complexity should match the threat model |
+| Should OAB provide a proxy from Level 1? | No — start with behavioral constraints for trusted operators, add proxy when multi-tenant or untrusted agents are needed | Complexity should match the threat model |
 
 ---
 
