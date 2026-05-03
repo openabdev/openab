@@ -63,11 +63,26 @@ export PATH="$HOME/bin:$PATH"
 rm -rf /tmp/package.deb /tmp/deb-extract
 ```
 
-## Examples
+## Common Tools
+
+| Tool | Type | Install |
+|------|------|---------|
+| **OpenSSH** (`ssh`, `scp`, `ssh-keygen`) | `.deb` extract | See [remote-ssh-debugging.md](refarch/remote-ssh-debugging.md) |
+| **AWS CLI v2** (`aws`) | Installer | [Install steps](#aws-cli-v2) |
+| **GitLab CLI** (`glab`) | `.tar.gz` | [Install steps](#gitlab-cli-glab) |
+| **Cloudflare Wrangler** (`wrangler`) | `npm` | [Install steps](#cloudflare-wrangler) |
+| **Terraform** (`terraform`) | `.zip` | [Install steps](#terraform) |
+| **kubectl** | Binary | [Install steps](#kubectl) |
+
+> All examples below auto-detect architecture (ARM64 / AMD64).
+
+## Install Steps
 
 ### OpenSSH Client
 
-See [docs/refarch/remote-ssh-debugging.md](refarch/remote-ssh-debugging.md) for the full guide. Quick version:
+Full guide with SSH key setup and remote host config: [docs/refarch/remote-ssh-debugging.md](refarch/remote-ssh-debugging.md)
+
+Quick install:
 
 ```bash
 mkdir -p ~/bin /tmp/ssh-extract
@@ -78,25 +93,7 @@ cp /tmp/ssh-extract/usr/bin/{ssh,ssh-keygen,scp} ~/bin/
 chmod +x ~/bin/{ssh,ssh-keygen,scp}
 export PATH="$HOME/bin:$PATH"
 ssh -V
-```
-
-### GitLab CLI (glab)
-
-```bash
-mkdir -p ~/bin /tmp/glab-extract
-ARCH=$(uname -m)
-# Map architecture
-if [ "$ARCH" = "aarch64" ]; then ARCH="arm64"; elif [ "$ARCH" = "x86_64" ]; then ARCH="amd64"; fi
-# Get latest version
-GLAB_VERSION=$(curl -fsSL https://gitlab.com/api/v4/projects/34675721/releases | grep -o '"tag_name":"v[^"]*"' | head -1 | grep -o '[0-9][0-9.]*')
-curl -fsSL -o /tmp/glab.tar.gz \
-  "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_${ARCH}.tar.gz"
-tar -xzf /tmp/glab.tar.gz -C /tmp/glab-extract
-cp /tmp/glab-extract/bin/glab ~/bin/
-chmod +x ~/bin/glab
-export PATH="$HOME/bin:$PATH"
-glab --version
-rm -rf /tmp/glab.tar.gz /tmp/glab-extract
+rm -rf /tmp/openssh-client.deb /tmp/ssh-extract
 ```
 
 ### AWS CLI v2
@@ -111,6 +108,65 @@ unzip -q /tmp/awscli.zip -d /tmp/aws-extract
 export PATH="$HOME/bin:$PATH"
 aws --version
 rm -rf /tmp/awscli.zip /tmp/aws-extract
+```
+
+### GitLab CLI (glab)
+
+```bash
+mkdir -p ~/bin /tmp/glab-extract
+ARCH=$(uname -m)
+if [ "$ARCH" = "aarch64" ]; then ARCH="arm64"; elif [ "$ARCH" = "x86_64" ]; then ARCH="amd64"; fi
+GLAB_VERSION=$(curl -fsSL https://gitlab.com/api/v4/projects/34675721/releases | grep -o '"tag_name":"v[^"]*"' | head -1 | grep -o '[0-9][0-9.]*')
+curl -fsSL -o /tmp/glab.tar.gz \
+  "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_${ARCH}.tar.gz"
+tar -xzf /tmp/glab.tar.gz -C /tmp/glab-extract
+cp /tmp/glab-extract/bin/glab ~/bin/
+chmod +x ~/bin/glab
+export PATH="$HOME/bin:$PATH"
+glab --version
+rm -rf /tmp/glab.tar.gz /tmp/glab-extract
+```
+
+### Cloudflare Wrangler
+
+```bash
+mkdir -p ~/bin
+npm install -g wrangler --prefix ~/npm-global
+ln -sf ~/npm-global/bin/wrangler ~/bin/wrangler
+export PATH="$HOME/bin:$PATH"
+wrangler --version
+```
+
+> Requires Node.js. If Node.js is not available, install it first with the [generic template](#generic-template) using the [official prebuilt binaries](https://nodejs.org/en/download).
+
+### Terraform
+
+```bash
+mkdir -p ~/bin
+ARCH=$(uname -m)
+if [ "$ARCH" = "aarch64" ]; then ARCH="arm64"; elif [ "$ARCH" = "x86_64" ]; then ARCH="amd64"; fi
+TF_VERSION=$(curl -fsSL https://checkpoint-api.hashicorp.com/v1/check/terraform | grep -o '"current_version":"[^"]*"' | grep -o '[0-9][0-9.]*')
+curl -fsSL -o /tmp/terraform.zip \
+  "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_${ARCH}.zip"
+unzip -o /tmp/terraform.zip -d ~/bin
+chmod +x ~/bin/terraform
+export PATH="$HOME/bin:$PATH"
+terraform --version
+rm -f /tmp/terraform.zip
+```
+
+### kubectl
+
+```bash
+mkdir -p ~/bin
+ARCH=$(uname -m)
+if [ "$ARCH" = "aarch64" ]; then ARCH="arm64"; elif [ "$ARCH" = "x86_64" ]; then ARCH="amd64"; fi
+KUBECTL_VERSION=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+curl -fsSL -o ~/bin/kubectl \
+  "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl"
+chmod +x ~/bin/kubectl
+export PATH="$HOME/bin:$PATH"
+kubectl version --client
 ```
 
 ## Persistence
