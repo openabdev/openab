@@ -137,11 +137,7 @@ How it works: the gateway sends a placeholder "…" message, receives the real `
 
 Multi-bot support allows the gateway to process messages from other bots, matching Discord's `allow_bot_messages` feature.
 
-| Env Var | Default | Description |
-|---------|---------|-------------|
-| `FEISHU_ALLOW_BOTS` | `off` | `off` — ignore bot messages. `mentions` — process if this bot is @mentioned. `all` — process all bot messages. |
-| `FEISHU_TRUSTED_BOT_IDS` | — | Comma-separated open_id list. If empty and `FEISHU_ALLOWED_USERS` is set, any sender not in the user allowlist is treated as a bot. |
-| `FEISHU_MAX_BOT_TURNS` | `20` | Max consecutive bot replies per channel. A human message resets the counter. |
+Bot identification requires explicit configuration via `FEISHU_TRUSTED_BOT_IDS` because Feishu marks other bots as `sender_type="user"` — they cannot be identified from the event alone.
 
 > **Feishu platform limitation:** Feishu does not deliver bot-sent messages to other bots' WebSocket connections. Bot-to-bot automatic collaboration is not currently possible. The gateway logic is ready if Feishu lifts this restriction in the future.
 
