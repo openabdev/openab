@@ -140,9 +140,19 @@ impl ChatAdapter for GatewayAdapter {
     }
 
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
-        let req_id = format!("req_{}", uuid::Uuid::new_v4());
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending.lock().await.insert(req_id.clone(), tx);
+        let req_id = if self.streaming {
+            Some(format!("req_{}", uuid::Uuid::new_v4()))
+        } else {
+            None
+        };
+
+        let pending_rx = if let Some(ref id) = req_id {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.pending.lock().await.insert(id.clone(), tx);
+            Some(rx)
+        } else {
+            None
+        };
 
         let reply = GatewayReply {
             schema: "openab.gateway.reply.v1".into(),
@@ -157,20 +167,23 @@ impl ChatAdapter for GatewayAdapter {
                 text: content.into(),
             },
             command: None,
-            request_id: Some(req_id.clone()),
+            request_id: req_id.clone(),
         };
         let json = serde_json::to_string(&reply)?;
         self.ws_tx.lock().await.send(Message::Text(json)).await?;
 
-        // All platforms use request-response with timeout fallback.
-        // Platforms that return message_id enable streaming edit;
-        // others timeout gracefully and fall back to "gw_sent".
-        let msg_id = match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
-            Ok(Ok(resp)) if resp.success => resp.message_id.unwrap_or_else(|| "gw_sent".into()),
-            _ => {
-                self.pending.lock().await.remove(&req_id);
-                "gw_sent".into()
+        // When streaming is enabled, wait for gateway to return real message_id
+        // (needed for edit_message). Otherwise fire-and-forget.
+        let msg_id = if let (Some(rx), Some(ref id)) = (pending_rx, &req_id) {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+                Ok(Ok(resp)) if resp.success => resp.message_id.unwrap_or_else(|| "gw_sent".into()),
+                _ => {
+                    self.pending.lock().await.remove(id);
+                    "gw_sent".into()
+                }
             }
+        } else {
+            "gw_sent".into()
         };
 
         Ok(MessageRef {

@@ -1031,14 +1031,50 @@ fn parse_inline(line: &str) -> Vec<serde_json::Value> {
                 continue;
             }
         }
-        // Strip ** (bold), * (italic), ~~ (strikethrough), ` (inline code)
-        if chars[i] == '*' || chars[i] == '~' || chars[i] == '`' {
+        // Inline code: find matching closing backtick(s), preserve content literally
+        if chars[i] == '`' {
+            let mut ticks = 0;
+            while i + ticks < len && chars[i + ticks] == '`' {
+                ticks += 1;
+            }
+            i += ticks;
+            // Find matching closing backtick sequence of same length
+            let mut end = i;
+            'outer: while end < len {
+                if chars[end] == '`' {
+                    let mut close_ticks = 0;
+                    while end + close_ticks < len && chars[end + close_ticks] == '`' {
+                        close_ticks += 1;
+                    }
+                    if close_ticks == ticks {
+                        // Found matching close — content between is literal
+                        for j in i..end {
+                            buf.push(chars[j]);
+                        }
+                        i = end + close_ticks;
+                        break 'outer;
+                    }
+                    end += close_ticks;
+                } else {
+                    end += 1;
+                }
+            }
+            if end >= len {
+                // No matching close — treat backticks as literal
+                for j in i..len {
+                    buf.push(chars[j]);
+                }
+                i = len;
+            }
+            continue;
+        }
+        // Strip ** (bold), * (italic), ~~ (strikethrough) markers
+        if chars[i] == '*' || chars[i] == '~' {
             let ch = chars[i];
             let mut run = 0;
             while i + run < len && chars[i + run] == ch {
                 run += 1;
             }
-            // For inline code `, keep the content as-is but strip the backticks
             i += run;
             continue;
         }
