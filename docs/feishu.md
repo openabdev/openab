@@ -121,6 +121,14 @@ Agent replies are sent as Feishu **post** (rich text) messages instead of plain 
 
 Inline Markdown formatting (`**bold**`, `*italic*`, `` `code` ``, `~~strike~~`) is stripped to plain text because Feishu's post format does not support inline styles.
 
+## Streaming (Typewriter)
+
+Agent replies stream incrementally — a placeholder message appears immediately, then updates every ~1.5 seconds as the agent generates content. This matches Discord's streaming behavior.
+
+Streaming is enabled by default for Feishu. No configuration needed.
+
+How it works: the gateway sends a placeholder "…" message, receives the real `message_id` from Feishu, then updates the message in-place via `PUT /open-apis/im/v1/messages/{id}` as new content arrives.
+
 ## Bot-to-Bot Collaboration
 
 Multi-bot support allows the gateway to process messages from other bots, matching Discord's `allow_bot_messages` feature.
