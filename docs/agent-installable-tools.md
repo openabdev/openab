@@ -140,3 +140,7 @@ If you're contributing a doc for a new tool (e.g., `docs/gitlab.md`, `docs/cloud
 1. **Keep it short** — provide the install commands with architecture detection and a verification step
 2. **Reference this doc** — link back here for the general pattern and philosophy
 3. **Test the prompt** — verify that asking your agent _"per docs/your-tool.md from OpenAB repo, install X for me"_ actually works end-to-end
+
+## Advanced: Sidecars and Init Containers
+
+For use cases that go beyond installing CLI tools — such as running a network tunnel, a database sidecar, or pre-installing a deterministic toolset via init containers — see [docs/sidecar.md](sidecar.md).
