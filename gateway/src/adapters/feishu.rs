@@ -1441,6 +1441,39 @@ mod tests {
         assert!(msg_id.is_none());
     }
 
+    #[tokio::test]
+    async fn send_text_message_invalid_json_returns_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/open-apis/im/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let msg_id = send_text_message(&client, &server.uri(), "t-tok", "oc_chat1", "hello").await;
+        assert!(msg_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn send_text_message_missing_message_id_returns_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/open-apis/im/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "msg": "success",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let msg_id = send_text_message(&client, &server.uri(), "t-tok", "oc_chat1", "hello").await;
+        assert!(msg_id.is_none());
+    }
+
     // --- Split text tests ---
 
     #[test]
