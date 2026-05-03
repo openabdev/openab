@@ -77,6 +77,9 @@ https://your-gateway-host/webhook/feishu
 | `feishu.requireMention` | `FEISHU_REQUIRE_MENTION` | `true` | Require @mention in groups |
 | — | `FEISHU_DEDUPE_TTL_SECS` | `300` | Event deduplication cache TTL (seconds) |
 | — | `FEISHU_MESSAGE_LIMIT` | `4000` | Max message length before auto-splitting (bytes) |
+| — | `FEISHU_ALLOW_BOTS` | `off` | Bot message handling: `off` / `mentions` / `all` |
+| — | `FEISHU_TRUSTED_BOT_IDS` | — | Comma-separated open_id list of known bots |
+| — | `FEISHU_MAX_BOT_TURNS` | `20` | Max consecutive bot replies per channel before suppression |
 | `gateway.botUsername` | — | — | Set to bot's `open_id` for @mention gating |
 
 ## @mention Gating
@@ -96,6 +99,39 @@ To disable mention gating: `feishu.requireMention: false`.
 - `appSecret`, `verificationToken`, and `encryptKey` are stored in a Kubernetes Secret, not in ConfigMap.
 - In webhook mode, always set both `verificationToken` and `encryptKey` for production.
 - The gateway enforces a 1 MB body size limit and per-IP rate limiting (120 req/60s) on the webhook endpoint.
+
+## Slash Commands
+
+The gateway intercepts `/reset` and `/cancel` messages before they reach the agent:
+
+| Command | Action |
+|---------|--------|
+| `/reset` | Clears the conversation session. Equivalent to Discord's `/reset`. |
+| `/cancel` | Sends a cancel signal to the running agent. Equivalent to Discord's `/cancel`. |
+
+These work in both DMs and group chats, across all gateway platforms (Feishu, LINE, Telegram).
+
+## Rich Text (Post) Messages
+
+Agent replies are sent as Feishu **post** (rich text) messages instead of plain text. This enables:
+
+- Fenced code blocks with syntax highlighting
+- Clickable hyperlinks
+- Proper line breaks and paragraph structure
+
+Inline Markdown formatting (`**bold**`, `*italic*`, `` `code` ``, `~~strike~~`) is stripped to plain text because Feishu's post format does not support inline styles.
+
+## Bot-to-Bot Collaboration
+
+Multi-bot support allows the gateway to process messages from other bots, matching Discord's `allow_bot_messages` feature.
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `FEISHU_ALLOW_BOTS` | `off` | `off` — ignore bot messages. `mentions` — process if this bot is @mentioned. `all` — process all bot messages. |
+| `FEISHU_TRUSTED_BOT_IDS` | — | Comma-separated open_id list. If empty and `FEISHU_ALLOWED_USERS` is set, any sender not in the user allowlist is treated as a bot. |
+| `FEISHU_MAX_BOT_TURNS` | `20` | Max consecutive bot replies per channel. A human message resets the counter. |
+
+> **Feishu platform limitation:** Feishu does not deliver bot-sent messages to other bots' WebSocket connections. Bot-to-bot automatic collaboration is not currently possible. The gateway logic is ready if Feishu lifts this restriction in the future.
 
 ## Troubleshooting
 

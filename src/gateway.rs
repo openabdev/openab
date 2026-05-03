@@ -416,6 +416,28 @@ pub async fn run_gateway_adapter(
                                     let router = router.clone();
                                     let prompt = event.content.text.clone();
 
+                                    // Slash command interception for gateway platforms
+                                    // (Feishu/LINE/Telegram don't have native slash commands)
+                                    let trimmed = prompt.trim();
+                                    if trimmed == "/reset" {
+                                        let thread_key = format!("{}:{}", event.platform, event.channel.id);
+                                        let msg = match router.pool().reset_session(&thread_key).await {
+                                            Ok(()) => "🔄 Session reset. Start a new conversation!",
+                                            Err(_) => "⚠️ No active session to reset.",
+                                        };
+                                        let _ = adapter.send_message(&channel, msg).await;
+                                        continue;
+                                    }
+                                    if trimmed == "/cancel" {
+                                        let thread_key = format!("{}:{}", event.platform, event.channel.id);
+                                        let msg = match router.pool().cancel_session(&thread_key).await {
+                                            Ok(()) => "🛑 Cancel signal sent.",
+                                            Err(e) => &format!("⚠️ {e}"),
+                                        };
+                                        let _ = adapter.send_message(&channel, msg).await;
+                                        continue;
+                                    }
+
                                     tasks.spawn(async move {
                                         // If supergroup with no thread_id, create a forum topic
                                         let thread_channel = if event.channel.channel_type == "supergroup"

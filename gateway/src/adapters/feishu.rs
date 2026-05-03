@@ -61,6 +61,13 @@ pub enum ConnectionMode {
     Webhook,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum AllowBots {
+    Off,
+    Mentions,
+    All,
+}
+
 #[derive(Debug, Clone)]
 pub struct FeishuConfig {
     pub app_id: String,
@@ -73,6 +80,9 @@ pub struct FeishuConfig {
     pub allowed_groups: Vec<String>,
     pub allowed_users: Vec<String>,
     pub require_mention: bool,
+    pub allow_bots: AllowBots,
+    pub trusted_bot_ids: Vec<String>,
+    pub max_bot_turns: u32,
     pub dedupe_ttl_secs: u64,
     pub message_limit: usize,
 }
@@ -105,6 +115,20 @@ impl FeishuConfig {
         let require_mention = std::env::var("FEISHU_REQUIRE_MENTION")
             .map(|v| v != "false" && v != "0")
             .unwrap_or(true);
+        let allow_bots = match std::env::var("FEISHU_ALLOW_BOTS")
+            .unwrap_or_else(|_| "off".into())
+            .to_lowercase()
+            .as_str()
+        {
+            "mentions" => AllowBots::Mentions,
+            "all" => AllowBots::All,
+            _ => AllowBots::Off,
+        };
+        let trusted_bot_ids = parse_csv("FEISHU_TRUSTED_BOT_IDS");
+        let max_bot_turns = std::env::var("FEISHU_MAX_BOT_TURNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
         let dedupe_ttl_secs = std::env::var("FEISHU_DEDUPE_TTL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -125,6 +149,9 @@ impl FeishuConfig {
             allowed_groups,
             allowed_users,
             require_mention,
+            allow_bots,
+            trusted_bot_ids,
+            max_bot_turns,
             dedupe_ttl_secs,
             message_limit,
         })
@@ -227,20 +254,46 @@ mod event_types {
         if msg.message_type.as_deref() != Some("text") {
             return None;
         }
-        // Skip bot messages (sender_type: "bot" or "app")
+        // Skip bot messages with explicit sender_type
         if matches!(sender.sender_type.as_deref(), Some("bot") | Some("app")) {
             return None;
         }
 
         let sender_open_id = sender.sender_id.as_ref()?.open_id.as_deref()?;
+        // Skip messages from self
         if let Some(bot_id) = bot_open_id {
             if sender_open_id == bot_id {
                 return None;
             }
         }
 
+        // Check if sender is a known bot:
+        // 1. If trusted_bot_ids is configured, check against it
+        // 2. If trusted_bot_ids is empty but allowed_users is configured,
+        //    any sender NOT in allowed_users is treated as a bot
+        //    (Feishu marks other bots as sender_type="user", so this is
+        //    the only reliable way to identify them)
+        let is_bot_sender = if !config.trusted_bot_ids.is_empty() {
+            config.trusted_bot_ids.iter().any(|id| id == sender_open_id)
+        } else if !config.allowed_users.is_empty() {
+            !config.allowed_users.iter().any(|u| u == sender_open_id)
+        } else {
+            false
+        };
+
+        if is_bot_sender {
+            match config.allow_bots {
+                AllowBots::Off => return None,
+                AllowBots::Mentions | AllowBots::All => {
+                    // Allowed — will check mentions below for Mentions mode
+                }
+            }
+        }
+
         // User allowlist: if configured, only allow listed users
-        if !config.allowed_users.is_empty()
+        // Trusted bots bypass user allowlist (same as Discord behavior)
+        if !is_bot_sender
+            && !config.allowed_users.is_empty()
             && !config.allowed_users.iter().any(|u| u == sender_open_id)
         {
             return None;
@@ -280,8 +333,19 @@ mod event_types {
         };
 
         // Gateway-side mention gating: in groups, skip if require_mention
-        // is true and bot is not mentioned
-        if channel_type == "group" && config.require_mention {
+        // is true and bot is not mentioned (for human senders)
+        if channel_type == "group" && !is_bot_sender && config.require_mention {
+            if let Some(bot_id) = bot_open_id {
+                let bot_mentioned = mention_ids.iter().any(|id| id == bot_id);
+                if !bot_mentioned {
+                    return None;
+                }
+            }
+        }
+
+        // Bot-to-bot mention gating: in AllowBots::Mentions mode,
+        // bot messages must @mention this bot (like Discord "mentions" mode)
+        if is_bot_sender && config.allow_bots == AllowBots::Mentions {
             if let Some(bot_id) = bot_open_id {
                 let bot_mentioned = mention_ids.iter().any(|id| id == bot_id);
                 if !bot_mentioned {
@@ -292,7 +356,7 @@ mod event_types {
 
         let thread_id = msg.root_id.clone().or_else(|| msg.parent_id.clone());
 
-        Some(GatewayEvent::new(
+        let mut event = GatewayEvent::new(
             "feishu",
             ChannelInfo {
                 id: chat_id.to_string(),
@@ -303,12 +367,13 @@ mod event_types {
                 id: sender_open_id.to_string(),
                 name: sender_open_id.to_string(),
                 display_name: sender_open_id.to_string(),
-                is_bot: false,
+                is_bot: is_bot_sender,
             },
             clean_text.trim(),
             message_id,
             mention_ids,
-        ))
+        );
+        Some(event)
     }
 
     fn extract_mentions(
@@ -482,6 +547,9 @@ pub struct FeishuAdapter {
     pub dedupe: Arc<DedupeCache>,
     pub rate_limiter: Arc<RateLimiter>,
     pub name_cache: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// Per-channel bot turn counter. Key = chat_id, Value = (count, last_reset).
+    /// Human message resets count to 0. Prevents runaway bot-to-bot loops.
+    pub bot_turns: Arc<std::sync::Mutex<HashMap<String, u32>>>,
     pub client: reqwest::Client,
 }
 
@@ -497,6 +565,7 @@ impl FeishuAdapter {
             rate_limiter,
             bot_open_id: Arc::new(RwLock::new(None)),
             name_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            bot_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
             client: reqwest::Client::new(),
         }
     }
@@ -589,6 +658,7 @@ pub async fn start_websocket(
     let config = adapter.config.clone();
     let client = adapter.client.clone();
     let name_cache = adapter.name_cache.clone();
+    let bot_turns = adapter.bot_turns.clone();
 
     let handle = tokio::spawn(async move {
         let mut backoff_secs = 1u64;
@@ -602,6 +672,7 @@ pub async fn start_websocket(
                 &event_tx,
                 &mut shutdown_rx,
                 &name_cache,
+                &bot_turns,
             )
             .await;
 
@@ -641,6 +712,7 @@ async fn ws_connect_loop(
     event_tx: &broadcast::Sender<String>,
     shutdown_rx: &mut watch::Receiver<bool>,
     name_cache: &Arc<std::sync::Mutex<HashMap<String, String>>>,
+    bot_turns: &Arc<std::sync::Mutex<HashMap<String, u32>>>,
 ) -> anyhow::Result<()> {
     let api_base = config.api_base();
 
@@ -668,7 +740,7 @@ async fn ws_connect_loop(
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
                         handle_ws_message(
                             &text, bot_open_id_store, dedupe, config, event_tx,
-                            name_cache, token_cache, client,
+                            name_cache, token_cache, client, bot_turns,
                         ).await;
                     }
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data))) => {
@@ -689,7 +761,7 @@ async fn ws_connect_loop(
                                         if let Ok(text) = String::from_utf8(payload.clone()) {
                                             handle_ws_message(
                                                 &text, bot_open_id_store, dedupe, config, event_tx,
-                                                name_cache, token_cache, client,
+                                                name_cache, token_cache, client, bot_turns,
                                             ).await;
                                         }
                                     }
@@ -728,6 +800,7 @@ async fn handle_ws_message(
     name_cache: &Arc<std::sync::Mutex<HashMap<String, String>>>,
     token_cache: &Arc<FeishuTokenCache>,
     client: &reqwest::Client,
+    bot_turns: &Arc<std::sync::Mutex<HashMap<String, u32>>>,
 ) {
     let envelope: FeishuEventEnvelope = match serde_json::from_str(text) {
         Ok(e) => e,
@@ -768,6 +841,29 @@ async fn handle_ws_message(
         if dedupe.is_duplicate(&gateway_event.message_id) {
             return;
         }
+
+        // Bot turn tracking: prevent runaway bot-to-bot loops
+        let channel_id = &gateway_event.channel.id;
+        {
+            let mut turns = bot_turns.lock().unwrap_or_else(|e| e.into_inner());
+            if gateway_event.sender.is_bot {
+                let count = turns.entry(channel_id.to_string()).or_insert(0);
+                *count += 1;
+                if *count > config.max_bot_turns {
+                    warn!(
+                        channel = %channel_id,
+                        count = *count,
+                        max = config.max_bot_turns,
+                        "feishu: bot turn limit reached, dropping message"
+                    );
+                    return;
+                }
+            } else {
+                // Human message resets bot turn counter
+                turns.remove(channel_id.as_str());
+            }
+        }
+
         // Resolve sender display name (lazy, cached)
         let name = resolve_user_name(
             &gateway_event.sender.id, name_cache, token_cache, client, &config.api_base(),
@@ -828,6 +924,190 @@ async fn resolve_user_name(
 
 // ---------------------------------------------------------------------------
 // Send message
+// ---------------------------------------------------------------------------
+// Markdown → Feishu post conversion
+// ---------------------------------------------------------------------------
+
+/// Convert markdown text to feishu post content JSON.
+/// Supported: code blocks → code_block tag, links → a tag, @mentions preserved.
+/// Unsupported inline formatting (bold, italic, etc.) is stripped to plain text.
+fn markdown_to_post(md: &str) -> serde_json::Value {
+    let mut lines: Vec<Vec<serde_json::Value>> = Vec::new();
+    let mut chars = md.chars().peekable();
+    let mut i = 0;
+    let bytes = md.as_bytes();
+    let len = md.len();
+
+    // We work byte-offset based for code fence detection, line-based otherwise.
+    let raw_lines: Vec<&str> = md.split('\n').collect();
+    let mut li = 0;
+    while li < raw_lines.len() {
+        let line = raw_lines[li];
+        // Detect fenced code block
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            let lang = trimmed[3..].trim().to_string();
+            let mut code = String::new();
+            li += 1;
+            while li < raw_lines.len() {
+                if raw_lines[li].trim_start().starts_with("```") {
+                    break;
+                }
+                if !code.is_empty() {
+                    code.push('\n');
+                }
+                code.push_str(raw_lines[li]);
+                li += 1;
+            }
+            li += 1; // skip closing ```
+            let mut block = serde_json::json!({"tag": "code_block", "text": code});
+            if !lang.is_empty() {
+                block["language"] = serde_json::Value::String(lang);
+            }
+            lines.push(vec![block]);
+            continue;
+        }
+        // Normal line: parse inline elements
+        let elems = parse_inline(line);
+        lines.push(elems);
+        li += 1;
+    }
+
+    serde_json::json!({
+        "zh_cn": {
+            "content": lines
+        }
+    })
+}
+
+/// Parse inline markdown elements in a single line.
+/// Extracts links [text](url) → a tag, strips bold/italic/strikethrough markers.
+fn parse_inline(line: &str) -> Vec<serde_json::Value> {
+    let mut elems = Vec::new();
+    let mut buf = String::new();
+    let chars: Vec<char> = line.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        // Link: [text](url)
+        if chars[i] == '[' {
+            if let Some((text, url, end)) = try_parse_link(&chars, i) {
+                if !buf.is_empty() {
+                    elems.push(serde_json::json!({"tag": "text", "text": buf}));
+                    buf.clear();
+                }
+                elems.push(serde_json::json!({"tag": "a", "text": text, "href": url}));
+                i = end;
+                continue;
+            }
+        }
+        // Strip ** (bold), * (italic), ~~ (strikethrough), ` (inline code)
+        if chars[i] == '*' || chars[i] == '~' || chars[i] == '`' {
+            let ch = chars[i];
+            let mut run = 0;
+            while i + run < len && chars[i + run] == ch {
+                run += 1;
+            }
+            // For inline code `, keep the content as-is but strip the backticks
+            i += run;
+            continue;
+        }
+        buf.push(chars[i]);
+        i += 1;
+    }
+    if !buf.is_empty() {
+        elems.push(serde_json::json!({"tag": "text", "text": buf}));
+    }
+    if elems.is_empty() {
+        elems.push(serde_json::json!({"tag": "text", "text": ""}));
+    }
+    elems
+}
+
+/// Try to parse a markdown link starting at position `start` (which is '[').
+/// Returns (text, url, next_index) on success.
+fn try_parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
+    let len = chars.len();
+    // Find closing ]
+    let mut i = start + 1;
+    let mut text = String::new();
+    while i < len && chars[i] != ']' {
+        text.push(chars[i]);
+        i += 1;
+    }
+    if i >= len {
+        return None;
+    }
+    i += 1; // skip ]
+    if i >= len || chars[i] != '(' {
+        return None;
+    }
+    i += 1; // skip (
+    let mut url = String::new();
+    while i < len && chars[i] != ')' {
+        url.push(chars[i]);
+        i += 1;
+    }
+    if i >= len {
+        return None;
+    }
+    i += 1; // skip )
+    Some((text, url, i))
+}
+
+/// Send a post (rich text) message to a feishu chat_id.
+/// Returns the sent message_id on success, None on failure.
+pub async fn send_post_message(
+    client: &reqwest::Client,
+    api_base: &str,
+    token: &str,
+    chat_id: &str,
+    text: &str,
+) -> Option<String> {
+    let url = format!(
+        "{}/open-apis/im/v1/messages?receive_id_type=chat_id",
+        api_base
+    );
+    let post_content = markdown_to_post(text);
+    let content = post_content.to_string();
+    let body = serde_json::json!({
+        "receive_id": chat_id,
+        "msg_type": "post",
+        "content": content,
+    });
+
+    match client
+        .post(&url)
+        .bearer_auth(token)
+        .header("Content-Type", "application/json; charset=utf-8")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                let resp_body: serde_json::Value = resp.json().await.unwrap_or_default();
+                let msg_id = resp_body
+                    .pointer("/data/message_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                info!(chat_id = %chat_id, message_id = ?msg_id, "feishu post message sent");
+                msg_id
+            } else {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                tracing::error!(status = %status, body = %text, "feishu send post message failed");
+                None
+            }
+        }
+        Err(e) => {
+            tracing::error!(err = %e, "feishu send post message request failed");
+            None
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 
 /// Send a text message to a feishu chat_id.
@@ -1014,13 +1294,14 @@ pub async fn handle_reply(
 
     // Split long messages; store sent message_ids in dedupe to prevent
     // self-echo (Feishu pushes bot's own messages back via WebSocket)
+    // Use post (rich text) format for markdown rendering.
     if text.len() <= limit {
-        if let Some(msg_id) = send_text_message(&adapter.client, &api_base, &token, &reply.channel.id, text).await {
+        if let Some(msg_id) = send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, text).await {
             adapter.dedupe.is_duplicate(&msg_id);
         }
     } else {
         for chunk in split_text(text, limit) {
-            if let Some(msg_id) = send_text_message(&adapter.client, &api_base, &token, &reply.channel.id, chunk).await {
+            if let Some(msg_id) = send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, chunk).await {
                 adapter.dedupe.is_duplicate(&msg_id);
             }
         }
@@ -1340,6 +1621,9 @@ mod tests {
             allowed_groups: vec![],
             allowed_users: vec![],
             require_mention: true,
+            allow_bots: AllowBots::Off,
+            trusted_bot_ids: vec![],
+            max_bot_turns: 20,
             dedupe_ttl_secs: 300,
             message_limit: 4000,
         }
