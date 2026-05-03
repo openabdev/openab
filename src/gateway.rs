@@ -137,7 +137,7 @@ impl ChatAdapter for GatewayAdapter {
     }
 
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
-        let needs_msg_id = channel.platform == "feishu";
+        let needs_msg_id = self.supports_streaming();
         let req_id = if needs_msg_id {
             Some(format!("req_{}", uuid::Uuid::new_v4()))
         } else {
@@ -302,7 +302,16 @@ impl ChatAdapter for GatewayAdapter {
     }
 
     fn use_streaming(&self, _other_bot_present: bool) -> bool {
-        self.platform_name == "feishu"
+        self.supports_streaming()
+    }
+}
+
+impl GatewayAdapter {
+    /// Whether this gateway platform supports message editing (for streaming).
+    /// Platforms that support edit get request-response send_message (real message_id)
+    /// and streaming edit loop. Others use fire-and-forget.
+    fn supports_streaming(&self) -> bool {
+        matches!(self.platform_name, "feishu" | "lark")
     }
 }
 
@@ -483,59 +492,6 @@ pub async fn run_gateway_adapter(
                                         let msg = match router.pool().cancel_session(&thread_key).await {
                                             Ok(()) => "🛑 Cancel signal sent.".to_string(),
                                             Err(e) => format!("⚠️ {e}"),
-                                        };
-                                        let _ = adapter.send_message(&channel, &msg).await;
-                                        continue;
-                                    }
-                                    if trimmed.starts_with("/models") || trimmed.starts_with("/agents") {
-                                        let (category, label) = if trimmed.starts_with("/models") {
-                                            ("model", "model")
-                                        } else {
-                                            ("agent", "agent")
-                                        };
-                                        let arg = trimmed.split_once(' ').map(|x| x.1.trim()).unwrap_or("");
-                                        let thread_key = format!("{}:{}", event.platform, event.channel.thread_id.as_deref().unwrap_or(&event.channel.id));
-                                        let options = router.pool().get_config_options(&thread_key).await;
-                                        let filtered: Vec<_> = options.iter()
-                                            .filter(|o| o.category.as_deref() == Some(category))
-                                            .collect();
-
-                                        let msg = if filtered.is_empty() {
-                                            format!("⚠️ No {label} options available. Start a conversation first.")
-                                        } else if arg.is_empty() {
-                                            // List options
-                                            let mut lines = vec![format!("🔧 Available {label}s:")];
-                                            for opt in &filtered {
-                                                for v in &opt.options {
-                                                    let marker = if v.value == opt.current_value { " ✅" } else { "" };
-                                                    lines.push(format!("  • {}{}", v.name, marker));
-                                                }
-                                            }
-                                            lines.push(format!("\nUsage: /{label}s <name>"));
-                                            lines.join("\n")
-                                        } else {
-                                            // Find matching option (case-insensitive substring)
-                                            let arg_lower = arg.to_lowercase();
-                                            let mut found = None;
-                                            for opt in &filtered {
-                                                for v in &opt.options {
-                                                    if v.value.to_lowercase().contains(&arg_lower)
-                                                        || v.name.to_lowercase().contains(&arg_lower)
-                                                    {
-                                                        found = Some((opt.id.clone(), v.value.clone(), v.name.clone()));
-                                                        break;
-                                                    }
-                                                }
-                                                if found.is_some() { break; }
-                                            }
-                                            if let Some((config_id, value, name)) = found {
-                                                match router.pool().set_config_option(&thread_key, &config_id, &value).await {
-                                                    Ok(_) => format!("✅ Switched to **{}**", name),
-                                                    Err(e) => format!("❌ Failed to switch: {e}"),
-                                                }
-                                            } else {
-                                                format!("⚠️ No {label} matching \"{arg}\". Use /{label}s to see options.")
-                                            }
                                         };
                                         let _ = adapter.send_message(&channel, &msg).await;
                                         continue;
