@@ -10,6 +10,47 @@ per docs/* from OpenAB GitHub repo, how to install <TOOL_NAME> for my OAB agent
 
 Your agent will query the relevant docs under `docs/`, find the recommended approach, and guide you through the entire installation — or just do it for you. That's it. One prompt, done.
 
+## How It Works
+
+```
+  Human                        Agent                         OpenAB Pod
+  ┌─────────────────┐         ┌──────────────────┐          ┌──────────────────────────┐
+  │                  │         │                  │          │  Container (read-only)   │
+  │ "install glab   │────────►│ reads docs/*     │          │  ┌────────────────────┐  │
+  │  for my OAB     │         │ from OpenAB repo │          │  │ curl, gh, rg, tini │  │
+  │  agent"         │         │                  │          │  │ (built-in, minimal)│  │
+  │                  │         │ finds install    │          │  └────────────────────┘  │
+  │                  │         │ steps for glab   │          │                          │
+  │                  │         │                  │          │  PVC (persistent ~/):    │
+  │                  │         │ executes:        │          │  ┌────────────────────┐  │
+  │                  │         │  curl ─► extract │─────────►│  │ ~/bin/             │  │
+  │                  │         │  ─► ~/bin/glab   │          │  │  ├── glab    ✅ new│  │
+  │                  │         │  ─► verify       │          │  │  ├── aws          │  │
+  │                  │         │                  │          │  │  ├── ssh          │  │
+  │  "done! glab    │◄────────│ "glab v1.46      │          │  │  ├── terraform    │  │
+  │   ready to use" │         │  installed ✅"    │          │  │  └── kubectl      │  │
+  │                  │         │                  │          │  │                    │  │
+  └─────────────────┘         └──────────────────┘          │  │ ~/.ssh/  ~/.config/│  │
+                                                            │  │ ~/.kiro/ ~/aws-cli/│  │
+                                                            │  └────────────────────┘  │
+                                                            └──────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │  Migration: move PVC to new node / cluster / cloud                         │
+  │                                                                            │
+  │  Old Cluster              PVC                    New Cluster               │
+  │  ┌──────────┐     ┌────────────────┐     ┌──────────────┐                 │
+  │  │ Pod ──────┼────►│ ~/bin/         │────►│ New Pod      │                 │
+  │  │ (delete)  │     │ ~/.ssh/        │     │ (attach PVC) │                 │
+  │  └──────────┘     │ ~/.config/     │     │              │                 │
+  │                    │ ~/.kiro/       │     │ Everything   │                 │
+  │                    │ ~/aws-cli/     │     │ just works™  │                 │
+  │                    └────────────────┘     └──────────────┘                 │
+  │                                                                            │
+  │  Zero reinstallation. All tools, configs, keys, and agent memory persist. │
+  └─────────────────────────────────────────────────────────────────────────────┘
+```
+
 ## Why This Pattern
 
 OpenAB keeps its Docker image minimal — only the essentials ship in the Dockerfile. Everything else is installed **at runtime by the agent** into the home directory (`~/bin/`). This is a deliberate design choice:
@@ -184,7 +225,7 @@ kubectl version --client
 
 ## Persistence & Portability
 
-Everything under `~/` is mounted on a PVC. When you migrate your OpenAB deployment — move the PVC to a new node, a new cluster, or even a new cloud provider — your agent's entire environment comes along:
+Everything under `~/` is mounted on a PVC — see the migration diagram above. Key directories that persist:
 
 ```
 ~/bin/           → all installed tool binaries
@@ -194,8 +235,6 @@ Everything under `~/` is mounted on a PVC. When you migrate your OpenAB deployme
 ~/.config/       → tool configs (glab, wrangler, etc.)
 ~/.kiro/         → agent steering docs and memory
 ```
-
-No reinstallation needed. Attach the PVC, start the pod, and everything works.
 
 The only time tools are lost is if the PVC itself is deleted.
 
