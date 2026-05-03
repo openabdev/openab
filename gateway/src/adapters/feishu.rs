@@ -860,11 +860,16 @@ pub async fn send_text_message(
     {
         Ok(resp) => {
             if resp.status().is_success() {
-                let resp_body: serde_json::Value = resp.json().await.unwrap_or_default();
-                let msg_id = resp_body
-                    .pointer("/data/message_id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
+                let msg_id = match resp.json::<serde_json::Value>().await {
+                    Ok(body) => body
+                        .pointer("/data/message_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    Err(e) => {
+                        warn!(chat_id = %chat_id, err = %e, "feishu 200 response not valid JSON, self-echo dedupe will be skipped");
+                        None
+                    }
+                };
                 info!(chat_id = %chat_id, message_id = ?msg_id, "feishu message sent");
                 msg_id
             } else {
