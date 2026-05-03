@@ -12,7 +12,7 @@ Google Chat ──POST──▶ Gateway (:8080) ◀──WebSocket── OAB Pod
 - A running OAB instance (with kiro-cli or any ACP agent authenticated)
 - The Custom Gateway deployed ([gateway/README.md](../gateway/README.md))
 - A Google Cloud project with the Google Chat API enabled
-- A Google Cloud Service Account with the Chat Bot scope
+- A Google Cloud Service Account (JSON key recommended; no special IAM roles needed)
 
 ## 1. Create a Google Chat App
 
