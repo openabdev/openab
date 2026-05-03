@@ -428,8 +428,13 @@ pub async fn run_gateway_adapter(
 
                             match serde_json::from_str::<GatewayEvent>(text_str) {
                                 Ok(event) => {
+                                    // TODO: gateway adapters (feishu) do their own bot filtering
+                                    // via AllowBots + trusted_bot_ids, but Telegram does not.
+                                    // When Feishu lifts the bot-to-bot delivery restriction,
+                                    // this guard needs to become adapter-aware (e.g. a field on
+                                    // GatewayEvent indicating the adapter already filtered bots).
                                     if event.sender.is_bot {
-                                        continue; // skip bot messages
+                                        continue;
                                     }
 
                                     // Channel allowlist gate
