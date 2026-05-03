@@ -179,7 +179,7 @@ pub async fn handle_reply(
         return;
     };
 
-    let url = format!("{}/{}/messages", GOOGLE_CHAT_API_BASE, reply.channel.id);
+    let mut url = format!("{}/{}/messages", GOOGLE_CHAT_API_BASE, reply.channel.id);
 
     let mut body = serde_json::json!({
         "text": reply.content.text,
@@ -189,6 +189,7 @@ pub async fn handle_reply(
         body["thread"] = serde_json::json!({
             "name": thread_id,
         });
+        url.push_str("?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD");
     }
 
     let _ = client
