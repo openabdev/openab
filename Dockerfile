@@ -29,6 +29,20 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     apt-get update && apt-get install -y --no-install-recommends gh && \
     rm -rf /var/lib/apt/lists/*
 
+# Install glab CLI (GitLab) - supports amd64 and arm64
+ARG GLAB_VERSION=1.93.0
+RUN ARCH=$(dpkg --print-architecture) && \
+    if [ "$ARCH" = "arm64" ]; then \
+      GLAB_ARCH="arm64"; \
+    else \
+      GLAB_ARCH="amd64"; \
+    fi && \
+    curl -fsSL https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_${GLAB_ARCH}.deb \
+      -o /tmp/glab.deb && \
+    apt-get update && apt-get install -y --no-install-recommends /tmp/glab.deb && \
+    rm -f /tmp/glab.deb && \
+    rm -rf /var/lib/apt/lists/*
+
 RUN useradd -m -s /bin/bash -u 1000 agent
 RUN mkdir -p /home/agent/.local/share/kiro-cli /home/agent/.kiro && \
     chown -R agent:agent /home/agent
