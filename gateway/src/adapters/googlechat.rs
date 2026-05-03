@@ -71,20 +71,20 @@ pub struct GoogleChatSpace {
 
 const GOOGLE_CHAT_ISSUER: &str = "https://accounts.google.com";
 const GOOGLE_CHAT_JWKS_URL: &str = "https://www.googleapis.com/oauth2/v3/certs";
-const GOOGLE_CHAT_SERVICE_ACCOUNT_EMAIL: &str = "chat@system.gserviceaccount.com";
+const GOOGLE_CHAT_EMAIL_SUFFIX: &str = "@gcp-sa-gsuiteaddons.iam.gserviceaccount.com";
 const JWKS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// Verify the JWT's `email` claim equals the Google Chat service account address.
-/// Without this check, any Google-issued ID token (e.g. Sign-In) would be accepted —
-/// `iss=accounts.google.com` alone doesn't prove the request came from Google Chat.
+/// Verify the JWT's `email` claim belongs to a Google Chat service account.
+/// Google Chat webhooks use `service-{PROJECT_NUMBER}@gcp-sa-gsuiteaddons.iam.gserviceaccount.com`.
+/// Without this check, any Google-issued ID token would be accepted.
 fn verify_email_claim(claims: &serde_json::Value) -> Result<(), String> {
     let email = claims
         .get("email")
         .and_then(|v| v.as_str())
         .ok_or("missing email claim")?;
-    if email != GOOGLE_CHAT_SERVICE_ACCOUNT_EMAIL {
+    if !email.ends_with(GOOGLE_CHAT_EMAIL_SUFFIX) {
         return Err(format!(
-            "email claim mismatch: expected {GOOGLE_CHAT_SERVICE_ACCOUNT_EMAIL}, got {email}"
+            "email claim mismatch: expected *{GOOGLE_CHAT_EMAIL_SUFFIX}, got {email}"
         ));
     }
     Ok(())
@@ -831,8 +831,8 @@ mod tests {
     }
 
     #[test]
-    fn email_claim_accepts_chat_system_account() {
-        let claims = serde_json::json!({"email": "chat@system.gserviceaccount.com"});
+    fn email_claim_accepts_gsuite_addons_account() {
+        let claims = serde_json::json!({"email": "service-123456@gcp-sa-gsuiteaddons.iam.gserviceaccount.com"});
         assert!(verify_email_claim(&claims).is_ok());
     }
 
@@ -841,6 +841,12 @@ mod tests {
         let claims = serde_json::json!({"email": "attacker@example.iam.gserviceaccount.com"});
         let err = verify_email_claim(&claims).unwrap_err();
         assert!(err.contains("email claim mismatch"));
+    }
+
+    #[test]
+    fn email_claim_rejects_unrelated_gserviceaccount() {
+        let claims = serde_json::json!({"email": "my-sa@my-project.iam.gserviceaccount.com"});
+        assert!(verify_email_claim(&claims).is_err());
     }
 
     #[test]
