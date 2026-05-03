@@ -39,9 +39,8 @@ pub struct BufferedMessage {
     pub arrived_at: Instant,
     /// Rough token estimate for `max_batch_tokens` cap.
     pub estimated_tokens: usize,
-    /// Snapshot of "is another bot present in this thread" at submit time —
-    /// matches v0.8.2-beta.1's per-message by-value pattern. `dispatch_batch`
-    /// uses the freshest snapshot in the batch (`batch.last()`).
+    /// Snapshot at submit time. Captured per-message so a batch reflects the
+    /// freshest known state; `dispatch_batch` reads `batch.last()`.
     pub other_bot_present: bool,
 }
 
@@ -66,7 +65,7 @@ impl std::fmt::Display for DispatchError {
 
 struct ThreadHandle {
     tx: tokio::sync::mpsc::Sender<BufferedMessage>,
-    _consumer: tokio::task::JoinHandle<()>,
+    consumer: tokio::task::JoinHandle<()>,
     /// Race-safe eviction counter (§2.5). Plain u64 — all reads/writes under per_thread lock.
     generation: u64,
     channel_id: String,
@@ -74,11 +73,9 @@ struct ThreadHandle {
 }
 
 impl ThreadHandle {
-    /// Close the sender and drain remaining messages for shutdown logging.
-    fn drain_pending(&mut self) -> usize {
-        // Closing the sender causes the consumer to exit on next recv().
-        // We can't synchronously drain an async channel, so we report the
-        // approximate capacity used via the channel's current length.
+    /// Approximate number of messages still buffered in the mpsc — used for
+    /// shutdown / cancel logging. Not exact: tokio's mpsc has no sync `.len()`.
+    fn pending_count(&self) -> usize {
         self.tx.max_capacity() - self.tx.capacity()
     }
 }
@@ -159,7 +156,7 @@ impl Dispatcher {
                 ));
                 ThreadHandle {
                     tx,
-                    _consumer: consumer,
+                    consumer,
                     generation: next_g,
                     channel_id: thread_channel.channel_id.clone(),
                     adapter_kind: adapter.platform().to_string(),
@@ -167,7 +164,6 @@ impl Dispatcher {
             });
             (entry.tx.clone(), entry.generation)
         };
-        // Dispatcher mutex released — held only to look up/insert the handle.
 
         if let Err(e) = tx.send(msg).await {
             // Consumer has exited — race-safe eviction under lock (§2.5).
@@ -179,7 +175,7 @@ impl Dispatcher {
             let _ = adapter
                 .add_reaction(
                     &failed_msg.trigger_msg,
-                    &crate::config::ReactionsConfig::default().emojis.error,
+                    &self.router.reactions_config().emojis.error,
                 )
                 .await;
             let _ = adapter
@@ -203,8 +199,8 @@ impl Dispatcher {
     pub fn cancel_buffered(&self, thread_key: &str) -> usize {
         let mut map = self.per_thread.lock().unwrap();
         if let Some(handle) = map.remove(thread_key) {
-            let pending = handle.tx.max_capacity() - handle.tx.capacity();
-            handle._consumer.abort();
+            let pending = handle.pending_count();
+            handle.consumer.abort();
             pending
         } else {
             0
@@ -233,15 +229,15 @@ impl Dispatcher {
     /// Log buffered-message counts and drop all handles (called on SIGTERM).
     pub fn shutdown(&self) {
         let mut map = self.per_thread.lock().unwrap();
-        for (thread_id, handle) in map.iter_mut() {
-            let pending = handle.drain_pending();
+        for (thread_id, handle) in map.iter() {
+            let pending = handle.pending_count();
             if pending > 0 {
                 warn!(
                     thread_id = %thread_id,
                     channel   = %handle.channel_id,
                     adapter   = %handle.adapter_kind,
                     buffered_lost = pending,
-                    "shutdown drained pending messages without dispatch",
+                    "shutdown dropped pending messages without dispatch",
                 );
             }
         }
@@ -273,7 +269,9 @@ async fn consumer_loop(
             Some(msg) => msg,
             None => match rx.recv().await {
                 Some(msg) => msg,
-                None => break, // all senders dropped → cleanup_idle evicted us
+                // All senders dropped → either shutdown() cleared the map, or
+                // cancel_buffered() removed our entry. Exit the loop.
+                None => break,
             },
         };
 
@@ -296,9 +294,7 @@ async fn consumer_loop(
             }
         }
 
-        // §2.6 freshness: use the freshest snapshot in the batch — the last
-        // message's `other_bot_present` (captured at submit time, mirrors
-        // v0.8.2-beta.1's per-message by-value pattern). batch is non-empty.
+        // §2.6: read the freshest snapshot in the batch (batch is non-empty).
         let bot_present = batch.last().unwrap().other_bot_present;
 
         dispatch_batch(
@@ -311,7 +307,6 @@ async fn consumer_loop(
         )
         .await;
     }
-    // rx.recv() returned None → all senders dropped → exit cleanly.
 }
 
 // ---------------------------------------------------------------------------
@@ -330,10 +325,14 @@ async fn dispatch_batch(
     let batch_size = batch.len();
 
     // Apply 👀 reaction to every message in the batch before dispatch (§6.7).
-    let queued_emoji = crate::config::ReactionsConfig::default().emojis.queued;
-    for msg in &batch {
-        let _ = adapter.add_reaction(&msg.trigger_msg, &queued_emoji).await;
-    }
+    // Parallelized so first-token latency isn't paid for N serial reaction RPCs.
+    let queued_emoji = &router.reactions_config().emojis.queued;
+    futures_util::future::join_all(
+        batch
+            .iter()
+            .map(|msg| adapter.add_reaction(&msg.trigger_msg, queued_emoji)),
+    )
+    .await;
 
     // Collect per-event observability data.
     let tokens_per_event: Vec<usize> = batch.iter().map(|m| m.estimated_tokens).collect();
@@ -689,7 +688,7 @@ mod tests {
         let consumer = tokio::spawn(async {});
         ThreadHandle {
             tx,
-            _consumer: consumer,
+            consumer,
             generation,
             channel_id: "C".into(),
             adapter_kind: "discord".into(),
