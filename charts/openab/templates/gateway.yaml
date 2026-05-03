@@ -157,6 +157,33 @@ spec:
               value: "false"
             {{- end }}
             {{- end }}
+            {{- $hasGoogleChat := or (($cfg.gateway).googleChat).saKeyJson (($cfg.gateway).googleChat).accessToken (($cfg.gateway).googleChat).audience }}
+            {{- if $hasGoogleChat }}
+            - name: GOOGLE_CHAT_ENABLED
+              value: "true"
+            {{- if (($cfg.gateway).googleChat).audience }}
+            - name: GOOGLE_CHAT_AUDIENCE
+              value: {{ ($cfg.gateway).googleChat.audience | quote }}
+            {{- end }}
+            {{- if (($cfg.gateway).googleChat).saKeyJson }}
+            - name: GOOGLE_CHAT_SA_KEY_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: google-chat-sa-key-json
+            {{- end }}
+            {{- if (($cfg.gateway).googleChat).accessToken }}
+            - name: GOOGLE_CHAT_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: google-chat-access-token
+            {{- end }}
+            {{- if (($cfg.gateway).googleChat).webhookPath }}
+            - name: GOOGLE_CHAT_WEBHOOK_PATH
+              value: {{ ($cfg.gateway).googleChat.webhookPath | quote }}
+            {{- end }}
+            {{- end }}
             - name: RUST_LOG
               value: {{ ($cfg.gateway).rustLog | default "info" | quote }}
           livenessProbe:

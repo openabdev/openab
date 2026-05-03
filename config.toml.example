@@ -35,7 +35,7 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 
 # [gateway]
 # url = "ws://openab-gateway:8080/ws"  # WebSocket URL of the custom gateway
-# platform = "line"                     # "telegram" (default) | "line"
+# platform = "line"                     # "telegram" (default) | "line" | "googlechat"
 # token = "${GATEWAY_TOKEN}"            # shared token for WebSocket auth (optional but recommended)
 # bot_username = "my_bot"               # for @mention gating in groups
 # allow_all_channels = true             # true = allow all channels; false = only allowed_channels

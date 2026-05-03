@@ -48,6 +48,8 @@ pub struct AppState {
     pub teams_service_urls: Mutex<HashMap<String, (String, Instant)>>,
     /// Feishu adapter (None if Feishu disabled)
     pub feishu: Option<adapters::feishu::FeishuAdapter>,
+    /// Google Chat adapter (None if Google Chat disabled)
+    pub google_chat: Option<adapters::googlechat::GoogleChatAdapter>,
     /// WebSocket authentication token
     pub ws_token: Option<String>,
     /// Broadcast channel: gateway → OAB (events from all platforms)
@@ -162,6 +164,13 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                                     warn!("reply for feishu but adapter not configured");
                                 }
                             }
+                            "googlechat" => {
+                                if let Some(ref gc) = state_for_recv.google_chat {
+                                    gc.handle_reply(&reply).await;
+                                } else {
+                                    warn!("reply for googlechat but adapter not configured");
+                                }
+                            }
                             other => warn!(platform = other, "unknown reply platform"),
                         }
                     }
@@ -261,12 +270,57 @@ async fn main() -> Result<()> {
         f.resolve_bot_identity().await;
     }
 
+    // Google Chat adapter
+    let google_chat_enabled = std::env::var("GOOGLE_CHAT_ENABLED")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    let google_chat = if google_chat_enabled {
+        let token_cache = std::env::var("GOOGLE_CHAT_SA_KEY_JSON")
+            .ok()
+            .or_else(|| {
+                std::env::var("GOOGLE_CHAT_SA_KEY_FILE")
+                    .ok()
+                    .and_then(|path| std::fs::read_to_string(&path).ok())
+            })
+            .and_then(|json| {
+                adapters::googlechat::GoogleChatTokenCache::new(&json)
+                    .map_err(|e| warn!("googlechat SA key error: {e}"))
+                    .ok()
+            });
+        let access_token = std::env::var("GOOGLE_CHAT_ACCESS_TOKEN").ok();
+        let jwt_verifier = std::env::var("GOOGLE_CHAT_AUDIENCE").ok().map(|aud| {
+            info!("googlechat webhook JWT verification enabled (audience={aud})");
+            adapters::googlechat::GoogleChatJwtVerifier::new(aud)
+        });
+
+        let webhook_path = std::env::var("GOOGLE_CHAT_WEBHOOK_PATH")
+            .unwrap_or_else(|_| "/webhook/googlechat".into());
+        info!(path = %webhook_path, "googlechat adapter enabled");
+        app = app.route(&webhook_path, post(adapters::googlechat::webhook));
+
+        if token_cache.is_some() {
+            info!("googlechat service account configured — token auto-refresh enabled");
+        } else if access_token.is_some() {
+            warn!("googlechat using static access token — will expire in ~1 hour");
+        } else {
+            warn!("GOOGLE_CHAT_ACCESS_TOKEN / GOOGLE_CHAT_SA_KEY_JSON not set — replies will be logged but not sent");
+        }
+        if jwt_verifier.is_none() {
+            warn!("GOOGLE_CHAT_AUDIENCE not set — webhook requests are NOT authenticated (insecure)");
+        }
+
+        Some(adapters::googlechat::GoogleChatAdapter::new(token_cache, access_token, jwt_verifier))
+    } else {
+        None
+    };
+
     if telegram_bot_token.is_none()
         && line_access_token.is_none()
         && teams.is_none()
         && feishu.is_none()
+        && google_chat.is_none()
     {
-        warn!("no adapters configured — set TELEGRAM_BOT_TOKEN, LINE_CHANNEL_ACCESS_TOKEN, TEAMS_APP_ID + TEAMS_APP_SECRET, and/or FEISHU_APP_ID + FEISHU_APP_SECRET");
+        warn!("no adapters configured — set TELEGRAM_BOT_TOKEN, LINE_CHANNEL_ACCESS_TOKEN, TEAMS_APP_ID + TEAMS_APP_SECRET, FEISHU_APP_ID + FEISHU_APP_SECRET, and/or GOOGLE_CHAT_ENABLED=true");
     }
 
     let state = Arc::new(AppState {
@@ -277,6 +331,7 @@ async fn main() -> Result<()> {
         teams,
         teams_service_urls: Mutex::new(HashMap::new()),
         feishu,
+        google_chat,
         ws_token,
         event_tx,
         reply_token_cache,

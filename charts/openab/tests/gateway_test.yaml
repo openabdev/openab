@@ -227,6 +227,91 @@ tests:
                 key: line-channel-access-token
         documentIndex: 0
 
+  # --- Google Chat deployment env var rendering ---
+
+  - it: enables Google Chat adapter when only audience is set (receive-only mode)
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+      agents.kiro.gateway.googleChat.audience: "https://example.com/webhook/googlechat"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GOOGLE_CHAT_ENABLED
+            value: "true"
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GOOGLE_CHAT_AUDIENCE
+            value: "https://example.com/webhook/googlechat"
+        documentIndex: 0
+
+  - it: enables Google Chat adapter when only saKeyJson is set
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+      agents.kiro.gateway.googleChat.saKeyJson: '{"client_email":"x","private_key":"y"}'
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GOOGLE_CHAT_ENABLED
+            value: "true"
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GOOGLE_CHAT_SA_KEY_JSON
+            valueFrom:
+              secretKeyRef:
+                name: RELEASE-NAME-openab-kiro-gateway
+                key: google-chat-sa-key-json
+        documentIndex: 0
+
+  - it: injects GOOGLE_CHAT_ACCESS_TOKEN when accessToken is set
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+      agents.kiro.gateway.googleChat.accessToken: "ya29.test"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GOOGLE_CHAT_ACCESS_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: RELEASE-NAME-openab-kiro-gateway
+                key: google-chat-access-token
+        documentIndex: 0
+
+  - it: injects GOOGLE_CHAT_WEBHOOK_PATH when set
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+      agents.kiro.gateway.googleChat.audience: "https://example.com/webhook/googlechat"
+      agents.kiro.gateway.googleChat.webhookPath: "/custom/gc"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GOOGLE_CHAT_WEBHOOK_PATH
+            value: "/custom/gc"
+        documentIndex: 0
+
+  - it: does not inject Google Chat env vars when no googleChat fields are set
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GOOGLE_CHAT_ENABLED
+          any: true
+        documentIndex: 0
+
   - it: renders extraContainers as sidecars
     set:
       agents.kiro.gateway.enabled: true
@@ -351,6 +436,39 @@ tests:
       - equal:
           path: data["teams-app-secret"]
           value: "YXBwLXNlY3JldA=="
+
+  - it: renders Google Chat saKeyJson secret
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+      agents.kiro.gateway.googleChat.saKeyJson: '{"client_email":"x"}'
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: data["google-chat-sa-key-json"]
+          value: "eyJjbGllbnRfZW1haWwiOiJ4In0="
+
+  - it: renders Google Chat accessToken secret
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+      agents.kiro.gateway.googleChat.accessToken: "ya29.test"
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: data["google-chat-access-token"]
+          value: "eWEyOS50ZXN0"
+
+  - it: does not render Google Chat secret when only audience is set
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+      agents.kiro.gateway.googleChat.audience: "https://example.com/webhook/googlechat"
+    asserts:
+      - hasDocuments:
+          count: 0
 
   - it: does not render when no platform secrets configured
     set:

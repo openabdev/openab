@@ -246,6 +246,13 @@ agents:
         allowedGroups: []      # List of chat_id → FEISHU_ALLOWED_GROUPS
         allowedUsers: []       # List of open_id → FEISHU_ALLOWED_USERS
         requireMention: true   # Require @mention in groups → FEISHU_REQUIRE_MENTION
+      # Google Chat adapter config (gateway-side env vars)
+      # See docs/google-chat.md for full setup guide
+      googleChat:
+        audience: ""           # JWT audience → GOOGLE_CHAT_AUDIENCE (set to your webhook URL to enable JWT verification)
+        saKeyJson: ""          # Service account key JSON string → GOOGLE_CHAT_SA_KEY_JSON (recommended, auto-refresh)
+        accessToken: ""        # Static OAuth2 access token → GOOGLE_CHAT_ACCESS_TOKEN (fallback, 1-hour TTL)
+        webhookPath: ""        # Gateway default: /webhook/googlechat → GOOGLE_CHAT_WEBHOOK_PATH
     # Scheduled messages — config-driven cron (ADR: basic-cronjob)
     # Each entry sends a message to the agent at the specified schedule.
     # Example:

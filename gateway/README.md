@@ -61,9 +61,12 @@ url = "ws://gateway:8080/ws"
 | `FEISHU_REQUIRE_MENTION` | `true` | Require @mention in groups |
 | `FEISHU_DEDUPE_TTL_SECS` | `300` | Event deduplication cache TTL (seconds) |
 | `FEISHU_MESSAGE_LIMIT` | `4000` | Max message length before auto-splitting (bytes) |
-| `FEISHU_ALLOW_BOTS` | `off` | Bot message handling: `off` / `mentions` / `all` |
-| `FEISHU_TRUSTED_BOT_IDS` | (optional) | Comma-separated open_id list of known bots |
-| `FEISHU_MAX_BOT_TURNS` | `20` | Max consecutive bot replies per channel |
+| `GOOGLE_CHAT_ENABLED` | `false` | Set to `true` or `1` to enable the Google Chat adapter |
+| `GOOGLE_CHAT_AUDIENCE` | (optional) | JWT audience for webhook verification (full webhook URL, e.g. `https://your-domain.com/webhook/googlechat`) |
+| `GOOGLE_CHAT_SA_KEY_JSON` | (optional) | Service account key JSON string (enables token auto-refresh) |
+| `GOOGLE_CHAT_SA_KEY_FILE` | (optional) | Path to service account key JSON file (alternative to `SA_KEY_JSON`) |
+| `GOOGLE_CHAT_ACCESS_TOKEN` | (optional) | Static OAuth2 access token (fallback, expires in 1 hour) |
+| `GOOGLE_CHAT_WEBHOOK_PATH` | `/webhook/googlechat` | Webhook endpoint path |
 
 ### Endpoints
 
@@ -72,6 +75,7 @@ url = "ws://gateway:8080/ws"
 | `POST /webhook/telegram` | Telegram webhook receiver |
 | `POST /webhook/line` | LINE webhook receiver |
 | `POST /webhook/feishu` | Feishu webhook receiver (when `FEISHU_CONNECTION_MODE=webhook`) |
+| `POST /webhook/googlechat` | Google Chat webhook receiver |
 | `GET /ws` | WebSocket server (OAB connects here) |
 | `GET /health` | Health check |
 
@@ -101,16 +105,19 @@ url = "ws://gateway:8080/ws"
 
 5. For supergroup forum topics (thread isolation like Discord), give the bot **Manage Topics** permission in the group settings.
 
-### LINE (TBD)
+### LINE
 
-LINE adapter is planned. It will follow the same pattern:
-- Webhook at `/webhook/line`
-- Signature validation via `X-Line-Signature` header
-- Reply via LINE Push Message API
+See [docs/line.md](../docs/line.md) for the full setup guide.
 
-See [ADR: LINE Adapter](../docs/adr/line-adapter.md) for the design.
+### Feishu/Lark
 
-### Other Platforms (TBD)
+See [docs/feishu.md](../docs/feishu.md) for the full setup guide.
+
+### Google Chat
+
+See [docs/google-chat.md](../docs/google-chat.md) for the full setup guide.
+
+### Other Platforms
 
 GitHub webhooks, CI/CD events, monitoring alerts — any HTTP event source can be added as a gateway adapter. See the ADR for the adapter interface.
 
