@@ -167,6 +167,80 @@ impl GoogleChatJwtVerifier {
     }
 }
 
+// --- Adapter (encapsulates all Google Chat state) ---
+
+pub struct GoogleChatAdapter {
+    pub token_cache: Option<GoogleChatTokenCache>,
+    pub access_token: Option<String>,
+    pub jwt_verifier: Option<GoogleChatJwtVerifier>,
+    pub client: reqwest::Client,
+}
+
+impl GoogleChatAdapter {
+    pub fn new(
+        token_cache: Option<GoogleChatTokenCache>,
+        access_token: Option<String>,
+        jwt_verifier: Option<GoogleChatJwtVerifier>,
+    ) -> Self {
+        Self {
+            token_cache,
+            access_token,
+            jwt_verifier,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    async fn get_token(&self) -> Option<String> {
+        if let Some(ref cache) = self.token_cache {
+            match cache.get_token(&self.client).await {
+                Ok(t) => return Some(t),
+                Err(e) => {
+                    error!("googlechat token refresh failed: {e}");
+                    return None;
+                }
+            }
+        }
+        self.access_token.clone()
+    }
+
+    pub async fn handle_reply(&self, reply: &GatewayReply) {
+        if matches!(
+            reply.command.as_deref(),
+            Some("add_reaction") | Some("remove_reaction") | Some("create_topic")
+        ) {
+            return;
+        }
+
+        info!(
+            space = %reply.channel.id,
+            thread_id = ?reply.channel.thread_id,
+            "gateway → googlechat"
+        );
+
+        let Some(token) = self.get_token().await else {
+            info!(
+                text = %reply.content.text,
+                "googlechat reply (dry-run, no credentials configured)"
+            );
+            return;
+        };
+
+        let text = &reply.content.text;
+        let chunks = split_text(text, GOOGLE_CHAT_MESSAGE_LIMIT);
+
+        for chunk in chunks {
+            send_message(
+                &self.client,
+                &token,
+                &reply.channel.id,
+                reply.channel.thread_id.as_deref(),
+                chunk,
+            )
+            .await;
+        }
+    }
+}
+
 // --- Webhook handler ---
 
 pub async fn webhook(
@@ -176,20 +250,22 @@ pub async fn webhook(
 ) -> axum::response::Response {
     info!("googlechat webhook received ({} bytes)", body.len());
 
-    if let Some(ref verifier) = state.google_chat_jwt_verifier {
-        let auth_header = match headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-        {
-            Some(h) => h,
-            None => {
-                warn!("googlechat webhook: missing authorization header");
+    if let Some(ref adapter) = state.google_chat {
+        if let Some(ref verifier) = adapter.jwt_verifier {
+            let auth_header = match headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+            {
+                Some(h) => h,
+                None => {
+                    warn!("googlechat webhook: missing authorization header");
+                    return (axum::http::StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+                }
+            };
+            if let Err(e) = verifier.verify(auth_header).await {
+                warn!(error = %e, "googlechat webhook JWT verification failed");
                 return (axum::http::StatusCode::UNAUTHORIZED, "unauthorized").into_response();
             }
-        };
-        if let Err(e) = verifier.verify(auth_header).await {
-            warn!(error = %e, "googlechat webhook JWT verification failed");
-            return (axum::http::StatusCode::UNAUTHORIZED, "unauthorized").into_response();
         }
     }
 
@@ -393,56 +469,6 @@ impl GoogleChatTokenCache {
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
         jsonwebtoken::encode(&header, &claims, &key)
             .map_err(|e| format!("JWT encode error: {e}"))
-    }
-}
-
-// --- Reply handler ---
-
-pub async fn handle_reply(
-    reply: &GatewayReply,
-    token_cache: Option<&GoogleChatTokenCache>,
-    static_token: Option<&str>,
-    client: &reqwest::Client,
-) {
-    if reply.command.as_deref() == Some("add_reaction")
-        || reply.command.as_deref() == Some("remove_reaction")
-    {
-        return;
-    }
-
-    if reply.command.as_deref() == Some("create_topic") {
-        return;
-    }
-
-    info!(
-        space = %reply.channel.id,
-        thread_id = ?reply.channel.thread_id,
-        "gateway → googlechat"
-    );
-
-    let token = if let Some(cache) = token_cache {
-        match cache.get_token(client).await {
-            Ok(t) => t,
-            Err(e) => {
-                error!("googlechat token refresh failed: {e}");
-                return;
-            }
-        }
-    } else if let Some(t) = static_token {
-        t.to_string()
-    } else {
-        info!(
-            text = %reply.content.text,
-            "googlechat reply (dry-run, no credentials configured)"
-        );
-        return;
-    };
-
-    let text = &reply.content.text;
-    let chunks = split_text(text, GOOGLE_CHAT_MESSAGE_LIMIT);
-
-    for chunk in chunks {
-        send_message(client, &token, &reply.channel.id, reply.channel.thread_id.as_deref(), chunk).await;
     }
 }
 
