@@ -280,6 +280,17 @@ impl Dispatcher {
         false
     }
 
+    /// Remove map entries whose consumer task has finished (idle timeout or
+    /// unexpected exit). Called periodically from the cleanup task in main.rs
+    /// to prevent unbounded map growth from one-shot thread keys that never
+    /// receive a second `submit()`. Returns the number of entries swept.
+    pub fn sweep_stale(&self) -> usize {
+        let mut map = self.per_thread.lock().unwrap();
+        let before = map.len();
+        map.retain(|_, handle| !handle.consumer.is_finished());
+        before - map.len()
+    }
+
     /// Log buffered-message counts and drop all handles (called on SIGTERM).
     pub fn shutdown(&self) {
         let mut map = self.per_thread.lock().unwrap();

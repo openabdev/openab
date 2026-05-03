@@ -22,7 +22,7 @@ use serenity::gateway::GatewayError;
 use serenity::prelude::*;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::{error, info, warn};
 
 /// Wait for SIGINT (ctrl_c) or, on unix, SIGTERM. SIGTERM is what Kubernetes
@@ -145,14 +145,20 @@ async fn main() -> anyhow::Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Dispatcher handles tracked here so SIGTERM cleanup can call shutdown() on each (ADR §6.8).
-    let mut dispatchers: Vec<Arc<dispatch::Dispatcher>> = Vec::new();
+    // Also shared with the cleanup task for periodic stale-entry sweeping.
+    let dispatchers: Arc<Mutex<Vec<Arc<dispatch::Dispatcher>>>> = Arc::new(Mutex::new(Vec::new()));
 
     // Spawn cleanup task
     let cleanup_pool = pool.clone();
+    let cleanup_dispatchers = dispatchers.clone();
     let cleanup_handle = tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             cleanup_pool.cleanup_idle(ttl_secs).await;
+            // Sweep stale per-thread dispatcher entries (idle-exited consumers).
+            for d in cleanup_dispatchers.lock().unwrap().iter() {
+                d.sweep_stale();
+            }
         }
     });
 
@@ -204,7 +210,7 @@ async fn main() -> anyhow::Result<()> {
             slack_cap,
             slack_cfg.max_batch_tokens,
         ));
-        dispatchers.push(slack_dispatcher.clone());
+        dispatchers.lock().unwrap().push(slack_dispatcher.clone());
         Some(tokio::spawn(async move {
             if let Err(e) = slack::run_slack_adapter(
                 adapter,
@@ -244,7 +250,7 @@ async fn main() -> anyhow::Result<()> {
             gw_cap,
             gw_cfg.max_batch_tokens,
         ));
-        dispatchers.push(gw_dispatcher.clone());
+        dispatchers.lock().unwrap().push(gw_dispatcher.clone());
         let params = gateway::GatewayParams {
             url: gw_cfg.url,
             platform: gw_cfg.platform,
@@ -337,7 +343,7 @@ async fn main() -> anyhow::Result<()> {
             discord_cap,
             discord_cfg.max_batch_tokens,
         ));
-        dispatchers.push(discord_dispatcher.clone());
+        dispatchers.lock().unwrap().push(discord_dispatcher.clone());
 
         let handler = discord::Handler {
             router,
@@ -418,7 +424,7 @@ async fn main() -> anyhow::Result<()> {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(35), handle).await;
     }
     // Drain per-thread dispatchers and log buffered_lost counts before pool shutdown (ADR §6.8).
-    for d in &dispatchers {
+    for d in dispatchers.lock().unwrap().iter() {
         d.shutdown();
     }
     let shutdown_pool = pool;
