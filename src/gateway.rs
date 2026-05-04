@@ -625,12 +625,12 @@ pub async fn run_gateway_adapter(
                                         let _ = send_fire_and_forget(&slash_ws_tx, &channel, &msg).await;
                                         continue;
                                     }
-                                    if trimmed.starts_with("/models") || trimmed.starts_with("/agents") {
+                                    {
                                         let thread_key = format!("{}:{}", event.platform, event.channel.thread_id.as_deref().unwrap_or(&event.channel.id));
                                         if let Some(msg) = handle_config_command(trimmed, &router, &thread_key).await {
                                             let _ = send_fire_and_forget(&slash_ws_tx, &channel, &msg).await;
+                                            continue;
                                         }
-                                        continue;
                                     }
 
                                     tasks.spawn(async move {
