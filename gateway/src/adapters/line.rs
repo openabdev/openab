@@ -99,55 +99,67 @@ pub async fn webhook(
             if msg.message_type == "image" || msg.message_type == "audio" {
                 let url = format!("https://api-data.line.me/v2/bot/message/{}/content", msg.id);
                 let client = reqwest::Client::new();
-                let resp = client
-                    .get(url)
-                    .bearer_auth(access_token)
-                    .send()
-                    .await;
+                let resp = client.get(url).bearer_auth(access_token).send().await;
 
                 if let Ok(r) = resp {
                     if !r.status().is_success() {
                         warn!(status = %r.status(), id = %msg.id, "failed to download LINE media");
                     } else {
                         let mime = r
-                        .headers()
-                        .get("content-type")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or(if msg.message_type == "image" {
-                            "image/jpeg"
-                        } else {
-                            "audio/x-m4a"
-                        })
-                        .to_string();
-
-                    if let Ok(data) = r.bytes().await {
-                        let uuid = uuid::Uuid::new_v4().to_string();
-                        {
-                            let mut store =
-                                state.media_store.lock().unwrap_or_else(|e| e.into_inner());
-                            if store.len() >= state.media_max_entries {
-                                warn!(
-                                    size = store.len(),
-                                    "media store full, skipping LINE media proxy"
-                                );
+                            .headers()
+                            .get("content-type")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or(if msg.message_type == "image" {
+                                "image/jpeg"
                             } else {
-                                store.insert(
-                                    uuid.clone(),
-                                    (data.to_vec(), mime, std::time::Instant::now()),
-                                );
+                                "audio/x-m4a"
+                            })
+                            .to_string();
+
+                        if let Ok(data) = r.bytes().await {
+                            let uuid = uuid::Uuid::new_v4().to_string();
+                            let size = data.len() as u64;
+                            let proxied = {
+                                let mut store =
+                                    state.media_store.lock().unwrap_or_else(|e| e.into_inner());
+                                if store.len() >= state.media_max_entries {
+                                    warn!(
+                                        size = store.len(),
+                                        "media store full, skipping LINE media proxy"
+                                    );
+                                    false
+                                } else {
+                                    store.insert(
+                                        uuid.clone(),
+                                        (data.to_vec(), mime.clone(), std::time::Instant::now()),
+                                    );
+                                    true
+                                }
+                            };
+                            if proxied {
+                                attachments.push(Attachment {
+                                    attachment_type: msg.message_type.clone(),
+                                    url: format!("{}/media/{}", state.public_url, uuid),
+                                    mime_type: Some(mime),
+                                    filename: Some(format!(
+                                        "line-{}.{}",
+                                        msg.id,
+                                        if msg.message_type == "image" {
+                                            "jpg"
+                                        } else {
+                                            "m4a"
+                                        }
+                                    )),
+                                    size: Some(size),
+                                });
+                                if text.is_empty() {
+                                    text = format!("[{}]", msg.message_type);
+                                }
+                                info!(id = %msg.id, uuid = %uuid, "proxied LINE inbound media");
                             }
                         }
-                        attachments.push(Attachment {
-                            attachment_type: msg.message_type.clone(),
-                            url: format!("{}/media/{}", state.public_url, uuid),
-                        });
-                        if text.is_empty() {
-                            text = format!("[{}]", msg.message_type);
-                        }
-                        info!(id = %msg.id, uuid = %uuid, "proxied LINE inbound media");
                     }
                 }
-            }
             } else if msg.message_type != "text" {
                 continue;
             }
@@ -161,33 +173,27 @@ pub async fn webhook(
 
         let source = event.source.as_ref();
         let (channel_id, channel_type) = match source {
-            Some(s) if s.source_type == "group" => {
-                match s.group_id.as_deref() {
-                    Some(id) if !id.is_empty() => (id.to_string(), "group".to_string()),
-                    _ => {
-                        warn!("LINE group event missing groupId, skipping");
-                        continue;
-                    }
+            Some(s) if s.source_type == "group" => match s.group_id.as_deref() {
+                Some(id) if !id.is_empty() => (id.to_string(), "group".to_string()),
+                _ => {
+                    warn!("LINE group event missing groupId, skipping");
+                    continue;
                 }
-            }
-            Some(s) if s.source_type == "room" => {
-                match s.room_id.as_deref() {
-                    Some(id) if !id.is_empty() => (id.to_string(), "room".to_string()),
-                    _ => {
-                        warn!("LINE room event missing roomId, skipping");
-                        continue;
-                    }
+            },
+            Some(s) if s.source_type == "room" => match s.room_id.as_deref() {
+                Some(id) if !id.is_empty() => (id.to_string(), "room".to_string()),
+                _ => {
+                    warn!("LINE room event missing roomId, skipping");
+                    continue;
                 }
-            }
-            Some(s) => {
-                match s.user_id.as_deref() {
-                    Some(id) if !id.is_empty() => (id.to_string(), "user".to_string()),
-                    _ => {
-                        warn!("LINE user event missing userId, skipping");
-                        continue;
-                    }
+            },
+            Some(s) => match s.user_id.as_deref() {
+                Some(id) if !id.is_empty() => (id.to_string(), "user".to_string()),
+                _ => {
+                    warn!("LINE user event missing userId, skipping");
+                    continue;
                 }
-            }
+            },
             None => {
                 warn!("LINE event missing source, skipping");
                 continue;
