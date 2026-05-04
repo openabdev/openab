@@ -512,15 +512,20 @@ fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
     let config: Config = toml::from_str(&expanded)
         .map_err(|e| anyhow::anyhow!("failed to parse config from {source}: {e}"))?;
 
-    // Validate max_buffered_messages > 0 (tokio::sync::mpsc::channel panics on 0).
+    // Validate max_buffered_messages > 0 (tokio::sync::mpsc::channel panics on 0)
+    // and max_batch_tokens > 0 (otherwise the consumer's token-cap check forces every
+    // batch to size 1 — functionally per-message via a confusing path).
     if let Some(ref d) = config.discord {
         anyhow::ensure!(d.max_buffered_messages > 0, "discord.max_buffered_messages must be > 0");
+        anyhow::ensure!(d.max_batch_tokens > 0, "discord.max_batch_tokens must be > 0");
     }
     if let Some(ref s) = config.slack {
         anyhow::ensure!(s.max_buffered_messages > 0, "slack.max_buffered_messages must be > 0");
+        anyhow::ensure!(s.max_batch_tokens > 0, "slack.max_batch_tokens must be > 0");
     }
     if let Some(ref g) = config.gateway {
         anyhow::ensure!(g.max_buffered_messages > 0, "gateway.max_buffered_messages must be > 0");
+        anyhow::ensure!(g.max_batch_tokens > 0, "gateway.max_batch_tokens must be > 0");
     }
 
     Ok(config)
