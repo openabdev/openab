@@ -139,7 +139,8 @@ pub async fn webhook(
 
                             if let Ok(data) = r.bytes().await {
                                 let uuid = uuid::Uuid::new_v4().to_string();
-                                {
+                                let size = data.len() as u64;
+                                let proxied = {
                                     let mut store =
                                         state.media_store.lock().unwrap_or_else(|e| e.into_inner());
                                     if store.len() >= state.media_max_entries {
@@ -147,21 +148,36 @@ pub async fn webhook(
                                             size = store.len(),
                                             "media store full, skipping Telegram media proxy"
                                         );
+                                        false
                                     } else {
                                         store.insert(
                                             uuid.clone(),
-                                            (data.to_vec(), mime, std::time::Instant::now()),
+                                            (
+                                                data.to_vec(),
+                                                mime.clone(),
+                                                std::time::Instant::now(),
+                                            ),
                                         );
+                                        true
                                     }
+                                };
+                                if proxied {
+                                    attachments.push(Attachment {
+                                        attachment_type: m_type.into(),
+                                        url: format!("{}/media/{}", state.public_url, uuid),
+                                        mime_type: Some(mime),
+                                        filename: Some(format!(
+                                            "telegram-{}.{}",
+                                            file_id,
+                                            if m_type == "image" { "jpg" } else { "ogg" }
+                                        )),
+                                        size: Some(size),
+                                    });
+                                    if text.is_empty() {
+                                        text = format!("[{}]", m_type);
+                                    }
+                                    info!(id = %file_id, uuid = %uuid, "proxied Telegram inbound media");
                                 }
-                                attachments.push(Attachment {
-                                    attachment_type: m_type.into(),
-                                    url: format!("{}/media/{}", state.public_url, uuid),
-                                });
-                                if text.is_empty() {
-                                    text = format!("[{}]", m_type);
-                                }
-                                info!(id = %file_id, uuid = %uuid, "proxied Telegram inbound media");
                             }
                         }
                     }
@@ -169,7 +185,6 @@ pub async fn webhook(
             }
         }
     }
-
 
     if text.trim().is_empty() && attachments.is_empty() {
         return axum::http::StatusCode::OK;

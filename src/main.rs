@@ -228,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
             allow_all_users: config::resolve_allow_all(gw_cfg.allow_all_users, &gw_cfg.allowed_users),
             allowed_users: gw_cfg.allowed_users,
             streaming: gw_cfg.streaming,
+            stt_config: cfg.stt.clone(),
         };
         Some(tokio::spawn(async move {
             if let Err(e) = gateway::run_gateway_adapter(params, router, shutdown_rx).await {

@@ -502,7 +502,7 @@ message = "hello"
 "#;
         let cfg: UsercronFile = toml::from_str(toml_str).unwrap();
         let job = &cfg.jobs[0];
-        assert!(job.enabled);
+        assert_eq!(job.enabled, true);
         assert_eq!(job.platform, "discord");
         assert_eq!(job.sender_name, "openab-cron");
         assert_eq!(job.timezone, "UTC");
@@ -519,7 +519,7 @@ channel = "123"
 message = "hello"
 "#;
         let cfg: UsercronFile = toml::from_str(toml_str).unwrap();
-        assert!(!cfg.jobs[0].enabled);
+        assert_eq!(cfg.jobs[0].enabled, false);
     }
 
     #[test]
