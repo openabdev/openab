@@ -227,14 +227,6 @@ The Docker image bundles both `openab` and `kiro-cli` in a single container.
 └───────────────────────────────────────────────────────┘
 ```
 
-### Build & Push
-
-```bash
-docker build -t openab:latest .
-docker tag openab:latest <your-registry>/openab:latest
-docker push <your-registry>/openab:latest
-```
-
 ### Deploy without Helm
 
 ```bash
