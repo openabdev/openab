@@ -254,11 +254,19 @@ pub struct ClearEnvConfig {
     /// Allow-list mode: when non-empty under `enabled = true`, only these
     /// keys pass through from the OAB process env (deny_list is ignored).
     /// No effect under `enabled = false`.
+    ///
+    /// Baseline vars (HOME, PATH, USER on Unix; USERPROFILE, USERNAME, PATH,
+    /// SystemRoot, SystemDrive on Windows) are always added separately and
+    /// are NOT subject to this filter — `allow_list = ["FOO"]` yields
+    /// `{baseline + [agent].env + FOO}`, not `{FOO}` alone.
     #[serde(default)]
     pub allow_list: Vec<String>,
     /// Deny-list mode: when non-empty under `enabled = true` AND `allow_list`
     /// is empty, all process env passes through EXCEPT these keys. No effect
     /// under `enabled = false` or when `allow_list` is non-empty.
+    ///
+    /// Baseline vars are added unconditionally and CANNOT be denied —
+    /// `deny_list = ["PATH"]` does NOT remove PATH from the subprocess.
     #[serde(default)]
     pub deny_list: Vec<String>,
 }

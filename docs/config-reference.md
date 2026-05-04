@@ -97,8 +97,8 @@ The AI agent subprocess that OpenAB spawns to handle messages via ACP.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | `true` | When `true`, `env_clear()` runs and inheritance follows the decision tree below. When `false`, the subprocess inherits the FULL OAB process env and both lists are ignored (escape hatch). |
-| `allow_list` | string[] | `[]` | When non-empty under `enabled = true`: only these keys pass through from the OAB process env (deny_list ignored). |
-| `deny_list` | string[] | `[]` | When non-empty under `enabled = true` AND `allow_list` is empty: all process env passes through EXCEPT these keys. |
+| `allow_list` | string[] | `[]` | When non-empty under `enabled = true`: only these keys pass through from the OAB process env (deny_list ignored). **Baseline (`HOME`, `PATH`, `USER`, etc.) is always added separately** — `allow_list = ["FOO"]` yields `{baseline + [agent].env + FOO}`, not `{FOO}` alone. |
+| `deny_list` | string[] | `[]` | When non-empty under `enabled = true` AND `allow_list` is empty: all process env passes through EXCEPT these keys. **Baseline keys are added unconditionally and cannot be denied** — `deny_list = ["PATH"]` does NOT remove `PATH` from the subprocess. |
 
 **Decision tree** (always after `env_clear()` + baseline + `[agent].env`):
 
