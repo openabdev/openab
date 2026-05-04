@@ -158,7 +158,7 @@ OpenAB's `allow_bot_messages` defaults to ignoring bot messages. Peer discovery 
 1. **Shared registry file**: All agents read/write a shared `peers.yaml` or equivalent file on a shared filesystem or object store. On startup, an agent writes its own entry and reads others. Implementations MUST acquire a file-level lock (e.g. `peers.yaml.lock`) before writing registry entries. If the lock is held, the agent MUST wait or skip with a warning — the same semantics as `/reflect` locking (§4.3). Implementations SHOULD ignore invalid or partial updates and retain the last known valid registry state. **Note**: This mechanism requires a shared filesystem or object store and is NOT available in isolated environments (see below).
 2. **Platform API query**: Query the platform API (e.g. Discord guild members) to discover other agents, then populate the local registry.
 3. **Operator-managed static config** (RECOMMENDED): The operator maintains `peers.yaml` and deploys a copy into each agent's filesystem at provisioning time. Simplest approach, no bot-to-bot messaging or shared filesystem required. This is the RECOMMENDED default because it works in all environments, including isolated filesystems.
-4. **Mention-triggered exchange** (RECOMMENDED in isolated environments): When an agent is @mentioned by another agent, it MAY respond with a structured capability announcement. This works under `allow_bot_messages="mentions"`.
+4. **Mention-triggered exchange** (OPTIONAL, requires explicit config): When an agent is @mentioned by another agent, it MAY respond with a structured capability announcement. This mechanism is only available when the deployment explicitly enables `allow_bot_messages="mentions"` or an equivalent setting.
 
 #### Isolated Filesystem Environments
 
@@ -166,10 +166,10 @@ In many deployments (e.g. containerized agents, sandboxed runtimes), each agent 
 
 - **Shared registry file** (mechanism 1) is NOT available. Agents MUST NOT assume a shared filesystem exists.
 - **Operator-managed static config** (mechanism 3) is RECOMMENDED for stable environments where the set of agents rarely changes. The operator pre-provisions each agent's `peers.yaml` at deployment time.
-- **Mention-triggered exchange** (mechanism 4) is RECOMMENDED for dynamic environments where agents may join or leave at runtime. Agents discover each other naturally through @mentions in the chat platform — no shared filesystem or operator intervention required. Upon receiving a handshake message, the agent MUST update its local `peers.yaml` with the peer's information.
+- **Mention-triggered exchange** (mechanism 4) MAY be enabled for dynamic environments where agents may join or leave at runtime, but it is NOT compatible with OpenAB's default `allow_bot_messages` behavior. Operators MUST explicitly enable bot mentions before relying on it. Upon receiving a handshake message, the agent MUST update its local `peers.yaml` with the peer's information.
 - **Platform API query** (mechanism 2) remains a viable alternative since it communicates through the platform, not the filesystem.
 
-Mechanisms 3 and 4 are complementary: static config provides a known baseline of peers at startup, while mention-triggered exchange allows the registry to grow organically as new agents appear.
+Mechanisms 2, 3, and 4 are complementary: static config provides a known baseline of peers at startup, platform API queries can discover registered peers without bot-to-bot messaging, and mention-triggered exchange can grow the registry organically when explicitly enabled.
 
 Implementors MUST document which discovery mechanism they use and whether their environment provides a shared filesystem.
 
@@ -291,7 +291,8 @@ CREATE TABLE knowledge_files (
     tags          TEXT,
     summary       TEXT,
     content       TEXT,                              -- full text from .md file
-    owner_uid     TEXT NOT NULL,                      -- agent UID that owns this file
+    owner_uid     TEXT NOT NULL,                      -- agent UID that created/owns this file
+    last_writer_uid TEXT NOT NULL,                    -- agent UID that most recently wrote this file
     visibility    TEXT NOT NULL DEFAULT 'private',    -- private | shared | public
     created_at    TEXT NOT NULL,                      -- ISO 8601
     updated_at    TEXT NOT NULL,
@@ -350,7 +351,7 @@ Three commands power the knowledge lifecycle.
 3. Update or create the knowledge `.md` file.
 4. Update the SQLite index.
 
-All writes MUST set `owner_uid` to the writing agent's UID.
+Before mutating the daily log, knowledge file, or SQLite index, `/remember` MUST acquire the same file-level write lock used by `/reflect` (e.g. `memory.db.lock`). On create, it MUST set both `owner_uid` and `last_writer_uid` to the writing agent's UID. On update, it MUST preserve `owner_uid` and set `last_writer_uid` to the writing agent's UID.
 
 ### 4.3 `/reflect` — Extract & Refine Knowledge (Level 2+)
 
@@ -361,14 +362,15 @@ All writes MUST set `owner_uid` to the writing agent's UID.
 5. For each knowledge point:
    - If a related knowledge file exists → update it.
    - If no related file exists → create a new one.
-6. Update the SQLite index for all affected files.
+6. Update the SQLite index for all affected files, preserving `owner_uid` and setting `last_writer_uid` to the agent performing the write.
 7. Update `checkpoint` after each successfully processed entry.
 8. Set `status = 'done'` when the entire log is processed.
 9. Return a summary of changes.
 
 #### Concurrency & Failure Handling
 
-- **Locking**: An agent MUST acquire a file-level lock (e.g. `memory.db.lock`) before running `/reflect`. If the lock is held, the agent MUST wait or skip with a warning. This prevents concurrent `/remember` and `/reflect` from corrupting state.
+- **Shared write lock**: All commands that mutate the knowledge base (`/remember`, `/reflect`, and any shared-knowledge writer) MUST acquire the same file-level write lock (e.g. `memory.db.lock`) before touching the daily log, knowledge files, or SQLite index. If the lock is held, the agent MUST wait or skip with a warning.
+- **`/reflect` locking**: `/reflect` MUST hold that write lock for the duration of its mutation phase. This prevents concurrent `/remember` and `/reflect` from corrupting state.
 - **Crash recovery**: If `/reflect` crashes mid-execution, the `checkpoint` field records the last successfully processed entry. On next invocation, the agent MUST resume from the checkpoint, not restart from the beginning.
 - **Idempotency**: Running `/reflect` multiple times on the same log MUST produce the same result. Use `status`, `checkpoint`, and changelog entries to prevent duplication.
 
@@ -463,11 +465,11 @@ No assumption on LLM, framework, or platform. This spec works with any agent run
 
 ### 6.6 Privacy & Visibility
 
-Knowledge files have a `visibility` field and an `owner_uid` field:
+Knowledge files have a `visibility` field, an `owner_uid` field, and a `last_writer_uid` field:
 
 - **`private`** (default): Only the owning agent (`owner_uid`) can read and write.
 - **`shared`**: All agents in the same workspace can read; only the owner can write.
-- **`public`**: All agents can read and write.
+- **`public`**: All agents can read and write. `owner_uid` remains the original owning/maintaining agent for policy decisions, while `last_writer_uid` records the most recent writer for auditability.
 
 Implementors MUST enforce visibility at the query layer. An agent querying `/recall` MUST NOT return results from `private` files where `owner_uid` does not match the querying agent. Sensitive knowledge SHOULD be encrypted at rest.
 
@@ -501,7 +503,7 @@ An implementation is conformant at a given level if it satisfies all of the foll
 - [ ] `identity.uid` is validated against actual platform `sender_id` at startup
 - [ ] `capabilities` field uses `<tool>:v<major>` format
 - [ ] `knowledge/` directory contains `.md` files with Changelog sections
-- [ ] `memory.db` contains `knowledge_files` and `knowledge_fts` tables with `owner_uid` column
+- [ ] `memory.db` contains `knowledge_files` and `knowledge_fts` tables with `owner_uid` and `last_writer_uid` columns
 - [ ] `/recall` returns results filtered by `visibility` and `owner_uid`
 - [ ] SQLite index can be rebuilt entirely from `.md` files
 - [ ] At least one index sync strategy is implemented
@@ -512,10 +514,11 @@ An implementation is conformant at a given level if it satisfies all of the foll
 - [ ] Peer registry is treated as single source of truth for UID-to-name mappings
 - [ ] Mentions use correct `mention_syntax` from peer registry (no omissions, no wrong UIDs)
 - [ ] `/remember` appends to daily log and updates knowledge files + index
-- [ ] `/remember` sets `owner_uid` on all created/updated records
+- [ ] `/remember` acquires the shared write lock before mutating logs, knowledge files, or index
+- [ ] `/remember` preserves `owner_uid` on update and sets `last_writer_uid` on all created/updated records
 - [ ] `/reflect` processes `pending` logs with three-state tracking (pending → processing → done)
 - [ ] `/reflect` uses checkpoint for crash recovery
-- [ ] `/reflect` acquires file-level lock before execution
+- [ ] `/reflect` acquires the shared write lock before execution
 - [ ] `/reflect` is idempotent on the same log
 - [ ] `/reflect` resumes from checkpoint after crash without reprocessing already-reflected entries
 
