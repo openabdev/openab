@@ -11,8 +11,6 @@ use std::path::Path;
 ///   produce one ACP turn per turn boundary.
 /// - `PerLane`: one buffer per (thread, sender); each sender batches independently and gets
 ///   its own ACP turn — no silent-drop risk when multiple senders address the same thread.
-///
-/// The legacy alias `"batched"` resolves to `PerLane` (the recommended batching default).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MessageProcessingMode {
     #[default]
@@ -27,8 +25,7 @@ impl<'de> Deserialize<'de> for MessageProcessingMode {
         match s.to_lowercase().replace('-', "_").as_str() {
             "per_message" => Ok(Self::PerMessage),
             "per_thread" => Ok(Self::PerThread),
-            // "batched" is a legacy alias for PerLane — the new default batching mode.
-            "per_lane" | "batched" => Ok(Self::PerLane),
+            "per_lane" => Ok(Self::PerLane),
             other => Err(serde::de::Error::unknown_variant(
                 other,
                 &["per-message", "per-thread", "per-lane"],
@@ -709,10 +706,10 @@ command = "echo"
         );
     }
 
-    // Legacy alias: "batched" used to mean per-thread; it now resolves to PerLane
-    // (the recommended batching default). Existing configs continue to load.
+    // The legacy alias "batched" was removed: only per-message / per-thread / per-lane
+    // are accepted. Configs still using "batched" must migrate to an explicit value.
     #[test]
-    fn message_processing_mode_batched_alias_is_per_lane() {
+    fn message_processing_mode_batched_is_rejected() {
         let toml = r#"
 [discord]
 bot_token = "t"
@@ -721,11 +718,7 @@ message_processing_mode = "batched"
 [agent]
 command = "echo"
 "#;
-        let cfg = parse_config(toml, "test").unwrap();
-        assert_eq!(
-            cfg.discord.unwrap().message_processing_mode,
-            MessageProcessingMode::PerLane
-        );
+        assert!(parse_config(toml, "test").is_err());
     }
 
     #[test]
