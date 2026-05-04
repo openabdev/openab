@@ -222,27 +222,6 @@ kubectl apply -f k8s/deployment.yaml
 | `k8s/secret.yaml` | `DISCORD_BOT_TOKEN` injected as env var |
 | `k8s/pvc.yaml` | Persistent storage for auth + settings |
 
-## Project Structure
-
-```
-├── Dockerfile          # multi-stage: rust build + debian-slim runtime with kiro-cli
-├── config.toml.example # example config with all agent backends
-├── k8s/                # Kubernetes manifests
-└── src/
-    ├── main.rs         # entrypoint: multi-adapter startup, cleanup, shutdown
-    ├── adapter.rs      # ChatAdapter trait, AdapterRouter (platform-agnostic)
-    ├── config.rs       # TOML config + ${ENV_VAR} expansion
-    ├── discord.rs      # DiscordAdapter: serenity EventHandler + ChatAdapter impl
-    ├── slack.rs        # SlackAdapter: Socket Mode + ChatAdapter impl
-    ├── media.rs        # shared image resize/compress + STT download
-    ├── format.rs       # message splitting, thread name shortening
-    ├── reactions.rs    # status reaction controller (debounce, stall detection)
-    └── acp/
-        ├── protocol.rs # JSON-RPC types + ACP event classification
-        ├── connection.rs # spawn CLI, stdio JSON-RPC communication
-        └── pool.rs     # session key → AcpConnection map
-```
-
 ## Inspired By
 
 - [sample-acp-bridge](https://github.com/aws-samples/sample-acp-bridge) — ACP protocol + process pool architecture

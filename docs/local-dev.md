@@ -38,3 +38,24 @@ docker build -t openab:latest .
 docker tag openab:latest <your-registry>/openab:latest
 docker push <your-registry>/openab:latest
 ```
+
+## Project Structure
+
+```
+├── Dockerfile          # multi-stage: rust build + debian-slim runtime with kiro-cli
+├── config.toml.example # example config with all agent backends
+├── k8s/                # Kubernetes manifests
+└── src/
+    ├── main.rs         # entrypoint: multi-adapter startup, cleanup, shutdown
+    ├── adapter.rs      # ChatAdapter trait, AdapterRouter (platform-agnostic)
+    ├── config.rs       # TOML config + ${ENV_VAR} expansion
+    ├── discord.rs      # DiscordAdapter: serenity EventHandler + ChatAdapter impl
+    ├── slack.rs        # SlackAdapter: Socket Mode + ChatAdapter impl
+    ├── media.rs        # shared image resize/compress + STT download
+    ├── format.rs       # message splitting, thread name shortening
+    ├── reactions.rs    # status reaction controller (debounce, stall detection)
+    └── acp/
+        ├── protocol.rs # JSON-RPC types + ACP event classification
+        ├── connection.rs # spawn CLI, stdio JSON-RPC communication
+        └── pool.rs     # session key → AcpConnection map
+```
