@@ -325,6 +325,7 @@ impl EventHandler for Handler {
                             // Only warn if this bot actually participated in the
                             // thread — prevents uninvolved bots from spamming
                             // warnings in shared channels. (#727)
+                            // Second value is `is_multibot`; not needed here.
                             let (participated, _) = self
                                 .bot_participated_in_thread(&ctx.http, msg.channel_id, bot_id)
                                 .await;
