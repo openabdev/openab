@@ -1,0 +1,124 @@
+suite: messageProcessingMode & batching params
+templates:
+  - templates/configmap.yaml
+tests:
+  - it: discord renders message_processing_mode = "per-lane"
+    set:
+      agents.kiro.discord.messageProcessingMode: per-lane
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'message_processing_mode = "per-lane"'
+
+  - it: discord renders message_processing_mode = "per-thread"
+    set:
+      agents.kiro.discord.messageProcessingMode: per-thread
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'message_processing_mode = "per-thread"'
+
+  - it: discord renders message_processing_mode = "per-message"
+    set:
+      agents.kiro.discord.messageProcessingMode: per-message
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'message_processing_mode = "per-message"'
+
+  - it: discord rejects invalid messageProcessingMode value
+    set:
+      agents.kiro.discord.messageProcessingMode: batched
+    asserts:
+      - failedTemplate:
+          errorPattern: "must be one of: per-message, per-thread, per-lane"
+
+  - it: discord omits message_processing_mode when not set
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: 'message_processing_mode'
+
+  - it: discord renders maxBufferedMessages and maxBatchTokens
+    set:
+      agents.kiro.discord.messageProcessingMode: per-lane
+      agents.kiro.discord.maxBufferedMessages: 25
+      agents.kiro.discord.maxBatchTokens: 32000
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'max_buffered_messages = 25'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'max_batch_tokens = 32000'
+
+  - it: slack renders message_processing_mode = "per-thread"
+    set:
+      agents.kiro.slack.enabled: true
+      agents.kiro.slack.botToken: xoxb-x
+      agents.kiro.slack.appToken: xapp-x
+      agents.kiro.slack.messageProcessingMode: per-thread
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'message_processing_mode = "per-thread"'
+
+  - it: slack rejects invalid messageProcessingMode value
+    set:
+      agents.kiro.slack.enabled: true
+      agents.kiro.slack.botToken: xoxb-x
+      agents.kiro.slack.appToken: xapp-x
+      agents.kiro.slack.messageProcessingMode: batched
+    asserts:
+      - failedTemplate:
+          errorPattern: "must be one of: per-message, per-thread, per-lane"
+
+  - it: slack renders maxBufferedMessages and maxBatchTokens
+    set:
+      agents.kiro.slack.enabled: true
+      agents.kiro.slack.botToken: xoxb-x
+      agents.kiro.slack.appToken: xapp-x
+      agents.kiro.slack.messageProcessingMode: per-lane
+      agents.kiro.slack.maxBufferedMessages: 15
+      agents.kiro.slack.maxBatchTokens: 18000
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'max_buffered_messages = 15'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'max_batch_tokens = 18000'
+
+  - it: gateway renders message_processing_mode = "per-lane"
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: ws://openab-gateway:8080/ws
+      agents.kiro.gateway.messageProcessingMode: per-lane
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'message_processing_mode = "per-lane"'
+
+  - it: gateway rejects invalid messageProcessingMode value
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: ws://openab-gateway:8080/ws
+      agents.kiro.gateway.messageProcessingMode: batched
+    asserts:
+      - failedTemplate:
+          errorPattern: "must be one of: per-message, per-thread, per-lane"
+
+  - it: gateway renders maxBufferedMessages and maxBatchTokens
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: ws://openab-gateway:8080/ws
+      agents.kiro.gateway.messageProcessingMode: per-thread
+      agents.kiro.gateway.maxBufferedMessages: 50
+      agents.kiro.gateway.maxBatchTokens: 12000
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'max_buffered_messages = 50'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'max_batch_tokens = 12000'

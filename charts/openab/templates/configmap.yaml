@@ -58,6 +58,19 @@ data:
     {{- if hasKey ($cfg.discord | default dict) "maxBotTurns" }}
     max_bot_turns = {{ ($cfg.discord).maxBotTurns | int }}
     {{- end }}
+    {{- /* messageProcessingMode: per-message (default) | per-thread | per-lane (turn-boundary batching) */ -}}
+    {{- if hasKey ($cfg.discord | default dict) "messageProcessingMode" }}
+    {{- if not (has ($cfg.discord).messageProcessingMode (list "per-message" "per-thread" "per-lane")) }}
+    {{- fail (printf "agents.%s.discord.messageProcessingMode must be one of: per-message, per-thread, per-lane — got: %s" $name ($cfg.discord).messageProcessingMode) }}
+    {{- end }}
+    message_processing_mode = {{ ($cfg.discord).messageProcessingMode | toJson }}
+    {{- end }}
+    {{- if hasKey ($cfg.discord | default dict) "maxBufferedMessages" }}
+    max_buffered_messages = {{ ($cfg.discord).maxBufferedMessages | int }}
+    {{- end }}
+    {{- if hasKey ($cfg.discord | default dict) "maxBatchTokens" }}
+    max_batch_tokens = {{ ($cfg.discord).maxBatchTokens | int }}
+    {{- end }}
     {{- end }}
 
     {{- if and ($cfg.slack).enabled }}
@@ -96,6 +109,19 @@ data:
     {{- /* maxBotTurns: soft cap on consecutive bot turns per thread (human msg resets the counter) */ -}}
     {{- if hasKey ($cfg.slack | default dict) "maxBotTurns" }}
     max_bot_turns = {{ ($cfg.slack).maxBotTurns | int }}
+    {{- end }}
+    {{- /* messageProcessingMode: per-message (default) | per-thread | per-lane (turn-boundary batching) */ -}}
+    {{- if hasKey ($cfg.slack | default dict) "messageProcessingMode" }}
+    {{- if not (has ($cfg.slack).messageProcessingMode (list "per-message" "per-thread" "per-lane")) }}
+    {{- fail (printf "agents.%s.slack.messageProcessingMode must be one of: per-message, per-thread, per-lane — got: %s" $name ($cfg.slack).messageProcessingMode) }}
+    {{- end }}
+    message_processing_mode = {{ ($cfg.slack).messageProcessingMode | toJson }}
+    {{- end }}
+    {{- if hasKey ($cfg.slack | default dict) "maxBufferedMessages" }}
+    max_buffered_messages = {{ ($cfg.slack).maxBufferedMessages | int }}
+    {{- end }}
+    {{- if hasKey ($cfg.slack | default dict) "maxBatchTokens" }}
+    max_batch_tokens = {{ ($cfg.slack).maxBatchTokens | int }}
     {{- end }}
     {{- end }}
 
@@ -162,6 +188,19 @@ data:
     {{- end }}
     {{- end }}
     allowed_users = {{ ($cfg.gateway).allowedUsers | default list | toJson }}
+    {{- /* messageProcessingMode: per-message (default) | per-thread | per-lane (turn-boundary batching) */ -}}
+    {{- if hasKey ($cfg.gateway | default dict) "messageProcessingMode" }}
+    {{- if not (has ($cfg.gateway).messageProcessingMode (list "per-message" "per-thread" "per-lane")) }}
+    {{- fail (printf "agents.%s.gateway.messageProcessingMode must be one of: per-message, per-thread, per-lane — got: %s" $name ($cfg.gateway).messageProcessingMode) }}
+    {{- end }}
+    message_processing_mode = {{ ($cfg.gateway).messageProcessingMode | toJson }}
+    {{- end }}
+    {{- if hasKey ($cfg.gateway | default dict) "maxBufferedMessages" }}
+    max_buffered_messages = {{ ($cfg.gateway).maxBufferedMessages | int }}
+    {{- end }}
+    {{- if hasKey ($cfg.gateway | default dict) "maxBatchTokens" }}
+    max_batch_tokens = {{ ($cfg.gateway).maxBatchTokens | int }}
+    {{- end }}
     {{- end }}
     {{- if or ($cfg.cronjobs) (($cfg.cron).usercronEnabled) (($cfg.cron).usercronPath) }}
 

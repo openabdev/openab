@@ -151,6 +151,14 @@ agents:
       # multi-agent collaborations; lower to throttle runaway loops more
       # aggressively. Hard cap remains 100 regardless (compiled-in).
       # maxBotTurns: 20
+      # messageProcessingMode: "per-message" (default) | "per-thread" | "per-lane"
+      # per-thread: all senders in a thread share one batch → one ACP turn per turn boundary
+      # per-lane:   each (thread, sender) batches independently → no silent-drop risk
+      # messageProcessingMode: "per-lane"
+      # maxBufferedMessages: per-thread mpsc capacity for batching modes (default 10)
+      # maxBufferedMessages: 10
+      # maxBatchTokens: soft token cap per ACP turn for batching modes (default 24000)
+      # maxBatchTokens: 24000
     slack:
       enabled: false
       botToken: ""       # Bot User OAuth Token (xoxb-...)
@@ -175,6 +183,14 @@ agents:
       # multi-agent collaborations; lower to throttle runaway loops more
       # aggressively. Hard cap remains 100 regardless (compiled-in).
       # maxBotTurns: 20
+      # messageProcessingMode: "per-message" (default) | "per-thread" | "per-lane"
+      # per-thread: all senders in a thread share one batch → one ACP turn per turn boundary
+      # per-lane:   each (thread, sender) batches independently → no silent-drop risk
+      # messageProcessingMode: "per-lane"
+      # maxBufferedMessages: per-thread mpsc capacity for batching modes (default 10)
+      # maxBufferedMessages: 10
+      # maxBatchTokens: soft token cap per ACP turn for batching modes (default 24000)
+      # maxBatchTokens: 24000
     workingDir: /home/agent
     env: {}
     envFrom: []
@@ -200,6 +216,14 @@ agents:
       platform: "telegram"  # default platform when gateway is enabled
       token: ""         # optional shared secret (injected via GATEWAY_WS_TOKEN env var)
       botUsername: ""   # optional, for @mention gating
+      # messageProcessingMode: "per-message" (default) | "per-thread" | "per-lane"
+      # per-thread: all senders in a thread share one batch → one ACP turn per turn boundary
+      # per-lane:   each (thread, sender) batches independently → no silent-drop risk
+      # messageProcessingMode: "per-lane"
+      # maxBufferedMessages: per-thread mpsc capacity for batching modes (default 10)
+      # maxBufferedMessages: 10
+      # maxBatchTokens: soft token cap per ACP turn for batching modes (default 24000)
+      # maxBatchTokens: 24000
       image: "ghcr.io/openabdev/openab-gateway"  # gateway container image
       tag: ""           # defaults to Chart.AppVersion
       strategy: "Recreate"  # Recreate (default, prevents concurrent WS conflicts) or RollingUpdate
