@@ -82,8 +82,9 @@ Custom Gateway adapter for platforms like Telegram, LINE, Feishu/Lark, and Googl
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `GATEWAY_MEDIA_BASE_URL` | Public base URL for media proxy (e.g. `https://gateway.example.com`). | `http://127.0.0.1:9090` |
+| `GATEWAY_MEDIA_BASE_URL` | Public base URL for media proxy (e.g. `https://gateway.example.com`). | `http://localhost:8080` |
 | `GATEWAY_MEDIA_STORE_TTL` | Seconds to keep media in memory before expiration. | `300` |
+| `GATEWAY_MEDIA_STORE_MAX_ENTRIES` | Maximum number of media items to keep in memory. | `1000` |
 
 
 ---

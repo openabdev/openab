@@ -1,4 +1,4 @@
-use crate::adapter::{AdapterRouter, ChatAdapter, ChannelRef, SenderContext};
+use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, SenderContext};
 use crate::config::CronJobConfig;
 use crate::format;
 use chrono::{Timelike, Utc};
@@ -24,9 +24,7 @@ pub fn parse_cron_expr(expr: &str) -> Result<Schedule, cron::error::Error> {
 /// schedule has an event at exactly that minute.
 pub fn should_fire(schedule: &Schedule, tz: Tz) -> bool {
     let now = Utc::now().with_timezone(&tz);
-    let minute_start = now
-        .with_second(0).unwrap()
-        .with_nanosecond(0).unwrap();
+    let minute_start = now.with_second(0).unwrap().with_nanosecond(0).unwrap();
     let query_from = minute_start - chrono::Duration::seconds(1);
     schedule
         .after(&query_from)
@@ -39,20 +37,35 @@ pub fn should_fire(schedule: &Schedule, tz: Tz) -> bool {
 const VALID_PLATFORMS: &[&str] = &["discord", "slack"];
 
 /// Validate all cronjob configs (fail-fast on bad cron expressions or timezones).
-pub fn validate_cronjobs(cronjobs: &[CronJobConfig], configured_platforms: &[&str]) -> anyhow::Result<()> {
+pub fn validate_cronjobs(
+    cronjobs: &[CronJobConfig],
+    configured_platforms: &[&str],
+) -> anyhow::Result<()> {
     for (i, job) in cronjobs.iter().enumerate() {
-        if !job.enabled { continue; }
+        if !job.enabled {
+            continue;
+        }
         parse_cron_expr(&job.schedule).map_err(|e| {
-            anyhow::anyhow!("cronjobs[{i}]: invalid cron expression {:?}: {e}", job.schedule)
+            anyhow::anyhow!(
+                "cronjobs[{i}]: invalid cron expression {:?}: {e}",
+                job.schedule
+            )
         })?;
         job.timezone.parse::<Tz>().map_err(|e| {
             anyhow::anyhow!("cronjobs[{i}]: invalid timezone {:?}: {e}", job.timezone)
         })?;
         if !VALID_PLATFORMS.contains(&job.platform.as_str()) {
-            anyhow::bail!("cronjobs[{i}]: unknown platform {:?} (expected one of: {VALID_PLATFORMS:?})", job.platform);
+            anyhow::bail!(
+                "cronjobs[{i}]: unknown platform {:?} (expected one of: {VALID_PLATFORMS:?})",
+                job.platform
+            );
         }
         if !configured_platforms.contains(&job.platform.as_str()) {
-            anyhow::bail!("cronjobs[{i}]: platform {:?} is not configured — add [{}] to config.toml", job.platform, job.platform);
+            anyhow::bail!(
+                "cronjobs[{i}]: platform {:?} is not configured — add [{}] to config.toml",
+                job.platform,
+                job.platform
+            );
         }
     }
     Ok(())
@@ -183,7 +196,9 @@ pub async fn run_scheduler(
 
     if baseline_jobs.is_empty() && usercron_jobs.is_empty() {
         if usercron_path.is_some() {
-            info!("no cronjobs yet, but usercron_path is set — scheduler will watch for cronjob.toml");
+            info!(
+                "no cronjobs yet, but usercron_path is set — scheduler will watch for cronjob.toml"
+            );
         } else {
             debug!("no cronjobs configured, scheduler not started");
             return;
@@ -191,14 +206,23 @@ pub async fn run_scheduler(
     }
 
     let total = baseline_jobs.len() + usercron_jobs.len();
-    info!(baseline = baseline_jobs.len(), usercron = usercron_jobs.len(), total, "cron scheduler started");
+    info!(
+        baseline = baseline_jobs.len(),
+        usercron = usercron_jobs.len(),
+        total,
+        "cron scheduler started"
+    );
 
     let in_flight: Arc<Mutex<HashSet<usize>>> = Arc::new(Mutex::new(HashSet::new()));
 
     // Align to next minute boundary
     let now = Utc::now();
     let secs_into_minute = now.timestamp() % 60;
-    let align_delay = if secs_into_minute == 0 { 0 } else { 60 - secs_into_minute as u64 };
+    let align_delay = if secs_into_minute == 0 {
+        0
+    } else {
+        60 - secs_into_minute as u64
+    };
     if align_delay > 0 {
         debug!(align_secs = align_delay, "aligning to next minute boundary");
         tokio::time::sleep(std::time::Duration::from_secs(align_delay)).await;
@@ -301,7 +325,10 @@ async fn fire_cronjob(
     adapters: &HashMap<String, Arc<dyn ChatAdapter>>,
     in_flight: Arc<Mutex<HashSet<usize>>>,
 ) {
-    let _guard = InFlightGuard { idx, set: in_flight };
+    let _guard = InFlightGuard {
+        idx,
+        set: in_flight,
+    };
 
     let adapter = match adapters.get(&job.platform) {
         Some(a) => a.clone(),
@@ -319,7 +346,13 @@ async fn fire_cronjob(
         origin_event_id: None,
     };
 
-    let trigger_msg = match adapter.send_message(&thread_channel, &format!("🕐 [{}]: {}", job.sender_name, job.message)).await {
+    let trigger_msg = match adapter
+        .send_message(
+            &thread_channel,
+            &format!("🕐 [{}]: {}", job.sender_name, job.message),
+        )
+        .await
+    {
         Ok(msg) => msg,
         Err(e) => {
             error!(channel = %job.channel, error = %e, "failed to send cron message");
@@ -331,11 +364,19 @@ async fn fire_cronjob(
         thread_channel.clone()
     } else {
         let thread_name = format::shorten_thread_name(&job.message);
-        match adapter.create_thread(&thread_channel, &trigger_msg, &thread_name).await {
+        match adapter
+            .create_thread(&thread_channel, &trigger_msg, &thread_name)
+            .await
+        {
             Ok(ch) => ch,
             Err(e) => {
                 error!(channel = %job.channel, error = %e, "failed to create cron thread");
-                let _ = adapter.send_message(&thread_channel, &format!("⚠️ cronjob: failed to create thread: {e}")).await;
+                let _ = adapter
+                    .send_message(
+                        &thread_channel,
+                        &format!("⚠️ cronjob: failed to create thread: {e}"),
+                    )
+                    .await;
                 return;
             }
         }
@@ -347,8 +388,15 @@ async fn fire_cronjob(
         sender_name: job.sender_name.clone(),
         display_name: job.sender_name.clone(),
         channel: job.platform.clone(),
-        channel_id: reply_channel.parent_id.as_deref().unwrap_or(&reply_channel.channel_id).to_string(),
-        thread_id: reply_channel.thread_id.clone().or(Some(reply_channel.channel_id.clone())),
+        channel_id: reply_channel
+            .parent_id
+            .as_deref()
+            .unwrap_or(&reply_channel.channel_id)
+            .to_string(),
+        thread_id: reply_channel
+            .thread_id
+            .clone()
+            .or(Some(reply_channel.channel_id.clone())),
         is_bot: true,
         timestamp: Some(Utc::now().to_rfc3339()),
     };
@@ -372,7 +420,9 @@ async fn fire_cronjob(
         .await
     {
         error!("cron handle_message error: {e}");
-        let _ = adapter.send_message(&reply_channel, &format!("⚠️ cronjob error: {e}")).await;
+        let _ = adapter
+            .send_message(&reply_channel, &format!("⚠️ cronjob error: {e}"))
+            .await;
     }
 }
 
@@ -452,7 +502,7 @@ message = "hello"
 "#;
         let cfg: UsercronFile = toml::from_str(toml_str).unwrap();
         let job = &cfg.jobs[0];
-        assert_eq!(job.enabled, true);
+        assert!(job.enabled);
         assert_eq!(job.platform, "discord");
         assert_eq!(job.sender_name, "openab-cron");
         assert_eq!(job.timezone, "UTC");
@@ -469,7 +519,7 @@ channel = "123"
 message = "hello"
 "#;
         let cfg: UsercronFile = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.jobs[0].enabled, false);
+        assert!(!cfg.jobs[0].enabled);
     }
 
     #[test]
@@ -502,12 +552,16 @@ thread_id = "789"
     fn load_usercron_valid_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cronjob.toml");
-        std::fs::write(&path, r#"
+        std::fs::write(
+            &path,
+            r#"
 [[jobs]]
 schedule = "* * * * *"
 channel = "123"
 message = "ping"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let jobs = load_usercron_file(&path, &["discord"]);
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].message, "ping");
@@ -526,7 +580,9 @@ message = "ping"
     fn load_usercron_skips_invalid_entries() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cronjob.toml");
-        std::fs::write(&path, r#"
+        std::fs::write(
+            &path,
+            r#"
 [[jobs]]
 schedule = "* * * * *"
 channel = "123"
@@ -536,7 +592,9 @@ message = "good"
 schedule = "bad cron"
 channel = "456"
 message = "bad"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let jobs = load_usercron_file(&path, &["discord"]);
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].message, "good");
@@ -546,7 +604,9 @@ message = "bad"
     fn load_usercron_skips_unconfigured_platform() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cronjob.toml");
-        std::fs::write(&path, r#"
+        std::fs::write(
+            &path,
+            r#"
 [[jobs]]
 schedule = "* * * * *"
 channel = "123"
@@ -557,7 +617,9 @@ schedule = "* * * * *"
 channel = "456"
 message = "slack job"
 platform = "slack"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         // Only discord configured
         let jobs = load_usercron_file(&path, &["discord"]);
         assert_eq!(jobs.len(), 1);
@@ -569,9 +631,14 @@ platform = "slack"
     #[test]
     fn validate_cronjobs_valid_passes() {
         let jobs = vec![CronJobConfig {
-            enabled: true, schedule: "0 9 * * 1-5".into(), channel: "123".into(),
-            message: "hi".into(), platform: "discord".into(), sender_name: "test".into(),
-            thread_id: None, timezone: "UTC".into(),
+            enabled: true,
+            schedule: "0 9 * * 1-5".into(),
+            channel: "123".into(),
+            message: "hi".into(),
+            platform: "discord".into(),
+            sender_name: "test".into(),
+            thread_id: None,
+            timezone: "UTC".into(),
         }];
         assert!(validate_cronjobs(&jobs, &["discord"]).is_ok());
     }
@@ -579,9 +646,14 @@ platform = "slack"
     #[test]
     fn validate_cronjobs_invalid_cron_fails() {
         let jobs = vec![CronJobConfig {
-            enabled: true, schedule: "bad".into(), channel: "123".into(),
-            message: "hi".into(), platform: "discord".into(), sender_name: "test".into(),
-            thread_id: None, timezone: "UTC".into(),
+            enabled: true,
+            schedule: "bad".into(),
+            channel: "123".into(),
+            message: "hi".into(),
+            platform: "discord".into(),
+            sender_name: "test".into(),
+            thread_id: None,
+            timezone: "UTC".into(),
         }];
         let err = validate_cronjobs(&jobs, &["discord"]).unwrap_err();
         assert!(err.to_string().contains("invalid cron expression"));
@@ -590,9 +662,14 @@ platform = "slack"
     #[test]
     fn validate_cronjobs_invalid_timezone_fails() {
         let jobs = vec![CronJobConfig {
-            enabled: true, schedule: "* * * * *".into(), channel: "123".into(),
-            message: "hi".into(), platform: "discord".into(), sender_name: "test".into(),
-            thread_id: None, timezone: "Mars/Olympus".into(),
+            enabled: true,
+            schedule: "* * * * *".into(),
+            channel: "123".into(),
+            message: "hi".into(),
+            platform: "discord".into(),
+            sender_name: "test".into(),
+            thread_id: None,
+            timezone: "Mars/Olympus".into(),
         }];
         let err = validate_cronjobs(&jobs, &["discord"]).unwrap_err();
         assert!(err.to_string().contains("invalid timezone"));
@@ -601,9 +678,14 @@ platform = "slack"
     #[test]
     fn validate_cronjobs_unknown_platform_fails() {
         let jobs = vec![CronJobConfig {
-            enabled: true, schedule: "* * * * *".into(), channel: "123".into(),
-            message: "hi".into(), platform: "telegram".into(), sender_name: "test".into(),
-            thread_id: None, timezone: "UTC".into(),
+            enabled: true,
+            schedule: "* * * * *".into(),
+            channel: "123".into(),
+            message: "hi".into(),
+            platform: "telegram".into(),
+            sender_name: "test".into(),
+            thread_id: None,
+            timezone: "UTC".into(),
         }];
         let err = validate_cronjobs(&jobs, &["discord"]).unwrap_err();
         assert!(err.to_string().contains("unknown platform"));
@@ -612,9 +694,14 @@ platform = "slack"
     #[test]
     fn validate_cronjobs_unconfigured_platform_fails() {
         let jobs = vec![CronJobConfig {
-            enabled: true, schedule: "* * * * *".into(), channel: "123".into(),
-            message: "hi".into(), platform: "slack".into(), sender_name: "test".into(),
-            thread_id: None, timezone: "UTC".into(),
+            enabled: true,
+            schedule: "* * * * *".into(),
+            channel: "123".into(),
+            message: "hi".into(),
+            platform: "slack".into(),
+            sender_name: "test".into(),
+            thread_id: None,
+            timezone: "UTC".into(),
         }];
         let err = validate_cronjobs(&jobs, &["discord"]).unwrap_err();
         assert!(err.to_string().contains("not configured"));
@@ -623,9 +710,14 @@ platform = "slack"
     #[test]
     fn validate_cronjobs_disabled_with_invalid_cron_passes() {
         let jobs = vec![CronJobConfig {
-            enabled: false, schedule: "bad".into(), channel: "123".into(),
-            message: "hi".into(), platform: "discord".into(), sender_name: "test".into(),
-            thread_id: None, timezone: "UTC".into(),
+            enabled: false,
+            schedule: "bad".into(),
+            channel: "123".into(),
+            message: "hi".into(),
+            platform: "discord".into(),
+            sender_name: "test".into(),
+            thread_id: None,
+            timezone: "UTC".into(),
         }];
         assert!(validate_cronjobs(&jobs, &["discord"]).is_ok());
     }
@@ -633,9 +725,14 @@ platform = "slack"
     #[test]
     fn validate_cronjobs_enabled_with_invalid_cron_still_fails() {
         let jobs = vec![CronJobConfig {
-            enabled: true, schedule: "bad".into(), channel: "123".into(),
-            message: "hi".into(), platform: "discord".into(), sender_name: "test".into(),
-            thread_id: None, timezone: "UTC".into(),
+            enabled: true,
+            schedule: "bad".into(),
+            channel: "123".into(),
+            message: "hi".into(),
+            platform: "discord".into(),
+            sender_name: "test".into(),
+            thread_id: None,
+            timezone: "UTC".into(),
         }];
         assert!(validate_cronjobs(&jobs, &["discord"]).is_err());
     }

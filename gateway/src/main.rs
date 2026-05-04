@@ -67,6 +67,8 @@ pub struct AppState {
     pub public_url: String,
     /// TTL for media in memory
     pub media_ttl: u64,
+    /// Maximum number of entries in the media store
+    pub media_max_entries: usize,
 }
 
 // --- WebSocket handler (OAB connects here) ---
@@ -130,7 +132,10 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
             if let Message::Text(text) = msg {
                 match serde_json::from_str::<GatewayReply>(&text) {
                     Ok(mut reply) => {
-                        // Auto-fill reply_to if empty using the last event sent to this client
+                        // Auto-fill reply_to if empty using the last event sent to this client.
+                        // Rationale: This ensures agents don't need to track event IDs for simple replies.
+                        // Note: reply_to is used by the LINE adapter to look up replyTokens; auto-filling
+                        // allows LINE hybrid Reply/Push dispatch to work even if the agent omits reply_to.
                         if reply.reply_to.is_empty() {
                             let last = last_event_id_for_recv.lock().await;
                             if let Some(eid) = last.get(&reply.channel.id) {
@@ -256,6 +261,10 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(300);
+    let media_max_entries = std::env::var("GATEWAY_MEDIA_STORE_MAX_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1000);
 
     if ws_token.is_none() {
         warn!("GATEWAY_WS_TOKEN not set — WebSocket connections are NOT authenticated (insecure)");
@@ -268,7 +277,7 @@ async fn main() -> Result<()> {
     let mut app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/health", get(health))
-        .route("/media/:uuid", get(media_handler));
+        .route("/media/{uuid}", get(media_handler));
 
     // Telegram adapter
     let telegram_bot_token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
@@ -395,6 +404,7 @@ async fn main() -> Result<()> {
         media_store,
         public_url,
         media_ttl,
+        media_max_entries,
     });
 
     // Background task: sweep expired reply tokens every REPLY_TOKEN_TTL_SECS

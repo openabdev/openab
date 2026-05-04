@@ -125,10 +125,17 @@ pub async fn webhook(
                         {
                             let mut store =
                                 state.media_store.lock().unwrap_or_else(|e| e.into_inner());
-                            store.insert(
-                                uuid.clone(),
-                                (data.to_vec(), mime, std::time::Instant::now()),
-                            );
+                            if store.len() >= state.media_max_entries {
+                                warn!(
+                                    size = store.len(),
+                                    "media store full, skipping LINE media proxy"
+                                );
+                            } else {
+                                store.insert(
+                                    uuid.clone(),
+                                    (data.to_vec(), mime, std::time::Instant::now()),
+                                );
+                            }
                         }
                         attachments.push(Attachment {
                             attachment_type: msg.message_type.clone(),

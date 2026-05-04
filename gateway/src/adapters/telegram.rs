@@ -138,30 +138,37 @@ pub async fn webhook(
                                 .to_string();
 
                             if let Ok(data) = r.bytes().await {
-                            let uuid = uuid::Uuid::new_v4().to_string();
-                            {
-                                let mut store =
-                                    state.media_store.lock().unwrap_or_else(|e| e.into_inner());
-                                store.insert(
-                                    uuid.clone(),
-                                    (data.to_vec(), mime, std::time::Instant::now()),
-                                );
+                                let uuid = uuid::Uuid::new_v4().to_string();
+                                {
+                                    let mut store =
+                                        state.media_store.lock().unwrap_or_else(|e| e.into_inner());
+                                    if store.len() >= state.media_max_entries {
+                                        warn!(
+                                            size = store.len(),
+                                            "media store full, skipping Telegram media proxy"
+                                        );
+                                    } else {
+                                        store.insert(
+                                            uuid.clone(),
+                                            (data.to_vec(), mime, std::time::Instant::now()),
+                                        );
+                                    }
+                                }
+                                attachments.push(Attachment {
+                                    attachment_type: m_type.into(),
+                                    url: format!("{}/media/{}", state.public_url, uuid),
+                                });
+                                if text.is_empty() {
+                                    text = format!("[{}]", m_type);
+                                }
+                                info!(id = %file_id, uuid = %uuid, "proxied Telegram inbound media");
                             }
-                            attachments.push(Attachment {
-                                attachment_type: m_type.into(),
-                                url: format!("{}/media/{}", state.public_url, uuid),
-                            });
-                            if text.is_empty() {
-                                text = format!("[{}]", m_type);
-                            }
-                            info!(id = %file_id, uuid = %uuid, "proxied Telegram inbound media");
                         }
                     }
                 }
             }
         }
     }
-}
 
 
     if text.trim().is_empty() && attachments.is_empty() {
