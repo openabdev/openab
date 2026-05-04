@@ -273,8 +273,9 @@ async fn main() -> anyhow::Result<()> {
             allowed_users: gw_cfg.allowed_users,
             streaming: gw_cfg.streaming,
         };
+        let gw_router = router.clone();
         Some(tokio::spawn(async move {
-            if let Err(e) = gateway::run_gateway_adapter(params, shutdown_rx, gw_dispatcher).await {
+            if let Err(e) = gateway::run_gateway_adapter(params, shutdown_rx, gw_dispatcher, gw_router).await {
                 error!("gateway adapter error: {e}");
             }
         }))

@@ -277,22 +277,34 @@ impl Dispatcher {
         Ok(())
     }
 
-    /// Drop the per-thread handle and abort its consumer, discarding any messages
-    /// buffered at cancel time (§2.5 / §4.4). Returns the approximate number of
-    /// messages that were buffered (mpsc length at removal time).
+    /// Drop all per-thread handles whose key belongs to `(platform, thread_id)`,
+    /// regardless of grouping, and abort each consumer (§2.5 / §4.4). Returns
+    /// the total number of buffered messages discarded across all lanes.
+    ///
+    /// Matches both PerThread keys (`<platform>:<thread_id>`) and PerLane keys
+    /// (`<platform>:<thread_id>:<sender_id>`). Used by `/reset` and
+    /// `/cancel-all` to clear the entire thread, not just one lane.
     ///
     /// Disjoint from SendError recovery: removal happens *before* abort, so any
     /// fresh `submit` after this returns lands on a lazily-constructed new handle
     /// instead of observing `SendError`.
-    pub fn cancel_buffered(&self, thread_key: &str) -> usize {
+    pub fn cancel_buffered_thread(&self, platform: &str, thread_id: &str) -> usize {
+        let prefix = format!("{platform}:{thread_id}");
+        let lane_prefix = format!("{prefix}:");
         let mut map = self.per_thread.lock().unwrap();
-        if let Some(handle) = map.remove(thread_key) {
-            let pending = handle.pending_count();
-            handle.consumer.abort();
-            pending
-        } else {
-            0
+        let keys: Vec<String> = map
+            .keys()
+            .filter(|k| k.as_str() == prefix || k.starts_with(&lane_prefix))
+            .cloned()
+            .collect();
+        let mut dropped = 0;
+        for k in keys {
+            if let Some(handle) = map.remove(&k) {
+                dropped += handle.pending_count();
+                handle.consumer.abort();
+            }
         }
+        dropped
     }
 
     /// §2.5 race-safe eviction. Caller must hold the `per_thread` mutex.
@@ -379,7 +391,7 @@ async fn consumer_loop(
             None => match tokio::time::timeout(CONSUMER_IDLE_TIMEOUT, rx.recv()).await {
                 Ok(Some(msg)) => msg,
                 Ok(None) => {
-                    // All senders dropped → shutdown() or cancel_buffered().
+                    // All senders dropped → shutdown() or cancel_buffered_thread().
                     break;
                 }
                 Err(_elapsed) => {
@@ -881,5 +893,56 @@ mod tests {
         assert_eq!(d.key("discord", "T1", "userB"), "discord:T1:userB");
         // Different threads remain distinct.
         assert_eq!(d.key("slack", "T2", "userA"), "slack:T2:userA");
+    }
+
+    fn insert_dummy_handle(d: &Dispatcher, key: &str) {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<BufferedMessage>(10);
+        let consumer = tokio::spawn(async {});
+        let handle = ThreadHandle {
+            tx,
+            consumer,
+            generation: 0,
+            channel_id: "c".into(),
+            adapter_kind: "discord".into(),
+        };
+        d.per_thread.lock().unwrap().insert(key.to_string(), handle);
+    }
+
+    #[tokio::test]
+    async fn cancel_buffered_thread_drops_per_thread_key() {
+        let d = make_dispatcher(BatchGrouping::PerThread);
+        insert_dummy_handle(&d, "discord:T1");
+        insert_dummy_handle(&d, "discord:T2"); // different thread, must survive
+        assert_eq!(d.cancel_buffered_thread("discord", "T1"), 0); // no buffered msgs
+        let map = d.per_thread.lock().unwrap();
+        assert!(!map.contains_key("discord:T1"));
+        assert!(map.contains_key("discord:T2"));
+    }
+
+    #[tokio::test]
+    async fn cancel_buffered_thread_drops_all_lanes() {
+        let d = make_dispatcher(BatchGrouping::PerLane);
+        insert_dummy_handle(&d, "discord:T1:userA");
+        insert_dummy_handle(&d, "discord:T1:userB");
+        insert_dummy_handle(&d, "discord:T2:userA"); // different thread
+        insert_dummy_handle(&d, "slack:T1:userA");   // different platform
+        d.cancel_buffered_thread("discord", "T1");
+        let map = d.per_thread.lock().unwrap();
+        assert!(!map.contains_key("discord:T1:userA"));
+        assert!(!map.contains_key("discord:T1:userB"));
+        assert!(map.contains_key("discord:T2:userA"));
+        assert!(map.contains_key("slack:T1:userA"));
+    }
+
+    #[tokio::test]
+    async fn cancel_buffered_thread_does_not_match_thread_id_prefix() {
+        // T1 must not match T10 / T11 (substring trap).
+        let d = make_dispatcher(BatchGrouping::PerLane);
+        insert_dummy_handle(&d, "discord:T1:userA");
+        insert_dummy_handle(&d, "discord:T10:userA");
+        d.cancel_buffered_thread("discord", "T1");
+        let map = d.per_thread.lock().unwrap();
+        assert!(!map.contains_key("discord:T1:userA"));
+        assert!(map.contains_key("discord:T10:userA"));
     }
 }

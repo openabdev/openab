@@ -350,6 +350,7 @@ pub async fn run_gateway_adapter(
     params: GatewayParams,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     dispatcher: Arc<crate::dispatch::Dispatcher>,
+    router: Arc<crate::adapter::AdapterRouter>,
 ) -> Result<()> {
     let platform: &'static str = Box::leak(params.platform.into_boxed_str());
 
@@ -514,12 +515,16 @@ pub async fn run_gateway_adapter(
                                     // need message_id for streaming edits.
                                     let trimmed = prompt.trim();
                                     if trimmed == "/reset" {
-                                        let thread_key = format!("{}:{}", event.platform, event.channel.thread_id.as_deref().unwrap_or(&event.channel.id));
-                                        let msg = match router.pool().reset_session(&thread_key).await {
-                                            Ok(()) => "🔄 Session reset. Start a new conversation!",
-                                            Err(_) => "⚠️ No active session to reset.",
+                                        let thread_id_str = event.channel.thread_id.as_deref().unwrap_or(&event.channel.id);
+                                        let thread_key = format!("{}:{}", event.platform, thread_id_str);
+                                        let dropped = dispatcher.cancel_buffered_thread(event.platform.as_str(), thread_id_str);
+                                        let msg = match (router.pool().reset_session(&thread_key).await, dropped) {
+                                            (Ok(()), 0) => "🔄 Session reset. Start a new conversation!".to_string(),
+                                            (Ok(()), n) => format!("🔄 Session reset. Dropped {n} buffered message(s). Start a new conversation!"),
+                                            (Err(_), 0) => "⚠️ No active session to reset.".to_string(),
+                                            (Err(_), n) => format!("🔄 Dropped {n} buffered message(s). No active session to reset."),
                                         };
-                                        let _ = send_fire_and_forget(&slash_ws_tx, &channel, msg).await;
+                                        let _ = send_fire_and_forget(&slash_ws_tx, &channel, &msg).await;
                                         continue;
                                     }
                                     if trimmed == "/cancel" {

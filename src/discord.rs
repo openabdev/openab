@@ -886,18 +886,12 @@ impl Handler {
         ctx: &Context,
         cmd: &serenity::model::application::CommandInteraction,
     ) {
-        // Session pool key is always per-thread (B4-a: cancel the in-flight ACP turn even
-        // in PerLane mode — it's the only escape hatch from a runaway turn, and the
-        // shared session means there's only one in-flight turn anyway).
+        // /cancel-all is the nuclear escape hatch: stop the in-flight turn AND clear
+        // every lane's buffer in this thread, so a human can intervene from a clean slate.
         let session_key = format!("discord:{}", cmd.channel_id.get());
-        // Dispatcher key follows the configured grouping. In PerLane mode this scopes
-        // the buffer drop to the invoker's own lane (B1=X).
-        let invoker_id = cmd.user.id.to_string();
-        let dispatcher_key = self
+        let dropped = self
             .dispatcher
-            .key("discord", &cmd.channel_id.get().to_string(), &invoker_id);
-
-        let dropped = self.dispatcher.cancel_buffered(&dispatcher_key);
+            .cancel_buffered_thread("discord", &cmd.channel_id.get().to_string());
 
         let cancel_result = self.router.pool().cancel_session(&session_key).await;
 
@@ -921,15 +915,12 @@ impl Handler {
         ctx: &Context,
         cmd: &serenity::model::application::CommandInteraction,
     ) {
-        // Session pool key is always per-thread (see /cancel-all for rationale).
+        // /reset clears every lane's buffer in this thread and tears down the shared
+        // ACP session — the next message in the thread starts a fresh conversation.
         let session_key = format!("discord:{}", cmd.channel_id.get());
-        let invoker_id = cmd.user.id.to_string();
-        let dispatcher_key = self
+        let dropped = self
             .dispatcher
-            .key("discord", &cmd.channel_id.get().to_string(), &invoker_id);
-
-        // /reset is a superset of /cancel-all: drop buffered work, then tear down the session.
-        let dropped = self.dispatcher.cancel_buffered(&dispatcher_key);
+            .cancel_buffered_thread("discord", &cmd.channel_id.get().to_string());
 
         let result = self.router.pool().reset_session(&session_key).await;
 
