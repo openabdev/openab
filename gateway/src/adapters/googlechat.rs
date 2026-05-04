@@ -64,6 +64,7 @@ pub struct GoogleChatSpace {
     pub name: String,
     #[serde(rename = "type")]
     pub space_type: Option<String>,
+    #[allow(dead_code)]
     pub space_type_renamed: Option<String>,
 }
 

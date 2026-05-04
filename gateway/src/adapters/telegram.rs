@@ -27,6 +27,25 @@ struct TelegramMessage {
     text: Option<String>,
     #[serde(default)]
     entities: Vec<TelegramEntity>,
+    photo: Option<Vec<TelegramPhotoSize>>,
+    voice: Option<TelegramVoice>,
+    audio: Option<TelegramAudio>,
+    caption: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramPhotoSize {
+    file_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramVoice {
+    file_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramAudio {
+    file_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,10 +94,77 @@ pub async fn webhook(
     let Some(msg) = update.message else {
         return axum::http::StatusCode::OK;
     };
-    let Some(text) = msg.text.as_deref() else {
-        return axum::http::StatusCode::OK;
+
+    let mut text = msg
+        .text
+        .clone()
+        .unwrap_or_else(|| msg.caption.clone().unwrap_or_default());
+    let mut attachments = vec![];
+
+    // Handle Image/Audio attachments (Issue #690 Phase 1)
+    let media_info = if let Some(ref photos) = msg.photo {
+        photos.last().map(|p| (p.file_id.clone(), "image"))
+    } else {
+        msg.voice
+            .as_ref()
+            .map(|v| (v.file_id.clone(), "audio"))
+            .or_else(|| msg.audio.as_ref().map(|a| (a.file_id.clone(), "audio")))
     };
-    if text.trim().is_empty() {
+
+    if let (Some((file_id, m_type)), Some(ref token)) = (media_info, &state.telegram_bot_token) {
+        let client = reqwest::Client::new();
+        // 1. getFile to get file_path
+        let url = format!("{TELEGRAM_API_BASE}/bot{token}/getFile?file_id={file_id}");
+        if let Ok(resp) = client.get(url).send().await {
+            if !resp.status().is_success() {
+                warn!(status = %resp.status(), id = %file_id, "Telegram getFile failed");
+            } else if let Ok(body) = resp.json::<serde_json::Value>().await {
+                if let Some(file_path) = body["result"]["file_path"].as_str() {
+                    // 2. Download the file
+                    let download_url = format!("{TELEGRAM_API_BASE}/file/bot{token}/{file_path}");
+                    if let Ok(r) = client.get(download_url).send().await {
+                        if !r.status().is_success() {
+                            warn!(status = %r.status(), id = %file_id, "failed to download Telegram media");
+                        } else {
+                            let mime = r
+                                .headers()
+                                .get("content-type")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or(if m_type == "image" {
+                                    "image/jpeg"
+                                } else {
+                                    "audio/ogg"
+                                })
+                                .to_string();
+
+                            if let Ok(data) = r.bytes().await {
+                            let uuid = uuid::Uuid::new_v4().to_string();
+                            {
+                                let mut store =
+                                    state.media_store.lock().unwrap_or_else(|e| e.into_inner());
+                                store.insert(
+                                    uuid.clone(),
+                                    (data.to_vec(), mime, std::time::Instant::now()),
+                                );
+                            }
+                            attachments.push(Attachment {
+                                attachment_type: m_type.into(),
+                                url: format!("{}/media/{}", state.public_url, uuid),
+                            });
+                            if text.is_empty() {
+                                text = format!("[{}]", m_type);
+                            }
+                            info!(id = %file_id, uuid = %uuid, "proxied Telegram inbound media");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+    if text.trim().is_empty() && attachments.is_empty() {
         return axum::http::StatusCode::OK;
     }
 
@@ -107,7 +193,7 @@ pub async fn webhook(
         })
         .collect();
 
-    let event = GatewayEvent::new(
+    let mut event = GatewayEvent::new(
         "telegram",
         ChannelInfo {
             id: msg.chat.id.to_string(),
@@ -120,10 +206,11 @@ pub async fn webhook(
             display_name,
             is_bot: from.map(|u| u.is_bot).unwrap_or(false),
         },
-        text,
+        &text,
         &msg.message_id.to_string(),
         mentions,
     );
+    event.attachments = attachments;
 
     let json = serde_json::to_string(&event).unwrap();
     info!(chat_id = %msg.chat.id, sender = %sender_name, "telegram → gateway");

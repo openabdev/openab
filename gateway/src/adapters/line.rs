@@ -90,13 +90,65 @@ pub async fn webhook(
         let Some(ref msg) = event.message else {
             continue;
         };
-        if msg.message_type != "text" {
+
+        let mut attachments = vec![];
+        let mut text = msg.text.clone().unwrap_or_default();
+
+        // Handle Image/Audio attachments (Issue #690 Phase 1)
+        if let Some(ref access_token) = state.line_access_token {
+            if msg.message_type == "image" || msg.message_type == "audio" {
+                let url = format!("https://api-data.line.me/v2/bot/message/{}/content", msg.id);
+                let client = reqwest::Client::new();
+                let resp = client
+                    .get(url)
+                    .bearer_auth(access_token)
+                    .send()
+                    .await;
+
+                if let Ok(r) = resp {
+                    if !r.status().is_success() {
+                        warn!(status = %r.status(), id = %msg.id, "failed to download LINE media");
+                    } else {
+                        let mime = r
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or(if msg.message_type == "image" {
+                            "image/jpeg"
+                        } else {
+                            "audio/x-m4a"
+                        })
+                        .to_string();
+
+                    if let Ok(data) = r.bytes().await {
+                        let uuid = uuid::Uuid::new_v4().to_string();
+                        {
+                            let mut store =
+                                state.media_store.lock().unwrap_or_else(|e| e.into_inner());
+                            store.insert(
+                                uuid.clone(),
+                                (data.to_vec(), mime, std::time::Instant::now()),
+                            );
+                        }
+                        attachments.push(Attachment {
+                            attachment_type: msg.message_type.clone(),
+                            url: format!("{}/media/{}", state.public_url, uuid),
+                        });
+                        if text.is_empty() {
+                            text = format!("[{}]", msg.message_type);
+                        }
+                        info!(id = %msg.id, uuid = %uuid, "proxied LINE inbound media");
+                    }
+                }
+            }
+            } else if msg.message_type != "text" {
+                continue;
+            }
+        } else if msg.message_type != "text" {
             continue;
         }
-        let Some(ref text) = msg.text else {
-            continue;
-        };
-        if text.trim().is_empty() {
+
+        if text.trim().is_empty() && attachments.is_empty() {
             continue;
         }
 
@@ -138,7 +190,7 @@ pub async fn webhook(
             .and_then(|s| s.user_id.as_deref())
             .unwrap_or("unknown");
 
-        let gateway_event = GatewayEvent::new(
+        let mut gateway_event = GatewayEvent::new(
             "line",
             ChannelInfo {
                 id: channel_id.clone(),
@@ -151,10 +203,11 @@ pub async fn webhook(
                 display_name: user_id.into(),
                 is_bot: false,
             },
-            text,
+            &text,
             &msg.id,
             vec![],
         );
+        gateway_event.attachments = attachments;
 
         // Cache the reply token for hybrid Reply/Push dispatch
         if let Some(ref reply_token) = event.reply_token {

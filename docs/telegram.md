@@ -168,6 +168,10 @@ explain VPC peering              ← ignored in groups
 
 DMs and replies within forum topics always trigger the agent (no @mention needed).
 
+### Media support
+
+Incoming images and audio/voice messages are supported via media proxy. The gateway downloads the media and provides a temporary URL to the agent for analysis.
+
 ### Emoji reactions
 
 The bot shows status reactions on your message as the agent works:

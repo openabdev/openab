@@ -78,6 +78,14 @@ Custom Gateway adapter for platforms like Telegram, LINE, Feishu/Lark, and Googl
 | `allow_all_users` | bool \| omit | auto-detect | `true` = any user; `false` = only `allowed_users`. Omitted = inferred from list. |
 | `allowed_users` | string[] | `[]` | User IDs to allow. Only checked when `allow_all_users` resolves to false. |
 
+### Gateway Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `GATEWAY_MEDIA_BASE_URL` | Public base URL for media proxy (e.g. `https://gateway.example.com`). | `http://127.0.0.1:9090` |
+| `GATEWAY_MEDIA_STORE_TTL` | Seconds to keep media in memory before expiration. | `300` |
+
+
 ---
 
 ## `[agent]`

@@ -189,12 +189,14 @@ mod event_types {
         pub event: Option<FeishuEventBody>,
         pub challenge: Option<String>,
         #[serde(rename = "type")]
+        #[allow(dead_code)]
         pub event_type_field: Option<String>,
     }
 
     #[derive(Debug, Deserialize)]
     pub struct FeishuEventHeader {
         pub event_id: Option<String>,
+        #[allow(dead_code)]
         pub event_type: Option<String>,
     }
 
@@ -231,6 +233,7 @@ mod event_types {
     pub struct FeishuMention {
         pub key: Option<String>,
         pub id: Option<FeishuMentionId>,
+        #[allow(dead_code)]
         pub name: Option<String>,
     }
 
@@ -781,6 +784,7 @@ pub async fn start_websocket(
 }
 
 /// Single WebSocket connection lifecycle.
+#[allow(clippy::too_many_arguments)]
 async fn ws_connect_loop(
     token_cache: &Arc<FeishuTokenCache>,
     bot_open_id_store: &Arc<RwLock<Option<String>>>,
@@ -848,7 +852,7 @@ async fn ws_connect_loop(
                                     ack.payload = Some(b"{\"code\":200}".to_vec());
                                     let ack_bytes = ack.encode_to_vec();
                                     let _ = ws_tx.send(
-                                        tokio_tungstenite::tungstenite::Message::Binary(ack_bytes.into())
+                                        tokio_tungstenite::tungstenite::Message::Binary(ack_bytes)
                                     ).await;
                                 }
                             }
@@ -869,6 +873,7 @@ async fn ws_connect_loop(
 }
 
 /// Process a single WebSocket text message.
+#[allow(clippy::too_many_arguments)]
 async fn handle_ws_message(
     text: &str,
     bot_open_id_store: &Arc<RwLock<Option<String>>>,
@@ -1080,8 +1085,8 @@ fn markdown_to_post(md: &str) -> serde_json::Value {
         let line = raw_lines[li];
         // Detect fenced code block
         let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
-            let lang = trimmed[3..].trim().to_string();
+        if let Some(rest) = trimmed.strip_prefix("```") {
+            let lang = rest.trim().to_string();
             let mut code = String::new();
             li += 1;
             while li < raw_lines.len() {
@@ -1154,8 +1159,8 @@ fn parse_inline(line: &str) -> Vec<serde_json::Value> {
                     }
                     if close_ticks == ticks {
                         // Found matching close — content between is literal
-                        for j in i..end {
-                            buf.push(chars[j]);
+                        for ch in chars.iter().take(end).skip(i) {
+                            buf.push(*ch);
                         }
                         i = end + close_ticks;
                         break 'outer;
@@ -1167,8 +1172,8 @@ fn parse_inline(line: &str) -> Vec<serde_json::Value> {
             }
             if end >= len {
                 // No matching close — treat backticks as literal
-                for j in i..len {
-                    buf.push(chars[j]);
+                for ch in chars.iter().skip(i) {
+                    buf.push(*ch);
                 }
                 i = len;
             }
@@ -1194,8 +1199,8 @@ fn parse_inline(line: &str) -> Vec<serde_json::Value> {
                     }
                     if close_run == run {
                         // Found matching close — strip both, keep inner text
-                        for j in after..scan {
-                            buf.push(chars[j]);
+                        for ch in chars.iter().take(scan).skip(after) {
+                            buf.push(*ch);
                         }
                         i = scan + close_run;
                         found_close = true;

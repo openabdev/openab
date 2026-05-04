@@ -84,6 +84,7 @@ In the LINE Developers Console → **Messaging API** tab → scan the QR code wi
 - **1:1 chat** — send a message to the bot, get an AI agent response
 - **Group chat** — add the bot to a group, it responds to all messages
 - **Webhook signature validation** — HMAC-SHA256 via `LINE_CHANNEL_SECRET`
+- **Media Support** — Support for incoming images and audio/voice messages via media proxy.
 
 ### Not Supported (LINE API limitations)
 
