@@ -152,27 +152,48 @@ async fn send_fire_and_forget(
 
 /// Handle `/models` or `/agents` text commands for gateway platforms.
 /// Returns the response message, or None if the command was not recognized.
+///
+/// Supported syntax:
+///   /model list       — numbered list of available models
+///   /model set <name> — switch by exact name or number
+///   /models           — alias of /model list
+///   /agent list       — numbered list of available agents
+///   /agent set <name> — switch by exact name or number
+///   /agents           — alias of /agent list
 async fn handle_config_command(
     trimmed: &str,
     router: &AdapterRouter,
     thread_key: &str,
 ) -> Option<String> {
-    let (cmd, category, label) = if trimmed == "/models" || trimmed.starts_with("/models ") {
-        ("/models", "model", "model")
-    } else if trimmed == "/agents" || trimmed.starts_with("/agents ") {
-        ("/agents", "agent", "agent")
+    // Parse command: /model <action> <arg> or /models (alias)
+    let (category, label, action, arg) = if trimmed == "/models" {
+        ("model", "model", "list", "")
+    } else if trimmed == "/agents" {
+        ("agent", "agent", "list", "")
+    } else if trimmed.starts_with("/model ") {
+        let rest = trimmed.strip_prefix("/model ").unwrap().trim();
+        let (action, arg) = rest.split_once(' ').unwrap_or((rest, ""));
+        ("model", "model", action, arg.trim())
+    } else if trimmed.starts_with("/agent ") {
+        let rest = trimmed.strip_prefix("/agent ").unwrap().trim();
+        let (action, arg) = rest.split_once(' ').unwrap_or((rest, ""));
+        ("agent", "agent", action, arg.trim())
+    } else if trimmed == "/model" {
+        ("model", "model", "list", "")
+    } else if trimmed == "/agent" {
+        ("agent", "agent", "list", "")
     } else {
         return None;
     };
 
-    let arg = trimmed.strip_prefix(cmd).unwrap_or("").trim();
-    let options = router.pool().get_config_options(thread_key).await;
     // Support both "agent" and "mode" categories (kiro-cli vs cursor-agent)
     let categories: &[&str] = if category == "agent" {
         &["agent", "mode"]
     } else {
         &[category]
     };
+
+    let options = router.pool().get_config_options(thread_key).await;
     let filtered: Vec<_> = options
         .iter()
         .filter(|o| {
@@ -188,67 +209,73 @@ async fn handle_config_command(
         ));
     }
 
-    if arg.is_empty() {
-        // List options
-        let mut lines = vec![format!("🔧 Available {label}s:")];
-        for opt in &filtered {
-            for v in &opt.options {
-                let marker = if v.value == opt.current_value {
-                    " ✅"
-                } else {
-                    ""
-                };
-                lines.push(format!("  • {}{}", v.name, marker));
-            }
-        }
-        lines.push(format!("\nUsage: /{label}s <name>"));
-        return Some(lines.join("\n"));
-    }
-
-    // Find matching option: exact match on value first, then substring
-    let arg_lower = arg.to_lowercase();
-    let mut exact = None;
-    let mut substring_matches = Vec::new();
+    // Collect all values with index for numbered list / set-by-number
+    let mut all_values: Vec<(String, String, String, bool)> = Vec::new(); // (config_id, value, name, is_current)
     for opt in &filtered {
         for v in &opt.options {
-            if v.value.to_lowercase() == arg_lower || v.name.to_lowercase() == arg_lower {
-                exact = Some((opt.id.clone(), v.value.clone(), v.name.clone()));
-                break;
-            }
-            if v.value.to_lowercase().contains(&arg_lower)
-                || v.name.to_lowercase().contains(&arg_lower)
-            {
-                substring_matches.push((opt.id.clone(), v.value.clone(), v.name.clone()));
-            }
-        }
-        if exact.is_some() {
-            break;
+            all_values.push((
+                opt.id.clone(),
+                v.value.clone(),
+                v.name.clone(),
+                v.value == opt.current_value,
+            ));
         }
     }
 
-    let (config_id, value, name) = if let Some(m) = exact {
-        m
-    } else if substring_matches.len() == 1 {
-        substring_matches.into_iter().next().unwrap()
-    } else if substring_matches.len() > 1 {
-        let names: Vec<_> = substring_matches.iter().map(|(_, _, n)| n.as_str()).collect();
-        return Some(format!(
-            "⚠️ Multiple {label}s match \"{arg}\": {}\nUse the exact name: /{label}s <name>",
-            names.join(", ")
-        ));
-    } else {
-        return Some(format!(
-            "⚠️ No {label} matching \"{arg}\". Use /{label}s to see options."
-        ));
-    };
-
-    match router
-        .pool()
-        .set_config_option(thread_key, &config_id, &value)
-        .await
-    {
-        Ok(_) => Some(format!("✅ Switched to **{name}**")),
-        Err(e) => Some(format!("❌ Failed to switch: {e}")),
+    match action {
+        "list" => {
+            let mut lines = vec![format!("🔧 Available {label}s:")];
+            for (i, (_, _, name, is_current)) in all_values.iter().enumerate() {
+                let marker = if *is_current { " ✅" } else { "" };
+                lines.push(format!("  {}. {}{}", i + 1, name, marker));
+            }
+            lines.push(format!("\nUsage: /{label} set <number or name>"));
+            Some(lines.join("\n"))
+        }
+        "set" => {
+            if arg.is_empty() {
+                return Some(format!("Usage: /{label} set <number or name>"));
+            }
+            // Try number first
+            if let Ok(num) = arg.parse::<usize>() {
+                if num >= 1 && num <= all_values.len() {
+                    let (ref config_id, ref value, ref name, _) = all_values[num - 1];
+                    return match router
+                        .pool()
+                        .set_config_option(thread_key, config_id, value)
+                        .await
+                    {
+                        Ok(_) => Some(format!("✅ Switched to **{name}**")),
+                        Err(e) => Some(format!("❌ Failed to switch: {e}")),
+                    };
+                } else {
+                    return Some(format!(
+                        "⚠️ Invalid number. Use 1–{}.",
+                        all_values.len()
+                    ));
+                }
+            }
+            // Exact match on value or name
+            let arg_lower = arg.to_lowercase();
+            for (config_id, value, name, _) in &all_values {
+                if value.to_lowercase() == arg_lower || name.to_lowercase() == arg_lower {
+                    return match router
+                        .pool()
+                        .set_config_option(thread_key, config_id, value)
+                        .await
+                    {
+                        Ok(_) => Some(format!("✅ Switched to **{name}**")),
+                        Err(e) => Some(format!("❌ Failed to switch: {e}")),
+                    };
+                }
+            }
+            Some(format!(
+                "⚠️ No {label} matching \"{arg}\". Use /{label} list to see options."
+            ))
+        }
+        _ => Some(format!(
+            "Unknown action \"{action}\". Usage: /{label} list | /{label} set <name>"
+        )),
     }
 }
 

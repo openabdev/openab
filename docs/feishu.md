@@ -109,12 +109,14 @@ The gateway intercepts slash commands before they reach the agent:
 |---------|--------|
 | `/reset` | Clears the conversation session. |
 | `/cancel` | Sends a cancel signal to the running agent. |
-| `/models` | Lists available models with current selection marked ✅. |
-| `/models <name>` | Switches to a matching model. Exact match first; if multiple substring matches, lists them for disambiguation. |
-| `/agents` | Lists available agents with current selection marked ✅. |
-| `/agents <name>` | Switches to a matching agent. |
+| `/model list` | Numbered list of available models with ✅ current selection. |
+| `/model set <name or number>` | Switch model by exact name or list number. |
+| `/models` | Alias of `/model list`. |
+| `/agent list` | Numbered list of available agents with ✅ current selection. |
+| `/agent set <name or number>` | Switch agent by exact name or list number. |
+| `/agents` | Alias of `/agent list`. |
 
-`/models` and `/agents` require an active session — send a message first to start one. These work in both DMs and group chats, across all gateway platforms.
+`/model` and `/agent` commands require an active session — send a message first to start one. These work in both DMs and group chats, across all gateway platforms.
 
 ## Rich Text (Post) Messages
 
