@@ -150,6 +150,108 @@ async fn send_fire_and_forget(
     Ok(())
 }
 
+/// Handle `/models` or `/agents` text commands for gateway platforms.
+/// Returns the response message, or None if the command was not recognized.
+async fn handle_config_command(
+    trimmed: &str,
+    router: &AdapterRouter,
+    thread_key: &str,
+) -> Option<String> {
+    let (cmd, category, label) = if trimmed == "/models" || trimmed.starts_with("/models ") {
+        ("/models", "model", "model")
+    } else if trimmed == "/agents" || trimmed.starts_with("/agents ") {
+        ("/agents", "agent", "agent")
+    } else {
+        return None;
+    };
+
+    let arg = trimmed.strip_prefix(cmd).unwrap_or("").trim();
+    let options = router.pool().get_config_options(thread_key).await;
+    // Support both "agent" and "mode" categories (kiro-cli vs cursor-agent)
+    let categories: &[&str] = if category == "agent" {
+        &["agent", "mode"]
+    } else {
+        &[category]
+    };
+    let filtered: Vec<_> = options
+        .iter()
+        .filter(|o| {
+            o.category
+                .as_deref()
+                .is_some_and(|c| categories.contains(&c))
+        })
+        .collect();
+
+    if filtered.is_empty() {
+        return Some(format!(
+            "⚠️ No {label} options available. Start a conversation first."
+        ));
+    }
+
+    if arg.is_empty() {
+        // List options
+        let mut lines = vec![format!("🔧 Available {label}s:")];
+        for opt in &filtered {
+            for v in &opt.options {
+                let marker = if v.value == opt.current_value {
+                    " ✅"
+                } else {
+                    ""
+                };
+                lines.push(format!("  • {}{}", v.name, marker));
+            }
+        }
+        lines.push(format!("\nUsage: /{label}s <name>"));
+        return Some(lines.join("\n"));
+    }
+
+    // Find matching option: exact match on value first, then substring
+    let arg_lower = arg.to_lowercase();
+    let mut exact = None;
+    let mut substring_matches = Vec::new();
+    for opt in &filtered {
+        for v in &opt.options {
+            if v.value.to_lowercase() == arg_lower || v.name.to_lowercase() == arg_lower {
+                exact = Some((opt.id.clone(), v.value.clone(), v.name.clone()));
+                break;
+            }
+            if v.value.to_lowercase().contains(&arg_lower)
+                || v.name.to_lowercase().contains(&arg_lower)
+            {
+                substring_matches.push((opt.id.clone(), v.value.clone(), v.name.clone()));
+            }
+        }
+        if exact.is_some() {
+            break;
+        }
+    }
+
+    let (config_id, value, name) = if let Some(m) = exact {
+        m
+    } else if substring_matches.len() == 1 {
+        substring_matches.into_iter().next().unwrap()
+    } else if substring_matches.len() > 1 {
+        let names: Vec<_> = substring_matches.iter().map(|(_, _, n)| n.as_str()).collect();
+        return Some(format!(
+            "⚠️ Multiple {label}s match \"{arg}\": {}\nUse the exact name: /{label}s <name>",
+            names.join(", ")
+        ));
+    } else {
+        return Some(format!(
+            "⚠️ No {label} matching \"{arg}\". Use /{label}s to see options."
+        ));
+    };
+
+    match router
+        .pool()
+        .set_config_option(thread_key, &config_id, &value)
+        .await
+    {
+        Ok(_) => Some(format!("✅ Switched to **{name}**")),
+        Err(e) => Some(format!("❌ Failed to switch: {e}")),
+    }
+}
+
 #[async_trait]
 impl ChatAdapter for GatewayAdapter {
     fn platform(&self) -> &'static str {
@@ -521,6 +623,13 @@ pub async fn run_gateway_adapter(
                                             Err(e) => format!("⚠️ {e}"),
                                         };
                                         let _ = send_fire_and_forget(&slash_ws_tx, &channel, &msg).await;
+                                        continue;
+                                    }
+                                    if trimmed.starts_with("/models") || trimmed.starts_with("/agents") {
+                                        let thread_key = format!("{}:{}", event.platform, event.channel.thread_id.as_deref().unwrap_or(&event.channel.id));
+                                        if let Some(msg) = handle_config_command(trimmed, &router, &thread_key).await {
+                                            let _ = send_fire_and_forget(&slash_ws_tx, &channel, &msg).await;
+                                        }
                                         continue;
                                     }
 
