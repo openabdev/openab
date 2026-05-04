@@ -6,26 +6,26 @@ use std::path::Path;
 
 /// Controls how incoming messages are dispatched to ACP turns.
 ///
-/// - `PerMessage` (default): each message becomes its own ACP turn (v0.8.2-beta.1 behaviour).
-/// - `PerThread`: one buffer per thread; all senders in a thread share a single batch and
+/// - `Message` (default): each message becomes its own ACP turn (v0.8.2-beta.1 behaviour).
+/// - `Thread`: one buffer per thread; all senders in a thread share a single batch and
 ///   produce one ACP turn per turn boundary.
-/// - `PerLane`: one buffer per (thread, sender); each sender batches independently and gets
+/// - `Lane`: one buffer per (thread, sender); each sender batches independently and gets
 ///   its own ACP turn — no silent-drop risk when multiple senders address the same thread.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MessageProcessingMode {
     #[default]
-    PerMessage,
-    PerThread,
-    PerLane,
+    Message,
+    Thread,
+    Lane,
 }
 
 impl<'de> Deserialize<'de> for MessageProcessingMode {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
         match s.to_lowercase().replace('-', "_").as_str() {
-            "per_message" => Ok(Self::PerMessage),
-            "per_thread" => Ok(Self::PerThread),
-            "per_lane" => Ok(Self::PerLane),
+            "per_message" => Ok(Self::Message),
+            "per_thread" => Ok(Self::Thread),
+            "per_lane" => Ok(Self::Lane),
             other => Err(serde::de::Error::unknown_variant(
                 other,
                 &["per-message", "per-thread", "per-lane"],
@@ -668,7 +668,7 @@ command = "echo"
         let cfg = parse_config(toml, "test").unwrap();
         assert_eq!(
             cfg.discord.unwrap().message_processing_mode,
-            MessageProcessingMode::PerMessage
+            MessageProcessingMode::Message
         );
     }
 
@@ -685,7 +685,7 @@ command = "echo"
         let cfg = parse_config(toml, "test").unwrap();
         assert_eq!(
             cfg.discord.unwrap().message_processing_mode,
-            MessageProcessingMode::PerThread
+            MessageProcessingMode::Thread
         );
     }
 
@@ -702,7 +702,7 @@ command = "echo"
         let cfg = parse_config(toml, "test").unwrap();
         assert_eq!(
             cfg.discord.unwrap().message_processing_mode,
-            MessageProcessingMode::PerLane
+            MessageProcessingMode::Lane
         );
     }
 
@@ -726,7 +726,7 @@ command = "echo"
         let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
         assert_eq!(
             cfg.discord.unwrap().message_processing_mode,
-            MessageProcessingMode::PerMessage
+            MessageProcessingMode::Message
         );
     }
 

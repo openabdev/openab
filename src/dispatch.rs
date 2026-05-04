@@ -50,18 +50,18 @@ pub struct BufferedMessage {
 
 /// How `thread_key` is built for the dispatcher's per-thread map.
 ///
-/// - `PerThread`: one mpsc per thread → all senders in a thread share one batch → one
+/// - `Thread`: one mpsc per thread → all senders in a thread share one batch → one
 ///   ACP turn per batch (cheaper, but risks silent drop when the agent's single reply
 ///   forgets to address some senders).
-/// - `PerLane`: one mpsc per (thread, sender) → each sender batches independently and
+/// - `Lane`: one mpsc per (thread, sender) → each sender batches independently and
 ///   gets a dedicated ACP turn. Sessions are still shared per-thread; turns serialise
 ///   through the shared session.
 ///
 /// Derived from `config::MessageProcessingMode` in `main.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchGrouping {
-    PerThread,
-    PerLane,
+    Thread,
+    Lane,
 }
 
 /// Error returned by `Dispatcher::submit`.
@@ -142,7 +142,7 @@ impl Dispatcher {
 
     /// Build the dispatcher key for a (platform, thread, sender) tuple.
     ///
-    /// In `PerThread` mode the sender is ignored; in `PerLane` mode the sender is appended
+    /// In `Thread` mode the sender is ignored; in `Lane` mode the sender is appended
     /// so each (thread, sender) pair gets its own mpsc and consumer.
     ///
     /// Note: this is the *dispatcher* key, not the *session pool* key. Session pool keys
@@ -150,8 +150,8 @@ impl Dispatcher {
     /// shared per-thread by design).
     pub fn key(&self, platform: &str, thread_id: &str, sender_id: &str) -> String {
         match self.grouping {
-            BatchGrouping::PerThread => format!("{platform}:{thread_id}"),
-            BatchGrouping::PerLane => format!("{platform}:{thread_id}:{sender_id}"),
+            BatchGrouping::Thread => format!("{platform}:{thread_id}"),
+            BatchGrouping::Lane => format!("{platform}:{thread_id}:{sender_id}"),
         }
     }
 
@@ -293,7 +293,7 @@ impl Dispatcher {
     /// regardless of grouping, and abort each consumer (§2.5 / §4.4). Returns
     /// the total number of buffered messages discarded across all lanes.
     ///
-    /// Matches both PerThread keys (`<platform>:<thread_id>`) and PerLane keys
+    /// Matches both Thread keys (`<platform>:<thread_id>`) and Lane keys
     /// (`<platform>:<thread_id>:<sender_id>`). Used by `/reset` and
     /// `/cancel-all` to clear the entire thread, not just one lane.
     ///
@@ -895,14 +895,14 @@ mod tests {
 
     #[tokio::test]
     async fn key_per_thread_ignores_sender() {
-        let d = make_dispatcher(BatchGrouping::PerThread);
+        let d = make_dispatcher(BatchGrouping::Thread);
         assert_eq!(d.key("discord", "T1", "userA"), "discord:T1");
         assert_eq!(d.key("discord", "T1", "userB"), "discord:T1");
     }
 
     #[tokio::test]
     async fn key_per_lane_includes_sender() {
-        let d = make_dispatcher(BatchGrouping::PerLane);
+        let d = make_dispatcher(BatchGrouping::Lane);
         assert_eq!(d.key("discord", "T1", "userA"), "discord:T1:userA");
         assert_eq!(d.key("discord", "T1", "userB"), "discord:T1:userB");
         // Different threads remain distinct.
@@ -924,7 +924,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_buffered_thread_drops_per_thread_key() {
-        let d = make_dispatcher(BatchGrouping::PerThread);
+        let d = make_dispatcher(BatchGrouping::Thread);
         insert_dummy_handle(&d, "discord:T1");
         insert_dummy_handle(&d, "discord:T2"); // different thread, must survive
         assert_eq!(d.cancel_buffered_thread("discord", "T1"), 0); // no buffered msgs
@@ -935,7 +935,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_buffered_thread_drops_all_lanes() {
-        let d = make_dispatcher(BatchGrouping::PerLane);
+        let d = make_dispatcher(BatchGrouping::Lane);
         insert_dummy_handle(&d, "discord:T1:userA");
         insert_dummy_handle(&d, "discord:T1:userB");
         insert_dummy_handle(&d, "discord:T2:userA"); // different thread
@@ -951,7 +951,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_buffered_thread_does_not_match_thread_id_prefix() {
         // T1 must not match T10 / T11 (substring trap).
-        let d = make_dispatcher(BatchGrouping::PerLane);
+        let d = make_dispatcher(BatchGrouping::Lane);
         insert_dummy_handle(&d, "discord:T1:userA");
         insert_dummy_handle(&d, "discord:T10:userA");
         d.cancel_buffered_thread("discord", "T1");

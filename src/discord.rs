@@ -160,7 +160,7 @@ pub struct Handler {
     pub bot_turns: tokio::sync::Mutex<BotTurnTracker>,
     /// Allow the bot to respond to Discord DMs.
     pub allow_dm: bool,
-    /// Per-thread dispatcher (PerMessage mode uses cap=1 for FIFO; Batched uses configured cap).
+    /// Per-thread dispatcher (Message mode uses cap=1 for FIFO; Thread/Lane use configured cap).
     pub dispatcher: Arc<crate::dispatch::Dispatcher>,
 }
 
