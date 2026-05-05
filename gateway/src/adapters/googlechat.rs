@@ -222,12 +222,47 @@ impl GoogleChatAdapter {
         self.access_token.clone()
     }
 
-    pub async fn handle_reply(&self, reply: &GatewayReply) {
-        if matches!(
-            reply.command.as_deref(),
-            Some("add_reaction") | Some("remove_reaction") | Some("create_topic")
-        ) {
+    async fn edit_message(&self, message_name: &str, text: &str) {
+        let Some(token) = self.get_token().await else {
+            tracing::warn!("googlechat edit_message: no token available");
             return;
+        };
+
+        let formatted = markdown_to_gchat(text);
+        let url = format!(
+            "{}/{}?updateMask=text",
+            GOOGLE_CHAT_API_BASE, message_name
+        );
+        let body = serde_json::json!({ "text": formatted });
+
+        match self.client.put(&url).bearer_auth(&token).json(&body).send().await {
+            Ok(r) if r.status().is_success() => {
+                tracing::trace!(message_name = %message_name, "googlechat message edited");
+            }
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                error!(status = %status, body = %body, "googlechat edit_message failed");
+            }
+            Err(e) => {
+                error!(err = %e, "googlechat edit_message request failed");
+            }
+        }
+    }
+
+    pub async fn handle_reply(
+        &self,
+        reply: &GatewayReply,
+        event_tx: &tokio::sync::broadcast::Sender<String>,
+    ) {
+        // Command routing
+        match reply.command.as_deref() {
+            Some("add_reaction") | Some("remove_reaction") | Some("create_topic") => return,
+            Some("edit_message") => {
+                self.edit_message(&reply.reply_to, &reply.content.text).await;
+                return;
+            }
+            _ => {}
         }
 
         info!(
@@ -247,15 +282,45 @@ impl GoogleChatAdapter {
         let text = &reply.content.text;
         let chunks = split_text(text, GOOGLE_CHAT_MESSAGE_LIMIT);
 
-        for chunk in chunks {
-            send_message(
+        if chunks.len() <= 1 {
+            let msg_name = send_message(
                 &self.client,
                 &token,
                 &reply.channel.id,
                 reply.channel.thread_id.as_deref(),
-                chunk,
+                text,
             )
             .await;
+
+            // Send GatewayResponse with message_id back for streaming
+            if let Some(ref req_id) = reply.request_id {
+                let resp = crate::schema::GatewayResponse {
+                    schema: "openab.gateway.response.v1".into(),
+                    request_id: req_id.clone(),
+                    success: msg_name.is_some(),
+                    thread_id: None,
+                    message_id: msg_name,
+                    error: if chunks.is_empty() {
+                        Some("empty message".into())
+                    } else {
+                        None
+                    },
+                };
+                if let Ok(json) = serde_json::to_string(&resp) {
+                    let _ = event_tx.send(json);
+                }
+            }
+        } else {
+            for chunk in chunks {
+                send_message(
+                    &self.client,
+                    &token,
+                    &reply.channel.id,
+                    reply.channel.thread_id.as_deref(),
+                    chunk,
+                )
+                .await;
+            }
         }
     }
 }
@@ -653,11 +718,12 @@ async fn send_message(
     space: &str,
     thread_id: Option<&str>,
     text: &str,
-) {
+) -> Option<String> {
     let mut url = format!("{}/{}/messages", GOOGLE_CHAT_API_BASE, space);
 
+    let formatted = markdown_to_gchat(text);
     let mut body = serde_json::json!({
-        "text": text,
+        "text": formatted,
     });
 
     if let Some(thread_id) = thread_id {
@@ -675,13 +741,21 @@ async fn send_message(
         .await;
 
     match resp {
-        Ok(r) if !r.status().is_success() => {
+        Ok(r) if r.status().is_success() => {
+            let body = r.text().await.unwrap_or_default();
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            parsed.get("name").and_then(|v| v.as_str()).map(String::from)
+        }
+        Ok(r) => {
             let status = r.status();
             let body = r.text().await.unwrap_or_default();
             error!(status = %status, body = %body, "googlechat send error");
+            None
         }
-        Err(e) => error!("googlechat send error: {e}"),
-        _ => {}
+        Err(e) => {
+            error!("googlechat send error: {e}");
+            None
+        }
     }
 }
 
@@ -1100,5 +1174,13 @@ mod tests {
             markdown_to_gchat("[**bold link**](http://x.com)"),
             "<http://x.com|*bold link*>"
         );
+    }
+
+    #[test]
+    fn parse_send_message_response_name() {
+        let resp_json = r#"{"name": "spaces/SP1/messages/msg123", "text": "hello"}"#;
+        let parsed: serde_json::Value = serde_json::from_str(resp_json).unwrap();
+        let name = parsed.get("name").and_then(|v| v.as_str());
+        assert_eq!(name, Some("spaces/SP1/messages/msg123"));
     }
 }

@@ -166,7 +166,7 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                             }
                             "googlechat" => {
                                 if let Some(ref gc) = state_for_recv.google_chat {
-                                    gc.handle_reply(&reply).await;
+                                    gc.handle_reply(&reply, &state_for_recv.event_tx).await;
                                 } else {
                                     warn!("reply for googlechat but adapter not configured");
                                 }
