@@ -297,8 +297,26 @@ impl GoogleChatAdapter {
         let text = &reply.content.text;
         let chunks = split_text(text, GOOGLE_CHAT_MESSAGE_LIMIT);
 
-        if chunks.len() <= 1 {
-            let msg_name = send_message(
+        // Empty message: short-circuit, send failure ack and skip API call
+        if chunks.is_empty() {
+            if let Some(ref req_id) = reply.request_id {
+                let resp = crate::schema::GatewayResponse {
+                    schema: "openab.gateway.response.v1".into(),
+                    request_id: req_id.clone(),
+                    success: false,
+                    thread_id: None,
+                    message_id: None,
+                    error: Some("empty message".into()),
+                };
+                if let Ok(json) = serde_json::to_string(&resp) {
+                    let _ = event_tx.send(json);
+                }
+            }
+            return;
+        }
+
+        if chunks.len() == 1 {
+            let result = send_message(
                 &self.client,
                 &token,
                 &reply.channel.id,
@@ -308,28 +326,28 @@ impl GoogleChatAdapter {
             )
             .await;
 
-            // Send GatewayResponse with message_id back for streaming
             if let Some(ref req_id) = reply.request_id {
+                let (success, message_id, error) = match result {
+                    Ok(name) => (true, Some(name), None),
+                    Err(e) => (false, None, Some(e)),
+                };
                 let resp = crate::schema::GatewayResponse {
                     schema: "openab.gateway.response.v1".into(),
                     request_id: req_id.clone(),
-                    success: msg_name.is_some(),
+                    success,
                     thread_id: None,
-                    message_id: msg_name,
-                    error: if chunks.is_empty() {
-                        Some("empty message".into())
-                    } else {
-                        None
-                    },
+                    message_id,
+                    error,
                 };
                 if let Ok(json) = serde_json::to_string(&resp) {
                     let _ = event_tx.send(json);
                 }
             }
         } else {
-            let mut first_msg_name = None;
+            let mut first_msg_name: Option<String> = None;
+            let mut first_error: Option<String> = None;
             for chunk in chunks {
-                let msg_name = send_message(
+                match send_message(
                     &self.client,
                     &token,
                     &reply.channel.id,
@@ -337,9 +355,18 @@ impl GoogleChatAdapter {
                     chunk,
                     &self.api_base,
                 )
-                .await;
-                if first_msg_name.is_none() {
-                    first_msg_name = msg_name;
+                .await
+                {
+                    Ok(name) => {
+                        if first_msg_name.is_none() {
+                            first_msg_name = Some(name);
+                        }
+                    }
+                    Err(e) => {
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
                 }
             }
             if let Some(ref req_id) = reply.request_id {
@@ -349,7 +376,7 @@ impl GoogleChatAdapter {
                     success: first_msg_name.is_some(),
                     thread_id: None,
                     message_id: first_msg_name,
-                    error: None,
+                    error: first_error,
                 };
                 if let Ok(json) = serde_json::to_string(&resp) {
                     let _ = event_tx.send(json);
@@ -695,10 +722,40 @@ fn convert_inline(line: &str) -> String {
                 continue;
             }
         }
+        // Italic: *text* → _text_ (single asterisk, not part of **bold**)
+        // Must come AFTER the **bold** check above. Requires non-asterisk
+        // immediately after opening * and before closing *.
+        if chars[i] == '*'
+            && i + 1 < chars.len()
+            && chars[i + 1] != '*'
+            && !chars[i + 1].is_whitespace()
+        {
+            if let Some(end) = find_single(&chars, i + 1, '*') {
+                if end > i + 1 && !chars[end - 1].is_whitespace() {
+                    out.push('_');
+                    let inner: String = chars[i + 1..end].iter().collect();
+                    out.push_str(&convert_inline(&inner));
+                    out.push('_');
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
         out.push(chars[i]);
         i += 1;
     }
     out
+}
+
+fn find_single(chars: &[char], start: usize, target: char) -> Option<usize> {
+    let mut i = start;
+    while i < chars.len() {
+        if chars[i] == target {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 fn parse_md_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
@@ -764,7 +821,7 @@ async fn send_message(
     thread_id: Option<&str>,
     text: &str,
     api_base: &str,
-) -> Option<String> {
+) -> Result<String, String> {
     let mut url = format!("{}/{}/messages", api_base, space);
 
     let formatted = markdown_to_gchat(text);
@@ -790,17 +847,21 @@ async fn send_message(
         Ok(r) if r.status().is_success() => {
             let body = r.text().await.unwrap_or_default();
             let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-            parsed.get("name").and_then(|v| v.as_str()).map(String::from)
+            parsed
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .ok_or_else(|| "missing message name in response".into())
         }
         Ok(r) => {
             let status = r.status();
             let body = r.text().await.unwrap_or_default();
             error!(status = %status, body = %body, "googlechat send error");
-            None
+            Err(format!("send failed: {} {}", status, body))
         }
         Err(e) => {
             error!("googlechat send error: {e}");
-            None
+            Err(format!("request error: {e}"))
         }
     }
 }
@@ -1206,6 +1267,38 @@ mod tests {
     }
 
     #[test]
+    fn markdown_italic_asterisk() {
+        assert_eq!(markdown_to_gchat("*italic*"), "_italic_");
+        assert_eq!(
+            markdown_to_gchat("plain *one* and *two*"),
+            "plain _one_ and _two_"
+        );
+    }
+
+    #[test]
+    fn markdown_italic_does_not_match_bold() {
+        assert_eq!(markdown_to_gchat("**bold**"), "*bold*");
+        assert_eq!(
+            markdown_to_gchat("**bold** and *italic*"),
+            "*bold* and _italic_"
+        );
+    }
+
+    #[test]
+    fn markdown_italic_underscore_passes_through() {
+        // Google Chat italic is _text_, single underscore should pass through
+        assert_eq!(markdown_to_gchat("_italic_"), "_italic_");
+    }
+
+    #[test]
+    fn markdown_italic_no_match_when_unbalanced() {
+        // Lone asterisks (no closing) should pass through
+        assert_eq!(markdown_to_gchat("a * b"), "a * b");
+        // Whitespace adjacent to asterisks should not match (avoid matching multiplication)
+        assert_eq!(markdown_to_gchat("2 * 3 * 4"), "2 * 3 * 4");
+    }
+
+    #[test]
     fn markdown_empty_string() {
         assert_eq!(markdown_to_gchat(""), "");
     }
@@ -1323,6 +1416,97 @@ mod tests {
         assert_eq!(resp.request_id, "req_fail");
         assert!(!resp.success);
         assert!(resp.message_id.is_none());
+        let err = resp.error.expect("error should be set on send failure");
+        assert!(err.contains("500"), "error should include status code, got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn handle_reply_empty_message_short_circuits() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
+
+        let mock_server = MockServer::start().await;
+        // Mount a mock that would fail the test if called
+        Mock::given(method("POST"))
+            .and(path_regex("/spaces/.*/messages"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        adapter.api_base = mock_server.uri();
+
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "orig_msg".into(),
+            platform: "googlechat".into(),
+            channel: ReplyChannel {
+                id: "spaces/TEST".into(),
+                thread_id: None,
+            },
+            content: Content {
+                content_type: "text".into(),
+                text: "".into(),
+            },
+            command: None,
+            request_id: Some("req_empty".into()),
+        };
+
+        adapter.handle_reply(&reply, &event_tx).await;
+
+        let received = event_rx.try_recv();
+        assert!(received.is_ok(), "expected failure GatewayResponse for empty message");
+        let resp: GatewayResponse = serde_json::from_str(&received.unwrap()).unwrap();
+        assert_eq!(resp.request_id, "req_empty");
+        assert!(!resp.success);
+        assert_eq!(resp.error, Some("empty message".into()));
+    }
+
+    #[tokio::test]
+    async fn handle_reply_multi_chunk_failure_includes_error() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/spaces/.*/messages"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        adapter.api_base = mock_server.uri();
+
+        let long_text = "x".repeat(5000);
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "orig_msg".into(),
+            platform: "googlechat".into(),
+            channel: ReplyChannel {
+                id: "spaces/TEST".into(),
+                thread_id: None,
+            },
+            content: Content {
+                content_type: "text".into(),
+                text: long_text,
+            },
+            command: None,
+            request_id: Some("req_multi_fail".into()),
+        };
+
+        adapter.handle_reply(&reply, &event_tx).await;
+
+        let received = event_rx.try_recv();
+        assert!(received.is_ok(), "expected GatewayResponse");
+        let resp: GatewayResponse = serde_json::from_str(&received.unwrap()).unwrap();
+        assert_eq!(resp.request_id, "req_multi_fail");
+        assert!(!resp.success);
+        assert!(resp.message_id.is_none());
+        let err = resp.error.expect("multi-chunk failure should set error");
+        assert!(err.contains("500"));
     }
 
     #[tokio::test]
