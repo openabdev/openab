@@ -684,6 +684,17 @@ fn convert_inline(line: &str) -> String {
                 continue;
             }
         }
+        // Strikethrough: ~~text~~ → ~text~
+        if chars[i] == '~' && i + 1 < chars.len() && chars[i + 1] == '~' {
+            if let Some(end) = find_closing(&chars, i + 2, &['~', '~']) {
+                out.push('~');
+                let inner: String = chars[i + 2..end].iter().collect();
+                out.push_str(&convert_inline(&inner));
+                out.push('~');
+                i = end + 2;
+                continue;
+            }
+        }
         out.push(chars[i]);
         i += 1;
     }
@@ -1182,6 +1193,15 @@ mod tests {
         assert_eq!(
             markdown_to_gchat("use `**not bold**` here **bold**"),
             "use `**not bold**` here *bold*"
+        );
+    }
+
+    #[test]
+    fn markdown_strikethrough() {
+        assert_eq!(markdown_to_gchat("~~deleted~~"), "~deleted~");
+        assert_eq!(
+            markdown_to_gchat("keep ~~this~~ and ~~that~~"),
+            "keep ~this~ and ~that~"
         );
     }
 
