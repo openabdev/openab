@@ -368,6 +368,9 @@ mod event_types {
                                             texts.push(t.to_string());
                                         }
                                     }
+                                    Some("at") => {
+                                        // Mentions handled via msg.mentions at envelope level
+                                    }
                                     _ => {}
                                 }
                             }
@@ -948,14 +951,7 @@ async fn handle_ws_message(
 
         // Download media attachments (images, text files)
         if !media_refs.is_empty() {
-            let token = match token_cache.get_token(client).await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!(error = %e, "feishu: cannot get token for media download");
-                    String::new()
-                }
-            };
-            if !token.is_empty() {
+            if let Ok(token) = token_cache.get_token(client).await {
                 let api_base = config.api_base();
                 for media_ref in &media_refs {
                     let attachment = match media_ref {
@@ -1352,9 +1348,10 @@ pub async fn download_feishu_image(
     };
     use base64::Engine;
     let data = base64::engine::general_purpose::STANDARD.encode(&compressed);
+    let ext = if mime == "image/gif" { "gif" } else { "jpg" };
     Some(crate::schema::Attachment {
         attachment_type: "image".into(),
-        filename: format!("{}.jpg", image_key),
+        filename: format!("{}.{}", image_key, ext),
         mime_type: mime,
         data,
         size: compressed.len() as u64,
