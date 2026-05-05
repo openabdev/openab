@@ -1,4 +1,4 @@
-use crate::adapter::{ChannelRef, ChatAdapter, MessageRef, SenderContext};
+use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
