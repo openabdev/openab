@@ -106,8 +106,19 @@ data:
     {{- if $cfg.env }}
     env = { {{ $first := true }}{{ range $k, $v := $cfg.env }}{{ if not $first }}, {{ end }}{{ $k }} = {{ $v | toJson }}{{ $first = false }}{{ end }} }
     {{- end }}
-    {{- if $cfg.inheritEnv }}
-    inherit_env = {{ $cfg.inheritEnv | toJson }}
+    {{- range $cfg.secretEnv }}
+    {{- if not (and .name .secretName .secretKey) }}
+    {{- fail (printf "agents.%s.secretEnv entries require name, secretName, and secretKey" $name) }}
+    {{- end }}
+    {{- if hasKey ($cfg.env | default dict) .name }}
+    {{- fail (printf "agents.%s.secretEnv key %q also exists in env — remove it from env to avoid plaintext secret in ConfigMap" $name .name) }}
+    {{- end }}
+    {{- end }}
+    {{- $secretEnvKeys := list }}
+    {{- range $cfg.secretEnv }}{{ $secretEnvKeys = append $secretEnvKeys .name }}{{ end }}
+    {{- $mergedInheritEnv := concat ($cfg.inheritEnv | default list) $secretEnvKeys | uniq }}
+    {{- if $mergedInheritEnv }}
+    inherit_env = {{ $mergedInheritEnv | toJson }}
     {{- end }}
 
     [pool]

@@ -83,6 +83,18 @@ spec:
             - name: {{ $k }}
               value: {{ $v | quote }}
             {{- end }}
+            {{- range $cfg.secretEnv }}
+            {{- if not (and .name .secretName .secretKey) }}
+            {{- fail (printf "agents.%s.secretEnv entries require name, secretName, and secretKey" $name) }}
+            {{- end }}
+            {{- end }}
+            {{- range $cfg.secretEnv }}
+            - name: {{ .name }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .secretName }}
+                  key: {{ .secretKey }}
+            {{- end }}
           {{- with $cfg.envFrom }}
           envFrom:
             {{- toYaml . | nindent 12 }}

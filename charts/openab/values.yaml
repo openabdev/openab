@@ -42,6 +42,14 @@ agents:
     #   nameOverride: ""
     #   env: {}
     #   envFrom: []
+    #   # secretEnv: inject API keys from a Kubernetes Secret without storing them in the ConfigMap.
+    #   # Each entry renders as valueFrom.secretKeyRef in the Deployment and auto-adds the key name
+    #   # to inherit_env in config.toml. ⚠️ Do NOT also list the same key in env — use one or the other.
+    #   # secretEnv:
+    #   #   - name: GEMINI_API_KEY
+    #   #     secretName: my-secrets
+    #   #     secretKey: GEMINI_API_KEY
+    #   secretEnv: []
     #   pool:
     #     maxSessions: 10
     #     sessionTtlHours: 24
@@ -76,6 +84,7 @@ agents:
     #   workingDir: /home/node
     #   env: {}
     #   envFrom: []
+    #   secretEnv: []
     #   pool:
     #     maxSessions: 10
     #     sessionTtlHours: 24
@@ -107,6 +116,7 @@ agents:
     #   workingDir: /home/agent
     #   env: {}
     #   envFrom: []
+    #   secretEnv: []
     #   pool:
     #     maxSessions: 10
     #     sessionTtlHours: 24
@@ -178,6 +188,7 @@ agents:
     workingDir: /home/agent
     env: {}
     envFrom: []
+    secretEnv: []  # list of {name, secretName, secretKey} — rendered as valueFrom.secretKeyRef; keys auto-added to inherit_env
     pool:
       maxSessions: 10
       sessionTtlHours: 24
