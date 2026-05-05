@@ -150,6 +150,135 @@ async fn send_fire_and_forget(
     Ok(())
 }
 
+/// Handle `/models` or `/agents` text commands for gateway platforms.
+/// Returns the response message, or None if the command was not recognized.
+///
+/// Supported syntax:
+///   /model list       — numbered list of available models
+///   /model set <name> — switch by exact name or number
+///   /models           — alias of /model list
+///   /agent list       — numbered list of available agents
+///   /agent set <name> — switch by exact name or number
+///   /agents           — alias of /agent list
+async fn handle_config_command(
+    trimmed: &str,
+    router: &AdapterRouter,
+    thread_key: &str,
+) -> Option<String> {
+    // Parse command: /model <action> <arg> or /models (alias)
+    let (category, label, action, arg) = if trimmed == "/models" {
+        ("model", "model", "list", "")
+    } else if trimmed == "/agents" {
+        ("agent", "agent", "list", "")
+    } else if trimmed.starts_with("/model ") {
+        let rest = trimmed.strip_prefix("/model ").unwrap().trim();
+        let (action, arg) = rest.split_once(' ').unwrap_or((rest, ""));
+        ("model", "model", action, arg.trim())
+    } else if trimmed.starts_with("/agent ") {
+        let rest = trimmed.strip_prefix("/agent ").unwrap().trim();
+        let (action, arg) = rest.split_once(' ').unwrap_or((rest, ""));
+        ("agent", "agent", action, arg.trim())
+    } else if trimmed == "/model" {
+        ("model", "model", "list", "")
+    } else if trimmed == "/agent" {
+        ("agent", "agent", "list", "")
+    } else {
+        return None;
+    };
+
+    // Support both "agent" and "mode" categories (kiro-cli vs cursor-agent)
+    let categories: &[&str] = if category == "agent" {
+        &["agent", "mode"]
+    } else {
+        &[category]
+    };
+
+    let options = router.pool().get_config_options(thread_key).await;
+    let filtered: Vec<_> = options
+        .iter()
+        .filter(|o| {
+            o.category
+                .as_deref()
+                .is_some_and(|c| categories.contains(&c))
+        })
+        .collect();
+
+    if filtered.is_empty() {
+        return Some(format!(
+            "⚠️ No {label} options available. Start a conversation first."
+        ));
+    }
+
+    // Collect all values with index for numbered list / set-by-number
+    let mut all_values: Vec<(String, String, String, bool)> = Vec::new(); // (config_id, value, name, is_current)
+    for opt in &filtered {
+        for v in &opt.options {
+            all_values.push((
+                opt.id.clone(),
+                v.value.clone(),
+                v.name.clone(),
+                v.value == opt.current_value,
+            ));
+        }
+    }
+
+    match action {
+        "list" => {
+            let mut lines = vec![format!("🔧 Available {label}s:")];
+            for (i, (_, _, name, is_current)) in all_values.iter().enumerate() {
+                let marker = if *is_current { " ✅" } else { "" };
+                lines.push(format!("  {}. {}{}", i + 1, name, marker));
+            }
+            lines.push(format!("\nUsage: /{label} set <number or name>"));
+            Some(lines.join("\n"))
+        }
+        "set" => {
+            if arg.is_empty() {
+                return Some(format!("Usage: /{label} set <number or name>"));
+            }
+            // Try number first
+            if let Ok(num) = arg.parse::<usize>() {
+                if num >= 1 && num <= all_values.len() {
+                    let (ref config_id, ref value, ref name, _) = all_values[num - 1];
+                    return match router
+                        .pool()
+                        .set_config_option(thread_key, config_id, value)
+                        .await
+                    {
+                        Ok(_) => Some(format!("✅ Switched to **{name}**")),
+                        Err(e) => Some(format!("❌ Failed to switch: {e}")),
+                    };
+                } else {
+                    return Some(format!(
+                        "⚠️ Invalid number. Use 1–{}.",
+                        all_values.len()
+                    ));
+                }
+            }
+            // Exact match on value or name
+            let arg_lower = arg.to_lowercase();
+            for (config_id, value, name, _) in &all_values {
+                if value.to_lowercase() == arg_lower || name.to_lowercase() == arg_lower {
+                    return match router
+                        .pool()
+                        .set_config_option(thread_key, config_id, value)
+                        .await
+                    {
+                        Ok(_) => Some(format!("✅ Switched to **{name}**")),
+                        Err(e) => Some(format!("❌ Failed to switch: {e}")),
+                    };
+                }
+            }
+            Some(format!(
+                "⚠️ No {label} matching \"{arg}\". Use /{label} list to see options."
+            ))
+        }
+        _ => Some(format!(
+            "Unknown action \"{action}\". Usage: /{label} list | /{label} set <name>"
+        )),
+    }
+}
+
 #[async_trait]
 impl ChatAdapter for GatewayAdapter {
     fn platform(&self) -> &'static str {
@@ -535,6 +664,13 @@ pub async fn run_gateway_adapter(
                                         };
                                         let _ = send_fire_and_forget(&slash_ws_tx, &channel, &msg).await;
                                         continue;
+                                    }
+                                    {
+                                        let thread_key = format!("{}:{}", event.platform, event.channel.thread_id.as_deref().unwrap_or(&event.channel.id));
+                                        if let Some(msg) = handle_config_command(trimmed, &router, &thread_key).await {
+                                            let _ = send_fire_and_forget(&slash_ws_tx, &channel, &msg).await;
+                                            continue;
+                                        }
                                     }
 
                                     tasks.spawn(async move {

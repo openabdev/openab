@@ -109,8 +109,14 @@ The gateway intercepts slash commands before they reach the agent:
 |---------|--------|
 | `/reset` | Clears the conversation session. |
 | `/cancel` | Sends a cancel signal to the running agent. |
+| `/model list` | Numbered list of available models with ✅ current selection. |
+| `/model set <name or number>` | Switch model by exact name or list number. |
+| `/models` | Alias of `/model list`. |
+| `/agent list` | Numbered list of available agents with ✅ current selection. |
+| `/agent set <name or number>` | Switch agent by exact name or list number. |
+| `/agents` | Alias of `/agent list`. |
 
-These work in both DMs and group chats, across all gateway platforms.
+`/model` and `/agent` commands require an active session — send a message first to start one. These work in both DMs and group chats, across all gateway platforms.
 
 ## Rich Text (Post) Messages
 
@@ -136,6 +142,18 @@ streaming = true
 ```
 
 The gateway platform must support message editing (Feishu/Lark do). Platforms that don't support editing should leave `streaming = false` (default).
+
+## Thread (Topic) Replies
+
+When a user replies to a bot message in a group chat, Feishu creates a thread (topic). The bot replies within the same thread, and each thread gets its own independent session.
+
+To start a threaded conversation: reply to any bot message in a group chat (long-press or hover → Reply). The bot's response will appear in the same thread. Subsequent messages in the thread still require @mention (same as group chat).
+
+**How it works:** Feishu reply events include a `root_id` (the original message that started the thread). The gateway uses this as `thread_id` for session isolation. Replies are sent via `POST /im/v1/messages/{root_id}/reply` to stay in the thread.
+
+**Limitation:** Messages sent directly in the Feishu thread panel (not via the "Reply" action) do not include `root_id` and will be treated as regular group messages. Use the "Reply" action to ensure thread context is preserved.
+
+Streaming (typewriter) mode works in threads — edits target the same message regardless of thread context.
 
 ## Bot-to-Bot Collaboration (Gateway-Side Only)
 

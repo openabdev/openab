@@ -37,11 +37,16 @@ A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**,
 ## Features
 
 - **Multi-platform** — supports Discord and Slack, run one or both simultaneously
+- **Custom Gateway** — extend to Telegram, LINE, Feishu/Lark, Google Chat, MS Teams via standalone [gateway](gateway/)
 - **Pluggable agent backend** — swap between Kiro CLI, Claude Code, Codex, Gemini, OpenCode, Copilot CLI via config
 - **@mention trigger** — mention the bot in an allowed channel to start a conversation
 - **Thread-based multi-turn** — auto-creates threads; no @mention needed for follow-ups
+- **Multi-agent collaboration** — bot-to-bot messaging for coordinated workflows ([docs/multi-agent.md](docs/multi-agent.md))
 - **Edit-streaming** — live-updates the Discord message every 1.5s as tokens arrive
 - **Emoji status reactions** — 👀→🤔→🔥/👨‍💻/⚡→👍+random mood face
+- **Image & file support** — send images and files through chat ([docs/sendimages.md](docs/sendimages.md), [docs/sendfiles.md](docs/sendfiles.md))
+- **Scheduled messages** — config-driven cron jobs for automated agent prompts ([docs/cronjob.md](docs/cronjob.md))
+- **Slash commands** — built-in slash command support ([docs/slash-commands.md](docs/slash-commands.md))
 - **Session pool** — one CLI process per thread, auto-managed lifecycle
 - **ACP protocol** — JSON-RPC over stdio with tool call, thinking, and permission auto-reply support
 - **Kubernetes-ready** — Dockerfile + k8s manifests with PVC for auth persistence
@@ -156,37 +161,6 @@ The bot creates a thread. After that, just type in the thread — no @mention ne
 
 > 🔧 Running multiple agents? See [docs/multi-agent.md](docs/multi-agent.md)
 
-## Local Development
-
-```bash
-cp config.toml.example config.toml
-# Edit config.toml with your bot token and channel ID
-
-export DISCORD_BOT_TOKEN="your-token"
-cargo run
-```
-
-### Remote Config
-
-Config can be loaded from a local file or a remote URL via the `--config` / `-c` flag:
-
-```bash
-# Local file
-openab run --config config.toml
-openab run -c config.toml
-
-# Remote URL (http:// or https://)
-openab run --config https://example.com/config.toml
-openab run -c https://example.com/config.toml
-
-# Default (no flag → config.toml)
-openab run
-```
-
-This is useful for containerized or multi-node deployments where config is hosted on a central server (e.g. S3, Git raw URL, internal HTTP service).
-
-> **Security best practice:** Never hardcode secrets in remote config files. Use environment variable references like `bot_token = "${DISCORD_BOT_TOKEN}"` and inject the actual values via local environment variables or Kubernetes Secrets. OpenAB expands `${VAR}` identically for both local and remote config.
-
 ## Configuration Reference
 
 > 📖 Full reference with all options, defaults, and Helm mapping: [docs/config-reference.md](docs/config-reference.md)
@@ -218,29 +192,6 @@ enabled = true                        # enable emoji status reactions
 remove_after_reply = false            # remove reactions after reply
 ```
 
-<details>
-<summary>Full reactions config</summary>
-
-```toml
-[reactions.emojis]
-queued = "👀"
-thinking = "🤔"
-tool = "🔥"
-coding = "👨‍💻"
-web = "⚡"
-done = "🆗"
-error = "😱"
-
-[reactions.timing]
-debounce_ms = 700
-stall_soft_ms = 10000
-stall_hard_ms = 30000
-done_hold_ms = 1500
-error_hold_ms = 2500
-```
-
-</details>
-
 ## Kubernetes Deployment
 
 The Docker image bundles both `openab` and `kiro-cli` in a single container.
@@ -256,14 +207,6 @@ The Docker image bundles both `openab` and `kiro-cli` in a single container.
 │    ├─ ~/.kiro/                  (settings, sessions)  │
 │    └─ ~/.local/share/kiro-cli/  (OAuth tokens)        │
 └───────────────────────────────────────────────────────┘
-```
-
-### Build & Push
-
-```bash
-docker build -t openab:latest .
-docker tag openab:latest <your-registry>/openab:latest
-docker push <your-registry>/openab:latest
 ```
 
 ### Deploy without Helm
@@ -283,27 +226,6 @@ kubectl apply -f k8s/deployment.yaml
 | `k8s/configmap.yaml` | `config.toml` mounted at `/etc/openab/` |
 | `k8s/secret.yaml` | `DISCORD_BOT_TOKEN` injected as env var |
 | `k8s/pvc.yaml` | Persistent storage for auth + settings |
-
-## Project Structure
-
-```
-├── Dockerfile          # multi-stage: rust build + debian-slim runtime with kiro-cli
-├── config.toml.example # example config with all agent backends
-├── k8s/                # Kubernetes manifests
-└── src/
-    ├── main.rs         # entrypoint: multi-adapter startup, cleanup, shutdown
-    ├── adapter.rs      # ChatAdapter trait, AdapterRouter (platform-agnostic)
-    ├── config.rs       # TOML config + ${ENV_VAR} expansion
-    ├── discord.rs      # DiscordAdapter: serenity EventHandler + ChatAdapter impl
-    ├── slack.rs        # SlackAdapter: Socket Mode + ChatAdapter impl
-    ├── media.rs        # shared image resize/compress + STT download
-    ├── format.rs       # message splitting, thread name shortening
-    ├── reactions.rs    # status reaction controller (debounce, stall detection)
-    └── acp/
-        ├── protocol.rs # JSON-RPC types + ACP event classification
-        ├── connection.rs # spawn CLI, stdio JSON-RPC communication
-        └── pool.rs     # session key → AcpConnection map
-```
 
 ## Inspired By
 

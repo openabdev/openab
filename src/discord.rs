@@ -324,7 +324,16 @@ impl EventHandler for Handler {
                             }
                         }
                         if msg.author.id != bot_id && allowed_here {
-                            let _ = msg.channel_id.say(&ctx.http, &user_message).await;
+                            // Only warn if this bot actually participated in the
+                            // thread — prevents uninvolved bots from spamming
+                            // warnings in shared channels. (#727)
+                            // Second value is `is_multibot`; not needed here.
+                            let (participated, _) = self
+                                .bot_participated_in_thread(&ctx.http, msg.channel_id, bot_id)
+                                .await;
+                            if participated {
+                                let _ = msg.channel_id.say(&ctx.http, &user_message).await;
+                            }
                         }
                         return;
                     }

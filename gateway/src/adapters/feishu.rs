@@ -298,7 +298,6 @@ mod event_types {
 
         let chat_id = msg.chat_id.as_deref()?;
         let message_id = msg.message_id.as_deref()?;
-
         // Group allowlist: if configured, only allow listed groups
         let is_group = msg.chat_type.as_deref() != Some("p2p");
         if is_group
@@ -329,8 +328,10 @@ mod event_types {
             _ => "group",
         };
 
+        let thread_id = msg.root_id.clone().or_else(|| msg.parent_id.clone());
+
         // Gateway-side mention gating: in groups, skip if require_mention
-        // is true and bot is not mentioned (for human senders)
+        // is true and bot is not mentioned (for human senders).
         if channel_type == "group" && !is_bot_sender && config.require_mention {
             if let Some(bot_id) = bot_open_id {
                 let bot_mentioned = mention_ids.iter().any(|id| id == bot_id);
@@ -352,8 +353,6 @@ mod event_types {
                 }
             }
         }
-
-        let thread_id = msg.root_id.clone().or_else(|| msg.parent_id.clone());
 
         let event = GatewayEvent::new(
             "feishu",
@@ -872,6 +871,7 @@ async fn handle_ws_message(
         let json = serde_json::to_string(&gateway_event).unwrap();
         info!(
             channel = %gateway_event.channel.id,
+            thread_id = ?gateway_event.channel.thread_id,
             sender = %gateway_event.sender.id,
             "feishu → gateway"
         );
@@ -1154,24 +1154,34 @@ fn try_parse_link(chars: &[char], start: usize) -> Option<(String, String, usize
 
 /// Send a post (rich text) message to a feishu chat_id.
 /// Returns the sent message_id on success, None on failure.
+/// When `reply_to` is Some(root_id), uses the reply API to stay in a thread.
+/// When `reply_to` is None, sends a new message to the chat.
 pub async fn send_post_message(
     client: &reqwest::Client,
     api_base: &str,
     token: &str,
     chat_id: &str,
+    reply_to: Option<&str>,
     text: &str,
 ) -> Option<String> {
-    let url = format!(
-        "{}/open-apis/im/v1/messages?receive_id_type=chat_id",
-        api_base
-    );
-    let post_content = markdown_to_post(text);
-    let content = post_content.to_string();
-    let body = serde_json::json!({
-        "receive_id": chat_id,
-        "msg_type": "post",
-        "content": content,
-    });
+    let (url, body) = if let Some(root_id) = reply_to {
+        (
+            format!("{}/open-apis/im/v1/messages/{}/reply", api_base, root_id),
+            serde_json::json!({
+                "msg_type": "post",
+                "content": markdown_to_post(text).to_string(),
+            }),
+        )
+    } else {
+        (
+            format!("{}/open-apis/im/v1/messages?receive_id_type=chat_id", api_base),
+            serde_json::json!({
+                "receive_id": chat_id,
+                "msg_type": "post",
+                "content": markdown_to_post(text).to_string(),
+            }),
+        )
+    };
 
     match client
         .post(&url)
@@ -1194,7 +1204,7 @@ pub async fn send_post_message(
                     .pointer("/data/message_id")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                info!(chat_id = %chat_id, message_id = ?msg_id, "feishu post message sent");
+                info!(chat_id = %chat_id, reply_to = ?reply_to, message_id = ?msg_id, "feishu post message sent");
                 msg_id
             } else {
                 let status = resp.status();
@@ -1393,6 +1403,19 @@ pub async fn handle_reply(
         Ok(t) => t,
         Err(e) => {
             tracing::error!(err = %e, "feishu: cannot get token for reply");
+            if let Some(ref req_id) = reply.request_id {
+                let resp = crate::schema::GatewayResponse {
+                    schema: "openab.gateway.response.v1".into(),
+                    request_id: req_id.clone(),
+                    success: false,
+                    thread_id: None,
+                    message_id: None,
+                    error: Some(format!("token error: {e}")),
+                };
+                if let Ok(json) = serde_json::to_string(&resp) {
+                    let _ = event_tx.send(json);
+                }
+            }
             return;
         }
     };
@@ -1400,12 +1423,14 @@ pub async fn handle_reply(
     let api_base = adapter.config.api_base();
     let text = &reply.content.text;
     let limit = adapter.config.message_limit;
+    let thread_id = reply.channel.thread_id.as_deref();
 
     // Split long messages; store sent message_ids in dedupe to prevent
     // self-echo (Feishu pushes bot's own messages back via WebSocket)
     // Use post (rich text) format for markdown rendering.
+    // When in a thread (thread_id present), use reply API to stay in the same thread.
     if text.len() <= limit {
-        match send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, text).await {
+        match send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, thread_id, text).await {
             Some(msg_id) => {
                 adapter.dedupe.is_duplicate(&msg_id);
                 // Send response with message_id back to OAB core (for streaming edit)
@@ -1442,7 +1467,7 @@ pub async fn handle_reply(
         }
     } else {
         for chunk in split_text(text, limit) {
-            if let Some(msg_id) = send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, chunk).await {
+            if let Some(msg_id) = send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, thread_id, chunk).await {
                 adapter.dedupe.is_duplicate(&msg_id);
             }
         }
