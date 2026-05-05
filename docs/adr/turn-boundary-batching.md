@@ -4,7 +4,7 @@
 - **Date:** 2026-04-29
 - **Author:** @brettchien
 - **Tracking issue:** [#580](https://github.com/openabdev/openab/issues/580) — kept as historical discussion record
-- **Supersedes:** [PR #598](https://github.com/openabdev/openab/pull/598) (standalone batched-turn-packing ADR — folded into §3)
+- **Implementation PR:** [#686](https://github.com/openabdev/openab/pull/686) (Phase 1 wiring; this ADR documents the design it lands)
 - **Related:** [#78](https://github.com/openabdev/openab/issues/78) (Session Management — precondition), [#58](https://github.com/openabdev/openab/issues/58) (per-connection locking — precondition), [#307](https://github.com/openabdev/openab/issues/307) (cross-session blocking — adjacent symptom of §2.7)
 - **Anchor pinning:** All file:line references in this document are anchored to **v0.8.2-beta.1** ([`52052b8`](https://github.com/openabdev/openab/commit/52052b8b104a85a7073dd6ae99eeb9f2fd331abe)). New modules introduced by the Phase 1 PR (e.g. `src/dispatch.rs`) are described conceptually, without line-number anchors, since they do not exist in the released base.
 
@@ -131,16 +131,23 @@ The `Dispatcher` sits **above** `SessionPool` in the call graph. Per-thread keyi
 // At v0.8.2-beta.1 (discord.rs:600-608):
 tokio::spawn(async move { router.handle_message(...).await });
 
-// After Phase 1 — per-message mode unchanged; batched mode goes through dispatcher:
+// After Phase 1 — all three modes go through the same dispatcher; the mode
+// only changes (cap, grouping, idle_timeout). The dispatcher's `key()`
+// computes the mpsc identity from grouping; `Per-Message` reduces to a
+// 1-deep buffer per thread (each message dispatches alone, FIFO).
 tokio::spawn(async move {
-    match mode {
-        PerMessage => router.handle_message(...).await,
-        Batched    => dispatcher.submit(
-            thread_key, thread_channel, adapter, buf, other_bot_present,
-        ).await,
-    }
+    dispatcher.submit(
+        thread_key, thread_channel, adapter, buf, other_bot_present,
+    ).await
 });
+
+// where (cap, grouping, idle) are derived from message_processing_mode:
+//   PerMessage -> (1,                   Thread, PER_MESSAGE_CONSUMER_IDLE_TIMEOUT)
+//   PerThread  -> (max_buffered_messages, Thread, DEFAULT_CONSUMER_IDLE_TIMEOUT)
+//   PerLane    -> (max_buffered_messages, Lane,   DEFAULT_CONSUMER_IDLE_TIMEOUT)
 ```
+
+`PerMessage` is structurally a uniform-path special case (cap=1; consumer drains exactly one message per turn). `PerThread` and `PerLane` differ only in dispatcher key shape — `PerThread` keys mpsc identity by `(platform, thread_id)`, `PerLane` keys by `(platform, thread_id, sender_id)` so each sender owns a separate buffer + consumer (still serialized through the shared `Arc<Mutex<AcpConnection>>` per thread). See §4.1 for config-side rationale.
 
 ### 2.3 Producer / consumer lifecycle
 
@@ -299,24 +306,26 @@ These benefits scale with input fragmentation and do not apply to isolated messa
 
 ## 3. Packing Format Decision
 
-**Decision:** the broker emits **N repetitions of the per-arrival-event template** — `<sender_context>{json}</sender_context>\n\n{prompt}` followed by that arrival's attachments — concatenated into one `Vec<ContentBlock>`. `<sender_context>` is itself the boundary marker; the next opening of `<sender_context>` ends the previous arrival event. One additive schema bump (`SenderContext.timestamp`, ISO 8601 UTC) makes adjacent same-author repetitions distinguishable.
+**Decision:** the broker emits **N repetitions of the per-arrival-event template** — a standalone `<sender_context>{json}</sender_context>` Text block, followed by transcript Text blocks (if any), followed by `{prompt}` as its own Text block (omitted if empty), followed by non-Text attachments — concatenated into one `Vec<ContentBlock>`. `<sender_context>` is its own ContentBlock and serves as a structural delimiter; the next opening of `<sender_context>` ends the previous arrival event. One additive schema bump (`SenderContext.timestamp`, ISO 8601 UTC) makes adjacent same-author repetitions distinguishable.
 
 This subsumes T1.4 / B1 (attribution of attachments to their owning sub-message), T2.b (`sender_name` disambiguation — handled by the existing `sender_id` field), and T2.j (`arrived_at_relative` — agent computes from absolute timestamps).
 
 The chosen design preserves the existing per-arrival template from `adapter.rs:131-152`, so single-message dispatch is byte-identical to v0.8.2-beta.1 except for the additive `timestamp` field and one ordering change for STT voice transcripts (§3.6 Scenario D).
 
-### 3.1 Per-arrival-event template (unchanged from `adapter.rs:131-152`)
+### 3.1 Per-arrival-event template
+
+Per arrival event, `pack_arrival_event` emits this sequence of `ContentBlock`s:
 
 ```
-<sender_context>
-{json}
-</sender_context>
-
-{prompt}
-[ContentBlock for attachment 1]
-[ContentBlock for attachment 2]
-…
+ContentBlock::Text { "<sender_context>\n{json}\n</sender_context>" }   ← standalone delimiter
+[ContentBlock::Text from extra_blocks — e.g. STT transcripts, in arrival order]
+ContentBlock::Text { "{prompt}" }                                       ← omitted if {prompt} is empty
+[non-Text ContentBlocks from extra_blocks — e.g. ImageBlock, in arrival order]
 ```
+
+`<sender_context>` is its own block so that, in batched dispatch, agents can scan the `Vec<ContentBlock>` for `<sender_context>` openers to find arrival boundaries without parsing inside any single Text block. Within an arrival, transcripts precede `{prompt}` (so voice content reads first, matching pre-batching adapter UX); images trail `{prompt}` (matching pre-batching adapter UX).
+
+For a single-message dispatch (`batch.len() == 1`) the minimum is two blocks: delimiter + prompt. Each transcript adds one Text block; each image adds one non-Text block. An empty-prompt arrival (e.g. voice-only) skips the prompt block — minimum becomes one delimiter + one transcript.
 
 `{json}` is the existing `SenderContext` record:
 
@@ -352,18 +361,22 @@ The chosen design preserves the existing per-arrival template from `adapter.rs:1
 
 For `batch.len() == N` arrival events, the consumer emits the per-arrival template N times back-to-back. **No outer wrapper, no banner, no instruction string, no `<message index=N>` tags.** The next `<sender_context>` opening is itself the boundary marker.
 
-**Example.** Two messages, each with text + one attachment:
+**Example.** Two messages from alice:
 
-- M1 = "look at this" + screenshot, sender = alice
-- M2 = "listen to this" + audio transcript, sender = alice
+- M1 = "look at this" + screenshot
+- M2 = audio transcript + "listen to this"
 
 ```
 Vec<ContentBlock>:
-  Text  { "<sender_context>\n{...alice's JSON, timestamp=T1...}\n</sender_context>\n\nlook at this" }
-  Image { screenshot }                  ← belongs to M1 (most recent <sender_context> preceding it)
-  Text  { "<sender_context>\n{...alice's JSON, timestamp=T2...}\n</sender_context>\n\nlisten to this" }
-  Text  { transcript content }          ← belongs to M2 (boundary moved when T2's <sender_context> opened)
+  Text  { "<sender_context>\n{...alice's JSON, timestamp=T1...}\n</sender_context>" }   ← delimiter for M1
+  Text  { "look at this" }                                ← M1 prompt
+  Image { screenshot }                                    ← M1 attachment
+  Text  { "<sender_context>\n{...alice's JSON, timestamp=T2...}\n</sender_context>" }   ← delimiter for M2
+  Text  { transcript content }                            ← M2 transcript (precedes prompt)
+  Text  { "listen to this" }                              ← M2 prompt
 ```
+
+Boundary rule: a block belongs to the most recent `<sender_context>` delimiter preceding it; the boundary moves the moment the next `<sender_context>` opens.
 
 What the agent reads when ContentBlocks are concatenated logically:
 
@@ -371,16 +384,13 @@ What the agent reads when ContentBlocks are concatenated logically:
 <sender_context>
 {"schema":"openab.sender.v1","sender_id":"…","sender_name":"alice","display_name":"alice","channel":"discord","channel_id":"…","is_bot":false,"timestamp":"2026-04-26T18:33:19.912Z"}
 </sender_context>
-
 look at this
 [ImageBlock — screenshot]
-
 <sender_context>
 {"schema":"openab.sender.v1","sender_id":"…","sender_name":"alice","display_name":"alice","channel":"discord","channel_id":"…","is_bot":false,"timestamp":"2026-04-26T18:33:23.105Z"}
 </sender_context>
-
-listen to this
 [TextBlock — transcript content]
+listen to this
 ```
 
 Properties:
@@ -394,22 +404,24 @@ Properties:
 | Aspect | Current per-message (`adapter.rs:131-152`) | RFC MVP (Appendix A "Packing a batch") | This ADR |
 |---|---|---|---|
 | Sender attribution | `<sender_context>` JSON wrapper around prompt | New `<message index=N from="…">` attribute (parallel schema) | **Reuse** existing `<sender_context>` JSON verbatim — adds `timestamp` field only |
-| Per-batch wrapper | n/a | One combined `Text` block: banner + N `<message>` tags | One `Text` block per sub-message + interleaved attachment blocks; no outer wrapper |
+| Per-batch wrapper | n/a | One combined `Text` block: banner + N `<message>` tags | One delimiter Text block + one prompt Text block + interleaved extras per arrival; no outer wrapper |
 | Banner / semantic framing | n/a | `[Batched: N messages…]` always emitted | **None.** No banner, no instruction, no metadata beyond `<sender_context>` |
-| Boundary marker | n/a | `<message index=N from="…">` opening + `</message>` close | The next `<sender_context>` opening *is* the boundary — no separate tag |
-| Text extras (transcripts) | Prepended before main text (`adapter.rs:138-143`) | Flattened at end of ContentBlock array | Interleaved between this message's `<sender_context>` and the next, in arrival order |
-| Image extras | Appended after main text (`adapter.rs:148-152`) | Flattened at end of ContentBlock array | Same as text extras — interleaved in arrival order |
-| Attachment ↔ message link | Implicit (single message) | **Lost** — flattened blocks have no tie back to a sub-message (T1.4 / B1 blocker) | **Structural by adjacency** |
+| Boundary marker | n/a | `<message index=N from="…">` opening + `</message>` close | A standalone `<sender_context>` ContentBlock — the next delimiter opens, the previous arrival ends |
+| `<sender_context>` block | Prepended into the same Text block as `{prompt}` | n/a (wholly different schema) | **Standalone** Text block — separate from `{prompt}` block |
+| Text extras (transcripts) | Prepended before the combined `<sender_context>+prompt` block (`adapter.rs:138-143`) | Flattened at end of ContentBlock array | Placed after the delimiter but before the `{prompt}` block — voice content reads first |
+| Image extras | Appended after main text (`adapter.rs:148-152`) | Flattened at end of ContentBlock array | Appended after the `{prompt}` block (unchanged from pre-batching) |
+| Attachment ↔ message link | Implicit (single message) | **Lost** — flattened blocks have no tie back to a sub-message (T1.4 / B1 blocker) | **Structural by adjacency** to the most recent `<sender_context>` delimiter |
 | `batch.len() == 1` vs `≥ 2` code paths | Baseline (only path) | Two paths (with/without banner-Text combination) | **Single uniform path** — N=1 is just one repetition of the same template |
 
 ### 3.5 Single uniform code path
 
-The packing is one template emitted N times — no special-case fast path for isolated messages. For `batch.len() == 1` the output is one `<sender_context>...</sender_context>\n\n{prompt}` repetition with attachments interleaved, structurally equivalent to today's per-message dispatch with two small differences:
+The packing is one template emitted N times — no special-case fast path for isolated messages. For `batch.len() == 1` the output is one delimiter + transcripts + prompt + images sequence, structurally equivalent to today's per-message dispatch with three small differences:
 
 1. `<sender_context>` JSON now carries a `timestamp` field (additive schema change).
-2. `extra_blocks` (text transcripts, images) are placed **after** the message's `<sender_context>...{prompt}` block in arrival order, rather than today's asymmetric "text-prepended, image-appended" ordering at `adapter.rs:138-152`.
+2. `<sender_context>` is its own ContentBlock instead of being prepended into the same Text block as `{prompt}`.
+3. STT transcripts move from **before the `<sender_context>` envelope** (today's `adapter.rs:138-143`) to **after the delimiter but before `{prompt}`** — image ordering (after `{prompt}`) is unchanged.
 
-Concretely this means **STT voice-message transcripts move from before the `<sender_context>` block to after it** (Scenario D below). In the current per-message path (`adapter.rs:138-143`), the transcript is prepended before the entire per-arrival template — including `<sender_context>` itself — so it reads as if it were user-typed text:
+Concretely (Scenario D below): in the current per-message path (`adapter.rs:138-143`), the transcript is prepended before the entire per-arrival template — including `<sender_context>` itself — so it reads as if it were user-typed text:
 
 ```
 [Voice message transcript]: hey can we sync about the deploy
@@ -419,7 +431,7 @@ Concretely this means **STT voice-message transcripts move from before the `<sen
 
 ```
 
-Under this ADR the transcript moves to after `<sender_context>{prompt}`, owned by its arrival event like any other attachment. The boundary rule stays clean: `<sender_context>` always opens an arrival event; attachments always follow.
+Under this ADR the transcript moves to inside the arrival event (after the delimiter, before `{prompt}`), owned by its arrival event like any other attachment. The boundary rule stays clean: `<sender_context>` always opens an arrival event; transcripts/prompt/images always follow within the same arrival.
 
 ### 3.6 Scope of attribution — Scenarios A–D
 
@@ -445,12 +457,11 @@ The image follows alice's `<sender_context>` with no other `<sender_context>` be
 ```
 <sender_context>{alice, ts=T1}</sender_context>
 see this image
-
 <sender_context>{alice, ts=T2}</sender_context>
 [ImageBlock]
 ```
 
-Broker keeps the structural truth (image arrived as M2, alone). The agent reads identical `sender_id` on both `<sender_context>` blocks and trivially infers M1's "this image" refers to M2's attachment. The `timestamp` delta `T2 − T1` reinforces this when M1 and M2 are seconds apart.
+M2 has no `{prompt}` block (empty prompt is omitted, §3.1). Broker keeps the structural truth (image arrived as M2, alone). The agent reads identical `sender_id` on both `<sender_context>` blocks and trivially infers M1's "this image" refers to M2's attachment. The `timestamp` delta `T2 − T1` reinforces this when M1 and M2 are seconds apart.
 
 **Scenario C — fragmented multi-author batch** (alice's text → bob's interjection → alice's image)
 
@@ -461,10 +472,8 @@ Broker keeps the structural truth (image arrived as M2, alone). The agent reads 
 ```
 <sender_context>{alice, sender_id=A, ts=T1}</sender_context>
 see this image
-
 <sender_context>{bob, sender_id=B, ts=T2}</sender_context>
 what?
-
 <sender_context>{alice, sender_id=A, ts=T3}</sender_context>
 [ImageBlock]
 ```
@@ -481,18 +490,15 @@ The broker does not "skip" bob's message or re-link alice's M1 ↔ M3 — those 
 <sender_context>{alice, ts=T1}</sender_context>
 look at this
 [ImageBlock]
-
 <sender_context>{alice, ts=T2}</sender_context>
-
 [Voice message transcript]: hey can we sync about the deploy
-
 <sender_context>{bob, ts=T3}</sender_context>
 what?
 ```
 
-M2's `{prompt}` is empty (line after `</sender_context>` is blank), and the transcript Text block lands immediately after as M2's first attachment.
+M2 has empty `{prompt}` (so the prompt block is omitted, §3.1) and one transcript block. The transcript lands immediately after the delimiter — within M2's arrival, before any `{prompt}` block would appear.
 
-**Behavior change vs. v0.8.2-beta.1:** in the per-message path (`adapter.rs:138-143`) the transcript is *prepended* before `<sender_context>` so it reads as if it were the user's typed text. Under this ADR the transcript moves to *after* `<sender_context>`, owned by M2 like any other attachment. The agent still sees the transcript content — just one block down.
+**Behavior change vs. v0.8.2-beta.1:** in the per-message path (`adapter.rs:138-143`) the transcript is *prepended* before `<sender_context>` so it reads as if it were the user's typed text. Under this ADR the transcript moves to *inside the arrival event*, after the `<sender_context>` delimiter and before `{prompt}`, owned by M2 like any other attachment. The agent still sees the transcript content — just one block down, with the sender envelope explicitly framing it.
 
 **Rollback path if cross-agent smoke fails.** If a Phase 1 cross-agent smoke fixture (Scenario D against Claude Code, Cursor, and Copilot) shows any target regressing on voice-only handling, the response is a code change, not a runtime toggle: either revert the `pack_arrival_event` call for the single-message voice case, or land a hotfix PR re-introducing the `extra_blocks.len() == 1 && prompt.is_empty()` special case that treats the transcript as a `{prompt}` substitute. **No always-on feature flag.** The cross-agent smoke fixture is the gate; a hotfix PR is the rollback mechanism.
 
@@ -512,12 +518,28 @@ Today's broker (`discord.rs:480-483`) extracts only `msg.content` and `msg.attac
 [discord]
 message_processing_mode = "per-message"  # default in Phase 1
 # Or:
-message_processing_mode = "batched"
-max_buffered_messages   = 10             # batched mode only; per-thread channel cap
-max_batch_tokens        = 24000          # batched mode only; soft cap on cumulative tokens
+message_processing_mode = "per-thread"   # one buffer per (platform, thread)
+# Or:
+message_processing_mode = "per-lane"     # one buffer per (platform, thread, sender)
+max_buffered_messages   = 10             # per-thread / per-lane only; mpsc cap
+max_batch_tokens        = 24000          # per-thread / per-lane only; soft cap on cumulative tokens
 
 # Slack and Gateway adapters expose the same three keys under [slack] / [gateway].
 ```
+
+`message_processing_mode` is **3-valued** (`per-message` / `per-thread` / `per-lane`). All three flow through the same `Dispatcher::submit` path; they differ only in how the dispatcher derives the mpsc identity (`Dispatcher::key`) and what consumer idle timeout it uses (§6.10):
+
+| Mode | mpsc cap | dispatcher key | Idle timeout | When to pick |
+|---|---|---|---|---|
+| `per-message` | **1** | `(platform, thread_id)` | 10s (`PER_MESSAGE_CONSUMER_IDLE_TIMEOUT`) | Default in Phase 1 — preserves v0.8.2-beta.1 dispatch shape (each message dispatches alone, FIFO via the dispatcher), with the structural changes from §3 (split `<sender_context>` block, transcript ordering). |
+| `per-thread` | configured | `(platform, thread_id)` | 300s (`DEFAULT_CONSUMER_IDLE_TIMEOUT`) | One buffer per thread regardless of sender — turn-boundary batching as originally designed. Multiple senders in the same thread share a buffer and produce one ACP turn covering all of them. |
+| `per-lane` | configured | `(platform, thread_id, sender_id)` | 300s (`DEFAULT_CONSUMER_IDLE_TIMEOUT`) | One buffer per (thread × sender) — appropriate when peer bots and humans share a thread but their inputs should batch independently. Each sender gets their own mpsc + consumer; all senders still serialize through the shared `Arc<Mutex<AcpConnection>>` per thread. |
+
+**Session pool keying is unchanged across all three modes** — the ACP session is per-thread (`(platform, thread_id)`); only the dispatcher's mpsc identity varies. In `per-lane` mode the per-lane consumers compete for the same connection mutex; per-thread sequential ACP-turn order is preserved by the mutex, while per-lane FIFO order is preserved by each lane's mpsc.
+
+**Why `per-message` still uses the dispatcher (cap=1)** instead of bypassing it: keeping a uniform code path means `cancel_buffered`, sweep, `SendError` recovery (§2.5), and observability (§6.6) work identically across modes — there is no "per-message has its own dispatch path" to maintain. The cap=1 buffer adds μs-scale handle lookup; ACP turn duration dominates by 4–6 orders of magnitude.
+
+**Legacy `"batched"` alias is rejected** — earlier drafts of this ADR used a 2-valued mode (`per-message` / `batched`); configs still using `"batched"` must migrate to either `per-thread` or `per-lane` explicitly. The deserializer rejects unknown values with a clear error so silent fallthrough cannot happen.
 
 ### 4.2 Sizing `max_buffered_messages`
 
@@ -545,32 +567,49 @@ Default **24000**, sized below typical ACP CLI context budgets with headroom for
 
 ```
 Phase 1 — Mechanism + T1 dispositions (single PR, Discord + Slack + Gateway)
-  - New module: src/dispatch.rs (Dispatcher + ThreadHandle + consumer_loop + pack_arrival_event)
-  - MessageProcessingMode enum in config (default = PerMessage)
-  - Discord wiring (discord.rs:600-608): branch on mode
+  - New module: src/dispatch.rs (Dispatcher + ThreadHandle + consumer_loop)
+  - pack_arrival_event lives on adapter.rs (single packing path for all modes, §3)
+  - 3-valued MessageProcessingMode enum in config (Message / Thread / Lane;
+    default = Message)
+  - All three modes go through Dispatcher::submit; mode controls
+    (cap, BatchGrouping, idle_timeout):
+      Message -> (1, BatchGrouping::Thread, PER_MESSAGE_CONSUMER_IDLE_TIMEOUT)
+      Thread  -> (max_buffered_messages, BatchGrouping::Thread, DEFAULT_CONSUMER_IDLE_TIMEOUT)
+      Lane    -> (max_buffered_messages, BatchGrouping::Lane,   DEFAULT_CONSUMER_IDLE_TIMEOUT)
+  - Discord wiring (discord.rs:600-608): unconditional dispatcher.submit()
   - Slack wiring: platform preprocessing moved before dispatcher.submit();
     KeyedAsyncQueue removed — Dispatcher consumer task takes over per-thread serialization
   - Gateway wiring: router.handle_message() replaced with dispatcher.submit()
   - Packing (§3): SenderContext.timestamp additive; pack_arrival_event uniform
-    for batch.len() == 1 and ≥ 2; extra_blocks interleaved after each <sender_context>
+    across modes; <sender_context> emitted as standalone Text block (delimiter);
+    transcripts placed between delimiter and {prompt}; images placed after {prompt}
   - SendError handling (§2.5): evict + ❌ + ⚠️ + return Err
   - submit does NOT touch last_active (§2.7)
   - other_bot_present per-thread Arc<AtomicBool> mirror (§2.6)
   - Dispatcher::per_thread uses std::sync::Mutex; ThreadHandle.generation: u64
-  - max_buffered_messages configurable (default 10, multi-bot 30)
-  - max_batch_tokens soft cap on greedy drain (default 24000)
+  - sweep_stale: periodic eviction of consumers idle longer than idle_timeout
+    (one-shot threads never trigger lazy eviction by themselves; sweep keeps
+    HashMap bounded — see §6.10)
+  - max_buffered_messages configurable (default 10, multi-bot 30) — per-thread / per-lane only
+  - max_batch_tokens soft cap on greedy drain (default 24000) — per-thread / per-lane only
   - Reactions: queued (👀) reaction on ALL messages in batch before dispatch (§6.7);
-    trailing message anchors StatusReactionController progress
+    applied sequentially (not parallel) to preserve message-ID order in the
+    Discord/Slack reaction list; trailing message anchors StatusReactionController progress
   - /cancel-all command + Dispatcher::cancel_buffered (uses generation field)
   - Tracing spans: buffer_wait_ms / agent_dispatch_ms / batch_size (§6.5)
   - SIGTERM: log per-thread buffered count before drop (§6.6)
   - Cross-agent recognition smoke fixture (Claude Code / Cursor / Copilot — Scenario D)
+  - SendError manual staging smoke entry (§6.11)
 
   Tests:
-    - single-message batch (batched mode == per-message for batch_size=1)
-    - 3-message fragmentation merges into one batch
-    - new message arrives mid-turn, joins next batch
-    - /cancel during batched turn does not drop buffer
+    - per-message mode: single-message dispatch, structurally equivalent to v0.8.2-beta.1
+      modulo §3 split-block layout
+    - per-thread mode: 3-message fragmentation merges into one batch
+    - per-thread mode: new message arrives mid-turn, joins next batch
+    - per-lane mode: two senders in same thread → two independent buffers, two
+      consumers, but serialized through shared connection mutex
+    - per-lane mode: dispatcher key shape is {platform}:{thread}:{sender}
+    - /cancel during a batched turn does not drop buffer
     - /cancel-all drops buffered messages and aborts consumer
     - SendError → evict + ❌ + ⚠️ + return Err
     - concurrent SendError → only one eviction; both observers react on own trigger
@@ -579,9 +618,10 @@ Phase 1 — Mechanism + T1 dispositions (single PR, Discord + Slack + Gateway)
     - oversized batch (cumulative tokens > cap) splits across two ACP turns; FIFO preserved
     - single message > max_batch_tokens dispatches alone; ACP error surfaces normally
     - voice-only Scenario D pack output
-    - queued reaction applied to all batch messages before dispatch
+    - queued reaction applied to all batch messages before dispatch (sequential)
     - Scenario B packing: image in separate message from text (same author) — structural adjacency preserved
     - Scenario C packing: multi-author interleaved batch — per-sender attribution preserved across non-adjacent messages
+    - per-mode idle timeout: PerMessage consumer evicts after 10s idle; per-thread/per-lane after 300s
 
 Phase 2 — Validation
   - Roll out to a single channel (e.g. dev sandbox)
@@ -592,10 +632,12 @@ Phase 2 — Validation
   - Per-channel config override ([discord.channels.<id>] for max_buffered_messages,
     message_processing_mode)
   - Gateway per-platform batching validation
+  - Per-thread vs per-lane comparison on multi-bot threads (which mode produces
+    cleaner ACP output for peer-bot interleaving)
 
 Phase 3 — Default flip (separate RFC if needed)
-  - Make `batched` the default mode
-  - Or: remove the mode flag entirely if no real-world reason to keep `per-message`
+  - Promote per-thread or per-lane to default (decision deferred to Phase 2 data)
+  - Or: keep per-message default if Phase 2 shows no real-world batching wins
 ```
 
 ### 4.5 Adapter integration pattern
@@ -715,7 +757,7 @@ HTTP request coalescing in proxies (Varnish, nginx) — same shape ("while one r
 - **Multi-message batches lower the ACP-turn count visible to ops.** `bot_turns` ingest counter (`slack.rs:672-696`) runs before the dispatcher, so per-message loop limits still fire correctly. The downstream "ACP turns" metric shifts to count batches; document it.
 - **`/cancel` cancels one ACP turn that may now contain multiple user messages.** Documented: "cancel current ACP work; buffered messages fire next." `/cancel-all` covers drop-on-cancel (Phase 1).
 - **§2.7 zombie blast radius widens under batching** until the dedicated follow-up lands. Phase 1 is no-worse-than-released (it does not amplify the bug, but does not fix the underlying `cleanup_idle.try_lock` skip either).
-- **Scenario D regression in non-batched mode.** STT voice transcripts move from prepended-before-`<sender_context>` to appended-after, changing the read order for single-message voice dispatches. Reversible via a special case if cross-agent smoke shows real disruption.
+- **Scenario D regression even in `per-message` mode.** STT voice transcripts move from prepended-before-`<sender_context>` to placed-between-delimiter-and-prompt, changing the read order for single-message voice dispatches. The change is structural (it affects all three modes — `per-message` included — because all share the §3 packing path). Reversible via a special case if cross-agent smoke shows real disruption.
 - **`{prompt}` empty case is structurally valid.** Voice-only / attachment-only messages produce an empty line between `</sender_context>` and the first attachment block. Agents that strictly validate "non-empty prompt" need to relax that assumption — but this is already the case for any voice-only message under today's format.
 - **Cross-agent recognition risk.** Multi-`<sender_context>` repetition is a new shape from the agent's perspective. Existing single-`<sender_context>` parsing should generalize naturally (it's just the same envelope opening twice), but Phase 1 includes a manual cross-agent smoke fixture against Claude Code, Cursor, and Copilot.
 - **Token-cost surface widens.** Each repetition re-emits the full `<sender_context>` JSON. For multi-bot channels with `max_buffered_messages = 30`, the per-batch envelope overhead is non-trivial. `max_batch_tokens` (default 24000) bounds total batch size — drain stops when either count or token cap fires, splitting only at message boundaries.
@@ -738,7 +780,7 @@ The rules below operationalize I3 (broker structural fidelity). Together they fo
 
 3. **No wrapper tags beyond `<sender_context>`.** Multi-message batches are produced by repeating the per-arrival template; no `<message>`, `<batch>`, or other wrapper schema is introduced. Future schema needs are extended as additive fields inside `<sender_context>` JSON, not as new XML tags.
 
-4. **Attachment attribution is structural via array position.** Broker must place each arrival event's `extra_blocks` immediately after that event's `<sender_context>` in the ContentBlock array, in the same order they were received from the platform adapter. No reordering, no deduplication, no cross-arrival re-attribution.
+4. **Attachment attribution is structural via array position.** Broker must place each arrival event's `extra_blocks` between that event's `<sender_context>` delimiter and the next event's `<sender_context>` delimiter (i.e. inside the same arrival event), in the same order they were received from the platform adapter. Within an arrival, Text `extra_blocks` precede `{prompt}` and non-Text `extra_blocks` follow `{prompt}` (§3.1). No reordering, no deduplication, no cross-arrival re-attribution.
 
    **Counter-examples (prohibited):** broker sorting `extra_blocks` by type (e.g. all images first, then transcripts); broker hoisting all images of a batch to a "gallery" section at the end; broker deduplicating two identical images sent in the same batch; broker re-attributing M2's image to M1 because M1 had text and M2 was image-only.
 
@@ -810,6 +852,8 @@ for msg in &batch {
 
 Applies to all batches including `batch.len() == 1` — the loop runs once for a single-message batch, making the reaction path uniform and removing the need for a separate `set_queued()` call in `StatusReactionController` for the single-message case. The reactions are fire-and-forget (`let _ =`); failures are silently ignored, same as existing reaction calls throughout the codebase. The 👀 reactions are not removed after dispatch — they serve as permanent "received" markers.
 
+**Sequential, not parallel.** The loop applies reactions one at a time (`for ... await`), not concurrently via `join_all`. Both Discord and Slack append reactions in the order the API receives them; parallel `join_all` would race-order the appends and produce visually inconsistent reaction-list ordering across the batch (M3's reaction may land before M1's in the API's view). The serial latency cost is bounded — each `add_reaction` is one HTTP round-trip (≤200ms typical), and a full burst-cap-30 batch is ≤6s — small relative to the ACP turn duration this is gating against.
+
 ### 6.8 Graceful shutdown
 
 On `SIGTERM`, `Dispatcher::shutdown()` iterates active threads and logs `thread_id=…, channel=…, adapter=…, buffered_lost=N` per thread before drop. `ThreadHandle` carries `channel_id: String` and `adapter_kind: String` (set at consumer-spawn time) so the shutdown log can identify which channel lost messages without iterating `BufferedMessage` contents.
@@ -838,7 +882,7 @@ Buffered state is in-memory only; pod restart loses it by design (no on-disk WAL
 
 ### 6.9 Scenario D smoke matrix (Phase 1 must-do)
 
-Cross-agent smoke verifies that agents correctly read transcript content after the ordering change (transcript moves from before `<sender_context>` to after).
+Cross-agent smoke verifies that agents correctly read transcript content after the ordering change (transcript moves from before `<sender_context>` to inside the arrival event, between the `<sender_context>` delimiter and `{prompt}`).
 
 **Prerequisites:** `stt.enabled = true`, `GROQ_API_KEY` set, Discord mobile to send voice messages (Discord desktop does not support voice message recording), `audio/ogg` MIME passing `media::is_audio_mime()`.
 
@@ -850,6 +894,48 @@ Cross-agent smoke verifies that agents correctly read transcript content after t
 | Copilot | Voice-only message in a thread → agent responds | Same as Claude Code voice-only |
 
 **Decision gate:** if any agent fails to reference transcript content, do not merge Phase 1. Apply the `extra_blocks.len() == 1 && prompt.is_empty()` escape hatch (§3.6 rollback), re-run the matrix. If still failing: hold Phase 1, file follow-up.
+
+### 6.10 Per-mode consumer idle timeout
+
+Each `Dispatcher` carries an `idle_timeout: Duration` chosen per `MessageProcessingMode` (§4.1). The consumer evicts itself when no message arrives within `idle_timeout`; eviction drops the `ThreadHandle` and closes the mpsc, after which the next `submit` lazily constructs a fresh handle through the same map-insert path used at first arrival.
+
+Two named constants:
+
+```rust
+pub const PER_MESSAGE_CONSUMER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_CONSUMER_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+```
+
+| Mode | Idle timeout | Rationale |
+|---|---|---|
+| `per-message` | 10s | The buffer is cap=1, so each consumer drains exactly one message per turn. Once the turn completes there is no batching window to preserve — keeping the consumer alive is pure overhead. A 10s timeout absorbs consecutive rapid-fire messages without the cost of repeatedly re-spawning the consumer task, while still freeing the slot quickly when the user goes idle. |
+| `per-thread` / `per-lane` | 300s | The buffer fills *during the turn* (I1) and the consumer needs to be there at turn completion to drain. After the turn, the consumer parks on `recv()` waiting for follow-up messages from the same thread / lane. Five minutes is long enough to absorb typical user-thinking-then-typing pauses while still bounding the idle resource footprint. |
+
+**Why not zero / one-shot for `per-message`.** A consumer-per-message lifecycle would re-spawn `tokio::Task` + re-allocate the handle on every arrival, doubling the dispatcher overhead per message. For rapid-fire bursts (the workload §1.1 documents) this is the wrong direction. 10s gives the consumer a chance to handle the burst as a sequence of cap=1 dispatches with one task spawn.
+
+**Why not 300s for `per-message`.** Per Little's Law (`L = λ × W`), an N-thread system at λ messages/min/thread × 5min idle window yields ~30× more idle consumer tasks than a 10s window. For batched modes the long window is paying for batching opportunity; for `per-message` it is paying for nothing.
+
+**Sweep eviction.** `Dispatcher::sweep_stale` runs periodically (called from `main.rs`) to evict consumers that have been idle past `idle_timeout`. This is required because lazy eviction (consumer self-times-out on `recv` and exits) only fires when the consumer is parked — for one-shot threads where a single message arrives and the user never returns, the consumer would otherwise live until the process exits. Sweep keeps the `per_thread` HashMap bounded at the cost of one synchronous lock + a HashMap iteration per tick.
+
+### 6.11 SendError manual staging smoke matrix (Phase 1 must-do)
+
+Automating an end-to-end SendError test is awkward because the failure path requires a panic inside a live consumer task — which is hard to inject deterministically in CI without making `dispatch.rs` test-flag-aware. SendError handling (§2.5) therefore validates via a manual staging smoke run; this section is the matrix that run uses.
+
+**Prerequisites:** staging deployment with `RUST_LOG=openab=debug` (so `dispatch` debug events show up); a thread the operator owns; ability to attach to the pod (`kubectl exec`) to send a `SIGUSR1`-style panic — or, alternatively, deploy a build that injects a one-shot panic via env var.
+
+| Step | Action | Pass criteria |
+|---|---|---|
+| 1 | Send M1 in a fresh thread; wait for the agent to start a turn (👀 reaction visible). | Consumer task is running, `<thread_key>` appears in `per_thread` map. |
+| 2 | While the turn is in flight, send M2 and M3. | Both arrivals get the 👀 reaction; both are in the consumer's mpsc buffer. |
+| 3 | Trigger a panic inside the consumer task (e.g. via injected one-shot panic, or `pkill` the agent process so `session_prompt` returns Err and the consumer panics). | Consumer task exits; the existing `<thread_key>` entry is now stale. |
+| 4 | Send M4 in the same thread. | M4's `submit` observes `SendError` and: (a) ❌ reaction lands on M4's trigger message; (b) `⚠️ {format_user_error}` text is sent to the channel; (c) the dispatcher map entry is evicted; (d) submit returns `Err`. |
+| 5 | Send M5 in the same thread. | A fresh consumer is lazily constructed under the same `<thread_key>`; M5 dispatches normally. M2 / M3 / M4 are not recovered (residual loss, §2.5). |
+| 6 | Trigger SendError concurrently from two messages (script that sends two messages in <50ms after the consumer has died). | Only one eviction happens (verify in `dispatch` debug logs). Both messages get their own ❌ + `⚠️` (anchored to their own `trigger_msg`). |
+
+**Decision gate:** all six rows must pass on staging before Phase 1 ships. Failures fall into two classes:
+
+- **(a)–(d) at step 4 partial fail** — e.g. ❌ lands but `⚠️` text doesn't, or eviction doesn't happen. Hold Phase 1, fix, re-run.
+- **Step 6 double-eviction** — eviction is supposed to be race-safe via the generation counter (§2.5). Hold Phase 1, debug the `per_thread` lock + generation field, re-run.
 
 ---
 
