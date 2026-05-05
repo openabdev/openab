@@ -8,34 +8,55 @@ OpenAB supports three message dispatch modes that control how incoming messages 
 
 Each message triggers its own ACP turn. This is the default behavior — simple, predictable, no batching. Existing deployments use this mode automatically without any configuration change.
 
-**Use when:**
-- Single-user threads (most common case)
-- Low message volume
-- You want the simplest mental model (1 message = 1 agent response)
+**Pros:**
+- Zero added latency — every message dispatches immediately
+- Simplest mental model (1 message = 1 agent response)
+- No configuration needed
+- No risk of messages being grouped with unrelated context
 
-**Trade-off:** If a user sends 3 messages quickly while the agent is processing, each becomes a separate turn — the agent sees them independently and responds 3 times.
+**Cons:**
+- Redundant context: if a user sends 3 messages quickly, the agent loads full context 3 times
+- Higher token cost under burst traffic (N messages = N full context windows)
+- Agent responds to each message independently — can't synthesize a coherent answer across rapid-fire messages
 
 ### `per-thread`
 
 All messages in a thread share one buffer. Messages that arrive while the agent is processing are batched into a single ACP turn at the next turn boundary.
 
-**Use when:**
-- High-traffic threads where multiple users address the bot simultaneously
-- You want to minimize token cost (one context window serves N messages)
-- The agent is expected to address all senders in a single reply
+**Pros:**
+- Lowest token cost — one context window serves N messages
+- Agent sees the full picture and can synthesize a single coherent response
+- Reduces "sorry I already answered that" noise from sequential turns
 
-**Trade-off:** If Alice and Bob both message in the same thread, they share one batch. The agent gets one turn to address both — if it only replies to Alice, Bob's message is effectively "silent-dropped" (delivered but not addressed).
+**Cons:**
+- Silent-drop risk: if Alice and Bob both message, the agent may only address Alice
+- Single response must cover all senders — harder for the agent to structure
+- Slight latency for messages 2..N (they wait for the current turn to finish)
 
 ### `per-lane`
 
 Each (thread, sender) pair gets its own buffer. Messages from the same sender batch together, but different senders get independent ACP turns.
 
-**Use when:**
-- Multi-user threads where each sender expects a dedicated response
-- Multi-agent collaboration (bot-to-bot threads)
-- You want batching benefits without silent-drop risk
+**Pros:**
+- No silent-drop risk — every sender gets their own dedicated turn and response
+- Same-sender batching still reduces redundant context (rapid-fire messages consolidated)
+- Best for multi-agent collaboration (each bot gets its own turn)
 
-**Trade-off:** More ACP turns than `per-thread` (one per active sender per turn boundary), so higher token cost. Turns serialize through the shared session — sender B waits for sender A's turn to complete.
+**Cons:**
+- Higher token cost than `per-thread` (one turn per active sender per boundary)
+- Turns serialize through the shared session — sender B waits for sender A's turn to complete
+- More complex to reason about (ordering depends on arrival time)
+
+## Comparison Table
+
+| | `per-message` | `per-thread` | `per-lane` |
+|---|---|---|---|
+| Token cost | Highest (N turns) | Lowest (1 turn) | Medium (1 per sender) |
+| Latency | Zero | Wait for turn boundary | Wait for turn boundary |
+| Silent-drop risk | None | Yes (multi-sender) | None |
+| Rapid-fire handling | Each separate | All batched | Same-sender batched |
+| Best for | Single user, low traffic | Cost-sensitive, single-reply | Multi-user, multi-bot |
+| Configuration | None (default) | Opt-in | Opt-in |
 
 ## Decision Guide
 
