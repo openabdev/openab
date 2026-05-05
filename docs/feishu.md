@@ -80,6 +80,7 @@ https://your-gateway-host/webhook/feishu
 | — | `FEISHU_ALLOW_BOTS` | `off` | Bot message handling: `off` / `mentions` / `all` |
 | — | `FEISHU_TRUSTED_BOT_IDS` | — | Comma-separated open_id list of known bots |
 | — | `FEISHU_MAX_BOT_TURNS` | `20` | Max consecutive bot replies per channel before suppression |
+| — | `FEISHU_SESSION_TTL_HOURS` | `24` | How long the bot remembers thread participation (hours). After expiry, @mention is required again. |
 | `gateway.botUsername` | — | — | Set to bot's `open_id` for @mention gating |
 | `gateway.streaming` | — | `false` | Enable streaming (typewriter) mode |
 
@@ -94,6 +95,14 @@ In group chats, the bot only responds when @mentioned (default). To find your bo
 2. Set `gateway.botUsername` to this value.
 
 To disable mention gating: `feishu.requireMention: false`.
+
+### Thread Participation (Involved Mode)
+
+Once the bot replies in a thread (topic), it remembers that thread and responds to subsequent messages **without requiring @mention** — similar to Discord's `allow_user_messages: "involved"` mode.
+
+- Only applies to threads (messages with `root_id`). Main channel messages always require @mention.
+- Participation is stored in memory. Gateway restart clears the cache; users need to @mention once to re-engage.
+- TTL controlled by `FEISHU_SESSION_TTL_HOURS` (default 24h). After expiry, @mention is required again.
 
 ## Security Notes
 
