@@ -104,8 +104,9 @@ pub async fn webhook(
                 if let Ok(r) = resp {
                     if !r.status().is_success() {
                         warn!(status = %r.status(), id = %msg.id, "failed to download LINE media");
-                    } else {
-                        // Issue #690 review fix: Check file size before downloading
+                        continue;
+                    }
+                    // Issue #690 review fix: Check file size before downloading
                         let content_length = r
                             .headers()
                             .get("content-length")

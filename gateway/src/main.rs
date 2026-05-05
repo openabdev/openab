@@ -265,6 +265,15 @@ async fn main() -> Result<()> {
     let public_url = std::env::var("GATEWAY_MEDIA_BASE_URL")
         .or_else(|_| std::env::var("GATEWAY_PUBLIC_URL"))
         .unwrap_or_else(|_| "http://localhost:8080".into());
+    
+    // Warn if public_url looks like a loopback address (Issue #690 review fix)
+    if public_url.contains("localhost") || public_url.contains("127.0.0.1") {
+        warn!(
+            public_url = %public_url,
+            "GATEWAY_PUBLIC_URL looks like a loopback address. Media attachments will not be reachable from other pods/containers. Set GATEWAY_PUBLIC_URL to the gateway's cluster-internal Service URL (e.g. http://openab-gateway:8080) or its external ingress URL."
+        );
+    }
+    
     let media_ttl = std::env::var("GATEWAY_MEDIA_STORE_TTL")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
