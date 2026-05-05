@@ -34,11 +34,13 @@ fn unix_to_iso8601(secs: u64, ms: u64) -> String {
 
 /// Convert a Slack `ts` string ("<unix_seconds>.<microseconds>") to ISO 8601 UTC.
 /// Best-effort; falls back to epoch on parse failure.
+///
+/// Parses as `f64` so the fractional part carries decimal semantics directly —
+/// ".12" maps to 120 ms, not 12 ms — without any string-padding gymnastics.
 pub fn slack_ts_to_iso8601(ts: &str) -> String {
-    let mut parts = ts.splitn(2, '.');
-    let secs = parts.next().unwrap_or("0").parse::<u64>().unwrap_or(0);
-    let frac = parts.next().unwrap_or("000");
-    let ms: u64 = frac.chars().take(3).collect::<String>().parse().unwrap_or(0);
+    let total = ts.parse::<f64>().unwrap_or(0.0);
+    let secs = total.trunc() as u64;
+    let ms = (total.fract() * 1000.0).round() as u64;
     unix_to_iso8601(secs, ms)
 }
 
@@ -68,6 +70,18 @@ mod tests {
     #[test]
     fn slack_ts_missing_fraction_uses_zero() {
         assert_eq!(slack_ts_to_iso8601("1714204397"), "2024-04-27T07:53:17.000Z");
+    }
+
+    #[test]
+    fn slack_ts_two_digit_fraction_is_120ms_not_12ms() {
+        // ".12" carries decimal semantics: 0.12 s = 120 ms.
+        assert_eq!(slack_ts_to_iso8601("1714204397.12"), "2024-04-27T07:53:17.120Z");
+    }
+
+    #[test]
+    fn slack_ts_one_digit_fraction_is_100ms_not_1ms() {
+        // ".1" carries decimal semantics: 0.1 s = 100 ms.
+        assert_eq!(slack_ts_to_iso8601("1714204397.1"), "2024-04-27T07:53:17.100Z");
     }
 
     #[test]
