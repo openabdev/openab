@@ -542,8 +542,9 @@ async fn build_attachment_blocks(
                 {
                     blocks.push(block);
                 } else {
+                    // Issue #690 review fix: Don't leak internal URL to LLM on failure
                     blocks.push(ContentBlock::Text {
-                        text: format!("[Image attachment URL]: {}", attachment.url),
+                        text: "[Image attachment failed to load]".to_string(),
                     });
                 }
             }

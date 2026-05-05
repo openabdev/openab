@@ -126,57 +126,74 @@ pub async fn webhook(
                         if !r.status().is_success() {
                             warn!(status = %r.status(), id = %file_id, "failed to download Telegram media");
                         } else {
-                            let mime = r
+                            // Issue #690 review fix: Check file size before downloading
+                            let content_length = r
                                 .headers()
-                                .get("content-type")
+                                .get("content-length")
                                 .and_then(|v| v.to_str().ok())
-                                .unwrap_or(if m_type == "image" {
-                                    "image/jpeg"
-                                } else {
-                                    "audio/ogg"
-                                })
-                                .to_string();
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .unwrap_or(0);
 
-                            if let Ok(data) = r.bytes().await {
-                                let uuid = uuid::Uuid::new_v4().to_string();
-                                let size = data.len() as u64;
-                                let proxied = {
-                                    let mut store =
-                                        state.media_store.lock().unwrap_or_else(|e| e.into_inner());
-                                    if store.len() >= state.media_max_entries {
-                                        warn!(
-                                            size = store.len(),
-                                            "media store full, skipping Telegram media proxy"
-                                        );
-                                        false
+                            if content_length > state.media_max_file_size {
+                                warn!(
+                                    size = content_length,
+                                    max = state.media_max_file_size,
+                                    id = %file_id,
+                                    "Telegram media too large, skipping"
+                                );
+                            } else {
+                                let mime = r
+                                    .headers()
+                                    .get("content-type")
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or(if m_type == "image" {
+                                        "image/jpeg"
                                     } else {
-                                        store.insert(
-                                            uuid.clone(),
-                                            (
-                                                data.to_vec(),
-                                                mime.clone(),
-                                                std::time::Instant::now(),
-                                            ),
-                                        );
-                                        true
+                                        "audio/ogg"
+                                    })
+                                    .to_string();
+
+                                if let Ok(data) = r.bytes().await {
+                                    let uuid = uuid::Uuid::new_v4().to_string();
+                                    let size = data.len() as u64;
+                                    let proxied = {
+                                        let mut store =
+                                            state.media_store.lock().unwrap_or_else(|e| e.into_inner());
+                                        if store.len() >= state.media_max_entries {
+                                            warn!(
+                                                size = store.len(),
+                                                "media store full, skipping Telegram media proxy"
+                                            );
+                                            false
+                                        } else {
+                                            store.insert(
+                                                uuid.clone(),
+                                                (
+                                                    data.to_vec(),
+                                                    mime.clone(),
+                                                    std::time::Instant::now(),
+                                                ),
+                                            );
+                                            true
+                                        }
+                                    };
+                                    if proxied {
+                                        attachments.push(Attachment {
+                                            attachment_type: m_type.into(),
+                                            url: format!("{}/media/{}", state.public_url, uuid),
+                                            mime_type: Some(mime),
+                                            filename: Some(format!(
+                                                "telegram-{}.{}",
+                                                file_id,
+                                                if m_type == "image" { "jpg" } else { "ogg" }
+                                            )),
+                                            size: Some(size),
+                                        });
+                                        if text.is_empty() {
+                                            text = format!("[{}]", m_type);
+                                        }
+                                        info!(id = %file_id, uuid = %uuid, "proxied Telegram inbound media");
                                     }
-                                };
-                                if proxied {
-                                    attachments.push(Attachment {
-                                        attachment_type: m_type.into(),
-                                        url: format!("{}/media/{}", state.public_url, uuid),
-                                        mime_type: Some(mime),
-                                        filename: Some(format!(
-                                            "telegram-{}.{}",
-                                            file_id,
-                                            if m_type == "image" { "jpg" } else { "ogg" }
-                                        )),
-                                        size: Some(size),
-                                    });
-                                    if text.is_empty() {
-                                        text = format!("[{}]", m_type);
-                                    }
-                                    info!(id = %file_id, uuid = %uuid, "proxied Telegram inbound media");
                                 }
                             }
                         }

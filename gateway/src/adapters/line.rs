@@ -105,6 +105,24 @@ pub async fn webhook(
                     if !r.status().is_success() {
                         warn!(status = %r.status(), id = %msg.id, "failed to download LINE media");
                     } else {
+                        // Issue #690 review fix: Check file size before downloading
+                        let content_length = r
+                            .headers()
+                            .get("content-length")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(0);
+
+                        if content_length > state.media_max_file_size {
+                            warn!(
+                                size = content_length,
+                                max = state.media_max_file_size,
+                                id = %msg.id,
+                                "LINE media too large, skipping"
+                            );
+                            continue;
+                        }
+
                         let mime = r
                             .headers()
                             .get("content-type")
@@ -161,9 +179,18 @@ pub async fn webhook(
                     }
                 }
             } else if msg.message_type != "text" {
+                // Issue #690 review fix: Warn when media message is dropped due to missing access_token
+                warn!(
+                    msg_type = %msg.message_type,
+                    "LINE media message dropped (access_token not configured)"
+                );
                 continue;
             }
         } else if msg.message_type != "text" {
+            warn!(
+                msg_type = %msg.message_type,
+                "LINE media message dropped (access_token not configured)"
+            );
             continue;
         }
 

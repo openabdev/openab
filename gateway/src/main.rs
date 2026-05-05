@@ -69,6 +69,8 @@ pub struct AppState {
     pub media_ttl: u64,
     /// Maximum number of entries in the media store
     pub media_max_entries: usize,
+    /// Maximum file size for media downloads (in bytes, Issue #690 review fix)
+    pub media_max_file_size: u64,
 }
 
 // --- WebSocket handler (OAB connects here) ---
@@ -136,7 +138,9 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                         // Rationale: This ensures agents don't need to track event IDs for simple replies.
                         // Note: reply_to is used by the LINE adapter to look up replyTokens; auto-filling
                         // allows LINE hybrid Reply/Push dispatch to work even if the agent omits reply_to.
-                        if reply.reply_to.is_empty() {
+                        // Issue #690 review fix: Only auto-fill if channel.id is non-empty to prevent
+                        // cross-channel contamination (e.g., LINE reply tokens used for wrong messages).
+                        if reply.reply_to.is_empty() && !reply.channel.id.is_empty() {
                             let last = last_event_id_for_recv.lock().await;
                             if let Some(eid) = last.get(&reply.channel.id) {
                                 reply.reply_to = eid.clone();
@@ -232,7 +236,11 @@ async fn media_handler(
         cache.get(&uuid).cloned()
     };
 
-    if let Some((data, mime, _)) = entry {
+    if let Some((data, mime, created_at)) = entry {
+        // Check TTL before serving (Issue #690 review fix)
+        if created_at.elapsed().as_secs() >= state.media_ttl {
+            return axum::http::StatusCode::NOT_FOUND.into_response();
+        }
         axum::response::Response::builder()
             .header("content-type", mime)
             .body(axum::body::Body::from(data))
@@ -265,6 +273,11 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(1000);
+    // Issue #690 review fix: per-file size limit to prevent OOM
+    let media_max_file_size = std::env::var("GATEWAY_MEDIA_MAX_FILE_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(10 * 1024 * 1024); // 10MB default
 
     if ws_token.is_none() {
         warn!("GATEWAY_WS_TOKEN not set — WebSocket connections are NOT authenticated (insecure)");
@@ -405,6 +418,7 @@ async fn main() -> Result<()> {
         public_url,
         media_ttl,
         media_max_entries,
+        media_max_file_size,
     });
 
     // Background task: sweep expired reply tokens every REPLY_TOKEN_TTL_SECS
