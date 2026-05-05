@@ -130,6 +130,39 @@ agents:
     #     storageClass: ""
     #     size: 1Gi
     #   image: "ghcr.io/openabdev/openab-cursor:latest"
+    # qwen:
+    #   command: qwen
+    #   args:
+    #     - --acp
+    #     - --yolo
+    #   discord:
+    #     enabled: true
+    #     allowedChannels:
+    #       - "YOUR_CHANNEL_ID"
+    #     allowedUsers: []
+    #     allowBotMessages: "off"
+    #     trustedBotIds: []
+    #   workingDir: /home/node
+    #   # Auth via OpenRouter — set OPENROUTER_API_KEY and mount ~/.qwen/settings.json
+    #   # See docs/qwen.md for the full settings.json template.
+    #   env: {}
+    #   envFrom: []
+    #   secretEnv:
+    #     - name: OPENROUTER_API_KEY
+    #       secretName: qwen-secrets
+    #       secretKey: OPENROUTER_API_KEY
+    #   pool:
+    #     maxSessions: 10
+    #     sessionTtlHours: 24
+    #   reactions:
+    #     enabled: true
+    #     removeAfterReply: false
+    #   persistence:
+    #     enabled: true
+    #     existingClaim: ""
+    #     storageClass: ""
+    #     size: 1Gi
+    #   image: "ghcr.io/openabdev/openab-qwen:latest"
     image: ""
     command: kiro-cli
     args:

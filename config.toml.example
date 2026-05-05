@@ -101,6 +101,18 @@ working_dir = "/home/agent"
 # working_dir = "/home/agent"
 # env = {}  # Auth via: kubectl exec -it <pod> -- cursor-agent login
 
+# [agent]
+# command = "qwen"
+# args = ["--acp", "--yolo"]
+# working_dir = "/home/node"
+# # Qwen Code uses ~/.qwen/settings.json for provider config.
+# # Auth via OpenRouter: set OPENROUTER_API_KEY env var and mount settings.json
+# # with baseUrl = "https://openrouter.ai/api/v1" and envKey = "OPENROUTER_API_KEY".
+# # See docs/qwen.md for the full settings.json template.
+# # ⚠️ Passing API keys via env is for LOCAL DEV ONLY. In K8s, use secretEnv
+# # (valueFrom.secretKeyRef) to avoid storing keys in plaintext config.
+# env = { OPENROUTER_API_KEY = "${OPENROUTER_API_KEY}" }
+
 [pool]
 max_sessions = 10
 session_ttl_hours = 24

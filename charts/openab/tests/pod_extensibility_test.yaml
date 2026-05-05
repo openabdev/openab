@@ -1,0 +1,109 @@
+suite: pod extensibility — extraInitContainers / extraVolumes / extraVolumeMounts
+templates:
+  - templates/deployment.yaml
+
+tests:
+  - it: renders extraInitContainers as initContainers on the pod
+    set:
+      agents.kiro.extraInitContainers:
+        - name: copy-qwen-settings
+          image: busybox:1.37
+          command: ["sh", "-c", "cp /src/settings.json /dst/settings.json"]
+          volumeMounts:
+            - name: qwen-config
+              mountPath: /src
+              readOnly: true
+            - name: qwen-data
+              mountPath: /dst
+    asserts:
+      - contains:
+          path: spec.template.spec.initContainers
+          content:
+            name: copy-qwen-settings
+            image: busybox:1.37
+            command: ["sh", "-c", "cp /src/settings.json /dst/settings.json"]
+            volumeMounts:
+              - name: qwen-config
+                mountPath: /src
+                readOnly: true
+              - name: qwen-data
+                mountPath: /dst
+
+  - it: renders extraVolumeMounts inside the agent container
+    set:
+      agents.kiro.extraVolumeMounts:
+        - name: qwen-data
+          mountPath: /home/node/.qwen
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: qwen-data
+            mountPath: /home/node/.qwen
+
+  - it: renders extraVolumes in the pod volumes list
+    set:
+      agents.kiro.extraVolumes:
+        - name: qwen-config
+          configMap:
+            name: qwen-settings
+        - name: qwen-data
+          emptyDir: {}
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: qwen-config
+            configMap:
+              name: qwen-settings
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: qwen-data
+            emptyDir: {}
+
+  - it: renders all three together (init container pattern for settings.json injection)
+    set:
+      agents.kiro.extraInitContainers:
+        - name: copy-qwen-settings
+          image: busybox:1.37
+          command: ["sh", "-c", "cp /qwen-config/settings.json /home/node/.qwen/settings.json"]
+          volumeMounts:
+            - name: qwen-config
+              mountPath: /qwen-config
+              readOnly: true
+            - name: qwen-data
+              mountPath: /home/node/.qwen
+      agents.kiro.extraVolumes:
+        - name: qwen-config
+          configMap:
+            name: qwen-settings
+        - name: qwen-data
+          emptyDir: {}
+      agents.kiro.extraVolumeMounts:
+        - name: qwen-data
+          mountPath: /home/node/.qwen
+    asserts:
+      - contains:
+          path: spec.template.spec.initContainers
+          content:
+            name: copy-qwen-settings
+            image: busybox:1.37
+            command: ["sh", "-c", "cp /qwen-config/settings.json /home/node/.qwen/settings.json"]
+            volumeMounts:
+              - name: qwen-config
+                mountPath: /qwen-config
+                readOnly: true
+              - name: qwen-data
+                mountPath: /home/node/.qwen
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: qwen-config
+            configMap:
+              name: qwen-settings
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: qwen-data
+            mountPath: /home/node/.qwen

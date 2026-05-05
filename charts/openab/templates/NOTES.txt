@@ -42,6 +42,13 @@ Agents deployed:
 {{- else if eq (toString $cfg.command) "cursor-agent" }}
     Authenticate:
     kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- cursor-agent login
+{{- else if eq (toString $cfg.command) "qwen" }}
+    Authenticate (OpenRouter):
+    1. Set OPENROUTER_API_KEY via secretEnv in Helm values
+    2. Write settings.json to the PVC (persists across restarts):
+    kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- sh -c 'mkdir -p ~/.qwen && cat > ~/.qwen/settings.json << EOF
+    {"modelProviders":{"openai":[{"id":"qwen/qwen3-coder","baseUrl":"https://openrouter.ai/api/v1","envKey":"OPENROUTER_API_KEY"}]},"security":{"auth":{"selectedType":"openai"}},"model":{"name":"qwen/qwen3-coder"}}
+    EOF'
 {{- end }}
 
     Restart after auth:

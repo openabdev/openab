@@ -20,6 +20,7 @@ jobs:
           - { dockerfile: Dockerfile.copilot, suffix: "-copilot", agent: "copilot", agent_args: "--acp" }
           - { dockerfile: Dockerfile.opencode, suffix: "-opencode", agent: "opencode", agent_args: "acp" }
           - { dockerfile: Dockerfile.cursor, suffix: "-cursor", agent: "cursor-agent", agent_args: "acp" }
+          - { dockerfile: Dockerfile.qwen, suffix: "-qwen", agent: "qwen", agent_args: "--acp" }
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

@@ -51,6 +51,7 @@ See individual agent docs for authentication steps:
 - [Claude Code](claude-code.md)
 - [Codex](codex.md)
 - [Gemini](gemini.md)
+- [Qwen Code](qwen.md)
 
 ## Bot-to-Bot Communication
 
