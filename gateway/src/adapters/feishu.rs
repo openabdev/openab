@@ -68,6 +68,20 @@ pub enum AllowBots {
     All,
 }
 
+/// Controls when the bot responds without @mention in threads.
+/// Mirrors Discord's `allow_user_messages` setting.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum AllowUsers {
+    /// Bot responds in threads it has participated in without @mention.
+    #[default]
+    Involved,
+    /// Always require @mention, even in participated threads.
+    Mentions,
+    /// Like Involved, but if another bot has also posted in the thread,
+    /// require @mention to avoid all bots responding.
+    MultibotMentions,
+}
+
 #[derive(Debug, Clone)]
 pub struct FeishuConfig {
     pub app_id: String,
@@ -81,6 +95,7 @@ pub struct FeishuConfig {
     pub allowed_users: Vec<String>,
     pub require_mention: bool,
     pub allow_bots: AllowBots,
+    pub allow_user_messages: AllowUsers,
     pub trusted_bot_ids: Vec<String>,
     pub max_bot_turns: u32,
     pub dedupe_ttl_secs: u64,
@@ -130,6 +145,16 @@ impl FeishuConfig {
             _ => AllowBots::Off,
         };
         let trusted_bot_ids = parse_csv("FEISHU_TRUSTED_BOT_IDS");
+        let allow_user_messages = match std::env::var("FEISHU_ALLOW_USER_MESSAGES")
+            .unwrap_or_else(|_| "involved".into())
+            .to_lowercase()
+            .replace('-', "_")
+            .as_str()
+        {
+            "mentions" => AllowUsers::Mentions,
+            "multibot_mentions" => AllowUsers::MultibotMentions,
+            _ => AllowUsers::Involved,
+        };
         let max_bot_turns = std::env::var("FEISHU_MAX_BOT_TURNS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -160,6 +185,7 @@ impl FeishuConfig {
             allowed_users,
             require_mention,
             allow_bots,
+            allow_user_messages,
             trusted_bot_ids,
             max_bot_turns,
             dedupe_ttl_secs,
@@ -649,6 +675,9 @@ pub struct FeishuAdapter {
     /// When bot has replied in a thread, subsequent messages in that thread
     /// bypass @mention gating (like Discord's "involved" mode).
     pub participated_threads: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    /// Positive-only cache: thread_id → first_seen for threads where other bots
+    /// have posted. Used by multibot-mentions mode to require @mention.
+    pub multibot_threads: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
     pub client: reqwest::Client,
 }
 
@@ -666,6 +695,7 @@ impl FeishuAdapter {
             name_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             bot_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
             participated_threads: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            multibot_threads: Arc::new(std::sync::Mutex::new(HashMap::new())),
             client: reqwest::Client::new(),
         }
     }
@@ -760,6 +790,7 @@ pub async fn start_websocket(
     let name_cache = adapter.name_cache.clone();
     let bot_turns = adapter.bot_turns.clone();
     let participated_threads = adapter.participated_threads.clone();
+    let multibot_threads = adapter.multibot_threads.clone();
 
     let handle = tokio::spawn(async move {
         let mut backoff_secs = 1u64;
@@ -775,6 +806,7 @@ pub async fn start_websocket(
                 &name_cache,
                 &bot_turns,
                 &participated_threads,
+                &multibot_threads,
             )
             .await;
 
@@ -816,6 +848,7 @@ async fn ws_connect_loop(
     name_cache: &Arc<std::sync::Mutex<HashMap<String, String>>>,
     bot_turns: &Arc<std::sync::Mutex<HashMap<String, u32>>>,
     participated_threads: &Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    multibot_threads: &Arc<std::sync::Mutex<HashMap<String, Instant>>>,
 ) -> anyhow::Result<()> {
     let api_base = config.api_base();
 
@@ -843,7 +876,7 @@ async fn ws_connect_loop(
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
                         handle_ws_message(
                             &text, bot_open_id_store, dedupe, config, event_tx,
-                            name_cache, token_cache, client, bot_turns, participated_threads,
+                            name_cache, token_cache, client, bot_turns, participated_threads, multibot_threads,
                         ).await;
                     }
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data))) => {
@@ -864,7 +897,7 @@ async fn ws_connect_loop(
                                         if let Ok(text) = String::from_utf8(payload.clone()) {
                                             handle_ws_message(
                                                 &text, bot_open_id_store, dedupe, config, event_tx,
-                                                name_cache, token_cache, client, bot_turns, participated_threads,
+                                                name_cache, token_cache, client, bot_turns, participated_threads, multibot_threads,
                                             ).await;
                                         }
                                     }
@@ -905,6 +938,7 @@ async fn handle_ws_message(
     client: &reqwest::Client,
     bot_turns: &Arc<std::sync::Mutex<HashMap<String, u32>>>,
     participated_threads: &Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    multibot_threads: &Arc<std::sync::Mutex<HashMap<String, Instant>>>,
 ) {
     let envelope: FeishuEventEnvelope = match serde_json::from_str(text) {
         Ok(e) => e,
@@ -940,10 +974,86 @@ async fn handle_ws_message(
     let bot_id = bot_open_id_store.read().await;
     let bot_id_ref = bot_id.as_deref();
 
-    // Check if the message is in a thread where bot has previously replied
-    let is_thread_participated = check_thread_participated(
+    // Check if the message is in a thread where bot has previously replied,
+    // respecting the allow_user_messages mode:
+    // - Involved (default): bypass @mention if participated
+    // - MultibotMentions: bypass only if participated AND no other bot in thread
+    // - Mentions: never bypass
+    let thread_id_for_check = envelope
+        .event
+        .as_ref()
+        .and_then(|e| e.message.as_ref())
+        .and_then(|m| m.root_id.as_deref().or(m.parent_id.as_deref()));
+
+    // Early multibot detection (before participation check): if a message in a
+    // thread @mentions another bot, mark the thread as multibot immediately.
+    // Only check threads where this bot has participated — no point marking
+    // threads we haven't joined yet (we wouldn't respond anyway).
+    // Detection strategy:
+    //   1. If FEISHU_TRUSTED_BOT_IDS is configured → exact match (explicit)
+    //   2. Otherwise → infer: any @mention that is not self and not in allowed_users
+    //      is assumed to be another bot. This works because in a controlled group,
+    //      allowed_users lists the humans; anything else is likely a bot.
+    // This avoids requiring users to discover per-app open_ids for other bots.
+    let self_participated = check_thread_participated(
         &envelope, participated_threads, config.session_ttl_secs,
     );
+    if let Some(tid) = thread_id_for_check {
+        if self_participated {
+            let mentions = envelope
+                .event
+                .as_ref()
+                .and_then(|e| e.message.as_ref())
+                .and_then(|m| m.mentions.as_ref());
+            if let Some(mention_list) = mentions {
+                let bot_self_id = bot_id_ref.unwrap_or("");
+                let mention_ids: Vec<_> = mention_list.iter().filter_map(|m| {
+                    m.id.as_ref().and_then(|id| id.open_id.as_deref())
+                }).collect();
+
+                let mentions_other_bot = if !config.trusted_bot_ids.is_empty() {
+                    mention_ids.iter().any(|oid| {
+                        config.trusted_bot_ids.iter().any(|bid| bid == oid)
+                    })
+                } else if !config.allowed_users.is_empty() {
+                    mention_ids.iter().any(|oid| {
+                        *oid != bot_self_id && !config.allowed_users.iter().any(|u| u == oid)
+                    })
+                } else {
+                    false
+                };
+
+                if mentions_other_bot {
+                    info!(thread_id = %tid, "multibot thread detected via @mention");
+                    // Intentionally recover from poisoned mutex
+                    let mut cache = multibot_threads.lock().unwrap_or_else(|e| e.into_inner());
+                    cache.entry(tid.to_string()).or_insert_with(Instant::now);
+                    // Evict expired entries if over capacity
+                    if cache.len() > PARTICIPATION_CACHE_MAX {
+                        cache.retain(|_, ts| ts.elapsed().as_secs() < config.session_ttl_secs);
+                    }
+                }
+            }
+        }
+    }
+
+    let is_thread_participated = match config.allow_user_messages {
+        AllowUsers::Mentions => false,
+        AllowUsers::Involved => self_participated,
+        AllowUsers::MultibotMentions => {
+            if !self_participated {
+                false
+            } else {
+                // Already participated; check if thread is multibot
+                thread_id_for_check
+                    .map(|tid| {
+                        let cache = multibot_threads.lock().unwrap_or_else(|e| e.into_inner());
+                        !cache.get(tid).is_some_and(|ts| ts.elapsed().as_secs() < config.session_ttl_secs)
+                    })
+                    .unwrap_or(true) // no thread_id → not multibot → allow
+            }
+        }
+    };
 
     if let Some((mut gateway_event, media_refs)) = parse_message_event(&envelope, bot_id_ref, config, is_thread_participated) {
         // Also dedupe by message_id
@@ -967,6 +1077,8 @@ async fn handle_ws_message(
                     );
                     return;
                 }
+                // (Feishu doesn't push bot messages to other bots' WebSocket,
+                // so multibot detection is done via mentions instead — see below.)
             } else {
                 // Human message resets bot turn counter
                 turns.remove(channel_id.as_str());
@@ -2104,10 +2216,64 @@ pub async fn webhook(
     let bot_id = feishu.bot_open_id.read().await;
     let bot_id_ref = bot_id.as_deref();
 
-    // Check participated threads for mention bypass
-    let is_thread_participated = check_thread_participated(
+    // Check participated threads for mention bypass (respects allow_user_messages mode)
+    let self_participated = check_thread_participated(
         &envelope, &feishu.participated_threads, feishu.config.session_ttl_secs,
     );
+
+    // Early multibot detection (same logic as WebSocket path)
+    let thread_id_for_check = envelope
+        .event
+        .as_ref()
+        .and_then(|e| e.message.as_ref())
+        .and_then(|m| m.root_id.as_deref().or(m.parent_id.as_deref()));
+
+    if let Some(tid) = thread_id_for_check {
+        if self_participated {
+            let mentions = envelope
+                .event
+                .as_ref()
+                .and_then(|e| e.message.as_ref())
+                .and_then(|m| m.mentions.as_ref());
+            if let Some(mention_list) = mentions {
+                let bot_self_id = bot_id_ref.unwrap_or("");
+                let mention_ids: Vec<_> = mention_list.iter().filter_map(|m| {
+                    m.id.as_ref().and_then(|id| id.open_id.as_deref())
+                }).collect();
+                let mentions_other_bot = if !feishu.config.trusted_bot_ids.is_empty() {
+                    mention_ids.iter().any(|oid| feishu.config.trusted_bot_ids.iter().any(|bid| bid == oid))
+                } else if !feishu.config.allowed_users.is_empty() {
+                    mention_ids.iter().any(|oid| *oid != bot_self_id && !feishu.config.allowed_users.iter().any(|u| u == oid))
+                } else {
+                    false
+                };
+                if mentions_other_bot {
+                    let mut cache = feishu.multibot_threads.lock().unwrap_or_else(|e| e.into_inner());
+                    cache.entry(tid.to_string()).or_insert_with(Instant::now);
+                    if cache.len() > PARTICIPATION_CACHE_MAX {
+                        cache.retain(|_, ts| ts.elapsed().as_secs() < feishu.config.session_ttl_secs);
+                    }
+                }
+            }
+        }
+    }
+
+    let is_thread_participated = match feishu.config.allow_user_messages {
+        AllowUsers::Mentions => false,
+        AllowUsers::Involved => self_participated,
+        AllowUsers::MultibotMentions => {
+            if !self_participated {
+                false
+            } else {
+                thread_id_for_check
+                    .map(|tid| {
+                        let cache = feishu.multibot_threads.lock().unwrap_or_else(|e| e.into_inner());
+                        !cache.get(tid).is_some_and(|ts| ts.elapsed().as_secs() < feishu.config.session_ttl_secs)
+                    })
+                    .unwrap_or(true)
+            }
+        }
+    };
 
     if let Some((mut gateway_event, media_refs)) = parse_message_event(&envelope, bot_id_ref, &feishu.config, is_thread_participated) {
         if !feishu.dedupe.is_duplicate(&gateway_event.message_id) {
@@ -2179,6 +2345,7 @@ mod tests {
             allowed_users: vec![],
             require_mention: true,
             allow_bots: AllowBots::Off,
+            allow_user_messages: AllowUsers::Involved,
             trusted_bot_ids: vec![],
             max_bot_turns: 20,
             dedupe_ttl_secs: 300,
@@ -2773,5 +2940,39 @@ mod tests {
         }
         // After eviction, should be roughly half
         assert!(cache.lock().unwrap().len() <= PARTICIPATION_CACHE_MAX);
+    }
+
+    // --- Multibot-mentions mode tests ---
+
+    #[test]
+    fn multibot_mentions_mode_bypasses_when_single_bot() {
+        let mut cfg = test_config();
+        cfg.allow_user_messages = AllowUsers::MultibotMentions;
+        let mut env = make_envelope("group", "Hello", "ou_user1", None);
+        env.event.as_mut().unwrap().message.as_mut().unwrap().root_id = Some("root_456".into());
+        // participated + no other bot → bypass (is_thread_participated=true)
+        let result = parse_message_event(&env, Some("ou_bot"), &cfg, true);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn multibot_mentions_mode_requires_mention_when_not_participated() {
+        let mut cfg = test_config();
+        cfg.allow_user_messages = AllowUsers::MultibotMentions;
+        let mut env = make_envelope("group", "Hello", "ou_user1", None);
+        env.event.as_mut().unwrap().message.as_mut().unwrap().root_id = Some("root_456".into());
+        // not participated → require @mention (is_thread_participated=false)
+        assert!(parse_message_event(&env, Some("ou_bot"), &cfg, false).is_none());
+    }
+
+    #[test]
+    fn mentions_mode_never_bypasses() {
+        let mut cfg = test_config();
+        cfg.allow_user_messages = AllowUsers::Mentions;
+        let mut env = make_envelope("group", "Hello", "ou_user1", None);
+        env.event.as_mut().unwrap().message.as_mut().unwrap().root_id = Some("root_789".into());
+        // Even with is_thread_participated=true, Mentions mode never bypasses
+        // (caller would pass false because Mentions mode always returns false)
+        assert!(parse_message_event(&env, Some("ou_bot"), &cfg, false).is_none());
     }
 }

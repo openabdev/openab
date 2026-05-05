@@ -81,6 +81,7 @@ https://your-gateway-host/webhook/feishu
 | — | `FEISHU_TRUSTED_BOT_IDS` | — | Comma-separated open_id list of known bots |
 | — | `FEISHU_MAX_BOT_TURNS` | `20` | Max consecutive bot replies per channel before suppression |
 | — | `FEISHU_SESSION_TTL_HOURS` | `24` | How long the bot remembers thread participation (hours). After expiry, @mention is required again. |
+| — | `FEISHU_ALLOW_USER_MESSAGES` | `involved` | Thread response mode: `involved` / `mentions` / `multibot-mentions`. See below. |
 | `gateway.botUsername` | — | — | Set to bot's `open_id` for @mention gating |
 | `gateway.streaming` | — | `false` | Enable streaming (typewriter) mode |
 
@@ -103,6 +104,24 @@ Once the bot replies in a thread (topic), it remembers that thread and responds 
 - Only applies to threads (messages with `root_id`). Main channel messages always require @mention.
 - Participation is stored in memory. Gateway restart clears the cache; users need to @mention once to re-engage.
 - TTL controlled by `FEISHU_SESSION_TTL_HOURS` (default 24h). After expiry, @mention is required again.
+
+### Multi-Bot Threads (multibot-mentions Mode)
+
+When `FEISHU_ALLOW_USER_MESSAGES=multibot-mentions`, the bot detects when another bot is @mentioned in a participated thread and reverts to requiring @mention — preventing all bots from responding simultaneously.
+
+| Mode | Behavior |
+|------|----------|
+| `involved` (default) | Bot responds in participated threads without @mention. All participated bots respond. |
+| `multibot-mentions` | Same as `involved`, but once another bot is @mentioned in the thread, require @mention for all bots. |
+| `mentions` | Always require @mention, even in participated threads. |
+
+**Multi-bot detection** (how the gateway identifies "another bot"):
+
+1. If `FEISHU_TRUSTED_BOT_IDS` is set → exact match against configured IDs
+2. If only `FEISHU_ALLOWED_USERS` is set → any @mention that is not self and not in allowed_users is inferred as another bot (recommended, zero-config)
+3. If neither is set → no multibot detection
+
+Note: Detection only triggers in threads where the bot has already participated. This prevents premature marking of threads the bot hasn't joined.
 
 ## Security Notes
 
