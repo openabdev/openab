@@ -118,7 +118,6 @@ pub async fn webhook(
         if let Ok(resp) = client.get(url).send().await {
             if !resp.status().is_success() {
                 warn!(status = %resp.status(), id = %file_id, "Telegram getFile failed");
-                continue;
             } else if let Ok(body) = resp.json::<serde_json::Value>().await {
                 if let Some(file_path) = body["result"]["file_path"].as_str() {
                     // 2. Download the file
@@ -126,9 +125,8 @@ pub async fn webhook(
                     if let Ok(r) = client.get(download_url).send().await {
                         if !r.status().is_success() {
                             warn!(status = %r.status(), id = %file_id, "failed to download Telegram media");
-                            continue;
-                        }
-                        // Issue #690 review fix: Check file size before downloading
+                        } else {
+                            // Issue #690 review fix: Check file size before downloading
                             let content_length = r
                                 .headers()
                                 .get("content-length")
