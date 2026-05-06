@@ -4,7 +4,7 @@
 - **Date:** 2026-04-29
 - **Author:** @brettchien
 - **Tracking issue:** [#580](https://github.com/openabdev/openab/issues/580) — kept as historical discussion record
-- **Implementation PR:** [#686](https://github.com/openabdev/openab/pull/686) (Phase 1 wiring; this ADR documents the design it lands)
+- **Implementation PR:** [#686](https://github.com/openabdev/openab/pull/686) (Phase 1 wiring; the ADR documents the design that PR implements)
 - **Related:** [#78](https://github.com/openabdev/openab/issues/78) (Session Management — precondition), [#58](https://github.com/openabdev/openab/issues/58) (per-connection locking — precondition), [#307](https://github.com/openabdev/openab/issues/307) (cross-session blocking — adjacent symptom of §2.7)
 - **Anchor pinning:**
   - **Released-code anchors (file:line) — pinned to v0.8.2-beta.1** ([`52052b8`](https://github.com/openabdev/openab/commit/52052b8b104a85a7073dd6ae99eeb9f2fd331abe)). All `acp/connection.rs:NNN`, `acp/pool.rs:NNN`, `adapter.rs:NNN`, `discord.rs:NNN`, `slack.rs:NNN` references resolve at this SHA. They will drift against later commits — that's expected; the ADR documents the *design* relative to a stable base, not a moving target.
@@ -360,7 +360,7 @@ For a single-message dispatch (`batch.len() == 1`) the minimum is two blocks: de
 | Source | Value |
 |---|---|
 | Discord adapter | `msg.timestamp` (serenity 0.12 `Timestamp`, RFC 3339 by default) |
-| Slack adapter | `slack_ts_to_iso8601(event.ts)` — converts epoch-seconds-with-fractional to ISO 8601 with millisecond precision |
+| Slack adapter | `slack_ts_to_iso8601(event.ts)` (proposed helper) — converts epoch-seconds-with-fractional to ISO 8601 with millisecond precision |
 | Gateway adapter | `chrono::Utc::now().to_rfc3339()` at receive time — best-effort for non-Discord/Slack channels; documented as approximate |
 
 `schema` stays `openab.sender.v1` — the field is additive and existing parsers keep working. Two purposes:
@@ -788,6 +788,8 @@ The rules below operationalize I3 (broker structural fidelity). Together they fo
 
 1. **Broker forwards `{prompt}` verbatim.** Broker must not parse, classify, transform, summarize, or annotate the user-supplied text content within `{prompt}`. Any future feature that needs to inspect `{prompt}` content must do so without mutating what the agent receives.
 
+   *Note: Adapter-level preprocessing that runs before `{prompt}` is constructed (e.g. `resolve_mentions()` in `discord.rs`) is not subject to this rule. This rule applies to the broker/dispatcher layer — i.e. from `Dispatcher::submit` onward.*
+
    **Counter-examples (prohibited):** broker stripping markdown formatting before dispatch; broker expanding Discord `<@123>` mentions to `@username` strings; broker appending an `[image attached]` string when an image accompanies the prompt; broker collapsing repeated whitespace; broker normalizing Unicode forms.
 
 2. **No banners or framing strings.** Broker must not inject any leading or trailing instruction text into the dispatched batch (e.g. no `[Batched: N messages…]`, no `[End of batch]`). All metadata lives in `<sender_context>` JSON.
@@ -804,7 +806,7 @@ The rules below operationalize I3 (broker structural fidelity). Together they fo
 
 7. **Splitting only at message boundaries.** When the token-budget cap (`max_batch_tokens`) forces a batch to split across multiple ACP turns, the split must occur between two arrival events — never inside a single arrival event. A single oversized message dispatches alone; the broker does not truncate or summarize it.
 
-8. **No silent failure on consumer death.** When `submit` observes `SendError` (consumer task death), the failure must surface as ❌ on `msg.trigger_msg` **and** `⚠️ {format_user_error}` text in the channel **and** `Err` propagated to the caller. Already-enqueued messages whose `submit` already returned `Ok` are residual loss equivalent to a pod restart mid-turn (documented; out of Phase 1 scope to recover). Messages in the consumer's in-flight batch at the time of the panic are also residual loss — their `submit` already returned `Ok` before the consumer died, so they cannot be reacted from the `SendError` path.
+8. **No silent failure on consumer death (retry-failed case).** When `submit` observes `SendError` (consumer task death), it first attempts a transparent retry — evict the dead consumer, spawn a fresh one, and re-send (§2.5). The first `SendError` is absorbed silently because the dominant cause is the benign first-message-after-idle race. Only when the **retry also fails** must the failure surface as ❌ on `msg.trigger_msg` **and** `⚠️ {format_user_error}` text in the channel **and** `Err` propagated to the caller. Already-enqueued messages whose `submit` already returned `Ok` are residual loss equivalent to a pod restart mid-turn (documented; out of Phase 1 scope to recover). Messages in the consumer's in-flight batch at the time of the panic are also residual loss — their `submit` already returned `Ok` before the consumer died, so they cannot be reacted from the `SendError` path.
 
 9. **`bot_turns` runs at ingest, not at dispatch.** Multi-bot loop guards (`slack.rs:672-696`) execute before `submit`; batching is downstream and cannot bypass them. Bot-turn-limit counts batches as turns (one ACP invocation = one logical turn); the per-message ingest counter is unchanged.
 
@@ -848,7 +850,7 @@ info_span!("dispatch", channel = %channel_id, adapter = "discord")
 
 Per-event metrics fold into the per-dispatch line as array fields → log line count = dispatch count, independent of batch size.
 
-**Threshold for dedup re-evaluation:** when `p95_batch_size × avg_tokens_per_event > 500 tokens` (used as a rough proxy for per-dispatch `<sender_context>` envelope overhead) on any production channel for a sustained 24h window, the broker team must re-open the dedup question (e.g. emit `<sender_context>` only when sender or timestamp delta changes). Below that threshold the envelope cost is below noise and the readability win of always-explicit headers wins.
+**Threshold for dedup re-evaluation:** when `p95_batch_size (count) × avg_tokens_per_event (tokens) > 500 tokens` of per-dispatch `<sender_context>` envelope overhead on any production channel for a sustained 24h window, the broker team must re-open the dedup question (e.g. emit `<sender_context>` only when sender or timestamp delta changes). Below that threshold the envelope cost is below noise and the readability win of always-explicit headers wins.
 
 **Phase 1 acceptance test (masami #1):** after Phase 1 lands and is deployed to a test channel, send a 3-message batch and verify the single `info!` line carries `events_per_dispatch = 3`, `packed_block_count = N`, `agent_dispatch_ms = N`, `tokens_per_event = [t1, t2, t3]`, `wait_ms = [w1, w2, w3]`. If any field is missing or events are split across multiple log lines, Phase 1 does not merge.
 
