@@ -107,28 +107,28 @@ working_dir = "/home/agent"
 [agent]
 command = "claude"
 args = ["--acp"]
-working_dir = "/home/agent"
+working_dir = "/home/node"
 env = { ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}" }
 
 # Codex
 [agent]
 command = "codex"
 args = ["--acp"]
-working_dir = "/home/agent"
+working_dir = "/home/node"
 env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
 
 # Gemini CLI
 [agent]
 command = "gemini"
 args = ["--acp"]
-working_dir = "/home/agent"
+working_dir = "/home/node"
 env = { GEMINI_API_KEY = "${GEMINI_API_KEY}" }
 
 # GitHub Copilot
 [agent]
 command = "copilot"
 args = ["--acp", "--stdio"]
-working_dir = "/home/agent"
+working_dir = "/home/node"
 
 # opencode
 [agent]

@@ -53,7 +53,7 @@ working_dir = "/home/agent"
 # [agent]
 # command = "claude"
 # args = ["--acp"]
-# working_dir = "/home/agent"
+# working_dir = "/home/node"
 # ⚠️ SECURITY WARNING: Any env var listed here is accessible to the agent.
 # A user could trick the agent into leaking these values via prompt injection.
 # All supported backends support OAuth login — prefer that over env var API keys.
@@ -71,19 +71,19 @@ working_dir = "/home/agent"
 # [agent]
 # command = "codex"
 # args = ["--acp"]
-# working_dir = "/home/agent"
+# working_dir = "/home/node"
 # env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
 
 # [agent]
 # command = "gemini"
 # args = ["--acp"]
-# working_dir = "/home/agent"
+# working_dir = "/home/node"
 # env = { GEMINI_API_KEY = "${GEMINI_API_KEY}" }
 
 # [agent]
 # command = "copilot"
 # args = ["--acp", "--stdio"]
-# working_dir = "/home/agent"
+# working_dir = "/home/node"
 # env = {}  # Auth via: kubectl exec -it <pod> -- gh auth login -p https -w
 
 # [agent]
