@@ -49,6 +49,8 @@ Follow the device code flow in your browser, then restart the pod:
 kubectl rollout restart deployment/openab-codex
 ```
 
+> **Note**: See [gh-auth-device-flow.md](gh-auth-device-flow.md) for `gh` device flow in headless containers and pods.
+
 ### Persisted Paths (PVC)
 
 | Path | Contents |
