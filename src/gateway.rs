@@ -503,6 +503,7 @@ pub async fn run_gateway_adapter(
     let bot_username = params.bot_username;
     let allow_all_channels = params.allow_all_channels;
     let allowed_channels = params.allowed_channels;
+    let allow_all_users = params.allow_all_users;
     let allowed_users = params.allowed_users;
     let streaming = params.streaming;
     let stt = params.stt;
@@ -670,6 +671,25 @@ pub async fn run_gateway_adapter(
                                                     extra_blocks.push(ContentBlock::Text {
                                                         text: format!("```{}\n{}\n```", att.filename, text),
                                                     });
+                                                }
+                                            }
+                                            "audio" => {
+                                                if stt.enabled {
+                                                    use base64::Engine;
+                                                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&att.data) {
+                                                        let client = reqwest::Client::new();
+                                                        if let Some(text) = crate::stt::transcribe(
+                                                            &client,
+                                                            &stt,
+                                                            bytes,
+                                                            att.filename.clone(),
+                                                            &att.mime_type
+                                                        ).await {
+                                                            extra_blocks.push(ContentBlock::Text {
+                                                                text: format!("[Audio: {}]", text),
+                                                            });
+                                                        }
+                                                    }
                                                 }
                                             }
                                             _ => {}
