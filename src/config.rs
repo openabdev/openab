@@ -313,6 +313,12 @@ pub struct PoolConfig {
     pub max_sessions: usize,
     #[serde(default = "default_ttl_hours")]
     pub session_ttl_hours: u64,
+    /// Hard ceiling for a single prompt (#732). Once exceeded, the broker
+    /// abandons the in-flight request, sends `session/cancel` to the agent,
+    /// and clears the pending entry so late responses cannot leak into the
+    /// next prompt's subscriber.
+    #[serde(default = "default_prompt_hard_timeout_secs")]
+    pub prompt_hard_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -434,6 +440,9 @@ fn default_max_sessions() -> usize {
 fn default_ttl_hours() -> u64 {
     4
 }
+pub(crate) fn default_prompt_hard_timeout_secs() -> u64 {
+    30 * 60
+}
 fn default_true() -> bool {
     true
 }
@@ -481,6 +490,7 @@ impl Default for PoolConfig {
         Self {
             max_sessions: default_max_sessions(),
             session_ttl_hours: default_ttl_hours(),
+            prompt_hard_timeout_secs: default_prompt_hard_timeout_secs(),
         }
     }
 }

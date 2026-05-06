@@ -104,6 +104,8 @@ working_dir = "/home/agent"
 [pool]
 max_sessions = 10
 session_ttl_hours = 24
+# Hard ceiling (sec) per prompt; see #732. Default: 1800 (30 min).
+# prompt_hard_timeout_secs = 1800
 
 [markdown]
 tables = "code"  # "code" (default) | "bullets" | "off"

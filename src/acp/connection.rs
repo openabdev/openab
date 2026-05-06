@@ -557,6 +557,24 @@ impl AcpConnection {
         self.last_active = Instant::now();
     }
 
+    /// Drop the pending entry for `request_id` and best-effort send
+    /// `session/cancel`. Errors are swallowed: the agent process may already
+    /// be dead, in which case the stdin write fails harmlessly. See #732.
+    pub async fn abandon_request(&self, request_id: u64) {
+        self.pending.lock().await.remove(&request_id);
+        let Some(session_id) = self.acp_session_id.as_deref() else {
+            return;
+        };
+        let req = json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": {"sessionId": session_id},
+        });
+        if let Ok(data) = serde_json::to_string(&req) {
+            let _ = self.send_raw(&data).await;
+        }
+    }
+
     /// Return a clone of the stdin handle for lock-free cancel.
     pub fn cancel_handle(&self) -> Arc<Mutex<ChildStdin>> {
         Arc::clone(&self.stdin)

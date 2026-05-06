@@ -147,6 +147,7 @@ async fn main() -> anyhow::Result<()> {
         pool.clone(),
         cfg.reactions,
         cfg.markdown.tables,
+        cfg.pool.prompt_hard_timeout_secs,
     ));
 
     // Shutdown signal for Slack adapter
