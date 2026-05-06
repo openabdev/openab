@@ -1702,6 +1702,9 @@ fn record_participation(
     thread_id: &str,
     session_ttl_secs: u64,
 ) {
+    if session_ttl_secs == 0 {
+        return; // Participation tracking disabled
+    }
     // Intentionally recover from poisoned mutex — cache data loss is acceptable
     // and preferable to panicking the gateway.
     let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
