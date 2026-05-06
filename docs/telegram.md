@@ -172,6 +172,7 @@ DMs and replies within forum topics always trigger the agent (no @mention needed
 
 - **Images** — send photos (compressed/resized automatically).
 - **Documents** — send text-based files (e.g. `.txt`, `.csv`, `.rs`, `.py`) up to 512KB. They are passed directly to the agent as text.
+- **Audio/Voice** — send voice notes or audio files. They are automatically transcribed (if STT is enabled in Core) and passed to the agent as text.
 
 ### Emoji reactions
 
