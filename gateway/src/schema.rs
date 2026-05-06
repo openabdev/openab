@@ -22,13 +22,16 @@ pub struct GatewayEvent {
 pub struct Attachment {
     #[serde(rename = "type")]
     pub attachment_type: String, // "image", "audio", etc.
-    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>, // Legacy base64 support
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -56,15 +59,6 @@ pub struct Content {
     pub attachments: Vec<Attachment>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Attachment {
-    #[serde(rename = "type")]
-    pub attachment_type: String, // "image", "text_file"
-    pub filename: String,
-    pub mime_type: String,
-    pub data: String, // base64 encoded
-    pub size: u64,    // size in bytes (after compression for images)
-}
 
 // --- Reply schema (ADR openab.gateway.reply.v1) ---
 

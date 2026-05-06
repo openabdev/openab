@@ -158,7 +158,7 @@ pub async fn webhook(
                             if proxied {
                                 attachments.push(Attachment {
                                     attachment_type: msg.message_type.clone(),
-                                    url: format!("{}/media/{}", state.public_url, uuid),
+                                    url: Some(format!("{}/media/{}", state.public_url, uuid)),
                                     mime_type: Some(mime),
                                     filename: Some(format!(
                                         "line-{}.{}",
@@ -170,6 +170,7 @@ pub async fn webhook(
                                         }
                                     )),
                                     size: Some(size),
+                                    data: None,
                                 });
                                 if text.is_empty() {
                                     text = format!("[{}]", msg.message_type);
@@ -178,7 +179,6 @@ pub async fn webhook(
                             }
                         }
                     }
-                }
             } else if msg.message_type != "text" {
                 // Issue #690 review fix: Warn when media message is dropped due to missing access_token
                 warn!(

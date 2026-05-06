@@ -1356,12 +1356,14 @@ pub async fn download_feishu_image(
     let ext = if mime == "image/gif" { "gif" } else { "jpg" };
     Some(crate::schema::Attachment {
         attachment_type: "image".into(),
-        filename: format!("{}.{}", image_key, ext),
-        mime_type: mime,
-        data,
-        size: compressed.len() as u64,
+        url: None,
+        filename: Some(format!("{}.{}", image_key, ext)),
+        mime_type: Some(mime),
+        data: Some(data),
+        size: Some(compressed.len() as u64),
     })
 }
+
 
 /// Download a Feishu file by message_id + file_key → base64 Attachment (text files only).
 pub async fn download_feishu_file(
@@ -1418,12 +1420,14 @@ pub async fn download_feishu_file(
     let data = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     Some(crate::schema::Attachment {
         attachment_type: "text_file".into(),
-        filename: file_name.to_string(),
-        mime_type: "text/plain".into(),
-        data,
-        size: bytes.len() as u64,
+        url: None,
+        filename: Some(file_name.to_string()),
+        mime_type: Some("text/plain".into()),
+        data: Some(data),
+        size: Some(bytes.len() as u64),
     })
 }
+
 
 /// Send a post (rich text) message to a feishu chat_id.
 /// Returns the sent message_id on success, None on failure.

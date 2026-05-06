@@ -256,6 +256,12 @@ impl Handler {
 #[serenity::async_trait]
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
+        tracing::info!(
+            author = %msg.author.name,
+            content = %msg.content,
+            channel_id = %msg.channel_id,
+            "received discord message"
+        );
         let bot_id = ctx.cache.current_user().id;
 
         // Early multibot detection: cache that another bot is present.

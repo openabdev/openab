@@ -1,5 +1,5 @@
 use crate::acp::ContentBlock;
-use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
+use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageContext, MessageRef, SenderContext};
 use crate::config::SttConfig;
 use crate::media;
 use anyhow::Result;
@@ -37,13 +37,16 @@ struct GatewayEvent {
 struct GwAttachment {
     #[serde(rename = "type")]
     attachment_type: String,
-    url: String,
+    #[serde(default)]
+    url: Option<String>,
     #[serde(default)]
     mime_type: Option<String>,
     #[serde(default)]
     filename: Option<String>,
     #[serde(default)]
     size: Option<u64>,
+    #[serde(default)]
+    data: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -72,16 +75,7 @@ struct GwContent {
     attachments: Vec<GwAttachment>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-struct GwAttachment {
-    #[serde(rename = "type")]
-    attachment_type: String,
-    filename: String,
-    mime_type: String,
-    data: String,
-    #[allow(dead_code)]
-    size: u64,
-}
+
 
 #[derive(Serialize)]
 struct GatewayReply {
@@ -532,7 +526,7 @@ async fn build_attachment_blocks(
         match attachment.attachment_type.as_str() {
             "image" => {
                 if let Some(block) = media::download_and_encode_image(
-                    &attachment.url,
+                    attachment.url.as_deref().unwrap_or(""),
                     attachment.mime_type.as_deref(),
                     attachment_filename(attachment),
                     attachment.size.unwrap_or(0),
@@ -552,7 +546,7 @@ async fn build_attachment_blocks(
                 let mut added_transcript = false;
                 if stt_config.enabled {
                     if let Some(transcript) = media::download_and_transcribe(
-                        &attachment.url,
+                        attachment.url.as_deref().unwrap_or(""),
                         attachment_filename(attachment),
                         attachment.mime_type.as_deref().unwrap_or("audio/ogg"),
                         attachment.size.unwrap_or(0),
@@ -569,14 +563,14 @@ async fn build_attachment_blocks(
                 }
                 if !added_transcript {
                     blocks.push(ContentBlock::Text {
-                        text: format!("[Audio attachment URL]: {}", attachment.url),
+                        text: format!("[Audio attachment URL]: {}", attachment.url.as_deref().unwrap_or("N/A")),
                     });
                 }
             }
             _ => blocks.push(ContentBlock::Text {
                 text: format!(
                     "[{} attachment URL]: {}",
-                    attachment.attachment_type, attachment.url
+                    attachment.attachment_type, attachment.url.as_deref().unwrap_or("N/A")
                 ),
             }),
         }
@@ -787,6 +781,7 @@ pub async fn run_gateway_adapter(
                                         }
                                     }
 
+                                    let router = router.clone();
                                     tasks.spawn(async move {
                                         // If supergroup with no thread_id, create a forum topic
                                         let thread_channel = if event.channel.channel_type == "supergroup"
@@ -807,18 +802,16 @@ pub async fn run_gateway_adapter(
                                         let extra_blocks =
                                             build_attachment_blocks(&attachments, &stt_config).await;
 
-                                        if let Err(e) = router
-                                            .handle_message(
-                                                &adapter,
-                                                &thread_channel,
-                                                &sender_json,
-                                                &prompt,
-                                                extra_blocks,
-                                                &trigger_msg,
-                                                false,
-                                            )
-                                            .await
-                                        {
+                                        let ctx = MessageContext {
+                                            thread_channel: thread_channel.clone(),
+                                            sender_json: sender_json.clone(),
+                                            prompt: prompt.clone(),
+                                            extra_blocks,
+                                            trigger_msg: trigger_msg.clone(),
+                                            other_bot_present: false,
+                                        };
+
+                                        if let Err(e) = router.handle_message(&adapter, ctx).await {
                                             error!("gateway message handling error: {e}");
                                         }
                                     });

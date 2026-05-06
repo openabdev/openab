@@ -180,7 +180,7 @@ pub async fn webhook(
                                     if proxied {
                                         attachments.push(Attachment {
                                             attachment_type: m_type.into(),
-                                            url: format!("{}/media/{}", state.public_url, uuid),
+                                            url: Some(format!("{}/media/{}", state.public_url, uuid)),
                                             mime_type: Some(mime),
                                             filename: Some(format!(
                                                 "telegram-{}.{}",
@@ -188,6 +188,7 @@ pub async fn webhook(
                                                 if m_type == "image" { "jpg" } else { "ogg" }
                                             )),
                                             size: Some(size),
+                                            data: None,
                                         });
                                         if text.is_empty() {
                                             text = format!("[{}]", m_type);
