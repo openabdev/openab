@@ -17,9 +17,9 @@ Deploy a single OpenAB bot on ECS Fargate Spot for ~$2.7/month with persistent a
 │         ↑              ↑        ↑              ↑           │
 │         └──────────────┴── /data volume ───────┘           │
 └─────────────────────────────────────────────────────────────┘
-         ↕                    ↕                    ↕
-    S3 Bucket           Discord API         Secrets Manager
-  (auth state)        (bot gateway)         (bot token)
+         ↕                    ↕         ↕              ↕
+    S3 Bucket           Discord API   GitHub Gist   Secrets Manager
+  (auth state)        (bot gateway)  (config.toml)  (bot token)
 ```
 
 ## Cost
@@ -76,9 +76,12 @@ Create two roles for ECS tasks:
 
 ### Phase 4: Create the config.toml
 
-Host `config.toml` at a URL accessible to the task (GitHub Gist, S3 presigned URL, or raw URL):
+Host `config.toml` as a GitHub Gist (recommended) or any HTTPS URL. OpenAB fetches it at startup via `openab run -c <URL>`.
 
-```toml
+Create a **secret gist** (or public if you prefer) with your config:
+
+```bash
+gh gist create --filename config.toml --desc "OpenAB ECS config" - <<'EOF'
 [discord]
 bot_token = "${DISCORD_BOT_TOKEN}"
 allow_all_channels = true
@@ -100,7 +103,10 @@ session_ttl_hours = 1
 [reactions]
 enabled = true
 remove_after_reply = false
+EOF
 ```
+
+Use the raw gist URL (e.g. `https://gist.githubusercontent.com/<user>/<id>/raw/<sha>/config.toml`) in Phase 5.
 
 ### Phase 5: Register task definition and create service
 
