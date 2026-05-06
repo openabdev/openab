@@ -617,6 +617,13 @@ impl GoogleChatTokenCache {
     }
 }
 
+/// Convert markdown to Google Chat native formatting.
+///
+/// Called by both `send_message` and `edit_message`. Assumes the caller passes
+/// **raw markdown** — passing already-converted text would double-convert
+/// (e.g. `*bold*` from a previous pass would be re-parsed as `*italic*`).
+/// OAB core is expected to always emit raw markdown for both initial replies
+/// and streaming edits.
 fn markdown_to_gchat(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let lines: Vec<&str> = text.split('\n').collect();
@@ -661,6 +668,9 @@ fn markdown_to_gchat(text: &str) -> String {
     result
 }
 
+// TODO(perf): allocates Vec<char> per line. Acceptable at current scale,
+// but on hot streaming paths with many edit_message updates this could be
+// rewritten with byte-level iteration over &str.
 fn convert_inline(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let chars: Vec<char> = line.chars().collect();
