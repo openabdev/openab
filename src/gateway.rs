@@ -690,6 +690,12 @@ pub async fn run_gateway_adapter(
                                                         }
                                                         None => {
                                                             tracing::warn!(filename = %att.filename, "gateway audio STT failed");
+                                                            extra_blocks.push(ContentBlock::Text {
+                                                                text: format!(
+                                                                    "[Voice message — transcription failed for {}]",
+                                                                    att.filename
+                                                                ),
+                                                            });
                                                         }
                                                     }
                                                 }

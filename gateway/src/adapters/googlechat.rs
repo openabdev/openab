@@ -17,6 +17,13 @@ const IMAGE_JPEG_QUALITY: u8 = 75;
 const IMAGE_MAX_DOWNLOAD: u64 = 10 * 1024 * 1024; // 10 MB
 const FILE_MAX_DOWNLOAD: u64 = 512 * 1024; // 512 KB
 const AUDIO_MAX_DOWNLOAD: u64 = 25 * 1024 * 1024; // 25 MB
+/// Per-request timeout for Google Chat Media API downloads. Prevents a hung
+/// connection from blocking the spawned download task indefinitely.
+const MEDIA_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Cap on text file attachments per message (matches Discord/Slack).
+const TEXT_FILE_COUNT_CAP: usize = 5;
+/// Cap on aggregate text file bytes per message (matches Discord/Slack 1 MB).
+const TEXT_TOTAL_CAP: u64 = 1024 * 1024;
 
 // --- Google Chat types (v2 envelope format) ---
 
@@ -488,7 +495,8 @@ pub async fn webhook(
         .argument_text
         .as_deref()
         .or(msg.text.as_deref())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
 
     let media_refs = parse_attachments(&msg.attachment);
 
@@ -528,9 +536,30 @@ pub async fn webhook(
         .unwrap_or(&msg.name)
         .to_string();
 
-    // Async download attachments (uses adapter's token + client + api_base)
-    let mut downloaded_attachments: Vec<crate::schema::Attachment> = Vec::new();
-    if !media_refs.is_empty() {
+    // No attachments → emit event synchronously and respond 200
+    if media_refs.is_empty() {
+        send_googlechat_event(
+            &state,
+            &space_name,
+            space_type,
+            thread_id,
+            &sender_id,
+            &sender_name,
+            &display_name,
+            &text,
+            &message_id,
+            Vec::new(),
+        );
+        return empty_json_response();
+    }
+
+    // Has attachments — spawn background task so the webhook returns 200 within
+    // Google Chat's 30 s deadline regardless of how long downloads take.
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut downloaded: Vec<crate::schema::Attachment> = Vec::new();
+        let mut text_file_count: usize = 0;
+        let mut text_file_bytes: u64 = 0;
         if let Some(ref adapter) = state.google_chat {
             if let Some(token) = adapter.get_token().await {
                 for media_ref in &media_refs {
@@ -554,14 +583,41 @@ pub async fn webhook(
                             content_name,
                             ..
                         } => {
-                            download_googlechat_file(
-                                &adapter.client,
-                                &token,
-                                &adapter.api_base,
-                                resource_name,
-                                content_name,
-                            )
-                            .await
+                            // Match Discord/Slack: cap text file count and aggregate bytes.
+                            if text_file_count >= TEXT_FILE_COUNT_CAP {
+                                warn!(
+                                    content_name = %content_name,
+                                    cap = TEXT_FILE_COUNT_CAP,
+                                    "googlechat text file count cap reached, skipping"
+                                );
+                                None
+                            } else {
+                                let result = download_googlechat_file(
+                                    &adapter.client,
+                                    &token,
+                                    &adapter.api_base,
+                                    resource_name,
+                                    content_name,
+                                )
+                                .await;
+                                if let Some(ref att) = result {
+                                    if text_file_bytes + att.size > TEXT_TOTAL_CAP {
+                                        warn!(
+                                            content_name = %content_name,
+                                            total = text_file_bytes + att.size,
+                                            cap = TEXT_TOTAL_CAP,
+                                            "googlechat text file aggregate exceeds cap, skipping"
+                                        );
+                                        None
+                                    } else {
+                                        text_file_count += 1;
+                                        text_file_bytes += att.size;
+                                        result
+                                    }
+                                } else {
+                                    None
+                                }
+                            }
                         }
                         GoogleChatMediaRef::Audio {
                             resource_name,
@@ -580,48 +636,87 @@ pub async fn webhook(
                         }
                     };
                     if let Some(att) = attachment {
-                        downloaded_attachments.push(att);
+                        downloaded.push(att);
                     }
                 }
             } else {
                 warn!("googlechat: no token available for attachment download");
             }
         }
-    }
 
-    // If text is empty AND no attachments downloaded successfully, drop event
-    if text.trim().is_empty() && downloaded_attachments.is_empty() {
-        return empty_json_response();
-    }
+        // If text is empty AND every attachment failed to download, drop the event.
+        if text.trim().is_empty() && downloaded.is_empty() {
+            warn!(
+                space = %space_name,
+                "googlechat: empty text + all attachments failed, dropping event"
+            );
+            return;
+        }
 
+        send_googlechat_event(
+            &state,
+            &space_name,
+            space_type,
+            thread_id,
+            &sender_id,
+            &sender_name,
+            &display_name,
+            &text,
+            &message_id,
+            downloaded,
+        );
+    });
+
+    empty_json_response()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_googlechat_event(
+    state: &Arc<crate::AppState>,
+    space_name: &str,
+    space_type: String,
+    thread_id: Option<String>,
+    sender_id: &str,
+    sender_name: &str,
+    display_name: &str,
+    text: &str,
+    message_id: &str,
+    attachments: Vec<crate::schema::Attachment>,
+) {
     let mut gw_event = GatewayEvent::new(
         "googlechat",
         ChannelInfo {
-            id: space_name.clone(),
+            id: space_name.to_string(),
             channel_type: space_type,
             thread_id,
         },
         SenderInfo {
-            id: sender_id,
-            name: sender_name.clone(),
-            display_name,
+            id: sender_id.to_string(),
+            name: sender_name.to_string(),
+            display_name: display_name.to_string(),
             is_bot: false,
         },
         text,
-        &message_id,
+        message_id,
         vec![],
     );
-    gw_event.content.attachments = downloaded_attachments;
+    gw_event.content.attachments = attachments;
 
-    let json = serde_json::to_string(&gw_event).unwrap();
+    let attachment_count = gw_event.content.attachments.len();
+    let json = match serde_json::to_string(&gw_event) {
+        Ok(j) => j,
+        Err(e) => {
+            error!(error = %e, "googlechat: failed to serialize GatewayEvent");
+            return;
+        }
+    };
     info!(
         space = %space_name,
         sender = %sender_name,
-        attachment_count = gw_event.content.attachments.len(),
+        attachment_count,
         "googlechat → gateway"
     );
     let _ = state.event_tx.send(json);
-    empty_json_response()
 }
 
 fn empty_json_response() -> axum::response::Response {
@@ -1139,7 +1234,7 @@ pub async fn download_googlechat_image(
     content_name: &str,
 ) -> Option<crate::schema::Attachment> {
     let url = media_url(api_base, resource_name);
-    let resp = match client.get(&url).bearer_auth(token).send().await {
+    let resp = match client.get(&url).bearer_auth(token).timeout(MEDIA_REQUEST_TIMEOUT).send().await {
         Ok(r) => r,
         Err(e) => {
             warn!(content_name, error = %e, "googlechat image download failed");
@@ -1196,7 +1291,7 @@ pub async fn download_googlechat_file(
         return None;
     }
     let url = media_url(api_base, resource_name);
-    let resp = match client.get(&url).bearer_auth(token).send().await {
+    let resp = match client.get(&url).bearer_auth(token).timeout(MEDIA_REQUEST_TIMEOUT).send().await {
         Ok(r) => r,
         Err(e) => {
             warn!(content_name, error = %e, "googlechat file download failed");
@@ -1243,7 +1338,7 @@ pub async fn download_googlechat_audio(
     content_type: &str,
 ) -> Option<crate::schema::Attachment> {
     let url = media_url(api_base, resource_name);
-    let resp = match client.get(&url).bearer_auth(token).send().await {
+    let resp = match client.get(&url).bearer_auth(token).timeout(MEDIA_REQUEST_TIMEOUT).send().await {
         Ok(r) => r,
         Err(e) => {
             warn!(content_name, error = %e, "googlechat audio download failed");
