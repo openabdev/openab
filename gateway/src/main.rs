@@ -258,6 +258,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
+<<<<<<< Updated upstream
     let listen_addr = std::env::var("GATEWAY_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let ws_token = std::env::var("GATEWAY_WS_TOKEN").ok();
     
@@ -272,6 +273,23 @@ async fn main() -> Result<()> {
             public_url = %public_url,
             "GATEWAY_PUBLIC_URL looks like a loopback address. Media attachments will not be reachable from other pods/containers. Set GATEWAY_PUBLIC_URL to the gateway's cluster-internal Service URL (e.g. http://openab-gateway:8080) or its external ingress URL."
         );
+=======
+    // Load configuration from environment
+    let bot_token = std::env::var("TELEGRAM_BOT_TOKEN").expect("TELEGRAM_BOT_TOKEN must be set");
+    let secret_token = std::env::var("TELEGRAM_SECRET_TOKEN").ok();
+    let ws_token = std::env::var("GATEWAY_WS_TOKEN").ok();
+    let line_channel_secret = std::env::var("LINE_CHANNEL_SECRET").ok();
+    let line_access_token = std::env::var("LINE_CHANNEL_ACCESS_TOKEN").ok();
+    let listen_addr = std::env::var("GATEWAY_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
+    // Configurable webhook paths
+    let telegram_webhook_path = std::env::var("TELEGRAM_WEBHOOK_PATH").unwrap_or_else(|_| "/webhook/telegram".into());
+    let line_webhook_path = std::env::var("LINE_WEBHOOK_PATH").unwrap_or_else(|_| "/webhook/line".into());
+    // Optional Cloudflare Tunnel domain for logging / external reference
+    let cloudflare_tunnel_url = std::env::var("CLOUDFLARE_TUNNEL_URL").ok();
+
+    if secret_token.is_none() {
+        warn!("TELEGRAM_SECRET_TOKEN not set — webhook requests are NOT validated (insecure)");
+>>>>>>> Stashed changes
     }
     
     let media_ttl = std::env::var("GATEWAY_MEDIA_STORE_TTL")
@@ -290,6 +308,9 @@ async fn main() -> Result<()> {
 
     if ws_token.is_none() {
         warn!("GATEWAY_WS_TOKEN not set — WebSocket connections are NOT authenticated (insecure)");
+    }
+    if let Some(ref url) = cloudflare_tunnel_url {
+        info!("Using Cloudflare Tunnel URL: {}", url);
     }
 
     let (event_tx, _) = broadcast::channel::<String>(256);
