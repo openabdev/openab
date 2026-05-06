@@ -1,0 +1,8 @@
+/target
+config.toml
+*.swp
+.DS_Store
+.env
+.kiro/
+CLAUDE.md
+gateway/target/

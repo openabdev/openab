@@ -1,0 +1,156 @@
+{{- range $name, $cfg := .Values.agents }}
+{{- if ne (include "openab.agentEnabled" $cfg) "false" }}
+{{- $d := dict "ctx" $ "agent" $name "cfg" $cfg }}
+{{- $pvcEnabled := not (eq (include "openab.persistenceEnabled" $cfg) "false") }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "openab.agentFullname" $d }}
+  labels:
+    {{- include "openab.labels" $d | nindent 4 }}
+spec:
+  # Hardcoded for PVC-backed agents: RWO volumes can't be shared across pods,
+  # so rolling updates and multiple replicas are not supported.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "openab.selectorLabels" $d | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ $cfg | toJson | sha256sum }}
+      labels:
+        {{- include "openab.selectorLabels" $d | nindent 8 }}
+    spec:
+      {{- with $.Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $cfg.extraInitContainers }}
+      initContainers:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: openab
+          image: {{ include "openab.agentImage" $d | quote }}
+          imagePullPolicy: {{ include "openab.agentImagePullPolicy" $d }}
+          {{- with $.Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            {{- if and (ne (toString ($cfg.discord).enabled) "false") ($cfg.discord).botToken }}
+            - name: DISCORD_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: discord-bot-token
+            {{- end }}
+            {{- if and ($cfg.slack).enabled ($cfg.slack).botToken }}
+            - name: SLACK_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: slack-bot-token
+            {{- end }}
+            {{- if and ($cfg.slack).enabled ($cfg.slack).appToken }}
+            - name: SLACK_APP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: slack-app-token
+            {{- end }}
+            {{- if and ($cfg.stt).enabled ($cfg.stt).apiKey }}
+            - name: STT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: stt-api-key
+            {{- end }}
+            {{- if and ($cfg.gateway).enabled ($cfg.gateway).token }}
+            - name: GATEWAY_WS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: gateway-ws-token
+            {{- end }}
+            - name: HOME
+              value: {{ $cfg.workingDir | default "/home/agent" }}
+            {{- range $k, $v := $cfg.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+            {{- include "openab.validateSecretEnv" (dict "secretEnv" $cfg.secretEnv "agentName" $name) }}
+            {{- range $cfg.secretEnv }}
+            - name: {{ .name }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .secretName }}
+                  key: {{ .secretKey }}
+            {{- end }}
+          {{- with $cfg.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $cfg.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/openab
+              readOnly: true
+            {{- if $pvcEnabled }}
+            - name: data
+              mountPath: {{ $cfg.workingDir | default "/home/agent" }}
+            {{- end }}
+            {{- if $cfg.agentsMd }}
+            - name: config
+              mountPath: {{ $cfg.workingDir | default "/home/agent" }}/AGENTS.md
+              subPath: AGENTS.md
+            - name: config
+              mountPath: {{ $cfg.workingDir | default "/home/agent" }}/CLAUDE.md
+              subPath: AGENTS.md
+            - name: config
+              mountPath: {{ $cfg.workingDir | default "/home/agent" }}/GEMINI.md
+              subPath: AGENTS.md
+            {{- end }}
+            - name: tmp
+              mountPath: /tmp
+            {{- with $cfg.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      {{- with $cfg.extraContainers }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $cfg.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $cfg.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $cfg.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "openab.agentFullname" $d }}
+        {{- if $pvcEnabled }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ (and $cfg.persistence $cfg.persistence.existingClaim) | default (include "openab.agentFullname" $d) }}
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+        {{- with $cfg.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+{{- end }}
+{{- end }}

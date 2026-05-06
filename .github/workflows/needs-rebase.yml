@@ -1,0 +1,57 @@
+name: Label needs-rebase PRs
+
+on:
+  schedule:
+    - cron: '0 * * * *'  # hourly
+  workflow_dispatch:
+
+jobs:
+  check-rebase:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const REBASE = 'needs-rebase';
+            const CONTRIBUTOR = 'pending-contributor';
+
+            const prs = await github.rest.pulls.list({
+              ...context.repo,
+              state: 'open',
+              per_page: 100
+            });
+
+            for (const pr of prs.data) {
+              // Fetch full PR detail for mergeable status
+              const { data: detail } = await github.rest.pulls.get({
+                ...context.repo,
+                pull_number: pr.number
+              });
+
+              const hasRebase = detail.labels.some(l => l.name === REBASE);
+              const conflicting = detail.mergeable === false;
+
+              if (conflicting && !hasRebase) {
+                await github.rest.issues.addLabels({
+                  ...context.repo,
+                  issue_number: pr.number,
+                  labels: [REBASE, CONTRIBUTOR]
+                });
+                console.log(`#${pr.number} — added ${REBASE} + ${CONTRIBUTOR}`);
+              } else if (!conflicting && hasRebase) {
+                await github.rest.issues.removeLabel({
+                  ...context.repo,
+                  issue_number: pr.number,
+                  name: REBASE
+                }).catch(() => {});
+                await github.rest.issues.removeLabel({
+                  ...context.repo,
+                  issue_number: pr.number,
+                  name: CONTRIBUTOR
+                }).catch(() => {});
+                console.log(`#${pr.number} — removed ${REBASE} + ${CONTRIBUTOR}`);
+              }
+            }

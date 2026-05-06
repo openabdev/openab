@@ -1,0 +1,64 @@
+name: Docker Smoke Test
+
+on:
+  pull_request:
+    paths:
+      - 'Dockerfile*'
+      - 'src/**'
+      - 'Cargo.*'
+
+jobs:
+  smoke-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - { dockerfile: Dockerfile, suffix: "", agent: "kiro-cli", agent_args: "acp --trust-all-tools" }
+          - { dockerfile: Dockerfile.claude, suffix: "-claude", agent: "claude-agent-acp", agent_args: "" }
+          - { dockerfile: Dockerfile.codex, suffix: "-codex", agent: "codex-acp", agent_args: "" }
+          - { dockerfile: Dockerfile.gemini, suffix: "-gemini", agent: "gemini", agent_args: "--acp" }
+          - { dockerfile: Dockerfile.copilot, suffix: "-copilot", agent: "copilot", agent_args: "--acp" }
+          - { dockerfile: Dockerfile.opencode, suffix: "-opencode", agent: "opencode", agent_args: "acp" }
+          - { dockerfile: Dockerfile.cursor, suffix: "-cursor", agent: "cursor-agent", agent_args: "acp" }
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build image
+        run: docker build -t openab-test${{ matrix.variant.suffix }} -f ${{ matrix.variant.dockerfile }} .
+
+      - name: Verify openab CMD does not crash
+        run: |
+          OUTPUT=$(docker run --rm openab-test${{ matrix.variant.suffix }} 2>&1 || true)
+          if echo "$OUTPUT" | grep -q "unrecognized subcommand"; then
+            echo "❌ CMD regression: $OUTPUT"
+            exit 1
+          fi
+          echo "✅ openab CMD ok"
+
+      - name: Verify agent CLI exists
+        run: docker run --rm --entrypoint which openab-test${{ matrix.variant.suffix }} ${{ matrix.variant.agent }}
+
+      - name: Verify agent responds
+        run: |
+          INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"ci-test","version":"0.0.1"}}}'
+
+          RAW=$(echo "$INIT" | timeout 30 docker run --rm -i \
+            --entrypoint ${{ matrix.variant.agent }} \
+            openab-test${{ matrix.variant.suffix }} \
+            ${{ matrix.variant.agent_args }} 2>/dev/null || true)
+
+          echo "Raw output:"
+          echo "$RAW"
+
+          RESPONSE=$(echo "$RAW" | grep -m1 '^{' || true)
+
+          if [ -n "$RESPONSE" ] && echo "$RESPONSE" | jq -e '.result.agentInfo.name' > /dev/null 2>&1; then
+            AGENT_NAME=$(echo "$RESPONSE" | jq -r '.result.agentInfo.name')
+            echo "✅ ACP handshake ok — agent=$AGENT_NAME"
+          else
+            echo "⚠️ ACP handshake returned no response — falling back to CLI check"
+            docker run --rm --entrypoint ${{ matrix.variant.agent }} \
+              openab-test${{ matrix.variant.suffix }} --help >/dev/null 2>&1
+            echo "✅ Agent CLI responds (ACP skipped — likely needs auth)"
+          fi

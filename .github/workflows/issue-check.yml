@@ -1,0 +1,163 @@
+name: Issue Completeness Check
+
+on:
+  issues:
+    types: [opened, edited, labeled]
+
+concurrency:
+  group: issue-check-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const body = issue.body || '';
+            const labels = issue.labels.map(l => l.name);
+            const marker = '<!-- openab-issue-check -->';
+
+            const rules = {
+              bug: ['Description', 'Steps to Reproduce', 'Expected Behavior'],
+              feature: ['Description', 'Use Case'],
+              documentation: ['Description'],
+              guidance: ['Question']
+            };
+
+            const typeLabels = [...Object.keys(rules), 'rfc'];
+            const labelAliases = { 'enhancement': 'feature' };
+
+            // Broad synonyms for VALIDATION (after type is known)
+            const synonyms = {
+              'description': ['problem', 'summary', 'overview', 'background', 'what happened', 'bug description'],
+              'steps to reproduce': ['reproduction', 'how to reproduce', 'repro steps', 'steps to replicate', 'reproduce', 'repro'],
+              'expected behavior': ['expected result', 'what should happen', 'expected behaviour', 'expected outcome'],
+              'use case': ['motivation', 'why', 'rationale', 'use cases', 'why it matters', 'benefits', 'proposal'],
+              'question': ['question', 'ask']
+            };
+
+            // Strict signals for AUTO-DETECTION (only unambiguous headings)
+            const detectionSignals = {
+              'steps to reproduce': ['steps to reproduce', 'reproduction', 'how to reproduce', 'repro steps', 'repro'],
+              'root cause': ['root cause'],
+              'expected behavior': ['expected behavior', 'expected behaviour', 'expected result', 'what should happen'],
+              'use case': ['use case', 'use cases', 'motivation'],
+              'question': ['question']
+            };
+
+            // Helper: check if a heading exists with content
+            function hasHeadingFrom(candidates) {
+              for (const candidate of candidates) {
+                const escaped = candidate.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const regex = new RegExp(
+                  `#{2,3}\\s*${escaped}\\s*\\n+([\\s\\S]*?)(?=\\n*#{2,3}\\s|$)`,
+                  'i'
+                );
+                const match = body.match(regex);
+                if (match && match[1].trim() && match[1].trim() !== '_No response_') return true;
+              }
+              return false;
+            }
+
+            // Validation: check field using broad synonyms
+            function fieldPresent(field) {
+              const fieldLower = field.toLowerCase();
+              const candidates = [fieldLower, ...(synonyms[fieldLower] || [])];
+              return hasHeadingFrom(candidates);
+            }
+
+            // Detection: check using strict signals only
+            function hasSignal(signal) {
+              const candidates = detectionSignals[signal] || [signal];
+              return hasHeadingFrom(candidates);
+            }
+
+            // Helper: find old bot comment
+            async function findOldComment() {
+              const comments = await github.rest.issues.listComments({
+                ...context.repo,
+                issue_number: issue.number
+              });
+              return comments.data.find(c => c.body.includes(marker));
+            }
+
+            // Step 1: Resolve type from labels (including aliases)
+            let type = typeLabels.find(k => labels.includes(k));
+            if (!type) {
+              const alias = Object.keys(labelAliases).find(k => labels.includes(k));
+              if (alias) type = labelAliases[alias];
+            }
+
+            // Step 2: No type label → auto-detect from title prefix + strict heading signals
+            if (!type) {
+              const title = issue.title || '';
+              if (/^fix[\s(:]/i.test(title) || /^bug[\s(:]/i.test(title)) {
+                type = 'bug';
+              } else if (/^feat[\s(:]/i.test(title) || /^feature[\s(:]/i.test(title)) {
+                type = 'feature';
+              } else if (/^docs?[\s(:]/i.test(title) || /^documentation[\s(:]/i.test(title)) {
+                type = 'documentation';
+              } else if ((hasSignal('steps to reproduce') || hasSignal('root cause')) && hasSignal('expected behavior')) {
+                type = 'bug';
+              } else if (hasSignal('use case')) {
+                type = 'feature';
+              } else if (hasSignal('question')) {
+                type = 'guidance';
+              }
+
+              if (type) {
+                await github.rest.issues.addLabels({
+                  ...context.repo,
+                  issue_number: issue.number,
+                  labels: [type]
+                });
+              } else {
+                // Cannot detect — flag for maintainer triage
+                const old = await findOldComment();
+                if (old && labels.includes('incomplete')) return;
+
+                const msg = `${marker}\nThanks for the report! A maintainer will triage this shortly and apply the appropriate label. Once a type label is added, the issue will be re-validated automatically.`;
+                if (old) {
+                  await github.rest.issues.deleteComment({ ...context.repo, comment_id: old.id });
+                }
+                await github.rest.issues.createComment({ ...context.repo, issue_number: issue.number, body: msg });
+                if (!labels.includes('incomplete')) {
+                  await github.rest.issues.addLabels({ ...context.repo, issue_number: issue.number, labels: ['incomplete', 'needs-triage'] });
+                }
+                return;
+              }
+            }
+
+            // rfc is free-form — skip heading check
+            if (type === 'rfc') return;
+
+            // Step 3: Fuzzy heading check using broad synonyms
+            const old = await findOldComment();
+            const missing = rules[type].filter(field => !fieldPresent(field));
+
+            if (missing.length > 0) {
+              const list = missing.map(f => `- [ ] **${f}**`).join('\n');
+              const msg = `${marker}\n⚠️ This issue is missing the following required information and will not be processed until completed:\n\n${list}\n\nPlease edit this issue to fill in the missing fields. Thank you!\n\n> **Tip:** Use headings like \`## Description\` or \`### Description\` — common synonyms (e.g. \`## Problem\`, \`## Reproduction\`, \`## Motivation\`) are also accepted.`;
+
+              if (old) {
+                await github.rest.issues.deleteComment({ ...context.repo, comment_id: old.id });
+              }
+              await github.rest.issues.createComment({ ...context.repo, issue_number: issue.number, body: msg });
+              if (!labels.includes('incomplete')) {
+                await github.rest.issues.addLabels({ ...context.repo, issue_number: issue.number, labels: ['incomplete', 'needs-triage'] });
+              }
+            } else {
+              if (old) {
+                await github.rest.issues.deleteComment({ ...context.repo, comment_id: old.id });
+              }
+              if (labels.includes('incomplete')) {
+                try {
+                  await github.rest.issues.removeLabel({ ...context.repo, issue_number: issue.number, name: 'incomplete' });
+                } catch (e) { if (e.status !== 404) throw e; }
+              }
+            }

@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openab
+  labels:
+    app: openab
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # PVC is ReadWriteOnce
+  selector:
+    matchLabels:
+      app: openab
+  template:
+    metadata:
+      labels:
+        app: openab
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: openab
+          image: openab:latest
+          imagePullPolicy: Never
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: DISCORD_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: openab-secret
+                  key: discord-bot-token
+            - name: HOME
+              value: /home/agent
+          volumeMounts:
+            - name: config
+              mountPath: /etc/openab
+              readOnly: true
+            - name: data
+              mountPath: /home/agent/.kiro
+              subPath: dot-kiro
+            - name: data
+              mountPath: /home/agent/.local/share/kiro-cli
+              subPath: kiro-cli-data
+      volumes:
+        - name: config
+          configMap:
+            name: openab-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: openab-data

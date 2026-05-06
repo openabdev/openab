@@ -1,0 +1,254 @@
+{{- range $name, $cfg := .Values.agents }}
+{{- if ne (include "openab.agentEnabled" $cfg) "false" }}
+{{- $d := dict "ctx" $ "agent" $name "cfg" $cfg }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "openab.agentFullname" $d }}
+  labels:
+    {{- include "openab.labels" $d | nindent 4 }}
+data:
+  config.toml: |
+    {{- if ($cfg.discord).enabled }}
+    [discord]
+    bot_token = "${DISCORD_BOT_TOKEN}"
+    allow_all_channels = {{ if and (hasKey $cfg.discord "allowAllChannels") (ne $cfg.discord.allowAllChannels nil) }}{{ $cfg.discord.allowAllChannels }}{{ else if $cfg.discord.allowedChannels }}false{{ else }}true{{ end }}
+    allow_all_users = {{ if and (hasKey $cfg.discord "allowAllUsers") (ne $cfg.discord.allowAllUsers nil) }}{{ $cfg.discord.allowAllUsers }}{{ else if $cfg.discord.allowedUsers }}false{{ else }}true{{ end }}
+    {{- range $cfg.discord.allowedChannels }}
+    {{- if regexMatch "e\\+|E\\+" (toString .) }}
+    {{- fail (printf "discord.allowedChannels contains a mangled ID: %s — use --set-string instead of --set for channel IDs" (toString .)) }}
+    {{- end }}
+    {{- end }}
+    allowed_channels = {{ $cfg.discord.allowedChannels | default list | toJson }}
+    {{- range $cfg.discord.allowedUsers }}
+    {{- if regexMatch "e\\+|E\\+" (toString .) }}
+    {{- fail (printf "discord.allowedUsers contains a mangled ID: %s — use --set-string instead of --set for user IDs" (toString .)) }}
+    {{- end }}
+    {{- end }}
+    allowed_users = {{ $cfg.discord.allowedUsers | default list | toJson }}
+    {{- if $cfg.discord.allowBotMessages }}
+    {{- if not (has $cfg.discord.allowBotMessages (list "off" "mentions" "all")) }}
+    {{- fail (printf "agents.%s.discord.allowBotMessages must be one of: off, mentions, all — got: %s" $name $cfg.discord.allowBotMessages) }}
+    {{- end }}
+    allow_bot_messages = {{ $cfg.discord.allowBotMessages | toJson }}
+    {{- end }}
+    {{- range $cfg.discord.trustedBotIds }}
+    {{- if regexMatch "e\\+|E\\+" (toString .) }}
+    {{- fail (printf "discord.trustedBotIds contains a mangled ID: %s — use --set-string instead of --set for bot IDs" (toString .)) }}
+    {{- end }}
+    {{- if not (regexMatch "^[0-9]{17,20}$" (toString .)) }}
+    {{- fail (printf "discord.trustedBotIds contains an invalid bot ID: %s — must be a 17-20 digit snowflake ID" (toString .)) }}
+    {{- end }}
+    {{- end }}
+    {{- if $cfg.discord.trustedBotIds }}
+    trusted_bot_ids = {{ $cfg.discord.trustedBotIds | toJson }}
+    {{- end }}
+    {{- range $cfg.discord.allowedRoleIds }}
+    {{- if regexMatch "e\\+|E\\+" (toString .) }}
+    {{- fail (printf "discord.allowedRoleIds contains a mangled ID: %s — use --set-string instead of --set for role IDs" (toString .)) }}
+    {{- end }}
+    {{- if not (regexMatch "^[0-9]{17,20}$" (toString .)) }}
+    {{- fail (printf "discord.allowedRoleIds contains an invalid role ID: %s — must be a 17-20 digit snowflake ID" (toString .)) }}
+    {{- end }}
+    {{- end }}
+    {{- if $cfg.discord.allowedRoleIds }}
+    allowed_role_ids = {{ $cfg.discord.allowedRoleIds | toJson }}
+    {{- end }}
+    {{- /* allowUserMessages: controls whether the bot requires @mention in threads (Discord) */ -}}
+    {{- if $cfg.discord.allowUserMessages }}
+    {{- if not (has $cfg.discord.allowUserMessages (list "involved" "mentions" "multibot-mentions")) }}
+    {{- fail (printf "agents.%s.discord.allowUserMessages must be one of: involved, mentions, multibot-mentions (use hyphen form, not underscore) — got: %s" $name $cfg.discord.allowUserMessages) }}
+    {{- end }}
+    allow_user_messages = {{ $cfg.discord.allowUserMessages | toJson }}  {{- /* involved (default): respond in bot's threads without @mention | mentions: always require @mention | multibot-mentions: require @mention only when another bot has posted in the thread */ -}}
+    {{- end }}
+    {{- if hasKey $cfg.discord "allowDm" }}
+    allow_dm = {{ $cfg.discord.allowDm }}
+    {{- end }}
+    {{- /* maxBotTurns: soft cap on consecutive bot turns per thread (human msg resets the counter) */ -}}
+    {{- if hasKey ($cfg.discord | default dict) "maxBotTurns" }}
+    max_bot_turns = {{ ($cfg.discord).maxBotTurns | int }}
+    {{- end }}
+    {{- /* messageProcessingMode: per-message (default) | per-thread | per-lane (turn-boundary batching) */ -}}
+    {{- if hasKey ($cfg.discord | default dict) "messageProcessingMode" }}
+    {{- if not (has ($cfg.discord).messageProcessingMode (list "per-message" "per-thread" "per-lane")) }}
+    {{- fail (printf "agents.%s.discord.messageProcessingMode must be one of: per-message, per-thread, per-lane — got: %s" $name ($cfg.discord).messageProcessingMode) }}
+    {{- end }}
+    message_processing_mode = {{ ($cfg.discord).messageProcessingMode | toJson }}
+    {{- end }}
+    {{- if hasKey ($cfg.discord | default dict) "maxBufferedMessages" }}
+    max_buffered_messages = {{ ($cfg.discord).maxBufferedMessages | int }}
+    {{- end }}
+    {{- if hasKey ($cfg.discord | default dict) "maxBatchTokens" }}
+    max_batch_tokens = {{ ($cfg.discord).maxBatchTokens | int }}
+    {{- end }}
+    {{- end }}
+
+    {{- if and ($cfg.slack).enabled }}
+    [slack]
+    bot_token = "${SLACK_BOT_TOKEN}"
+    app_token = "${SLACK_APP_TOKEN}"
+    allow_all_channels = {{ if and (hasKey ($cfg.slack) "allowAllChannels") (ne ($cfg.slack).allowAllChannels nil) }}{{ ($cfg.slack).allowAllChannels }}{{ else if ($cfg.slack).allowedChannels }}false{{ else }}true{{ end }}
+    allow_all_users = {{ if and (hasKey ($cfg.slack) "allowAllUsers") (ne ($cfg.slack).allowAllUsers nil) }}{{ ($cfg.slack).allowAllUsers }}{{ else if ($cfg.slack).allowedUsers }}false{{ else }}true{{ end }}
+    {{- range ($cfg.slack).allowedChannels }}
+    {{- if regexMatch "e\\+|E\\+" (toString .) }}
+    {{- fail (printf "slack.allowedChannels contains a mangled ID: %s — use --set-string instead of --set for channel IDs" (toString .)) }}
+    {{- end }}
+    {{- end }}
+    allowed_channels = {{ ($cfg.slack).allowedChannels | default list | toJson }}
+    {{- range ($cfg.slack).allowedUsers }}
+    {{- if regexMatch "e\\+|E\\+" (toString .) }}
+    {{- fail (printf "slack.allowedUsers contains a mangled ID: %s — use --set-string instead of --set for user IDs" (toString .)) }}
+    {{- end }}
+    {{- end }}
+    allowed_users = {{ ($cfg.slack).allowedUsers | default list | toJson }}
+    {{- if ($cfg.slack).allowBotMessages }}
+    {{- if not (has ($cfg.slack).allowBotMessages (list "off" "mentions" "all")) }}
+    {{- fail (printf "agents.%s.slack.allowBotMessages must be one of: off, mentions, all — got: %s" $name ($cfg.slack).allowBotMessages) }}
+    {{- end }}
+    allow_bot_messages = {{ ($cfg.slack).allowBotMessages | toJson }}
+    {{- end }}
+    {{- if ($cfg.slack).trustedBotIds }}
+    trusted_bot_ids = {{ ($cfg.slack).trustedBotIds | toJson }}
+    {{- end }}
+    {{- if ($cfg.slack).allowUserMessages }}
+    {{- if not (has ($cfg.slack).allowUserMessages (list "involved" "mentions" "multibot-mentions")) }}
+    {{- fail (printf "agents.%s.slack.allowUserMessages must be one of: involved, mentions, multibot-mentions (use hyphen form, not underscore) — got: %s" $name ($cfg.slack).allowUserMessages) }}
+    {{- end }}
+    allow_user_messages = {{ ($cfg.slack).allowUserMessages | toJson }}  {{- /* involved (default): respond in bot's threads without @mention | mentions: always require @mention | multibot-mentions: require @mention only when another bot has posted in the thread */ -}}
+    {{- end }}
+    {{- /* maxBotTurns: soft cap on consecutive bot turns per thread (human msg resets the counter) */ -}}
+    {{- if hasKey ($cfg.slack | default dict) "maxBotTurns" }}
+    max_bot_turns = {{ ($cfg.slack).maxBotTurns | int }}
+    {{- end }}
+    {{- /* messageProcessingMode: per-message (default) | per-thread | per-lane (turn-boundary batching) */ -}}
+    {{- if hasKey ($cfg.slack | default dict) "messageProcessingMode" }}
+    {{- if not (has ($cfg.slack).messageProcessingMode (list "per-message" "per-thread" "per-lane")) }}
+    {{- fail (printf "agents.%s.slack.messageProcessingMode must be one of: per-message, per-thread, per-lane — got: %s" $name ($cfg.slack).messageProcessingMode) }}
+    {{- end }}
+    message_processing_mode = {{ ($cfg.slack).messageProcessingMode | toJson }}
+    {{- end }}
+    {{- if hasKey ($cfg.slack | default dict) "maxBufferedMessages" }}
+    max_buffered_messages = {{ ($cfg.slack).maxBufferedMessages | int }}
+    {{- end }}
+    {{- if hasKey ($cfg.slack | default dict) "maxBatchTokens" }}
+    max_batch_tokens = {{ ($cfg.slack).maxBatchTokens | int }}
+    {{- end }}
+    {{- end }}
+
+    [agent]
+    command = {{ $cfg.command | toJson }}
+    args = {{ if $cfg.args }}{{ $cfg.args | toJson }}{{ else }}[]{{ end }}
+    working_dir = {{ $cfg.workingDir | default "/home/agent" | toJson }}
+    {{- if $cfg.env }}
+    env = { {{ $first := true }}{{ range $k, $v := $cfg.env }}{{ if not $first }}, {{ end }}{{ $k }} = {{ $v | toJson }}{{ $first = false }}{{ end }} }
+    {{- end }}
+    {{- range $cfg.secretEnv }}
+    {{- if hasKey ($cfg.env | default dict) .name }}
+    {{- fail (printf "agents.%s.secretEnv key %q also exists in env — remove it from env to avoid plaintext secret in ConfigMap" $name .name) }}
+    {{- end }}
+    {{- end }}
+    {{- $secretEnvKeys := list }}
+    {{- range $cfg.secretEnv }}{{ $secretEnvKeys = append $secretEnvKeys .name }}{{ end }}
+    {{- $mergedInheritEnv := concat ($cfg.inheritEnv | default list) $secretEnvKeys | uniq }}
+    {{- if $mergedInheritEnv }}
+    inherit_env = {{ $mergedInheritEnv | toJson }}
+    {{- end }}
+
+    [pool]
+    max_sessions = {{ ($cfg.pool).maxSessions | default 10 }}
+    session_ttl_hours = {{ ($cfg.pool).sessionTtlHours | default 24 }}
+
+    [reactions]
+    enabled = {{ if hasKey ($cfg.reactions) "enabled" }}{{ ($cfg.reactions).enabled }}{{ else }}true{{ end }}
+    remove_after_reply = {{ if hasKey ($cfg.reactions) "removeAfterReply" }}{{ ($cfg.reactions).removeAfterReply }}{{ else }}false{{ end }}
+    {{- if ($cfg.reactions).toolDisplay }}
+    {{- if not (has ($cfg.reactions).toolDisplay (list "full" "compact" "none")) }}
+    {{- fail (printf "agents.%s.reactions.toolDisplay must be one of: full, compact, none — got: %s" $name ($cfg.reactions).toolDisplay) }}
+    {{- end }}
+    tool_display = {{ ($cfg.reactions).toolDisplay | toJson }}
+    {{- end }}
+    {{- if ($cfg.stt).enabled }}
+    {{- if not ($cfg.stt).apiKey }}
+    {{ fail (printf "agents.%s.stt.apiKey is required when stt.enabled=true" $name) }}
+    {{- end }}
+
+    [stt]
+    enabled = true
+    api_key = "${STT_API_KEY}"
+    model = {{ ($cfg.stt).model | default "whisper-large-v3-turbo" | toJson }}
+    base_url = {{ ($cfg.stt).baseUrl | default "https://api.groq.com/openai/v1" | toJson }}
+    {{- if hasKey ($cfg.stt | default dict) "echoTranscript" }}
+    echo_transcript = {{ ($cfg.stt).echoTranscript }}
+    {{- end }}
+    {{- end }}
+    {{- if ($cfg.gateway).enabled }}
+    {{- if not ($cfg.gateway).url }}
+    {{ fail (printf "agents.%s.gateway.url is required when gateway.enabled=true" $name) }}
+    {{- end }}
+
+    [gateway]
+    url = {{ ($cfg.gateway).url | toJson }}
+    platform = {{ ($cfg.gateway).platform | default "telegram" | toJson }}
+    {{- if ($cfg.gateway).token }}
+    token = "${GATEWAY_WS_TOKEN}"
+    {{- end }}
+    {{- if ($cfg.gateway).botUsername }}
+    bot_username = {{ ($cfg.gateway).botUsername | toJson }}
+    {{- end }}
+    allow_all_channels = {{ if and (hasKey ($cfg.gateway) "allowAllChannels") (ne ($cfg.gateway).allowAllChannels nil) }}{{ ($cfg.gateway).allowAllChannels }}{{ else if ($cfg.gateway).allowedChannels }}false{{ else }}true{{ end }}
+    {{- range ($cfg.gateway).allowedChannels }}
+    {{- if regexMatch "[eE]\\+" (toString .) }}
+    {{- fail (printf "gateway.allowedChannels contains a mangled ID: %s — use --set-string instead of --set for channel IDs" (toString .)) }}
+    {{- end }}
+    {{- end }}
+    allowed_channels = {{ ($cfg.gateway).allowedChannels | default list | toJson }}
+    allow_all_users = {{ if and (hasKey ($cfg.gateway) "allowAllUsers") (ne ($cfg.gateway).allowAllUsers nil) }}{{ ($cfg.gateway).allowAllUsers }}{{ else if ($cfg.gateway).allowedUsers }}false{{ else }}true{{ end }}
+    {{- range ($cfg.gateway).allowedUsers }}
+    {{- if regexMatch "[eE]\\+" (toString .) }}
+    {{- fail (printf "gateway.allowedUsers contains a mangled ID: %s — use --set-string instead of --set for user IDs" (toString .)) }}
+    {{- end }}
+    {{- end }}
+    allowed_users = {{ ($cfg.gateway).allowedUsers | default list | toJson }}
+    {{- /* messageProcessingMode: per-message (default) | per-thread | per-lane (turn-boundary batching) */ -}}
+    {{- if hasKey ($cfg.gateway | default dict) "messageProcessingMode" }}
+    {{- if not (has ($cfg.gateway).messageProcessingMode (list "per-message" "per-thread" "per-lane")) }}
+    {{- fail (printf "agents.%s.gateway.messageProcessingMode must be one of: per-message, per-thread, per-lane — got: %s" $name ($cfg.gateway).messageProcessingMode) }}
+    {{- end }}
+    message_processing_mode = {{ ($cfg.gateway).messageProcessingMode | toJson }}
+    {{- end }}
+    {{- if hasKey ($cfg.gateway | default dict) "maxBufferedMessages" }}
+    max_buffered_messages = {{ ($cfg.gateway).maxBufferedMessages | int }}
+    {{- end }}
+    {{- if hasKey ($cfg.gateway | default dict) "maxBatchTokens" }}
+    max_batch_tokens = {{ ($cfg.gateway).maxBatchTokens | int }}
+    {{- end }}
+    {{- end }}
+    {{- if or ($cfg.cronjobs) (($cfg.cron).usercronEnabled) (($cfg.cron).usercronPath) }}
+
+    [cron]
+    usercron_enabled = {{ if hasKey ($cfg.cron) "usercronEnabled" }}{{ (($cfg.cron).usercronEnabled) }}{{ else }}false{{ end }}
+    {{- if (($cfg.cron).usercronPath) }}
+    usercron_path = {{ ($cfg.cron).usercronPath | toJson }}
+    {{- end }}
+    {{- range ($cfg.cronjobs) }}
+
+    [[cron.jobs]]
+    enabled = {{ if hasKey . "enabled" }}{{ .enabled }}{{ else }}true{{ end }}
+    schedule = {{ .schedule | toJson }}
+    channel = {{ .channel | toJson }}
+    message = {{ .message | toJson }}
+    platform = {{ .platform | default "discord" | toJson }}
+    sender_name = {{ .senderName | default "openab-cron" | toJson }}
+    timezone = {{ .timezone | default "UTC" | toJson }}
+    {{- if .threadId }}
+    thread_id = {{ .threadId | toJson }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+  {{- if $cfg.agentsMd }}
+  AGENTS.md: |
+    {{- $cfg.agentsMd | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}

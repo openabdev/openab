@@ -1,0 +1,56 @@
+name: Label stale pending-contributor PRs
+
+on:
+  schedule:
+    - cron: '0 * * * *'  # hourly
+  workflow_dispatch:
+
+jobs:
+  check-stale:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const CONTRIBUTOR = 'pending-contributor';
+            const CLOSING = 'closing-soon';
+            const STALE_DAYS = 2;
+            const cutoff = new Date(Date.now() - STALE_DAYS * 24 * 60 * 60 * 1000);
+
+            const prs = await github.rest.pulls.list({
+              ...context.repo,
+              state: 'open',
+              per_page: 100
+            });
+
+            for (const pr of prs.data) {
+              const labels = pr.labels.map(l => l.name);
+              if (!labels.includes(CONTRIBUTOR)) continue;
+              if (labels.includes(CLOSING)) continue;
+
+              // Find when pending-contributor was last applied
+              const { data: events } = await github.rest.issues.listEvents({
+                ...context.repo,
+                issue_number: pr.number,
+                per_page: 100
+              });
+
+              const labelEvent = events
+                .filter(e => e.event === 'labeled' && e.label?.name === CONTRIBUTOR)
+                .pop();
+
+              if (!labelEvent) continue;
+
+              const labeledAt = new Date(labelEvent.created_at);
+              if (labeledAt > cutoff) continue;
+
+              await github.rest.issues.addLabels({
+                ...context.repo,
+                issue_number: pr.number,
+                labels: [CLOSING]
+              });
+              console.log(`#${pr.number} — ${CONTRIBUTOR} since ${labeledAt.toISOString()}, added ${CLOSING}`);
+            }

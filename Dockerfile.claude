@@ -1,0 +1,38 @@
+# --- Build stage ---
+FROM rust:1-bookworm AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
+COPY src/ src/
+RUN touch src/main.rs && cargo build --release
+
+# --- Runtime stage ---
+FROM node:22-bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini && rm -rf /var/lib/apt/lists/*
+
+# Install claude-agent-acp adapter and Claude Code CLI.
+# Without CLAUDE_CODE_EXECUTABLE the adapter uses its own bundled SDK cli.js,
+# ignoring the globally installed claude-code binary (see #418).
+ARG CLAUDE_AGENT_ACP_VERSION=0.29.2
+ARG CLAUDE_CODE_VERSION=2.1.124
+RUN npm install -g @agentclientprotocol/claude-agent-acp@${CLAUDE_AGENT_ACP_VERSION} @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} --retry 3
+ENV CLAUDE_CODE_EXECUTABLE=/usr/local/bin/claude
+
+# Install gh CLI
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV HOME=/home/node
+WORKDIR /home/node
+
+COPY --from=builder --chown=node:node /build/target/release/openab /usr/local/bin/openab
+
+USER node
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]

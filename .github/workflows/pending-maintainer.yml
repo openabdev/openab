@@ -1,0 +1,125 @@
+name: Label pending-maintainer PRs
+
+on:
+  schedule:
+    - cron: '0 * * * *'  # hourly safety net
+  issue_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  workflow_dispatch:
+
+jobs:
+  check-pending:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.issue.pull_request != null || github.event.pull_request != null
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+      checks: read
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const MAINTAINER = 'pending-maintainer';
+            const CONTRIBUTOR = 'pending-contributor';
+
+            let prNumbers = [];
+
+            if (context.eventName === 'workflow_dispatch' || context.eventName === 'schedule') {
+              const prs = await github.rest.pulls.list({
+                ...context.repo,
+                state: 'open',
+                per_page: 100
+              });
+              prNumbers = prs.data.map(pr => pr.number);
+            } else if (context.eventName === 'issue_comment') {
+              prNumbers = [context.payload.issue.number];
+            } else if (context.eventName === 'pull_request_review') {
+              prNumbers = [context.payload.pull_request.number];
+            }
+
+            for (const prNumber of prNumbers) {
+              const { data: pr } = await github.rest.pulls.get({
+                ...context.repo,
+                pull_number: prNumber
+              });
+
+              const labels = pr.labels.map(l => l.name);
+
+              // Skip drafts — not ready for maintainer review
+              if (pr.draft) {
+                console.log(`#${prNumber} — draft, skipping`);
+                continue;
+              }
+
+              // Skip if closing-soon — contributor has incomplete work
+              if (labels.includes('closing-soon')) {
+                console.log(`#${prNumber} — closing-soon, skipping`);
+                continue;
+              }
+
+              // Skip if has merge conflicts or already labeled needs-rebase
+              if (pr.mergeable === false || labels.includes('needs-rebase')) {
+                console.log(`#${prNumber} — has conflicts or needs-rebase, skipping`);
+                continue;
+              }
+
+              // Skip if wontfix or not-planned
+              if (labels.includes('wontfix') || labels.includes('not-planned')) {
+                console.log(`#${prNumber} — wontfix/not-planned, skipping`);
+                continue;
+              }
+
+              // Check CI status on head commit
+              const { data: status } = await github.rest.repos.getCombinedStatusForRef({
+                ...context.repo,
+                ref: pr.head.sha
+              });
+              const { data: checks } = await github.rest.checks.listForRef({
+                ...context.repo,
+                ref: pr.head.sha,
+                per_page: 100
+              });
+              const ciRed = status.state === 'failure'
+                || checks.check_runs.some(c => c.conclusion === 'failure');
+              if (ciRed) {
+                console.log(`#${prNumber} — CI failing, skipping`);
+                continue;
+              }
+
+              // Check last comment from a human (skip bot comments) is from PR author
+              const { data: allComments } = await github.rest.issues.listComments({
+                ...context.repo,
+                issue_number: prNumber,
+                per_page: 100
+              });
+              const EXCLUDED_BOTS = ['shaun-agent'];
+              const humanComments = allComments.filter(c =>
+                c.user.type !== 'Bot' && !EXCLUDED_BOTS.includes(c.user.login)
+              );
+              // If there are human comments, check who spoke last.
+              // Last comment by someone other than author = ball is with contributor, skip.
+              // No human comments = new PR awaiting first review, fall through.
+              if (humanComments.length > 0) {
+                const lastCommenter = humanComments[humanComments.length - 1].user.login;
+                if (lastCommenter !== pr.user.login) continue;
+              }
+
+              // All conditions met: not draft, no conflicts, CI green, awaiting maintainer
+              if (!labels.includes(MAINTAINER)) {
+                await github.rest.issues.addLabels({
+                  ...context.repo,
+                  issue_number: prNumber,
+                  labels: [MAINTAINER]
+                });
+              }
+              if (labels.includes(CONTRIBUTOR)) {
+                await github.rest.issues.removeLabel({
+                  ...context.repo,
+                  issue_number: prNumber,
+                  name: CONTRIBUTOR
+                }).catch(() => {});
+              }
+              console.log(`#${prNumber} — all clear, set ${MAINTAINER}`);
+            }

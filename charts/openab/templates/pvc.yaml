@@ -1,0 +1,25 @@
+{{- range $name, $cfg := .Values.agents }}
+{{- if ne (include "openab.agentEnabled" $cfg) "false" }}
+{{- if and (not (eq (include "openab.persistenceEnabled" $cfg) "false")) (not (and $cfg.persistence $cfg.persistence.existingClaim)) }}
+{{- $d := dict "ctx" $ "agent" $name "cfg" $cfg }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "openab.agentFullname" $d }}
+  labels:
+    {{- include "openab.labels" $d | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if and $cfg.persistence $cfg.persistence.storageClass }}
+  storageClassName: {{ $cfg.persistence.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ (and $cfg.persistence $cfg.persistence.size) | default "1Gi" }}
+{{- end }}
+{{- end }}
+{{- end }}

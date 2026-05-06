@@ -1,0 +1,81 @@
+name: Build Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag (e.g. v0.8.1-beta.5)'
+        required: true
+        type: string
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-latest, os: linux, arch: x64, ext: "", archive: tar.gz }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, os: linux, arch: arm64, ext: "", archive: tar.gz }
+          - { target: x86_64-pc-windows-msvc, runner: windows-latest, os: windows, arch: x64, ext: ".exe", archive: zip }
+          - { target: aarch64-pc-windows-msvc, runner: windows-latest, os: windows, arch: arm64, ext: ".exe", archive: zip }
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          VERSION="${{ steps.tag.outputs.version }}"
+          NAME="openab-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/openab${{ matrix.ext }} dist/
+          cp config.toml.example dist/
+          cd dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a ../${NAME}.zip *
+          else
+            tar czf ../${NAME}.tar.gz *
+          fi
+
+      - name: Upload to release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          VERSION="${{ steps.tag.outputs.version }}"
+          NAME="openab-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}.${{ matrix.archive }}"
+          # Helm release uses openab-X.Y.Z tag, binary release uses vX.Y.Z tag
+          # Try both — one will exist
+          gh release upload "openab-${VERSION}" "$NAME" --clobber 2>/dev/null \
+            || gh release upload "${{ steps.tag.outputs.tag }}" "$NAME" --clobber \
+            || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openab-${{ matrix.os }}-${{ matrix.arch }}
+          path: openab-*.${{ matrix.archive }}
+          retention-days: 7

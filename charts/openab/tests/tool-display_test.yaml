@@ -1,0 +1,40 @@
+suite: toolDisplay
+templates:
+  - templates/configmap.yaml
+tests:
+  - it: renders tool_display = "compact"
+    set:
+      agents.kiro.reactions.toolDisplay: compact
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'tool_display = "compact"'
+
+  - it: renders tool_display = "full"
+    set:
+      agents.kiro.reactions.toolDisplay: full
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'tool_display = "full"'
+
+  - it: renders tool_display = "none"
+    set:
+      agents.kiro.reactions.toolDisplay: none
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'tool_display = "none"'
+
+  - it: omits tool_display when not set
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: tool_display
+
+  - it: rejects invalid toolDisplay value
+    set:
+      agents.kiro.reactions.toolDisplay: hidden
+    asserts:
+      - failedTemplate:
+          errorPattern: "must be one of: full, compact, none"

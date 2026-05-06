@@ -1,0 +1,135 @@
+name: PR Preview Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number (e.g. 123)'
+        required: true
+        type: number
+      variant:
+        description: 'Dockerfile variant'
+        required: false
+        type: choice
+        options:
+          - default
+          - claude
+          - codex
+          - copilot
+          - cursor
+          - gemini
+          - opencode
+        default: 'default'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  resolve-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      ref: ${{ steps.pr.outputs.ref }}
+      repo: ${{ steps.pr.outputs.repo }}
+      dockerfile: ${{ steps.df.outputs.file }}
+      suffix: ${{ steps.df.outputs.suffix }}
+    steps:
+      - name: Get PR branch
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_JSON=$(gh api repos/${{ github.repository }}/pulls/${{ inputs.pr_number }})
+          echo "ref=$(echo "$PR_JSON" | jq -r '.head.ref')" >> "$GITHUB_OUTPUT"
+          echo "repo=$(echo "$PR_JSON" | jq -r '.head.repo.full_name')" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve Dockerfile
+        id: df
+        run: |
+          if [ "${{ inputs.variant }}" = "default" ]; then
+            echo "file=Dockerfile" >> "$GITHUB_OUTPUT"
+            echo "suffix=" >> "$GITHUB_OUTPUT"
+          else
+            echo "file=Dockerfile.${{ inputs.variant }}" >> "$GITHUB_OUTPUT"
+            echo "suffix=-${{ inputs.variant }}" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: resolve-pr
+    strategy:
+      matrix:
+        platform:
+          - { os: linux/amd64, runner: ubuntu-latest }
+          - { os: linux/arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.platform.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ needs.resolve-pr.outputs.repo }}
+          ref: ${{ needs.resolve-pr.outputs.ref }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ needs.resolve-pr.outputs.dockerfile }}
+          platforms: ${{ matrix.platform.os }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ needs.resolve-pr.outputs.suffix }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=pr-${{ inputs.variant }}-${{ matrix.platform.os }}
+          cache-to: type=gha,scope=pr-${{ inputs.variant }}-${{ matrix.platform.os }},mode=max
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.platform.runner }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  merge:
+    needs: [resolve-pr, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ needs.resolve-pr.outputs.suffix }}"
+          docker buildx imagetools create \
+            -t "${IMAGE}:pr${{ inputs.pr_number }}" \
+            $(printf "${IMAGE}@sha256:%s " $(ls /tmp/digests/))

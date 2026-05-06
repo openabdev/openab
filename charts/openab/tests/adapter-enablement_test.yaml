@@ -1,0 +1,70 @@
+suite: adapter enablement gating
+templates:
+  - templates/configmap.yaml
+tests:
+  - it: renders [discord] with placeholder token when enabled=true without botToken
+    set:
+      agents.kiro.discord.enabled: true
+      agents.kiro.discord.botToken: ""
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "\\[discord\\]"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'bot_token = "\$\{DISCORD_BOT_TOKEN\}"'
+
+  - it: omits [discord] when enabled=false
+    set:
+      agents.kiro.discord.enabled: false
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: "\\[discord\\]"
+
+  - it: omits [discord] when discord is not set
+    set:
+      agents.kiro.discord: null
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: "\\[discord\\]"
+
+  - it: renders [slack] when enabled=true
+    set:
+      agents.kiro.slack.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "\\[slack\\]"
+
+  - it: omits [slack] when enabled=false
+    set:
+      agents.kiro.slack.enabled: false
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: "\\[slack\\]"
+
+  - it: renders [slack] with placeholder tokens when enabled=true
+    set:
+      agents.kiro.slack.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'bot_token = "\$\{SLACK_BOT_TOKEN\}"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'app_token = "\$\{SLACK_APP_TOKEN\}"'
+
+  - it: renders both [discord] and [slack] when both enabled
+    set:
+      agents.kiro.discord.enabled: true
+      agents.kiro.slack.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "\\[discord\\]"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "\\[slack\\]"

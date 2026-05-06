@@ -1,0 +1,22 @@
+name: Feature Request
+description: Suggest a new feature
+labels: [feature, needs-triage]
+body:
+  - type: textarea
+    attributes:
+      label: Description
+      description: What feature would you like?
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Use Case
+      description: Why do you need this?
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Proposed Solution
+      description: Do you have any ideas on how this could be implemented?
+    validations:
+      required: false

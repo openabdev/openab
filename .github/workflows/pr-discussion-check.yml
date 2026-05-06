@@ -1,0 +1,96 @@
+name: PR Discussion URL Check
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize]
+
+concurrency:
+  group: pr-discussion-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const body = pr.body || '';
+            const labels = pr.labels.map(l => l.name);
+            const marker = '<!-- openab-pr-discussion-check -->';
+            const label = 'closing-soon';
+
+            const hasDiscordUrl = /https:\/\/discord\.com\/channels\/\d+\/\d+/.test(body);
+
+            const comments = await github.rest.issues.listComments({
+              ...context.repo,
+              issue_number: pr.number
+            });
+            const old = comments.data.find(c => c.body.includes(marker));
+
+            // Exempt bot-authored PRs (e.g. openab-app release PRs)
+            if (pr.user.type === 'Bot') {
+              console.log(`Skipping discussion check for bot PR by ${pr.user.login}`);
+              if (old) {
+                await github.rest.issues.deleteComment({ ...context.repo, comment_id: old.id });
+              }
+              if (labels.includes(label)) {
+                try { await github.rest.issues.removeLabel({ ...context.repo, issue_number: pr.number, name: label }); } catch (e) { if (e.status !== 404) throw e; }
+              }
+              return;
+            }
+
+            if (!hasDiscordUrl) {
+              if (!labels.includes(label)) {
+                await github.rest.issues.addLabels({
+                  ...context.repo,
+                  issue_number: pr.number,
+                  labels: [label]
+                });
+              }
+
+              const msg = [
+                marker,
+                '⚠️ This PR is missing a **Discord Discussion URL** in the body.',
+                '',
+                'All PRs must reference a prior Discord discussion to ensure community alignment before implementation.',
+                '',
+                'Please edit the PR description to include a link like:',
+                '```',
+                'Discord Discussion URL: https://discord.com/channels/...',
+                '```',
+                '',
+                `This PR will be **automatically closed in 3 days** if the link is not added.`
+              ].join('\n');
+
+              if (!old) {
+                await github.rest.issues.createComment({
+                  ...context.repo,
+                  issue_number: pr.number,
+                  body: msg
+                });
+              }
+            } else {
+              // URL found — remove label and comment if present
+              if (labels.includes(label)) {
+                try {
+                  await github.rest.issues.removeLabel({
+                    ...context.repo,
+                    issue_number: pr.number,
+                    name: label
+                  });
+                } catch (e) {
+                  if (e.status !== 404) throw e;
+                }
+              }
+              if (old) {
+                await github.rest.issues.deleteComment({
+                  ...context.repo,
+                  comment_id: old.id
+                });
+              }
+            }

@@ -1,0 +1,49 @@
+# --- Build stage ---
+FROM rust:1-bookworm AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
+COPY src/ src/
+RUN touch src/main.rs && cargo build --release
+
+# --- Runtime stage ---
+# node:22-bookworm-slim mirrors the base image used by Dockerfile.claude,
+# Dockerfile.codex, and Dockerfile.gemini, keeping the project on a single
+# consistent runtime base.
+#
+# opencode is published to npm as `opencode-ai`; the npm package is a thin
+# postinstall wrapper (~9 KB) that downloads the same pre-compiled binary
+# used by the official install script, so `npm install -g` and
+# `curl | bash` are equivalent in the end result.
+#
+# Version is pinned for reproducible builds.
+# opencode releases very frequently (often daily); bump this version via
+# a dedicated PR when a new release is needed.
+#
+# Note: opencode does not publish SHA256 checksums for its releases,
+# so checksum verification is not possible at this time.
+FROM node:22-bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini && rm -rf /var/lib/apt/lists/*
+
+# Install opencode
+ARG OPENCODE_VERSION=1.14.31
+RUN npm install -g opencode-ai@${OPENCODE_VERSION} --retry 3
+
+# Install gh CLI (matches Dockerfile.claude / Dockerfile.gemini / Dockerfile.codex)
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV HOME=/home/node
+WORKDIR /home/node
+
+COPY --from=builder --chown=node:node /build/target/release/openab /usr/local/bin/openab
+
+USER node
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]

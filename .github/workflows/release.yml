@@ -1,0 +1,79 @@
+name: Release Charts
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "charts/openab/Chart.yaml"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Run chart-releaser
+        uses: helm/chart-releaser-action@v1.6.0
+        with:
+          skip_existing: true
+        env:
+          CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Append install instructions to release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OWNER="${{ github.repository_owner }}"
+          REPO="${{ github.event.repository.name }}"
+          CHART=charts/openab
+          NAME=$(grep '^name:' ${CHART}/Chart.yaml | awk '{print $2}')
+          VERSION=$(grep '^version:' ${CHART}/Chart.yaml | awk '{print $2}')
+          APP_VERSION=$(grep '^appVersion:' ${CHART}/Chart.yaml | awk '{print $2}' | tr -d '"')
+          TAG="${NAME}-${VERSION}"
+
+          if ! gh release view "${TAG}" --repo "${OWNER}/${REPO}" > /dev/null 2>&1; then
+            echo "Release ${TAG} not found, skipping notes update."
+            exit 0
+          fi
+
+          cat > /tmp/notes.md << EOF
+
+          ## Version Info
+          - Chart Version: ${VERSION}
+          - App Version: ${APP_VERSION}
+
+          ## Installation
+
+          ### Helm Repository (GitHub Pages)
+          \`\`\`bash
+          helm repo add openab https://${OWNER}.github.io/${REPO}
+          helm repo update
+          helm install openab openab/openab --version ${VERSION}
+          \`\`\`
+
+          ### OCI Registry
+          \`\`\`bash
+          helm install openab oci://ghcr.io/${OWNER}/charts/openab --version ${VERSION}
+          \`\`\`
+          EOF
+
+          EXISTING=$(gh release view "${TAG}" --repo "${OWNER}/${REPO}" --json body --jq '.body' 2>/dev/null || echo "")
+          printf '%s\n' "${EXISTING}" > /tmp/existing.md
+          cat /tmp/existing.md /tmp/notes.md > /tmp/final.md
+          gh release edit "${TAG}" --repo "${OWNER}/${REPO}" --notes-file /tmp/final.md

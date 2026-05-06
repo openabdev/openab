@@ -1,0 +1,51 @@
+suite: persistence PVC rendering
+templates:
+  - templates/pvc.yaml
+  - templates/deployment.yaml
+tests:
+  - it: keeps chart-created PVCs on helm uninstall
+    template: templates/pvc.yaml
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/resource-policy"]
+          value: keep
+
+  - it: mounts the chart-created PVC by default
+    template: templates/deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.volumes[1].persistentVolumeClaim.claimName
+          value: RELEASE-NAME-openab-kiro
+
+  - it: skips PVC creation when existingClaim is set
+    template: templates/pvc.yaml
+    set:
+      agents.kiro.persistence.existingClaim: openab-existing-kiro
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: mounts existingClaim when set
+    template: templates/deployment.yaml
+    set:
+      agents.kiro.persistence.existingClaim: openab-existing-kiro
+    asserts:
+      - equal:
+          path: spec.template.spec.volumes[1].persistentVolumeClaim.claimName
+          value: openab-existing-kiro
+
+  - it: skips PVC when persistence is disabled
+    template: templates/pvc.yaml
+    set:
+      agents.kiro.persistence.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: skips data volume mount when persistence is disabled
+    template: templates/deployment.yaml
+    set:
+      agents.kiro.persistence.enabled: false
+    asserts:
+      - notExists:
+          path: spec.template.spec.volumes[1].persistentVolumeClaim

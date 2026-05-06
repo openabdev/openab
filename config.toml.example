@@ -1,0 +1,156 @@
+# Enable one or more adapters. At least one [discord] or [slack] section is required.
+
+[discord]
+bot_token = "${DISCORD_BOT_TOKEN}"
+# allow_all_channels = true            # true = allow all channels; false = only allowed_channels
+#                                      # omitted = auto-detect from list (non-empty → false, empty → true)
+allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-detected as false
+# allow_all_users = true               # true = any user; false = only allowed_users
+#                                      # omitted = auto-detect from list (non-empty → false, empty → true)
+# allowed_users = ["<YOUR_DISCORD_USER_ID>"]  # ↑ omitted + empty/absent list → auto-detected as true
+# allow_bot_messages = "off"  # "off" (default) | "mentions" | "all"
+                               # "mentions" is recommended for multi-agent collaboration
+# trusted_bot_ids = []         # empty = any bot (mode permitting); set to restrict
+# allowed_role_ids = []        # role IDs that trigger the bot (same as direct @mention)
+                               # note: if multiple bots share the same role, all will respond simultaneously
+# allow_user_messages = "involved"  # "involved" (default) | "mentions"
+                                     # "involved" = reply in threads bot owns or has participated in
+                                     # "mentions" = always require @mention
+# allow_dm = false                     # true = respond to Discord DMs; false (default) = ignore DMs
+                                       # allowed_users still applies in DMs
+
+# [slack]
+# bot_token = "${SLACK_BOT_TOKEN}"     # Bot User OAuth Token (xoxb-...)
+# app_token = "${SLACK_APP_TOKEN}"     # App-Level Token (xapp-...) for Socket Mode
+# allow_all_channels = true            # true (default) = allow all channels; false = only allowed_channels
+# allowed_channels = ["C0123456789"]   # only checked when allow_all_channels = false
+# allow_all_users = true               # true (default) = any user; false = only allowed_users
+# allowed_users = ["U0123456789"]      # only checked when allow_all_users = false
+# allow_bot_messages = "off"           # "off" (default) | "mentions" | "all"
+# trusted_bot_ids = []                 # empty = any bot (mode permitting); set to restrict
+# allow_user_messages = "involved"     # "involved" (default) | "mentions" | "multibot-mentions"
+                                        # "involved" = reply in threads bot has participated in
+                                        # "mentions" = always require @mention
+                                        # "multibot-mentions" = like "involved", but require @mention
+                                        #   once another bot has posted in the thread
+# max_bot_turns = 100                  # soft cap on consecutive bot turns per thread (human msg resets)
+
+# [gateway]
+# url = "ws://openab-gateway:8080/ws"  # WebSocket URL of the custom gateway
+# platform = "line"                     # "telegram" (default) | "line" | "googlechat"
+# token = "${GATEWAY_TOKEN}"            # shared token for WebSocket auth (optional but recommended)
+# bot_username = "my_bot"               # for @mention gating in groups
+# allow_all_channels = true             # true = allow all channels; false = only allowed_channels
+#                                       # omitted = auto-detect from list (non-empty → false, empty → true)
+# allowed_channels = ["C1234"]          # only checked when allow_all_channels = false
+# allow_all_users = true                # true = any user; false = only allowed_users
+#                                       # omitted = auto-detect from list (non-empty → false, empty → true)
+# allowed_users = ["U5678"]             # only checked when allow_all_users = false
+
+[agent]
+command = "kiro-cli"
+args = ["acp", "--trust-all-tools"]
+working_dir = "/home/agent"
+
+# [agent]
+# command = "claude"
+# args = ["--acp"]
+# working_dir = "/home/node"
+# ⚠️ SECURITY WARNING: Any env var listed here is accessible to the agent.
+# A user could trick the agent into leaking these values via prompt injection.
+# All supported backends support OAuth login — prefer that over env var API keys.
+# Note: env vars here can override baseline vars (HOME, PATH, USER) if needed.
+# env = { ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}" }
+#
+# By default, the agent subprocess only inherits these baseline vars:
+#   Linux/macOS: HOME, PATH, USER
+#   Windows:     USERPROFILE, USERNAME, PATH, SystemRoot, SystemDrive
+#
+# To pass additional env vars from the OAB process (e.g. vars injected via K8s envFrom),
+# list them in inherit_env. Keys in [agent].env take precedence over inherited ones.
+# inherit_env = ["API_BASE_URL", "MODEL_NAME"]
+
+# [agent]
+# command = "codex"
+# args = ["--acp"]
+# working_dir = "/home/node"
+# env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
+
+# [agent]
+# command = "gemini"
+# args = ["--acp"]
+# working_dir = "/home/node"
+# env = { GEMINI_API_KEY = "${GEMINI_API_KEY}" }
+
+# [agent]
+# command = "copilot"
+# args = ["--acp", "--stdio"]
+# working_dir = "/home/node"
+# env = {}  # Auth via: kubectl exec -it <pod> -- gh auth login -p https -w
+
+# [agent]
+# command = "opencode"
+# args = ["acp"]
+# working_dir = "/home/node"
+# # Note: opencode handles tool authorization internally and never emits
+# # session/request_permission — all tools run without user confirmation,
+# # equivalent to --trust-all-tools on other backends.
+# # Run `opencode auth login` once before starting openab.
+
+# [agent]
+# command = "cursor-agent"
+# args = ["acp", "--model", "auto", "--workspace", "/home/agent"]
+# working_dir = "/home/agent"
+# env = {}  # Auth via: kubectl exec -it <pod> -- cursor-agent login
+
+[pool]
+max_sessions = 10
+session_ttl_hours = 24
+
+[markdown]
+tables = "code"  # "code" (default) | "bullets" | "off"
+                 # code: wrap tables in fenced code blocks with aligned columns
+                 # bullets: convert each row into bullet points (• Header: Value)
+                 # off: pass through unchanged
+
+[reactions]
+enabled = true
+remove_after_reply = false
+
+[reactions.emojis]
+queued = "👀"
+thinking = "🤔"
+tool = "🔥"
+coding = "👨💻"
+web = "⚡"
+done = "🆗"
+error = "😱"
+
+[reactions.timing]
+debounce_ms = 700
+stall_soft_ms = 10000
+stall_hard_ms = 30000
+done_hold_ms = 1500
+error_hold_ms = 2500
+
+# --- Scheduled messages (config-driven cron) ---
+# Everything cron-related lives under [cron].
+
+# [cron]
+# usercron_enabled = true                      # enable hot-reload (default: false)
+# usercron_path = "cronjob.toml"               # relative to $HOME/.openab/, or absolute
+
+# [[cron.jobs]]
+# enabled = true                               # optional, default: true
+# schedule = "0 9 * * 1-5"                    # weekdays at 9:00 AM
+# channel = "123456789"                        # target channel/thread ID
+# message = "summarize yesterday's merged PRs" # prompt for the agent
+# platform = "discord"                         # "discord" or "slack"
+# sender_name = "DailyOps"                     # attribution (default: "openab-cron")
+# timezone = "America/New_York"                # IANA timezone (default: "UTC")
+# thread_id = ""                               # optional: post to existing thread
+
+# [[cron.jobs]]
+# schedule = "0 0 * * 0"
+# channel = "123456789"
+# message = "generate weekly status report"

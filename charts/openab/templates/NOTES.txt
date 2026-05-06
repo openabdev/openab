@@ -1,0 +1,65 @@
+openab {{ .Chart.AppVersion }} has been installed!
+
+💡 Agent images without an explicit tag (no ":") auto-append {{ .Chart.AppVersion }}.
+
+⚠️  Channel/user IDs must be set with --set-string (not --set) to avoid float64 precision loss.
+
+Agents deployed:
+{{- range $name, $cfg := .Values.agents }}
+{{- if ne (include "openab.agentEnabled" $cfg) "false" }}
+  • {{ $name }} ({{ $cfg.command }})
+{{- if not (or (and (ne (toString ($cfg.discord).enabled) "false") ($cfg.discord).botToken) (and ($cfg.slack).enabled ($cfg.slack).botToken)) }}
+    ⚠️  No bot token provided. Set one via Helm values or create the secret manually:
+    kubectl create secret generic {{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} \
+      --from-literal=discord-bot-token="YOUR_TOKEN"   # for Discord
+    # --from-literal=slack-bot-token="YOUR_TOKEN"      # for Slack
+{{- end }}
+
+{{- if and (ne (toString ($cfg.discord).enabled) "false") ($cfg.discord).botToken }}
+    Discord: ✅ configured
+{{- end }}
+{{- if and ($cfg.slack).enabled ($cfg.slack).botToken }}
+    Slack: ✅ configured (Socket Mode)
+    Ensure your Slack app has these bot events: app_mention, message.channels, message.groups
+    Required scopes: app_mentions:read, chat:write, channels:history, groups:history, channels:read, groups:read, reactions:write, files:read
+{{- end }}
+
+{{- if eq (toString $cfg.command) "kiro-cli" }}
+    Authenticate:
+    kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- kiro-cli login --use-device-flow
+{{- else if eq (toString $cfg.command) "codex-acp" }}
+    Authenticate:
+    kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- codex login --device-auth
+{{- else if eq (toString $cfg.command) "claude-agent-acp" }}
+    Authenticate:
+    kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- claude auth login
+{{- else if eq (toString $cfg.command) "gemini" }}
+    Authenticate:
+    kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- gemini
+{{- else if eq (toString $cfg.command) "opencode" }}
+    Authenticate:
+    kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- opencode auth login
+{{- else if eq (toString $cfg.command) "cursor-agent" }}
+    Authenticate:
+    kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- cursor-agent login
+{{- end }}
+
+    Restart after auth:
+    kubectl rollout restart deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }}
+{{- if not (eq (include "openab.persistenceEnabled" $cfg) "false") }}
+
+    Persistence:
+{{- if and $cfg.persistence $cfg.persistence.existingClaim }}
+    using existing PVC {{ $cfg.persistence.existingClaim }} (not managed by this chart)
+{{- else }}
+    PVC {{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} is kept on helm uninstall.
+    To delete stored auth/session data, delete the PVC manually:
+    kubectl delete pvc {{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+⚠️  SECURITY: The agent subprocess only receives HOME, PATH, and explicitly configured [agent].env vars.
+    Any env var passed via [agent].env is accessible to the agent and could be exfiltrated via prompt injection.
+    All supported backends use OAuth/file-based auth — avoid passing API keys via env vars when possible.

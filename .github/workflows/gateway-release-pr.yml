@@ -1,0 +1,50 @@
+name: Gateway Release PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version (e.g. 0.1.0, 0.2.0-beta.1)"
+        required: true
+        type: string
+
+jobs:
+  create-release-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Generate App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v6
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Update gateway version
+        run: |
+          VERSION="${{ inputs.version }}"
+          sed -i "s/^version = .*/version = \"${VERSION}\"/" gateway/Cargo.toml
+          echo "::notice::Gateway release version: ${VERSION}"
+
+      - name: Create release PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          VERSION="${{ inputs.version }}"
+          BRANCH="release/gateway-v${VERSION}"
+          git config user.name "openab-app[bot]"
+          git config user.email "274185012+openab-app[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add -A
+          git commit -m "release: gateway-v${VERSION}"
+          git push origin "$BRANCH"
+          gh pr create \
+            --title "release: gateway-v${VERSION}" \
+            --body "Merge this PR to tag \`gateway-v${VERSION}\` and trigger the gateway build pipeline." \
+            --base main --head "$BRANCH"

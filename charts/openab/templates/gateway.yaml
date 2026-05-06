@@ -1,0 +1,246 @@
+{{- range $name, $cfg := .Values.agents }}
+{{- if and (ne (include "openab.agentEnabled" $cfg) "false") ($cfg.gateway).enabled }}
+{{- if ne (($cfg.gateway).deploy | toString) "false" }}
+{{- $gwCfg := omit $cfg "nameOverride" }}
+{{- $d := dict "ctx" $ "agent" (printf "%s-gateway" $name) "cfg" $gwCfg }}
+{{- $agentD := dict "ctx" $ "agent" $name "cfg" $cfg }}
+{{- $hasTeams := and (($cfg.gateway).teams).appId (($cfg.gateway).teams).appSecret }}
+{{- $hasTelegram := (($cfg.gateway).telegram).botToken }}
+{{- $hasLine := (($cfg.gateway).line).channelSecret }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "openab.agentFullname" $d }}
+  labels:
+    {{- include "openab.labels" $d | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: {{ (($cfg.gateway).strategy) | default "Recreate" }}
+  selector:
+    matchLabels:
+      {{- include "openab.selectorLabels" $d | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ $cfg.gateway | toJson | sha256sum }}
+      labels:
+        {{- include "openab.selectorLabels" $d | nindent 8 }}
+    spec:
+      {{- with $.Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: gateway
+          image: {{ printf "%s:%s" (($cfg.gateway).image | default "ghcr.io/openabdev/openab-gateway") (($cfg.gateway).tag | default $.Chart.AppVersion) }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          {{- with $.Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            {{- if ($cfg.gateway).token }}
+            - name: GATEWAY_WS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $agentD }}
+                  key: gateway-ws-token
+            {{- end }}
+            {{- if $hasTelegram }}
+            - name: TELEGRAM_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: telegram-bot-token
+            {{- if (($cfg.gateway).telegram).secretToken }}
+            - name: TELEGRAM_SECRET_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: telegram-secret-token
+            {{- end }}
+            {{- if (($cfg.gateway).telegram).webhookPath }}
+            - name: TELEGRAM_WEBHOOK_PATH
+              value: {{ (($cfg.gateway).telegram).webhookPath | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if $hasLine }}
+            - name: LINE_CHANNEL_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: line-channel-secret
+            {{- if (($cfg.gateway).line).channelAccessToken }}
+            - name: LINE_CHANNEL_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: line-channel-access-token
+            {{- end }}
+            {{- end }}
+            {{- if $hasTeams }}
+            - name: TEAMS_APP_ID
+              value: {{ ($cfg.gateway).teams.appId | quote }}
+            - name: TEAMS_APP_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: teams-app-secret
+            {{- if ($cfg.gateway).teams.oauthEndpoint }}
+            - name: TEAMS_OAUTH_ENDPOINT
+              value: {{ ($cfg.gateway).teams.oauthEndpoint | quote }}
+            {{- end }}
+            {{- if ($cfg.gateway).teams.openidMetadata }}
+            - name: TEAMS_OPENID_METADATA
+              value: {{ ($cfg.gateway).teams.openidMetadata | quote }}
+            {{- end }}
+            {{- if ($cfg.gateway).teams.allowedTenants }}
+            - name: TEAMS_ALLOWED_TENANTS
+              value: {{ ($cfg.gateway).teams.allowedTenants | join "," | quote }}
+            {{- end }}
+            {{- if ($cfg.gateway).teams.webhookPath }}
+            - name: TEAMS_WEBHOOK_PATH
+              value: {{ ($cfg.gateway).teams.webhookPath | quote }}
+            {{- end }}
+            {{- end }}
+            {{- $hasFeishu := and (($cfg.gateway).feishu).appId (($cfg.gateway).feishu).appSecret }}
+            {{- if $hasFeishu }}
+            - name: FEISHU_APP_ID
+              value: {{ ($cfg.gateway).feishu.appId | quote }}
+            - name: FEISHU_APP_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: feishu-app-secret
+            {{- if ($cfg.gateway).feishu.domain }}
+            - name: FEISHU_DOMAIN
+              value: {{ ($cfg.gateway).feishu.domain | quote }}
+            {{- end }}
+            {{- if ($cfg.gateway).feishu.connectionMode }}
+            - name: FEISHU_CONNECTION_MODE
+              value: {{ ($cfg.gateway).feishu.connectionMode | quote }}
+            {{- end }}
+            {{- if ($cfg.gateway).feishu.webhookPath }}
+            - name: FEISHU_WEBHOOK_PATH
+              value: {{ ($cfg.gateway).feishu.webhookPath | quote }}
+            {{- end }}
+            {{- if ($cfg.gateway).feishu.verificationToken }}
+            - name: FEISHU_VERIFICATION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: feishu-verification-token
+            {{- end }}
+            {{- if ($cfg.gateway).feishu.encryptKey }}
+            - name: FEISHU_ENCRYPT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: feishu-encrypt-key
+            {{- end }}
+            {{- if ($cfg.gateway).feishu.allowedGroups }}
+            - name: FEISHU_ALLOWED_GROUPS
+              value: {{ ($cfg.gateway).feishu.allowedGroups | join "," | quote }}
+            {{- end }}
+            {{- if ($cfg.gateway).feishu.allowedUsers }}
+            - name: FEISHU_ALLOWED_USERS
+              value: {{ ($cfg.gateway).feishu.allowedUsers | join "," | quote }}
+            {{- end }}
+            {{- if not (($cfg.gateway).feishu).requireMention }}
+            - name: FEISHU_REQUIRE_MENTION
+              value: "false"
+            {{- end }}
+            {{- end }}
+            {{- $hasGoogleChat := or (($cfg.gateway).googleChat).saKeyJson (($cfg.gateway).googleChat).accessToken (($cfg.gateway).googleChat).audience }}
+            {{- if $hasGoogleChat }}
+            - name: GOOGLE_CHAT_ENABLED
+              value: "true"
+            {{- if (($cfg.gateway).googleChat).audience }}
+            - name: GOOGLE_CHAT_AUDIENCE
+              value: {{ ($cfg.gateway).googleChat.audience | quote }}
+            {{- end }}
+            {{- if (($cfg.gateway).googleChat).saKeyJson }}
+            - name: GOOGLE_CHAT_SA_KEY_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: google-chat-sa-key-json
+            {{- end }}
+            {{- if (($cfg.gateway).googleChat).accessToken }}
+            - name: GOOGLE_CHAT_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: google-chat-access-token
+            {{- end }}
+            {{- if (($cfg.gateway).googleChat).webhookPath }}
+            - name: GOOGLE_CHAT_WEBHOOK_PATH
+              value: {{ ($cfg.gateway).googleChat.webhookPath | quote }}
+            {{- end }}
+            {{- end }}
+            - name: RUST_LOG
+              value: {{ ($cfg.gateway).rustLog | default "info" | quote }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          {{- with ($cfg.gateway).resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with ($cfg.gateway).extraVolumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with ($cfg.gateway).extraContainers }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with ($cfg.gateway).nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with ($cfg.gateway).affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with ($cfg.gateway).tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with ($cfg.gateway).extraVolumes }}
+      volumes:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "openab.agentFullname" $d }}
+  labels:
+    {{- include "openab.labels" $d | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "openab.selectorLabels" $d | nindent 4 }}
+{{- end }}
+{{- end }}
+{{- end }}
