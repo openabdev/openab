@@ -85,10 +85,7 @@ pub fn generate_config(
         },
         agent: {
             let (command, args): (&str, Vec<String>) = match agent_command {
-                "kiro" => (
-                    "kiro-cli",
-                    vec!["acp".into(), "--trust-all-tools".into()],
-                ),
+                "kiro" => ("kiro-cli", vec!["acp".into(), "--trust-all-tools".into()]),
                 "claude" => ("claude-agent-acp", vec![]),
                 "codex" => ("codex-acp", vec![]),
                 "gemini" => ("gemini", vec!["--acp".into()]),
@@ -152,14 +149,7 @@ mod tests {
 
     #[test]
     fn test_generate_config_kiro_working_dir() {
-        let config = generate_config(
-            "tok",
-            "kiro",
-            vec!["ch".to_string()],
-            "/home/agent",
-            10,
-            24,
-        );
+        let config = generate_config("tok", "kiro", vec!["ch".to_string()], "/home/agent", 10, 24);
         assert!(config.contains(r#"working_dir = "/home/agent""#));
         assert!(config.contains("acp"));
         assert!(config.contains("--trust-all-tools"));

@@ -71,7 +71,10 @@ pub async fn download_and_encode_image(
 
     let response = match req.send().await {
         Ok(resp) => resp,
-        Err(e) => { error!(url, error = %e, "download failed"); return None; }
+        Err(e) => {
+            error!(url, error = %e, "download failed");
+            return None;
+        }
     };
     if !response.status().is_success() {
         error!(url, status = %response.status(), "HTTP error downloading image");
@@ -79,11 +82,18 @@ pub async fn download_and_encode_image(
     }
     let bytes = match response.bytes().await {
         Ok(b) => b,
-        Err(e) => { error!(url, error = %e, "read failed"); return None; }
+        Err(e) => {
+            error!(url, error = %e, "read failed");
+            return None;
+        }
     };
 
     if bytes.len() as u64 > MAX_SIZE {
-        error!(filename, size = bytes.len(), "downloaded image exceeds limit");
+        error!(
+            filename,
+            size = bytes.len(),
+            "downloaded image exceeds limit"
+        );
         return None;
     }
 
@@ -142,14 +152,20 @@ pub async fn download_and_transcribe(
     }
     let bytes = resp.bytes().await.ok()?.to_vec();
 
-    crate::stt::transcribe(&HTTP_CLIENT, stt_config, bytes, filename.to_string(), mime_type).await
+    crate::stt::transcribe(
+        &HTTP_CLIENT,
+        stt_config,
+        bytes,
+        filename.to_string(),
+        mime_type,
+    )
+    .await
 }
 
 /// Resize image so longest side <= IMAGE_MAX_DIMENSION_PX, then encode as JPEG.
 /// GIFs are passed through unchanged to preserve animation.
 pub fn resize_and_compress(raw: &[u8]) -> Result<(Vec<u8>, String), image::ImageError> {
-    let reader = ImageReader::new(Cursor::new(raw))
-        .with_guessed_format()?;
+    let reader = ImageReader::new(Cursor::new(raw)).with_guessed_format()?;
 
     let format = reader.format();
 
@@ -184,16 +200,23 @@ pub fn is_audio_mime(mime: &str) -> bool {
 
 /// Extensions recognised as text-based files that can be inlined into the prompt.
 const TEXT_EXTENSIONS: &[&str] = &[
-    "txt", "csv", "log", "md", "json", "jsonl", "yaml", "yml", "toml", "xml",
-    "rs", "py", "js", "ts", "jsx", "tsx", "go", "java", "c", "cpp", "h", "hpp",
-    "rb", "sh", "bash", "zsh", "fish", "ps1", "bat", "sql", "html", "css",
-    "scss", "less", "ini", "cfg", "conf", "env",
+    "txt", "csv", "log", "md", "json", "jsonl", "yaml", "yml", "toml", "xml", "rs", "py", "js",
+    "ts", "jsx", "tsx", "go", "java", "c", "cpp", "h", "hpp", "rb", "sh", "bash", "zsh", "fish",
+    "ps1", "bat", "sql", "html", "css", "scss", "less", "ini", "cfg", "conf", "env",
 ];
 
 /// Exact filenames (no extension) recognised as text files.
 const TEXT_FILENAMES: &[&str] = &[
-    "dockerfile", "makefile", "justfile", "rakefile", "gemfile",
-    "procfile", "vagrantfile", ".gitignore", ".dockerignore", ".editorconfig",
+    "dockerfile",
+    "makefile",
+    "justfile",
+    "rakefile",
+    "gemfile",
+    "procfile",
+    "vagrantfile",
+    ".gitignore",
+    ".dockerignore",
+    ".editorconfig",
 ];
 
 /// MIME types recognised as text-based (beyond `text/*`).
@@ -268,7 +291,11 @@ pub async fn download_and_read_text_file(
 
     // Defense-in-depth: verify actual download size
     if actual_size > MAX_SIZE {
-        tracing::warn!(filename, size = actual_size, "downloaded text file exceeds 512KB limit, skipping");
+        tracing::warn!(
+            filename,
+            size = actual_size,
+            "downloaded text file exceeds 512KB limit, skipping"
+        );
         return None;
     }
 
@@ -348,16 +375,19 @@ mod tests {
         let png = make_png(3000, 2000);
         let (compressed, _) = resize_and_compress(&png).unwrap();
 
-        assert!(compressed.len() < png.len(), "compressed {} should be < original {}", compressed.len(), png.len());
+        assert!(
+            compressed.len() < png.len(),
+            "compressed {} should be < original {}",
+            compressed.len(),
+            png.len()
+        );
     }
 
     #[test]
     fn gif_passes_through_unchanged() {
         let gif: Vec<u8> = vec![
-            0x47, 0x49, 0x46, 0x38, 0x39, 0x61,
-            0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
-            0x2C, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
-            0x02, 0x02, 0x44, 0x01, 0x00,
+            0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2C,
+            0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00,
             0x3B,
         ];
         let (output, mime) = resize_and_compress(&gif).unwrap();

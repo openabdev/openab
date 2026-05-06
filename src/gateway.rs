@@ -107,12 +107,16 @@ struct GatewayResponse {
 // --- GatewayAdapter: ChatAdapter over WebSocket ---
 
 type PendingRequests = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<GatewayResponse>>>>;
-type SharedWsTx = Arc<Mutex<futures_util::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+type SharedWsTx = Arc<
+    Mutex<
+        futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            Message,
+        >,
     >,
-    Message,
->>>;
+>;
 
 pub struct GatewayAdapter {
     ws_tx: SharedWsTx,
@@ -263,10 +267,7 @@ async fn handle_config_command(
                         Err(e) => Some(format!("❌ Failed to switch: {e}")),
                     };
                 } else {
-                    return Some(format!(
-                        "⚠️ Invalid number. Use 1–{}.",
-                        all_values.len()
-                    ));
+                    return Some(format!("⚠️ Invalid number. Use 1–{}.", all_values.len()));
                 }
             }
             // Exact match on value or name
@@ -548,8 +549,12 @@ pub async fn run_gateway_adapter(
         let (ws_tx, mut ws_rx) = ws_stream.split();
         let ws_tx: SharedWsTx = Arc::new(Mutex::new(ws_tx));
         let pending: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
-        let adapter: Arc<dyn ChatAdapter> =
-            Arc::new(GatewayAdapter::new(ws_tx.clone(), pending.clone(), platform, streaming));
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(GatewayAdapter::new(
+            ws_tx.clone(),
+            pending.clone(),
+            platform,
+            streaming,
+        ));
         let slash_ws_tx = ws_tx.clone(); // for fire-and-forget slash command responses
         let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
@@ -792,4 +797,3 @@ pub async fn run_gateway_adapter(
         backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF);
     } // outer reconnect loop
 }
-

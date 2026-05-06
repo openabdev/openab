@@ -78,7 +78,10 @@ pub async fn transcribe(
     filename: String,
     mime_type: &str,
 ) -> Option<String> {
-    let url = format!("{}/audio/transcriptions", cfg.base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/audio/transcriptions",
+        cfg.base_url.trim_end_matches('/')
+    );
 
     let file_part = multipart::Part::bytes(audio_bytes)
         .file_name(filename)
@@ -185,21 +188,43 @@ mod tests {
 
     #[async_trait]
     impl ChatAdapter for MockAdapter {
-        fn platform(&self) -> &'static str { "mock" }
-        fn message_limit(&self) -> usize { 4000 }
-        async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
-            self.sent_messages.lock().unwrap().push((channel.clone(), content.to_string()));
-            Ok(MessageRef { channel: channel.clone(), message_id: "mock-msg".into() })
+        fn platform(&self) -> &'static str {
+            "mock"
         }
-        async fn create_thread(&self, channel: &ChannelRef, _trigger: &MessageRef, _title: &str) -> Result<ChannelRef> {
+        fn message_limit(&self) -> usize {
+            4000
+        }
+        async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
+            self.sent_messages
+                .lock()
+                .unwrap()
+                .push((channel.clone(), content.to_string()));
+            Ok(MessageRef {
+                channel: channel.clone(),
+                message_id: "mock-msg".into(),
+            })
+        }
+        async fn create_thread(
+            &self,
+            channel: &ChannelRef,
+            _trigger: &MessageRef,
+            _title: &str,
+        ) -> Result<ChannelRef> {
             Ok(channel.clone())
         }
         async fn add_reaction(&self, msg: &MessageRef, emoji: &str) -> Result<()> {
-            self.reactions.lock().unwrap().push((msg.clone(), emoji.to_string()));
+            self.reactions
+                .lock()
+                .unwrap()
+                .push((msg.clone(), emoji.to_string()));
             Ok(())
         }
-        async fn remove_reaction(&self, _msg: &MessageRef, _emoji: &str) -> Result<()> { Ok(()) }
-        fn use_streaming(&self, _other_bot_present: bool) -> bool { false }
+        async fn remove_reaction(&self, _msg: &MessageRef, _emoji: &str) -> Result<()> {
+            Ok(())
+        }
+        fn use_streaming(&self, _other_bot_present: bool) -> bool {
+            false
+        }
     }
 
     fn test_channel() -> ChannelRef {
@@ -213,11 +238,17 @@ mod tests {
     }
 
     fn test_trigger() -> MessageRef {
-        MessageRef { channel: test_channel(), message_id: "M1".into() }
+        MessageRef {
+            channel: test_channel(),
+            message_id: "M1".into(),
+        }
     }
 
     fn cfg(echo: bool) -> SttConfig {
-        SttConfig { echo_transcript: echo, ..SttConfig::default() }
+        SttConfig {
+            echo_transcript: echo,
+            ..SttConfig::default()
+        }
     }
 
     #[tokio::test]
@@ -225,7 +256,14 @@ mod tests {
         let mock = Arc::new(MockAdapter::default());
         let adapter: Arc<dyn ChatAdapter> = mock.clone();
         let entries = vec![EchoEntry::Success("hello".into())];
-        post_echo(&adapter, &test_channel(), &test_trigger(), &entries, &cfg(true)).await;
+        post_echo(
+            &adapter,
+            &test_channel(),
+            &test_trigger(),
+            &entries,
+            &cfg(true),
+        )
+        .await;
 
         assert_eq!(mock.sent_messages.lock().unwrap().len(), 1);
         assert_eq!(mock.sent_messages.lock().unwrap()[0].1, "> 🎤 hello");
@@ -237,10 +275,20 @@ mod tests {
         let mock = Arc::new(MockAdapter::default());
         let adapter: Arc<dyn ChatAdapter> = mock.clone();
         let entries = vec![EchoEntry::Failed];
-        post_echo(&adapter, &test_channel(), &test_trigger(), &entries, &cfg(true)).await;
+        post_echo(
+            &adapter,
+            &test_channel(),
+            &test_trigger(),
+            &entries,
+            &cfg(true),
+        )
+        .await;
 
         assert_eq!(mock.sent_messages.lock().unwrap().len(), 1);
-        assert_eq!(mock.sent_messages.lock().unwrap()[0].1, "> 🎤 (transcription failed)");
+        assert_eq!(
+            mock.sent_messages.lock().unwrap()[0].1,
+            "> 🎤 (transcription failed)"
+        );
         let reactions = mock.reactions.lock().unwrap();
         assert_eq!(reactions.len(), 1);
         assert_eq!(reactions[0].1, "⚠️");
@@ -250,14 +298,21 @@ mod tests {
     async fn post_echo_mixed_one_message_one_reaction() {
         let mock = Arc::new(MockAdapter::default());
         let adapter: Arc<dyn ChatAdapter> = mock.clone();
-        let entries = vec![
-            EchoEntry::Success("ok".into()),
-            EchoEntry::Failed,
-        ];
-        post_echo(&adapter, &test_channel(), &test_trigger(), &entries, &cfg(true)).await;
+        let entries = vec![EchoEntry::Success("ok".into()), EchoEntry::Failed];
+        post_echo(
+            &adapter,
+            &test_channel(),
+            &test_trigger(),
+            &entries,
+            &cfg(true),
+        )
+        .await;
 
         assert_eq!(mock.sent_messages.lock().unwrap().len(), 1);
-        assert_eq!(mock.sent_messages.lock().unwrap()[0].1, "> 🎤 ok\n> 🎤 (transcription failed)");
+        assert_eq!(
+            mock.sent_messages.lock().unwrap()[0].1,
+            "> 🎤 ok\n> 🎤 (transcription failed)"
+        );
         assert_eq!(mock.reactions.lock().unwrap().len(), 1);
     }
 
@@ -266,7 +321,14 @@ mod tests {
         let mock = Arc::new(MockAdapter::default());
         let adapter: Arc<dyn ChatAdapter> = mock.clone();
         let entries = vec![EchoEntry::Success("hi".into()), EchoEntry::Failed];
-        post_echo(&adapter, &test_channel(), &test_trigger(), &entries, &cfg(false)).await;
+        post_echo(
+            &adapter,
+            &test_channel(),
+            &test_trigger(),
+            &entries,
+            &cfg(false),
+        )
+        .await;
 
         assert!(mock.sent_messages.lock().unwrap().is_empty());
         assert!(mock.reactions.lock().unwrap().is_empty());
@@ -277,7 +339,14 @@ mod tests {
         let mock = Arc::new(MockAdapter::default());
         let adapter: Arc<dyn ChatAdapter> = mock.clone();
         let entries: Vec<EchoEntry> = vec![];
-        post_echo(&adapter, &test_channel(), &test_trigger(), &entries, &cfg(true)).await;
+        post_echo(
+            &adapter,
+            &test_channel(),
+            &test_trigger(),
+            &entries,
+            &cfg(true),
+        )
+        .await;
 
         assert!(mock.sent_messages.lock().unwrap().is_empty());
         assert!(mock.reactions.lock().unwrap().is_empty());

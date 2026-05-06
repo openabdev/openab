@@ -34,7 +34,10 @@ pub struct BotTurnTracker {
 
 impl BotTurnTracker {
     pub fn new(soft_limit: u32) -> Self {
-        Self { soft_limit, counts: HashMap::new() }
+        Self {
+            soft_limit,
+            counts: HashMap::new(),
+        }
     }
 
     pub fn on_bot_message(&mut self, thread_id: &str) -> TurnResult {
@@ -307,12 +310,18 @@ mod tests {
         assert_eq!(t.classify_bot_message("t1"), TurnAction::Continue);
         assert!(matches!(
             t.classify_bot_message("t1"),
-            TurnAction::WarnAndStop { severity: TurnSeverity::Soft, .. },
+            TurnAction::WarnAndStop {
+                severity: TurnSeverity::Soft,
+                ..
+            },
         ));
         assert_eq!(t.classify_bot_message("t2"), TurnAction::Continue);
         assert!(matches!(
             t.classify_bot_message("t2"),
-            TurnAction::WarnAndStop { severity: TurnSeverity::Soft, .. },
+            TurnAction::WarnAndStop {
+                severity: TurnSeverity::Soft,
+                ..
+            },
         ));
     }
 
@@ -333,7 +342,11 @@ mod tests {
         assert_eq!(t.classify_bot_message("t1"), TurnAction::Continue);
         assert!(matches!(
             t.classify_bot_message("t1"),
-            TurnAction::WarnAndStop { severity: TurnSeverity::Soft, turns: 2, .. },
+            TurnAction::WarnAndStop {
+                severity: TurnSeverity::Soft,
+                turns: 2,
+                ..
+            },
         ));
     }
 }

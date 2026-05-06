@@ -154,7 +154,11 @@ fn print_box(lines: &[&str]) {
         .unwrap_or(60);
     let width = width.clamp(60, 76);
     println!();
-    cprintln!(C.cyan, "{}", "╔".to_string() + &BORDER.to_string().repeat(width + 2) + "╗");
+    cprintln!(
+        C.cyan,
+        "{}",
+        "╔".to_string() + &BORDER.to_string().repeat(width + 2) + "╗"
+    );
     for line in lines {
         let padded = format!(" {:<width$} ", format!("{}", line), width = width);
         print!("{}", C.cyan);
@@ -163,7 +167,11 @@ fn print_box(lines: &[&str]) {
         print!("{}", C.cyan);
         println!("║");
     }
-    cprintln!(C.cyan, "{}", "╚".to_string() + &BORDER.to_string().repeat(width + 2) + "╝");
+    cprintln!(
+        C.cyan,
+        "{}",
+        "╚".to_string() + &BORDER.to_string().repeat(width + 2) + "╝"
+    );
     println!();
 }
 
@@ -299,10 +307,7 @@ fn section_channels(client: &DiscordClient) -> anyhow::Result<Vec<String>> {
     println!();
 
     if guilds.is_empty() {
-        cprintln!(
-            C.yellow,
-            "  No servers found. Enter channel IDs manually."
-        );
+        cprintln!(C.yellow, "  No servers found. Enter channel IDs manually.");
         let input = prompt("  Channel ID(s), comma-separated");
         let ids: Vec<String> = input
             .split(',')
@@ -342,21 +347,11 @@ fn section_channels(client: &DiscordClient) -> anyhow::Result<Vec<String>> {
         return Ok(ids);
     }
 
-    let channel_names: Vec<String> = channels
-        .iter()
-        .map(|(_, n, _)| format!("#{}", n))
-        .collect();
-    let channel_names_refs: Vec<&str> = channel_names
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
+    let channel_names: Vec<String> = channels.iter().map(|(_, n, _)| format!("#{}", n)).collect();
+    let channel_names_refs: Vec<&str> = channel_names.iter().map(|s| s.as_str()).collect();
 
-    let selected =
-        prompt_checklist("  Select channels (by number):", &channel_names_refs);
-    let selected_ids: Vec<String> = selected
-        .iter()
-        .map(|&i| channels[i].0.clone())
-        .collect();
+    let selected = prompt_checklist("  Select channels (by number):", &channel_names_refs);
+    let selected_ids: Vec<String> = selected.iter().map(|&i| channels[i].0.clone()).collect();
 
     println!();
     cprintln!(C.green, "  Selected {} channel(s)", selected_ids.len());
@@ -408,12 +403,7 @@ fn section_agent() -> (String, String, bool) {
 
     let working_dir = prompt_default("  Working directory", default_dir);
 
-    cprintln!(
-        C.green,
-        "  Agent: {} | Working dir: {}",
-        agent,
-        working_dir
-    );
+    cprintln!(C.green, "  Agent: {} | Working dir: {}", agent, working_dir);
     println!();
 
     (agent.to_string(), working_dir, is_local)
@@ -428,9 +418,7 @@ fn section_pool() -> (usize, u64) {
     cprintln!(C.bold, "--- Step 4: Session Pool ---");
     println!();
 
-    let max_sessions: usize = prompt_default("  Max sessions", "10")
-        .parse()
-        .unwrap_or(10);
+    let max_sessions: usize = prompt_default("  Max sessions", "10").parse().unwrap_or(10);
     let ttl_hours: u64 = prompt_default("  Session TTL (hours)", "24")
         .parse()
         .unwrap_or(24);
@@ -457,9 +445,7 @@ fn section_preview_and_save(config_content: &str, output_path: &PathBuf) -> anyh
     println!("{}", mask_bot_token(config_content));
     println!();
 
-    if output_path.exists()
-        && !prompt_yes_no("  File exists. Overwrite?", false)
-    {
+    if output_path.exists() && !prompt_yes_no("  File exists. Overwrite?", false) {
         println!("  Saving cancelled.");
         return Ok(());
     }
@@ -517,7 +503,10 @@ fn print_next_steps(agent: &str, output_path: &Path, is_local: bool) {
     if is_local {
         match agent {
             "kiro" => {
-                cprintln!(C.cyan, "  1. Install kiro-cli (see https://kiro.dev for installer)");
+                cprintln!(
+                    C.cyan,
+                    "  1. Install kiro-cli (see https://kiro.dev for installer)"
+                );
                 cprintln!(C.cyan, "  2. Authenticate:");
                 println!("       kiro-cli login --use-device-flow");
             }
@@ -536,7 +525,10 @@ fn print_next_steps(agent: &str, output_path: &Path, is_local: bool) {
             "gemini" => {
                 cprintln!(C.cyan, "  1. Install Gemini CLI:");
                 println!("       npm install -g @google/gemini-cli");
-                cprintln!(C.cyan, "  2. Authenticate via Google OAuth, or set GEMINI_API_KEY in config.toml");
+                cprintln!(
+                    C.cyan,
+                    "  2. Authenticate via Google OAuth, or set GEMINI_API_KEY in config.toml"
+                );
             }
             _ => {}
         }
@@ -552,22 +544,28 @@ fn print_next_steps(agent: &str, output_path: &Path, is_local: bool) {
         println!();
         cprintln!(C.cyan, "  1. Deploy with Helm (or your preferred method):");
         println!("       helm install openab openab/openab \\");
-        println!("         --set agents.{}.discord.botToken=\"$BOT_TOKEN\"", agent);
+        println!(
+            "         --set agents.{}.discord.botToken=\"$BOT_TOKEN\"",
+            agent
+        );
         println!();
-        cprintln!(C.cyan, "  2. Authenticate inside the pod (first time only):");
+        cprintln!(
+            C.cyan,
+            "  2. Authenticate inside the pod (first time only):"
+        );
         match agent {
             "kiro" => println!(
                 "       kubectl exec -it deployment/openab-kiro -- kiro-cli login --use-device-flow"
             ),
-            "claude" => println!(
-                "       kubectl exec -it deployment/openab-claude -- claude auth login"
-            ),
+            "claude" => {
+                println!("       kubectl exec -it deployment/openab-claude -- claude auth login")
+            }
             "codex" => println!(
                 "       kubectl exec -it deployment/openab-codex -- codex login --device-auth"
             ),
-            "gemini" => println!(
-                "       Set GEMINI_API_KEY via secret, or exec into the pod for OAuth"
-            ),
+            "gemini" => {
+                println!("       Set GEMINI_API_KEY via secret, or exec into the pod for OAuth")
+            }
             _ => {}
         }
         println!();
@@ -605,10 +603,7 @@ pub fn run_setup(output_path: Option<PathBuf>) -> anyhow::Result<()> {
     println!();
     let bot_token = prompt_password("  Bot Token (or press Enter to skip)");
     if bot_token.is_empty() {
-        cprintln!(
-            C.yellow,
-            "  Skipped. Set bot_token manually in config.toml"
-        );
+        cprintln!(C.yellow, "  Skipped. Set bot_token manually in config.toml");
         println!();
         cprintln!(
             C.green,
@@ -632,11 +627,7 @@ pub fn run_setup(output_path: Option<PathBuf>) -> anyhow::Result<()> {
             vec![]
         }
         Err(e) => {
-            cprintln!(
-                C.yellow,
-                "  Channel fetch failed: {}. Enter manually.",
-                e
-            );
+            cprintln!(C.yellow, "  Channel fetch failed: {}. Enter manually.", e);
             let input = prompt("  Channel ID(s), comma-separated");
             let ids: Vec<String> = input
                 .split(',')

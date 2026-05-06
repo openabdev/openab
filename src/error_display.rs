@@ -16,18 +16,25 @@ pub fn format_user_error(message: &str) -> String {
         if let Some(start) = msg_lower.find("timeout waiting for ") {
             let rest = &message[start + "timeout waiting for ".len()..];
             let method = rest.split_whitespace().next().unwrap_or("request");
-            return format!("**Request Timeout**\nTimeout waiting for {}, please try again.", method);
+            return format!(
+                "**Request Timeout**\nTimeout waiting for {}, please try again.",
+                method
+            );
         }
-        return "**Request Timeout**\nTimeout waiting for a response, please try again.".to_string();
+        return "**Request Timeout**\nTimeout waiting for a response, please try again."
+            .to_string();
     }
     if msg_lower.contains("connection closed") || msg_lower.contains("channel closed") {
-        return "**Connection Lost**\nThe connection to the agent was lost, please try again.".to_string();
+        return "**Connection Lost**\nThe connection to the agent was lost, please try again."
+            .to_string();
     }
     if msg_lower.contains("failed to spawn") || msg_lower.contains("no such file") {
-        return "**Agent Not Found**\nCould not start the agent — please check your configuration.".to_string();
+        return "**Agent Not Found**\nCould not start the agent — please check your configuration."
+            .to_string();
     }
     if msg_lower.contains("pool exhausted") {
-        return "**Service Busy**\nAll agent sessions are in use, please try again shortly.".to_string();
+        return "**Service Busy**\nAll agent sessions are in use, please try again shortly."
+            .to_string();
     }
     if msg_lower.contains("invalid api key") || msg_lower.contains("unauthorized") {
         return "**Unauthorized**\nPlease check your API key configuration.".to_string();

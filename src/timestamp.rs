@@ -64,24 +64,36 @@ mod tests {
     #[test]
     fn slack_ts_keeps_milliseconds() {
         // 1714204397 = 2024-04-27T07:53:17 UTC; .123456 → .123 ms
-        assert_eq!(slack_ts_to_iso8601("1714204397.123456"), "2024-04-27T07:53:17.123Z");
+        assert_eq!(
+            slack_ts_to_iso8601("1714204397.123456"),
+            "2024-04-27T07:53:17.123Z"
+        );
     }
 
     #[test]
     fn slack_ts_missing_fraction_uses_zero() {
-        assert_eq!(slack_ts_to_iso8601("1714204397"), "2024-04-27T07:53:17.000Z");
+        assert_eq!(
+            slack_ts_to_iso8601("1714204397"),
+            "2024-04-27T07:53:17.000Z"
+        );
     }
 
     #[test]
     fn slack_ts_two_digit_fraction_is_120ms_not_12ms() {
         // ".12" carries decimal semantics: 0.12 s = 120 ms.
-        assert_eq!(slack_ts_to_iso8601("1714204397.12"), "2024-04-27T07:53:17.120Z");
+        assert_eq!(
+            slack_ts_to_iso8601("1714204397.12"),
+            "2024-04-27T07:53:17.120Z"
+        );
     }
 
     #[test]
     fn slack_ts_one_digit_fraction_is_100ms_not_1ms() {
         // ".1" carries decimal semantics: 0.1 s = 100 ms.
-        assert_eq!(slack_ts_to_iso8601("1714204397.1"), "2024-04-27T07:53:17.100Z");
+        assert_eq!(
+            slack_ts_to_iso8601("1714204397.1"),
+            "2024-04-27T07:53:17.100Z"
+        );
     }
 
     #[test]

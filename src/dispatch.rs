@@ -17,8 +17,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tracing::{debug, error, info, info_span, warn};
 
-use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef};
 use crate::acp::ContentBlock;
+use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef};
 use crate::config::ReactionsConfig;
 use crate::error_display::format_user_error;
 use crate::reactions::StatusReactionController;
@@ -196,9 +196,19 @@ pub fn dispatch_params(
 ) -> (usize, BatchGrouping, Duration) {
     use crate::config::MessageProcessingMode;
     match mode {
-        MessageProcessingMode::Message => (1, BatchGrouping::Thread, PER_MESSAGE_CONSUMER_IDLE_TIMEOUT),
-        MessageProcessingMode::Thread => (max_buffered, BatchGrouping::Thread, DEFAULT_CONSUMER_IDLE_TIMEOUT),
-        MessageProcessingMode::Lane => (max_buffered, BatchGrouping::Lane, DEFAULT_CONSUMER_IDLE_TIMEOUT),
+        MessageProcessingMode::Message => {
+            (1, BatchGrouping::Thread, PER_MESSAGE_CONSUMER_IDLE_TIMEOUT)
+        }
+        MessageProcessingMode::Thread => (
+            max_buffered,
+            BatchGrouping::Thread,
+            DEFAULT_CONSUMER_IDLE_TIMEOUT,
+        ),
+        MessageProcessingMode::Lane => (
+            max_buffered,
+            BatchGrouping::Lane,
+            DEFAULT_CONSUMER_IDLE_TIMEOUT,
+        ),
     }
 }
 
@@ -394,7 +404,10 @@ impl Dispatcher {
                 let _ = adapter
                     .send_message(
                         &thread_channel,
-                        &format!("⚠️ {}", format_user_error("dispatch consumer exited unexpectedly")),
+                        &format!(
+                            "⚠️ {}",
+                            format_user_error("dispatch consumer exited unexpectedly")
+                        ),
                     )
                     .await;
                 return Err(DispatchError::ConsumerDead);
@@ -740,11 +753,8 @@ mod tests {
 
     #[test]
     fn pack_arrival_event_single() {
-        let blocks = AdapterRouter::pack_arrival_event(
-            r#"{"schema":"openab.sender.v1"}"#,
-            "hello",
-            vec![],
-        );
+        let blocks =
+            AdapterRouter::pack_arrival_event(r#"{"schema":"openab.sender.v1"}"#, "hello", vec![]);
         // sender_context delimiter + prompt = 2 blocks
         assert_eq!(blocks.len(), 2);
         if let ContentBlock::Text { text } = &blocks[0] {
@@ -765,14 +775,23 @@ mod tests {
     #[test]
     fn pack_arrival_event_with_extra_blocks() {
         let extra = vec![
-            ContentBlock::Text { text: "[Voice transcript]: hi".into() },
-            ContentBlock::Image { media_type: "image/png".into(), data: "abc".into() },
+            ContentBlock::Text {
+                text: "[Voice transcript]: hi".into(),
+            },
+            ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "abc".into(),
+            },
         ];
         let blocks = AdapterRouter::pack_arrival_event("{}", "prompt", extra);
         // delimiter + transcript + prompt + image = 4 blocks
         assert_eq!(blocks.len(), 4);
-        assert!(matches!(&blocks[0], ContentBlock::Text { text } if text.contains("<sender_context>")));
-        assert!(matches!(&blocks[1], ContentBlock::Text { text } if text.contains("Voice transcript")));
+        assert!(
+            matches!(&blocks[0], ContentBlock::Text { text } if text.contains("<sender_context>"))
+        );
+        assert!(
+            matches!(&blocks[1], ContentBlock::Text { text } if text.contains("Voice transcript"))
+        );
         assert!(matches!(&blocks[2], ContentBlock::Text { text } if text == "prompt"));
         assert!(matches!(&blocks[3], ContentBlock::Image { .. }));
     }
@@ -781,8 +800,16 @@ mod tests {
     fn pack_arrival_event_batch_n2() {
         // Two arrival events concatenated → 2 (header + prompt) pairs = 4 blocks.
         let mut all: Vec<ContentBlock> = Vec::new();
-        all.extend(AdapterRouter::pack_arrival_event(r#"{"ts":"T1"}"#, "msg1", vec![]));
-        all.extend(AdapterRouter::pack_arrival_event(r#"{"ts":"T2"}"#, "msg2", vec![]));
+        all.extend(AdapterRouter::pack_arrival_event(
+            r#"{"ts":"T1"}"#,
+            "msg1",
+            vec![],
+        ));
+        all.extend(AdapterRouter::pack_arrival_event(
+            r#"{"ts":"T2"}"#,
+            "msg2",
+            vec![],
+        ));
         assert_eq!(all.len(), 4);
         if let ContentBlock::Text { text } = &all[0] {
             assert!(text.contains(r#""ts":"T1""#));
@@ -1095,7 +1122,7 @@ mod tests {
         insert_dummy_handle(&d, "discord:T1:userA");
         insert_dummy_handle(&d, "discord:T1:userB");
         insert_dummy_handle(&d, "discord:T2:userA"); // different thread
-        insert_dummy_handle(&d, "slack:T1:userA");   // different platform
+        insert_dummy_handle(&d, "slack:T1:userA"); // different platform
         d.cancel_buffered_thread("discord", "T1");
         let map = d.per_thread.lock().unwrap();
         assert!(!map.contains_key("discord:T1:userA"));
@@ -1268,11 +1295,18 @@ mod tests {
 
     #[async_trait]
     impl ChatAdapter for MockChatAdapter {
-        fn platform(&self) -> &'static str { "mock" }
-        fn message_limit(&self) -> usize { 2000 }
+        fn platform(&self) -> &'static str {
+            "mock"
+        }
+        fn message_limit(&self) -> usize {
+            2000
+        }
 
         async fn send_message(&self, channel: &ChannelRef, _content: &str) -> Result<MessageRef> {
-            Ok(MessageRef { channel: channel.clone(), message_id: "mock-msg".into() })
+            Ok(MessageRef {
+                channel: channel.clone(),
+                message_id: "mock-msg".into(),
+            })
         }
 
         async fn create_thread(
@@ -1284,9 +1318,15 @@ mod tests {
             Ok(channel.clone())
         }
 
-        async fn add_reaction(&self, _msg: &MessageRef, _emoji: &str) -> Result<()> { Ok(()) }
-        async fn remove_reaction(&self, _msg: &MessageRef, _emoji: &str) -> Result<()> { Ok(()) }
-        fn use_streaming(&self, _other_bot_present: bool) -> bool { false }
+        async fn add_reaction(&self, _msg: &MessageRef, _emoji: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn remove_reaction(&self, _msg: &MessageRef, _emoji: &str) -> Result<()> {
+            Ok(())
+        }
+        fn use_streaming(&self, _other_bot_present: bool) -> bool {
+            false
+        }
     }
 
     fn make_channel(thread: &str) -> ChannelRef {
@@ -1301,7 +1341,8 @@ mod tests {
 
     fn make_msg(prompt: &str, tokens: usize) -> BufferedMessage {
         BufferedMessage {
-            sender_json: r#"{"schema":"openab.sender.v1","sender_id":"u","sender_name":"u"}"#.into(),
+            sender_json: r#"{"schema":"openab.sender.v1","sender_id":"u","sender_name":"u"}"#
+                .into(),
             sender_name: "u".into(),
             prompt: prompt.into(),
             extra_blocks: vec![],
@@ -1403,7 +1444,10 @@ mod tests {
         ));
         // Wait enough for the timeout branch + a tick for the task to finish.
         tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(consumer.is_finished(), "consumer should exit after idle timeout");
+        assert!(
+            consumer.is_finished(),
+            "consumer should exit after idle timeout"
+        );
         // No dispatches should have been recorded.
         assert!(mock.calls().is_empty());
         drop(tx);
@@ -1417,7 +1461,13 @@ mod tests {
         // whose consumer is still parked but whose rx has been dropped.
         let mock = Arc::new(MockDispatchTarget::new());
         let target: Arc<dyn DispatchTarget> = mock.clone();
-        let d = Dispatcher::with_idle_timeout(target, 10, 24_000, BatchGrouping::Thread, DEFAULT_CONSUMER_IDLE_TIMEOUT);
+        let d = Dispatcher::with_idle_timeout(
+            target,
+            10,
+            24_000,
+            BatchGrouping::Thread,
+            DEFAULT_CONSUMER_IDLE_TIMEOUT,
+        );
         let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
 
         let key = "mock:T".to_string();
@@ -1444,7 +1494,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let calls = mock.calls();
-        assert_eq!(calls.len(), 1, "fresh consumer should have dispatched the retry");
+        assert_eq!(
+            calls.len(),
+            1,
+            "fresh consumer should have dispatched the retry"
+        );
         // pack_arrival_event with no extra_blocks → delimiter + prompt = 2 blocks.
         assert_eq!(calls[0].block_count, 2);
 

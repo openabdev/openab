@@ -5,10 +5,15 @@ pub fn validate_bot_token(token: &str) -> anyhow::Result<()> {
     if token.is_empty() {
         anyhow::bail!("Token cannot be empty");
     }
-    if !token
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_' || c == '/' || c == '*' || c == '=')
-    {
+    if !token.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || c == '-'
+            || c == '.'
+            || c == '_'
+            || c == '/'
+            || c == '*'
+            || c == '='
+    }) {
         anyhow::bail!(
             "Token must only contain ASCII letters, numbers, dash, period, underscore, slash, or equals"
         );

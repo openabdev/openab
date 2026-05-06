@@ -330,9 +330,7 @@ Some text after.
         // The table is inside a ``` block — backtick wrapping must be stripped.
         assert!(result.contains("value"), "cell content should be present");
         // Only the fence markers themselves should contain backticks.
-        let inner = result
-            .trim_start_matches("```\n")
-            .trim_end_matches("```\n");
+        let inner = result.trim_start_matches("```\n").trim_end_matches("```\n");
         assert!(
             !inner.contains('`'),
             "no backticks should appear inside the code fence: {result:?}"
@@ -343,6 +341,9 @@ Some text after.
     fn bullets_mode_keeps_backticks_in_code_cells() {
         let md = "| col |\n|-----|\n| `value` |\n";
         let result = convert_tables(md, TableMode::Bullets);
-        assert!(result.contains("`value`"), "backticks should be kept in bullets mode");
+        assert!(
+            result.contains("`value`"),
+            "backticks should be kept in bullets mode"
+        );
     }
 }

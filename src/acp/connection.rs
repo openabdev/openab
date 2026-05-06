@@ -1,4 +1,6 @@
-use crate::acp::protocol::{ConfigOption, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, parse_config_options};
+use crate::acp::protocol::{
+    parse_config_options, ConfigOption, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -9,7 +11,6 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info};
-
 
 /// Pick the most permissive selectable permission option from ACP options.
 fn pick_best_option(options: &[Value]) -> Option<String> {
@@ -187,20 +188,39 @@ impl AcpConnection {
         // Preserve the real HOME so agents can find OAuth/auth files (~/.codex,
         // ~/.claude, ~/.config/gh, etc.). working_dir is already set via
         // current_dir() above and is not necessarily the user's home directory.
-        cmd.env("HOME", std::env::var("HOME").unwrap_or_else(|_| working_dir.into()));
-        cmd.env("PATH", std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into()));
+        cmd.env(
+            "HOME",
+            std::env::var("HOME").unwrap_or_else(|_| working_dir.into()),
+        );
+        cmd.env(
+            "PATH",
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into()),
+        );
         #[cfg(unix)]
         {
-            cmd.env("USER", std::env::var("USER").unwrap_or_else(|_| "agent".into()));
+            cmd.env(
+                "USER",
+                std::env::var("USER").unwrap_or_else(|_| "agent".into()),
+            );
         }
         #[cfg(windows)]
         {
             // Windows requires SystemRoot for DLL loading and basic OS functionality.
             // USERPROFILE is the Windows equivalent of HOME.
-            cmd.env("USERPROFILE", std::env::var("USERPROFILE").unwrap_or_else(|_| working_dir.into()));
-            cmd.env("USERNAME", std::env::var("USERNAME").unwrap_or_else(|_| "agent".into()));
-            if let Ok(v) = std::env::var("SystemRoot") { cmd.env("SystemRoot", v); }
-            if let Ok(v) = std::env::var("SystemDrive") { cmd.env("SystemDrive", v); }
+            cmd.env(
+                "USERPROFILE",
+                std::env::var("USERPROFILE").unwrap_or_else(|_| working_dir.into()),
+            );
+            cmd.env(
+                "USERNAME",
+                std::env::var("USERNAME").unwrap_or_else(|_| "agent".into()),
+            );
+            if let Ok(v) = std::env::var("SystemRoot") {
+                cmd.env("SystemRoot", v);
+            }
+            if let Ok(v) = std::env::var("SystemDrive") {
+                cmd.env("SystemDrive", v);
+            }
         }
         for (k, v) in env {
             cmd.env(k, expand_env(v));
@@ -223,8 +243,7 @@ impl AcpConnection {
         let mut proc = cmd
             .spawn()
             .map_err(|e| anyhow!("failed to spawn {command}: {e}"))?;
-        let child_pgid = proc.id()
-            .and_then(|pid| i32::try_from(pid).ok());
+        let child_pgid = proc.id().and_then(|pid| i32::try_from(pid).ok());
 
         let stdout = proc.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         let stdin = proc.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
@@ -403,19 +422,22 @@ impl AcpConnection {
             .and_then(|c| c.get("loadSession"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        info!(agent = agent_name, load_session = self.supports_load_session, "initialized");
+        info!(
+            agent = agent_name,
+            load_session = self.supports_load_session,
+            "initialized"
+        );
         Ok(())
     }
 
     pub async fn session_new(&mut self, cwd: &str) -> Result<String> {
         let resp = self
-            .send_request(
-                "session/new",
-                Some(json!({"cwd": cwd, "mcpServers": []})),
-            )
+            .send_request("session/new", Some(json!({"cwd": cwd, "mcpServers": []})))
             .await?;
 
-        let session_id = resp.result.as_ref()
+        let session_id = resp
+            .result
+            .as_ref()
             .and_then(|r| r.get("sessionId"))
             .and_then(|s| s.as_str())
             .ok_or_else(|| anyhow!("no sessionId in session/new response"))?
@@ -434,7 +456,11 @@ impl AcpConnection {
 
     /// Set a config option (e.g. model, mode) via ACP session/set_config_option.
     /// Returns the updated list of all config options.
-    pub async fn set_config_option(&mut self, config_id: &str, value: &str) -> Result<Vec<ConfigOption>> {
+    pub async fn set_config_option(
+        &mut self,
+        config_id: &str,
+        value: &str,
+    ) -> Result<Vec<ConfigOption>> {
         let session_id = self
             .acp_session_id
             .as_ref()
@@ -462,7 +488,10 @@ impl AcpConnection {
             Err(_) => {
                 // Fall back: send as a slash command (e.g. "/model claude-sonnet-4")
                 let cmd = format!("/{config_id} {value}");
-                info!(cmd, "set_config_option not supported, falling back to prompt");
+                info!(
+                    cmd,
+                    "set_config_option not supported, falling back to prompt"
+                );
                 let _resp = self
                     .send_request(
                         "session/prompt",
@@ -503,10 +532,7 @@ impl AcpConnection {
         let id = self.next_id();
 
         // Convert content blocks to JSON
-        let prompt_json: Vec<Value> = content_blocks
-            .iter()
-            .map(|b| b.to_json())
-            .collect();
+        let prompt_json: Vec<Value> = content_blocks.iter().map(|b| b.to_json()).collect();
 
         let req = JsonRpcRequest::new(
             id,
@@ -572,11 +598,15 @@ impl AcpConnection {
         #[cfg(unix)]
         {
             // Stage 1: SIGTERM the process group
-            unsafe { libc::kill(-pgid, libc::SIGTERM); }
+            unsafe {
+                libc::kill(-pgid, libc::SIGTERM);
+            }
             // Stage 2: SIGKILL after brief grace (std::thread survives runtime shutdown)
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(1500));
-                unsafe { libc::kill(-pgid, libc::SIGKILL); }
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
             });
         }
         #[cfg(not(unix))]

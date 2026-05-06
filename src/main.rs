@@ -7,13 +7,13 @@ mod discord;
 mod dispatch;
 mod error_display;
 mod format;
+mod gateway;
 mod markdown;
 mod media;
 mod reactions;
 mod setup;
 mod slack;
 mod stt;
-mod gateway;
 mod timestamp;
 
 use adapter::AdapterRouter;
@@ -85,7 +85,9 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cmd = Cli::parse().command.unwrap_or(Commands::Run { config: None });
+    let cmd = Cli::parse()
+        .command
+        .unwrap_or(Commands::Run { config: None });
 
     let config_arg = match cmd {
         Commands::Setup { output } => {
@@ -117,7 +119,9 @@ async fn main() -> anyhow::Result<()> {
     );
 
     if cfg.discord.is_none() && cfg.slack.is_none() && cfg.gateway.is_none() {
-        anyhow::bail!("no adapter configured — add [discord], [slack], and/or [gateway] to config.toml");
+        anyhow::bail!(
+            "no adapter configured — add [discord], [slack], and/or [gateway] to config.toml"
+        );
     }
 
     let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions));
@@ -139,7 +143,11 @@ async fn main() -> anyhow::Result<()> {
         info!(model = %cfg.stt.model, base_url = %cfg.stt.base_url, "STT enabled");
     }
 
-    let router = Arc::new(AdapterRouter::new(pool.clone(), cfg.reactions, cfg.markdown.tables));
+    let router = Arc::new(AdapterRouter::new(
+        pool.clone(),
+        cfg.reactions,
+        cfg.markdown.tables,
+    ));
 
     // Shutdown signal for Slack adapter
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -166,25 +174,36 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Pre-build shared adapters for cron scheduler (avoids duplicate Http clients / rate-limit buckets)
-    let shared_discord_adapter: Option<Arc<dyn adapter::ChatAdapter>> = cfg.discord.as_ref().map(|dc| {
-        let http = Arc::new(serenity::http::Http::new(&dc.bot_token));
-        Arc::new(discord::DiscordAdapter::new(http)) as Arc<dyn adapter::ChatAdapter>
-    });
+    let shared_discord_adapter: Option<Arc<dyn adapter::ChatAdapter>> =
+        cfg.discord.as_ref().map(|dc| {
+            let http = Arc::new(serenity::http::Http::new(&dc.bot_token));
+            Arc::new(discord::DiscordAdapter::new(http)) as Arc<dyn adapter::ChatAdapter>
+        });
     let session_ttl_dur = std::time::Duration::from_secs(ttl_secs);
     let shared_slack_adapter: Option<Arc<slack::SlackAdapter>> = cfg.slack.as_ref().map(|s| {
-        Arc::new(slack::SlackAdapter::new(s.bot_token.clone(), session_ttl_dur, s.allow_bot_messages))
+        Arc::new(slack::SlackAdapter::new(
+            s.bot_token.clone(),
+            session_ttl_dur,
+            s.allow_bot_messages,
+        ))
     });
 
     // Validate cronjob config at startup (fail-fast on bad cron expressions or timezones)
     let mut configured_platforms: Vec<&str> = Vec::new();
-    if cfg.discord.is_some() { configured_platforms.push("discord"); }
-    if cfg.slack.is_some() { configured_platforms.push("slack"); }
+    if cfg.discord.is_some() {
+        configured_platforms.push("discord");
+    }
+    if cfg.slack.is_some() {
+        configured_platforms.push("slack");
+    }
     cron::validate_cronjobs(&cfg.cron.jobs, &configured_platforms)?;
 
     // Spawn Slack adapter (background task)
     let slack_handle = if let Some(slack_cfg) = cfg.slack {
-        let allow_all_channels = config::resolve_allow_all(slack_cfg.allow_all_channels, &slack_cfg.allowed_channels);
-        let allow_all_users = config::resolve_allow_all(slack_cfg.allow_all_users, &slack_cfg.allowed_users);
+        let allow_all_channels =
+            config::resolve_allow_all(slack_cfg.allow_all_channels, &slack_cfg.allowed_channels);
+        let allow_all_users =
+            config::resolve_allow_all(slack_cfg.allow_all_users, &slack_cfg.allowed_users);
         if !allow_all_channels && slack_cfg.allowed_channels.is_empty() {
             warn!("allow_all_channels=false with empty allowed_channels for Slack — bot will deny all channels");
         }
@@ -201,7 +220,9 @@ async fn main() -> anyhow::Result<()> {
         let stt = cfg.stt.clone();
         let max_bot_turns = slack_cfg.max_bot_turns;
         let slack_shutdown_rx = shutdown_rx.clone();
-        let adapter = shared_slack_adapter.clone().expect("shared_slack_adapter must exist when slack config is present");
+        let adapter = shared_slack_adapter
+            .clone()
+            .expect("shared_slack_adapter must exist when slack config is present");
         // Dispatcher is the sole serialization path for all modes. Message = cap 1
         // (each message dispatches alone, FIFO). Thread / Lane = configured cap;
         // grouping decides whether senders share a buffer or get their own lane.
@@ -264,15 +285,23 @@ async fn main() -> anyhow::Result<()> {
             platform: gw_cfg.platform,
             token: gw_cfg.token,
             bot_username: gw_cfg.bot_username,
-            allow_all_channels: config::resolve_allow_all(gw_cfg.allow_all_channels, &gw_cfg.allowed_channels),
+            allow_all_channels: config::resolve_allow_all(
+                gw_cfg.allow_all_channels,
+                &gw_cfg.allowed_channels,
+            ),
             allowed_channels: gw_cfg.allowed_channels,
-            allow_all_users: config::resolve_allow_all(gw_cfg.allow_all_users, &gw_cfg.allowed_users),
+            allow_all_users: config::resolve_allow_all(
+                gw_cfg.allow_all_users,
+                &gw_cfg.allowed_users,
+            ),
             allowed_users: gw_cfg.allowed_users,
             streaming: gw_cfg.streaming,
         };
         let gw_router = router.clone();
         Some(tokio::spawn(async move {
-            if let Err(e) = gateway::run_gateway_adapter(params, shutdown_rx, gw_dispatcher, gw_router).await {
+            if let Err(e) =
+                gateway::run_gateway_adapter(params, shutdown_rx, gw_dispatcher, gw_router).await
+            {
                 error!("gateway adapter error: {e}");
             }
         }))
@@ -311,10 +340,19 @@ async fn main() -> anyhow::Result<()> {
         if let Some(ref a) = shared_slack_adapter {
             cron_adapters.insert("slack".into(), a.clone() as Arc<dyn adapter::ChatAdapter>);
         }
-        let cron_platforms: Vec<String> = configured_platforms.iter().map(|s| s.to_string()).collect();
+        let cron_platforms: Vec<String> =
+            configured_platforms.iter().map(|s| s.to_string()).collect();
         info!(baseline = cronjobs.len(), usercron = ?usercron_path, "starting cron scheduler");
         Some(tokio::spawn(async move {
-            cron::run_scheduler(cronjobs, usercron_path, cron_platforms, cron_router, cron_adapters, shutdown_rx).await;
+            cron::run_scheduler(
+                cronjobs,
+                usercron_path,
+                cron_platforms,
+                cron_router,
+                cron_adapters,
+                shutdown_rx,
+            )
+            .await;
         }))
     } else {
         None
@@ -322,15 +360,20 @@ async fn main() -> anyhow::Result<()> {
 
     // Run Discord adapter (foreground, blocking) or wait for ctrl_c
     if let Some(discord_cfg) = cfg.discord {
-        let allow_all_channels = config::resolve_allow_all(discord_cfg.allow_all_channels, &discord_cfg.allowed_channels);
-        let allow_all_users = config::resolve_allow_all(discord_cfg.allow_all_users, &discord_cfg.allowed_users);
+        let allow_all_channels = config::resolve_allow_all(
+            discord_cfg.allow_all_channels,
+            &discord_cfg.allowed_channels,
+        );
+        let allow_all_users =
+            config::resolve_allow_all(discord_cfg.allow_all_users, &discord_cfg.allowed_users);
         let allowed_channels =
             parse_id_set(&discord_cfg.allowed_channels, "discord.allowed_channels")?;
         if !allow_all_channels && allowed_channels.is_empty() {
             warn!("allow_all_channels=false with empty allowed_channels for Discord — bot will deny all channels");
         }
         let allowed_users = parse_id_set(&discord_cfg.allowed_users, "discord.allowed_users")?;
-        let trusted_bot_ids = parse_id_set(&discord_cfg.trusted_bot_ids, "discord.trusted_bot_ids")?;
+        let trusted_bot_ids =
+            parse_id_set(&discord_cfg.trusted_bot_ids, "discord.trusted_bot_ids")?;
         info!(
             allow_all_channels,
             allow_all_users,
@@ -371,7 +414,9 @@ async fn main() -> anyhow::Result<()> {
             multibot_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             session_ttl: std::time::Duration::from_secs(ttl_secs),
             max_bot_turns: discord_cfg.max_bot_turns,
-            bot_turns: tokio::sync::Mutex::new(bot_turns::BotTurnTracker::new(discord_cfg.max_bot_turns)),
+            bot_turns: tokio::sync::Mutex::new(bot_turns::BotTurnTracker::new(
+                discord_cfg.max_bot_turns,
+            )),
             allow_dm: discord_cfg.allow_dm,
             dispatcher: discord_dispatcher,
         };
@@ -503,7 +548,8 @@ mod tests {
 
     #[test]
     fn cli_run_with_remote_url() {
-        let cli = Cli::try_parse_from(["openab", "run", "-c", "https://example.com/config.toml"]).unwrap();
+        let cli = Cli::try_parse_from(["openab", "run", "-c", "https://example.com/config.toml"])
+            .unwrap();
         match cli.command.unwrap() {
             Commands::Run { config } => assert!(config.unwrap().starts_with("https://")),
             _ => panic!("expected Run"),

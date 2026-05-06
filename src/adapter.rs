@@ -306,7 +306,15 @@ impl AdapterRouter {
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
     ) -> Result<()> {
-        self.stream_prompt_blocks(adapter, thread_key, content_blocks, thread_channel, reactions, other_bot_present).await
+        self.stream_prompt_blocks(
+            adapter,
+            thread_key,
+            content_blocks,
+            thread_channel,
+            reactions,
+            other_bot_present,
+        )
+        .await
     }
 
     /// Drive one ACP turn with the given pre-packed ContentBlocks.

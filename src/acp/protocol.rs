@@ -14,7 +14,12 @@ pub struct JsonRpcRequest {
 
 impl JsonRpcRequest {
     pub fn new(id: u64, method: impl Into<String>, params: Option<Value>) -> Self {
-        Self { jsonrpc: "2.0", id, method: method.into(), params }
+        Self {
+            jsonrpc: "2.0",
+            id,
+            method: method.into(),
+            params,
+        }
     }
 }
 
@@ -27,7 +32,11 @@ pub struct JsonRpcResponse {
 
 impl JsonRpcResponse {
     pub fn new(id: u64, result: Value) -> Self {
-        Self { jsonrpc: "2.0", id, result }
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result,
+        }
     }
 }
 
@@ -95,17 +104,26 @@ pub fn parse_config_options(result: &Value) -> Vec<ConfigOption> {
     let mut options = Vec::new();
 
     if let Some(models) = result.get("models") {
-        let current = models.get("currentModelId").and_then(|v| v.as_str()).unwrap_or("");
+        let current = models
+            .get("currentModelId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if let Some(available) = models.get("availableModels").and_then(|v| v.as_array()) {
             let values: Vec<ConfigOptionValue> = available
                 .iter()
                 .filter_map(|m| {
-                    let id = m.get("modelId").or_else(|| m.get("id")).and_then(|v| v.as_str())?;
+                    let id = m
+                        .get("modelId")
+                        .or_else(|| m.get("id"))
+                        .and_then(|v| v.as_str())?;
                     let name = m.get("name").and_then(|v| v.as_str()).unwrap_or(id);
                     Some(ConfigOptionValue {
                         value: id.to_string(),
                         name: name.to_string(),
-                        description: m.get("description").and_then(|v| v.as_str()).map(String::from),
+                        description: m
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
                     })
                 })
                 .collect();
@@ -124,7 +142,10 @@ pub fn parse_config_options(result: &Value) -> Vec<ConfigOption> {
     }
 
     if let Some(modes) = result.get("modes") {
-        let current = modes.get("currentModeId").and_then(|v| v.as_str()).unwrap_or("");
+        let current = modes
+            .get("currentModeId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if let Some(available) = modes.get("availableModes").and_then(|v| v.as_array()) {
             let values: Vec<ConfigOptionValue> = available
                 .iter()
@@ -134,7 +155,10 @@ pub fn parse_config_options(result: &Value) -> Vec<ConfigOption> {
                     Some(ConfigOptionValue {
                         value: id.to_string(),
                         name: name.to_string(),
-                        description: m.get("description").and_then(|v| v.as_str()).map(String::from),
+                        description: m
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
                     })
                 })
                 .collect();
@@ -161,9 +185,18 @@ pub fn parse_config_options(result: &Value) -> Vec<ConfigOption> {
 pub enum AcpEvent {
     Text(String),
     Thinking,
-    ToolStart { id: String, title: String },
-    ToolDone { id: String, title: String, status: String },
-    ConfigUpdate { options: Vec<ConfigOption> },
+    ToolStart {
+        id: String,
+        title: String,
+    },
+    ToolDone {
+        id: String,
+        title: String,
+        status: String,
+    },
+    ConfigUpdate {
+        options: Vec<ConfigOption>,
+    },
     Status,
 }
 
@@ -190,18 +223,32 @@ pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
             let text = update.get("content")?.get("text")?.as_str()?;
             Some(AcpEvent::Text(text.to_string()))
         }
-        "agent_thought_chunk" => {
-            Some(AcpEvent::Thinking)
-        }
+        "agent_thought_chunk" => Some(AcpEvent::Thinking),
         "tool_call" => {
-            let title = update.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let title = update
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             Some(AcpEvent::ToolStart { id: tool_id, title })
         }
         "tool_call_update" => {
-            let title = update.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let status = update.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let title = update
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let status = update
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             if status == "completed" || status == "failed" {
-                Some(AcpEvent::ToolDone { id: tool_id, title, status })
+                Some(AcpEvent::ToolDone {
+                    id: tool_id,
+                    title,
+                    status,
+                })
             } else {
                 Some(AcpEvent::ToolStart { id: tool_id, title })
             }
