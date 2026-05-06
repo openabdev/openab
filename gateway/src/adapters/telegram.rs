@@ -1,3 +1,4 @@
+use crate::media::{resize_and_compress, FILE_MAX_DOWNLOAD, IMAGE_MAX_DOWNLOAD};
 use crate::schema::*;
 use axum::extract::State;
 use axum::Json;
@@ -25,8 +26,25 @@ struct TelegramMessage {
     chat: TelegramChat,
     from: Option<TelegramUser>,
     text: Option<String>,
+    caption: Option<String>,
     #[serde(default)]
     entities: Vec<TelegramEntity>,
+    #[serde(default)]
+    photo: Vec<TelegramPhoto>,
+    document: Option<TelegramDocument>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramPhoto {
+    file_id: String,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramDocument {
+    file_id: String,
+    file_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,11 +93,44 @@ pub async fn webhook(
     let Some(msg) = update.message else {
         return axum::http::StatusCode::OK;
     };
-    let Some(text) = msg.text.as_deref() else {
+    let is_voice = msg.voice.is_some();
+    let is_audio = msg.audio.is_some();
+    let text = msg.text.as_deref().or(msg.caption.as_deref()).unwrap_or("");
+
+    if text.trim().is_empty() && !is_photo && !is_document && !is_voice && !is_audio {
         return axum::http::StatusCode::OK;
-    };
-    if text.trim().is_empty() {
-        return axum::http::StatusCode::OK;
+    }
+
+    let mut attachments = Vec::new();
+    if is_photo || is_document || is_voice || is_audio {
+        if let Some(ref token) = state.telegram_bot_token {
+            let client = reqwest::Client::new();
+            if is_photo {
+                // Take the largest photo
+                if let Some(largest) = msg.photo.iter().max_by_key(|p| p.width * p.height) {
+                    if let Some(att) =
+                        download_telegram_media(&client, token, &largest.file_id, "image").await
+                    {
+                        attachments.push(att);
+                    }
+                }
+            } else if let Some(doc) = msg.document {
+                let file_name = doc.file_name.unwrap_or_else(|| "unknown.txt".to_string());
+                if let Some(att) =
+                    download_telegram_document(&client, token, &doc.file_id, &file_name).await
+                {
+                    attachments.push(att);
+                }
+            } else if let Some(voice) = msg.voice {
+                if let Some(att) = download_telegram_media(&client, token, &voice.file_id, "audio").await {
+                    attachments.push(att);
+                }
+            } else if let Some(audio) = msg.audio {
+                if let Some(att) = download_telegram_media(&client, token, &audio.file_id, "audio").await {
+                    attachments.push(att);
+                }
+            }
+        }
     }
 
     let from = msg.from.as_ref();
@@ -107,7 +158,7 @@ pub async fn webhook(
         })
         .collect();
 
-    let event = GatewayEvent::new(
+    let mut event = GatewayEvent::new(
         "telegram",
         ChannelInfo {
             id: msg.chat.id.to_string(),
@@ -124,6 +175,7 @@ pub async fn webhook(
         &msg.message_id.to_string(),
         mentions,
     );
+    event.content.attachments = attachments;
 
     let json = serde_json::to_string(&event).unwrap();
     info!(chat_id = %msg.chat.id, sender = %sender_name, "telegram → gateway");
@@ -261,4 +313,162 @@ pub async fn handle_reply(
         .send()
         .await
         .map_err(|e| error!("telegram send error: {e}"));
+}
+
+/// Download photo from Telegram via getFile + download URL.
+async fn download_telegram_media(
+    client: &reqwest::Client,
+    bot_token: &str,
+    file_id: &str,
+    attachment_type: &str,
+) -> Option<Attachment> {
+    // 1. Get file path
+    let get_file_url = format!("{TELEGRAM_API_BASE}/bot{}/getFile", bot_token);
+    let resp = client
+        .get(get_file_url)
+        .query(&[("file_id", file_id)])
+        .send()
+        .await
+        .ok()?;
+
+    let body: serde_json::Value = resp.json().await.ok()?;
+    let file_path = body["result"]["file_path"].as_str()?;
+
+    // 2. Download file
+    let download_url = format!("{TELEGRAM_API_BASE}/file/bot{}/{}", bot_token, file_path);
+    let resp = client.get(download_url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    let max_size = if attachment_type == "image" {
+        IMAGE_MAX_DOWNLOAD
+    } else {
+        AUDIO_MAX_DOWNLOAD
+    };
+
+    if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
+        if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
+            if size > max_size {
+                warn!(file_id, size, "Telegram {} Content-Length exceeds limit", attachment_type);
+                return None;
+            }
+        }
+    }
+
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.len() as u64 > max_size {
+        warn!(file_id, size = bytes.len(), "Telegram {} exceeds limit", attachment_type);
+        return None;
+    }
+
+    let (data_bytes, mime, filename) = if attachment_type == "image" {
+        match resize_and_compress(&bytes) {
+            Ok((c, m)) => (c, m, format!("{}.jpg", file_id)),
+            Err(e) => {
+                error!(err = %e, "Telegram image processing failed");
+                return None;
+            }
+        }
+    } else {
+        // For audio/voice, we don't process.
+        let mime = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("audio/ogg") // Default for Telegram voice
+            .to_string();
+        let ext = if mime.contains("mpeg") || mime.contains("mp3") {
+            "mp3"
+        } else if mime.contains("m4a") {
+            "m4a"
+        } else {
+            "ogg"
+        };
+        (bytes.to_vec(), mime, format!("{}.{}", file_id, ext))
+    };
+
+    use base64::Engine;
+    let b64_data = base64::engine::general_purpose::STANDARD.encode(&data_bytes);
+
+    Some(Attachment {
+        attachment_type: attachment_type.into(),
+        filename,
+        mime_type: mime,
+        data: b64_data,
+        size: data_bytes.len() as u64,
+    })
+}
+
+/// Download document from Telegram via getFile + download URL (text files only).
+async fn download_telegram_document(
+    client: &reqwest::Client,
+    bot_token: &str,
+    file_id: &str,
+    file_name: &str,
+) -> Option<Attachment> {
+    // Only download text-like files
+    let ext = file_name.rsplit('.').next().unwrap_or("").to_lowercase();
+    const TEXT_EXTS: &[&str] = &[
+        "txt", "csv", "log", "md", "json", "jsonl", "yaml", "yml", "toml", "xml", "rs", "py", "js",
+        "ts", "jsx", "tsx", "go", "java", "c", "cpp", "h", "hpp", "rb", "sh", "bash", "sql",
+        "html", "css", "ini", "cfg", "conf", "env",
+    ];
+    if !TEXT_EXTS.contains(&ext.as_str()) {
+        tracing::debug!(file_name, "skipping non-text file attachment");
+        return None;
+    }
+
+    // 1. Get file path
+    let get_file_url = format!("{TELEGRAM_API_BASE}/bot{}/getFile", bot_token);
+    let resp = client
+        .get(get_file_url)
+        .query(&[("file_id", file_id)])
+        .send()
+        .await
+        .ok()?;
+
+    let body: serde_json::Value = resp.json().await.ok()?;
+    let file_path = body["result"]["file_path"].as_str()?;
+
+    // 2. Download file
+    let download_url = format!("{TELEGRAM_API_BASE}/file/bot{}/{}", bot_token, file_path);
+    let resp = client.get(download_url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
+        if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
+            if size > FILE_MAX_DOWNLOAD {
+                warn!(
+                    file_id,
+                    size, "Telegram document Content-Length exceeds limit"
+                );
+                return None;
+            }
+        }
+    }
+
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.len() as u64 > FILE_MAX_DOWNLOAD {
+        warn!(
+            file_id,
+            size = bytes.len(),
+            "Telegram document exceeds limit"
+        );
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&bytes);
+    use base64::Engine;
+    let data = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+
+    Some(Attachment {
+        attachment_type: "text_file".into(),
+        filename: file_name.to_string(),
+        mime_type: "text/plain".into(),
+        data,
+        size: bytes.len() as u64,
+    })
 }

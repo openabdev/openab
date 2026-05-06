@@ -168,6 +168,11 @@ explain VPC peering              ← ignored in groups
 
 DMs and replies within forum topics always trigger the agent (no @mention needed).
 
+### File Attachments
+
+- **Images** — send photos (compressed/resized automatically).
+- **Documents** — send text-based files (e.g. `.txt`, `.csv`, `.rs`, `.py`) up to 512KB. They are passed directly to the agent as text.
+
 ### Emoji reactions
 
 The bot shows status reactions on your message as the agent works:

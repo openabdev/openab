@@ -487,6 +487,7 @@ pub struct GatewayParams {
     pub allow_all_users: bool,
     pub allowed_users: Vec<String>,
     pub streaming: bool,
+    pub stt: crate::config::SttConfig,
 }
 
 pub async fn run_gateway_adapter(
@@ -502,9 +503,9 @@ pub async fn run_gateway_adapter(
     let bot_username = params.bot_username;
     let allow_all_channels = params.allow_all_channels;
     let allowed_channels = params.allowed_channels;
-    let allow_all_users = params.allow_all_users;
     let allowed_users = params.allowed_users;
     let streaming = params.streaming;
+    let stt = params.stt;
 
     let connect_url = match &params.token {
         Some(token) => {

@@ -275,7 +275,9 @@ impl TeamsAdapter {
         }
 
         // B2: Validate channel endorsements — key must endorse the activity's channelId
-        let channel_id = activity.channel_id.as_deref()
+        let channel_id = activity
+            .channel_id
+            .as_deref()
             .ok_or_else(|| anyhow::anyhow!("activity missing channelId"))?;
         if key.endorsements.is_empty() {
             anyhow::bail!("JWK has no endorsements — cannot verify channelId={channel_id}");
@@ -301,9 +303,13 @@ impl TeamsAdapter {
         let token_data = decode::<serde_json::Value>(token, &decoding_key, &validation)?;
 
         // B1: Validate serviceUrl claim matches activity's serviceUrl
-        let activity_service_url = activity.service_url.as_deref()
+        let activity_service_url = activity
+            .service_url
+            .as_deref()
             .ok_or_else(|| anyhow::anyhow!("activity missing serviceUrl"))?;
-        let token_service_url = token_data.claims.get("serviceurl")
+        let token_service_url = token_data
+            .claims
+            .get("serviceurl")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("JWT missing serviceurl claim"))?;
         if token_service_url != activity_service_url {
@@ -743,7 +749,9 @@ mod tests {
     async fn jwt_rejects_garbage_token() {
         let adapter = TeamsAdapter::new(make_config(vec![]));
         let activity = make_activity_with_tenant(Some("t1"));
-        let result = adapter.validate_jwt("Bearer not.a.valid.jwt", &activity).await;
+        let result = adapter
+            .validate_jwt("Bearer not.a.valid.jwt", &activity)
+            .await;
         assert!(result.is_err());
     }
 

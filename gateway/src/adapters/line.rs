@@ -1,3 +1,4 @@
+use crate::media::{resize_and_compress, IMAGE_MAX_DOWNLOAD};
 use crate::schema::*;
 use axum::extract::State;
 use serde::Deserialize;
@@ -90,45 +91,54 @@ pub async fn webhook(
         let Some(ref msg) = event.message else {
             continue;
         };
-        if msg.message_type != "text" {
+        let is_text = msg.message_type == "text";
+        let is_audio = msg.message_type == "audio";
+
+        if !is_text && !is_image && !is_audio {
             continue;
         }
-        let Some(ref text) = msg.text else {
+
+        let mut text = msg.text.clone().unwrap_or_default();
+        if is_text && text.trim().is_empty() {
             continue;
-        };
-        if text.trim().is_empty() {
-            continue;
+        }
+
+        let mut attachments = Vec::new();
+        if is_image || is_audio {
+            if let Some(ref access_token) = state.line_access_token {
+                let client = reqwest::Client::new();
+                let att_type = if is_image { "image" } else { "audio" };
+                if let Some(att) = download_line_media(&client, access_token, &msg.id, att_type).await {
+                    attachments.push(att);
+                }
+            } else {
+                warn!("LINE media received but LINE_CHANNEL_ACCESS_TOKEN not set");
+            }
         }
 
         let source = event.source.as_ref();
         let (channel_id, channel_type) = match source {
-            Some(s) if s.source_type == "group" => {
-                match s.group_id.as_deref() {
-                    Some(id) if !id.is_empty() => (id.to_string(), "group".to_string()),
-                    _ => {
-                        warn!("LINE group event missing groupId, skipping");
-                        continue;
-                    }
+            Some(s) if s.source_type == "group" => match s.group_id.as_deref() {
+                Some(id) if !id.is_empty() => (id.to_string(), "group".to_string()),
+                _ => {
+                    warn!("LINE group event missing groupId, skipping");
+                    continue;
                 }
-            }
-            Some(s) if s.source_type == "room" => {
-                match s.room_id.as_deref() {
-                    Some(id) if !id.is_empty() => (id.to_string(), "room".to_string()),
-                    _ => {
-                        warn!("LINE room event missing roomId, skipping");
-                        continue;
-                    }
+            },
+            Some(s) if s.source_type == "room" => match s.room_id.as_deref() {
+                Some(id) if !id.is_empty() => (id.to_string(), "room".to_string()),
+                _ => {
+                    warn!("LINE room event missing roomId, skipping");
+                    continue;
                 }
-            }
-            Some(s) => {
-                match s.user_id.as_deref() {
-                    Some(id) if !id.is_empty() => (id.to_string(), "user".to_string()),
-                    _ => {
-                        warn!("LINE user event missing userId, skipping");
-                        continue;
-                    }
+            },
+            Some(s) => match s.user_id.as_deref() {
+                Some(id) if !id.is_empty() => (id.to_string(), "user".to_string()),
+                _ => {
+                    warn!("LINE user event missing userId, skipping");
+                    continue;
                 }
-            }
+            },
             None => {
                 warn!("LINE event missing source, skipping");
                 continue;
@@ -138,7 +148,7 @@ pub async fn webhook(
             .and_then(|s| s.user_id.as_deref())
             .unwrap_or("unknown");
 
-        let gateway_event = GatewayEvent::new(
+        let mut gateway_event = GatewayEvent::new(
             "line",
             ChannelInfo {
                 id: channel_id.clone(),
@@ -151,10 +161,11 @@ pub async fn webhook(
                 display_name: user_id.into(),
                 is_bot: false,
             },
-            text,
+            &text,
             &msg.id,
             vec![],
         );
+        gateway_event.content.attachments = attachments;
 
         // Cache the reply token for hybrid Reply/Push dispatch
         if let Some(ref reply_token) = event.reply_token {
@@ -265,4 +276,81 @@ pub async fn dispatch_line_reply(
     }
 
     used_reply
+}
+
+/// Download media content from LINE Messaging API.
+async fn download_line_media(
+    client: &reqwest::Client,
+    access_token: &str,
+    message_id: &str,
+    attachment_type: &str,
+) -> Option<Attachment> {
+    let url = format!(
+        "https://api-data.line.me/v2/bot/message/{}/content",
+        message_id
+    );
+    let resp = client
+        .get(url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .ok()?;
+
+    if !resp.status().is_success() {
+        error!(status = %resp.status(), "LINE media download failed");
+        return None;
+    }
+
+    let max_size = if attachment_type == "image" {
+        IMAGE_MAX_DOWNLOAD
+    } else {
+        AUDIO_MAX_DOWNLOAD
+    };
+
+    if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
+        if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
+            if size > max_size {
+                warn!(message_id, size, "LINE {} Content-Length exceeds limit", attachment_type);
+                return None;
+            }
+        }
+    }
+
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.len() as u64 > max_size {
+        warn!(message_id, size = bytes.len(), "LINE {} exceeds limit", attachment_type);
+        return None;
+    }
+
+    let (data_bytes, mime, filename) = if attachment_type == "image" {
+        match resize_and_compress(&bytes) {
+            Ok((c, m)) => (c, m, format!("{}.jpg", message_id)),
+            Err(e) => {
+                error!(err = %e, "LINE image processing failed");
+                return None;
+            }
+        }
+    } else {
+        // For audio, we don't process, just send as is.
+        // LINE audio is usually m4a.
+        let mime = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("audio/x-m4a")
+            .to_string();
+        let ext = if mime.contains("mp3") { "mp3" } else { "m4a" };
+        (bytes.to_vec(), mime, format!("{}.{}", message_id, ext))
+    };
+
+    use base64::Engine;
+    let b64_data = base64::engine::general_purpose::STANDARD.encode(&data_bytes);
+
+    Some(Attachment {
+        attachment_type: attachment_type.into(),
+        filename,
+        mime_type: mime,
+        data: b64_data,
+        size: data_bytes.len() as u64,
+    })
 }

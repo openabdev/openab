@@ -1,4 +1,5 @@
 mod adapters;
+mod media;
 mod schema;
 
 use anyhow::Result;
@@ -159,7 +160,12 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                             }
                             "feishu" => {
                                 if let Some(ref feishu) = state_for_recv.feishu {
-                                    adapters::feishu::handle_reply(&reply, feishu, &state_for_recv.event_tx).await;
+                                    adapters::feishu::handle_reply(
+                                        &reply,
+                                        feishu,
+                                        &state_for_recv.event_tx,
+                                    )
+                                    .await;
                                 } else {
                                     warn!("reply for feishu but adapter not configured");
                                 }
@@ -306,10 +312,16 @@ async fn main() -> Result<()> {
             warn!("GOOGLE_CHAT_ACCESS_TOKEN / GOOGLE_CHAT_SA_KEY_JSON not set — replies will be logged but not sent");
         }
         if jwt_verifier.is_none() {
-            warn!("GOOGLE_CHAT_AUDIENCE not set — webhook requests are NOT authenticated (insecure)");
+            warn!(
+                "GOOGLE_CHAT_AUDIENCE not set — webhook requests are NOT authenticated (insecure)"
+            );
         }
 
-        Some(adapters::googlechat::GoogleChatAdapter::new(token_cache, access_token, jwt_verifier))
+        Some(adapters::googlechat::GoogleChatAdapter::new(
+            token_cache,
+            access_token,
+            jwt_verifier,
+        ))
     } else {
         None
     };
@@ -390,7 +402,13 @@ async fn main() -> Result<()> {
     let (feishu_shutdown_tx, feishu_shutdown_rx) = tokio::sync::watch::channel(false);
     if feishu_ws_mode {
         if let Some(ref feishu) = state.feishu {
-            match adapters::feishu::start_websocket(feishu, state.event_tx.clone(), feishu_shutdown_rx).await {
+            match adapters::feishu::start_websocket(
+                feishu,
+                state.event_tx.clone(),
+                feishu_shutdown_rx,
+            )
+            .await
+            {
                 Ok(_handle) => info!("feishu websocket task spawned"),
                 Err(e) => tracing::error!(err = %e, "feishu websocket startup failed"),
             }
