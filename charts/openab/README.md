@@ -37,8 +37,12 @@ Each agent lives under `agents.<name>`.
 | `pool.maxSessions` | Maximum concurrent ACP sessions for the agent. | `10` |
 | `pool.sessionTtlHours` | Idle session TTL in hours. | `24` |
 | `reactions.enabled` | Enable status reactions. | `true` |
+| `reactions.removeAfterReply` | Remove status reactions after the agent replies. | `false` |
 | `reactions.toolDisplay` | Tool display verbosity: `full`, `compact`, or `none`. | `"full"` |
 | `stt.enabled` | Enable voice-message speech-to-text. | `false` |
+| `stt.apiKey` | API key for the speech-to-text provider. | `""` |
+| `stt.model` | STT model name. | `"whisper-large-v3-turbo"` |
+| `stt.baseUrl` | STT API base URL. | `"https://api.groq.com/openai/v1"` |
 | `gateway.enabled` | Enable the gateway config block for webhook-based platforms. | `false` |
 | `gateway.deploy` | Deploy the gateway Deployment and Service. | `true` |
 | `cron.usercronEnabled` | Enable user-provided cron configuration. | `false` |
@@ -58,7 +62,7 @@ Each agent lives under `agents.<name>`.
 ```bash
 helm install prod openab/openab \
   --set fullnameOverride=my-openab \
-  --set agents.kiro.discord.botToken="$DISCORD_BOT_TOKEN" \
+  --set-literal agents.kiro.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.kiro.discord.allowedChannels[0]=YOUR_CHANNEL_ID'
 ```
 
@@ -82,7 +86,7 @@ This is useful for credentials such as `GH_TOKEN` without storing them directly 
 
 ```bash
 helm install openab openab/openab \
-  --set agents.kiro.discord.botToken="$DISCORD_BOT_TOKEN" \
+  --set-literal agents.kiro.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.kiro.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
   --set-file agents.kiro.agentsMd=./AGENTS.md
 ```
