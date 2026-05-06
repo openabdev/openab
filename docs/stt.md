@@ -1,6 +1,6 @@
 # Speech-to-Text (STT) for Voice Messages
 
-openab can automatically transcribe Discord voice message attachments and forward the transcript to your ACP agent as text.
+openab can automatically transcribe voice message attachments (Discord, Feishu, and other gateway platforms) and forward the transcript to your ACP agent as text.
 
 ## Quick Start
 
@@ -24,7 +24,7 @@ api_key = "${GROQ_API_KEY}"
 ## How It Works
 
 ```
-Discord voice message (.ogg)
+Voice message (Discord .ogg, Feishu opus/ogg, etc.)
        │
        ▼
   openab downloads the audio file
@@ -170,6 +170,6 @@ When disabled, audio attachments are silently skipped with no impact on existing
 ## Technical Notes
 
 - openab sends `response_format=json` in the transcription request to ensure the response is always parseable JSON. Some local whisper servers default to plain text output without this parameter.
-- The actual MIME type from the Discord attachment is passed through to the STT API (e.g. `audio/ogg`, `audio/mp4`, `audio/wav`).
+- The actual MIME type from the platform attachment is passed through to the STT API (e.g. `audio/ogg` for Discord and Feishu voice messages, `audio/mp4`, `audio/wav`).
 - Environment variables in config values are expanded via `${VAR}` syntax (e.g. `api_key = "${GROQ_API_KEY}"`).
 - The `api_key` field is auto-detected from the `GROQ_API_KEY` environment variable when using the default Groq endpoint. If you set a custom `base_url` (e.g. local server), auto-detect is disabled to avoid leaking the Groq key to unrelated endpoints — you must set `api_key` explicitly.

@@ -298,6 +298,7 @@ async fn main() -> anyhow::Result<()> {
             ),
             allowed_users: gw_cfg.allowed_users,
             streaming: gw_cfg.streaming,
+            stt: cfg.stt.clone(),
         };
         let gw_router = router.clone();
         Some(tokio::spawn(async move {
