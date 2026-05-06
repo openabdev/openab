@@ -297,7 +297,7 @@ mod event_types {
         let sender = event.sender.as_ref()?;
 
         let msg_type = msg.message_type.as_deref().unwrap_or("text");
-        if !matches!(msg_type, "text" | "image" | "file" | "post") {
+        if !matches!(msg_type, "text" | "image" | "file" | "post" | "audio") {
             return None;
         }
         // Skip bot messages with explicit sender_type
@@ -382,6 +382,17 @@ mod event_types {
                     message_id: message_id.to_string(),
                     file_key: file_key.to_string(),
                     file_name: file_name.to_string(),
+                }];
+                (String::new(), mentions.1, refs)
+            }
+            "audio" => {
+                let file_key = content_json.get("file_key")?.as_str()?;
+                let mentions = extract_mentions(
+                    "", msg.mentions.as_deref().unwrap_or(&[]), bot_open_id,
+                );
+                let refs = vec![MediaRef::Audio {
+                    message_id: message_id.to_string(),
+                    file_key: file_key.to_string(),
                 }];
                 (String::new(), mentions.1, refs)
             }
@@ -1038,6 +1049,9 @@ async fn handle_ws_message(
                         MediaRef::File { message_id, file_key, file_name } => {
                             download_feishu_file(client, &api_base, &token, message_id, file_key, file_name).await
                         }
+                        MediaRef::Audio { message_id, file_key } => {
+                            download_feishu_audio(client, &api_base, &token, message_id, file_key).await
+                        }
                     };
                     if let Some(att) = attachment {
                         gateway_event.content.attachments.push(att);
@@ -1343,6 +1357,7 @@ fn try_parse_link(chars: &[char], start: usize) -> Option<(String, String, usize
 pub enum MediaRef {
     Image { message_id: String, image_key: String },
     File { message_id: String, file_key: String, file_name: String },
+    Audio { message_id: String, file_key: String },
 }
 
 const IMAGE_MAX_DIMENSION_PX: u32 = 1200;
@@ -1492,6 +1507,56 @@ pub async fn download_feishu_file(
         attachment_type: "text_file".into(),
         filename: file_name.to_string(),
         mime_type: "text/plain".into(),
+        data,
+        size: bytes.len() as u64,
+    })
+}
+
+const AUDIO_MAX_DOWNLOAD: u64 = 25 * 1024 * 1024; // 25 MB (Whisper API limit)
+
+/// Download a Feishu audio message by message_id + file_key → base64 Attachment.
+pub async fn download_feishu_audio(
+    client: &reqwest::Client,
+    api_base: &str,
+    token: &str,
+    message_id: &str,
+    file_key: &str,
+) -> Option<crate::schema::Attachment> {
+    let url = format!(
+        "{}/open-apis/im/v1/messages/{}/resources/{}?type=file",
+        api_base, message_id, file_key
+    );
+    let resp = match client.get(&url).bearer_auth(token).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(file_key, error = %e, "feishu audio download failed");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::warn!(file_key, status = %resp.status(), "feishu audio download failed");
+        return None;
+    }
+    if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
+        if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
+            if size > AUDIO_MAX_DOWNLOAD {
+                tracing::warn!(file_key, size, "feishu audio exceeds 25MB limit");
+                return None;
+            }
+        }
+    }
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.len() as u64 > AUDIO_MAX_DOWNLOAD {
+        tracing::warn!(file_key, size = bytes.len(), "feishu audio exceeds 25MB limit");
+        return None;
+    }
+    tracing::debug!(file_key, size = bytes.len(), "feishu audio downloaded");
+    use base64::Engine;
+    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Some(crate::schema::Attachment {
+        attachment_type: "audio".into(),
+        filename: format!("{}.ogg", file_key),
+        mime_type: "audio/ogg".into(),
         data,
         size: bytes.len() as u64,
     })
@@ -2259,6 +2324,9 @@ pub async fn webhook(
                             }
                             MediaRef::File { message_id, file_key, file_name } => {
                                 download_feishu_file(&feishu.client, &api_base, &token, message_id, file_key, file_name).await
+                            }
+                            MediaRef::Audio { message_id, file_key } => {
+                                download_feishu_audio(&feishu.client, &api_base, &token, message_id, file_key).await
                             }
                         };
                         if let Some(att) = attachment {

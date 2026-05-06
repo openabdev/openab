@@ -487,6 +487,7 @@ pub struct GatewayParams {
     pub allow_all_users: bool,
     pub allowed_users: Vec<String>,
     pub streaming: bool,
+    pub stt: crate::config::SttConfig,
 }
 
 pub async fn run_gateway_adapter(
@@ -504,6 +505,7 @@ pub async fn run_gateway_adapter(
     let allow_all_users = params.allow_all_users;
     let allowed_users = params.allowed_users;
     let streaming = params.streaming;
+    let stt_config = params.stt;
 
     let connect_url = match &params.token {
         Some(token) => {
@@ -660,6 +662,26 @@ pub async fn run_gateway_adapter(
                                                     extra_blocks.push(ContentBlock::Text {
                                                         text: format!("```{}\n{}\n```", att.filename, text),
                                                     });
+                                                }
+                                            }
+                                            "audio" => {
+                                                if stt_config.enabled {
+                                                    use base64::Engine;
+                                                    if let Ok(audio_bytes) = base64::engine::general_purpose::STANDARD.decode(&att.data) {
+                                                        if let Some(transcript) = crate::stt::transcribe(
+                                                            &crate::media::HTTP_CLIENT,
+                                                            &stt_config,
+                                                            audio_bytes,
+                                                            att.filename.clone(),
+                                                            &att.mime_type,
+                                                        ).await {
+                                                            extra_blocks.push(ContentBlock::Text {
+                                                                text: format!("[Voice message transcript]: {transcript}"),
+                                                            });
+                                                        }
+                                                    } else {
+                                                        warn!(filename = %att.filename, "audio attachment base64 decode failed");
+                                                    }
                                                 }
                                             }
                                             _ => {}
