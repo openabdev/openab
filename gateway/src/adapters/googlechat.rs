@@ -373,7 +373,7 @@ impl GoogleChatAdapter {
                 let resp = crate::schema::GatewayResponse {
                     schema: "openab.gateway.response.v1".into(),
                     request_id: req_id.clone(),
-                    success: first_msg_name.is_some(),
+                    success: first_msg_name.is_some() && first_error.is_none(),
                     thread_id: None,
                     message_id: first_msg_name,
                     error: first_error,
@@ -1633,5 +1633,63 @@ mod tests {
         assert_eq!(resp.request_id, "req_multi");
         assert!(resp.success);
         assert_eq!(resp.message_id, Some("spaces/TEST/messages/first_chunk".into()));
+    }
+
+    #[tokio::test]
+    async fn handle_reply_multi_chunk_partial_failure_reports_failure() {
+        // Mixed success/failure: chunk 1 succeeds, subsequent chunks fail.
+        // Expect success=false (any chunk failure marks overall as failed),
+        // but message_id is still set so core has a reference.
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
+
+        let mock_server = MockServer::start().await;
+        // First request: 200 OK with message name
+        Mock::given(method("POST"))
+            .and(path_regex("/spaces/.*/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"name": "spaces/TEST/messages/first_chunk"}),
+            ))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        // Subsequent requests: 500
+        Mock::given(method("POST"))
+            .and(path_regex("/spaces/.*/messages"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        adapter.api_base = mock_server.uri();
+
+        let long_text = "x".repeat(5000);
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "orig_msg".into(),
+            platform: "googlechat".into(),
+            channel: ReplyChannel {
+                id: "spaces/TEST".into(),
+                thread_id: None,
+            },
+            content: Content {
+                content_type: "text".into(),
+                text: long_text,
+            },
+            command: None,
+            request_id: Some("req_partial".into()),
+        };
+
+        adapter.handle_reply(&reply, &event_tx).await;
+
+        let received = event_rx.try_recv();
+        assert!(received.is_ok(), "expected GatewayResponse");
+        let resp: GatewayResponse = serde_json::from_str(&received.unwrap()).unwrap();
+        assert_eq!(resp.request_id, "req_partial");
+        assert!(!resp.success, "partial failure must report success=false");
+        assert_eq!(resp.message_id, Some("spaces/TEST/messages/first_chunk".into()));
+        let err = resp.error.expect("partial failure should set error");
+        assert!(err.contains("500"));
     }
 }
