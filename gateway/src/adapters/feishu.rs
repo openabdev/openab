@@ -68,6 +68,20 @@ pub enum AllowBots {
     All,
 }
 
+/// Controls when the bot responds without @mention in threads.
+/// Mirrors Discord's `allow_user_messages` setting.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum AllowUsers {
+    /// Bot responds in threads it has participated in without @mention.
+    #[default]
+    Involved,
+    /// Always require @mention, even in participated threads.
+    Mentions,
+    /// Like Involved, but if another bot has also posted in the thread,
+    /// require @mention to avoid all bots responding.
+    MultibotMentions,
+}
+
 #[derive(Debug, Clone)]
 pub struct FeishuConfig {
     pub app_id: String,
@@ -81,10 +95,17 @@ pub struct FeishuConfig {
     pub allowed_users: Vec<String>,
     pub require_mention: bool,
     pub allow_bots: AllowBots,
+    pub allow_user_messages: AllowUsers,
     pub trusted_bot_ids: Vec<String>,
     pub max_bot_turns: u32,
     pub dedupe_ttl_secs: u64,
     pub message_limit: usize,
+    /// TTL for participated-thread cache entries (seconds). Threads older than
+    /// this are forgotten and require a fresh @mention to re-engage.
+    /// Set to 0 (via FEISHU_SESSION_TTL_HOURS=0) to disable participation
+    /// tracking entirely — all messages will require @mention.
+    /// Converted from `FEISHU_SESSION_TTL_HOURS` (user-facing, in hours) to seconds internally.
+    pub session_ttl_secs: u64,
 }
 
 impl FeishuConfig {
@@ -125,6 +146,16 @@ impl FeishuConfig {
             _ => AllowBots::Off,
         };
         let trusted_bot_ids = parse_csv("FEISHU_TRUSTED_BOT_IDS");
+        let allow_user_messages = match std::env::var("FEISHU_ALLOW_USER_MESSAGES")
+            .unwrap_or_else(|_| "involved".into())
+            .to_lowercase()
+            .replace('-', "_")
+            .as_str()
+        {
+            "mentions" => AllowUsers::Mentions,
+            "multibot_mentions" => AllowUsers::MultibotMentions,
+            _ => AllowUsers::Involved,
+        };
         let max_bot_turns = std::env::var("FEISHU_MAX_BOT_TURNS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -137,6 +168,11 @@ impl FeishuConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(4000);
+        let session_ttl_secs = std::env::var("FEISHU_SESSION_TTL_HOURS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(24)
+            * 3600;
 
         Some(Self {
             app_id,
@@ -150,10 +186,12 @@ impl FeishuConfig {
             allowed_users,
             require_mention,
             allow_bots,
+            allow_user_messages,
             trusted_bot_ids,
             max_bot_turns,
             dedupe_ttl_secs,
             message_limit,
+            session_ttl_secs,
         })
     }
 
@@ -242,10 +280,16 @@ mod event_types {
     /// Parse a feishu im.message.receive_v1 event into a GatewayEvent.
     /// Returns None if the event should be skipped (unsupported type, bot message, etc).
     /// The Vec<MediaRef> contains references to media that need async download.
+    ///
+    /// `bypass_mention_gating`: whether the bot should skip @mention requirement for this message.
+    /// This is the final computed result from mode-specific logic (detect_and_mark_multibot),
+    /// already accounting for the configured `allow_user_messages` mode.
+    /// Do NOT pass raw participation status here.
     pub fn parse_message_event(
         envelope: &FeishuEventEnvelope,
         bot_open_id: Option<&str>,
         config: &FeishuConfig,
+        bypass_mention_gating: bool,
     ) -> Option<(GatewayEvent, Vec<MediaRef>)> {
         let _header = envelope.header.as_ref()?;
         let event = envelope.event.as_ref()?;
@@ -253,7 +297,7 @@ mod event_types {
         let sender = event.sender.as_ref()?;
 
         let msg_type = msg.message_type.as_deref().unwrap_or("text");
-        if !matches!(msg_type, "text" | "image" | "file" | "post") {
+        if !matches!(msg_type, "text" | "image" | "file" | "post" | "audio") {
             return None;
         }
         // Skip bot messages with explicit sender_type
@@ -341,6 +385,17 @@ mod event_types {
                 }];
                 (String::new(), mentions.1, refs)
             }
+            "audio" => {
+                let file_key = content_json.get("file_key")?.as_str()?;
+                let mentions = extract_mentions(
+                    "", msg.mentions.as_deref().unwrap_or(&[]), bot_open_id,
+                );
+                let refs = vec![MediaRef::Audio {
+                    message_id: message_id.to_string(),
+                    file_key: file_key.to_string(),
+                }];
+                (String::new(), mentions.1, refs)
+            }
             "post" => {
                 // Rich text: content is {"title":"...","content":[[{tag,text,...},{tag,image_key,...}]]}
                 let mut texts = Vec::new();
@@ -412,11 +467,16 @@ mod event_types {
 
         // Gateway-side mention gating: in groups, skip if require_mention
         // is true and bot is not mentioned (for human senders).
+        // Bypass: if bot has previously replied in this thread (participated),
+        // no @mention needed (like Discord's "involved" mode).
+        let in_thread = thread_id.is_some();
         if channel_type == "group" && !is_bot_sender && config.require_mention {
-            if let Some(bot_id) = bot_open_id {
-                let bot_mentioned = mention_ids.iter().any(|id| id == bot_id);
-                if !bot_mentioned {
-                    return None;
+            if !(in_thread && bypass_mention_gating) {
+                if let Some(bot_id) = bot_open_id {
+                    let bot_mentioned = mention_ids.iter().any(|id| id == bot_id);
+                    if !bot_mentioned {
+                        return None;
+                    }
                 }
             }
         }
@@ -627,7 +687,14 @@ pub struct FeishuAdapter {
     pub name_cache: Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// Per-channel bot turn counter. Key = chat_id, Value = (count, last_reset).
     /// Human message resets count to 0. Prevents runaway bot-to-bot loops.
-    pub bot_turns: Arc<std::sync::Mutex<HashMap<String, u32>>>, // TODO: add TTL eviction for long-running deploys
+    pub bot_turns: Arc<std::sync::Mutex<HashMap<String, u32>>>, // eviction: human msg resets; follow-up can add TTL like participated_threads
+    /// Positive-only cache: thread_id (root_id) → last_replied_at.
+    /// When bot has replied in a thread, subsequent messages in that thread
+    /// bypass @mention gating (like Discord's "involved" mode).
+    pub participated_threads: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    /// Positive-only cache: thread_id → first_seen for threads where other bots
+    /// have posted. Used by multibot-mentions mode to require @mention.
+    pub multibot_threads: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
     pub client: reqwest::Client,
 }
 
@@ -644,6 +711,8 @@ impl FeishuAdapter {
             bot_open_id: Arc::new(RwLock::new(None)),
             name_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             bot_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            participated_threads: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            multibot_threads: Arc::new(std::sync::Mutex::new(HashMap::new())),
             client: reqwest::Client::new(),
         }
     }
@@ -737,6 +806,8 @@ pub async fn start_websocket(
     let client = adapter.client.clone();
     let name_cache = adapter.name_cache.clone();
     let bot_turns = adapter.bot_turns.clone();
+    let participated_threads = adapter.participated_threads.clone();
+    let multibot_threads = adapter.multibot_threads.clone();
 
     let handle = tokio::spawn(async move {
         let mut backoff_secs = 1u64;
@@ -751,6 +822,8 @@ pub async fn start_websocket(
                 &mut shutdown_rx,
                 &name_cache,
                 &bot_turns,
+                &participated_threads,
+                &multibot_threads,
             )
             .await;
 
@@ -791,6 +864,8 @@ async fn ws_connect_loop(
     shutdown_rx: &mut watch::Receiver<bool>,
     name_cache: &Arc<std::sync::Mutex<HashMap<String, String>>>,
     bot_turns: &Arc<std::sync::Mutex<HashMap<String, u32>>>,
+    participated_threads: &Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    multibot_threads: &Arc<std::sync::Mutex<HashMap<String, Instant>>>,
 ) -> anyhow::Result<()> {
     let api_base = config.api_base();
 
@@ -818,7 +893,7 @@ async fn ws_connect_loop(
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
                         handle_ws_message(
                             &text, bot_open_id_store, dedupe, config, event_tx,
-                            name_cache, token_cache, client, bot_turns,
+                            name_cache, token_cache, client, bot_turns, participated_threads, multibot_threads,
                         ).await;
                     }
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data))) => {
@@ -839,7 +914,7 @@ async fn ws_connect_loop(
                                         if let Ok(text) = String::from_utf8(payload.clone()) {
                                             handle_ws_message(
                                                 &text, bot_open_id_store, dedupe, config, event_tx,
-                                                name_cache, token_cache, client, bot_turns,
+                                                name_cache, token_cache, client, bot_turns, participated_threads, multibot_threads,
                                             ).await;
                                         }
                                     }
@@ -879,6 +954,8 @@ async fn handle_ws_message(
     token_cache: &Arc<FeishuTokenCache>,
     client: &reqwest::Client,
     bot_turns: &Arc<std::sync::Mutex<HashMap<String, u32>>>,
+    participated_threads: &Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    multibot_threads: &Arc<std::sync::Mutex<HashMap<String, Instant>>>,
 ) {
     let envelope: FeishuEventEnvelope = match serde_json::from_str(text) {
         Ok(e) => e,
@@ -914,7 +991,16 @@ async fn handle_ws_message(
     let bot_id = bot_open_id_store.read().await;
     let bot_id_ref = bot_id.as_deref();
 
-    if let Some((mut gateway_event, media_refs)) = parse_message_event(&envelope, bot_id_ref, config) {
+    // Check if the message is in a thread where bot has previously replied,
+    // respecting the allow_user_messages mode:
+    // - Involved (default): bypass @mention if participated
+    // - MultibotMentions: bypass only if participated AND no other bot in thread
+    // - Mentions: never bypass
+    let is_thread_participated = detect_and_mark_multibot(
+        &envelope, bot_id_ref, config, participated_threads, multibot_threads,
+    );
+
+    if let Some((mut gateway_event, media_refs)) = parse_message_event(&envelope, bot_id_ref, config, is_thread_participated) {
         // Also dedupe by message_id
         if dedupe.is_duplicate(&gateway_event.message_id) {
             return;
@@ -936,6 +1022,8 @@ async fn handle_ws_message(
                     );
                     return;
                 }
+                // (Feishu doesn't push bot messages to other bots' WebSocket,
+                // so multibot detection is done via mentions instead — see below.)
             } else {
                 // Human message resets bot turn counter
                 turns.remove(channel_id.as_str());
@@ -960,6 +1048,9 @@ async fn handle_ws_message(
                         }
                         MediaRef::File { message_id, file_key, file_name } => {
                             download_feishu_file(client, &api_base, &token, message_id, file_key, file_name).await
+                        }
+                        MediaRef::Audio { message_id, file_key } => {
+                            download_feishu_audio(client, &api_base, &token, message_id, file_key).await
                         }
                     };
                     if let Some(att) = attachment {
@@ -1266,6 +1357,7 @@ fn try_parse_link(chars: &[char], start: usize) -> Option<(String, String, usize
 pub enum MediaRef {
     Image { message_id: String, image_key: String },
     File { message_id: String, file_key: String, file_name: String },
+    Audio { message_id: String, file_key: String },
 }
 
 const IMAGE_MAX_DIMENSION_PX: u32 = 1200;
@@ -1415,6 +1507,56 @@ pub async fn download_feishu_file(
         attachment_type: "text_file".into(),
         filename: file_name.to_string(),
         mime_type: "text/plain".into(),
+        data,
+        size: bytes.len() as u64,
+    })
+}
+
+const AUDIO_MAX_DOWNLOAD: u64 = 25 * 1024 * 1024; // 25 MB (Whisper API limit)
+
+/// Download a Feishu audio message by message_id + file_key → base64 Attachment.
+pub async fn download_feishu_audio(
+    client: &reqwest::Client,
+    api_base: &str,
+    token: &str,
+    message_id: &str,
+    file_key: &str,
+) -> Option<crate::schema::Attachment> {
+    let url = format!(
+        "{}/open-apis/im/v1/messages/{}/resources/{}?type=file",
+        api_base, message_id, file_key
+    );
+    let resp = match client.get(&url).bearer_auth(token).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(file_key, error = %e, "feishu audio download failed");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::warn!(file_key, status = %resp.status(), "feishu audio download failed");
+        return None;
+    }
+    if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
+        if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
+            if size > AUDIO_MAX_DOWNLOAD {
+                tracing::warn!(file_key, size, "feishu audio exceeds 25MB limit");
+                return None;
+            }
+        }
+    }
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.len() as u64 > AUDIO_MAX_DOWNLOAD {
+        tracing::warn!(file_key, size = bytes.len(), "feishu audio exceeds 25MB limit");
+        return None;
+    }
+    tracing::debug!(file_key, size = bytes.len(), "feishu audio downloaded");
+    use base64::Engine;
+    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Some(crate::schema::Attachment {
+        attachment_type: "audio".into(),
+        filename: format!("{}.ogg", file_key),
+        mime_type: "audio/ogg".into(),
         data,
         size: bytes.len() as u64,
     })
@@ -1639,6 +1781,139 @@ async fn remove_reaction(adapter: &FeishuAdapter, message_id: &str, emoji: &str)
 // Reply handler
 // ---------------------------------------------------------------------------
 
+/// Check if the bot has participated in the thread referenced by this envelope.
+/// Returns `true` if the message is in a thread and that thread has a valid
+/// (non-expired) participation entry in the cache.
+fn check_thread_participated(
+    envelope: &FeishuEventEnvelope,
+    cache: &Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    session_ttl_secs: u64,
+) -> bool {
+    envelope
+        .event
+        .as_ref()
+        .and_then(|e| e.message.as_ref())
+        .and_then(|m| m.root_id.as_deref().or(m.parent_id.as_deref()))
+        .map(|tid| {
+            // Intentionally recover from poisoned mutex — cache data loss is acceptable
+            // and preferable to panicking the gateway.
+            let c = cache.lock().unwrap_or_else(|e| e.into_inner());
+            c.get(tid).is_some_and(|ts| ts.elapsed().as_secs() < session_ttl_secs)
+        })
+        .unwrap_or(false)
+}
+
+/// Max entries before eviction. Shared by both `participated_threads` and
+/// `multibot_threads` caches — they have the same cardinality (one entry per
+/// active thread) so a single limit is appropriate for both.
+const PARTICIPATION_CACHE_MAX: usize = 1000;
+
+/// Detect if a message @mentions another bot in a participated thread, and if
+/// so, mark the thread in the multibot cache. Returns the computed
+/// `is_thread_participated` value respecting the `allow_user_messages` mode.
+///
+/// This consolidates the duplicated multibot detection logic used by both the
+/// WebSocket and webhook paths.
+fn detect_and_mark_multibot(
+    envelope: &FeishuEventEnvelope,
+    bot_open_id: Option<&str>,
+    config: &FeishuConfig,
+    participated_threads: &Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    multibot_threads: &Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+) -> bool {
+    let self_participated = check_thread_participated(
+        envelope, participated_threads, config.session_ttl_secs,
+    );
+
+    let thread_id_for_check = envelope
+        .event
+        .as_ref()
+        .and_then(|e| e.message.as_ref())
+        .and_then(|m| m.root_id.as_deref().or(m.parent_id.as_deref()));
+
+    // Early multibot detection: if a message in a participated thread @mentions
+    // another bot, mark the thread as multibot immediately.
+    if let Some(tid) = thread_id_for_check {
+        if self_participated {
+            let mentions = envelope
+                .event
+                .as_ref()
+                .and_then(|e| e.message.as_ref())
+                .and_then(|m| m.mentions.as_ref());
+            if let Some(mention_list) = mentions {
+                let bot_self_id = bot_open_id.unwrap_or("");
+                let mention_ids: Vec<_> = mention_list.iter().filter_map(|m| {
+                    m.id.as_ref().and_then(|id| id.open_id.as_deref())
+                }).collect();
+
+                let mentions_other_bot = if !config.trusted_bot_ids.is_empty() {
+                    mention_ids.iter().any(|oid| {
+                        config.trusted_bot_ids.iter().any(|bid| bid == oid)
+                    })
+                } else if !config.allowed_users.is_empty() {
+                    mention_ids.iter().any(|oid| {
+                        *oid != bot_self_id && !config.allowed_users.iter().any(|u| u == oid)
+                    })
+                } else {
+                    false
+                };
+
+                if mentions_other_bot {
+                    info!(thread_id = %tid, "multibot thread detected via @mention");
+                    let mut cache = multibot_threads.lock().unwrap_or_else(|e| e.into_inner());
+                    cache.entry(tid.to_string()).or_insert_with(Instant::now);
+                    if cache.len() > PARTICIPATION_CACHE_MAX {
+                        cache.retain(|_, ts| ts.elapsed().as_secs() < config.session_ttl_secs);
+                    }
+                }
+            }
+        }
+    }
+
+    // Compute is_thread_participated based on mode
+    match config.allow_user_messages {
+        AllowUsers::Mentions => false,
+        AllowUsers::Involved => self_participated,
+        AllowUsers::MultibotMentions => {
+            if !self_participated {
+                false
+            } else {
+                thread_id_for_check
+                    .map(|tid| {
+                        let cache = multibot_threads.lock().unwrap_or_else(|e| e.into_inner());
+                        !cache.get(tid).is_some_and(|ts| ts.elapsed().as_secs() < config.session_ttl_secs)
+                    })
+                    .unwrap_or(true)
+            }
+        }
+    }
+}
+
+/// Record that the bot has participated in a thread. Evicts oldest entries
+/// when the cache exceeds PARTICIPATION_CACHE_MAX.
+fn record_participation(
+    cache: &Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    thread_id: &str,
+    session_ttl_secs: u64,
+) {
+    // Intentionally recover from poisoned mutex — cache data loss is acceptable
+    // and preferable to panicking the gateway.
+    let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
+    map.insert(thread_id.to_string(), Instant::now());
+    // Evict if over capacity: first drop expired entries, then oldest half if still over
+    if map.len() > PARTICIPATION_CACHE_MAX {
+        map.retain(|_, ts| ts.elapsed().as_secs() < session_ttl_secs);
+        if map.len() > PARTICIPATION_CACHE_MAX {
+            let mut entries: Vec<_> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            entries.sort_by_key(|(_, ts)| *ts);
+            let evict_count = entries.len() / 2;
+            for (k, _) in entries.into_iter().take(evict_count) {
+                map.remove(&k);
+            }
+        }
+    }
+}
+
 pub async fn handle_reply(
     reply: &GatewayReply,
     adapter: &FeishuAdapter,
@@ -1701,6 +1976,10 @@ pub async fn handle_reply(
         match send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, thread_id, text).await {
             Some(msg_id) => {
                 adapter.dedupe.is_duplicate(&msg_id);
+                // Record thread participation for mention bypass
+                if let Some(tid) = thread_id {
+                    record_participation(&adapter.participated_threads, tid, adapter.config.session_ttl_secs);
+                }
                 // Send response with message_id back to OAB core (for streaming edit)
                 if let Some(ref req_id) = reply.request_id {
                     let resp = crate::schema::GatewayResponse {
@@ -1734,9 +2013,16 @@ pub async fn handle_reply(
             }
         }
     } else {
+        let mut sent_any = false;
         for chunk in split_text(text, limit) {
             if let Some(msg_id) = send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, thread_id, chunk).await {
                 adapter.dedupe.is_duplicate(&msg_id);
+                sent_any = true;
+            }
+        }
+        if sent_any {
+            if let Some(tid) = thread_id {
+                record_participation(&adapter.participated_threads, tid, adapter.config.session_ttl_secs);
             }
         }
     }
@@ -2012,7 +2298,13 @@ pub async fn webhook(
     let bot_id = feishu.bot_open_id.read().await;
     let bot_id_ref = bot_id.as_deref();
 
-    if let Some((mut gateway_event, media_refs)) = parse_message_event(&envelope, bot_id_ref, &feishu.config) {
+    // Check participated threads and multibot detection for mention bypass
+    let is_thread_participated = detect_and_mark_multibot(
+        &envelope, bot_id_ref, &feishu.config,
+        &feishu.participated_threads, &feishu.multibot_threads,
+    );
+
+    if let Some((mut gateway_event, media_refs)) = parse_message_event(&envelope, bot_id_ref, &feishu.config, is_thread_participated) {
         if !feishu.dedupe.is_duplicate(&gateway_event.message_id) {
             let name = resolve_user_name(
                 &gateway_event.sender.id, &feishu.name_cache, &feishu.token_cache,
@@ -2032,6 +2324,9 @@ pub async fn webhook(
                             }
                             MediaRef::File { message_id, file_key, file_name } => {
                                 download_feishu_file(&feishu.client, &api_base, &token, message_id, file_key, file_name).await
+                            }
+                            MediaRef::Audio { message_id, file_key } => {
+                                download_feishu_audio(&feishu.client, &api_base, &token, message_id, file_key).await
                             }
                         };
                         if let Some(att) = attachment {
@@ -2082,10 +2377,12 @@ mod tests {
             allowed_users: vec![],
             require_mention: true,
             allow_bots: AllowBots::Off,
+            allow_user_messages: AllowUsers::Involved,
             trusted_bot_ids: vec![],
             max_bot_turns: 20,
             dedupe_ttl_secs: 300,
             message_limit: 4000,
+            session_ttl_secs: 86400,
         }
     }
 
@@ -2304,7 +2601,7 @@ mod tests {
     fn parse_dm_text() {
         let env = make_envelope("p2p", "hello", "ou_user1", None);
         let cfg = test_config();
-        let (evt, _media) = parse_message_event(&env, Some("ou_bot"), &cfg).unwrap();
+        let (evt, _media) = parse_message_event(&env, Some("ou_bot"), &cfg, false).unwrap();
         assert_eq!(evt.platform, "feishu");
         assert_eq!(evt.channel.channel_type, "direct");
         assert_eq!(evt.channel.id, "oc_chat1");
@@ -2324,7 +2621,7 @@ mod tests {
         }];
         let env = make_envelope("group", "@_user_1 explain VPC", "ou_user1", Some(mentions));
         let cfg = test_config();
-        let (evt, _media) = parse_message_event(&env, Some("ou_bot"), &cfg).unwrap();
+        let (evt, _media) = parse_message_event(&env, Some("ou_bot"), &cfg, false).unwrap();
         assert_eq!(evt.channel.channel_type, "group");
         assert_eq!(evt.content.text, "explain VPC");
         assert_eq!(evt.mentions, vec!["ou_bot"]);
@@ -2335,7 +2632,7 @@ mod tests {
         let env = make_envelope("group", "just chatting", "ou_user1", None);
         let cfg = test_config(); // require_mention = true
         // Gateway-side mention gating: group message without bot mention is filtered
-        assert!(parse_message_event(&env, Some("ou_bot"), &cfg).is_none());
+        assert!(parse_message_event(&env, Some("ou_bot"), &cfg, false).is_none());
     }
 
     #[test]
@@ -2343,7 +2640,7 @@ mod tests {
         let env = make_envelope("group", "just chatting", "ou_user1", None);
         let mut cfg = test_config();
         cfg.require_mention = false;
-        let evt = parse_message_event(&env, Some("ou_bot"), &cfg);
+        let evt = parse_message_event(&env, Some("ou_bot"), &cfg, false);
         assert!(evt.is_some());
     }
 
@@ -2352,14 +2649,14 @@ mod tests {
         let mut env = make_envelope("p2p", "hello", "ou_bot", None);
         env.event.as_mut().unwrap().sender.as_mut().unwrap().sender_type = Some("bot".into());
         let cfg = test_config();
-        assert!(parse_message_event(&env, Some("ou_bot"), &cfg).is_none());
+        assert!(parse_message_event(&env, Some("ou_bot"), &cfg, false).is_none());
     }
 
     #[test]
     fn parse_skips_empty_text() {
         let env = make_envelope("p2p", "  ", "ou_user1", None);
         let cfg = test_config();
-        assert!(parse_message_event(&env, Some("ou_bot"), &cfg).is_none());
+        assert!(parse_message_event(&env, Some("ou_bot"), &cfg, false).is_none());
     }
 
     #[test]
@@ -2367,14 +2664,14 @@ mod tests {
         let mut env = make_envelope("p2p", "hello", "ou_user1", None);
         env.event.as_mut().unwrap().message.as_mut().unwrap().message_type = Some("sticker".into());
         let cfg = test_config();
-        assert!(parse_message_event(&env, Some("ou_bot"), &cfg).is_none());
+        assert!(parse_message_event(&env, Some("ou_bot"), &cfg, false).is_none());
     }
 
     #[test]
     fn parse_skips_self_message() {
         let env = make_envelope("p2p", "hello", "ou_bot", None);
         let cfg = test_config();
-        assert!(parse_message_event(&env, Some("ou_bot"), &cfg).is_none());
+        assert!(parse_message_event(&env, Some("ou_bot"), &cfg, false).is_none());
     }
 
     // --- Dedupe tests ---
@@ -2506,7 +2803,7 @@ mod tests {
         }];
         let env = make_envelope("group", "@_user_1 tell me about @_user_1 patterns", "ou_user1", Some(mentions));
         let cfg = test_config();
-        let (evt, _media) = parse_message_event(&env, Some("ou_bot"), &cfg).unwrap();
+        let (evt, _media) = parse_message_event(&env, Some("ou_bot"), &cfg, false).unwrap();
         // Only first @_user_1 removed, second preserved
         assert!(evt.content.text.contains("@_user_1"));
     }
@@ -2518,7 +2815,7 @@ mod tests {
         let env = make_envelope("p2p", "hello", "ou_stranger", None);
         let mut cfg = test_config();
         cfg.allowed_users = vec!["ou_vip".into()];
-        assert!(parse_message_event(&env, Some("ou_bot"), &cfg).is_none());
+        assert!(parse_message_event(&env, Some("ou_bot"), &cfg, false).is_none());
     }
 
     #[test]
@@ -2526,7 +2823,7 @@ mod tests {
         let env = make_envelope("p2p", "hello", "ou_vip", None);
         let mut cfg = test_config();
         cfg.allowed_users = vec!["ou_vip".into()];
-        assert!(parse_message_event(&env, Some("ou_bot"), &cfg).is_some());
+        assert!(parse_message_event(&env, Some("ou_bot"), &cfg, false).is_some());
     }
 
     // --- allowed_groups filtering ---
@@ -2541,7 +2838,7 @@ mod tests {
         let env = make_envelope("group", "@_user_1 hello", "ou_user1", Some(mentions));
         let mut cfg = test_config();
         cfg.allowed_groups = vec!["oc_other".into()]; // oc_chat1 not in list
-        assert!(parse_message_event(&env, Some("ou_bot"), &cfg).is_none());
+        assert!(parse_message_event(&env, Some("ou_bot"), &cfg, false).is_none());
     }
 
     #[test]
@@ -2554,7 +2851,7 @@ mod tests {
         let env = make_envelope("group", "@_user_1 hello", "ou_user1", Some(mentions));
         let mut cfg = test_config();
         cfg.allowed_groups = vec!["oc_chat1".into()];
-        assert!(parse_message_event(&env, Some("ou_bot"), &cfg).is_some());
+        assert!(parse_message_event(&env, Some("ou_bot"), &cfg, false).is_some());
     }
 
     // --- Token TTL from API response ---
@@ -2611,7 +2908,7 @@ mod tests {
         let mut env = make_envelope("p2p", "reply", "ou_user1", None);
         env.event.as_mut().unwrap().message.as_mut().unwrap().root_id = Some("om_root".into());
         let cfg = test_config();
-        let (evt, _media) = parse_message_event(&env, Some("ou_bot"), &cfg).unwrap();
+        let (evt, _media) = parse_message_event(&env, Some("ou_bot"), &cfg, false).unwrap();
         assert_eq!(evt.channel.thread_id, Some("om_root".into()));
     }
 
@@ -2620,7 +2917,7 @@ mod tests {
         let mut env = make_envelope("p2p", "reply", "ou_user1", None);
         env.event.as_mut().unwrap().message.as_mut().unwrap().parent_id = Some("om_parent".into());
         let cfg = test_config();
-        let (evt, _media) = parse_message_event(&env, Some("ou_bot"), &cfg).unwrap();
+        let (evt, _media) = parse_message_event(&env, Some("ou_bot"), &cfg, false).unwrap();
         assert_eq!(evt.channel.thread_id, Some("om_parent".into()));
     }
 
@@ -2636,5 +2933,78 @@ mod tests {
     #[test]
     fn emoji_mapping_unknown() {
         assert_eq!(emoji_to_feishu_reaction("🎉"), None);
+    }
+
+    // --- Participated thread tests ---
+
+    #[test]
+    fn participated_thread_bypasses_mention_gating() {
+        let cfg = test_config(); // require_mention = true
+        // Build envelope with root_id (in a thread)
+        let mut env = make_envelope("group", "Hello", "ou_user1", None);
+        env.event.as_mut().unwrap().message.as_mut().unwrap().root_id = Some("root_123".into());
+        // Without participation: no @mention → None
+        assert!(parse_message_event(&env, Some("ou_bot"), &cfg, false).is_none());
+        // With participation: no @mention → Some (bypass)
+        let result = parse_message_event(&env, Some("ou_bot"), &cfg, true);
+        assert!(result.is_some());
+        let (evt, _) = result.unwrap();
+        assert_eq!(evt.channel.thread_id.as_deref(), Some("root_123"));
+    }
+
+    #[test]
+    fn participated_no_effect_without_thread() {
+        let cfg = test_config(); // require_mention = true
+        // Message in main channel (no thread_id) — participated flag doesn't help
+        let env = make_envelope("group", "Hello", "ou_user1", None);
+        assert!(parse_message_event(&env, Some("ou_bot"), &cfg, true).is_none());
+    }
+
+    #[test]
+    fn record_participation_and_eviction() {
+        let cache = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        // Record a thread
+        record_participation(&cache, "thread_1", 86400);
+        assert_eq!(cache.lock().unwrap().len(), 1);
+        // Fill beyond PARTICIPATION_CACHE_MAX
+        for i in 0..PARTICIPATION_CACHE_MAX + 10 {
+            record_participation(&cache, &format!("thread_{i}"), 86400);
+        }
+        // After eviction, should be roughly half
+        assert!(cache.lock().unwrap().len() <= PARTICIPATION_CACHE_MAX);
+    }
+
+    // --- Multibot-mentions mode tests ---
+
+    #[test]
+    fn multibot_mentions_mode_bypasses_when_single_bot() {
+        let mut cfg = test_config();
+        cfg.allow_user_messages = AllowUsers::MultibotMentions;
+        let mut env = make_envelope("group", "Hello", "ou_user1", None);
+        env.event.as_mut().unwrap().message.as_mut().unwrap().root_id = Some("root_456".into());
+        // participated + no other bot → bypass_mention_gating=true
+        let result = parse_message_event(&env, Some("ou_bot"), &cfg, true);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn multibot_mentions_mode_requires_mention_when_not_participated() {
+        let mut cfg = test_config();
+        cfg.allow_user_messages = AllowUsers::MultibotMentions;
+        let mut env = make_envelope("group", "Hello", "ou_user1", None);
+        env.event.as_mut().unwrap().message.as_mut().unwrap().root_id = Some("root_456".into());
+        // not participated → bypass_mention_gating=false
+        assert!(parse_message_event(&env, Some("ou_bot"), &cfg, false).is_none());
+    }
+
+    #[test]
+    fn mentions_mode_never_bypasses() {
+        let mut cfg = test_config();
+        cfg.allow_user_messages = AllowUsers::Mentions;
+        let mut env = make_envelope("group", "Hello", "ou_user1", None);
+        env.event.as_mut().unwrap().message.as_mut().unwrap().root_id = Some("root_789".into());
+        // Even with bypass_mention_gating=true, Mentions mode never bypasses
+        // (caller would pass false because Mentions mode always returns false)
+        assert!(parse_message_event(&env, Some("ou_bot"), &cfg, false).is_none());
     }
 }
