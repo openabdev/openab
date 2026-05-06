@@ -9,6 +9,7 @@ Google Chat ──POST──▶ Gateway (:8080) ◀──WebSocket── OAB Pod
 
 ## Prerequisites
 
+- **A Google Workspace (Business or Enterprise) account** — required by Google to configure the Chat API. Regular `@gmail.com` consumer accounts cannot create Google Chat apps. Workspace Individual or Business Starter is the cheapest qualifying tier. See [Configure the Google Chat API](https://developers.google.com/workspace/chat/configure-chat-api).
 - A running OAB instance (with kiro-cli or any ACP agent authenticated)
 - The Custom Gateway deployed ([gateway/README.md](../gateway/README.md))
 - A Google Cloud project with the Google Chat API enabled
