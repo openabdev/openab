@@ -673,22 +673,20 @@ pub async fn run_gateway_adapter(
                                                     });
                                                 }
                                             }
-                                            "audio" => {
-                                                if stt.enabled {
-                                                    use base64::Engine;
-                                                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&att.data) {
-                                                        let client = reqwest::Client::new();
-                                                        if let Some(text) = crate::stt::transcribe(
-                                                            &client,
-                                                            &stt,
-                                                            bytes,
-                                                            att.filename.clone(),
-                                                            &att.mime_type
-                                                        ).await {
-                                                            extra_blocks.push(ContentBlock::Text {
-                                                                text: format!("[Audio: {}]", text),
-                                                            });
-                                                        }
+                                            "audio" if stt.enabled => {
+                                                use base64::Engine;
+                                                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&att.data) {
+                                                    let client = reqwest::Client::new();
+                                                    if let Some(text) = crate::stt::transcribe(
+                                                        &client,
+                                                        &stt,
+                                                        bytes,
+                                                        att.filename.clone(),
+                                                        &att.mime_type
+                                                    ).await {
+                                                        extra_blocks.push(ContentBlock::Text {
+                                                            text: format!("[Audio: {}]", text),
+                                                        });
                                                     }
                                                 }
                                             }

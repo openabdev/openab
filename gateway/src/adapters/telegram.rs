@@ -1,4 +1,4 @@
-use crate::media::{resize_and_compress, FILE_MAX_DOWNLOAD, IMAGE_MAX_DOWNLOAD};
+use crate::media::{resize_and_compress, AUDIO_MAX_DOWNLOAD, FILE_MAX_DOWNLOAD, IMAGE_MAX_DOWNLOAD};
 use crate::schema::*;
 use axum::extract::State;
 use axum::Json;
@@ -32,6 +32,8 @@ struct TelegramMessage {
     #[serde(default)]
     photo: Vec<TelegramPhoto>,
     document: Option<TelegramDocument>,
+    voice: Option<TelegramVoice>,
+    audio: Option<TelegramAudio>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,6 +47,20 @@ struct TelegramPhoto {
 struct TelegramDocument {
     file_id: String,
     file_name: Option<String>,
+    mime_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramVoice {
+    file_id: String,
+    mime_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramAudio {
+    file_id: String,
+    file_name: Option<String>,
+    mime_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +109,8 @@ pub async fn webhook(
     let Some(msg) = update.message else {
         return axum::http::StatusCode::OK;
     };
+    let is_photo = !msg.photo.is_empty();
+    let is_document = msg.document.is_some();
     let is_voice = msg.voice.is_some();
     let is_audio = msg.audio.is_some();
     let text = msg.text.as_deref().or(msg.caption.as_deref()).unwrap_or("");
@@ -356,6 +374,13 @@ async fn download_telegram_media(
         }
     }
 
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or(if attachment_type == "image" { "image/jpeg" } else { "audio/ogg" })
+        .to_string();
+
     let bytes = resp.bytes().await.ok()?;
     if bytes.len() as u64 > max_size {
         warn!(file_id, size = bytes.len(), "Telegram {} exceeds limit", attachment_type);
@@ -364,7 +389,7 @@ async fn download_telegram_media(
 
     let (data_bytes, mime, filename) = if attachment_type == "image" {
         match resize_and_compress(&bytes) {
-            Ok((c, m)) => (c, m, format!("{}.jpg", file_id)),
+            Ok((c, _m)) => (c, content_type, format!("{}.jpg", file_id)),
             Err(e) => {
                 error!(err = %e, "Telegram image processing failed");
                 return None;
@@ -372,20 +397,14 @@ async fn download_telegram_media(
         }
     } else {
         // For audio/voice, we don't process.
-        let mime = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("audio/ogg") // Default for Telegram voice
-            .to_string();
-        let ext = if mime.contains("mpeg") || mime.contains("mp3") {
+        let ext = if content_type.contains("mpeg") || content_type.contains("mp3") {
             "mp3"
-        } else if mime.contains("m4a") {
+        } else if content_type.contains("m4a") {
             "m4a"
         } else {
             "ogg"
         };
-        (bytes.to_vec(), mime, format!("{}.{}", file_id, ext))
+        (bytes.to_vec(), content_type, format!("{}.{}", file_id, ext))
     };
 
     use base64::Engine;

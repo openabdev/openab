@@ -1,4 +1,4 @@
-use crate::media::{resize_and_compress, IMAGE_MAX_DOWNLOAD};
+use crate::media::{resize_and_compress, AUDIO_MAX_DOWNLOAD, IMAGE_MAX_DOWNLOAD};
 use crate::schema::*;
 use axum::extract::State;
 use serde::Deserialize;
@@ -92,13 +92,14 @@ pub async fn webhook(
             continue;
         };
         let is_text = msg.message_type == "text";
+        let is_image = msg.message_type == "image";
         let is_audio = msg.message_type == "audio";
 
         if !is_text && !is_image && !is_audio {
             continue;
         }
 
-        let mut text = msg.text.clone().unwrap_or_default();
+        let text = msg.text.clone().unwrap_or_default();
         if is_text && text.trim().is_empty() {
             continue;
         }
@@ -316,6 +317,13 @@ async fn download_line_media(
         }
     }
 
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or(if attachment_type == "image" { "image/jpeg" } else { "audio/x-m4a" })
+        .to_string();
+
     let bytes = resp.bytes().await.ok()?;
     if bytes.len() as u64 > max_size {
         warn!(message_id, size = bytes.len(), "LINE {} exceeds limit", attachment_type);
@@ -324,7 +332,7 @@ async fn download_line_media(
 
     let (data_bytes, mime, filename) = if attachment_type == "image" {
         match resize_and_compress(&bytes) {
-            Ok((c, m)) => (c, m, format!("{}.jpg", message_id)),
+            Ok((c, _m)) => (c, content_type, format!("{}.jpg", message_id)),
             Err(e) => {
                 error!(err = %e, "LINE image processing failed");
                 return None;
@@ -333,14 +341,7 @@ async fn download_line_media(
     } else {
         // For audio, we don't process, just send as is.
         // LINE audio is usually m4a.
-        let mime = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("audio/x-m4a")
-            .to_string();
-        let ext = if mime.contains("mp3") { "mp3" } else { "m4a" };
-        (bytes.to_vec(), mime, format!("{}.{}", message_id, ext))
+        (bytes.to_vec(), content_type, format!("{}.m4a", message_id))
     };
 
     use base64::Engine;
