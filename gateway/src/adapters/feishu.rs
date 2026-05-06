@@ -104,6 +104,7 @@ pub struct FeishuConfig {
     /// this are forgotten and require a fresh @mention to re-engage.
     /// Set to 0 (via FEISHU_SESSION_TTL_HOURS=0) to disable participation
     /// tracking entirely — all messages will require @mention.
+    /// Converted from `FEISHU_SESSION_TTL_HOURS` (user-facing, in hours) to seconds internally.
     pub session_ttl_secs: u64,
 }
 
@@ -279,11 +280,16 @@ mod event_types {
     /// Parse a feishu im.message.receive_v1 event into a GatewayEvent.
     /// Returns None if the event should be skipped (unsupported type, bot message, etc).
     /// The Vec<MediaRef> contains references to media that need async download.
+    ///
+    /// `bypass_mention_gating`: whether the bot should skip @mention requirement for this message.
+    /// This is the final computed result from mode-specific logic (detect_and_mark_multibot),
+    /// already accounting for the configured `allow_user_messages` mode.
+    /// Do NOT pass raw participation status here.
     pub fn parse_message_event(
         envelope: &FeishuEventEnvelope,
         bot_open_id: Option<&str>,
         config: &FeishuConfig,
-        is_thread_participated: bool,
+        bypass_mention_gating: bool,
     ) -> Option<(GatewayEvent, Vec<MediaRef>)> {
         let _header = envelope.header.as_ref()?;
         let event = envelope.event.as_ref()?;
@@ -454,7 +460,7 @@ mod event_types {
         // no @mention needed (like Discord's "involved" mode).
         let in_thread = thread_id.is_some();
         if channel_type == "group" && !is_bot_sender && config.require_mention {
-            if !(in_thread && is_thread_participated) {
+            if !(in_thread && bypass_mention_gating) {
                 if let Some(bot_id) = bot_open_id {
                     let bot_mentioned = mention_ids.iter().any(|id| id == bot_id);
                     if !bot_mentioned {
@@ -2908,7 +2914,7 @@ mod tests {
         cfg.allow_user_messages = AllowUsers::MultibotMentions;
         let mut env = make_envelope("group", "Hello", "ou_user1", None);
         env.event.as_mut().unwrap().message.as_mut().unwrap().root_id = Some("root_456".into());
-        // participated + no other bot → bypass (is_thread_participated=true)
+        // participated + no other bot → bypass_mention_gating=true
         let result = parse_message_event(&env, Some("ou_bot"), &cfg, true);
         assert!(result.is_some());
     }
@@ -2919,7 +2925,7 @@ mod tests {
         cfg.allow_user_messages = AllowUsers::MultibotMentions;
         let mut env = make_envelope("group", "Hello", "ou_user1", None);
         env.event.as_mut().unwrap().message.as_mut().unwrap().root_id = Some("root_456".into());
-        // not participated → require @mention (is_thread_participated=false)
+        // not participated → bypass_mention_gating=false
         assert!(parse_message_event(&env, Some("ou_bot"), &cfg, false).is_none());
     }
 
@@ -2929,7 +2935,7 @@ mod tests {
         cfg.allow_user_messages = AllowUsers::Mentions;
         let mut env = make_envelope("group", "Hello", "ou_user1", None);
         env.event.as_mut().unwrap().message.as_mut().unwrap().root_id = Some("root_789".into());
-        // Even with is_thread_participated=true, Mentions mode never bypasses
+        // Even with bypass_mention_gating=true, Mentions mode never bypasses
         // (caller would pass false because Mentions mode always returns false)
         assert!(parse_message_event(&env, Some("ou_bot"), &cfg, false).is_none());
     }
