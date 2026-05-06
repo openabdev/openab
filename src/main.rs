@@ -123,6 +123,14 @@ async fn main() -> anyhow::Result<()> {
     let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions));
     let ttl_secs = cfg.pool.session_ttl_hours * 3600;
 
+    // Agent health check — verify the agent can spawn, initialize, and create a session
+    // before accepting any messages. Failure is logged but non-fatal so the process stays
+    // alive (launchd KeepAlive handles restarts); the error will surface on first message too.
+    match pool.health_check().await {
+        Ok(()) => info!("agent health check passed"),
+        Err(e) => error!("agent health check FAILED: {e} — all messages will fail until the agent is fixed"),
+    }
+
     // Resolve STT config (auto-detect GROQ_API_KEY from env)
     if cfg.stt.enabled {
         if cfg.stt.api_key.is_empty() && cfg.stt.base_url.contains("groq.com") {

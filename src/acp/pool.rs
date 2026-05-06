@@ -32,12 +32,7 @@ pub struct SessionPool {
     mapping_path: PathBuf,
 }
 
-type EvictionCandidate = (
-    String,
-    Arc<Mutex<AcpConnection>>,
-    Instant,
-    Option<String>,
-);
+type EvictionCandidate = (String, Arc<Mutex<AcpConnection>>, Instant, Option<String>);
 
 fn remove_if_same_handle<T>(
     map: &mut HashMap<String, Arc<Mutex<T>>>,
@@ -54,10 +49,7 @@ fn remove_if_same_handle<T>(
     }
 }
 
-fn get_or_insert_gate(
-    map: &mut HashMap<String, Arc<Mutex<()>>>,
-    key: &str,
-) -> Arc<Mutex<()>> {
+fn get_or_insert_gate(map: &mut HashMap<String, Arc<Mutex<()>>>, key: &str) -> Arc<Mutex<()>> {
     map.entry(key.to_string())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
@@ -85,6 +77,23 @@ impl SessionPool {
         }
     }
 
+    /// Spawn a temporary agent connection, run initialize + session/new, then drop it.
+    /// Returns Ok on success or Err with a description of what failed.
+    pub async fn health_check(&self) -> Result<()> {
+        let mut conn = AcpConnection::spawn(
+            &self.config.command,
+            &self.config.args,
+            &self.config.working_dir,
+            &self.config.env,
+            &self.config.inherit_env,
+        )
+        .await?;
+        conn.initialize().await?;
+        conn.session_new(&self.config.working_dir).await?;
+        Ok(())
+        // conn dropped here → kill_process_group()
+    }
+
     fn load_mapping(path: &Path) -> HashMap<String, String> {
         match std::fs::read_to_string(path) {
             Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
@@ -104,7 +113,9 @@ impl SessionPool {
             }
         };
         let tmp = self.mapping_path.with_extension("json.tmp");
-        if let Err(e) = std::fs::write(&tmp, &data).and_then(|_| std::fs::rename(&tmp, &self.mapping_path)) {
+        if let Err(e) =
+            std::fs::write(&tmp, &data).and_then(|_| std::fs::rename(&tmp, &self.mapping_path))
+        {
             warn!(path = %self.mapping_path.display(), error = %e, "failed to persist thread mapping");
         }
     }
@@ -157,7 +168,12 @@ impl SessionPool {
                 skipped_locked_candidates += 1;
                 continue;
             };
-            let candidate = (key, conn_handle, conn.last_active, conn.acp_session_id.clone());
+            let candidate = (
+                key,
+                conn_handle,
+                conn.last_active,
+                conn.acp_session_id.clone(),
+            );
             match &eviction_candidate {
                 Some((_, _, oldest_last_active, _)) if candidate.2 >= *oldest_last_active => {}
                 _ => eviction_candidate = Some(candidate),
@@ -250,7 +266,9 @@ impl SessionPool {
         state.active.insert(thread_id.to_string(), new_conn);
         self.save_mapping(&state.suspended);
         if !cancel_session_id.is_empty() {
-            state.cancel_handles.insert(thread_id.to_string(), (cancel_handle, cancel_session_id));
+            state
+                .cancel_handles
+                .insert(thread_id.to_string(), (cancel_handle, cancel_session_id));
         }
         Ok(())
     }
@@ -260,7 +278,9 @@ impl SessionPool {
     where
         F: for<'a> FnOnce(
             &'a mut AcpConnection,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<R>> + Send + 'a>>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<R>> + Send + 'a>,
+        >,
     {
         let conn = {
             let state = self.state.read().await;
@@ -311,7 +331,10 @@ impl SessionPool {
     pub async fn cancel_session(&self, thread_id: &str) -> Result<()> {
         let (stdin, session_id) = {
             let state = self.state.read().await;
-            state.cancel_handles.get(thread_id).cloned()
+            state
+                .cancel_handles
+                .get(thread_id)
+                .cloned()
                 .ok_or_else(|| anyhow!("no session for thread {thread_id}"))?
         };
         let data = serde_json::to_string(&serde_json::json!({
@@ -414,7 +437,11 @@ impl SessionPool {
         // awaiting a connection lock).
         let snapshot: Vec<(String, Arc<Mutex<AcpConnection>>)> = {
             let state = self.state.read().await;
-            state.active.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect()
+            state
+                .active
+                .iter()
+                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .collect()
         };
 
         let mut session_ids: Vec<(String, String)> = Vec::new();
@@ -438,8 +465,11 @@ impl SessionPool {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_or_insert_gate, remove_if_same_handle};
+    use super::{get_or_insert_gate, remove_if_same_handle, SessionPool};
+    use crate::config::AgentConfig;
     use std::collections::HashMap;
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -476,5 +506,53 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(map.len(), 1);
+    }
+
+    #[cfg(unix)]
+    fn temp_working_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "openab-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).expect("create temp working dir");
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn health_check_surfaces_fast_fail_stderr() {
+        let working_dir = temp_working_dir("health-check");
+        let pool = SessionPool::new(
+            AgentConfig {
+                command: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "printf 'env: node: No such file or directory\\n' >&2; exit 1".into(),
+                ],
+                working_dir: working_dir
+                    .to_str()
+                    .expect("temp path should be utf-8")
+                    .to_string(),
+                env: HashMap::new(),
+                inherit_env: vec![],
+            },
+            1,
+        );
+
+        let err = pool
+            .health_check()
+            .await
+            .expect_err("health check should fail")
+            .to_string();
+
+        assert!(
+            err.contains("connection closed; agent stderr: env: node: No such file or directory")
+        );
+
+        let _ = fs::remove_dir_all(working_dir);
     }
 }
