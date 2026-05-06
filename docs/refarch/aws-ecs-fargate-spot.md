@@ -1,5 +1,13 @@
 # Reference Architecture: OpenAB on AWS ECS Fargate Spot
 
+> **This doc is meant to be used with Kiro or any coding CLI.** Prompt your AI agent with something like:
+>
+> ```
+> per docs/refarch/aws-ecs-fargate-spot.md, deploy an openab on ECS Fargate Spot for me in my AWS account
+> ```
+>
+> and it will guide you through (or handle) the full setup on AWS.
+
 Deploy a single OpenAB bot on ECS Fargate Spot for ~$2.7/month with persistent auth via S3.
 
 ## Architecture
