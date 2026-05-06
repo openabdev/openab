@@ -134,18 +134,53 @@ trusted_bot_ids = ["123456789012345678"]  # only this bot's messages pass throug
 
 Empty (default) = any bot can pass through (subject to the mode check).
 
+### `allowed_role_ids`
+
+Role IDs that trigger the bot, same as a direct @mention. This enables users to invoke multiple bots simultaneously with a single role mention (e.g. `@AllBots review this`).
+
+```toml
+allowed_role_ids = ["123456789012345678"]  # @mention this role = trigger the bot
+```
+
+Empty (default) = role mentions do not trigger the bot.
+
+**Setup:**
+1. Create a Discord role (e.g. `Bots` or `AllAgents`)
+2. Assign the role to all bots you want to trigger together
+3. Add the role's ID to each bot's `allowed_role_ids`
+4. Users type `@RoleName <prompt>` to trigger all bots at once
+
+> **Note:** If multiple bots share the same role, all will respond simultaneously. Use `multibot-mentions` mode if you want bots to require explicit @mention when other bots are already in the thread.
+
+#### Interaction with `multibot-mentions` mode
+
+When `allow_user_messages = "multibot-mentions"` is set alongside `allowed_role_ids`:
+
+| Action | Result |
+|--------|--------|
+| `@Role review this` in a channel | All bots trigger (role mention = explicit mention) |
+| Follow-up in the thread without @mention | Only the thread owner responds (multibot gate kicks in) |
+| `@Role follow up` in the thread | All bots respond again |
+
+This gives the best of both worlds: one role mention to summon all bots, but subsequent messages in the thread don't cause all bots to pile on.
+
 ---
 
 ## @Mention Behavior
 
-**Always @mention the bot user, not the role.** Discord shows both in autocomplete — pick the one without the role icon.
+The bot responds to:
+
+1. **Direct @mention** (`@BotUser`) — always works
+2. **Role mention** (`@RoleName`) — only if the role ID is in `allowed_role_ids`
+3. **Thread reply** — depends on `allow_user_messages` mode (no @mention needed in `involved` mode)
 
 ```
-✅ @AgentBroker hello     ← user mention, bot responds
-❌ @AgentBroker hello     ← role mention (with role icon), bot ignores
+✅ @AgentBroker hello           ← user mention, bot responds
+✅ @AllBots hello               ← role mention, bot responds (if role in allowed_role_ids)
+❌ @SomeOtherRole hello         ← role not in allowed_role_ids, bot ignores
 ```
 
-Role mentions are ignored because they are shared across bots and cause false positives in multi-bot setups. This is intentional since v0.7.8-beta.3 (#420, #440).
+The triggering role mention is stripped from the prompt sent to the agent (same as the bot's own user mention).
 
 ### User mention UIDs
 
@@ -153,7 +188,8 @@ When a user mentions another user (e.g. `@SomeUser`) in a message to the bot, th
 
 - The LLM can copy `<@UID>` into its reply to produce a clickable Discord mention
 - The bot's own mention is stripped (so the bot doesn't see itself being triggered)
-- Role mentions are replaced with `@(role)` placeholder
+- Triggering role mentions (in `allowed_role_ids`) are stripped
+- Other role mentions are replaced with `@(role)` placeholder
 
 To help the LLM know who each UID refers to, provide a UID→name mapping via system prompt or context entry (see [Multi-Bot Setup](#multi-bot-setup) below).
 
@@ -274,10 +310,11 @@ helm install openab openab/openab \
   --set agents.kiro.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.kiro.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
   --set agents.kiro.discord.allowBotMessages=off \
-  --set agents.kiro.discord.allowUserMessages=involved
+  --set agents.kiro.discord.allowUserMessages=involved \
+  --set-string 'agents.kiro.discord.allowedRoleIds[0]=YOUR_ROLE_ID'
 ```
 
-⚠️ Use `--set-string` for channel/user IDs to avoid float64 precision loss.
+⚠️ Use `--set-string` for channel/user/role IDs to avoid float64 precision loss.
 
 ---
 
@@ -288,7 +325,7 @@ helm install openab openab/openab \
 1. **Check channel ID** — make sure it's in `allowed_channels`
 2. **Check permissions** — bot needs Send Messages, Create Public Threads, Read Message History in the channel
 3. **Check intents** — Message Content Intent must be enabled in Developer Portal
-4. **Check @mention type** — use user mention, not role mention
+4. **Check @mention type** — use user mention or a role in `allowed_role_ids`
 5. **Check if in a thread** — with `mentions` mode, @mention is required even in threads
 
 ### Bot stops receiving messages after restart
