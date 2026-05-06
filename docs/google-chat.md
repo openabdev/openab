@@ -143,11 +143,17 @@ working_dir = "/home/agent"
   - Inline code, fenced code blocks: pass through unchanged
   - Tables and other unsupported syntax pass through as-is
 - **Streaming (edit_message)** — when OAB streaming is enabled, the bot edits its initial reply in-place as tokens arrive (typewriter effect)
+- **Inbound attachments** — image, text file, and audio attachments are downloaded via Google Chat Media API and forwarded to the agent as base64 (PR #731 pattern):
+  - Images: resized to ≤1200px JPEG (q75); GIFs preserved. Max 10 MB.
+  - Text files: only known text extensions (`.txt`, `.md`, `.json`, `.py`, `.rs`, etc.). Max 512 KB.
+  - Audio: forwarded as-is for STT processing by core. Max 25 MB.
+  - Drive-sourced attachments are skipped (require separate Drive API integration).
 
 ### Not Supported
 
 - **Reactions** — Google Chat API does not support message reactions on behalf of bots
-- **File/image attachments** — not yet implemented
+- **Outbound attachments** — bot cannot send image/file attachments back to the user yet
+- **Drive-linked attachments** — only `UPLOADED_CONTENT` source is handled; `DRIVE_FILE` source skipped
 
 ## Environment Variables (Gateway)
 
