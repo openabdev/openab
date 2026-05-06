@@ -153,9 +153,6 @@ pub trait ChatAdapter: Send + Sync + 'static {
 
 // --- AdapterRouter ---
 
-/// Polling cadence for the recv-loop liveness check (#732).
-const LIVENESS_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// Shared logic for routing messages to ACP agents, managing sessions,
 /// streaming edits, and controlling reactions. Platform-independent.
 pub struct AdapterRouter {
@@ -163,6 +160,8 @@ pub struct AdapterRouter {
     reactions_config: ReactionsConfig,
     table_mode: TableMode,
     prompt_hard_timeout: std::time::Duration,
+    /// Polling cadence for the recv-loop liveness check (#732).
+    liveness_check_interval: std::time::Duration,
 }
 
 impl AdapterRouter {
@@ -171,12 +170,14 @@ impl AdapterRouter {
         reactions_config: ReactionsConfig,
         table_mode: TableMode,
         prompt_hard_timeout_secs: u64,
+        liveness_check_secs: u64,
     ) -> Self {
         Self {
             pool,
             reactions_config,
             table_mode,
             prompt_hard_timeout: std::time::Duration::from_secs(prompt_hard_timeout_secs),
+            liveness_check_interval: std::time::Duration::from_secs(liveness_check_secs),
         }
     }
 
@@ -342,6 +343,7 @@ impl AdapterRouter {
         let table_mode = self.table_mode;
         let tool_display = self.reactions_config.tool_display;
         let prompt_hard_timeout = self.prompt_hard_timeout;
+        let liveness_check_interval = self.liveness_check_interval;
 
         self.pool
             .with_connection(thread_key, |conn| {
@@ -415,7 +417,7 @@ impl AdapterRouter {
                                 // Reader saw EOF and already drained pending; nothing to abandon.
                                 None => break,
                             },
-                            _ = tokio::time::sleep(LIVENESS_CHECK_INTERVAL) => {
+                            _ = tokio::time::sleep(liveness_check_interval) => {
                                 if !conn.alive() {
                                     response_error = Some("Agent process died".into());
                                     conn.abandon_request(request_id).await;
@@ -423,8 +425,8 @@ impl AdapterRouter {
                                 }
                                 if prompt_start.elapsed() > prompt_hard_timeout {
                                     response_error = Some(format!(
-                                        "Agent exceeded hard timeout ({}m)",
-                                        prompt_hard_timeout.as_secs() / 60,
+                                        "Agent exceeded hard timeout ({}s)",
+                                        prompt_hard_timeout.as_secs(),
                                     ));
                                     conn.abandon_request(request_id).await;
                                     break;

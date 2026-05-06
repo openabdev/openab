@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace};
 
 /// Pick the most permissive selectable permission option from ACP options.
 fn pick_best_option(options: &[Value]) -> Option<String> {
@@ -319,6 +319,10 @@ impl AcpConnection {
                             let _ = tx.send(msg);
                             continue;
                         }
+                        // Stale id (#732): pending was already abandoned. Falls through
+                        // to subscriber forwarding; the adapter recv loop filters by
+                        // request_id so it can't leak into the next prompt.
+                        trace!(request_id = id, "stale id-bearing message after abandon");
                     }
 
                     // Notification → forward to subscriber
