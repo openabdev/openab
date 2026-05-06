@@ -122,12 +122,12 @@ pub async fn webhook(
     let mut attachments = Vec::new();
     if is_photo || is_document || is_voice || is_audio {
         if let Some(ref token) = state.telegram_bot_token {
-            let client = reqwest::Client::new();
+            let client = &state.client;
             if is_photo {
                 // Take the largest photo
                 if let Some(largest) = msg.photo.iter().max_by_key(|p| p.width * p.height) {
                     if let Some(att) =
-                        download_telegram_media(&client, token, &largest.file_id, "image").await
+                        download_telegram_media(client, token, &largest.file_id, "image").await
                     {
                         attachments.push(att);
                     }
@@ -135,16 +135,16 @@ pub async fn webhook(
             } else if let Some(doc) = msg.document {
                 let file_name = doc.file_name.unwrap_or_else(|| "unknown.txt".to_string());
                 if let Some(att) =
-                    download_telegram_document(&client, token, &doc.file_id, &file_name).await
+                    download_telegram_document(client, token, &doc.file_id, &file_name).await
                 {
                     attachments.push(att);
                 }
             } else if let Some(voice) = msg.voice {
-                if let Some(att) = download_telegram_media(&client, token, &voice.file_id, "audio").await {
+                if let Some(att) = download_telegram_media(client, token, &voice.file_id, "audio").await {
                     attachments.push(att);
                 }
             } else if let Some(audio) = msg.audio {
-                if let Some(att) = download_telegram_media(&client, token, &audio.file_id, "audio").await {
+                if let Some(att) = download_telegram_media(client, token, &audio.file_id, "audio").await {
                     attachments.push(att);
                 }
             }
@@ -409,6 +409,7 @@ async fn download_telegram_media(
 
     use base64::Engine;
     let b64_data = base64::engine::general_purpose::STANDARD.encode(&data_bytes);
+    info!(file_id, size = data_bytes.len(), "Telegram {} download successful", attachment_type);
 
     Some(Attachment {
         attachment_type: attachment_type.into(),
@@ -482,6 +483,7 @@ async fn download_telegram_document(
     let text = String::from_utf8_lossy(&bytes);
     use base64::Engine;
     let data = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    info!(file_id, file_name, size = bytes.len(), "Telegram document download successful");
 
     Some(Attachment {
         attachment_type: "text_file".into(),

@@ -107,9 +107,9 @@ pub async fn webhook(
         let mut attachments = Vec::new();
         if is_image || is_audio {
             if let Some(ref access_token) = state.line_access_token {
-                let client = reqwest::Client::new();
+                let client = &state.client;
                 let att_type = if is_image { "image" } else { "audio" };
-                if let Some(att) = download_line_media(&client, access_token, &msg.id, att_type).await {
+                if let Some(att) = download_line_media(client, access_token, &msg.id, att_type).await {
                     attachments.push(att);
                 }
             } else {
@@ -321,7 +321,7 @@ async fn download_line_media(
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
-        .unwrap_or(if attachment_type == "image" { "image/jpeg" } else { "audio/x-m4a" })
+        .unwrap_or(if attachment_type == "image" { "image/jpeg" } else { "audio/mp4" })
         .to_string();
 
     let bytes = resp.bytes().await.ok()?;
@@ -346,6 +346,7 @@ async fn download_line_media(
 
     use base64::Engine;
     let b64_data = base64::engine::general_purpose::STANDARD.encode(&data_bytes);
+    info!(message_id, size = data_bytes.len(), "LINE {} download successful", attachment_type);
 
     Some(Attachment {
         attachment_type: attachment_type.into(),
