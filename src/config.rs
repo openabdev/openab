@@ -639,6 +639,10 @@ fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
             "gateway.max_batch_tokens must be > 0"
         );
     }
+    anyhow::ensure!(
+        config.pool.liveness_check_secs > 0,
+        "pool.liveness_check_secs must be > 0 (zero would spin the recv loop)"
+    );
 
     Ok(config)
 }

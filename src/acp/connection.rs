@@ -577,14 +577,10 @@ impl AcpConnection {
     }
 
     /// Drop the pending entry for `request_id` and best-effort send
-    /// `session/cancel`. Errors are swallowed: the agent process may already
-    /// be dead, in which case the stdin write fails harmlessly. See #732.
-    ///
-    /// `session/cancel` carries a fresh JSON-RPC id but is not registered in
-    /// `pending`, so the agent's reply lands in the stale-id branch of
-    /// `run_reader_loop` and only emits a `trace!`. That is intentional: we
-    /// never wait on the cancel response, and the adapter recv loop's
-    /// request_id filter prevents leakage into the next prompt.
+    /// `session/cancel` as a JSON-RPC notification (no id; per ACP spec the
+    /// agent does not reply). Errors are swallowed: the agent process may
+    /// already be dead, in which case the stdin write fails harmlessly.
+    /// See #732.
     pub async fn abandon_request(&self, request_id: u64) {
         self.pending.lock().await.remove(&request_id);
         let Some(session_id) = self.acp_session_id.as_deref() else {
@@ -592,7 +588,6 @@ impl AcpConnection {
         };
         let req = json!({
             "jsonrpc": "2.0",
-            "id": self.next_id(),
             "method": "session/cancel",
             "params": {"sessionId": session_id},
         });
