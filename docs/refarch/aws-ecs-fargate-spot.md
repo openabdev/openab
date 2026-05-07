@@ -3,7 +3,7 @@
 > **This doc is meant to be used with Kiro or any coding CLI.** Prompt your AI agent with something like:
 >
 > ```
-> per docs/refarch/aws-ecs-fargate-spot.md, deploy an openab on ECS Fargate Spot for me in my AWS account
+> per https://github.com/openabdev/openab/blob/main/docs/refarch/aws-ecs-fargate-spot.md deploy an openab on ECS Fargate Spot for me in my AWS account
 > ```
 >
 > and it will guide you through (or handle) the full setup on AWS.
