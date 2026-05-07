@@ -1,3 +1,4 @@
+use crate::media::{resize_and_compress, FILE_MAX_DOWNLOAD, IMAGE_MAX_DOWNLOAD};
 use crate::schema::*;
 use axum::extract::State;
 use prost::Message as ProstMessage;
@@ -106,8 +107,8 @@ impl FeishuConfig {
             "webhook" => ConnectionMode::Webhook,
             _ => ConnectionMode::Websocket,
         };
-        let webhook_path =
-            std::env::var("FEISHU_WEBHOOK_PATH").unwrap_or_else(|_| "/webhook/feishu".into());
+        let webhook_path = std::env::var("FEISHU_WEBHOOK_PATH")
+            .unwrap_or_else(|_| "/webhook/feishu".into());
         let verification_token = std::env::var("FEISHU_VERIFICATION_TOKEN").ok();
         let encrypt_key = std::env::var("FEISHU_ENCRYPT_KEY").ok();
         let allowed_groups = parse_csv("FEISHU_ALLOWED_GROUPS");
@@ -308,9 +309,7 @@ mod event_types {
             return None;
         }
 
-        let content_json: serde_json::Value = msg
-            .content
-            .as_deref()
+        let content_json: serde_json::Value = msg.content.as_deref()
             .and_then(|s| serde_json::from_str(s).ok())?;
 
         let message_id = msg.message_id.as_deref()?;
@@ -319,8 +318,9 @@ mod event_types {
         let (clean_text, mention_ids, media_refs) = match msg_type {
             "image" => {
                 let image_key = content_json.get("image_key")?.as_str()?;
-                let mentions =
-                    extract_mentions("", msg.mentions.as_deref().unwrap_or(&[]), bot_open_id);
+                let mentions = extract_mentions(
+                    "", msg.mentions.as_deref().unwrap_or(&[]), bot_open_id,
+                );
                 let refs = vec![MediaRef::Image {
                     message_id: message_id.to_string(),
                     image_key: image_key.to_string(),
@@ -329,12 +329,12 @@ mod event_types {
             }
             "file" => {
                 let file_key = content_json.get("file_key")?.as_str()?;
-                let file_name = content_json
-                    .get("file_name")
+                let file_name = content_json.get("file_name")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
-                let mentions =
-                    extract_mentions("", msg.mentions.as_deref().unwrap_or(&[]), bot_open_id);
+                let mentions = extract_mentions(
+                    "", msg.mentions.as_deref().unwrap_or(&[]), bot_open_id,
+                );
                 let refs = vec![MediaRef::File {
                     message_id: message_id.to_string(),
                     file_key: file_key.to_string(),
@@ -357,9 +357,7 @@ mod event_types {
                                         }
                                     }
                                     Some("img") => {
-                                        if let Some(key) =
-                                            el.get("image_key").and_then(|v| v.as_str())
-                                        {
+                                        if let Some(key) = el.get("image_key").and_then(|v| v.as_str()) {
                                             refs.push(MediaRef::Image {
                                                 message_id: message_id.to_string(),
                                                 image_key: key.to_string(),
@@ -390,10 +388,7 @@ mod event_types {
             }
             _ => {
                 // text
-                let raw_text = content_json
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let raw_text = content_json.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 if raw_text.trim().is_empty() {
                     return None;
                 }
@@ -611,8 +606,7 @@ impl FeishuTokenCache {
 
         let expire = body.get("expire").and_then(|v| v.as_u64()).unwrap_or(7200);
 
-        let token = body
-            .get("tenant_access_token")
+        let token = body.get("tenant_access_token")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow::anyhow!("feishu token refresh: missing tenant_access_token"))?;
@@ -704,10 +698,7 @@ async fn get_ws_endpoint(
     let body: serde_json::Value = resp.json().await?;
     let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     if code != 0 {
-        let msg = body
-            .get("msg")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
+        let msg = body.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
         anyhow::bail!("feishu ws endpoint error: code={code} msg={msg}");
     }
     body.get("data")
@@ -924,9 +915,7 @@ async fn handle_ws_message(
     let bot_id = bot_open_id_store.read().await;
     let bot_id_ref = bot_id.as_deref();
 
-    if let Some((mut gateway_event, media_refs)) =
-        parse_message_event(&envelope, bot_id_ref, config)
-    {
+    if let Some((mut gateway_event, media_refs)) = parse_message_event(&envelope, bot_id_ref, config) {
         // Also dedupe by message_id
         if dedupe.is_duplicate(&gateway_event.message_id) {
             return;
@@ -956,13 +945,8 @@ async fn handle_ws_message(
 
         // Resolve sender display name (lazy, cached)
         let name = resolve_user_name(
-            &gateway_event.sender.id,
-            name_cache,
-            token_cache,
-            client,
-            &config.api_base(),
-        )
-        .await;
+            &gateway_event.sender.id, name_cache, token_cache, client, &config.api_base(),
+        ).await;
         gateway_event.sender.name = name.clone();
         gateway_event.sender.display_name = name;
 
@@ -972,22 +956,11 @@ async fn handle_ws_message(
                 let api_base = config.api_base();
                 for media_ref in &media_refs {
                     let attachment = match media_ref {
-                        MediaRef::Image {
-                            message_id,
-                            image_key,
-                        } => {
-                            download_feishu_image(client, &api_base, &token, message_id, image_key)
-                                .await
+                        MediaRef::Image { message_id, image_key } => {
+                            download_feishu_image(client, &api_base, &token, message_id, image_key).await
                         }
-                        MediaRef::File {
-                            message_id,
-                            file_key,
-                            file_name,
-                        } => {
-                            download_feishu_file(
-                                client, &api_base, &token, message_id, file_key, file_name,
-                            )
-                            .await
+                        MediaRef::File { message_id, file_key, file_name } => {
+                            download_feishu_file(client, &api_base, &token, message_id, file_key, file_name).await
                         }
                     };
                     if let Some(att) = attachment {
@@ -998,9 +971,7 @@ async fn handle_ws_message(
         }
 
         // Skip if no text and no attachments (e.g. unsupported file type)
-        if gateway_event.content.text.trim().is_empty()
-            && gateway_event.content.attachments.is_empty()
-        {
+        if gateway_event.content.text.trim().is_empty() && gateway_event.content.attachments.is_empty() {
             return;
         }
 
@@ -1075,14 +1046,9 @@ async fn edit_feishu_message(adapter: &FeishuAdapter, message_id: &str, text: &s
         "msg_type": "post",
         "content": post_content.to_string(),
     });
-    match adapter
-        .client
-        .put(&url)
-        .bearer_auth(&token)
+    match adapter.client.put(&url).bearer_auth(&token)
         .header("Content-Type", "application/json; charset=utf-8")
-        .json(&body)
-        .send()
-        .await
+        .json(&body).send().await
     {
         Ok(resp) if resp.status().is_success() => {
             tracing::trace!(message_id = %message_id, "feishu message edited");
@@ -1299,18 +1265,10 @@ fn try_parse_link(chars: &[char], start: usize) -> Option<(String, String, usize
 
 /// Reference to a media resource that needs async download after parse_message_event.
 pub enum MediaRef {
-    Image {
-        message_id: String,
-        image_key: String,
-    },
-    File {
-        message_id: String,
-        file_key: String,
-        file_name: String,
-    },
+    Image { message_id: String, image_key: String },
+    File { message_id: String, file_key: String, file_name: String },
 }
 
-use crate::media::{resize_and_compress, FILE_MAX_DOWNLOAD, IMAGE_MAX_DOWNLOAD};
 
 /// Download a Feishu image by message_id + image_key → resize/compress → base64 Attachment.
 pub async fn download_feishu_image(
@@ -1339,11 +1297,7 @@ pub async fn download_feishu_image(
     if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
             if size > IMAGE_MAX_DOWNLOAD {
-                tracing::warn!(
-                    image_key,
-                    size,
-                    "feishu image Content-Length exceeds 10MB limit, skipping download"
-                );
+                tracing::warn!(image_key, size, "feishu image Content-Length exceeds 10MB limit, skipping download");
                 return None;
             }
         }
@@ -1351,11 +1305,7 @@ pub async fn download_feishu_image(
     let bytes = resp.bytes().await.ok()?;
     // Fallback check (Content-Length may be absent or misreported)
     if bytes.len() as u64 > IMAGE_MAX_DOWNLOAD {
-        tracing::warn!(
-            image_key,
-            size = bytes.len(),
-            "feishu image exceeds 10MB limit"
-        );
+        tracing::warn!(image_key, size = bytes.len(), "feishu image exceeds 10MB limit");
         return None;
     }
     let (compressed, mime) = match resize_and_compress(&bytes) {
@@ -1389,9 +1339,9 @@ pub async fn download_feishu_file(
     // Only download text-like files
     let ext = file_name.rsplit('.').next().unwrap_or("").to_lowercase();
     const TEXT_EXTS: &[&str] = &[
-        "txt", "csv", "log", "md", "json", "jsonl", "yaml", "yml", "toml", "xml", "rs", "py", "js",
-        "ts", "jsx", "tsx", "go", "java", "c", "cpp", "h", "hpp", "rb", "sh", "bash", "sql",
-        "html", "css", "ini", "cfg", "conf", "env",
+        "txt", "csv", "log", "md", "json", "jsonl", "yaml", "yml", "toml", "xml",
+        "rs", "py", "js", "ts", "jsx", "tsx", "go", "java", "c", "cpp", "h", "hpp",
+        "rb", "sh", "bash", "sql", "html", "css", "ini", "cfg", "conf", "env",
     ];
     if !TEXT_EXTS.contains(&ext.as_str()) {
         tracing::debug!(file_name, "skipping non-text file attachment");
@@ -1416,11 +1366,7 @@ pub async fn download_feishu_file(
     if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
             if size > FILE_MAX_DOWNLOAD {
-                tracing::warn!(
-                    file_name,
-                    size,
-                    "feishu file Content-Length exceeds 512KB limit, skipping download"
-                );
+                tracing::warn!(file_name, size, "feishu file Content-Length exceeds 512KB limit, skipping download");
                 return None;
             }
         }
@@ -1428,11 +1374,7 @@ pub async fn download_feishu_file(
     let bytes = resp.bytes().await.ok()?;
     // Fallback check (Content-Length may be absent or misreported)
     if bytes.len() as u64 > FILE_MAX_DOWNLOAD {
-        tracing::warn!(
-            file_name,
-            size = bytes.len(),
-            "feishu file exceeds 512KB limit"
-        );
+        tracing::warn!(file_name, size = bytes.len(), "feishu file exceeds 512KB limit");
         return None;
     }
     let text = String::from_utf8_lossy(&bytes);
@@ -1469,10 +1411,7 @@ pub async fn send_post_message(
         )
     } else {
         (
-            format!(
-                "{}/open-apis/im/v1/messages?receive_id_type=chat_id",
-                api_base
-            ),
+            format!("{}/open-apis/im/v1/messages?receive_id_type=chat_id", api_base),
             serde_json::json!({
                 "receive_id": chat_id,
                 "msg_type": "post",
@@ -1607,18 +1546,13 @@ async fn add_reaction(adapter: &FeishuAdapter, message_id: &str, emoji: &str) {
     };
     let token = match adapter.token_cache.get_token(&adapter.client).await {
         Ok(t) => t,
-        Err(e) => {
-            tracing::error!(err = %e, "feishu: cannot get token for reaction");
-            return;
-        }
+        Err(e) => { tracing::error!(err = %e, "feishu: cannot get token for reaction"); return; }
     };
     let url = format!(
         "{}/open-apis/im/v1/messages/{}/reactions",
-        adapter.config.api_base(),
-        message_id
+        adapter.config.api_base(), message_id
     );
-    let _ = adapter
-        .client
+    let _ = adapter.client
         .post(&url)
         .bearer_auth(&token)
         .json(&serde_json::json!({"reaction_type": {"emoji_type": reaction_type}}))
@@ -1634,26 +1568,15 @@ async fn remove_reaction(adapter: &FeishuAdapter, message_id: &str, emoji: &str)
     };
     let token = match adapter.token_cache.get_token(&adapter.client).await {
         Ok(t) => t,
-        Err(e) => {
-            tracing::error!(err = %e, "feishu: cannot get token for reaction");
-            return;
-        }
+        Err(e) => { tracing::error!(err = %e, "feishu: cannot get token for reaction"); return; }
     };
     // Feishu remove reaction needs reaction_id. Simpler approach: delete by type.
     // GET reactions, find matching, DELETE by id.
     let list_url = format!(
         "{}/open-apis/im/v1/messages/{}/reactions?reaction_type={}",
-        adapter.config.api_base(),
-        message_id,
-        reaction_type
+        adapter.config.api_base(), message_id, reaction_type
     );
-    let resp = match adapter
-        .client
-        .get(&list_url)
-        .bearer_auth(&token)
-        .send()
-        .await
-    {
+    let resp = match adapter.client.get(&list_url).bearer_auth(&token).send().await {
         Ok(r) => r,
         Err(_) => return,
     };
@@ -1665,24 +1588,15 @@ async fn remove_reaction(adapter: &FeishuAdapter, message_id: &str, emoji: &str)
     if let Some(items) = body.pointer("/data/items").and_then(|v| v.as_array()) {
         let bot_id = adapter.bot_open_id.read().await;
         for item in items {
-            let is_ours = item
-                .pointer("/operator/operator_id/open_id")
-                .and_then(|v| v.as_str())
-                == bot_id.as_deref();
+            let is_ours = item.pointer("/operator/operator_id/open_id")
+                .and_then(|v| v.as_str()) == bot_id.as_deref();
             if is_ours {
                 if let Some(reaction_id) = item.get("reaction_id").and_then(|v| v.as_str()) {
                     let del_url = format!(
                         "{}/open-apis/im/v1/messages/{}/reactions/{}",
-                        adapter.config.api_base(),
-                        message_id,
-                        reaction_id
+                        adapter.config.api_base(), message_id, reaction_id
                     );
-                    let _ = adapter
-                        .client
-                        .delete(&del_url)
-                        .bearer_auth(&token)
-                        .send()
-                        .await;
+                    let _ = adapter.client.delete(&del_url).bearer_auth(&token).send().await;
                     return;
                 }
             }
@@ -1753,16 +1667,7 @@ pub async fn handle_reply(
     // Use post (rich text) format for markdown rendering.
     // When in a thread (thread_id present), use reply API to stay in the same thread.
     if text.len() <= limit {
-        match send_post_message(
-            &adapter.client,
-            &api_base,
-            &token,
-            &reply.channel.id,
-            thread_id,
-            text,
-        )
-        .await
-        {
+        match send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, thread_id, text).await {
             Some(msg_id) => {
                 adapter.dedupe.is_duplicate(&msg_id);
                 // Send response with message_id back to OAB core (for streaming edit)
@@ -1799,16 +1704,7 @@ pub async fn handle_reply(
         }
     } else {
         for chunk in split_text(text, limit) {
-            if let Some(msg_id) = send_post_message(
-                &adapter.client,
-                &api_base,
-                &token,
-                &reply.channel.id,
-                thread_id,
-                chunk,
-            )
-            .await
-            {
+            if let Some(msg_id) = send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, thread_id, chunk).await {
                 adapter.dedupe.is_duplicate(&msg_id);
             }
         }
@@ -1912,9 +1808,11 @@ fn verify_signature(
 fn decrypt_event(encrypt_key: &str, encrypted: &str) -> anyhow::Result<String> {
     use sha2::{Digest, Sha256};
     let key = Sha256::digest(encrypt_key.as_bytes());
-    let cipher_bytes =
-        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encrypted)
-            .map_err(|e| anyhow::anyhow!("base64 decode failed: {e}"))?;
+    let cipher_bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        encrypted,
+    )
+    .map_err(|e| anyhow::anyhow!("base64 decode failed: {e}"))?;
 
     if cipher_bytes.len() < 16 {
         anyhow::bail!("encrypted data too short");
@@ -1963,10 +1861,7 @@ pub async fn webhook(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown");
     if feishu.rate_limiter.check(ip) {
-        return (
-            axum::http::StatusCode::TOO_MANY_REQUESTS,
-            "rate limit exceeded",
-        )
+        return (axum::http::StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded")
             .into_response();
     }
 
@@ -2086,18 +1981,12 @@ pub async fn webhook(
     let bot_id = feishu.bot_open_id.read().await;
     let bot_id_ref = bot_id.as_deref();
 
-    if let Some((mut gateway_event, media_refs)) =
-        parse_message_event(&envelope, bot_id_ref, &feishu.config)
-    {
+    if let Some((mut gateway_event, media_refs)) = parse_message_event(&envelope, bot_id_ref, &feishu.config) {
         if !feishu.dedupe.is_duplicate(&gateway_event.message_id) {
             let name = resolve_user_name(
-                &gateway_event.sender.id,
-                &feishu.name_cache,
-                &feishu.token_cache,
-                &feishu.client,
-                &feishu.config.api_base(),
-            )
-            .await;
+                &gateway_event.sender.id, &feishu.name_cache, &feishu.token_cache,
+                &feishu.client, &feishu.config.api_base(),
+            ).await;
             gateway_event.sender.name = name.clone();
             gateway_event.sender.display_name = name;
 
@@ -2107,33 +1996,11 @@ pub async fn webhook(
                     let api_base = feishu.config.api_base();
                     for media_ref in &media_refs {
                         let attachment = match media_ref {
-                            MediaRef::Image {
-                                message_id,
-                                image_key,
-                            } => {
-                                download_feishu_image(
-                                    &feishu.client,
-                                    &api_base,
-                                    &token,
-                                    message_id,
-                                    image_key,
-                                )
-                                .await
+                            MediaRef::Image { message_id, image_key } => {
+                                download_feishu_image(&feishu.client, &api_base, &token, message_id, image_key).await
                             }
-                            MediaRef::File {
-                                message_id,
-                                file_key,
-                                file_name,
-                            } => {
-                                download_feishu_file(
-                                    &feishu.client,
-                                    &api_base,
-                                    &token,
-                                    message_id,
-                                    file_key,
-                                    file_name,
-                                )
-                                .await
+                            MediaRef::File { message_id, file_key, file_name } => {
+                                download_feishu_file(&feishu.client, &api_base, &token, message_id, file_key, file_name).await
                             }
                         };
                         if let Some(att) = attachment {
@@ -2144,9 +2011,7 @@ pub async fn webhook(
             }
 
             // Skip if no text and no attachments (e.g. unsupported file type)
-            if gateway_event.content.text.trim().is_empty()
-                && gateway_event.content.attachments.is_empty()
-            {
+            if gateway_event.content.text.trim().is_empty() && gateway_event.content.attachments.is_empty() {
                 return axum::http::StatusCode::OK.into_response();
             }
 
@@ -2438,7 +2303,7 @@ mod tests {
     fn parse_group_without_mention_filtered() {
         let env = make_envelope("group", "just chatting", "ou_user1", None);
         let cfg = test_config(); // require_mention = true
-                                 // Gateway-side mention gating: group message without bot mention is filtered
+        // Gateway-side mention gating: group message without bot mention is filtered
         assert!(parse_message_event(&env, Some("ou_bot"), &cfg).is_none());
     }
 
@@ -2454,13 +2319,7 @@ mod tests {
     #[test]
     fn parse_skips_bot_sender() {
         let mut env = make_envelope("p2p", "hello", "ou_bot", None);
-        env.event
-            .as_mut()
-            .unwrap()
-            .sender
-            .as_mut()
-            .unwrap()
-            .sender_type = Some("bot".into());
+        env.event.as_mut().unwrap().sender.as_mut().unwrap().sender_type = Some("bot".into());
         let cfg = test_config();
         assert!(parse_message_event(&env, Some("ou_bot"), &cfg).is_none());
     }
@@ -2475,13 +2334,7 @@ mod tests {
     #[test]
     fn parse_skips_non_text_message() {
         let mut env = make_envelope("p2p", "hello", "ou_user1", None);
-        env.event
-            .as_mut()
-            .unwrap()
-            .message
-            .as_mut()
-            .unwrap()
-            .message_type = Some("sticker".into());
+        env.event.as_mut().unwrap().message.as_mut().unwrap().message_type = Some("sticker".into());
         let cfg = test_config();
         assert!(parse_message_event(&env, Some("ou_bot"), &cfg).is_none());
     }
@@ -2575,25 +2428,11 @@ mod tests {
         let name_cache = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let client = reqwest::Client::new();
 
-        let name = resolve_user_name(
-            "ou_user1",
-            &name_cache,
-            &token_cache,
-            &client,
-            &server.uri(),
-        )
-        .await;
+        let name = resolve_user_name("ou_user1", &name_cache, &token_cache, &client, &server.uri()).await;
         assert_eq!(name, "Alice");
 
         // Second call should use cache (expect(1) above ensures no second API call)
-        let name2 = resolve_user_name(
-            "ou_user1",
-            &name_cache,
-            &token_cache,
-            &client,
-            &server.uri(),
-        )
-        .await;
+        let name2 = resolve_user_name("ou_user1", &name_cache, &token_cache, &client, &server.uri()).await;
         assert_eq!(name2, "Alice");
     }
 
@@ -2620,14 +2459,7 @@ mod tests {
         let name_cache = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let client = reqwest::Client::new();
 
-        let name = resolve_user_name(
-            "ou_unknown",
-            &name_cache,
-            &token_cache,
-            &client,
-            &server.uri(),
-        )
-        .await;
+        let name = resolve_user_name("ou_unknown", &name_cache, &token_cache, &client, &server.uri()).await;
         assert_eq!(name, "ou_unknown");
     }
 
@@ -2638,17 +2470,10 @@ mod tests {
         // If mention key appears in normal text too, only the first occurrence is removed
         let mentions = vec![FeishuMention {
             key: Some("@_user_1".into()),
-            id: Some(FeishuMentionId {
-                open_id: Some("ou_bot".into()),
-            }),
+            id: Some(FeishuMentionId { open_id: Some("ou_bot".into()) }),
             name: Some("Bot".into()),
         }];
-        let env = make_envelope(
-            "group",
-            "@_user_1 tell me about @_user_1 patterns",
-            "ou_user1",
-            Some(mentions),
-        );
+        let env = make_envelope("group", "@_user_1 tell me about @_user_1 patterns", "ou_user1", Some(mentions));
         let cfg = test_config();
         let (evt, _media) = parse_message_event(&env, Some("ou_bot"), &cfg).unwrap();
         // Only first @_user_1 removed, second preserved
@@ -2679,9 +2504,7 @@ mod tests {
     fn parse_allowed_groups_blocks_unlisted() {
         let mentions = vec![FeishuMention {
             key: Some("@_user_1".into()),
-            id: Some(FeishuMentionId {
-                open_id: Some("ou_bot".into()),
-            }),
+            id: Some(FeishuMentionId { open_id: Some("ou_bot".into()) }),
             name: Some("Bot".into()),
         }];
         let env = make_envelope("group", "@_user_1 hello", "ou_user1", Some(mentions));
@@ -2694,9 +2517,7 @@ mod tests {
     fn parse_allowed_groups_permits_listed() {
         let mentions = vec![FeishuMention {
             key: Some("@_user_1".into()),
-            id: Some(FeishuMentionId {
-                open_id: Some("ou_bot".into()),
-            }),
+            id: Some(FeishuMentionId { open_id: Some("ou_bot".into()) }),
             name: Some("Bot".into()),
         }];
         let env = make_envelope("group", "@_user_1 hello", "ou_user1", Some(mentions));
@@ -2757,13 +2578,7 @@ mod tests {
     #[test]
     fn parse_thread_id_from_root_id() {
         let mut env = make_envelope("p2p", "reply", "ou_user1", None);
-        env.event
-            .as_mut()
-            .unwrap()
-            .message
-            .as_mut()
-            .unwrap()
-            .root_id = Some("om_root".into());
+        env.event.as_mut().unwrap().message.as_mut().unwrap().root_id = Some("om_root".into());
         let cfg = test_config();
         let (evt, _media) = parse_message_event(&env, Some("ou_bot"), &cfg).unwrap();
         assert_eq!(evt.channel.thread_id, Some("om_root".into()));
@@ -2772,13 +2587,7 @@ mod tests {
     #[test]
     fn parse_thread_id_from_parent_id() {
         let mut env = make_envelope("p2p", "reply", "ou_user1", None);
-        env.event
-            .as_mut()
-            .unwrap()
-            .message
-            .as_mut()
-            .unwrap()
-            .parent_id = Some("om_parent".into());
+        env.event.as_mut().unwrap().message.as_mut().unwrap().parent_id = Some("om_parent".into());
         let cfg = test_config();
         let (evt, _media) = parse_message_event(&env, Some("ou_bot"), &cfg).unwrap();
         assert_eq!(evt.channel.thread_id, Some("om_parent".into()));

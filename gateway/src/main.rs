@@ -109,7 +109,7 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
     let reaction_state: Arc<Mutex<HashMap<String, Vec<String>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let recv_task = tokio::spawn(async move {
-        let client = reqwest::Client::new();
+        let client = &state_for_recv.client;
         while let Some(Ok(msg)) = ws_rx.next().await {
             if let Message::Text(text) = msg {
                 match serde_json::from_str::<GatewayReply>(&*text) {
