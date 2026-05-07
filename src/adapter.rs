@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::Serialize;
 use std::sync::Arc;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
 use crate::config::{ReactionsConfig, ToolDisplay};
@@ -159,6 +159,9 @@ pub struct AdapterRouter {
     pool: Arc<SessionPool>,
     reactions_config: ReactionsConfig,
     table_mode: TableMode,
+    prompt_hard_timeout: std::time::Duration,
+    /// Polling cadence for the recv-loop liveness check (#732).
+    liveness_check_interval: std::time::Duration,
 }
 
 impl AdapterRouter {
@@ -166,11 +169,24 @@ impl AdapterRouter {
         pool: Arc<SessionPool>,
         reactions_config: ReactionsConfig,
         table_mode: TableMode,
+        prompt_hard_timeout_secs: u64,
+        liveness_check_secs: u64,
     ) -> Self {
+        if liveness_check_secs >= prompt_hard_timeout_secs {
+            warn!(
+                liveness_check_secs,
+                prompt_hard_timeout_secs,
+                "pool.liveness_check_secs >= pool.prompt_hard_timeout_secs; \
+                 the hard ceiling will only fire after the next liveness tick \
+                 and may be effectively bypassed. Lower liveness_check_secs."
+            );
+        }
         Self {
             pool,
             reactions_config,
             table_mode,
+            prompt_hard_timeout: std::time::Duration::from_secs(prompt_hard_timeout_secs),
+            liveness_check_interval: std::time::Duration::from_secs(liveness_check_secs),
         }
     }
 
@@ -335,6 +351,8 @@ impl AdapterRouter {
         let streaming = adapter.use_streaming(other_bot_present);
         let table_mode = self.table_mode;
         let tool_display = self.reactions_config.tool_display;
+        let prompt_hard_timeout = self.prompt_hard_timeout;
+        let liveness_check_interval = self.liveness_check_interval;
 
         self.pool
             .with_connection(thread_key, |conn| {
@@ -343,7 +361,7 @@ impl AdapterRouter {
                     let reset = conn.session_reset;
                     conn.session_reset = false;
 
-                    let (mut rx, _) = conn.session_prompt(content_blocks).await?;
+                    let (mut rx, request_id) = conn.session_prompt(content_blocks).await?;
                     reactions.set_thinking().await;
 
                     let mut text_buf = String::new();
@@ -396,20 +414,44 @@ impl AdapterRouter {
                         (None, None)
                     };
 
-                    // Process ACP notifications
+                    // (#732) Liveness-aware recv loop. Filters stale id-bearing
+                    // messages and abandons cleanly on dead agent / hard ceiling
+                    // so late responses cannot leak into the next prompt.
                     let mut response_error: Option<String> = None;
-                    let recv_timeout = std::time::Duration::from_secs(600);
+                    let prompt_start = tokio::time::Instant::now();
                     loop {
-                        let notification = match tokio::time::timeout(recv_timeout, rx.recv()).await
-                        {
-                            Ok(Some(n)) => n,
-                            Ok(None) => break, // channel closed
-                            Err(_) => {
-                                response_error = Some("Agent stopped responding".into());
-                                break;
+                        let notification = tokio::select! {
+                            msg = rx.recv() => match msg {
+                                Some(n) => n,
+                                // Reader saw EOF and already drained pending; nothing to abandon.
+                                None => break,
+                            },
+                            _ = tokio::time::sleep(liveness_check_interval) => {
+                                if !conn.alive() {
+                                    response_error = Some("Agent process died".into());
+                                    conn.abandon_request(request_id).await;
+                                    break;
+                                }
+                                if prompt_start.elapsed() > prompt_hard_timeout {
+                                    response_error = Some(format!(
+                                        "Agent exceeded hard timeout ({}s)",
+                                        prompt_hard_timeout.as_secs(),
+                                    ));
+                                    conn.abandon_request(request_id).await;
+                                    break;
+                                }
+                                continue;
                             }
                         };
-                        if notification.id.is_some() {
+                        if let Some(notification_id) = notification.id {
+                            if notification_id != request_id {
+                                // Stale response from a previously-abandoned prompt.
+                                // No automated test seam: this path only triggers when a
+                                // real subprocess emits a late response after the broker
+                                // already called abandon_request — covered by manual
+                                // repro against a live agent (see #732 PR description).
+                                continue;
+                            }
                             if let Some(ref err) = notification.error {
                                 response_error = Some(format_coded_error(err.code, &err.message));
                             }
