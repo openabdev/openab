@@ -488,6 +488,7 @@ pub struct GatewayParams {
     pub allow_all_users: bool,
     pub allowed_users: Vec<String>,
     pub streaming: bool,
+    pub stt: crate::config::SttConfig,
 }
 
 pub async fn run_gateway_adapter(
@@ -506,6 +507,7 @@ pub async fn run_gateway_adapter(
     let allow_all_users = params.allow_all_users;
     let allowed_users = params.allowed_users;
     let streaming = params.streaming;
+    let stt = params.stt;
 
     let connect_url = match &params.token {
         Some(token) => {
@@ -674,6 +676,23 @@ pub async fn run_gateway_adapter(
                                                     extra_blocks.push(ContentBlock::Text {
                                                         text: format!("```{}\n{}\n```", att.filename, text),
                                                     });
+                                                }
+                                            }
+                                            "audio" if stt.enabled => {
+                                                use base64::Engine;
+                                                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&att.data) {
+                                                    let client = reqwest::Client::new();
+                                                    if let Some(text) = crate::stt::transcribe(
+                                                        &client,
+                                                        &stt,
+                                                        bytes,
+                                                        att.filename.clone(),
+                                                        &att.mime_type
+                                                    ).await {
+                                                        extra_blocks.push(ContentBlock::Text {
+                                                            text: format!("[Audio: {}]", text),
+                                                        });
+                                                    }
                                                 }
                                             }
                                             _ => {}

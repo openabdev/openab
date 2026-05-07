@@ -1,4 +1,5 @@
 mod adapters;
+mod media;
 mod schema;
 
 use anyhow::Result;
@@ -59,7 +60,10 @@ pub struct AppState {
     /// the first client to `remove()` a token wins the free Reply API call;
     /// other clients for the same event naturally fall back to Push API.
     pub reply_token_cache: ReplyTokenCache,
+    /// Shared HTTP client for media downloads and API calls
+    pub client: reqwest::Client,
 }
+
 
 // --- WebSocket handler (OAB connects here) ---
 
@@ -105,7 +109,7 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
     let reaction_state: Arc<Mutex<HashMap<String, Vec<String>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let recv_task = tokio::spawn(async move {
-        let client = reqwest::Client::new();
+        let client = &state_for_recv.client;
         while let Some(Ok(msg)) = ws_rx.next().await {
             if let Message::Text(text) = msg {
                 match serde_json::from_str::<GatewayReply>(&*text) {
@@ -159,7 +163,12 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                             }
                             "feishu" => {
                                 if let Some(ref feishu) = state_for_recv.feishu {
-                                    adapters::feishu::handle_reply(&reply, feishu, &state_for_recv.event_tx).await;
+                                    adapters::feishu::handle_reply(
+                                        &reply,
+                                        feishu,
+                                        &state_for_recv.event_tx,
+                                    )
+                                    .await;
                                 } else {
                                     warn!("reply for feishu but adapter not configured");
                                 }
@@ -306,10 +315,16 @@ async fn main() -> Result<()> {
             warn!("GOOGLE_CHAT_ACCESS_TOKEN / GOOGLE_CHAT_SA_KEY_JSON not set — replies will be logged but not sent");
         }
         if jwt_verifier.is_none() {
-            warn!("GOOGLE_CHAT_AUDIENCE not set — webhook requests are NOT authenticated (insecure)");
+            warn!(
+                "GOOGLE_CHAT_AUDIENCE not set — webhook requests are NOT authenticated (insecure)"
+            );
         }
 
-        Some(adapters::googlechat::GoogleChatAdapter::new(token_cache, access_token, jwt_verifier))
+        Some(adapters::googlechat::GoogleChatAdapter::new(
+            token_cache,
+            access_token,
+            jwt_verifier,
+        ))
     } else {
         None
     };
@@ -323,6 +338,10 @@ async fn main() -> Result<()> {
         warn!("no adapters configured — set TELEGRAM_BOT_TOKEN, LINE_CHANNEL_ACCESS_TOKEN, TEAMS_APP_ID + TEAMS_APP_SECRET, FEISHU_APP_ID + FEISHU_APP_SECRET, and/or GOOGLE_CHAT_ENABLED=true");
     }
 
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
     let state = Arc::new(AppState {
         telegram_bot_token,
         telegram_secret_token,
@@ -335,6 +354,7 @@ async fn main() -> Result<()> {
         ws_token,
         event_tx,
         reply_token_cache,
+        client,
     });
 
     // Background task: sweep expired reply tokens every REPLY_TOKEN_TTL_SECS
@@ -390,7 +410,13 @@ async fn main() -> Result<()> {
     let (feishu_shutdown_tx, feishu_shutdown_rx) = tokio::sync::watch::channel(false);
     if feishu_ws_mode {
         if let Some(ref feishu) = state.feishu {
-            match adapters::feishu::start_websocket(feishu, state.event_tx.clone(), feishu_shutdown_rx).await {
+            match adapters::feishu::start_websocket(
+                feishu,
+                state.event_tx.clone(),
+                feishu_shutdown_rx,
+            )
+            .await
+            {
                 Ok(_handle) => info!("feishu websocket task spawned"),
                 Err(e) => tracing::error!(err = %e, "feishu websocket startup failed"),
             }
