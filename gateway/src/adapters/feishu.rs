@@ -985,11 +985,11 @@ async fn handle_ws_message(
     // - Involved (default): bypass @mention if participated
     // - MultibotMentions: bypass only if participated AND no other bot in thread
     // - Mentions: never bypass
-    let is_thread_participated = detect_and_mark_multibot(
+    let bypass_mention = detect_and_mark_multibot(
         &envelope, bot_id_ref, config, participated_threads, multibot_threads,
     );
 
-    if let Some((mut gateway_event, media_refs)) = parse_message_event(&envelope, bot_id_ref, config, is_thread_participated) {
+    if let Some((mut gateway_event, media_refs)) = parse_message_event(&envelope, bot_id_ref, config, bypass_mention) {
         // Also dedupe by message_id
         if dedupe.is_duplicate(&gateway_event.message_id) {
             return;
@@ -1744,8 +1744,8 @@ fn check_thread_participated(
 const PARTICIPATION_CACHE_MAX: usize = 1000;
 
 /// Detect if a message @mentions another bot in a participated thread, and if
-/// so, mark the thread in the multibot cache. Returns the computed
-/// `is_thread_participated` value respecting the `allow_user_messages` mode.
+/// so, mark the thread in the multibot cache. Returns whether @mention gating
+/// should be bypassed, respecting the configured `allow_user_messages` mode.
 ///
 /// This consolidates the duplicated multibot detection logic used by both the
 /// WebSocket and webhook paths.
@@ -1805,7 +1805,7 @@ fn detect_and_mark_multibot(
         }
     }
 
-    // Compute is_thread_participated based on mode
+    // Compute bypass_mention_gating based on mode
     match config.allow_user_messages {
         AllowUsers::Mentions => false,
         AllowUsers::Involved => self_participated,
@@ -2237,12 +2237,12 @@ pub async fn webhook(
     let bot_id_ref = bot_id.as_deref();
 
     // Check participated threads and multibot detection for mention bypass
-    let is_thread_participated = detect_and_mark_multibot(
+    let bypass_mention = detect_and_mark_multibot(
         &envelope, bot_id_ref, &feishu.config,
         &feishu.participated_threads, &feishu.multibot_threads,
     );
 
-    if let Some((mut gateway_event, media_refs)) = parse_message_event(&envelope, bot_id_ref, &feishu.config, is_thread_participated) {
+    if let Some((mut gateway_event, media_refs)) = parse_message_event(&envelope, bot_id_ref, &feishu.config, bypass_mention) {
         if !feishu.dedupe.is_duplicate(&gateway_event.message_id) {
             let name = resolve_user_name(
                 &gateway_event.sender.id, &feishu.name_cache, &feishu.token_cache,
