@@ -206,6 +206,37 @@ Each thread gets its own agent session. Sessions are cleaned up after `session_t
 
 ---
 
+## Attachment Handling
+
+OpenAB processes Discord file attachments and converts them into content blocks
+for the agent. Supported types (checked in order):
+
+| Type | Detection | Agent receives |
+|------|-----------|----------------|
+| Audio | MIME `audio/*` | Transcribed text via STT (if enabled) |
+| Text files | Extension list (`.txt`, `.md`, `.json`, etc.) | File content inlined (up to 5 files, 1 MB total) |
+| Images | MIME `image/*` or image extensions | Base64-encoded image block |
+| Video | MIME `video/*` or extensions (`.mp4`, `.mov`, `.webm`, `.mkv`, `.m4v`, `.avi`) | Text block with filename, content type, size, and Discord CDN URL |
+
+Unsupported attachment types are silently ignored.
+
+### Video attachments
+
+Video files are not downloaded or transcoded. The agent receives metadata and the
+Discord CDN URL so it can fetch or inspect the file using tools like `ffprobe`.
+
+```
+[Video attachment]
+filename: demo.mp4
+content_type: video/mp4
+size_bytes: 8421376
+url: https://cdn.discordapp.com/attachments/.../demo.mp4
+```
+
+No configuration is needed — video forwarding is always enabled.
+
+---
+
 ## Streaming
 
 OpenAB uses **edit-streaming** on Discord — the bot sends a placeholder message and updates it every 1.5 seconds as tokens arrive, giving a live typing effect.
