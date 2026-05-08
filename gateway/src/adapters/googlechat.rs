@@ -1371,6 +1371,7 @@ mod tests {
             content: Content {
                 content_type: "text".into(),
                 text: "hello".into(),
+                attachments: vec![],
             },
             command: None,
             request_id: Some("req_123".into()),
@@ -1413,6 +1414,7 @@ mod tests {
             content: Content {
                 content_type: "text".into(),
                 text: "hello".into(),
+                attachments: vec![],
             },
             command: None,
             request_id: Some("req_fail".into()),
@@ -1459,6 +1461,7 @@ mod tests {
             content: Content {
                 content_type: "text".into(),
                 text: "".into(),
+                attachments: vec![],
             },
             command: None,
             request_id: Some("req_empty".into()),
@@ -1502,6 +1505,7 @@ mod tests {
             content: Content {
                 content_type: "text".into(),
                 text: long_text,
+                attachments: vec![],
             },
             command: None,
             request_id: Some("req_multi_fail".into()),
@@ -1535,6 +1539,7 @@ mod tests {
             content: Content {
                 content_type: "text".into(),
                 text: "hello".into(),
+                attachments: vec![],
             },
             command: None,
             request_id: Some("req_notoken".into()),
@@ -1579,6 +1584,7 @@ mod tests {
             content: Content {
                 content_type: "text".into(),
                 text: "updated text".into(),
+                attachments: vec![],
             },
             command: Some("edit_message".into()),
             request_id: None,
@@ -1620,6 +1626,7 @@ mod tests {
             content: Content {
                 content_type: "text".into(),
                 text: long_text,
+                attachments: vec![],
             },
             command: None,
             request_id: Some("req_multi".into()),
@@ -1676,6 +1683,7 @@ mod tests {
             content: Content {
                 content_type: "text".into(),
                 text: long_text,
+                attachments: vec![],
             },
             command: None,
             request_id: Some("req_partial".into()),
