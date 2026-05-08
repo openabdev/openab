@@ -198,6 +198,26 @@ pub fn is_audio_mime(mime: &str) -> bool {
     mime.starts_with("audio/")
 }
 
+/// Check if an attachment is a video file.
+pub fn is_video_file(filename: &str, content_type: Option<&str>) -> bool {
+    let mime = content_type.unwrap_or("");
+    let mime_base = mime.split(';').next().unwrap_or(mime).trim();
+    if mime_base.starts_with("video/") {
+        return true;
+    }
+
+    filename
+        .rsplit('.')
+        .next()
+        .map(|ext| {
+            matches!(
+                ext.to_lowercase().as_str(),
+                "mp4" | "mov" | "m4v" | "webm" | "mkv" | "avi"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// Extensions recognised as text-based files that can be inlined into the prompt.
 const TEXT_EXTENSIONS: &[&str] = &[
     "txt", "csv", "log", "md", "json", "jsonl", "yaml", "yml", "toml", "xml", "rs", "py", "js",
@@ -400,5 +420,13 @@ mod tests {
     fn invalid_data_returns_error() {
         let garbage = vec![0x00, 0x01, 0x02, 0x03];
         assert!(resize_and_compress(&garbage).is_err());
+    }
+
+    #[test]
+    fn video_file_detects_mime_and_common_extensions() {
+        assert!(is_video_file("clip.bin", Some("video/mp4")));
+        assert!(is_video_file("clip.mp4", None));
+        assert!(is_video_file("clip.MOV", None));
+        assert!(!is_video_file("notes.txt", Some("text/plain")));
     }
 }

@@ -596,7 +596,8 @@ impl EventHandler for Handler {
             &msg.timestamp.to_rfc3339().unwrap_or_default(),
         );
 
-        // Build extra content blocks from attachments (audio → STT, text → inline, image → encode)
+        // Build extra content blocks from attachments (audio -> STT, text -> inline,
+        // image -> encode, video -> URL for agent-side inspection).
         let mut extra_blocks = Vec::new();
         let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
         let mut text_file_bytes: u64 = 0;
@@ -675,6 +676,14 @@ impl EventHandler for Handler {
             {
                 debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
                 extra_blocks.push(block);
+            } else if media::is_video_file(&attachment.filename, attachment.content_type.as_deref()) {
+                debug!(url = %attachment.url, filename = %attachment.filename, "adding video attachment link");
+                extra_blocks.push(video_attachment_block(
+                    &attachment.filename,
+                    attachment.content_type.as_deref(),
+                    u64::from(attachment.size),
+                    &attachment.url,
+                ));
             }
         }
 
@@ -1285,6 +1294,23 @@ fn resolve_mentions(content: &str, bot_id: UserId, allowed_role_ids: &HashSet<u6
     out.trim().to_string()
 }
 
+fn video_attachment_block(
+    filename: &str,
+    content_type: Option<&str>,
+    size: u64,
+    url: &str,
+) -> ContentBlock {
+    ContentBlock::Text {
+        text: format!(
+            "[Video attachment]\nfilename: {}\ncontent_type: {}\nsize_bytes: {}\nurl: {}",
+            filename,
+            content_type.unwrap_or("unknown"),
+            size,
+            url
+        ),
+    }
+}
+
 /// Build a `SenderContext` for Discord messages.
 ///
 /// Pure function extracted from `EventHandler::message` for testability.
@@ -1478,6 +1504,26 @@ mod tests {
         let roles: HashSet<u64> = [999].into_iter().collect();
         let result = resolve_mentions("<@&999> check <@&888>", bot_id, &roles);
         assert_eq!(result, "check @(role)");
+    }
+
+    #[test]
+    fn video_attachment_block_includes_actionable_metadata() {
+        let block = video_attachment_block(
+            "demo.mp4",
+            Some("video/mp4"),
+            12345,
+            "https://cdn.discordapp.com/attachments/demo.mp4",
+        );
+
+        let ContentBlock::Text { text } = block else {
+            panic!("video attachments must be forwarded as text metadata");
+        };
+
+        assert!(text.contains("[Video attachment]"));
+        assert!(text.contains("filename: demo.mp4"));
+        assert!(text.contains("content_type: video/mp4"));
+        assert!(text.contains("size_bytes: 12345"));
+        assert!(text.contains("url: https://cdn.discordapp.com/attachments/demo.mp4"));
     }
 
     // --- thread-race error detection ---
