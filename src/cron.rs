@@ -85,8 +85,8 @@ fn translate_posix_cron_expr(expr: &str) -> Result<String, String> {
 /// # Mixed numeric and name notation
 ///
 /// Mixing numeric and name tokens in the same field (e.g. `1,Mon`) is not
-/// supported and will be passed through untranslated. Use either all numeric
-/// (POSIX) or all name-based notation.
+/// supported and will return an error. Use either all numeric (POSIX) or all
+/// name-based notation.
 fn translate_posix_dow_field(field: &str) -> Result<String, String> {
     use std::collections::BTreeSet;
 
@@ -160,7 +160,9 @@ fn translate_posix_dow_field(field: &str) -> Result<String, String> {
             }
             if step > 1 {
                 // n/step means "from n through end-of-domain, stepping by step"
-                (n..=6).collect()
+                // Normalize 7 (Sunday alias) to 0 before expansion.
+                let start = if n == 7 { 0 } else { n };
+                (start..=6).collect()
             } else {
                 vec![n]
             }
@@ -741,6 +743,12 @@ mod tests {
     fn translate_dow_step_from_singleton_sunday() {
         // POSIX 0/3 = from Sun through Sat, step 3 = {0,3,6} = Sun,Wed,Sat -> cron crate 1,4,7
         assert_eq!(translate_posix_dow_field("0/3").unwrap(), "1,4,7");
+    }
+
+    #[test]
+    fn translate_dow_step_from_singleton_seven() {
+        // POSIX 7/2 = Sunday alias, same as 0/2 = {0,2,4,6} = Sun,Tue,Thu,Sat -> cron crate 1,3,5,7
+        assert_eq!(translate_posix_dow_field("7/2").unwrap(), "1,3,5,7");
     }
 
     #[test]
