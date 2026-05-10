@@ -170,7 +170,7 @@ fn translate_posix_dow_field(field: &str) -> Result<String, String> {
 
         // Apply step filter, normalize 7 → 0, collect into the set.
         for (i, &v) in raw_values.iter().enumerate() {
-            if (i as u32) % step == 0 {
+            if (i as u32).is_multiple_of(step) {
                 let normalized = if v == 7 { 0 } else { v };
                 days.insert(normalized);
             }
