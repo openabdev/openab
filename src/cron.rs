@@ -13,10 +13,195 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 /// Parse a 5-field POSIX cron expression into a `Schedule`.
+///
 /// The `cron` crate expects a 6-field expression (with seconds), so we prepend "0".
-pub fn parse_cron_expr(expr: &str) -> Result<Schedule, cron::error::Error> {
-    let six_field = format!("0 {}", expr);
-    Schedule::from_str(&six_field)
+///
+/// POSIX numeric day-of-week values (0..=7, where 0 or 7 = Sunday) are translated
+/// to the `cron` crate's 1-based form (1..=7, where 1 = Sunday) before being handed
+/// to the underlying parser. Without this, numeric day-of-week values are off by one
+/// — e.g. `1-5` (Mon-Fri in POSIX) would be evaluated as Sun-Thu. See the
+/// [`translate_posix_dow_field`] doc comment for details.
+///
+/// Name-based day-of-week tokens (`Mon`, `Sun`, `Mon-Fri`, ...) are passed through
+/// unchanged — the `cron` crate's internal name-to-ordinal map is consistent.
+pub fn parse_cron_expr(expr: &str) -> Result<Schedule, String> {
+    let translated = translate_posix_cron_expr(expr)?;
+    let six_field = format!("0 {}", translated);
+    Schedule::from_str(&six_field).map_err(|e| e.to_string())
+}
+
+/// Translate a 5-field POSIX cron expression so the day-of-week field uses the
+/// numeric convention of the `cron` crate.
+///
+/// Only the 5th field (day-of-week) is rewritten; the other four fields pass
+/// through unchanged.
+fn translate_posix_cron_expr(expr: &str) -> Result<String, String> {
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    if fields.len() != 5 {
+        return Err(format!(
+            "expected 5 whitespace-separated cron fields, got {}: {:?}",
+            fields.len(),
+            expr
+        ));
+    }
+    let translated_dow = translate_posix_dow_field(fields[4])?;
+    Ok(format!(
+        "{} {} {} {} {}",
+        fields[0], fields[1], fields[2], fields[3], translated_dow
+    ))
+}
+
+/// Translate a POSIX day-of-week field to the `cron` crate's numeric form.
+///
+/// # Background
+///
+/// POSIX cron (and Linux crontab, Kubernetes CronJob, GitHub Actions) uses
+/// `0..=7` where `0` or `7` = Sunday, `1` = Monday, ..., `6` = Saturday.
+///
+/// The `cron` crate uses `1..=7` where `1` = Sunday, `2` = Monday, ..., `7` = Saturday
+/// (it matches via chrono's `Weekday::number_from_sunday()`). Without translation,
+/// every numeric day-of-week value fires one day early:
+///
+/// | POSIX intent  | Without translation (cron crate reads as) |
+/// |---------------|-------------------------------------------|
+/// | `0`, `7` (Sun) | out-of-range / Sat                       |
+/// | `1` (Mon)     | Sun                                        |
+/// | `5` (Fri)     | Thu                                        |
+/// | `1-5` (Mon-Fri) | Sun-Thu                                  |
+///
+/// # Algorithm
+///
+/// 1. If the field contains any ASCII letter (e.g. `Mon-Fri`), pass it through —
+///    the cron crate's name-to-ordinal map is internally consistent.
+/// 2. Otherwise, expand each comma-separated component into the set of POSIX
+///    day values it represents. Ranges (`a-b`) and step values (`a/s`, `a-b/s`,
+///    `*/s`) are expanded here. `7` is normalized to `0` (both = Sunday) to
+///    avoid duplication.
+/// 3. If the resulting set covers all 7 days, emit `*` for brevity.
+/// 4. Otherwise, shift each value by `+1` (POSIX `{0..=6}` → cron crate
+///    `{1..=7}`) and emit as a comma-separated list, compacting contiguous
+///    runs into ranges for readability.
+///
+/// # Mixed numeric and name notation
+///
+/// Mixing numeric and name tokens in the same field (e.g. `1,Mon`) is not
+/// supported and will be passed through untranslated. Use either all numeric
+/// (POSIX) or all name-based notation.
+fn translate_posix_dow_field(field: &str) -> Result<String, String> {
+    use std::collections::BTreeSet;
+
+    // Name-based notation is internally consistent in the cron crate — pass through.
+    if field.chars().any(|c| c.is_ascii_alphabetic()) {
+        return Ok(field.to_string());
+    }
+
+    if field.is_empty() {
+        return Err("empty day-of-week field".to_string());
+    }
+
+    let mut days: BTreeSet<u32> = BTreeSet::new();
+
+    for part in field.split(',') {
+        if part.is_empty() {
+            return Err(format!("empty component in day-of-week field: {:?}", field));
+        }
+
+        // Split off optional step: `a/s`, `a-b/s`, `*/s`.
+        let (range_part, step) = match part.split_once('/') {
+            Some((r, s)) => {
+                let step_n: u32 = s
+                    .parse()
+                    .map_err(|_| format!("invalid step value in {:?}", part))?;
+                if step_n == 0 {
+                    return Err(format!("step value cannot be zero in {:?}", part));
+                }
+                (r, step_n)
+            }
+            None => (part, 1u32),
+        };
+
+        // Expand range_part to the list of POSIX day values it represents.
+        // Values may include 7 (Sunday alias for 0); normalization happens below.
+        let raw_values: Vec<u32> = if range_part == "*" {
+            (0..=6).collect()
+        } else if let Some((a, b)) = range_part.split_once('-') {
+            let a_n: u32 = a
+                .parse()
+                .map_err(|_| format!("invalid range start in {:?}", part))?;
+            let b_n: u32 = b
+                .parse()
+                .map_err(|_| format!("invalid range end in {:?}", part))?;
+            if a_n > 7 || b_n > 7 {
+                return Err(format!(
+                    "day-of-week value out of range (0-7) in {:?}",
+                    part
+                ));
+            }
+            if a_n > b_n {
+                return Err(format!("invalid range {:?}: start > end", part));
+            }
+            (a_n..=b_n).collect()
+        } else {
+            let n: u32 = range_part
+                .parse()
+                .map_err(|_| format!("invalid number in {:?}", part))?;
+            if n > 7 {
+                return Err(format!("day-of-week value out of range (0-7): {}", n));
+            }
+            vec![n]
+        };
+
+        // Apply step filter, normalize 7 → 0, collect into the set.
+        for (i, &v) in raw_values.iter().enumerate() {
+            if (i as u32) % step == 0 {
+                let normalized = if v == 7 { 0 } else { v };
+                days.insert(normalized);
+            }
+        }
+    }
+
+    if days.is_empty() {
+        return Err(format!("empty day-of-week field: {:?}", field));
+    }
+
+    // All 7 days → emit `*` for brevity.
+    if days.len() == 7 {
+        return Ok("*".to_string());
+    }
+
+    // Shift POSIX {0..=6} → cron crate {1..=7} and emit, compacting contiguous runs.
+    let shifted: Vec<u32> = days.iter().map(|d| d + 1).collect();
+    Ok(compact_ordinal_set(&shifted))
+}
+
+/// Compact a sorted list of ordinals into cron-style comma-list with ranges,
+/// e.g. `[2,3,4,5,6]` → `"2-6"`, `[1,3,5]` → `"1,3,5"`, `[1,2,4,5]` → `"1-2,4-5"`.
+fn compact_ordinal_set(sorted: &[u32]) -> String {
+    if sorted.is_empty() {
+        return String::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut start = sorted[0];
+    let mut end = sorted[0];
+    for &v in &sorted[1..] {
+        if v == end + 1 {
+            end = v;
+        } else {
+            out.push(render_run(start, end));
+            start = v;
+            end = v;
+        }
+    }
+    out.push(render_run(start, end));
+    out.join(",")
+}
+
+fn render_run(start: u32, end: u32) -> String {
+    if start == end {
+        format!("{}", start)
+    } else {
+        format!("{}-{}", start, end)
+    }
 }
 
 /// Check whether a cron schedule should fire right now.
@@ -434,6 +619,233 @@ async fn fire_cronjob(
 mod tests {
     use super::*;
     use chrono::{Datelike, Timelike};
+
+    // --- POSIX day-of-week translator ---
+
+    #[test]
+    fn translate_dow_star_passes_through() {
+        assert_eq!(translate_posix_dow_field("*").unwrap(), "*");
+    }
+
+    #[test]
+    fn translate_dow_single_sunday_zero() {
+        assert_eq!(translate_posix_dow_field("0").unwrap(), "1");
+    }
+
+    #[test]
+    fn translate_dow_single_sunday_seven() {
+        assert_eq!(translate_posix_dow_field("7").unwrap(), "1");
+    }
+
+    #[test]
+    fn translate_dow_single_monday() {
+        assert_eq!(translate_posix_dow_field("1").unwrap(), "2");
+    }
+
+    #[test]
+    fn translate_dow_single_saturday() {
+        assert_eq!(translate_posix_dow_field("6").unwrap(), "7");
+    }
+
+    #[test]
+    fn translate_dow_weekday_range() {
+        // POSIX 1-5 (Mon-Fri) -> cron crate 2-6
+        assert_eq!(translate_posix_dow_field("1-5").unwrap(), "2-6");
+    }
+
+    #[test]
+    fn translate_dow_all_days_zero_to_six() {
+        assert_eq!(translate_posix_dow_field("0-6").unwrap(), "*");
+    }
+
+    #[test]
+    fn translate_dow_all_days_zero_to_seven() {
+        // POSIX `0-7` is a quirky but valid "all days" expression.
+        assert_eq!(translate_posix_dow_field("0-7").unwrap(), "*");
+    }
+
+    #[test]
+    fn translate_dow_all_days_one_to_seven() {
+        // POSIX `1-7` covers Mon..Sun = all 7 days.
+        assert_eq!(translate_posix_dow_field("1-7").unwrap(), "*");
+    }
+
+    #[test]
+    fn translate_dow_range_three_to_five() {
+        // POSIX 3-5 (Wed-Fri) -> cron crate 4-6
+        assert_eq!(translate_posix_dow_field("3-5").unwrap(), "4-6");
+    }
+
+    #[test]
+    fn translate_dow_list_dedupes_zero_and_seven() {
+        // Both 0 and 7 = Sunday; output is a single value.
+        assert_eq!(translate_posix_dow_field("0,7").unwrap(), "1");
+    }
+
+    #[test]
+    fn translate_dow_list_non_contiguous() {
+        // POSIX 1,3,5 (Mon,Wed,Fri) -> cron crate 2,4,6
+        assert_eq!(translate_posix_dow_field("1,3,5").unwrap(), "2,4,6");
+    }
+
+    #[test]
+    fn translate_dow_list_compacts_contiguous_runs() {
+        // POSIX 1,2,4,5 -> cron crate 2,3,5,6 -> "2-3,5-6"
+        assert_eq!(translate_posix_dow_field("1,2,4,5").unwrap(), "2-3,5-6");
+    }
+
+    #[test]
+    fn translate_dow_step_from_star() {
+        // POSIX */2 = 0,2,4,6 = Sun,Tue,Thu,Sat -> cron crate 1,3,5,7
+        assert_eq!(translate_posix_dow_field("*/2").unwrap(), "1,3,5,7");
+    }
+
+    #[test]
+    fn translate_dow_step_from_range() {
+        // POSIX 1-5/2 = 1,3,5 = Mon,Wed,Fri -> cron crate 2,4,6
+        assert_eq!(translate_posix_dow_field("1-5/2").unwrap(), "2,4,6");
+    }
+
+    #[test]
+    fn translate_dow_names_pass_through() {
+        assert_eq!(translate_posix_dow_field("Mon-Fri").unwrap(), "Mon-Fri");
+        assert_eq!(
+            translate_posix_dow_field("Mon,Wed,Fri").unwrap(),
+            "Mon,Wed,Fri"
+        );
+        assert_eq!(translate_posix_dow_field("Sun").unwrap(), "Sun");
+    }
+
+    #[test]
+    fn translate_dow_rejects_out_of_range() {
+        assert!(translate_posix_dow_field("8").is_err());
+        assert!(translate_posix_dow_field("0-8").is_err());
+    }
+
+    #[test]
+    fn translate_dow_rejects_reversed_range() {
+        assert!(translate_posix_dow_field("5-3").is_err());
+    }
+
+    #[test]
+    fn translate_dow_rejects_empty() {
+        assert!(translate_posix_dow_field("").is_err());
+        assert!(translate_posix_dow_field(",1").is_err());
+        assert!(translate_posix_dow_field("1,").is_err());
+    }
+
+    #[test]
+    fn translate_dow_rejects_zero_step() {
+        assert!(translate_posix_dow_field("*/0").is_err());
+    }
+
+    // --- parse_cron_expr rejects wrong number of fields ---
+
+    #[test]
+    fn parse_rejects_too_few_fields() {
+        assert!(parse_cron_expr("* * * *").is_err());
+    }
+
+    // --- POSIX-semantic Schedule behavior (regression for #784) ---
+
+    #[test]
+    fn weekday_schedule_does_not_fire_on_sunday() {
+        use chrono::TimeZone;
+        // Regression for the reported bug: "0 7 * * 1-5" with timezone Asia/Taipei
+        // was firing on Sunday 2026-05-10 because the cron crate's `1-5` means
+        // Sun-Thu without translation.
+        let schedule = parse_cron_expr("0 7 * * 1-5").unwrap();
+        let tz: Tz = "Asia/Taipei".parse().unwrap();
+        let sunday = tz.with_ymd_and_hms(2026, 5, 10, 7, 0, 0).unwrap();
+        let before = sunday - chrono::Duration::seconds(1);
+        let next = schedule.after(&before).next();
+        assert_ne!(
+            next,
+            Some(sunday),
+            "POSIX 1-5 must not fire on Sunday (got next = {:?})",
+            next
+        );
+    }
+
+    #[test]
+    fn weekday_schedule_fires_on_monday() {
+        use chrono::TimeZone;
+        let schedule = parse_cron_expr("0 7 * * 1-5").unwrap();
+        let tz: Tz = "Asia/Taipei".parse().unwrap();
+        let monday = tz.with_ymd_and_hms(2026, 5, 11, 7, 0, 0).unwrap();
+        let before = monday - chrono::Duration::seconds(1);
+        let next = schedule.after(&before).next();
+        assert_eq!(next, Some(monday), "POSIX 1-5 must fire on Monday");
+    }
+
+    #[test]
+    fn weekday_schedule_fires_on_friday_not_saturday() {
+        use chrono::TimeZone;
+        let schedule = parse_cron_expr("0 7 * * 1-5").unwrap();
+        let tz: Tz = "Asia/Taipei".parse().unwrap();
+        // 2026-05-15 is Friday
+        let friday = tz.with_ymd_and_hms(2026, 5, 15, 7, 0, 0).unwrap();
+        let before = friday - chrono::Duration::seconds(1);
+        let next = schedule.after(&before).next();
+        assert_eq!(next, Some(friday), "POSIX 1-5 must fire on Friday");
+
+        // 2026-05-16 is Saturday - should not fire
+        let saturday = tz.with_ymd_and_hms(2026, 5, 16, 7, 0, 0).unwrap();
+        let before = saturday - chrono::Duration::seconds(1);
+        let next = schedule.after(&before).next();
+        assert_ne!(next, Some(saturday), "POSIX 1-5 must not fire on Saturday");
+    }
+
+    #[test]
+    fn sunday_schedule_fires_on_sunday_via_zero() {
+        use chrono::TimeZone;
+        let schedule = parse_cron_expr("0 7 * * 0").unwrap();
+        let tz: Tz = "Asia/Taipei".parse().unwrap();
+        let sunday = tz.with_ymd_and_hms(2026, 5, 10, 7, 0, 0).unwrap();
+        let before = sunday - chrono::Duration::seconds(1);
+        let next = schedule.after(&before).next();
+        assert_eq!(next, Some(sunday), "POSIX `0` must fire on Sunday");
+    }
+
+    #[test]
+    fn sunday_schedule_fires_on_sunday_via_seven() {
+        use chrono::TimeZone;
+        let schedule = parse_cron_expr("0 7 * * 7").unwrap();
+        let tz: Tz = "Asia/Taipei".parse().unwrap();
+        let sunday = tz.with_ymd_and_hms(2026, 5, 10, 7, 0, 0).unwrap();
+        let before = sunday - chrono::Duration::seconds(1);
+        let next = schedule.after(&before).next();
+        assert_eq!(next, Some(sunday), "POSIX `7` must also fire on Sunday");
+    }
+
+    #[test]
+    fn saturday_schedule_fires_on_saturday_via_six() {
+        use chrono::TimeZone;
+        let schedule = parse_cron_expr("0 7 * * 6").unwrap();
+        let tz: Tz = "Asia/Taipei".parse().unwrap();
+        // 2026-05-16 is Saturday
+        let saturday = tz.with_ymd_and_hms(2026, 5, 16, 7, 0, 0).unwrap();
+        let before = saturday - chrono::Duration::seconds(1);
+        let next = schedule.after(&before).next();
+        assert_eq!(next, Some(saturday), "POSIX `6` must fire on Saturday");
+    }
+
+    #[test]
+    fn name_based_weekday_still_works() {
+        use chrono::TimeZone;
+        // Name-based notation should be unaffected by the translation.
+        let schedule = parse_cron_expr("0 7 * * Mon-Fri").unwrap();
+        let tz: Tz = "Asia/Taipei".parse().unwrap();
+        let monday = tz.with_ymd_and_hms(2026, 5, 11, 7, 0, 0).unwrap();
+        let before = monday - chrono::Duration::seconds(1);
+        let next = schedule.after(&before).next();
+        assert_eq!(next, Some(monday));
+
+        let sunday = tz.with_ymd_and_hms(2026, 5, 10, 7, 0, 0).unwrap();
+        let before = sunday - chrono::Duration::seconds(1);
+        let next = schedule.after(&before).next();
+        assert_ne!(next, Some(sunday));
+    }
 
     #[test]
     fn parse_valid_cron_expression() {
