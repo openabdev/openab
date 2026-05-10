@@ -300,6 +300,15 @@ Config-driven cron covers the 80% use case: "send this message at this time." Fo
 
 See [Kubernetes CronJob Reference Architecture](cronjob_k8s_refarch.md) for the external scheduler approach.
 
+## Known Limitations
+
+| Limitation | Details |
+|---|---|
+| Mixed numeric/name day-of-week | `1,Mon` or `Mon,3` is not supported and will be rejected. Use either all numeric (`1-5`) or all name-based (`Mon-Fri`) notation. |
+| Wrap-around day-of-week ranges | `5-2` (Fri through Tue) is not supported. Use explicit listing instead: `5,6,0,1,2`. |
+
+> **Tip:** Name-based notation (`Mon-Fri`, `Sun`, `Mon,Wed,Fri`) is always available as an alternative to numeric day-of-week values.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
