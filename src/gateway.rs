@@ -77,6 +77,9 @@ struct GatewayReply {
     command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     request_id: Option<String>,
+    /// When set, the gateway should send this message as a reply/quote to the specified message ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quote_message_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -139,6 +142,60 @@ impl GatewayAdapter {
             streaming,
         }
     }
+
+    /// Internal helper for send_message / send_message_with_reply.
+    async fn send_gateway_reply(
+        &self,
+        channel: &ChannelRef,
+        content: &str,
+        quote_message_id: Option<&str>,
+    ) -> Result<MessageRef> {
+        let req_id = if self.streaming {
+            Some(format!("req_{}", uuid::Uuid::new_v4()))
+        } else {
+            None
+        };
+        let pending_rx = if let Some(ref id) = req_id {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.pending.lock().await.insert(id.clone(), tx);
+            Some(rx)
+        } else {
+            None
+        };
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: channel.origin_event_id.clone().unwrap_or_default(),
+            platform: channel.platform.clone(),
+            channel: ReplyChannel {
+                id: channel.channel_id.clone(),
+                thread_id: channel.thread_id.clone(),
+            },
+            content: ReplyContent {
+                content_type: "text".into(),
+                text: content.into(),
+            },
+            command: None,
+            request_id: req_id.clone(),
+            quote_message_id: quote_message_id.map(|s| s.to_string()),
+        };
+        let json = serde_json::to_string(&reply)?;
+        self.ws_tx.lock().await.send(Message::Text(json)).await?;
+        let msg_id = if let (Some(rx), Some(ref id)) = (pending_rx, &req_id) {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+                Ok(Ok(resp)) if resp.success => resp.message_id.unwrap_or_else(|| "gw_sent".into()),
+                _ => {
+                    self.pending.lock().await.remove(id);
+                    "gw_sent".into()
+                }
+            }
+        } else {
+            "gw_sent".into()
+        };
+        Ok(MessageRef {
+            channel: channel.clone(),
+            message_id: msg_id,
+        })
+    }
 }
 
 /// Send a fire-and-forget reply via the shared WebSocket (no request-response).
@@ -162,6 +219,7 @@ async fn send_fire_and_forget(
         },
         command: None,
         request_id: None,
+        quote_message_id: None,
     };
     let json = serde_json::to_string(&reply)?;
     ws_tx.lock().await.send(Message::Text(json)).await?;
@@ -305,56 +363,16 @@ impl ChatAdapter for GatewayAdapter {
     }
 
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
-        let req_id = if self.streaming {
-            Some(format!("req_{}", uuid::Uuid::new_v4()))
-        } else {
-            None
-        };
+        self.send_gateway_reply(channel, content, None).await
+    }
 
-        let pending_rx = if let Some(ref id) = req_id {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            self.pending.lock().await.insert(id.clone(), tx);
-            Some(rx)
-        } else {
-            None
-        };
-
-        let reply = GatewayReply {
-            schema: "openab.gateway.reply.v1".into(),
-            reply_to: channel.origin_event_id.clone().unwrap_or_default(),
-            platform: channel.platform.clone(),
-            channel: ReplyChannel {
-                id: channel.channel_id.clone(),
-                thread_id: channel.thread_id.clone(),
-            },
-            content: ReplyContent {
-                content_type: "text".into(),
-                text: content.into(),
-            },
-            command: None,
-            request_id: req_id.clone(),
-        };
-        let json = serde_json::to_string(&reply)?;
-        self.ws_tx.lock().await.send(Message::Text(json)).await?;
-
-        // When streaming is enabled, wait for gateway to return real message_id
-        // (needed for edit_message). Otherwise fire-and-forget.
-        let msg_id = if let (Some(rx), Some(ref id)) = (pending_rx, &req_id) {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
-                Ok(Ok(resp)) if resp.success => resp.message_id.unwrap_or_else(|| "gw_sent".into()),
-                _ => {
-                    self.pending.lock().await.remove(id);
-                    "gw_sent".into()
-                }
-            }
-        } else {
-            "gw_sent".into()
-        };
-
-        Ok(MessageRef {
-            channel: channel.clone(),
-            message_id: msg_id,
-        })
+    async fn send_message_with_reply(
+        &self,
+        channel: &ChannelRef,
+        content: &str,
+        reply_to_message_id: &str,
+    ) -> Result<MessageRef> {
+        self.send_gateway_reply(channel, content, Some(reply_to_message_id)).await
     }
 
     async fn create_thread(
@@ -382,6 +400,7 @@ impl ChatAdapter for GatewayAdapter {
             },
             command: Some("create_topic".into()),
             request_id: Some(req_id.clone()),
+            quote_message_id: None,
         };
         let json = serde_json::to_string(&reply)?;
         self.ws_tx.lock().await.send(Message::Text(json)).await?;
@@ -421,6 +440,7 @@ impl ChatAdapter for GatewayAdapter {
                 text: emoji.into(),
             },
             command: Some("add_reaction".into()),
+            quote_message_id: None,
             request_id: None,
         };
         let json = serde_json::to_string(&reply)?;
@@ -442,6 +462,7 @@ impl ChatAdapter for GatewayAdapter {
                 text: emoji.into(),
             },
             command: Some("remove_reaction".into()),
+            quote_message_id: None,
             request_id: None,
         };
         let json = serde_json::to_string(&reply)?;
@@ -463,6 +484,7 @@ impl ChatAdapter for GatewayAdapter {
                 text: content.into(),
             },
             command: Some("edit_message".into()),
+            quote_message_id: None,
             request_id: None,
         };
         let json = serde_json::to_string(&reply)?;

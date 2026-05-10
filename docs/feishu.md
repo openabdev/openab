@@ -200,6 +200,22 @@ To start a threaded conversation: reply to any bot message in a group chat (long
 
 Streaming (typewriter) mode works in threads — edits target the same message regardless of thread context.
 
+## Agent-Controlled Reply-To
+
+Agents can reply to a specific message using the `[[reply_to:message_id]]` output directive (see [docs/output-directives.md](output-directives.md)). The gateway sends the reply via Feishu's native Reply API, showing a quote reference in the UI.
+
+```
+Agent output:
+  [[reply_to:om_xxx]]
+  This is my reply to that specific message.
+```
+
+**How agents get message IDs:** Every incoming message includes `message_id` in the `SenderContext` injected into the agent prompt. Agents can store and reference these IDs to reply to specific messages.
+
+**Fallback:** If the specified message ID is invalid or the Reply API fails, the gateway automatically falls back to a plain send (no quote).
+
+**Use case:** In multi-bot threads, each bot can reply to a different message, creating clear visual conversation threads within a Feishu thread.
+
 ## Bot-to-Bot Collaboration (Gateway-Side Only)
 
 The gateway adapter includes bot identification and filtering scaffolding (`AllowBots` enum, `FEISHU_TRUSTED_BOT_IDS`, `FEISHU_MAX_BOT_TURNS` with human-reset safety valve), matching Discord's `allow_bot_messages` design.

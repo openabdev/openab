@@ -1904,6 +1904,9 @@ pub async fn handle_reply(
     let api_base = adapter.config.api_base();
     let text = &reply.content.text;
     let limit = adapter.config.message_limit;
+    // quote_message_id (agent-controlled reply-to) takes priority over thread_id
+    let reply_target = reply.quote_message_id.as_deref()
+        .or(reply.channel.thread_id.as_deref());
     let thread_id = reply.channel.thread_id.as_deref();
 
     // Split long messages; store sent message_ids in dedupe to prevent
@@ -1911,7 +1914,15 @@ pub async fn handle_reply(
     // Use post (rich text) format for markdown rendering.
     // When in a thread (thread_id present), use reply API to stay in the same thread.
     if text.len() <= limit {
-        match send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, thread_id, text).await {
+        let result = send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, reply_target, text).await;
+        // Fallback: if quote_message_id caused failure, retry without it
+        let result = if result.is_none() && reply.quote_message_id.is_some() {
+            tracing::warn!("reply-to failed, falling back to plain send");
+            send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, thread_id, text).await
+        } else {
+            result
+        };
+        match result {
             Some(msg_id) => {
                 adapter.dedupe.is_duplicate(&msg_id);
                 // Record thread participation for mention bypass
@@ -1953,7 +1964,7 @@ pub async fn handle_reply(
     } else {
         let mut sent_any = false;
         for chunk in split_text(text, limit) {
-            if let Some(msg_id) = send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, thread_id, chunk).await {
+            if let Some(msg_id) = send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, reply_target, chunk).await {
                 adapter.dedupe.is_duplicate(&msg_id);
                 sent_any = true;
             }

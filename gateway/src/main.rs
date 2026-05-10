@@ -427,6 +427,7 @@ mod tests {
             },
             command: None,
             request_id: None,
+            quote_message_id: None,
         }
     }
 

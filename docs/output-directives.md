@@ -35,6 +35,7 @@ Here is my reply to that specific message.
 
 **Behavior**:
 - Discord: sends with `message_reference`, showing the native "replying to..." UI
+- Feishu: sends via Reply API (`POST /im/v1/messages/{id}/reply`), showing native quote UI
 - Invalid/non-existent message ID: silently falls back to plain send
 - Works in both streaming and send-once modes
 
@@ -73,4 +74,4 @@ This creates clear visual conversation threads within a Discord thread — essen
 | Hermes Agent | `DISCORD_REPLY_TO_MODE` env var | ❌ Platform decides, always to trigger msg |
 | **OAB** | `[[reply_to:message_id]]` directive | ✅ Agent chooses any message |
 
-> **Note:** `reply_to` is currently implemented for Discord only. Slack message IDs (ts format like `1234567890.123456`) are accepted by the parser but the Slack adapter does not yet send threaded replies via this directive — it falls back to plain send. Slack support can be added in a future PR.
+> **Note:** `reply_to` is currently implemented for Discord and Feishu (gateway). Slack message IDs (ts format like `1234567890.123456`) are accepted by the parser but the Slack adapter does not yet send threaded replies via this directive — it falls back to plain send. Slack support can be added in a future PR.
