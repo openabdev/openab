@@ -91,7 +91,17 @@ fn translate_posix_dow_field(field: &str) -> Result<String, String> {
     use std::collections::BTreeSet;
 
     // Name-based notation is internally consistent in the cron crate — pass through.
-    if field.chars().any(|c| c.is_ascii_alphabetic()) {
+    // But reject mixed numeric+name notation (e.g. "1,Mon") which would leave the
+    // numeric part untranslated and silently wrong.
+    let has_alpha = field.chars().any(|c| c.is_ascii_alphabetic());
+    let has_digit = field.chars().any(|c| c.is_ascii_digit());
+    if has_alpha && has_digit {
+        return Err(format!(
+            "mixed numeric and name notation is not supported in day-of-week field: {:?}",
+            field
+        ));
+    }
+    if has_alpha {
         return Ok(field.to_string());
     }
 
@@ -148,7 +158,12 @@ fn translate_posix_dow_field(field: &str) -> Result<String, String> {
             if n > 7 {
                 return Err(format!("day-of-week value out of range (0-7): {}", n));
             }
-            vec![n]
+            if step > 1 {
+                // n/step means "from n through end-of-domain, stepping by step"
+                (n..=6).collect()
+            } else {
+                vec![n]
+            }
         };
 
         // Apply step filter, normalize 7 → 0, collect into the set.
@@ -714,6 +729,25 @@ mod tests {
             "Mon,Wed,Fri"
         );
         assert_eq!(translate_posix_dow_field("Sun").unwrap(), "Sun");
+    }
+
+    #[test]
+    fn translate_dow_step_from_singleton() {
+        // POSIX 1/2 = from Mon through Sat, step 2 = {1,3,5} = Mon,Wed,Fri -> cron crate 2,4,6
+        assert_eq!(translate_posix_dow_field("1/2").unwrap(), "2,4,6");
+    }
+
+    #[test]
+    fn translate_dow_step_from_singleton_sunday() {
+        // POSIX 0/3 = from Sun through Sat, step 3 = {0,3,6} = Sun,Wed,Sat -> cron crate 1,4,7
+        assert_eq!(translate_posix_dow_field("0/3").unwrap(), "1,4,7");
+    }
+
+    #[test]
+    fn translate_dow_rejects_mixed_notation() {
+        assert!(translate_posix_dow_field("1,Mon").is_err());
+        assert!(translate_posix_dow_field("Mon,1").is_err());
+        assert!(translate_posix_dow_field("1-Fri").is_err());
     }
 
     #[test]
