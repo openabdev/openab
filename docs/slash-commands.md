@@ -10,6 +10,7 @@ OpenAB registers Discord slash commands for session control. These work in both 
 | `/agents` | Select the agent mode via dropdown menu | Yes |
 | `/cancel` | Cancel the current in-flight operation | Yes |
 | `/reset` | Reset the conversation session (clear history, start fresh) | Yes |
+| `/export-thread` | Download the current Discord thread as a `.txt` transcript | No |
 
 All responses are **ephemeral** — only the user who invoked the command sees the reply.
 
@@ -62,6 +63,12 @@ This is equivalent to the `sessions close` + `sessions new` pattern used by [Ope
 **What is preserved:**
 - Bot identity and system prompt (re-applied on next session creation)
 - Config settings in `config.toml`
+
+### `/export-thread`
+
+Fetches the current Discord thread or DM history and returns a `.txt` file as an ephemeral follow-up. The transcript includes message timestamps, author names and IDs, message text, and attachment URLs.
+
+The command only works in allowed Discord threads or enabled DMs. Very large threads are capped and may be truncated to fit Discord's attachment size limit.
 
 ## Passing CLI Commands via @mention
 

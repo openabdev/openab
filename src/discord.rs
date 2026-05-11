@@ -7,9 +7,9 @@ use crate::format;
 use crate::media;
 use async_trait::async_trait;
 use serenity::builder::{
-    CreateActionRow, CreateButton, CreateCommand, CreateInteractionResponse,
-    CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind,
-    CreateSelectMenuOption, CreateThread, EditMessage,
+    CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateInteractionResponse,
+    CreateInteractionResponseFollowup, CreateInteractionResponseMessage, CreateSelectMenu,
+    CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditMessage, GetMessages,
 };
 use serenity::http::Http;
 use serenity::model::application::ButtonStyle;
@@ -32,6 +32,9 @@ const PARTICIPATION_CACHE_MAX: usize = 1000;
 
 /// Discord StringSelectMenu hard limit on options.
 const SELECT_MENU_PAGE_SIZE: usize = 25;
+
+/// Avoid unbounded Discord history exports from very large threads.
+const THREAD_EXPORT_MESSAGE_LIMIT: usize = 5000;
 
 // --- DiscordAdapter: implements ChatAdapter for Discord via serenity ---
 
@@ -815,6 +818,8 @@ impl EventHandler for Handler {
             CreateCommand::new("cancel-all")
                 .description("Cancel current operation and drop all buffered messages"),
             CreateCommand::new("reset").description("Reset the conversation session"),
+            CreateCommand::new("export-thread")
+                .description("Download this thread as a text file"),
         ];
 
         // Register global commands (works in DMs + all guilds after propagation).
@@ -853,6 +858,9 @@ impl EventHandler for Handler {
             }
             Interaction::Command(cmd) if cmd.data.name == "reset" => {
                 self.handle_reset_command(&ctx, &cmd).await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "export-thread" => {
+                self.handle_export_thread_command(&ctx, &cmd).await;
             }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_config_") => {
                 self.handle_config_select(&ctx, &comp).await;
@@ -1116,6 +1124,110 @@ impl Handler {
         }
     }
 
+    async fn handle_export_thread_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        if is_denied_user(
+            false,
+            self.allow_all_users,
+            &self.allowed_users,
+            cmd.user.id.get(),
+        ) {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 You are not allowed to use this bot.")
+                    .ephemeral(true),
+            );
+            if let Err(e) = cmd.create_response(&ctx.http, response).await {
+                tracing::error!(error = %e, "failed to deny /export-thread command");
+            }
+            return;
+        }
+
+        let channel_id = cmd.channel_id;
+        let (export_allowed, export_name) = match channel_id.to_channel(&ctx.http).await {
+            Ok(serenity::model::channel::Channel::Guild(gc)) => {
+                let in_allowed_channel =
+                    self.allow_all_channels || self.allowed_channels.contains(&channel_id.get());
+                let (in_thread, _) = detect_thread(
+                    gc.thread_metadata.is_some(),
+                    gc.parent_id.map(|id| id.get()),
+                    gc.owner_id.map(|id| id.get()),
+                    ctx.cache.current_user().id.get(),
+                    &self.allowed_channels,
+                    self.allow_all_channels,
+                    in_allowed_channel,
+                );
+                (in_thread, gc.name.clone())
+            }
+            Ok(serenity::model::channel::Channel::Private(_)) => {
+                (self.allow_dm, "dm".to_string())
+            }
+            Ok(_) => (false, "channel".to_string()),
+            Err(e) => {
+                tracing::warn!(channel_id = %channel_id, error = %e, "failed to inspect channel for export");
+                (false, "channel".to_string())
+            }
+        };
+
+        if !export_allowed {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ Run this command inside an allowed Discord thread or DM.")
+                    .ephemeral(true),
+            );
+            if let Err(e) = cmd.create_response(&ctx.http, response).await {
+                tracing::error!(error = %e, "failed to respond to /export-thread rejection");
+            }
+            return;
+        }
+
+        let response = CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content("Preparing thread export...")
+                .ephemeral(true),
+        );
+        if let Err(e) = cmd.create_response(&ctx.http, response).await {
+            tracing::error!(error = %e, "failed to acknowledge /export-thread command");
+            return;
+        }
+
+        match export_channel_messages(
+            &ctx.http,
+            channel_id,
+            &export_name,
+            cmd.attachment_size_limit,
+        )
+        .await
+        {
+            Ok((filename, transcript, message_count, truncated)) => {
+                let mut content = format!("Exported {message_count} messages.");
+                if truncated {
+                    content.push_str(" The export was truncated to fit Discord's attachment limit.");
+                }
+                let attachment = CreateAttachment::bytes(transcript.into_bytes(), filename);
+                let followup = CreateInteractionResponseFollowup::new()
+                    .content(content)
+                    .add_file(attachment)
+                    .ephemeral(true);
+                if let Err(e) = cmd.create_followup(&ctx.http, followup).await {
+                    tracing::error!(error = %e, "failed to send /export-thread attachment");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(channel_id = %channel_id, error = %e, "failed to export thread");
+                let followup = CreateInteractionResponseFollowup::new()
+                    .content(format!("⚠️ Failed to export thread: {e}"))
+                    .ephemeral(true);
+                if let Err(e) = cmd.create_followup(&ctx.http, followup).await {
+                    tracing::error!(error = %e, "failed to send /export-thread error");
+                }
+            }
+        }
+    }
+
     async fn handle_config_select(
         &self,
         ctx: &Context,
@@ -1229,6 +1341,134 @@ fn discord_msg_ref(msg: &Message) -> MessageRef {
             origin_event_id: None,
         },
         message_id: msg.id.to_string(),
+    }
+}
+
+async fn export_channel_messages(
+    http: &Http,
+    channel_id: ChannelId,
+    channel_name: &str,
+    attachment_size_limit: u32,
+) -> anyhow::Result<(String, String, usize, bool)> {
+    let mut messages = Vec::new();
+    let mut before = None;
+
+    while messages.len() < THREAD_EXPORT_MESSAGE_LIMIT {
+        let remaining = THREAD_EXPORT_MESSAGE_LIMIT - messages.len();
+        let limit = remaining.min(100) as u8;
+        let mut request = GetMessages::new().limit(limit);
+        if let Some(before_id) = before {
+            request = request.before(before_id);
+        }
+
+        let batch = channel_id.messages(http, request).await?;
+        if batch.is_empty() {
+            break;
+        }
+
+        before = batch.last().map(|m| m.id);
+        let fetched = batch.len();
+        messages.extend(batch);
+
+        if fetched < limit as usize {
+            break;
+        }
+    }
+
+    messages.reverse();
+
+    let filename = export_filename(channel_id, channel_name);
+    let max_bytes = usize::try_from(attachment_size_limit)
+        .unwrap_or(8 * 1024 * 1024)
+        .saturating_sub(1024)
+        .max(1024);
+    let (transcript, truncated) =
+        format_thread_export(channel_id, channel_name, &messages, max_bytes);
+    let message_count = messages.len();
+
+    Ok((filename, transcript, message_count, truncated))
+}
+
+fn format_thread_export(
+    channel_id: ChannelId,
+    channel_name: &str,
+    messages: &[Message],
+    max_bytes: usize,
+) -> (String, bool) {
+    let mut out = format!(
+        "Discord thread export\nChannel: {channel_name} ({channel_id})\nMessages: {}\n\n",
+        messages.len()
+    );
+    let mut truncated = false;
+
+    for msg in messages {
+        let entry = format_export_message(msg);
+        if out.len() + entry.len() > max_bytes {
+            truncated = true;
+            break;
+        }
+        out.push_str(&entry);
+    }
+
+    if truncated {
+        let note = "\n[Export truncated to fit Discord attachment size limit]\n";
+        let room = max_bytes.saturating_sub(out.len());
+        if room >= note.len() {
+            out.push_str(note);
+        }
+    }
+
+    (out, truncated)
+}
+
+fn format_export_message(msg: &Message) -> String {
+    let bot_marker = if msg.author.bot { " [bot]" } else { "" };
+    let mut out = format!(
+        "[{}] {}{} ({})\n",
+        msg.timestamp,
+        msg.author.name,
+        bot_marker,
+        msg.author.id
+    );
+
+    if msg.content.is_empty() {
+        out.push_str("(no text)\n");
+    } else {
+        out.push_str(&msg.content);
+        out.push('\n');
+    }
+
+    for attachment in &msg.attachments {
+        let mime = attachment.content_type.as_deref().unwrap_or("unknown");
+        out.push_str(&format!(
+            "[attachment] {} ({} bytes, {}): {}\n",
+            attachment.filename, attachment.size, mime, attachment.url
+        ));
+    }
+
+    out.push('\n');
+    out
+}
+
+fn export_filename(channel_id: ChannelId, channel_name: &str) -> String {
+    let safe_name = sanitize_filename_component(channel_name);
+    format!("discord-thread-{safe_name}-{channel_id}.txt")
+}
+
+fn sanitize_filename_component(input: &str) -> String {
+    let mut safe = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+            safe.push(ch);
+        } else if ch.is_whitespace() || matches!(ch, '.' | '/') {
+            safe.push('-');
+        }
+    }
+    let safe = safe.trim_matches('-');
+    if safe.is_empty() {
+        "thread".to_string()
+    } else {
+        safe.chars().take(64).collect()
     }
 }
 
@@ -1595,6 +1835,21 @@ mod tests {
         assert!(!is_thread_already_exists_error(&err));
         let err = anyhow::anyhow!("rate limit exceeded");
         assert!(!is_thread_already_exists_error(&err));
+    }
+
+    // --- thread export helpers ---
+
+    #[test]
+    fn sanitize_filename_component_keeps_safe_ascii() {
+        assert_eq!(
+            sanitize_filename_component("release notes_v2"),
+            "release-notes_v2"
+        );
+    }
+
+    #[test]
+    fn sanitize_filename_component_falls_back_for_empty_result() {
+        assert_eq!(sanitize_filename_component("///..."), "thread");
     }
 
     // --- should_process_user_message tests (GIVEN/WHEN/THEN) ---
