@@ -1917,7 +1917,7 @@ pub async fn handle_reply(
         let result = send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, reply_target, text).await;
         // Fallback: if quote_message_id caused failure, retry without it
         let result = if result.is_none() && reply.quote_message_id.is_some() {
-            tracing::warn!("reply-to failed, falling back to plain send");
+            tracing::warn!(quote_message_id = ?reply.quote_message_id, channel_id = %reply.channel.id, "reply-to failed, falling back to plain send");
             send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, thread_id, text).await
         } else {
             result
@@ -1967,6 +1967,16 @@ pub async fn handle_reply(
             if let Some(msg_id) = send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, reply_target, chunk).await {
                 adapter.dedupe.is_duplicate(&msg_id);
                 sent_any = true;
+            }
+        }
+        // Fallback: if quote_message_id caused all chunks to fail, retry without it
+        if !sent_any && reply.quote_message_id.is_some() {
+            tracing::warn!(quote_message_id = ?reply.quote_message_id, channel_id = %reply.channel.id, "chunked reply-to failed, falling back to plain send");
+            for chunk in split_text(text, limit) {
+                if let Some(msg_id) = send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, thread_id, chunk).await {
+                    adapter.dedupe.is_duplicate(&msg_id);
+                    sent_any = true;
+                }
             }
         }
         if sent_any {

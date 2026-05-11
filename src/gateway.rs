@@ -179,7 +179,12 @@ impl GatewayAdapter {
             quote_message_id: quote_message_id.map(|s| s.to_string()),
         };
         let json = serde_json::to_string(&reply)?;
-        self.ws_tx.lock().await.send(Message::Text(json)).await?;
+        if let Err(e) = self.ws_tx.lock().await.send(Message::Text(json)).await {
+            if let Some(ref id) = req_id {
+                self.pending.lock().await.remove(id);
+            }
+            return Err(e.into());
+        }
         let msg_id = if let (Some(rx), Some(ref id)) = (pending_rx, &req_id) {
             match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
                 Ok(Ok(resp)) if resp.success => resp.message_id.unwrap_or_else(|| "gw_sent".into()),
