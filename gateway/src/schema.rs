@@ -65,6 +65,9 @@ pub struct GatewayReply {
     #[serde(default)]
     pub request_id: Option<String>,
     /// When set, send this message as a reply/quote to the specified platform message ID.
+    /// Unlike `reply_to` (which identifies the triggering event for routing/dedup),
+    /// this field controls the visual reply/quote UI on the platform.
+    /// If quoting fails, the gateway MUST fall back to sending without quoting.
     #[serde(default)]
     pub quote_message_id: Option<String>,
 }

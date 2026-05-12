@@ -10,6 +10,9 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
+/// Timeout for waiting on gateway reply acknowledgement.
+const GATEWAY_REPLY_TIMEOUT_SECS: u64 = 5;
+
 // --- Gateway event/reply schemas (mirrors gateway service) ---
 
 #[derive(Clone, Debug, Deserialize)]
@@ -78,6 +81,8 @@ struct GatewayReply {
     #[serde(skip_serializing_if = "Option::is_none")]
     request_id: Option<String>,
     /// When set, the gateway should send this message as a reply/quote to the specified message ID.
+    /// Unlike `reply_to` (routing/dedup identifier for the triggering event), this field controls
+    /// the visual reply/quote UI on the platform. Falls back to plain send on failure.
     #[serde(skip_serializing_if = "Option::is_none")]
     quote_message_id: Option<String>,
 }
@@ -186,9 +191,20 @@ impl GatewayAdapter {
             return Err(e.into());
         }
         let msg_id = if let (Some(rx), Some(ref id)) = (pending_rx, &req_id) {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(GATEWAY_REPLY_TIMEOUT_SECS), rx).await {
                 Ok(Ok(resp)) if resp.success => resp.message_id.unwrap_or_else(|| "gw_sent".into()),
-                _ => {
+                Ok(Ok(_resp)) => {
+                    tracing::warn!(request_id = %id, "gateway replied with failure");
+                    self.pending.lock().await.remove(id);
+                    "gw_sent".into()
+                }
+                Ok(Err(_)) => {
+                    tracing::warn!(request_id = %id, "gateway response channel closed");
+                    self.pending.lock().await.remove(id);
+                    "gw_sent".into()
+                }
+                Err(_) => {
+                    tracing::warn!(request_id = %id, "gateway reply timed out");
                     self.pending.lock().await.remove(id);
                     "gw_sent".into()
                 }
