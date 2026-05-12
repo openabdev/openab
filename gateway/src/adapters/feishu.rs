@@ -3039,4 +3039,41 @@ mod tests {
             .or(reply.channel.thread_id.as_deref());
         assert_eq!(reply_target, None);
     }
+
+    #[tokio::test]
+    async fn quote_message_id_fallback_on_reply_failure() {
+        // Simulates the fallback logic in handle_reply: when send_post_message
+        // fails with a quote_message_id (reply API returns error), retry as plain send.
+        let server = MockServer::start().await;
+
+        // Reply API endpoint returns 400 (invalid message_id)
+        Mock::given(method("POST"))
+            .and(path("/open-apis/im/v1/messages/om_invalid/reply"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("invalid message_id"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Plain send endpoint succeeds (fallback)
+        Mock::given(method("POST"))
+            .and(path("/open-apis/im/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": {"message_id": "om_fallback_ok"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let api_base = server.uri();
+
+        // First attempt with quote_message_id — should fail (returns None)
+        let result = send_post_message(&client, &api_base, "t-tok", "chat_123", Some("om_invalid"), "hello").await;
+        assert!(result.is_none(), "reply to invalid message_id should fail");
+
+        // Fallback without quote — should succeed
+        let result = send_post_message(&client, &api_base, "t-tok", "chat_123", None, "hello").await;
+        assert_eq!(result.as_deref(), Some("om_fallback_ok"));
+    }
 }

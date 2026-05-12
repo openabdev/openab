@@ -195,14 +195,10 @@ impl GatewayAdapter {
                 Ok(Ok(resp)) if resp.success => resp.message_id.unwrap_or_else(|| "gw_sent".into()),
                 Ok(Ok(_resp)) => {
                     tracing::warn!(request_id = %id, "gateway replied with failure");
-                    // Defensive: entry already removed by response handler (line 614),
-                    // but remove again in case of race or future refactor.
-                    self.pending.lock().await.remove(id);
                     "gw_sent".into()
                 }
                 Ok(Err(_)) => {
                     tracing::warn!(request_id = %id, "gateway response channel closed");
-                    self.pending.lock().await.remove(id);
                     "gw_sent".into()
                 }
                 Err(_) => {
