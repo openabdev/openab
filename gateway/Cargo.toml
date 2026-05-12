@@ -25,6 +25,7 @@ cbc = "0.1"
 prost = "0.13"
 subtle = "2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+urlencoding = "2"
 
 [dev-dependencies]
 wiremock = "0.6"

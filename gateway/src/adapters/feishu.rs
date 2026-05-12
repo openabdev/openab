@@ -1522,9 +1522,10 @@ pub async fn download_feishu_audio(
     message_id: &str,
     file_key: &str,
 ) -> Option<crate::schema::Attachment> {
+    use urlencoding::encode;
     let url = format!(
         "{}/open-apis/im/v1/messages/{}/resources/{}?type=file",
-        api_base, message_id, file_key
+        api_base, encode(message_id), encode(file_key)
     );
     let resp = match client.get(&url).bearer_auth(token).send().await {
         Ok(r) => r,
@@ -1537,6 +1538,12 @@ pub async fn download_feishu_audio(
         tracing::warn!(file_key, status = %resp.status(), "feishu audio download failed");
         return None;
     }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("audio/ogg")
+        .to_string();
     if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
             if size > AUDIO_MAX_DOWNLOAD {
@@ -1556,7 +1563,7 @@ pub async fn download_feishu_audio(
     Some(crate::schema::Attachment {
         attachment_type: "audio".into(),
         filename: format!("{}.ogg", file_key),
-        mime_type: "audio/ogg".into(),
+        mime_type: content_type,
         data,
         size: bytes.len() as u64,
     })
