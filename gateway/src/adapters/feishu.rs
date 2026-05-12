@@ -106,6 +106,9 @@ pub struct FeishuConfig {
     /// tracking entirely — all messages will require @mention.
     /// Converted from `FEISHU_SESSION_TTL_HOURS` (user-facing, in hours) to seconds internally.
     pub session_ttl_secs: u64,
+    /// Override the API base URL. Used in tests to point at a mock server.
+    /// Always None in production (not read from env).
+    pub api_base_override: Option<String>,
 }
 
 impl FeishuConfig {
@@ -192,11 +195,15 @@ impl FeishuConfig {
             dedupe_ttl_secs,
             message_limit,
             session_ttl_secs,
+            api_base_override: None,
         })
     }
 
     /// API base URL for the configured domain.
     pub fn api_base(&self) -> String {
+        if let Some(ref base) = self.api_base_override {
+            return base.clone();
+        }
         if self.domain == "lark" {
             "https://open.larksuite.com".into()
         } else {
@@ -2339,6 +2346,7 @@ mod tests {
             dedupe_ttl_secs: 300,
             message_limit: 4000,
             session_ttl_secs: 86400,
+            api_base_override: None,
         }
     }
 
@@ -3042,19 +3050,31 @@ mod tests {
 
     #[tokio::test]
     async fn quote_message_id_fallback_on_reply_failure() {
-        // Simulates the fallback logic in handle_reply: when send_post_message
-        // fails with a quote_message_id (reply API returns error), retry as plain send.
+        // Tests the actual handle_reply fallback path: when quote_message_id
+        // is set and the reply API fails, handle_reply retries as plain send.
         let server = MockServer::start().await;
 
-        // Reply API endpoint returns 400 (invalid message_id)
+        // Token endpoint
+        Mock::given(method("POST"))
+            .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-test",
+                "expire": 7200
+            })))
+            .mount(&server)
+            .await;
+
+        // Reply API returns 400 (invalid quote_message_id)
         Mock::given(method("POST"))
             .and(path("/open-apis/im/v1/messages/om_invalid/reply"))
             .respond_with(ResponseTemplate::new(400).set_body_string("invalid message_id"))
             .expect(1)
+            .named("reply_api_fail")
             .mount(&server)
             .await;
 
-        // Plain send endpoint succeeds (fallback)
+        // Plain send endpoint succeeds (fallback path)
         Mock::given(method("POST"))
             .and(path("/open-apis/im/v1/messages"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3062,18 +3082,37 @@ mod tests {
                 "data": {"message_id": "om_fallback_ok"}
             })))
             .expect(1)
+            .named("plain_send_fallback")
             .mount(&server)
             .await;
 
-        let client = reqwest::Client::new();
-        let api_base = server.uri();
+        let mut config = test_config();
+        config.api_base_override = Some(server.uri());
+        let adapter = FeishuAdapter::new(config);
 
-        // First attempt with quote_message_id — should fail (returns None)
-        let result = send_post_message(&client, &api_base, "t-tok", "chat_123", Some("om_invalid"), "hello").await;
-        assert!(result.is_none(), "reply to invalid message_id should fail");
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
 
-        // Fallback without quote — should succeed
-        let result = send_post_message(&client, &api_base, "t-tok", "chat_123", None, "hello").await;
-        assert_eq!(result.as_deref(), Some("om_fallback_ok"));
+        let reply = crate::schema::GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "evt_123".into(),
+            platform: "feishu".into(),
+            channel: crate::schema::ReplyChannel {
+                id: "oc_chat1".into(),
+                thread_id: None,
+            },
+            content: crate::schema::Content {
+                content_type: "text".into(),
+                text: "hello from fallback test".into(),
+                attachments: vec![],
+            },
+            command: None,
+            request_id: None,
+            quote_message_id: Some("om_invalid".into()),
+        };
+
+        handle_reply(&reply, &adapter, &event_tx).await;
+        // wiremock expect(1) on both mocks verifies:
+        // 1. Reply API was called (and failed)
+        // 2. Plain send was called (fallback triggered by quote_message_id.is_some() guard)
     }
 }
