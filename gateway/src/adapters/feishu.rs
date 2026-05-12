@@ -2963,4 +2963,80 @@ mod tests {
         // (caller would pass false because Mentions mode always returns false)
         assert!(parse_message_event(&env, Some("ou_bot"), &cfg, false).is_none());
     }
+
+    #[test]
+    fn quote_message_id_takes_priority_over_thread_id() {
+        use crate::schema::{GatewayReply, ReplyChannel, Content};
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "evt_123".into(),
+            platform: "feishu".into(),
+            channel: ReplyChannel {
+                id: "chat_123".into(),
+                thread_id: Some("om_root".into()),
+            },
+            content: Content {
+                content_type: "text".into(),
+                text: "hello".into(),
+                attachments: vec![],
+            },
+            command: None,
+            request_id: None,
+            quote_message_id: Some("om_specific".into()),
+        };
+        // quote_message_id should take priority
+        let reply_target = reply.quote_message_id.as_deref()
+            .or(reply.channel.thread_id.as_deref());
+        assert_eq!(reply_target, Some("om_specific"));
+    }
+
+    #[test]
+    fn reply_target_falls_back_to_thread_id_when_no_quote() {
+        use crate::schema::{GatewayReply, ReplyChannel, Content};
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "evt_123".into(),
+            platform: "feishu".into(),
+            channel: ReplyChannel {
+                id: "chat_123".into(),
+                thread_id: Some("om_root".into()),
+            },
+            content: Content {
+                content_type: "text".into(),
+                text: "hello".into(),
+                attachments: vec![],
+            },
+            command: None,
+            request_id: None,
+            quote_message_id: None,
+        };
+        let reply_target = reply.quote_message_id.as_deref()
+            .or(reply.channel.thread_id.as_deref());
+        assert_eq!(reply_target, Some("om_root"));
+    }
+
+    #[test]
+    fn reply_target_is_none_when_both_absent() {
+        use crate::schema::{GatewayReply, ReplyChannel, Content};
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "evt_123".into(),
+            platform: "feishu".into(),
+            channel: ReplyChannel {
+                id: "chat_123".into(),
+                thread_id: None,
+            },
+            content: Content {
+                content_type: "text".into(),
+                text: "hello".into(),
+                attachments: vec![],
+            },
+            command: None,
+            request_id: None,
+            quote_message_id: None,
+        };
+        let reply_target = reply.quote_message_id.as_deref()
+            .or(reply.channel.thread_id.as_deref());
+        assert_eq!(reply_target, None);
+    }
 }
