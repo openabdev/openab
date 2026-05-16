@@ -53,14 +53,17 @@ args = ["acp", "--trust-all-tools"]
 working_dir = "/home/agent"
 
 # [agent]
-# command = "claude"
-# args = ["--acp"]
+# command = "claude-agent-acp"
+# args = []
 # working_dir = "/home/node"
+# # Install the adapter first (requires Node >= 20):
+# #   npm install -g @agentclientprotocol/claude-agent-acp
+# # Auth: run `claude auth login` once, or set CLAUDE_CODE_OAUTH_TOKEN.
 # ⚠️ SECURITY WARNING: Any env var listed here is accessible to the agent.
 # A user could trick the agent into leaking these values via prompt injection.
 # All supported backends support OAuth login — prefer that over env var API keys.
 # Note: env vars here can override baseline vars (HOME, PATH, USER) if needed.
-# env = { ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}" }
+# env = { CLAUDE_CODE_OAUTH_TOKEN = "${CLAUDE_CODE_OAUTH_TOKEN}" }
 #
 # By default, the agent subprocess only inherits these baseline vars:
 #   Linux/macOS: HOME, PATH, USER

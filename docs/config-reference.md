@@ -105,10 +105,10 @@ working_dir = "/home/agent"
 
 # Claude Code
 [agent]
-command = "claude"
-args = ["--acp"]
+command = "claude-agent-acp"
+args = []
 working_dir = "/home/node"
-env = { ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}" }
+env = { CLAUDE_CODE_OAUTH_TOKEN = "${CLAUDE_CODE_OAUTH_TOKEN}" }
 
 # Codex
 [agent]
