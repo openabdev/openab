@@ -161,6 +161,34 @@ agents:
     #     storageClass: ""
     #     size: 1Gi
     #   image: "ghcr.io/openabdev/openab-hermes"
+    # grok:
+    #   command: grok
+    #   args:
+    #     - agent
+    #     - stdio
+    #   # See docs/grok.md for the three authentication methods:
+    #   # 1. API key (recommended for bots): set GROK_CODE_XAI_API_KEY via env or secretEnv
+    #   # 2. Device-code OAuth: kubectl exec + `grok login --device-auth` (requires persistence)
+    #   # 3. Enterprise deployment key: GROK_DEPLOYMENT_KEY
+    #   discord:
+    #     enabled: true
+    #     allowedChannels:
+    #       - "YOUR_CHANNEL_ID"
+    #     allowedUsers: []
+    #     allowBotMessages: "off"
+    #     trustedBotIds: []
+    #   workingDir: /home/agent
+    #   env: {}
+    #   envFrom: []
+    #   secretEnv: []
+    #   pool:
+    #     maxSessions: 10
+    #     sessionTtlHours: 24
+    #   persistence:
+    #     enabled: true
+    #     storageClass: ""
+    #     size: 1Gi
+    #   image: "ghcr.io/openabdev/openab-grok"
     image: ""
     command: kiro-cli
     args:

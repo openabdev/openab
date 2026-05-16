@@ -42,6 +42,9 @@ Agents deployed:
 {{- else if eq (toString $cfg.command) "cursor-agent" }}
     Authenticate:
     kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- cursor-agent login
+{{- else if eq (toString $cfg.command) "grok" }}
+    Authenticate:
+    kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- grok login --device-auth
 {{- end }}
 
     Restart after auth:
