@@ -436,6 +436,7 @@ async fn main() -> anyhow::Result<()> {
             dispatcher: discord_dispatcher,
             reminder_store: reminder_store.clone(),
             scheduled_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+            processed_msg_updates: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES

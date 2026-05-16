@@ -17,6 +17,7 @@ use serenity::http::Http;
 use serenity::model::application::ButtonStyle;
 use serenity::model::application::{Command, CommandOptionType, ComponentInteractionDataKind, Interaction};
 use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, ReactionType};
+use serenity::model::event::MessageUpdateEvent;
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::prelude::*;
@@ -216,6 +217,10 @@ pub struct Handler {
     pub reminder_store: ReminderStore,
     /// Track scheduled reminder IDs to prevent duplicate scheduling on reconnect.
     pub scheduled_ids: tokio::sync::Mutex<std::collections::HashSet<String>>,
+    /// Dedup cache for message_update: message_id → first-processed-at.
+    /// Prevents streaming bots that emit multiple MESSAGE_UPDATE events for the
+    /// same message from triggering the bot multiple times for the same request.
+    pub processed_msg_updates: tokio::sync::Mutex<HashMap<u64, tokio::time::Instant>>,
 }
 
 impl Handler {
@@ -811,6 +816,109 @@ impl EventHandler for Handler {
                 error!("dispatcher submit error: {e}");
             }
         });
+    }
+
+    /// Re-process a bot message that was edited to add a @mention of this bot.
+    ///
+    /// Discord's streaming (typewriter) mode posts an initial placeholder and
+    /// then edits it with the full response via MESSAGE_UPDATE events.  The
+    /// `message` handler only fires on MESSAGE_CREATE, so the final @mention
+    /// inside a streamed edit is never seen.  This handler catches that edit
+    /// and delegates back to `message()` when a trusted bot first introduces
+    /// a @mention via an edit.
+    async fn message_update(
+        &self,
+        ctx: Context,
+        old_if_available: Option<Message>,
+        new: Option<Message>,
+        event: MessageUpdateEvent,
+    ) {
+        tracing::info!(
+            channel_id = %event.channel_id,
+            message_id = %event.id,
+            has_new = new.is_some(),
+            has_old = old_if_available.is_some(),
+            "message_update fired",
+        );
+
+        // Get the full updated message — prefer cache, fall back to HTTP fetch.
+        // Serenity only populates `new` when the message was previously cached;
+        // the placeholder sent by a streaming bot before this bot was in the
+        // thread may not be cached, so we must fetch it.
+        let new_msg = match new {
+            Some(msg) => msg,
+            None => match event.channel_id.message(&ctx.http, event.id).await {
+                Ok(msg) => msg,
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        channel_id = %event.channel_id,
+                        "message_update: HTTP fetch failed, skipping",
+                    );
+                    return;
+                }
+            },
+        };
+
+        let bot_id = ctx.cache.current_user().id;
+
+        // Skip own edits and non-bot authors
+        if !new_msg.author.bot || new_msg.author.id == bot_id {
+            return;
+        }
+
+        // Only continue if the edited message now mentions this bot
+        let is_mentioned = new_msg.mentions_user_id(bot_id)
+            || new_msg.content.contains(&format!("<@{}>", bot_id));
+        if !is_mentioned {
+            return;
+        }
+
+        // Skip if the old version already mentioned the bot — this edit did not
+        // add a new @mention, so we would be double-processing the same request.
+        if let Some(old) = &old_if_available {
+            if old.mentions_user_id(bot_id)
+                || old.content.contains(&format!("<@{}>", bot_id))
+            {
+                return;
+            }
+        }
+
+        // Apply the same trusted_bot_ids gate as message()
+        if !self.trusted_bot_ids.is_empty()
+            && !self.trusted_bot_ids.contains(&new_msg.author.id.get())
+        {
+            return;
+        }
+
+        // Dedup: streaming bots send multiple MESSAGE_UPDATE events for the same
+        // message as they edit the placeholder incrementally. Process each message
+        // ID at most once within a 30-second window to avoid duplicate agent turns.
+        {
+            const DEDUP_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+            let msg_id = new_msg.id.get();
+            let mut cache = self.processed_msg_updates.lock().await;
+            // Evict stale entries first to bound cache growth
+            cache.retain(|_, ts: &mut tokio::time::Instant| ts.elapsed() < DEDUP_TTL);
+            if cache.contains_key(&msg_id) {
+                tracing::debug!(
+                    message_id = %new_msg.id,
+                    "message_update: duplicate event for same message_id, skipping",
+                );
+                return;
+            }
+            cache.insert(msg_id, tokio::time::Instant::now());
+        }
+
+        tracing::info!(
+            channel_id = %new_msg.channel_id,
+            author_id = %new_msg.author.id,
+            "message_update: trusted bot added @mention via edit, reprocessing as message",
+        );
+
+        // Delegate to the existing message handler so all the thread-detection,
+        // session-dispatch, and gating logic runs exactly once.
+        self.message(ctx, new_msg).await;
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {
