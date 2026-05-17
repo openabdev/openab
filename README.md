@@ -4,7 +4,7 @@
 
 ![OpenAB banner](images/banner.jpg)
 
-A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**, and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, OpenCode, Copilot CLI, Hermes, etc.) over stdio JSON-RPC — delivering the next-generation development experience. **Telegram, LINE, Feishu/Lark, Google Chat**, and other webhook-based platforms are supported via the standalone [Custom Gateway](gateway/).
+A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**, and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, OpenCode, Copilot CLI, Hermes, Grok Build, etc.) over stdio JSON-RPC — delivering the next-generation development experience. **Telegram, LINE, Feishu/Lark, Google Chat**, and other webhook-based platforms are supported via the standalone [Custom Gateway](gateway/).
 
 🪼 **Join our community!** Come say hi on Discord — we'd love to have you: **[🪼 OpenAB — Official](https://discord.gg/DmbhfDZjQS)** 🎉
 
@@ -20,8 +20,8 @@ A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**,
 │   User       │            │         │                       │ copilot --acp    │
 ├──────────────┤            ▼         ▼                       │ hermes-acp       │
 │   LINE       │◄──webhook──┌──────────────────┐              │ opencode acp     │
-│   User       │            │  Custom Gateway  │              └──────────────────┘
-├──────────────┤            │  (standalone)    │
+│   User       │            │  Custom Gateway  │              │ grok agent stdio │
+├──────────────┤            │  (standalone)    │              └──────────────────┘
 │  Feishu/Lark │◄───WS──────│                  │
 │   User       │            │                  │
 ├──────────────┤            │                  │
@@ -38,7 +38,7 @@ A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**,
 
 - **Multi-platform** — supports Discord and Slack, run one or both simultaneously
 - **Custom Gateway** — extend to Telegram, LINE, Feishu/Lark, Google Chat, MS Teams via standalone [gateway](gateway/)
-- **Pluggable agent backend** — swap between Kiro CLI, Claude Code, Codex, Gemini, OpenCode, Copilot CLI, Hermes via config
+- **Pluggable agent backend** — swap between Kiro CLI, Claude Code, Codex, Gemini, OpenCode, Copilot CLI, Hermes, Grok Build via config
 - **@mention trigger** — mention the bot in an allowed channel to start a conversation
 - **Thread-based multi-turn** — auto-creates threads; no @mention needed for follow-ups
 - **Multi-agent collaboration** — bot-to-bot messaging for coordinated workflows ([docs/multi-agent.md](docs/multi-agent.md))
@@ -169,6 +169,7 @@ The bot creates a thread. After that, just type in the thread — no @mention ne
 | Copilot CLI ⚠️ | `copilot --acp --stdio` | Native | [docs/copilot.md](docs/copilot.md) |
 | Cursor | `cursor-agent acp` | Native | [docs/cursor.md](docs/cursor.md) |
 | Hermes Agent | `hermes-acp` | Native | [docs/hermes.md](docs/hermes.md) |
+| Grok Build | `grok agent stdio` | Native | [docs/grok.md](docs/grok.md) |
 
 > 🔧 Running multiple agents? See [docs/multi-agent.md](docs/multi-agent.md)
 
