@@ -45,6 +45,7 @@ Agents deployed:
 {{- else if eq (toString $cfg.command) "grok" }}
     Authenticate:
     kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- grok login --device-auth
+    For bot/CI deployments, prefer setting `GROK_CODE_XAI_API_KEY` via `secretEnv` instead of interactive device-auth login. See docs/grok.md for all authentication options.
 {{- end }}
 
     Restart after auth:
