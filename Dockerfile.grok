@@ -33,7 +33,6 @@ RUN set -eux; \
       -o /tmp/grok && \
     echo "${sha}  /tmp/grok" | sha256sum -c - && \
     install -m 0755 /tmp/grok /usr/local/bin/grok && \
-    ln -sf /usr/local/bin/grok /usr/local/bin/agent && \
     rm /tmp/grok
 
 # Install gh CLI
