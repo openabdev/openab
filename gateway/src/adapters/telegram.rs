@@ -49,7 +49,6 @@ struct TelegramPhoto {
 struct TelegramDocument {
     file_id: String,
     file_name: Option<String>,
-    #[allow(dead_code)]
     mime_type: Option<String>,
 }
 
@@ -139,8 +138,9 @@ pub async fn webhook(
                 }
             } else if let Some(doc) = msg.document {
                 let file_name = doc.file_name.unwrap_or_else(|| "unknown.txt".to_string());
+                let mime = doc.mime_type.unwrap_or_else(|| "text/plain".to_string());
                 if let Some(att) =
-                    download_telegram_document(client, token, &doc.file_id, &file_name).await
+                    download_telegram_document(client, token, &doc.file_id, &file_name, &mime).await
                 {
                     attachments.push(att);
                 }
@@ -437,6 +437,7 @@ async fn download_telegram_document(
     bot_token: &str,
     file_id: &str,
     file_name: &str,
+    mime_type: &str,
 ) -> Option<Attachment> {
     // Only download text-like files
     let ext = file_name.rsplit('.').next().unwrap_or("").to_lowercase();
@@ -499,7 +500,7 @@ async fn download_telegram_document(
     Some(Attachment {
         attachment_type: "text_file".into(),
         filename: file_name.to_string(),
-        mime_type: "text/plain".into(),
+        mime_type: mime_type.into(),
         data,
         size: bytes.len() as u64,
     })
