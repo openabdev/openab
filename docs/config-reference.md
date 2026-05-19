@@ -86,7 +86,7 @@ The AI agent subprocess that OpenAB spawns to handle messages via ACP.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `command` | string | *required* | Agent binary (e.g. `kiro-cli`, `claude`, `codex`, `gemini`, `copilot`, `opencode`, `cursor-agent`). |
+| `command` | string | *required* | Agent binary (e.g. `kiro-cli`, `claude-agent-acp`, `codex`, `gemini`, `copilot`, `opencode`, `cursor-agent`). |
 | `args` | string[] | `[]` | CLI arguments passed to the agent. |
 | `working_dir` | string | `"/tmp"` | Working directory for the agent process. |
 | `env` | map | `{}` | Extra environment variables (e.g. `{ OPENAI_API_KEY = "${OPENAI_API_KEY}" }`). |
@@ -108,7 +108,8 @@ working_dir = "/home/agent"
 command = "claude-agent-acp"
 args = []
 working_dir = "/home/node"
-env = { CLAUDE_CODE_OAUTH_TOKEN = "${CLAUDE_CODE_OAUTH_TOKEN}" }
+# Auth: kubectl exec -it deploy/openab-claude -- claude auth login
+# Credentials persist in HOME PVC across restarts. See docs/claude-code.md.
 
 # Codex
 [agent]
