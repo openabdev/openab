@@ -6,6 +6,7 @@ pub const IMAGE_JPEG_QUALITY: u8 = 75;
 pub const IMAGE_MAX_DOWNLOAD: u64 = 10 * 1024 * 1024; // 10 MB
 pub const FILE_MAX_DOWNLOAD: u64 = 512 * 1024; // 512 KB
 pub const AUDIO_MAX_DOWNLOAD: u64 = 20 * 1024 * 1024; // 20 MB
+pub const GIF_MAX_SIZE: usize = 5 * 1024 * 1024; // 5 MB — prevents base64 bloat exceeding LLM payload limits
 
 /// Resize image so longest side <= 1200px, then encode as JPEG.
 /// GIFs are passed through unchanged to preserve animation.
@@ -13,10 +14,11 @@ pub fn resize_and_compress(raw: &[u8]) -> Result<(Vec<u8>, String), image::Image
     let reader = ImageReader::new(Cursor::new(raw)).with_guessed_format()?;
     let format = reader.format();
     if format == Some(image::ImageFormat::Gif) {
-        if raw.len() > 5_000_000 {
-            return Err(image::ImageError::Limits(
-                image::error::LimitError::from_kind(image::error::LimitErrorKind::DimensionError),
-            ));
+        if raw.len() > GIF_MAX_SIZE {
+            return Err(image::ImageError::IoError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("GIF exceeds {}MB size limit", GIF_MAX_SIZE / 1024 / 1024),
+            )));
         }
         return Ok((raw.to_vec(), "image/gif".to_string()));
     }

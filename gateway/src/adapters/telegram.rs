@@ -46,10 +46,10 @@ struct TelegramPhoto {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct TelegramDocument {
     file_id: String,
     file_name: Option<String>,
+    #[allow(dead_code)]
     mime_type: Option<String>,
 }
 

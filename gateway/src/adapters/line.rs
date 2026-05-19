@@ -344,9 +344,14 @@ async fn download_line_media(
             }
         }
     } else {
-        // For audio, we don't process, just send as is.
-        // LINE audio is usually m4a.
-        (bytes.to_vec(), content_type, format!("{}.m4a", message_id))
+        let ext = if content_type.contains("mpeg") || content_type.contains("mp3") {
+            "mp3"
+        } else if content_type.contains("ogg") {
+            "ogg"
+        } else {
+            "m4a"
+        };
+        (bytes.to_vec(), content_type, format!("{}.{}", message_id, ext))
     };
 
     use base64::Engine;
