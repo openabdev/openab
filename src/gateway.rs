@@ -534,6 +534,7 @@ pub struct GatewayParams {
     pub allowed_users: Vec<String>,
     pub streaming: bool,
     pub stt: crate::config::SttConfig,
+    pub steering: crate::config::SteeringConfig,
 }
 
 pub async fn run_gateway_adapter(
@@ -553,6 +554,7 @@ pub async fn run_gateway_adapter(
     let allowed_users = params.allowed_users;
     let streaming = params.streaming;
     let stt_config = params.stt;
+    let steering_config = params.steering;
 
     let connect_url = match &params.token {
         Some(token) => {
@@ -845,6 +847,29 @@ pub async fn run_gateway_adapter(
                                             .thread_id
                                             .as_deref()
                                             .unwrap_or(&thread_channel.channel_id);
+
+                                        // --- Steering message injection ---
+                                        let thread_key_for_steering = format!("{}:{thread_id}", thread_channel.platform);
+                                        if let Some(stripped) = crate::steering::detect_steering(&prompt, &steering_config) {
+                                            match dispatcher.steer_session(&thread_key_for_steering, &stripped).await {
+                                                Ok(true) => return, // injected successfully
+                                                Ok(false) => {}    // session idle/absent — fall through
+                                                Err(e) => {
+                                                    match steering_config.fallback {
+                                                        crate::config::SteeringFallback::Drop => return,
+                                                        crate::config::SteeringFallback::Error => {
+                                                            let _ = adapter.send_message(
+                                                                &thread_channel,
+                                                                &crate::steering::format_steering_error(&e.to_string()),
+                                                            ).await;
+                                                            return;
+                                                        }
+                                                        crate::config::SteeringFallback::Queue => {} // fall through
+                                                    }
+                                                }
+                                            }
+                                        }
+
                                         let thread_key = dispatcher.key(
                                             &thread_channel.platform,
                                             thread_id,

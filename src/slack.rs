@@ -488,6 +488,7 @@ pub async fn run_slack_adapter(
     stt_config: SttConfig,
     mut shutdown_rx: watch::Receiver<bool>,
     dispatcher: Arc<crate::dispatch::Dispatcher>,
+    steering_config: crate::config::SteeringConfig,
 ) -> Result<()> {
     let bot_token = adapter.bot_token().to_string();
     let bot_turns = Arc::new(tokio::sync::Mutex::new(BotTurnTracker::new(max_bot_turns)));
@@ -583,6 +584,7 @@ pub async fn run_slack_adapter(
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
                                                 let dispatcher = dispatcher.clone();
+                                                let steering_cfg = steering_config.clone();
                                                 tokio::spawn(async move {
                                                     handle_message(
                                                         &event,
@@ -594,6 +596,7 @@ pub async fn run_slack_adapter(
                                                         &allowed_users,
                                                         &stt_config,
                                                         &dispatcher,
+                                                        &steering_cfg,
                                                     )
                                                     .await;
                                                 });
@@ -812,6 +815,7 @@ pub async fn run_slack_adapter(
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
                                                 let dispatcher = dispatcher.clone();
+                                                let steering_cfg = steering_config.clone();
                                                 tokio::spawn(async move {
                                                     handle_message(
                                                         &event,
@@ -823,6 +827,7 @@ pub async fn run_slack_adapter(
                                                         &allowed_users,
                                                         &stt_config,
                                                         &dispatcher,
+                                                        &steering_cfg,
                                                     )
                                                     .await;
                                                 });
@@ -894,6 +899,7 @@ async fn handle_message(
     allowed_users: &HashSet<String>,
     stt_config: &SttConfig,
     dispatcher: &Arc<crate::dispatch::Dispatcher>,
+    steering_config: &crate::config::SteeringConfig,
 ) {
     let channel_id = match event["channel"].as_str() {
         Some(ch) => ch.to_string(),
@@ -1135,6 +1141,32 @@ async fn handle_message(
         })
     };
 
+    // --- Steering message injection ---
+    let thread_id = thread_channel
+        .thread_id
+        .as_deref()
+        .unwrap_or(&thread_channel.channel_id);
+    let thread_key_for_steering = format!("slack:{thread_id}");
+    if let Some(stripped) = crate::steering::detect_steering(&prompt, steering_config) {
+        match dispatcher.steer_session(&thread_key_for_steering, &stripped).await {
+            Ok(true) => return, // injected successfully
+            Ok(false) => {}    // session idle/absent — fall through
+            Err(e) => {
+                match steering_config.fallback {
+                    crate::config::SteeringFallback::Drop => return,
+                    crate::config::SteeringFallback::Error => {
+                        let _ = adapter_dyn.send_message(
+                            &thread_channel,
+                            &crate::steering::format_steering_error(&e.to_string()),
+                        ).await;
+                        return;
+                    }
+                    crate::config::SteeringFallback::Queue => {} // fall through
+                }
+            }
+        }
+    }
+
     // Best-effort echo before the agent reply so the user can verify STT.
     crate::stt::post_echo(
         &adapter_dyn,
@@ -1145,10 +1177,6 @@ async fn handle_message(
     )
     .await;
 
-    let thread_id = thread_channel
-        .thread_id
-        .as_deref()
-        .unwrap_or(&thread_channel.channel_id);
     let thread_key = dispatcher.key("slack", thread_id, &sender.sender_id);
     let estimated_tokens = crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
     let buf_msg = crate::dispatch::BufferedMessage {

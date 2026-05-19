@@ -120,6 +120,10 @@ pub trait DispatchTarget: Send + Sync + 'static {
     /// Ensure the ACP session for `session_key` exists (idempotent).
     async fn ensure_session(&self, session_key: &str) -> Result<()>;
 
+    /// Inject a steering message directly into a running session.
+    /// Returns `Ok(true)` if injected, `Ok(false)` if session is idle/absent.
+    async fn steer_session(&self, thread_id: &str, stripped_text: &str) -> Result<bool>;
+
     /// Drive one ACP turn with the pre-packed `content_blocks`.
     #[allow(clippy::too_many_arguments)]
     async fn stream_prompt_blocks(
@@ -141,6 +145,10 @@ impl DispatchTarget for AdapterRouter {
 
     async fn ensure_session(&self, session_key: &str) -> Result<()> {
         self.pool().get_or_create(session_key).await
+    }
+
+    async fn steer_session(&self, thread_id: &str, stripped_text: &str) -> Result<bool> {
+        self.pool().steer_session(thread_id, stripped_text).await
     }
 
     async fn stream_prompt_blocks(
@@ -464,6 +472,13 @@ impl Dispatcher {
             }
         }
         false
+    }
+
+    /// Inject a steering message directly into a running session via the
+    /// underlying `DispatchTarget`. Returns `Ok(true)` if injected,
+    /// `Ok(false)` if the session is idle or absent.
+    pub async fn steer_session(&self, thread_id: &str, stripped_text: &str) -> Result<bool> {
+        self.target.steer_session(thread_id, stripped_text).await
     }
 
     /// Remove map entries whose consumer task has finished (idle timeout or
@@ -1268,6 +1283,10 @@ mod tests {
                 return Err(anyhow::anyhow!(msg));
             }
             Ok(())
+        }
+
+        async fn steer_session(&self, _thread_id: &str, _stripped_text: &str) -> Result<bool> {
+            Ok(false)
         }
 
         async fn stream_prompt_blocks(

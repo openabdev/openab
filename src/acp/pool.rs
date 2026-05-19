@@ -338,6 +338,74 @@ impl SessionPool {
         Ok(())
     }
 
+    /// Inject a steering message directly into a running agent session.
+    ///
+    /// Returns `Ok(true)` if the message was injected, `Ok(false)` if the session
+    /// is idle or absent (caller should fall through to normal dispatch),
+    /// and `Err` if the write to stdin failed.
+    ///
+    /// The prompt is sent as a `session/prompt` JSON-RPC request with a UUID id
+    /// so it does not collide with the connection's sequential `next_id`. The agent
+    /// may process it concurrently with the in-flight turn; its intermediate output
+    /// (text, tool notifications) arrives through the existing subscriber channel.
+    /// The final response bearing the UUID id is treated as stale by the recv loop
+    /// and harmlessly skipped.
+    pub async fn steer_session(
+        &self,
+        thread_id: &str,
+        stripped_text: &str,
+    ) -> Result<bool> {
+        // 1. Look up the lock-free stdin handle and session id.
+        let (stdin, session_id) = {
+            let state = self.state.read().await;
+            match state.cancel_handles.get(thread_id) {
+                Some((stdin, sid)) => (stdin.clone(), sid.clone()),
+                None => return Ok(false),
+            }
+        };
+
+        // 2. Check whether the connection is actually busy.
+        // If try_lock succeeds the session is idle → fall through to normal dispatch.
+        let is_busy = {
+            let state = self.state.read().await;
+            match state.active.get(thread_id) {
+                Some(conn) => conn.try_lock().is_err(),
+                None => return Ok(false),
+            }
+        };
+        if !is_busy {
+            return Ok(false);
+        }
+
+        // 3. Build the steering prompt as a single text block.
+        let prompt_json = serde_json::json!([
+            {
+                "type": "text",
+                "text": stripped_text
+            }
+        ]);
+
+        // 4. Use a UUID request id so it can never collide with the connection's u64 ids.
+        let req_id = format!("steer_{}", uuid::Uuid::new_v4());
+        let data = serde_json::to_string(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": session_id,
+                "prompt": prompt_json,
+            }
+        }))?;
+
+        tracing::info!(session_id, "injecting steering message");
+        use tokio::io::AsyncWriteExt;
+        let mut w = stdin.lock().await;
+        w.write_all(data.as_bytes()).await?;
+        w.write_all(b"\n").await?;
+        w.flush().await?;
+        Ok(true)
+    }
+
     /// Reset a session: cancel any in-flight operation, remove the active connection,
     /// and clear all suspended state. The ACP process will be killed once the last
     /// Arc reference is dropped (after streaming finishes). The next message will
@@ -490,5 +558,19 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(map.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn steer_session_returns_false_when_no_session() {
+        let agent_cfg = crate::config::AgentConfig {
+            command: "/bin/true".into(),
+            args: vec![],
+            working_dir: "/tmp".into(),
+            env: std::collections::HashMap::new(),
+            inherit_env: vec![],
+        };
+        let pool = SessionPool::new(agent_cfg, 1);
+        let result = pool.steer_session("missing", "stop").await.unwrap();
+        assert!(!result, "steer_session should return false when no session exists");
     }
 }

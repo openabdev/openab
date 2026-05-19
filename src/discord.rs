@@ -216,6 +216,8 @@ pub struct Handler {
     pub reminder_store: ReminderStore,
     /// Track scheduled reminder IDs to prevent duplicate scheduling on reconnect.
     pub scheduled_ids: tokio::sync::Mutex<std::collections::HashSet<String>>,
+    /// Steering message configuration (mid-turn injection).
+    pub steering_config: crate::config::SteeringConfig,
 }
 
 impl Handler {
@@ -775,7 +777,32 @@ impl EventHandler for Handler {
             sender.thread_id = Some(thread_channel.channel_id.clone());
         }
 
+        // --- Steering message injection ---
+        // If the message qualifies as steering and the session is busy, inject
+        // directly into the agent's stdin. Otherwise fall through to normal dispatch.
+        let steering_config = self.steering_config.clone();
         let dispatcher = self.dispatcher.clone();
+        let thread_key_for_steering = format!("discord:{}", thread_channel.channel_id);
+        if let Some(stripped) = crate::steering::detect_steering(&prompt, &steering_config) {
+            match dispatcher.steer_session(&thread_key_for_steering, &stripped).await {
+                Ok(true) => return, // injected successfully
+                Ok(false) => {}    // session idle/absent — fall through
+                Err(e) => {
+                    match steering_config.fallback {
+                        crate::config::SteeringFallback::Drop => return,
+                        crate::config::SteeringFallback::Error => {
+                            let _ = adapter.send_message(
+                                &thread_channel,
+                                &crate::steering::format_steering_error(&e.to_string()),
+                            ).await;
+                            return;
+                        }
+                        crate::config::SteeringFallback::Queue => {} // fall through
+                    }
+                }
+            }
+        }
+
         let stt_cfg = self.stt_config.clone();
 
         tokio::spawn(async move {

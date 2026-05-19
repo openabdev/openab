@@ -14,6 +14,7 @@ mod reactions;
 mod remind;
 mod setup;
 mod slack;
+mod steering;
 mod stt;
 mod timestamp;
 
@@ -256,6 +257,7 @@ async fn main() -> anyhow::Result<()> {
                 stt,
                 slack_shutdown_rx,
                 slack_dispatcher,
+                cfg.steering.clone(),
             )
             .await
             {
@@ -300,6 +302,7 @@ async fn main() -> anyhow::Result<()> {
             allowed_users: gw_cfg.allowed_users,
             streaming: gw_cfg.streaming,
             stt: cfg.stt.clone(),
+            steering: cfg.steering.clone(),
         };
         let gw_router = router.clone();
         Some(tokio::spawn(async move {
@@ -436,6 +439,7 @@ async fn main() -> anyhow::Result<()> {
             dispatcher: discord_dispatcher,
             reminder_store: reminder_store.clone(),
             scheduled_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+            steering_config: cfg.steering.clone(),
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES

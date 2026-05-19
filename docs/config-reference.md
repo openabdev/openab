@@ -222,6 +222,27 @@ Speech-to-text transcription for voice messages. Uses an OpenAI-compatible `/aud
 
 ---
 
+## `[steering]`
+
+Mid-turn steering message support. When enabled, messages matching the configured criteria are injected directly into a running agent session's stdin, bypassing the normal dispatch queue.
+
+```toml
+[steering]
+enabled  = false       # default: false (backward compatible)
+prefix   = "!!"        # trigger prefix
+mode     = "prefix"    # "off" | "prefix" | "implicit"
+fallback = "queue"     # "queue" | "drop" | "error"
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable steering message support. |
+| `prefix` | string | `"!!"` | Trigger prefix for `mode = "prefix"`. The prefix is stripped before the message is sent to the agent. |
+| `mode` | string | `"prefix"` | Detection mode: `"off"` disables steering; `"prefix"` only steers messages starting with `prefix`; `"implicit"` treats any message sent while the agent is busy as steering. |
+| `fallback` | string | `"queue"` | Behavior when steering injection fails (e.g. agent does not support mid-turn input): `"queue"` falls back to normal buffered dispatch; `"drop"` silently drops the message; `"error"` sends an error reply to the user. |
+
+---
+
 ## `[cron]`
 
 Everything cron-related lives under `[cron]`.

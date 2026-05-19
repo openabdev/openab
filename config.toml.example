@@ -134,6 +134,16 @@ tables = "code"  # "code" (default) | "bullets" | "off"
                  # bullets: convert each row into bullet points (• Header: Value)
                  # off: pass through unchanged
 
+# --- Steering messages (mid-turn injection) ---
+# When enabled, messages matching the steering criteria are written directly
+# to the agent's stdin while it is busy, allowing real-time redirection.
+#
+# [steering]
+# enabled = false                    # default: false (backward compatible)
+# prefix = "!!"                      # trigger prefix for prefix mode
+# mode = "prefix"                    # "off" | "prefix" (default) | "implicit"
+# fallback = "queue"                 # "queue" (default) | "drop" | "error"
+
 [reactions]
 enabled = true
 remove_after_reply = false

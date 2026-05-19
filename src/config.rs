@@ -4,6 +4,90 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Controls whether steering messages are enabled and how they are detected.
+///
+/// - `Off` (default): feature disabled; all messages use normal queueing.
+/// - `Prefix`: only messages starting with the configured prefix are treated as steering.
+/// - `Implicit`: any message sent while the agent is busy is treated as steering (opt-in).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SteeringMode {
+    #[default]
+    Off,
+    Prefix,
+    Implicit,
+}
+
+impl<'de> Deserialize<'de> for SteeringMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "off" | "false" | "none" => Ok(Self::Off),
+            "prefix" => Ok(Self::Prefix),
+            "implicit" => Ok(Self::Implicit),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["off", "prefix", "implicit"],
+            )),
+        }
+    }
+}
+
+/// Controls fallback behavior when a steering message cannot be injected.
+///
+/// - `Queue` (default): fall back to normal buffered dispatch.
+/// - `Drop`: silently drop the message.
+/// - `Error`: send an error reply to the user.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SteeringFallback {
+    #[default]
+    Queue,
+    Drop,
+    Error,
+}
+
+impl<'de> Deserialize<'de> for SteeringFallback {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "queue" => Ok(Self::Queue),
+            "drop" => Ok(Self::Drop),
+            "error" => Ok(Self::Error),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["queue", "drop", "error"],
+            )),
+        }
+    }
+}
+
+/// Steering message configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SteeringConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_steering_prefix")]
+    pub prefix: String,
+    #[serde(default)]
+    pub mode: SteeringMode,
+    #[serde(default)]
+    pub fallback: SteeringFallback,
+}
+
+fn default_steering_prefix() -> String {
+    "!!".into()
+}
+
+impl Default for SteeringConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            prefix: default_steering_prefix(),
+            mode: SteeringMode::default(),
+            fallback: SteeringFallback::default(),
+        }
+    }
+}
+
 /// Controls how incoming messages are dispatched to ACP turns.
 ///
 /// - `Message` (default): each message becomes its own ACP turn (v0.8.2-beta.1 behaviour).
@@ -81,6 +165,8 @@ pub struct Config {
     pub markdown: MarkdownConfig,
     #[serde(default)]
     pub cron: CronConfig,
+    #[serde(default)]
+    pub steering: SteeringConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -921,5 +1007,73 @@ echo_transcript = false
         let cfg = parse_config(toml, "test").unwrap();
         assert!(cfg.stt.enabled);
         assert!(!cfg.stt.echo_transcript);
+    }
+
+    #[test]
+    fn steering_defaults_to_disabled() {
+        let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
+        assert!(!cfg.steering.enabled);
+        assert_eq!(cfg.steering.mode, SteeringMode::Off);
+        assert_eq!(cfg.steering.prefix, "!!");
+        assert_eq!(cfg.steering.fallback, SteeringFallback::Queue);
+    }
+
+    #[test]
+    fn steering_parses_prefix_mode() {
+        let toml = r#"
+[agent]
+command = "echo"
+
+[steering]
+enabled = true
+prefix = "/steer"
+mode = "prefix"
+fallback = "drop"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(cfg.steering.enabled);
+        assert_eq!(cfg.steering.mode, SteeringMode::Prefix);
+        assert_eq!(cfg.steering.prefix, "/steer");
+        assert_eq!(cfg.steering.fallback, SteeringFallback::Drop);
+    }
+
+    #[test]
+    fn steering_parses_implicit_mode() {
+        let toml = r#"
+[agent]
+command = "echo"
+
+[steering]
+enabled = true
+mode = "implicit"
+fallback = "error"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(cfg.steering.mode, SteeringMode::Implicit);
+        assert_eq!(cfg.steering.fallback, SteeringFallback::Error);
+    }
+
+    #[test]
+    fn steering_invalid_mode_errors() {
+        let toml = r#"
+[agent]
+command = "echo"
+
+[steering]
+mode = "bogus"
+"#;
+        assert!(parse_config(toml, "test").is_err());
+    }
+
+    #[test]
+    fn steering_invalid_fallback_errors() {
+        let toml = r#"
+[agent]
+command = "echo"
+
+[steering]
+fallback = "bogus"
+"#;
+        assert!(parse_config(toml, "test").is_err());
     }
 }
