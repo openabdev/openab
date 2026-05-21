@@ -1,0 +1,51 @@
+name: PR Watch — Upstream Activity Notify
+
+on:
+  schedule:
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check upstream activity and notify Discord
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SINCE: '2026-05-19T14:00:00Z'
+        run: |
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          FOUND=0
+          MSG=""
+
+          COMMENTS=$(gh api "/repos/openabdev/openab/issues/829/comments" \
+            --jq ".[] | select(.created_at > \"$SINCE\") | \"💬 [\(.user.login)] \(.created_at[:16]): \(.body[:120])\"" 2>/dev/null)
+          if [ -n "$COMMENTS" ]; then
+            FOUND=1
+            MSG="${MSG}\n**PR #829 — New Comments:**\n${COMMENTS}"
+          fi
+
+          REVIEWS=$(gh api "/repos/openabdev/openab/pulls/829/reviews" \
+            --jq ".[] | select(.submitted_at > \"$SINCE\") | \"🔍 [\(.user.login)] [\(.state)] \(.submitted_at[:16]): \(.body[:120])\"" 2>/dev/null)
+          if [ -n "$REVIEWS" ]; then
+            FOUND=1
+            MSG="${MSG}\n**PR #829 — New Reviews:**\n${REVIEWS}"
+          fi
+
+          PR_STATE=$(gh api /repos/openabdev/openab/pulls/829 \
+            --jq '"state=\(.state) mergeable=\(.mergeable_state) updated=\(.updated_at[:16])"' 2>/dev/null)
+          MSG="${MSG}\n**PR #829 Status:** ${PR_STATE}"
+
+          if [ "$FOUND" -eq 1 ]; then
+            HEADER="🔔 **GitHub Watch Report** | $(date -u '+%Y-%m-%d %H:%M UTC')"
+            FULL_MSG="${HEADER}\n${MSG}"
+          else
+            FULL_MSG="✅ **GitHub Watch** | $(date -u '+%Y-%m-%d %H:%M UTC') — No new activity on PR #829 since ${SINCE}."
+          fi
+
+          printf '%b' "$FULL_MSG" > /tmp/msg.txt
+          PAYLOAD=$(jq -n --rawfile msg /tmp/msg.txt '{content: $msg}')
+          curl -sf -X POST "$DISCORD_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD"
