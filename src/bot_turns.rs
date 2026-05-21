@@ -13,6 +13,11 @@ use std::collections::HashMap;
 /// between human resets.
 pub const HARD_BOT_TURN_LIMIT: u32 = 1000;
 
+/// Stable prefix used in all bot turn limit warning messages.
+/// Referenced by the dedup check in the Discord adapter — changing this
+/// string requires updating the dedup check too.
+pub const BOT_TURN_LIMIT_WARNING_PREFIX: &str = "⚠️ Bot turn limit reached";
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum TurnResult {
     /// Counter below limits — continue normally.

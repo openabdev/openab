@@ -1,7 +1,7 @@
 use crate::acp::protocol::ConfigOption;
 use crate::acp::ContentBlock;
 use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
-use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
+use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::format;
 use crate::media;
@@ -2167,16 +2167,20 @@ fn should_process_user_message(
 
 /// Returns true if any bot message in `messages` contains a turn limit warning.
 /// Used to dedup `WarnAndStop` across multiple bot processes sharing a thread. (#530)
+/// Note: this is best-effort — a narrow race window exists where two bots fetch
+/// simultaneously and both see no warning, resulting in a duplicate. For most
+/// deployments this is acceptable; strict once-only semantics would require
+/// shared state (e.g. gateway-owned emission or distributed lock).
 fn turn_limit_warning_present(messages: &[Message]) -> bool {
     messages
         .iter()
-        .any(|m| m.author.bot && m.content.contains("Bot turn limit reached"))
+        .any(|m| m.author.bot && m.content.contains(BOT_TURN_LIMIT_WARNING_PREFIX))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bot_turns::{TurnResult, HARD_BOT_TURN_LIMIT};
+    use crate::bot_turns::{TurnResult, HARD_BOT_TURN_LIMIT, BOT_TURN_LIMIT_WARNING_PREFIX};
 
     // --- resolve_mentions tests ---
 
@@ -2992,14 +2996,16 @@ mod tests {
 
     #[test]
     fn dedup_detects_existing_bot_warning() {
-        let msgs = vec![make_message(true, "⚠️ Bot turn limit reached (20/20). A human must reply.")];
+        let msg = format!("{} (20/20). A human must reply.", BOT_TURN_LIMIT_WARNING_PREFIX);
+        let msgs = vec![make_message(true, &msg)];
         assert!(turn_limit_warning_present(&msgs));
     }
 
     #[test]
     fn dedup_ignores_human_warning_text() {
         // Same text from a human should not count as a warning
-        let msgs = vec![make_message(false, "⚠️ Bot turn limit reached (20/20). A human must reply.")];
+        let msg = format!("{} (20/20). A human must reply.", BOT_TURN_LIMIT_WARNING_PREFIX);
+        let msgs = vec![make_message(false, &msg)];
         assert!(!turn_limit_warning_present(&msgs));
     }
 
