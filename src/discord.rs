@@ -397,7 +397,25 @@ impl EventHandler for Handler {
                                 .bot_participated_in_thread(&ctx.http, msg.channel_id, bot_id)
                                 .await;
                             if participated {
-                                let _ = msg.channel_id.say(&ctx.http, &user_message).await;
+                                // Dedup: skip if another bot already posted the same
+                                // warning in this thread. Prevents N duplicate warnings
+                                // when N bot processes each hit the soft limit. (#530)
+                                let already_warned = msg
+                                    .channel_id
+                                    .messages(
+                                        &ctx.http,
+                                        serenity::builder::GetMessages::new().limit(10),
+                                    )
+                                    .await
+                                    .unwrap_or_default()
+                                    .iter()
+                                    .any(|m| {
+                                        m.author.bot
+                                            && m.content.contains("Bot turn limit reached")
+                                    });
+                                if !already_warned {
+                                    let _ = msg.channel_id.say(&ctx.http, &user_message).await;
+                                }
                             }
                         }
                         return;
