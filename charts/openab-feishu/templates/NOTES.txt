@@ -1,0 +1,73 @@
+🎉 OpenAB Feishu bot deployed!
+
+{{- if include "openab-feishu.tunnelEnabled" . }}
+Pod: {{ include "openab-feishu.fullname" . }} (3 containers: openab, gateway, cloudflared)
+Mode: webhook (with Cloudflare Tunnel)
+{{- else }}
+Pod: {{ include "openab-feishu.fullname" . }} (2 containers: openab, gateway)
+Mode: websocket (outbound-only, no public endpoint needed)
+{{- end }}
+
+## Post-Install Steps
+
+{{- if eq .Values.feishu.connectionMode "websocket" }}
+
+### Step 1: Configure Feishu Open Platform (one-time)
+
+1. Go to https://open.feishu.cn → Create or select your app
+2. Under "Event Subscriptions" → Connection mode: select "WebSocket"
+3. Subscribe to event: im.message.receive_v1
+4. Under "Permissions", add:
+   - im:message (Send and receive messages)
+   - im:message.group_at_msg (Receive group @messages)
+   - im:resource (Download message resources)
+   - contact:user.base:readonly (Read user basic info — for display names)
+5. Publish the app version
+
+No public URL or webhook configuration needed — the gateway connects outbound.
+
+{{- else }}
+
+### Step 1: Configure Cloudflare Tunnel ingress
+
+Option A — Via Cloudflare Dashboard:
+  https://one.dash.cloudflare.com/ → Networks → Tunnels → your tunnel → Public Hostname → Add:
+    Hostname: {{ .Values.webhookDomain | default "bot.example.com" }}
+    Type: HTTP
+    URL: localhost:8080
+
+### Step 2: Configure Feishu Open Platform
+
+1. Go to https://open.feishu.cn → Create or select your app
+2. Under "Event Subscriptions" → Connection mode: select "HTTP"
+3. Set Request URL: https://{{ .Values.webhookDomain | default "YOUR_DOMAIN" }}/webhook/feishu
+   (The gateway must be running — Feishu sends a challenge request immediately)
+4. Subscribe to event: im.message.receive_v1
+5. Under "Permissions", add:
+   - im:message
+   - im:message.group_at_msg
+   - im:resource
+   - contact:user.base:readonly
+6. Publish the app version
+
+{{- end }}
+
+### {{ if eq .Values.feishu.connectionMode "websocket" }}Step 2{{ else }}Step 3{{ end }}: Authenticate the agent
+
+The agent needs a one-time OAuth login:
+
+  kubectl exec -it deployment/{{ include "openab-feishu.fullname" . }} -n {{ .Release.Namespace }} -c openab -- {{ .Values.agent.command }} login --use-device-flow
+
+Then restart to pick up credentials:
+
+  kubectl rollout restart deployment/{{ include "openab-feishu.fullname" . }} -n {{ .Release.Namespace }}
+
+## Verify
+
+Send a message to your bot on Feishu (DM or @mention in a group). Check logs if no response:
+
+  kubectl logs -n {{ .Release.Namespace }} deployment/{{ include "openab-feishu.fullname" . }} -c openab --tail=20
+  kubectl logs -n {{ .Release.Namespace }} deployment/{{ include "openab-feishu.fullname" . }} -c gateway --tail=20
+{{- if include "openab-feishu.tunnelEnabled" . }}
+  kubectl logs -n {{ .Release.Namespace }} deployment/{{ include "openab-feishu.fullname" . }} -c cloudflared --tail=20
+{{- end }}

@@ -1,0 +1,116 @@
+# openab-feishu values
+#
+# Install (WebSocket mode — default, no tunnel needed):
+#   helm install my-bot ./charts/openab-feishu \
+#     --set feishu.appId="cli_xxx" \
+#     --set feishu.appSecret="xxx" \
+#     --namespace openab --create-namespace
+#
+# Required:
+#   feishu.appId       -- Feishu/Lark App ID (from open.feishu.cn)
+#   feishu.appSecret   -- Feishu/Lark App Secret
+#
+# Optional:
+#   feishu.domain              -- "feishu" (default, China) or "lark" (overseas)
+#   feishu.connectionMode      -- "websocket" (default) or "webhook"
+#   tunnel.enabled             -- Enable cloudflared sidecar (auto-enabled in webhook mode)
+#   tunnel.token               -- Cloudflare Tunnel token (required if tunnel.enabled)
+
+# -- Feishu/Lark application credentials
+feishu:
+  # -- (required unless existingSecret is set) App ID from Feishu Open Platform
+  appId: ""
+  # -- (required unless existingSecret is set) App Secret
+  appSecret: ""
+  # -- "feishu" for feishu.cn (China) or "lark" for larksuite.com (overseas)
+  domain: "feishu"
+  # -- "websocket" (default, outbound-only, no public endpoint needed) or "webhook"
+  connectionMode: "websocket"
+  # -- (webhook mode only) Verification token from Feishu Open Platform
+  verificationToken: ""
+  # -- (webhook mode only) Encrypt key for event signature verification
+  encryptKey: ""
+
+# -- Use a pre-existing K8s Secret instead of creating one from --set values.
+# The Secret must contain keys: feishu-app-id, feishu-app-secret
+# Optional keys: feishu-verification-token, feishu-encrypt-key, cloudflare-tunnel-token
+existingSecret: ""
+
+# -- Cloudflare Tunnel sidecar (only needed for webhook mode)
+tunnel:
+  # -- Enable tunnel sidecar. Auto-enabled when connectionMode=webhook and token is set.
+  enabled: false
+  # -- Cloudflare Tunnel token
+  token: ""
+  image: cloudflare/cloudflared
+  tag: "2026.5.0"
+
+# -- Webhook domain (shown in post-install notes)
+webhookDomain: ""
+
+# -- Release channel: "stable" or "beta"
+channel: stable
+
+# -- OAB agent image
+image:
+  repository: ghcr.io/openabdev/openab
+  tag: ""  # defaults to channel
+  pullPolicy: IfNotPresent
+
+# -- Gateway image
+gateway:
+  image: ghcr.io/openabdev/openab-gateway
+  tag: "v0.5.1"
+
+# -- Agent configuration
+agent:
+  command: kiro-cli
+  args:
+    - acp
+    - --trust-all-tools
+  workingDir: /home/agent
+  env: {}
+  secretEnv: []
+  pool:
+    maxSessions: 10
+    sessionTtlHours: 24
+  reactions:
+    enabled: true
+    removeAfterReply: false
+
+# -- Gateway platform settings
+platform:
+  # -- Require @mention in groups (recommended for shared groups)
+  requireMention: true
+  # -- Feishu group chat IDs allowed (empty = all groups)
+  allowedGroups: []
+  # -- Feishu user open_ids allowed (empty = all users)
+  allowedUsers: []
+
+# -- Persistence for agent working directory
+persistence:
+  enabled: true
+  existingClaim: ""
+  storageClass: ""
+  size: 1Gi
+
+# -- Pod-level settings
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL

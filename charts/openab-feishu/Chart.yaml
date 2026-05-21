@@ -1,0 +1,6 @@
+apiVersion: v2
+name: openab-feishu
+description: OpenAB + Feishu/Lark — single-pod deployment with gateway (WebSocket by default, optional Cloudflare Tunnel for webhook mode).
+type: application
+version: 0.1.0
+appVersion: "0.8.3"

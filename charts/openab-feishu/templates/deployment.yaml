@@ -1,0 +1,180 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "openab-feishu.fullname" . }}
+  labels:
+    {{- include "openab-feishu.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "openab-feishu.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print .Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print .Template.BasePath "/secret.yaml") . | sha256sum }}
+      labels:
+        {{- include "openab-feishu.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        # --- OAB agent (main) ---
+        - name: openab
+          image: {{ include "openab-feishu.agentImage" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            - name: HOME
+              value: {{ .Values.agent.workingDir | default "/home/agent" }}
+            {{- range $k, $v := .Values.agent.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+            {{- range .Values.agent.secretEnv }}
+            - name: {{ .name }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .secretName }}
+                  key: {{ .secretKey }}
+            {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/openab
+              readOnly: true
+            {{- if .Values.persistence.enabled }}
+            - name: data
+              mountPath: {{ .Values.agent.workingDir | default "/home/agent" }}
+            {{- end }}
+            - name: tmp
+              mountPath: /tmp
+
+        # --- Gateway (sidecar) ---
+        - name: gateway
+          image: {{ include "openab-feishu.gatewayImage" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: HOME
+              value: {{ .Values.agent.workingDir | default "/home/agent" }}
+            - name: FEISHU_APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab-feishu.secretName" . }}
+                  key: feishu-app-id
+            - name: FEISHU_APP_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab-feishu.secretName" . }}
+                  key: feishu-app-secret
+            - name: FEISHU_DOMAIN
+              value: {{ .Values.feishu.domain | quote }}
+            - name: FEISHU_CONNECTION_MODE
+              value: {{ .Values.feishu.connectionMode | quote }}
+            {{- if .Values.feishu.verificationToken }}
+            - name: FEISHU_VERIFICATION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab-feishu.secretName" . }}
+                  key: feishu-verification-token
+            {{- end }}
+            {{- if .Values.feishu.encryptKey }}
+            - name: FEISHU_ENCRYPT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab-feishu.secretName" . }}
+                  key: feishu-encrypt-key
+            {{- end }}
+            {{- if .Values.platform.requireMention }}
+            - name: FEISHU_REQUIRE_MENTION
+              value: "true"
+            {{- else }}
+            - name: FEISHU_REQUIRE_MENTION
+              value: "false"
+            {{- end }}
+            {{- if .Values.platform.allowedGroups }}
+            - name: FEISHU_ALLOWED_GROUPS
+              value: {{ join "," .Values.platform.allowedGroups | quote }}
+            {{- end }}
+            {{- if .Values.platform.allowedUsers }}
+            - name: FEISHU_ALLOWED_USERS
+              value: {{ join "," .Values.platform.allowedUsers | quote }}
+            {{- end }}
+          volumeMounts:
+            {{- if .Values.persistence.enabled }}
+            - name: data
+              mountPath: {{ .Values.agent.workingDir | default "/home/agent" }}
+            {{- end }}
+            - name: tmp
+              mountPath: /tmp
+
+        {{- if include "openab-feishu.tunnelEnabled" . }}
+        # --- Cloudflared tunnel (sidecar, webhook mode only) ---
+        - name: cloudflared
+          image: {{ printf "%s:%s" .Values.tunnel.image .Values.tunnel.tag }}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          args:
+            - tunnel
+            - --no-autoupdate
+            - run
+            - --token
+            - $(TUNNEL_TOKEN)
+          env:
+            - name: TUNNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab-feishu.secretName" . }}
+                  key: cloudflare-tunnel-token
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+        {{- end }}
+
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "openab-feishu.fullname" . }}
+        {{- if .Values.persistence.enabled }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim | default (include "openab-feishu.fullname" .) }}
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
