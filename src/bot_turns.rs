@@ -80,8 +80,9 @@ impl BotTurnTracker {
                 severity: TurnSeverity::Soft,
                 turns: n,
                 user_message: format!(
-                    "⚠️ Bot turn limit reached ({n}/{soft}). \
+                    "{} ({n}/{soft}). \
                      A human must reply in this thread to continue bot-to-bot conversation.",
+                    BOT_TURN_LIMIT_WARNING_PREFIX,
                     soft = self.soft_limit,
                 ),
             },
@@ -89,8 +90,9 @@ impl BotTurnTracker {
                 severity: TurnSeverity::Hard,
                 turns: HARD_BOT_TURN_LIMIT,
                 user_message: format!(
-                    "🛑 Hard bot turn limit reached ({HARD_BOT_TURN_LIMIT}). \
-                     A human must reply to continue."
+                    "🛑 {} ({HARD_BOT_TURN_LIMIT}/{HARD_BOT_TURN_LIMIT} hard limit). \
+                     A human must reply to continue.",
+                    BOT_TURN_LIMIT_WARNING_PREFIX,
                 ),
             },
             TurnResult::Throttled | TurnResult::Stopped => TurnAction::SilentStop,
@@ -281,9 +283,11 @@ mod tests {
             TurnAction::WarnAndStop {
                 severity: TurnSeverity::Soft,
                 turns: 3,
-                user_message: "⚠️ Bot turn limit reached (3/3). \
-                               A human must reply in this thread to continue bot-to-bot conversation."
-                    .to_string(),
+                user_message: format!(
+                    "{} (3/3). \
+                     A human must reply in this thread to continue bot-to-bot conversation.",
+                    BOT_TURN_LIMIT_WARNING_PREFIX,
+                ),
             },
         );
     }
@@ -309,8 +313,10 @@ mod tests {
                 severity: TurnSeverity::Hard,
                 turns: HARD_BOT_TURN_LIMIT,
                 user_message: format!(
-                    "🛑 Hard bot turn limit reached ({HARD_BOT_TURN_LIMIT}). \
-                     A human must reply to continue."
+                user_message: format!(
+                    "🛑 {} ({HARD_BOT_TURN_LIMIT}/{HARD_BOT_TURN_LIMIT} hard limit). \
+                     A human must reply to continue.",
+                    BOT_TURN_LIMIT_WARNING_PREFIX,
                 ),
             },
         );
