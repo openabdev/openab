@@ -90,9 +90,8 @@ impl BotTurnTracker {
                 severity: TurnSeverity::Hard,
                 turns: HARD_BOT_TURN_LIMIT,
                 user_message: format!(
-                    "🛑 {} ({HARD_BOT_TURN_LIMIT}/{HARD_BOT_TURN_LIMIT} hard limit). \
-                     A human must reply to continue.",
-                    BOT_TURN_LIMIT_WARNING_PREFIX,
+                    "🛑 Hard bot turn limit reached ({HARD_BOT_TURN_LIMIT}). \
+                     A human must reply to continue."
                 ),
             },
             TurnResult::Throttled | TurnResult::Stopped => TurnAction::SilentStop,
@@ -313,10 +312,8 @@ mod tests {
                 severity: TurnSeverity::Hard,
                 turns: HARD_BOT_TURN_LIMIT,
                 user_message: format!(
-                user_message: format!(
-                    "🛑 {} ({HARD_BOT_TURN_LIMIT}/{HARD_BOT_TURN_LIMIT} hard limit). \
-                     A human must reply to continue.",
-                    BOT_TURN_LIMIT_WARNING_PREFIX,
+                    "🛑 Hard bot turn limit reached ({HARD_BOT_TURN_LIMIT}). \
+                     A human must reply to continue."
                 ),
             },
         );
