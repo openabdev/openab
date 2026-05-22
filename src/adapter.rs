@@ -564,7 +564,7 @@ impl AdapterRouter {
                                 continue;
                             }
                             if let Some(ref err) = notification.error {
-                                response_error = Some(format_coded_error(err.code, &err.message));
+                                response_error = Some(format_coded_error(err));
                             }
                             break;
                         }

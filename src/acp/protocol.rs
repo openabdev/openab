@@ -55,11 +55,32 @@ pub struct JsonRpcMessage {
 pub struct JsonRpcError {
     pub code: i64,
     pub message: String,
+    // Optional diagnostic payload per JSON-RPC 2.0 §5.1. ACP adapters
+    // (codex-acp in particular) put actionable detail in `data.details`
+    // — without it, every -32603 surfaces to the user as the same opaque
+    // "Internal Error" regardless of cause (model deprecation, auth
+    // failure, missing peer dep, …). See `data_details()`.
+    #[serde(default)]
+    pub data: Option<Value>,
+}
+
+impl JsonRpcError {
+    /// Returns the `data.details` string if `data` is an object with a string
+    /// `details` field. Mirrors the codex-acp / acpx convention:
+    /// <https://github.com/openclaw/acpx/blob/main/src/acp/error-normalization.ts>
+    pub fn data_details(&self) -> Option<&str> {
+        self.data.as_ref()?.get("details")?.as_str()
+    }
 }
 
 impl std::fmt::Display for JsonRpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "JSON-RPC error {}: {}", self.code, self.message)
+        match self.data_details() {
+            Some(d) if !d.is_empty() && !self.message.contains(d) => {
+                write!(f, "JSON-RPC error {}: {} ({})", self.code, self.message, d)
+            }
+            _ => write!(f, "JSON-RPC error {}: {}", self.code, self.message),
+        }
     }
 }
 
@@ -381,5 +402,70 @@ mod tests {
         let opts = parse_config_options(&result);
         assert_eq!(opts.len(), 1);
         assert_eq!(opts[0].id, "model");
+    }
+
+    // ─── JsonRpcError data passthrough ──────────────────────────────────────
+
+    #[test]
+    fn jsonrpc_error_deserializes_without_data_field() {
+        // Backward compat: pre-existing agents that emit just {code, message}
+        // must still deserialize cleanly.
+        let raw = json!({"code": -32602, "message": "Invalid params"});
+        let err: JsonRpcError = serde_json::from_value(raw).unwrap();
+        assert_eq!(err.code, -32602);
+        assert_eq!(err.message, "Invalid params");
+        assert!(err.data.is_none());
+        assert!(err.data_details().is_none());
+    }
+
+    #[test]
+    fn jsonrpc_error_deserializes_with_data_details() {
+        // codex-acp shape observed in the wild
+        let raw = json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": {"details": "model 'gpt-5.2-codex' is no longer supported"}
+        });
+        let err: JsonRpcError = serde_json::from_value(raw).unwrap();
+        assert_eq!(err.code, -32603);
+        assert_eq!(
+            err.data_details(),
+            Some("model 'gpt-5.2-codex' is no longer supported")
+        );
+    }
+
+    #[test]
+    fn jsonrpc_error_data_details_is_none_for_non_string() {
+        let raw = json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": {"details": 42}
+        });
+        let err: JsonRpcError = serde_json::from_value(raw).unwrap();
+        assert!(err.data_details().is_none());
+        assert!(err.data.is_some(), "raw data is preserved for callers");
+    }
+
+    #[test]
+    fn jsonrpc_error_display_appends_details_when_present() {
+        let err = JsonRpcError {
+            code: -32603,
+            message: "Internal error".into(),
+            data: Some(json!({"details": "model deprecated"})),
+        };
+        assert_eq!(
+            err.to_string(),
+            "JSON-RPC error -32603: Internal error (model deprecated)"
+        );
+    }
+
+    #[test]
+    fn jsonrpc_error_display_omits_details_when_absent() {
+        let err = JsonRpcError {
+            code: -32602,
+            message: "Invalid params".into(),
+            data: None,
+        };
+        assert_eq!(err.to_string(), "JSON-RPC error -32602: Invalid params");
     }
 }

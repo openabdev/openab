@@ -51,8 +51,13 @@ pub fn format_user_error(message: &str) -> String {
 /// Format coded error from ACP agent for display in Discord.
 /// Used for response errors that have a JSON-RPC or HTTP status code.
 /// Public for reuse by other adapters (e.g. Slack).
-pub fn format_coded_error(code: i64, message: &str) -> String {
-    let prefix = match code {
+///
+/// When the upstream JSON-RPC error carries `data.details` (codex-acp /
+/// acpx convention), the detail string is appended so users can tell
+/// apart causes that otherwise share a single code+label (e.g. -32603
+/// "Internal Error" for model deprecation vs. auth vs. peer-dep failure).
+pub fn format_coded_error(err: &crate::acp::protocol::JsonRpcError) -> String {
+    let prefix = match err.code {
         400 => "**Bad Request**",
         401 => "**Unauthorized**",
         403 => "**Forbidden**",
@@ -70,11 +75,19 @@ pub fn format_coded_error(code: i64, message: &str) -> String {
         -32099..=-32000 => "**Server Error**",
         _ => "**Error**",
     };
-    if message.is_empty() {
-        format!("{} (code: {})", prefix, code)
-    } else {
-        format!("{} (code: {})\n{}", prefix, code, message)
-    }
+    let head = format!("{} (code: {})", prefix, err.code);
+    let details = err.data_details().unwrap_or("").trim();
+
+    let body = match (err.message.as_str(), details) {
+        ("", "") => return head,
+        ("", d) => d.to_string(),
+        (m, "") => m.to_string(),
+        // Avoid duplicate text when the adapter already echoed `details`
+        // into `message` (some agents do this for legacy clients).
+        (m, d) if m.contains(d) => m.to_string(),
+        (m, d) => format!("{}\n{}", m, d),
+    };
+    format!("{}\n{}", head, body)
 }
 
 #[cfg(test)]
@@ -164,9 +177,28 @@ mod tests {
 
     // ─── format_coded_error tests ───────────────────────────────────────────
 
+    use crate::acp::protocol::JsonRpcError;
+    use serde_json::json;
+
+    fn err(code: i64, message: &str) -> JsonRpcError {
+        JsonRpcError {
+            code,
+            message: message.into(),
+            data: None,
+        }
+    }
+
+    fn err_with_data(code: i64, message: &str, data: serde_json::Value) -> JsonRpcError {
+        JsonRpcError {
+            code,
+            message: message.into(),
+            data: Some(data),
+        }
+    }
+
     #[test]
     fn test_format_coded_error_401() {
-        let result = format_coded_error(401, "invalid token");
+        let result = format_coded_error(&err(401, "invalid token"));
         assert!(result.contains("Unauthorized"));
         assert!(result.contains("401"));
         assert!(result.contains("invalid token"));
@@ -174,7 +206,7 @@ mod tests {
 
     #[test]
     fn test_format_coded_error_429() {
-        let result = format_coded_error(429, "");
+        let result = format_coded_error(&err(429, ""));
         assert!(result.contains("Rate Limited"));
         assert!(result.contains("429"));
         assert!(!result.contains("\n")); // no message, no newline
@@ -182,7 +214,7 @@ mod tests {
 
     #[test]
     fn test_format_coded_error_503() {
-        let result = format_coded_error(503, "service unavailable");
+        let result = format_coded_error(&err(503, "service unavailable"));
         assert!(result.contains("Service Unavailable"));
         assert!(result.contains("503"));
         assert!(result.contains("service unavailable"));
@@ -190,30 +222,103 @@ mod tests {
 
     #[test]
     fn test_format_coded_error_json_rpc() {
-        let result = format_coded_error(-32602, "missing required parameter");
+        let result = format_coded_error(&err(-32602, "missing required parameter"));
         assert!(result.contains("Invalid Params"));
         assert!(result.contains("-32602"));
     }
 
     #[test]
     fn test_format_coded_error_server_error_range() {
-        let result = format_coded_error(-32050, "internal failure");
+        let result = format_coded_error(&err(-32050, "internal failure"));
         assert!(result.contains("Server Error"));
         assert!(result.contains("-32050"));
     }
 
     #[test]
     fn test_format_coded_error_connection_error() {
-        let result = format_coded_error(-32000, "connection refused");
+        let result = format_coded_error(&err(-32000, "connection refused"));
         assert!(result.contains("Server Error")); // -32000 falls in -32099..=-32000 range
         assert!(result.contains("-32000"));
     }
 
     #[test]
     fn test_format_coded_error_unknown_code() {
-        let result = format_coded_error(999, "something happened");
+        let result = format_coded_error(&err(999, "something happened"));
         assert!(result.contains("Error"));
         assert!(result.contains("999"));
         assert!(result.contains("something happened"));
+    }
+
+    // ─── data.details surfacing (new behavior) ─────────────────────────────
+
+    #[test]
+    fn test_format_coded_error_appends_data_details() {
+        // codex-acp model deprecation: message is generic, details has model id
+        let result = format_coded_error(&err_with_data(
+            -32603,
+            "Internal error",
+            json!({"details": "model 'gpt-5.2-codex' is no longer supported"}),
+        ));
+        assert!(result.contains("Internal Error"));
+        assert!(result.contains("-32603"));
+        assert!(result.contains("Internal error"));
+        assert!(result.contains("gpt-5.2-codex"));
+    }
+
+    #[test]
+    fn test_format_coded_error_details_only_when_message_empty() {
+        let result = format_coded_error(&err_with_data(
+            -32603,
+            "",
+            json!({"details": "query closed before response received"}),
+        ));
+        assert!(result.contains("Internal Error"));
+        assert!(result.contains("query closed before response received"));
+    }
+
+    #[test]
+    fn test_format_coded_error_no_duplicate_when_message_contains_details() {
+        // Some adapters echo details into message for legacy clients
+        let result = format_coded_error(&err_with_data(
+            -32603,
+            "Internal error: session timed out",
+            json!({"details": "session timed out"}),
+        ));
+        assert_eq!(result.matches("session timed out").count(), 1);
+    }
+
+    #[test]
+    fn test_format_coded_error_ignores_non_string_details() {
+        let result = format_coded_error(&err_with_data(
+            -32603,
+            "Internal error",
+            json!({"details": {"nested": "object"}}),
+        ));
+        assert!(result.contains("Internal error"));
+        assert!(!result.contains("nested"));
+        assert!(!result.contains("object"));
+    }
+
+    #[test]
+    fn test_format_coded_error_ignores_unknown_data_shape() {
+        let result = format_coded_error(&err_with_data(
+            -32603,
+            "Internal error",
+            json!({"unrelated": "field"}),
+        ));
+        assert!(result.contains("Internal error"));
+        assert!(!result.contains("unrelated"));
+    }
+
+    #[test]
+    fn test_format_coded_error_handles_empty_details_string() {
+        let result = format_coded_error(&err_with_data(
+            -32603,
+            "Internal error",
+            json!({"details": "   "}),
+        ));
+        // Whitespace-only details must not produce a trailing blank line.
+        assert!(!result.ends_with('\n'));
+        assert!(result.contains("Internal error"));
     }
 }

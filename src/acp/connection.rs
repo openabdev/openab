@@ -246,6 +246,7 @@ pub(crate) async fn run_reader_loop<R, W>(
             error: Some(crate::acp::protocol::JsonRpcError {
                 code: -1,
                 message: "connection closed".into(),
+                data: None,
             }),
             params: None,
         });
