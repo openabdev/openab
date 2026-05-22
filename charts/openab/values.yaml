@@ -59,6 +59,14 @@ agents:
     #   #     secretName: my-secrets
     #   #     secretKey: GEMINI_API_KEY
     #   secretEnv: []
+    #   # MCP servers forwarded to ACP session/new and session/load.
+    #   # Example:
+    #   # mcpServers:
+    #   #   local-tools:
+    #   #     command: example-mcp-server
+    #   #     args: ["--data-dir", "/home/agent/.cache/example-mcp"]
+    #   #     env: {}
+    #   mcpServers: {}
     #   pool:
     #     maxSessions: 10
     #     sessionTtlHours: 24
@@ -272,6 +280,14 @@ agents:
     # Load env vars from existing Secrets or ConfigMaps, e.g. GH_TOKEN.
     envFrom: []
     secretEnv: []  # list of {name, secretName, secretKey} — rendered as valueFrom.secretKeyRef; keys auto-added to inherit_env
+    # MCP servers forwarded to ACP session/new and session/load.
+    # Example:
+    # mcpServers:
+    #   local-tools:
+    #     command: example-mcp-server
+    #     args: ["--data-dir", "/home/agent/.cache/example-mcp"]
+    #     env: {}
+    mcpServers: {}
     pool:
       maxSessions: 10
       sessionTtlHours: 24

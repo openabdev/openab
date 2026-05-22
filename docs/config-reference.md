@@ -100,8 +100,44 @@ The AI agent subprocess that OpenAB spawns to handle messages via ACP.
 | `working_dir` | string | `"/tmp"` | Working directory for the agent process. |
 | `env` | map | `{}` | Extra environment variables (e.g. `{ OPENAI_API_KEY = "${OPENAI_API_KEY}" }`). |
 | `inherit_env` | string[] | `[]` | Env var names to inherit from the OAB process (e.g. vars injected via K8s `envFrom`). Keys in `env` take precedence. |
+| `mcp_servers` | table | `{}` | MCP servers forwarded to the ACP agent in `session/new` and `session/load`. |
 
 > **Default inherited vars:** After `env_clear()`, the agent always receives `HOME`, `PATH`, and `USER` (on Windows: `USERPROFILE`, `USERNAME`, `PATH`, `SystemRoot`, `SystemDrive`). Use `inherit_env` to pass additional vars beyond this baseline.
+
+### Agent MCP servers
+
+Configure MCP servers under `[agent.mcp_servers.<name>]`. OpenAB forwards these entries to ACP-compatible agents that support client MCP servers, including `codex-acp` and `claude-agent-acp`.
+
+Stdio server example:
+
+```toml
+[agent.mcp_servers.local_tools]
+command = "example-mcp-server"
+args = ["--data-dir", "/home/agent/.cache/example-mcp"]
+env = { MCP_STORAGE = "/home/agent/.cache/example-mcp" }
+```
+
+HTTP server example:
+
+```toml
+[agent.mcp_servers.remote_tools]
+type = "http"
+url = "https://mcp.example.com/mcp"
+headers = { Authorization = "${REMOTE_MCP_AUTH_HEADER}" }
+```
+
+Supported fields:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `type` | string | `"stdio"` | MCP transport: `"stdio"`, `"http"`, or `"sse"`. |
+| `command` | string | *required for stdio* | Local command to launch a stdio MCP server. |
+| `args` | string[] | `[]` | Arguments passed to the stdio MCP server command. |
+| `env` | map | `{}` | Environment variables passed to the stdio MCP server. |
+| `url` | string | *required for http/sse* | Remote MCP server URL. |
+| `headers` | map | `{}` | Headers sent to a remote HTTP or SSE MCP server. |
+
+> **Security note:** MCP servers run inside the agent trust boundary. OpenAB still clears the child process environment before spawning the agent, so platform credentials such as Discord and Slack tokens are not passed unless you explicitly put them in `[agent].env`, `inherit_env`, or an MCP server `env`/`headers` value.
 
 ### Agent examples
 

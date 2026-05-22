@@ -71,6 +71,17 @@ working_dir = "/home/agent"
 # To pass additional env vars from the OAB process (e.g. vars injected via K8s envFrom),
 # list them in inherit_env. Keys in [agent].env take precedence over inherited ones.
 # inherit_env = ["API_BASE_URL", "MODEL_NAME"]
+#
+# To forward MCP servers to agents that support ACP client MCP servers:
+# [agent.mcp_servers.local_tools]
+# command = "example-mcp-server"
+# args = ["--data-dir", "/home/agent/.cache/example-mcp"]
+# env = { MCP_STORAGE = "/home/agent/.cache/example-mcp" }
+#
+# [agent.mcp_servers.remote_tools]
+# type = "http"
+# url = "https://mcp.example.com/mcp"
+# headers = { Authorization = "${REMOTE_MCP_AUTH_HEADER}" }
 
 # [agent]
 # command = "codex"

@@ -34,6 +34,7 @@ Each agent lives under `agents.<name>`.
 | `workingDir` | Working directory and HOME inside the container. | `"/home/agent"` |
 | `env` | Inline environment variables passed to the agent process. | `{}` |
 | `envFrom` | Additional environment sources from existing Secrets or ConfigMaps. | `[]` |
+| `mcpServers` | MCP servers forwarded to ACP `session/new` and `session/load`. | `{}` |
 | `pool.maxSessions` | Maximum concurrent ACP sessions for the agent. | `10` |
 | `pool.sessionTtlHours` | Idle session TTL in hours. | `24` |
 | `reactions.enabled` | Enable status reactions. | `true` |
@@ -81,6 +82,25 @@ agents:
 ```
 
 This is useful for credentials such as `GH_TOKEN` without storing them directly in Helm values.
+
+### Forward MCP servers
+
+```yaml
+agents:
+  codex:
+    command: codex-acp
+    workingDir: /home/agent
+    mcpServers:
+      local-tools:
+        command: example-mcp-server
+        args:
+          - --data-dir
+          - /home/agent/.cache/example-mcp
+        env:
+          MCP_STORAGE: /home/agent/.cache/example-mcp
+```
+
+OpenAB renders this as `[agent.mcp_servers."local-tools"]` and forwards it to ACP agents that support client MCP servers.
 
 ### Provide `AGENTS.md` with `--set-file`
 

@@ -1066,6 +1066,7 @@ mod tests {
             working_dir: "/tmp".into(),
             env: std::collections::HashMap::new(),
             inherit_env: vec![],
+            mcp_servers: std::collections::HashMap::new(),
         };
         let pool = Arc::new(SessionPool::new(agent_cfg, 1));
         let router = Arc::new(AdapterRouter::new(

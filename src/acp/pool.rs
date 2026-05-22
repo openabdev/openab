@@ -163,6 +163,8 @@ impl SessionPool {
             }
         }
 
+        let mcp_servers = self.config.acp_mcp_servers()?;
+
         // Build the replacement connection outside the state lock so one stuck
         // initialization does not block all unrelated sessions.
         let mut new_conn = AcpConnection::spawn(
@@ -179,7 +181,10 @@ impl SessionPool {
         let mut resumed = false;
         if let Some(ref sid) = saved_session_id {
             if new_conn.supports_load_session {
-                match new_conn.session_load(sid, &self.config.working_dir).await {
+                match new_conn
+                    .session_load(sid, &self.config.working_dir, &mcp_servers)
+                    .await
+                {
                     Ok(()) => {
                         info!(thread_id, session_id = %sid, "session resumed via session/load");
                         resumed = true;
@@ -192,7 +197,9 @@ impl SessionPool {
         }
 
         if !resumed {
-            new_conn.session_new(&self.config.working_dir).await?;
+            new_conn
+                .session_new(&self.config.working_dir, &mcp_servers)
+                .await?;
             // Surface the reset banner both for restored sessions and for stale
             // live entries that died before we could recover a resumable
             // session id. In both cases the caller is continuing after an

@@ -158,3 +158,55 @@ tests:
       - notMatchRegex:
           path: data["config.toml"]
           pattern: 'inherit_env'
+
+  - it: renders MCP stdio servers
+    set:
+      agents.kiro.mcpServers:
+        local-tools:
+          command: example-mcp-server
+          args:
+            - "--data-dir"
+            - "/home/agent/.cache/example-mcp"
+          env:
+            MCP_STORAGE: /home/agent/.cache/example-mcp
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[agent\.mcp_servers\."local-tools"\]'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'command = "example-mcp-server"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'args = \["--data-dir","/home/agent/.cache/example-mcp"\]'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'env = \{ MCP_STORAGE = "/home/agent/.cache/example-mcp" \}'
+
+  - it: renders MCP HTTP servers
+    set:
+      agents.kiro.mcpServers:
+        remote-tools:
+          type: http
+          url: https://mcp.example.com/mcp
+          headers:
+            Authorization: "${REMOTE_MCP_AUTH_HEADER}"
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[agent\.mcp_servers\."remote-tools"\]'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'type = "http"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'url = "https://mcp.example.com/mcp"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'headers = \{ Authorization = "\$\{REMOTE_MCP_AUTH_HEADER\}" \}'
+
+  - it: does not render MCP servers when unset
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: 'mcp_servers'

@@ -154,6 +154,28 @@ data:
     {{- if $mergedInheritEnv }}
     inherit_env = {{ $mergedInheritEnv | toJson }}
     {{- end }}
+    {{- range $serverName, $server := $cfg.mcpServers }}
+
+    [agent.mcp_servers.{{ $serverName | toJson }}]
+    {{- if $server.type }}
+    type = {{ $server.type | toJson }}
+    {{- end }}
+    {{- if $server.command }}
+    command = {{ $server.command | toJson }}
+    {{- end }}
+    {{- if $server.args }}
+    args = {{ $server.args | toJson }}
+    {{- end }}
+    {{- if $server.url }}
+    url = {{ $server.url | toJson }}
+    {{- end }}
+    {{- if $server.env }}
+    env = { {{ $first := true }}{{ range $k, $v := $server.env }}{{ if not $first }}, {{ end }}{{ $k }} = {{ $v | toJson }}{{ $first = false }}{{ end }} }
+    {{- end }}
+    {{- if $server.headers }}
+    headers = { {{ $first := true }}{{ range $k, $v := $server.headers }}{{ if not $first }}, {{ end }}{{ $k }} = {{ $v | toJson }}{{ $first = false }}{{ end }} }
+    {{- end }}
+    {{- end }}
 
     [pool]
     max_sessions = {{ ($cfg.pool).maxSessions | default 10 }}

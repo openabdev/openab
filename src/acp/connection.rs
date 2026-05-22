@@ -10,6 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tracing::{debug, error, info, trace};
 
 /// Pick the most permissive selectable permission option from ACP options.
@@ -74,6 +75,48 @@ fn build_permission_response(params: Option<&Value>) -> Value {
     }
 }
 
+fn session_new_params(cwd: &str, mcp_servers: &[Value]) -> Value {
+    json!({"cwd": cwd, "mcpServers": mcp_servers})
+}
+
+fn session_load_params(session_id: &str, cwd: &str, mcp_servers: &[Value]) -> Value {
+    json!({"sessionId": session_id, "cwd": cwd, "mcpServers": mcp_servers})
+}
+
+fn redact_acp_log_data(data: &str) -> String {
+    let trimmed = data.trim();
+    let Ok(mut value) = serde_json::from_str::<Value>(trimmed) else {
+        return trimmed.to_owned();
+    };
+
+    if let Some(servers) = value
+        .get_mut("params")
+        .and_then(|params| params.get_mut("mcpServers"))
+        .and_then(Value::as_array_mut)
+    {
+        for server in servers {
+            redact_name_value_array(server, "env");
+            redact_name_value_array(server, "headers");
+        }
+    }
+
+    serde_json::to_string(&value).unwrap_or_else(|_| trimmed.to_owned())
+}
+
+fn redact_name_value_array(value: &mut Value, field: &str) {
+    let Some(entries) = value.get_mut(field).and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    for entry in entries {
+        if let Some(object) = entry.as_object_mut() {
+            if object.contains_key("value") {
+                object.insert("value".to_owned(), Value::String("[redacted]".to_owned()));
+            }
+        }
+    }
+}
+
 fn expand_env(val: &str) -> String {
     if val.starts_with("${") && val.ends_with('}') {
         let key = &val[2..val.len() - 1];
@@ -82,7 +125,6 @@ fn expand_env(val: &str) -> String {
         val.to_string()
     }
 }
-use tokio::time::Instant;
 
 /// A content block for the ACP prompt — either text or image.
 #[derive(Debug, Clone)]
@@ -371,7 +413,8 @@ impl AcpConnection {
                         Ok(_) => {
                             let trimmed = line.trim();
                             if !trimmed.is_empty() {
-                                let sanitized: String = trimmed.chars()
+                                let sanitized: String = trimmed
+                                    .chars()
                                     .filter(|c| !c.is_control() || *c == '\t')
                                     .collect();
                                 if !sanitized.is_empty() {
@@ -421,7 +464,9 @@ impl AcpConnection {
     }
 
     pub(crate) async fn send_raw(&self, data: &str) -> Result<()> {
-        debug!(data = data.trim(), "acp_send");
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(data = redact_acp_log_data(data), "acp_send");
+        }
         let mut w = self.stdin.lock().await;
         w.write_all(data.as_bytes()).await?;
         w.write_all(b"\n").await?;
@@ -482,9 +527,9 @@ impl AcpConnection {
         Ok(())
     }
 
-    pub async fn session_new(&mut self, cwd: &str) -> Result<String> {
+    pub async fn session_new(&mut self, cwd: &str, mcp_servers: &[Value]) -> Result<String> {
         let resp = self
-            .send_request("session/new", Some(json!({"cwd": cwd, "mcpServers": []})))
+            .send_request("session/new", Some(session_new_params(cwd, mcp_servers)))
             .await?;
 
         let session_id = resp
@@ -640,11 +685,16 @@ impl AcpConnection {
 
     /// Resume a previous session by ID. Returns Ok(()) if the agent accepted
     /// the load, or an error if it failed (caller should fall back to session/new).
-    pub async fn session_load(&mut self, session_id: &str, cwd: &str) -> Result<()> {
+    pub async fn session_load(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        mcp_servers: &[Value],
+    ) -> Result<()> {
         let resp = self
             .send_request(
                 "session/load",
-                Some(json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []})),
+                Some(session_load_params(session_id, cwd, mcp_servers)),
             )
             .await?;
         // Accept any non-error response as success
@@ -699,8 +749,11 @@ impl Drop for AcpConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_agent_env, build_permission_response, pick_best_option};
-    use serde_json::json;
+    use super::{
+        build_agent_env, build_permission_response, pick_best_option, redact_acp_log_data,
+        session_load_params, session_new_params,
+    };
+    use serde_json::{json, Value};
 
     #[test]
     fn picks_allow_always_over_other_options() {
@@ -794,6 +847,91 @@ mod tests {
     }
 
     #[test]
+    fn session_new_params_include_mcp_servers() {
+        let servers = vec![json!({
+            "name": "local-tools",
+            "command": "example-mcp-server",
+            "args": ["--data-dir", "/tmp/example-mcp"],
+            "env": []
+        })];
+
+        assert_eq!(
+            session_new_params("/workspace", &servers),
+            json!({
+                "cwd": "/workspace",
+                "mcpServers": servers
+            })
+        );
+    }
+
+    #[test]
+    fn session_load_params_include_mcp_servers() {
+        let servers = vec![json!({
+            "name": "local-tools",
+            "command": "example-mcp-server",
+            "args": [],
+            "env": []
+        })];
+
+        assert_eq!(
+            session_load_params("session-1", "/workspace", &servers),
+            json!({
+                "sessionId": "session-1",
+                "cwd": "/workspace",
+                "mcpServers": servers
+            })
+        );
+    }
+
+    #[test]
+    fn redacts_mcp_server_env_and_headers_from_log_data() {
+        let data = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/new",
+            "params": {
+                "cwd": "/workspace",
+                "mcpServers": [
+                    {
+                        "name": "remote-memory",
+                        "type": "http",
+                        "url": "https://mcp.example.test/mcp",
+                        "headers": [
+                            {"name": "Authorization", "value": "Bearer secret-token"}
+                        ]
+                    },
+                    {
+                        "name": "local-tools",
+                        "command": "mcp-server",
+                        "args": [],
+                        "env": [
+                            {"name": "MCP_API_KEY", "value": "env-secret"}
+                        ]
+                    }
+                ]
+            }
+        }))
+        .unwrap();
+
+        let redacted = redact_acp_log_data(&data);
+
+        assert!(!redacted.contains("Bearer secret-token"));
+        assert!(!redacted.contains("env-secret"));
+        assert!(redacted.contains("remote-memory"));
+        assert!(redacted.contains("local-tools"));
+
+        let value: Value = serde_json::from_str(&redacted).unwrap();
+        assert_eq!(
+            value["params"]["mcpServers"][0]["headers"][0]["value"],
+            "[redacted]"
+        );
+        assert_eq!(
+            value["params"]["mcpServers"][1]["env"][0]["value"],
+            "[redacted]"
+        );
+    }
+
+    #[test]
     fn explicit_env_takes_precedence_over_inherit_env() {
         let key = "OAB_TEST_PRECEDENCE";
         std::env::set_var(key, "from_process");
@@ -872,13 +1010,10 @@ mod reader_loop_tests {
         agent_stdout_writer.write_all(stale).await.unwrap();
         agent_stdout_writer.flush().await.unwrap();
 
-        let forwarded = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            sub_rx.recv(),
-        )
-        .await
-        .expect("subscriber should receive stale message before timeout")
-        .expect("subscriber channel should not be closed");
+        let forwarded = tokio::time::timeout(std::time::Duration::from_secs(2), sub_rx.recv())
+            .await
+            .expect("subscriber should receive stale message before timeout")
+            .expect("subscriber channel should not be closed");
         assert_eq!(forwarded.id, Some(42));
         assert!(pending.lock().await.is_empty());
 

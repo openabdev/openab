@@ -310,6 +310,99 @@ pub struct AgentConfig {
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub inherit_env: Vec<String>,
+    #[serde(default)]
+    pub mcp_servers: HashMap<String, AgentMcpServerConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AgentMcpServerConfig {
+    /// MCP transport type. Omit for stdio.
+    #[serde(default, rename = "type")]
+    pub server_type: Option<String>,
+    /// Stdio server command.
+    pub command: Option<String>,
+    /// Stdio server arguments.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// HTTP or SSE server URL.
+    pub url: Option<String>,
+    /// Stdio server environment.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// HTTP or SSE request headers.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+
+impl AgentConfig {
+    pub fn acp_mcp_servers(&self) -> anyhow::Result<Vec<serde_json::Value>> {
+        let mut servers: Vec<_> = self.mcp_servers.iter().collect();
+        servers.sort_by_key(|(name, _)| *name);
+        servers
+            .into_iter()
+            .map(|(name, config)| config.to_acp_value(name))
+            .collect()
+    }
+}
+
+impl AgentMcpServerConfig {
+    fn to_acp_value(&self, name: &str) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(
+            !name.trim().is_empty(),
+            "agent.mcp_servers name cannot be empty"
+        );
+
+        match self
+            .server_type
+            .as_deref()
+            .unwrap_or("stdio")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "stdio" => {
+                let command = self.command.as_deref().unwrap_or("").trim();
+                anyhow::ensure!(
+                    !command.is_empty(),
+                    "agent.mcp_servers.{name}.command is required for stdio MCP servers"
+                );
+                Ok(serde_json::json!({
+                    "name": name,
+                    "command": command,
+                    "args": &self.args,
+                    "env": name_value_entries(&self.env),
+                }))
+            }
+            "http" | "sse" => {
+                let server_type = self.server_type.as_deref().unwrap_or("http");
+                let url = self.url.as_deref().unwrap_or("").trim();
+                anyhow::ensure!(
+                    !url.is_empty(),
+                    "agent.mcp_servers.{name}.url is required for {server_type} MCP servers"
+                );
+                let mut value = serde_json::json!({
+                    "name": name,
+                    "type": server_type.to_ascii_lowercase(),
+                    "url": url,
+                });
+                if !self.headers.is_empty() {
+                    value["headers"] = serde_json::Value::Array(name_value_entries(&self.headers));
+                }
+                Ok(value)
+            }
+            other => anyhow::bail!(
+                "agent.mcp_servers.{name}.type must be one of: stdio, http, sse (got {other})"
+            ),
+        }
+    }
+}
+
+fn name_value_entries(map: &HashMap<String, String>) -> Vec<serde_json::Value> {
+    let mut entries: Vec<_> = map.iter().collect();
+    entries.sort_by_key(|(name, _)| *name);
+    entries
+        .into_iter()
+        .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -664,6 +757,7 @@ fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
         config.pool.liveness_check_secs > 0,
         "pool.liveness_check_secs must be > 0 (zero would spin the recv loop)"
     );
+    let _ = config.agent.acp_mcp_servers()?;
 
     Ok(config)
 }
@@ -686,8 +780,140 @@ command = "echo"
         let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
         assert_eq!(cfg.discord.unwrap().bot_token, "test-token");
         assert_eq!(cfg.agent.command, "echo");
+        assert!(cfg.agent.mcp_servers.is_empty());
+        assert_eq!(
+            cfg.agent.acp_mcp_servers().unwrap(),
+            Vec::<serde_json::Value>::new()
+        );
         assert_eq!(cfg.pool.max_sessions, 10);
         assert!(cfg.reactions.enabled);
+    }
+
+    #[test]
+    fn parse_agent_mcp_stdio_config() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "codex-acp"
+
+[agent.mcp_servers.local_tools]
+command = "example-mcp-server"
+args = ["--data-dir", "/tmp/example-mcp"]
+env = { MCP_STORAGE = "/tmp/example-mcp" }
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let servers = cfg.agent.acp_mcp_servers().unwrap();
+        assert_eq!(
+            servers,
+            vec![serde_json::json!({
+                "name": "local_tools",
+                "command": "example-mcp-server",
+                "args": ["--data-dir", "/tmp/example-mcp"],
+                "env": [
+                    {"name": "MCP_STORAGE", "value": "/tmp/example-mcp"}
+                ]
+            })]
+        );
+    }
+
+    #[test]
+    fn parse_agent_mcp_http_config() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "codex-acp"
+
+[agent.mcp_servers.memory]
+type = "http"
+url = "https://example.test/mcp"
+headers = { Authorization = "Bearer test" }
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let servers = cfg.agent.acp_mcp_servers().unwrap();
+        assert_eq!(
+            servers,
+            vec![serde_json::json!({
+                "name": "memory",
+                "type": "http",
+                "url": "https://example.test/mcp",
+                "headers": [
+                    {"name": "Authorization", "value": "Bearer test"}
+                ]
+            })]
+        );
+    }
+
+    #[test]
+    fn parse_agent_mcp_sse_config() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "codex-acp"
+
+[agent.mcp_servers.events]
+type = "sse"
+url = "https://example.test/events"
+headers = { Authorization = "Bearer test" }
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let servers = cfg.agent.acp_mcp_servers().unwrap();
+        assert_eq!(
+            servers,
+            vec![serde_json::json!({
+                "name": "events",
+                "type": "sse",
+                "url": "https://example.test/events",
+                "headers": [
+                    {"name": "Authorization", "value": "Bearer test"}
+                ]
+            })]
+        );
+    }
+
+    #[test]
+    fn agent_mcp_servers_are_sorted_by_name() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "codex-acp"
+
+[agent.mcp_servers.zeta]
+command = "zeta-mcp"
+
+[agent.mcp_servers.alpha]
+command = "alpha-mcp"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let servers = cfg.agent.acp_mcp_servers().unwrap();
+        let names: Vec<_> = servers
+            .iter()
+            .map(|server| server["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn parse_agent_mcp_stdio_requires_command() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "codex-acp"
+
+[agent.mcp_servers.bad]
+args = ["--flag"]
+"#;
+        let err = parse_config(toml, "test").unwrap_err().to_string();
+        assert!(err.contains("agent.mcp_servers.bad.command is required"));
     }
 
     #[test]
