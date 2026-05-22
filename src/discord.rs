@@ -400,15 +400,19 @@ impl EventHandler for Handler {
                                 // Dedup: skip if another bot already posted the same
                                 // warning in this thread. Prevents N duplicate warnings
                                 // when N bot processes each hit the soft limit. (#530)
-                                let already_warned = turn_limit_warning_present(
-                                    &msg.channel_id
-                                        .messages(
-                                            &ctx.http,
-                                            serenity::builder::GetMessages::new().limit(10),
-                                        )
-                                        .await
-                                        .unwrap_or_default(),
-                                );
+                                let recent = msg
+                                    .channel_id
+                                    .messages(
+                                        &ctx.http,
+                                        serenity::builder::GetMessages::new().limit(10),
+                                    )
+                                    .await
+                                    .unwrap_or_default();
+                                let pairs: Vec<(bool, &str)> = recent
+                                    .iter()
+                                    .map(|m| (m.author.bot, m.content.as_str()))
+                                    .collect();
+                                let already_warned = turn_limit_warning_present(&pairs);
                                 if !already_warned {
                                     let _ = msg.channel_id.say(&ctx.http, &user_message).await;
                                 }
@@ -2171,10 +2175,14 @@ fn should_process_user_message(
 /// simultaneously and both see no warning, resulting in a duplicate. For most
 /// deployments this is acceptable; strict once-only semantics would require
 /// shared state (e.g. gateway-owned emission or distributed lock).
-fn turn_limit_warning_present(messages: &[Message]) -> bool {
+///
+/// Accepts `(is_bot, content)` pairs so the logic can be unit-tested without
+/// constructing `serenity::model::channel::Message` values (see existing test
+/// boundary comment at `format_thread_export`).
+fn turn_limit_warning_present(messages: &[(bool, &str)]) -> bool {
     messages
         .iter()
-        .any(|m| m.author.bot && m.content.contains(BOT_TURN_LIMIT_WARNING_PREFIX))
+        .any(|(is_bot, content)| *is_bot && content.contains(BOT_TURN_LIMIT_WARNING_PREFIX))
 }
 
 #[cfg(test)]
@@ -2968,54 +2976,21 @@ mod tests {
 
     // --- WarnAndStop dedup tests (#530) ---
 
-    fn make_message(is_bot: bool, content: &str) -> Message {
-        serde_json::from_value(serde_json::json!({
-            "id": "1",
-            "channel_id": "1",
-            "author": {
-                "id": "1",
-                "username": "bot",
-                "discriminator": "0000",
-                "bot": is_bot,
-                "avatar": null
-            },
-            "content": content,
-            "timestamp": "2026-01-01T00:00:00+00:00",
-            "edited_timestamp": null,
-            "tts": false,
-            "mention_everyone": false,
-            "mentions": [],
-            "mention_roles": [],
-            "attachments": [],
-            "embeds": [],
-            "pinned": false,
-            "type": 0
-        }))
-        .expect("valid Message JSON")
-    }
-
     #[test]
     fn dedup_detects_existing_bot_warning() {
         let msg = format!("{} (20/20). A human must reply.", BOT_TURN_LIMIT_WARNING_PREFIX);
-        let msgs = vec![make_message(true, &msg)];
-        assert!(turn_limit_warning_present(&msgs));
+        assert!(turn_limit_warning_present(&[(true, &msg)]));
     }
 
     #[test]
     fn dedup_ignores_human_warning_text() {
-        // Same text from a human should not count as a warning
         let msg = format!("{} (20/20). A human must reply.", BOT_TURN_LIMIT_WARNING_PREFIX);
-        let msgs = vec![make_message(false, &msg)];
-        assert!(!turn_limit_warning_present(&msgs));
+        assert!(!turn_limit_warning_present(&[(false, &msg)]));
     }
 
     #[test]
     fn dedup_returns_false_when_no_warning() {
-        let msgs = vec![
-            make_message(true, "hello"),
-            make_message(false, "world"),
-        ];
-        assert!(!turn_limit_warning_present(&msgs));
+        assert!(!turn_limit_warning_present(&[(true, "hello"), (false, "world")]));
     }
 
     #[test]
