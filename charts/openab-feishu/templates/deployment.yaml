@@ -15,7 +15,9 @@ spec:
     metadata:
       annotations:
         checksum/config: {{ include (print .Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if not .Values.existingSecret }}
         checksum/secret: {{ include (print .Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
       labels:
         {{- include "openab-feishu.selectorLabels" . | nindent 8 }}
     spec:
@@ -90,19 +92,21 @@ spec:
               value: {{ .Values.feishu.domain | quote }}
             - name: FEISHU_CONNECTION_MODE
               value: {{ .Values.feishu.connectionMode | quote }}
-            {{- if .Values.feishu.verificationToken }}
+            {{- if or .Values.feishu.verificationToken (eq .Values.feishu.connectionMode "webhook") }}
             - name: FEISHU_VERIFICATION_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ include "openab-feishu.secretName" . }}
                   key: feishu-verification-token
+                  optional: true
             {{- end }}
-            {{- if .Values.feishu.encryptKey }}
+            {{- if or .Values.feishu.encryptKey (eq .Values.feishu.connectionMode "webhook") }}
             - name: FEISHU_ENCRYPT_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ include "openab-feishu.secretName" . }}
                   key: feishu-encrypt-key
+                  optional: true
             {{- end }}
             {{- if .Values.platform.requireMention }}
             - name: FEISHU_REQUIRE_MENTION
@@ -128,6 +132,9 @@ spec:
               mountPath: /tmp
 
         {{- if include "openab-feishu.tunnelEnabled" . }}
+        {{- if and (not .Values.tunnel.token) (not .Values.existingSecret) }}
+        {{- fail "tunnel.token is required when the cloudflared tunnel is enabled (set tunnel.token, or supply credentials via existingSecret with a cloudflare-tunnel-token key)" }}
+        {{- end }}
         # --- Cloudflared tunnel (sidecar, webhook mode only) ---
         - name: cloudflared
           image: {{ printf "%s:%s" .Values.tunnel.image .Values.tunnel.tag }}

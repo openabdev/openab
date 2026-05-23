@@ -11,7 +11,7 @@ data:
     args = {{ .Values.agent.args | default list | toJson }}
     working_dir = {{ .Values.agent.workingDir | default "/home/agent" | toJson }}
     {{- if .Values.agent.env }}
-    env = { {{ $first := true }}{{ range $k, $v := .Values.agent.env }}{{ if not $first }}, {{ end }}{{ $k }} = {{ $v | toJson }}{{ $first = false }}{{ end }} }
+    env = { {{ range $i, $k := (.Values.agent.env | keys | sortAlpha) }}{{ if gt $i 0 }}, {{ end }}{{ $k }} = {{ index $.Values.agent.env $k | toJson }}{{ end }} }
     {{- end }}
     {{- $secretEnvKeys := list }}
     {{- range .Values.agent.secretEnv }}{{ $secretEnvKeys = append $secretEnvKeys .name }}{{ end }}
@@ -24,8 +24,8 @@ data:
     session_ttl_hours = {{ .Values.agent.pool.sessionTtlHours | default 24 }}
 
     [reactions]
-    enabled = {{ .Values.agent.reactions.enabled | default true }}
-    remove_after_reply = {{ .Values.agent.reactions.removeAfterReply | default false }}
+    enabled = {{ .Values.agent.reactions.enabled }}
+    remove_after_reply = {{ .Values.agent.reactions.removeAfterReply }}
 
     [gateway]
     url = "ws://localhost:8080/ws"
