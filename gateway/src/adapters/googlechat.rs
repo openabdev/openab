@@ -2439,4 +2439,32 @@ mod tests {
         .await;
         assert!(result.is_none(), "oversized image must be rejected");
     }
+
+    #[test]
+    fn parses_http_endpoint_url_top_level_envelope() {
+        let envelope: GoogleChatEnvelope = serde_json::from_value(serde_json::json!({
+            "message": {
+                "name": "spaces/AAAA/messages/BBBB",
+                "text": "hello",
+                "attachment": []
+            },
+            "user": {
+                "name": "users/123",
+                "displayName": "Test User",
+                "type": "HUMAN"
+            },
+            "space": {
+                "name": "spaces/AAAA",
+                "type": "DM"
+            }
+        }))
+        .unwrap();
+        assert!(envelope.chat.is_none());
+        assert!(envelope.message.is_some());
+        assert_eq!(envelope.message.unwrap().name, "spaces/AAAA/messages/BBBB");
+        assert!(envelope.user.is_some());
+        assert_eq!(envelope.user.unwrap().name, "users/123");
+        assert!(envelope.space.is_some());
+        assert_eq!(envelope.space.unwrap().name, "spaces/AAAA");
+    }
 }
