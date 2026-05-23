@@ -25,11 +25,22 @@ const TEXT_FILE_COUNT_CAP: usize = 5;
 /// Cap on aggregate text file bytes per message (matches Discord/Slack 1 MB).
 const TEXT_TOTAL_CAP: u64 = 1024 * 1024;
 
-// --- Google Chat types (v2 envelope format) ---
+// --- Google Chat types ---
+//
+// Google Chat delivers webhooks in two shapes depending on the App's
+// Connection settings in the Cloud Console:
+//   - HTTP endpoint URL mode: top-level fields (message, user, space, ...)
+//   - Pub/Sub mode:           wrapped under `chat.messagePayload`
+// Both are supported via the optional fields below; the handler prefers
+// the wrapped form and falls back to top-level when `chat` is absent.
 
 #[derive(Debug, Deserialize)]
 pub struct GoogleChatEnvelope {
     pub chat: Option<ChatPayload>,
+    // HTTP endpoint URL top-level fields (used when `chat` is None)
+    pub message: Option<GoogleChatMessage>,
+    pub user: Option<GoogleChatUser>,
+    pub space: Option<GoogleChatSpace>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,20 +143,20 @@ pub struct GoogleChatSpace {
 
 const GOOGLE_CHAT_ISSUER: &str = "https://accounts.google.com";
 const GOOGLE_CHAT_JWKS_URL: &str = "https://www.googleapis.com/oauth2/v3/certs";
-const GOOGLE_CHAT_EMAIL_SUFFIX: &str = "@gcp-sa-gsuiteaddons.iam.gserviceaccount.com";
+const GOOGLE_CHAT_SIGNER_EMAIL: &str = "chat@system.gserviceaccount.com";
 const JWKS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// Verify the JWT's `email` claim belongs to a Google Chat service account.
-/// Google Chat webhooks use `service-{PROJECT_NUMBER}@gcp-sa-gsuiteaddons.iam.gserviceaccount.com`.
+/// Verify the JWT's `email` claim belongs to Google Chat.
+/// HTTP endpoint URL webhooks are signed by `chat@system.gserviceaccount.com`.
 /// Without this check, any Google-issued ID token would be accepted.
 fn verify_email_claim(claims: &serde_json::Value) -> Result<(), String> {
     let email = claims
         .get("email")
         .and_then(|v| v.as_str())
         .ok_or("missing email claim")?;
-    if !email.ends_with(GOOGLE_CHAT_EMAIL_SUFFIX) {
+    if email != GOOGLE_CHAT_SIGNER_EMAIL {
         return Err(format!(
-            "email claim mismatch: expected *{GOOGLE_CHAT_EMAIL_SUFFIX}, got {email}"
+            "email claim mismatch: expected {GOOGLE_CHAT_SIGNER_EMAIL}, got {email}"
         ));
     }
     Ok(())
@@ -484,13 +495,20 @@ pub async fn webhook(
         }
     };
 
-    let Some(chat) = envelope.chat else {
-        return empty_json_response();
+    // Try the Pub/Sub `chat`-wrapped shape first, then fall back to the
+    // HTTP endpoint URL top-level shape.
+    let (msg_opt, top_user, top_space) = if let Some(chat) = envelope.chat {
+        let user = chat.user;
+        let (msg, space) = match chat.message_payload {
+            Some(p) => (p.message, p.space),
+            None => (None, None),
+        };
+        (msg, user, space)
+    } else {
+        (envelope.message, envelope.user, envelope.space)
     };
-    let Some(payload) = chat.message_payload else {
-        return empty_json_response();
-    };
-    let Some(ref msg) = payload.message else {
+
+    let Some(ref msg) = msg_opt else {
         return empty_json_response();
     };
 
@@ -507,8 +525,8 @@ pub async fn webhook(
         return empty_json_response();
     }
 
-    let sender = msg.sender.as_ref().or(chat.user.as_ref());
-    let space = msg.space.as_ref().or(payload.space.as_ref());
+    let sender = msg.sender.as_ref().or(top_user.as_ref());
+    let space = msg.space.as_ref().or(top_space.as_ref());
 
     let is_bot = sender.map(|s| s.user_type == "BOT").unwrap_or(false);
     if is_bot {
@@ -1641,8 +1659,8 @@ mod tests {
     }
 
     #[test]
-    fn email_claim_accepts_gsuite_addons_account() {
-        let claims = serde_json::json!({"email": "service-123456@gcp-sa-gsuiteaddons.iam.gserviceaccount.com"});
+    fn email_claim_accepts_chat_system_account() {
+        let claims = serde_json::json!({"email": "chat@system.gserviceaccount.com"});
         assert!(verify_email_claim(&claims).is_ok());
     }
 
