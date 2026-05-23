@@ -34,6 +34,12 @@ feishu:
 # -- Use a pre-existing K8s Secret instead of creating one from --set values.
 # The Secret must contain keys: feishu-app-id, feishu-app-secret
 # Optional keys: feishu-verification-token, feishu-encrypt-key, cloudflare-tunnel-token
+#
+# NOTE: When existingSecret is set, the chart cannot track changes to the external
+# Secret's contents — rotating credentials will NOT automatically trigger a Pod
+# rollout. To enable automatic rollout on secret rotation, use a tool such as
+# Reloader (https://github.com/stakater/Reloader) and annotate the Deployment:
+#   kubectl annotate deployment <release-name> reloader.stakater.com/auto="true"
 existingSecret: ""
 
 # -- Cloudflare Tunnel sidecar (only needed for webhook mode)
