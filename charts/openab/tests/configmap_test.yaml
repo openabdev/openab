@@ -181,7 +181,7 @@ tests:
           pattern: 'args = \["--data-dir","/home/agent/.cache/example-mcp"\]'
       - matchRegex:
           path: data["config.toml"]
-          pattern: 'env = \{ MCP_STORAGE = "/home/agent/.cache/example-mcp" \}'
+          pattern: 'env = \{ "MCP_STORAGE" = "/home/agent/.cache/example-mcp" \}'
 
   - it: renders MCP HTTP servers
     set:
@@ -203,7 +203,25 @@ tests:
           pattern: 'url = "https://mcp.example.com/mcp"'
       - matchRegex:
           path: data["config.toml"]
-          pattern: 'headers = \{ Authorization = "\$\{REMOTE_MCP_AUTH_HEADER\}" \}'
+          pattern: 'headers = \{ "Authorization" = "\$\{REMOTE_MCP_AUTH_HEADER\}" \}'
+
+  - it: quotes MCP inline table keys
+    set:
+      agents.kiro.mcpServers:
+        remote-tools:
+          type: http
+          url: https://mcp.example.com/mcp
+          env:
+            MCP-STORAGE.PATH: /home/agent/.cache/example-mcp
+          headers:
+            X-API-Key: "${REMOTE_MCP_API_KEY}"
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'env = \{ "MCP-STORAGE\.PATH" = "/home/agent/.cache/example-mcp" \}'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'headers = \{ "X-API-Key" = "\$\{REMOTE_MCP_API_KEY\}" \}'
 
   - it: does not render MCP servers when unset
     asserts:

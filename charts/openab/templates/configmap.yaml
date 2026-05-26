@@ -141,7 +141,7 @@ data:
     args = {{ if $cfg.args }}{{ $cfg.args | toJson }}{{ else }}[]{{ end }}
     working_dir = {{ $cfg.workingDir | default "/home/agent" | toJson }}
     {{- if $cfg.env }}
-    env = { {{ $first := true }}{{ range $k, $v := $cfg.env }}{{ if not $first }}, {{ end }}{{ $k }} = {{ $v | toJson }}{{ $first = false }}{{ end }} }
+    env = { {{ $first := true }}{{ range $k, $v := $cfg.env }}{{ if not $first }}, {{ end }}{{ $k | toJson }} = {{ $v | toJson }}{{ $first = false }}{{ end }} }
     {{- end }}
     {{- range $cfg.secretEnv }}
     {{- if hasKey ($cfg.env | default dict) .name }}
@@ -170,10 +170,10 @@ data:
     url = {{ $server.url | toJson }}
     {{- end }}
     {{- if $server.env }}
-    env = { {{ $first := true }}{{ range $k, $v := $server.env }}{{ if not $first }}, {{ end }}{{ $k }} = {{ $v | toJson }}{{ $first = false }}{{ end }} }
+    env = { {{ $first := true }}{{ range $k, $v := $server.env }}{{ if not $first }}, {{ end }}{{ $k | toJson }} = {{ $v | toJson }}{{ $first = false }}{{ end }} }
     {{- end }}
     {{- if $server.headers }}
-    headers = { {{ $first := true }}{{ range $k, $v := $server.headers }}{{ if not $first }}, {{ end }}{{ $k }} = {{ $v | toJson }}{{ $first = false }}{{ end }} }
+    headers = { {{ $first := true }}{{ range $k, $v := $server.headers }}{{ if not $first }}, {{ end }}{{ $k | toJson }} = {{ $v | toJson }}{{ $first = false }}{{ end }} }
     {{- end }}
     {{- end }}
 
