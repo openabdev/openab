@@ -26,6 +26,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::{error, info, warn};
 
+/// Returns true for Discord errors that are permanent configuration failures
+/// (invalid token, disallowed intents). These should not be retried.
+fn is_fatal_discord_error(e: &serenity::Error) -> bool {
+    matches!(
+        e,
+        serenity::Error::Gateway(GatewayError::InvalidAuthentication)
+            | serenity::Error::Gateway(GatewayError::DisallowedGatewayIntents)
+    )
+}
+
 /// Wait for SIGINT (ctrl_c) or, on unix, SIGTERM. SIGTERM is what Kubernetes
 /// sends during pod termination, so handling it lets us run the full cleanup
 /// path (shard manager, ACP pool drain) instead of getting SIGKILL'd after the
@@ -468,6 +478,11 @@ async fn main() -> anyhow::Result<()> {
             {
                 Ok(c) => c,
                 Err(e) => {
+                    if is_fatal_discord_error(&e) {
+                        error!(err = %e, "discord client build failed with fatal error, not retrying");
+                        fatal_exit = true;
+                        break;
+                    }
                     error!(err = %e, backoff = backoff_secs, "discord client build failed, retrying");
                     if *discord_shutdown_rx.borrow() {
                         break;
@@ -493,19 +508,23 @@ async fn main() -> anyhow::Result<()> {
                         backoff_secs = 1;
                     }
                     match result {
-                        Err(serenity::Error::Gateway(GatewayError::DisallowedGatewayIntents)) => {
-                            error!(
-                                "Discord rejected privileged intents. \
-                                 Enable MESSAGE CONTENT INTENT at: \
-                                 https://discord.com/developers/applications → Bot → Privileged Gateway Intents"
-                            );
-                            true
-                        }
-                        Err(serenity::Error::Gateway(GatewayError::InvalidAuthentication)) => {
-                            error!(
-                                "Discord rejected bot token. \
-                                 Verify your bot_token in config.toml is correct and has not been reset."
-                            );
+                        Err(e) if is_fatal_discord_error(&e) => {
+                            match &e {
+                                serenity::Error::Gateway(GatewayError::DisallowedGatewayIntents) => {
+                                    error!(
+                                        "Discord rejected privileged intents. \
+                                         Enable MESSAGE CONTENT INTENT at: \
+                                         https://discord.com/developers/applications → Bot → Privileged Gateway Intents"
+                                    );
+                                }
+                                serenity::Error::Gateway(GatewayError::InvalidAuthentication) => {
+                                    error!(
+                                        "Discord rejected bot token. \
+                                         Verify your bot_token in config.toml is correct and has not been reset."
+                                    );
+                                }
+                                _ => error!(err = %e, "discord fatal gateway error, not retrying"),
+                            }
                             true
                         }
                         Err(e) => {
