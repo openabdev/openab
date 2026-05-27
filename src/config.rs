@@ -401,7 +401,7 @@ fn name_value_entries(map: &HashMap<String, String>) -> Vec<serde_json::Value> {
     entries.sort_by_key(|(name, _)| *name);
     entries
         .into_iter()
-        .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
+        .map(|(name, value)| serde_json::json!({ "name": name, "value": expand_env_vars(value) }))
         .collect()
 }
 
@@ -790,7 +790,7 @@ command = "echo"
     }
 
     #[test]
-    fn parse_agent_mcp_stdio_config() {
+    fn test_parse_agent_mcp_stdio_config_returns_acp_stdio_server() {
         let toml = r#"
 [discord]
 bot_token = "test-token"
@@ -819,7 +819,7 @@ env = { MCP_STORAGE = "/tmp/example-mcp" }
     }
 
     #[test]
-    fn parse_agent_mcp_http_config() {
+    fn test_parse_agent_mcp_http_config_returns_acp_http_server() {
         let toml = r#"
 [discord]
 bot_token = "test-token"
@@ -848,7 +848,7 @@ headers = { Authorization = "Bearer test" }
     }
 
     #[test]
-    fn parse_agent_mcp_sse_config() {
+    fn test_parse_agent_mcp_sse_config_returns_acp_sse_server() {
         let toml = r#"
 [discord]
 bot_token = "test-token"
@@ -877,7 +877,7 @@ headers = { Authorization = "Bearer test" }
     }
 
     #[test]
-    fn agent_mcp_servers_are_sorted_by_name() {
+    fn test_agent_mcp_servers_with_multiple_entries_returns_sorted_names() {
         let toml = r#"
 [discord]
 bot_token = "test-token"
@@ -901,7 +901,7 @@ command = "alpha-mcp"
     }
 
     #[test]
-    fn parse_agent_mcp_stdio_requires_command() {
+    fn test_parse_agent_mcp_stdio_without_command_returns_error() {
         let toml = r#"
 [discord]
 bot_token = "test-token"
@@ -914,6 +914,81 @@ args = ["--flag"]
 "#;
         let err = parse_config(toml, "test").unwrap_err().to_string();
         assert!(err.contains("agent.mcp_servers.bad.command is required"));
+    }
+
+    #[test]
+    fn test_agent_mcp_env_and_headers_with_env_vars_expand_in_acp_payload() {
+        std::env::set_var("AB_MCP_ENV_SECRET", "env-secret");
+        std::env::set_var("AB_MCP_HEADER_SECRET", "header-secret");
+
+        let mut local_env = HashMap::new();
+        local_env.insert(
+            "MCP_API_KEY".to_string(),
+            "prefix-${AB_MCP_ENV_SECRET}".to_string(),
+        );
+        let mut headers = HashMap::new();
+        headers.insert(
+            "Authorization".to_string(),
+            "Bearer ${AB_MCP_HEADER_SECRET}".to_string(),
+        );
+        let mut mcp_servers = HashMap::new();
+        mcp_servers.insert(
+            "local".to_string(),
+            AgentMcpServerConfig {
+                server_type: None,
+                command: Some("example-mcp-server".to_string()),
+                args: Vec::new(),
+                url: None,
+                env: local_env,
+                headers: HashMap::new(),
+            },
+        );
+        mcp_servers.insert(
+            "remote".to_string(),
+            AgentMcpServerConfig {
+                server_type: Some("http".to_string()),
+                command: None,
+                args: Vec::new(),
+                url: Some("https://example.test/mcp".to_string()),
+                env: HashMap::new(),
+                headers,
+            },
+        );
+        let cfg = AgentConfig {
+            command: "codex-acp".to_string(),
+            args: Vec::new(),
+            working_dir: "/workspace".to_string(),
+            env: HashMap::new(),
+            inherit_env: Vec::new(),
+            mcp_servers,
+        };
+
+        let servers = cfg.acp_mcp_servers().unwrap();
+
+        assert_eq!(
+            servers,
+            vec![
+                serde_json::json!({
+                    "name": "local",
+                    "command": "example-mcp-server",
+                    "args": [],
+                    "env": [
+                        {"name": "MCP_API_KEY", "value": "prefix-env-secret"}
+                    ]
+                }),
+                serde_json::json!({
+                    "name": "remote",
+                    "type": "http",
+                    "url": "https://example.test/mcp",
+                    "headers": [
+                        {"name": "Authorization", "value": "Bearer header-secret"}
+                    ]
+                })
+            ]
+        );
+
+        std::env::remove_var("AB_MCP_ENV_SECRET");
+        std::env::remove_var("AB_MCP_HEADER_SECRET");
     }
 
     #[test]

@@ -84,9 +84,10 @@ fn session_load_params(session_id: &str, cwd: &str, mcp_servers: &[Value]) -> Va
 }
 
 fn redact_acp_log_data(data: &str) -> String {
+    const REDACTION_FAILED: &str = "[redaction failed - raw log suppressed]";
     let trimmed = data.trim();
     let Ok(mut value) = serde_json::from_str::<Value>(trimmed) else {
-        return trimmed.to_owned();
+        return REDACTION_FAILED.to_owned();
     };
 
     if let Some(servers) = value
@@ -100,7 +101,7 @@ fn redact_acp_log_data(data: &str) -> String {
         }
     }
 
-    serde_json::to_string(&value).unwrap_or_else(|_| trimmed.to_owned())
+    serde_json::to_string(&value).unwrap_or_else(|_| REDACTION_FAILED.to_owned())
 }
 
 fn redact_name_value_array(value: &mut Value, field: &str) {
@@ -847,7 +848,7 @@ mod tests {
     }
 
     #[test]
-    fn session_new_params_include_mcp_servers() {
+    fn test_session_new_params_with_mcp_servers_includes_payload() {
         let servers = vec![json!({
             "name": "local-tools",
             "command": "example-mcp-server",
@@ -865,7 +866,7 @@ mod tests {
     }
 
     #[test]
-    fn session_load_params_include_mcp_servers() {
+    fn test_session_load_params_with_mcp_servers_includes_payload() {
         let servers = vec![json!({
             "name": "local-tools",
             "command": "example-mcp-server",
@@ -884,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn redacts_mcp_server_env_and_headers_from_log_data() {
+    fn test_redact_acp_log_data_with_mcp_credentials_redacts_values() {
         let data = serde_json::to_string(&json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -929,6 +930,16 @@ mod tests {
             value["params"]["mcpServers"][1]["env"][0]["value"],
             "[redacted]"
         );
+    }
+
+    #[test]
+    fn test_redact_acp_log_data_with_malformed_json_suppresses_raw_payload() {
+        let data = r#"{"params":{"mcpServers":[{"headers":[{"name":"Authorization","value":"Bearer secret"}]}"#;
+
+        let redacted = redact_acp_log_data(data);
+
+        assert_eq!(redacted, "[redaction failed - raw log suppressed]");
+        assert!(!redacted.contains("Bearer secret"));
     }
 
     #[test]
