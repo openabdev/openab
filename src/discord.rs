@@ -655,6 +655,7 @@ impl EventHandler for Handler {
             .member
             .as_ref()
             .and_then(|m| m.nick.as_ref())
+            .or(msg.author.global_name.as_ref())
             .unwrap_or(&msg.author.name);
         let sender = build_sender_context(
             &msg.author.id.to_string(),
