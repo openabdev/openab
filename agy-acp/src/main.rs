@@ -9,6 +9,8 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+const DEFAULT_AGY_MODEL: &str = "Gemini 3.5 Flash (Medium)";
+
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
     id: Option<u64>,
@@ -61,13 +63,75 @@ impl Adapter {
     fn new() -> Self {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         let state_dir = PathBuf::from(&home).join(".openab/agy-acp");
+        let working_dir = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "/tmp".to_string());
+        let settings_file = PathBuf::from(&home).join(".gemini/antigravity-cli/settings.json");
+        let default_model =
+            std::env::var("AGY_DEFAULT_MODEL").unwrap_or_else(|_| DEFAULT_AGY_MODEL.to_string());
+        Self::ensure_default_settings(&settings_file, &default_model, &working_dir);
+
         Self {
             sessions: HashMap::new(),
-            working_dir: std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| "/tmp".to_string()),
+            working_dir,
             conversations_dir: PathBuf::from(&home).join(".gemini/antigravity-cli/conversations"),
             state_file: state_dir.join("sessions.json"),
+        }
+    }
+
+    /// Seed Antigravity's native settings file when no model is configured.
+    ///
+    /// agy print mode does not expose a `--model` flag, so model selection is
+    /// owned by ~/.gemini/antigravity-cli/settings.json. Preserve explicit
+    /// operator choices; only write the OpenAB default for fresh PVCs or
+    /// incomplete settings files.
+    fn ensure_default_settings(settings_file: &PathBuf, default_model: &str, working_dir: &str) {
+        if default_model.trim().is_empty() {
+            return;
+        }
+
+        if let Some(parent) = settings_file.parent() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                eprintln!("[agy-acp] WARN: failed to create settings dir: {err}");
+                return;
+            }
+        }
+
+        let mut settings = fs::read_to_string(settings_file)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .filter(|v| v.is_object())
+            .unwrap_or_else(|| json!({}));
+
+        let mut changed = false;
+        let has_model = settings
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if !has_model {
+            settings["model"] = json!(default_model);
+            changed = true;
+        }
+
+        if !settings
+            .get("trustedWorkspaces")
+            .map(|v| v.is_array())
+            .unwrap_or(false)
+        {
+            settings["trustedWorkspaces"] = json!([working_dir]);
+            changed = true;
+        }
+
+        if changed {
+            match serde_json::to_string_pretty(&settings) {
+                Ok(body) => {
+                    if let Err(err) = fs::write(settings_file, format!("{body}\n")) {
+                        eprintln!("[agy-acp] WARN: failed to write settings: {err}");
+                    }
+                }
+                Err(err) => eprintln!("[agy-acp] WARN: failed to serialize settings: {err}"),
+            }
         }
     }
 
@@ -490,6 +554,62 @@ mod tests {
     fn test_extract_delta_preserves_leading_spaces() {
         let result = Adapter::extract_delta("hello\n", "hello\n  indented code", true);
         assert_eq!(result, "  indented code");
+    }
+
+    #[test]
+    fn test_ensure_default_settings_seeds_missing_model() {
+        let root = std::env::temp_dir().join(format!("agy-acp-settings-{}", Uuid::new_v4()));
+        let settings_file = root.join("settings.json");
+
+        Adapter::ensure_default_settings(&settings_file, "Gemini 3.5 Flash (Medium)", "/work");
+
+        let settings: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_file).unwrap()).unwrap();
+        assert_eq!(
+            settings.get("model").and_then(|v| v.as_str()),
+            Some("Gemini 3.5 Flash (Medium)")
+        );
+        assert_eq!(
+            settings
+                .get("trustedWorkspaces")
+                .and_then(|v| v.as_array())
+                .and_then(|v| v.first())
+                .and_then(|v| v.as_str()),
+            Some("/work")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_ensure_default_settings_preserves_existing_model() {
+        let root = std::env::temp_dir().join(format!("agy-acp-settings-{}", Uuid::new_v4()));
+        let settings_file = root.join("settings.json");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            &settings_file,
+            r#"{"model":"Claude Sonnet 4.6 (Thinking)","trustedWorkspaces":["/existing"]}"#,
+        )
+        .unwrap();
+
+        Adapter::ensure_default_settings(&settings_file, "Gemini 3.5 Flash (Medium)", "/work");
+
+        let settings: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_file).unwrap()).unwrap();
+        assert_eq!(
+            settings.get("model").and_then(|v| v.as_str()),
+            Some("Claude Sonnet 4.6 (Thinking)")
+        );
+        assert_eq!(
+            settings
+                .get("trustedWorkspaces")
+                .and_then(|v| v.as_array())
+                .and_then(|v| v.first())
+                .and_then(|v| v.as_str()),
+            Some("/existing")
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

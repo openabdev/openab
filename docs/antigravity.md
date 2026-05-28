@@ -29,6 +29,19 @@ working_dir = "/home/agent"
 |----------|-------------|---------|
 | `AGY_WORKING_DIR` | Working directory for agy invocations | `/tmp` |
 | `AGY_EXTRA_ARGS` | Extra arguments prepended to every `agy` invocation (optional) | (none) |
+| `AGY_DEFAULT_MODEL` | Model to seed into Antigravity's native `settings.json` when no model is configured | `Gemini 3.5 Flash (Medium)` |
+
+`agy` print mode does not currently expose a `--model` flag. Model selection is
+therefore controlled through Antigravity's own settings file:
+
+```text
+~/.gemini/antigravity-cli/settings.json
+```
+
+On startup, `agy-acp` creates or repairs that file only when no model is already
+configured. Existing operator-selected models are preserved. This gives fresh
+OpenAB Antigravity pods a known-good default while still allowing users to change
+the model through Antigravity itself.
 
 ## Steering Files
 
