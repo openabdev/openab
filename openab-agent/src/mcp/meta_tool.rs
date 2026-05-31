@@ -7,7 +7,7 @@
 //! `RunningService` borrow path lands in the next slice. The Phase 2
 //! `login` / `complete_login` actions land with the OAuth slice.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -47,6 +47,7 @@ pub async fn dispatch(manager: &McpRuntimeManager, action: Action) -> Result<Val
     match action {
         Action::Help => Ok(json!(HELP)),
         Action::ListServers => Ok(list_servers(manager).await),
+        Action::ListTools { server } => list_tools(manager, &server).await,
         other => Err(anyhow!("{}", not_implemented_msg(&other))),
     }
 }
@@ -66,8 +67,9 @@ fn not_implemented_msg(action: &Action) -> String {
     };
     format!(
         "mcp action '{name}' is not yet implemented (phase 1 scaffold). \
-         Currently supported: 'help', 'list_servers'. To complete your task \
-         right now, fall back to the native agent tools (read, write, edit, bash)."
+         Currently supported: 'help', 'list_servers', 'list_tools'. To complete \
+         your task right now, fall back to the native agent tools (read, write, \
+         edit, bash)."
     )
 }
 
@@ -85,6 +87,30 @@ Actions:
 Connections are lazy: the first action that needs a server spawns its \
 child process and runs the handshake. Idle servers are evicted after \
 the configured TTL.";
+
+async fn list_tools(manager: &McpRuntimeManager, server: &str) -> Result<Value> {
+    // Lazy connect per ADR §5.3 — idempotent if already Connected.
+    manager
+        .connect(server)
+        .await
+        .with_context(|| format!("connect mcp server {server:?}"))?;
+    let peer = manager.arc_peer(server).await?;
+    // Arc lets the I/O `.await` run with no runtime lock held.
+    let tools = peer
+        .list_all_tools()
+        .await
+        .with_context(|| format!("list_all_tools on {server:?}"))?;
+    let entries: Vec<Value> = tools
+        .into_iter()
+        .map(|t| {
+            json!({
+                "name": t.name,
+                "description": t.description,
+            })
+        })
+        .collect();
+    Ok(Value::Array(entries))
+}
 
 async fn list_servers(manager: &McpRuntimeManager) -> Value {
     let snapshot = manager.snapshot().await;
@@ -159,15 +185,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_tools_propagates_connect_failure() {
+        let mgr = mgr_from(
+            r#"{
+                "mcpServers": {
+                    "broken": {
+                        "type": "stdio",
+                        "command": "/nonexistent/path/openab-mcp-test-stub-zzz"
+                    }
+                }
+            }"#,
+        );
+        let err = dispatch(
+            &mgr,
+            Action::ListTools {
+                server: "broken".into(),
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("connect mcp server"), "got: {err}");
+    }
+
+    #[tokio::test]
     async fn unimplemented_actions_name_themselves_and_guide_fallback() {
         let mgr = mgr_from(r#"{"mcpServers":{}}"#);
         let cases = [
-            (
-                Action::ListTools {
-                    server: "fs".into(),
-                },
-                "list_tools",
-            ),
             (
                 Action::DescribeTool {
                     server: "fs".into(),

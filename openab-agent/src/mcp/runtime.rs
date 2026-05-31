@@ -48,7 +48,11 @@ pub struct ServerHandle {
     pub name: String,
     pub config: ServerConfig,
     pub status: ServerStatus,
-    pub client: Option<RunningService<RoleClient, ()>>,
+    /// `Arc` so foreground callers can clone a peer handle out under a
+    /// short read lock, drop the guard, and then run `peer.list_all_tools()`
+    /// / `peer.call_tool()` without holding any runtime lock across the
+    /// I/O `.await` (avoids writer starvation + `Future is not Send` traps).
+    pub client: Option<Arc<RunningService<RoleClient, ()>>>,
 }
 
 impl std::fmt::Debug for ServerHandle {
@@ -107,6 +111,26 @@ impl McpRuntimeManager {
         self.handles.read().await.is_empty()
     }
 
+    /// Clone the live MCP client handle for `name` out from under a short
+    /// read lock. The caller `.await`s on the returned `Arc` with no
+    /// runtime lock held, so background writers (idle eviction, new
+    /// `connect`s) are not starved by long-running tool calls.
+    ///
+    /// Errors if the server isn't configured or isn't currently
+    /// `Connected`. Callers that want lazy-connect should run
+    /// `connect(name)` first.
+    pub async fn arc_peer(&self, name: &str) -> Result<Arc<RunningService<RoleClient, ()>>> {
+        let guard = self.handles.read().await;
+        let handle = guard
+            .get(name)
+            .ok_or_else(|| anyhow!("no mcp server named {name:?}"))?;
+        handle
+            .client
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow!("mcp server {name:?} is not connected"))
+    }
+
     /// Snapshot of `(name, status, transport_label)` sorted by name. Used
     /// by the `list_servers` meta-tool action; the static transport label
     /// avoids cloning the `Stdio { args, env, .. }` payload.
@@ -161,7 +185,7 @@ impl McpRuntimeManager {
         match dial_result {
             Ok(client) => {
                 handle.status = ServerStatus::Connected;
-                handle.client = Some(client);
+                handle.client = Some(Arc::new(client));
                 Ok(())
             }
             Err(e) => {
