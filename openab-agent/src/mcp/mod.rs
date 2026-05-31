@@ -25,9 +25,9 @@ pub fn cli_list_servers(resolve: bool) {
         return;
     }
     if resolve {
-        println!("⚠ --resolve: env vars substituted into output below.");
-        println!("⚠ Output may contain secrets — do not paste publicly.");
-        println!();
+        eprintln!("⚠ --resolve: env vars substituted into output below.");
+        eprintln!("⚠ Output may contain secrets — do not paste publicly.");
+        eprintln!();
     }
     let mut servers: Vec<_> = cfg.servers.iter().collect();
     servers.sort_by_key(|(name, _)| *name);
