@@ -36,6 +36,19 @@ pub enum ServerConfig {
     },
 }
 
+impl ServerConfig {
+    /// Static label used by the `mcp` meta-tool's `list_servers` action.
+    /// Returning `&'static str` lets `snapshot()` avoid cloning the
+    /// (potentially large) `Stdio { args, env, ... }` payload just to
+    /// read the transport variant.
+    pub fn transport_label(&self) -> &'static str {
+        match self {
+            ServerConfig::Stdio { .. } => "stdio",
+            ServerConfig::Http { .. } => "http",
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ToolFilter {
     #[serde(default)]

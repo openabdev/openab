@@ -107,15 +107,15 @@ impl McpRuntimeManager {
         self.handles.read().await.is_empty()
     }
 
-    /// Snapshot of `(name, status, config)` sorted by name. Used by the
-    /// `list_servers` meta-tool action which needs the transport variant
-    /// alongside the runtime status.
-    pub async fn snapshot(&self) -> Vec<(String, ServerStatus, ServerConfig)> {
+    /// Snapshot of `(name, status, transport_label)` sorted by name. Used
+    /// by the `list_servers` meta-tool action; the static transport label
+    /// avoids cloning the `Stdio { args, env, .. }` payload.
+    pub async fn snapshot(&self) -> Vec<(String, ServerStatus, &'static str)> {
         let mut out: Vec<_> = {
             let guard = self.handles.read().await;
             guard
                 .iter()
-                .map(|(name, h)| (name.clone(), h.status.clone(), h.config.clone()))
+                .map(|(name, h)| (name.clone(), h.status.clone(), h.config.transport_label()))
                 .collect()
         };
         out.sort_by(|(a, ..), (b, ..)| a.cmp(b));

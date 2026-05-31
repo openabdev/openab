@@ -11,7 +11,6 @@ use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::config::ServerConfig;
 use super::runtime::{McpRuntimeManager, ServerStatus};
 
 /// Deserialized form of the meta-tool's input JSON (ADR §5.2). The LLM
@@ -48,13 +47,28 @@ pub async fn dispatch(manager: &McpRuntimeManager, action: Action) -> Result<Val
     match action {
         Action::Help => Ok(json!(HELP)),
         Action::ListServers => Ok(list_servers(manager).await),
-        Action::ListTools { .. }
-        | Action::DescribeTool { .. }
-        | Action::Call { .. }
-        | Action::Status { .. } => Err(anyhow!(
-            "mcp action not yet implemented in phase 1 (lands with the peer-borrow slice)"
-        )),
+        other => Err(anyhow!("{}", not_implemented_msg(&other))),
     }
+}
+
+/// Error body for actions whose handler hasn't landed yet. Mentions the
+/// requested action and the supported set so the LLM can recover by
+/// falling back to the native `read` / `write` / `edit` / `bash` tools
+/// instead of retrying the same action blindly.
+fn not_implemented_msg(action: &Action) -> String {
+    let name = match action {
+        Action::Help => "help",
+        Action::ListServers => "list_servers",
+        Action::ListTools { .. } => "list_tools",
+        Action::DescribeTool { .. } => "describe_tool",
+        Action::Call { .. } => "call",
+        Action::Status { .. } => "status",
+    };
+    format!(
+        "mcp action '{name}' is not yet implemented (phase 1 scaffold). \
+         Currently supported: 'help', 'list_servers'. To complete your task \
+         right now, fall back to the native agent tools (read, write, edit, bash)."
+    )
 }
 
 const HELP: &str = "\
@@ -76,11 +90,11 @@ async fn list_servers(manager: &McpRuntimeManager) -> Value {
     let snapshot = manager.snapshot().await;
     let entries: Vec<Value> = snapshot
         .into_iter()
-        .map(|(name, status, config)| {
+        .map(|(name, status, transport)| {
             json!({
                 "name": name,
                 "status": status_label(&status),
-                "transport": transport_label(&config),
+                "transport": transport,
             })
         })
         .collect();
@@ -93,13 +107,6 @@ fn status_label(status: &ServerStatus) -> &'static str {
         ServerStatus::Connecting => "connecting",
         ServerStatus::Connected => "connected",
         ServerStatus::Failed(_) => "failed",
-    }
-}
-
-fn transport_label(config: &ServerConfig) -> &'static str {
-    match config {
-        ServerConfig::Stdio { .. } => "stdio",
-        ServerConfig::Http { .. } => "http",
     }
 }
 
@@ -152,25 +159,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unimplemented_actions_error_cleanly() {
+    async fn unimplemented_actions_name_themselves_and_guide_fallback() {
         let mgr = mgr_from(r#"{"mcpServers":{}}"#);
-        for action in [
-            Action::ListTools {
-                server: "fs".into(),
-            },
-            Action::DescribeTool {
-                server: "fs".into(),
-                tool: "read".into(),
-            },
-            Action::Call {
-                server: "fs".into(),
-                tool: "read".into(),
-                arguments: json!({}),
-            },
-            Action::Status { server: None },
-        ] {
+        let cases = [
+            (
+                Action::ListTools {
+                    server: "fs".into(),
+                },
+                "list_tools",
+            ),
+            (
+                Action::DescribeTool {
+                    server: "fs".into(),
+                    tool: "read".into(),
+                },
+                "describe_tool",
+            ),
+            (
+                Action::Call {
+                    server: "fs".into(),
+                    tool: "read".into(),
+                    arguments: json!({}),
+                },
+                "call",
+            ),
+            (Action::Status { server: None }, "status"),
+        ];
+        for (action, expected_name) in cases {
             let err = dispatch(&mgr, action).await.unwrap_err().to_string();
+            assert!(err.contains(expected_name), "missing action name: {err}");
             assert!(err.contains("not yet implemented"), "got: {err}");
+            assert!(err.contains("read, write, edit, bash"), "missing fallback: {err}");
         }
     }
 
