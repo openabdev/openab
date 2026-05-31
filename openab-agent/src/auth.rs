@@ -128,8 +128,8 @@ fn save_tokens(store: &TokenStore) -> Result<()> {
 #[allow(dead_code)] // wired in next slice (mcp/oauth.rs login flow)
 pub fn load_namespaced_token(key: &str) -> Result<TokenStore> {
     let path = auth_path();
-    let map = read_auth_file(&path)
-        .map_err(|_| anyhow!("No credentials found at {}", path.display()))?;
+    let map =
+        read_auth_file(&path).map_err(|_| anyhow!("No credentials found at {}", path.display()))?;
     map.get(key)
         .cloned()
         .ok_or_else(|| anyhow!("no credentials stored for {key:?}"))
