@@ -1,11 +1,8 @@
 //! Single `mcp` meta-tool the LLM sees. See ADR §5.2 + §5.3.
 //!
-//! Phase 1 scope: action enum + dispatch wiring + the two no-IO actions
-//! (`help`, `list_servers`). The IO-bearing actions (`list_tools`,
-//! `describe_tool`, `call`, `status`) return a `not yet implemented`
-//! error so the contract surface is visible to callers while the
-//! `RunningService` borrow path lands in the next slice. The Phase 2
-//! `login` / `complete_login` actions land with the OAuth slice.
+//! Phase 1 scope: action enum + dispatch wiring + all six Phase 1 actions
+//! (`help`, `list_servers`, `list_tools`, `describe_tool`, `call`, `status`).
+//! The Phase 2 `login` / `complete_login` actions land with the OAuth slice.
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
@@ -48,34 +45,14 @@ pub async fn dispatch(manager: &McpRuntimeManager, action: Action) -> Result<Val
         Action::Help => Ok(json!(HELP)),
         Action::ListServers => Ok(list_servers(manager).await),
         Action::ListTools { server } => list_tools(manager, &server).await,
+        Action::DescribeTool { server, tool } => describe_tool(manager, &server, &tool).await,
         Action::Call {
             server,
             tool,
             arguments,
         } => call_tool(manager, &server, &tool, arguments).await,
-        other => Err(anyhow!("{}", not_implemented_msg(&other))),
+        Action::Status { server } => Ok(status(manager, server.as_deref()).await),
     }
-}
-
-/// Error body for actions whose handler hasn't landed yet. Mentions the
-/// requested action and the supported set so the LLM can recover by
-/// falling back to the native `read` / `write` / `edit` / `bash` tools
-/// instead of retrying the same action blindly.
-fn not_implemented_msg(action: &Action) -> String {
-    let name = match action {
-        Action::Help => "help",
-        Action::ListServers => "list_servers",
-        Action::ListTools { .. } => "list_tools",
-        Action::DescribeTool { .. } => "describe_tool",
-        Action::Call { .. } => "call",
-        Action::Status { .. } => "status",
-    };
-    format!(
-        "mcp action '{name}' is not yet implemented (phase 1 scaffold). \
-         Currently supported: 'help', 'list_servers', 'list_tools', 'call'. \
-         To complete your task right now, fall back to the native agent tools \
-         (read, write, edit, bash)."
-    )
 }
 
 const HELP: &str = "\
@@ -125,19 +102,24 @@ async fn call_tool(
     serde_json::to_value(&result).context("serialize CallToolResult")
 }
 
-async fn list_tools(manager: &McpRuntimeManager, server: &str) -> Result<Value> {
-    // Lazy connect per ADR §5.3 — idempotent if already Connected.
+/// Lazy-connect + list all tools on `server`. Shared by `list_tools` /
+/// `describe_tool` (and the planned `tools_cache` on ServerHandle will plug
+/// in here). The `Arc<RunningService>` clone lets the I/O `.await` run with
+/// no runtime lock held.
+async fn fetch_tools(manager: &McpRuntimeManager, server: &str) -> Result<Vec<rmcp::model::Tool>> {
     manager
         .connect(server)
         .await
         .with_context(|| format!("connect mcp server {server:?}"))?;
     let peer = manager.arc_peer(server).await?;
-    // Arc lets the I/O `.await` run with no runtime lock held.
-    let tools = peer
-        .list_all_tools()
+    peer.list_all_tools()
         .await
-        .with_context(|| format!("list_all_tools on {server:?}"))?;
-    let entries: Vec<Value> = tools
+        .with_context(|| format!("list_all_tools on {server:?}"))
+}
+
+async fn list_tools(manager: &McpRuntimeManager, server: &str) -> Result<Value> {
+    let entries: Vec<Value> = fetch_tools(manager, server)
+        .await?
         .into_iter()
         .map(|t| {
             json!({
@@ -147,6 +129,43 @@ async fn list_tools(manager: &McpRuntimeManager, server: &str) -> Result<Value> 
         })
         .collect();
     Ok(Value::Array(entries))
+}
+
+async fn describe_tool(manager: &McpRuntimeManager, server: &str, tool: &str) -> Result<Value> {
+    // Progressive disclosure (ADR §5.2): `list_tools` returns compact
+    // `{name, description}`; this action returns the full `input_schema`
+    // for one tool. MCP has no single-tool query, so we list + filter.
+    let tool_def = fetch_tools(manager, server)
+        .await?
+        .into_iter()
+        .find(|t| t.name.as_ref() == tool)
+        .ok_or_else(|| anyhow!("no tool {tool:?} on mcp server {server:?}"))?;
+    Ok(json!({
+        "name": tool_def.name,
+        "description": tool_def.description,
+        "input_schema": tool_def.input_schema,
+    }))
+}
+
+async fn status(manager: &McpRuntimeManager, filter: Option<&str>) -> Value {
+    let snapshot = manager.snapshot().await;
+    let entries: Vec<Value> = snapshot
+        .into_iter()
+        .filter(|(name, _, _)| filter.map_or(true, |f| f == name.as_str()))
+        .map(|(name, status, transport)| {
+            let last_error = match &status {
+                ServerStatus::Failed(msg) => Some(msg.clone()),
+                _ => None,
+            };
+            json!({
+                "name": name,
+                "status": status_label(&status),
+                "transport": transport,
+                "last_error": last_error,
+            })
+        })
+        .collect();
+    Value::Array(entries)
 }
 
 async fn list_servers(manager: &McpRuntimeManager) -> Value {
@@ -298,27 +317,118 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unimplemented_actions_name_themselves_and_guide_fallback() {
-        let mgr = mgr_from(r#"{"mcpServers":{}}"#);
-        let cases = [
-            (
-                Action::DescribeTool {
-                    server: "fs".into(),
-                    tool: "read".into(),
-                },
-                "describe_tool",
-            ),
-            (Action::Status { server: None }, "status"),
-        ];
-        for (action, expected_name) in cases {
-            let err = dispatch(&mgr, action).await.unwrap_err().to_string();
-            assert!(err.contains(expected_name), "missing action name: {err}");
-            assert!(err.contains("not yet implemented"), "got: {err}");
-            assert!(
-                err.contains("read, write, edit, bash"),
-                "missing fallback: {err}"
-            );
+    async fn describe_tool_propagates_connect_failure() {
+        let mgr = mgr_from(
+            r#"{
+                "mcpServers": {
+                    "broken": {
+                        "type": "stdio",
+                        "command": "/nonexistent/path/openab-mcp-test-stub-zzz"
+                    }
+                }
+            }"#,
+        );
+        let err = dispatch(
+            &mgr,
+            Action::DescribeTool {
+                server: "broken".into(),
+                tool: "read".into(),
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("connect mcp server"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn status_lists_each_server_with_null_last_error_by_default() {
+        let mgr = mgr_from(
+            r#"{
+                "mcpServers": {
+                    "fs": { "type": "stdio", "command": "mcp-server-filesystem" },
+                    "linear": { "type": "http", "url": "https://mcp.linear.app/mcp" }
+                }
+            }"#,
+        );
+        let result = dispatch(&mgr, Action::Status { server: None }).await.unwrap();
+        let entries = result.as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        for e in entries {
+            assert_eq!(e["status"], "disconnected");
+            assert!(e["last_error"].is_null());
         }
+    }
+
+    #[tokio::test]
+    async fn status_filter_by_server_returns_single_entry() {
+        let mgr = mgr_from(
+            r#"{
+                "mcpServers": {
+                    "fs": { "type": "stdio", "command": "mcp-server-filesystem" },
+                    "linear": { "type": "http", "url": "https://mcp.linear.app/mcp" }
+                }
+            }"#,
+        );
+        let result = dispatch(
+            &mgr,
+            Action::Status {
+                server: Some("fs".into()),
+            },
+        )
+        .await
+        .unwrap();
+        let entries = result.as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"], "fs");
+        assert_eq!(entries[0]["transport"], "stdio");
+    }
+
+    #[tokio::test]
+    async fn status_unknown_filter_returns_empty_array() {
+        let mgr = mgr_from(
+            r#"{
+                "mcpServers": {
+                    "fs": { "type": "stdio", "command": "mcp-server-filesystem" }
+                }
+            }"#,
+        );
+        let result = dispatch(
+            &mgr,
+            Action::Status {
+                server: Some("nope".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(result.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn status_surfaces_last_error_after_failed_connect() {
+        let mgr = mgr_from(
+            r#"{
+                "mcpServers": {
+                    "broken": {
+                        "type": "stdio",
+                        "command": "/nonexistent/path/openab-mcp-test-stub-zzz"
+                    }
+                }
+            }"#,
+        );
+        let _ = dispatch(
+            &mgr,
+            Action::ListTools {
+                server: "broken".into(),
+            },
+        )
+        .await;
+        let result = dispatch(&mgr, Action::Status { server: None }).await.unwrap();
+        let entries = result.as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["status"], "failed");
+        let last_error = entries[0]["last_error"].as_str().unwrap();
+        assert!(last_error.contains("spawn"), "got: {last_error}");
     }
 
     #[test]
