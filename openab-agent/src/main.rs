@@ -36,7 +36,13 @@ enum Commands {
 #[derive(Subcommand)]
 enum McpAction {
     /// List configured MCP servers (loads global + project mcp.json)
-    List,
+    List {
+        /// Substitute ${env:VAR} placeholders with real values.
+        /// WARNING: output will contain secrets if your config references
+        /// tokens via env vars — do not paste publicly.
+        #[arg(long)]
+        resolve: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -87,7 +93,7 @@ async fn main() {
         },
         #[cfg(feature = "mcp")]
         Some(Commands::Mcp { action }) => match action {
-            McpAction::List => mcp::cli_list_servers(),
+            McpAction::List { resolve } => mcp::cli_list_servers(resolve),
         },
     }
 }
