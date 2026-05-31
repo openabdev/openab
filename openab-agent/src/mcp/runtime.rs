@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use rmcp::service::{RoleClient, RunningService};
-use rmcp::ServiceExt;
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
+use rmcp::ServiceExt;
 use tokio::process::Command;
 use tokio::sync::RwLock;
 
@@ -124,9 +124,7 @@ impl McpRuntimeManager {
                     command, args, env, ..
                 } => StdioDial { command, args, env },
                 ServerConfig::Http { .. } => {
-                    return Err(anyhow!(
-                        "http transport lands in phase 2 (server {name:?})"
-                    ));
+                    return Err(anyhow!("http transport lands in phase 2 (server {name:?})"));
                 }
             };
             handle.status = ServerStatus::Connecting;
@@ -168,11 +166,7 @@ struct StdioDial {
 
 impl StdioDial {
     async fn run(self) -> Result<RunningService<RoleClient, ()>> {
-        let Self {
-            command,
-            args,
-            env,
-        } = self;
+        let Self { command, args, env } = self;
         let cmd = Command::new(&command).configure(|c| {
             c.args(&args);
             c.envs(&env);
