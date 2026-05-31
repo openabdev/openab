@@ -139,6 +139,12 @@ impl McpRuntimeManager {
         let handle = guard
             .get_mut(name)
             .ok_or_else(|| anyhow!("server {name:?} vanished during connect"))?;
+        // Race guard: a concurrent connect() may have installed a client while
+        // we were dialing. Yield to the winner — `dial_result` drops here,
+        // killing the duplicate child via RunningService's Drop impl.
+        if matches!(handle.status, ServerStatus::Connected) && handle.client.is_some() {
+            return Ok(());
+        }
         match dial_result {
             Ok(client) => {
                 handle.status = ServerStatus::Connected;
