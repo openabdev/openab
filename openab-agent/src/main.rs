@@ -2,6 +2,8 @@ mod acp;
 mod agent;
 mod auth;
 mod llm;
+#[cfg(feature = "mcp")]
+mod mcp;
 mod skills;
 mod tools;
 

@@ -1,0 +1,261 @@
+//! `mcpServers` config schema + loader. See ADR §5.6.
+//!
+//! Loaded from `.openab/agent/mcp.json` (project) and `~/.openab/agent/mcp.json`
+//! (global), project entries take precedence on name collision.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, anyhow};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct McpConfig {
+    #[serde(rename = "mcpServers", default)]
+    pub servers: HashMap<String, ServerConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerConfig {
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: HashMap<String, String>,
+        #[serde(default, rename = "tool_filter")]
+        tool_filter: Option<ToolFilter>,
+    },
+    Http {
+        url: String,
+        #[serde(default)]
+        oauth: Option<OAuthConfig>,
+        #[serde(default, rename = "tool_filter")]
+        tool_filter: Option<ToolFilter>,
+    },
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ToolFilter {
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+/// OAuth block. Phase 1 only parses `provider` + `scopes`; custom-provider
+/// fields (§6.3: `authorize_url`, `token_url`, `device_authorization_endpoint`,
+/// `discovery`, `discovery_allowlist`) land with the Phase 2 auth slice.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthConfig {
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
+impl McpConfig {
+    /// Load + merge global and project configs from the standard locations.
+    /// Missing files are treated as empty.
+    pub fn load() -> Result<Self> {
+        let global = home_dir().map(|h| h.join(".openab/agent/mcp.json"));
+        let project = std::env::current_dir()
+            .ok()
+            .map(|c| c.join(".openab/agent/mcp.json"));
+        Self::load_layered(global.as_deref(), project.as_deref())
+    }
+
+    /// Load + merge two layers; project wins on name collision.
+    pub fn load_layered(global: Option<&Path>, project: Option<&Path>) -> Result<Self> {
+        let mut merged = Self::default();
+        for path in [global, project].into_iter().flatten() {
+            if !path.exists() {
+                continue;
+            }
+            let layer = Self::load_file(path)?;
+            merged.servers.extend(layer.servers);
+        }
+        Ok(merged)
+    }
+
+    fn load_file(path: &Path) -> Result<Self> {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("read mcp config {}", path.display()))?;
+        serde_json::from_str(&raw)
+            .with_context(|| format!("parse mcp config {}", path.display()))
+    }
+}
+
+impl ServerConfig {
+    /// Return a copy with `${env:VAR}` placeholders resolved against the
+    /// process environment. Missing env vars are an error for that server;
+    /// callers should skip the server and continue (ADR §5.6 "per-server
+    /// failure isolated"). `name` is the server name used in error context.
+    pub fn resolved(&self, name: &str) -> Result<Self> {
+        let json = serde_json::to_value(self)?;
+        let resolved = interpolate_value(json, &std::env::vars().collect())
+            .with_context(|| format!("resolve env for mcp server {name:?}"))?;
+        Ok(serde_json::from_value(resolved)?)
+    }
+}
+
+fn interpolate_value(
+    value: serde_json::Value,
+    env: &HashMap<String, String>,
+) -> Result<serde_json::Value> {
+    use serde_json::Value;
+    match value {
+        Value::String(s) => Ok(Value::String(interpolate_env(&s, env)?)),
+        Value::Array(items) => items
+            .into_iter()
+            .map(|v| interpolate_value(v, env))
+            .collect::<Result<Vec<_>>>()
+            .map(Value::Array),
+        Value::Object(map) => map
+            .into_iter()
+            .map(|(k, v)| interpolate_value(v, env).map(|v| (k, v)))
+            .collect::<Result<serde_json::Map<_, _>>>()
+            .map(Value::Object),
+        other => Ok(other),
+    }
+}
+
+/// Replace `${env:VAR}` tokens in `input` with the matching env value.
+/// Missing variables produce an error naming the offender.
+pub fn interpolate_env(input: &str, env: &HashMap<String, String>) -> Result<String> {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("${env:") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + "${env:".len()..];
+        let end = after
+            .find('}')
+            .ok_or_else(|| anyhow!("unterminated ${{env:..}} in {input:?}"))?;
+        let var = &after[..end];
+        let val = env
+            .get(var)
+            .ok_or_else(|| anyhow!("env var ${var} not set (referenced by mcp config)"))?;
+        out.push_str(val);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn interpolate_replaces_tokens() {
+        let e = env(&[("FOO", "bar"), ("X", "y")]);
+        assert_eq!(interpolate_env("a${env:FOO}b${env:X}", &e).unwrap(), "abarby");
+    }
+
+    #[test]
+    fn interpolate_passes_through_plain_strings() {
+        let e = env(&[]);
+        assert_eq!(interpolate_env("plain", &e).unwrap(), "plain");
+    }
+
+    #[test]
+    fn interpolate_errors_on_missing_var() {
+        let e = env(&[]);
+        let err = interpolate_env("${env:MISSING}", &e).unwrap_err().to_string();
+        assert!(err.contains("MISSING"), "expected MISSING in error: {err}");
+    }
+
+    #[test]
+    fn interpolate_errors_on_unterminated() {
+        let e = env(&[("FOO", "bar")]);
+        assert!(interpolate_env("${env:FOO", &e).is_err());
+    }
+
+    #[test]
+    fn parses_stdio_and_http_servers() {
+        let json = r#"{
+            "mcpServers": {
+                "fs": {
+                    "type": "stdio",
+                    "command": "mcp-server-filesystem",
+                    "args": ["/workspace"],
+                    "tool_filter": { "include": ["read_*"] }
+                },
+                "linear": {
+                    "type": "http",
+                    "url": "https://mcp.linear.app/mcp",
+                    "oauth": { "provider": "linear" }
+                }
+            }
+        }"#;
+        let cfg: McpConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.servers.len(), 2);
+        match cfg.servers.get("fs").unwrap() {
+            ServerConfig::Stdio { command, args, tool_filter, .. } => {
+                assert_eq!(command, "mcp-server-filesystem");
+                assert_eq!(args, &vec!["/workspace".to_string()]);
+                assert_eq!(tool_filter.as_ref().unwrap().include, vec!["read_*"]);
+            }
+            _ => panic!("expected stdio"),
+        }
+        match cfg.servers.get("linear").unwrap() {
+            ServerConfig::Http { url, oauth, .. } => {
+                assert_eq!(url, "https://mcp.linear.app/mcp");
+                assert_eq!(oauth.as_ref().unwrap().provider.as_deref(), Some("linear"));
+            }
+            _ => panic!("expected http"),
+        }
+    }
+
+    #[test]
+    fn resolved_substitutes_env_in_args() {
+        // SAFETY: single-threaded test; isolated env key.
+        unsafe { std::env::set_var("MCP_TEST_TOKEN", "secret123"); }
+        let cfg = ServerConfig::Stdio {
+            command: "github-mcp-server".into(),
+            args: vec!["--token".into(), "${env:MCP_TEST_TOKEN}".into()],
+            env: HashMap::new(),
+            tool_filter: None,
+        };
+        match cfg.resolved("github").unwrap() {
+            ServerConfig::Stdio { args, .. } => {
+                assert_eq!(args[1], "secret123");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn merge_project_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.json");
+        let project = dir.path().join("project.json");
+        std::fs::write(
+            &global,
+            r#"{"mcpServers":{"fs":{"type":"stdio","command":"global-fs"},"x":{"type":"stdio","command":"global-x"}}}"#,
+        ).unwrap();
+        std::fs::write(
+            &project,
+            r#"{"mcpServers":{"fs":{"type":"stdio","command":"project-fs"}}}"#,
+        ).unwrap();
+        let cfg = McpConfig::load_layered(Some(&global), Some(&project)).unwrap();
+        assert_eq!(cfg.servers.len(), 2);
+        match cfg.servers.get("fs").unwrap() {
+            ServerConfig::Stdio { command, .. } => assert_eq!(command, "project-fs"),
+            _ => unreachable!(),
+        }
+        match cfg.servers.get("x").unwrap() {
+            ServerConfig::Stdio { command, .. } => assert_eq!(command, "global-x"),
+            _ => unreachable!(),
+        }
+    }
+}
