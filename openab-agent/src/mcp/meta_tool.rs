@@ -189,7 +189,10 @@ mod tests {
             let err = dispatch(&mgr, action).await.unwrap_err().to_string();
             assert!(err.contains(expected_name), "missing action name: {err}");
             assert!(err.contains("not yet implemented"), "got: {err}");
-            assert!(err.contains("read, write, edit, bash"), "missing fallback: {err}");
+            assert!(
+                err.contains("read, write, edit, bash"),
+                "missing fallback: {err}"
+            );
         }
     }
 
