@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use rmcp::service::{RoleClient, RunningService};
-use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
+use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::ServiceExt;
 use tokio::process::Command;
 use tokio::sync::RwLock;
@@ -147,7 +147,8 @@ impl McpRuntimeManager {
     }
 
     /// Lazy-connect the named server (ADR §5.7). Idempotent if already
-    /// `Connected` with a live client. HTTP transport is Phase 2.
+    /// `Connected` with a live client. HTTP servers requiring OAuth are
+    /// rejected until the Phase 2 auth slice lands (ADR §6).
     pub async fn connect(&self, name: &str) -> Result<()> {
         let dial = {
             let mut guard = self.handles.write().await;
@@ -161,10 +162,21 @@ impl McpRuntimeManager {
             let dial = match resolved {
                 ServerConfig::Stdio {
                     command, args, env, ..
-                } => StdioDial { command, args, env },
-                ServerConfig::Http { .. } => {
-                    return Err(anyhow!("http transport lands in phase 2 (server {name:?})"));
+                } => Dial::Stdio { command, args, env },
+                // Reject oauth-protected servers BEFORE the `Connecting`
+                // transition: we never attempted a handshake, so leaving
+                // status at `Disconnected` is the honest state. Status
+                // becomes `Failed` only when a dial was actually tried.
+                ServerConfig::Http {
+                    oauth: Some(_),
+                    url,
+                    ..
+                } => {
+                    return Err(anyhow!(
+                        "oauth-protected http server {url:?} requires the auth slice (Phase 2 §6)"
+                    ));
                 }
+                ServerConfig::Http { url, .. } => Dial::Http { url },
             };
             handle.status = ServerStatus::Connecting;
             dial
@@ -197,24 +209,41 @@ impl McpRuntimeManager {
     }
 }
 
-struct StdioDial {
-    command: String,
-    args: Vec<String>,
-    env: HashMap<String, String>,
+/// Per-transport dial parameters, extracted under the manager's write lock
+/// then dialed without holding the lock. Flat (no nested `*Dial` structs)
+/// because two variants don't warrant a dispatch enum.
+enum Dial {
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+    },
+    Http {
+        url: String,
+    },
 }
 
-impl StdioDial {
+impl Dial {
     async fn run(self) -> Result<RunningService<RoleClient, ()>> {
-        let Self { command, args, env } = self;
-        let cmd = Command::new(&command).configure(|c| {
-            c.args(&args);
-            c.envs(&env);
-        });
-        let transport = TokioChildProcess::new(cmd)
-            .with_context(|| format!("spawn mcp child process {command:?}"))?;
-        ().serve(transport)
-            .await
-            .with_context(|| format!("mcp handshake with {command:?}"))
+        match self {
+            Dial::Stdio { command, args, env } => {
+                let cmd = Command::new(&command).configure(|c| {
+                    c.args(&args);
+                    c.envs(&env);
+                });
+                let transport = TokioChildProcess::new(cmd)
+                    .with_context(|| format!("spawn mcp child process {command:?}"))?;
+                ().serve(transport)
+                    .await
+                    .with_context(|| format!("mcp handshake with {command:?}"))
+            }
+            Dial::Http { url } => {
+                let transport = StreamableHttpClientTransport::from_uri(url.as_str());
+                ().serve(transport)
+                    .await
+                    .with_context(|| format!("mcp handshake with {url:?}"))
+            }
+        }
     }
 }
 
@@ -269,18 +298,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_http_returns_phase2_error() {
+    async fn connect_http_with_oauth_defers_to_auth_slice() {
         let json = r#"{
             "mcpServers": {
-                "linear": { "type": "http", "url": "https://mcp.linear.app/mcp" }
+                "linear": {
+                    "type": "http",
+                    "url": "https://mcp.linear.app/mcp",
+                    "oauth": { "provider": "linear" }
+                }
             }
         }"#;
         let cfg: McpConfig = serde_json::from_str(json).unwrap();
         let mgr = McpRuntimeManager::from_config(cfg);
         let err = mgr.connect("linear").await.unwrap_err().to_string();
-        assert!(err.contains("phase 2"), "expected 'phase 2' in {err}");
-        // Status not advanced past Disconnected for unsupported transports.
+        assert!(err.contains("oauth"), "expected 'oauth' in {err}");
+        // OAuth rejection happens BEFORE the Connecting transition, so the
+        // server remains Disconnected — no dial was attempted.
         assert_eq!(mgr.statuses().await[0].1, ServerStatus::Disconnected);
+    }
+
+    #[tokio::test]
+    async fn connect_http_anonymous_to_dead_address_records_failed() {
+        // 127.0.0.1:1 is a TCP port that no MCP server will ever bind. The
+        // handshake `.serve()` future fails fast at the connect() syscall,
+        // so this test stays hermetic — no network reachability assumed.
+        let json = r#"{
+            "mcpServers": {
+                "dead": { "type": "http", "url": "http://127.0.0.1:1/mcp" }
+            }
+        }"#;
+        let cfg: McpConfig = serde_json::from_str(json).unwrap();
+        let mgr = McpRuntimeManager::from_config(cfg);
+        let err = mgr.connect("dead").await.unwrap_err().to_string();
+        assert!(err.contains("handshake"), "expected 'handshake' in {err}");
+        match &mgr.statuses().await[0].1 {
+            ServerStatus::Failed(_) => {}
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     #[tokio::test]
