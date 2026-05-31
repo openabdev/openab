@@ -256,6 +256,13 @@ impl AcpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate process-global env vars (notably
+    /// `ANTHROPIC_API_KEY`). Without this, `test_session_new` and
+    /// `test_session_new_missing_key` race on the same key when run in
+    /// parallel — set/remove from one thread is observed by the other.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_initialize_response() {
@@ -270,6 +277,7 @@ mod tests {
 
     #[test]
     fn test_session_new() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Set a fake key so from_env() succeeds in CI
         unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-key") };
         let mut server = AcpServer::new();
@@ -282,6 +290,7 @@ mod tests {
 
     #[test]
     fn test_session_new_missing_key() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Ensure no OAuth token exists either
         let auth_path =
             std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
