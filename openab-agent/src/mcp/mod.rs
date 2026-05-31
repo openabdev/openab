@@ -64,13 +64,13 @@ fn print_json<T: serde::Serialize>(status: &str, name: &str, value: &T) {
 /// Prints per-server runtime status. Phase 1 always reports `Disconnected`
 /// because servers are not yet dialed; the next slice wires `connect()` and
 /// real state transitions land then.
-pub fn cli_show_status() {
+pub async fn cli_show_status() {
     let manager = McpRuntimeManager::from_config(load_config_or_exit());
-    if manager.is_empty() {
+    if manager.is_empty().await {
         println!("No MCP servers configured.");
         return;
     }
-    for (name, status) in manager.statuses() {
+    for (name, status) in manager.statuses().await {
         println!("{} {name}", status.icon());
     }
 }

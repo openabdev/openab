@@ -96,7 +96,7 @@ async fn main() {
         #[cfg(feature = "mcp")]
         Some(Commands::Mcp { action }) => match action {
             McpAction::List { resolve } => mcp::cli_list_servers(resolve),
-            McpAction::Status => mcp::cli_show_status(),
+            McpAction::Status => mcp::cli_show_status().await,
         },
     }
 }
