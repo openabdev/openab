@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod meta_tool;
+pub mod oauth;
 pub mod runtime;
 
 use serde_json::json;
