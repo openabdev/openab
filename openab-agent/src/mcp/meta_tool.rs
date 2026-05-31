@@ -351,7 +351,9 @@ mod tests {
                 }
             }"#,
         );
-        let result = dispatch(&mgr, Action::Status { server: None }).await.unwrap();
+        let result = dispatch(&mgr, Action::Status { server: None })
+            .await
+            .unwrap();
         let entries = result.as_array().unwrap();
         assert_eq!(entries.len(), 2);
         for e in entries {
@@ -423,7 +425,9 @@ mod tests {
             },
         )
         .await;
-        let result = dispatch(&mgr, Action::Status { server: None }).await.unwrap();
+        let result = dispatch(&mgr, Action::Status { server: None })
+            .await
+            .unwrap();
         let entries = result.as_array().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["status"], "failed");
