@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -82,8 +82,7 @@ impl McpConfig {
     fn load_file(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("read mcp config {}", path.display()))?;
-        serde_json::from_str(&raw)
-            .with_context(|| format!("parse mcp config {}", path.display()))
+        serde_json::from_str(&raw).with_context(|| format!("parse mcp config {}", path.display()))
     }
 }
 
@@ -152,13 +151,19 @@ mod tests {
     use super::*;
 
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
     fn interpolate_replaces_tokens() {
         let e = env(&[("FOO", "bar"), ("X", "y")]);
-        assert_eq!(interpolate_env("a${env:FOO}b${env:X}", &e).unwrap(), "abarby");
+        assert_eq!(
+            interpolate_env("a${env:FOO}b${env:X}", &e).unwrap(),
+            "abarby"
+        );
     }
 
     #[test]
@@ -170,7 +175,9 @@ mod tests {
     #[test]
     fn interpolate_errors_on_missing_var() {
         let e = env(&[]);
-        let err = interpolate_env("${env:MISSING}", &e).unwrap_err().to_string();
+        let err = interpolate_env("${env:MISSING}", &e)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("MISSING"), "expected MISSING in error: {err}");
     }
 
@@ -200,7 +207,12 @@ mod tests {
         let cfg: McpConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.servers.len(), 2);
         match cfg.servers.get("fs").unwrap() {
-            ServerConfig::Stdio { command, args, tool_filter, .. } => {
+            ServerConfig::Stdio {
+                command,
+                args,
+                tool_filter,
+                ..
+            } => {
                 assert_eq!(command, "mcp-server-filesystem");
                 assert_eq!(args, &vec!["/workspace".to_string()]);
                 assert_eq!(tool_filter.as_ref().unwrap().include, vec!["read_*"]);
@@ -219,7 +231,9 @@ mod tests {
     #[test]
     fn resolved_substitutes_env_in_args() {
         // SAFETY: single-threaded test; isolated env key.
-        unsafe { std::env::set_var("MCP_TEST_TOKEN", "secret123"); }
+        unsafe {
+            std::env::set_var("MCP_TEST_TOKEN", "secret123");
+        }
         let cfg = ServerConfig::Stdio {
             command: "github-mcp-server".into(),
             args: vec!["--token".into(), "${env:MCP_TEST_TOKEN}".into()],
@@ -242,11 +256,13 @@ mod tests {
         std::fs::write(
             &global,
             r#"{"mcpServers":{"fs":{"type":"stdio","command":"global-fs"},"x":{"type":"stdio","command":"global-x"}}}"#,
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(
             &project,
             r#"{"mcpServers":{"fs":{"type":"stdio","command":"project-fs"}}}"#,
-        ).unwrap();
+        )
+        .unwrap();
         let cfg = McpConfig::load_layered(Some(&global), Some(&project)).unwrap();
         assert_eq!(cfg.servers.len(), 2);
         match cfg.servers.get("fs").unwrap() {
