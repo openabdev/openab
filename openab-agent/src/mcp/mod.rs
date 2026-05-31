@@ -1,6 +1,7 @@
 //! Native MCP client. See `docs/adr/openab-agent-mcp.md`.
 
 pub mod config;
+pub mod meta_tool;
 pub mod runtime;
 
 use config::{McpConfig, ServerConfig};

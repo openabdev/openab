@@ -107,6 +107,21 @@ impl McpRuntimeManager {
         self.handles.read().await.is_empty()
     }
 
+    /// Snapshot of `(name, status, config)` sorted by name. Used by the
+    /// `list_servers` meta-tool action which needs the transport variant
+    /// alongside the runtime status.
+    pub async fn snapshot(&self) -> Vec<(String, ServerStatus, ServerConfig)> {
+        let mut out: Vec<_> = {
+            let guard = self.handles.read().await;
+            guard
+                .iter()
+                .map(|(name, h)| (name.clone(), h.status.clone(), h.config.clone()))
+                .collect()
+        };
+        out.sort_by(|(a, ..), (b, ..)| a.cmp(b));
+        out
+    }
+
     /// Lazy-connect the named server (ADR §5.7). Idempotent if already
     /// `Connected` with a live client. HTTP transport is Phase 2.
     pub async fn connect(&self, name: &str) -> Result<()> {
