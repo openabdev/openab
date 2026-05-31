@@ -48,6 +48,11 @@ pub async fn dispatch(manager: &McpRuntimeManager, action: Action) -> Result<Val
         Action::Help => Ok(json!(HELP)),
         Action::ListServers => Ok(list_servers(manager).await),
         Action::ListTools { server } => list_tools(manager, &server).await,
+        Action::Call {
+            server,
+            tool,
+            arguments,
+        } => call_tool(manager, &server, &tool, arguments).await,
         other => Err(anyhow!("{}", not_implemented_msg(&other))),
     }
 }
@@ -67,9 +72,9 @@ fn not_implemented_msg(action: &Action) -> String {
     };
     format!(
         "mcp action '{name}' is not yet implemented (phase 1 scaffold). \
-         Currently supported: 'help', 'list_servers', 'list_tools'. To complete \
-         your task right now, fall back to the native agent tools (read, write, \
-         edit, bash)."
+         Currently supported: 'help', 'list_servers', 'list_tools', 'call'. \
+         To complete your task right now, fall back to the native agent tools \
+         (read, write, edit, bash)."
     )
 }
 
@@ -87,6 +92,39 @@ Actions:
 Connections are lazy: the first action that needs a server spawns its \
 child process and runs the handshake. Idle servers are evicted after \
 the configured TTL.";
+
+async fn call_tool(
+    manager: &McpRuntimeManager,
+    server: &str,
+    tool: &str,
+    arguments: Value,
+) -> Result<Value> {
+    // Lenient arg coercion per Mira's Tick 18 review: LLMs often send
+    // `null` or omit `arguments` for no-arg tools; rejecting those would
+    // make zero-arg calls fragile. Only real type errors (string, number,
+    // array, bool) are refused.
+    let args_map = match arguments {
+        Value::Object(map) => map,
+        Value::Null => serde_json::Map::new(),
+        other => {
+            return Err(anyhow!(
+                "mcp call arguments must be a JSON object (or null/omitted for no-arg tools), got {other}"
+            ));
+        }
+    };
+    manager
+        .connect(server)
+        .await
+        .with_context(|| format!("connect mcp server {server:?}"))?;
+    let peer = manager.arc_peer(server).await?;
+    let params = rmcp::model::CallToolRequestParams::new(tool.to_string())
+        .with_arguments(args_map);
+    let result = peer
+        .call_tool(params)
+        .await
+        .with_context(|| format!("call_tool {tool:?} on {server:?}"))?;
+    serde_json::to_value(&result).context("serialize CallToolResult")
+}
 
 async fn list_tools(manager: &McpRuntimeManager, server: &str) -> Result<Value> {
     // Lazy connect per ADR §5.3 — idempotent if already Connected.
@@ -185,6 +223,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn call_rejects_non_object_arguments() {
+        let mgr = mgr_from(
+            r#"{
+                "mcpServers": {
+                    "fs": { "type": "stdio", "command": "true" }
+                }
+            }"#,
+        );
+        let err = dispatch(
+            &mgr,
+            Action::Call {
+                server: "fs".into(),
+                tool: "read".into(),
+                arguments: json!("oops, a string"),
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("must be a JSON object"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn call_null_arguments_passes_validation_and_reaches_connect() {
+        // Null args should be coerced to {} and fail at the *connect* step
+        // (binary doesn't exist), not at the validation step.
+        let mgr = mgr_from(
+            r#"{
+                "mcpServers": {
+                    "broken": {
+                        "type": "stdio",
+                        "command": "/nonexistent/openab-mcp-test-stub-zzz"
+                    }
+                }
+            }"#,
+        );
+        let err = dispatch(
+            &mgr,
+            Action::Call {
+                server: "broken".into(),
+                tool: "read".into(),
+                arguments: Value::Null,
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("connect mcp server"), "got: {err}");
+        assert!(!err.contains("must be a JSON object"), "got: {err}");
+    }
+
+    #[tokio::test]
     async fn list_tools_propagates_connect_failure() {
         let mgr = mgr_from(
             r#"{
@@ -218,14 +308,6 @@ mod tests {
                     tool: "read".into(),
                 },
                 "describe_tool",
-            ),
-            (
-                Action::Call {
-                    server: "fs".into(),
-                    tool: "read".into(),
-                    arguments: json!({}),
-                },
-                "call",
             ),
             (Action::Status { server: None }, "status"),
         ];
