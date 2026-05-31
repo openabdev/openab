@@ -2,10 +2,15 @@ use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Namespace key for the existing Codex single-tenant credential.
+/// Lives next to future `mcp:<server>` entries inside `auth.json`.
+const CODEX_NAMESPACE: &str = "codex";
 
 const REFRESH_SKEW_SECONDS: u64 = 120;
 
@@ -42,23 +47,36 @@ fn auth_path() -> PathBuf {
         .join("auth.json")
 }
 
-pub fn load_tokens() -> Result<TokenStore> {
-    let path = auth_path();
-    let data = std::fs::read_to_string(&path).map_err(|_| {
-        anyhow!(
-            "No credentials found at {}. Run `openab-agent auth codex-oauth` first.",
-            path.display()
-        )
-    })?;
-    serde_json::from_str(&data).map_err(|e| anyhow!("Invalid auth.json: {e}"))
+/// Read the `auth.json` map, transparently migrating a legacy single-tenant
+/// Codex token file into the new namespaced shape. The migrated map is held
+/// in-memory only; the file is rewritten in the new shape on the next save.
+///
+/// Discriminates by the top-level `access_token` key — present means the
+/// file is the legacy `TokenStore` shape, absent means the new namespaced
+/// map. A single JSON parse gives accurate error context either way.
+fn read_auth_file(path: &Path) -> Result<HashMap<String, TokenStore>> {
+    let data = std::fs::read_to_string(path)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&data).map_err(|e| anyhow!("Invalid auth.json: {e}"))?;
+    if value.get("access_token").is_some() {
+        let legacy: TokenStore = serde_json::from_value(value)
+            .map_err(|e| anyhow!("Invalid auth.json (legacy format): {e}"))?;
+        let mut map = HashMap::new();
+        map.insert(CODEX_NAMESPACE.to_string(), legacy);
+        return Ok(map);
+    }
+    serde_json::from_value(value).map_err(|e| anyhow!("Invalid auth.json: {e}"))
 }
 
-fn save_tokens(store: &TokenStore) -> Result<()> {
-    let path = auth_path();
+/// Atomically replace `auth.json` with the new map. `fsync(2)` after write
+/// satisfies the ADR §6.1 refresh-token rotation contract — without it, a
+/// Spot interruption between local write and S3 sync would restore a
+/// revoked refresh token from durable storage on the next task start.
+fn write_auth_file(path: &Path, map: &HashMap<String, TokenStore>) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let data = serde_json::to_string_pretty(store)?;
+    let data = serde_json::to_string_pretty(map)?;
     #[cfg(unix)]
     {
         use std::fs::OpenOptions;
@@ -69,14 +87,85 @@ fn save_tokens(store: &TokenStore) -> Result<()> {
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(&path)?;
+            .open(path)?;
         file.write_all(data.as_bytes())?;
+        file.sync_all()?;
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(&path, &data)?;
+        std::fs::write(path, &data)?;
     }
     Ok(())
+}
+
+pub fn load_tokens() -> Result<TokenStore> {
+    let path = auth_path();
+    let map = read_auth_file(&path).map_err(|_| {
+        anyhow!(
+            "No credentials found at {}. Run `openab-agent auth codex-oauth` first.",
+            path.display()
+        )
+    })?;
+    map.get(CODEX_NAMESPACE).cloned().ok_or_else(|| {
+        anyhow!(
+            "No codex credentials in {}. Run `openab-agent auth codex-oauth` first.",
+            path.display()
+        )
+    })
+}
+
+fn save_tokens(store: &TokenStore) -> Result<()> {
+    let path = auth_path();
+    let mut map = read_auth_file(&path).unwrap_or_default();
+    map.insert(CODEX_NAMESPACE.to_string(), store.clone());
+    write_auth_file(&path, &map)
+}
+
+/// Look up the credential at `key` (e.g. `mcp:linear`). Returns the codex
+/// entry for `key = "codex"`, but prefer `load_tokens()` for that path —
+/// this helper exists for MCP server-namespaced lookups (ADR §6.1).
+#[cfg(feature = "mcp")]
+#[allow(dead_code)] // wired in next slice (mcp/oauth.rs login flow)
+pub fn load_namespaced_token(key: &str) -> Result<TokenStore> {
+    let path = auth_path();
+    let map = read_auth_file(&path)
+        .map_err(|_| anyhow!("No credentials found at {}", path.display()))?;
+    map.get(key)
+        .cloned()
+        .ok_or_else(|| anyhow!("no credentials stored for {key:?}"))
+}
+
+/// Insert or replace the credential at `key`, preserving all other entries.
+/// Read-modify-write on a single file: callers in the same process must
+/// serialize themselves (the lifecycle manager already does per ADR §5.7).
+#[cfg(feature = "mcp")]
+#[allow(dead_code)] // wired in next slice (mcp/oauth.rs login flow)
+pub fn save_namespaced_token(key: &str, store: &TokenStore) -> Result<()> {
+    let path = auth_path();
+    let mut map = read_auth_file(&path).unwrap_or_default();
+    map.insert(key.to_string(), store.clone());
+    write_auth_file(&path, &map)
+}
+
+/// Remove the credential at `key`. Idempotent — missing key is not an
+/// error. If the map becomes empty, the file is deleted so `mcp doctor`
+/// can report "no credentials" instead of "empty file".
+#[cfg(feature = "mcp")]
+#[allow(dead_code)] // wired in next slice (mcp logout / revoked-refresh recovery)
+pub fn remove_namespaced_token(key: &str) -> Result<()> {
+    let path = auth_path();
+    let mut map = match read_auth_file(&path) {
+        Ok(m) => m,
+        Err(_) => return Ok(()),
+    };
+    if map.remove(key).is_none() {
+        return Ok(());
+    }
+    if map.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return Ok(());
+    }
+    write_auth_file(&path, &map)
 }
 
 fn is_expired(store: &TokenStore) -> bool {
@@ -534,5 +623,59 @@ mod tests {
         assert!(!verifier.is_empty());
         let expected = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         assert_eq!(challenge, expected);
+    }
+
+    #[test]
+    fn read_auth_file_migrates_legacy_single_tenant_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let legacy = serde_json::to_string_pretty(&make_store(9_999_999_999)).unwrap();
+        std::fs::write(&path, legacy).unwrap();
+        let map = read_auth_file(&path).unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(
+            map.get(CODEX_NAMESPACE).unwrap().access_token,
+            "test_access_token_value"
+        );
+    }
+
+    #[test]
+    fn read_auth_file_parses_new_namespaced_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut input = HashMap::new();
+        input.insert("codex".to_string(), make_store(1));
+        input.insert("mcp:linear".to_string(), make_store(2));
+        write_auth_file(&path, &input).unwrap();
+        let map = read_auth_file(&path).unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("codex").unwrap().expires_at, 1);
+        assert_eq!(map.get("mcp:linear").unwrap().expires_at, 2);
+    }
+
+    #[test]
+    fn write_auth_file_round_trips_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut input = HashMap::new();
+        input.insert("mcp:github".to_string(), make_store(42));
+        write_auth_file(&path, &input).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("mcp:github"));
+        let map = read_auth_file(&path).unwrap();
+        assert_eq!(map.get("mcp:github").unwrap().expires_at, 42);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_auth_file_creates_file_with_0600_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut input = HashMap::new();
+        input.insert("codex".to_string(), make_store(0));
+        write_auth_file(&path, &input).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected 0600, got {mode:o}");
     }
 }
