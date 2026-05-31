@@ -12,7 +12,6 @@ use super::runtime::{McpRuntimeManager, ServerStatus};
 
 /// Deserialized form of the meta-tool's input JSON (ADR §5.2). The LLM
 /// sends `{ "action": "...", ... }`; `tag = "action"` routes by that field.
-#[allow(dead_code)] // wired into agent.rs execute_tool dispatch in the next slice
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Action {
@@ -39,7 +38,6 @@ pub enum Action {
 
 /// Entry point — the LLM tool dispatcher hands us a deserialized `Action`
 /// and we return the JSON payload that becomes the tool result.
-#[allow(dead_code)] // wired into agent.rs execute_tool dispatch in the next slice
 pub async fn dispatch(manager: &McpRuntimeManager, action: Action) -> Result<Value> {
     match action {
         Action::Help => Ok(json!(HELP)),

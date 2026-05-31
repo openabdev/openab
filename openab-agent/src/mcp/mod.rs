@@ -4,14 +4,70 @@ pub mod config;
 pub mod meta_tool;
 pub mod runtime;
 
+use serde_json::json;
+
+use crate::llm::ToolDef;
 use config::{McpConfig, ServerConfig};
-use runtime::McpRuntimeManager;
+
+pub use runtime::McpRuntimeManager;
+
+/// Shared tool name used by `mcp_tool_def()` and the agent dispatch arm —
+/// keeps the implicit contract between the two call sites explicit.
+pub const MCP_TOOL_NAME: &str = "mcp";
+
+/// The single `mcp` tool definition the LLM sees (ADR §5.2). The schema is
+/// intentionally permissive on the per-action fields — the LLM should call
+/// `mcp(action="help")` first to learn the action-specific contract.
+pub fn mcp_tool_def() -> ToolDef {
+    ToolDef {
+        name: MCP_TOOL_NAME.to_string(),
+        description: "Talk to configured MCP servers. Call with \
+             {action: 'help'} first to see the available actions \
+             (help, list_servers, list_tools, describe_tool, call, status)."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["help", "list_servers", "list_tools",
+                             "describe_tool", "call", "status"],
+                    "description": "Which meta-tool action to invoke"
+                },
+                "server": {
+                    "type": "string",
+                    "description": "Server name (required by list_tools / describe_tool / call; optional filter for status)"
+                },
+                "tool": {
+                    "type": "string",
+                    "description": "Tool name on the server (required by describe_tool / call)"
+                },
+                "arguments": {
+                    "description": "Tool arguments for call — JSON object, or null/omitted for no-arg tools"
+                }
+            },
+            "required": ["action"]
+        }),
+    }
+}
 
 fn load_config_or_exit() -> McpConfig {
     McpConfig::load().unwrap_or_else(|e| {
         eprintln!("failed to load mcp config: {e:#}");
         std::process::exit(1);
     })
+}
+
+/// Construct an `McpRuntimeManager` from on-disk config, falling back to an
+/// empty manager (with a `tracing::warn!`) on parse failure. Long-running
+/// servers (ACP, future HTTP) call this so a malformed `mcp.json` cannot
+/// kill the host process — CLI subcommands use `load_config_or_exit` instead.
+pub fn load_runtime_or_warn() -> McpRuntimeManager {
+    let cfg = McpConfig::load().unwrap_or_else(|e| {
+        tracing::warn!("mcp config failed to load, starting with no servers: {e:#}");
+        McpConfig::default()
+    });
+    McpRuntimeManager::from_config(cfg)
 }
 
 /// `openab-agent mcp list [--resolve]`.

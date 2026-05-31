@@ -1,20 +1,30 @@
 use anyhow::Result;
+#[cfg(feature = "mcp")]
+use serde::Deserialize;
 use std::path::PathBuf;
 use tracing::{debug, info};
 
 use crate::llm::{ContentBlock, LlmEvent, LlmProvider, Message, ToolDef};
+#[cfg(feature = "mcp")]
+use crate::mcp::{self, McpRuntimeManager};
 use crate::skills;
 use crate::tools;
 
 const SYSTEM_PROMPT: &str = r#"You are openab-agent, a coding assistant. You help users by reading, writing, and editing files, and running shell commands.
 
-You have 4 tools available:
+You have these tools available:
 - read: Read file contents or list a directory
 - write: Create or overwrite a file
 - edit: Replace a string in a file (first occurrence)
 - bash: Execute a shell command
 
 Be direct and concise. Execute tasks immediately rather than explaining what you would do. When you need to understand code, read the relevant files first."#;
+
+#[cfg(feature = "mcp")]
+const MCP_SYSTEM_PROMPT_APPENDIX: &str = "\n\nAdditional tool:\n\
+    - mcp: Talk to configured MCP servers. Always call `mcp(action=\"help\")` \
+    first to learn the action surface, then `mcp(action=\"list_servers\")` to see \
+    what's configured before calling tools.";
 
 const MAX_TOOL_LOOPS: usize = 50;
 /// Maximum number of messages to keep in context. When exceeded, oldest
@@ -27,44 +37,69 @@ pub struct Agent {
     working_dir: PathBuf,
     system_prompt: String,
     tools: Vec<ToolDef>,
+    #[cfg(feature = "mcp")]
+    mcp_manager: Option<McpRuntimeManager>,
 }
 
 impl Agent {
     #[cfg(test)]
     pub fn new(provider: impl LlmProvider + 'static, working_dir: String) -> Self {
-        let system_prompt = Self::build_system_prompt(&working_dir);
+        let system_prompt = Self::build_system_prompt(&working_dir, false);
         Self {
             provider: Box::new(provider),
             messages: Vec::new(),
             working_dir: PathBuf::from(working_dir),
             system_prompt,
             tools: tools::tool_definitions(),
+            #[cfg(feature = "mcp")]
+            mcp_manager: None,
         }
     }
 
-    pub fn new_boxed(provider: Box<dyn LlmProvider>, working_dir: String) -> Self {
-        let system_prompt = Self::build_system_prompt(&working_dir);
+    pub fn new_boxed(
+        provider: Box<dyn LlmProvider>,
+        working_dir: String,
+        #[cfg(feature = "mcp")] mcp_manager: Option<McpRuntimeManager>,
+    ) -> Self {
+        #[cfg(feature = "mcp")]
+        let has_mcp = mcp_manager.is_some();
+        #[cfg(not(feature = "mcp"))]
+        let has_mcp = false;
+        let system_prompt = Self::build_system_prompt(&working_dir, has_mcp);
+        let mut tools = tools::tool_definitions();
+        #[cfg(feature = "mcp")]
+        if mcp_manager.is_some() {
+            tools.push(mcp::mcp_tool_def());
+        }
         Self {
             provider,
             messages: Vec::new(),
             working_dir: PathBuf::from(working_dir),
             system_prompt,
-            tools: tools::tool_definitions(),
+            tools,
+            #[cfg(feature = "mcp")]
+            mcp_manager,
         }
     }
 
     /// Run the agent with a user prompt, executing tool calls until completion.
     /// Returns the final text response.
-    fn build_system_prompt(working_dir: &str) -> String {
+    #[cfg_attr(not(feature = "mcp"), allow(unused_variables))]
+    fn build_system_prompt(working_dir: &str, mcp_enabled: bool) -> String {
         let wd = std::path::Path::new(working_dir);
         let agents_md = wd.join("AGENTS.md");
         let custom = std::fs::read_to_string(&agents_md).unwrap_or_default();
 
-        let base = if custom.is_empty() {
+        let mut base = if custom.is_empty() {
             SYSTEM_PROMPT.to_string()
         } else {
             format!("{}\n\n---\n\n{}", custom.trim(), SYSTEM_PROMPT)
         };
+
+        #[cfg(feature = "mcp")]
+        if mcp_enabled {
+            base.push_str(MCP_SYSTEM_PROMPT_APPENDIX);
+        }
 
         let discovered = skills::discover_skills(wd);
         if discovered.is_empty() {
@@ -140,7 +175,7 @@ impl Agent {
             let mut tool_results: Vec<ContentBlock> = Vec::new();
             for (id, name, input) in &tool_calls {
                 info!("executing tool: {name}");
-                let result = tools::execute_tool(name, input, &self.working_dir).await;
+                let result = self.execute_tool_call(name, input).await;
                 match result {
                     Ok(output) => {
                         tool_results.push(ContentBlock::ToolResult {
@@ -182,6 +217,26 @@ impl Agent {
             let end = (1 + 2).min(self.messages.len());
             self.messages.drain(1..end);
         }
+    }
+
+    /// Route the `mcp` meta-tool to the MCP runtime when configured;
+    /// everything else goes to the stateless `tools::execute_tool`. Keeping
+    /// the routing here (rather than inside `tools.rs`) lets `tools.rs` stay
+    /// stateless and free of MCP/feature plumbing.
+    async fn execute_tool_call(&self, name: &str, input: &serde_json::Value) -> Result<String> {
+        #[cfg(feature = "mcp")]
+        if name == mcp::MCP_TOOL_NAME {
+            let Some(manager) = self.mcp_manager.as_ref() else {
+                return Err(anyhow::anyhow!(
+                    "mcp tool invoked but no McpRuntimeManager configured"
+                ));
+            };
+            let action = mcp::meta_tool::Action::deserialize(input)
+                .map_err(|e| anyhow::anyhow!("invalid mcp action payload: {e}"))?;
+            let value = mcp::meta_tool::dispatch(manager, action).await?;
+            return Ok(serde_json::to_string(&value)?);
+        }
+        tools::execute_tool(name, input, &self.working_dir).await
     }
 
     async fn call_llm(&self) -> Result<Vec<LlmEvent>> {
