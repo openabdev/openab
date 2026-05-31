@@ -183,7 +183,10 @@ mod tests {
             ..Default::default()
         };
         let ResolvedProvider::Builtin {
-            provider_name, callback, scopes, ..
+            provider_name,
+            callback,
+            scopes,
+            ..
         } = resolve(&cfg).unwrap()
         else {
             panic!("expected Builtin variant");
@@ -252,7 +255,10 @@ mod tests {
             ..Default::default()
         };
         let ResolvedProvider::Custom {
-            client_id, device_authorization_endpoint, scopes, ..
+            client_id,
+            device_authorization_endpoint,
+            scopes,
+            ..
         } = resolve(&cfg).unwrap()
         else {
             panic!("expected Custom variant");
