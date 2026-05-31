@@ -509,6 +509,12 @@ While `Open`, `mcp call` returns `{"error":"server unavailable, cooldown 45s rem
 
 **Cold-start refresh**: on process start the runtime reads TokenStore lazily (on first `mcp call` per server). Expired access tokens trigger an in-process refresh via the stored refresh token; success updates the store and proceeds transparently. Refresh failure (revoked / expired refresh token) flips the server's state to `NeedsAuth` (§5.7); the next `mcp call` returns an error that prompts the LLM to re-run the §6.4 login flow. No human interaction is required as long as the refresh token remains valid.
 
+**Refresh-token rotation race with async persistence layers**: OAuth 2.1 servers issue a new refresh token on every rotation and immediately revoke the previous one; reuse of a revoked refresh token is treated as a replay attack and cascade-revokes the entire token chain. Deployments where TokenStore persistence is asynchronous (Fargate S3 sidecar sync, eventually-consistent volumes) must flush new tokens to durable storage *before* the agent can be killed — otherwise a Spot interruption between local write and remote sync restores the revoked token from S3 on the next task and locks the user out. Contract:
+
+- **Agent side**: `TokenStore` calls `fsync(2)` after every write to `auth.json`
+- **Deployment side**: the S3 / volume sync layer must trigger on `auth.json` mtime change (`inotify` / `fsnotify` event), not poll on a cron. Cron-driven sync (≥1 min interval) is incompatible with refresh-token rotation under Spot interruption
+- **Reference deployment**: Mira (openab-ecs Fargate Spot) `mira-home/` S3 sync configuration
+
 ### 6.2 Built-in providers (Phase 2)
 
 | Provider | Auth URL | Token URL | Callback | Scopes |
@@ -521,7 +527,7 @@ Callback values apply when the browser flow is engaged (`--browser` / `$DISPLAY`
 
 ### 6.3 Custom provider extension point
 
-Config can declare `oauth: { authorize_url, token_url, client_id, scopes, device_authorization_endpoint? }` for any server. The generic provider handles PKCE + callback + token persistence. No code change needed for new MCP servers that use standard OAuth 2.1. If `device_authorization_endpoint` is set (or RFC 8414 `/.well-known/oauth-authorization-server` advertises one), §6.4 device-code flow is preferred over paste-back.
+Config can declare `oauth: { authorize_url, token_url, client_id, scopes, device_authorization_endpoint?, discovery?, discovery_allowlist? }` for any server. The generic provider handles PKCE + callback + token persistence. No code change needed for new MCP servers that use standard OAuth 2.1. If `device_authorization_endpoint` is set, §6.4 device-code flow is preferred over paste-back. RFC 8414 dynamic discovery is opt-in only and requires an allowlist — see §6.4.
 
 ### 6.4 Agent-guided OAuth flow (default)
 
@@ -529,8 +535,10 @@ openab-agent's primary deployment surface is containerized (k8s pods, Fargate ta
 
 **Selection logic** (on `mcp(action: "login", server: X)`):
 
-1. If `X` declares an `oauth.device_authorization_endpoint` in config (§6.3) — or if RFC 8414 discovery against the server's authorize URL advertises one — runtime uses **device-code flow** (RFC 8628). Matches openab's existing CLI convention (`claude auth login`, `codex --device-auth`, `grok --device-auth`).
+1. If `X` declares an `oauth.device_authorization_endpoint` in config (§6.3), runtime uses **device-code flow** (RFC 8628). Matches openab's existing CLI convention (`claude auth login`, `codex --device-auth`, `grok --device-auth`).
 2. Else runtime uses **paste-back flow** (standard auth-code + PKCE). Universal fallback for OAuth 2.1 servers without a device endpoint (Linear, Notion, Figma, Sentry, ...).
+
+RFC 8414 dynamic discovery (`/.well-known/oauth-authorization-server`) is **disabled by default**. Operators opt in per-server via `oauth.discovery: true` plus an explicit `oauth.discovery_allowlist` of permitted domains (e.g. `["*.anthropic.com"]`); boot rejects `discovery: true` without an allowlist. Rationale: awsvpc egress restrictions + SSRF surface in multi-tenant deployments.
 
 **Device-code flow** (typically platform OAuth: Anthropic, OpenAI, xAI):
 
