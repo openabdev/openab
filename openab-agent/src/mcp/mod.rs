@@ -20,7 +20,7 @@ pub fn cli_list_servers() {
         return;
     }
     let mut servers: Vec<_> = cfg.servers.iter().collect();
-    servers.sort_by(|(a, _), (b, _)| a.cmp(b));
+    servers.sort_by_key(|(name, _)| *name);
     for (name, server) in servers {
         match server.resolved(name) {
             Ok(resolved) => {
