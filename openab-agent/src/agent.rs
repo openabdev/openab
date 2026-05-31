@@ -66,6 +66,7 @@ impl Agent {
         #[cfg(not(feature = "mcp"))]
         let has_mcp = false;
         let system_prompt = Self::build_system_prompt(&working_dir, has_mcp);
+        #[cfg_attr(not(feature = "mcp"), allow(unused_mut))]
         let mut tools = tools::tool_definitions();
         #[cfg(feature = "mcp")]
         if mcp_manager.is_some() {
@@ -90,6 +91,7 @@ impl Agent {
         let agents_md = wd.join("AGENTS.md");
         let custom = std::fs::read_to_string(&agents_md).unwrap_or_default();
 
+        #[cfg_attr(not(feature = "mcp"), allow(unused_mut))]
         let mut base = if custom.is_empty() {
             SYSTEM_PROMPT.to_string()
         } else {
