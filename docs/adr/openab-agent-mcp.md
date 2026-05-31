@@ -208,6 +208,8 @@ Anthropic reference + community packages. All ship as `command + args`; no netwo
 | `mcp-server-time` | Rust | `mcp-server-time` (cargo) |
 | `mcp-server-gitlab` | Node | `@modelcontextprotocol/server-gitlab` (npm) |
 
+**Container-image caveat for headless deployments**: Node/Python stdio servers require the corresponding interpreter (`node`, `python3`, `uvx`, `npx`) in the image. The openab base image ships none. Operators running openab-agent in headless environments (Fargate, Kubernetes pods, CI) must either bake the interpreter into a derived image or limit `mcpServers` to Go/Rust binaries (column above). A misconfigured server fails in isolation per §5.9.
+
 #### Vendor-hosted SaaS servers — all Streamable HTTP
 
 Survey of mainstream public endpoints (2026-Q2). Every active vendor endpoint surveyed is Streamable HTTP. The Atlassian SSE URL is the lone holdout and has a published sunset date.
@@ -302,11 +304,13 @@ openab-agent/src/tools.rs::tool_definitions() returns 5 entries:
       "action": {
         "type": "string",
         "enum": ["help", "list_servers", "list_tools",
-                 "describe_tool", "call", "status"]
+                 "describe_tool", "call", "status",
+                 "login", "complete_login"]
       },
-      "server":    { "type": "string" },
-      "tool":      { "type": "string" },
-      "arguments": { "type": "object" }
+      "server":       { "type": "string" },
+      "tool":         { "type": "string" },
+      "arguments":    { "type": "object" },
+      "redirect_url": { "type": "string" }
     },
     "required": ["action"]
   }
@@ -323,6 +327,8 @@ Per-action contract:
 | `describe_tool` | `server`, `tool` | `{ name, description, input_schema }` |
 | `call` | `server`, `tool`, `arguments` | tool's `CallToolResult` |
 | `status` | `server?` | per-server health / last error / OAuth state |
+| `login` | `server` | `{ flow: "device", user_code, verification_url, ... }` or `{ flow: "paste", authorize_url, state, ... }` — see §6.4 |
+| `complete_login` | `server`, `redirect_url` | `{ ok: true }` or `{ error }` — paste flow only; device flow polls internally |
 
 ### 5.3 Agent loop interaction
 
@@ -412,9 +418,10 @@ Single root key `mcpServers` to match Claude Code / Codex / Cursor / Cline conve
                     ┌─────────────────────────────────────┐
                     │ McpRuntimeManager  (1 per agent)    │
                     │                                     │
-                    │  config:  Arc<McpConfig>            │
-                    │  servers: Map<name, ServerHandle>   │
-                    │  idle_ttl: Duration (default 10m)   │
+                    │  config:           Arc<McpConfig>   │
+                    │  servers:          Map<name, Hdl>   │
+                    │  idle_ttl:         Duration (10m)   │
+                    │  max_concurrent:   usize    (10)    │
                     └─────────────────────────────────────┘
                                     │
                                     │ on first call needing server X:
@@ -440,7 +447,7 @@ Single root key `mcpServers` to match Claude Code / Codex / Cursor / Cline conve
 
 - **Lazy connect**: server is `Disconnected` at boot; transitions to `Connecting → Connected` on first action needing it
 - **Idle eviction**: background task evicts servers idle > `idle_ttl` (default 10m, configurable per server). State drops to `Disconnected`; tools cache retained for fast re-connect
-- **No per-thread isolation**: agent is single-thread-per-session; openab broker handles thread-level concurrency upstream
+- **Concurrency cap**: `max_concurrent_servers` bounds simultaneously-`Connected` servers (default 10; see §7 for constrained-env tuning). When at cap, the LRU connected server is force-evicted before connecting a new one
 - **Connection reuse**: while connected, all `mcp call` actions reuse the same `Peer`
 
 ### 5.8 Config refresh model
@@ -498,6 +505,10 @@ While `Open`, `mcp call` returns `{"error":"server unavailable, cooldown 45s rem
 
 `openab-agent/src/auth.rs` already implements hand-rolled PKCE for Codex (`CODEX_AUTHORIZE_URL`, port 1455). The TokenStore (`~/.openab/agent/auth.json`, 0o600) is reused — `mcp/oauth.rs` calls into the same store with namespaced keys (`mcp:<server_name>` vs `codex`).
 
+**Persistence assumption**: TokenStore is treated as persistent state. Deployments must mount `~/.openab/` on durable storage — hostPath / PVC (k8s work-agents), volume + S3 sync (Fargate Mira), or developer-laptop home directory. Ephemeral container filesystems force a re-bootstrap on every restart and are not a supported configuration.
+
+**Cold-start refresh**: on process start the runtime reads TokenStore lazily (on first `mcp call` per server). Expired access tokens trigger an in-process refresh via the stored refresh token; success updates the store and proceeds transparently. Refresh failure (revoked / expired refresh token) flips the server's state to `NeedsAuth` (§5.7); the next `mcp call` returns an error that prompts the LLM to re-run the §6.4 login flow. No human interaction is required as long as the refresh token remains valid.
+
 ### 6.2 Built-in providers (Phase 2)
 
 | Provider | Auth URL | Token URL | Callback | Scopes |
@@ -506,9 +517,40 @@ While `Open`, `mcp call` returns `{"error":"server unavailable, cooldown 45s rem
 | `github-copilot` | (existing pi/anthropic flow) | existing | existing | existing |
 | `generic` | from `mcpServers[name].oauth.authorize_url` | from `.oauth.token_url` | dynamically allocated port | from `.oauth.scopes` |
 
+Callback values apply when the browser flow is engaged (`--browser` / `$DISPLAY` set), and when the agent-guided paste-back branch of §6.4 is selected (user copies the redirect URL from the browser URL bar). The device-code branch of §6.4 ignores the callback entirely.
+
 ### 6.3 Custom provider extension point
 
-Config can declare `oauth: { authorize_url, token_url, client_id, scopes }` for any server. The generic provider handles PKCE + callback + token persistence. No code change needed for new MCP servers that use standard OAuth 2.1.
+Config can declare `oauth: { authorize_url, token_url, client_id, scopes, device_authorization_endpoint? }` for any server. The generic provider handles PKCE + callback + token persistence. No code change needed for new MCP servers that use standard OAuth 2.1. If `device_authorization_endpoint` is set (or RFC 8414 `/.well-known/oauth-authorization-server` advertises one), §6.4 device-code flow is preferred over paste-back.
+
+### 6.4 Agent-guided OAuth flow (default)
+
+openab-agent's primary deployment surface is containerized (k8s pods, Fargate tasks) where `localhost:53692/callback` is unreachable and there is no display to open. Two non-browser flows are supported; the runtime picks per server based on capability. Browser-callback remains a laptop-only opt-in (`$DISPLAY` set, or `--browser` passed to `openab-agent mcp login`).
+
+**Selection logic** (on `mcp(action: "login", server: X)`):
+
+1. If `X` declares an `oauth.device_authorization_endpoint` in config (§6.3) — or if RFC 8414 discovery against the server's authorize URL advertises one — runtime uses **device-code flow** (RFC 8628). Matches openab's existing CLI convention (`claude auth login`, `codex --device-auth`, `grok --device-auth`).
+2. Else runtime uses **paste-back flow** (standard auth-code + PKCE). Universal fallback for OAuth 2.1 servers without a device endpoint (Linear, Notion, Figma, Sentry, ...).
+
+**Device-code flow** (typically platform OAuth: Anthropic, OpenAI, xAI):
+
+- `login` returns `{ flow: "device", user_code, verification_url, expires_in }`. Agent relays to chat: "Open `https://example.com/device`, enter code: `ABCD-EFGH`".
+- Runtime polls the token endpoint in background (5s interval, RFC 8628 §3.5). On success, persists tokens under `mcp:X`, transitions server to `Connected`.
+- LLM checks `mcp(action: "status", server: X)` to learn when ready; `complete_login` not required for this branch.
+
+**Paste-back flow** (typically MCP SaaS: Linear, Notion, Figma, ...):
+
+- `login` returns `{ flow: "paste", authorize_url, state }`. Runtime persists transient `{verifier, state}` in TokenStore. Agent relays to chat: "Open this link, sign in, paste the URL you land on back here".
+- User pastes the URL as next chat message; LLM calls `mcp(action: "complete_login", server: X, redirect_url: "...")`.
+- Runtime parses `code` + `state`, validates `state`, performs PKCE token exchange against `token_url`, persists tokens under `mcp:X`, drops transient state.
+
+**Security** (both flows):
+
+- Device-code `user_code` is short-lived (RFC 8628 §3.2, typically ≤10 min); an attacker who sees the code in chat must also race the polling loop and prove device ownership.
+- Paste-back redirect URL carries only the authorization code (OAuth 2.1 PKCE; implicit/hybrid removed); code is single-use + ≤10 min; PKCE verifier held in-process makes intercepted codes unusable.
+- Token exchange happens entirely inside the agent process; the chat channel never carries access or refresh tokens. Refresh rotation runs in-process per §6.1.
+
+`openab-agent/src/auth.rs` already ships all three paths for Codex OAuth (browser L150-244, paste-back L165-201, device L328-440). This ADR generalizes that pattern across MCP servers and centralizes flow selection on per-server capability rather than per-CLI hard-coding. OpenHands notes the same headless-OAuth incompatibility (§3.5) without shipping a fix.
 
 ---
 
@@ -528,6 +570,8 @@ Included because the sidecar alternative (§4.1 B) was motivated by memory.
 
 The 1-2 MB sidecar saving is dominated by per-server child RAM (identical across architectures) and by token cost (identical *as long as progressive disclosure is used*). Memory does not justify the sidecar.
 
+**Constrained-environment note (Fargate / small Kubernetes pods).** Fargate Spot tasks at 512 MB / 1 GB have no swap; OOMKill is hard. Worst-case stack — agent baseline 40 MB + 5 Node/Python stdio servers at 80 MB each + LLM context buffers — sums to ~440-540 MB, which trips a 512 MB task before any prompt processing. Two mitigations: (a) lower `max_concurrent_servers` to 3 in `mcp.json` (§5.7), bounding worst case to ~280 MB; (b) prefer Go/Rust stdio servers (5-20 MB) or HTTP servers (0 MB local) over Node/Python interpreters. The `mcp doctor` CLI (§8) flags configurations whose worst-case sum exceeds the cgroup limit.
+
 ---
 
 ## 8. CLI Surface
@@ -538,7 +582,7 @@ openab-agent mcp status [server]            — health, last error, OAuth state
 openab-agent mcp add <name> <command>       — append a stdio server to config
 openab-agent mcp add <name> --url <url>     — append an http server
 openab-agent mcp remove <name>              — remove a server from config
-openab-agent mcp login <name>               — run OAuth flow for a server
+openab-agent mcp login <name> [--browser]   — run OAuth flow (see §6.4; --browser opts into localhost callback)
 openab-agent mcp refresh <name>             — force-refresh OAuth token
 openab-agent mcp test <name> <tool> [json]  — invoke a tool from CLI (debug)
 openab-agent mcp doctor                     — diagnose config, network, auth
