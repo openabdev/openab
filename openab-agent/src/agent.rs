@@ -22,9 +22,10 @@ Be direct and concise. Execute tasks immediately rather than explaining what you
 
 #[cfg(feature = "mcp")]
 const MCP_SYSTEM_PROMPT_APPENDIX: &str = "\n\nAdditional tool:\n\
-    - mcp: Talk to configured MCP servers. Always call `mcp(action=\"help\")` \
-    first to learn the action surface, then `mcp(action=\"list_servers\")` to see \
-    what's configured before calling tools.";
+    - mcp: Talk to configured MCP servers. Call `mcp(action=\"list_servers\")` \
+    to see what's configured, then `mcp(action=\"list_tools\", server=...)` to \
+    discover per-server tools. Use `mcp(action=\"help\")` only if action shapes \
+    are unclear.";
 
 const MAX_TOOL_LOOPS: usize = 50;
 /// Maximum number of messages to keep in context. When exceeded, oldest
@@ -66,12 +67,16 @@ impl Agent {
         #[cfg(not(feature = "mcp"))]
         let has_mcp = false;
         let system_prompt = Self::build_system_prompt(&working_dir, has_mcp);
-        #[cfg_attr(not(feature = "mcp"), allow(unused_mut))]
-        let mut tools = tools::tool_definitions();
         #[cfg(feature = "mcp")]
-        if mcp_manager.is_some() {
-            tools.push(mcp::mcp_tool_def());
-        }
+        let tools = {
+            let mut t = tools::tool_definitions();
+            if mcp_manager.is_some() {
+                t.push(mcp::mcp_tool_def());
+            }
+            t
+        };
+        #[cfg(not(feature = "mcp"))]
+        let tools = tools::tool_definitions();
         Self {
             provider,
             messages: Vec::new(),
@@ -85,23 +90,25 @@ impl Agent {
 
     /// Run the agent with a user prompt, executing tool calls until completion.
     /// Returns the final text response.
-    #[cfg_attr(not(feature = "mcp"), allow(unused_variables))]
     fn build_system_prompt(working_dir: &str, mcp_enabled: bool) -> String {
+        #[cfg(not(feature = "mcp"))]
+        let _ = mcp_enabled;
         let wd = std::path::Path::new(working_dir);
         let agents_md = wd.join("AGENTS.md");
         let custom = std::fs::read_to_string(&agents_md).unwrap_or_default();
 
-        #[cfg_attr(not(feature = "mcp"), allow(unused_mut))]
-        let mut base = if custom.is_empty() {
+        let base = if custom.is_empty() {
             SYSTEM_PROMPT.to_string()
         } else {
             format!("{}\n\n---\n\n{}", custom.trim(), SYSTEM_PROMPT)
         };
 
         #[cfg(feature = "mcp")]
-        if mcp_enabled {
-            base.push_str(MCP_SYSTEM_PROMPT_APPENDIX);
-        }
+        let base = if mcp_enabled {
+            format!("{base}{MCP_SYSTEM_PROMPT_APPENDIX}")
+        } else {
+            base
+        };
 
         let discovered = skills::discover_skills(wd);
         if discovered.is_empty() {

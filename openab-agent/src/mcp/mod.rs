@@ -58,16 +58,22 @@ fn load_config_or_exit() -> McpConfig {
     })
 }
 
-/// Construct an `McpRuntimeManager` from on-disk config, falling back to an
-/// empty manager (with a `tracing::warn!`) on parse failure. Long-running
-/// servers (ACP, future HTTP) call this so a malformed `mcp.json` cannot
-/// kill the host process — CLI subcommands use `load_config_or_exit` instead.
-pub fn load_runtime_or_warn() -> McpRuntimeManager {
+/// Construct an `McpRuntimeManager` from on-disk config — returns `None`
+/// when no servers are configured so callers can skip the entire MCP path
+/// (saves system-prompt tokens + keeps the LLM from hallucinating an empty
+/// tool surface). Parse failure falls back to `None` with a `tracing::warn!`.
+/// Long-running servers (ACP, future HTTP) call this; CLI subcommands use
+/// `load_config_or_exit` instead.
+pub fn load_runtime_or_warn() -> Option<McpRuntimeManager> {
     let cfg = McpConfig::load().unwrap_or_else(|e| {
         tracing::warn!("mcp config failed to load, starting with no servers: {e:#}");
         McpConfig::default()
     });
-    McpRuntimeManager::from_config(cfg)
+    if cfg.servers.is_empty() {
+        None
+    } else {
+        Some(McpRuntimeManager::from_config(cfg))
+    }
 }
 
 /// `openab-agent mcp list [--resolve]`.

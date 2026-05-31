@@ -38,7 +38,7 @@ pub struct AcpServer {
     sessions: HashMap<String, Agent>,
     working_dir: String,
     #[cfg(feature = "mcp")]
-    mcp_manager: McpRuntimeManager,
+    mcp_manager: Option<McpRuntimeManager>,
 }
 
 impl AcpServer {
@@ -164,7 +164,7 @@ impl AcpServer {
             provider,
             self.working_dir.clone(),
             #[cfg(feature = "mcp")]
-            Some(self.mcp_manager.clone()),
+            self.mcp_manager.clone(),
         );
         self.sessions.insert(session_id.clone(), agent);
         let resp = JsonRpcResponse {
