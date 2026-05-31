@@ -45,6 +45,11 @@ enum McpAction {
     },
     /// Show per-server runtime status
     Status,
+    /// Spawn the configured server and run the MCP handshake (smoke-test).
+    Connect {
+        /// Server name as configured in mcp.json
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -97,6 +102,7 @@ async fn main() {
         Some(Commands::Mcp { action }) => match action {
             McpAction::List { resolve } => mcp::cli_list_servers(resolve),
             McpAction::Status => mcp::cli_show_status().await,
+            McpAction::Connect { name } => mcp::cli_connect(name).await,
         },
     }
 }

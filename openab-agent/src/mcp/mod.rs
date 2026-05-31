@@ -61,9 +61,9 @@ fn print_json<T: serde::Serialize>(status: &str, name: &str, value: &T) {
 
 /// `openab-agent mcp status`.
 ///
-/// Prints per-server runtime status. Phase 1 always reports `Disconnected`
-/// because servers are not yet dialed; the next slice wires `connect()` and
-/// real state transitions land then.
+/// Prints per-server runtime status. Servers start `Disconnected` and only
+/// advance after `mcp connect <name>` (or, later, lazy dial from the agent
+/// path).
 pub async fn cli_show_status() {
     let manager = McpRuntimeManager::from_config(load_config_or_exit());
     if manager.is_empty().await {
@@ -72,5 +72,20 @@ pub async fn cli_show_status() {
     }
     for (name, status) in manager.statuses().await {
         println!("{} {name}", status.icon());
+    }
+}
+
+/// `openab-agent mcp connect <name>`. Spawns the configured stdio server,
+/// runs the rmcp handshake, and reports success or the failure reason.
+/// The connection is dropped on process exit — this CLI is a smoke-test
+/// for `mcp.json` entries, not a long-running session.
+pub async fn cli_connect(name: String) {
+    let manager = McpRuntimeManager::from_config(load_config_or_exit());
+    match manager.connect(&name).await {
+        Ok(()) => println!("● connected: {name}"),
+        Err(e) => {
+            eprintln!("✗ {name}: {e:#}");
+            std::process::exit(1);
+        }
     }
 }
