@@ -18,6 +18,7 @@ use super::config::OAuthConfig;
 /// from the server config; per-server overrides win when present.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderSpec {
+    pub name: &'static str,
     pub authorize_url: &'static str,
     pub token_url: &'static str,
     pub callback: &'static str,
@@ -27,6 +28,7 @@ pub struct ProviderSpec {
 /// Anthropic MCP (claude.ai). Scope list from ADR §6.2 — `org:create_api_key`
 /// is the broadest grant; consumers should narrow via per-server overrides.
 pub const ANTHROPIC_MCP: ProviderSpec = ProviderSpec {
+    name: "anthropic-mcp",
     authorize_url: "https://claude.ai/oauth/authorize",
     token_url: "https://platform.claude.com/v1/oauth/token",
     callback: "http://localhost:53692/callback",
@@ -40,46 +42,86 @@ pub const ANTHROPIC_MCP: ProviderSpec = ProviderSpec {
     ],
 };
 
+const BUILTINS: &[ProviderSpec] = &[ANTHROPIC_MCP];
+
 /// Look up a built-in `ProviderSpec` by config name. Returns `None` for
 /// custom providers (§6.3) and for unknown names.
 pub fn builtin(name: &str) -> Option<ProviderSpec> {
-    match name {
-        "anthropic-mcp" => Some(ANTHROPIC_MCP),
-        _ => None,
-    }
+    BUILTINS.iter().copied().find(|spec| spec.name == name)
 }
 
 /// Effective per-server OAuth parameters after resolving the built-in catalog
-/// and `OAuthConfig` overrides. `callback` is `None` for custom providers
-/// (§6.4 picks a free port at login time); built-ins pin theirs. `client_id`
-/// is `None` for built-ins (the per-provider flow code in §6.4 owns it) and
-/// optional for custom providers — OAuth 2.1 servers vary on whether public
-/// clients must register.
+/// and `OAuthConfig` overrides.
+///
+/// The two variants encode invariants that an `Option`-heavy struct couldn't:
+/// built-ins always pin a `callback` (their PKCE port is hard-coded in the
+/// provider's app registration) and never carry a `client_id` (the §6.4 flow
+/// code owns it, mirroring `auth.rs::codex_client_id()`). Custom providers
+/// flip both: §6.4 allocates a free port at login time, and `client_id`
+/// comes from config (OAuth 2.1 public clients vary on registration).
+///
+/// `device_authorization_endpoint` only appears on `Custom` — adding device
+/// support for a built-in provider is a `ProviderSpec` schema change, not a
+/// config flag.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedProvider {
-    pub authorize_url: String,
-    pub token_url: String,
-    pub client_id: Option<String>,
-    pub callback: Option<String>,
-    pub device_authorization_endpoint: Option<String>,
-    pub scopes: Vec<String>,
+pub enum ResolvedProvider {
+    Builtin {
+        provider_name: &'static str,
+        authorize_url: &'static str,
+        token_url: &'static str,
+        callback: &'static str,
+        scopes: Vec<String>,
+    },
+    Custom {
+        provider_name: String,
+        authorize_url: String,
+        token_url: String,
+        client_id: Option<String>,
+        device_authorization_endpoint: Option<String>,
+        scopes: Vec<String>,
+    },
+}
+
+impl ResolvedProvider {
+    /// Accessor for the shared `authorize_url` field. Callers that don't
+    /// need to distinguish built-in vs custom can skip the `match`.
+    pub fn authorize_url(&self) -> &str {
+        match self {
+            Self::Builtin { authorize_url, .. } => authorize_url,
+            Self::Custom { authorize_url, .. } => authorize_url,
+        }
+    }
+
+    /// Accessor for the shared `token_url` field.
+    pub fn token_url(&self) -> &str {
+        match self {
+            Self::Builtin { token_url, .. } => token_url,
+            Self::Custom { token_url, .. } => token_url,
+        }
+    }
+
+    /// Accessor for the shared scope list.
+    pub fn scopes(&self) -> &[String] {
+        match self {
+            Self::Builtin { scopes, .. } | Self::Custom { scopes, .. } => scopes,
+        }
+    }
 }
 
 /// Resolve a server's `oauth:` block. Built-in providers come from
 /// `builtin()`; unknown providers fall through to the §6.3 custom path,
 /// which requires `authorize_url` + `token_url` on the config.
 ///
-/// `OAuthConfig::scopes`, when non-empty, replaces the spec's defaults
+/// `OAuthConfig::scopes`, when non-empty, replaces the built-in defaults
 /// entirely — the caller never needs to merge.
 pub fn resolve(cfg: &OAuthConfig) -> Result<ResolvedProvider> {
     let provider = cfg
         .provider
         .as_deref()
         .ok_or_else(|| anyhow!("oauth.provider is required"))?;
-    if let Some(spec) = builtin(provider) {
-        Ok(resolve_builtin(spec, cfg))
-    } else {
-        resolve_custom(provider, cfg)
+    match builtin(provider) {
+        Some(spec) => Ok(resolve_builtin(spec, cfg)),
+        None => resolve_custom(provider, cfg),
     }
 }
 
@@ -89,12 +131,11 @@ fn resolve_builtin(spec: ProviderSpec, cfg: &OAuthConfig) -> ResolvedProvider {
     } else {
         cfg.scopes.clone()
     };
-    ResolvedProvider {
-        authorize_url: spec.authorize_url.to_string(),
-        token_url: spec.token_url.to_string(),
-        client_id: None,
-        callback: Some(spec.callback.to_string()),
-        device_authorization_endpoint: None,
+    ResolvedProvider::Builtin {
+        provider_name: spec.name,
+        authorize_url: spec.authorize_url,
+        token_url: spec.token_url,
+        callback: spec.callback,
         scopes,
     }
 }
@@ -106,11 +147,11 @@ fn resolve_custom(provider: &str, cfg: &OAuthConfig) -> Result<ResolvedProvider>
     let token_url = cfg.token_url.clone().ok_or_else(|| {
         anyhow!("custom oauth provider {provider:?}: oauth.token_url is required (ADR §6.3)")
     })?;
-    Ok(ResolvedProvider {
+    Ok(ResolvedProvider::Custom {
+        provider_name: provider.to_string(),
         authorize_url,
         token_url,
         client_id: cfg.client_id.clone(),
-        callback: None,
         device_authorization_endpoint: cfg.device_authorization_endpoint.clone(),
         scopes: cfg.scopes.clone(),
     })
@@ -141,12 +182,15 @@ mod tests {
             provider: Some("anthropic-mcp".to_string()),
             ..Default::default()
         };
-        let r = resolve(&cfg).unwrap();
-        assert_eq!(r.authorize_url, ANTHROPIC_MCP.authorize_url);
-        assert_eq!(r.callback.as_deref(), Some(ANTHROPIC_MCP.callback));
-        assert_eq!(r.scopes.len(), ANTHROPIC_MCP.default_scopes.len());
-        assert!(r.client_id.is_none());
-        assert!(r.device_authorization_endpoint.is_none());
+        let ResolvedProvider::Builtin {
+            provider_name, callback, scopes, ..
+        } = resolve(&cfg).unwrap()
+        else {
+            panic!("expected Builtin variant");
+        };
+        assert_eq!(provider_name, "anthropic-mcp");
+        assert_eq!(callback, ANTHROPIC_MCP.callback);
+        assert_eq!(scopes.len(), ANTHROPIC_MCP.default_scopes.len());
     }
 
     #[test]
@@ -157,7 +201,7 @@ mod tests {
             ..Default::default()
         };
         let r = resolve(&cfg).unwrap();
-        assert_eq!(r.scopes, vec!["user:profile", "user:inference"]);
+        assert_eq!(r.scopes(), &["user:profile", "user:inference"]);
     }
 
     #[test]
@@ -177,19 +221,26 @@ mod tests {
             scopes: vec!["read".to_string(), "write".to_string()],
             ..Default::default()
         };
-        let r = resolve(&cfg).unwrap();
-        assert_eq!(r.authorize_url, "https://linear.app/oauth/authorize");
-        assert_eq!(r.token_url, "https://api.linear.app/oauth/token");
-        assert_eq!(r.client_id.as_deref(), Some("client-abc"));
+        let ResolvedProvider::Custom {
+            provider_name,
+            authorize_url,
+            token_url,
+            client_id,
+            device_authorization_endpoint,
+            scopes,
+        } = resolve(&cfg).unwrap()
+        else {
+            panic!("expected Custom variant");
+        };
+        assert_eq!(provider_name, "linear");
+        assert_eq!(authorize_url, "https://linear.app/oauth/authorize");
+        assert_eq!(token_url, "https://api.linear.app/oauth/token");
+        assert_eq!(client_id.as_deref(), Some("client-abc"));
         assert_eq!(
-            r.device_authorization_endpoint.as_deref(),
+            device_authorization_endpoint.as_deref(),
             Some("https://linear.app/oauth/device"),
         );
-        assert!(
-            r.callback.is_none(),
-            "custom providers defer callback to login-time port allocation",
-        );
-        assert_eq!(r.scopes, vec!["read", "write"]);
+        assert_eq!(scopes, vec!["read", "write"]);
     }
 
     #[test]
@@ -200,11 +251,15 @@ mod tests {
             token_url: Some("https://acme.example/token".to_string()),
             ..Default::default()
         };
-        let r = resolve(&cfg).unwrap();
-        assert!(r.client_id.is_none());
-        assert!(r.device_authorization_endpoint.is_none());
-        assert!(r.callback.is_none());
-        assert!(r.scopes.is_empty());
+        let ResolvedProvider::Custom {
+            client_id, device_authorization_endpoint, scopes, ..
+        } = resolve(&cfg).unwrap()
+        else {
+            panic!("expected Custom variant");
+        };
+        assert!(client_id.is_none());
+        assert!(device_authorization_endpoint.is_none());
+        assert!(scopes.is_empty());
     }
 
     #[test]
