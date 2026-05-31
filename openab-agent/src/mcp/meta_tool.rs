@@ -151,7 +151,7 @@ async fn status(manager: &McpRuntimeManager, filter: Option<&str>) -> Value {
     let snapshot = manager.snapshot().await;
     let entries: Vec<Value> = snapshot
         .into_iter()
-        .filter(|(name, _, _)| filter.map_or(true, |f| f == name.as_str()))
+        .filter(|(name, _, _)| filter.is_none_or(|f| f == name.as_str()))
         .map(|(name, status, transport)| {
             let last_error = match &status {
                 ServerStatus::Failed(msg) => Some(msg.clone()),
