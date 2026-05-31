@@ -24,6 +24,19 @@ enum Commands {
         #[command(subcommand)]
         provider: AuthProvider,
     },
+    /// Inspect / manage configured MCP servers
+    #[cfg(feature = "mcp")]
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
+}
+
+#[cfg(feature = "mcp")]
+#[derive(Subcommand)]
+enum McpAction {
+    /// List configured MCP servers (loads global + project mcp.json)
+    List,
 }
 
 #[derive(Subcommand)]
@@ -71,6 +84,10 @@ async fn main() {
             AuthProvider::Status => {
                 auth::show_status();
             }
+        },
+        #[cfg(feature = "mcp")]
+        Some(Commands::Mcp { action }) => match action {
+            McpAction::List => mcp::cli_list_servers(),
         },
     }
 }
