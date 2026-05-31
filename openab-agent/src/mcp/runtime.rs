@@ -93,6 +93,7 @@ impl McpRuntimeManager {
     /// Transition the named server to `Connecting`. The rmcp
     /// `TokioChildProcess` dial + transition to `Connected` / `Failed`
     /// lands in the next slice — see module doc.
+    #[allow(dead_code)] // wired into meta-tool dispatch in the next slice; tests keep it covered
     pub async fn connect(&self, name: &str) -> Result<()> {
         let mut guard = self.handles.write().await;
         let handle = guard
