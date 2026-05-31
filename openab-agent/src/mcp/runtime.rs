@@ -74,10 +74,6 @@ impl McpRuntimeManager {
         out
     }
 
-    pub fn len(&self) -> usize {
-        self.handles.len()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.handles.is_empty()
     }
@@ -97,7 +93,6 @@ mod tests {
         }"#;
         let cfg: McpConfig = serde_json::from_str(json).unwrap();
         let mgr = McpRuntimeManager::from_config(cfg);
-        assert_eq!(mgr.len(), 2);
         let statuses = mgr.statuses();
         assert_eq!(statuses.len(), 2);
         for (_, status) in statuses {
@@ -109,7 +104,6 @@ mod tests {
     fn empty_config_yields_empty_manager() {
         let mgr = McpRuntimeManager::from_config(McpConfig::default());
         assert!(mgr.is_empty());
-        assert_eq!(mgr.len(), 0);
         assert!(mgr.statuses().is_empty());
     }
 
