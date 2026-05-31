@@ -43,6 +43,8 @@ enum McpAction {
         #[arg(long)]
         resolve: bool,
     },
+    /// Show per-server runtime status
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -94,6 +96,7 @@ async fn main() {
         #[cfg(feature = "mcp")]
         Some(Commands::Mcp { action }) => match action {
             McpAction::List { resolve } => mcp::cli_list_servers(resolve),
+            McpAction::Status => mcp::cli_show_status(),
         },
     }
 }

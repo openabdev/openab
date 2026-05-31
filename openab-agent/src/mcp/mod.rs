@@ -1,8 +1,17 @@
 //! Native MCP client. See `docs/adr/openab-agent-mcp.md`.
 
 pub mod config;
+pub mod runtime;
 
 use config::{McpConfig, ServerConfig};
+use runtime::McpRuntimeManager;
+
+fn load_config_or_exit() -> McpConfig {
+    McpConfig::load().unwrap_or_else(|e| {
+        eprintln!("failed to load mcp config: {e:#}");
+        std::process::exit(1);
+    })
+}
 
 /// `openab-agent mcp list [--resolve]`.
 ///
@@ -11,13 +20,7 @@ use config::{McpConfig, ServerConfig};
 /// substituting env vars and prints a leading warning — useful for debugging
 /// missing-env startup failures locally.
 pub fn cli_list_servers(resolve: bool) {
-    let cfg = match McpConfig::load() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("failed to load mcp config: {e:#}");
-            std::process::exit(1);
-        }
-    };
+    let cfg = load_config_or_exit();
     if cfg.servers.is_empty() {
         println!("No MCP servers configured.");
         println!("  global:  ~/.openab/agent/mcp.json");
@@ -53,5 +56,21 @@ fn print_json<T: serde::Serialize>(status: &str, name: &str, value: &T) {
         for line in json.lines() {
             println!("    {line}");
         }
+    }
+}
+
+/// `openab-agent mcp status`.
+///
+/// Prints per-server runtime status. Phase 1 always reports `Disconnected`
+/// because servers are not yet dialed; the next slice wires `connect()` and
+/// real state transitions land then.
+pub fn cli_show_status() {
+    let manager = McpRuntimeManager::from_config(load_config_or_exit());
+    if manager.is_empty() {
+        println!("No MCP servers configured.");
+        return;
+    }
+    for (name, status) in manager.statuses() {
+        println!("{} {name}", status.icon());
     }
 }
