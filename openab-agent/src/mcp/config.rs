@@ -57,15 +57,46 @@ pub struct ToolFilter {
     pub exclude: Vec<String>,
 }
 
-/// OAuth block. Phase 1 only parses `provider` + `scopes`; custom-provider
-/// fields (§6.3: `authorize_url`, `token_url`, `device_authorization_endpoint`,
-/// `discovery`, `discovery_allowlist`) land with the Phase 2 auth slice.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// OAuth block.
+///
+/// `provider` selects a built-in spec from `oauth::builtin()`. Setting it
+/// to an unknown name + supplying `authorize_url` / `token_url` defines a
+/// custom OAuth 2.1 provider (ADR §6.3). `discovery: true` opts into
+/// RFC 8414 dynamic discovery and requires a non-empty
+/// `discovery_allowlist` of domains (§6.4 SSRF guard).
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct OAuthConfig {
     #[serde(default)]
     pub provider: Option<String>,
     #[serde(default)]
     pub scopes: Vec<String>,
+    #[serde(default)]
+    pub authorize_url: Option<String>,
+    #[serde(default)]
+    pub token_url: Option<String>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub device_authorization_endpoint: Option<String>,
+    #[serde(default)]
+    pub discovery: bool,
+    #[serde(default)]
+    pub discovery_allowlist: Vec<String>,
+}
+
+impl OAuthConfig {
+    /// Boot-time validation (ADR §6.3 / §6.4). `discovery: true` without an
+    /// explicit allowlist is rejected — RFC 8414 lookups in multi-tenant
+    /// deployments would otherwise become an SSRF vector.
+    pub fn validate(&self, server: &str) -> Result<()> {
+        if self.discovery && self.discovery_allowlist.is_empty() {
+            return Err(anyhow!(
+                "mcp server {server:?}: oauth.discovery=true requires \
+                 a non-empty oauth.discovery_allowlist (ADR §6.3)"
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl McpConfig {
@@ -89,7 +120,19 @@ impl McpConfig {
             let layer = Self::load_file(path)?;
             merged.servers.extend(layer.servers);
         }
+        merged.validate()?;
         Ok(merged)
+    }
+
+    /// Validate every server's `oauth` block (ADR §6.3 boot check). Returns
+    /// the first failure — finer-grained per-server isolation lives in §5.6.
+    pub fn validate(&self) -> Result<()> {
+        for (name, server) in &self.servers {
+            if let ServerConfig::Http { oauth: Some(oauth), .. } = server {
+                oauth.validate(name)?;
+            }
+        }
+        Ok(())
     }
 
     fn load_file(path: &Path) -> Result<Self> {
@@ -287,5 +330,84 @@ mod tests {
             ServerConfig::Stdio { command, .. } => assert_eq!(command, "global-x"),
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn parses_custom_oauth_provider_fields() {
+        let json = r#"{
+            "mcpServers": {
+                "custom": {
+                    "type": "http",
+                    "url": "https://example.com/mcp",
+                    "oauth": {
+                        "provider": "custom",
+                        "authorize_url": "https://example.com/oauth/authorize",
+                        "token_url": "https://example.com/oauth/token",
+                        "client_id": "abc123",
+                        "device_authorization_endpoint": "https://example.com/oauth/device",
+                        "discovery": true,
+                        "discovery_allowlist": ["*.example.com"]
+                    }
+                }
+            }
+        }"#;
+        let cfg: McpConfig = serde_json::from_str(json).unwrap();
+        let ServerConfig::Http { oauth: Some(oauth), .. } = cfg.servers.get("custom").unwrap()
+        else {
+            panic!("expected http with oauth");
+        };
+        assert_eq!(
+            oauth.authorize_url.as_deref(),
+            Some("https://example.com/oauth/authorize"),
+        );
+        assert_eq!(
+            oauth.token_url.as_deref(),
+            Some("https://example.com/oauth/token"),
+        );
+        assert_eq!(oauth.client_id.as_deref(), Some("abc123"));
+        assert_eq!(
+            oauth.device_authorization_endpoint.as_deref(),
+            Some("https://example.com/oauth/device"),
+        );
+        assert!(oauth.discovery);
+        assert_eq!(oauth.discovery_allowlist, vec!["*.example.com".to_string()]);
+    }
+
+    #[test]
+    fn validate_rejects_discovery_without_allowlist() {
+        let oauth = OAuthConfig {
+            provider: Some("custom".into()),
+            discovery: true,
+            ..Default::default()
+        };
+        let err = oauth.validate("srv").unwrap_err().to_string();
+        assert!(err.contains("discovery_allowlist"), "got: {err}");
+        assert!(err.contains("srv"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_discovery_with_allowlist() {
+        let oauth = OAuthConfig {
+            provider: Some("custom".into()),
+            discovery: true,
+            discovery_allowlist: vec!["*.example.com".into()],
+            ..Default::default()
+        };
+        oauth.validate("srv").unwrap();
+    }
+
+    #[test]
+    fn load_layered_rejects_invalid_discovery_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project.json");
+        std::fs::write(
+            &project,
+            r#"{"mcpServers":{"bad":{"type":"http","url":"https://example.com","oauth":{"provider":"custom","discovery":true}}}}"#,
+        )
+        .unwrap();
+        let err = McpConfig::load_layered(None, Some(&project))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("discovery_allowlist"), "got: {err}");
     }
 }

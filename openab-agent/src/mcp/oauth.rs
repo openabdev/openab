@@ -100,7 +100,7 @@ mod tests {
     fn resolve_uses_default_scopes_when_config_omits_them() {
         let cfg = OAuthConfig {
             provider: Some("anthropic-mcp".to_string()),
-            scopes: vec![],
+            ..Default::default()
         };
         let (spec, scopes) = resolve(&cfg).unwrap();
         assert_eq!(spec, ANTHROPIC_MCP);
@@ -112,6 +112,7 @@ mod tests {
         let cfg = OAuthConfig {
             provider: Some("anthropic-mcp".to_string()),
             scopes: vec!["user:profile".to_string(), "user:inference".to_string()],
+            ..Default::default()
         };
         let (_, scopes) = resolve(&cfg).unwrap();
         assert_eq!(scopes, vec!["user:profile", "user:inference"]);
@@ -119,10 +120,7 @@ mod tests {
 
     #[test]
     fn resolve_rejects_missing_provider() {
-        let cfg = OAuthConfig {
-            provider: None,
-            scopes: vec![],
-        };
+        let cfg = OAuthConfig::default();
         let err = resolve(&cfg).unwrap_err().to_string();
         assert!(err.contains("required"), "got: {err}");
     }
@@ -131,7 +129,7 @@ mod tests {
     fn resolve_rejects_unknown_provider() {
         let cfg = OAuthConfig {
             provider: Some("github-copilot".to_string()),
-            scopes: vec![],
+            ..Default::default()
         };
         let err = resolve(&cfg).unwrap_err().to_string();
         assert!(err.contains("unknown oauth provider"), "got: {err}");
