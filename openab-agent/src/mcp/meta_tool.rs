@@ -117,8 +117,7 @@ async fn call_tool(
         .await
         .with_context(|| format!("connect mcp server {server:?}"))?;
     let peer = manager.arc_peer(server).await?;
-    let params = rmcp::model::CallToolRequestParams::new(tool.to_string())
-        .with_arguments(args_map);
+    let params = rmcp::model::CallToolRequestParams::new(tool.to_string()).with_arguments(args_map);
     let result = peer
         .call_tool(params)
         .await
