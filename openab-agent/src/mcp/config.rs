@@ -128,7 +128,10 @@ impl McpConfig {
     /// the first failure — finer-grained per-server isolation lives in §5.6.
     pub fn validate(&self) -> Result<()> {
         for (name, server) in &self.servers {
-            if let ServerConfig::Http { oauth: Some(oauth), .. } = server {
+            if let ServerConfig::Http {
+                oauth: Some(oauth), ..
+            } = server
+            {
                 oauth.validate(name)?;
             }
         }
@@ -351,7 +354,9 @@ mod tests {
             }
         }"#;
         let cfg: McpConfig = serde_json::from_str(json).unwrap();
-        let ServerConfig::Http { oauth: Some(oauth), .. } = cfg.servers.get("custom").unwrap()
+        let ServerConfig::Http {
+            oauth: Some(oauth), ..
+        } = cfg.servers.get("custom").unwrap()
         else {
             panic!("expected http with oauth");
         };
