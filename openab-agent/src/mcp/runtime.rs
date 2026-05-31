@@ -142,12 +142,7 @@ mod tests {
         }"#;
         let cfg: McpConfig = serde_json::from_str(json).unwrap();
         let mgr = McpRuntimeManager::from_config(cfg);
-        let names: Vec<String> = mgr
-            .statuses()
-            .await
-            .into_iter()
-            .map(|(n, _)| n)
-            .collect();
+        let names: Vec<String> = mgr.statuses().await.into_iter().map(|(n, _)| n).collect();
         assert_eq!(names, vec!["alpha", "mid", "zed"]);
     }
 
