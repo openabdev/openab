@@ -385,11 +385,6 @@ impl McpRuntimeManager {
                 ServerConfig::Stdio {
                     command, args, env, ..
                 } => DialPlan::Dial(Dial::Stdio { command, args, env }),
-                // Oauth-protected: cached-valid → dial; expired but with a
-                // refresh_token → defer to outside-lock async refresh
-                // (`DialPlan::NeedsRefresh`); missing/expired-no-refresh
-                // → bounce to `NeedsAuth` so `mcp login` stays the user-
-                // actionable path.
                 ServerConfig::Http {
                     url,
                     oauth: Some(_),
@@ -504,32 +499,24 @@ struct TokenExchangeResponse {
     expires_in: Option<u64>,
 }
 
-/// POST the auth code to the OAuth 2.1 token endpoint per RFC 6749
-/// §4.1.3 + RFC 7636 §4.5 (PKCE verifier). Public client — no
+/// Shared POST helper for both `post_token_exchange` (RFC 6749 §4.1.3)
+/// and `post_token_refresh` (RFC 6749 §6). Public client — no
 /// `client_secret`. Errors fold body text into the message so transient
 /// 4xx from the provider land in the user's terminal verbatim.
-async fn post_token_exchange(
+async fn post_token_form(
     token_url: &str,
-    client_id: &str,
-    redirect_uri: &str,
-    code: &str,
-    code_verifier: &str,
+    form: &[(&str, &str)],
+    grant_label: &str,
 ) -> Result<TokenExchangeResponse> {
     let client = reqwest::Client::builder()
         .build()
         .context("build reqwest client")?;
     let resp = client
         .post(token_url)
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("code_verifier", code_verifier),
-            ("client_id", client_id),
-            ("redirect_uri", redirect_uri),
-        ])
+        .form(form)
         .send()
         .await
-        .with_context(|| format!("POST {token_url} (token exchange)"))?;
+        .with_context(|| format!("POST {token_url} ({grant_label})"))?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -538,33 +525,42 @@ async fn post_token_exchange(
     serde_json::from_str(&body).map_err(|e| anyhow!("invalid token response: {e}; body={body}"))
 }
 
-/// POST a refresh-grant to the OAuth 2.1 token endpoint per RFC 6749 §6.
-/// Public client — no `client_secret`. Same response shape as the
-/// auth-code exchange (`TokenExchangeResponse`).
+async fn post_token_exchange(
+    token_url: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    code: &str,
+    code_verifier: &str,
+) -> Result<TokenExchangeResponse> {
+    post_token_form(
+        token_url,
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("code_verifier", code_verifier),
+            ("client_id", client_id),
+            ("redirect_uri", redirect_uri),
+        ],
+        "token exchange",
+    )
+    .await
+}
+
 async fn post_token_refresh(
     token_url: &str,
     client_id: &str,
     refresh_token: &str,
 ) -> Result<TokenExchangeResponse> {
-    let client = reqwest::Client::builder()
-        .build()
-        .context("build reqwest client")?;
-    let resp = client
-        .post(token_url)
-        .form(&[
+    post_token_form(
+        token_url,
+        &[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
             ("client_id", client_id),
-        ])
-        .send()
-        .await
-        .with_context(|| format!("POST {token_url} (token refresh)"))?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(anyhow!("token endpoint returned {status}: {body}"));
-    }
-    serde_json::from_str(&body).map_err(|e| anyhow!("invalid token response: {e}; body={body}"))
+        ],
+        "token refresh",
+    )
+    .await
 }
 
 /// Two-phase plan for `connect()`: most server types resolve directly to
