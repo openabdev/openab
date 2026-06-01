@@ -42,12 +42,14 @@ struct SessionStore {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredSession {
     conversation_id: Option<String>,
+    #[serde(default)]
+    emitted_line_count: usize,
 }
 
 struct Session {
     conversation_id: Option<String>,
-    /// Full stdout from the previous turn for prefix-checked delta extraction
-    prev_output: String,
+    /// Number of already-emitted stdout lines for the current conversation.
+    emitted_line_count: usize,
 }
 
 struct Adapter {
@@ -102,17 +104,19 @@ impl Adapter {
     }
 
     /// Persist session store with exclusive lock and atomic write.
-    /// Try to restore conversation_id from persisted state.
-    fn restore_session(&self, session_id: &str) -> Option<String> {
+    /// Try to restore session state from persisted storage.
+    fn restore_session(&self, session_id: &str) -> Option<StoredSession> {
         let store = self.load_store();
-        store
-            .sessions
-            .get(session_id)
-            .and_then(|s| s.conversation_id.clone())
+        store.sessions.get(session_id).cloned()
     }
 
     /// Persist a session binding (read-modify-write under single lock).
-    fn persist_session(&self, session_id: &str, conversation_id: Option<&str>) {
+    fn persist_session(
+        &self,
+        session_id: &str,
+        conversation_id: Option<&str>,
+        emitted_line_count: usize,
+    ) {
         let Some(_lock) = self.lock_state_file() else {
             return;
         };
@@ -121,6 +125,7 @@ impl Adapter {
             session_id.to_string(),
             StoredSession {
                 conversation_id: conversation_id.map(String::from),
+                emitted_line_count,
             },
         );
         let tmp = self.state_file.with_extension("tmp");
@@ -164,16 +169,29 @@ impl Adapter {
         Some(created.remove(0).clone())
     }
 
-    fn extract_delta(prev_output: &str, full_text: &str, conversation_bound: bool) -> String {
-        if !conversation_bound || prev_output.is_empty() {
+    fn count_lines(text: &str) -> usize {
+        if text.is_empty() {
+            0
+        } else {
+            text.split_inclusive('\n').count()
+        }
+    }
+
+    fn extract_delta(
+        emitted_line_count: usize,
+        full_text: &str,
+        conversation_bound: bool,
+    ) -> String {
+        if !conversation_bound || emitted_line_count == 0 {
             return full_text.to_string();
         }
-        if let Some(delta) = full_text.strip_prefix(prev_output) {
-            return delta.trim_start_matches('\n').to_string();
+        let lines: Vec<&str> = full_text.split_inclusive('\n').collect();
+        if emitted_line_count <= lines.len() {
+            return lines[emitted_line_count..].concat();
         }
         eprintln!(
-            "[agy-acp] WARN: agy stdout was not append-only; \
-             sending full output and resetting delta baseline"
+            "[agy-acp] WARN: agy stdout line count shrank; \
+             sending full output and resetting line-count baseline"
         );
         full_text.to_string()
     }
@@ -188,7 +206,10 @@ impl Adapter {
     }
 
     fn restore_session_state(&mut self, session_id: &str) -> bool {
-        let Some(conversation_id) = self.restore_session(session_id) else {
+        let Some(stored) = self.restore_session(session_id) else {
+            return false;
+        };
+        let Some(conversation_id) = stored.conversation_id else {
             return false;
         };
         // Evict only after confirming the restore target exists
@@ -199,7 +220,7 @@ impl Adapter {
             session_id.to_string(),
             Session {
                 conversation_id: Some(conversation_id),
-                prev_output: String::new(),
+                emitted_line_count: stored.emitted_line_count,
             },
         );
         true
@@ -226,7 +247,7 @@ impl Adapter {
             session_id.clone(),
             Session {
                 conversation_id,
-                prev_output: String::new(),
+                emitted_line_count: 0,
             },
         );
         JsonRpcResponse {
@@ -363,44 +384,46 @@ impl Adapter {
 
                 let full_text = String::from_utf8_lossy(&output.stdout).to_string();
 
-                let prev_output = self
+                let emitted_line_count = self
                     .sessions
                     .get(session_id)
-                    .map(|s| s.prev_output.as_str())
-                    .unwrap_or("");
+                    .map(|s| s.emitted_line_count)
+                    .unwrap_or(0);
                 let conversation_bound = self
                     .sessions
                     .get(session_id)
                     .map(|s| s.conversation_id.is_some())
                     .unwrap_or(false);
-                let new_text = Self::extract_delta(prev_output, &full_text, conversation_bound);
+                let new_text =
+                    Self::extract_delta(emitted_line_count, &full_text, conversation_bound);
+                let full_text_line_count = Self::count_lines(&full_text);
 
                 // Bind conversation from snapshot diff
                 let conv_id = snapshot
                     .as_ref()
                     .and_then(|before| self.new_conversation_id(before));
 
-                let mut persist_conv_id: Option<String> = None;
+                let mut persist_state: Option<(String, usize)> = None;
                 if let Some(session) = self.sessions.get_mut(session_id) {
-                    let newly_bound = session.conversation_id.is_none() && conv_id.is_some();
                     if session.conversation_id.is_none() {
                         session.conversation_id = conv_id.clone();
                     }
                     if session.conversation_id.is_some() {
-                        session.prev_output = full_text;
-                        if newly_bound {
-                            persist_conv_id = session.conversation_id.clone();
-                        }
+                        session.emitted_line_count = full_text_line_count;
+                        persist_state = session
+                            .conversation_id
+                            .clone()
+                            .map(|cid| (cid, session.emitted_line_count));
                     } else {
-                        session.prev_output.clear();
+                        session.emitted_line_count = 0;
                         eprintln!(
                             "[agy-acp] WARN: could not bind conversation ID; \
                              running in single-turn mode"
                         );
                     }
                 }
-                if let Some(ref cid) = persist_conv_id {
-                    self.persist_session(session_id, Some(cid.as_str()));
+                if let Some((cid, emitted_line_count)) = persist_state {
+                    self.persist_session(session_id, Some(cid.as_str()), emitted_line_count);
                 }
 
                 let notification = serde_json::to_string(&JsonRpcNotification {
@@ -521,26 +544,31 @@ mod tests {
 
     #[test]
     fn test_extract_delta_returns_full_text_when_unbound() {
-        let result = Adapter::extract_delta("old", "oldnew", false);
+        let result = Adapter::extract_delta(3, "oldnew", false);
         assert_eq!(result, "oldnew");
     }
 
     #[test]
-    fn test_extract_delta_strips_prefix_when_bound() {
-        let result =
-            Adapter::extract_delta("first response\n", "first response\nsecond response", true);
+    fn test_extract_delta_skips_emitted_lines_when_bound() {
+        let result = Adapter::extract_delta(1, "first response\nsecond response", true);
         assert_eq!(result, "second response");
     }
 
     #[test]
-    fn test_extract_delta_returns_full_when_not_append_only() {
-        let result = Adapter::extract_delta("old response", "fresh response", true);
+    fn test_extract_delta_returns_empty_when_line_count_unchanged() {
+        let result = Adapter::extract_delta(1, "fresh response", true);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_extract_delta_returns_full_when_line_count_shrinks() {
+        let result = Adapter::extract_delta(2, "fresh response", true);
         assert_eq!(result, "fresh response");
     }
 
     #[test]
     fn test_extract_delta_preserves_leading_spaces() {
-        let result = Adapter::extract_delta("hello\n", "hello\n  indented code", true);
+        let result = Adapter::extract_delta(1, "hello\n  indented code", true);
         assert_eq!(result, "  indented code");
     }
 
@@ -571,7 +599,7 @@ mod tests {
             conversations_dir: root.join("conversations"),
             state_file: root.join("sessions.json"),
         };
-        adapter.persist_session("sess-1", Some("conv-abc"));
+        adapter.persist_session("sess-1", Some("conv-abc"), 3);
 
         let response = adapter.handle_session_load(7, &json!({"sessionId": "sess-1"}));
         assert!(response.error.is_none());
@@ -583,11 +611,8 @@ mod tests {
             Some("conv-abc")
         );
         assert_eq!(
-            adapter
-                .sessions
-                .get("sess-1")
-                .map(|s| s.prev_output.as_str()),
-            Some("")
+            adapter.sessions.get("sess-1").map(|s| s.emitted_line_count),
+            Some(3)
         );
 
         let _ = fs::remove_dir_all(root);
@@ -680,12 +705,16 @@ mod tests {
             state_file: root.join("sessions.json"),
         };
 
-        adapter.persist_session("sess-1", Some("conv-abc"));
+        adapter.persist_session("sess-1", Some("conv-abc"), 4);
         let restored = adapter.restore_session("sess-1");
-        assert_eq!(restored, Some("conv-abc".to_string()));
+        assert_eq!(
+            restored.as_ref().and_then(|s| s.conversation_id.as_deref()),
+            Some("conv-abc")
+        );
+        assert_eq!(restored.map(|s| s.emitted_line_count), Some(4));
 
         let missing = adapter.restore_session("sess-unknown");
-        assert_eq!(missing, None);
+        assert!(missing.is_none());
 
         let _ = fs::remove_dir_all(root);
     }
