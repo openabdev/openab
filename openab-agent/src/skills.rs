@@ -99,6 +99,11 @@ fn parse_frontmatter(content: &str) -> Option<(String, String)> {
     Some((name, description))
 }
 
+/// Escape XML special characters in user-controlled strings to preserve prompt structure.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
 /// Format skills as a system prompt section listing available skills.
 pub fn format_skills_prompt(skills: &[Skill]) -> String {
     if skills.is_empty() {
@@ -113,8 +118,8 @@ pub fn format_skills_prompt(skills: &[Skill]) -> String {
     for skill in skills {
         out.push_str(&format!(
             "  <skill>\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>\n  </skill>\n",
-            skill.name,
-            skill.description,
+            xml_escape(&skill.name),
+            xml_escape(&skill.description),
             skill.path.join("SKILL.md").display(),
         ));
     }
@@ -229,5 +234,17 @@ mod tests {
         assert!(prompt.contains("<location>/home/agent/.openab/skills/test/SKILL.md</location>"));
         assert!(prompt.contains("</available_skills>"));
         assert!(prompt.contains("Before replying, scan the skills below"));
+    }
+
+    #[test]
+    fn format_skills_prompt_escapes_xml_chars() {
+        let skills = vec![Skill {
+            name: "a<b".to_string(),
+            description: "Use <tag> & \"quotes\"".to_string(),
+            path: PathBuf::from("/skills/test"),
+        }];
+        let prompt = format_skills_prompt(&skills);
+        assert!(prompt.contains("<name>a&lt;b</name>"));
+        assert!(prompt.contains("<description>Use &lt;tag&gt; &amp; \"quotes\"</description>"));
     }
 }
