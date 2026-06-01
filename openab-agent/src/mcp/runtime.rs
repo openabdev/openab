@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use rmcp::service::{RoleClient, RunningService};
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::ServiceExt;
 use tokio::process::Command;
@@ -27,8 +28,9 @@ use super::config::{McpConfig, ServerConfig};
 use super::flow::{init_paste_authorize, parse_paste_callback};
 use super::oauth::{builtin_client_id, resolve, ResolvedProvider};
 use crate::auth::{
-    auth_path, list_pending_logins_at, load_pending_login, pending_key, remove_pending_login,
-    save_namespaced_token_at, save_pending_login, PendingPasteLogin, TokenStore,
+    auth_path, is_expired, list_pending_logins_at, load_namespaced_token_at, load_pending_login,
+    pending_key, remove_pending_login, save_namespaced_token_at, save_pending_login,
+    PendingPasteLogin, TokenStore,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,19 +352,30 @@ impl McpRuntimeManager {
                 ServerConfig::Stdio {
                     command, args, env, ..
                 } => Dial::Stdio { command, args, env },
-                // Oauth-protected servers can't be dialed via plain connect;
-                // mark `NeedsAuth` so `mcp status` shows a persistent
-                // "waiting for login" signal (vs `Disconnected`, which
-                // implies a plain `connect` would succeed). The `Failed`
-                // path remains reserved for dials that were attempted and
-                // failed at handshake.
-                ServerConfig::Http { oauth: Some(_), .. } => {
-                    handle.status = ServerStatus::NeedsAuth;
-                    return Err(anyhow!(
-                        "mcp server {name:?} needs oauth login — run `mcp login {name}`"
-                    ));
-                }
-                ServerConfig::Http { url, .. } => Dial::Http { url },
+                // Oauth-protected: dial with a cached bearer if one exists
+                // and is still within the refresh skew; otherwise bounce to
+                // `NeedsAuth` so `mcp status` shows a persistent "waiting
+                // for login" signal (vs `Disconnected`, which implies a
+                // plain `connect` would succeed). Refresh-token rotation
+                // for the expired-but-recoverable case is the next slice;
+                // for now an expired token falls through to NeedsAuth.
+                ServerConfig::Http {
+                    url,
+                    oauth: Some(_),
+                    ..
+                } => match load_namespaced_token_at(&self.auth_path, name) {
+                    Ok(store) if !is_expired(&store) => Dial::Http {
+                        url,
+                        auth: Some(store.access_token),
+                    },
+                    _ => {
+                        handle.status = ServerStatus::NeedsAuth;
+                        return Err(anyhow!(
+                            "mcp server {name:?} needs oauth login — run `mcp login {name}`"
+                        ));
+                    }
+                },
+                ServerConfig::Http { url, .. } => Dial::Http { url, auth: None },
             };
             handle.status = ServerStatus::Connecting;
             dial
@@ -472,6 +485,8 @@ enum Dial {
     },
     Http {
         url: String,
+        /// Bearer token for oauth-protected servers; `None` for anonymous HTTP.
+        auth: Option<String>,
     },
 }
 
@@ -490,8 +505,15 @@ impl Dial {
                     .await
                     .with_context(|| format!("mcp handshake with {command:?}"))
             }
-            Dial::Http { url } => {
-                let transport = StreamableHttpClientTransport::from_uri(url.as_str());
+            Dial::Http { url, auth } => {
+                let transport = match auth {
+                    Some(token) => {
+                        let cfg = StreamableHttpClientTransportConfig::with_uri(url.as_str())
+                            .auth_header(token);
+                        StreamableHttpClientTransport::from_config(cfg)
+                    }
+                    None => StreamableHttpClientTransport::from_uri(url.as_str()),
+                };
                 ().serve(transport)
                     .await
                     .with_context(|| format!("mcp handshake with {url:?}"))
@@ -909,6 +931,69 @@ mod tests {
         seed_pending(&mgr, "ghost", "s3");
         let names = mgr.pending_logins();
         assert_eq!(names, vec!["ghost", "linear", "zed-mcp"]);
+    }
+
+    fn dead_oauth_cfg() -> &'static str {
+        // 127.0.0.1:1 dials hermetically (no reachable MCP server) so
+        // tests can prove the connect() reached the dial — i.e. the
+        // oauth branch didn't short-circuit at NeedsAuth — without any
+        // network round-trip.
+        r#"{
+            "mcpServers": {
+                "linear": {
+                    "type": "http",
+                    "url": "http://127.0.0.1:1/mcp",
+                    "oauth": {
+                        "provider": "linear",
+                        "authorize_url": "https://linear.app/oauth/authorize",
+                        "token_url": "https://api.linear.app/oauth/token",
+                        "client_id": "linear-client",
+                        "scopes": ["read"]
+                    }
+                }
+            }
+        }"#
+    }
+
+    fn seed_token(mgr: &McpRuntimeManager, name: &str, expires_at: u64) {
+        let store = TokenStore {
+            access_token: format!("atok-{name}"),
+            refresh_token: "rtok".to_string(),
+            expires_at,
+            token_endpoint: "https://api.linear.app/oauth/token".to_string(),
+            provider: "linear".to_string(),
+        };
+        save_namespaced_token_at(&mgr.auth_path, name, &store).unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_oauth_with_valid_cached_token_attempts_dial_not_needs_auth() {
+        // Valid token cached → connect() must NOT bounce at NeedsAuth.
+        // Dial reaches the dead address and fails at handshake — that
+        // failure surface is the proof the bearer was injected.
+        let cfg: McpConfig = serde_json::from_str(dead_oauth_cfg()).unwrap();
+        let (mgr, _dir) = mgr_with_tempdir(cfg);
+        seed_token(&mgr, "linear", u64::MAX);
+        let err = mgr.connect("linear").await.unwrap_err().to_string();
+        assert!(err.contains("handshake"), "expected 'handshake' in {err}");
+        match &mgr.statuses().await[0].1 {
+            ServerStatus::Failed(_) => {}
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_oauth_with_expired_token_bounces_to_needs_auth() {
+        // Expired token (within REFRESH_SKEW_SECONDS of now, or past) must
+        // NOT be sent — refresh-rotation is a later slice. Treat as
+        // missing: bounce to NeedsAuth so `mcp login` is the actionable
+        // path the user sees.
+        let cfg: McpConfig = serde_json::from_str(dead_oauth_cfg()).unwrap();
+        let (mgr, _dir) = mgr_with_tempdir(cfg);
+        seed_token(&mgr, "linear", 0);
+        let err = mgr.connect("linear").await.unwrap_err().to_string();
+        assert!(err.contains("needs oauth login"), "got: {err}");
+        assert_eq!(mgr.statuses().await[0].1, ServerStatus::NeedsAuth);
     }
 
     #[tokio::test]

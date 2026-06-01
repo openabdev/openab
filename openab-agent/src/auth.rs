@@ -295,7 +295,7 @@ pub fn remove_namespaced_token(key: &str) -> Result<()> {
     write_auth_file(&path, &map)
 }
 
-fn is_expired(store: &TokenStore) -> bool {
+pub(crate) fn is_expired(store: &TokenStore) -> bool {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
