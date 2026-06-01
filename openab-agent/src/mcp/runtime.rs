@@ -27,8 +27,8 @@ use super::config::{McpConfig, ServerConfig};
 use super::flow::{init_paste_authorize, parse_paste_callback};
 use super::oauth::{builtin_client_id, resolve, ResolvedProvider};
 use crate::auth::{
-    auth_path, list_pending_logins_at, load_pending_login, remove_pending_login,
-    save_namespaced_token_at, save_pending_login, PendingPasteLogin, TokenStore, PENDING_PREFIX,
+    auth_path, list_pending_logins_at, load_pending_login, pending_key, remove_pending_login,
+    save_namespaced_token_at, save_pending_login, PendingPasteLogin, TokenStore,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,9 +141,6 @@ impl McpRuntimeManager {
     /// `auth.json`. Lets `mcp status` surface "you started a login but
     /// haven't finished" — including for servers no longer in config
     /// (caller cross-references against `statuses()` to spot orphans).
-    /// Synchronous filesystem read on the same thread as the caller; the
-    /// pending map is tiny (~one entry per concurrent login) so blocking is
-    /// trivial and avoids tokio::task::spawn_blocking overhead.
     pub fn pending_logins(&self) -> Vec<String> {
         list_pending_logins_at(&self.auth_path)
     }
@@ -405,11 +402,6 @@ fn provider_name_of(provider: &ResolvedProvider) -> String {
         ResolvedProvider::Builtin { provider_name, .. } => (*provider_name).to_string(),
         ResolvedProvider::Custom { provider_name, .. } => provider_name.clone(),
     }
-}
-
-/// `auth.json` key for an in-flight paste-login (ADR §6.4 namespace).
-fn pending_key(name: &str) -> String {
-    format!("{PENDING_PREFIX}{name}")
 }
 
 /// Wall-clock seconds since Unix epoch. Saturates at 0 if the clock is

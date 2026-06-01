@@ -139,10 +139,11 @@ pub async fn cli_show_status() {
         return;
     }
     let statuses = manager.statuses().await;
-    let pending: std::collections::HashSet<String> = manager.pending_logins().into_iter().collect();
+    let mut pending: std::collections::HashSet<String> =
+        manager.pending_logins().into_iter().collect();
     for (name, status) in &statuses {
         let mut line = format!("{} {name}", status.icon());
-        if pending.contains(name) {
+        if pending.remove(name) {
             line.push_str(&format!(
                 " (login pending — run `mcp login {name}` to finish)"
             ));
@@ -151,18 +152,12 @@ pub async fn cli_show_status() {
         }
         println!("{line}");
     }
-    let configured: std::collections::HashSet<&str> =
-        statuses.iter().map(|(n, _)| n.as_str()).collect();
-    let orphans: Vec<&String> = pending
-        .iter()
-        .filter(|n| !configured.contains(n.as_str()))
-        .collect();
-    if !orphans.is_empty() {
+    if !pending.is_empty() {
         println!();
         println!("Orphaned pending logins (no matching server in mcp.json):");
-        let mut sorted = orphans;
-        sorted.sort();
-        for name in sorted {
+        let mut orphans: Vec<String> = pending.into_iter().collect();
+        orphans.sort();
+        for name in orphans {
             println!("  ⏳ {name}");
         }
     }
@@ -198,11 +193,6 @@ pub async fn cli_connect(name: String) {
 /// Errors at any step exit non-zero; the pending entry is preserved on
 /// state-mismatch / network failure so the user can retry with a fresh
 /// paste of the same redirect URL without re-running this command.
-///
-/// Security note: for non-interactive use, prefer piping the redirect
-/// URL via stdin (`echo "<url>" | openab-agent mcp login <name>`) over
-/// `--paste`. PKCE makes either route safe in theory, but pipes leave
-/// no trace in shell history or `ps` output — defense-in-depth.
 pub async fn cli_login(name: String, paste: Option<String>) {
     let manager = McpRuntimeManager::from_config(load_config_or_exit());
     let start = match manager.start_paste_login(&name).await {

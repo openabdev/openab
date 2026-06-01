@@ -197,16 +197,24 @@ pub fn save_namespaced_token_at(path: &Path, key: &str, store: &TokenStore) -> R
     write_auth_file(path, &map)
 }
 
-/// `auth.json` namespace prefix for in-flight paste-back logins (ADR §6.4).
-/// Pinned as a constant so `pending_key` (write side) and
-/// `list_pending_logins_at` (read side) can't drift on the string literal.
 #[cfg(feature = "mcp")]
-pub const PENDING_PREFIX: &str = "mcp-pending:";
+const PENDING_PREFIX: &str = "mcp-pending:";
+
+/// `auth.json` key for an in-flight paste-back login (ADR §6.4 namespace).
+/// Single construction site so read/write callers can't drift on the literal.
+#[cfg(feature = "mcp")]
+pub fn pending_key(name: &str) -> String {
+    format!("{PENDING_PREFIX}{name}")
+}
 
 /// Enumerate the server names of all in-flight `mcp-pending:<name>` entries
 /// — surfaces partially completed paste-back logins to `mcp status`. Returns
 /// sorted names with the prefix stripped. Missing / unreadable `auth.json`
 /// → empty Vec; this is a best-effort status view, not a load-bearing path.
+///
+/// Synchronous filesystem read: the pending map is tiny (~one entry per
+/// concurrent login), so blocking is trivial and avoids `spawn_blocking`
+/// overhead — callers may invoke this from an async context directly.
 #[cfg(feature = "mcp")]
 pub fn list_pending_logins_at(path: &Path) -> Vec<String> {
     let Ok(map) = read_auth_file(path) else {
