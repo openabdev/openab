@@ -563,6 +563,124 @@ async fn post_token_refresh(
     .await
 }
 
+/// RFC 8628 §3.2 device authorization response. `verification_uri_complete`
+/// is the §3.3.1 extension (`verification_uri` + `user_code` is the always-
+/// present fallback the agent relays to the user). `interval` defaults to
+/// 5s per RFC 8628 §3.5 when omitted by the provider.
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+struct DeviceAuthResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    #[serde(default)]
+    verification_uri_complete: Option<String>,
+    expires_in: u64,
+    #[serde(default = "default_device_poll_interval")]
+    interval: u64,
+}
+
+fn default_device_poll_interval() -> u64 {
+    5
+}
+
+/// RFC 8628 §3.5 polling outcome. The four named "errors"
+/// (`authorization_pending`, `slow_down`, `access_denied`, `expired_token`)
+/// are flow-level states NOT real failures — they drive the polling loop.
+/// Everything else folds into a fatal `Err` at the call site.
+#[derive(Debug)]
+#[allow(dead_code)]
+enum DevicePollOutcome {
+    Success(TokenExchangeResponse),
+    AuthorizationPending,
+    SlowDown,
+    AccessDenied,
+    ExpiredToken,
+}
+
+/// Pure response classifier — split from the HTTP path so the RFC 8628
+/// §3.5 error-code mapping is unit-testable without a mock server. 2xx
+/// parses as a token response; 4xx parses `{"error": "..."}` and maps the
+/// four flow-state codes to enum variants; everything else (including
+/// non-JSON / unknown error codes) folds into `Err`.
+fn classify_device_poll(status: reqwest::StatusCode, body: &str) -> Result<DevicePollOutcome> {
+    if status.is_success() {
+        return serde_json::from_str(body)
+            .map(DevicePollOutcome::Success)
+            .map_err(|e| anyhow!("invalid token response: {e}; body={body}"));
+    }
+    #[derive(serde::Deserialize)]
+    struct ErrBody {
+        error: String,
+    }
+    let err_code = serde_json::from_str::<ErrBody>(body).ok().map(|e| e.error);
+    match err_code.as_deref() {
+        Some("authorization_pending") => Ok(DevicePollOutcome::AuthorizationPending),
+        Some("slow_down") => Ok(DevicePollOutcome::SlowDown),
+        Some("access_denied") => Ok(DevicePollOutcome::AccessDenied),
+        Some("expired_token") => Ok(DevicePollOutcome::ExpiredToken),
+        _ => Err(anyhow!("token endpoint returned {status}: {body}")),
+    }
+}
+
+/// POST to the RFC 8628 §3.1 device authorization endpoint. Public client
+/// — no `client_secret`. Returns the `{device_code, user_code, ...}`
+/// bundle the runtime relays to the user and polls against the token
+/// endpoint via `post_device_token_poll`.
+#[allow(dead_code)]
+async fn post_device_authorization(
+    device_endpoint: &str,
+    client_id: &str,
+    scopes: &str,
+) -> Result<DeviceAuthResponse> {
+    let client = reqwest::Client::builder()
+        .build()
+        .context("build reqwest client")?;
+    let resp = client
+        .post(device_endpoint)
+        .form(&[("client_id", client_id), ("scope", scopes)])
+        .send()
+        .await
+        .with_context(|| format!("POST {device_endpoint} (device authorization)"))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(anyhow!(
+            "device authorization endpoint returned {status}: {body}"
+        ));
+    }
+    serde_json::from_str(&body)
+        .map_err(|e| anyhow!("invalid device authorization response: {e}; body={body}"))
+}
+
+/// POST one polling tick to the token endpoint per RFC 8628 §3.4. Caller
+/// owns the polling loop (interval, expires_in deadline, SlowDown back-
+/// off). Returns a `DevicePollOutcome` so the loop can distinguish the
+/// four RFC 8628 §3.5 flow states from real errors.
+#[allow(dead_code)]
+async fn post_device_token_poll(
+    token_url: &str,
+    client_id: &str,
+    device_code: &str,
+) -> Result<DevicePollOutcome> {
+    let client = reqwest::Client::builder()
+        .build()
+        .context("build reqwest client")?;
+    let resp = client
+        .post(token_url)
+        .form(&[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ("device_code", device_code),
+            ("client_id", client_id),
+        ])
+        .send()
+        .await
+        .with_context(|| format!("POST {token_url} (device token poll)"))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    classify_device_poll(status, &body)
+}
+
 /// Two-phase plan for `connect()`: most server types resolve directly to
 /// a `Dial`, but HTTP+oauth with an expired-but-refreshable token needs
 /// async work (the refresh POST) before a `Dial` can be built. Keeping
@@ -1135,5 +1253,69 @@ mod tests {
         // cause an immediate-expiry / refresh-loop / NeedsAuth bounce on
         // first use (Mira Tick 46 catch).
         assert_eq!(token.expires_at, u64::MAX);
+    }
+
+    #[test]
+    fn classify_device_poll_decodes_success_into_token() {
+        let body = r#"{"access_token": "atk", "refresh_token": "rtk", "expires_in": 3600}"#;
+        let outcome = classify_device_poll(reqwest::StatusCode::OK, body).unwrap();
+        let DevicePollOutcome::Success(token) = outcome else {
+            panic!("expected Success");
+        };
+        assert_eq!(token.access_token, "atk");
+        assert_eq!(token.refresh_token.as_deref(), Some("rtk"));
+        assert_eq!(token.expires_in, Some(3600));
+    }
+
+    #[test]
+    fn classify_device_poll_maps_rfc8628_flow_states() {
+        let cases = [
+            ("authorization_pending", "AuthorizationPending"),
+            ("slow_down", "SlowDown"),
+            ("access_denied", "AccessDenied"),
+            ("expired_token", "ExpiredToken"),
+        ];
+        for (code, want) in cases {
+            let body = format!(r#"{{"error": "{code}"}}"#);
+            let outcome = classify_device_poll(reqwest::StatusCode::BAD_REQUEST, &body).unwrap();
+            let got = match outcome {
+                DevicePollOutcome::AuthorizationPending => "AuthorizationPending",
+                DevicePollOutcome::SlowDown => "SlowDown",
+                DevicePollOutcome::AccessDenied => "AccessDenied",
+                DevicePollOutcome::ExpiredToken => "ExpiredToken",
+                DevicePollOutcome::Success(_) => "Success",
+            };
+            assert_eq!(got, want, "code={code}");
+        }
+    }
+
+    #[test]
+    fn classify_device_poll_folds_unknown_error_into_err() {
+        let body = r#"{"error": "invalid_grant"}"#;
+        let err = classify_device_poll(reqwest::StatusCode::BAD_REQUEST, body)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid_grant"), "got: {err}");
+    }
+
+    #[test]
+    fn classify_device_poll_folds_non_json_5xx_into_err() {
+        let err = classify_device_poll(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "<html>")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("500"), "got: {err}");
+    }
+
+    #[test]
+    fn device_auth_response_defaults_interval_to_rfc8628_value() {
+        let body = r#"{
+            "device_code": "dc",
+            "user_code": "AAAA-BBBB",
+            "verification_uri": "https://example.com/device",
+            "expires_in": 1800
+        }"#;
+        let resp: DeviceAuthResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(resp.interval, 5);
+        assert!(resp.verification_uri_complete.is_none());
     }
 }
