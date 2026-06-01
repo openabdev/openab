@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{anyhow, Context, Result};
 use rmcp::service::{RoleClient, RunningService};
@@ -23,6 +23,7 @@ use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioC
 use rmcp::ServiceExt;
 use tokio::process::Command;
 use tokio::sync::RwLock;
+use tokio::task::AbortHandle;
 
 use super::config::{McpConfig, ServerConfig};
 use super::flow::{init_paste_authorize, parse_paste_callback};
@@ -107,6 +108,12 @@ pub struct McpRuntimeManager {
     /// Injectable so tests can point at a tempdir instead of `$HOME`,
     /// avoiding cross-module HOME-env races (ADR §6.4).
     auth_path: PathBuf,
+    /// Abort handle of the most-recent device-poll task per server. A
+    /// fresh `start_device_login` aborts the prior poller so a retry
+    /// after a transient failure doesn't leave two loops racing to
+    /// finalize the same server. `std::sync::Mutex` is fine: the lock
+    /// is only held for `HashMap` ops, never across `.await`.
+    device_login_tasks: Arc<StdMutex<HashMap<String, AbortHandle>>>,
 }
 
 impl McpRuntimeManager {
@@ -131,6 +138,7 @@ impl McpRuntimeManager {
         Self {
             handles: Arc::new(RwLock::new(handles)),
             auth_path,
+            device_login_tasks: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -324,7 +332,8 @@ impl McpRuntimeManager {
         let token_url_owned = token_url;
         let client_id_owned = client_id;
         let provider_name_owned = provider_name;
-        tokio::spawn(async move {
+        let task_name = name.to_string();
+        let handle = tokio::spawn(async move {
             manager
                 .run_device_poll_loop(
                     &name_owned,
@@ -337,6 +346,16 @@ impl McpRuntimeManager {
                 )
                 .await;
         });
+        let prior = {
+            let mut tasks = self
+                .device_login_tasks
+                .lock()
+                .expect("device_login_tasks mutex poisoned");
+            tasks.insert(task_name, handle.abort_handle())
+        };
+        if let Some(prior) = prior {
+            prior.abort();
+        }
         Ok(DeviceLoginStart {
             user_code: auth.user_code,
             verification_uri: auth.verification_uri,
