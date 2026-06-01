@@ -211,10 +211,13 @@ impl McpRuntimeManager {
         let provider = resolve(&oauth_cfg)?;
         let (client_id, redirect_uri) = match &provider {
             ResolvedProvider::Builtin {
-                provider_name, callback, ..
+                provider_name,
+                callback,
+                ..
             } => (builtin_client_id(provider_name)?, (*callback).to_string()),
             ResolvedProvider::Custom {
-                device_authorization_endpoint: Some(_), ..
+                device_authorization_endpoint: Some(_),
+                ..
             } => {
                 return Err(anyhow!(
                     "mcp server {name:?} has a device endpoint; use device flow"
@@ -517,10 +520,7 @@ mod tests {
     }
 
     async fn start_login_err(mgr: &McpRuntimeManager, name: &str) -> String {
-        mgr.start_paste_login(name)
-            .await
-            .unwrap_err()
-            .to_string()
+        mgr.start_paste_login(name).await.unwrap_err().to_string()
     }
 
     #[tokio::test]
@@ -533,9 +533,13 @@ mod tests {
         let cfg: McpConfig = serde_json::from_str(anthropic_builtin_cfg()).unwrap();
         let mgr = McpRuntimeManager::from_config(cfg);
         let start = mgr.start_paste_login("anthro").await.unwrap();
-        assert!(start.authorize_url.starts_with("https://claude.ai/oauth/authorize?"));
+        assert!(start
+            .authorize_url
+            .starts_with("https://claude.ai/oauth/authorize?"));
         assert!(start.authorize_url.contains("client_id=anth-cid"));
-        assert!(start.authorize_url.contains(&format!("state={}", start.state)));
+        assert!(start
+            .authorize_url
+            .contains(&format!("state={}", start.state)));
         let pending = mgr.pending_paste_login("anthro").await.unwrap();
         assert_eq!(pending.state, start.state);
         assert!(!pending.verifier.is_empty());
