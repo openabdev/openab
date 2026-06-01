@@ -163,9 +163,15 @@ fn save_tokens(store: &TokenStore) -> Result<()> {
 #[cfg(feature = "mcp")]
 #[allow(dead_code)] // wired in next slice (mcp/oauth.rs login flow)
 pub fn load_namespaced_token(key: &str) -> Result<TokenStore> {
-    let path = auth_path();
+    load_namespaced_token_at(&auth_path(), key)
+}
+
+/// Path-injected sibling of `load_namespaced_token` (Tick 42 lesson).
+#[cfg(feature = "mcp")]
+#[allow(dead_code)] // wired in next slice (mcp login regression test)
+pub fn load_namespaced_token_at(path: &Path, key: &str) -> Result<TokenStore> {
     let map =
-        read_auth_file(&path).map_err(|_| anyhow!("No credentials found at {}", path.display()))?;
+        read_auth_file(path).map_err(|_| anyhow!("No credentials found at {}", path.display()))?;
     match map.get(key) {
         Some(AuthEntry::Token(t)) => Ok(t.clone()),
         Some(AuthEntry::Pending(_)) => Err(anyhow!("{key:?} is a pending login, not a token")),
@@ -179,10 +185,17 @@ pub fn load_namespaced_token(key: &str) -> Result<TokenStore> {
 #[cfg(feature = "mcp")]
 #[allow(dead_code)] // wired in next slice (mcp/oauth.rs login flow)
 pub fn save_namespaced_token(key: &str, store: &TokenStore) -> Result<()> {
-    let path = auth_path();
-    let mut map = read_auth_file(&path).unwrap_or_default();
+    save_namespaced_token_at(&auth_path(), key, store)
+}
+
+/// Path-injected sibling of `save_namespaced_token` so tests + the runtime
+/// manager can target a tempdir without `$HOME` overrides (Tick 42 lesson).
+#[cfg(feature = "mcp")]
+#[allow(dead_code)] // wired in next slice (mcp/oauth.rs complete_login)
+pub fn save_namespaced_token_at(path: &Path, key: &str, store: &TokenStore) -> Result<()> {
+    let mut map = read_auth_file(path).unwrap_or_default();
     map.insert(key.to_string(), AuthEntry::Token(store.clone()));
-    write_auth_file(&path, &map)
+    write_auth_file(path, &map)
 }
 
 /// Read a `mcp-pending:<server>` entry from `auth.json` (ADR §6.4). Errors

@@ -24,9 +24,12 @@ use tokio::process::Command;
 use tokio::sync::RwLock;
 
 use super::config::{McpConfig, ServerConfig};
-use super::flow::init_paste_authorize;
+use super::flow::{init_paste_authorize, parse_paste_callback};
 use super::oauth::{builtin_client_id, resolve, ResolvedProvider};
-use crate::auth::{auth_path, load_pending_login, save_pending_login, PendingPasteLogin};
+use crate::auth::{
+    auth_path, load_pending_login, remove_pending_login, save_namespaced_token_at,
+    save_pending_login, PendingPasteLogin, TokenStore,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerStatus {
@@ -183,46 +186,7 @@ impl McpRuntimeManager {
     /// are explicit so the LLM can pick a different action.
     #[allow(dead_code)] // wired in next slice (mcp::login meta-tool action)
     pub async fn start_paste_login(&self, name: &str) -> Result<PasteLoginStart> {
-        let oauth_cfg = {
-            let guard = self.handles.read().await;
-            let handle = guard
-                .get(name)
-                .ok_or_else(|| anyhow!("no mcp server named {name:?}"))?;
-            match handle.config.resolved(name)? {
-                ServerConfig::Http {
-                    oauth: Some(oauth), ..
-                } => oauth,
-                ServerConfig::Http { oauth: None, .. } => {
-                    return Err(anyhow!("mcp server {name:?} has no oauth block"));
-                }
-                ServerConfig::Stdio { .. } => {
-                    return Err(anyhow!("mcp server {name:?} is stdio, not http+oauth"));
-                }
-            }
-        };
-
-        let provider = resolve(&oauth_cfg)?;
-        let (client_id, redirect_uri) = match &provider {
-            ResolvedProvider::Builtin {
-                provider_name,
-                callback,
-                ..
-            } => (builtin_client_id(provider_name)?, (*callback).to_string()),
-            ResolvedProvider::Custom {
-                device_authorization_endpoint: Some(_),
-                ..
-            } => {
-                return Err(anyhow!(
-                    "mcp server {name:?} has a device endpoint; use device flow"
-                ));
-            }
-            ResolvedProvider::Custom { .. } => {
-                return Err(anyhow!(
-                    "mcp server {name:?}: custom-provider paste-back not yet supported"
-                ));
-            }
-        };
-
+        let (provider, client_id, redirect_uri) = self.resolve_paste_client(name).await?;
         let started = init_paste_authorize(&provider, &client_id, &redirect_uri)?;
         let pending = PendingPasteLogin {
             verifier: started.code_verifier,
@@ -244,12 +208,108 @@ impl McpRuntimeManager {
     }
 
     /// Read the on-disk pending paste-login for `name`. `None` if there's
-    /// no entry or the file is unreadable; `complete_login` (next slice)
-    /// is the intended consumer and will distinguish the cases via the
-    /// `auth::load_pending_login` error message.
-    #[allow(dead_code)] // first prod caller is complete_login in next slice
+    /// no entry or the file is unreadable. Used by `complete_login` to
+    /// drive flow continuation and by `mcp status` to surface a partially
+    /// completed login (next slice will add the status surfacing).
+    #[allow(dead_code)] // wired in next slice (mcp status surfacing)
     pub async fn pending_paste_login(&self, name: &str) -> Option<PendingPasteLogin> {
         load_pending_login(&self.auth_path, &pending_key(name)).ok()
+    }
+
+    /// Finish a paste-back OAuth flow (ADR §6.4). Reads the snapshotted
+    /// `PendingPasteLogin`, validates the redirect URL's `state` against
+    /// the snapshotted nonce (RFC 6749 §10.12), exchanges the auth code
+    /// at the snapshotted `token_url`, persists the resulting
+    /// `TokenStore` under `<name>`, and clears the pending entry. Status
+    /// transitions `NeedsAuth → Disconnected` so the next `connect()`
+    /// dials the now-authenticated transport.
+    #[allow(dead_code)] // wired in next slice (mcp login CLI subcommand)
+    pub async fn complete_login(&self, name: &str, redirect_url: &str) -> Result<()> {
+        let pending = load_pending_login(&self.auth_path, &pending_key(name))
+            .map_err(|_| anyhow!("no pending login for {name:?}; run `mcp login {name}` first"))?;
+        let code = parse_paste_callback(redirect_url, &pending.state)?;
+        let (_provider, client_id, redirect_uri) = self.resolve_paste_client(name).await?;
+        let resp = post_token_exchange(
+            &pending.token_url,
+            &client_id,
+            &redirect_uri,
+            &code,
+            &pending.verifier,
+        )
+        .await?;
+        self.finish_login(name, &pending, resp).await
+    }
+
+    /// Pure-persistence tail of `complete_login`. Split out so tests can
+    /// drive the state-machine + on-disk transition without a real token
+    /// endpoint. Errors leave the pending entry intact so the user can
+    /// retry the same flow.
+    async fn finish_login(
+        &self,
+        name: &str,
+        pending: &PendingPasteLogin,
+        resp: TokenExchangeResponse,
+    ) -> Result<()> {
+        let store = TokenStore {
+            access_token: resp.access_token,
+            refresh_token: resp.refresh_token.unwrap_or_default(),
+            expires_at: now_secs().saturating_add(resp.expires_in.unwrap_or(0)),
+            token_endpoint: pending.token_url.clone(),
+            provider: pending.provider_name.clone(),
+        };
+        save_namespaced_token_at(&self.auth_path, name, &store)?;
+        remove_pending_login(&self.auth_path, &pending_key(name))?;
+        let mut handles = self.handles.write().await;
+        if let Some(handle) = handles.get_mut(name) {
+            handle.status = ServerStatus::Disconnected;
+        }
+        Ok(())
+    }
+
+    /// Resolve a paste-back OAuth client `(provider, client_id, redirect_uri)`
+    /// from the server's config. Shared by `start_paste_login` and
+    /// `complete_login` so a config drift between init and finish surfaces
+    /// the same error from both entry points.
+    async fn resolve_paste_client(&self, name: &str) -> Result<(ResolvedProvider, String, String)> {
+        let oauth_cfg = {
+            let guard = self.handles.read().await;
+            let handle = guard
+                .get(name)
+                .ok_or_else(|| anyhow!("no mcp server named {name:?}"))?;
+            match handle.config.resolved(name)? {
+                ServerConfig::Http {
+                    oauth: Some(oauth), ..
+                } => oauth,
+                ServerConfig::Http { oauth: None, .. } => {
+                    return Err(anyhow!("mcp server {name:?} has no oauth block"));
+                }
+                ServerConfig::Stdio { .. } => {
+                    return Err(anyhow!("mcp server {name:?} is stdio, not http+oauth"));
+                }
+            }
+        };
+        let provider = resolve(&oauth_cfg)?;
+        let (client_id, redirect_uri) = match &provider {
+            ResolvedProvider::Builtin {
+                provider_name,
+                callback,
+                ..
+            } => (builtin_client_id(provider_name)?, (*callback).to_string()),
+            ResolvedProvider::Custom {
+                device_authorization_endpoint: Some(_),
+                ..
+            } => {
+                return Err(anyhow!(
+                    "mcp server {name:?} has a device endpoint; use device flow"
+                ));
+            }
+            ResolvedProvider::Custom { .. } => {
+                return Err(anyhow!(
+                    "mcp server {name:?}: custom-provider paste-back not yet supported"
+                ));
+            }
+        };
+        Ok((provider, client_id, redirect_uri))
     }
 
     /// Lazy-connect the named server (ADR §5.7). Idempotent if already
@@ -328,6 +388,63 @@ fn provider_name_of(provider: &ResolvedProvider) -> String {
 /// `auth.json` key for an in-flight paste-login (ADR §6.4 namespace).
 fn pending_key(name: &str) -> String {
     format!("mcp-pending:{name}")
+}
+
+/// Wall-clock seconds since Unix epoch. Saturates at 0 if the clock is
+/// pre-epoch (would only happen on a misconfigured container).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Token endpoint response (RFC 6749 §4.1.4 / §5.1). `refresh_token` and
+/// `expires_in` are optional — some providers (xAI as of writing) omit
+/// them on initial exchange. The runtime tolerates the absence and
+/// records empty/zero, leaving the refresh path to bail explicitly when
+/// invoked.
+#[derive(Debug, serde::Deserialize)]
+struct TokenExchangeResponse {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<u64>,
+}
+
+/// POST the auth code to the OAuth 2.1 token endpoint per RFC 6749
+/// §4.1.3 + RFC 7636 §4.5 (PKCE verifier). Public client — no
+/// `client_secret`. Errors fold body text into the message so transient
+/// 4xx from the provider land in the user's terminal verbatim.
+async fn post_token_exchange(
+    token_url: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    code: &str,
+    code_verifier: &str,
+) -> Result<TokenExchangeResponse> {
+    let client = reqwest::Client::builder()
+        .build()
+        .context("build reqwest client")?;
+    let resp = client
+        .post(token_url)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("code_verifier", code_verifier),
+            ("client_id", client_id),
+            ("redirect_uri", redirect_uri),
+        ])
+        .send()
+        .await
+        .with_context(|| format!("POST {token_url} (token exchange)"))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(anyhow!("token endpoint returned {status}: {body}"));
+    }
+    serde_json::from_str(&body).map_err(|e| anyhow!("invalid token response: {e}; body={body}"))
 }
 
 /// Per-transport dial parameters, extracted under the manager's write lock
@@ -694,5 +811,93 @@ mod tests {
         assert_eq!(env.get("PATH").map(String::as_str), Some("/custom/bin"));
         assert!(!env.contains_key("DISCORD_BOT_TOKEN"));
         assert!(!env.contains_key("ANTHROPIC_API_KEY"));
+    }
+
+    fn seed_pending(mgr: &McpRuntimeManager, name: &str, state: &str) -> PendingPasteLogin {
+        let pending = PendingPasteLogin {
+            verifier: "v3rifier".to_string(),
+            state: state.to_string(),
+            token_url: "https://example.test/token".to_string(),
+            provider_name: "linear".to_string(),
+        };
+        save_pending_login(&mgr.auth_path, &pending_key(name), &pending).unwrap();
+        pending
+    }
+
+    #[tokio::test]
+    async fn complete_login_rejects_when_no_pending_entry() {
+        let cfg: McpConfig = serde_json::from_str(linear_custom_cfg()).unwrap();
+        let (mgr, _dir) = mgr_with_tempdir(cfg);
+        let err = mgr
+            .complete_login("linear", "http://localhost/cb?code=c&state=s")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no pending login"), "expected hint in {err}");
+        assert!(err.contains("mcp login"), "expected CLI hint in {err}");
+    }
+
+    #[tokio::test]
+    async fn complete_login_rejects_state_mismatch_and_keeps_pending() {
+        let cfg: McpConfig = serde_json::from_str(linear_custom_cfg()).unwrap();
+        let (mgr, _dir) = mgr_with_tempdir(cfg);
+        let pending = seed_pending(&mgr, "linear", "want");
+        let url = "http://localhost/cb?code=c&state=other";
+        let err = mgr
+            .complete_login("linear", url)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("state mismatch"),
+            "expected CSRF guard in {err}"
+        );
+        // Pending entry must survive a rejected attempt so the user can
+        // re-issue the same paste without going through `mcp login` again.
+        let got = mgr.pending_paste_login("linear").await.unwrap();
+        assert_eq!(got, pending);
+    }
+
+    #[tokio::test]
+    async fn finish_login_persists_token_clears_pending_and_unblocks_connect() {
+        let cfg: McpConfig = serde_json::from_str(linear_custom_cfg()).unwrap();
+        let (mgr, _dir) = mgr_with_tempdir(cfg);
+        let pending = seed_pending(&mgr, "linear", "s");
+        // Pre-set NeedsAuth so we can observe the transition.
+        {
+            let mut h = mgr.handles.write().await;
+            h.get_mut("linear").unwrap().status = ServerStatus::NeedsAuth;
+        }
+        let resp = TokenExchangeResponse {
+            access_token: "atok".to_string(),
+            refresh_token: Some("rtok".to_string()),
+            expires_in: Some(3600),
+        };
+        mgr.finish_login("linear", &pending, resp).await.unwrap();
+        assert!(mgr.pending_paste_login("linear").await.is_none());
+        let token = crate::auth::load_namespaced_token_at(&mgr.auth_path, "linear").unwrap();
+        assert_eq!(token.access_token, "atok");
+        assert_eq!(token.refresh_token, "rtok");
+        assert_eq!(token.token_endpoint, "https://example.test/token");
+        assert_eq!(token.provider, "linear");
+        assert_eq!(mgr.statuses().await[0].1, ServerStatus::Disconnected);
+    }
+
+    #[tokio::test]
+    async fn finish_login_tolerates_provider_omitting_refresh_token() {
+        let cfg: McpConfig = serde_json::from_str(linear_custom_cfg()).unwrap();
+        let (mgr, _dir) = mgr_with_tempdir(cfg);
+        let pending = seed_pending(&mgr, "linear", "s");
+        let resp = TokenExchangeResponse {
+            access_token: "atok".to_string(),
+            refresh_token: None,
+            expires_in: None,
+        };
+        mgr.finish_login("linear", &pending, resp).await.unwrap();
+        let token = crate::auth::load_namespaced_token_at(&mgr.auth_path, "linear").unwrap();
+        assert_eq!(token.access_token, "atok");
+        assert!(token.refresh_token.is_empty());
+        // expires_at = now_secs() + 0 → effectively "already expired"; the
+        // refresh path bails explicitly when invoked, which is fine here.
     }
 }
