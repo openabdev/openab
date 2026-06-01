@@ -517,15 +517,16 @@ mod tests {
 
     #[test]
     fn test_codex_client_id_default() {
-        unsafe { std::env::remove_var("OPENAB_AGENT_OAUTH_CLIENT_ID") };
-        assert_eq!(codex_client_id(), "app_EMoamEEZ73f0CkXaXp7hrann");
+        temp_env::with_var("OPENAB_AGENT_OAUTH_CLIENT_ID", None::<&str>, || {
+            assert_eq!(codex_client_id(), "app_EMoamEEZ73f0CkXaXp7hrann");
+        });
     }
 
     #[test]
     fn test_codex_client_id_override() {
-        unsafe { std::env::set_var("OPENAB_AGENT_OAUTH_CLIENT_ID", "custom_id") };
-        assert_eq!(codex_client_id(), "custom_id");
-        unsafe { std::env::remove_var("OPENAB_AGENT_OAUTH_CLIENT_ID") };
+        temp_env::with_var("OPENAB_AGENT_OAUTH_CLIENT_ID", Some("custom_id"), || {
+            assert_eq!(codex_client_id(), "custom_id");
+        });
     }
 
     #[test]

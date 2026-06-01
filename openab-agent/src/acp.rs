@@ -256,13 +256,6 @@ impl AcpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Serializes tests that mutate process-global env vars (notably
-    /// `ANTHROPIC_API_KEY`). Without this, `test_session_new` and
-    /// `test_session_new_missing_key` race on the same key when run in
-    /// parallel — set/remove from one thread is observed by the other.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_initialize_response() {
@@ -277,11 +270,16 @@ mod tests {
 
     #[test]
     fn test_session_new() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Set a fake key so from_env() succeeds in CI
-        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-key") };
-        let mut server = AcpServer::new();
-        let resp_str = server.handle_session_new(2);
+        let resp_str = temp_env::with_vars(
+            [
+                ("ANTHROPIC_API_KEY", Some("test-key")),
+                ("OPENAB_AGENT_PROVIDER", None),
+            ],
+            || {
+                let mut server = AcpServer::new();
+                server.handle_session_new(2)
+            },
+        );
         let resp: Value = serde_json::from_str(&resp_str).unwrap();
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 2);
@@ -290,15 +288,19 @@ mod tests {
 
     #[test]
     fn test_session_new_missing_key() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Ensure no OAuth token exists either
-        let auth_path =
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
-                .join(".openab/agent/auth.json");
-        let _ = std::fs::remove_file(&auth_path);
-        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
-        let mut server = AcpServer::new();
-        let resp_str = server.handle_session_new(3);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().to_string_lossy().to_string();
+        let resp_str = temp_env::with_vars(
+            [
+                ("ANTHROPIC_API_KEY", None),
+                ("OPENAB_AGENT_PROVIDER", None),
+                ("HOME", Some(home.as_str())),
+            ],
+            || {
+                let mut server = AcpServer::new();
+                server.handle_session_new(3)
+            },
+        );
         let resp: Value = serde_json::from_str(&resp_str).unwrap();
         assert!(resp["error"].is_object());
         assert!(resp["error"]["message"]

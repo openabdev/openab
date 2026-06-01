@@ -105,8 +105,12 @@ impl ServerConfig {
     /// callers should skip the server and continue (ADR §5.6 "per-server
     /// failure isolated"). `name` is the server name used in error context.
     pub fn resolved(&self, name: &str) -> Result<Self> {
+        self.resolved_with_env(name, &std::env::vars().collect())
+    }
+
+    fn resolved_with_env(&self, name: &str, env: &HashMap<String, String>) -> Result<Self> {
         let json = serde_json::to_value(self)?;
-        let resolved = interpolate_value(json, &std::env::vars().collect())
+        let resolved = interpolate_value(json, env)
             .with_context(|| format!("resolve env for mcp server {name:?}"))?;
         Ok(serde_json::from_value(resolved)?)
     }
@@ -243,17 +247,14 @@ mod tests {
 
     #[test]
     fn resolved_substitutes_env_in_args() {
-        // SAFETY: single-threaded test; isolated env key.
-        unsafe {
-            std::env::set_var("MCP_TEST_TOKEN", "secret123");
-        }
+        let env = env(&[("MCP_TEST_TOKEN", "secret123")]);
         let cfg = ServerConfig::Stdio {
             command: "github-mcp-server".into(),
             args: vec!["--token".into(), "${env:MCP_TEST_TOKEN}".into()],
             env: HashMap::new(),
             tool_filter: None,
         };
-        match cfg.resolved("github").unwrap() {
+        match cfg.resolved_with_env("github", &env).unwrap() {
             ServerConfig::Stdio { args, .. } => {
                 assert_eq!(args[1], "secret123");
             }

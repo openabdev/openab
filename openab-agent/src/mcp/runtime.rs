@@ -228,8 +228,9 @@ impl Dial {
         match self {
             Dial::Stdio { command, args, env } => {
                 let cmd = Command::new(&command).configure(|c| {
+                    c.env_clear();
+                    c.envs(stdio_child_env(&env));
                     c.args(&args);
-                    c.envs(&env);
                 });
                 let transport = TokioChildProcess::new(cmd)
                     .with_context(|| format!("spawn mcp child process {command:?}"))?;
@@ -245,6 +246,45 @@ impl Dial {
             }
         }
     }
+}
+
+fn stdio_child_env(explicit: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut env = baseline_child_env();
+    env.extend(explicit.clone());
+    env
+}
+
+fn baseline_child_env() -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    for key in baseline_env_keys() {
+        if let Ok(val) = std::env::var(key) {
+            env.insert((*key).to_string(), val);
+        }
+    }
+    env
+}
+
+#[cfg(unix)]
+fn baseline_env_keys() -> &'static [&'static str] {
+    &["HOME", "PATH", "TERM", "USER"]
+}
+
+#[cfg(windows)]
+fn baseline_env_keys() -> &'static [&'static str] {
+    &[
+        "HOME",
+        "PATH",
+        "TERM",
+        "USERPROFILE",
+        "USERNAME",
+        "SystemRoot",
+        "SystemDrive",
+    ]
+}
+
+#[cfg(not(any(unix, windows)))]
+fn baseline_env_keys() -> &'static [&'static str] {
+    &["HOME", "PATH", "TERM"]
 }
 
 #[cfg(test)]
@@ -355,5 +395,22 @@ mod tests {
             ServerStatus::Failed(msg) => assert!(msg.contains("spawn")),
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stdio_child_env_keeps_only_baseline_plus_explicit() {
+        let mut explicit = HashMap::new();
+        explicit.insert("MCP_TOKEN".to_string(), "server-token".to_string());
+        explicit.insert("PATH".to_string(), "/custom/bin".to_string());
+
+        let env = stdio_child_env(&explicit);
+
+        assert_eq!(
+            env.get("MCP_TOKEN").map(String::as_str),
+            Some("server-token")
+        );
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/custom/bin"));
+        assert!(!env.contains_key("DISCORD_BOT_TOKEN"));
+        assert!(!env.contains_key("ANTHROPIC_API_KEY"));
     }
 }
