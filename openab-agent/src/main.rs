@@ -42,6 +42,10 @@ enum McpAction {
     },
     /// Show per-server runtime status
     Status,
+    /// Diagnose each configured server end-to-end: env vars, OAuth token,
+    /// live connect. Prints actionable remediation hints and exits
+    /// non-zero on any server failure (ADR §8).
+    Doctor,
     /// Spawn the configured server and run the MCP handshake (smoke-test).
     Connect {
         /// Server name as configured in mcp.json
@@ -121,6 +125,7 @@ async fn main() {
         Some(Commands::Mcp { action }) => match action {
             McpAction::List { resolve } => mcp::cli_list_servers(resolve),
             McpAction::Status => mcp::cli_show_status().await,
+            McpAction::Doctor => mcp::cli_doctor().await,
             McpAction::Connect { name } => mcp::cli_connect(name).await,
             McpAction::Login {
                 name,

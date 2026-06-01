@@ -9,6 +9,7 @@ pub mod runtime;
 
 use serde_json::json;
 
+use crate::auth::{auth_path, load_namespaced_token_at};
 use crate::llm::ToolDef;
 use config::{McpConfig, ServerConfig};
 
@@ -291,6 +292,97 @@ pub async fn cli_login_device(name: String) {
                 std::process::exit(1);
             }
             _ => continue,
+        }
+    }
+}
+
+/// `openab-agent mcp doctor`. Per-server diagnostic that runs a live
+/// `connect()` against every configured server and surfaces the result
+/// plus a remediation hint when something's broken (ADR §8).
+///
+/// Per-server checks (run in order, short-circuit on first ✗):
+/// 1. **Config resolution** — `${env:VAR}` placeholders resolve against
+///    the live process env. Missing vars print the offending name +
+///    hint to set it.
+/// 2. **OAuth state** (HTTP + `oauth:` only) — cached `TokenStore` in
+///    `auth.json`. Missing → `mcp login <name>` hint; expired → noted
+///    but not fatal (connect will attempt refresh).
+/// 3. **Live connect** — `manager.connect(name).await`. Any error is
+///    surfaced verbatim (including the circuit-breaker `retry in {n}s`
+///    hint from §5.9 when the breaker is open).
+///
+/// Exits non-zero if any server fails diagnostic, so CI / scripts can
+/// `openab-agent mcp doctor || alert`.
+pub async fn cli_doctor() {
+    let cfg = load_config_or_exit();
+    if cfg.servers.is_empty() {
+        println!("No MCP servers configured.");
+        println!("  global:  ~/.openab/agent/mcp.json");
+        println!("  project: ./.openab/agent/mcp.json");
+        return;
+    }
+    let manager = McpRuntimeManager::from_config(cfg.clone());
+    let auth = auth_path();
+    let mut servers: Vec<_> = cfg.servers.iter().collect();
+    servers.sort_by_key(|(name, _)| *name);
+    let mut failed = 0usize;
+    for (name, server) in &servers {
+        println!();
+        println!("● {name}  ({})", server.transport_label());
+        if !doctor_server(&manager, &auth, name, server).await {
+            failed += 1;
+        }
+    }
+    println!();
+    if failed == 0 {
+        println!("✓ all {} server(s) healthy", servers.len());
+    } else {
+        println!(
+            "✗ {failed} of {} server(s) failed diagnostic",
+            servers.len()
+        );
+        std::process::exit(1);
+    }
+}
+
+/// Returns `true` if every check passed for this server, `false` on the
+/// first failure (subsequent checks are skipped to keep the report focused
+/// on the root cause).
+async fn doctor_server(
+    manager: &McpRuntimeManager,
+    auth: &std::path::Path,
+    name: &str,
+    server: &ServerConfig,
+) -> bool {
+    if let Err(e) = server.resolved(name) {
+        println!("    ✗ config: {e:#}");
+        println!("    → set the missing env var(s) above and re-run");
+        return false;
+    }
+    println!("    ✓ config: env vars resolved");
+    if let ServerConfig::Http { oauth: Some(_), .. } = server {
+        match load_namespaced_token_at(auth, name) {
+            Ok(store) if !store.is_expired() => {
+                println!("    ✓ oauth: valid token cached");
+            }
+            Ok(_) => {
+                println!("    ⚠ oauth: token expired (connect will attempt refresh)");
+            }
+            Err(_) => {
+                println!("    ✗ oauth: no token cached");
+                println!("    → run `openab-agent mcp login {name}`");
+                return false;
+            }
+        }
+    }
+    match manager.connect(name).await {
+        Ok(()) => {
+            println!("    ✓ connect: handshake succeeded");
+            true
+        }
+        Err(e) => {
+            println!("    ✗ connect: {e:#}");
+            false
         }
     }
 }
