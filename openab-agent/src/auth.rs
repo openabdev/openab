@@ -115,28 +115,51 @@ fn read_auth_file(path: &Path) -> Result<HashMap<String, AuthEntry>> {
     serde_json::from_value(value).map_err(|e| anyhow!("Invalid auth.json: {e}"))
 }
 
-/// Atomically replace `auth.json` with the new map. `fsync(2)` after write
-/// satisfies the ADR §6.1 refresh-token rotation contract — without it, a
-/// Spot interruption between local write and S3 sync would restore a
-/// revoked refresh token from durable storage on the next task start.
+/// Atomically replace `auth.json` with the new map via tmp + `rename(2)` +
+/// parent-dir fsync. A crash between the tmp write and the rename leaves
+/// `auth.json` unchanged; a crash after the rename has the new file
+/// already durable. Satisfies the ADR §6.1 refresh-token rotation
+/// contract — without rename atomicity, a Spot interruption mid-write
+/// would leave a half-written `auth.json` that the next task start would
+/// fail to parse, then re-restore from S3 with a now-revoked refresh
+/// token.
 fn write_auth_file(path: &Path, map: &HashMap<String, AuthEntry>) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
+    let dir = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
     let data = serde_json::to_string_pretty(map)?;
     #[cfg(unix)]
     {
-        use std::fs::OpenOptions;
+        use std::fs::{File, OpenOptions};
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(data.as_bytes())?;
-        file.sync_all()?;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!("auth.json.tmp.{}.{seq}", std::process::id()));
+        let write_and_sync = || -> Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            file.write_all(data.as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        };
+        if let Err(e) = write_and_sync() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        // fsync the parent dir so the rename itself is durable; without
+        // this, the inode swap can be reordered after a power loss even
+        // though the tmp's contents were synced.
+        if let Ok(dir_handle) = File::open(dir) {
+            let _ = dir_handle.sync_all();
+        }
     }
     #[cfg(not(unix))]
     {
