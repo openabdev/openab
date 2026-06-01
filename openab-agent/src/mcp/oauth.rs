@@ -50,6 +50,29 @@ pub fn builtin(name: &str) -> Option<ProviderSpec> {
     BUILTINS.iter().copied().find(|spec| spec.name == name)
 }
 
+/// Resolve a built-in provider's OAuth `client_id`. Mirrors
+/// `auth::codex_client_id`'s env-var-override pattern but without a hard-
+/// coded default — the Anthropic MCP public client_id isn't yet pinned in
+/// this repo, so requiring the env var fails fast with a useful error
+/// rather than silently dialing with a placeholder. Replace with a
+/// hard-coded default once a real value is published.
+pub fn builtin_client_id(provider: &str) -> Result<String> {
+    let env_var = match provider {
+        "anthropic-mcp" => "OPENAB_MCP_ANTHROPIC_CLIENT_ID",
+        other => {
+            return Err(anyhow!(
+                "no built-in client_id mapping for provider {other:?}"
+            ));
+        }
+    };
+    std::env::var(env_var).map_err(|_| {
+        anyhow!(
+            "built-in provider {provider:?} requires env var {env_var} \
+             (client_id of the provider's OAuth app)"
+        )
+    })
+}
+
 /// Effective per-server OAuth parameters after resolving the built-in catalog
 /// and `OAuthConfig` overrides.
 ///
@@ -160,6 +183,43 @@ fn resolve_custom(provider: &str, cfg: &OAuthConfig) -> Result<ResolvedProvider>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Both env-touching tests below race the same OS env var; serialize
+    // them per the runbook's Tick 24 lesson (acp.rs ANTHROPIC_API_KEY race).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn builtin_client_id_requires_env_var() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: serialized via ENV_LOCK; isolated env key.
+        unsafe {
+            std::env::remove_var("OPENAB_MCP_ANTHROPIC_CLIENT_ID");
+        }
+        let err = builtin_client_id("anthropic-mcp")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("OPENAB_MCP_ANTHROPIC_CLIENT_ID"), "got: {err}");
+    }
+
+    #[test]
+    fn builtin_client_id_uses_env_var_when_set() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: serialized via ENV_LOCK; isolated env key.
+        unsafe {
+            std::env::set_var("OPENAB_MCP_ANTHROPIC_CLIENT_ID", "anth-test-id");
+        }
+        let id = builtin_client_id("anthropic-mcp").unwrap();
+        assert_eq!(id, "anth-test-id");
+        unsafe {
+            std::env::remove_var("OPENAB_MCP_ANTHROPIC_CLIENT_ID");
+        }
+    }
+
+    #[test]
+    fn builtin_client_id_rejects_unknown_provider() {
+        let err = builtin_client_id("does-not-exist").unwrap_err().to_string();
+        assert!(err.contains("does-not-exist"), "got: {err}");
+    }
 
     #[test]
     fn anthropic_mcp_spec_matches_adr_table() {

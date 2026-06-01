@@ -3,11 +3,6 @@
 //! security-primitive change can't drift between modules. Orchestration
 //! (device polling, callback parsing) lands in subsequent slices.
 
-// First prod caller (§6.4 login orchestration) lands in the next slice;
-// until then every item is reachable only via tests, so
-// `clippy --features mcp -D warnings` would flag dead_code.
-#![allow(dead_code)]
-
 use anyhow::Result;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use url::Url;
