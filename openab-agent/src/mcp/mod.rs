@@ -170,6 +170,11 @@ pub async fn cli_connect(name: String) {
 /// Errors at any step exit non-zero; the pending entry is preserved on
 /// state-mismatch / network failure so the user can retry with a fresh
 /// paste of the same redirect URL without re-running this command.
+///
+/// Security note: for non-interactive use, prefer piping the redirect
+/// URL via stdin (`echo "<url>" | openab-agent mcp login <name>`) over
+/// `--paste`. PKCE makes either route safe in theory, but pipes leave
+/// no trace in shell history or `ps` output — defense-in-depth.
 pub async fn cli_login(name: String, paste: Option<String>) {
     let manager = McpRuntimeManager::from_config(load_config_or_exit());
     let start = match manager.start_paste_login(&name).await {

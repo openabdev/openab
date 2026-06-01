@@ -52,12 +52,18 @@ enum McpAction {
     },
     /// Authenticate with an MCP server's OAuth provider (paste-back flow,
     /// ADR §6.4). Prints the authorize URL, then reads the post-redirect
-    /// URL from stdin (or `--paste` for non-interactive use).
+    /// URL from stdin.
+    ///
+    /// For non-interactive use, prefer piping the URL via stdin
+    /// (`echo "<url>" | openab-agent mcp login <name>`) over `--paste` —
+    /// pipes leave no trace in shell history or `ps` output. PKCE makes
+    /// either route safe in theory; the pipe form is defense-in-depth.
     Login {
         /// Server name as configured in mcp.json
         name: String,
-        /// Pre-fill the redirect URL (skip the stdin prompt). Useful for
-        /// scripted setups and CI smoke tests.
+        /// Pre-fill the redirect URL (skip the stdin prompt). Convenient
+        /// for ad-hoc testing; CI / scripts should prefer the stdin pipe
+        /// form to keep `code` + `state` out of shell history and `ps`.
         #[arg(long, value_name = "URL")]
         paste: Option<String>,
     },
