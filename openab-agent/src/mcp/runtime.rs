@@ -27,8 +27,8 @@ use super::config::{McpConfig, ServerConfig};
 use super::flow::{init_paste_authorize, parse_paste_callback};
 use super::oauth::{builtin_client_id, resolve, ResolvedProvider};
 use crate::auth::{
-    auth_path, load_pending_login, remove_pending_login, save_namespaced_token_at,
-    save_pending_login, PendingPasteLogin, TokenStore,
+    auth_path, list_pending_logins_at, load_pending_login, remove_pending_login,
+    save_namespaced_token_at, save_pending_login, PendingPasteLogin, TokenStore, PENDING_PREFIX,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +135,17 @@ impl McpRuntimeManager {
 
     pub async fn is_empty(&self) -> bool {
         self.handles.read().await.is_empty()
+    }
+
+    /// Sorted server names with an in-flight `mcp-pending:<name>` entry in
+    /// `auth.json`. Lets `mcp status` surface "you started a login but
+    /// haven't finished" — including for servers no longer in config
+    /// (caller cross-references against `statuses()` to spot orphans).
+    /// Synchronous filesystem read on the same thread as the caller; the
+    /// pending map is tiny (~one entry per concurrent login) so blocking is
+    /// trivial and avoids tokio::task::spawn_blocking overhead.
+    pub fn pending_logins(&self) -> Vec<String> {
+        list_pending_logins_at(&self.auth_path)
     }
 
     /// Clone the live MCP client handle for `name` out from under a short
@@ -398,7 +409,7 @@ fn provider_name_of(provider: &ResolvedProvider) -> String {
 
 /// `auth.json` key for an in-flight paste-login (ADR §6.4 namespace).
 fn pending_key(name: &str) -> String {
-    format!("mcp-pending:{name}")
+    format!("{PENDING_PREFIX}{name}")
 }
 
 /// Wall-clock seconds since Unix epoch. Saturates at 0 if the clock is
@@ -892,6 +903,20 @@ mod tests {
         assert_eq!(token.token_endpoint, "https://example.test/token");
         assert_eq!(token.provider, "linear");
         assert_eq!(mgr.statuses().await[0].1, ServerStatus::Disconnected);
+    }
+
+    #[tokio::test]
+    async fn pending_logins_returns_sorted_names_and_includes_orphans() {
+        // `linear` is in cfg; `zed-mcp` + `ghost` are not — surfacing all
+        // three is the point (orphans get separately filed by cli_show_status).
+        let cfg: McpConfig = serde_json::from_str(linear_custom_cfg()).unwrap();
+        let (mgr, _dir) = mgr_with_tempdir(cfg);
+        assert!(mgr.pending_logins().is_empty());
+        seed_pending(&mgr, "zed-mcp", "s1");
+        seed_pending(&mgr, "linear", "s2");
+        seed_pending(&mgr, "ghost", "s3");
+        let names = mgr.pending_logins();
+        assert_eq!(names, vec!["ghost", "linear", "zed-mcp"]);
     }
 
     #[tokio::test]

@@ -128,15 +128,43 @@ fn print_json<T: serde::Serialize>(status: &str, name: &str, value: &T) {
 ///
 /// Prints per-server runtime status. Servers start `Disconnected` and only
 /// advance after `mcp connect <name>` (or, later, lazy dial from the agent
-/// path).
+/// path). Servers with an in-flight `mcp-pending:<name>` entry get a
+/// `(login pending — run mcp login <name>)` suffix so the user knows the
+/// flow stalled mid-paste-back. Orphaned pending entries (no matching
+/// config) get listed under a separator so they're visible for cleanup.
 pub async fn cli_show_status() {
     let manager = McpRuntimeManager::from_config(load_config_or_exit());
     if manager.is_empty().await {
         println!("No MCP servers configured.");
         return;
     }
-    for (name, status) in manager.statuses().await {
-        println!("{} {name}", status.icon());
+    let statuses = manager.statuses().await;
+    let pending: std::collections::HashSet<String> = manager.pending_logins().into_iter().collect();
+    for (name, status) in &statuses {
+        let mut line = format!("{} {name}", status.icon());
+        if pending.contains(name) {
+            line.push_str(&format!(
+                " (login pending — run `mcp login {name}` to finish)"
+            ));
+        } else if matches!(status, runtime::ServerStatus::NeedsAuth) {
+            line.push_str(&format!(" (run `mcp login {name}`)"));
+        }
+        println!("{line}");
+    }
+    let configured: std::collections::HashSet<&str> =
+        statuses.iter().map(|(n, _)| n.as_str()).collect();
+    let orphans: Vec<&String> = pending
+        .iter()
+        .filter(|n| !configured.contains(n.as_str()))
+        .collect();
+    if !orphans.is_empty() {
+        println!();
+        println!("Orphaned pending logins (no matching server in mcp.json):");
+        let mut sorted = orphans;
+        sorted.sort();
+        for name in sorted {
+            println!("  ⏳ {name}");
+        }
     }
 }
 

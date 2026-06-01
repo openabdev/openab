@@ -197,6 +197,32 @@ pub fn save_namespaced_token_at(path: &Path, key: &str, store: &TokenStore) -> R
     write_auth_file(path, &map)
 }
 
+/// `auth.json` namespace prefix for in-flight paste-back logins (ADR §6.4).
+/// Pinned as a constant so `pending_key` (write side) and
+/// `list_pending_logins_at` (read side) can't drift on the string literal.
+#[cfg(feature = "mcp")]
+pub const PENDING_PREFIX: &str = "mcp-pending:";
+
+/// Enumerate the server names of all in-flight `mcp-pending:<name>` entries
+/// — surfaces partially completed paste-back logins to `mcp status`. Returns
+/// sorted names with the prefix stripped. Missing / unreadable `auth.json`
+/// → empty Vec; this is a best-effort status view, not a load-bearing path.
+#[cfg(feature = "mcp")]
+pub fn list_pending_logins_at(path: &Path) -> Vec<String> {
+    let Ok(map) = read_auth_file(path) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = map
+        .iter()
+        .filter_map(|(k, v)| match v {
+            AuthEntry::Pending(_) => k.strip_prefix(PENDING_PREFIX).map(str::to_string),
+            AuthEntry::Token(_) => None,
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 /// Read a `mcp-pending:<server>` entry from `auth.json` (ADR §6.4). Errors
 /// if the key holds a token instead — the two namespaces shouldn't
 /// collide, but a hand-edited file would. `path` is injected so the
@@ -822,6 +848,35 @@ mod tests {
         assert_eq!(got, make_pending());
         remove_pending_login(&path, key).unwrap();
         assert!(load_pending_login(&path, key).is_err());
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn list_pending_logins_strips_prefix_sorts_and_skips_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut input = HashMap::new();
+        input.insert("codex".to_string(), AuthEntry::Token(make_store(0)));
+        input.insert(
+            "mcp-pending:zed-mcp".to_string(),
+            AuthEntry::Pending(make_pending()),
+        );
+        input.insert(
+            "mcp-pending:linear".to_string(),
+            AuthEntry::Pending(make_pending()),
+        );
+        input.insert("mcp:linear".to_string(), AuthEntry::Token(make_store(1)));
+        write_auth_file(&path, &input).unwrap();
+        let names = list_pending_logins_at(&path);
+        assert_eq!(names, vec!["linear".to_string(), "zed-mcp".to_string()]);
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn list_pending_logins_returns_empty_on_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.json");
+        assert!(list_pending_logins_at(&path).is_empty());
     }
 
     #[cfg(feature = "mcp")]
