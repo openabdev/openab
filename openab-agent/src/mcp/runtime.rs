@@ -558,6 +558,18 @@ impl McpRuntimeManager {
     /// (Google-style rotation); the agent fsyncs `auth.json` before
     /// returning so deployment-side mtime watchers can sync the rotated
     /// token to peer replicas.
+    ///
+    /// Concurrent `connect()` callers on the same server may each enter
+    /// this path with the same stale `refresh_token` — there is no
+    /// per-server single-flight gate here. That is intentional for now:
+    /// the connect() race guard (see the `NeedsRefresh` branch below)
+    /// keeps a failed concurrent refresh from clobbering a peer's
+    /// successful `Connected` install, so the worst-case outcome is N
+    /// duplicate POSTs to the token endpoint rather than state
+    /// corruption. Providers that cascade-revoke on replayed refresh
+    /// tokens would still bounce the user back through `mcp login`;
+    /// a Phase 3 follow-up will add a `tokio::sync::Mutex` per server
+    /// (or `OnceCell<TokenStore>`) to single-flight refreshes.
     async fn try_refresh_oauth_token(&self, name: &str, store: &TokenStore) -> Result<TokenStore> {
         if store.refresh_token.is_empty() {
             return Err(anyhow!("no refresh_token cached for {name:?}"));
