@@ -109,13 +109,18 @@ pub fn format_skills_prompt(skills: &[Skill]) -> String {
     if skills.is_empty() {
         return String::new();
     }
+
+    // Sort skills by name to ensure deterministic output
+    let mut sorted_skills = skills.to_vec();
+    sorted_skills.sort_by(|a, b| a.name.cmp(&b.name));
+
     let mut out = String::from(concat!(
         "\n\n## Skills\n\n",
         "Before replying, scan the skills below. If one matches or may be relevant to the user's task, ",
         "use the `read` tool to load the full SKILL.md at the listed location and follow its instructions.\n\n",
         "<available_skills>\n",
     ));
-    for skill in skills {
+    for skill in sorted_skills {
         out.push_str(&format!(
             "  <skill>\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>\n  </skill>\n",
             xml_escape(&skill.name),
@@ -246,5 +251,25 @@ mod tests {
         let prompt = format_skills_prompt(&skills);
         assert!(prompt.contains("<name>a&lt;b</name>"));
         assert!(prompt.contains("<description>Use &lt;tag&gt; &amp; \"quotes\"</description>"));
+    }
+
+    #[test]
+    fn format_skills_prompt_is_deterministic() {
+        let skills = vec![
+            Skill {
+                name: "zoo".to_string(),
+                description: "Zoo skill".to_string(),
+                path: PathBuf::from("/skills/zoo"),
+            },
+            Skill {
+                name: "apple".to_string(),
+                description: "Apple skill".to_string(),
+                path: PathBuf::from("/skills/apple"),
+            },
+        ];
+        let prompt = format_skills_prompt(&skills);
+        let apple_idx = prompt.find("<name>apple</name>").unwrap();
+        let zoo_idx = prompt.find("<name>zoo</name>").unwrap();
+        assert!(apple_idx < zoo_idx);
     }
 }
