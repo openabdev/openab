@@ -103,8 +103,7 @@ impl Adapter {
         self.load_store_inner()
     }
 
-    /// Persist session store with exclusive lock and atomic write.
-    /// Try to restore session state from persisted storage.
+    /// Load a persisted session record, including conversation ID and emitted line count.
     fn restore_session(&self, session_id: &str) -> Option<StoredSession> {
         let store = self.load_store();
         store.sessions.get(session_id).cloned()
@@ -190,7 +189,7 @@ impl Adapter {
             return lines[emitted_line_count..].concat();
         }
         eprintln!(
-            "[agy-acp] WARN: agy stdout line count shrank; \
+            "[agy-acp] WARN: agy stdout was not append-only; \
              sending full output and resetting line-count baseline"
         );
         full_text.to_string()
@@ -212,7 +211,8 @@ impl Adapter {
         let Some(conversation_id) = stored.conversation_id else {
             return false;
         };
-        // Evict only after confirming the restore target exists
+        // Restore both the conversation binding and the emitted line-count baseline.
+        // Evict only after confirming the restore target exists.
         if !self.sessions.contains_key(session_id) {
             self.evict_if_needed();
         }
