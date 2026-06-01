@@ -93,10 +93,19 @@ async fn call_tool(
         .with_context(|| format!("connect mcp server {server:?}"))?;
     let peer = manager.arc_peer(server).await?;
     let params = rmcp::model::CallToolRequestParams::new(tool.to_string()).with_arguments(args_map);
-    let result = peer
-        .call_tool(params)
-        .await
-        .with_context(|| format!("call_tool {tool:?} on {server:?}"))?;
+    // Wire-level Err = transport failure → trips the breaker; wire-level
+    // Ok (even with `isError: true`) resets it. See ADR §5.9 / #966 Q2.
+    let result = match peer.call_tool(params).await {
+        Ok(r) => {
+            manager.record_tool_call_outcome(server, true);
+            r
+        }
+        Err(e) => {
+            manager.record_tool_call_outcome(server, false);
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("call_tool {tool:?} on {server:?}"));
+        }
+    };
     serde_json::to_value(&result).context("serialize CallToolResult")
 }
 

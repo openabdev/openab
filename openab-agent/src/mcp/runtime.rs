@@ -25,6 +25,7 @@ use tokio::process::Command;
 use tokio::sync::RwLock;
 use tokio::task::AbortHandle;
 
+use super::breaker::{ServerBreaker, Verdict};
 use super::config::{McpConfig, ServerConfig};
 use super::flow::{init_paste_authorize, parse_paste_callback};
 use super::oauth::{builtin_client_id, resolve, ResolvedProvider};
@@ -121,6 +122,11 @@ pub struct McpRuntimeManager {
     /// observe the winner's rotated token instead of replaying a stale
     /// refresh_token (which providers like Google would cascade-revoke).
     refresh_locks: Arc<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Per-server circuit breaker (ADR §5.9). Counts consecutive
+    /// transport-level failures; once tripped, short-circuits `connect`
+    /// and tool-call dispatch until the cooldown elapses and a
+    /// half-open probe succeeds.
+    breaker: Arc<ServerBreaker>,
 }
 
 impl McpRuntimeManager {
@@ -147,6 +153,7 @@ impl McpRuntimeManager {
             auth_path,
             device_login_tasks: Arc::new(StdMutex::new(HashMap::new())),
             refresh_locks: Arc::new(StdMutex::new(HashMap::new())),
+            breaker: Arc::new(ServerBreaker::new()),
         }
     }
 
@@ -638,6 +645,16 @@ impl McpRuntimeManager {
             if matches!(handle.status, ServerStatus::Connected) && handle.client.is_some() {
                 return Ok(());
             }
+            // Breaker check after the already-connected fast path so the
+            // hot tool-call path stays lock-free on the breaker map. Auth
+            // bounces below (`NeedsAuth`) don't increment the breaker —
+            // only the dial result at the end does, matching the "transport
+            // failures only" semantics from ADR §5.9 / Hermes.
+            if let Verdict::Reject { retry_in_secs } = self.breaker.check(name) {
+                return Err(anyhow!(
+                    "mcp server {name:?} circuit-breaker open — retry in {retry_in_secs}s"
+                ));
+            }
             let resolved = handle.config.resolved(name)?;
             let plan = match resolved {
                 ServerConfig::Stdio {
@@ -714,13 +731,30 @@ impl McpRuntimeManager {
             Ok(client) => {
                 handle.status = ServerStatus::Connected;
                 handle.client = Some(Arc::new(client));
+                self.breaker.record_success(name);
                 Ok(())
             }
             Err(e) => {
                 let msg = format!("{e:#}");
                 handle.status = ServerStatus::Failed(msg.clone());
+                self.breaker.record_failure(name);
                 Err(anyhow!(msg))
             }
+        }
+    }
+
+    /// Record a tool-call outcome on the breaker. Called from
+    /// `meta_tool::call_tool` after `peer.call_tool().await` returns.
+    /// Wire-level `Ok` resets the counter regardless of `CallToolResult.is_error`
+    /// (the `isError` bit is protocol-normal payload, not a transport fault).
+    /// Wire-level `Err` is a transport-level failure and increments the
+    /// counter — matching the single-counter / transport-only model from
+    /// the #966 design decisions.
+    pub fn record_tool_call_outcome(&self, name: &str, ok: bool) {
+        if ok {
+            self.breaker.record_success(name);
+        } else {
+            self.breaker.record_failure(name);
         }
     }
 }
@@ -1166,6 +1200,54 @@ mod tests {
         match &mgr.statuses().await[0].1 {
             ServerStatus::Failed(_) => {}
             other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn breaker_opens_after_threshold_consecutive_connect_failures() {
+        // 127.0.0.1:1 hermetic dead-port (same pattern as the test above).
+        // After FAIL_THRESHOLD dial failures the breaker trips, and the
+        // next connect() short-circuits with the cooldown hint instead of
+        // attempting another dial.
+        let json = r#"{
+            "mcpServers": {
+                "dead": { "type": "http", "url": "http://127.0.0.1:1/mcp" }
+            }
+        }"#;
+        let cfg: McpConfig = serde_json::from_str(json).unwrap();
+        let mgr = McpRuntimeManager::from_config(cfg);
+        for _ in 0..crate::mcp::breaker::FAIL_THRESHOLD {
+            assert!(mgr.connect("dead").await.is_err());
+        }
+        let err = mgr.connect("dead").await.unwrap_err().to_string();
+        assert!(
+            err.contains("circuit-breaker open"),
+            "expected breaker hint in {err}"
+        );
+        assert!(err.contains("retry in"), "expected retry hint in {err}");
+    }
+
+    #[tokio::test]
+    async fn breaker_does_not_count_oauth_needs_auth_bounces() {
+        // NeedsAuth is an auth-level state, not a transport-level failure;
+        // the breaker must NOT trip after repeated NeedsAuth returns.
+        let json = r#"{
+            "mcpServers": {
+                "linear": {
+                    "type": "http",
+                    "url": "https://mcp.linear.app/mcp",
+                    "oauth": { "provider": "linear" }
+                }
+            }
+        }"#;
+        let cfg: McpConfig = serde_json::from_str(json).unwrap();
+        let mgr = McpRuntimeManager::from_config(cfg);
+        for _ in 0..(crate::mcp::breaker::FAIL_THRESHOLD + 2) {
+            let err = mgr.connect("linear").await.unwrap_err().to_string();
+            assert!(
+                err.contains("needs oauth login"),
+                "expected NeedsAuth bounce, got {err}"
+            );
         }
     }
 

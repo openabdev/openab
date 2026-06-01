@@ -12,8 +12,6 @@
 //! consecutive failures with no time window — going Hermes-simple here.
 //! Any success resets the counter.
 
-#![allow(dead_code)] // wired into McpRuntimeManager in next slice
-
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
