@@ -58,18 +58,46 @@ fn load_config_or_exit() -> McpConfig {
     })
 }
 
+/// Runtime opt-in env var (PR #959 review, chaodu F6). MCP stays dormant
+/// unless this is explicitly set to a truthy value, even when `mcp.json`
+/// exists at one of the search paths. Prevents accidental activation in
+/// environments where the config file might be present incidentally
+/// (e.g. project tree copied into a container image, baseline VM rollouts).
+pub const OPT_IN_ENV: &str = "OPENAB_AGENT_MCP";
+
+/// Returns `true` when the user has explicitly opted into the MCP runtime
+/// via `OPENAB_AGENT_MCP={1,true,yes,on}` (case-insensitive). Any other
+/// value — including unset, empty, or `false` — keeps MCP dormant.
+fn opted_in() -> bool {
+    matches!(
+        std::env::var(OPT_IN_ENV)
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Ok("1" | "true" | "yes" | "on")
+    )
+}
+
 /// Construct an `McpRuntimeManager` from on-disk config — returns `None`
-/// when no servers are configured so callers can skip the entire MCP path
-/// (saves system-prompt tokens + keeps the LLM from hallucinating an empty
-/// tool surface). Parse failure falls back to `None` with a `tracing::warn!`.
-/// Long-running servers (ACP, future HTTP) call this; CLI subcommands use
-/// `load_config_or_exit` instead.
+/// when MCP is not opted in (see [`OPT_IN_ENV`]) or no servers are
+/// configured, so callers can skip the entire MCP path (saves system-prompt
+/// tokens + keeps the LLM from hallucinating an empty tool surface). Parse
+/// failure falls back to `None` with a `tracing::warn!`. Long-running
+/// servers (ACP, future HTTP) call this; CLI subcommands use
+/// `load_config_or_exit` instead so they work without the opt-in env var.
 pub fn load_runtime_or_warn() -> Option<McpRuntimeManager> {
+    if !opted_in() {
+        return None;
+    }
     let cfg = McpConfig::load().unwrap_or_else(|e| {
         tracing::warn!("mcp config failed to load, starting with no servers: {e:#}");
         McpConfig::default()
     });
     if cfg.servers.is_empty() {
+        tracing::warn!(
+            "{OPT_IN_ENV} is set but no mcp servers configured at \
+             ~/.openab/agent/mcp.json or ./.openab/agent/mcp.json"
+        );
         None
     } else {
         Some(McpRuntimeManager::from_config(cfg))

@@ -359,6 +359,14 @@ openab-agent/src/
 
 Estimated total: **500-750 LOC** (no `reload.rs`; per-session refresh handled by `McpRuntimeManager::new()` re-reading config at session start). `llm.rs` is unchanged because both Anthropic and OpenAI Responses providers consume the generic `ToolDef` abstraction.
 
+#### 5.4.1 Runtime activation & isolation choices
+
+Three intentional choices that surfaced in PR #959 review (chaodu F2 / F6 / F7) and are load-bearing enough to belong in the design contract:
+
+1. **Runtime opt-in gate (F6, env-only).** `load_runtime_or_warn()` returns `None` unless `OPENAB_AGENT_MCP={1,true,yes,on}` (case-insensitive) is set in the process env, even when `mcp.json` is present. Reasoning: file presence is not a strong enough activation signal — `mcp.json` can land in a deploy tree incidentally (image baseline, project clone) and an unrelated agent shouldn't start spawning third-party child processes. The CLI subcommands (`mcp list / status / connect / doctor`) call `load_config_or_exit` instead and work without the env var so operators can inspect a config before activating it.
+2. **Stdio child env scrubbing (F2, intentional security).** `Dial::Stdio` calls `env_clear()` and passes only the 4-var baseline allowlist (`HOME`, `PATH`, `TERM`, `USER` on Unix; Windows equivalents) plus the explicit `env:` map from `mcp.json`. Reasoning: openab-agent inherits high-value secrets from its launcher (`DISCORD_BOT_TOKEN`, `ANTHROPIC_API_KEY`, AWS credentials, GitHub tokens) and stdio MCP servers are third-party binaries with no contractual constraint on what they read from their environment. Leaking those by default is a much larger risk than the convenience of inherited proxy/locale settings. Servers that genuinely need additional env (proxy, certs, locale, provider config) declare them per-server in the config — a future `inherit_env` opt-in list is tracked as follow-up if user demand surfaces.
+3. **Per-process shared `McpRuntimeManager` (F7).** A single manager is `Arc`-cloned across all ACP sessions of the same process. Reasoning: MCP servers are expensive to spawn (stdio child fork, HTTP handshake + OAuth) and most are pure-state read-only tools where cross-session visibility is benign. Trade-off: a `mcp connect github` in session A makes the `github` server immediately available in session B. We accept this — per-session isolation would multiply child processes and break the breaker / TTL accounting in §5.7 / §5.9.
+
 ### 5.5 `rmcp` dependency & features
 
 ```toml

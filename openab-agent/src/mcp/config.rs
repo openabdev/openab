@@ -205,6 +205,32 @@ mod tests {
     }
 
     #[test]
+    fn resolved_errors_on_missing_env_var_with_var_name() {
+        // chaodu F9 (#959 review): contract is that a missing env var
+        // referenced via `${env:VAR}` in any config field surfaces an error
+        // naming the offender, so users can fix `mcp.json` instead of
+        // chasing a generic parse failure.
+        let cfg = ServerConfig::Stdio {
+            command: "github-mcp-server".into(),
+            args: vec!["--token".into(), "${env:CHAODU_F9_MISSING}".into()],
+            env: HashMap::new(),
+            tool_filter: None,
+        };
+        let err = format!(
+            "{:#}",
+            cfg.resolved_with_env("github", &env(&[])).unwrap_err()
+        );
+        assert!(
+            err.contains("CHAODU_F9_MISSING"),
+            "expected missing var name in error: {err}"
+        );
+        assert!(
+            err.contains("github"),
+            "expected server name in error context: {err}"
+        );
+    }
+
+    #[test]
     fn parses_stdio_and_http_servers() {
         let json = r#"{
             "mcpServers": {

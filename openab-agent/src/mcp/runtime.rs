@@ -397,6 +397,44 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn race_guard_no_stuck_connecting_on_concurrent_failures() {
+        // Two concurrent connect() tasks race against a guaranteed-failure
+        // server (non-existent binary). Per chaodu F4 (#959 review), the
+        // race guard must never leave status stuck at `Connecting` even when
+        // both dial attempts fail. Final status must be Failed (terminal),
+        // and a third connect() after the race must still be allowed to
+        // retry from Failed.
+        let json = r#"{
+            "mcpServers": {
+                "broken": {
+                    "type": "stdio",
+                    "command": "/nonexistent/path/openab-mcp-race-test-zzz"
+                }
+            }
+        }"#;
+        let cfg: McpConfig = serde_json::from_str(json).unwrap();
+        let mgr = std::sync::Arc::new(McpRuntimeManager::from_config(cfg));
+        let a = {
+            let mgr = mgr.clone();
+            tokio::spawn(async move { mgr.connect("broken").await })
+        };
+        let b = {
+            let mgr = mgr.clone();
+            tokio::spawn(async move { mgr.connect("broken").await })
+        };
+        let _ = a.await.unwrap();
+        let _ = b.await.unwrap();
+        match &mgr.statuses().await[0].1 {
+            ServerStatus::Failed(_) => {}
+            other => panic!("expected Failed after race, got {other:?}"),
+        }
+        // From Failed, a follow-up connect() must still attempt a fresh
+        // dial — proves the Failed → Connecting transition isn't gated out.
+        assert!(mgr.connect("broken").await.is_err());
+        assert!(matches!(mgr.statuses().await[0].1, ServerStatus::Failed(_)));
+    }
+
     #[test]
     fn stdio_child_env_keeps_only_baseline_plus_explicit() {
         let mut explicit = HashMap::new();

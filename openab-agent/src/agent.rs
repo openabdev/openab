@@ -222,8 +222,12 @@ impl Agent {
     /// first user message and maintaining strict user/assistant alternation.
     fn truncate_context(&mut self) {
         while self.messages.len() > MAX_CONTEXT_MESSAGES {
-            // Drain in pairs (assistant + user) from index 1 to maintain alternation
-            let end = (1 + 2).min(self.messages.len());
+            // Drain a (assistant, user) pair from indices 1..3, preserving
+            // the original first user message at index 0 so user/assistant
+            // alternation stays intact. The `min()` guard is defensive — if
+            // the loop is ever entered with fewer than 3 messages, we drain
+            // whatever single tail message exists rather than panic.
+            let end = 3.min(self.messages.len());
             self.messages.drain(1..end);
         }
     }
@@ -233,17 +237,31 @@ impl Agent {
     /// the routing here (rather than inside `tools.rs`) lets `tools.rs` stay
     /// stateless and free of MCP/feature plumbing.
     async fn execute_tool_call(&self, name: &str, input: &serde_json::Value) -> Result<String> {
+        // Defensive guard (PR #959 chaodu F5): even though the `mcp` tool is
+        // only registered when a manager is loaded — and the system-prompt
+        // appendix is gated on `mcp_manager.is_some()` — a sufficiently
+        // creative LLM could still emit a `mcp(...)` tool call. Surface an
+        // actionable, non-fatal error so the loop continues instead of
+        // panicking or leaking an impl-detail message.
         #[cfg(feature = "mcp")]
         if name == mcp::MCP_TOOL_NAME {
             let Some(manager) = self.mcp_manager.as_ref() else {
                 return Err(anyhow::anyhow!(
-                    "mcp tool invoked but no McpRuntimeManager configured"
+                    "tool `mcp` is not available in this session — \
+                     MCP runtime was not opted in (set `OPENAB_AGENT_MCP=true` \
+                     and configure `mcp.json`). Do not call `mcp` again."
                 ));
             };
             let action = mcp::meta_tool::Action::deserialize(input)
                 .map_err(|e| anyhow::anyhow!("invalid mcp action payload: {e}"))?;
             let value = mcp::meta_tool::dispatch(manager, action).await?;
             return Ok(serde_json::to_string(&value)?);
+        }
+        #[cfg(not(feature = "mcp"))]
+        if name == "mcp" {
+            return Err(anyhow::anyhow!(
+                "tool `mcp` is not compiled into this build. Do not call `mcp` again."
+            ));
         }
         tools::execute_tool(name, input, &self.working_dir).await
     }
