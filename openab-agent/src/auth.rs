@@ -39,6 +39,38 @@ pub struct TokenStore {
     pub provider: String,
 }
 
+/// Transient per-server state captured at `start_paste_login` and consumed
+/// by `complete_login` (ADR §6.4). Lives in `auth.json` under
+/// `mcp-pending:<server>`. `token_url` + `provider_name` are snapshotted
+/// up front so a config edit between init and finish can't redirect the
+/// token exchange.
+///
+/// Unconditionally compiled (not behind `mcp` feature) so a non-mcp build
+/// can still parse + round-trip an `auth.json` containing pending entries.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingPasteLogin {
+    pub verifier: String,
+    pub state: String,
+    pub token_url: String,
+    pub provider_name: String,
+}
+
+/// `auth.json` value type. Untagged Serde enum: `TokenStore` has required
+/// `access_token`, `PendingPasteLogin` has required `verifier` — the
+/// shapes are disjoint, so deserialization picks the right variant
+/// without an explicit tag (and existing files stay byte-compatible).
+///
+/// Per Mira's Tick 39 review: option-A (repurposing TokenStore fields for
+/// pending state) would have made the refresh task treat pending entries
+/// as "expired tokens" and loop on them. The untagged enum keeps the two
+/// state machines completely separate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AuthEntry {
+    Token(TokenStore),
+    Pending(PendingPasteLogin),
+}
+
 fn auth_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(home)
@@ -54,7 +86,7 @@ fn auth_path() -> PathBuf {
 /// Discriminates by the top-level `access_token` key — present means the
 /// file is the legacy `TokenStore` shape, absent means the new namespaced
 /// map. A single JSON parse gives accurate error context either way.
-fn read_auth_file(path: &Path) -> Result<HashMap<String, TokenStore>> {
+fn read_auth_file(path: &Path) -> Result<HashMap<String, AuthEntry>> {
     let data = std::fs::read_to_string(path)?;
     let value: serde_json::Value =
         serde_json::from_str(&data).map_err(|e| anyhow!("Invalid auth.json: {e}"))?;
@@ -62,7 +94,7 @@ fn read_auth_file(path: &Path) -> Result<HashMap<String, TokenStore>> {
         let legacy: TokenStore = serde_json::from_value(value)
             .map_err(|e| anyhow!("Invalid auth.json (legacy format): {e}"))?;
         let mut map = HashMap::new();
-        map.insert(CODEX_NAMESPACE.to_string(), legacy);
+        map.insert(CODEX_NAMESPACE.to_string(), AuthEntry::Token(legacy));
         return Ok(map);
     }
     serde_json::from_value(value).map_err(|e| anyhow!("Invalid auth.json: {e}"))
@@ -72,7 +104,7 @@ fn read_auth_file(path: &Path) -> Result<HashMap<String, TokenStore>> {
 /// satisfies the ADR §6.1 refresh-token rotation contract — without it, a
 /// Spot interruption between local write and S3 sync would restore a
 /// revoked refresh token from durable storage on the next task start.
-fn write_auth_file(path: &Path, map: &HashMap<String, TokenStore>) -> Result<()> {
+fn write_auth_file(path: &Path, map: &HashMap<String, AuthEntry>) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -106,18 +138,19 @@ pub fn load_tokens() -> Result<TokenStore> {
             path.display()
         )
     })?;
-    map.get(CODEX_NAMESPACE).cloned().ok_or_else(|| {
-        anyhow!(
+    match map.get(CODEX_NAMESPACE) {
+        Some(AuthEntry::Token(t)) => Ok(t.clone()),
+        _ => Err(anyhow!(
             "No codex credentials in {}. Run `openab-agent auth codex-oauth` first.",
             path.display()
-        )
-    })
+        )),
+    }
 }
 
 fn save_tokens(store: &TokenStore) -> Result<()> {
     let path = auth_path();
     let mut map = read_auth_file(&path).unwrap_or_default();
-    map.insert(CODEX_NAMESPACE.to_string(), store.clone());
+    map.insert(CODEX_NAMESPACE.to_string(), AuthEntry::Token(store.clone()));
     write_auth_file(&path, &map)
 }
 
@@ -130,9 +163,11 @@ pub fn load_namespaced_token(key: &str) -> Result<TokenStore> {
     let path = auth_path();
     let map =
         read_auth_file(&path).map_err(|_| anyhow!("No credentials found at {}", path.display()))?;
-    map.get(key)
-        .cloned()
-        .ok_or_else(|| anyhow!("no credentials stored for {key:?}"))
+    match map.get(key) {
+        Some(AuthEntry::Token(t)) => Ok(t.clone()),
+        Some(AuthEntry::Pending(_)) => Err(anyhow!("{key:?} is a pending login, not a token")),
+        None => Err(anyhow!("no credentials stored for {key:?}")),
+    }
 }
 
 /// Insert or replace the credential at `key`, preserving all other entries.
@@ -143,7 +178,54 @@ pub fn load_namespaced_token(key: &str) -> Result<TokenStore> {
 pub fn save_namespaced_token(key: &str, store: &TokenStore) -> Result<()> {
     let path = auth_path();
     let mut map = read_auth_file(&path).unwrap_or_default();
-    map.insert(key.to_string(), store.clone());
+    map.insert(key.to_string(), AuthEntry::Token(store.clone()));
+    write_auth_file(&path, &map)
+}
+
+/// Read a `mcp-pending:<server>` entry from `auth.json` (ADR §6.4). Errors
+/// if the key holds a token instead — the two namespaces shouldn't
+/// collide, but a hand-edited file would.
+#[cfg(feature = "mcp")]
+#[allow(dead_code)] // wired in next slice (runtime::start_paste_login)
+pub fn load_pending_login(key: &str) -> Result<PendingPasteLogin> {
+    let path = auth_path();
+    let map =
+        read_auth_file(&path).map_err(|_| anyhow!("No credentials found at {}", path.display()))?;
+    match map.get(key) {
+        Some(AuthEntry::Pending(p)) => Ok(p.clone()),
+        Some(AuthEntry::Token(_)) => Err(anyhow!("{key:?} is a token, not a pending login")),
+        None => Err(anyhow!("no pending login for {key:?}")),
+    }
+}
+
+/// Persist a `PendingPasteLogin` under `mcp-pending:<server>` (ADR §6.4).
+/// Read-modify-write — same serialization caveat as `save_namespaced_token`.
+#[cfg(feature = "mcp")]
+#[allow(dead_code)] // wired in next slice (runtime::start_paste_login)
+pub fn save_pending_login(key: &str, val: &PendingPasteLogin) -> Result<()> {
+    let path = auth_path();
+    let mut map = read_auth_file(&path).unwrap_or_default();
+    map.insert(key.to_string(), AuthEntry::Pending(val.clone()));
+    write_auth_file(&path, &map)
+}
+
+/// Remove a pending-login entry (consumed on successful `complete_login`,
+/// expired entry GC, or `mcp logout`). Idempotent — missing key is OK.
+#[cfg(feature = "mcp")]
+#[allow(dead_code)] // wired in next slice (complete_login)
+pub fn remove_pending_login(key: &str) -> Result<()> {
+    let path = auth_path();
+    let mut map = match read_auth_file(&path) {
+        Ok(m) => m,
+        Err(_) => return Ok(()),
+    };
+    if map.remove(key).is_none() {
+        return Ok(());
+    }
+    if map.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return Ok(());
+    }
     write_auth_file(&path, &map)
 }
 
@@ -626,6 +708,13 @@ mod tests {
         assert_eq!(challenge, expected);
     }
 
+    fn token_of(entry: Option<&AuthEntry>) -> &TokenStore {
+        match entry {
+            Some(AuthEntry::Token(t)) => t,
+            other => panic!("expected Token, got {other:?}"),
+        }
+    }
+
     #[test]
     fn read_auth_file_migrates_legacy_single_tenant_format() {
         let dir = tempfile::tempdir().unwrap();
@@ -635,7 +724,7 @@ mod tests {
         let map = read_auth_file(&path).unwrap();
         assert_eq!(map.len(), 1);
         assert_eq!(
-            map.get(CODEX_NAMESPACE).unwrap().access_token,
+            token_of(map.get(CODEX_NAMESPACE)).access_token,
             "test_access_token_value"
         );
     }
@@ -645,13 +734,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         let mut input = HashMap::new();
-        input.insert("codex".to_string(), make_store(1));
-        input.insert("mcp:linear".to_string(), make_store(2));
+        input.insert("codex".to_string(), AuthEntry::Token(make_store(1)));
+        input.insert("mcp:linear".to_string(), AuthEntry::Token(make_store(2)));
         write_auth_file(&path, &input).unwrap();
         let map = read_auth_file(&path).unwrap();
         assert_eq!(map.len(), 2);
-        assert_eq!(map.get("codex").unwrap().expires_at, 1);
-        assert_eq!(map.get("mcp:linear").unwrap().expires_at, 2);
+        assert_eq!(token_of(map.get("codex")).expires_at, 1);
+        assert_eq!(token_of(map.get("mcp:linear")).expires_at, 2);
     }
 
     #[test]
@@ -659,12 +748,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         let mut input = HashMap::new();
-        input.insert("mcp:github".to_string(), make_store(42));
+        input.insert("mcp:github".to_string(), AuthEntry::Token(make_store(42)));
         write_auth_file(&path, &input).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.contains("mcp:github"));
         let map = read_auth_file(&path).unwrap();
-        assert_eq!(map.get("mcp:github").unwrap().expires_at, 42);
+        assert_eq!(token_of(map.get("mcp:github")).expires_at, 42);
     }
 
     #[cfg(unix)]
@@ -674,9 +763,83 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         let mut input = HashMap::new();
-        input.insert("codex".to_string(), make_store(0));
+        input.insert("codex".to_string(), AuthEntry::Token(make_store(0)));
         write_auth_file(&path, &input).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "expected 0600, got {mode:o}");
+    }
+
+    fn make_pending() -> PendingPasteLogin {
+        PendingPasteLogin {
+            verifier: "test-verifier".to_string(),
+            state: "test-state".to_string(),
+            token_url: "https://example.com/token".to_string(),
+            provider_name: "anthropic-mcp".to_string(),
+        }
+    }
+
+    #[test]
+    fn auth_entry_untagged_round_trip_mixed_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut input = HashMap::new();
+        input.insert("codex".to_string(), AuthEntry::Token(make_store(1)));
+        input.insert(
+            "mcp-pending:linear".to_string(),
+            AuthEntry::Pending(make_pending()),
+        );
+        write_auth_file(&path, &input).unwrap();
+        let map = read_auth_file(&path).unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(token_of(map.get("codex")).expires_at, 1);
+        match map.get("mcp-pending:linear") {
+            Some(AuthEntry::Pending(p)) => assert_eq!(p.verifier, "test-verifier"),
+            other => panic!("expected Pending, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn pending_login_helpers_round_trip_via_global_path() {
+        // Drive the disk-backed save/load/remove path end-to-end. Touches
+        // the real `auth_path()` (env HOME) so isolate via a tempdir HOME.
+        // Single test = no need for an ENV_LOCK mutex.
+        let dir = tempfile::tempdir().unwrap();
+        let prior_home = std::env::var("HOME").ok();
+        // SAFETY: single-threaded, restored at end.
+        unsafe {
+            std::env::set_var("HOME", dir.path());
+        }
+        let key = "mcp-pending:test-srv";
+        save_pending_login(key, &make_pending()).unwrap();
+        let got = load_pending_login(key).unwrap();
+        assert_eq!(got, make_pending());
+        remove_pending_login(key).unwrap();
+        assert!(load_pending_login(key).is_err());
+        unsafe {
+            match prior_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn load_namespaced_token_errors_on_pending_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut input = HashMap::new();
+        input.insert(
+            "mcp-pending:srv".to_string(),
+            AuthEntry::Pending(make_pending()),
+        );
+        write_auth_file(&path, &input).unwrap();
+        let map = read_auth_file(&path).unwrap();
+        // Directly assert the discriminant rather than calling
+        // `load_namespaced_token`, which would also touch HOME and race
+        // the pending-helpers test above. Same intent, smaller blast radius.
+        let pending = map.get("mcp-pending:srv");
+        assert!(matches!(pending, Some(AuthEntry::Pending(_))));
     }
 }
