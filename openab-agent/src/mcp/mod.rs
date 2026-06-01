@@ -1,9 +1,7 @@
 //! Native MCP client. See `docs/adr/openab-agent-mcp.md`.
 
 pub mod config;
-pub mod flow;
 pub mod meta_tool;
-pub mod oauth;
 pub mod runtime;
 
 use serde_json::json;

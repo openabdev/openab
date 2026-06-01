@@ -13,7 +13,6 @@
 //! the duration of a child-process spawn + handshake.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -24,16 +23,13 @@ use tokio::process::Command;
 use tokio::sync::RwLock;
 
 use super::config::{McpConfig, ServerConfig};
-use super::flow::init_paste_authorize;
-use super::oauth::{builtin_client_id, resolve, ResolvedProvider};
-use crate::auth::{auth_path, load_pending_login, save_pending_login, PendingPasteLogin};
 
+#[allow(dead_code)] // NeedsAuth lands with the Phase 2 OAuth slice (ADR §5.7)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerStatus {
     Disconnected,
     Connecting,
     Connected,
-    NeedsAuth,
     Failed(String),
 }
 
@@ -43,7 +39,6 @@ impl ServerStatus {
             ServerStatus::Disconnected => "○",
             ServerStatus::Connecting => "◐",
             ServerStatus::Connected => "●",
-            ServerStatus::NeedsAuth => "◌",
             ServerStatus::Failed(_) => "✗",
         }
     }
@@ -71,33 +66,15 @@ impl std::fmt::Debug for ServerHandle {
     }
 }
 
-/// Public return of `start_paste_login`. The caller relays `authorize_url`
-/// to the user; `state` is echoed so the agent can show / log it without
-/// reaching into runtime internals.
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // wired in next slice (mcp::login meta-tool action)
-pub struct PasteLoginStart {
-    pub authorize_url: String,
-    pub state: String,
-}
-
 /// Owns one `ServerHandle` per configured server, behind an async `RwLock`
 /// so the foreground LLM path and the background eviction task can share it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct McpRuntimeManager {
     handles: Arc<RwLock<HashMap<String, ServerHandle>>>,
-    /// `auth.json` location used for `mcp-pending:<server>` persistence.
-    /// Injectable so tests can point at a tempdir instead of `$HOME`,
-    /// avoiding cross-module HOME-env races (Tick 24 lesson + ADR §6.4).
-    auth_path: PathBuf,
 }
 
 impl McpRuntimeManager {
     pub fn from_config(cfg: McpConfig) -> Self {
-        Self::from_config_with_auth_path(cfg, auth_path())
-    }
-
-    pub fn from_config_with_auth_path(cfg: McpConfig, auth_path: PathBuf) -> Self {
         let handles: HashMap<_, _> = cfg
             .servers
             .into_iter()
@@ -113,7 +90,6 @@ impl McpRuntimeManager {
             .collect();
         Self {
             handles: Arc::new(RwLock::new(handles)),
-            auth_path,
         }
     }
 
@@ -170,93 +146,9 @@ impl McpRuntimeManager {
         out
     }
 
-    /// Begin a paste-back OAuth login for an HTTP server with an `oauth:`
-    /// block (ADR §6.4). Produces the authorize URL the agent surfaces to
-    /// the user; the matching PKCE verifier + `state` nonce are persisted
-    /// under `mcp-pending:<name>` in `auth.json` for `complete_login`
-    /// (next slice) to consume.
-    ///
-    /// Scoped to **built-in** providers this slice. Custom-provider
-    /// paste-back needs runtime port allocation for the callback (§6.4),
-    /// and any provider that advertises a `device_authorization_endpoint`
-    /// should run device-code instead (§6.4 selection logic). Both errors
-    /// are explicit so the LLM can pick a different action.
-    #[allow(dead_code)] // wired in next slice (mcp::login meta-tool action)
-    pub async fn start_paste_login(&self, name: &str) -> Result<PasteLoginStart> {
-        let oauth_cfg = {
-            let guard = self.handles.read().await;
-            let handle = guard
-                .get(name)
-                .ok_or_else(|| anyhow!("no mcp server named {name:?}"))?;
-            match handle.config.resolved(name)? {
-                ServerConfig::Http {
-                    oauth: Some(oauth), ..
-                } => oauth,
-                ServerConfig::Http { oauth: None, .. } => {
-                    return Err(anyhow!("mcp server {name:?} has no oauth block"));
-                }
-                ServerConfig::Stdio { .. } => {
-                    return Err(anyhow!("mcp server {name:?} is stdio, not http+oauth"));
-                }
-            }
-        };
-
-        let provider = resolve(&oauth_cfg)?;
-        let (client_id, redirect_uri) = match &provider {
-            ResolvedProvider::Builtin {
-                provider_name,
-                callback,
-                ..
-            } => (builtin_client_id(provider_name)?, (*callback).to_string()),
-            ResolvedProvider::Custom {
-                device_authorization_endpoint: Some(_),
-                ..
-            } => {
-                return Err(anyhow!(
-                    "mcp server {name:?} has a device endpoint; use device flow"
-                ));
-            }
-            ResolvedProvider::Custom { .. } => {
-                return Err(anyhow!(
-                    "mcp server {name:?}: custom-provider paste-back not yet supported"
-                ));
-            }
-        };
-
-        let started = init_paste_authorize(&provider, &client_id, &redirect_uri)?;
-        let pending = PendingPasteLogin {
-            verifier: started.code_verifier,
-            state: started.state.clone(),
-            token_url: provider.token_url().to_string(),
-            provider_name: provider_name_of(&provider),
-        };
-        save_pending_login(&self.auth_path, &pending_key(name), &pending)?;
-        {
-            let mut handles = self.handles.write().await;
-            if let Some(handle) = handles.get_mut(name) {
-                handle.status = ServerStatus::NeedsAuth;
-            }
-        }
-        Ok(PasteLoginStart {
-            authorize_url: started.url,
-            state: started.state,
-        })
-    }
-
-    /// Read the on-disk pending paste-login for `name`. `None` if there's
-    /// no entry or the file is unreadable; `complete_login` (next slice)
-    /// is the intended consumer and will distinguish the cases via the
-    /// `auth::load_pending_login` error message.
-    #[allow(dead_code)] // first prod caller is complete_login in next slice
-    pub async fn pending_paste_login(&self, name: &str) -> Option<PendingPasteLogin> {
-        load_pending_login(&self.auth_path, &pending_key(name)).ok()
-    }
-
     /// Lazy-connect the named server (ADR §5.7). Idempotent if already
-    /// `Connected` with a live client. HTTP servers with an `oauth:` block
-    /// are routed through `mcp login` first — `connect` marks them
-    /// `NeedsAuth` and returns an error pointing the caller at the login
-    /// subcommand rather than attempting an unauthenticated dial.
+    /// `Connected` with a live client. HTTP servers requiring OAuth are
+    /// rejected until the Phase 2 auth slice lands (ADR §6).
     pub async fn connect(&self, name: &str) -> Result<()> {
         let dial = {
             let mut guard = self.handles.write().await;
@@ -271,16 +163,17 @@ impl McpRuntimeManager {
                 ServerConfig::Stdio {
                     command, args, env, ..
                 } => Dial::Stdio { command, args, env },
-                // Oauth-protected servers can't be dialed via plain connect;
-                // mark `NeedsAuth` so `mcp status` shows a persistent
-                // "waiting for login" signal (vs `Disconnected`, which
-                // implies a plain `connect` would succeed). The `Failed`
-                // path remains reserved for dials that were attempted and
-                // failed at handshake.
-                ServerConfig::Http { oauth: Some(_), .. } => {
-                    handle.status = ServerStatus::NeedsAuth;
+                // Reject oauth-protected servers BEFORE the `Connecting`
+                // transition: we never attempted a handshake, so leaving
+                // status at `Disconnected` is the honest state. Status
+                // becomes `Failed` only when a dial was actually tried.
+                ServerConfig::Http {
+                    oauth: Some(_),
+                    url,
+                    ..
+                } => {
                     return Err(anyhow!(
-                        "mcp server {name:?} needs oauth login — run `mcp login {name}`"
+                        "oauth-protected http server {url:?} requires the auth slice (Phase 2 §6)"
                     ));
                 }
                 ServerConfig::Http { url, .. } => Dial::Http { url },
@@ -314,20 +207,6 @@ impl McpRuntimeManager {
             }
         }
     }
-}
-
-/// Stringified provider name for the pending-state record. `Builtin` keeps
-/// its `&'static str` static; `Custom` already owns a `String`.
-fn provider_name_of(provider: &ResolvedProvider) -> String {
-    match provider {
-        ResolvedProvider::Builtin { provider_name, .. } => (*provider_name).to_string(),
-        ResolvedProvider::Custom { provider_name, .. } => provider_name.clone(),
-    }
-}
-
-/// `auth.json` key for an in-flight paste-login (ADR §6.4 namespace).
-fn pending_key(name: &str) -> String {
-    format!("mcp-pending:{name}")
 }
 
 /// Per-transport dial parameters, extracted under the manager's write lock
@@ -419,7 +298,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_http_with_oauth_marks_needs_auth() {
+    async fn connect_http_with_oauth_defers_to_auth_slice() {
         let json = r#"{
             "mcpServers": {
                 "linear": {
@@ -432,33 +311,10 @@ mod tests {
         let cfg: McpConfig = serde_json::from_str(json).unwrap();
         let mgr = McpRuntimeManager::from_config(cfg);
         let err = mgr.connect("linear").await.unwrap_err().to_string();
-        assert!(err.contains("needs oauth login"), "expected hint in {err}");
-        assert!(
-            err.contains("mcp login"),
-            "expected 'mcp login' hint in {err}"
-        );
-        assert_eq!(mgr.statuses().await[0].1, ServerStatus::NeedsAuth);
-    }
-
-    #[tokio::test]
-    async fn connect_oauth_twice_keeps_needs_auth_sticky() {
-        // Second connect() must NOT silently re-enter `Connecting` and
-        // shadow the user-actionable state — the only path out of
-        // `NeedsAuth` is a successful `mcp login`.
-        let json = r#"{
-            "mcpServers": {
-                "linear": {
-                    "type": "http",
-                    "url": "https://mcp.linear.app/mcp",
-                    "oauth": { "provider": "linear" }
-                }
-            }
-        }"#;
-        let cfg: McpConfig = serde_json::from_str(json).unwrap();
-        let mgr = McpRuntimeManager::from_config(cfg);
-        assert!(mgr.connect("linear").await.is_err());
-        assert!(mgr.connect("linear").await.is_err());
-        assert_eq!(mgr.statuses().await[0].1, ServerStatus::NeedsAuth);
+        assert!(err.contains("oauth"), "expected 'oauth' in {err}");
+        // OAuth rejection happens BEFORE the Connecting transition, so the
+        // server remains Disconnected — no dial was attempted.
+        assert_eq!(mgr.statuses().await[0].1, ServerStatus::Disconnected);
     }
 
     #[tokio::test]
@@ -479,144 +335,6 @@ mod tests {
             ServerStatus::Failed(_) => {}
             other => panic!("expected Failed, got {other:?}"),
         }
-    }
-
-    // start_paste_login + builtin_client_id race on the same env var.
-    // Same fix as oauth.rs / acp.rs (Tick 24 lesson).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn linear_custom_cfg() -> &'static str {
-        r#"{
-            "mcpServers": {
-                "linear": {
-                    "type": "http",
-                    "url": "https://mcp.linear.app/mcp",
-                    "oauth": {
-                        "provider": "linear",
-                        "authorize_url": "https://linear.app/oauth/authorize",
-                        "token_url": "https://api.linear.app/oauth/token",
-                        "client_id": "linear-client",
-                        "scopes": ["read"]
-                    }
-                }
-            }
-        }"#
-    }
-
-    fn anthropic_builtin_cfg() -> &'static str {
-        r#"{
-            "mcpServers": {
-                "anthro": {
-                    "type": "http",
-                    "url": "https://example.com/mcp",
-                    "oauth": { "provider": "anthropic-mcp" }
-                }
-            }
-        }"#
-    }
-
-    async fn start_login_err(mgr: &McpRuntimeManager, name: &str) -> String {
-        mgr.start_paste_login(name).await.unwrap_err().to_string()
-    }
-
-    fn mgr_with_tempdir(cfg: McpConfig) -> (McpRuntimeManager, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let mgr = McpRuntimeManager::from_config_with_auth_path(cfg, dir.path().join("auth.json"));
-        (mgr, dir)
-    }
-
-    #[tokio::test]
-    async fn start_paste_login_builtin_returns_authorize_url_and_pins_pending() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: serialized via ENV_LOCK; isolated env key.
-        unsafe {
-            std::env::set_var("OPENAB_MCP_ANTHROPIC_CLIENT_ID", "anth-cid");
-        }
-        let cfg: McpConfig = serde_json::from_str(anthropic_builtin_cfg()).unwrap();
-        let (mgr, _dir) = mgr_with_tempdir(cfg);
-        let start = mgr.start_paste_login("anthro").await.unwrap();
-        assert!(start
-            .authorize_url
-            .starts_with("https://claude.ai/oauth/authorize?"));
-        assert!(start.authorize_url.contains("client_id=anth-cid"));
-        assert!(start
-            .authorize_url
-            .contains(&format!("state={}", start.state)));
-        let pending = mgr.pending_paste_login("anthro").await.unwrap();
-        assert_eq!(pending.state, start.state);
-        assert!(!pending.verifier.is_empty());
-        assert_eq!(
-            pending.token_url,
-            "https://platform.claude.com/v1/oauth/token"
-        );
-        assert_eq!(pending.provider_name, "anthropic-mcp");
-        assert_eq!(mgr.statuses().await[0].1, ServerStatus::NeedsAuth);
-        unsafe {
-            std::env::remove_var("OPENAB_MCP_ANTHROPIC_CLIENT_ID");
-        }
-    }
-
-    #[tokio::test]
-    async fn start_paste_login_rejects_custom_provider_for_now() {
-        let cfg: McpConfig = serde_json::from_str(linear_custom_cfg()).unwrap();
-        let (mgr, _dir) = mgr_with_tempdir(cfg);
-        let err = start_login_err(&mgr, "linear").await;
-        assert!(err.contains("custom-provider"), "got: {err}");
-        assert!(mgr.pending_paste_login("linear").await.is_none());
-    }
-
-    #[tokio::test]
-    async fn start_paste_login_rejects_custom_with_device_endpoint() {
-        let json = r#"{
-            "mcpServers": {
-                "dev": {
-                    "type": "http",
-                    "url": "https://example.com/mcp",
-                    "oauth": {
-                        "provider": "dev",
-                        "authorize_url": "https://example.com/oauth/authorize",
-                        "token_url": "https://example.com/oauth/token",
-                        "device_authorization_endpoint": "https://example.com/oauth/device"
-                    }
-                }
-            }
-        }"#;
-        let cfg: McpConfig = serde_json::from_str(json).unwrap();
-        let mgr = McpRuntimeManager::from_config(cfg);
-        let err = start_login_err(&mgr, "dev").await;
-        assert!(err.contains("device flow"), "got: {err}");
-    }
-
-    #[tokio::test]
-    async fn start_paste_login_rejects_stdio_server() {
-        let json = r#"{
-            "mcpServers": {
-                "fs": { "type": "stdio", "command": "mcp-server-filesystem" }
-            }
-        }"#;
-        let cfg: McpConfig = serde_json::from_str(json).unwrap();
-        let mgr = McpRuntimeManager::from_config(cfg);
-        let err = start_login_err(&mgr, "fs").await;
-        assert!(err.contains("stdio"), "got: {err}");
-    }
-
-    #[tokio::test]
-    async fn start_paste_login_unknown_server_errors() {
-        let mgr = McpRuntimeManager::from_config(McpConfig::default());
-        let err = start_login_err(&mgr, "ghost").await;
-        assert!(err.contains("ghost"), "got: {err}");
-    }
-
-    #[tokio::test]
-    async fn start_paste_login_builtin_without_env_var_errors_loud() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::remove_var("OPENAB_MCP_ANTHROPIC_CLIENT_ID");
-        }
-        let cfg: McpConfig = serde_json::from_str(anthropic_builtin_cfg()).unwrap();
-        let mgr = McpRuntimeManager::from_config(cfg);
-        let err = start_login_err(&mgr, "anthro").await;
-        assert!(err.contains("OPENAB_MCP_ANTHROPIC_CLIENT_ID"), "got: {err}");
     }
 
     #[tokio::test]
