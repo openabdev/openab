@@ -91,7 +91,6 @@ pub struct PasteLoginStart {
 /// prefer it when present and fall back to the
 /// `verification_uri` + `user_code` pair.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct DeviceLoginStart {
     pub user_code: String,
     pub verification_uri: String,
@@ -319,7 +318,6 @@ impl McpRuntimeManager {
     /// keeps the polling task out of the MCP handshake path. The next
     /// `connect()` reads the cached token via the oauth-aware `DialPlan`
     /// branch and reaches `Connected` through the normal lifecycle.
-    #[allow(dead_code)]
     pub async fn start_device_login(&self, name: &str) -> Result<DeviceLoginStart> {
         let (device_endpoint, client_id, token_url, scopes, provider_name) =
             self.resolve_device_client(name).await?;
@@ -364,7 +362,6 @@ impl McpRuntimeManager {
     /// for `name`. Rejects non-Http / non-oauth / built-in / missing-endpoint
     /// configurations with explicit errors so the user sees what to fix in
     /// `mcp.json`.
-    #[allow(dead_code)]
     async fn resolve_device_client(
         &self,
         name: &str,
@@ -409,7 +406,7 @@ impl McpRuntimeManager {
     /// only observable side-effect is `auth.json` (on Success) + the
     /// `ServerHandle.status` transition. Errors are logged via `tracing`
     /// and surface to the user via `mcp status` (Failed/NeedsAuth).
-    #[allow(dead_code, clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn run_device_poll_loop(
         &self,
         name: &str,
@@ -467,7 +464,6 @@ impl McpRuntimeManager {
     /// Pure-persistence tail of `run_device_poll_loop` on RFC 8628 §3.5
     /// Success. Mirrors `finish_login`'s `u64::MAX` sentinel for absent
     /// `expires_in` (Mira Tick 46 catch).
-    #[allow(dead_code)]
     async fn finalize_device_login(
         &self,
         name: &str,
@@ -496,7 +492,6 @@ impl McpRuntimeManager {
         }
     }
 
-    #[allow(dead_code)]
     async fn mark_device_login_failed(&self, name: &str, err: anyhow::Error) {
         tracing::warn!(server = %name, error = %err, "device-flow polling failed");
         let mut handles = self.handles.write().await;
@@ -786,7 +781,6 @@ async fn post_token_refresh(
 /// present fallback the agent relays to the user). `interval` defaults to
 /// 5s per RFC 8628 §3.5 when omitted by the provider.
 #[derive(Debug, serde::Deserialize)]
-#[allow(dead_code)]
 struct DeviceAuthResponse {
     device_code: String,
     user_code: String,
@@ -798,7 +792,6 @@ struct DeviceAuthResponse {
     interval: u64,
 }
 
-#[allow(dead_code)]
 fn default_device_poll_interval() -> u64 {
     5
 }
@@ -808,7 +801,6 @@ fn default_device_poll_interval() -> u64 {
 /// are flow-level states NOT real failures — they drive the polling loop.
 /// Everything else folds into a fatal `Err` at the call site.
 #[derive(Debug)]
-#[allow(dead_code)]
 enum DevicePollOutcome {
     Success(TokenExchangeResponse),
     AuthorizationPending,
@@ -822,7 +814,6 @@ enum DevicePollOutcome {
 /// parses as a token response; 4xx parses `{"error": "..."}` and maps the
 /// four flow-state codes to enum variants; everything else (including
 /// non-JSON / unknown error codes) folds into `Err`.
-#[allow(dead_code)]
 fn classify_device_poll(status: reqwest::StatusCode, body: &str) -> Result<DevicePollOutcome> {
     if status.is_success() {
         return serde_json::from_str(body)
@@ -847,7 +838,6 @@ fn classify_device_poll(status: reqwest::StatusCode, body: &str) -> Result<Devic
 /// — no `client_secret`. Returns the `{device_code, user_code, ...}`
 /// bundle the runtime relays to the user and polls against the token
 /// endpoint via `post_device_token_poll`.
-#[allow(dead_code)]
 async fn post_device_authorization(
     device_endpoint: &str,
     client_id: &str,
@@ -877,7 +867,6 @@ async fn post_device_authorization(
 /// owns the polling loop (interval, expires_in deadline, SlowDown back-
 /// off). Returns a `DevicePollOutcome` so the loop can distinguish the
 /// four RFC 8628 §3.5 flow states from real errors.
-#[allow(dead_code)]
 async fn post_device_token_poll(
     token_url: &str,
     client_id: &str,
