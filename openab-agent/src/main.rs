@@ -50,6 +50,17 @@ enum McpAction {
         /// Server name as configured in mcp.json
         name: String,
     },
+    /// Authenticate with an MCP server's OAuth provider (paste-back flow,
+    /// ADR §6.4). Prints the authorize URL, then reads the post-redirect
+    /// URL from stdin (or `--paste` for non-interactive use).
+    Login {
+        /// Server name as configured in mcp.json
+        name: String,
+        /// Pre-fill the redirect URL (skip the stdin prompt). Useful for
+        /// scripted setups and CI smoke tests.
+        #[arg(long, value_name = "URL")]
+        paste: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -103,6 +114,7 @@ async fn main() {
             McpAction::List { resolve } => mcp::cli_list_servers(resolve),
             McpAction::Status => mcp::cli_show_status().await,
             McpAction::Connect { name } => mcp::cli_connect(name).await,
+            McpAction::Login { name, paste } => mcp::cli_login(name, paste).await,
         },
     }
 }

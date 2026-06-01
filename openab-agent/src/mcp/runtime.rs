@@ -78,7 +78,6 @@ impl std::fmt::Debug for ServerHandle {
 /// to the user; `state` is echoed so the agent can show / log it without
 /// reaching into runtime internals.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // wired in next slice (mcp::login meta-tool action)
 pub struct PasteLoginStart {
     pub authorize_url: String,
     pub state: String,
@@ -184,7 +183,6 @@ impl McpRuntimeManager {
     /// and any provider that advertises a `device_authorization_endpoint`
     /// should run device-code instead (§6.4 selection logic). Both errors
     /// are explicit so the LLM can pick a different action.
-    #[allow(dead_code)] // wired in next slice (mcp::login meta-tool action)
     pub async fn start_paste_login(&self, name: &str) -> Result<PasteLoginStart> {
         let (provider, client_id, redirect_uri) = self.resolve_paste_client(name).await?;
         let started = init_paste_authorize(&provider, &client_id, &redirect_uri)?;
@@ -223,7 +221,6 @@ impl McpRuntimeManager {
     /// `TokenStore` under `<name>`, and clears the pending entry. Status
     /// transitions `NeedsAuth → Disconnected` so the next `connect()`
     /// dials the now-authenticated transport.
-    #[allow(dead_code)] // wired in next slice (mcp login CLI subcommand)
     pub async fn complete_login(&self, name: &str, redirect_url: &str) -> Result<()> {
         let pending = load_pending_login(&self.auth_path, &pending_key(name))
             .map_err(|_| anyhow!("no pending login for {name:?}; run `mcp login {name}` first"))?;

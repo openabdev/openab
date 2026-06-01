@@ -154,3 +154,65 @@ pub async fn cli_connect(name: String) {
         }
     }
 }
+
+/// `openab-agent mcp login <name> [--paste URL]`. Drives the §6.4
+/// paste-back flow end-to-end:
+///
+/// 1. `start_paste_login` builds the authorize URL + pins PKCE state to
+///    `auth.json` under `mcp-pending:<name>`
+/// 2. The CLI prints the URL for the user to open in a browser, then
+///    blocks on stdin waiting for the redirect URL to be pasted back
+///    (or skips the prompt when `--paste` was supplied)
+/// 3. `complete_login` validates the `state` nonce, exchanges the auth
+///    code, persists the resulting `TokenStore`, and clears the pending
+///    entry — leaving the server `Disconnected` and ready for `connect`
+///
+/// Errors at any step exit non-zero; the pending entry is preserved on
+/// state-mismatch / network failure so the user can retry with a fresh
+/// paste of the same redirect URL without re-running this command.
+pub async fn cli_login(name: String, paste: Option<String>) {
+    let manager = McpRuntimeManager::from_config(load_config_or_exit());
+    let start = match manager.start_paste_login(&name).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("✗ {name}: {e:#}");
+            std::process::exit(1);
+        }
+    };
+    println!("Open this URL in a browser to authorize:");
+    println!();
+    println!("    {}", start.authorize_url);
+    println!();
+    println!("State nonce (pinned): {}", start.state);
+    println!();
+    let redirect = match paste {
+        Some(u) => u,
+        None => match read_redirect_from_stdin() {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("✗ failed to read redirect URL: {e}");
+                std::process::exit(1);
+            }
+        },
+    };
+    if redirect.is_empty() {
+        eprintln!("✗ empty redirect URL — aborting");
+        std::process::exit(1);
+    }
+    match manager.complete_login(&name, &redirect).await {
+        Ok(()) => println!("● logged in: {name}"),
+        Err(e) => {
+            eprintln!("✗ login failed: {e:#}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn read_redirect_from_stdin() -> std::io::Result<String> {
+    use std::io::Write;
+    print!("Paste the FULL redirect URL: ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim().to_string())
+}

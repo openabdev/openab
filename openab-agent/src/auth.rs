@@ -191,7 +191,6 @@ pub fn save_namespaced_token(key: &str, store: &TokenStore) -> Result<()> {
 /// Path-injected sibling of `save_namespaced_token` so tests + the runtime
 /// manager can target a tempdir without `$HOME` overrides (Tick 42 lesson).
 #[cfg(feature = "mcp")]
-#[allow(dead_code)] // wired in next slice (mcp/oauth.rs complete_login)
 pub fn save_namespaced_token_at(path: &Path, key: &str, store: &TokenStore) -> Result<()> {
     let mut map = read_auth_file(path).unwrap_or_default();
     map.insert(key.to_string(), AuthEntry::Token(store.clone()));
@@ -226,7 +225,6 @@ pub fn save_pending_login(path: &Path, key: &str, val: &PendingPasteLogin) -> Re
 /// Remove a pending-login entry (consumed on successful `complete_login`,
 /// expired entry GC, or `mcp logout`). Idempotent — missing key is OK.
 #[cfg(feature = "mcp")]
-#[allow(dead_code)] // wired in next slice (complete_login)
 pub fn remove_pending_login(path: &Path, key: &str) -> Result<()> {
     let mut map = match read_auth_file(path) {
         Ok(m) => m,
