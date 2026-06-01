@@ -71,7 +71,10 @@ pub enum AuthEntry {
     Pending(PendingPasteLogin),
 }
 
-fn auth_path() -> PathBuf {
+/// Default location of `auth.json`. Exposed so `McpRuntimeManager` can
+/// thread the same path into its constructor and tests can inject a
+/// tempdir without touching `$HOME` (which would race cross-module).
+pub fn auth_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(home)
         .join(".openab")
@@ -184,13 +187,13 @@ pub fn save_namespaced_token(key: &str, store: &TokenStore) -> Result<()> {
 
 /// Read a `mcp-pending:<server>` entry from `auth.json` (ADR §6.4). Errors
 /// if the key holds a token instead — the two namespaces shouldn't
-/// collide, but a hand-edited file would.
+/// collide, but a hand-edited file would. `path` is injected so the
+/// runtime manager can point tests at a tempdir; production callers pass
+/// `auth_path()`.
 #[cfg(feature = "mcp")]
-#[allow(dead_code)] // wired in next slice (runtime::start_paste_login)
-pub fn load_pending_login(key: &str) -> Result<PendingPasteLogin> {
-    let path = auth_path();
+pub fn load_pending_login(path: &Path, key: &str) -> Result<PendingPasteLogin> {
     let map =
-        read_auth_file(&path).map_err(|_| anyhow!("No credentials found at {}", path.display()))?;
+        read_auth_file(path).map_err(|_| anyhow!("No credentials found at {}", path.display()))?;
     match map.get(key) {
         Some(AuthEntry::Pending(p)) => Ok(p.clone()),
         Some(AuthEntry::Token(_)) => Err(anyhow!("{key:?} is a token, not a pending login")),
@@ -201,21 +204,18 @@ pub fn load_pending_login(key: &str) -> Result<PendingPasteLogin> {
 /// Persist a `PendingPasteLogin` under `mcp-pending:<server>` (ADR §6.4).
 /// Read-modify-write — same serialization caveat as `save_namespaced_token`.
 #[cfg(feature = "mcp")]
-#[allow(dead_code)] // wired in next slice (runtime::start_paste_login)
-pub fn save_pending_login(key: &str, val: &PendingPasteLogin) -> Result<()> {
-    let path = auth_path();
-    let mut map = read_auth_file(&path).unwrap_or_default();
+pub fn save_pending_login(path: &Path, key: &str, val: &PendingPasteLogin) -> Result<()> {
+    let mut map = read_auth_file(path).unwrap_or_default();
     map.insert(key.to_string(), AuthEntry::Pending(val.clone()));
-    write_auth_file(&path, &map)
+    write_auth_file(path, &map)
 }
 
 /// Remove a pending-login entry (consumed on successful `complete_login`,
 /// expired entry GC, or `mcp logout`). Idempotent — missing key is OK.
 #[cfg(feature = "mcp")]
 #[allow(dead_code)] // wired in next slice (complete_login)
-pub fn remove_pending_login(key: &str) -> Result<()> {
-    let path = auth_path();
-    let mut map = match read_auth_file(&path) {
+pub fn remove_pending_login(path: &Path, key: &str) -> Result<()> {
+    let mut map = match read_auth_file(path) {
         Ok(m) => m,
         Err(_) => return Ok(()),
     };
@@ -223,10 +223,10 @@ pub fn remove_pending_login(key: &str) -> Result<()> {
         return Ok(());
     }
     if map.is_empty() {
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path);
         return Ok(());
     }
-    write_auth_file(&path, &map)
+    write_auth_file(path, &map)
 }
 
 /// Remove the credential at `key`. Idempotent — missing key is not an
@@ -800,28 +800,17 @@ mod tests {
 
     #[cfg(feature = "mcp")]
     #[test]
-    fn pending_login_helpers_round_trip_via_global_path() {
-        // Drive the disk-backed save/load/remove path end-to-end. Touches
-        // the real `auth_path()` (env HOME) so isolate via a tempdir HOME.
-        // Single test = no need for an ENV_LOCK mutex.
+    fn pending_login_helpers_round_trip_via_injected_path() {
+        // Tempdir path injected directly — no HOME-env shimming, so this
+        // test can't race auth-touching tests in other modules.
         let dir = tempfile::tempdir().unwrap();
-        let prior_home = std::env::var("HOME").ok();
-        // SAFETY: single-threaded, restored at end.
-        unsafe {
-            std::env::set_var("HOME", dir.path());
-        }
+        let path = dir.path().join("auth.json");
         let key = "mcp-pending:test-srv";
-        save_pending_login(key, &make_pending()).unwrap();
-        let got = load_pending_login(key).unwrap();
+        save_pending_login(&path, key, &make_pending()).unwrap();
+        let got = load_pending_login(&path, key).unwrap();
         assert_eq!(got, make_pending());
-        remove_pending_login(key).unwrap();
-        assert!(load_pending_login(key).is_err());
-        unsafe {
-            match prior_home {
-                Some(h) => std::env::set_var("HOME", h),
-                None => std::env::remove_var("HOME"),
-            }
-        }
+        remove_pending_login(&path, key).unwrap();
+        assert!(load_pending_login(&path, key).is_err());
     }
 
     #[cfg(feature = "mcp")]
@@ -836,9 +825,10 @@ mod tests {
         );
         write_auth_file(&path, &input).unwrap();
         let map = read_auth_file(&path).unwrap();
-        // Directly assert the discriminant rather than calling
-        // `load_namespaced_token`, which would also touch HOME and race
-        // the pending-helpers test above. Same intent, smaller blast radius.
+        // Assert the discriminant directly. `load_namespaced_token` would
+        // reach into the real `$HOME/.openab/agent/auth.json` and race
+        // cross-module tests; the variant check is the actual property
+        // under test.
         let pending = map.get("mcp-pending:srv");
         assert!(matches!(pending, Some(AuthEntry::Pending(_))));
     }
