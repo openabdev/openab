@@ -13,6 +13,7 @@
 //! the duration of a child-process spawn + handshake.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -25,6 +26,7 @@ use tokio::sync::RwLock;
 use super::config::{McpConfig, ServerConfig};
 use super::flow::init_paste_authorize;
 use super::oauth::{builtin_client_id, resolve, ResolvedProvider};
+use crate::auth::{auth_path, load_pending_login, save_pending_login, PendingPasteLogin};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerStatus {
@@ -69,23 +71,6 @@ impl std::fmt::Debug for ServerHandle {
     }
 }
 
-/// Transient per-server state captured at `start_paste_login` and consumed
-/// by `complete_login` (next slice). `token_url` + `provider_name` are
-/// snapshotted up front so a config edit between the two calls can't
-/// silently redirect the token exchange.
-///
-/// ADR §6.4 says this lives "in TokenStore"; this slice keeps it in
-/// process memory only — `auth.json` would need a heterogeneous-entry
-/// schema change to hold non-token shapes, deferred to its own slice.
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // wired in next slice (complete_login)
-pub struct PendingPasteLogin {
-    pub verifier: String,
-    pub state: String,
-    pub token_url: String,
-    pub provider_name: String,
-}
-
 /// Public return of `start_paste_login`. The caller relays `authorize_url`
 /// to the user; `state` is echoed so the agent can show / log it without
 /// reaching into runtime internals.
@@ -98,14 +83,21 @@ pub struct PasteLoginStart {
 
 /// Owns one `ServerHandle` per configured server, behind an async `RwLock`
 /// so the foreground LLM path and the background eviction task can share it.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct McpRuntimeManager {
     handles: Arc<RwLock<HashMap<String, ServerHandle>>>,
-    pending_logins: Arc<RwLock<HashMap<String, PendingPasteLogin>>>,
+    /// `auth.json` location used for `mcp-pending:<server>` persistence.
+    /// Injectable so tests can point at a tempdir instead of `$HOME`,
+    /// avoiding cross-module HOME-env races (Tick 24 lesson + ADR §6.4).
+    auth_path: PathBuf,
 }
 
 impl McpRuntimeManager {
     pub fn from_config(cfg: McpConfig) -> Self {
+        Self::from_config_with_auth_path(cfg, auth_path())
+    }
+
+    pub fn from_config_with_auth_path(cfg: McpConfig, auth_path: PathBuf) -> Self {
         let handles: HashMap<_, _> = cfg
             .servers
             .into_iter()
@@ -121,7 +113,7 @@ impl McpRuntimeManager {
             .collect();
         Self {
             handles: Arc::new(RwLock::new(handles)),
-            pending_logins: Arc::new(RwLock::new(HashMap::new())),
+            auth_path,
         }
     }
 
@@ -180,8 +172,9 @@ impl McpRuntimeManager {
 
     /// Begin a paste-back OAuth login for an HTTP server with an `oauth:`
     /// block (ADR §6.4). Produces the authorize URL the agent surfaces to
-    /// the user; the matching PKCE verifier + `state` nonce are kept on
-    /// `self.pending_logins` for `complete_login` (next slice) to consume.
+    /// the user; the matching PKCE verifier + `state` nonce are persisted
+    /// under `mcp-pending:<name>` in `auth.json` for `complete_login`
+    /// (next slice) to consume.
     ///
     /// Scoped to **built-in** providers this slice. Custom-provider
     /// paste-back needs runtime port allocation for the callback (§6.4),
@@ -237,28 +230,26 @@ impl McpRuntimeManager {
             token_url: provider.token_url().to_string(),
             provider_name: provider_name_of(&provider),
         };
+        save_pending_login(&self.auth_path, &pending_key(name), &pending)?;
         {
             let mut handles = self.handles.write().await;
             if let Some(handle) = handles.get_mut(name) {
                 handle.status = ServerStatus::NeedsAuth;
             }
         }
-        self.pending_logins
-            .write()
-            .await
-            .insert(name.to_string(), pending);
         Ok(PasteLoginStart {
             authorize_url: started.url,
             state: started.state,
         })
     }
 
-    /// Borrow the in-flight pending paste-login for `name`. Returns a
-    /// clone so callers don't hold the lock; `complete_login` (next
-    /// slice) is the intended consumer.
+    /// Read the on-disk pending paste-login for `name`. `None` if there's
+    /// no entry or the file is unreadable; `complete_login` (next slice)
+    /// is the intended consumer and will distinguish the cases via the
+    /// `auth::load_pending_login` error message.
     #[allow(dead_code)] // first prod caller is complete_login in next slice
     pub async fn pending_paste_login(&self, name: &str) -> Option<PendingPasteLogin> {
-        self.pending_logins.read().await.get(name).cloned()
+        load_pending_login(&self.auth_path, &pending_key(name)).ok()
     }
 
     /// Lazy-connect the named server (ADR §5.7). Idempotent if already
@@ -332,6 +323,11 @@ fn provider_name_of(provider: &ResolvedProvider) -> String {
         ResolvedProvider::Builtin { provider_name, .. } => (*provider_name).to_string(),
         ResolvedProvider::Custom { provider_name, .. } => provider_name.clone(),
     }
+}
+
+/// `auth.json` key for an in-flight paste-login (ADR §6.4 namespace).
+fn pending_key(name: &str) -> String {
+    format!("mcp-pending:{name}")
 }
 
 /// Per-transport dial parameters, extracted under the manager's write lock
@@ -523,6 +519,12 @@ mod tests {
         mgr.start_paste_login(name).await.unwrap_err().to_string()
     }
 
+    fn mgr_with_tempdir(cfg: McpConfig) -> (McpRuntimeManager, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        (McpRuntimeManager::from_config_with_auth_path(cfg, path), dir)
+    }
+
     #[tokio::test]
     async fn start_paste_login_builtin_returns_authorize_url_and_pins_pending() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -531,7 +533,7 @@ mod tests {
             std::env::set_var("OPENAB_MCP_ANTHROPIC_CLIENT_ID", "anth-cid");
         }
         let cfg: McpConfig = serde_json::from_str(anthropic_builtin_cfg()).unwrap();
-        let mgr = McpRuntimeManager::from_config(cfg);
+        let (mgr, _dir) = mgr_with_tempdir(cfg);
         let start = mgr.start_paste_login("anthro").await.unwrap();
         assert!(start
             .authorize_url
@@ -557,7 +559,7 @@ mod tests {
     #[tokio::test]
     async fn start_paste_login_rejects_custom_provider_for_now() {
         let cfg: McpConfig = serde_json::from_str(linear_custom_cfg()).unwrap();
-        let mgr = McpRuntimeManager::from_config(cfg);
+        let (mgr, _dir) = mgr_with_tempdir(cfg);
         let err = start_login_err(&mgr, "linear").await;
         assert!(err.contains("custom-provider"), "got: {err}");
         assert!(mgr.pending_paste_login("linear").await.is_none());
