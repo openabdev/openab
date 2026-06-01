@@ -352,7 +352,7 @@ impl McpRuntimeManager {
             .refresh_token
             .unwrap_or_else(|| store.refresh_token.clone());
         let expires_at = match resp.expires_in {
-            Some(secs) => now_secs() + secs,
+            Some(secs) => now_secs().saturating_add(secs),
             None => u64::MAX,
         };
         let new_store = TokenStore {
