@@ -28,9 +28,9 @@ use super::config::{McpConfig, ServerConfig};
 use super::flow::{init_paste_authorize, parse_paste_callback};
 use super::oauth::{builtin_client_id, resolve, ResolvedProvider};
 use crate::auth::{
-    auth_path, is_expired, list_pending_logins_at, load_namespaced_token_at, load_pending_login,
-    pending_key, remove_pending_login, save_namespaced_token_at, save_pending_login,
-    PendingPasteLogin, TokenStore,
+    auth_path, list_pending_logins_at, load_namespaced_token_at, load_pending_login, pending_key,
+    remove_pending_login, save_namespaced_token_at, save_pending_login, PendingPasteLogin,
+    TokenStore,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -618,7 +618,7 @@ impl McpRuntimeManager {
                     oauth: Some(_),
                     ..
                 } => match load_namespaced_token_at(&self.auth_path, name) {
-                    Ok(store) if !is_expired(&store) => DialPlan::Dial(Dial::Http {
+                    Ok(store) if !store.is_expired() => DialPlan::Dial(Dial::Http {
                         url,
                         auth: Some(store.access_token),
                     }),

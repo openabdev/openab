@@ -39,6 +39,21 @@ pub struct TokenStore {
     pub provider: String,
 }
 
+impl TokenStore {
+    /// True when the cached access token has expired (with `REFRESH_SKEW_SECONDS`
+    /// safety margin so callers refresh proactively). `u64::MAX` is the
+    /// "never expires" sentinel used by providers that omit `expires_in`
+    /// — `saturating_add` keeps the skew arithmetic safe against the sentinel
+    /// and against any other near-`u64::MAX` clock value.
+    pub fn is_expired(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        now.saturating_add(REFRESH_SKEW_SECONDS) >= self.expires_at
+    }
+}
+
 /// Transient per-server state captured at `start_paste_login` and consumed
 /// by `complete_login` (ADR §6.4). Lives in `auth.json` under
 /// `mcp-pending:<server>`. `token_url` + `provider_name` are snapshotted
@@ -295,17 +310,9 @@ pub fn remove_namespaced_token(key: &str) -> Result<()> {
     write_auth_file(&path, &map)
 }
 
-pub(crate) fn is_expired(store: &TokenStore) -> bool {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    now + REFRESH_SKEW_SECONDS >= store.expires_at
-}
-
 pub async fn get_valid_token() -> Result<String> {
     let mut store = load_tokens()?;
-    if is_expired(&store) {
+    if store.is_expired() {
         store = refresh_token(&store).await?;
         save_tokens(&store)?;
     }
@@ -658,11 +665,7 @@ pub async fn login_codex_device_flow() -> Result<()> {
 pub fn show_status() {
     match load_tokens() {
         Ok(store) => {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let expired = now + REFRESH_SKEW_SECONDS >= store.expires_at;
+            let expired = store.is_expired();
             let masked = if store.access_token.len() > 12 {
                 format!(
                     "{}...{}",
@@ -707,12 +710,12 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        assert!(!is_expired(&make_store(now + 3600)));
+        assert!(!make_store(now + 3600).is_expired());
     }
 
     #[test]
     fn test_is_expired_past_token() {
-        assert!(is_expired(&make_store(0)));
+        assert!(make_store(0).is_expired());
     }
 
     #[test]
@@ -721,7 +724,12 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        assert!(is_expired(&make_store(now + 60)));
+        assert!(make_store(now + 60).is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_sentinel_u64_max() {
+        assert!(!make_store(u64::MAX).is_expired());
     }
 
     #[test]
