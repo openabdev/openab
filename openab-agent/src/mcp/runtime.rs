@@ -250,10 +250,24 @@ impl McpRuntimeManager {
         pending: &PendingPasteLogin,
         resp: TokenExchangeResponse,
     ) -> Result<()> {
+        // `expires_in: None` means the provider didn't advertise a
+        // lifetime (Figma, Sentry, xAI as of writing). Falling back to
+        // `now + 0` (Mira's Tick 46 catch) would set the token "already
+        // expired", triggering an immediate refresh on the next
+        // connect() — which fails closed if refresh_token is also None,
+        // bouncing the user back to NeedsAuth seconds after a successful
+        // login. Treat absent `expires_in` as a long-lived token via the
+        // u64::MAX sentinel: `is_expired` will return false until the
+        // provider eventually 401s on use (at which point the user runs
+        // `mcp login` again, the correct UX for non-refreshable tokens).
+        let expires_at = match resp.expires_in {
+            Some(secs) => now_secs().saturating_add(secs),
+            None => u64::MAX,
+        };
         let store = TokenStore {
             access_token: resp.access_token,
             refresh_token: resp.refresh_token.unwrap_or_default(),
-            expires_at: now_secs().saturating_add(resp.expires_in.unwrap_or(0)),
+            expires_at,
             token_endpoint: pending.token_url.clone(),
             provider: pending.provider_name.clone(),
         };
@@ -897,7 +911,9 @@ mod tests {
         let token = crate::auth::load_namespaced_token_at(&mgr.auth_path, "linear").unwrap();
         assert_eq!(token.access_token, "atok");
         assert!(token.refresh_token.is_empty());
-        // expires_at = now_secs() + 0 → effectively "already expired"; the
-        // refresh path bails explicitly when invoked, which is fine here.
+        // Long-lived sentinel: no `expires_in` from the provider must NOT
+        // cause an immediate-expiry / refresh-loop / NeedsAuth bounce on
+        // first use (Mira Tick 46 catch).
+        assert_eq!(token.expires_at, u64::MAX);
     }
 }
