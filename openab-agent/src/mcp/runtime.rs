@@ -429,7 +429,13 @@ impl McpRuntimeManager {
                     Err(e) => {
                         let mut guard = self.handles.write().await;
                         if let Some(h) = guard.get_mut(name) {
-                            h.status = ServerStatus::NeedsAuth;
+                            // A concurrent connect() may have refreshed +
+                            // dialed successfully while we were awaiting
+                            // our (failed) refresh. Don't clobber the
+                            // winner's Connected status with NeedsAuth.
+                            if !matches!(h.status, ServerStatus::Connected) {
+                                h.status = ServerStatus::NeedsAuth;
+                            }
                         }
                         return Err(anyhow!(
                             "mcp server {name:?} oauth refresh failed: {e:#} — run `mcp login {name}`"
