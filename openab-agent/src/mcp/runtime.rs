@@ -521,8 +521,8 @@ mod tests {
 
     fn mgr_with_tempdir(cfg: McpConfig) -> (McpRuntimeManager, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("auth.json");
-        (McpRuntimeManager::from_config_with_auth_path(cfg, path), dir)
+        let mgr = McpRuntimeManager::from_config_with_auth_path(cfg, dir.path().join("auth.json"));
+        (mgr, dir)
     }
 
     #[tokio::test]
