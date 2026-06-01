@@ -189,6 +189,7 @@ fn status_label(status: &ServerStatus) -> &'static str {
         ServerStatus::Disconnected => "disconnected",
         ServerStatus::Connecting => "connecting",
         ServerStatus::Connected => "connected",
+        ServerStatus::NeedsAuth => "needs_auth",
         ServerStatus::Failed(_) => "failed",
     }
 }
