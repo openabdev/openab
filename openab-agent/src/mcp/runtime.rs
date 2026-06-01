@@ -314,7 +314,10 @@ mod tests {
         let mgr = McpRuntimeManager::from_config(cfg);
         let err = mgr.connect("linear").await.unwrap_err().to_string();
         assert!(err.contains("needs oauth login"), "expected hint in {err}");
-        assert!(err.contains("mcp login"), "expected 'mcp login' hint in {err}");
+        assert!(
+            err.contains("mcp login"),
+            "expected 'mcp login' hint in {err}"
+        );
         assert_eq!(mgr.statuses().await[0].1, ServerStatus::NeedsAuth);
     }
 
