@@ -101,7 +101,9 @@ fn parse_frontmatter(content: &str) -> Option<(String, String)> {
 
 /// Escape XML special characters in user-controlled strings to preserve prompt structure.
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Format skills as a system prompt section listing available skills.
