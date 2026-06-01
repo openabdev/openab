@@ -195,9 +195,7 @@ mod tests {
         unsafe {
             std::env::remove_var("OPENAB_MCP_ANTHROPIC_CLIENT_ID");
         }
-        let err = builtin_client_id("anthropic-mcp")
-            .unwrap_err()
-            .to_string();
+        let err = builtin_client_id("anthropic-mcp").unwrap_err().to_string();
         assert!(err.contains("OPENAB_MCP_ANTHROPIC_CLIENT_ID"), "got: {err}");
     }
 
