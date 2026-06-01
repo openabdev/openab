@@ -545,8 +545,8 @@ RFC 8414 dynamic discovery (`/.well-known/oauth-authorization-server`) is **disa
 **Device-code flow** (typically platform OAuth: Anthropic, OpenAI, xAI):
 
 - `login` returns `{ flow: "device", user_code, verification_url, expires_in }`. Agent relays to chat: "Open `https://example.com/device`, enter code: `ABCD-EFGH`".
-- Runtime polls the token endpoint in background (5s interval, RFC 8628 §3.5). On success, persists tokens under `mcp:X`, transitions server to `Connected`.
-- LLM checks `mcp(action: "status", server: X)` to learn when ready; `complete_login` not required for this branch.
+- Runtime polls the token endpoint in background (5s interval, RFC 8628 §3.5). On success, persists tokens under `mcp:X`, transitions server to `Disconnected` so the next `connect()` reads the cached token via the oauth-aware dial path and reaches `Connected` through the normal lifecycle. Keeping the rmcp handshake out of the polling task avoids spawning child processes from a detached `tokio::task`.
+- LLM checks `mcp(action: "status", server: X)` to learn when the polling loop completes (status leaves `Connecting`); `complete_login` is not required for this branch — the next `mcp call` triggers `connect()`.
 
 **Paste-back flow** (typically MCP SaaS: Linear, Notion, Figma, ...):
 
