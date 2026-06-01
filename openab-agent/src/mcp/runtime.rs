@@ -85,6 +85,20 @@ pub struct PasteLoginStart {
     pub state: String,
 }
 
+/// Public return of `start_device_login` (RFC 8628 §3.2 user-facing
+/// bundle). `verification_uri_complete` is the §3.3.1 extension that
+/// pre-fills the user_code into the QR/link target; clients should
+/// prefer it when present and fall back to the
+/// `verification_uri` + `user_code` pair.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct DeviceLoginStart {
+    pub user_code: String,
+    pub verification_uri: String,
+    pub verification_uri_complete: Option<String>,
+    pub expires_in: u64,
+}
+
 /// Owns one `ServerHandle` per configured server, behind an async `RwLock`
 /// so the foreground LLM path and the background eviction task can share it.
 #[derive(Debug, Clone)]
@@ -285,6 +299,210 @@ impl McpRuntimeManager {
             handle.status = ServerStatus::Disconnected;
         }
         Ok(())
+    }
+
+    /// Begin a device-code OAuth login (ADR §6.4 + RFC 8628) for an HTTP
+    /// server whose `oauth:` block declares a `device_authorization_endpoint`
+    /// (§6.3). Built-in providers don't yet ship device endpoints — that
+    /// requires a `ProviderSpec` schema extension (out of scope this slice).
+    ///
+    /// 1. POST RFC 8628 §3.1 device authorization → user_code +
+    ///    verification_uri + interval + expires_in
+    /// 2. Spawn a detached `tokio::task` that drives the §3.4 polling loop,
+    ///    persists the `TokenStore` on success, and writes server status
+    ///    (`Disconnected` on success so the next `connect()` picks up the
+    ///    cached token; `NeedsAuth` on terminal failure)
+    /// 3. Return the user-facing bundle (the polling task is fire-and-
+    ///    forget — observed via `mcp status`)
+    ///
+    /// Choosing `Disconnected` over the ADR's "transitions to Connected"
+    /// keeps the polling task out of the MCP handshake path. The next
+    /// `connect()` reads the cached token via the oauth-aware `DialPlan`
+    /// branch and reaches `Connected` through the normal lifecycle.
+    #[allow(dead_code)]
+    pub async fn start_device_login(&self, name: &str) -> Result<DeviceLoginStart> {
+        let (device_endpoint, client_id, token_url, scopes, provider_name) =
+            self.resolve_device_client(name).await?;
+        let auth =
+            post_device_authorization(&device_endpoint, &client_id, &scopes.join(" ")).await?;
+        {
+            let mut handles = self.handles.write().await;
+            if let Some(handle) = handles.get_mut(name) {
+                handle.status = ServerStatus::Connecting;
+            }
+        }
+        let manager = self.clone();
+        let name_owned = name.to_string();
+        let device_code = auth.device_code.clone();
+        let initial_interval = auth.interval;
+        let expires_in = auth.expires_in;
+        let token_url_owned = token_url;
+        let client_id_owned = client_id;
+        let provider_name_owned = provider_name;
+        tokio::spawn(async move {
+            manager
+                .run_device_poll_loop(
+                    &name_owned,
+                    &token_url_owned,
+                    &client_id_owned,
+                    &device_code,
+                    &provider_name_owned,
+                    initial_interval,
+                    expires_in,
+                )
+                .await;
+        });
+        Ok(DeviceLoginStart {
+            user_code: auth.user_code,
+            verification_uri: auth.verification_uri,
+            verification_uri_complete: auth.verification_uri_complete,
+            expires_in: auth.expires_in,
+        })
+    }
+
+    /// Resolve `(device_endpoint, client_id, token_url, scopes, provider_name)`
+    /// for `name`. Rejects non-Http / non-oauth / built-in / missing-endpoint
+    /// configurations with explicit errors so the user sees what to fix in
+    /// `mcp.json`.
+    #[allow(dead_code)]
+    async fn resolve_device_client(
+        &self,
+        name: &str,
+    ) -> Result<(String, String, String, Vec<String>, String)> {
+        let oauth_cfg = {
+            let guard = self.handles.read().await;
+            let handle = guard
+                .get(name)
+                .ok_or_else(|| anyhow!("no mcp server named {name:?}"))?;
+            match handle.config.resolved(name)? {
+                ServerConfig::Http {
+                    oauth: Some(oauth), ..
+                } => oauth,
+                ServerConfig::Http { oauth: None, .. } => {
+                    return Err(anyhow!("mcp server {name:?} has no oauth block"));
+                }
+                ServerConfig::Stdio { .. } => {
+                    return Err(anyhow!("mcp server {name:?} is stdio, not http+oauth"));
+                }
+            }
+        };
+        let provider = resolve(&oauth_cfg)?;
+        let ResolvedProvider::Custom {
+            provider_name,
+            token_url,
+            client_id: Some(client_id),
+            device_authorization_endpoint: Some(device_endpoint),
+            scopes,
+            ..
+        } = provider
+        else {
+            return Err(anyhow!(
+                "mcp server {name:?} device-flow requires a Custom provider with \
+                 both `oauth.device_authorization_endpoint` and `oauth.client_id` \
+                 set in mcp.json"
+            ));
+        };
+        Ok((device_endpoint, client_id, token_url, scopes, provider_name))
+    }
+
+    /// RFC 8628 §3.4 polling loop. Runs detached in `tokio::spawn`; the
+    /// only observable side-effect is `auth.json` (on Success) + the
+    /// `ServerHandle.status` transition. Errors are logged via `tracing`
+    /// and surface to the user via `mcp status` (Failed/NeedsAuth).
+    #[allow(dead_code, clippy::too_many_arguments)]
+    async fn run_device_poll_loop(
+        &self,
+        name: &str,
+        token_url: &str,
+        client_id: &str,
+        device_code: &str,
+        provider_name: &str,
+        initial_interval: u64,
+        expires_in_secs: u64,
+    ) {
+        let deadline = now_secs().saturating_add(expires_in_secs);
+        let mut interval = initial_interval;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+            if now_secs() >= deadline {
+                self.mark_device_login_failed(
+                    name,
+                    anyhow!("device-flow expired before user authorized"),
+                )
+                .await;
+                return;
+            }
+            let outcome = match post_device_token_poll(token_url, client_id, device_code).await {
+                Ok(o) => o,
+                Err(e) => {
+                    self.mark_device_login_failed(name, e).await;
+                    return;
+                }
+            };
+            match outcome {
+                DevicePollOutcome::Success(resp) => {
+                    self.finalize_device_login(name, provider_name, token_url, resp)
+                        .await;
+                    return;
+                }
+                DevicePollOutcome::AuthorizationPending => continue,
+                DevicePollOutcome::SlowDown => {
+                    // RFC 8628 §3.5: SlowDown means add 5s to the interval.
+                    interval = interval.saturating_add(5);
+                }
+                DevicePollOutcome::AccessDenied => {
+                    self.mark_device_login_failed(name, anyhow!("device-flow denied by user"))
+                        .await;
+                    return;
+                }
+                DevicePollOutcome::ExpiredToken => {
+                    self.mark_device_login_failed(name, anyhow!("device_code expired"))
+                        .await;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Pure-persistence tail of `run_device_poll_loop` on RFC 8628 §3.5
+    /// Success. Mirrors `finish_login`'s `u64::MAX` sentinel for absent
+    /// `expires_in` (Mira Tick 46 catch).
+    #[allow(dead_code)]
+    async fn finalize_device_login(
+        &self,
+        name: &str,
+        provider_name: &str,
+        token_url: &str,
+        resp: TokenExchangeResponse,
+    ) {
+        let expires_at = match resp.expires_in {
+            Some(secs) => now_secs().saturating_add(secs),
+            None => u64::MAX,
+        };
+        let store = TokenStore {
+            access_token: resp.access_token,
+            refresh_token: resp.refresh_token.unwrap_or_default(),
+            expires_at,
+            token_endpoint: token_url.to_string(),
+            provider: provider_name.to_string(),
+        };
+        if let Err(e) = save_namespaced_token_at(&self.auth_path, name, &store) {
+            self.mark_device_login_failed(name, e).await;
+            return;
+        }
+        let mut handles = self.handles.write().await;
+        if let Some(handle) = handles.get_mut(name) {
+            handle.status = ServerStatus::Disconnected;
+        }
+    }
+
+    #[allow(dead_code)]
+    async fn mark_device_login_failed(&self, name: &str, err: anyhow::Error) {
+        tracing::warn!(server = %name, error = %err, "device-flow polling failed");
+        let mut handles = self.handles.write().await;
+        if let Some(handle) = handles.get_mut(name) {
+            handle.status = ServerStatus::NeedsAuth;
+        }
     }
 
     /// Resolve a paste-back OAuth client `(provider, client_id, redirect_uri)`
@@ -580,6 +798,7 @@ struct DeviceAuthResponse {
     interval: u64,
 }
 
+#[allow(dead_code)]
 fn default_device_poll_interval() -> u64 {
     5
 }
@@ -603,6 +822,7 @@ enum DevicePollOutcome {
 /// parses as a token response; 4xx parses `{"error": "..."}` and maps the
 /// four flow-state codes to enum variants; everything else (including
 /// non-JSON / unknown error codes) folds into `Err`.
+#[allow(dead_code)]
 fn classify_device_poll(status: reqwest::StatusCode, body: &str) -> Result<DevicePollOutcome> {
     if status.is_success() {
         return serde_json::from_str(body)
@@ -1317,5 +1537,80 @@ mod tests {
         let resp: DeviceAuthResponse = serde_json::from_str(body).unwrap();
         assert_eq!(resp.interval, 5);
         assert!(resp.verification_uri_complete.is_none());
+    }
+
+    fn linear_device_cfg() -> &'static str {
+        // 127.0.0.1:1 dials hermetically so tests can prove
+        // start_device_login() reached the device-authorization POST —
+        // i.e. config validation passed — without a network round-trip.
+        r#"{
+            "mcpServers": {
+                "linear": {
+                    "type": "http",
+                    "url": "https://mcp.linear.app/mcp",
+                    "oauth": {
+                        "provider": "linear",
+                        "authorize_url": "https://linear.app/oauth/authorize",
+                        "token_url": "https://api.linear.app/oauth/token",
+                        "device_authorization_endpoint": "http://127.0.0.1:1/device",
+                        "client_id": "linear-client",
+                        "scopes": ["read"]
+                    }
+                }
+            }
+        }"#
+    }
+
+    async fn start_device_err(mgr: &McpRuntimeManager, name: &str) -> String {
+        mgr.start_device_login(name).await.unwrap_err().to_string()
+    }
+
+    #[tokio::test]
+    async fn start_device_login_rejects_unknown_server() {
+        let cfg: McpConfig = serde_json::from_str(linear_device_cfg()).unwrap();
+        let (mgr, _dir) = mgr_with_tempdir(cfg);
+        let err = start_device_err(&mgr, "ghost").await;
+        assert!(err.contains("ghost"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn start_device_login_rejects_stdio_server() {
+        let json = r#"{
+            "mcpServers": {
+                "fs": {
+                    "type": "stdio",
+                    "command": "/bin/true"
+                }
+            }
+        }"#;
+        let cfg: McpConfig = serde_json::from_str(json).unwrap();
+        let (mgr, _dir) = mgr_with_tempdir(cfg);
+        let err = start_device_err(&mgr, "fs").await;
+        assert!(err.contains("stdio"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn start_device_login_rejects_custom_without_device_endpoint() {
+        // linear_custom_cfg omits `device_authorization_endpoint` — the
+        // paste-back fixture from earlier slices doubles as the negative
+        // case here.
+        let cfg: McpConfig = serde_json::from_str(linear_custom_cfg()).unwrap();
+        let (mgr, _dir) = mgr_with_tempdir(cfg);
+        let err = start_device_err(&mgr, "linear").await;
+        assert!(err.contains("device_authorization_endpoint"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn start_device_login_with_device_endpoint_reaches_http_post() {
+        // Config validation passes (Custom + device_endpoint + client_id all
+        // present) so the failure must come from the POST itself — proves
+        // the gate didn't short-circuit before dial.
+        let cfg: McpConfig = serde_json::from_str(linear_device_cfg()).unwrap();
+        let (mgr, _dir) = mgr_with_tempdir(cfg);
+        let err = start_device_err(&mgr, "linear").await;
+        assert!(
+            !err.contains("device_authorization_endpoint"),
+            "config validation should have passed; got: {err}"
+        );
     }
 }
