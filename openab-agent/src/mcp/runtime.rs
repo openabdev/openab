@@ -114,6 +114,13 @@ pub struct McpRuntimeManager {
     /// finalize the same server. `std::sync::Mutex` is fine: the lock
     /// is only held for `HashMap` ops, never across `.await`.
     device_login_tasks: Arc<StdMutex<HashMap<String, AbortHandle>>>,
+    /// Per-server single-flight gate for refresh-grant requests. The
+    /// outer `StdMutex` guards the map (held only for `entry().or_insert`
+    /// ops, never across `.await`); the inner `tokio::Mutex` is held
+    /// across the network round-trip + disk write so concurrent waiters
+    /// observe the winner's rotated token instead of replaying a stale
+    /// refresh_token (which providers like Google would cascade-revoke).
+    refresh_locks: Arc<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl McpRuntimeManager {
@@ -139,6 +146,7 @@ impl McpRuntimeManager {
             handles: Arc::new(RwLock::new(handles)),
             auth_path,
             device_login_tasks: Arc::new(StdMutex::new(HashMap::new())),
+            refresh_locks: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -578,20 +586,30 @@ impl McpRuntimeManager {
     /// returning so deployment-side mtime watchers can sync the rotated
     /// token to peer replicas.
     ///
-    /// Concurrent `connect()` callers on the same server may each enter
-    /// this path with the same stale `refresh_token` — there is no
-    /// per-server single-flight gate here. That is intentional for now:
-    /// the connect() race guard (see the `NeedsRefresh` branch below)
-    /// keeps a failed concurrent refresh from clobbering a peer's
-    /// successful `Connected` install, so the worst-case outcome is N
-    /// duplicate POSTs to the token endpoint rather than state
-    /// corruption. Providers that cascade-revoke on replayed refresh
-    /// tokens would still bounce the user back through `mcp login`;
-    /// a Phase 3 follow-up will add a `tokio::sync::Mutex` per server
-    /// (or `OnceCell<TokenStore>`) to single-flight refreshes.
+    /// Per-server single-flight: concurrent `connect()` callers serialize
+    /// on `refresh_locks[name]`. After acquiring the lock, the function
+    /// re-reads the on-disk token; if a prior waiter already refreshed,
+    /// the cached store is returned without a second POST. This prevents
+    /// replayed-refresh cascade-revokes on providers like Google.
     async fn try_refresh_oauth_token(&self, name: &str, store: &TokenStore) -> Result<TokenStore> {
         if store.refresh_token.is_empty() {
             return Err(anyhow!("no refresh_token cached for {name:?}"));
+        }
+        let lock = {
+            let mut locks = self
+                .refresh_locks
+                .lock()
+                .expect("refresh_locks mutex poisoned");
+            locks
+                .entry(name.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _guard = lock.lock().await;
+        if let Ok(cached) = load_namespaced_token_at(&self.auth_path, name) {
+            if !cached.is_expired() {
+                return Ok(cached);
+            }
         }
         let (_provider, client_id, _redirect_uri) = self.resolve_paste_client(name).await?;
         let resp =
@@ -1704,5 +1722,28 @@ mod tests {
             !err.contains("device_authorization_endpoint"),
             "config validation should have passed; got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn try_refresh_short_circuits_when_disk_has_fresh_token() {
+        // Single-flight contract: if another waiter has already refreshed
+        // (fresh token on disk), `try_refresh_oauth_token` must return the
+        // cached store without POSTing to the dead `token_endpoint`. The
+        // input `store` is intentionally stale (zero `expires_at`) and
+        // points at 127.0.0.1:1 — any POST attempt would surface a connect
+        // error, so a successful return proves the re-check ran.
+        let cfg: McpConfig = serde_json::from_str(dead_oauth_cfg()).unwrap();
+        let (mgr, _dir) = mgr_with_tempdir(cfg);
+        seed_token(&mgr, "linear", u64::MAX);
+        let stale = TokenStore {
+            access_token: "stale".to_string(),
+            refresh_token: "rtok".to_string(),
+            expires_at: 0,
+            token_endpoint: "http://127.0.0.1:1/token".to_string(),
+            provider: "linear".to_string(),
+        };
+        let fresh = mgr.try_refresh_oauth_token("linear", &stale).await.unwrap();
+        assert_eq!(fresh.access_token, "atok-linear");
+        assert!(!fresh.is_expired());
     }
 }
