@@ -127,7 +127,7 @@ pub fn format_skills_prompt(skills: &[Skill]) -> String {
             "  <skill>\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>\n  </skill>\n",
             xml_escape(&skill.name),
             xml_escape(&skill.description),
-            skill.path.join("SKILL.md").display(),
+            xml_escape(&skill.path.join("SKILL.md").to_string_lossy()),
         ));
     }
     out.push_str("</available_skills>\n");
@@ -247,12 +247,13 @@ mod tests {
     fn format_skills_prompt_escapes_xml_chars() {
         let skills = vec![Skill {
             name: "a<b".to_string(),
-            description: "Use <tag> & \"quotes\"".to_string(),
-            path: PathBuf::from("/skills/test"),
+            description: "Use <tag> & \"quotes\" </description> injection test".to_string(),
+            path: PathBuf::from("/skills/test&cool"),
         }];
         let prompt = format_skills_prompt(&skills);
         assert!(prompt.contains("<name>a&lt;b</name>"));
-        assert!(prompt.contains("<description>Use &lt;tag&gt; &amp; \"quotes\"</description>"));
+        assert!(prompt.contains("<description>Use &lt;tag&gt; &amp; \"quotes\" &lt;/description&gt; injection test</description>"));
+        assert!(prompt.contains("<location>/skills/test&amp;cool/SKILL.md</location>"));
     }
 
     #[test]
