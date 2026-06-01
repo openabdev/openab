@@ -12,8 +12,8 @@ use anyhow::Result;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use url::Url;
 
-use crate::auth::generate_pkce;
 use super::oauth::ResolvedProvider;
+use crate::auth::generate_pkce;
 
 /// 16-byte URL-safe `state` nonce for the OAuth authorize URL.
 fn generate_state() -> String {
@@ -64,9 +64,9 @@ pub fn init_paste_authorize(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::mcp::config::OAuthConfig;
     use crate::mcp::oauth::resolve;
-    use super::*;
 
     const TEST_REDIRECT: &str = "http://localhost:53692/callback";
 
