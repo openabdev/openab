@@ -24,12 +24,12 @@ use tokio::sync::RwLock;
 
 use super::config::{McpConfig, ServerConfig};
 
-#[allow(dead_code)] // NeedsAuth lands with the Phase 2 OAuth slice (ADR §5.7)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerStatus {
     Disconnected,
     Connecting,
     Connected,
+    NeedsAuth,
     Failed(String),
 }
 
@@ -39,6 +39,7 @@ impl ServerStatus {
             ServerStatus::Disconnected => "○",
             ServerStatus::Connecting => "◐",
             ServerStatus::Connected => "●",
+            ServerStatus::NeedsAuth => "◌",
             ServerStatus::Failed(_) => "✗",
         }
     }
@@ -147,8 +148,10 @@ impl McpRuntimeManager {
     }
 
     /// Lazy-connect the named server (ADR §5.7). Idempotent if already
-    /// `Connected` with a live client. HTTP servers requiring OAuth are
-    /// rejected until the Phase 2 auth slice lands (ADR §6).
+    /// `Connected` with a live client. HTTP servers with an `oauth:` block
+    /// are routed through `mcp login` first — `connect` marks them
+    /// `NeedsAuth` and returns an error pointing the caller at the login
+    /// subcommand rather than attempting an unauthenticated dial.
     pub async fn connect(&self, name: &str) -> Result<()> {
         let dial = {
             let mut guard = self.handles.write().await;
@@ -163,17 +166,16 @@ impl McpRuntimeManager {
                 ServerConfig::Stdio {
                     command, args, env, ..
                 } => Dial::Stdio { command, args, env },
-                // Reject oauth-protected servers BEFORE the `Connecting`
-                // transition: we never attempted a handshake, so leaving
-                // status at `Disconnected` is the honest state. Status
-                // becomes `Failed` only when a dial was actually tried.
-                ServerConfig::Http {
-                    oauth: Some(_),
-                    url,
-                    ..
-                } => {
+                // Oauth-protected servers can't be dialed via plain connect;
+                // mark `NeedsAuth` so `mcp status` shows a persistent
+                // "waiting for login" signal (vs `Disconnected`, which
+                // implies a plain `connect` would succeed). The `Failed`
+                // path remains reserved for dials that were attempted and
+                // failed at handshake.
+                ServerConfig::Http { oauth: Some(_), .. } => {
+                    handle.status = ServerStatus::NeedsAuth;
                     return Err(anyhow!(
-                        "oauth-protected http server {url:?} requires the auth slice (Phase 2 §6)"
+                        "mcp server {name:?} needs oauth login — run `mcp login {name}`"
                     ));
                 }
                 ServerConfig::Http { url, .. } => Dial::Http { url },
@@ -298,7 +300,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_http_with_oauth_defers_to_auth_slice() {
+    async fn connect_http_with_oauth_marks_needs_auth() {
         let json = r#"{
             "mcpServers": {
                 "linear": {
@@ -311,10 +313,30 @@ mod tests {
         let cfg: McpConfig = serde_json::from_str(json).unwrap();
         let mgr = McpRuntimeManager::from_config(cfg);
         let err = mgr.connect("linear").await.unwrap_err().to_string();
-        assert!(err.contains("oauth"), "expected 'oauth' in {err}");
-        // OAuth rejection happens BEFORE the Connecting transition, so the
-        // server remains Disconnected — no dial was attempted.
-        assert_eq!(mgr.statuses().await[0].1, ServerStatus::Disconnected);
+        assert!(err.contains("needs oauth login"), "expected hint in {err}");
+        assert!(err.contains("mcp login"), "expected 'mcp login' hint in {err}");
+        assert_eq!(mgr.statuses().await[0].1, ServerStatus::NeedsAuth);
+    }
+
+    #[tokio::test]
+    async fn connect_oauth_twice_keeps_needs_auth_sticky() {
+        // Second connect() must NOT silently re-enter `Connecting` and
+        // shadow the user-actionable state — the only path out of
+        // `NeedsAuth` is a successful `mcp login`.
+        let json = r#"{
+            "mcpServers": {
+                "linear": {
+                    "type": "http",
+                    "url": "https://mcp.linear.app/mcp",
+                    "oauth": { "provider": "linear" }
+                }
+            }
+        }"#;
+        let cfg: McpConfig = serde_json::from_str(json).unwrap();
+        let mgr = McpRuntimeManager::from_config(cfg);
+        assert!(mgr.connect("linear").await.is_err());
+        assert!(mgr.connect("linear").await.is_err());
+        assert_eq!(mgr.statuses().await[0].1, ServerStatus::NeedsAuth);
     }
 
     #[tokio::test]
