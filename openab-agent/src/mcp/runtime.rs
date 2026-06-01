@@ -333,13 +333,46 @@ impl McpRuntimeManager {
         Ok((provider, client_id, redirect_uri))
     }
 
+    /// RFC 6749 §6 refresh-grant — exchange a cached `refresh_token` for a
+    /// new `access_token`. Resolves `client_id` from current config (so a
+    /// rotated builtin catalog entry is picked up automatically). Per
+    /// ADR §6.6 rotation contract: if the provider omits a new
+    /// `refresh_token` in the response, the previous one is preserved
+    /// (Google-style rotation); the agent fsyncs `auth.json` before
+    /// returning so deployment-side mtime watchers can sync the rotated
+    /// token to peer replicas.
+    async fn try_refresh_oauth_token(&self, name: &str, store: &TokenStore) -> Result<TokenStore> {
+        if store.refresh_token.is_empty() {
+            return Err(anyhow!("no refresh_token cached for {name:?}"));
+        }
+        let (_provider, client_id, _redirect_uri) = self.resolve_paste_client(name).await?;
+        let resp =
+            post_token_refresh(&store.token_endpoint, &client_id, &store.refresh_token).await?;
+        let new_refresh = resp
+            .refresh_token
+            .unwrap_or_else(|| store.refresh_token.clone());
+        let expires_at = match resp.expires_in {
+            Some(secs) => now_secs() + secs,
+            None => u64::MAX,
+        };
+        let new_store = TokenStore {
+            access_token: resp.access_token,
+            refresh_token: new_refresh,
+            expires_at,
+            token_endpoint: store.token_endpoint.clone(),
+            provider: store.provider.clone(),
+        };
+        save_namespaced_token_at(&self.auth_path, name, &new_store)?;
+        Ok(new_store)
+    }
+
     /// Lazy-connect the named server (ADR §5.7). Idempotent if already
     /// `Connected` with a live client. HTTP servers with an `oauth:` block
     /// are routed through `mcp login` first — `connect` marks them
     /// `NeedsAuth` and returns an error pointing the caller at the login
     /// subcommand rather than attempting an unauthenticated dial.
     pub async fn connect(&self, name: &str) -> Result<()> {
-        let dial = {
+        let plan = {
             let mut guard = self.handles.write().await;
             let handle = guard
                 .get_mut(name)
@@ -348,26 +381,27 @@ impl McpRuntimeManager {
                 return Ok(());
             }
             let resolved = handle.config.resolved(name)?;
-            let dial = match resolved {
+            let plan = match resolved {
                 ServerConfig::Stdio {
                     command, args, env, ..
-                } => Dial::Stdio { command, args, env },
-                // Oauth-protected: dial with a cached bearer if one exists
-                // and is still within the refresh skew; otherwise bounce to
-                // `NeedsAuth` so `mcp status` shows a persistent "waiting
-                // for login" signal (vs `Disconnected`, which implies a
-                // plain `connect` would succeed). Refresh-token rotation
-                // for the expired-but-recoverable case is the next slice;
-                // for now an expired token falls through to NeedsAuth.
+                } => DialPlan::Dial(Dial::Stdio { command, args, env }),
+                // Oauth-protected: cached-valid → dial; expired but with a
+                // refresh_token → defer to outside-lock async refresh
+                // (`DialPlan::NeedsRefresh`); missing/expired-no-refresh
+                // → bounce to `NeedsAuth` so `mcp login` stays the user-
+                // actionable path.
                 ServerConfig::Http {
                     url,
                     oauth: Some(_),
                     ..
                 } => match load_namespaced_token_at(&self.auth_path, name) {
-                    Ok(store) if !is_expired(&store) => Dial::Http {
+                    Ok(store) if !is_expired(&store) => DialPlan::Dial(Dial::Http {
                         url,
                         auth: Some(store.access_token),
-                    },
+                    }),
+                    Ok(store) if !store.refresh_token.is_empty() => {
+                        DialPlan::NeedsRefresh { url, store }
+                    }
                     _ => {
                         handle.status = ServerStatus::NeedsAuth;
                         return Err(anyhow!(
@@ -375,10 +409,34 @@ impl McpRuntimeManager {
                         ));
                     }
                 },
-                ServerConfig::Http { url, .. } => Dial::Http { url, auth: None },
+                ServerConfig::Http { url, .. } => DialPlan::Dial(Dial::Http { url, auth: None }),
             };
             handle.status = ServerStatus::Connecting;
-            dial
+            plan
+        };
+
+        // Resolve `NeedsRefresh` outside the write lock so a slow refresh
+        // doesn't block concurrent `mcp status` reads. Failed refresh →
+        // `NeedsAuth` (matching the missing-token bounce inside the lock).
+        let dial = match plan {
+            DialPlan::Dial(d) => d,
+            DialPlan::NeedsRefresh { url, store } => {
+                match self.try_refresh_oauth_token(name, &store).await {
+                    Ok(new_store) => Dial::Http {
+                        url,
+                        auth: Some(new_store.access_token),
+                    },
+                    Err(e) => {
+                        let mut guard = self.handles.write().await;
+                        if let Some(h) = guard.get_mut(name) {
+                            h.status = ServerStatus::NeedsAuth;
+                        }
+                        return Err(anyhow!(
+                            "mcp server {name:?} oauth refresh failed: {e:#} — run `mcp login {name}`"
+                        ));
+                    }
+                }
+            }
         };
 
         let dial_result = dial.run().await;
@@ -472,6 +530,44 @@ async fn post_token_exchange(
         return Err(anyhow!("token endpoint returned {status}: {body}"));
     }
     serde_json::from_str(&body).map_err(|e| anyhow!("invalid token response: {e}; body={body}"))
+}
+
+/// POST a refresh-grant to the OAuth 2.1 token endpoint per RFC 6749 §6.
+/// Public client — no `client_secret`. Same response shape as the
+/// auth-code exchange (`TokenExchangeResponse`).
+async fn post_token_refresh(
+    token_url: &str,
+    client_id: &str,
+    refresh_token: &str,
+) -> Result<TokenExchangeResponse> {
+    let client = reqwest::Client::builder()
+        .build()
+        .context("build reqwest client")?;
+    let resp = client
+        .post(token_url)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", client_id),
+        ])
+        .send()
+        .await
+        .with_context(|| format!("POST {token_url} (token refresh)"))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(anyhow!("token endpoint returned {status}: {body}"));
+    }
+    serde_json::from_str(&body).map_err(|e| anyhow!("invalid token response: {e}; body={body}"))
+}
+
+/// Two-phase plan for `connect()`: most server types resolve directly to
+/// a `Dial`, but HTTP+oauth with an expired-but-refreshable token needs
+/// async work (the refresh POST) before a `Dial` can be built. Keeping
+/// the variant lets us release the write lock before the refresh.
+enum DialPlan {
+    Dial(Dial),
+    NeedsRefresh { url: String, store: TokenStore },
 }
 
 /// Per-transport dial parameters, extracted under the manager's write lock
@@ -955,15 +1051,24 @@ mod tests {
         }"#
     }
 
-    fn seed_token(mgr: &McpRuntimeManager, name: &str, expires_at: u64) {
+    fn seed_token_with_refresh(
+        mgr: &McpRuntimeManager,
+        name: &str,
+        expires_at: u64,
+        refresh_token: &str,
+    ) {
         let store = TokenStore {
             access_token: format!("atok-{name}"),
-            refresh_token: "rtok".to_string(),
+            refresh_token: refresh_token.to_string(),
             expires_at,
-            token_endpoint: "https://api.linear.app/oauth/token".to_string(),
+            token_endpoint: "http://127.0.0.1:1/token".to_string(),
             provider: "linear".to_string(),
         };
         save_namespaced_token_at(&mgr.auth_path, name, &store).unwrap();
+    }
+
+    fn seed_token(mgr: &McpRuntimeManager, name: &str, expires_at: u64) {
+        seed_token_with_refresh(mgr, name, expires_at, "rtok");
     }
 
     #[tokio::test]
@@ -983,16 +1088,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_oauth_with_expired_token_bounces_to_needs_auth() {
-        // Expired token (within REFRESH_SKEW_SECONDS of now, or past) must
-        // NOT be sent — refresh-rotation is a later slice. Treat as
-        // missing: bounce to NeedsAuth so `mcp login` is the actionable
-        // path the user sees.
+    async fn connect_oauth_expired_no_refresh_token_bounces_to_needs_auth() {
+        // Expired token + empty refresh_token → no refresh attempt;
+        // bounce directly to NeedsAuth. Proves the empty-refresh guard
+        // short-circuits before the refresh POST.
+        let cfg: McpConfig = serde_json::from_str(dead_oauth_cfg()).unwrap();
+        let (mgr, _dir) = mgr_with_tempdir(cfg);
+        seed_token_with_refresh(&mgr, "linear", 0, "");
+        let err = mgr.connect("linear").await.unwrap_err().to_string();
+        assert!(err.contains("needs oauth login"), "got: {err}");
+        assert_eq!(mgr.statuses().await[0].1, ServerStatus::NeedsAuth);
+    }
+
+    #[tokio::test]
+    async fn connect_oauth_expired_with_refresh_token_failed_refresh_bounces_to_needs_auth() {
+        // Expired token + non-empty refresh_token → refresh attempted;
+        // refresh fails (custom-provider not yet supported in this slice,
+        // or dead token_endpoint) → NeedsAuth bounce with refresh-failed
+        // message. Proves the refresh path runs and that any failure
+        // surfaces as user-actionable NeedsAuth.
         let cfg: McpConfig = serde_json::from_str(dead_oauth_cfg()).unwrap();
         let (mgr, _dir) = mgr_with_tempdir(cfg);
         seed_token(&mgr, "linear", 0);
         let err = mgr.connect("linear").await.unwrap_err().to_string();
-        assert!(err.contains("needs oauth login"), "got: {err}");
+        assert!(err.contains("oauth refresh failed"), "got: {err}");
         assert_eq!(mgr.statuses().await[0].1, ServerStatus::NeedsAuth);
     }
 
