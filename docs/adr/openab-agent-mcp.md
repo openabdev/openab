@@ -527,7 +527,9 @@ Callback values apply when the browser flow is engaged (`--browser` / `$DISPLAY`
 
 ### 6.3 Custom provider extension point
 
-Config can declare `oauth: { authorize_url, token_url, client_id, scopes, device_authorization_endpoint?, discovery?, discovery_allowlist? }` for any server. The generic provider handles PKCE + callback + token persistence. No code change needed for new MCP servers that use standard OAuth 2.1. If `device_authorization_endpoint` is set, §6.4 device-code flow is preferred over paste-back. RFC 8414 dynamic discovery is opt-in only and requires an allowlist — see §6.4.
+Config can declare `oauth: { authorize_url, token_url, client_id, scopes, device_authorization_endpoint?, redirect_uri?, discovery?, discovery_allowlist? }` for any server. The generic provider handles PKCE + callback + token persistence. No code change needed for new MCP servers that use standard OAuth 2.1. If `device_authorization_endpoint` is set, §6.4 device-code flow is preferred over paste-back. RFC 8414 dynamic discovery is opt-in only and requires an allowlist — see §6.4.
+
+`oauth.redirect_uri` is required by the paste-back branch of §6.4 for custom providers — it must match the URL pre-registered with the provider's OAuth app, since custom paste-back doesn't bind a local listener (built-ins pin their callback in `ProviderSpec`; the device-code branch ignores it).
 
 ### 6.4 Agent-guided OAuth flow (default)
 
