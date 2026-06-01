@@ -26,9 +26,7 @@ jobs:
           workspaces: openab-agent
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
-      - run: cargo clippy --features mcp -- -D warnings
       - run: cargo test
-      - run: cargo test --features mcp
       - run: cargo test -- --ignored
         env:
           ANTHROPIC_API_KEY: "fake-key-for-ci"

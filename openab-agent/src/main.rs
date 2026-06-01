@@ -2,7 +2,6 @@ mod acp;
 mod agent;
 mod auth;
 mod llm;
-#[cfg(feature = "mcp")]
 mod mcp;
 mod skills;
 mod tools;
@@ -25,14 +24,12 @@ enum Commands {
         provider: AuthProvider,
     },
     /// Inspect / manage configured MCP servers
-    #[cfg(feature = "mcp")]
     Mcp {
         #[command(subcommand)]
         action: McpAction,
     },
 }
 
-#[cfg(feature = "mcp")]
 #[derive(Subcommand)]
 enum McpAction {
     /// List configured MCP servers (loads global + project mcp.json)
@@ -121,7 +118,6 @@ async fn main() {
                 auth::show_status();
             }
         },
-        #[cfg(feature = "mcp")]
         Some(Commands::Mcp { action }) => match action {
             McpAction::List { resolve } => mcp::cli_list_servers(resolve),
             McpAction::Status => mcp::cli_show_status().await,

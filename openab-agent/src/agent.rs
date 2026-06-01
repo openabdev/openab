@@ -1,11 +1,9 @@
 use anyhow::Result;
-#[cfg(feature = "mcp")]
 use serde::Deserialize;
 use std::path::PathBuf;
 use tracing::{debug, info};
 
 use crate::llm::{ContentBlock, LlmEvent, LlmProvider, Message, ToolDef};
-#[cfg(feature = "mcp")]
 use crate::mcp::{self, McpRuntimeManager};
 use crate::skills;
 use crate::tools;
@@ -20,7 +18,6 @@ You have these tools available:
 
 Be direct and concise. Execute tasks immediately rather than explaining what you would do. When you need to understand code, read the relevant files first."#;
 
-#[cfg(feature = "mcp")]
 const MCP_SYSTEM_PROMPT_APPENDIX: &str = "\n\nAdditional tool:\n\
     - mcp: Talk to configured MCP servers. Call `mcp(action=\"list_servers\")` \
     to see what's configured, then `mcp(action=\"list_tools\", server=...)` to \
@@ -38,7 +35,6 @@ pub struct Agent {
     working_dir: PathBuf,
     system_prompt: String,
     tools: Vec<ToolDef>,
-    #[cfg(feature = "mcp")]
     mcp_manager: Option<McpRuntimeManager>,
 }
 
@@ -52,7 +48,6 @@ impl Agent {
             working_dir: PathBuf::from(working_dir),
             system_prompt,
             tools: tools::tool_definitions(),
-            #[cfg(feature = "mcp")]
             mcp_manager: None,
         }
     }
@@ -60,14 +55,10 @@ impl Agent {
     pub fn new_boxed(
         provider: Box<dyn LlmProvider>,
         working_dir: String,
-        #[cfg(feature = "mcp")] mcp_manager: Option<McpRuntimeManager>,
+        mcp_manager: Option<McpRuntimeManager>,
     ) -> Self {
-        #[cfg(feature = "mcp")]
         let has_mcp = mcp_manager.is_some();
-        #[cfg(not(feature = "mcp"))]
-        let has_mcp = false;
         let system_prompt = Self::build_system_prompt(&working_dir, has_mcp);
-        #[cfg(feature = "mcp")]
         let tools = {
             let mut t = tools::tool_definitions();
             if mcp_manager.is_some() {
@@ -75,15 +66,12 @@ impl Agent {
             }
             t
         };
-        #[cfg(not(feature = "mcp"))]
-        let tools = tools::tool_definitions();
         Self {
             provider,
             messages: Vec::new(),
             working_dir: PathBuf::from(working_dir),
             system_prompt,
             tools,
-            #[cfg(feature = "mcp")]
             mcp_manager,
         }
     }
@@ -91,8 +79,6 @@ impl Agent {
     /// Run the agent with a user prompt, executing tool calls until completion.
     /// Returns the final text response.
     fn build_system_prompt(working_dir: &str, mcp_enabled: bool) -> String {
-        #[cfg(not(feature = "mcp"))]
-        let _ = mcp_enabled;
         let wd = std::path::Path::new(working_dir);
         let agents_md = wd.join("AGENTS.md");
         let custom = std::fs::read_to_string(&agents_md).unwrap_or_default();
@@ -103,7 +89,6 @@ impl Agent {
             format!("{}\n\n---\n\n{}", custom.trim(), SYSTEM_PROMPT)
         };
 
-        #[cfg(feature = "mcp")]
         let base = if mcp_enabled {
             format!("{base}{MCP_SYSTEM_PROMPT_APPENDIX}")
         } else {
@@ -233,7 +218,6 @@ impl Agent {
     /// the routing here (rather than inside `tools.rs`) lets `tools.rs` stay
     /// stateless and free of MCP/feature plumbing.
     async fn execute_tool_call(&self, name: &str, input: &serde_json::Value) -> Result<String> {
-        #[cfg(feature = "mcp")]
         if name == mcp::MCP_TOOL_NAME {
             let Some(manager) = self.mcp_manager.as_ref() else {
                 return Err(anyhow::anyhow!(

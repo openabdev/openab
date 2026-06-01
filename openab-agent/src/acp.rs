@@ -1,6 +1,5 @@
 use crate::agent::Agent;
 use crate::llm::AnthropicProvider;
-#[cfg(feature = "mcp")]
 use crate::mcp::{self, McpRuntimeManager};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -37,7 +36,6 @@ pub struct AcpServer {
     // TODO(v0.2): add session TTL and periodic cleanup to prevent OOM
     sessions: HashMap<String, Agent>,
     working_dir: String,
-    #[cfg(feature = "mcp")]
     mcp_manager: Option<McpRuntimeManager>,
 }
 
@@ -48,7 +46,6 @@ impl AcpServer {
             working_dir: std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| "/tmp".to_string()),
-            #[cfg(feature = "mcp")]
             mcp_manager: mcp::load_runtime_or_warn(),
         }
     }
@@ -160,12 +157,7 @@ impl AcpServer {
             }
         };
 
-        let agent = Agent::new_boxed(
-            provider,
-            self.working_dir.clone(),
-            #[cfg(feature = "mcp")]
-            self.mcp_manager.clone(),
-        );
+        let agent = Agent::new_boxed(provider, self.working_dir.clone(), self.mcp_manager.clone());
         self.sessions.insert(session_id.clone(), agent);
         let resp = JsonRpcResponse {
             jsonrpc: "2.0",

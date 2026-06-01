@@ -59,9 +59,6 @@ impl TokenStore {
 /// `mcp-pending:<server>`. `token_url` + `provider_name` are snapshotted
 /// up front so a config edit between init and finish can't redirect the
 /// token exchange.
-///
-/// Unconditionally compiled (not behind `mcp` feature) so a non-mcp build
-/// can still parse + round-trip an `auth.json` containing pending entries.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingPasteLogin {
     pub verifier: String,
@@ -197,7 +194,6 @@ fn save_tokens(store: &TokenStore) -> Result<()> {
 /// overrides. Returns the codex entry for `key = "codex"`, but prefer
 /// `load_tokens()` for that path — this helper exists for MCP
 /// server-namespaced lookups (ADR §6.1).
-#[cfg(feature = "mcp")]
 pub fn load_namespaced_token_at(path: &Path, key: &str) -> Result<TokenStore> {
     let map =
         read_auth_file(path).map_err(|_| anyhow!("No credentials found at {}", path.display()))?;
@@ -213,19 +209,16 @@ pub fn load_namespaced_token_at(path: &Path, key: &str) -> Result<TokenStore> {
 /// without `$HOME` overrides. Read-modify-write on a single file: callers
 /// in the same process must serialize themselves (the lifecycle manager
 /// already does per ADR §5.7).
-#[cfg(feature = "mcp")]
 pub fn save_namespaced_token_at(path: &Path, key: &str, store: &TokenStore) -> Result<()> {
     let mut map = read_auth_file(path).unwrap_or_default();
     map.insert(key.to_string(), AuthEntry::Token(store.clone()));
     write_auth_file(path, &map)
 }
 
-#[cfg(feature = "mcp")]
 const PENDING_PREFIX: &str = "mcp-pending:";
 
 /// `auth.json` key for an in-flight paste-back login (ADR §6.4 namespace).
 /// Single construction site so read/write callers can't drift on the literal.
-#[cfg(feature = "mcp")]
 pub fn pending_key(name: &str) -> String {
     format!("{PENDING_PREFIX}{name}")
 }
@@ -238,7 +231,6 @@ pub fn pending_key(name: &str) -> String {
 /// Synchronous filesystem read: the pending map is tiny (~one entry per
 /// concurrent login), so blocking is trivial and avoids `spawn_blocking`
 /// overhead — callers may invoke this from an async context directly.
-#[cfg(feature = "mcp")]
 pub fn list_pending_logins_at(path: &Path) -> Vec<String> {
     let Ok(map) = read_auth_file(path) else {
         return Vec::new();
@@ -259,7 +251,6 @@ pub fn list_pending_logins_at(path: &Path) -> Vec<String> {
 /// collide, but a hand-edited file would. `path` is injected so the
 /// runtime manager can point tests at a tempdir; production callers pass
 /// `auth_path()`.
-#[cfg(feature = "mcp")]
 pub fn load_pending_login(path: &Path, key: &str) -> Result<PendingPasteLogin> {
     let map =
         read_auth_file(path).map_err(|_| anyhow!("No credentials found at {}", path.display()))?;
@@ -272,7 +263,6 @@ pub fn load_pending_login(path: &Path, key: &str) -> Result<PendingPasteLogin> {
 
 /// Persist a `PendingPasteLogin` under `mcp-pending:<server>` (ADR §6.4).
 /// Read-modify-write — same serialization caveat as `save_namespaced_token`.
-#[cfg(feature = "mcp")]
 pub fn save_pending_login(path: &Path, key: &str, val: &PendingPasteLogin) -> Result<()> {
     let mut map = read_auth_file(path).unwrap_or_default();
     map.insert(key.to_string(), AuthEntry::Pending(val.clone()));
@@ -281,7 +271,6 @@ pub fn save_pending_login(path: &Path, key: &str, val: &PendingPasteLogin) -> Re
 
 /// Remove a pending-login entry (consumed on successful `complete_login`,
 /// expired entry GC, or `mcp logout`). Idempotent — missing key is OK.
-#[cfg(feature = "mcp")]
 pub fn remove_pending_login(path: &Path, key: &str) -> Result<()> {
     let mut map = match read_auth_file(path) {
         Ok(m) => m,
@@ -838,7 +827,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "mcp")]
     #[test]
     fn pending_login_helpers_round_trip_via_injected_path() {
         // Tempdir path injected directly — no HOME-env shimming, so this
@@ -853,7 +841,6 @@ mod tests {
         assert!(load_pending_login(&path, key).is_err());
     }
 
-    #[cfg(feature = "mcp")]
     #[test]
     fn list_pending_logins_strips_prefix_sorts_and_skips_tokens() {
         let dir = tempfile::tempdir().unwrap();
@@ -874,7 +861,6 @@ mod tests {
         assert_eq!(names, vec!["linear".to_string(), "zed-mcp".to_string()]);
     }
 
-    #[cfg(feature = "mcp")]
     #[test]
     fn list_pending_logins_returns_empty_on_missing_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -882,7 +868,6 @@ mod tests {
         assert!(list_pending_logins_at(&path).is_empty());
     }
 
-    #[cfg(feature = "mcp")]
     #[test]
     fn load_namespaced_token_errors_on_pending_entry() {
         let dir = tempfile::tempdir().unwrap();
