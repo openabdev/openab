@@ -101,6 +101,7 @@ pub enum ResolvedProvider {
         token_url: String,
         client_id: Option<String>,
         device_authorization_endpoint: Option<String>,
+        redirect_uri: Option<String>,
         scopes: Vec<String>,
     },
 }
@@ -176,6 +177,7 @@ fn resolve_custom(provider: &str, cfg: &OAuthConfig) -> Result<ResolvedProvider>
         token_url,
         client_id: cfg.client_id.clone(),
         device_authorization_endpoint: cfg.device_authorization_endpoint.clone(),
+        redirect_uri: cfg.redirect_uri.clone(),
         scopes: cfg.scopes.clone(),
     })
 }
@@ -289,6 +291,7 @@ mod tests {
             client_id,
             device_authorization_endpoint,
             scopes,
+            ..
         } = resolve(&cfg).unwrap()
         else {
             panic!("expected Custom variant");

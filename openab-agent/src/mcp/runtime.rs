@@ -537,9 +537,24 @@ impl McpRuntimeManager {
                     "mcp server {name:?} has a device endpoint; use device flow"
                 ));
             }
-            ResolvedProvider::Custom { .. } => {
+            ResolvedProvider::Custom {
+                client_id: Some(client_id),
+                redirect_uri: Some(redirect_uri),
+                ..
+            } => (client_id.clone(), redirect_uri.clone()),
+            ResolvedProvider::Custom {
+                client_id: None, ..
+            } => {
                 return Err(anyhow!(
-                    "mcp server {name:?}: custom-provider paste-back not yet supported"
+                    "mcp server {name:?} custom paste-back requires `oauth.client_id` in mcp.json"
+                ));
+            }
+            ResolvedProvider::Custom {
+                redirect_uri: None, ..
+            } => {
+                return Err(anyhow!(
+                    "mcp server {name:?} custom paste-back requires `oauth.redirect_uri` in mcp.json \
+                     (must match the redirect URL pre-registered with the provider)"
                 ));
             }
         };
@@ -1175,12 +1190,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_paste_login_rejects_custom_provider_for_now() {
+    async fn start_paste_login_rejects_custom_without_redirect_uri() {
         let cfg: McpConfig = serde_json::from_str(linear_custom_cfg()).unwrap();
         let (mgr, _dir) = mgr_with_tempdir(cfg);
         let err = start_login_err(&mgr, "linear").await;
-        assert!(err.contains("custom-provider"), "got: {err}");
+        assert!(err.contains("oauth.redirect_uri"), "got: {err}");
         assert!(mgr.pending_paste_login("linear").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn start_paste_login_rejects_custom_without_client_id() {
+        let json = r#"{
+            "mcpServers": {
+                "linear": {
+                    "type": "http",
+                    "url": "https://mcp.linear.app/mcp",
+                    "oauth": {
+                        "provider": "linear",
+                        "authorize_url": "https://linear.app/oauth/authorize",
+                        "token_url": "https://api.linear.app/oauth/token",
+                        "redirect_uri": "https://example.com/cb"
+                    }
+                }
+            }
+        }"#;
+        let cfg: McpConfig = serde_json::from_str(json).unwrap();
+        let (mgr, _dir) = mgr_with_tempdir(cfg);
+        let err = start_login_err(&mgr, "linear").await;
+        assert!(err.contains("oauth.client_id"), "got: {err}");
+        assert!(mgr.pending_paste_login("linear").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn start_paste_login_custom_with_client_id_and_redirect_uri_succeeds() {
+        let json = r#"{
+            "mcpServers": {
+                "linear": {
+                    "type": "http",
+                    "url": "https://mcp.linear.app/mcp",
+                    "oauth": {
+                        "provider": "linear",
+                        "authorize_url": "https://linear.app/oauth/authorize",
+                        "token_url": "https://api.linear.app/oauth/token",
+                        "client_id": "linear-client",
+                        "redirect_uri": "https://example.com/cb",
+                        "scopes": ["read"]
+                    }
+                }
+            }
+        }"#;
+        let cfg: McpConfig = serde_json::from_str(json).unwrap();
+        let (mgr, _dir) = mgr_with_tempdir(cfg);
+        let start = mgr.start_paste_login("linear").await.unwrap();
+        assert!(start.authorize_url.contains("client_id=linear-client"));
+        assert!(start.authorize_url.contains("redirect_uri=https"));
+        let pending = mgr.pending_paste_login("linear").await.unwrap();
+        assert_eq!(pending.state, start.state);
+        assert_eq!(pending.provider_name, "linear");
     }
 
     #[tokio::test]

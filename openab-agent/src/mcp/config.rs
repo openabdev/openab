@@ -78,6 +78,12 @@ pub struct OAuthConfig {
     pub client_id: Option<String>,
     #[serde(default)]
     pub device_authorization_endpoint: Option<String>,
+    /// Required for the paste-back branch of §6.4 on custom providers.
+    /// Must match what's pre-registered with the provider's OAuth app
+    /// (built-ins pin their callback in `ProviderSpec`). Ignored by the
+    /// device-code branch.
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
     #[serde(default)]
     pub discovery: bool,
     #[serde(default)]
