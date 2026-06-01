@@ -1,5 +1,6 @@
 //! Native MCP client. See `docs/adr/openab-agent-mcp.md`.
 
+pub mod breaker;
 pub mod config;
 pub mod flow;
 pub mod meta_tool;
