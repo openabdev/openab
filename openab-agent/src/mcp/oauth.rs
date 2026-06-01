@@ -180,8 +180,8 @@ fn resolve_custom(provider: &str, cfg: &OAuthConfig) -> Result<ResolvedProvider>
 mod tests {
     use super::*;
 
-    // Both env-touching tests below race the same OS env var; serialize
-    // them per the runbook's Tick 24 lesson (acp.rs ANTHROPIC_API_KEY race).
+    // Both env-touching tests below race the same OS env var — `set_var`
+    // is unsound under concurrent reads, so serialize them.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]

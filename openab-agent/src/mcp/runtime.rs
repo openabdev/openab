@@ -105,7 +105,7 @@ pub struct McpRuntimeManager {
     handles: Arc<RwLock<HashMap<String, ServerHandle>>>,
     /// `auth.json` location used for `mcp-pending:<server>` persistence.
     /// Injectable so tests can point at a tempdir instead of `$HOME`,
-    /// avoiding cross-module HOME-env races (Tick 24 lesson + ADR §6.4).
+    /// avoiding cross-module HOME-env races (ADR §6.4).
     auth_path: PathBuf,
 }
 
@@ -229,10 +229,10 @@ impl McpRuntimeManager {
     }
 
     /// Read the on-disk pending paste-login for `name`. `None` if there's
-    /// no entry or the file is unreadable. Used by `complete_login` to
-    /// drive flow continuation and by `mcp status` to surface a partially
-    /// completed login (next slice will add the status surfacing).
-    #[allow(dead_code)] // wired in next slice (mcp status surfacing)
+    /// no entry or the file is unreadable. `mcp status` surfaces in-flight
+    /// logins via `list_pending_logins_at`; this accessor is the single-
+    /// entry counterpart for callers that need the full snapshot.
+    #[allow(dead_code)] // accessor for future per-entry status detail
     pub async fn pending_paste_login(&self, name: &str) -> Option<PendingPasteLogin> {
         load_pending_login(&self.auth_path, &pending_key(name)).ok()
     }
@@ -245,8 +245,10 @@ impl McpRuntimeManager {
     /// transitions `NeedsAuth → Disconnected` so the next `connect()`
     /// dials the now-authenticated transport.
     pub async fn complete_login(&self, name: &str, redirect_url: &str) -> Result<()> {
-        let pending = load_pending_login(&self.auth_path, &pending_key(name))
-            .map_err(|_| anyhow!("no pending login for {name:?}; run `mcp login {name}` first"))?;
+        let pending =
+            load_pending_login(&self.auth_path, &pending_key(name)).with_context(|| {
+                format!("no pending login for {name:?}; run `mcp login {name}` first")
+            })?;
         let code = parse_paste_callback(redirect_url, &pending.state)?;
         let (_provider, client_id, redirect_uri) = self.resolve_paste_client(name).await?;
         let resp = post_token_exchange(
@@ -270,27 +272,12 @@ impl McpRuntimeManager {
         pending: &PendingPasteLogin,
         resp: TokenExchangeResponse,
     ) -> Result<()> {
-        // `expires_in: None` means the provider didn't advertise a
-        // lifetime (Figma, Sentry, xAI as of writing). Falling back to
-        // `now + 0` would set the token "already expired",
-        // triggering an immediate refresh on the next
-        // connect() — which fails closed if refresh_token is also None,
-        // bouncing the user back to NeedsAuth seconds after a successful
-        // login. Treat absent `expires_in` as a long-lived token via the
-        // u64::MAX sentinel: `is_expired` will return false until the
-        // provider eventually 401s on use (at which point the user runs
-        // `mcp login` again, the correct UX for non-refreshable tokens).
-        let expires_at = match resp.expires_in {
-            Some(secs) => now_secs().saturating_add(secs),
-            None => u64::MAX,
-        };
-        let store = TokenStore {
-            access_token: resp.access_token,
-            refresh_token: resp.refresh_token.unwrap_or_default(),
-            expires_at,
-            token_endpoint: pending.token_url.clone(),
-            provider: pending.provider_name.clone(),
-        };
+        let store = build_token_store(
+            resp,
+            pending.token_url.clone(),
+            pending.provider_name.clone(),
+            None,
+        );
         save_namespaced_token_at(&self.auth_path, name, &store)?;
         remove_pending_login(&self.auth_path, &pending_key(name))?;
         let mut handles = self.handles.write().await;
@@ -475,8 +462,7 @@ impl McpRuntimeManager {
     }
 
     /// Pure-persistence tail of `run_device_poll_loop` on RFC 8628 §3.5
-    /// Success. Mirrors `finish_login`'s `u64::MAX` sentinel for absent
-    /// `expires_in`.
+    /// Success.
     async fn finalize_device_login(
         &self,
         name: &str,
@@ -484,17 +470,7 @@ impl McpRuntimeManager {
         token_url: &str,
         resp: TokenExchangeResponse,
     ) {
-        let expires_at = match resp.expires_in {
-            Some(secs) => now_secs().saturating_add(secs),
-            None => u64::MAX,
-        };
-        let store = TokenStore {
-            access_token: resp.access_token,
-            refresh_token: resp.refresh_token.unwrap_or_default(),
-            expires_at,
-            token_endpoint: token_url.to_string(),
-            provider: provider_name.to_string(),
-        };
+        let store = build_token_store(resp, token_url.to_string(), provider_name.to_string(), None);
         if let Err(e) = save_namespaced_token_at(&self.auth_path, name, &store) {
             self.mark_device_login_failed(name, e).await;
             return;
@@ -589,20 +565,12 @@ impl McpRuntimeManager {
         let (_provider, client_id, _redirect_uri) = self.resolve_paste_client(name).await?;
         let resp =
             post_token_refresh(&store.token_endpoint, &client_id, &store.refresh_token).await?;
-        let new_refresh = resp
-            .refresh_token
-            .unwrap_or_else(|| store.refresh_token.clone());
-        let expires_at = match resp.expires_in {
-            Some(secs) => now_secs().saturating_add(secs),
-            None => u64::MAX,
-        };
-        let new_store = TokenStore {
-            access_token: resp.access_token,
-            refresh_token: new_refresh,
-            expires_at,
-            token_endpoint: store.token_endpoint.clone(),
-            provider: store.provider.clone(),
-        };
+        let new_store = build_token_store(
+            resp,
+            store.token_endpoint.clone(),
+            store.provider.clone(),
+            Some(store.refresh_token.clone()),
+        );
         save_namespaced_token_at(&self.auth_path, name, &new_store)?;
         Ok(new_store)
     }
@@ -738,6 +706,33 @@ struct TokenExchangeResponse {
     refresh_token: Option<String>,
     #[serde(default)]
     expires_in: Option<u64>,
+}
+
+/// Lift a token-endpoint response into the on-disk `TokenStore` shape.
+/// `expires_in: None` → `u64::MAX` sentinel (treated as never-expires by
+/// `TokenStore::is_expired`); a `now + 0` would mark the token already
+/// expired and bounce the user back through login on the next connect().
+/// `fallback_refresh` preserves the previous refresh token on rotation
+/// when the provider omits one (ADR §6.6 Google-style); fresh logins
+/// pass `None` so an omitted refresh token records as empty.
+fn build_token_store(
+    resp: TokenExchangeResponse,
+    token_endpoint: String,
+    provider: String,
+    fallback_refresh: Option<String>,
+) -> TokenStore {
+    let expires_at = match resp.expires_in {
+        Some(secs) => now_secs().saturating_add(secs),
+        None => u64::MAX,
+    };
+    let refresh_token = resp.refresh_token.or(fallback_refresh).unwrap_or_default();
+    TokenStore {
+        access_token: resp.access_token,
+        refresh_token,
+        expires_at,
+        token_endpoint,
+        provider,
+    }
 }
 
 /// Shared POST helper for both `post_token_exchange` (RFC 6749 §4.1.3)
@@ -1125,8 +1120,8 @@ mod tests {
         }
     }
 
-    // start_paste_login + builtin_client_id race on the same env var.
-    // Same fix as oauth.rs / acp.rs (Tick 24 lesson).
+    // start_paste_login + builtin_client_id race on the same OS env var —
+    // `set_var` is unsound under concurrent reads, so serialize them.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn linear_custom_cfg() -> &'static str {

@@ -74,11 +74,8 @@ pub struct PendingPasteLogin {
 /// `access_token`, `PendingPasteLogin` has required `verifier` — the
 /// shapes are disjoint, so deserialization picks the right variant
 /// without an explicit tag (and existing files stay byte-compatible).
-///
-/// Per Mira's Tick 39 review: option-A (repurposing TokenStore fields for
-/// pending state) would have made the refresh task treat pending entries
-/// as "expired tokens" and loop on them. The untagged enum keeps the two
-/// state machines completely separate.
+/// Keeping the two as distinct variants stops the refresh task from
+/// treating pending entries as "expired tokens" and looping on them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum AuthEntry {
@@ -172,17 +169,11 @@ fn save_tokens(store: &TokenStore) -> Result<()> {
     write_auth_file(&path, &map)
 }
 
-/// Look up the credential at `key` (e.g. `mcp:linear`). Returns the codex
-/// entry for `key = "codex"`, but prefer `load_tokens()` for that path —
-/// this helper exists for MCP server-namespaced lookups (ADR §6.1).
-#[cfg(feature = "mcp")]
-#[allow(dead_code)] // wired in next slice (mcp/oauth.rs login flow)
-pub fn load_namespaced_token(key: &str) -> Result<TokenStore> {
-    load_namespaced_token_at(&auth_path(), key)
-}
-
-/// Path-injected sibling of `load_namespaced_token` so tests + the runtime
-/// manager can target a tempdir without `$HOME` overrides.
+/// Look up the credential at `key` (e.g. `mcp:linear`). `path` is injected
+/// so the runtime manager + tests can target a tempdir without `$HOME`
+/// overrides. Returns the codex entry for `key = "codex"`, but prefer
+/// `load_tokens()` for that path — this helper exists for MCP
+/// server-namespaced lookups (ADR §6.1).
 #[cfg(feature = "mcp")]
 pub fn load_namespaced_token_at(path: &Path, key: &str) -> Result<TokenStore> {
     let map =
@@ -195,16 +186,10 @@ pub fn load_namespaced_token_at(path: &Path, key: &str) -> Result<TokenStore> {
 }
 
 /// Insert or replace the credential at `key`, preserving all other entries.
-/// Read-modify-write on a single file: callers in the same process must
-/// serialize themselves (the lifecycle manager already does per ADR §5.7).
-#[cfg(feature = "mcp")]
-#[allow(dead_code)] // wired in next slice (mcp/oauth.rs login flow)
-pub fn save_namespaced_token(key: &str, store: &TokenStore) -> Result<()> {
-    save_namespaced_token_at(&auth_path(), key, store)
-}
-
-/// Path-injected sibling of `save_namespaced_token` so tests + the runtime
-/// manager can target a tempdir without `$HOME` overrides.
+/// `path` is injected so the runtime manager + tests can target a tempdir
+/// without `$HOME` overrides. Read-modify-write on a single file: callers
+/// in the same process must serialize themselves (the lifecycle manager
+/// already does per ADR §5.7).
 #[cfg(feature = "mcp")]
 pub fn save_namespaced_token_at(path: &Path, key: &str, store: &TokenStore) -> Result<()> {
     let mut map = read_auth_file(path).unwrap_or_default();
@@ -287,27 +272,6 @@ pub fn remove_pending_login(path: &Path, key: &str) -> Result<()> {
         return Ok(());
     }
     write_auth_file(path, &map)
-}
-
-/// Remove the credential at `key`. Idempotent — missing key is not an
-/// error. If the map becomes empty, the file is deleted so `mcp doctor`
-/// can report "no credentials" instead of "empty file".
-#[cfg(feature = "mcp")]
-#[allow(dead_code)] // wired in next slice (mcp logout / revoked-refresh recovery)
-pub fn remove_namespaced_token(key: &str) -> Result<()> {
-    let path = auth_path();
-    let mut map = match read_auth_file(&path) {
-        Ok(m) => m,
-        Err(_) => return Ok(()),
-    };
-    if map.remove(key).is_none() {
-        return Ok(());
-    }
-    if map.is_empty() {
-        let _ = std::fs::remove_file(&path);
-        return Ok(());
-    }
-    write_auth_file(&path, &map)
 }
 
 pub async fn get_valid_token() -> Result<String> {

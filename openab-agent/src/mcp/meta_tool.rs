@@ -74,10 +74,10 @@ async fn call_tool(
     tool: &str,
     arguments: Value,
 ) -> Result<Value> {
-    // Lenient arg coercion per Mira's Tick 18 review: LLMs often send
-    // `null` or omit `arguments` for no-arg tools; rejecting those would
-    // make zero-arg calls fragile. Only real type errors (string, number,
-    // array, bool) are refused.
+    // Lenient arg coercion: LLMs often send `null` or omit `arguments`
+    // for no-arg tools; rejecting those would make zero-arg calls
+    // fragile. Only real type errors (string, number, array, bool)
+    // are refused.
     let args_map = match arguments {
         Value::Object(map) => map,
         Value::Null => serde_json::Map::new(),
