@@ -177,6 +177,15 @@ impl Adapter {
         }
     }
 
+    fn last_n_lines(text: &str, line_count: usize) -> String {
+        if line_count == 0 || text.is_empty() {
+            return String::new();
+        }
+        let lines: Vec<&str> = text.split_inclusive('\n').collect();
+        let start = lines.len().saturating_sub(line_count);
+        lines[start..].concat()
+    }
+
     fn extract_delta(
         emitted_line_count: usize,
         full_text: &str,
@@ -191,9 +200,9 @@ impl Adapter {
         }
         eprintln!(
             "[agy-acp] WARN: agy stdout line count shrank; \
-             sending full output and resetting line-count baseline"
+             sending only the last 5 lines and resetting line-count baseline"
         );
-        full_text.to_string()
+        Self::last_n_lines(full_text, 5)
     }
 
     fn evict_if_needed(&mut self) {
@@ -562,14 +571,20 @@ mod tests {
 
     #[test]
     fn test_extract_delta_returns_full_when_line_count_shrinks() {
-        let result = Adapter::extract_delta(2, "fresh response", true);
-        assert_eq!(result, "fresh response");
+        let result = Adapter::extract_delta(7, "l1\nl2\nl3\nl4\nl5\nl6\n", true);
+        assert_eq!(result, "l2\nl3\nl4\nl5\nl6\n");
     }
 
     #[test]
     fn test_extract_delta_preserves_leading_spaces() {
         let result = Adapter::extract_delta(1, "hello\n  indented code", true);
         assert_eq!(result, "  indented code");
+    }
+
+    #[test]
+    fn test_extract_delta_returns_all_lines_when_fewer_than_five_on_fallback() {
+        let result = Adapter::extract_delta(4, "l1\nl2\nl3\n", true);
+        assert_eq!(result, "l1\nl2\nl3\n");
     }
 
     #[test]
