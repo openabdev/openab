@@ -272,8 +272,8 @@ impl McpRuntimeManager {
     ) -> Result<()> {
         // `expires_in: None` means the provider didn't advertise a
         // lifetime (Figma, Sentry, xAI as of writing). Falling back to
-        // `now + 0` (Mira's Tick 46 catch) would set the token "already
-        // expired", triggering an immediate refresh on the next
+        // `now + 0` would set the token "already expired",
+        // triggering an immediate refresh on the next
         // connect() — which fails closed if refresh_token is also None,
         // bouncing the user back to NeedsAuth seconds after a successful
         // login. Treat absent `expires_in` as a long-lived token via the
@@ -417,6 +417,18 @@ impl McpRuntimeManager {
         initial_interval: u64,
         expires_in_secs: u64,
     ) {
+        // One client across the whole loop — `reqwest::Client` is an
+        // `Arc`-backed connection pool, so reusing it keeps TLS / TCP
+        // handshakes amortized across the dozens-to-hundreds of polls a
+        // 30-minute device-flow window can produce.
+        let client = match reqwest::Client::builder().build() {
+            Ok(c) => c,
+            Err(e) => {
+                self.mark_device_login_failed(name, anyhow!("build reqwest client: {e}"))
+                    .await;
+                return;
+            }
+        };
         let deadline = now_secs().saturating_add(expires_in_secs);
         let mut interval = initial_interval;
         loop {
@@ -429,13 +441,14 @@ impl McpRuntimeManager {
                 .await;
                 return;
             }
-            let outcome = match post_device_token_poll(token_url, client_id, device_code).await {
-                Ok(o) => o,
-                Err(e) => {
-                    self.mark_device_login_failed(name, e).await;
-                    return;
-                }
-            };
+            let outcome =
+                match post_device_token_poll(&client, token_url, client_id, device_code).await {
+                    Ok(o) => o,
+                    Err(e) => {
+                        self.mark_device_login_failed(name, e).await;
+                        return;
+                    }
+                };
             match outcome {
                 DevicePollOutcome::Success(resp) => {
                     self.finalize_device_login(name, provider_name, token_url, resp)
@@ -463,7 +476,7 @@ impl McpRuntimeManager {
 
     /// Pure-persistence tail of `run_device_poll_loop` on RFC 8628 §3.5
     /// Success. Mirrors `finish_login`'s `u64::MAX` sentinel for absent
-    /// `expires_in` (Mira Tick 46 catch).
+    /// `expires_in`.
     async fn finalize_device_login(
         &self,
         name: &str,
@@ -883,13 +896,11 @@ async fn post_device_authorization(
 /// off). Returns a `DevicePollOutcome` so the loop can distinguish the
 /// four RFC 8628 §3.5 flow states from real errors.
 async fn post_device_token_poll(
+    client: &reqwest::Client,
     token_url: &str,
     client_id: &str,
     device_code: &str,
 ) -> Result<DevicePollOutcome> {
-    let client = reqwest::Client::builder()
-        .build()
-        .context("build reqwest client")?;
     let resp = client
         .post(token_url)
         .form(&[
@@ -1526,7 +1537,7 @@ mod tests {
         assert!(token.refresh_token.is_empty());
         // Long-lived sentinel: no `expires_in` from the provider must NOT
         // cause an immediate-expiry / refresh-loop / NeedsAuth bounce on
-        // first use (Mira Tick 46 catch).
+        // first use.
         assert_eq!(token.expires_at, u64::MAX);
     }
 

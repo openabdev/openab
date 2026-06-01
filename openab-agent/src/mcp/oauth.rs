@@ -3,12 +3,6 @@
 //! (§6.4) lands in subsequent slices; this module is the data layer the
 //! login / refresh code will dispatch through.
 
-// The §6.4 login slice is the first prod caller — until then, every item
-// here is reachable only via the unit tests below, so `cargo clippy
-// --features mcp -- -D warnings` would flag them as dead. Module-scope
-// allow rather than per-item once that slice lands.
-#![allow(dead_code)]
-
 use anyhow::{anyhow, Result};
 
 use super::config::OAuthConfig;

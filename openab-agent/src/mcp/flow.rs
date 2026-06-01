@@ -62,7 +62,6 @@ pub fn init_paste_authorize(
 /// mismatched `state` indicates CSRF / cross-flow contamination and MUST
 /// reject the exchange before any token-endpoint round-trip. Tolerates
 /// extra query params (vendor-specific tracking, `iss`, etc.).
-#[allow(dead_code)] // wired in next slice (runtime::complete_login)
 pub fn parse_paste_callback(redirect_url: &str, expected_state: &str) -> Result<String> {
     let url = Url::parse(redirect_url).map_err(|e| anyhow!("invalid redirect URL: {e}"))?;
     let mut code = None;

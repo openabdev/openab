@@ -181,9 +181,9 @@ pub fn load_namespaced_token(key: &str) -> Result<TokenStore> {
     load_namespaced_token_at(&auth_path(), key)
 }
 
-/// Path-injected sibling of `load_namespaced_token` (Tick 42 lesson).
+/// Path-injected sibling of `load_namespaced_token` so tests + the runtime
+/// manager can target a tempdir without `$HOME` overrides.
 #[cfg(feature = "mcp")]
-#[allow(dead_code)] // wired in next slice (mcp login regression test)
 pub fn load_namespaced_token_at(path: &Path, key: &str) -> Result<TokenStore> {
     let map =
         read_auth_file(path).map_err(|_| anyhow!("No credentials found at {}", path.display()))?;
@@ -204,7 +204,7 @@ pub fn save_namespaced_token(key: &str, store: &TokenStore) -> Result<()> {
 }
 
 /// Path-injected sibling of `save_namespaced_token` so tests + the runtime
-/// manager can target a tempdir without `$HOME` overrides (Tick 42 lesson).
+/// manager can target a tempdir without `$HOME` overrides.
 #[cfg(feature = "mcp")]
 pub fn save_namespaced_token_at(path: &Path, key: &str, store: &TokenStore) -> Result<()> {
     let mut map = read_auth_file(path).unwrap_or_default();
