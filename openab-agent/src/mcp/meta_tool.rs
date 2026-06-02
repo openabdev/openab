@@ -186,7 +186,13 @@ async fn list_servers(manager: &McpRuntimeManager) -> Value {
 
 fn status_label(status: &ServerStatus) -> &'static str {
     match status {
-        ServerStatus::Disconnected => "disconnected",
+        // `Disconnected` is the cold/idle state — config loaded but the
+        // child process hasn't been spawned yet. Lazy connect happens on
+        // the first `call` / `list_tools`, so this is NOT a failure mode.
+        // Earlier label `"disconnected"` confused LLMs into reporting the
+        // server as broken on a plain `list_servers` (PR #959 F1 PoC
+        // observation). `"failed"` already covers the error case below.
+        ServerStatus::Disconnected => "idle",
         ServerStatus::Connecting => "connecting",
         ServerStatus::Connected => "connected",
         ServerStatus::Failed(_) => "failed",
@@ -230,7 +236,7 @@ mod tests {
             .map(|e| (e["name"].as_str().unwrap(), e))
             .collect();
         assert_eq!(by_name["fs"]["transport"], "stdio");
-        assert_eq!(by_name["fs"]["status"], "disconnected");
+        assert_eq!(by_name["fs"]["status"], "idle");
         assert_eq!(by_name["linear"]["transport"], "http");
     }
 
@@ -358,9 +364,46 @@ mod tests {
         let entries = result.as_array().unwrap();
         assert_eq!(entries.len(), 2);
         for e in entries {
-            assert_eq!(e["status"], "disconnected");
+            assert_eq!(e["status"], "idle");
             assert!(e["last_error"].is_null());
         }
+    }
+
+    #[tokio::test]
+    async fn status_labels_failed_servers_with_last_error() {
+        // Status uses a `Failed` state distinct from `idle`; the LLM should
+        // see the failure surfaced explicitly via `status: "failed"` +
+        // `last_error: <msg>` rather than collapsing into `idle`.
+        let mgr = mgr_from(
+            r#"{
+                "mcpServers": {
+                    "broken": {
+                        "type": "stdio",
+                        "command": "/nonexistent/openab-mcp-test-stub-zzz"
+                    }
+                }
+            }"#,
+        );
+        // Trip the Failed state via a connect attempt that will fail at spawn.
+        let _ = dispatch(
+            &mgr,
+            Action::Call {
+                server: "broken".into(),
+                tool: "anything".into(),
+                arguments: serde_json::json!({}),
+            },
+        )
+        .await;
+        let result = dispatch(&mgr, Action::Status { server: None })
+            .await
+            .unwrap();
+        let entries = result.as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["status"], "failed");
+        assert!(
+            !entries[0]["last_error"].is_null(),
+            "Failed status should carry last_error"
+        );
     }
 
     #[tokio::test]

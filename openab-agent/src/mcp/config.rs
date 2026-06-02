@@ -47,6 +47,13 @@ impl ServerConfig {
             ServerConfig::Http { .. } => "http",
         }
     }
+
+    /// `true` when the server is HTTP with an `oauth` block — used by the
+    /// system-prompt catalogue (PR #959 F1 discovery slice) to hint that
+    /// the LLM should ask the user to run `mcp login <name>` before calling.
+    pub fn requires_oauth(&self) -> bool {
+        matches!(self, ServerConfig::Http { oauth: Some(_), .. })
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
