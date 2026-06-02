@@ -18,11 +18,12 @@ You have these tools available:
 
 Be direct and concise. Execute tasks immediately rather than explaining what you would do. When you need to understand code, read the relevant files first."#;
 
-const MCP_SYSTEM_PROMPT_APPENDIX: &str = "\n\nAdditional tool:\n\
-    - mcp: Talk to configured MCP servers. Call `mcp(action=\"list_servers\")` \
-    to see what's configured, then `mcp(action=\"list_tools\", server=...)` to \
-    discover per-server tools. Use `mcp(action=\"help\")` only if action shapes \
-    are unclear.";
+// The MCP system-prompt appendix is generated dynamically by
+// `mcp::format_system_prompt_appendix(manager)` so the LLM sees both the
+// `mcp` tool intro AND a server catalogue (PR #959 F1 discovery slice).
+// Previously a static const here, but that hid the configured server names
+// from the LLM and produced the "fs is disconnected, I give up" failure
+// mode observed in the F1 PoC.
 
 const MAX_TOOL_LOOPS: usize = 50;
 /// Maximum number of messages to keep in context. When exceeded, oldest
@@ -41,7 +42,7 @@ pub struct Agent {
 impl Agent {
     #[cfg(test)]
     pub fn new(provider: impl LlmProvider + 'static, working_dir: String) -> Self {
-        let system_prompt = Self::build_system_prompt(&working_dir, false);
+        let system_prompt = Self::build_system_prompt(&working_dir, None);
         Self {
             provider: Box::new(provider),
             messages: Vec::new(),
@@ -57,8 +58,7 @@ impl Agent {
         working_dir: String,
         mcp_manager: Option<McpRuntimeManager>,
     ) -> Self {
-        let has_mcp = mcp_manager.is_some();
-        let system_prompt = Self::build_system_prompt(&working_dir, has_mcp);
+        let system_prompt = Self::build_system_prompt(&working_dir, mcp_manager.as_ref());
         let tools = {
             let mut t = tools::tool_definitions();
             if mcp_manager.is_some() {
@@ -76,9 +76,18 @@ impl Agent {
         }
     }
 
-    /// Run the agent with a user prompt, executing tool calls until completion.
-    /// Returns the final text response.
-    fn build_system_prompt(working_dir: &str, mcp_enabled: bool) -> String {
+    /// Build the system prompt sent on every LLM call. Composition order:
+    ///   1. base prompt (`SYSTEM_PROMPT`, optionally prefixed by project-local
+    ///      `AGENTS.md`),
+    ///   2. MCP appendix — tool intro + server catalogue (PR #959 F1
+    ///      discovery slice); only when `mcp_manager` is `Some`,
+    ///   3. skills catalogue.
+    ///
+    /// Built once at `Agent::new*` time and reused on every `call_llm`.
+    fn build_system_prompt(
+        working_dir: &str,
+        mcp_manager: Option<&McpRuntimeManager>,
+    ) -> String {
         let wd = std::path::Path::new(working_dir);
         let agents_md = wd.join("AGENTS.md");
         let custom = std::fs::read_to_string(&agents_md).unwrap_or_default();
@@ -89,8 +98,8 @@ impl Agent {
             format!("{}\n\n---\n\n{}", custom.trim(), SYSTEM_PROMPT)
         };
 
-        let base = if mcp_enabled {
-            format!("{base}{MCP_SYSTEM_PROMPT_APPENDIX}")
+        let base = if let Some(mgr) = mcp_manager {
+            format!("{base}{}", mcp::format_system_prompt_appendix(mgr))
         } else {
             base
         };
@@ -344,6 +353,55 @@ mod tests {
             }
             _ => panic!("expected ToolResult"),
         }
+    }
+
+    #[test]
+    fn build_system_prompt_includes_mcp_catalogue_when_manager_provided() {
+        // PR #959 F1 discovery slice: when an MCP manager is wired in, the
+        // system prompt must surface the configured server catalogue so the
+        // LLM knows `list_tools` is worth calling (the "fs disconnected, I
+        // give up" failure mode the static const previously caused).
+        use crate::mcp::config::McpConfig;
+        let cfg: McpConfig = serde_json::from_str(
+            r#"{
+                "mcpServers": {
+                    "fs": { "type": "stdio", "command": "mcp-server-filesystem" },
+                    "linear": {
+                        "type": "http",
+                        "url": "https://mcp.linear.app/mcp",
+                        "oauth": { "provider": "linear" }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let mgr = McpRuntimeManager::from_config(cfg);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prompt = Agent::build_system_prompt(&tmp.path().to_string_lossy(), Some(&mgr));
+
+        assert!(
+            prompt.contains("## MCP tool"),
+            "missing MCP section:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("**fs** (stdio)"),
+            "missing fs catalogue entry:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("requires `mcp login linear`"),
+            "missing OAuth login hint:\n{prompt}"
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_omits_mcp_section_when_no_manager() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prompt = Agent::build_system_prompt(&tmp.path().to_string_lossy(), None);
+        assert!(
+            !prompt.contains("## MCP tool"),
+            "MCP section leaked into prompt without manager:\n{prompt}"
+        );
     }
 
     #[tokio::test]

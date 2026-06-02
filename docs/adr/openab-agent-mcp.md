@@ -359,6 +359,26 @@ openab-agent/src/
 
 Estimated total: **500-750 LOC** (no `reload.rs`; per-session refresh handled by `McpRuntimeManager::new()` re-reading config at session start). `llm.rs` is unchanged because both Anthropic and OpenAI Responses providers consume the generic `ToolDef` abstraction.
 
+#### 5.4.1 Runtime activation & isolation choices
+
+Three intentional choices that surfaced in PR #959 review (chaodu F2 / F6 / F7) and are load-bearing enough to belong in the design contract:
+
+1. **Runtime opt-in gate (F6, env-only).** `load_runtime_or_warn()` returns `None` unless `OPENAB_AGENT_MCP={1,true,yes,on}` (case-insensitive) is set in the process env, even when `mcp.json` is present. Reasoning: file presence is not a strong enough activation signal — `mcp.json` can land in a deploy tree incidentally (image baseline, project clone) and an unrelated agent shouldn't start spawning third-party child processes. The CLI subcommands (`mcp list / status / connect / doctor`) call `load_config_or_exit` instead and work without the env var so operators can inspect a config before activating it.
+2. **Stdio child env scrubbing (F2, intentional security).** `Dial::Stdio` calls `env_clear()` and passes only the 4-var baseline allowlist (`HOME`, `PATH`, `TERM`, `USER` on Unix; Windows equivalents) plus the explicit `env:` map from `mcp.json`. Reasoning: openab-agent inherits high-value secrets from its launcher (`DISCORD_BOT_TOKEN`, `ANTHROPIC_API_KEY`, AWS credentials, GitHub tokens) and stdio MCP servers are third-party binaries with no contractual constraint on what they read from their environment. Leaking those by default is a much larger risk than the convenience of inherited proxy/locale settings. Servers that genuinely need additional env (proxy, certs, locale, provider config) declare them per-server in the config — a future `inherit_env` opt-in list is tracked as follow-up if user demand surfaces.
+3. **Per-process shared `McpRuntimeManager` (F7).** A single manager is `Arc`-cloned across all ACP sessions of the same process. Reasoning: MCP servers are expensive to spawn (stdio child fork, HTTP handshake + OAuth) and most are pure-state read-only tools where cross-session visibility is benign. Trade-off: a `mcp connect github` in session A makes the `github` server immediately available in session B. We accept this — per-session isolation would multiply child processes and break the breaker / TTL accounting in §5.7 / §5.9.
+
+#### 5.4.2 Discovery slice — bounded catalogue + idle semantics (F1)
+
+The §5.1 / §5.2 single `mcp` meta-tool minimizes the LLM-facing tool surface, but it also *hides* the configured server names from the LLM. The F1 PoC reproduced the resulting failure mode: when a user said "use mcp fs to list /workspace", the LLM called `mcp(action: "status")`, saw `fs: disconnected`, read it as "broken", and refused to retry. Two intentional choices remove that failure mode without re-flattening the tool surface:
+
+1. **Static server catalogue in the system prompt.** `mcp::format_system_prompt_appendix(manager)` appends a `## MCP tool` section containing the tool intro plus `- **{name}** ({transport})` per configured server (with a `requires \`mcp login <name>\`` annotation when an `oauth` block is present). The list is built once at `Agent::new_boxed` time from a sync `manager.catalog()` snapshot frozen at `from_config`, so no async or lock coordination is needed inside `build_system_prompt`. Token-budget invariance is preserved: section size grows **O(server count)** — not O(server count × tool count) — because per-tool descriptors stay behind `mcp(action: "list_tools", server)`. The PoC measured ≤100 tokens per server-side entry under this pattern; flattening tools per-server (≈ what the multi-tool alternative in §4.1 would expose) blows that budget by ~30× for a typical 30-tool github server.
+
+   Mirror with the Skills catalogue (`skills::format_skills_prompt`): both advertise *names + headline metadata* in the always-present system prompt and force *body / contract* discovery through an explicit tool call (`mcp(action: "list_tools" | "describe_tool")` here, `read("skills/<name>")` there). Same intent (the LLM knows the surface exists; details are lazy), same token-budget shape (linear in surface count, not in surface depth).
+
+2. **Status label `idle` for lazy-connect servers.** The meta-tool's `status_label` returns `idle` — not `disconnected` — when a server is in `ServerStatus::Disconnected` with no failure history. `disconnected` reads as "broken" to the LLM (PoC observation above); `idle` correctly signals "ready, will dial on first call". The genuine failure case still maps to `status: "failed"` with the dial / handshake error in `last_error`, so the LLM can distinguish "not tried yet" from "tried and broke". The system-prompt section also advertises these semantics explicitly so the LLM doesn't have to guess.
+
+These choices are wired into PR #959 (Phase 1) because the failure mode they fix is reachable as soon as `list_servers` and `status` ship — deferring to Phase 2/3 would mean shipping a known-broken discovery UX on the foundation slice.
+
 ### 5.5 `rmcp` dependency & features
 
 ```toml

@@ -100,6 +100,18 @@ pub struct DeviceLoginStart {
     pub expires_in: u64,
 }
 
+/// Immutable, lock-free view of a configured server for catalogue
+/// advertising in the system prompt (PR #959 chaodu F1, discovery slice).
+/// Lives outside the `RwLock<HashMap>` so `format_system_prompt_appendix`
+/// can build the prompt synchronously at `Agent::new_with_provider` time
+/// without coordinating with the async runtime.
+#[derive(Debug, Clone)]
+pub struct CatalogEntry {
+    pub name: String,
+    pub transport: &'static str,
+    pub requires_oauth: bool,
+}
+
 /// Owns one `ServerHandle` per configured server, behind an async `RwLock`
 /// so the foreground LLM path and the background eviction task can share it.
 #[derive(Debug, Clone)]
@@ -127,6 +139,11 @@ pub struct McpRuntimeManager {
     /// and tool-call dispatch until the cooldown elapses and a
     /// half-open probe succeeds.
     breaker: Arc<ServerBreaker>,
+    /// Sorted-by-name snapshot of static server identity (name + transport +
+    /// oauth-required flag). Frozen at `from_config` — never mutated, so it
+    /// is safe to read without locking. Used by the system-prompt catalogue
+    /// (PR #959 F1 discovery slice).
+    catalog: Arc<[CatalogEntry]>,
 }
 
 impl McpRuntimeManager {
@@ -135,6 +152,16 @@ impl McpRuntimeManager {
     }
 
     pub fn from_config_with_auth_path(cfg: McpConfig, auth_path: PathBuf) -> Self {
+        let mut catalog: Vec<CatalogEntry> = cfg
+            .servers
+            .iter()
+            .map(|(name, config)| CatalogEntry {
+                name: name.clone(),
+                transport: config.transport_label(),
+                requires_oauth: config.requires_oauth(),
+            })
+            .collect();
+        catalog.sort_by(|a, b| a.name.cmp(&b.name));
         let handles: HashMap<_, _> = cfg
             .servers
             .into_iter()
@@ -154,7 +181,14 @@ impl McpRuntimeManager {
             device_login_tasks: Arc::new(StdMutex::new(HashMap::new())),
             refresh_locks: Arc::new(StdMutex::new(HashMap::new())),
             breaker: Arc::new(ServerBreaker::new()),
+            catalog: catalog.into(),
         }
+    }
+
+    /// Lock-free, synchronous access to the configured-server catalogue.
+    /// See `CatalogEntry` for the rationale.
+    pub fn catalog(&self) -> &[CatalogEntry] {
+        &self.catalog
     }
 
     /// Snapshot of `(name, status)` sorted by name. Clones out so the read
@@ -1116,6 +1150,35 @@ mod tests {
         let mgr = McpRuntimeManager::from_config(McpConfig::default());
         assert!(mgr.is_empty().await);
         assert!(mgr.statuses().await.is_empty());
+        assert!(mgr.catalog().is_empty());
+    }
+
+    #[test]
+    fn catalog_is_sorted_and_flags_oauth() {
+        let json = r#"{
+            "mcpServers": {
+                "linear": {
+                    "type": "http",
+                    "url": "https://mcp.linear.app/mcp",
+                    "oauth": { "provider": "linear", "scopes": ["read"] }
+                },
+                "fs": { "type": "stdio", "command": "mcp-server-filesystem" },
+                "weather": { "type": "http", "url": "https://example/mcp" }
+            }
+        }"#;
+        let cfg: McpConfig = serde_json::from_str(json).unwrap();
+        let mgr = McpRuntimeManager::from_config(cfg);
+        let cat = mgr.catalog();
+        let names: Vec<&str> = cat.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["fs", "linear", "weather"]);
+        let by_name: std::collections::HashMap<&str, &CatalogEntry> =
+            cat.iter().map(|e| (e.name.as_str(), e)).collect();
+        assert_eq!(by_name["fs"].transport, "stdio");
+        assert!(!by_name["fs"].requires_oauth);
+        assert_eq!(by_name["linear"].transport, "http");
+        assert!(by_name["linear"].requires_oauth);
+        assert_eq!(by_name["weather"].transport, "http");
+        assert!(!by_name["weather"].requires_oauth);
     }
 
     #[tokio::test]

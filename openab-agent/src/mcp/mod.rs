@@ -80,6 +80,51 @@ pub fn load_runtime_or_warn() -> Option<McpRuntimeManager> {
     }
 }
 
+/// Build the MCP section appended to the system prompt at session start
+/// (PR #959 chaodu F1, discovery slice). Mirrors the skills-catalogue
+/// pattern: advertise *server names + transports* — not individual tools —
+/// so the LLM knows the surface exists and can call
+/// `mcp(action="list_tools", server=...)` to discover capabilities on demand.
+///
+/// Token-budget invariance: the section grows O(server count), not
+/// O(server count × tool count). PR #959 F1 PoC measured ≤100 tokens per
+/// server-side meta entry under this pattern; flattening per-tool would
+/// blow that invariance up.
+///
+/// Status semantics worth surfacing to the LLM (matches `status_label` in
+/// `meta_tool`): `idle` = ready (lazy-connect on first call), not broken.
+pub fn format_system_prompt_appendix(manager: &McpRuntimeManager) -> String {
+    let catalog = manager.catalog();
+    let mut out = String::from(
+        "\n\n## MCP tool\n\n\
+         Use the `mcp` tool to talk to configured MCP servers. Key actions: \
+         `list_tools(server)` discovers a server's tools, \
+         `call(server, tool, arguments)` invokes one. Servers auto-connect \
+         on first use — `status: \"idle\"` means ready (not broken); \
+         `status: \"failed\"` carries the error reason in `last_error`. \
+         Call `mcp(action=\"help\")` only if action shapes are unclear.\n\n",
+    );
+    if catalog.is_empty() {
+        out.push_str(
+            "No MCP servers are configured. The `mcp` tool will report an \
+             empty `list_servers` until one is added.\n",
+        );
+        return out;
+    }
+    out.push_str("Configured servers:\n");
+    for entry in catalog {
+        if entry.requires_oauth {
+            out.push_str(&format!(
+                "- **{}** ({}, requires `mcp login {}` before first call)\n",
+                entry.name, entry.transport, entry.name,
+            ));
+        } else {
+            out.push_str(&format!("- **{}** ({})\n", entry.name, entry.transport));
+        }
+    }
+    out
+}
+
 /// `openab-agent mcp list [--resolve]`.
 ///
 /// Default: print configs verbatim (`${env:VAR}` placeholders kept as-is) so
@@ -394,4 +439,64 @@ fn read_redirect_from_stdin() -> std::io::Result<String> {
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
     Ok(line.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use config::McpConfig;
+
+    fn mgr_from(json: &str) -> McpRuntimeManager {
+        let cfg: McpConfig = serde_json::from_str(json).unwrap();
+        McpRuntimeManager::from_config(cfg)
+    }
+
+    #[test]
+    fn format_system_prompt_appendix_lists_each_server() {
+        let mgr = mgr_from(
+            r#"{
+                "mcpServers": {
+                    "fs": { "type": "stdio", "command": "mcp-server-filesystem" },
+                    "weather": { "type": "http", "url": "https://example/mcp" }
+                }
+            }"#,
+        );
+        let s = format_system_prompt_appendix(&mgr);
+        assert!(s.contains("## MCP tool"));
+        assert!(s.contains("Configured servers:"));
+        assert!(s.contains("**fs** (stdio)"));
+        assert!(s.contains("**weather** (http)"));
+        // Status semantics must be advertised so LLM doesn't misread `idle`
+        // as a failure (PR #959 F1 PoC observation).
+        assert!(s.contains("idle"));
+    }
+
+    #[test]
+    fn format_system_prompt_appendix_marks_oauth_servers() {
+        let mgr = mgr_from(
+            r#"{
+                "mcpServers": {
+                    "linear": {
+                        "type": "http",
+                        "url": "https://mcp.linear.app/mcp",
+                        "oauth": { "provider": "linear", "scopes": ["read"] }
+                    }
+                }
+            }"#,
+        );
+        let s = format_system_prompt_appendix(&mgr);
+        assert!(
+            s.contains("requires `mcp login linear`"),
+            "OAuth servers must surface the login hint; got:\n{s}"
+        );
+    }
+
+    #[test]
+    fn format_system_prompt_appendix_handles_empty_catalog() {
+        let mgr = mgr_from(r#"{"mcpServers":{}}"#);
+        let s = format_system_prompt_appendix(&mgr);
+        assert!(s.contains("## MCP tool"));
+        assert!(s.contains("No MCP servers are configured"));
+        assert!(!s.contains("Configured servers:"));
+    }
 }
