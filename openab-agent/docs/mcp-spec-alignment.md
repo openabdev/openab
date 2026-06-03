@@ -974,22 +974,35 @@ Source: [`server/utilities/logging.mdx`](https://github.com/modelcontextprotocol
 
 | # | Item | Normative | Status | Location / Notes |
 |---|---|---|---|---|
-| 581 | Servers emitting log notifications MUST declare `logging` capability | MUST | | |
-| 582 | Log levels follow RFC 5424 (debug, info, notice, warning, error, critical, alert, emergency) | (field) | | |
-| 583 | `logging/setLevel` request | (method) | | |
-| 584 | Clients MAY send `logging/setLevel` | MAY | | |
-| 584a | Server MAY automatically decide log level if no `logging/setLevel` request has been received from the client (per `schema.mdx` JSDoc on `LoggingMessageParams`) | MAY | | |
-| 585 | `notifications/message` with level / logger / data | (notification) | | |
-| 586 | Servers SHOULD return `-32602` invalid level, `-32603` internal errors | SHOULD | | |
-| 587 | Servers SHOULD rate-limit log messages | SHOULD | | |
-| 588 | Servers SHOULD include context in `data` field | SHOULD | | |
-| 589 | Servers SHOULD use consistent logger names | SHOULD | | |
-| 590 | Servers SHOULD remove sensitive info | SHOULD | | |
-| 591 | Clients MAY present / filter / persist log messages | MAY | | |
-| 592 | Log messages MUST NOT contain credentials/secrets | MUST NOT | | |
-| 593 | Log messages MUST NOT contain PII | MUST NOT | | |
-| 594 | Log messages MUST NOT contain internal details aiding attacks | MUST NOT | | |
-| 595 | Implementations SHOULD rate-limit, validate data, control log access, monitor for sensitive content | SHOULD | | |
+| 581 | Servers emitting log notifications MUST declare `logging` capability | MUST | N/A | server-side normative; we are an MCP client. `ServerCapabilities.logging: Option<JsonObject>` (rmcp `model/capabilities.rs:308`) — parsed but unused |
+| 582 | Log levels follow RFC 5424 (debug, info, notice, warning, error, critical, alert, emergency) | (field) | N/A | server-produced field. rmcp `LoggingLevel` enum exposes all 8 levels for incoming notifications (SDK `model.rs:1450-1459`) |
+| 583 | `logging/setLevel` request | (method) | N/A | server-side handler obligation. rmcp ships `SetLevelRequestParams` + `SetLevelRequest` (SDK `model.rs:1467-1496`); not invoked in `src/mcp/**` |
+| 584 | Clients MAY send `logging/setLevel` | MAY | ❌ | rmcp provides `peer.set_level(SetLevelRequestParams)` (SDK `service/client.rs:357`); zero callsite in `src/mcp/**`. Capability exists; deferred — see §2 |
+| 584a | Server MAY automatically decide log level if no `logging/setLevel` request has been received from the client (per `schema.mdx` JSDoc on `LoggingMessageParams`) | MAY | N/A | server-side policy; we never call `peer.set_level` so server defaults always apply |
+| 585 | `notifications/message` with level / logger / data | (notification) | N/A | server-produced. rmcp `LoggingMessageNotificationParam` (SDK `model.rs:1504-1512`) routed to `on_logging_message`; `()` blanket impl at `src/mcp/runtime.rs:1066,1079` uses default no-op (SDK `handler/client.rs:208-214`) |
+| 586 | Servers SHOULD return `-32602` invalid level, `-32603` internal errors | SHOULD | N/A | server-side error mapping; we never invoke `set_level` |
+| 587 | Servers SHOULD rate-limit log messages | SHOULD | N/A | server-side rate-limit policy |
+| 588 | Servers SHOULD include context in `data` field | SHOULD | N/A | server-side field population |
+| 589 | Servers SHOULD use consistent logger names | SHOULD | N/A | server-side logger naming convention |
+| 590 | Servers SHOULD remove sensitive info | SHOULD | N/A | server-side content filtering obligation |
+| 591 | Clients MAY present / filter / persist log messages | MAY | ⚠️ | rmcp wires `LoggingMessageNotificationParam` to handler trait; `()` impl drops every notification via default no-op (SDK `handler/client.rs:208-214`). MAY satisfied vacuously — see §1 |
+| 592 | Log messages MUST NOT contain credentials/secrets | MUST NOT | N/A | server-side authorship obligation; we relay unmodified from peer |
+| 593 | Log messages MUST NOT contain PII | MUST NOT | N/A | server-side authorship obligation |
+| 594 | Log messages MUST NOT contain internal details aiding attacks | MUST NOT | N/A | server-side authorship obligation |
+| 595 | Implementations SHOULD rate-limit, validate data, control log access, monitor for sensitive content | SHOULD | N/A | server-side implementation obligation; client-side we receive unsanitized notification and default-drop |
+
+### Improvement Plan (Jelly draft, pending Mira retroactive review)
+
+**Section-level disposition**: openab-agent has no observability surface for server-emitted logs today. rmcp 1.7.0 ships the full client plumbing (`LoggingMessageNotificationParam`, `on_logging_message` trait hook, `peer.set_level`, `LoggingLevel` RFC 5424 enum), but the `()` ClientHandler blanket impl drops every notification. All server-side rows are N/A by topology; client MAY rows (584, 591) are deferred pending an ops driver.
+
+- [ ] **§1. Replace `()` ClientHandler with a named struct that tees server logs into local `tracing`.** Override `on_logging_message` to map `LoggingLevel` → `tracing::{error,warn,info,debug,trace}!` and emit `(server, logger, level)` as plaintext fields per repo convention. Do NOT propagate the `data` field contents (log the *fact* a message arrived plus byte size, not the payload) to avoid transitive secret leakage if a server is compromised (row 590 is aspirational). Bundle with Section 10 §1 / Section 11 row 503 / Section 12 §3 — they all need the same named-handler refactor.
+  - **Eval**: openab-agent layer · drop-in (~40-60 LOC; bundled with named ClientHandler) · **fit: in-scope (bundled)**. Cheap once the handler struct lands; gives ops visibility into upstream server failures (e.g., "tool X polling timed out") without LLM round-trips.
+- [ ] **§2. If §1 ships: wire `peer.set_level` from connect-time config.** Add an optional `logging.level` field to `ServerConfig` (`src/mcp/config.rs`); when populated, parse to `LoggingLevel` and call `peer.set_level(SetLevelRequestParams::new(level))` in `Dial::run` after handshake. Upgrades row 584 from ❌ to ✅.
+  - **Eval**: openab-agent layer · drop-in (~30 LOC + config schema bump) · **fit: in-scope (gated on §1)**. Free observability dial once §1's handler exists; pointless without it.
+- [ ] **§3. Rate-limiting on client side.** Defer — server-side SHOULD (row 587) already covers the producer; if a peer floods us, the named handler from §1 can add a token bucket later, but no concrete bug today.
+  - **Eval**: openab-agent layer · non-trivial (~80 LOC + per-server bucket state) · **fit: defer**. Wait for a real noisy server before paying the complexity.
+- [ ] **§4. Document the deferral.** Add a one-paragraph note in this section's preamble describing the §1 abstention + the planned `OPENAB_LOG_LEVEL` style env var if §2 ships. Cross-reference Section 17 (Trust / Safety) on secret-scrubbing.
+  - **Eval**: docs only · drop-in (~6 lines) · **fit: in-scope**. Cheap; prevents future auditors from re-deriving the same question.
 
 ## Pagination
 
