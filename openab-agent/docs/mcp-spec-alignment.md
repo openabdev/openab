@@ -421,21 +421,30 @@ Source: [`basic/utilities/progress.mdx`](https://github.com/modelcontextprotocol
 
 | # | Item | Normative | Status | Location / Notes |
 |---|---|---|---|---|
-| 255 | `progressToken` carried in request `_meta` | (field) | | |
-| 256 | Progress tokens MUST be string or integer | MUST | | |
-| 257 | Progress tokens MUST be unique across active requests | MUST | | |
-| 258 | `notifications/progress` carries token, progress, optional total/message | (notification) | | |
-| 259 | `progress` value MUST increase with each notification, even if total is unknown | MUST | | |
-| 260 | `progress` and `total` MAY be float | MAY | | |
-| 261 | `message` field SHOULD provide relevant human-readable progress information | SHOULD | | |
-| 262 | Progress notifications MUST only reference active in-progress operation tokens | MUST | | |
-| 263 | Receivers MAY skip notifications / set frequency / omit total | MAY | | |
-| 264 | For task-augmented requests, the `progressToken` from the original request MUST continue to be used for progress notifications throughout task lifetime — valid until the task reaches a terminal status, even after `CreateTaskResult` returns | MUST | | |
-| 265 | Progress notifications for tasks MUST use the original `progressToken` | MUST | | |
-| 266 | Progress notifications for tasks MUST stop after terminal status | MUST | | |
-| 267 | Senders and receivers SHOULD track active progress tokens | SHOULD | | |
-| 268 | Both parties SHOULD implement rate limiting on progress notifications | SHOULD | | |
-| 269 | Progress notifications MUST stop after completion | MUST | | |
+| 255 | `progressToken` carried in request `_meta` | (field) | ❌ | we never populate `_meta.progressToken` on outbound `peer.call_tool(params)` — `CallToolRequestParams::new(...).with_arguments(...)` at `meta_tool.rs:95-98` only sets `name` + `arguments`. So no server can stream progress back to us today |
+| 256 | Progress tokens MUST be string or integer | MUST | ✅ (schema) | `rmcp::model::ProgressToken(pub NumberOrString)` (SDK `model.rs:305`) — `NumberOrString` enforces string-or-integer at the type level |
+| 257 | Progress tokens MUST be unique across active requests | MUST | N/A (vacuous) | we send no `progressToken` (row 255); if implemented, would need a per-`McpRuntimeManager` token counter or UUID source |
+| 258 | `notifications/progress` carries token, progress, optional total/message | (notification) | ✅ (schema) | `rmcp::model::ProgressNotificationParam { progress_token, progress: f64, total: Option<f64>, message: Option<String> }` (SDK `model.rs:1100-1115`); method const `notifications/progress` |
+| 259 | `progress` value MUST increase with each notification, even if total is unknown | MUST | N/A | we send no progress; on receive we discard via `()` handler. The SDK doc-comment on `progress: f64` matches the spec wording (SDK `model.rs:1107-1108`) but rmcp does not enforce monotonicity on either send or receive — it's the application's burden |
+| 260 | `progress` and `total` MAY be float | MAY | ✅ (schema) | both fields are `f64` in rmcp schema (SDK `model.rs:1107, 1110`) |
+| 261 | `message` field SHOULD provide relevant human-readable progress information | SHOULD | N/A | we send no progress; rmcp provides `with_message(impl Into<String>)` builder (SDK `model.rs:1134`) |
+| 262 | Progress notifications MUST only reference active in-progress operation tokens | MUST | N/A (vacuous) | we send no progress; if implemented, drop the token when request completes / cancels |
+| 263 | Receivers MAY skip notifications / set frequency / omit total | MAY | ✅ | `()` client handler (`runtime.rs:1066,1079`) means rmcp routes incoming `ProgressNotification` to the blanket `ClientHandler::on_progress` default-impl which discards (SDK `handler/client.rs:201-203, 321-326`); we "skip" by virtue of having no handler |
+| 264 | For task-augmented requests, the `progressToken` from the original request MUST continue to be used for progress notifications throughout task lifetime — valid until the task reaches a terminal status, even after `CreateTaskResult` returns | MUST | N/A | we do not implement task augmentation (Section 1 row 55 ❌); spec item only applies if we adopt `tasks` capability |
+| 265 | Progress notifications for tasks MUST use the original `progressToken` | MUST | N/A | as above |
+| 266 | Progress notifications for tasks MUST stop after terminal status | MUST | N/A | as above |
+| 267 | Senders and receivers SHOULD track active progress tokens | SHOULD | N/A (vacuous) | we send no progress (row 255), we discard incoming progress (row 263) — nothing to track |
+| 268 | Both parties SHOULD implement rate limiting on progress notifications | SHOULD | N/A (vacuous) | as above; rmcp does no rate limiting either way |
+| 269 | Progress notifications MUST stop after completion | MUST | N/A (vacuous) | as above; spec compliance is the sender's responsibility |
+
+### Improvement Plan (Jelly draft, pending Mira retroactive review)
+
+- [ ] **Row 255 (emit `progressToken` on outbound requests)**: optionally set `_meta.progressToken` on `CallToolRequestParams` at `meta_tool.rs:95-98` so servers running long operations (file scans, large API queries, build steps) can stream progress back to us. Token would be a monotonically increasing per-server counter or a UUID; `()` client handler upgraded to a wrapper that routes `on_progress` to ACP `session/notify` so the orchestrator/user sees live updates.
+  - **Eval**: rmcp covers most of the plumbing — `ProgressToken`, `ProgressNotificationParam`, `ClientHandler::on_progress` trait method all exist; `CallToolRequestParams` already supports `_meta` (verify: `with_meta` builder or direct field) · wrapper-sized in openab-agent (~150-200 LOC: token allocator, on_progress→ACP notify bridge, token-to-request-id mapping for row 262 compliance) · **fit: in-scope but borderline architectural**. Requires us to leave `()` handler — same architectural threshold as Section 1 rows 52-56 client capabilities. Worth bundling with `roots` capability work. Until then, document as known gap.
+- [ ] **Row 268 (rate limiting on receive side)**: if we adopt outbound `progressToken` (row 255), add a simple `tokio::sync::Semaphore` or "max 10 notifications/sec per token" filter in the `on_progress` handler to protect the ACP/UI surface from chatty servers.
+  - **Eval**: openab-agent only · drop-in (~30 LOC throttled stream) · **fit: in-scope as defensive layer**, only meaningful once row 255 lands. Score: defer until row 255.
+- [ ] **Documentation**: in the same `openab-agent/docs/` matrix as Section 3 / Section 0 docs improvements, note that we do not currently emit or surface progress, and what users should expect for long-running tools.
+  - **Eval**: docs only · drop-in · **fit: in-scope**. Cheap; honest about UX gap.
 
 ## Ping
 
