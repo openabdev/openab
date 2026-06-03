@@ -683,76 +683,91 @@ Source: [`client/sampling.mdx`](https://github.com/modelcontextprotocol/modelcon
 
 Source: [`client/elicitation.mdx`](https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/docs/specification/2025-11-25/client/elicitation.mdx)
 
+**Section-level finding**: openab-agent uses the unit `()` `ClientHandler` blanket impl (`src/mcp/runtime.rs:1066,1079`; `RoleClient, ()` peer type at `src/mcp/runtime.rs:67,228,1056`). The default `ClientHandler::create_elicitation` returns `ElicitationAction::Decline` (SDK `handler/client.rs:165-178`), and we never set `ClientCapabilities.elicitation` (SDK `model/capabilities.rs:276`), so every server-initiated `elicitation/create` is silently declined and no `form` / `url` mode is advertised. ACP (`src/acp.rs`) currently only routes `session/prompt` (`src/acp.rs:87-89`) and has no `session/request_permission` surface to pass an elicitation through to Brett. Most spec rows are therefore N/A-by-omission; they re-activate only if we ship row 414 (declare a capability) — see Improvement Plan below.
+
 | # | Item | Normative | Status | Location / Notes |
 |---|---|---|---|---|
-| 414 | Clients supporting elicitation MUST declare `elicitation` capability | MUST | | |
-| 415 | Empty `elicitation: {}` is equivalent to declaring `form` mode only | (compat) | | |
-| 416 | Clients declaring `elicitation` MUST support at least one mode (`form` or `url`) | MUST | | |
-| 417 | Servers MUST NOT send elicitation requests with modes not supported by the client | MUST NOT | | |
-| 418 | All elicitation requests MUST include `message`; `mode` is required for URL mode and optional (defaults to `"form"`) for form mode | MUST | | |
-| 419 | For backwards compat, servers MAY omit `mode` for form mode requests | MAY | | |
-| 420 | Clients MUST treat absent `mode` as form mode | MUST | | |
-| 421 | Form mode elicitation MUST either specify `mode:"form"` or omit `mode`, and include `requestedSchema` | MUST | | |
-| 422 | `requestedSchema` is restricted: flat object, primitive types (string, number/integer, boolean, enum) | (constraint) | | |
-| 422a | `requestedSchema` also supports multi-select enum: `type: "array"` with `items.enum` or `items.anyOf` (fifth schema kind beyond the primitives in row 422) | (constraint) | | |
-| 423 | Supported string formats: `email`, `uri`, `date`, `date-time` | (constraint) | | |
-| 424 | All primitive types support optional default values | (field) | | |
-| 425 | Clients supporting defaults SHOULD pre-populate form fields with default values | SHOULD | | |
-| 426 | URL mode elicitation MUST specify `mode:"url"`, `message`, `url`, `elicitationId` | MUST | | |
-| 427 | `url` parameter MUST contain a valid URL | MUST | | |
-| 428 | Servers MAY send `notifications/elicitation/complete` on URL-mode completion | MAY | | |
-| 429 | Servers MUST only send completion notification to the client that initiated the elicitation | MUST | | |
-| 430 | Completion notification MUST include the original `elicitationId` | MUST | | |
-| 430a | Client MUST treat `ElicitRequestURLParams.elicitationId` as opaque (per `schema.mdx` JSDoc) | MUST | | |
-| 431 | Clients MUST ignore completion notifications for unknown / already-completed IDs | MUST | | |
-| 432 | Clients MAY wait for completion notification to retry / update UI / continue | MAY | | |
-| 433 | Clients SHOULD still provide manual retry/cancel controls if notification never arrives | SHOULD | | |
-| 434 | Servers MAY return `URLElicitationRequiredError` (-32042) | MAY | | |
-| 435 | Server MUST NOT return `URLElicitationRequiredError` except when URL elicitation required | MUST NOT | | |
-| 436 | The error MUST include list of required elicitations | MUST | | |
-| 437 | Elicitations in error MUST be URL mode and have `elicitationId` | MUST | | |
-| 438 | Servers MUST return `-32042` when request blocked on URL elicitation | MUST | | |
-| 439 | Clients MUST return `-32602` when elicitation mode not declared in capabilities | MUST | | |
-| 440 | Servers MUST NOT request sensitive info via form mode (passwords, API keys, access tokens, payment credentials) | MUST NOT | | |
-| 441 | Servers MUST use URL mode for sensitive info interactions | MUST | | |
-| 442 | Clients MUST provide UI making it clear which server is requesting | MUST | | |
-| 443 | Clients MUST respect privacy with clear decline/cancel options | MUST | | |
-| 444 | For form mode, clients MUST allow user review/modify before sending | MUST | | |
-| 445 | For URL mode, clients MUST clearly display target domain/host and gather user consent before navigation | MUST | | |
-| 446 | Three-action response model: accept / decline / cancel | (field) | | |
-| 447 | Servers MUST bind elicitation requests to client and user identity | MUST | | |
-| 448 | Servers implementing elicitation MUST securely associate user state per security best practices | MUST | | |
-| 449 | State MUST NOT be associated with session IDs alone | MUST NOT | | |
-| 450 | State storage MUST be protected against unauthorized access | MUST | | |
-| 451 | Remote servers MUST derive user identification from MCP authorization credentials when possible | MUST | | |
-| 452 | MCP servers MUST NOT rely on URL elicitation to authorize users for themselves | MUST NOT | | |
-| 453 | Third-party credentials MUST NOT transit through the MCP client | MUST NOT | | |
-| 454 | MCP server MUST NOT use client's MCP credentials for third-party service (no token passthrough) | MUST NOT | | |
-| 455 | User MUST authorize MCP server directly for external authorization | MUST | | |
-| 456 | MCP server MUST NOT transmit credentials obtained via URL elicitation to MCP client | MUST NOT | | |
-| 457 | Servers MUST NOT include sensitive info / PII / credentials in elicitation URL | MUST NOT | | |
-| 458 | Servers MUST NOT provide pre-authenticated URLs (impersonation risk) | MUST NOT | | |
-| 459 | Servers SHOULD NOT include clickable URLs in form-mode fields | SHOULD NOT | | |
-| 460 | Servers SHOULD use HTTPS URLs for non-development environments | SHOULD | | |
-| 461 | Clients implementing URL mode MUST handle URLs carefully (prevent malicious links) | MUST | | |
-| 462 | Clients MUST NOT auto-prefetch elicitation URLs or metadata | MUST NOT | | |
-| 463 | Clients MUST NOT open URL without explicit user consent | MUST NOT | | |
-| 464 | Clients MUST show full URL for user examination before consent | MUST | | |
-| 465 | Clients MUST open URL in secure manner (no LLM/client inspection of content) | MUST | | |
-| 466 | Clients SHOULD highlight URL domain to mitigate subdomain spoofing | SHOULD | | |
-| 467 | Clients SHOULD warn on ambiguous/suspicious URIs (Punycode) | SHOULD | | |
-| 468 | Clients SHOULD NOT render URLs as clickable in elicitation fields except the URL-mode `url` field | SHOULD NOT | | |
-| 469 | Servers MUST NOT rely on client-provided user ID without server verification | MUST NOT | | |
-| 470 | Servers SHOULD follow security best practices for user identification | SHOULD | | |
-| 471 | Clients SHOULD validate all form responses against provided schema | SHOULD | | |
-| 472 | Servers SHOULD validate received data matches requested schema | SHOULD | | |
-| 473 | Servers MUST verify identity of user opening URL before accepting info (anti-phishing) | MUST | | |
-| 474 | Server MUST ensure user who started elicitation is same user who completes authorization flow | MUST | | |
-| 475 | Mechanism to determine user identity MUST be resilient to attacks where an attacker can modify the elicitation URL | MUST | | |
-| 476 | Clients SHOULD implement user approval controls | SHOULD | | |
-| 477 | Clients SHOULD allow users to decline elicitation requests at any time | SHOULD | | |
-| 478 | Clients SHOULD implement rate limiting | SHOULD | | |
-| 479 | Clients SHOULD present elicitation requests clearly (what / why) | SHOULD | | |
+| 414 | Clients supporting elicitation MUST declare `elicitation` capability | MUST | N/A | we do not support elicitation. No `ClientCapabilities.elicitation` set anywhere in `src/mcp/`; default `()` handler declines. Gating row for everything below — see Improvement Plan §1 |
+| 415 | Empty `elicitation: {}` is equivalent to declaring `form` mode only | (compat) | N/A | not declared. rmcp models the two sub-caps explicitly (`FormElicitationCapability` / `UrlElicitationCapability` at SDK `model/capabilities.rs:203,215`); when we declare we should opt into one sub-cap (not an empty object) to avoid the legacy implicit |
+| 416 | Clients declaring `elicitation` MUST support at least one mode (`form` or `url`) | MUST | N/A | not declared |
+| 417 | Servers MUST NOT send elicitation requests with modes not supported by the client | MUST NOT | N/A | server-side rule; we are the client |
+| 418 | All elicitation requests MUST include `message`; `mode` is required for URL mode and optional (defaults to `"form"`) for form mode | MUST | N/A | server-side payload rule. rmcp wire model enforces it via `CreateElicitationRequestParams::{FormElicitationParam, UrlElicitationParam}` untagged enum (SDK `model.rs:2600+`) |
+| 419 | For backwards compat, servers MAY omit `mode` for form mode requests | MAY | N/A | server-side. rmcp deserialises the absent-`mode` shape as `FormElicitationParam` via untagged enum (SDK `model.rs:3887` test) |
+| 420 | Clients MUST treat absent `mode` as form mode | MUST | ✅ | inherited from rmcp's untagged `CreateElicitationRequestParams` enum (SDK `model.rs:2600+`); whatever handler we plug in receives a `FormElicitationParam` variant — same code path as explicit `mode:"form"` |
+| 421 | Form mode elicitation MUST either specify `mode:"form"` or omit `mode`, and include `requestedSchema` | MUST | N/A | server-side payload shape; enforced by rmcp model |
+| 422 | `requestedSchema` is restricted: flat object, primitive types (string, number/integer, boolean, enum) | (constraint) | ✅ (SDK) | rmcp's `PrimitiveSchema` enum (SDK `model/elicitation_schema.rs:53-`) restricts to String/Number/Integer/Boolean/Enum; non-primitive payloads fail deserialisation before reaching our (currently-default) handler |
+| 422a | `requestedSchema` also supports multi-select enum: `type: "array"` with `items.enum` or `items.anyOf` (fifth schema kind beyond the primitives in row 422) | (constraint) | ✅ (SDK) | `MultiSelectEnumSchema` at SDK `model/elicitation_schema.rs:730-732` (Untitled + Titled variants, `type:"array"`, `items.enum`) |
+| 423 | Supported string formats: `email`, `uri`, `date`, `date-time` | (constraint) | ✅ (SDK) | `StringSchema` format field in SDK `model/elicitation_schema.rs` (covered by builder helpers like `required_email`) |
+| 424 | All primitive types support optional default values | (field) | ✅ (SDK) | defaults present on primitive schemas in SDK `model/elicitation_schema.rs` |
+| 425 | Clients supporting defaults SHOULD pre-populate form fields with default values | SHOULD | N/A | no form UI to pre-populate; gated on row 414 |
+| 426 | URL mode elicitation MUST specify `mode:"url"`, `message`, `url`, `elicitationId` | MUST | N/A | server-side. rmcp `UrlElicitationParam` struct enforces (SDK `model.rs:2660+`) |
+| 427 | `url` parameter MUST contain a valid URL | MUST | N/A | server-side; we'd revalidate before opening (gated on 414) |
+| 428 | Servers MAY send `notifications/elicitation/complete` on URL-mode completion | MAY | N/A | server-side |
+| 429 | Servers MUST only send completion notification to the client that initiated the elicitation | MUST | N/A | server-side |
+| 430 | Completion notification MUST include the original `elicitationId` | MUST | ✅ (SDK) | `ElicitationResponseNotificationParam.elicitation_id` (SDK `model.rs:2746`); notification method const at SDK `model.rs:2513` |
+| 430a | Client MUST treat `ElicitRequestURLParams.elicitationId` as opaque (per `schema.mdx` JSDoc) | MUST | ✅ | typed `String` in SDK `model.rs:2667,2746`; our (default) handler at SDK `handler/client.rs:241-247` never parses it — just no-ops |
+| 431 | Clients MUST ignore completion notifications for unknown / already-completed IDs | MUST | ⚠️ | default handler `on_url_elicitation_notification_complete` (SDK `handler/client.rs:241-247`) silently drops every notification — technically satisfies "ignore unknown" since *all* are unknown to us, but only because we never accept URL elicitation in the first place. Becomes a real obligation when row 414 lands |
+| 432 | Clients MAY wait for completion notification to retry / update UI / continue | MAY | N/A | we don't accept URL elicitation |
+| 433 | Clients SHOULD still provide manual retry/cancel controls if notification never arrives | SHOULD | N/A | same as 432 |
+| 434 | Servers MAY return `URLElicitationRequiredError` (-32042) | MAY | N/A | server-side rule. rmcp 1.7.0 ships the code: `ErrorCode::URL_ELICITATION_REQUIRED = -32042` (SDK `model.rs:509`) + helper `ErrorData::url_elicitation_required()` (SDK `model.rs:562-567`) |
+| 435 | Server MUST NOT return `URLElicitationRequiredError` except when URL elicitation required | MUST NOT | N/A | server-side |
+| 436 | The error MUST include list of required elicitations | MUST | ⚠️ | rmcp 1.7.0 exposes the error code but the structured `data: { elicitations: [...] }` payload required by the 2025-11-25 spec is not modelled — callers hand-roll JSON in `ErrorData.data: Option<Value>` (SDK `model.rs:528`). Track as schema gap; file upstream |
+| 437 | Elicitations in error MUST be URL mode and have `elicitationId` | MUST | ⚠️ | same gap as 436 — no typed wrapper in rmcp 1.7.0 |
+| 438 | Servers MUST return `-32042` when request blocked on URL elicitation | MUST | N/A | server-side |
+| 439 | Clients MUST return `-32602` when elicitation mode not declared in capabilities | MUST | ❌ | default `()` handler returns `Ok(Decline)` (SDK `handler/client.rs:171-178`) instead of `Err(-32602)`. Spec-compliant behaviour when no `elicitation` cap is declared would be to reject as `INVALID_PARAMS`; we silently decline. Low-risk because servers ought to gate on row 414 first, but technically non-conformant. Fix in Improvement Plan §2 |
+| 440 | Servers MUST NOT request sensitive info via form mode (passwords, API keys, access tokens, payment credentials) | MUST NOT | N/A | server-side |
+| 441 | Servers MUST use URL mode for sensitive info interactions | MUST | N/A | server-side |
+| 442 | Clients MUST provide UI making it clear which server is requesting | MUST | N/A | no UI surface yet; gated on row 414 + ACP `session/request_permission` (`src/acp.rs:87-89` only handles `session/prompt`) |
+| 443 | Clients MUST respect privacy with clear decline/cancel options | MUST | N/A | same as 442 |
+| 444 | For form mode, clients MUST allow user review/modify before sending | MUST | N/A | same as 442 |
+| 445 | For URL mode, clients MUST clearly display target domain/host and gather user consent before navigation | MUST | N/A | same as 442 |
+| 446 | Three-action response model: accept / decline / cancel | (field) | ✅ (SDK) | `ElicitationAction::{Accept, Decline, Cancel}` in rmcp 1.7.0 (SDK `model.rs:2515+`); default `()` impl returns `Decline` |
+| 447 | Servers MUST bind elicitation requests to client and user identity | MUST | N/A | server-side |
+| 448 | Servers implementing elicitation MUST securely associate user state per security best practices | MUST | N/A | server-side |
+| 449 | State MUST NOT be associated with session IDs alone | MUST NOT | N/A | server-side |
+| 450 | State storage MUST be protected against unauthorized access | MUST | N/A | server-side |
+| 451 | Remote servers MUST derive user identification from MCP authorization credentials when possible | MUST | N/A | server-side |
+| 452 | MCP servers MUST NOT rely on URL elicitation to authorize users for themselves | MUST NOT | N/A | server-side |
+| 453 | Third-party credentials MUST NOT transit through the MCP client | MUST NOT | ✅ | we never proxy URL-elicitation payloads; default decline + opaque-only handling at SDK `handler/client.rs:165-178,241-247`. Trivially satisfied today; needs re-audit if we implement URL mode (Improvement Plan §3) |
+| 454 | MCP server MUST NOT use client's MCP credentials for third-party service (no token passthrough) | MUST NOT | N/A | server-side. Our paste-back / device flows (`src/mcp/runtime.rs:255-345,347-550`) keep server credentials separate |
+| 455 | User MUST authorize MCP server directly for external authorization | MUST | N/A | server-side |
+| 456 | MCP server MUST NOT transmit credentials obtained via URL elicitation to MCP client | MUST NOT | N/A | server-side |
+| 457 | Servers MUST NOT include sensitive info / PII / credentials in elicitation URL | MUST NOT | N/A | server-side |
+| 458 | Servers MUST NOT provide pre-authenticated URLs (impersonation risk) | MUST NOT | N/A | server-side |
+| 459 | Servers SHOULD NOT include clickable URLs in form-mode fields | SHOULD NOT | N/A | server-side |
+| 460 | Servers SHOULD use HTTPS URLs for non-development environments | SHOULD | N/A | server-side |
+| 461 | Clients implementing URL mode MUST handle URLs carefully (prevent malicious links) | MUST | N/A | we don't implement URL mode |
+| 462 | Clients MUST NOT auto-prefetch elicitation URLs or metadata | MUST NOT | ✅ | default handler at SDK `handler/client.rs:165-178` never touches the URL — no HTTP client, no fetch |
+| 463 | Clients MUST NOT open URL without explicit user consent | MUST NOT | ✅ | same — we never open it |
+| 464 | Clients MUST show full URL for user examination before consent | MUST | N/A | no consent UI; gated on row 414 |
+| 465 | Clients MUST open URL in secure manner (no LLM/client inspection of content) | MUST | N/A | same as 464 |
+| 466 | Clients SHOULD highlight URL domain to mitigate subdomain spoofing | SHOULD | N/A | same as 464 |
+| 467 | Clients SHOULD warn on ambiguous/suspicious URIs (Punycode) | SHOULD | N/A | same as 464 |
+| 468 | Clients SHOULD NOT render URLs as clickable in elicitation fields except the URL-mode `url` field | SHOULD NOT | N/A | same as 464 |
+| 469 | Servers MUST NOT rely on client-provided user ID without server verification | MUST NOT | N/A | server-side |
+| 470 | Servers SHOULD follow security best practices for user identification | SHOULD | N/A | server-side |
+| 471 | Clients SHOULD validate all form responses against provided schema | SHOULD | N/A | no response generated. Note: rmcp gates schema validation behind opt-in `FormElicitationCapability { schema_validation: Some(true) }` (SDK `model/capabilities.rs:203-210` + builder `enable_elicitation_schema_validation` at `:559`). When we land row 414 we should opt in |
+| 472 | Servers SHOULD validate received data matches requested schema | SHOULD | N/A | server-side |
+| 473 | Servers MUST verify identity of user opening URL before accepting info (anti-phishing) | MUST | N/A | server-side |
+| 474 | Server MUST ensure user who started elicitation is same user who completes authorization flow | MUST | N/A | server-side |
+| 475 | Mechanism to determine user identity MUST be resilient to attacks where an attacker can modify the elicitation URL | MUST | N/A | server-side |
+| 476 | Clients SHOULD implement user approval controls | SHOULD | N/A | gated on row 414 + ACP surface |
+| 477 | Clients SHOULD allow users to decline elicitation requests at any time | SHOULD | ⚠️ | today we auto-decline 100% (default handler) — technically over-satisfies "user can decline" but degenerate. Real obligation lands with row 414 |
+| 478 | Clients SHOULD implement rate limiting | SHOULD | N/A | no accept path → no rate-limit surface yet |
+| 479 | Clients SHOULD present elicitation requests clearly (what / why) | SHOULD | N/A | gated on row 414 |
+
+### Improvement Plan (Jelly draft, pending Mira retroactive review)
+
+- [ ] **§1. Decide on elicitation as a client capability.** Either declare `ClientCapabilities { elicitation: Some(ElicitationCapability { form: Some(FormElicitationCapability { schema_validation: Some(true) }), url: Some(UrlElicitationCapability {}) }), .. }` and implement a real `ClientHandler` (replacing the `()` blanket at `src/mcp/runtime.rs:1066,1079` with a named struct that holds an `Arc<AcpClient>` channel), or stay opt-out and document the intentional gap so the ⚠️ rows (431/439/477) downgrade to ✅-by-design.
+  - **Eval**: openab-agent layer · non-trivial (~250-400 LOC: custom `ClientHandler` struct + `ClientCapabilities` plumbing in `runtime.rs::Dial::run` + ACP `session/request_permission` surface in `src/acp.rs` adjacent to existing `session/prompt` dispatch at `:87-89` + form-schema rendering for Brett) · **fit: in-scope**. Elicitation is the cleanest map onto our existing ACP human-in-the-loop UX — likely the first MCP client capability worth wiring end-to-end, and the prerequisite for unblocking every other N/A row in this section.
+- [ ] **§2. Make the not-supported path return `-32602` explicitly (row 439).** Until §1 ships, override `create_elicitation` with an impl that returns `Err(ErrorData::invalid_params("elicitation capability not declared", None))` instead of inheriting the default-decline (SDK `handler/client.rs:171-178`).
+  - **Eval**: openab-agent only · drop-in (~20 LOC: one `ClientHandler` impl on a zero-sized struct, swap `()` at `src/mcp/runtime.rs:1066,1079`) · **fit: in-scope**. Cheap precondition for §1 and removes the one concrete ❌ row in the section. Worth doing standalone even if §1 slips.
+- [ ] **§3. Re-audit rows 453 / 462 / 463 once §1 lands.** They are currently ✅ trivially (we don't accept URL mode); when we wire a real handler we must keep credential isolation and the no-prefetch invariant in the new code path.
+  - **Eval**: openab-agent layer · drop-in (test + doc only) · **fit: in-scope**. Cheap follow-up tied to §1's PR.
+- [ ] **§4. File rmcp upstream issue for `URLElicitationRequiredError` payload schema (rows 436/437).** rmcp 1.7.0 ships the `-32042` code constant + `ErrorData::url_elicitation_required()` helper (SDK `model.rs:509,562-567`) but no typed `{ elicitations: [...] }` payload struct; servers and clients have to hand-roll JSON in `ErrorData.data: Option<Value>`.
+  - **Eval**: rmcp upstream · non-trivial (schema PR + serde derives + cross-version compat for 2025-06-18 vs 2025-11-25) · **fit: borderline — file an issue, don't fork**. We are a client; even when §1 ships we only *receive* this error from servers we connect to (and can hand-parse `data` defensively until upstream lands a typed wrapper). Worth raising so the broader rmcp community converges.
+- [ ] **§5. After §1, add `notifications/elicitation/complete` handling.** Override `on_url_elicitation_notification_complete` (SDK `handler/client.rs:241-247`) to look up the `elicitation_id` in a per-server pending map (similar in spirit to `device_login_tasks` at `src/mcp/runtime.rs:129`) and surface the result back through ACP. Implement row 431 (ignore unknown IDs) as a real `HashMap::get` miss, not "we ignore everything".
+  - **Eval**: openab-agent layer · non-trivial (~100-150 LOC: pending-elicitation map with TTL + ACP fan-out wired into the new `ClientHandler` from §1) · **fit: in-scope (blocked on §1)**. Natural follow-up once URL mode is real; until then it's premature work.
 
 ## Server / Tools
 
