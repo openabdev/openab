@@ -53,45 +53,52 @@ Source: [`basic/index.mdx`](https://github.com/modelcontextprotocol/modelcontext
 
 | # | Item | Normative | Status | Location / Notes |
 |---|---|---|---|---|
-| 1 | All implementations MUST support base protocol and lifecycle management | MUST | | |
-| 2 | Other components MAY be implemented per app needs | MAY | | |
-| 3 | All messages MUST follow JSON-RPC 2.0 | MUST | | |
-| 4 | Requests MUST include a string or integer ID | MUST | | |
-| 5 | Request ID MUST NOT be `null` | MUST NOT | | |
-| 6 | Request ID MUST NOT be previously used by the requestor within the same session | MUST NOT | | |
-| 7 | Result responses MUST include the same ID as the request | MUST | | |
-| 8 | Result responses MUST include a `result` field | MUST | | |
-| 9 | The `result` MAY follow any JSON object structure | MAY | | |
-| 10 | Error responses MUST include the same ID as the request (except when malformed) | MUST | | |
-| 11 | Error responses MUST include an `error` field with `code` and `message` | MUST | | |
-| 12 | Error codes MUST be integers | MUST | | |
-| 13 | Notification receivers MUST NOT send a response | MUST NOT | | |
-| 14 | Notifications MUST NOT include an ID | MUST NOT | | |
-| 15 | HTTP-based transports SHOULD conform to Authorization spec | SHOULD | | |
-| 16 | STDIO transports SHOULD NOT follow auth spec; retrieve credentials from environment | SHOULD NOT | | |
-| 17 | Clients/servers MAY negotiate custom auth | MAY | | |
-| 18 | Implementations MUST support JSON Schema 2020-12 for schemas without explicit `$schema` | MUST | | |
-| 19 | Implementations MUST validate schemas according to declared/default dialect | MUST | | |
-| 20 | Implementations MUST handle unsupported dialects gracefully (return error indicating unsupported) | MUST | | |
-| 21 | Implementations SHOULD document which schema dialects they support | SHOULD | | |
-| 22 | Schemas MUST be valid according to their declared or default dialect | MUST | | |
-| 23 | Implementors are RECOMMENDED to use JSON Schema 2020-12 | RECOMMENDED | | |
-| 24 | Implementations MUST NOT make assumptions about values at reserved `_meta` keys | MUST NOT | | |
-| 25 | `_meta` prefix (if specified) MUST be dot-separated labels followed by `/`; each label MUST start with a letter and end with a letter or digit (interior chars MAY be letters, digits, or `-`) | MUST | | |
-| 26 | `_meta` prefixes containing `modelcontextprotocol` or `mcp` as second label are reserved | (reserved) | | |
-| 27 | `_meta` name MUST begin and end with alphanumeric | MUST | | |
-| 28 | `_meta` name MAY contain `-`, `_`, `.`, alphanumerics | MAY | | |
-| 29 | Implementations SHOULD use reverse DNS notation for `_meta` prefixes | SHOULD | | |
-| 30 | Icon-rendering clients MUST support `image/png` and `image/jpeg` (and `image/jpg`) MIME types | MUST | | |
-| 31 | Icon-rendering clients SHOULD also support `image/svg+xml` and `image/webp` | SHOULD | | |
-| 32 | Icon consumers MUST take appropriate security precautions when handling icons | MUST | | |
-| 33 | Clients MUST reject icon URIs with unsafe schemes (`javascript:`, `file:`, `ftp:`, `ws:`, local-app); MUST disallow scheme changes and cross-origin redirects | MUST | | |
-| 34 | Icon consumers MAY set limits for image size, dimensions, frame count | MAY | | |
-| 35 | Icons SHOULD be fetched without credentials — do not send cookies, `Authorization` headers, or client credentials | (security) | | |
-| 36 | Icon consumers MAY disallow specific file types or sanitize before rendering | MAY | | |
-| 37 | Validate MIME types and file contents before rendering icons (treat declared MIME as advisory; detect via magic bytes; reject on mismatch/unknown); maintain a strict allowlist of image types | (security) | | |
-| 37a | Verify icon URIs originate from the same origin as the server (cross-origin icons require explicit handling) | (security) | | |
-| 37b | JSON-RPC `Error.message` SHOULD be limited to a concise single sentence (per `schema.mdx` JSDoc) | SHOULD | | |
+| 1 | All implementations MUST support base protocol and lifecycle management | MUST | ✅ | `rmcp` 1.7 SDK — `src/mcp/runtime.rs:20-23` (`rmcp::ServiceExt`, `serve()`) |
+| 2 | Other components MAY be implemented per app needs | MAY | ✅ | meta-tool gateway exposes `tools/list` + `tools/call` (`src/mcp/meta_tool.rs`); other components intentionally deferred per ADR §5 |
+| 3 | All messages MUST follow JSON-RPC 2.0 | MUST | ✅ | `rmcp` SDK (delegated) |
+| 4 | Requests MUST include a string or integer ID | MUST | ✅ | `rmcp` SDK (`RequestId`) |
+| 5 | Request ID MUST NOT be `null` | MUST NOT | ✅ | `rmcp` SDK |
+| 6 | Request ID MUST NOT be previously used by the requestor within the same session | MUST NOT | ✅ | `rmcp` SDK (monotonic request id) |
+| 7 | Result responses MUST include the same ID as the request | MUST | ✅ | `rmcp` SDK |
+| 8 | Result responses MUST include a `result` field | MUST | ✅ | `rmcp` SDK |
+| 9 | The `result` MAY follow any JSON object structure | MAY | ✅ | `rmcp` SDK passes through |
+| 10 | Error responses MUST include the same ID as the request (except when malformed) | MUST | ✅ | `rmcp` SDK |
+| 11 | Error responses MUST include an `error` field with `code` and `message` | MUST | ✅ | `rmcp` SDK (`ErrorData`) |
+| 12 | Error codes MUST be integers | MUST | ✅ | `rmcp` SDK |
+| 13 | Notification receivers MUST NOT send a response | MUST NOT | ✅ | `rmcp` SDK |
+| 14 | Notifications MUST NOT include an ID | MUST NOT | ✅ | `rmcp` SDK |
+| 15 | HTTP-based transports SHOULD conform to Authorization spec | SHOULD | ✅ | `StreamableHttpClientTransport` `src/mcp/runtime.rs:21-22`; OAuth in `src/mcp/oauth.rs` + paste flow `src/mcp/flow.rs` |
+| 16 | STDIO transports SHOULD NOT follow auth spec; retrieve credentials from environment | SHOULD NOT | ✅ | `src/mcp/runtime.rs:1060-1064` (`env_clear()` + explicit `envs(stdio_child_env(&env))` + `TokioChildProcess::new`); resolver `src/mcp/config.rs:163-167` |
+| 17 | Clients/servers MAY negotiate custom auth | MAY | N/A | not implemented; we use only spec-defined transports |
+| 18 | Implementations MUST support JSON Schema 2020-12 for schemas without explicit `$schema` | MUST | ⚠️ | no in-code dialect handling; depends entirely on `rmcp` 1.7 internal validation (Jelly: needs confirmation from rmcp source / docs) |
+| 19 | Implementations MUST validate schemas according to declared/default dialect | MUST | ❌ | no schema validation in `openab-agent` — tool input schemas passed through to LLM as-is (`src/mcp/meta_tool.rs:95-116`) |
+| 20 | Implementations MUST handle unsupported dialects gracefully (return error indicating unsupported) | MUST | ❌ | no dialect detection / error path |
+| 21 | Implementations SHOULD document which schema dialects they support | SHOULD | ❌ | not documented in README / docs |
+| 22 | Schemas MUST be valid according to their declared or default dialect | MUST | N/A | server-authored; we are a client |
+| 23 | Implementors are RECOMMENDED to use JSON Schema 2020-12 | RECOMMENDED | N/A | we don't author schemas |
+| 24 | Implementations MUST NOT make assumptions about values at reserved `_meta` keys | MUST NOT | ✅ | no `_meta` references in `src/mcp/**`; we never read or rewrite the field, so by omission we don't assume |
+| 25 | `_meta` prefix format MUST be dot-separated labels followed by `/` | MUST | N/A | we don't author `_meta` |
+| 26 | `_meta` prefixes containing `modelcontextprotocol` / `mcp` reserved | (reserved) | N/A | we don't author |
+| 27 | `_meta` name MUST begin and end with alphanumeric | MUST | N/A | we don't author |
+| 28 | `_meta` name MAY contain `-`, `_`, `.`, alphanumerics | MAY | N/A | we don't author |
+| 29 | SHOULD use reverse DNS notation for `_meta` prefixes | SHOULD | N/A | we don't author |
+| 30 | Icon-rendering clients MUST support `image/png` and `image/jpeg` | MUST | N/A | `openab-agent` is a CLI/meta-tool gateway; no icon rendering surface |
+| 31 | Icon-rendering clients SHOULD support `image/svg+xml` and `image/webp` | SHOULD | N/A | same |
+| 32 | Icon consumers MUST take security precautions | MUST | N/A | same |
+| 33 | Clients MUST reject icon URIs with unsafe schemes | MUST | N/A | same |
+| 34 | MAY set image size limits | MAY | N/A | same |
+| 35 | Icons SHOULD be fetched without credentials | (security) | N/A | same |
+| 36 | MAY disallow file types | MAY | N/A | same |
+| 37 | Validate MIME via magic bytes / allowlist | (security) | N/A | same |
+| 37a | Verify icon URIs same-origin | (security) | N/A | same |
+| 37b | JSON-RPC `Error.message` SHOULD be concise single sentence | SHOULD | ⚠️ | wrapped via `anyhow::Context` + `format!` (e.g., `src/mcp/runtime.rs:1753`, `src/mcp/meta_tool.rs:95+`); no length enforcement, often multi-clause |
+
+### Improvement Plan (draft — pending Mira consensus)
+
+- [ ] **Row 18-21 (JSON Schema 2020-12)**: confirm `rmcp` 1.7 actually validates `tools/list` input schemas against declared dialect; if not, add a validation layer at `src/mcp/meta_tool.rs::fetch_tools` boundary or document the gap as a known limitation. Document supported dialect in README / `openab-agent/docs/`.
+- [ ] **Row 19-20**: surface unsupported-dialect tool entries as `NeedsAttention` rather than silently passing through; covers MUST-handle-gracefully.
+- [ ] **Row 37b (`Error.message` brevity)**: introduce a `concise_error_message(err: &anyhow::Error) -> String` helper that takes the top-level cause's `to_string()` (not the chained one) for the JSON-RPC error payload, and keep the full chain only in `tracing` logs. Audit `runtime.rs:1753` `format!(r#"{{"error": "{code}"}}"#)` for whether `code` value is ever a multi-clause string.
+- [ ] **Documentation**: README MCP section should explicitly call out (a) JSON Schema dialect support / passthrough behavior, (b) that `_meta` keys are passed through opaquely, (c) icon-rendering is N/A (we're not a UI client).
 
 ## Lifecycle
 
