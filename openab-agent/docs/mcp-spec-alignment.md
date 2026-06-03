@@ -257,6 +257,11 @@ Source: [`basic/authorization.mdx`](https://github.com/modelcontextprotocol/mode
 | 176 | CIMD: clients MAY use `private_key_jwt` for client authentication | MAY | | |
 | 177 | CIMD: MCP clients SHOULD check for `client_id_metadata_document_supported` AS capability | SHOULD | | |
 | 178 | CIMD: MCP clients MAY fall back to DCR or pre-registration if CIMD unavailable | MAY | | |
+| 178a | CIMD (AS-side): AS SHOULD fetch metadata documents when encountering URL-formatted `client_id`s | SHOULD | N/A — client-side | |
+| 178b | CIMD (AS-side): AS MUST validate fetched document's `client_id` matches the URL exactly | MUST | N/A — client-side | |
+| 178c | CIMD (AS-side): AS SHOULD cache metadata respecting HTTP cache headers | SHOULD | N/A — client-side | |
+| 178d | CIMD (AS-side): AS MUST validate redirect URIs in authorization request against metadata document | MUST | N/A — client-side | |
+| 178e | CIMD (AS-side): AS MUST validate metadata document structure is valid JSON and contains required fields | MUST | N/A — client-side | |
 | 179 | Pre-registration: MCP clients SHOULD support an option for static client credentials | SHOULD | | |
 | 180 | MCP clients and AS MAY support RFC 7591 Dynamic Client Registration | MAY | | |
 | 181 | Scope Selection: clients SHOULD follow least privilege when requesting scopes | SHOULD | | |
