@@ -91,7 +91,7 @@ Source: [`basic/index.mdx`](https://github.com/modelcontextprotocol/modelcontext
 | 36 | MAY disallow file types | MAY | N/A | same |
 | 37 | Validate MIME via magic bytes / allowlist | (security) | N/A | same |
 | 37a | Verify icon URIs same-origin | (security) | N/A | same |
-| 37b | JSON-RPC `Error.message` SHOULD be concise single sentence | SHOULD | ⚠️ | wrapped via `anyhow::Context` + `format!`; multi-clause sites confirmed: `src/mcp/runtime.rs:272` (pending-login load), `src/mcp/runtime.rs:1753` (HTTP error body format), `src/mcp/config.rs:149-150` (spec config read+parse), `src/mcp/config.rs:166` (env var resolve), `src/mcp/meta_tool.rs:95+` (tool-call params), `src/mcp/oauth.rs:57,63` (PKCE/OAuth) — Mira-extended inventory |
+| 37b | JSON-RPC `Error.message` SHOULD be concise single sentence | SHOULD | ⚠️ | wrapped via `anyhow::Context` + `format!`; multi-clause sites confirmed: `src/mcp/runtime.rs:1753` (HTTP error body format), `src/mcp/config.rs:155-157` (spec config `read_to_string` + `serde_json::from_str` with two `with_context` layers), `src/mcp/config.rs:170-173` (env var resolve via `interpolate_value` + `with_context`), `src/mcp/meta_tool.rs:95+` (tool-call params), `src/mcp/oauth.rs:57,63` (PKCE/OAuth `anyhow!` sites) — Mira-extended inventory; Jelly fact-check 2026-06-03 dropped stale `runtime.rs:272` (not an error site, struct-literal line) + repointed `config.rs:149-150` → `155-157`, `config.rs:166` → `170-173` |
 
 ### Improvement Plan (Jelly + Mira consensus, section 0)
 
@@ -251,109 +251,119 @@ Source: [`basic/authorization.mdx`](https://github.com/modelcontextprotocol/mode
 
 | # | Item | Normative | Status | Location / Notes |
 |---|---|---|---|---|
-| 146 | Authorization is OPTIONAL | OPTIONAL | | |
-| 147 | HTTP transports SHOULD conform to authorization spec | SHOULD | | |
-| 148 | STDIO SHOULD NOT follow this spec; credentials from environment | SHOULD NOT | | |
-| 149 | Alternative transports MUST follow established security best practices for their protocol | MUST | | |
-| 150 | Authorization servers MUST implement OAuth 2.1 with appropriate security measures for both confidential and public clients | MUST | | |
-| 151 | AS and MCP clients SHOULD support OAuth Client ID Metadata Documents | SHOULD | | |
-| 152 | AS and MCP clients MAY support RFC 7591 Dynamic Client Registration | MAY | | |
-| 153 | MCP servers MUST implement RFC 9728 Protected Resource Metadata | MUST | | |
-| 154 | MCP clients MUST use RFC 9728 PRM for authorization server discovery | MUST | | |
-| 155 | AS MUST provide at least one of: RFC 8414 AS metadata, OpenID Connect Discovery 1.0 | MUST | | |
-| 156 | MCP clients MUST support both AS metadata discovery mechanisms (RFC 8414 + OIDC Discovery 1.0) | MUST | | |
-| 157 | PRM document MUST include `authorization_servers` field with ≥1 AS | MUST | | |
-| 158 | MCP servers MUST implement one of the following PRM discovery mechanisms: `resource_metadata` in `WWW-Authenticate` on 401, or RFC 9728 well-known URI | MUST | | |
-| 159 | MCP clients MUST support both PRM discovery mechanisms (header + well-known fallback) | MUST | | |
-| 160 | MCP servers SHOULD include `scope` in `WWW-Authenticate` (per RFC 6750 §3) | SHOULD | | |
-| 161 | Clients MUST NOT assume relationship between `WWW-Authenticate` scope set and `scopes_supported` | MUST NOT | | |
-| 162 | Clients MUST treat challenge-provided scopes as authoritative for current request | MUST | | |
-| 163 | Servers SHOULD strive for consistency in scope set construction | SHOULD | | |
-| 164 | MCP clients MUST be able to parse `WWW-Authenticate` headers and respond appropriately to 401 | MUST | | |
-| 165 | If `scope` is absent from `WWW-Authenticate`, clients SHOULD apply Scope Selection Strategy fallback | SHOULD | | |
-| 166 | Clients MUST attempt multiple well-known endpoints (RFC 8414 + OIDC) when discovering AS metadata | MUST | | |
-| 167 | For path-bearing issuer URLs, clients MUST try priority order: oauth-authorization-server path-insert, openid-configuration path-insert, openid-configuration appended | MUST | | |
-| 168 | For pathless issuer URLs, clients MUST try oauth-authorization-server, then openid-configuration | MUST | | |
-| 169 | Clients supporting all registration options SHOULD prefer pre-registered, then CIMD, then DCR, then prompt | SHOULD | | |
-| 170 | MCP clients and AS SHOULD support OAuth Client ID Metadata Documents | SHOULD | | |
-| 171 | CIMD-supporting MCP implementations MUST follow OAuth CIMD requirements | MUST | | |
-| 172 | CIMD: clients MUST host metadata document at HTTPS URL per RFC requirements | MUST | | |
-| 173 | CIMD: `client_id` URL MUST use `https` scheme with a path component | MUST | | |
-| 174 | CIMD: metadata MUST include at least `client_id`, `client_name`, `redirect_uris` | MUST | | |
-| 175 | CIMD: clients MUST ensure `client_id` value matches the document URL exactly | MUST | | |
-| 176 | CIMD: clients MAY use `private_key_jwt` for client authentication | MAY | | |
-| 177 | CIMD: MCP clients SHOULD check for `client_id_metadata_document_supported` AS capability | SHOULD | | |
-| 178 | CIMD: MCP clients MAY fall back to DCR or pre-registration if CIMD unavailable | MAY | | |
-| 178a | CIMD (AS-side): AS SHOULD fetch metadata documents when encountering URL-formatted `client_id`s | SHOULD | N/A — client-side | |
-| 178b | CIMD (AS-side): AS MUST validate fetched document's `client_id` matches the URL exactly | MUST | N/A — client-side | |
-| 178c | CIMD (AS-side): AS SHOULD cache metadata respecting HTTP cache headers | SHOULD | N/A — client-side | |
-| 178d | CIMD (AS-side): AS MUST validate redirect URIs in authorization request against metadata document | MUST | N/A — client-side | |
-| 178e | CIMD (AS-side): AS MUST validate metadata document structure is valid JSON and contains required fields | MUST | N/A — client-side | |
-| 179 | Pre-registration: MCP clients SHOULD support an option for static client credentials | SHOULD | | |
-| 180 | MCP clients and AS MAY support RFC 7591 Dynamic Client Registration | MAY | | |
-| 181 | Scope Selection: clients SHOULD follow least privilege when requesting scopes | SHOULD | | |
-| 182 | Scope Selection: clients SHOULD prefer `scope` from initial `WWW-Authenticate` header, else `scopes_supported` from PRM, else omit `scope` | SHOULD | | |
-| 183 | MCP clients MUST implement RFC 8707 Resource Indicators (`resource` parameter) | MUST | | |
-| 184 | `resource` parameter MUST be included in both authorization and token requests | MUST | | |
-| 185 | `resource` parameter MUST identify the intended MCP server | MUST | | |
-| 186 | `resource` MUST use the canonical URI per RFC 8707 §2 | MUST | | |
-| 187 | MCP clients SHOULD provide the most specific URI possible for the MCP server | SHOULD | | |
-| 188 | Implementations SHOULD accept uppercase scheme/host for robustness | SHOULD | | |
-| 189 | Implementations SHOULD consistently use no-trailing-slash form for interoperability | SHOULD | | |
-| 190 | MCP clients MUST send `resource` regardless of AS support | MUST | | |
-| 191 | Access token handling MUST conform to OAuth 2.1 §5 | MUST | | |
-| 192 | MCP client MUST use `Authorization: Bearer <access-token>` header | MUST | | |
-| 193 | Authorization MUST be included on every HTTP request from client to server | MUST | | |
-| 194 | Access tokens MUST NOT be in URI query | MUST NOT | | |
-| 195 | MCP clients MUST NOT send tokens to the MCP server other than ones issued by the MCP server's AS | MUST NOT | | |
-| 196 | MCP servers MUST validate access tokens per OAuth 2.1 §5.2 | MUST | | |
-| 197 | MCP servers MUST validate tokens were issued specifically for them (audience) | MUST | | |
-| 198 | On validation failure, MCP servers MUST follow OAuth 2.1 §5.3 error handling | MUST | | |
-| 199 | Invalid/expired tokens MUST receive HTTP 401 | MUST | | |
-| 200 | MCP servers MUST only accept tokens valid for their own resources | MUST | | |
-| 201 | MCP servers MUST NOT accept or transit any other tokens | MUST NOT | | |
-| 202 | Servers MUST return appropriate HTTP status (401/403/400) for auth errors | MUST | | |
-| 203 | On runtime insufficient scope, server SHOULD return 403 + `WWW-Authenticate` with `error="insufficient_scope"`, `scope`, `resource_metadata`, optional `error_description` | SHOULD | | |
-| 204 | On insufficient-scope error, servers SHOULD include required scopes in `scope` parameter | SHOULD | | |
-| 205 | Servers SHOULD be consistent in scope inclusion strategy | SHOULD | | |
-| 206 | Servers SHOULD consider UX impact when choosing scopes for insufficient-scope errors | SHOULD | | |
-| 207 | Clients SHOULD respond to scope errors via step-up authorization flow OR handle the errors in other appropriate ways | SHOULD | | |
-| 207a | Clients acting on behalf of a user SHOULD attempt the step-up authorization flow | SHOULD | | |
-| 208 | `client_credentials` clients MAY attempt step-up authorization or abort | MAY | | |
-| 209 | Clients SHOULD implement retry limits and track scope-upgrade attempts | SHOULD | | |
-| 210 | Implementations MUST follow OAuth 2.1 §7 Security Considerations | MUST | | |
-| 211 | MCP clients MUST include `resource` parameter for audience binding | MUST | | |
-| 212 | MCP servers MUST validate tokens are issued for their own use | MUST | | |
-| 213 | Clients and servers MUST implement secure token storage per OAuth 2.1 §7.1 | MUST | | |
-| 214 | AS SHOULD issue short-lived access tokens | SHOULD | | |
-| 215 | For public clients, AS MUST rotate refresh tokens | MUST | | |
-| 216 | Implementations MUST follow OAuth 2.1 §1.5 Communication Security | MUST | | |
-| 217 | All AS endpoints MUST be HTTPS | MUST | | |
-| 218 | All redirect URIs MUST be localhost or HTTPS | MUST | | |
-| 219 | MCP clients MUST implement PKCE per OAuth 2.1 §7.5.2 | MUST | | |
-| 220 | MCP clients MUST verify PKCE support before proceeding with authorization | MUST | | |
-| 221 | MCP clients MUST use `S256` code challenge method when technically capable (OAuth 2.1 §4.1.1) | MUST | | |
-| 222 | OAuth 2.0 AS metadata: if `code_challenge_methods_supported` absent, clients MUST refuse to proceed | MUST | | |
-| 223 | OIDC Discovery 1.0: clients MUST verify `code_challenge_methods_supported` is present; refuse if absent | MUST | | |
-| 224 | AS providing OIDC Discovery 1.0 MUST include `code_challenge_methods_supported` | MUST | | |
-| 225 | MCP clients MUST have redirect URIs registered with the AS | MUST | | |
-| 226 | AS MUST validate exact redirect URIs against pre-registered values | MUST | | |
-| 227 | MCP clients SHOULD use and verify `state` parameter, discard mismatches | SHOULD | | |
-| 228 | AS MUST take precautions to prevent redirecting to untrusted URIs | MUST | | |
-| 229 | AS SHOULD only auto-redirect if URI is trusted | SHOULD | | |
-| 230 | AS implementing CIMD MUST consider security implications per CIMD §6 | MUST | | |
-| 231 | AS fetching CIMD documents SHOULD consider SSRF risks | SHOULD | | |
-| 232 | AS SHOULD display additional warnings for `localhost`-only redirect URIs | SHOULD | | |
-| 233 | AS MAY require additional attestation mechanisms for enhanced security (esp. in the context of `localhost` redirect URIs) | MAY | | |
-| 234 | AS MUST clearly display the redirect URI hostname during authorization | MUST | | |
-| 235 | AS MAY implement domain-based trust policies | MAY | | |
-| 236 | MCP proxies with static client IDs MUST obtain user consent for each dynamically registered client | MUST | | |
-| 237 | MCP servers MUST validate access tokens before processing requests | MUST | | |
-| 238 | MCP servers MUST follow OAuth 2.1 §5.2 for token validation | MUST | | |
-| 239 | MCP servers MUST only accept tokens specifically intended for themselves | MUST | | |
-| 240 | MCP servers MUST reject tokens that do not include them in the audience claim, or otherwise verify they are the intended recipient | MUST | | |
-| 241 | MCP servers MUST NOT pass through MCP-client tokens to upstream APIs | MUST NOT | | |
-| 242 | MCP clients MUST implement and use the RFC 8707 `resource` parameter (aligns with RFC 9728 §7.4 recommendation) | MUST | | |
+| 146 | Authorization is OPTIONAL | OPTIONAL | ✅ | per-server `oauth: Option<OAuthConfig>` (`src/mcp/config.rs:33`); HTTP servers can run anonymous (`runtime.rs:1077`) |
+| 147 | HTTP transports SHOULD conform to authorization spec | SHOULD | ⚠️ | OAuth 2.1 PKCE flow + bearer header (`src/mcp/oauth.rs`, `src/mcp/flow.rs`, `auth.rs:351-410`) — base mechanics conform; key MCP-spec gaps in PRM (RFC 9728), AS-metadata discovery dual-mechanism (RFC 8414+OIDC), CIMD, RFC 8707 resource param — see rows below |
+| 148 | STDIO SHOULD NOT follow this spec; credentials from environment | SHOULD NOT | ✅ | stdio uses `env_clear()` + explicit `envs(stdio_child_env(&env))` (`src/mcp/runtime.rs:1059-1063`); no OAuth on stdio path |
+| 149 | Alternative transports MUST follow established security best practices for their protocol | MUST | N/A | no alternative transports beyond stdio + Streamable HTTP |
+| 150 | Authorization servers MUST implement OAuth 2.1 with appropriate security measures for both confidential and public clients | MUST | N/A | AS-side |
+| 151 | AS and MCP clients SHOULD support OAuth Client ID Metadata Documents | SHOULD | ❌ | no CIMD client support; we use pre-registered client IDs only (env-injected via `OPENAB_MCP_<provider>_CLIENT_ID`, `oauth.rs:188-209`) |
+| 152 | AS and MCP clients MAY support RFC 7591 Dynamic Client Registration | MAY | ❌ | no DCR implementation |
+| 153 | MCP servers MUST implement RFC 9728 Protected Resource Metadata | MUST | N/A | server-side |
+| 154 | MCP clients MUST use RFC 9728 PRM for authorization server discovery | MUST | ❌ | no PRM consumer; AS endpoints come from built-in `ProviderSpec` (`oauth.rs:14-30`) or custom `OAuthConfig.{authorize_url, token_url}` (`config.rs:81-83`). `discovery: bool` field (`config.rs:95`) is declared but per `oauth.rs::resolve_custom` the discovery branch is not actually exercised — `authorize_url` + `token_url` are required even when `discovery=true` |
+| 155 | AS MUST provide at least one of: RFC 8414 AS metadata, OpenID Connect Discovery 1.0 | MUST | N/A | AS-side |
+| 156 | MCP clients MUST support both AS metadata discovery mechanisms (RFC 8414 + OIDC Discovery 1.0) | MUST | ❌ | no AS-metadata discovery client; `discovery_allowlist` SSRF guard (`config.rs:104-110`) is scaffolding for the missing implementation |
+| 157 | PRM document MUST include `authorization_servers` field with ≥1 AS | MUST | N/A | server-side |
+| 158 | MCP servers MUST implement one of the following PRM discovery mechanisms: `resource_metadata` in `WWW-Authenticate` on 401, or RFC 9728 well-known URI | MUST | N/A | server-side |
+| 159 | MCP clients MUST support both PRM discovery mechanisms (header + well-known fallback) | MUST | ❌ | no `WWW-Authenticate` parse, no `.well-known/oauth-protected-resource` fetch — searched `src/`: zero matches for `WWW-Authenticate` / `resource_metadata` / `protected-resource` outside `Cargo.lock` traces |
+| 160 | MCP servers SHOULD include `scope` in `WWW-Authenticate` (per RFC 6750 §3) | SHOULD | N/A | server-side |
+| 161 | Clients MUST NOT assume relationship between `WWW-Authenticate` scope set and `scopes_supported` | MUST NOT | ❌ (vacuously) | we don't parse `WWW-Authenticate` at all, so we don't conflate — but we also don't honour it; net gap |
+| 162 | Clients MUST treat challenge-provided scopes as authoritative for current request | MUST | ❌ | no challenge parsing |
+| 163 | Servers SHOULD strive for consistency in scope set construction | SHOULD | N/A | server-side |
+| 164 | MCP clients MUST be able to parse `WWW-Authenticate` headers and respond appropriately to 401 | MUST | ❌ | rmcp 1.7.0 surfaces 401 as `StreamableHttpError::AuthRequired` carrying the raw `WWW-Authenticate` header value (`rmcp transport/common/reqwest/streamable_http_client.rs:136-149` SDK) — but our agent code does not parse it or trigger reauth; just propagates the error |
+| 165 | If `scope` is absent from `WWW-Authenticate`, clients SHOULD apply Scope Selection Strategy fallback | SHOULD | ❌ | no Scope Selection Strategy implementation |
+| 166 | Clients MUST attempt multiple well-known endpoints (RFC 8414 + OIDC) when discovering AS metadata | MUST | ❌ | no discovery path |
+| 167 | For path-bearing issuer URLs, clients MUST try priority order: oauth-authorization-server path-insert, openid-configuration path-insert, openid-configuration appended | MUST | ❌ | no discovery path |
+| 168 | For pathless issuer URLs, clients MUST try oauth-authorization-server, then openid-configuration | MUST | ❌ | no discovery path |
+| 169 | Clients supporting all registration options SHOULD prefer pre-registered, then CIMD, then DCR, then prompt | SHOULD | ⚠️ (degenerate) | we only support pre-registered (env-injected client IDs) — top of the priority list is honoured, the rest don't exist |
+| 170 | MCP clients and AS SHOULD support OAuth Client ID Metadata Documents | SHOULD | ❌ | duplicate of row 151; no CIMD |
+| 171 | CIMD-supporting MCP implementations MUST follow OAuth CIMD requirements | MUST | N/A | no CIMD support — vacuously satisfied |
+| 172 | CIMD: clients MUST host metadata document at HTTPS URL per RFC requirements | MUST | N/A | no CIMD |
+| 173 | CIMD: `client_id` URL MUST use `https` scheme with a path component | MUST | N/A | no CIMD |
+| 174 | CIMD: metadata MUST include at least `client_id`, `client_name`, `redirect_uris` | MUST | N/A | no CIMD |
+| 175 | CIMD: clients MUST ensure `client_id` value matches the document URL exactly | MUST | N/A | no CIMD |
+| 176 | CIMD: clients MAY use `private_key_jwt` for client authentication | MAY | N/A | no CIMD |
+| 177 | CIMD: MCP clients SHOULD check for `client_id_metadata_document_supported` AS capability | SHOULD | N/A | no CIMD |
+| 178 | CIMD: MCP clients MAY fall back to DCR or pre-registration if CIMD unavailable | MAY | ⚠️ | we _always_ use pre-registration; this is "fall back to" by virtue of having no CIMD or DCR — vacuous |
+| 178a | CIMD (AS-side): AS SHOULD fetch metadata documents when encountering URL-formatted `client_id`s | SHOULD | N/A — client-side | (AS-side) |
+| 178b | CIMD (AS-side): AS MUST validate fetched document's `client_id` matches the URL exactly | MUST | N/A — client-side | (AS-side) |
+| 178c | CIMD (AS-side): AS SHOULD cache metadata respecting HTTP cache headers | SHOULD | N/A — client-side | (AS-side) |
+| 178d | CIMD (AS-side): AS MUST validate redirect URIs in authorization request against metadata document | MUST | N/A — client-side | (AS-side) |
+| 178e | CIMD (AS-side): AS MUST validate metadata document structure is valid JSON and contains required fields | MUST | N/A — client-side | (AS-side) |
+| 179 | Pre-registration: MCP clients SHOULD support an option for static client credentials | SHOULD | ✅ | env-injected client ID per built-in provider (`oauth.rs::builtin_client_id`, env var pattern `OPENAB_MCP_<provider>_CLIENT_ID`); custom providers carry `client_id: Option<String>` on `OAuthConfig` (`config.rs:85`) |
+| 180 | MCP clients and AS MAY support RFC 7591 Dynamic Client Registration | MAY | ❌ | no DCR |
+| 181 | Scope Selection: clients SHOULD follow least privilege when requesting scopes | SHOULD | ⚠️ | per-built-in `default_scopes` baked in (`oauth.rs::ProviderSpec`); custom providers carry user-supplied `scopes` (`config.rs:79`) — no enforcement that the set is least-privilege, but defaults are deliberately minimal (e.g. Linear `read`-set) |
+| 182 | Scope Selection: clients SHOULD prefer `scope` from initial `WWW-Authenticate` header, else `scopes_supported` from PRM, else omit `scope` | SHOULD | ❌ | no challenge-driven scope selection |
+| 183 | MCP clients MUST implement RFC 8707 Resource Indicators (`resource` parameter) | MUST | ❌ | no `resource` parameter on authorize URL — `flow.rs:48-50` appends `code_challenge`, `code_challenge_method`, no `resource`; auth.rs PKCE flow also lacks it (auth.rs:357) |
+| 184 | `resource` parameter MUST be included in both authorization and token requests | MUST | ❌ | not implemented in either |
+| 185 | `resource` parameter MUST identify the intended MCP server | MUST | ❌ | not implemented |
+| 186 | `resource` MUST use the canonical URI per RFC 8707 §2 | MUST | ❌ | not implemented |
+| 187 | MCP clients SHOULD provide the most specific URI possible for the MCP server | SHOULD | ❌ | not implemented |
+| 188 | Implementations SHOULD accept uppercase scheme/host for robustness | SHOULD | N/A | no `resource` canonicalization since none sent |
+| 189 | Implementations SHOULD consistently use no-trailing-slash form for interoperability | SHOULD | N/A | no `resource` canonicalization since none sent |
+| 190 | MCP clients MUST send `resource` regardless of AS support | MUST | ❌ | not implemented |
+| 191 | Access token handling MUST conform to OAuth 2.1 §5 | MUST | ✅ | tokens stored on disk via `save_namespaced_token_at` (`auth.rs:33`), retrieved via `load_namespaced_token_at`; bearer-injected into transport via `auth_header(token)` (`src/mcp/runtime.rs:1073-1074`) |
+| 192 | MCP client MUST use `Authorization: Bearer <access-token>` header | MUST | ✅ | rmcp `StreamableHttpClientTransportConfig::auth_header(token)` injects bearer (SDK `transport/common/reqwest/streamable_http_client.rs:126-128` uses `request.bearer_auth(...)`) |
+| 193 | Authorization MUST be included on every HTTP request from client to server | MUST | ✅ | `auth_header` is part of `StreamableHttpClientTransportConfig`; rmcp re-applies on every POST + GET + DELETE (`transport/common/reqwest/streamable_http_client.rs:64-66, 99-101, 126-128`) |
+| 194 | Access tokens MUST NOT be in URI query | MUST NOT | ✅ | rmcp always uses header (see row 192); no query usage in our code |
+| 195 | MCP clients MUST NOT send tokens to the MCP server other than ones issued by the MCP server's AS | MUST NOT | ✅ | per-server `oauth` block resolves to per-server token store (`namespaced_token` keyed by server name); no cross-server token reuse |
+| 196 | MCP servers MUST validate access tokens per OAuth 2.1 §5.2 | MUST | N/A | server-side |
+| 197 | MCP servers MUST validate tokens were issued specifically for them (audience) | MUST | N/A | server-side |
+| 198 | On validation failure, MCP servers MUST follow OAuth 2.1 §5.3 error handling | MUST | N/A | server-side |
+| 199 | Invalid/expired tokens MUST receive HTTP 401 | MUST | N/A | server-side; client side: 401 surfaces as `AuthRequired` error (SDK) — see row 164 |
+| 200 | MCP servers MUST only accept tokens valid for their own resources | MUST | N/A | server-side |
+| 201 | MCP servers MUST NOT accept or transit any other tokens | MUST NOT | N/A | server-side |
+| 202 | Servers MUST return appropriate HTTP status (401/403/400) for auth errors | MUST | N/A | server-side |
+| 203 | On runtime insufficient scope, server SHOULD return 403 + `WWW-Authenticate` with `error="insufficient_scope"`, `scope`, `resource_metadata`, optional `error_description` | SHOULD | N/A | server-side; client surface: rmcp 403 path → `StreamableHttpError::InsufficientScope` carrying `required_scope` extracted from `WWW-Authenticate` (SDK `transport/common/reqwest/streamable_http_client.rs:151-166`) |
+| 204 | On insufficient-scope error, servers SHOULD include required scopes in `scope` parameter | SHOULD | N/A | server-side |
+| 205 | Servers SHOULD be consistent in scope inclusion strategy | SHOULD | N/A | server-side |
+| 206 | Servers SHOULD consider UX impact when choosing scopes for insufficient-scope errors | SHOULD | N/A | server-side |
+| 207 | Clients SHOULD respond to scope errors via step-up authorization flow OR handle the errors in other appropriate ways | SHOULD | ❌ | rmcp surfaces `InsufficientScope.required_scope` (SDK) but our agent does not consume it — error bubbles up; no step-up reauth |
+| 207a | Clients acting on behalf of a user SHOULD attempt the step-up authorization flow | SHOULD | ❌ | as above |
+| 208 | `client_credentials` clients MAY attempt step-up authorization or abort | MAY | N/A | we don't use client_credentials grant |
+| 209 | Clients SHOULD implement retry limits and track scope-upgrade attempts | SHOULD | N/A | no step-up implementation to limit |
+| 210 | Implementations MUST follow OAuth 2.1 §7 Security Considerations | MUST | ⚠️ | PKCE + state nonce ✅, but missing: RFC 8707 resource audience binding (rows 183-190), `WWW-Authenticate`-driven reauth (row 164) |
+| 211 | MCP clients MUST include `resource` parameter for audience binding | MUST | ❌ | dup of 183/190 — not implemented |
+| 212 | MCP servers MUST validate tokens are issued for their own use | MUST | N/A | server-side |
+| 213 | Clients and servers MUST implement secure token storage per OAuth 2.1 §7.1 | MUST | ⚠️ | tokens written to `auth.json` under `~/.openab/agent/` via `auth.rs` (filesystem-permissioned to user); not encrypted at rest, not in OS keyring. Adequate for a single-user agent on a single-user host but not "secure storage" in the strong sense |
+| 214 | AS SHOULD issue short-lived access tokens | SHOULD | N/A | AS-side |
+| 215 | For public clients, AS MUST rotate refresh tokens | MUST | N/A | AS-side; client-side: refresh-token handling lives in `auth.rs` token-refresh path |
+| 216 | Implementations MUST follow OAuth 2.1 §1.5 Communication Security | MUST | ✅ | all auth flow URLs are HTTPS in built-in `ProviderSpec`s (`oauth.rs:14-30`); custom providers have unenforced URL scheme — see Improvement Plan |
+| 217 | All AS endpoints MUST be HTTPS | MUST | ⚠️ | built-ins ✅; custom provider `authorize_url` / `token_url` not validated as `https://` — see Improvement Plan |
+| 218 | All redirect URIs MUST be localhost or HTTPS | MUST | ⚠️ | built-ins pin `http://localhost:<port>/callback` (acceptable per spec localhost exception); custom `redirect_uri` not validated — see Improvement Plan |
+| 219 | MCP clients MUST implement PKCE per OAuth 2.1 §7.5.2 | MUST | ✅ | `generate_pkce()` + `code_challenge_method=S256` in `src/mcp/flow.rs:42-50` (paste-back) and `src/auth.rs:351, 357` (browser); verifier preserved across paste-back via `PendingPasteLogin` (`runtime.rs:269-275`) and sent to token endpoint (`auth.rs:410, 493, 585`) |
+| 220 | MCP clients MUST verify PKCE support before proceeding with authorization | MUST | ❌ | no `code_challenge_methods_supported` check; PKCE is unconditionally sent regardless of AS metadata (which we don't fetch — see row 156) |
+| 221 | MCP clients MUST use `S256` code challenge method when technically capable (OAuth 2.1 §4.1.1) | MUST | ✅ | unconditional `S256` (`flow.rs:50`, `auth.rs:357`) |
+| 222 | OAuth 2.0 AS metadata: if `code_challenge_methods_supported` absent, clients MUST refuse to proceed | MUST | ❌ | no AS-metadata fetch (row 156) so we can't enforce this; we send PKCE anyway, which is the safe behaviour but technically violates the "refuse to proceed" wording when metadata is absent |
+| 223 | OIDC Discovery 1.0: clients MUST verify `code_challenge_methods_supported` is present; refuse if absent | MUST | ❌ | as above |
+| 224 | AS providing OIDC Discovery 1.0 MUST include `code_challenge_methods_supported` | MUST | N/A | AS-side |
+| 225 | MCP clients MUST have redirect URIs registered with the AS | MUST | ✅ | built-ins pin `callback` per `ProviderSpec` (`oauth.rs:18, 23+`), pre-registered with each AS; custom flow requires `redirect_uri` field |
+| 226 | AS MUST validate exact redirect URIs against pre-registered values | MUST | N/A | AS-side |
+| 227 | MCP clients SHOULD use and verify `state` parameter, discard mismatches | SHOULD | ✅ | `state` generated + verified per `flow.rs::init_paste_authorize` (random nonce) + `flow.rs::complete_paste_authorize` (state echo check per RFC 6749 §10.12 — see runtime.rs:299 comment); state snapshot in `PendingPasteLogin` (`runtime.rs:271`) |
+| 228 | AS MUST take precautions to prevent redirecting to untrusted URIs | MUST | N/A | AS-side |
+| 229 | AS SHOULD only auto-redirect if URI is trusted | SHOULD | N/A | AS-side |
+| 230 | AS implementing CIMD MUST consider security implications per CIMD §6 | MUST | N/A | AS-side / no CIMD |
+| 231 | AS fetching CIMD documents SHOULD consider SSRF risks | SHOULD | N/A | AS-side |
+| 232 | AS SHOULD display additional warnings for `localhost`-only redirect URIs | SHOULD | N/A | AS-side |
+| 233 | AS MAY require additional attestation mechanisms for enhanced security (esp. in the context of `localhost` redirect URIs) | MAY | N/A | AS-side |
+| 234 | AS MUST clearly display the redirect URI hostname during authorization | MUST | N/A | AS-side |
+| 235 | AS MAY implement domain-based trust policies | MAY | N/A | AS-side |
+| 236 | MCP proxies with static client IDs MUST obtain user consent for each dynamically registered client | MUST | N/A | we are not a proxy / multi-tenant AS |
+| 237 | MCP servers MUST validate access tokens before processing requests | MUST | N/A | server-side |
+| 238 | MCP servers MUST follow OAuth 2.1 §5.2 for token validation | MUST | N/A | server-side |
+| 239 | MCP servers MUST only accept tokens specifically intended for themselves | MUST | N/A | server-side |
+| 240 | MCP servers MUST reject tokens that do not include them in the audience claim, or otherwise verify they are the intended recipient | MUST | N/A | server-side |
+| 241 | MCP servers MUST NOT pass through MCP-client tokens to upstream APIs | MUST NOT | N/A | server-side |
+| 242 | MCP clients MUST implement and use the RFC 8707 `resource` parameter (aligns with RFC 9728 §7.4 recommendation) | MUST | ❌ | dup of 183-190; not implemented |
+
+### Improvement Plan (Jelly draft, pending Mira retroactive review)
+
+- [ ] **Rows 153, 154, 156, 159, 164-168 (PRM + AS-metadata discovery)**: implement the spec-required client discovery surface — (a) on initial 401, parse `WWW-Authenticate` for `resource_metadata` and `scope`; (b) GET `/.well-known/oauth-protected-resource{path}` to fetch PRM; (c) follow `authorization_servers` to RFC 8414 / OIDC `.well-known/oauth-authorization-server` + `openid-configuration` (with the priority order in rows 167-168); (d) populate `authorize_url`, `token_url`, `code_challenge_methods_supported` from the discovered metadata when `OAuthConfig.discovery=true`. Existing `discovery_allowlist` SSRF guard (`config.rs:104-110`) becomes load-bearing instead of decorative. Largest single MCP-spec gap right now.
+- [ ] **Rows 183-190, 211, 242 (RFC 8707 `resource` parameter)**: add `resource=<canonical-server-URI>` to (a) authorize URL builder in `flow.rs:46-50` + `auth.rs:357`; (b) token-exchange request body in `auth.rs:410, 493, 585`. Source URI = `ServerConfig::Http.url` canonicalised per RFC 8707 §2 (lowercase scheme/host, strip default port, strip trailing slash). MUST in spec; audience-binding gap is the biggest security delta after PRM.
+- [ ] **Rows 161-162, 164, 207, 207a (`WWW-Authenticate` parsing + step-up reauth)**: when rmcp surfaces `StreamableHttpError::AuthRequired` / `InsufficientScope` (already carrying `required_scope`), trigger reauth flow with the challenge-provided scope set rather than bubbling up. Hook in `meta_tool.rs` tool-call path. Couples with row 183-190 (resource param needs to be re-sent on step-up).
+- [ ] **Rows 220, 222, 223 (PKCE methods verification)**: once AS-metadata discovery lands, check `code_challenge_methods_supported` contains `S256` before issuing the request; abort with clear error if absent. Until discovery is done, document the "always send PKCE, trust the AS" behaviour as a known soft-violation.
+- [ ] **Rows 217, 218 (HTTPS / localhost enforcement for custom providers)**: tighten `OAuthConfig::validate` to reject non-`https://` `authorize_url` / `token_url` and non-`localhost`/non-`https` `redirect_uri` for custom providers. Trivial 10-line addition in `src/mcp/config.rs:104-112`.
+- [ ] **Row 213 (secure token storage)**: optionally back `auth.json` with an OS keyring (`keyring` crate) when available; fall back to filesystem mode. Low priority unless we hear of a leak vector; current model is adequate for single-user dev hosts.
+- [ ] **Documentation**: `openab-agent/docs/` should call out (a) the PRM / RFC 8707 gap with explicit "what works without spec compliance" matrix, (b) supported / unsupported registration mechanisms (pre-registered only, no CIMD, no DCR), (c) which built-in providers exist and which env vars wire their client IDs.
 
 ## Cancellation
 
