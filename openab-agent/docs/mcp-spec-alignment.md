@@ -933,27 +933,40 @@ Source: [`server/resources.mdx`](https://github.com/modelcontextprotocol/modelco
 
 Source: [`server/utilities/completion.mdx`](https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/docs/specification/2025-11-25/server/utilities/completion.mdx)
 
+**Section-level finding**: openab-agent does NOT invoke `completion/complete`. We are a meta-tool gateway — the LLM constructs full `arguments` JSON for `tools/call`, so there is no "user is typing into an argument field" surface that completion suggestions would feed. rmcp 1.7.0 ships the full client-side surface (`CompleteRequestParams` model `model.rs:2222-2231`, `peer.complete()` request method generated at `service/client.rs:356` via `method!`, convenience `peer.complete_prompt_argument` `service/client.rs:463-482`, `peer.complete_resource_argument` `service/client.rs:494-...`, and `CompletionInfo::MAX_VALUES = 100` enforced in `model.rs:2280`) — but no callsite exists in `src/mcp/**` (grep `complete\b` in `src/mcp/*.rs` returns only OAuth `complete_login` / `verification_uri_complete` matches, all unrelated). All client SHOULDs (rows 574-576) are vacuously satisfied; server rows are off-surface.
+
 | # | Item | Normative | Status | Location / Notes |
 |---|---|---|---|---|
-| 563 | Servers supporting completions MUST declare `completions` capability | MUST | | |
-| 564 | `completion/complete` request | (method) | | |
-| 565 | Params: `ref`, `argument`, optional `context.arguments` | (field) | | |
-| 565a | Clients SHOULD include previously-resolved arguments in `context.arguments` for multi-argument refs | SHOULD | | |
-| 566 | Reference types: `ref/prompt`, `ref/resource` | (field) | | |
-| 567 | Result: `completion.values`, optional `total`, `hasMore` | (field) | | |
-| 568 | Max 100 items per completion response | (constraint) | | |
-| 569 | Servers SHOULD return `-32601` (capability not supported), `-32602` (invalid prompt name / missing required args), `-32603` (internal error) | SHOULD | | |
-| 570 | Servers SHOULD return suggestions sorted by relevance | SHOULD | | |
-| 571 | Servers SHOULD implement fuzzy matching where appropriate | SHOULD | | |
-| 572 | Servers SHOULD rate-limit completion requests | SHOULD | | |
-| 573 | Servers SHOULD validate all inputs | SHOULD | | |
-| 574 | Clients SHOULD debounce rapid completion requests | SHOULD | | |
-| 575 | Clients SHOULD cache completion results where appropriate | SHOULD | | |
-| 576 | Clients SHOULD handle missing/partial results gracefully | SHOULD | | |
-| 577 | Implementations MUST validate completion inputs | MUST | | |
-| 578 | Implementations MUST implement appropriate rate limiting | MUST | | |
-| 579 | Implementations MUST control access to sensitive suggestions | MUST | | |
-| 580 | Implementations MUST prevent info disclosure via completions | MUST | | |
+| 563 | Servers supporting completions MUST declare `completions` capability | MUST | N/A | server-side normative; we are an MCP client |
+| 564 | `completion/complete` request | (method) | N/A | we never invoke. rmcp ships `peer.complete(CompleteRequestParams)` (SDK `service/client.rs:356` via `method! peer_req complete`) + convenience methods `complete_prompt_argument` (`service/client.rs:463`) / `complete_resource_argument` (`service/client.rs:494`); zero callsite in `src/mcp/**` |
+| 565 | Params: `ref`, `argument`, optional `context.arguments` | (field) | N/A | params authoring surface; rmcp `CompleteRequestParams { meta, ref, argument, context: Option<CompletionContext> }` (SDK `model.rs:2222-2231`) carries all three with `_meta` per SEP-1319 |
+| 565a | Clients SHOULD include previously-resolved arguments in `context.arguments` for multi-argument refs | SHOULD | N/A (vacuously) | we send no completion requests; `CompletionContext` (SDK `model.rs:2179`) is wired into rmcp via the `with_context` builder (`model.rs:2245`) when/if invoked |
+| 566 | Reference types: `ref/prompt`, `ref/resource` | (field) | N/A | schema authoring surface; rmcp `Reference::for_prompt` / `Reference::for_resource` constructors used by the convenience methods (SDK `service/client.rs:472, 503`) |
+| 567 | Result: `completion.values`, optional `total`, `hasMore` | (field) | N/A | server-side result schema; rmcp `CompletionInfo { values: Vec<String>, total: Option<u32>, has_more: Option<bool> }` (SDK `model.rs:2270-2276`); we never receive |
+| 568 | Max 100 items per completion response | (constraint) | N/A | server obligation; rmcp enforces SDK-side via `CompletionInfo::MAX_VALUES = 100` const + validation in `CompletionInfo::new` (SDK `model.rs:2280-2290`) returning `Err` on overflow |
+| 569 | Servers SHOULD return `-32601` (capability not supported), `-32602` (invalid prompt name / missing required args), `-32603` (internal error) | SHOULD | N/A | server-emit obligation |
+| 570 | Servers SHOULD return suggestions sorted by relevance | SHOULD | N/A | server obligation |
+| 571 | Servers SHOULD implement fuzzy matching where appropriate | SHOULD | N/A | server obligation |
+| 572 | Servers SHOULD rate-limit completion requests | SHOULD | N/A | server obligation |
+| 573 | Servers SHOULD validate all inputs | SHOULD | N/A | server obligation |
+| 574 | Clients SHOULD debounce rapid completion requests | SHOULD | N/A (vacuously) | we issue zero completion requests — no rapid-fire stream to debounce |
+| 575 | Clients SHOULD cache completion results where appropriate | SHOULD | N/A (vacuously) | nothing to cache |
+| 576 | Clients SHOULD handle missing/partial results gracefully | SHOULD | N/A (vacuously) | we receive no results; if/when wired, `CompleteResult.completion` exposes `total: Option<u32>` / `has_more: Option<bool>` (SDK `model.rs:2273-2275`) so partial states are already typed in |
+| 577 | Implementations MUST validate completion inputs | MUST | N/A | server obligation (sender-side validation is server's burden when responding to `completion/complete`) |
+| 578 | Implementations MUST implement appropriate rate limiting | MUST | N/A | server obligation |
+| 579 | Implementations MUST control access to sensitive suggestions | MUST | N/A | server obligation (don't leak sensitive identifiers via suggestion stream) |
+| 580 | Implementations MUST prevent info disclosure via completions | MUST | N/A | server obligation (don't leak existence of restricted prompts / resources via suggestion presence) |
+
+### Improvement Plan (Jelly draft, pending Mira retroactive review)
+
+**Section-level disposition**: defer the entire surface until a client-side use case exists. Today's meta-tool flow (`src/mcp/meta_tool.rs`) routes `tools/list` + `tools/call` only — the LLM produces complete `arguments` JSON, there is no human-typing-an-argument moment to suggest into.
+
+- [ ] **§1. Document the abstention.** Add a one-paragraph note in this section's preamble (already added above as section-level finding) cross-referencing Sections 12 / 13 (prompts / resources — also unused on our side). Keeps the N/A column self-explanatory.
+  - **Eval**: docs only · drop-in (~6 lines, already inline above) · **fit: in-scope**. Cheap; ships the decision into the canonical doc; no code risk. Effectively already satisfied by this audit pass.
+- [ ] **§2. Future — `prompts/resources` UI surface.** Iff openab-agent ever grows a prompts catalog (Section 12) or resource picker (Section 13) that exposes an argument-typing surface, wire `peer.complete_prompt_argument(prompt, arg, partial, ctx)` / `peer.complete_resource_argument(uri_template, arg, partial, ctx)` from `rmcp::service::client` directly — the convenience methods already round-trip context-argument carry-through (SEP-1320 / row 565a). Pair with `(a)` debounce, `(b)` LRU cache, `(c)` `has_more`-aware paging UI.
+  - **Eval**: hybrid (rmcp ships convenience methods + 100-item cap; openab-agent owns ACP/UI plumbing + debounce + cache) · architectural commitment (no UI today, so this is a green-field surface; ~200-300 LOC if combined with §2 of Section 12) · **fit: defer**. Only meaningful if Section 12 / 13 ship a UI surface; today the LLM-driven dispatch model makes completion a no-op.
+- [ ] **§3. (Tracking only) — `_meta` carry-through.** If §2 lands, ensure SEP-1319 `_meta` is preserved across the request: rmcp `CompleteRequestParams.meta: Option<Meta>` field (SDK `model.rs:2225`) already supports it via `RequestParamsMeta` trait impl (`model.rs:2251`). No code change today; flag for §2 reviewers.
+  - **Eval**: rmcp upstream already covers · docs only · **fit: defer**. Tracking note for the §2 ship date.
 
 ## Logging
 
