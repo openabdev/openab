@@ -712,6 +712,7 @@ Source: [`server/resources.mdx`](https://github.com/modelcontextprotocol/modelco
 | 545 | Result: `contents[]` | (field) | | |
 | 546 | `resources/templates/list` request | (method) | | |
 | 547 | Result: `resourceTemplates[]` | (field) | | |
+| 547a | ResourceTemplate fields: `uriTemplate` (required, RFC 6570) / `name` (required) / `title` / `description` / `mimeType` / `icons` (optional) | (field) | | |
 | 548 | List-changed-capable servers SHOULD send `notifications/resources/list_changed` | SHOULD | | |
 | 549 | `resources/subscribe` request | (method) | | |
 | 550 | `notifications/resources/updated` notification | (notification) | | |
