@@ -57,8 +57,8 @@ Source: [`basic/index.mdx`](https://github.com/modelcontextprotocol/modelcontext
 | 2 | Other components MAY be implemented per app needs | MAY | ✅ | meta-tool gateway exposes `tools/list` + `tools/call` (`src/mcp/meta_tool.rs`); other components intentionally deferred per ADR §5 |
 | 3 | All messages MUST follow JSON-RPC 2.0 | MUST | ✅ | `rmcp` SDK (delegated) |
 | 4 | Requests MUST include a string or integer ID | MUST | ✅ | `rmcp` SDK (`RequestId`) |
-| 5 | Request ID MUST NOT be `null` | MUST NOT | ✅ | `rmcp` SDK |
-| 6 | Request ID MUST NOT be previously used by the requestor within the same session | MUST NOT | ✅ | `rmcp` SDK (monotonic request id) |
+| 5 | Request ID MUST NOT be `null` | MUST NOT | ✅ | `rmcp` SDK — Mira confirmed `RequestId` enum = `String(String) \| Integer(i64)` (no `Null` variant), so `"id": null` fails deserialization |
+| 6 | Request ID MUST NOT be previously used by the requestor within the same session | MUST NOT | ✅ | `rmcp` SDK — Mira confirmed atomic counter for client-side request id generation |
 | 7 | Result responses MUST include the same ID as the request | MUST | ✅ | `rmcp` SDK |
 | 8 | Result responses MUST include a `result` field | MUST | ✅ | `rmcp` SDK |
 | 9 | The `result` MAY follow any JSON object structure | MAY | ✅ | `rmcp` SDK passes through |
@@ -70,8 +70,8 @@ Source: [`basic/index.mdx`](https://github.com/modelcontextprotocol/modelcontext
 | 15 | HTTP-based transports SHOULD conform to Authorization spec | SHOULD | ✅ | `StreamableHttpClientTransport` `src/mcp/runtime.rs:21-22`; OAuth in `src/mcp/oauth.rs` + paste flow `src/mcp/flow.rs` |
 | 16 | STDIO transports SHOULD NOT follow auth spec; retrieve credentials from environment | SHOULD NOT | ✅ | `src/mcp/runtime.rs:1060-1064` (`env_clear()` + explicit `envs(stdio_child_env(&env))` + `TokioChildProcess::new`); resolver `src/mcp/config.rs:163-167` |
 | 17 | Clients/servers MAY negotiate custom auth | MAY | N/A | not implemented; we use only spec-defined transports |
-| 18 | Implementations MUST support JSON Schema 2020-12 for schemas without explicit `$schema` | MUST | ⚠️ | no in-code dialect handling; depends entirely on `rmcp` 1.7 internal validation (Jelly: needs confirmation from rmcp source / docs) |
-| 19 | Implementations MUST validate schemas according to declared/default dialect | MUST | ❌ | no schema validation in `openab-agent` — tool input schemas passed through to LLM as-is (`src/mcp/meta_tool.rs:95-116`) |
+| 18 | Implementations MUST support JSON Schema 2020-12 for schemas without explicit `$schema` | MUST | ⚠️ | no in-code dialect handling; Mira confirmed `rmcp` 1.7.0 does NOT pull `jsonschema` / `valico` (only `schemars` for generation + `serde` for deserialization) — no dialect validation either layer |
+| 19 | Implementations MUST validate schemas according to declared/default dialect | MUST | ❌ | no schema validation in `openab-agent` — tool input schemas passed through to LLM as-is (`src/mcp/meta_tool.rs:95-116`); confirmed by Mira via `Cargo.lock` audit |
 | 20 | Implementations MUST handle unsupported dialects gracefully (return error indicating unsupported) | MUST | ❌ | no dialect detection / error path |
 | 21 | Implementations SHOULD document which schema dialects they support | SHOULD | ❌ | not documented in README / docs |
 | 22 | Schemas MUST be valid according to their declared or default dialect | MUST | N/A | server-authored; we are a client |
@@ -91,13 +91,13 @@ Source: [`basic/index.mdx`](https://github.com/modelcontextprotocol/modelcontext
 | 36 | MAY disallow file types | MAY | N/A | same |
 | 37 | Validate MIME via magic bytes / allowlist | (security) | N/A | same |
 | 37a | Verify icon URIs same-origin | (security) | N/A | same |
-| 37b | JSON-RPC `Error.message` SHOULD be concise single sentence | SHOULD | ⚠️ | wrapped via `anyhow::Context` + `format!` (e.g., `src/mcp/runtime.rs:1753`, `src/mcp/meta_tool.rs:95+`); no length enforcement, often multi-clause |
+| 37b | JSON-RPC `Error.message` SHOULD be concise single sentence | SHOULD | ⚠️ | wrapped via `anyhow::Context` + `format!`; multi-clause sites confirmed: `src/mcp/runtime.rs:272` (pending-login load), `src/mcp/runtime.rs:1753` (HTTP error body format), `src/mcp/config.rs:149-150` (spec config read+parse), `src/mcp/config.rs:166` (env var resolve), `src/mcp/meta_tool.rs:95+` (tool-call params), `src/mcp/oauth.rs:57,63` (PKCE/OAuth) — Mira-extended inventory |
 
-### Improvement Plan (draft — pending Mira consensus)
+### Improvement Plan (Jelly + Mira consensus, section 0)
 
-- [ ] **Row 18-21 (JSON Schema 2020-12)**: confirm `rmcp` 1.7 actually validates `tools/list` input schemas against declared dialect; if not, add a validation layer at `src/mcp/meta_tool.rs::fetch_tools` boundary or document the gap as a known limitation. Document supported dialect in README / `openab-agent/docs/`.
-- [ ] **Row 19-20**: surface unsupported-dialect tool entries as `NeedsAttention` rather than silently passing through; covers MUST-handle-gracefully.
-- [ ] **Row 37b (`Error.message` brevity)**: introduce a `concise_error_message(err: &anyhow::Error) -> String` helper that takes the top-level cause's `to_string()` (not the chained one) for the JSON-RPC error payload, and keep the full chain only in `tracing` logs. Audit `runtime.rs:1753` `format!(r#"{{"error": "{code}"}}"#)` for whether `code` value is ever a multi-clause string.
+- [ ] **Rows 18-21 (JSON Schema 2020-12)**: rmcp 1.7.0 confirmed not to validate dialects (no `jsonschema` / `valico` in `Cargo.lock`; only `schemars` for gen + `serde` for deserialize). Decide: (a) add a thin validator at `src/mcp/meta_tool.rs::fetch_tools` boundary using `jsonschema` crate, OR (b) document this as a known limitation in README and surface unsupported-dialect tool entries as `NeedsAttention`. Either way, document supported dialect in `openab-agent/docs/`.
+- [ ] **Rows 19-20**: surface unsupported-dialect tool entries as `NeedsAttention` rather than silently passing through; covers MUST-handle-gracefully.
+- [ ] **Row 37b (`Error.message` brevity)**: introduce a `concise_error_message(err: &anyhow::Error) -> String` helper that takes the top-level cause's `to_string()` (not the chained one) for the JSON-RPC error payload, and keep the full chain only in `tracing` logs. Audit sites: `runtime.rs:272`, `runtime.rs:1753`, `config.rs:149-150`, `config.rs:166`, `meta_tool.rs:95+`, `oauth.rs:57,63`.
 - [ ] **Documentation**: README MCP section should explicitly call out (a) JSON Schema dialect support / passthrough behavior, (b) that `_meta` keys are passed through opaquely, (c) icon-rendering is N/A (we're not a UI client).
 
 ## Lifecycle
