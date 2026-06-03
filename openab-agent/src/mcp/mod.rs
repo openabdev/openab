@@ -62,6 +62,12 @@ fn load_config_or_exit() -> McpConfig {
     })
 }
 
+fn print_no_servers_hint() {
+    println!("No MCP servers configured.");
+    println!("  global:  ~/.openab/agent/mcp.json");
+    println!("  project: ./.openab/agent/mcp.json");
+}
+
 /// Construct an `McpRuntimeManager` from on-disk config — returns `None`
 /// when no servers are configured so callers can skip the entire MCP path
 /// (saves system-prompt tokens + keeps the LLM from hallucinating an empty
@@ -134,9 +140,7 @@ pub fn format_system_prompt_appendix(manager: &McpRuntimeManager) -> String {
 pub fn cli_list_servers(resolve: bool) {
     let cfg = load_config_or_exit();
     if cfg.servers.is_empty() {
-        println!("No MCP servers configured.");
-        println!("  global:  ~/.openab/agent/mcp.json");
-        println!("  project: ./.openab/agent/mcp.json");
+        print_no_servers_hint();
         return;
     }
     if resolve {
@@ -361,9 +365,7 @@ pub async fn cli_login_device(name: String) {
 pub async fn cli_doctor() {
     let cfg = load_config_or_exit();
     if cfg.servers.is_empty() {
-        println!("No MCP servers configured.");
-        println!("  global:  ~/.openab/agent/mcp.json");
-        println!("  project: ./.openab/agent/mcp.json");
+        print_no_servers_hint();
         return;
     }
     let manager = McpRuntimeManager::from_config(cfg.clone());

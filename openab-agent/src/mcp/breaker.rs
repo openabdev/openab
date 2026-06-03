@@ -58,12 +58,12 @@ impl ServerBreaker {
         Self::default()
     }
 
-    /// Test-only constructor that takes a clock — production code uses
-    /// [`new`](Self::new) which calls [`Instant::now`] internally.
     pub fn check(&self, server: &str) -> Verdict {
         self.check_at(server, Instant::now())
     }
 
+    /// Internal: parameterized check with an injectable clock so tests can
+    /// fast-forward past [`COOLDOWN`] without `tokio::time::sleep`.
     fn check_at(&self, server: &str, now: Instant) -> Verdict {
         let entries = self.entries.lock().expect("breaker mutex poisoned");
         let Some(entry) = entries.get(server) else {
@@ -79,6 +79,8 @@ impl ServerBreaker {
         if age >= COOLDOWN {
             Verdict::AllowProbe
         } else {
+            // Floor at 1s: returning 0 would render as "retry in 0s" to the
+            // LLM/CLI, which reads as "retry now" and defeats the cooldown.
             let remaining = COOLDOWN.saturating_sub(age).as_secs().max(1);
             Verdict::Reject {
                 retry_in_secs: remaining,
