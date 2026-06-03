@@ -135,6 +135,7 @@ Source: [`basic/lifecycle.mdx`](https://github.com/modelcontextprotocol/modelcon
 | 72 | Implementations MAY reset timeout clock on receiving a progress notification | MAY | | |
 | 73 | Implementations SHOULD always enforce a maximum timeout (even with progress) | SHOULD | | |
 | 74 | Implementations SHOULD handle version mismatch, capability failures, timeouts | SHOULD | | |
+| 74a | `Implementation` object (clientInfo / serverInfo) carries optional `title`, `description`, `icons`, `websiteUrl` fields | (schema) | | |
 
 ## Transports
 
