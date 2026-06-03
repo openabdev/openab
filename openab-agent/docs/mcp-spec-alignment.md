@@ -271,7 +271,7 @@ Source: [`basic/authorization.mdx`](https://github.com/modelcontextprotocol/mode
 | 148 | STDIO SHOULD NOT follow this spec; credentials from environment | SHOULD NOT | ✅ | stdio uses `env_clear()` + explicit `envs(stdio_child_env(&env))` (`src/mcp/runtime.rs:1059-1063`); no OAuth on stdio path |
 | 149 | Alternative transports MUST follow established security best practices for their protocol | MUST | N/A | no alternative transports beyond stdio + Streamable HTTP |
 | 150 | Authorization servers MUST implement OAuth 2.1 with appropriate security measures for both confidential and public clients | MUST | N/A | AS-side |
-| 151 | AS and MCP clients SHOULD support OAuth Client ID Metadata Documents | SHOULD | ❌ | no CIMD client support; we use pre-registered client IDs only (env-injected via `OPENAB_MCP_<provider>_CLIENT_ID`, `oauth.rs:188-209`) |
+| 151 | AS and MCP clients SHOULD support OAuth Client ID Metadata Documents | SHOULD | ❌ | no CIMD client support; we use pre-registered client IDs only (env-injected via `OPENAB_MCP_<provider>_CLIENT_ID`, `oauth.rs:53-69` for the `builtin_client_id` impl). Jelly fact-check 2026-06-03 repointed from stale `oauth.rs:188-209` (unit-test lines) |
 | 152 | AS and MCP clients MAY support RFC 7591 Dynamic Client Registration | MAY | ❌ | no DCR implementation |
 | 153 | MCP servers MUST implement RFC 9728 Protected Resource Metadata | MUST | N/A | server-side |
 | 154 | MCP clients MUST use RFC 9728 PRM for authorization server discovery | MUST | ❌ | no PRM consumer; AS endpoints come from built-in `ProviderSpec` (`oauth.rs:14-30`) or custom `OAuthConfig.{authorize_url, token_url}` (`config.rs:81-83`). `discovery: bool` field (`config.rs:95`) is declared but per `oauth.rs::resolve_custom` the discovery branch is not actually exercised — `authorize_url` + `token_url` are required even when `discovery=true` |
@@ -452,16 +452,23 @@ Source: [`basic/utilities/ping.mdx`](https://github.com/modelcontextprotocol/mod
 
 | # | Item | Normative | Status | Location / Notes |
 |---|---|---|---|---|
-| 270 | `ping` request method | (method) | | |
-| 271 | Receiver MUST respond promptly with empty `{}` result | MUST | | |
-| 272 | If no response within timeout, sender MAY consider connection stale / terminate / reconnect | MAY | | |
-| 273 | Implementations SHOULD periodically issue pings to detect connection health | SHOULD | | |
-| 274 | Ping frequency SHOULD be configurable | SHOULD | | |
-| 275 | Ping timeouts SHOULD be appropriate for network environment | SHOULD | | |
-| 276 | Excessive pinging SHOULD be avoided | SHOULD | | |
-| 277 | Ping timeouts SHOULD be treated as connection failures | SHOULD | | |
-| 278 | Multiple failed pings MAY trigger connection reset | MAY | | |
-| 279 | Implementations SHOULD log ping failures for diagnostics | SHOULD | | |
+| 270 | `ping` request method | (method) | ✅ (schema) | rmcp `PingRequest` model (SDK `model/meta.rs:141, 164`) + dispatched at `handler/client.rs:19` |
+| 271 | Receiver MUST respond promptly with empty `{}` result | MUST | ✅ | `()` client handler (`runtime.rs:1066,1079`) inherits `ClientHandler::ping` default-impl returning `Ok(())` mapped to `ClientResult::empty` (SDK `handler/client.rs:85-90, 19`); rmcp also auto-replies to pre-handshake pings via trace-log path (SDK `service/client.rs:130-138`) |
+| 272 | If no response within timeout, sender MAY consider connection stale / terminate / reconnect | MAY | N/A (vacuous) | we send no outbound pings (no `peer.send_request_with_option(PingRequest, ...)` callsite); rmcp does not expose a convenience `peer.ping()` method — sending requires manual `PingRequest` construction |
+| 273 | Implementations SHOULD periodically issue pings to detect connection health | SHOULD | ❌ | no periodic ping loop in `runtime.rs` / `breaker.rs`; we rely on next tool-call failure to detect stale connection (which trips the breaker via `record_tool_call_outcome` at `meta_tool.rs:101, 104`) |
+| 274 | Ping frequency SHOULD be configurable | SHOULD | ❌ | no ping config field in `McpConfig` (`config.rs:75-112`) |
+| 275 | Ping timeouts SHOULD be appropriate for network environment | SHOULD | N/A | no pinging |
+| 276 | Excessive pinging SHOULD be avoided | SHOULD | ✅ (vacuously) | we send zero pings — vacuously below any reasonable rate limit |
+| 277 | Ping timeouts SHOULD be treated as connection failures | SHOULD | N/A | no pinging |
+| 278 | Multiple failed pings MAY trigger connection reset | MAY | N/A | no pinging |
+| 279 | Implementations SHOULD log ping failures for diagnostics | SHOULD | N/A | no pinging to log |
+
+### Improvement Plan (Jelly draft, pending Mira retroactive review)
+
+- [ ] **Rows 273-279 (Periodic outbound ping for connection-health)**: add a per-server periodic ping loop. Spawn a `tokio::task` per `ServerHandle::client` that fires `PingRequest` every `ping_interval` (default 30s, configurable); on timeout (default 5s) emit `tracing::warn!(target="mcp.ping", server=%name, reason=%e)` and increment `breaker.rs` failure counter so repeated failures trip the breaker. Wired via the timeout-bearing `send_request_with_option` path (unified with Section 1 rows 69-71 + Section 4 finding).
+  - **Eval**: rmcp side — has `PingRequest` model (SDK `model/meta.rs:141`) and request-issuance via `send_request_with_option`; no convenience `peer.ping()` method · openab-agent wrapper (~80 LOC: ping task spawn at `connect()` / cleanup at `disconnect()`, config field in `McpConfig`, tracing + breaker hook) · **fit: in-scope, drop-in once Section 1 timeout work lands**. Spec is SHOULD across the board; main value is proactive detection of half-open HTTP connections that don't surface as transport errors until next call.
+- [ ] **Row 274 specifically (configurable frequency)**: surface `ping_interval_secs` + `ping_timeout_secs` fields on `McpConfig::Stdio` / `McpConfig::Http` (`config.rs:75-112`); when both are `None`, default to no pinging (opt-in). Avoids ping cost for short-lived servers (typical stdio meta-tool flow).
+  - **Eval**: openab-agent only · drop-in (~10 LOC config additions + threading through to ping task) · **fit: in-scope**. Same shape as rows 69-71 timeout config — keep schema consistent.
 
 ## Tasks — experimental
 
