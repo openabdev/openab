@@ -788,3 +788,29 @@ Source: [`server/utilities/pagination.mdx`](https://github.com/modelcontextproto
 | 606 | Clients MUST NOT parse or modify cursors | MUST NOT | | |
 | 607 | Clients MUST NOT persist cursors across sessions | MUST NOT | | |
 | 608 | Invalid cursors SHOULD result in `-32602` Invalid params | SHOULD | | |
+
+## Trust, Safety & Consent (Key Principles)
+
+Source: [`index.mdx`](https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/docs/specification/2025-11-25/index.mdx)
+
+The "Security and Trust & Safety" section of the spec is meta-governance — lowercase prose "must/should" forms principles (not BCP 14 normative), and the "Implementation Guidelines" subsection has 5 explicit **SHOULD** items. The protocol cannot enforce these at wire level, but implementations are tracked here for completeness.
+
+| # | Item | Normative | Status | Location / Notes |
+|---|---|---|---|---|
+| 609 | Users must explicitly consent to and understand all data access and operations | (principle) | | |
+| 610 | Users must retain control over what data is shared and what actions are taken | (principle) | | |
+| 611 | Implementors should provide clear UIs for reviewing and authorizing activities | (principle) | | |
+| 612 | Hosts must obtain explicit user consent before exposing user data to servers | (principle) | | |
+| 613 | Hosts must not transmit resource data elsewhere without user consent | (principle) | | |
+| 614 | User data should be protected with appropriate access controls | (principle) | | |
+| 615 | Tools represent arbitrary code execution and must be treated with appropriate caution | (principle) | | |
+| 616 | Descriptions of tool behavior (annotations) should be considered untrusted unless from a trusted server | (principle) | | see also row 508 |
+| 617 | Hosts must obtain explicit user consent before invoking any tool | (principle) | | |
+| 618 | Users should understand what each tool does before authorizing its use | (principle) | | |
+| 619 | Users must explicitly approve any LLM sampling requests | (principle) | | |
+| 620 | Users should control: whether sampling occurs at all, the actual prompt sent, what results the server can see | (principle) | | |
+| 621 | Implementors SHOULD build robust consent and authorization flows | SHOULD | | |
+| 622 | Implementors SHOULD provide clear documentation of security implications | SHOULD | | |
+| 623 | Implementors SHOULD implement appropriate access controls and data protections | SHOULD | | |
+| 624 | Implementors SHOULD follow security best practices in their integrations | SHOULD | | |
+| 625 | Implementors SHOULD consider privacy implications in their feature designs | SHOULD | | |
