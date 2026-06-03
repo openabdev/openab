@@ -106,43 +106,52 @@ Source: [`basic/lifecycle.mdx`](https://github.com/modelcontextprotocol/modelcon
 
 | # | Item | Normative | Status | Location / Notes |
 |---|---|---|---|---|
-| 38 | Initialization phase MUST be first interaction | MUST | | |
-| 39 | Client MUST initiate the `initialize` request | MUST | | |
-| 40 | `initialize` request carries `protocolVersion`, `capabilities`, `clientInfo` | (field) | | |
-| 41 | Server MUST respond with `protocolVersion`, `capabilities`, `serverInfo`; MAY include `instructions` | MUST | | |
-| 42 | After successful initialization, client MUST send `notifications/initialized` | MUST | | |
-| 43 | Client SHOULD NOT send other requests pre-init except ping | SHOULD NOT | | |
-| 44 | Server SHOULD NOT send other requests pre-init except ping/logging | SHOULD NOT | | |
-| 45 | Client MUST send a supported `protocolVersion` in `initialize` | MUST | | |
-| 45a | Client MAY support older `protocolVersion` values for backwards compatibility (per `schema.mdx` JSDoc on `InitializeRequest.params.protocolVersion`) | MAY | | |
-| 46 | Client SHOULD send the latest version it supports | SHOULD | | |
-| 47 | If server supports the requested version, it MUST echo same version | MUST | | |
-| 48 | Otherwise server MUST respond with another supported version | MUST | | |
-| 49 | Server SHOULD respond with its latest supported version | SHOULD | | |
-| 50 | If client does not support server's response version, client SHOULD disconnect | SHOULD | | |
-| 50a | ⚠️ Spec internal conflict: `schema.mdx` (`InitializeResult.protocolVersion` JSDoc) states this as `MUST disconnect`. Alignment doc follows the prose source `basic/lifecycle.mdx` (`SHOULD`); upstream should reconcile. | (spec-conflict) | | |
-| 51 | HTTP: client MUST include `MCP-Protocol-Version` header on subsequent requests | MUST | | |
-| 52 | Client capability: `roots` (with optional `listChanged`) | (capability) | | |
-| 53 | Client capability: `sampling` (LLM sampling support; `tools`/`context` sub-objects defined in `client/sampling.mdx`, not in `lifecycle.mdx` capability table) | (capability) | | |
-| 54 | Client capability: `elicitation` (form/URL elicitation support; example shows `form`/`url` sub-objects but capability table lists only `elicitation`) | (capability) | | |
-| 55 | Client capability: `tasks` with `requests.*` describing which incoming request types support task-augmentation (no `list`/`cancel` on client side — those are server-only) | (capability) | | |
-| 56 | Client capability: `experimental` | (capability) | | |
-| 57 | Server capability: `prompts` (with optional `listChanged`) | (capability) | | |
-| 58 | Server capability: `resources` (with optional `subscribe`, `listChanged`) | (capability) | | |
-| 59 | Server capability: `tools` (with optional `listChanged`) | (capability) | | |
-| 60 | Server capability: `logging` | (capability) | | |
-| 61 | Server capability: `completions` | (capability) | | |
-| 62 | Server capability: `tasks` (with `list`, `cancel`, `requests.*`) | (capability) | | |
-| 63 | Server capability: `experimental` | (capability) | | |
-| 64 | Both parties MUST respect the negotiated protocol version | MUST | | |
-| 65 | Both parties MUST only use successfully negotiated capabilities | MUST | | |
-| 66 | stdio shutdown: client SHOULD close stdin, wait, SIGTERM, then SIGKILL | SHOULD | | |
-| 67 | Server MAY initiate stdio shutdown by closing its output and exiting | MAY | | |
-| 68 | HTTP shutdown by closing associated HTTP connection(s) | (transport) | | |
-| 69 | Implementations SHOULD establish timeouts on all sent requests | SHOULD | | |
-| 70 | On timeout, sender SHOULD issue a cancellation notification | SHOULD | | |
-| 71 | SDKs/middleware SHOULD allow per-request timeout configuration | SHOULD | | |
-| 72 | Implementations MAY reset timeout clock on receiving a progress notification | MAY | | |
+| 38 | Initialization phase MUST be first interaction | MUST | ✅ | `rmcp::ServiceExt::serve()` enforces handshake at `src/mcp/runtime.rs:1066,1079` |
+| 39 | Client MUST initiate the `initialize` request | MUST | ✅ | `rmcp` SDK (client role via `RoleClient` at `src/mcp/runtime.rs:67`) |
+| 40 | `initialize` carries `protocolVersion`, `capabilities`, `clientInfo` | (field) | ✅ | `rmcp` SDK; our client handler is `()` (unit) at `runtime.rs:1066,1079` so `capabilities` payload is empty |
+| 41 | Server MUST respond with `protocolVersion`, `capabilities`, `serverInfo` | MUST | N/A | server-side requirement |
+| 42 | After successful initialization, client MUST send `notifications/initialized` | MUST | ✅ | `rmcp` SDK |
+| 43 | Client SHOULD NOT send other requests pre-init except ping | SHOULD NOT | ✅ | `rmcp` SDK (we only call `peer.list_all_tools()` / `peer.call_tool()` after `serve().await` returns Ok) |
+| 44 | Server SHOULD NOT send other requests pre-init except ping/logging | SHOULD NOT | N/A | server-side |
+| 45 | Client MUST send a supported `protocolVersion` | MUST | ✅ | `rmcp` SDK (sends `rmcp::model::ProtocolVersion::default()` which is the latest version the SDK knows) |
+| 45a | Client MAY support older `protocolVersion` values | MAY | ⚠️ | controlled by `rmcp` 1.7 internal version policy; not configurable from our code |
+| 46 | Client SHOULD send the latest version it supports | SHOULD | ✅ | `rmcp` SDK (default protocol version constant) |
+| 47 | If server supports requested version, it MUST echo | MUST | N/A | server-side |
+| 48 | Otherwise server MUST respond with another supported version | MUST | N/A | server-side |
+| 49 | Server SHOULD respond with its latest supported version | SHOULD | N/A | server-side |
+| 50 | If client does not support server's response version, client SHOULD disconnect | SHOULD | ⚠️ | `rmcp` `serve()` returns `Err` on incompatible version; we surface via `with_context(\|\| format!("mcp handshake with ..."))` at `runtime.rs:1068,1081` and mark `ServerStatus::Failed(...)` — disconnect implicit via dropping handle |
+| 50a | spec-conflict — schema says MUST | (spec-conflict) | N/A | not actionable; upstream should reconcile |
+| 51 | HTTP: client MUST include `MCP-Protocol-Version` header on subsequent requests | MUST | ⚠️ | `rmcp::transport::StreamableHttpClientTransport` SDK responsibility; not surfaced in our code (`runtime.rs:21-22,1073-1077`) — needs rmcp source verification |
+| 52 | Client capability: `roots` (listChanged optional) | (capability) | ❌ | bare `()` handler at `runtime.rs:1066,1079` — no `roots` advertised; servers depending on roots cannot constrain themselves |
+| 53 | Client capability: `sampling` | (capability) | ❌ | no client `sampling` handler — servers cannot request LLM sampling from us |
+| 54 | Client capability: `elicitation` | (capability) | ❌ | no elicitation handler — servers cannot ask user for form/URL input via us |
+| 55 | Client capability: `tasks` | (capability) | ❌ | no task-augmentation declaration |
+| 56 | Client capability: `experimental` | (capability) | ❌ | none declared |
+| 57 | Server capability: `prompts` | (capability) | N/A | server-side declaration |
+| 58 | Server capability: `resources` | (capability) | N/A | server-side |
+| 59 | Server capability: `tools` | (capability) | N/A | server-side; we consume via `peer.list_all_tools()` at `src/mcp/meta_tool.rs:122` + `peer.call_tool()` at `src/mcp/meta_tool.rs:98` |
+| 60 | Server capability: `logging` | (capability) | N/A | server-side |
+| 61 | Server capability: `completions` | (capability) | N/A | server-side |
+| 62 | Server capability: `tasks` | (capability) | N/A | server-side |
+| 63 | Server capability: `experimental` | (capability) | N/A | server-side |
+| 64 | Both parties MUST respect the negotiated protocol version | MUST | ✅ | `rmcp` SDK |
+| 65 | Both parties MUST only use successfully negotiated capabilities | MUST | ⚠️ | we only call `tools/list` + `tools/call`; we do NOT gate on server-advertised capabilities — assume `tools` cap is always present, no check before `meta_tool.rs:122` invocation |
+| 66 | stdio shutdown: client SHOULD close stdin, wait, SIGTERM, then SIGKILL | SHOULD | ❌ | no explicit shutdown sequence; relies on `Drop` of `RunningService` + `TokioChildProcess` which does not implement the spec-recommended graceful termination ladder |
+| 67 | Server MAY initiate stdio shutdown | MAY | N/A | server-side |
+| 68 | HTTP shutdown by closing associated HTTP connection(s) | (transport) | ✅ | `rmcp::transport::StreamableHttpClientTransport` connection lifecycle (drop) |
+| 69 | Implementations SHOULD establish timeouts on all sent requests | SHOULD | ❌ | no `tokio::time::timeout` wrapping `peer.call_tool().await` (`meta_tool.rs:98`) or `peer.list_all_tools().await` (`meta_tool.rs:122`); circuit breaker (`src/mcp/breaker.rs`) is failure-rate based, not per-request timeout |
+| 70 | On timeout, sender SHOULD issue a cancellation notification | SHOULD | ❌ | no cancellation; `src/acp.rs:91-92` has `TODO(v0.2): implement cancellation token to abort in-progress agent.run()` |
+| 71 | SDKs/middleware SHOULD allow per-request timeout configuration | SHOULD | ❌ | no API surface; `McpConfig` (`src/mcp/config.rs`) has no timeout fields |
+| 72 | MAY reset timeout clock on progress notification | MAY | N/A | no timeout to reset |
+
+### Improvement Plan (Jelly draft, pending Mira retroactive review)
+
+- [ ] **Row 51 (HTTP `MCP-Protocol-Version` header)**: verify `rmcp::transport::StreamableHttpClientTransport` injects the header on every subsequent request after handshake; if not, add via `auth_header()`-style injection on transport config (`runtime.rs:1073-1077`). Document the verification in alignment doc.
+- [ ] **Rows 52-56 (Client capabilities)**: decide minimum viable client capability set. Priority: (a) `roots` for filesystem-style servers that constrain by directory (most common server need); (b) `sampling` if/when we want servers to delegate LLM calls back to us; (c) `elicitation` for interactive UX. Implement via rmcp `ClientHandler` trait instead of `()`.
+- [ ] **Row 65 (Capability gating)**: before calling `peer.list_all_tools()` / `peer.call_tool()`, inspect `peer.peer_info()?.capabilities.tools` — if absent, fail with a clear `ServerStatus::Failed("server does not advertise tools capability")` instead of letting rmcp surface a generic JSON-RPC error.
+- [ ] **Row 66 (stdio shutdown ladder)**: implement explicit shutdown in `ServerHandle::disconnect()` — (1) close child stdin handle (drop sender), (2) `tokio::time::timeout(grace, child.wait())`, (3) on timeout `child.kill()` (SIGTERM via signal-hook or `Child::start_kill()`), (4) final SIGKILL on second grace expiry. Default grace 5s + 5s.
+- [ ] **Rows 69-71 (Request timeouts)**: add `request_timeout_secs` field per-server in `McpConfig::Stdio` / `McpConfig::Http` (`src/mcp/config.rs`), default 60s. Wrap every `peer.call_tool()` / `peer.list_all_tools()` site in `tokio::time::timeout(...)`. Pair with row 70.
+- [ ] **Row 70 (Cancellation notification on timeout)**: when the timeout from rows 69-71 fires, emit `notifications/cancelled` via rmcp `peer.notify_cancelled(request_id)` (verify SDK method name); covers SHOULD on cooperative cancellation. Also unblocks `acp.rs:91-92` TODO for `session/cancel`.
 | 73 | Implementations SHOULD always enforce a maximum timeout (even with progress) | SHOULD | | |
 | 74 | Implementations SHOULD handle version mismatch, capability failures, timeouts | SHOULD | | |
 | 74a | `Implementation` object (clientInfo / serverInfo) carries optional `title`, `description`, `icons`, `websiteUrl` fields | (schema) | | |
