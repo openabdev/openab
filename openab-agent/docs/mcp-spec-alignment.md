@@ -584,28 +584,39 @@ Source: [`client/roots.mdx`](https://github.com/modelcontextprotocol/modelcontex
 
 | # | Item | Normative | Status | Location / Notes |
 |---|---|---|---|---|
-| 363 | Clients supporting roots MUST declare `roots` capability | MUST | | |
-| 364 | `roots.listChanged` sub-capability | (capability) | | |
-| 365 | `roots/list` request method | (method) | | |
-| 366 | `roots/list` result: `roots[]` of `{uri, name}` | (field) | | |
-| 367 | Root `uri` MUST be `file://` URI | MUST | | |
-| 368 | Root `name` is optional | (field) | | |
-| 369 | On roots change, `listChanged`-capable clients MUST send `notifications/roots/list_changed` | MUST | | |
-| 370 | Clients SHOULD return `-32601` (method not found) if roots unsupported, `-32603` for internal | SHOULD | | |
-| 371 | Clients MUST only expose roots with appropriate permissions | MUST | | |
-| 372 | Clients MUST validate all root URIs (path traversal) | MUST | | |
-| 373 | Clients MUST implement proper access controls | MUST | | |
-| 374 | Clients MUST monitor root accessibility | MUST | | |
-| 375 | Servers SHOULD handle unavailable roots gracefully | SHOULD | | |
-| 376 | Servers SHOULD respect root boundaries during operations | SHOULD | | |
-| 377 | Servers SHOULD validate all paths against provided roots | SHOULD | | |
-| 378 | Clients SHOULD prompt user consent before exposing roots | SHOULD | | |
-| 379 | Clients SHOULD provide clear UI for root management | SHOULD | | |
-| 380 | Clients SHOULD validate root accessibility before exposing | SHOULD | | |
-| 381 | Clients SHOULD monitor for root changes | SHOULD | | |
-| 382 | Servers SHOULD check for roots capability before usage | SHOULD | | |
-| 383 | Servers SHOULD handle root list changes gracefully | SHOULD | | |
-| 384 | Servers SHOULD cache root information appropriately | SHOULD | | |
+| 363 | Clients supporting roots MUST declare `roots` capability | MUST | N/A | we don't support roots. `()` client handler at `runtime.rs:1066,1079` triggers blanket `impl ClientHandler for ()` (SDK `handler/client.rs:263`), whose `get_info()` returns `ClientInfo::default()` → `ClientCapabilities::default()` with no `roots` field set (SDK `model/capabilities.rs:260`). Vacuous-✅: by not declaring, the MUST does not bind us. |
+| 364 | `roots.listChanged` sub-capability | (capability) | N/A | not declared (see #363) |
+| 365 | `roots/list` request method | (method) | ⚠️ | SDK default `ClientHandler::list_roots` returns `Ok(ListRootsResult::default())` = empty `roots: []` (SDK `handler/client.rs:102-107`). A non-conformant server that calls `roots/list` despite our missing capability gets `{roots: []}` instead of `-32601`. See #370. |
+| 366 | `roots/list` result: `roots[]` of `{uri, name}` | (field) | ✅ (schema) | `rmcp::model::ListRootsResult { roots: Vec<Root> }` + `Root { uri, name }` (SDK `model.rs:2487-2493`) |
+| 367 | Root `uri` MUST be `file://` URI | MUST | N/A | we never construct a `Root`. Spec MUST applies only when emitting roots |
+| 368 | Root `name` is optional | (field) | N/A | we never construct a `Root` |
+| 369 | On roots change, `listChanged`-capable clients MUST send `notifications/roots/list_changed` | MUST | N/A | we don't declare `listChanged` (see #364). SDK exposes `peer.notify_roots_list_changed` (SDK `service/client.rs:371`) if we ever need it |
+| 370 | Clients SHOULD return `-32601` (method not found) if roots unsupported, `-32603` for internal | SHOULD | ⚠️ | SDK default returns empty list, not `-32601` (SDK `handler/client.rs:102-107`). To honor this SHOULD precisely we'd need a tiny `ClientHandler` impl overriding `list_roots` to `Err(McpError::method_not_found::<ListRootsRequestMethod>())`. Low impact since well-behaved servers gate on capability first |
+| 371 | Clients MUST only expose roots with appropriate permissions | MUST | N/A | we expose no roots |
+| 372 | Clients MUST validate all root URIs (path traversal) | MUST | N/A | we expose no roots |
+| 373 | Clients MUST implement proper access controls | MUST | N/A | we expose no roots |
+| 374 | Clients MUST monitor root accessibility | MUST | N/A | we expose no roots |
+| 375 | Servers SHOULD handle unavailable roots gracefully | SHOULD | N/A | server-side requirement; we are the client |
+| 376 | Servers SHOULD respect root boundaries during operations | SHOULD | N/A | server-side |
+| 377 | Servers SHOULD validate all paths against provided roots | SHOULD | N/A | server-side |
+| 378 | Clients SHOULD prompt user consent before exposing roots | SHOULD | N/A | we expose no roots. Would apply if we implement #363 |
+| 379 | Clients SHOULD provide clear UI for root management | SHOULD | N/A | we expose no roots; also no interactive UI surface in openab-agent (ACP relays to host) |
+| 380 | Clients SHOULD validate root accessibility before exposing | SHOULD | N/A | we expose no roots |
+| 381 | Clients SHOULD monitor for root changes | SHOULD | N/A | we expose no roots |
+| 382 | Servers SHOULD check for roots capability before usage | SHOULD | N/A | server-side |
+| 383 | Servers SHOULD handle root list changes gracefully | SHOULD | N/A | server-side |
+| 384 | Servers SHOULD cache root information appropriately | SHOULD | N/A | server-side |
+
+### Improvement Plan (Jelly draft, pending Mira retroactive review)
+
+- [ ] **Document we don't declare `roots` capability**: extend the same Section 0 / 3 / 5 / 7 client-capability docs matrix to call out that openab-agent advertises no `roots` capability, so spec-compliant servers will skip `roots/list` entirely. Pair with an explicit note that any server that ignores capability and calls `roots/list` anyway will currently receive an empty list (not `-32601`) due to the SDK default — and that this is benign for capability-respecting servers.
+  - **Eval**: docs only · drop-in · **fit: in-scope**. Same matrix expansion pattern used in earlier sections.
+- [ ] **Override SDK default `list_roots` to return `-32601`**: replace `()` handler at `src/mcp/runtime.rs:1066,1079` with a tiny named struct `OpenabClientHandler` that impls `ClientHandler` with `list_roots → Err(McpError::method_not_found::<ListRootsRequestMethod>())` so the wire response matches spec item #370 precisely.
+  - **Eval**: openab-agent only (rmcp `ClientHandler` trait is stable) · drop-in (~25 LOC: new module file + two `runtime.rs` call-site swaps) · **fit: borderline — defer**. Pure SHOULD compliance with no observed bug; benefit only materializes against a misbehaving server. Bundle with the eventual capability-declaration handler upgrade rather than landing standalone.
+- [ ] **(Whole `roots` capability — DEFER)**: implementing client-side `roots` means committing to a workspace/path model (which directories does an openab-agent session expose? the ACP `cwd`? a configured allow-list?), declaring `capabilities.roots.listChanged`, plumbing `notify_roots_list_changed` on workspace changes, and enforcing #371–#374 (permission/validation/access-control/accessibility monitoring). The natural source of truth is the ACP session's working directory plus any host-supplied allow-list, but we don't currently surface either to the MCP layer.
+  - **Eval**: openab-agent layer (rmcp has `Root`/`ListRootsResult`/`notify_roots_list_changed` primitives, no convenience layer) · architectural (~400-700 LOC: handler upgrade + workspace model + path validator + change-watcher + ACP cwd wiring) · **fit: borderline — defer until demand**. No filesystem-scoped MCP server currently in our deployment matrix needs it; revisit when a server explicitly requires `roots` (parallel trigger to Section 7 `tasks`).
+- [ ] **Document the `()` → SDK default behavior as a known divergence**: add a single row to the docs matrix mapping spec items #365 + #370 to "satisfied by SDK default (empty list) rather than `-32601`" so future readers don't think we silently implement roots.
+  - **Eval**: docs only · drop-in · **fit: in-scope**. Prevents future auditor confusion; same line-budget as the Section 7 divergence note.
 
 ## Client / Sampling
 
