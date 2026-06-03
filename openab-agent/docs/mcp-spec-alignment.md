@@ -154,6 +154,7 @@ Source: [`basic/transports.mdx`](https://github.com/modelcontextprotocol/modelco
 | 83 | Streamable HTTP server MUST provide single endpoint supporting POST + GET | MUST | | |
 | 84 | Server MUST validate `Origin` header on all incoming connections (DNS rebinding defence) | MUST | | |
 | 85 | If Origin header is present and invalid, server MUST respond with HTTP 403 Forbidden | MUST | | |
+| 85a | The 403 Forbidden response body MAY comprise a JSON-RPC error response with no `id` | MAY | | |
 | 86 | Local servers SHOULD bind only to localhost (127.0.0.1), not all network interfaces (0.0.0.0) | SHOULD | | |
 | 87 | Servers SHOULD implement proper authentication on all connections | SHOULD | | |
 | 88 | Every client JSON-RPC message MUST be a new HTTP POST | MUST | | |
@@ -215,6 +216,7 @@ Source: [`basic/transports.mdx`](https://github.com/modelcontextprotocol/modelco
 | 144 | Custom transports MUST preserve JSON-RPC + lifecycle | MUST | | |
 | 145 | Custom transports SHOULD document connection establishment / message exchange patterns | SHOULD | | |
 | 145a | Client MAY implement legacy HTTP+SSE backwards-compat flow: POST `InitializeRequest`; on HTTP 400/404/405 fall back to GET expecting `endpoint` SSE event (for interop with 2024-11-05 HTTP+SSE servers) | MAY | | |
+| 145b | Servers wanting to support older clients SHOULD continue to host both the SSE and POST endpoints of the old transport, alongside the new MCP endpoint | SHOULD | | |
 
 ## Authorization
 
