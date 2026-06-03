@@ -91,6 +91,7 @@ Source: [`basic/index.mdx`](https://github.com/modelcontextprotocol/modelcontext
 | 36 | Icon consumers MAY disallow specific file types or sanitize before rendering | MAY | | |
 | 37 | Validate MIME types and file contents before rendering icons (treat declared MIME as advisory; detect via magic bytes; reject on mismatch/unknown); maintain a strict allowlist of image types | (security) | | |
 | 37a | Verify icon URIs originate from the same origin as the server (cross-origin icons require explicit handling) | (security) | | |
+| 37b | JSON-RPC `Error.message` SHOULD be limited to a concise single sentence (per `schema.mdx` JSDoc) | SHOULD | | |
 
 ## Lifecycle
 
@@ -106,11 +107,13 @@ Source: [`basic/lifecycle.mdx`](https://github.com/modelcontextprotocol/modelcon
 | 43 | Client SHOULD NOT send other requests pre-init except ping | SHOULD NOT | | |
 | 44 | Server SHOULD NOT send other requests pre-init except ping/logging | SHOULD NOT | | |
 | 45 | Client MUST send a supported `protocolVersion` in `initialize` | MUST | | |
+| 45a | Client MAY support older `protocolVersion` values for backwards compatibility (per `schema.mdx` JSDoc on `InitializeRequest.params.protocolVersion`) | MAY | | |
 | 46 | Client SHOULD send the latest version it supports | SHOULD | | |
 | 47 | If server supports the requested version, it MUST echo same version | MUST | | |
 | 48 | Otherwise server MUST respond with another supported version | MUST | | |
 | 49 | Server SHOULD respond with its latest supported version | SHOULD | | |
 | 50 | If client does not support server's response version, client SHOULD disconnect | SHOULD | | |
+| 50a | ⚠️ Spec internal conflict: `schema.mdx` (`InitializeResult.protocolVersion` JSDoc) states this as `MUST disconnect`. Alignment doc follows the prose source `basic/lifecycle.mdx` (`SHOULD`); upstream should reconcile. | (spec-conflict) | | |
 | 51 | HTTP: client MUST include `MCP-Protocol-Version` header on subsequent requests | MUST | | |
 | 52 | Client capability: `roots` (with optional `listChanged`) | (capability) | | |
 | 53 | Client capability: `sampling` (LLM sampling support; `tools`/`context` sub-objects defined in `client/sampling.mdx`, not in `lifecycle.mdx` capability table) | (capability) | | |
@@ -521,13 +524,20 @@ Source: [`client/sampling.mdx`](https://github.com/modelcontextprotocol/modelcon
 | 385 | Clients supporting sampling MUST declare `sampling` capability | MUST | | |
 | 386 | Clients supporting tool-enabled sampling MUST declare `sampling.tools` capability | MUST | | |
 | 387 | Servers MUST NOT send tool-enabled sampling to clients without `sampling.tools` capability | MUST NOT | | |
+| 387a | Client MUST return an error if `CreateMessageRequestParams.tools` is provided but client did not declare `ClientCapabilities.sampling.tools` (symmetric to row 387, per `schema.mdx` JSDoc) | MUST | | |
 | 388 | `sampling.context` sub-capability (soft-deprecated) — servers SHOULD NOT use `includeContext` values `thisServer`/`allServers` unless client declares it | SHOULD NOT | | |
 | 389 | Servers SHOULD avoid `includeContext` `thisServer`/`allServers` (soft-deprecated) | SHOULD | | |
 | 390 | `sampling/createMessage` request | (method) | | |
 | 391 | Request params: `messages`, `modelPreferences`, `systemPrompt`, `maxTokens`, `includeContext` (default `"none"`) | (field) | | |
+| 391a | Client MAY ignore `modelPreferences` (per `schema.mdx` JSDoc) | MAY | | |
+| 391b | Client MAY modify or omit `systemPrompt` (per `schema.mdx` JSDoc) | MAY | | |
+| 391c | Client MAY ignore `includeContext` (per `schema.mdx` JSDoc) | MAY | | |
+| 391d | Client MAY sample fewer tokens than `maxTokens` requested (per `schema.mdx` JSDoc) | MAY | | |
 | 392 | Request params (tools): optional `tools[]`, `toolChoice` | (field) | | |
 | 393 | Result fields: `role`, `content`, `model`, `stopReason` | (field) | | |
 | 394 | Content types: text / image / audio / tool_use / tool_result | (field) | | |
+| 394a | Client SHOULD preserve `ToolUseContent._meta` for caching optimizations (per `schema.mdx` JSDoc) | SHOULD | | |
+| 394b | Client SHOULD preserve `ToolResultContent._meta` for caching optimizations (per `schema.mdx` JSDoc) | SHOULD | | |
 | 395 | Tool-result user messages MUST contain ONLY tool results (no mixing) | MUST | | |
 | 396 | Every assistant `ToolUseContent` block MUST be followed by user message of `ToolResultContent` matching by `toolUseId` | MUST | | |
 | 397 | `toolChoice` modes: `auto`, `required`, `none` | (field) | | |
@@ -535,7 +545,10 @@ Source: [`client/sampling.mdx`](https://github.com/modelcontextprotocol/modelcon
 | 399 | `toolChoice: none` — model MUST NOT use any tools | MUST NOT | | |
 | 400 | Model preferences: `costPriority`, `speedPriority`, `intelligencePriority` (0–1) | (field) | | |
 | 401 | Model `hints[].name` substring-match | (field) | | |
+| 401a | Client MUST evaluate `ModelPreferences.hints` in array order (per `schema.mdx` JSDoc) | MUST | | |
+| 401b | Client SHOULD prioritize `hints` over numeric priorities; MAY use numeric priorities as fallback (per `schema.mdx` JSDoc) | SHOULD | | |
 | 402 | Clients MAY map hints to equivalent models from different providers | MAY | | |
+| 402a | Client MAY ignore `ModelHint.meta` (non-standard model-specific metadata, per `schema.mdx` JSDoc) | MAY | | |
 | 403 | Human-in-the-loop SHOULD be able to deny sampling requests | SHOULD | | |
 | 404 | Applications SHOULD provide UI to review requests, edit prompts, present responses | SHOULD | | |
 | 405 | Clients SHOULD return errors for common failures (`-1` user rejected, `-32602` tool-result missing, `-32602` tool-results mixed) | SHOULD | | |
@@ -572,6 +585,7 @@ Source: [`client/elicitation.mdx`](https://github.com/modelcontextprotocol/model
 | 428 | Servers MAY send `notifications/elicitation/complete` on URL-mode completion | MAY | | |
 | 429 | Servers MUST only send completion notification to the client that initiated the elicitation | MUST | | |
 | 430 | Completion notification MUST include the original `elicitationId` | MUST | | |
+| 430a | Client MUST treat `ElicitRequestURLParams.elicitationId` as opaque (per `schema.mdx` JSDoc) | MUST | | |
 | 431 | Clients MUST ignore completion notifications for unknown / already-completed IDs | MUST | | |
 | 432 | Clients MAY wait for completion notification to retry / update UI / continue | MAY | | |
 | 433 | Clients SHOULD still provide manual retry/cancel controls if notification never arrives | SHOULD | | |
@@ -655,6 +669,7 @@ Source: [`server/tools.mdx`](https://github.com/modelcontextprotocol/modelcontex
 | 502 | List-changed-capable servers SHOULD send `notifications/tools/list_changed` | SHOULD | | |
 | 503 | `notifications/tools/list_changed` notification | (notification) | | |
 | 504 | Two error mechanisms: protocol errors (JSON-RPC) + tool execution errors (`isError: true`) | (model) | | |
+| 504a | Errors originating from tool execution SHOULD be reported inside `CallToolResult` (with `isError: true`), not as JSON-RPC protocol errors (per `schema.mdx` JSDoc) | SHOULD | | |
 | 505 | Input validation errors are classified as tool execution errors (`isError: true`), not protocol errors | (classification) | | |
 | 506 | Clients SHOULD provide tool execution errors to LLMs for self-correction | SHOULD | | |
 | 507 | Clients MAY provide protocol errors to LLMs | MAY | | |
@@ -766,6 +781,7 @@ Source: [`server/utilities/logging.mdx`](https://github.com/modelcontextprotocol
 | 582 | Log levels follow RFC 5424 (debug, info, notice, warning, error, critical, alert, emergency) | (field) | | |
 | 583 | `logging/setLevel` request | (method) | | |
 | 584 | Clients MAY send `logging/setLevel` | MAY | | |
+| 584a | Server MAY automatically decide log level if no `logging/setLevel` request has been received from the client (per `schema.mdx` JSDoc on `LoggingMessageParams`) | MAY | | |
 | 585 | `notifications/message` with level / logger / data | (notification) | | |
 | 586 | Servers SHOULD return `-32602` invalid level, `-32603` internal errors | SHOULD | | |
 | 587 | Servers SHOULD rate-limit log messages | SHOULD | | |
