@@ -84,10 +84,7 @@ impl Agent {
     ///   3. skills catalogue.
     ///
     /// Built once at `Agent::new*` time and reused on every `call_llm`.
-    fn build_system_prompt(
-        working_dir: &str,
-        mcp_manager: Option<&McpRuntimeManager>,
-    ) -> String {
+    fn build_system_prompt(working_dir: &str, mcp_manager: Option<&McpRuntimeManager>) -> String {
         let wd = std::path::Path::new(working_dir);
         let agents_md = wd.join("AGENTS.md");
         let custom = std::fs::read_to_string(&agents_md).unwrap_or_default();

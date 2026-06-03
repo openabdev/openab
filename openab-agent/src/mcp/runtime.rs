@@ -676,18 +676,17 @@ impl McpRuntimeManager {
             let handle = guard
                 .get_mut(name)
                 .ok_or_else(|| anyhow!("no mcp server named {name:?}"))?;
-            if matches!(handle.status, ServerStatus::Connected) && handle.client.is_some() {
-                return Ok(());
-            }
-            // Breaker check after the already-connected fast path so the
-            // hot tool-call path stays lock-free on the breaker map. Auth
-            // bounces below (`NeedsAuth`) don't increment the breaker —
-            // only the dial result at the end does, matching the "transport
-            // failures only" semantics from ADR §5.9 / Hermes.
+            // Check the breaker before the connected fast path. Tool-call
+            // transport failures can open the breaker while the client handle
+            // remains installed; those calls must still be short-circuited
+            // until the cooldown/probe cycle succeeds.
             if let Verdict::Reject { retry_in_secs } = self.breaker.check(name) {
                 return Err(anyhow!(
                     "mcp server {name:?} circuit-breaker open — retry in {retry_in_secs}s"
                 ));
+            }
+            if matches!(handle.status, ServerStatus::Connected) && handle.client.is_some() {
+                return Ok(());
             }
             let resolved = handle.config.resolved(name)?;
             let plan = match resolved {

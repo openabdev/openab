@@ -43,6 +43,7 @@ pub enum Verdict {
 struct Entry {
     consecutive_failures: u32,
     opened_at: Option<Instant>,
+    probe_in_flight: bool,
 }
 
 /// Per-server circuit breaker state. Cheap to clone — wraps a `Mutex` so
@@ -65,8 +66,8 @@ impl ServerBreaker {
     /// Internal: parameterized check with an injectable clock so tests can
     /// fast-forward past [`COOLDOWN`] without `tokio::time::sleep`.
     fn check_at(&self, server: &str, now: Instant) -> Verdict {
-        let entries = self.entries.lock().expect("breaker mutex poisoned");
-        let Some(entry) = entries.get(server) else {
+        let mut entries = self.entries.lock().expect("breaker mutex poisoned");
+        let Some(entry) = entries.get_mut(server) else {
             return Verdict::Allow;
         };
         if entry.consecutive_failures < FAIL_THRESHOLD {
@@ -77,6 +78,10 @@ impl ServerBreaker {
         };
         let age = now.saturating_duration_since(opened_at);
         if age >= COOLDOWN {
+            if entry.probe_in_flight {
+                return Verdict::Reject { retry_in_secs: 1 };
+            }
+            entry.probe_in_flight = true;
             Verdict::AllowProbe
         } else {
             // Floor at 1s: returning 0 would render as "retry in 0s" to the
@@ -107,6 +112,7 @@ impl ServerBreaker {
         let mut entries = self.entries.lock().expect("breaker mutex poisoned");
         let entry = entries.entry(server.to_string()).or_default();
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        entry.probe_in_flight = false;
         if entry.consecutive_failures >= FAIL_THRESHOLD {
             entry.opened_at = Some(now);
         }
@@ -165,6 +171,18 @@ mod tests {
         assert!(matches!(b.check_at("foo", t0), Verdict::Reject { .. }));
         let t1 = t0 + COOLDOWN + Duration::from_secs(1);
         assert_eq!(b.check_at("foo", t1), Verdict::AllowProbe);
+    }
+
+    #[test]
+    fn only_one_probe_is_allowed_after_cooldown() {
+        let b = ServerBreaker::new();
+        let t0 = Instant::now();
+        for _ in 0..FAIL_THRESHOLD {
+            b.record_failure_at("foo", t0);
+        }
+        let t1 = t0 + COOLDOWN + Duration::from_secs(1);
+        assert_eq!(b.check_at("foo", t1), Verdict::AllowProbe);
+        assert_eq!(b.check_at("foo", t1), Verdict::Reject { retry_in_secs: 1 });
     }
 
     #[test]

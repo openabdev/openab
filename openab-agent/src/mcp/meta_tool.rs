@@ -119,9 +119,16 @@ async fn fetch_tools(manager: &McpRuntimeManager, server: &str) -> Result<Vec<rm
         .await
         .with_context(|| format!("connect mcp server {server:?}"))?;
     let peer = manager.arc_peer(server).await?;
-    peer.list_all_tools()
-        .await
-        .with_context(|| format!("list_all_tools on {server:?}"))
+    match peer.list_all_tools().await {
+        Ok(tools) => {
+            manager.record_tool_call_outcome(server, true);
+            Ok(tools)
+        }
+        Err(e) => {
+            manager.record_tool_call_outcome(server, false);
+            Err(anyhow::Error::new(e)).with_context(|| format!("list_all_tools on {server:?}"))
+        }
+    }
 }
 
 async fn list_tools(manager: &McpRuntimeManager, server: &str) -> Result<Value> {
