@@ -844,27 +844,42 @@ Source: [`server/tools.mdx`](https://github.com/modelcontextprotocol/modelcontex
 
 Source: [`server/prompts.mdx`](https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/docs/specification/2025-11-25/server/prompts.mdx)
 
+**Section-level finding**: openab-agent does **not** implement the prompts client surface at all. Conversation turns are produced by the LLM provider layer (`src/llm.rs` — `AnthropicProvider` / `OpenAiProvider` SDKs called directly), so MCP prompts never enter the agent's prompt pipeline. The MCP integration in `src/mcp/meta_tool.rs` exposes only `fetch_tools` + `call_tool` (`src/mcp/meta_tool.rs:51,71,98,116`), and the runtime initialises the rmcp client with the unit `()` `ClientHandler` blanket impl (`src/mcp/runtime.rs:1066,1079`), which inherits every default — including the no-op `on_prompt_list_changed` (SDK `handler/client.rs`). The rmcp 1.7.0 SDK *does* surface `Peer<RoleClient>::list_prompts` / `list_all_prompts` / `get_prompt` (SDK `service/client.rs:358-410`), but no call site in our tree invokes them. Most rows are therefore N/A by deliberate abstention; row 536 (client SHOULD paginate) is ❌ because we never list at all; row 527 (notification) is ⚠️ silently dropped by the default handler.
+
 | # | Item | Normative | Status | Location / Notes |
 |---|---|---|---|---|
-| 520 | Servers with prompts MUST declare `prompts` capability | MUST | | |
-| 521 | `prompts.listChanged` sub-capability | (capability) | | |
-| 522 | `prompts/list` with pagination | (method) | | |
-| 523 | Result: `prompts[]`, optional `nextCursor` | (field) | | |
-| 524 | `prompts/get` request | (method) | | |
-| 525 | Result: `messages[]` (required), optional `description` | (field) | | |
-| 526 | List-changed-capable servers SHOULD send `notifications/prompts/list_changed` | SHOULD | | |
-| 527 | `notifications/prompts/list_changed` notification | (notification) | | |
-| 528 | Prompt fields: `name` (required) / `title` / `description` / `arguments` / `icons` (all optional) | (field) | | |
-| 529 | PromptMessage fields: role (user/assistant), content | (field) | | |
-| 530 | Prompt content types: text / image / audio / resource | (field) | | |
-| 531 | Image content MUST be base64-encoded with valid MIME | MUST | | |
-| 532 | Audio content MUST be base64-encoded with valid MIME | MUST | | |
-| 533 | Embedded resource MUST include valid URI, appropriate MIME, and text or blob | MUST | | |
-| 534 | Servers SHOULD return `-32602` invalid prompt / missing args, `-32603` internal errors | SHOULD | | |
-| 535 | Servers SHOULD validate prompt arguments before processing | SHOULD | | |
-| 536 | Clients SHOULD handle pagination for large prompt lists | SHOULD | | |
-| 537 | Both parties SHOULD respect capability negotiation | SHOULD | | |
-| 538 | Implementations MUST validate prompt inputs/outputs to prevent injection | MUST | | |
+| 520 | Servers with prompts MUST declare `prompts` capability | MUST | N/A | server-side declaration; openab-agent is client, no capability to publish |
+| 521 | `prompts.listChanged` sub-capability | (capability) | N/A | server-side sub-capability; client advertises nothing here |
+| 522 | `prompts/list` with pagination | (method) | N/A | server-side method; we never invoke `peer.list_prompts` (SDK `service/client.rs:359`) |
+| 523 | Result: `prompts[]`, optional `nextCursor` | (field) | N/A | server-side response shape; never deserialised on our side |
+| 524 | `prompts/get` request | (method) | N/A | server-side method; `peer.get_prompt` (SDK `service/client.rs:358`) never called |
+| 525 | Result: `messages[]` (required), optional `description` | (field) | N/A | server-side response shape; `GetPromptResult` never constructed nor consumed |
+| 526 | List-changed-capable servers SHOULD send `notifications/prompts/list_changed` | SHOULD | N/A | server-side emit obligation |
+| 527 | `notifications/prompts/list_changed` notification | (notification) | ⚠️ | received via rmcp default `on_prompt_list_changed` (SDK `handler/client.rs`); silently no-ops because `()` handler at `src/mcp/runtime.rs:1066,1079` |
+| 528 | Prompt fields: `name` (required) / `title` / `description` / `arguments` / `icons` (all optional) | (field) | N/A | schema field — we never produce or consume `Prompt` records |
+| 529 | PromptMessage fields: role (user/assistant), content | (field) | N/A | schema field — `PromptMessage` never read; LLM turns come from `src/llm.rs` |
+| 530 | Prompt content types: text / image / audio / resource | (field) | N/A | schema field — content variants never inspected on client side |
+| 531 | Image content MUST be base64-encoded with valid MIME | MUST | N/A | server-side encoding obligation; we never decode prompt images |
+| 532 | Audio content MUST be base64-encoded with valid MIME | MUST | N/A | server-side encoding obligation; we never decode prompt audio |
+| 533 | Embedded resource MUST include valid URI, appropriate MIME, and text or blob | MUST | N/A | server-side embedding obligation; no embedded-resource consumer in tree |
+| 534 | Servers SHOULD return `-32602` invalid prompt / missing args, `-32603` internal errors | SHOULD | N/A | server-side error contract; openab-agent never serves prompts |
+| 535 | Servers SHOULD validate prompt arguments before processing | SHOULD | N/A | server-side validation duty; openab-agent has no prompts to validate |
+| 536 | Clients SHOULD handle pagination for large prompt lists | SHOULD | ❌ | we never call `list_prompts` / `list_all_prompts` (SDK `service/client.rs:359,397`); pagination is moot — non-conformant by abstention. Mitigated by §1 below |
+| 537 | Both parties SHOULD respect capability negotiation | SHOULD | ✅ | inherited from rmcp handshake at `src/mcp/runtime.rs:1066,1079`; `()` handler advertises no client capabilities, server `prompts` cap is parsed and simply unused |
+| 538 | Implementations MUST validate prompt inputs/outputs to prevent injection | MUST | N/A | we never construct or render prompt messages; injection surface absent by abstention |
+
+### Improvement Plan (Jelly draft, pending Mira retroactive review)
+
+- [ ] **§1. Decide whether to implement the prompts client surface.** Two options:
+  - **(a) Implement** — wire `peer.list_all_prompts` + `peer.get_prompt` into `src/mcp/meta_tool.rs`, expose them on the ACP surface so Brett can pick a server-side prompt, then feed the resulting `PromptMessage[]` into `src/llm.rs` as system/user turns.
+  - **(b) Stay tools-only and document abstention (recommended).** `src/llm.rs` already owns turn construction via Anthropic/OpenAI SDKs; MCP prompts are a server-driven *template* mechanism whose value proposition overlaps with what we already do natively. Adopting prompts forces a second turn-assembly path in the agent for marginal gain, and no current MCP server in our deployment publishes prompts worth surfacing.
+  - **Eval**: docs only · docs only · **fit: in-scope**. Decision-only step; recommendation is (b) because integration cost is non-trivial and user-visible benefit is currently zero.
+- [ ] **§2. If (a) wins: add `peer.list_all_prompts` + `peer.get_prompt` calls + ACP surface to expose prompts to Brett.** Add a `fetch_prompts(server)` analogue to `fetch_tools` (`src/mcp/meta_tool.rs:116`), plus a `get_prompt(server, name, args)` analogue to `call_tool` (`src/mcp/meta_tool.rs:71`). Surface both through the ACP meta-tool dispatch so Brett can list and instantiate prompts, then translate `GetPromptResult.messages` into the agent's internal turn representation before handing off to `src/llm.rs`.
+  - **Eval**: openab-agent layer · non-trivial (~150-250 LOC across meta_tool / ACP schema / llm bridging + tests) · **fit: defer**. Architectural commitment to a parallel turn-assembly path; only worth it once a deployed MCP server actually publishes useful prompts.
+- [ ] **§3. Override `on_prompt_list_changed`** from default no-op to a logged-cache-invalidation once §2 lands. Replace the unit `()` handler (`src/mcp/runtime.rs:1066,1079`) with a named struct (or reuse the one introduced for Section 10 §1 / Section 11 row 503) and implement `on_prompt_list_changed` to `tracing::info!` the event with the server identifier and invalidate the §2 cache. Upgrades row 527 from ⚠️ to ✅.
+  - **Eval**: openab-agent layer · drop-in (~30 LOC; bundled with the named ClientHandler struct) · **fit: defer**. Mechanically trivial but pointless without §2's cache to invalidate.
+- [ ] **§4. Document the deliberate abstention.** Land a short paragraph — either as the section-level note above (this audit) and/or as a `//!` doc-comment in `src/mcp/mod.rs` — stating that the prompts client surface is intentionally not implemented because LLM turn construction lives in `src/llm.rs` via native provider SDKs. Makes the N/A-by-abstention status discoverable from code without re-deriving it from `grep`.
+  - **Eval**: docs only · docs only (~10 lines of prose) · **fit: in-scope**. Cheap, prevents future auditors from re-litigating the same question, and is the natural follow-through of recommending (b) in §1.
 
 ## Server / Resources
 
