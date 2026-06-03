@@ -624,45 +624,60 @@ Source: [`client/sampling.mdx`](https://github.com/modelcontextprotocol/modelcon
 
 | # | Item | Normative | Status | Location / Notes |
 |---|---|---|---|---|
-| 385 | Clients supporting sampling MUST declare `sampling` capability | MUST | | |
-| 386 | Clients supporting tool-enabled sampling MUST declare `sampling.tools` capability | MUST | | |
-| 387 | Servers MUST NOT send tool-enabled sampling to clients without `sampling.tools` capability | MUST NOT | | |
-| 387a | Client MUST return an error if `CreateMessageRequestParams.tools` is provided but client did not declare `ClientCapabilities.sampling.tools` (symmetric to row 387, per `schema.mdx` JSDoc) | MUST | | |
-| 388 | `sampling.context` sub-capability (soft-deprecated) — servers SHOULD NOT use `includeContext` values `thisServer`/`allServers` unless client declares it | SHOULD NOT | | |
-| 389 | Servers SHOULD avoid `includeContext` `thisServer`/`allServers` (soft-deprecated) | SHOULD | | |
-| 390 | `sampling/createMessage` request | (method) | | |
-| 391 | Request params: `messages`, `modelPreferences`, `systemPrompt`, `maxTokens`, `includeContext` (default `"none"`) | (field) | | |
-| 391a | Client MAY ignore `modelPreferences` (per `schema.mdx` JSDoc) | MAY | | |
-| 391b | Client MAY modify or omit `systemPrompt` (per `schema.mdx` JSDoc) | MAY | | |
-| 391c | Client MAY ignore `includeContext` (per `schema.mdx` JSDoc) | MAY | | |
-| 391d | Client MAY sample fewer tokens than `maxTokens` requested (per `schema.mdx` JSDoc) | MAY | | |
-| 392 | Request params (tools): optional `tools[]`, `toolChoice` | (field) | | |
-| 393 | Result fields: `role`, `content`, `model`, `stopReason` | (field) | | |
-| 394 | Content types: text / image / audio / tool_use / tool_result | (field) | | |
-| 394a | Client SHOULD preserve `ToolUseContent._meta` for caching optimizations (per `schema.mdx` JSDoc) | SHOULD | | |
-| 394b | Client SHOULD preserve `ToolResultContent._meta` for caching optimizations (per `schema.mdx` JSDoc) | SHOULD | | |
-| 395 | Tool-result user messages MUST contain ONLY tool results (no mixing) | MUST | | |
-| 396 | Every assistant `ToolUseContent` block MUST be followed by user message of `ToolResultContent` matching by `toolUseId` | MUST | | |
-| 397 | `toolChoice` modes: `auto`, `required`, `none` | (field) | | |
-| 398 | `toolChoice: required` — model MUST use at least one tool before completing | MUST | | |
-| 399 | `toolChoice: none` — model MUST NOT use any tools | MUST NOT | | |
-| 400 | Model preferences: `costPriority`, `speedPriority`, `intelligencePriority` (0–1) | (field) | | |
-| 401 | Model `hints[].name` substring-match | (field) | | |
-| 401a | Client MUST evaluate `ModelPreferences.hints` in array order (per `schema.mdx` JSDoc) | MUST | | |
-| 401b | Client SHOULD prioritize `hints` over numeric priorities; MAY use numeric priorities as fallback (per `schema.mdx` JSDoc) | SHOULD | | |
-| 402 | Clients MAY map hints to equivalent models from different providers | MAY | | |
-| 402a | Client MAY ignore `ModelHint.meta` (non-standard model-specific metadata, per `schema.mdx` JSDoc) | MAY | | |
-| 403 | Human-in-the-loop SHOULD be able to deny sampling requests | SHOULD | | |
-| 404 | Applications SHOULD provide UI to review requests, edit prompts, present responses | SHOULD | | |
-| 405 | Clients SHOULD return errors for common failures (`-1` user rejected, `-32602` tool-result missing, `-32602` tool-results mixed) | SHOULD | | |
-| 406 | Clients SHOULD implement user approval controls | SHOULD | | |
-| 407 | Both parties SHOULD validate message content | SHOULD | | |
-| 408 | Clients SHOULD respect model preference hints | SHOULD | | |
-| 409 | Clients SHOULD implement rate limiting | SHOULD | | |
-| 410 | Both parties MUST handle sensitive data appropriately | MUST | | |
-| 411 | When replying to a `stopReason: "toolUse"` response, servers MUST respond to each `ToolUseContent` with a `ToolResultContent` of matching `toolUseId` | MUST | | |
-| 412 | When tools are used, user message containing tool results MUST contain only tool results | MUST | | |
-| 413 | Both parties SHOULD implement iteration limits for tool loops | SHOULD | | |
+| 385 | Clients supporting sampling MUST declare `sampling` capability | MUST | N/A | we don't support sampling. `()` client handler at `runtime.rs:1066,1079` → `ClientHandler for ()` (SDK `handler/client.rs:263`) → `get_info()` returns `ClientInfo::default()` (SDK `handler/client.rs:257`) → `ClientCapabilities::default()` (SDK `model.rs:914`) with no `sampling` field. Grep across `src/` for `sampling`/`CreateMessage`/`create_message` returns zero hits — vacuously compliant by abstention |
+| 386 | Clients supporting tool-enabled sampling MUST declare `sampling.tools` capability | MUST | N/A | same as 385 — we don't support sampling, so `sampling.tools` is moot |
+| 387 | Servers MUST NOT send tool-enabled sampling to clients without `sampling.tools` capability | MUST NOT | N/A | server-side normative |
+| 387a | Client MUST return an error if `CreateMessageRequestParams.tools` is provided but client did not declare `ClientCapabilities.sampling.tools` (symmetric to row 387, per `schema.mdx` JSDoc) | MUST | ⚠️ (vacuous) | default `ClientHandler::create_message` (SDK `handler/client.rs:92-100`) unconditionally returns `McpError::method_not_found::<CreateMessageRequestMethod>()` regardless of whether `tools` is present. Servers should never call us in the first place (no `sampling` declared), but if one does, we reject the whole request — not specifically the `tools` field. Acceptable since we don't claim sampling support |
+| 388 | `sampling.context` sub-capability (soft-deprecated) — servers SHOULD NOT use `includeContext` values `thisServer`/`allServers` unless client declares it | SHOULD NOT | N/A | server-side |
+| 389 | Servers SHOULD avoid `includeContext` `thisServer`/`allServers` (soft-deprecated) | SHOULD | N/A | server-side |
+| 390 | `sampling/createMessage` request | (method) | ❌ | not implemented. Default `ClientHandler::create_message` (SDK `handler/client.rs:92-100`) returns `method_not_found`. We're an LLM client ourselves (`src/llm.rs` exposes `AnthropicProvider` / `OpenAiProvider` via `LlmProvider` trait, used by `src/agent.rs:6` and `src/acp.rs:2,133-146`), so we *could* implement sampling by routing back to our own provider — but we don't today, and we don't advertise the capability |
+| 391 | Request params: `messages`, `modelPreferences`, `systemPrompt`, `maxTokens`, `includeContext` (default `"none"`) | (field) | N/A | SDK `CreateMessageRequestParams` schema is provided by rmcp 1.7.0; we don't consume any of these fields |
+| 391a | Client MAY ignore `modelPreferences` (per `schema.mdx` JSDoc) | MAY | N/A | we don't process sampling requests |
+| 391b | Client MAY modify or omit `systemPrompt` (per `schema.mdx` JSDoc) | MAY | N/A | same |
+| 391c | Client MAY ignore `includeContext` (per `schema.mdx` JSDoc) | MAY | N/A | same |
+| 391d | Client MAY sample fewer tokens than `maxTokens` requested (per `schema.mdx` JSDoc) | MAY | N/A | same |
+| 392 | Request params (tools): optional `tools[]`, `toolChoice` | (field) | N/A | SDK schema only; not consumed |
+| 393 | Result fields: `role`, `content`, `model`, `stopReason` | (field) | N/A | we never produce `CreateMessageResult` |
+| 394 | Content types: text / image / audio / tool_use / tool_result | (field) | N/A | not consumed |
+| 394a | Client SHOULD preserve `ToolUseContent._meta` for caching optimizations (per `schema.mdx` JSDoc) | SHOULD | N/A | we don't process sampling content |
+| 394b | Client SHOULD preserve `ToolResultContent._meta` for caching optimizations (per `schema.mdx` JSDoc) | SHOULD | N/A | same |
+| 395 | Tool-result user messages MUST contain ONLY tool results (no mixing) | MUST | N/A | sampling response shape; we don't construct sampling messages |
+| 396 | Every assistant `ToolUseContent` block MUST be followed by user message of `ToolResultContent` matching by `toolUseId` | MUST | N/A | same |
+| 397 | `toolChoice` modes: `auto`, `required`, `none` | (field) | N/A | not consumed |
+| 398 | `toolChoice: required` — model MUST use at least one tool before completing | MUST | N/A | not applicable — we don't run sampling |
+| 399 | `toolChoice: none` — model MUST NOT use any tools | MUST NOT | N/A | same |
+| 400 | Model preferences: `costPriority`, `speedPriority`, `intelligencePriority` (0–1) | (field) | N/A | not consumed |
+| 401 | Model `hints[].name` substring-match | (field) | N/A | not consumed |
+| 401a | Client MUST evaluate `ModelPreferences.hints` in array order (per `schema.mdx` JSDoc) | MUST | N/A | not consumed |
+| 401b | Client SHOULD prioritize `hints` over numeric priorities; MAY use numeric priorities as fallback (per `schema.mdx` JSDoc) | SHOULD | N/A | not consumed |
+| 402 | Clients MAY map hints to equivalent models from different providers | MAY | N/A | not consumed |
+| 402a | Client MAY ignore `ModelHint.meta` (non-standard model-specific metadata, per `schema.mdx` JSDoc) | MAY | N/A | not consumed |
+| 403 | Human-in-the-loop SHOULD be able to deny sampling requests | SHOULD | N/A | no sampling = no human-in-the-loop surface needed; would become applicable if 390 is implemented |
+| 404 | Applications SHOULD provide UI to review requests, edit prompts, present responses | SHOULD | N/A | gated on implementing 390 |
+| 405 | Clients SHOULD return errors for common failures (`-1` user rejected, `-32602` tool-result missing, `-32602` tool-results mixed) | SHOULD | ⚠️ | default handler returns `method_not_found` (`-32601`) for every sampling call. Spec-compliant for "we don't support this", but not the granular error catalog the row describes (only matters once we implement sampling) |
+| 406 | Clients SHOULD implement user approval controls | SHOULD | N/A | gated on implementing 390 |
+| 407 | Both parties SHOULD validate message content | SHOULD | N/A | we don't process sampling messages; rmcp deserializes via `CreateMessageRequestParams` |
+| 408 | Clients SHOULD respect model preference hints | SHOULD | N/A | gated on implementing 390 |
+| 409 | Clients SHOULD implement rate limiting | SHOULD | N/A | gated on implementing 390 |
+| 410 | Both parties MUST handle sensitive data appropriately | MUST | N/A | vacuously satisfied — we never read/forward sampling payloads |
+| 411 | When replying to a `stopReason: "toolUse"` response, servers MUST respond to each `ToolUseContent` with a `ToolResultContent` of matching `toolUseId` | MUST | N/A | server-side (it says "servers MUST respond") |
+| 412 | When tools are used, user message containing tool results MUST contain only tool results | MUST | N/A | sampling-response shape; not constructed by us |
+| 413 | Both parties SHOULD implement iteration limits for tool loops | SHOULD | N/A | gated on implementing 390 |
+
+### Improvement Plan (Jelly draft, pending Mira retroactive review)
+
+- [ ] **Document the abstention explicitly** in this section and in a short `docs/mcp-client-capabilities.md` (or inline `src/mcp/mod.rs` comment) noting we use `()` as `ClientHandler` and therefore do not advertise `sampling` / `sampling.tools` / `roots` / `elicitation`.
+  - **Eval**: docs only · drop-in · **fit: in-scope**. Cheap, future-reader-friendly, prevents the next person from wondering whether the absence is intentional.
+- [ ] **Add an integration test** that spins up a mock rmcp server, sends a `sampling/createMessage` request to our client, and asserts we respond with `method_not_found` (`-32601`). Pins the "vacuously compliant by abstention" claim against accidental future opt-in.
+  - **Eval**: test layer · drop-in (~50 LOC if rmcp test infra exists) · **fit: borderline**. Guards 387a/390/405 simultaneously; only useful once we have any other rmcp-handler tests to amortize fixture cost — defer if test harness isn't there yet.
+- [ ] **Implement `ClientHandler::create_message`** by routing to our existing `LlmProvider` (`src/llm.rs` — `AnthropicProvider`, `OpenAiProvider`) and declare `capabilities.sampling = {}` (no `tools` sub-cap initially). Forms a "sampling pass-through": MCP server delegates an LLM call to us, we use the user's already-authenticated provider.
+  - **Eval**: openab-agent layer · architectural commitment (~300-500 LOC: custom `ClientHandler` struct replacing `()`, `CreateMessageRequestParams` → `llm::Message` mapping, content-block conversion, model-hint resolution, and an approval UX through the ACP front-end) · **fit: defer**. Sampling exists so server can borrow client's LLM; we'd be routing back to our own Anthropic/OpenAI client — concretely useful only when a server we actually run requests it. No demand signal today.
+- [ ] **If 390 is implemented, add `sampling.tools` sub-capability support**: pass `tools[]` / `toolChoice` through to the `LlmProvider`, enforce `toolChoice: required`/`none` semantics, and surface `ToolUseContent` / `ToolResultContent` ordering rules (rows 395, 396, 411, 412).
+  - **Eval**: openab-agent layer · additive on top of previous item (~200-300 LOC: tool-schema bridge from MCP → `llm::ToolDef`, response post-validation, `stopReason: "toolUse"` mapping) · **fit: defer**. Strictly dependent on the previous item landing; revisit only if a real MCP server we use starts requesting tool-enabled sampling.
+- [ ] **If 390 is implemented, add human-in-the-loop approval surface** (rows 403/404/406): route `CreateMessageRequestParams` through an ACP `request_permission` prompt before invoking the `LlmProvider`, with an option to edit `systemPrompt` / `messages` before sending.
+  - **Eval**: openab-agent + acp layer · non-trivial (~150-250 LOC: new ACP permission kind, prompt rendering, edit round-trip) · **fit: defer**. Required by spec (SHOULD) the moment we advertise `sampling`; treat as a hard prerequisite, not a follow-up, if 390 is ever picked up.
+- [ ] **If 390 is implemented, add per-server sampling rate limit (row 409) and tool-loop iteration cap (row 413)** — both configurable via `config.toml` per MCP server entry, defaults conservative (e.g. 10 calls/min, 8 tool iterations).
+  - **Eval**: openab-agent layer · drop-in once 390 lands (~50-100 LOC: token-bucket per server id, counter on tool-loop response chain) · **fit: defer**. Cheap insurance against runaway server costs; bundle with 390.
 
 ## Client / Elicitation
 
