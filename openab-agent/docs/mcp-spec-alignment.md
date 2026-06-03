@@ -773,51 +773,72 @@ Source: [`client/elicitation.mdx`](https://github.com/modelcontextprotocol/model
 
 Source: [`server/tools.mdx`](https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/docs/specification/2025-11-25/server/tools.mdx)
 
+**Section-level finding**: openab-agent is the **client**; the tools surface is the only MCP capability we actively consume. `src/mcp/meta_tool.rs` wires `fetch_tools` via `peer.list_all_tools` (auto-paginated, `src/mcp/meta_tool.rs:116-132`; SDK `service/client.rs:378-392`) and `call_tool` via `peer.call_tool` with `CallToolRequestParams::new(name).with_arguments(args)` (`src/mcp/meta_tool.rs:95-98`). The result projection in `list_tools` / `describe_tool` (`src/mcp/meta_tool.rs:139-161`) is intentionally minimal: only `name` + `description` are surfaced to the LLM, and `describe_tool` adds `input_schema`. `title`, `annotations`, `icons`, `execution`, `output_schema` are all dropped before the LLM sees them. The `()` `ClientHandler` blanket impl (`src/mcp/runtime.rs:1066,1079`) means `on_tool_list_changed` no-ops silently. The agent layer (`src/agent.rs:184`) always emits the outer meta-tool `ToolResult` with `is_error: None` regardless of inner `CallToolResult.is_error`. Server-side rows 480/481/485-491/497/499/500/502/504a/505/511-514 are N/A by topology.
+
 | # | Item | Normative | Status | Location / Notes |
 |---|---|---|---|---|
-| 480 | Servers with tools MUST declare `tools` capability | MUST | | |
-| 481 | `tools.listChanged` sub-capability bit | (capability) | | |
-| 482 | `tools/list` with pagination | (method) | | |
-| 483 | `tools/call` with `name` + `arguments` | (method) | | |
-| 484 | Tool fields: name / title / description / inputSchema / outputSchema / annotations / icons / execution | (field) | | |
-| 485 | `inputSchema` MUST be a valid JSON Schema object (not null) | MUST | | |
-| 486 | `inputSchema` follows JSON Schema usage guidelines (default 2020-12) | (constraint) | | |
-| 486a | For tools with no parameters, `inputSchema` SHOULD be `{"type":"object","additionalProperties":false}` (recommended) or `{"type":"object"}` | SHOULD | | |
-| 487 | `outputSchema` follows JSON Schema usage guidelines (default 2020-12) | (constraint) | | |
-| 488 | Tool names SHOULD be 1–128 characters (inclusive) | SHOULD | | |
-| 488a | Tool names SHOULD be considered case-sensitive | SHOULD | | |
-| 489 | Tool names SHOULD only contain A-Z, a-z, 0-9, `_`, `-`, `.` | SHOULD | | |
-| 490 | Tool names SHOULD NOT contain spaces / commas / special chars | SHOULD NOT | | |
-| 491 | Tool names SHOULD be unique within a server | SHOULD | | |
-| 492 | `execution.taskSupport` values: `"forbidden"` (default), `"optional"`, `"required"` | (field) | | |
-| 493 | Tool result content types: text / image / audio / resource_link / resource (embedded) | (field) | | |
-| 494 | Content types support optional annotations (audience / priority / lastModified) | (field) | | |
-| 495 | Tool MAY return `resource_link` items | MAY | | |
-| 496 | Tool result MAY embed `resource` items | MAY | | |
-| 497 | Servers using embedded resources SHOULD implement `resources` capability | SHOULD | | |
-| 498 | Result: `content[]`, `isError`, optional `structuredContent` | (field) | | |
-| 499 | Tools returning structured content SHOULD also return serialized JSON in a `TextContent` block (for backwards compatibility) | SHOULD | | |
-| 500 | If `outputSchema` provided, servers MUST provide structured results matching | MUST | | |
-| 501 | If `outputSchema` provided, clients SHOULD validate structured results against it | SHOULD | | |
-| 502 | List-changed-capable servers SHOULD send `notifications/tools/list_changed` | SHOULD | | |
-| 503 | `notifications/tools/list_changed` notification | (notification) | | |
-| 504 | Two error mechanisms: protocol errors (JSON-RPC) + tool execution errors (`isError: true`) | (model) | | |
-| 504a | Errors originating from tool execution SHOULD be reported inside `CallToolResult` (with `isError: true`), not as JSON-RPC protocol errors (per `schema.mdx` JSDoc) | SHOULD | | |
-| 505 | Input validation errors are classified as tool execution errors (`isError: true`), not protocol errors | (classification) | | |
-| 506 | Clients SHOULD provide tool execution errors to LLMs for self-correction | SHOULD | | |
-| 507 | Clients MAY provide protocol errors to LLMs | MAY | | |
-| 508 | Clients MUST consider tool annotations untrusted unless from trusted server | MUST | | |
-| 509 | Human-in-the-loop SHOULD be able to deny tool invocations | SHOULD | | |
-| 510 | Apps SHOULD show exposed tools + visual indicators + confirmation prompts | SHOULD | | |
-| 511 | Servers MUST validate all tool inputs | MUST | | |
-| 512 | Servers MUST implement proper access controls | MUST | | |
-| 513 | Servers MUST rate-limit tool invocations | MUST | | |
-| 514 | Servers MUST sanitize tool outputs | MUST | | |
-| 515 | Clients SHOULD prompt for confirmation on sensitive operations | SHOULD | | |
-| 516 | Clients SHOULD show tool inputs to user before calling server | SHOULD | | |
-| 517 | Clients SHOULD validate tool results before passing to LLM | SHOULD | | |
-| 518 | Clients SHOULD implement timeouts for tool calls | SHOULD | | |
-| 519 | Clients SHOULD log tool usage for audit | SHOULD | | |
+| 480 | Servers with tools MUST declare `tools` capability | MUST | N/A | server-side normative; we are an MCP client (`src/mcp/runtime.rs:1066,1079` use `()` ClientHandler) |
+| 481 | `tools.listChanged` sub-capability bit | (capability) | N/A | server-declared capability; client just reads it via rmcp `ServerCapabilities`; no openab-agent surface |
+| 482 | `tools/list` with pagination | (method) | ✅ | auto-paginated by rmcp `Peer::list_all_tools` (SDK `service/client.rs:378-392`); called at `src/mcp/meta_tool.rs:122` |
+| 483 | `tools/call` with `name` + `arguments` | (method) | ✅ | `src/mcp/meta_tool.rs:95-98` builds `CallToolRequestParams::new(name).with_arguments(args_map)`, dispatched via `peer.call_tool` |
+| 484 | Tool fields: name / title / description / inputSchema / outputSchema / annotations / icons / execution | (field) | ⚠️ | rmcp `Tool` carries all fields; our `list_tools` projection collapses to `{name, description}` only (`src/mcp/meta_tool.rs:139-143`). `describe_tool` adds `input_schema` (`:157-161`). `title`/`annotations`/`icons`/`execution`/`output_schema` silently dropped |
+| 485 | `inputSchema` MUST be a valid JSON Schema object (not null) | MUST | N/A | server obligation; client forwards `t.input_schema` to LLM opaquely (`src/mcp/meta_tool.rs:160`) |
+| 486 | `inputSchema` follows JSON Schema usage guidelines (default 2020-12) | (constraint) | N/A | server-side schema authoring constraint |
+| 486a | For tools with no parameters, `inputSchema` SHOULD be `{"type":"object","additionalProperties":false}` (recommended) or `{"type":"object"}` | SHOULD | N/A | server-authoring recommendation |
+| 487 | `outputSchema` follows JSON Schema usage guidelines (default 2020-12) | (constraint) | N/A | server-side schema authoring constraint |
+| 488 | Tool names SHOULD be 1–128 characters (inclusive) | SHOULD | N/A | server-naming SHOULD; client does not validate name length |
+| 488a | Tool names SHOULD be considered case-sensitive | SHOULD | ✅ | case-sensitive `String` equality in tool lookup (`src/mcp/meta_tool.rs:155` `find(|t| t.name.as_ref() == tool)`) |
+| 489 | Tool names SHOULD only contain A-Z, a-z, 0-9, `_`, `-`, `.` | SHOULD | N/A | server-naming SHOULD; client accepts any name string |
+| 490 | Tool names SHOULD NOT contain spaces / commas / special chars | SHOULD NOT | N/A | server-naming SHOULD NOT; client accepts any name string |
+| 491 | Tool names SHOULD be unique within a server | SHOULD | N/A | server uniqueness obligation; we trust server |
+| 492 | `execution.taskSupport` values: `"forbidden"` (default), `"optional"`, `"required"` | (field) | ❌ | `execution` field never read or surfaced; `describe_tool` (`src/mcp/meta_tool.rs:157-161`) returns name/description/input_schema only. We will silently invoke a tool whose server declared `taskSupport:"required"` even though we do not support tasks (see Section 7) |
+| 493 | Tool result content types: text / image / audio / resource_link / resource (embedded) | (field) | ⚠️ | `CallToolResult` round-tripped via `serde_json::to_value` (`src/mcp/meta_tool.rs:109`); LLM sees raw JSON, no per-type rendering or fan-out |
+| 494 | Content types support optional annotations (audience / priority / lastModified) | (field) | ⚠️ | annotations survive JSON round-trip but ignored — no `audience`/`priority` filtering before LLM sees content (`src/mcp/meta_tool.rs:109`) |
+| 495 | Tool MAY return `resource_link` items | MAY | ⚠️ | forwarded verbatim in serialized result; no fetch / dereference (`src/mcp/meta_tool.rs:109`) |
+| 496 | Tool result MAY embed `resource` items | MAY | ⚠️ | embedded resources forwarded verbatim, never specially rendered |
+| 497 | Servers using embedded resources SHOULD implement `resources` capability | SHOULD | N/A | server-side obligation |
+| 498 | Result: `content[]`, `isError`, optional `structuredContent` | (field) | ⚠️ | all three round-trip via rmcp `CallToolResult` (SDK `model.rs:2774-2787`); meta_tool emits whole struct to LLM but `src/agent.rs:184` does not branch on inner `is_error` |
+| 499 | Tools returning structured content SHOULD also return serialized JSON in a `TextContent` block (for backwards compatibility) | SHOULD | N/A | server-side SHOULD; client consumes whichever side is present |
+| 500 | If `outputSchema` provided, servers MUST provide structured results matching | MUST | N/A | server obligation |
+| 501 | If `outputSchema` provided, clients SHOULD validate structured results against it | SHOULD | ❌ | no JSON-Schema validator wired; `call_tool` serializes result without checking `structured_content` vs `output_schema` (`src/mcp/meta_tool.rs:98-109`) |
+| 502 | List-changed-capable servers SHOULD send `notifications/tools/list_changed` | SHOULD | N/A | server-side emit obligation |
+| 503 | `notifications/tools/list_changed` notification | (notification) | ❌ | `()` ClientHandler uses default `on_tool_list_changed` no-op (SDK `handler/client.rs`); no cache refresh, no LLM notification |
+| 504 | Two error mechanisms: protocol errors (JSON-RPC) + tool execution errors (`isError: true`) | (model) | ✅ | wire `Err` trips breaker + bubbles `anyhow` (`src/mcp/meta_tool.rs:103-107`); wire `Ok` with `isError:true` resets breaker (comment at `:96-97`, runtime hook) |
+| 504a | Errors originating from tool execution SHOULD be reported inside `CallToolResult` (with `isError: true`), not as JSON-RPC protocol errors (per `schema.mdx` JSDoc) | SHOULD | N/A | server-emit SHOULD; client respects whichever shape arrives |
+| 505 | Input validation errors are classified as tool execution errors (`isError: true`), not protocol errors | (classification) | N/A | server-classification obligation |
+| 506 | Clients SHOULD provide tool execution errors to LLMs for self-correction | SHOULD | ⚠️ | full `CallToolResult` (incl. `is_error`) serialized to LLM (`src/mcp/meta_tool.rs:109`), but outer meta-tool ToolResult always emits `is_error: None` (`src/agent.rs:184`); LLM has to parse inner JSON |
+| 507 | Clients MAY provide protocol errors to LLMs | MAY | ✅ | `anyhow::Error::new(e).with_context(...)` (`src/mcp/meta_tool.rs:105-106`) bubbles back through dispatch and renders as tool error to LLM |
+| 508 | Clients MUST consider tool annotations untrusted unless from trusted server | MUST | ⚠️ | annotations stripped from `list_tools` projection (`src/mcp/meta_tool.rs:139-143`); LLM never sees them, so de-facto untrusted by omission. No explicit trust model documented |
+| 509 | Human-in-the-loop SHOULD be able to deny tool invocations | SHOULD | ❌ | no interactive deny path in dispatch (`src/mcp/meta_tool.rs`); meta-tool calls fire on LLM decision without HITL gate |
+| 510 | Apps SHOULD show exposed tools + visual indicators + confirmation prompts | SHOULD | ❌ | no UI surface; openab-agent is headless ACP/CLI — no tool catalog UI or confirmation prompt |
+| 511 | Servers MUST validate all tool inputs | MUST | N/A | server obligation |
+| 512 | Servers MUST implement proper access controls | MUST | N/A | server obligation |
+| 513 | Servers MUST rate-limit tool invocations | MUST | N/A | server obligation (client-side circuit breaker in `src/mcp/breaker.rs` is transport-failure protection, not rate-limit) |
+| 514 | Servers MUST sanitize tool outputs | MUST | N/A | server obligation |
+| 515 | Clients SHOULD prompt for confirmation on sensitive operations | SHOULD | ❌ | no confirmation prompt path; dispatch goes straight to `peer.call_tool` (`src/mcp/meta_tool.rs:98`) |
+| 516 | Clients SHOULD show tool inputs to user before calling server | SHOULD | ❌ | headless; no pre-call display of `arguments` to user. ACP frame surfaces afterward, not before |
+| 517 | Clients SHOULD validate tool results before passing to LLM | SHOULD | ❌ | `call_tool` only `serde_json::to_value` then returns (`src/mcp/meta_tool.rs:109`); no schema check / sanitization |
+| 518 | Clients SHOULD implement timeouts for tool calls | SHOULD | ❌ | no `tokio::time::timeout` around `peer.call_tool` / `list_all_tools` (`src/mcp/meta_tool.rs:98,122`); only OAuth device-flow has wall-clock timeout (`src/mcp/mod.rs`) |
+| 519 | Clients SHOULD log tool usage for audit | SHOULD | ❌ | `meta_tool.rs` has no `tracing::info!` for call/list invocations; only `record_tool_call_outcome` updates breaker state (`:100,104`) |
+
+### Improvement Plan (Jelly draft, pending Mira retroactive review)
+
+- [ ] **Row 484 — enrich `list_tools` / `describe_tool` projection** to surface `title`, `annotations`, `icons`, `execution`, `output_schema` so the LLM can route on `taskSupport` and respect `audience`/`priority`. Today `list_tools` (`src/mcp/meta_tool.rs:139-143`) collapses to `{name, description}` only.
+  - **Eval**: openab-agent only · drop-in (~30 LOC, projection-only) · **fit: in-scope**. Pure additive JSON shape; no rmcp change required.
+- [ ] **Row 492 — honour `execution.taskSupport`** by refusing `call` actions on tools that declare `"required"` (we don't implement tasks) and surfacing the value to LLM via `describe_tool`.
+  - **Eval**: openab-agent only · drop-in (~20 LOC guard + describe_tool field) · **fit: in-scope**. Bounds the unsupported-tool failure mode that Section 7 Improvement #1 also flags; pair the patches.
+- [ ] **Row 501 — validate structured results against `outputSchema`** when both are present; emit warning + downgrade to text on mismatch.
+  - **Eval**: openab-agent layer · non-trivial (~80 LOC + `jsonschema` crate dependency) · **fit: borderline**. New dep is the cost; behaviour is SHOULD not MUST. Defer until first concrete divergence observed.
+- [ ] **Row 503 — wire `on_tool_list_changed`** to invalidate the per-server tools cache (planned in `src/mcp/meta_tool.rs:113` comment) and re-emit tool list to LLM. Same blocker as Section 10 §1 elicitation — needs replacing `()` blanket impl with a named `ClientHandler` struct.
+  - **Eval**: openab-agent layer · non-trivial (~60 LOC bundled with Section 10 §1 ClientHandler refactor) · **fit: in-scope (bundled)**. Free once the named-handler struct lands.
+- [ ] **Row 506 — propagate inner `CallToolResult.is_error` to outer meta-tool ToolResult** at `src/agent.rs:184` (currently always `is_error: None`). Lets the LLM's standard self-correction loop kick in without re-parsing inner JSON.
+  - **Eval**: openab-agent only · drop-in (~10 LOC; plumb a flag from `meta_tool::dispatch` to caller) · **fit: in-scope**. High value-per-LOC.
+- [ ] **Row 518 — per-call `tokio::time::timeout`** around `peer.call_tool` (and `list_all_tools`), default e.g. 60 s, overridable per server in `McpConfig`. On timeout: trip breaker, return tool error.
+  - **Eval**: openab-agent only · drop-in (~40 LOC + config field) · **fit: in-scope**. Low risk; protects against hung child processes.
+- [ ] **Row 519 — `tracing::info!` audit log** at `call_tool` entry + exit (server, tool, arg sha256, duration_ms, outcome, is_error) using existing tracing plaintext fields per repo convention.
+  - **Eval**: openab-agent only · drop-in (~15 LOC) · **fit: in-scope**. Free observability win; no new deps.
+- [ ] **Rows 509/515/516 — HITL deny / confirm hook** for `call` action: optional async callback (ACP `tool_call_approval` frame) before `peer.call_tool`. Default = allow to preserve headless behaviour; UIs opt in.
+  - **Eval**: hybrid (openab-agent + ACP adapter) · architectural commitment (~200 LOC + ACP frame schema design) · **fit: defer**. Needs ACP-side normative; track as design-doc placeholder.
 
 ## Server / Prompts
 
