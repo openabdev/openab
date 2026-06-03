@@ -125,7 +125,7 @@ Source: [`basic/lifecycle.mdx`](https://github.com/modelcontextprotocol/modelcon
 | 49 | Server SHOULD respond with its latest supported version | SHOULD | N/A | server-side |
 | 50 | If client does not support server's response version, client SHOULD disconnect | SHOULD | ⚠️ | `rmcp` `serve()` returns `Err` on incompatible version; we surface via `with_context(\|\| format!("mcp handshake with ..."))` at `runtime.rs:1068,1081` and mark `ServerStatus::Failed(...)` — disconnect implicit via dropping handle |
 | 50a | spec-conflict — schema says MUST | (spec-conflict) | N/A | not actionable; upstream should reconcile |
-| 51 | HTTP: client MUST include `MCP-Protocol-Version` header on subsequent requests | MUST | ⚠️ | `rmcp::transport::StreamableHttpClientTransport` SDK responsibility; not surfaced in our code (`runtime.rs:21-22,1073-1077`) — needs rmcp source verification |
+| 51 | HTTP: client MUST include `MCP-Protocol-Version` header on subsequent requests | MUST | ✅ | `rmcp::transport::StreamableHttpClientTransport` SDK responsibility (`runtime.rs:21-22,1073-1077`); Section 2 row 139 verified rmcp worker extracts `init_result.protocol_version` and injects into `protocol_headers` used for every subsequent POST (SDK `transport/streamable_http_client.rs:408-418, 511-522`). Jelly fact-check 2026-06-03 upgraded ⚠️→✅ |
 | 52 | Client capability: `roots` (listChanged optional) | (capability) | ❌ | bare `()` handler at `runtime.rs:1066,1079` — no `roots` advertised; servers depending on roots cannot constrain themselves |
 | 53 | Client capability: `sampling` | (capability) | ❌ | no client `sampling` handler — servers cannot request LLM sampling from us |
 | 54 | Client capability: `elicitation` | (capability) | ❌ | no elicitation handler — servers cannot ask user for form/URL input via us |
@@ -133,13 +133,13 @@ Source: [`basic/lifecycle.mdx`](https://github.com/modelcontextprotocol/modelcon
 | 56 | Client capability: `experimental` | (capability) | ❌ | none declared |
 | 57 | Server capability: `prompts` | (capability) | N/A | server-side declaration |
 | 58 | Server capability: `resources` | (capability) | N/A | server-side |
-| 59 | Server capability: `tools` | (capability) | N/A | server-side; we consume via `peer.list_all_tools()` at `src/mcp/meta_tool.rs:122` + `peer.call_tool()` at `src/mcp/meta_tool.rs:98` |
+| 59 | Server capability: `tools` | (capability) | N/A | server-side; we consume via `peer.list_all_tools()` at `src/mcp/meta_tool.rs:123` + `peer.call_tool()` at `src/mcp/meta_tool.rs:98` |
 | 60 | Server capability: `logging` | (capability) | N/A | server-side |
 | 61 | Server capability: `completions` | (capability) | N/A | server-side |
 | 62 | Server capability: `tasks` | (capability) | N/A | server-side |
 | 63 | Server capability: `experimental` | (capability) | N/A | server-side |
 | 64 | Both parties MUST respect the negotiated protocol version | MUST | ✅ | `rmcp` SDK |
-| 65 | Both parties MUST only use successfully negotiated capabilities | MUST | ⚠️ | we only call `tools/list` + `tools/call`; we do NOT gate on server-advertised capabilities — assume `tools` cap is always present, no check before `meta_tool.rs:122` invocation |
+| 65 | Both parties MUST only use successfully negotiated capabilities | MUST | ⚠️ | we only call `tools/list` + `tools/call`; we do NOT gate on server-advertised capabilities — assume `tools` cap is always present, no check before `meta_tool.rs:123` invocation |
 | 66 | stdio shutdown: client SHOULD close stdin, wait, SIGTERM, then SIGKILL | SHOULD | ❌ | no explicit shutdown sequence; relies on `Drop` of `RunningService` + `TokioChildProcess` which does not implement the spec-recommended graceful termination ladder |
 | 67 | Server MAY initiate stdio shutdown | MAY | N/A | server-side |
 | 68 | HTTP shutdown by closing associated HTTP connection(s) | (transport) | ✅ | `rmcp::transport::StreamableHttpClientTransport` connection lifecycle (drop) |
@@ -160,11 +160,11 @@ Source: [`basic/lifecycle.mdx`](https://github.com/modelcontextprotocol/modelcon
   - **Eval**: rmcp `TokioChildProcess` does NOT expose stdin-close-then-graceful-wait ladder — it relies on `Drop` which is ungraceful (SDK `transport/child_process.rs:23-200`) · openab-agent wrapper (~60 LOC) OR upstream rmcp PR adding `shutdown(grace)` method · **fit: in-scope as wrapper**. Spec is SHOULD, not MUST, but rude `SIGKILL`-on-drop has cost servers their state in the field. Wrapper is cleaner than waiting on upstream.
 - [ ] **Rows 69-71 (Request timeouts)**: add `request_timeout_secs` field per-server in `McpConfig::Stdio` / `McpConfig::Http` (`src/mcp/config.rs`), default 60s. Wrap every `peer.call_tool()` / `peer.list_all_tools()` site in `tokio::time::timeout(...)`. Pair with row 70.
   - **Eval**: openab-agent only · drop-in (~40 LOC config field + 2 callsite wraps) · **fit: in-scope**. Pure tokio idiom, no rmcp involvement; complements existing `breaker.rs` failure-rate logic with per-request bound.
-- [ ] **Row 70 (Cancellation notification on timeout)**: when the timeout from rows 69-71 fires, emit `notifications/cancelled` via rmcp `peer.notify_cancelled(request_id)` (verify SDK method name); covers SHOULD on cooperative cancellation. Also unblocks `acp.rs:91-92` TODO for `session/cancel`.
-  - **Eval**: rmcp 1.7.0 has `Peer::notify_cancelled` (in `service/mod.rs` peer notifier API) but the request-id has to be threaded from the in-flight `peer.call_tool().await` — that future doesn't expose its id naturally · wrapper-sized in openab-agent (intercept call via custom `Peer` extension OR rebuild call_tool with manual request-id tracking, ~120 LOC) · **fit: in-scope but non-trivial**. Couples tightly with rows 69-71 + ACP cancel; worth deferring until 69-71 lands so the timeout source is concrete.
-| 73 | Implementations SHOULD always enforce a maximum timeout (even with progress) | SHOULD | | |
-| 74 | Implementations SHOULD handle version mismatch, capability failures, timeouts | SHOULD | | |
-| 74a | `Implementation` object (clientInfo / serverInfo) carries optional `title`, `description`, `icons`, `websiteUrl` fields | (schema) | | |
+- [ ] **Row 70 (Cancellation notification on timeout)**: when the timeout from rows 69-71 fires, emit `notifications/cancelled` via rmcp's built-in auto-cancel path. Also unblocks `acp.rs:91-92` TODO for `session/cancel`.
+  - **Eval (corrected 2026-06-03)**: rmcp 1.7.0 `RequestHandle::await_response` (SDK `service.rs:322-343`) ALREADY auto-emits `CancelledNotification` with `reason="request timeout"` when `PeerRequestOptions.timeout` expires — request-id threading is internal to rmcp · openab-agent drop-in is just switching `peer.call_tool(p).await` to `peer.send_request_with_option(req, opt_with_timeout).await?.await_response().await` (~30-50 LOC unified with rows 69-71) · **fit: in-scope, drop-in**. Prior eval (~120 LOC, non-trivial) was wrong — rmcp ships this pattern. See Section 4 Improvement Plan for consolidated treatment.
+| 73 | Implementations SHOULD always enforce a maximum timeout (even with progress) | SHOULD | ❌ | no max-timeout ceiling; same gap as rows 69-71 (no `tokio::time::timeout` wrap at `meta_tool.rs:98, 123`). Jelly fact-check 2026-06-03 filled |
+| 74 | Implementations SHOULD handle version mismatch, capability failures, timeouts | SHOULD | ⚠️ | partial: version mismatch ✅ via rmcp `serve()` returning `Err` + our `with_context` wrap at `runtime.rs:1068,1081` → `ServerStatus::Failed`; capability failure ❌ (row 65, no gating); timeout ❌ (rows 69-71). Jelly fact-check 2026-06-03 filled |
+| 74a | `Implementation` object (clientInfo / serverInfo) carries optional `title`, `description`, `icons`, `websiteUrl` fields | (schema) | ✅ | `rmcp::model::Implementation` (1.7.0 schema) carries these via `serde(skip_serializing_if = "Option::is_none")`; we use bare default `Implementation` via `()` handler so we don't populate them — but the field-presence requirement is rmcp's responsibility (SDK side). Jelly fact-check 2026-06-03 filled |
 
 ## Transports
 
@@ -393,18 +393,27 @@ Source: [`basic/utilities/cancellation.mdx`](https://github.com/modelcontextprot
 
 | # | Item | Normative | Status | Location / Notes |
 |---|---|---|---|---|
-| 243 | `notifications/cancelled` carries `requestId` and optional `reason` | (notification) | | |
-| 244 | Cancellation notification MUST only reference requests issued in the same direction | MUST | | |
-| 245 | Cancellation notification MUST only target requests believed in-progress | MUST | | |
-| 246 | `initialize` request MUST NOT be cancelled by clients | MUST NOT | | |
-| 247 | For task-augmented requests, the `tasks/cancel` request MUST be used instead of the `notifications/cancelled` notification (tasks have a dedicated cancellation that returns final state) | MUST | | |
-| 248 | Receivers SHOULD stop processing, free resources, not respond | SHOULD | | |
-| 249 | Receivers MAY ignore cancellation if request unknown / complete / uncancellable | MAY | | |
-| 250 | Sender SHOULD ignore any late response to a cancelled request | SHOULD | | |
-| 251 | Both parties MUST handle cancel race conditions gracefully | MUST | | |
-| 252 | Both parties SHOULD log cancellation reasons | SHOULD | | |
-| 253 | Application UIs SHOULD indicate cancellation state | SHOULD | | |
-| 254 | Invalid cancellation notifications SHOULD be ignored | SHOULD | | |
+| 243 | `notifications/cancelled` carries `requestId` and optional `reason` | (notification) | ✅ (schema) | rmcp `CancelledNotificationParam { request_id, reason: Option<String> }` (SDK `service.rs:333-336`) — both fields present per schema |
+| 244 | Cancellation notification MUST only reference requests issued in the same direction | MUST | N/A (vacuous) | we send no `notifications/cancelled` today (no `notify_cancelled` callsite in `src/mcp/**`); if/when we do via rmcp `peer.notify_cancelled` (SDK `service/client.rs:368`) the direction will be client→server, matching same-direction requirement |
+| 245 | Cancellation notification MUST only target requests believed in-progress | MUST | N/A (vacuous) | no cancel emission today. Future: rmcp `RequestHandle::cancel` (SDK `service.rs:349-360`) drops the handle's receiver after sending — naturally only references in-progress request id |
+| 246 | `initialize` request MUST NOT be cancelled by clients | MUST NOT | ✅ | initialize is performed inside `().serve(transport).await` at `runtime.rs:1066,1079`; rmcp owns the request id and never exposes it externally, so we cannot cancel it even if we wanted to |
+| 247 | For task-augmented requests, the `tasks/cancel` request MUST be used instead of the `notifications/cancelled` notification (tasks have a dedicated cancellation that returns final state) | MUST | N/A | we do not use task-augmented requests (no `tasks` client capability per Section 1 row 55); `tasks/cancel` is the task transport's surface, not ours |
+| 248 | Receivers SHOULD stop processing, free resources, not respond | SHOULD | N/A | we never receive `notifications/cancelled` from server — client handler is bare `()` (no `on_cancelled` impl); rmcp default discards via the `ClientHandler` blanket impl (SDK `handler/client.rs:46`) |
+| 249 | Receivers MAY ignore cancellation if request unknown / complete / uncancellable | MAY | N/A | as above; we are effectively the "ignore" path by virtue of having no handler |
+| 250 | Sender SHOULD ignore any late response to a cancelled request | SHOULD | N/A (vacuous) | no cancellations sent today. Future: rmcp `RequestHandle::cancel` drops the response channel `rx` so any late response is discarded by the transport worker (SDK `service.rs:323-326`) |
+| 251 | Both parties MUST handle cancel race conditions gracefully | MUST | N/A (vacuous) | no cancellations sent. rmcp's auto-cancel-on-timeout (SDK `service.rs:332-343`) is race-safe (`rx` consumed before notification sent); inheriting this behaviour requires the `PeerRequestOptions { timeout }` work in Section 1 rows 69-71 |
+| 252 | Both parties SHOULD log cancellation reasons | SHOULD | ❌ | no cancellation emission; when implemented (Section 1 rows 69-70) we'd need `tracing::info!(target="mcp.cancel", server=%name, reason=%r)` at the emission site. rmcp internally already logs via the `tracing` crate but our reason wrappers aren't visible at our layer today |
+| 253 | Application UIs SHOULD indicate cancellation state | SHOULD | N/A | openab-agent is a CLI/meta-tool gateway — no UI surface. ACP `session/cancel` (`acp.rs:91-92`) is the closest surface but only a transport hook, not a UI |
+| 254 | Invalid cancellation notifications SHOULD be ignored | SHOULD | ✅ | rmcp `ClientHandler` default `on_cancelled` discards unknown notifications (no panic / error propagation); we inherit this via `()` handler — bare `()` impl satisfies the SHOULD by routing unknown notifications to no-op |
+
+### Improvement Plan (Jelly draft, pending Mira retroactive review)
+
+**Major finding (worth highlighting)**: rmcp 1.7.0 already implements the full cancel-on-timeout pattern internally — `RequestHandle::await_response` (SDK `service.rs:322-343`) auto-emits `CancelledNotification` with `reason="request timeout"` when `PeerRequestOptions.timeout` expires. We just don't use the option today (our `peer.call_tool(params).await` path doesn't go through the option-bearing API). This collapses Section 1 rows 69-71 + row 70 + Section 4 row 252 into a single switch: route `call_tool` via `peer.send_request_with_option(req, PeerRequestOptions::new().with_timeout(d))` then `await_response().await`.
+
+- [ ] **Row 252 (Log cancellation reasons)**: when adopting rmcp's auto-cancel-on-timeout (see major finding above), add a `tracing::info!(target="mcp.cancel", server=%name, request_id=?id, reason=%reason)` log at the openab-agent layer immediately after the timeout fires. rmcp itself does not log the cancellation at info level.
+  - **Eval**: openab-agent only (rmcp emits the notification on its own but doesn't expose a hook for application-level logging without rebuilding the path) · drop-in (~10 LOC if we own the `send_request_with_option` wrapper) · **fit: in-scope**. Trivial extension of the timeout work; matches our existing tracing-only observability rule.
+- [ ] **(consolidate with Section 1 rows 69-71 + row 70)**: switching `peer.call_tool(params).await` at `meta_tool.rs:98` and `peer.list_all_tools().await` at `meta_tool.rs:123` to the option-bearing path gives us, for free, (a) per-request timeout, (b) automatic `CancelledNotification` emission with `reason="request timeout"`, (c) race-safe response discard. This is a single ~50 LOC refactor that satisfies the entire timeout+cancel column.
+  - **Eval**: rmcp covers the heavy lifting (`PeerRequestOptions::with_timeout`, `RequestHandle::await_response`, auto-cancel emission) · openab-agent drop-in (replace `.call_tool(p).await` with `send_request_with_option(req, opt).await?.await_response().await`, plus a small param→request adapter) · **fit: in-scope, high value**. Previous Section 1 eval for Row 70 (called it "non-trivial, ~120 LOC") was WRONG — rmcp ships this pattern out of the box. Correcting that eval as part of this improvement.
 
 ## Progress
 
