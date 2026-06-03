@@ -966,7 +966,7 @@ Source: [`server/utilities/completion.mdx`](https://github.com/modelcontextproto
 - [ ] **§2. Future — `prompts/resources` UI surface.** Iff openab-agent ever grows a prompts catalog (Section 12) or resource picker (Section 13) that exposes an argument-typing surface, wire `peer.complete_prompt_argument(prompt, arg, partial, ctx)` / `peer.complete_resource_argument(uri_template, arg, partial, ctx)` from `rmcp::service::client` directly — the convenience methods already round-trip context-argument carry-through (SEP-1320 / row 565a). Pair with `(a)` debounce, `(b)` LRU cache, `(c)` `has_more`-aware paging UI.
   - **Eval**: hybrid (rmcp ships convenience methods + 100-item cap; openab-agent owns ACP/UI plumbing + debounce + cache) · architectural commitment (no UI today, so this is a green-field surface; ~200-300 LOC if combined with §2 of Section 12) · **fit: defer**. Only meaningful if Section 12 / 13 ship a UI surface; today the LLM-driven dispatch model makes completion a no-op.
 - [ ] **§3. (Tracking only) — `_meta` carry-through.** If §2 lands, ensure SEP-1319 `_meta` is preserved across the request: rmcp `CompleteRequestParams.meta: Option<Meta>` field (SDK `model.rs:2225`) already supports it via `RequestParamsMeta` trait impl (`model.rs:2251`). No code change today; flag for §2 reviewers.
-  - **Eval**: rmcp upstream already covers · docs only · **fit: defer**. Tracking note for the §2 ship date.
+  - **Eval**: rmcp upstream · docs only · **fit: defer**. Tracking note for the §2 ship date.
 
 ## Logging
 
@@ -1044,23 +1044,42 @@ The "Security and Trust & Safety" section of the spec is meta-governance — low
 
 | # | Item | Normative | Status | Location / Notes |
 |---|---|---|---|---|
-| 609 | Users must explicitly consent to and understand all data access and operations | (principle) | | |
-| 610 | Users must retain control over what data is shared and what actions are taken | (principle) | | |
-| 611 | Implementors should provide clear UIs for reviewing and authorizing activities | (principle) | | |
-| 612 | Hosts must obtain explicit user consent before exposing user data to servers | (principle) | | |
-| 613 | Hosts must not transmit resource data elsewhere without user consent | (principle) | | |
-| 614 | User data should be protected with appropriate access controls | (principle) | | |
-| 615 | Tools represent arbitrary code execution and must be treated with appropriate caution | (principle) | | |
-| 616 | Descriptions of tool behavior (annotations) should be considered untrusted unless from a trusted server | (principle) | | see also row 508 |
-| 617 | Hosts must obtain explicit user consent before invoking any tool | (principle) | | |
-| 618 | Users should understand what each tool does before authorizing its use | (principle) | | |
-| 619 | Users must explicitly approve any LLM sampling requests | (principle) | | |
-| 620 | Users should control: whether sampling occurs at all, the actual prompt sent, what results the server can see | (principle) | | |
-| 621 | Implementors SHOULD build robust consent and authorization flows | SHOULD | | |
-| 622 | Implementors SHOULD provide clear documentation of security implications | SHOULD | | |
-| 623 | Implementors SHOULD implement appropriate access controls and data protections | SHOULD | | |
-| 624 | Implementors SHOULD follow security best practices in their integrations | SHOULD | | |
-| 625 | Implementors SHOULD consider privacy implications in their feature designs | SHOULD | | |
-| 626 | Host enforces security policies and consent requirements | (role) | | from `architecture/index.mdx` Core Components |
-| 627 | Host handles user authorization decisions | (role) | | from `architecture/index.mdx` Core Components |
-| 628 | Host controls client connection permissions and lifecycle | (role) | | from `architecture/index.mdx` Core Components |
+| 609 | Users must explicitly consent to and understand all data access and operations | (principle) | N/A | Host responsibility (ACP host above openab-agent enforces); see §6 |
+| 610 | Users must retain control over what data is shared and what actions are taken | (principle) | N/A | Host responsibility (ACP); see §6 |
+| 611 | Implementors should provide clear UIs for reviewing and authorizing activities | (principle) | N/A | Host responsibility — openab-agent is headless / no UI surface |
+| 612 | Hosts must obtain explicit user consent before exposing user data to servers | (principle) | N/A | Host boundary — ACP host enforces before server connection; openab-agent reads `mcp.json` server list it was handed |
+| 613 | Hosts must not transmit resource data elsewhere without user consent | (principle) | N/A | Host policy layer — openab-agent relays MCP calls per Host instruction |
+| 614 | User data should be protected with appropriate access controls | (principle) | ⚠️ | partial: path validation on file tools (`src/tools.rs:12-55`); ACP host owns runtime isolation. openab-agent has no per-user data segregation |
+| 615 | Tools represent arbitrary code execution and must be treated with appropriate caution | (principle) | ⚠️ | acknowledged via circuit breaker on MCP failures (`src/mcp/breaker.rs`, called from `src/mcp/runtime.rs:137-141`) — no per-call human-in-the-loop consent gate; see §1 / §7 |
+| 616 | Descriptions of tool behavior (annotations) should be considered untrusted unless from a trusted server | (principle) | ❌ | annotations dropped before LLM sees them: `list_tools` / `describe_tool` projection (`src/mcp/meta_tool.rs:139-161`) returns `{name, description[, input_schema]}` only — `annotations` from `rmcp::model::Tool` silently stripped (see also row 508). De-facto "untrusted" by omission but no explicit trust model documented — see §1 |
+| 617 | Hosts must obtain explicit user consent before invoking any tool | (principle) | ❌ | no per-tool consent gate in openab-agent: `call_tool` (`src/mcp/meta_tool.rs:95-98`) dispatches via `peer.call_tool` directly; agent routing (`src/agent.rs:184` ish) executes LLM tool calls without user approval. ACP host can gate above us but openab-agent provides no hook today — see §2 / §7 |
+| 618 | Users should understand what each tool does before authorizing its use | (principle) | ⚠️ | partial: `describe_tool` provides `input_schema` but not `annotations` (`ToolAnnotations::{read_only_hint, destructive_hint, idempotent_hint, open_world_hint}`). Risk hints are not surfaced — see §1 |
+| 619 | Users must explicitly approve any LLM sampling requests | (principle) | N/A | vacuously compliant: no `on_create_message` override; client-side sampling capability not advertised in `ClientCapabilities` — see §3 |
+| 620 | Users should control: whether sampling occurs at all, the actual prompt sent, what results the server can see | (principle) | N/A | vacuously compliant: sampling not enabled client-side — see §3 |
+| 621 | Implementors SHOULD build robust consent and authorization flows | SHOULD | ❌ | not implemented — see row 617 gap. openab-agent layer lacks per-tool approval mechanism; ACP host responsible for consent UI — see §7 |
+| 622 | Implementors SHOULD provide clear documentation of security implications | SHOULD | ⚠️ | partial: ADR comments (`src/mcp/meta_tool.rs:1-5`, `src/mcp/runtime.rs:1-13`) explain phase scope; no explicit security documentation of annotation trust model or per-call consent design — see §5 |
+| 623 | Implementors SHOULD implement appropriate access controls and data protections | SHOULD | ⚠️ | partial: path validation (`src/tools.rs`), circuit breaker on MCP failures (`src/mcp/breaker.rs`). Structured audit log NOT implemented — `record_tool_call_outcome` (`src/mcp/runtime.rs` ish) logs breaker state, not per-call operation trail — see §2 |
+| 624 | Implementors SHOULD follow security best practices in their integrations | SHOULD | ⚠️ | partial: PKCE in OAuth (`src/mcp/flow.rs`), token refresh single-flight gate (`src/mcp/runtime.rs:131-136`). No secret scrubbing on tracing / audit path — see §4 |
+| 625 | Implementors SHOULD consider privacy implications in their feature designs | SHOULD | ⚠️ | partial: idle eviction (`src/mcp/runtime.rs` background task) limits long-term data retention; no per-user segregation; secret handling relies on user discretion — see §4 / §6 |
+| 626 | Host enforces security policies and consent requirements | (role) | N/A | Host role (from `architecture/index.mdx` Core Components); ACP host above openab-agent |
+| 627 | Host handles user authorization decisions | (role) | N/A | Host role (from `architecture/index.mdx` Core Components); ACP host above openab-agent |
+| 628 | Host controls client connection permissions and lifecycle | (role) | N/A | Host role (from `architecture/index.mdx` Core Components); ACP host above openab-agent |
+
+### Improvement Plan (Jelly draft, pending Mira retroactive review)
+
+**Section-level disposition**: openab-agent sits below an ACP Host. Spec rows 609-613 / 619-620 / 626-628 are Host obligations — N/A at this layer. Rows 614-618 (principles) and 621-625 (implementor SHOULDs) are openab-agent's responsibility, partially satisfied. Primary gaps: (1) annotations not surfaced through `describe_tool` (rows 616, 618), (2) no structured per-tool-call audit log (rows 621, 623), (3) no secret-scrubbing pass on tracing / audit emission (row 624), (4) no per-tool consent hook for ACP Host to wire into (rows 615, 617). Sampling rows (619, 620) are vacuously N/A by design — capability is not advertised.
+
+- [ ] **§1. Surface tool annotations in `list_tools` + `describe_tool` projection.** Add `annotations` (with sub-fields `read_only_hint`, `destructive_hint`, `idempotent_hint`, `open_world_hint`, `title`) and `title` to the JSON response in `src/mcp/meta_tool.rs:139-161` so the LLM (and any future ACP-side consent UI) can route on risk hints. Upgrades rows 616 / 618 from ❌ / ⚠️ to ⚠️ / ✅ (annotations remain untrusted by spec — surfacing makes the trust posture explicit instead of dropping silently). Bundle with Section 11 row 484 — same projection edit.
+  - **Eval**: openab-agent only · drop-in (~25 LOC; projection-only) · **fit: in-scope**. Bundle with the Section 11 Improvement Plan for tools.
+- [ ] **§2. Structured per-tool-call audit log line.** Add `tracing::info!(target = "openab_agent::mcp::audit", server, tool, args_sha256, duration_ms, is_error, ...)` at `peer.call_tool` entry + exit in `src/mcp/meta_tool.rs:98-109`. Plaintext tracing fields per repo convention (no JSON, no metrics crate). Lets the ACP Host or sidecar tap the audit stream — openab-agent emits the event, Host decides where it goes. Upgrades rows 621 / 623 from ❌ / ⚠️ to ⚠️ / ✅. Bundle with Section 11 row 519.
+  - **Eval**: openab-agent only · drop-in (~15 LOC; same as Section 11 row 519) · **fit: in-scope (bundled)**. Free observability win.
+- [ ] **§3. Document the sampling abstention (rows 619-620).** Drop a one-paragraph note in this section's preamble explaining that openab-agent advertises no `ClientCapabilities { sampling: .. }` today and the `()` ClientHandler default `on_create_message` returns `Err(-32601)`. If a future Host wants sampling, they must (a) advertise the capability, (b) override `on_create_message` to gate the request through ACP user-approval before forwarding to the LLM provider layer in `src/llm.rs`. Cross-reference Section 9 (Client / Sampling) audit if it exists.
+  - **Eval**: docs only · drop-in (~8 lines) · **fit: in-scope**. Cheap; makes vacuous compliance intentional rather than accidental.
+- [ ] **§4. Secret scrubbing on audit / tracing path (row 624).** Add an optional `redact_secrets()` pass on the audit-log fields from §2 that masks values matching patterns (`api_key`, `bearer`, `password`, `token`, `secret`, `AKIA[0-9A-Z]{16}`, etc.) before tracing emit. Pattern list configurable via env / `redact.toml`; default-on. Pair with row 590 (Logging) which is server-side aspirational — we cannot enforce on inbound logs, but we can enforce on our own audit emissions.
+  - **Eval**: openab-agent layer · drop-in (~30-40 LOC + pattern config) · **fit: in-scope (gated on §2)**. Cheap defensive measure; non-blocking — Host can layer its own pass on top.
+- [ ] **§5. Document Host / Agent / Server boundary in section preamble.** Land a paragraph clarifying: "Rows 609-613 / 619-620 / 626-628 are Host obligations (ACP host above openab-agent); rows 614-618 are principles openab-agent contributes mechanisms toward; rows 621-625 are implementor SHOULDs owned by openab-agent." Upgrades row 622 ⚠️ → ✅ and prevents future auditors from re-litigating the layering.
+  - **Eval**: docs only · drop-in (~10 lines) · **fit: in-scope**. Critical for next review pass; near-zero risk.
+- [ ] **§6. Per-tool consent hook for ACP Host wiring (rows 615 / 617 / 621).** Introduce an optional async callback `ToolCallApprovalFn` invoked before `peer.call_tool` in `src/mcp/meta_tool.rs:98`. Default = `Allow` (preserves current headless behaviour). ACP adapter (`src/acp.rs`) can register a callback that emits an ACP `tool_call_approval` frame and awaits Host response. Pair with §1 so the approval prompt carries annotation risk hints.
+  - **Eval**: hybrid (openab-agent + ACP adapter; needs ACP frame schema design) · architectural commitment (~200 LOC + protocol-level review) · **fit: defer**. Track as design-doc placeholder; bundle with Section 11 §HITL deny / confirm (rows 509 / 515 / 516). Not blocking until a Host actually asks for the gate.
+- [ ] **§7. Sampling capability gating tracker.** When (if) Section 9 ships a sampling client surface, this row's compliance flips from N/A vacuous to require explicit user approval (rows 619 / 620). Today's N/A is correct; the tracker prevents accidentally enabling sampling without consent flow.
+  - **Eval**: openab-agent layer · drop-in (audit tag in this row) · **fit: defer**. Tracking only.
