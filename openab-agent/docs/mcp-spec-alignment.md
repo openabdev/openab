@@ -885,34 +885,49 @@ Source: [`server/prompts.mdx`](https://github.com/modelcontextprotocol/modelcont
 
 Source: [`server/resources.mdx`](https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/docs/specification/2025-11-25/server/resources.mdx)
 
+**Section-level finding**: openab-agent is purely a client and currently covers only the **tools** path of the MCP server surface. `src/mcp/meta_tool.rs` wires `fetch_tools` + `call_tool` only — server payloads reach Brett through `CallToolResult.content` (text / structured / embedded resource blocks). The **resources** surface — list / read / templates / subscribe — is the MCP equivalent of a file/blob browser, designed for clients that want to walk server-exposed URIs independent of a tool invocation. openab-agent does **not** wire any of it: zero functional hits for `list_resources` / `read_resource` / `ResourceTemplate` / `subscribe` in `src/`, and the `RunningService<RoleClient, ()>` blanket impl at `src/mcp/runtime.rs:1066,1079` means every `notifications/resources/updated` and `notifications/resources/list_changed` is silently no-op'd by `<() as ClientHandler>` (SDK `handler/client.rs`). rmcp 1.7.0 *does* expose `peer.list_resources` / `list_resource_templates` / `read_resource` / `subscribe` (SDK `service/client.rs:360-364`) plus `list_all_resources` pagination (`service/client.rs:413`), all uncalled. Most rows are therefore N/A by abstention; rows 550 (resources/updated notification we'd receive) is ⚠️ silently dropped.
+
 | # | Item | Normative | Status | Location / Notes |
 |---|---|---|---|---|
-| 539 | Servers with resources MUST declare `resources` capability | MUST | | |
-| 540 | `resources.subscribe` sub-capability (optional) | (capability) | | |
-| 541 | `resources.listChanged` sub-capability (optional) | (capability) | | |
-| 542 | `resources/list` request with pagination | (method) | | |
-| 543 | Result: `resources[]`, optional `nextCursor` | (field) | | |
-| 544 | `resources/read` with `uri` param | (method) | | |
-| 545 | Result: `contents[]` | (field) | | |
-| 546 | `resources/templates/list` request | (method) | | |
-| 547 | Result: `resourceTemplates[]` | (field) | | |
-| 547a | ResourceTemplate fields: `uriTemplate` (required, RFC 6570) / `name` (required) / `title` / `description` / `mimeType` / `icons` (optional) | (field) | | |
-| 548 | List-changed-capable servers SHOULD send `notifications/resources/list_changed` | SHOULD | | |
-| 549 | `resources/subscribe` request | (method) | | |
-| 550 | `notifications/resources/updated` notification | (notification) | | |
-| 551 | Resource fields: uri / name / title / description / mimeType / size / icons | (field) | | |
-| 552 | Resource contents: text or base64 blob | (field) | | |
-| 553 | Annotations (`audience` / `priority` / `lastModified`) apply to resources, resource templates, and content blocks | (field) | | |
-| 554 | Servers SHOULD use `https://` only when client can fetch directly | SHOULD | | |
-| 555 | Servers SHOULD prefer another URI scheme (built-in or custom) when not directly web-fetchable | SHOULD | | |
-| 556 | MCP servers MAY use XDG MIME types (e.g. `inode/directory`) to identify non-regular `file://` resources without a standard MIME type | MAY | | |
-| 556a | Standard URI schemes in spec: `https://`, `file://`, `git://` (servers MAY use custom schemes too) | (field) | | |
-| 557 | Custom URI schemes MUST conform to RFC 3986 | MUST | | |
-| 558 | Servers SHOULD return `-32002` resource-not-found, `-32603` internal | SHOULD | | |
-| 559 | Servers MUST validate resource URIs | MUST | | |
-| 560 | Access controls SHOULD be implemented for sensitive resources | SHOULD | | |
-| 561 | Binary data MUST be properly encoded | MUST | | |
-| 562 | Resource permissions SHOULD be checked before operations | SHOULD | | |
+| 539 | Servers with resources MUST declare `resources` capability | MUST | N/A | server-side declaration; we're a client (`src/mcp/runtime.rs:1056` `RunningService<RoleClient, ()>`) |
+| 540 | `resources.subscribe` sub-capability (optional) | (capability) | N/A | server-declared capability; we never advertise (no server role) |
+| 541 | `resources.listChanged` sub-capability (optional) | (capability) | N/A | server-declared capability; client side is rmcp default, no override |
+| 542 | `resources/list` request with pagination | (method) | N/A | rmcp exposes `peer.list_resources` (SDK `service/client.rs:360`) — uncalled in our tree |
+| 543 | Result: `resources[]`, optional `nextCursor` | (field) | N/A | server-produced; never consumed — no `list_resources` call site |
+| 544 | `resources/read` with `uri` param | (method) | N/A | rmcp exposes `peer.read_resource` (SDK `service/client.rs:362`) — uncalled in `src/mcp/` |
+| 545 | Result: `contents[]` | (field) | N/A | never invoked; `ResourceContents` (SDK `model/resource.rs:64`) unused |
+| 546 | `resources/templates/list` request | (method) | N/A | rmcp `peer.list_resource_templates` (SDK `service/client.rs:361`) — uncalled |
+| 547 | Result: `resourceTemplates[]` | (field) | N/A | server-produced; not consumed in our tree |
+| 547a | ResourceTemplate fields: `uriTemplate` (required, RFC 6570) / `name` (required) / `title` / `description` / `mimeType` / `icons` (optional) | (field) | N/A | server-produced schema; SDK `RawResourceTemplate.uri_template: String` (SDK `model/resource.rs:44`) — no RFC 6570 parser in 1.7.0, see §4 |
+| 548 | List-changed-capable servers SHOULD send `notifications/resources/list_changed` | SHOULD | N/A | server-side emit; if received, default `on_resource_list_changed` no-ops (SDK `handler/client.rs`) |
+| 549 | `resources/subscribe` request | (method) | N/A | rmcp `peer.subscribe` (SDK `service/client.rs:363`) — uncalled; we never subscribe |
+| 550 | `notifications/resources/updated` notification | (notification) | ⚠️ | we'd receive it but default `on_resource_updated` no-ops (SDK `handler/client.rs:215`); silently dropped (gated on subscribe path we don't have) |
+| 551 | Resource fields: uri / name / title / description / mimeType / size / icons | (field) | N/A | server-produced field set; not consumed (no `read_resource` / `list_resources` calls) |
+| 552 | Resource contents: text or base64 blob | (field) | N/A | `ResourceContents::{Text,Blob}ResourceContents` (SDK `model/resource.rs:66,75`) unused |
+| 553 | Annotations (`audience` / `priority` / `lastModified`) apply to resources, resource templates, and content blocks | (field) | N/A | server-produced annotations; not consumed (no resources surface) |
+| 554 | Servers SHOULD use `https://` only when client can fetch directly | SHOULD | N/A | server-side scheme choice |
+| 555 | Servers SHOULD prefer another URI scheme (built-in or custom) when not directly web-fetchable | SHOULD | N/A | server-side scheme choice |
+| 556 | MCP servers MAY use XDG MIME types (e.g. `inode/directory`) to identify non-regular `file://` resources without a standard MIME type | MAY | N/A | server-side MIME assignment |
+| 556a | Standard URI schemes in spec: `https://`, `file://`, `git://` (servers MAY use custom schemes too) | (field) | N/A | server-side scheme choice |
+| 557 | Custom URI schemes MUST conform to RFC 3986 | MUST | N/A | server-side URI production; we never produce URIs for resources |
+| 558 | Servers SHOULD return `-32002` resource-not-found, `-32603` internal | SHOULD | N/A | server-side error mapping; we never call `read_resource` so the code path is unreachable |
+| 559 | Servers MUST validate resource URIs | MUST | N/A | server-side validation |
+| 560 | Access controls SHOULD be implemented for sensitive resources | SHOULD | N/A | server-side access control |
+| 561 | Binary data MUST be properly encoded | MUST | N/A | server-side encoding (base64 blob payload); we don't consume |
+| 562 | Resource permissions SHOULD be checked before operations | SHOULD | N/A | server-side authz |
+
+### Improvement Plan (Jelly draft, pending Mira retroactive review)
+
+- [ ] **§1. Decide on resources surface — (a) implement vs (b) stay tools-only (recommended).** The tool-result path (`CallToolResult.content` with `EmbeddedResource` blocks) already lets MCP servers return resource-like payloads in-band when a tool call asks for them; that matches our ACP UX where Brett issues an instruction and gets a streamed reply. A standalone "browse server's resource tree" surface only pays off when there's an interactive picker on the ACP client (Zed) and a user mental model of "the server has a filesystem I want to mount." Adding it now expands attack surface (untrusted URIs, base64 blobs) without a concrete product driver.
+  - **Eval**: docs only · docs only · **fit: in-scope**. Punt with a written abstention so the next reviewer doesn't re-litigate.
+- [ ] **§2. If (a) wins: wire `peer.list_resources` + `peer.read_resource` to ACP.** Add a `resources_meta_tool.rs` mirroring `meta_tool.rs`: `list_resources` / `read_resource` / `list_resource_templates` calling the existing rmcp `Peer<RoleClient>` methods (SDK `service/client.rs:360-362`), then surface results as ACP tool blocks (text → text content, blob → base64 attached as `EmbeddedResource`). Cursor pagination wrapper `list_all_resources` already exists in SDK (`service/client.rs:413`).
+  - **Eval**: openab-agent layer · non-trivial (~150-250 LOC + ACP surfaces + auth-scope review for `file://`) · **fit: defer**. Wait for a real ask from Brett or a concrete server we want to browse.
+- [ ] **§3. If (a) + subscribe: wire `on_resource_updated` from no-op to ACP push.** Replace the `()` blanket impl in `src/mcp/runtime.rs:1066,1079` with a named struct (bundled with Section 10 §1, Section 11 row 503, Section 12 §3) that overrides `on_resource_updated` (SDK `handler/client.rs:215`) and `on_resource_list_changed` and routes the URI into the ACP session as a notification block. Needs an ACP-side rendering decision (toast? inline?) plus per-subscription bookkeeping.
+  - **Eval**: openab-agent layer · architectural commitment (touches handler type, session-state map, ACP notification protocol) · **fit: defer**. Only meaningful after §2 lands.
+- [ ] **§4. File rmcp upstream tracker for 1.7.0 schema-as-string gaps.** Two concrete gaps observed: (i) `RawResourceTemplate.uri_template` is `String` with no RFC 6570 parser / validator (SDK `model/resource.rs:44`); (ii) `RawResource.uri` is `String` with no RFC 3986 typing. Both would bite §2 immediately.
+  - **Eval**: rmcp upstream · drop-in (issue + ask-bullets) · **fit: defer**. File only when §2 promotes from defer → in-scope; today it's a hypothetical pain point.
+- [ ] **§5. Document the abstention.** Drop a one-paragraph note in this section preamble (already added above as section-level finding) and cross-reference §1; keeps the N/A column self-explanatory for future reviewers and prevents a "why is the whole section blank?" round-trip.
+  - **Eval**: docs only · docs only (~6 lines) · **fit: in-scope**. Cheap; ships the decision into the canonical doc; no code risk. Effectively already satisfied by this audit pass.
 
 ## Completion
 
