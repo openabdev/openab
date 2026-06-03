@@ -660,7 +660,7 @@ Source: [`client/sampling.mdx`](https://github.com/modelcontextprotocol/modelcon
 | 408 | Clients SHOULD respect model preference hints | SHOULD | N/A | gated on implementing 390 |
 | 409 | Clients SHOULD implement rate limiting | SHOULD | N/A | gated on implementing 390 |
 | 410 | Both parties MUST handle sensitive data appropriately | MUST | N/A | vacuously satisfied — we never read/forward sampling payloads |
-| 411 | When replying to a `stopReason: "toolUse"` response, servers MUST respond to each `ToolUseContent` with a `ToolResultContent` of matching `toolUseId` | MUST | N/A | server-side (it says "servers MUST respond") |
+| 411 | When replying to a `stopReason: "toolUse"` response, servers MUST respond to each `ToolUseContent` with a `ToolResultContent` of matching `toolUseId` | MUST | N/A | server-side (spec reads "servers MUST respond") |
 | 412 | When tools are used, user message containing tool results MUST contain only tool results | MUST | N/A | sampling-response shape; not constructed by us |
 | 413 | Both parties SHOULD implement iteration limits for tool loops | SHOULD | N/A | gated on implementing 390 |
 
@@ -673,11 +673,11 @@ Source: [`client/sampling.mdx`](https://github.com/modelcontextprotocol/modelcon
 - [ ] **Implement `ClientHandler::create_message`** by routing to our existing `LlmProvider` (`src/llm.rs` — `AnthropicProvider`, `OpenAiProvider`) and declare `capabilities.sampling = {}` (no `tools` sub-cap initially). Forms a "sampling pass-through": MCP server delegates an LLM call to us, we use the user's already-authenticated provider.
   - **Eval**: openab-agent layer · architectural commitment (~300-500 LOC: custom `ClientHandler` struct replacing `()`, `CreateMessageRequestParams` → `llm::Message` mapping, content-block conversion, model-hint resolution, and an approval UX through the ACP front-end) · **fit: defer**. Sampling exists so server can borrow client's LLM; we'd be routing back to our own Anthropic/OpenAI client — concretely useful only when a server we actually run requests it. No demand signal today.
 - [ ] **If 390 is implemented, add `sampling.tools` sub-capability support**: pass `tools[]` / `toolChoice` through to the `LlmProvider`, enforce `toolChoice: required`/`none` semantics, and surface `ToolUseContent` / `ToolResultContent` ordering rules (rows 395, 396, 411, 412).
-  - **Eval**: openab-agent layer · additive on top of previous item (~200-300 LOC: tool-schema bridge from MCP → `llm::ToolDef`, response post-validation, `stopReason: "toolUse"` mapping) · **fit: defer**. Strictly dependent on the previous item landing; revisit only if a real MCP server we use starts requesting tool-enabled sampling.
+  - **Eval**: openab-agent layer · non-trivial (~200-300 LOC: tool-schema bridge from MCP → `llm::ToolDef`, response post-validation, `stopReason: "toolUse"` mapping; additive on top of previous item) · **fit: defer**. Strictly dependent on the previous item landing; revisit only if a real MCP server we use starts requesting tool-enabled sampling.
 - [ ] **If 390 is implemented, add human-in-the-loop approval surface** (rows 403/404/406): route `CreateMessageRequestParams` through an ACP `request_permission` prompt before invoking the `LlmProvider`, with an option to edit `systemPrompt` / `messages` before sending.
   - **Eval**: openab-agent + acp layer · non-trivial (~150-250 LOC: new ACP permission kind, prompt rendering, edit round-trip) · **fit: defer**. Required by spec (SHOULD) the moment we advertise `sampling`; treat as a hard prerequisite, not a follow-up, if 390 is ever picked up.
 - [ ] **If 390 is implemented, add per-server sampling rate limit (row 409) and tool-loop iteration cap (row 413)** — both configurable via `config.toml` per MCP server entry, defaults conservative (e.g. 10 calls/min, 8 tool iterations).
-  - **Eval**: openab-agent layer · drop-in once 390 lands (~50-100 LOC: token-bucket per server id, counter on tool-loop response chain) · **fit: defer**. Cheap insurance against runaway server costs; bundle with 390.
+  - **Eval**: openab-agent layer · drop-in (~50-100 LOC: token-bucket per server id, counter on tool-loop response chain) · **fit: defer**. Cheap insurance against runaway server costs; depends on 390 landing first, so bundle with it.
 
 ## Client / Elicitation
 
