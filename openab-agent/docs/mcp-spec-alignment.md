@@ -147,6 +147,9 @@ Source: [`basic/lifecycle.mdx`](https://github.com/modelcontextprotocol/modelcon
 | 70 | On timeout, sender SHOULD issue a cancellation notification | SHOULD | ❌ | no cancellation; `src/acp.rs:91-92` has `TODO(v0.2): implement cancellation token to abort in-progress agent.run()` |
 | 71 | SDKs/middleware SHOULD allow per-request timeout configuration | SHOULD | ❌ | no API surface; `McpConfig` (`src/mcp/config.rs`) has no timeout fields |
 | 72 | MAY reset timeout clock on progress notification | MAY | N/A | no timeout to reset |
+| 73 | Implementations SHOULD always enforce a maximum timeout (even with progress) | SHOULD | ❌ | no max-timeout ceiling; same gap as rows 69-71 (no `tokio::time::timeout` wrap at `meta_tool.rs:98, 123`). Jelly fact-check 2026-06-03 filled |
+| 74 | Implementations SHOULD handle version mismatch, capability failures, timeouts | SHOULD | ⚠️ | partial: version mismatch ✅ via rmcp `serve()` returning `Err` + our `with_context` wrap at `runtime.rs:1068,1081` → `ServerStatus::Failed`; capability failure ❌ (row 65, no gating); timeout ❌ (rows 69-71). Jelly fact-check 2026-06-03 filled |
+| 74a | `Implementation` object (clientInfo / serverInfo) carries optional `title`, `description`, `icons`, `websiteUrl` fields | (schema) | ✅ | `rmcp::model::Implementation` (1.7.0 schema) carries these via `serde(skip_serializing_if = "Option::is_none")`; we use bare default `Implementation` via `()` handler so we don't populate them — but the field-presence requirement is rmcp's responsibility (SDK side). Jelly fact-check 2026-06-03 filled |
 
 ### Improvement Plan (Jelly draft, pending Mira retroactive review)
 
@@ -162,9 +165,6 @@ Source: [`basic/lifecycle.mdx`](https://github.com/modelcontextprotocol/modelcon
   - **Eval**: openab-agent only · drop-in (~40 LOC config field + 2 callsite wraps) · **fit: in-scope**. Pure tokio idiom, no rmcp involvement; complements existing `breaker.rs` failure-rate logic with per-request bound.
 - [ ] **Row 70 (Cancellation notification on timeout)**: when the timeout from rows 69-71 fires, emit `notifications/cancelled` via rmcp's built-in auto-cancel path. Also unblocks `acp.rs:91-92` TODO for `session/cancel`.
   - **Eval (corrected 2026-06-03)**: rmcp 1.7.0 `RequestHandle::await_response` (SDK `service.rs:322-343`) ALREADY auto-emits `CancelledNotification` with `reason="request timeout"` when `PeerRequestOptions.timeout` expires — request-id threading is internal to rmcp · openab-agent drop-in is just switching `peer.call_tool(p).await` to `peer.send_request_with_option(req, opt_with_timeout).await?.await_response().await` (~30-50 LOC unified with rows 69-71) · **fit: in-scope, drop-in**. Prior eval (~120 LOC, non-trivial) was wrong — rmcp ships this pattern. See Section 4 Improvement Plan for consolidated treatment.
-| 73 | Implementations SHOULD always enforce a maximum timeout (even with progress) | SHOULD | ❌ | no max-timeout ceiling; same gap as rows 69-71 (no `tokio::time::timeout` wrap at `meta_tool.rs:98, 123`). Jelly fact-check 2026-06-03 filled |
-| 74 | Implementations SHOULD handle version mismatch, capability failures, timeouts | SHOULD | ⚠️ | partial: version mismatch ✅ via rmcp `serve()` returning `Err` + our `with_context` wrap at `runtime.rs:1068,1081` → `ServerStatus::Failed`; capability failure ❌ (row 65, no gating); timeout ❌ (rows 69-71). Jelly fact-check 2026-06-03 filled |
-| 74a | `Implementation` object (clientInfo / serverInfo) carries optional `title`, `description`, `icons`, `websiteUrl` fields | (schema) | ✅ | `rmcp::model::Implementation` (1.7.0 schema) carries these via `serde(skip_serializing_if = "Option::is_none")`; we use bare default `Implementation` via `()` handler so we don't populate them — but the field-presence requirement is rmcp's responsibility (SDK side). Jelly fact-check 2026-06-03 filled |
 
 ## Transports
 
@@ -289,7 +289,7 @@ Source: [`basic/authorization.mdx`](https://github.com/modelcontextprotocol/mode
 | 166 | Clients MUST attempt multiple well-known endpoints (RFC 8414 + OIDC) when discovering AS metadata | MUST | ❌ | no discovery path |
 | 167 | For path-bearing issuer URLs, clients MUST try priority order: oauth-authorization-server path-insert, openid-configuration path-insert, openid-configuration appended | MUST | ❌ | no discovery path |
 | 168 | For pathless issuer URLs, clients MUST try oauth-authorization-server, then openid-configuration | MUST | ❌ | no discovery path |
-| 169 | Clients supporting all registration options SHOULD prefer pre-registered, then CIMD, then DCR, then prompt | SHOULD | ⚠️ (degenerate) | we only support pre-registered (env-injected client IDs) — top of the priority list is honoured, the rest don't exist |
+| 169 | Clients supporting all registration options SHOULD prefer pre-registered, then CIMD, then DCR, then prompt | SHOULD | ⚠️ (vacuously) | we only support pre-registered (env-injected client IDs) — top of the priority list is honoured; the rest don't exist |
 | 170 | MCP clients and AS SHOULD support OAuth Client ID Metadata Documents | SHOULD | ❌ | duplicate of row 151; no CIMD |
 | 171 | CIMD-supporting MCP implementations MUST follow OAuth CIMD requirements | MUST | N/A | no CIMD support — vacuously satisfied |
 | 172 | CIMD: clients MUST host metadata document at HTTPS URL per RFC requirements | MUST | N/A | no CIMD |
@@ -298,7 +298,7 @@ Source: [`basic/authorization.mdx`](https://github.com/modelcontextprotocol/mode
 | 175 | CIMD: clients MUST ensure `client_id` value matches the document URL exactly | MUST | N/A | no CIMD |
 | 176 | CIMD: clients MAY use `private_key_jwt` for client authentication | MAY | N/A | no CIMD |
 | 177 | CIMD: MCP clients SHOULD check for `client_id_metadata_document_supported` AS capability | SHOULD | N/A | no CIMD |
-| 178 | CIMD: MCP clients MAY fall back to DCR or pre-registration if CIMD unavailable | MAY | ⚠️ | we _always_ use pre-registration; this is "fall back to" by virtue of having no CIMD or DCR — vacuous |
+| 178 | CIMD: MCP clients MAY fall back to DCR or pre-registration if CIMD unavailable | MAY | ⚠️ | we _always_ use pre-registration; this is "fall back to" by virtue of having no CIMD or DCR — vacuously satisfied |
 | 178a | CIMD (AS-side): AS SHOULD fetch metadata documents when encountering URL-formatted `client_id`s | SHOULD | N/A — client-side | (AS-side) |
 | 178b | CIMD (AS-side): AS MUST validate fetched document's `client_id` matches the URL exactly | MUST | N/A — client-side | (AS-side) |
 | 178c | CIMD (AS-side): AS SHOULD cache metadata respecting HTTP cache headers | SHOULD | N/A — client-side | (AS-side) |
@@ -394,14 +394,14 @@ Source: [`basic/utilities/cancellation.mdx`](https://github.com/modelcontextprot
 | # | Item | Normative | Status | Location / Notes |
 |---|---|---|---|---|
 | 243 | `notifications/cancelled` carries `requestId` and optional `reason` | (notification) | ✅ (schema) | rmcp `CancelledNotificationParam { request_id, reason: Option<String> }` (SDK `service.rs:333-336`) — both fields present per schema |
-| 244 | Cancellation notification MUST only reference requests issued in the same direction | MUST | N/A (vacuous) | we send no `notifications/cancelled` today (no `notify_cancelled` callsite in `src/mcp/**`); if/when we do via rmcp `peer.notify_cancelled` (SDK `service/client.rs:368`) the direction will be client→server, matching same-direction requirement |
-| 245 | Cancellation notification MUST only target requests believed in-progress | MUST | N/A (vacuous) | no cancel emission today. Future: rmcp `RequestHandle::cancel` (SDK `service.rs:349-360`) drops the handle's receiver after sending — naturally only references in-progress request id |
+| 244 | Cancellation notification MUST only reference requests issued in the same direction | MUST | N/A (vacuously) | we send no `notifications/cancelled` today (no `notify_cancelled` callsite in `src/mcp/**`); if/when we do via rmcp `peer.notify_cancelled` (SDK `service/client.rs:368`) the direction will be client→server, matching same-direction requirement |
+| 245 | Cancellation notification MUST only target requests believed in-progress | MUST | N/A (vacuously) | no cancel emission today. Future: rmcp `RequestHandle::cancel` (SDK `service.rs:349-360`) drops the handle's receiver after sending — naturally only references in-progress request id |
 | 246 | `initialize` request MUST NOT be cancelled by clients | MUST NOT | ✅ | initialize is performed inside `().serve(transport).await` at `runtime.rs:1066,1079`; rmcp owns the request id and never exposes it externally, so we cannot cancel it even if we wanted to |
 | 247 | For task-augmented requests, the `tasks/cancel` request MUST be used instead of the `notifications/cancelled` notification (tasks have a dedicated cancellation that returns final state) | MUST | N/A | we do not use task-augmented requests (no `tasks` client capability per Section 1 row 55); `tasks/cancel` is the task transport's surface, not ours |
 | 248 | Receivers SHOULD stop processing, free resources, not respond | SHOULD | N/A | we never receive `notifications/cancelled` from server — client handler is bare `()` (no `on_cancelled` impl); rmcp default discards via the `ClientHandler` blanket impl (SDK `handler/client.rs:46`) |
 | 249 | Receivers MAY ignore cancellation if request unknown / complete / uncancellable | MAY | N/A | as above; we are effectively the "ignore" path by virtue of having no handler |
-| 250 | Sender SHOULD ignore any late response to a cancelled request | SHOULD | N/A (vacuous) | no cancellations sent today. Future: rmcp `RequestHandle::cancel` drops the response channel `rx` so any late response is discarded by the transport worker (SDK `service.rs:323-326`) |
-| 251 | Both parties MUST handle cancel race conditions gracefully | MUST | N/A (vacuous) | no cancellations sent. rmcp's auto-cancel-on-timeout (SDK `service.rs:332-343`) is race-safe (`rx` consumed before notification sent); inheriting this behaviour requires the `PeerRequestOptions { timeout }` work in Section 1 rows 69-71 |
+| 250 | Sender SHOULD ignore any late response to a cancelled request | SHOULD | N/A (vacuously) | no cancellations sent today. Future: rmcp `RequestHandle::cancel` drops the response channel `rx` so any late response is discarded by the transport worker (SDK `service.rs:323-326`) |
+| 251 | Both parties MUST handle cancel race conditions gracefully | MUST | N/A (vacuously) | no cancellations sent. rmcp's auto-cancel-on-timeout (SDK `service.rs:332-343`) is race-safe (`rx` consumed before notification sent); inheriting this behaviour requires the `PeerRequestOptions { timeout }` work in Section 1 rows 69-71 |
 | 252 | Both parties SHOULD log cancellation reasons | SHOULD | ❌ | no cancellation emission; when implemented (Section 1 rows 69-70) we'd need `tracing::info!(target="mcp.cancel", server=%name, reason=%r)` at the emission site. rmcp internally already logs via the `tracing` crate but our reason wrappers aren't visible at our layer today |
 | 253 | Application UIs SHOULD indicate cancellation state | SHOULD | N/A | openab-agent is a CLI/meta-tool gateway — no UI surface. ACP `session/cancel` (`acp.rs:91-92`) is the closest surface but only a transport hook, not a UI |
 | 254 | Invalid cancellation notifications SHOULD be ignored | SHOULD | ✅ | rmcp `ClientHandler` default `on_cancelled` discards unknown notifications (no panic / error propagation); we inherit this via `()` handler — bare `()` impl satisfies the SHOULD by routing unknown notifications to no-op |
@@ -423,19 +423,19 @@ Source: [`basic/utilities/progress.mdx`](https://github.com/modelcontextprotocol
 |---|---|---|---|---|
 | 255 | `progressToken` carried in request `_meta` | (field) | ❌ | we never populate `_meta.progressToken` on outbound `peer.call_tool(params)` — `CallToolRequestParams::new(...).with_arguments(...)` at `meta_tool.rs:95-98` only sets `name` + `arguments`. So no server can stream progress back to us today |
 | 256 | Progress tokens MUST be string or integer | MUST | ✅ (schema) | `rmcp::model::ProgressToken(pub NumberOrString)` (SDK `model.rs:305`) — `NumberOrString` enforces string-or-integer at the type level |
-| 257 | Progress tokens MUST be unique across active requests | MUST | N/A (vacuous) | we send no `progressToken` (row 255); if implemented, would need a per-`McpRuntimeManager` token counter or UUID source |
+| 257 | Progress tokens MUST be unique across active requests | MUST | N/A (vacuously) | we send no `progressToken` (row 255); if implemented, would need a per-`McpRuntimeManager` token counter or UUID source |
 | 258 | `notifications/progress` carries token, progress, optional total/message | (notification) | ✅ (schema) | `rmcp::model::ProgressNotificationParam { progress_token, progress: f64, total: Option<f64>, message: Option<String> }` (SDK `model.rs:1100-1115`); method const `notifications/progress` |
 | 259 | `progress` value MUST increase with each notification, even if total is unknown | MUST | N/A | we send no progress; on receive we discard via `()` handler. The SDK doc-comment on `progress: f64` matches the spec wording (SDK `model.rs:1107-1108`) but rmcp does not enforce monotonicity on either send or receive — it's the application's burden |
 | 260 | `progress` and `total` MAY be float | MAY | ✅ (schema) | both fields are `f64` in rmcp schema (SDK `model.rs:1107, 1110`) |
 | 261 | `message` field SHOULD provide relevant human-readable progress information | SHOULD | N/A | we send no progress; rmcp provides `with_message(impl Into<String>)` builder (SDK `model.rs:1134`) |
-| 262 | Progress notifications MUST only reference active in-progress operation tokens | MUST | N/A (vacuous) | we send no progress; if implemented, drop the token when request completes / cancels |
+| 262 | Progress notifications MUST only reference active in-progress operation tokens | MUST | N/A (vacuously) | we send no progress; if implemented, drop the token when request completes / cancels |
 | 263 | Receivers MAY skip notifications / set frequency / omit total | MAY | ✅ | `()` client handler (`runtime.rs:1066,1079`) means rmcp routes incoming `ProgressNotification` to the blanket `ClientHandler::on_progress` default-impl which discards (SDK `handler/client.rs:201-203, 321-326`); we "skip" by virtue of having no handler |
 | 264 | For task-augmented requests, the `progressToken` from the original request MUST continue to be used for progress notifications throughout task lifetime — valid until the task reaches a terminal status, even after `CreateTaskResult` returns | MUST | N/A | we do not implement task augmentation (Section 1 row 55 ❌); spec item only applies if we adopt `tasks` capability |
 | 265 | Progress notifications for tasks MUST use the original `progressToken` | MUST | N/A | as above |
 | 266 | Progress notifications for tasks MUST stop after terminal status | MUST | N/A | as above |
-| 267 | Senders and receivers SHOULD track active progress tokens | SHOULD | N/A (vacuous) | we send no progress (row 255), we discard incoming progress (row 263) — nothing to track |
-| 268 | Both parties SHOULD implement rate limiting on progress notifications | SHOULD | N/A (vacuous) | as above; rmcp does no rate limiting either way |
-| 269 | Progress notifications MUST stop after completion | MUST | N/A (vacuous) | as above; spec compliance is the sender's responsibility |
+| 267 | Senders and receivers SHOULD track active progress tokens | SHOULD | N/A (vacuously) | we send no progress (row 255), we discard incoming progress (row 263) — nothing to track |
+| 268 | Both parties SHOULD implement rate limiting on progress notifications | SHOULD | N/A (vacuously) | as above; rmcp does no rate limiting either way |
+| 269 | Progress notifications MUST stop after completion | MUST | N/A (vacuously) | as above; spec compliance is the sender's responsibility |
 
 ### Improvement Plan (Jelly draft, pending Mira retroactive review)
 
@@ -454,7 +454,7 @@ Source: [`basic/utilities/ping.mdx`](https://github.com/modelcontextprotocol/mod
 |---|---|---|---|---|
 | 270 | `ping` request method | (method) | ✅ (schema) | rmcp `PingRequest` model (SDK `model/meta.rs:141, 164`) + dispatched at `handler/client.rs:19` |
 | 271 | Receiver MUST respond promptly with empty `{}` result | MUST | ✅ | `()` client handler (`runtime.rs:1066,1079`) inherits `ClientHandler::ping` default-impl returning `Ok(())` mapped to `ClientResult::empty` (SDK `handler/client.rs:85-90, 19`); rmcp also auto-replies to pre-handshake pings via trace-log path (SDK `service/client.rs:130-138`) |
-| 272 | If no response within timeout, sender MAY consider connection stale / terminate / reconnect | MAY | N/A (vacuous) | we send no outbound pings (no `peer.send_request_with_option(PingRequest, ...)` callsite); rmcp does not expose a convenience `peer.ping()` method — sending requires manual `PingRequest` construction |
+| 272 | If no response within timeout, sender MAY consider connection stale / terminate / reconnect | MAY | N/A (vacuously) | we send no outbound pings (no `peer.send_request_with_option(PingRequest, ...)` callsite); rmcp does not expose a convenience `peer.ping()` method — sending requires manual `PingRequest` construction |
 | 273 | Implementations SHOULD periodically issue pings to detect connection health | SHOULD | ❌ | no periodic ping loop in `runtime.rs` / `breaker.rs`; we rely on next tool-call failure to detect stale connection (which trips the breaker via `record_tool_call_outcome` at `meta_tool.rs:101, 104`) |
 | 274 | Ping frequency SHOULD be configurable | SHOULD | ❌ | no ping config field on `ServerConfig::Stdio` / `ServerConfig::Http` (`config.rs:21-36`); `McpConfig` itself at `config.rs:13-16` is just a server-list wrapper. Fact-check 2026-06-04: prior ref to `config.rs:75-112` was OAuthConfig — corrected. |
 | 275 | Ping timeouts SHOULD be appropriate for network environment | SHOULD | N/A | no pinging |
@@ -478,7 +478,7 @@ Source: [`basic/utilities/tasks.mdx`](https://github.com/modelcontextprotocol/mo
 
 | # | Item | Normative | Status | Location / Notes |
 |---|---|---|---|---|
-| 280 | Servers and clients supporting tasks MUST declare `tasks` capability during init | MUST | N/A (vacuous) | we don't support tasks; not declaring is the conforming path for non-supporters |
+| 280 | Servers and clients supporting tasks MUST declare `tasks` capability during init | MUST | N/A (vacuously) | we don't support tasks; not declaring is the conforming path for non-supporters |
 | 281 | Server `tasks` capability includes `list`, `cancel`, `requests.tools.call` | (capability) | N/A | server-side schema |
 | 282 | Client `tasks` capability includes `list`, `cancel`, `requests.sampling.createMessage`, `requests.elicitation.create` | (capability) | N/A | we don't declare (no `sampling` / `elicitation` either — Section 1 rows 53-54 ❌) |
 | 282a | `capabilities.tasks.requests` is exhaustive — request types not listed do NOT support task-augmentation | (capability) | N/A | semantic note for the capability schema |
@@ -563,8 +563,8 @@ Source: [`basic/utilities/tasks.mdx`](https://github.com/modelcontextprotocol/mo
 | 358 | Receivers SHOULD log task creation/completion/retrieval events for audit | SHOULD | N/A | server-side |
 | 359 | Receivers SHOULD include auth context in logs when available | SHOULD | N/A | server-side |
 | 360 | Receivers SHOULD monitor for suspicious patterns | SHOULD | N/A | server-side |
-| 361 | Requestors SHOULD log task lifecycle events for debugging/audit | SHOULD | N/A (vacuous) | no task lifecycle on client side |
-| 362 | Requestors SHOULD track task IDs and associated operations | SHOULD | N/A (vacuous) | no task IDs |
+| 361 | Requestors SHOULD log task lifecycle events for debugging/audit | SHOULD | N/A (vacuously) | no task lifecycle on client side |
+| 362 | Requestors SHOULD track task IDs and associated operations | SHOULD | N/A (vacuously) | no task IDs |
 | 362a | On Streamable HTTP, clients MAY disconnect from an SSE stream opened in response to `tasks/get` or `tasks/result` at any time | MAY | N/A | we don't issue `tasks/*` requests |
 | 362b | Servers SHOULD NOT upgrade to an SSE stream in response to a `tasks/get` request | SHOULD NOT | N/A | server-side |
 | 362c | Clients SHOULD expect task-related messages to be delivered on any SSE stream (including the HTTP GET stream) | SHOULD | N/A | we expect nothing task-related; if rmcp surfaces an unexpected task message via SSE, the `()` handler discards it |
