@@ -1010,20 +1010,31 @@ Source: [`server/utilities/pagination.mdx`](https://github.com/modelcontextproto
 
 | # | Item | Normative | Status | Location / Notes |
 |---|---|---|---|---|
-| 596 | Cursor-based pagination model | (model) | | |
-| 597 | Clients MUST NOT assume fixed page size | MUST NOT | | |
-| 598 | Response includes optional `nextCursor` | (field) | | |
-| 599 | Request includes optional `cursor` | (field) | | |
-| 600 | Paginated ops: resources/list, resources/templates/list, prompts/list, tools/list | (method) | | |
-| 601 | Servers SHOULD provide stable cursors | SHOULD | | |
-| 602 | Servers SHOULD handle invalid cursors gracefully | SHOULD | | |
-| 603 | Clients SHOULD treat missing `nextCursor` as end of results | SHOULD | | |
-| 604 | Clients SHOULD support both paginated and non-paginated flows | SHOULD | | |
-| 605 | Clients MUST treat cursors as opaque tokens | MUST | | |
-| 605a | Clients MUST NOT make assumptions about cursor format | MUST NOT | | |
-| 606 | Clients MUST NOT parse or modify cursors | MUST NOT | | |
-| 607 | Clients MUST NOT persist cursors across sessions | MUST NOT | | |
-| 608 | Invalid cursors SHOULD result in `-32602` Invalid params | SHOULD | | |
+| 596 | Cursor-based pagination model | (model) | ✅ | rmcp `Cursor` type alias for `String` (SDK `model.rs`); paginated result types carry `next_cursor: Option<Cursor>` via the `paginated_result!` macro |
+| 597 | Clients MUST NOT assume fixed page size | MUST NOT | ✅ | `peer.list_all_tools` (SDK `service/client.rs:378-392`) loops on `next_cursor` with no page-size assumption; openab-agent calls it at `src/mcp/meta_tool.rs:122` |
+| 598 | Response includes optional `nextCursor` | (field) | N/A | server-produced field; client-side rmcp deserialises into `next_cursor: Option<Cursor>` on all `*List` result types |
+| 599 | Request includes optional `cursor` | (field) | ✅ | rmcp `PaginatedRequestParams { meta, cursor: Option<String> }` (SDK `model.rs`); auto-passed through by `list_all_tools` |
+| 600 | Paginated ops: resources/list, resources/templates/list, prompts/list, tools/list | (method) | ⚠️ | tools-only on our side: `peer.list_all_tools` (`src/mcp/meta_tool.rs:122`). Prompts / resources / resource templates vacuously compliant — no client callsite (Sections 12 / 13 N/A by topology) |
+| 601 | Servers SHOULD provide stable cursors | SHOULD | N/A | server-side cursor lifecycle obligation |
+| 602 | Servers SHOULD handle invalid cursors gracefully | SHOULD | N/A | server-side error handling |
+| 603 | Clients SHOULD treat missing `nextCursor` as end of results | SHOULD | ✅ | rmcp `list_all_tools` loop breaks when `next_cursor.is_none()` (SDK `service/client.rs:378-392`); same pattern in `list_all_prompts` / `list_all_resources` |
+| 604 | Clients SHOULD support both paginated and non-paginated flows | SHOULD | ✅ | `list_all_tools` wraps the low-level `list_tools(Some(PaginatedRequestParams { .. }))` — servers returning a single page (zero `next_cursor`) complete in one iteration without special-casing |
+| 605 | Clients MUST treat cursors as opaque tokens | MUST | ✅ | cursors stored as `Option<String>` and passed through unmodified by rmcp; openab-agent never inspects them |
+| 605a | Clients MUST NOT make assumptions about cursor format | MUST NOT | ✅ | `Cursor = String` alias with no parser / pattern match in our tree; treated as black box |
+| 606 | Clients MUST NOT parse or modify cursors | MUST NOT | ✅ | `list_all_tools` consumes `result.next_cursor` and feeds it verbatim into the next `PaginatedRequestParams.cursor`; zero string ops in client code |
+| 607 | Clients MUST NOT persist cursors across sessions | MUST NOT | ✅ | cursor lifetime = single `list_all_tools` call stack (local `mut cursor = None`); no serialisation to disk / cache. Each `start_mcp_session` re-issues fresh `list_all_tools(cursor=None)` |
+| 608 | Invalid cursors SHOULD result in `-32602` Invalid params | SHOULD | N/A | server-side error mapping; rmcp surfaces wire `Err(-32602)` to caller unchanged but we never trigger it (we don't synthesise cursors) |
+
+### Improvement Plan (Jelly draft, pending Mira retroactive review)
+
+**Section-level disposition**: pagination compliance is complete for tools (the only paginated surface openab-agent actively consumes) and vacuously compliant for prompts / resources / resource templates (uncalled — see Sections 12 / 13). All client-side MUST / MUST NOT rows pass; SHOULDs are satisfied by rmcp SDK contract. Server rows are N/A by client topology. Recommendations are forward-hardening rather than corrective.
+
+- [ ] **§1. Document cursor opacity invariant in `src/mcp/meta_tool.rs`.** Add a one-line comment near the `peer.list_all_tools` call (`src/mcp/meta_tool.rs:122`) noting that cursors are opaque, single-request, and MUST NOT be persisted — reinforces rows 605-607 for future maintainers who might be tempted to cache pagination state across sessions.
+  - **Eval**: docs only · drop-in (~3 lines) · **fit: in-scope**. Cheap defensive doc; near-zero risk.
+- [ ] **§2. If Sections 12 / 13 ever ship the prompts / resources client surface (§2 of each), re-audit pagination there.** Today rows 600 for prompts / resources are vacuously compliant; once `peer.list_all_prompts` / `peer.list_all_resources` callsites land we must re-verify the same MUST NOT-persist / opaque-token invariants apply to the new code paths.
+  - **Eval**: openab-agent layer · drop-in (audit / re-check) · **fit: defer (bundled)**. Free follow-up tied to whichever section ships first.
+- [ ] **§3. (Tracking only) — rmcp SDK regression guard for cursor opacity.** rmcp 1.7.0 ships `Cursor = String` with no `impl FromStr` / `Display::format` parser; a future SDK version could regress by typing the cursor (e.g. base64 wrapper). No code change today; if such a change lands we re-evaluate rows 605/605a/606.
+  - **Eval**: rmcp upstream · docs only · **fit: defer**. Tracking note only.
 
 ## Trust, Safety & Consent (Key Principles)
 
