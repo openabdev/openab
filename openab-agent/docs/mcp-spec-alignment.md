@@ -162,80 +162,89 @@ Source: [`basic/transports.mdx`](https://github.com/modelcontextprotocol/modelco
 
 | # | Item | Normative | Status | Location / Notes |
 |---|---|---|---|---|
-| 75 | JSON-RPC messages MUST be UTF-8 | MUST | | |
-| 76 | Clients SHOULD support stdio whenever possible | SHOULD | | |
-| 77 | stdio messages delimited by newlines; MUST NOT contain embedded newlines | MUST NOT | | |
-| 78 | Server MAY write UTF-8 to stderr for any logging (including non-error) | MAY | | |
-| 79 | Client MAY capture/forward/ignore server's stderr | MAY | | |
-| 80 | Client SHOULD NOT assume stderr indicates errors | SHOULD NOT | | |
-| 81 | Server MUST NOT write non-MCP to stdout | MUST NOT | | |
-| 82 | Client MUST NOT write non-MCP to server's stdin | MUST NOT | | |
-| 83 | Streamable HTTP server MUST provide single endpoint supporting POST + GET | MUST | | |
-| 84 | Server MUST validate `Origin` header on all incoming connections (DNS rebinding defence) | MUST | | |
-| 85 | If Origin header is present and invalid, server MUST respond with HTTP 403 Forbidden | MUST | | |
-| 85a | The 403 Forbidden response body MAY comprise a JSON-RPC error response with no `id` | MAY | | |
-| 86 | Local servers SHOULD bind only to localhost (127.0.0.1), not all network interfaces (0.0.0.0) | SHOULD | | |
-| 87 | Servers SHOULD implement proper authentication on all connections | SHOULD | | |
-| 88 | Every client JSON-RPC message MUST be a new HTTP POST | MUST | | |
-| 89 | Client MUST use HTTP POST to send messages to the MCP endpoint | MUST | | |
-| 90 | Client MUST include `Accept: application/json, text/event-stream` | MUST | | |
-| 91 | POST body MUST be a single JSON-RPC request, notification, or response | MUST | | |
-| 92 | Server MUST return HTTP 202 Accepted (no body) on accepted notification/response input | MUST | | |
-| 93 | If notification/response input is rejected, server MUST return an HTTP error status (e.g., 400 Bad Request) | MUST | | |
-| 94 | Error response body MAY be a JSON-RPC error response with no `id` | MAY | | |
-| 95 | For JSON-RPC request input, server MUST return either `Content-Type: text/event-stream` (SSE stream) or `Content-Type: application/json` (single JSON object) | MUST | | |
-| 96 | Client MUST support both SSE and JSON response content types | MUST | | |
-| 97 | On SSE initiation, server SHOULD immediately send event with ID + empty `data` to prime reconnection | SHOULD | | |
-| 98 | After event-ID-bearing SSE event, server MAY close connection (without terminating SSE stream) | MAY | | |
-| 99 | Client SHOULD poll SSE stream by reconnecting when server closes connection | SHOULD | | |
-| 100 | If server closes connection before terminating SSE stream, it SHOULD send a `retry` SSE field | SHOULD | | |
-| 101 | Client MUST respect SSE `retry` field, waiting that many ms before reconnect | MUST | | |
-| 102 | SSE stream SHOULD eventually include the JSON-RPC response for the originating request | SHOULD | | |
-| 103 | Server MAY send other requests/notifications on SSE before the response | MAY | | |
-| 104 | Pre-response messages SHOULD relate to originating request | SHOULD | | |
-| 105 | Server MAY terminate SSE stream if session expires | MAY | | |
-| 106 | After response sent, server SHOULD terminate SSE stream | SHOULD | | |
-| 107 | Disconnection MAY occur at any time | MAY | | |
-| 108 | Disconnection SHOULD NOT be interpreted as request cancellation | SHOULD NOT | | |
-| 109 | To cancel, client SHOULD send `CancelledNotification` | SHOULD | | |
-| 110 | Server MAY make stream resumable to avoid message loss on disconnect | MAY | | |
-| 111 | Client MAY issue HTTP GET to open SSE listening stream | MAY | | |
-| 112 | GET MUST include `Accept: text/event-stream` | MUST | | |
-| 113 | On GET, server MUST return `Content-Type: text/event-stream` or HTTP 405 Method Not Allowed (indicating no SSE at this endpoint) | MUST | | |
-| 114 | Server MAY send JSON-RPC requests/notifications on GET SSE stream | MAY | | |
-| 115 | GET-stream messages SHOULD be unrelated to concurrent client requests | SHOULD | | |
-| 116 | Server MUST NOT send a JSON-RPC response on GET stream unless resuming a previous request | MUST NOT | | |
-| 117 | Server MAY close GET SSE stream at any time | MAY | | |
-| 118 | If server closes GET connection without terminating stream, it SHOULD send `retry` (same polling behavior) | SHOULD | | |
-| 119 | Client MAY close SSE stream at any time | MAY | | |
-| 120 | Client MAY remain connected to multiple SSE streams simultaneously | MAY | | |
-| 121 | Server MUST send each JSON-RPC message on only one stream (no broadcasting) | MUST | | |
-| 122 | Servers MAY attach `id` to SSE events for resumability | MAY | | |
-| 123 | If present, SSE event ID MUST be globally unique across all streams within the session (or across all streams for that client if session management is not in use) | MUST | | |
-| 124 | Event IDs SHOULD encode sufficient info to identify the originating stream | SHOULD | | |
-| 125 | To resume after disconnect, client SHOULD issue HTTP GET with `Last-Event-ID` header (regardless of original transport) | SHOULD | | |
-| 126 | Server MAY replay messages from `Last-Event-ID` on the disconnected stream | MAY | | |
-| 127 | Server MUST NOT replay messages from a different stream | MUST NOT | | |
-| 128 | Server MAY assign session ID at initialization by including `MCP-Session-Id` header on the HTTP response containing the `InitializeResult` | MAY | | |
-| 129 | Session ID SHOULD be globally unique and cryptographically secure | SHOULD | | |
-| 130 | Session ID MUST only contain visible ASCII (0x21–0x7E) | MUST | | |
-| 131 | Client MUST handle session ID securely | MUST | | |
-| 132 | Client MUST include `MCP-Session-Id` on all subsequent HTTP requests when issued | MUST | | |
-| 133 | Servers requiring a session SHOULD respond HTTP 400 to non-init requests without `MCP-Session-Id` | SHOULD | | |
-| 134 | Server MAY terminate session at any time | MAY | | |
-| 135 | Post-termination, server MUST respond HTTP 404 to requests with that session ID | MUST | | |
-| 136 | On HTTP 404 with session ID, client MUST start a new session via fresh `InitializeRequest` (no session ID) | MUST | | |
-| 137 | Client SHOULD send HTTP DELETE with `MCP-Session-Id` to terminate session | SHOULD | | |
-| 138 | Server MAY return HTTP 405 to DELETE | MAY | | |
-| 139 | Client MUST include `MCP-Protocol-Version: <protocol-version>` header on all HTTP requests | MUST | | |
-| 140 | Sent protocol-version header value SHOULD be the negotiated one | SHOULD | | |
-| 141 | If server receives no `MCP-Protocol-Version` header and has no other way to identify the version (e.g., via initialization negotiation), it SHOULD assume `2025-03-26` | SHOULD | | |
-| 142 | If invalid/unsupported `MCP-Protocol-Version` is sent, server MUST respond HTTP 400 | MUST | | |
-| 143 | Implementations MAY implement custom transports | MAY | | |
-| 144 | Custom transports MUST preserve JSON-RPC + lifecycle | MUST | | |
-| 145 | Custom transports SHOULD document connection establishment / message exchange patterns | SHOULD | | |
-| 145a | Client MAY implement legacy HTTP+SSE backwards-compat flow: POST `InitializeRequest`; on HTTP 400/404/405 fall back to GET expecting `endpoint` SSE event (for interop with 2024-11-05 HTTP+SSE servers) | MAY | | |
-| 145b | Servers wanting to support older clients SHOULD continue to host both the SSE and POST endpoints of the old transport, alongside the new MCP endpoint | SHOULD | | |
+| 75 | JSON-RPC messages MUST be UTF-8 | MUST | ✅ | `serde_json` produces UTF-8; rmcp `AsyncRwTransport` (SDK `rmcp::transport::async_rw`) serializes via `serde_json::to_string` |
+| 76 | Clients SHOULD support stdio whenever possible | SHOULD | ✅ | `Dial::Stdio` via `rmcp::transport::TokioChildProcess` (`src/mcp/runtime.rs:1064`); enabled via Cargo feature `transport-child-process` (`Cargo.toml:26`) |
+| 77 | stdio messages delimited by newlines; MUST NOT contain embedded newlines | MUST NOT | ✅ | rmcp `AsyncRwTransport` uses newline-delimited framing (`rmcp::transport::async_rw` LinesCodec-style reader/writer); `serde_json::to_string` produces single-line JSON (no embedded `\n`) |
+| 78 | Server MAY write UTF-8 to stderr for any logging (including non-error) | MAY | N/A | server-side |
+| 79 | Client MAY capture/forward/ignore server's stderr | MAY | ⚠️ | rmcp `TokioChildProcess` defaults `stderr=Stdio::inherit()` (SDK `rmcp::transport::child_process`), so child stderr flows to our process stderr; we don't capture per-server. Acceptable for "forward" semantics |
+| 80 | Client SHOULD NOT assume stderr indicates errors | SHOULD NOT | ✅ | we never read child stderr (inherited), so we don't classify it as an error signal |
+| 81 | Server MUST NOT write non-MCP to stdout | MUST NOT | N/A | server-side |
+| 82 | Client MUST NOT write non-MCP to server's stdin | MUST NOT | ✅ | rmcp `AsyncRwTransport` only writes serialized JSON-RPC frames; no other writes to child stdin |
+| 83 | Streamable HTTP server MUST provide single endpoint supporting POST + GET | MUST | N/A | server-side |
+| 84 | Server MUST validate `Origin` header on all incoming connections (DNS rebinding defence) | MUST | N/A | server-side |
+| 85 | If Origin header is present and invalid, server MUST respond with HTTP 403 Forbidden | MUST | N/A | server-side |
+| 85a | The 403 Forbidden response body MAY comprise a JSON-RPC error response with no `id` | MAY | N/A | server-side |
+| 86 | Local servers SHOULD bind only to localhost (127.0.0.1), not all network interfaces (0.0.0.0) | SHOULD | N/A | server-side |
+| 87 | Servers SHOULD implement proper authentication on all connections | SHOULD | N/A | server-side |
+| 88 | Every client JSON-RPC message MUST be a new HTTP POST | MUST | ✅ | rmcp `StreamableHttpClient::post_message` per outbound message (SDK `transport/common/reqwest/streamable_http_client.rs:115`); driven by worker loop (SDK `transport/streamable_http_client.rs:441+`) |
+| 89 | Client MUST use HTTP POST to send messages to the MCP endpoint | MUST | ✅ | `reqwest::Client::post(uri)` (SDK `transport/common/reqwest/streamable_http_client.rs:124`) |
+| 90 | Client MUST include `Accept: application/json, text/event-stream` | MUST | ✅ | `[EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE].join(", ")` on POST + GET (SDK `transport/common/reqwest/streamable_http_client.rs:59, 125`) — both media types present (order reversed but RFC 7231 allows) |
+| 91 | POST body MUST be a single JSON-RPC request, notification, or response | MUST | ✅ | `request.json(&message)` posts single `ClientJsonRpcMessage` (SDK `transport/common/reqwest/streamable_http_client.rs:135`); no batching |
+| 92 | Server MUST return HTTP 202 Accepted (no body) on accepted notification/response input | MUST | N/A | server-side. Client accepts both `ACCEPTED` and `NO_CONTENT` as success (SDK `transport/common/reqwest/streamable_http_client.rs:168-172`) |
+| 93 | If notification/response input is rejected, server MUST return an HTTP error status (e.g., 400 Bad Request) | MUST | N/A | server-side. Client surfaces non-2xx as `UnexpectedServerResponse` or parsed JSON-RPC error (SDK `transport/common/reqwest/streamable_http_client.rs:188-208`) |
+| 94 | Error response body MAY be a JSON-RPC error response with no `id` | MAY | ✅ (client side) | `parse_json_rpc_error` accepts `JsonRpcMessage::Error` and surfaces it (SDK `transport/common/reqwest/streamable_http_client.rs:39-44, 197-204`) |
+| 95 | For JSON-RPC request input, server MUST return either `Content-Type: text/event-stream` (SSE stream) or `Content-Type: application/json` (single JSON object) | MUST | N/A | server-side |
+| 96 | Client MUST support both SSE and JSON response content types | MUST | ✅ | content-type branch in SDK `transport/common/reqwest/streamable_http_client.rs:210-234` handles both `EVENT_STREAM_MIME_TYPE` (→ `SseStream::from_byte_stream`) and `JSON_MIME_TYPE` (→ `response.json::<ServerJsonRpcMessage>`); unknown → `UnexpectedContentType` |
+| 97 | On SSE initiation, server SHOULD immediately send event with ID + empty `data` to prime reconnection | SHOULD | N/A | server-side |
+| 98 | After event-ID-bearing SSE event, server MAY close connection (without terminating SSE stream) | MAY | N/A | server-side |
+| 99 | Client SHOULD poll SSE stream by reconnecting when server closes connection | SHOULD | ✅ | rmcp `SseRetryPolicy` + `retry_connection(last_event_id)` (SDK `transport/common/client_side_sse.rs:99, 112`); default `ExponentialBackoff` (SDK `transport/streamable_http_client.rs:1147`) |
+| 100 | If server closes connection before terminating SSE stream, it SHOULD send a `retry` SSE field | SHOULD | N/A | server-side |
+| 101 | Client MUST respect SSE `retry` field, waiting that many ms before reconnect | MUST | ⚠️ | rmcp `client_side_sse` tracks `server_retry_interval: Option<Duration>` (SDK `transport/common/client_side_sse.rs:135, 151`) — assumed honored by SSE retry loop. Needs verification that the field is actually applied vs. only the local `retry_policy` |
+| 102 | SSE stream SHOULD eventually include the JSON-RPC response for the originating request | SHOULD | N/A | server-side |
+| 103 | Server MAY send other requests/notifications on SSE before the response | MAY | N/A | server-side |
+| 104 | Pre-response messages SHOULD relate to originating request | SHOULD | N/A | server-side |
+| 105 | Server MAY terminate SSE stream if session expires | MAY | N/A | server-side |
+| 106 | After response sent, server SHOULD terminate SSE stream | SHOULD | N/A | server-side |
+| 107 | Disconnection MAY occur at any time | MAY | N/A | observational |
+| 108 | Disconnection SHOULD NOT be interpreted as request cancellation | SHOULD NOT | ✅ | rmcp client treats SSE disconnect as a transient stream event → triggers reconnect (`retry_connection`), not request abort |
+| 109 | To cancel, client SHOULD send `CancelledNotification` | SHOULD | ❌ | no client-side cancellation surface; `src/acp.rs:91-92` TODO + no `peer.notify_cancelled()` callsites in `src/mcp/` |
+| 110 | Server MAY make stream resumable to avoid message loss on disconnect | MAY | N/A | server-side |
+| 111 | Client MAY issue HTTP GET to open SSE listening stream | MAY | ✅ | rmcp `StreamableHttpClient::get_stream` (SDK `transport/common/reqwest/streamable_http_client.rs:49-89`) — invoked by worker when session permits server-initiated traffic |
+| 112 | GET MUST include `Accept: text/event-stream` | MUST | ✅ | `Accept: text/event-stream, application/json` on GET (SDK `transport/common/reqwest/streamable_http_client.rs:59`) |
+| 113 | On GET, server MUST return `Content-Type: text/event-stream` or HTTP 405 Method Not Allowed (indicating no SSE at this endpoint) | MUST | N/A (client handles both) | client maps 405 → `ServerDoesNotSupportSse` and proceeds without GET stream (SDK `transport/common/reqwest/streamable_http_client.rs:69-71`) |
+| 114 | Server MAY send JSON-RPC requests/notifications on GET SSE stream | MAY | N/A | server-side |
+| 115 | GET-stream messages SHOULD be unrelated to concurrent client requests | SHOULD | N/A | server-side |
+| 116 | Server MUST NOT send a JSON-RPC response on GET stream unless resuming a previous request | MUST NOT | N/A | server-side |
+| 117 | Server MAY close GET SSE stream at any time | MAY | N/A | server-side |
+| 118 | If server closes GET connection without terminating stream, it SHOULD send `retry` (same polling behavior) | SHOULD | N/A | server-side; client side mirrors row 99/101 handling |
+| 119 | Client MAY close SSE stream at any time | MAY | ✅ | rmcp `WorkerQuitReason` / cancellation token drops the SSE stream (SDK `transport/streamable_http_client.rs:464-465`) |
+| 120 | Client MAY remain connected to multiple SSE streams simultaneously | MAY | ⚠️ | rmcp worker typically holds POST-response SSE + GET SSE concurrently; not explicitly multiplexed beyond that. Likely acceptable for our single-server-per-`ServerHandle` model |
+| 121 | Server MUST send each JSON-RPC message on only one stream (no broadcasting) | MUST | N/A | server-side |
+| 122 | Servers MAY attach `id` to SSE events for resumability | MAY | N/A | server-side |
+| 123 | If present, SSE event ID MUST be globally unique across all streams within the session (or across all streams for that client if session management is not in use) | MUST | N/A | server-side |
+| 124 | Event IDs SHOULD encode sufficient info to identify the originating stream | SHOULD | N/A | server-side |
+| 125 | To resume after disconnect, client SHOULD issue HTTP GET with `Last-Event-ID` header (regardless of original transport) | SHOULD | ✅ | `get_stream` accepts `last_event_id: Option<String>` and sets `HEADER_LAST_EVENT_ID` (SDK `transport/common/reqwest/streamable_http_client.rs:53, 61-63`); `SseRetryPolicy::retry_connection(last_event_id)` carries last id (SDK `transport/common/client_side_sse.rs:112`) |
+| 126 | Server MAY replay messages from `Last-Event-ID` on the disconnected stream | MAY | N/A | server-side |
+| 127 | Server MUST NOT replay messages from a different stream | MUST NOT | N/A | server-side |
+| 128 | Server MAY assign session ID at initialization by including `MCP-Session-Id` header on the HTTP response containing the `InitializeResult` | MAY | ✅ (client extracts) | rmcp worker reads `HEADER_SESSION_ID` from init POST response → `session_id: Option<Arc<str>>` (SDK `transport/streamable_http_client.rs:497, 181-185`) |
+| 129 | Session ID SHOULD be globally unique and cryptographically secure | SHOULD | N/A | server-side |
+| 130 | Session ID MUST only contain visible ASCII (0x21–0x7E) | MUST | N/A | server-side; client passes raw header value through `HeaderValue` (rejects non-ASCII at the http crate level) |
+| 131 | Client MUST handle session ID securely | MUST | ✅ | session id kept in `Arc<str>` inside worker (SDK `transport/streamable_http_client.rs:497`); never logged at our layer; not persisted to disk |
+| 132 | Client MUST include `MCP-Session-Id` on all subsequent HTTP requests when issued | MUST | ✅ | POST attaches `HEADER_SESSION_ID` when `session_id.is_some()` (SDK `transport/common/reqwest/streamable_http_client.rs:131-134`); GET + DELETE always attach (lines 60, 102) |
+| 133 | Servers requiring a session SHOULD respond HTTP 400 to non-init requests without `MCP-Session-Id` | SHOULD | N/A | server-side. Client side: rmcp default `allow_stateless = true` (SDK `transport/streamable_http_client.rs:1149`) tolerates servers that don't issue a session id; servers that do require it will hand back 400 which we surface as `UnexpectedServerResponse` |
+| 134 | Server MAY terminate session at any time | MAY | N/A | server-side |
+| 135 | Post-termination, server MUST respond HTTP 404 to requests with that session ID | MUST | ✅ (client handles) | rmcp maps `NOT_FOUND` + `session_was_attached` → `StreamableHttpError::SessionExpired` (SDK `transport/common/reqwest/streamable_http_client.rs:174-176`) |
+| 136 | On HTTP 404 with session ID, client MUST start a new session via fresh `InitializeRequest` (no session ID) | MUST | ✅ | rmcp `perform_reinitialization` re-POSTs saved init request with `session_id: None`, then resumes (SDK `transport/streamable_http_client.rs:386-438`) |
+| 137 | Client SHOULD send HTTP DELETE with `MCP-Session-Id` to terminate session | SHOULD | ✅ | `delete_session` sends DELETE + `HEADER_SESSION_ID` (SDK `transport/common/reqwest/streamable_http_client.rs:91-113`); rmcp `SessionCleanupInfo` triggers it on worker shutdown (SDK `transport/streamable_http_client.rs:524-531`) |
+| 138 | Server MAY return HTTP 405 to DELETE | MAY | ✅ (client tolerates) | rmcp treats 405 on DELETE as success (SDK `transport/common/reqwest/streamable_http_client.rs:107-110`) with `tracing::debug!("this server doesn't support deleting session")` |
+| 139 | Client MUST include `MCP-Protocol-Version: <protocol-version>` header on all HTTP requests | MUST | ✅ | rmcp worker extracts `init_result.protocol_version` from `InitializeResult` and injects `mcp-protocol-version` header into `protocol_headers` used for all subsequent POSTs (SDK `transport/streamable_http_client.rs:408-418, 511-522`). GET uses `custom_headers` separately — see Improvement Plan |
+| 140 | Sent protocol-version header value SHOULD be the negotiated one | SHOULD | ✅ | uses `init_result.protocol_version.as_str()` directly (SDK `transport/streamable_http_client.rs:413, 515`) |
+| 141 | If server receives no `MCP-Protocol-Version` header and has no other way to identify the version (e.g., via initialization negotiation), it SHOULD assume `2025-03-26` | SHOULD | N/A | server-side |
+| 142 | If invalid/unsupported `MCP-Protocol-Version` is sent, server MUST respond HTTP 400 | MUST | N/A | server-side; rmcp surfaces as `UnexpectedServerResponse` |
+| 143 | Implementations MAY implement custom transports | MAY | N/A | we don't implement custom transports — stdio + Streamable HTTP only (`src/mcp/runtime.rs:1042-1053`) |
+| 144 | Custom transports MUST preserve JSON-RPC + lifecycle | MUST | N/A | no custom transports |
+| 145 | Custom transports SHOULD document connection establishment / message exchange patterns | SHOULD | N/A | no custom transports |
+| 145a | Client MAY implement legacy HTTP+SSE backwards-compat flow: POST `InitializeRequest`; on HTTP 400/404/405 fall back to GET expecting `endpoint` SSE event (for interop with 2024-11-05 HTTP+SSE servers) | MAY | ❌ | rmcp 1.7.0 client does not fall back to the 2024-11-05 HTTP+SSE legacy flow; init failure surfaces as `UnexpectedServerResponse` / fatal worker quit |
+| 145b | Servers wanting to support older clients SHOULD continue to host both the SSE and POST endpoints of the old transport, alongside the new MCP endpoint | SHOULD | N/A | server-side |
+
+### Improvement Plan (Jelly draft, pending Mira retroactive review)
+
+- [ ] **Row 79 (stderr capture)**: optionally capture per-server child stderr (via `rmcp::transport::child_process::TokioChildProcess::stderr(Stdio::piped())`) and tee into our `tracing` log with `target=mcp.<server_name>.stderr`. Lets operators see `npx mcp-server-*` startup failures without losing them in container stderr noise. Low priority unless Brett wants per-server log isolation.
+- [ ] **Row 90 (`Accept` header order)**: cosmetic — spec lists `application/json, text/event-stream`, rmcp emits `text/event-stream, application/json`. Order is non-normative per RFC 7231; document this in alignment doc as acceptable rather than file an rmcp PR.
+- [ ] **Row 101 (SSE `retry` field honoured)**: verify that rmcp's `client_side_sse::server_retry_interval` is actually applied to the reconnect delay (and overrides `retry_policy` per spec MUST). If not, file rmcp upstream issue; meanwhile flag this as known soft-gap.
+- [ ] **Row 109 (CancelledNotification)**: implement `notifications/cancelled` emission alongside Section 1's request timeout work (rows 69-71) and `acp.rs:91-92` TODO. Unified cancellation surface that timeout + `session/cancel` ACP method both route through.
+- [ ] **Row 139 (GET stream protocol header)**: confirm `get_stream` carries `MCP-Protocol-Version` — the worker passes `protocol_headers` into POST loops but `get_stream` accepts a `custom_headers` map separately. If rmcp doesn't merge `protocol_headers` into the GET call, the spec MUST is violated for the server-initiated SSE path. If gap is real, upstream-fix in rmcp (cleanest) or build a wrapper that re-injects via `custom_headers`.
+- [ ] **Row 145a (Legacy HTTP+SSE fallback)**: leave unimplemented unless we discover a real server in our deployment surface that only speaks 2024-11-05 HTTP+SSE. Document as conscious skip; revisit if a user-reported MCP server fails init with a recognisable 405/404 pattern.
 
 ## Authorization
 
