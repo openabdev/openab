@@ -234,7 +234,7 @@ Source: [`basic/transports.mdx`](https://github.com/modelcontextprotocol/modelco
 | 143 | Implementations MAY implement custom transports | MAY | N/A | we don't implement custom transports — stdio + Streamable HTTP only (`src/mcp/runtime.rs:1042-1053`) |
 | 144 | Custom transports MUST preserve JSON-RPC + lifecycle | MUST | N/A | no custom transports |
 | 145 | Custom transports SHOULD document connection establishment / message exchange patterns | SHOULD | N/A | no custom transports |
-| 145a | Client MAY implement legacy HTTP+SSE backwards-compat flow: POST `InitializeRequest`; on HTTP 400/404/405 fall back to GET expecting `endpoint` SSE event (for interop with 2024-11-05 HTTP+SSE servers) | MAY | ❌ | rmcp 1.7.0 client does not fall back to the 2024-11-05 HTTP+SSE legacy flow; init failure surfaces as `UnexpectedServerResponse` / fatal worker quit |
+| 145a | Client MAY implement legacy HTTP+SSE backwards-compat flow: POST `InitializeRequest`; on HTTP 400/404/405 fall back to GET expecting `endpoint` SSE event (for interop with 2024-11-05 HTTP+SSE servers) | MAY | N/A (intentional) | conscious decision (Brett 2026-06-03) to **not** implement legacy 2024-11-05 HTTP+SSE compatibility. rmcp 1.7.0 client doesn't fall back; init failure against a legacy-only server surfaces as `UnexpectedServerResponse`. Servers MUST upgrade to Streamable HTTP to be supported |
 | 145b | Servers wanting to support older clients SHOULD continue to host both the SSE and POST endpoints of the old transport, alongside the new MCP endpoint | SHOULD | N/A | server-side |
 
 ### Improvement Plan (Jelly draft, pending Mira retroactive review)
@@ -244,7 +244,6 @@ Source: [`basic/transports.mdx`](https://github.com/modelcontextprotocol/modelco
 - [ ] **Row 101 (SSE `retry` field honoured)**: verify that rmcp's `client_side_sse::server_retry_interval` is actually applied to the reconnect delay (and overrides `retry_policy` per spec MUST). If not, file rmcp upstream issue; meanwhile flag this as known soft-gap.
 - [ ] **Row 109 (CancelledNotification)**: implement `notifications/cancelled` emission alongside Section 1's request timeout work (rows 69-71) and `acp.rs:91-92` TODO. Unified cancellation surface that timeout + `session/cancel` ACP method both route through.
 - [ ] **Row 139 (GET stream protocol header)**: confirm `get_stream` carries `MCP-Protocol-Version` — the worker passes `protocol_headers` into POST loops but `get_stream` accepts a `custom_headers` map separately. If rmcp doesn't merge `protocol_headers` into the GET call, the spec MUST is violated for the server-initiated SSE path. If gap is real, upstream-fix in rmcp (cleanest) or build a wrapper that re-injects via `custom_headers`.
-- [ ] **Row 145a (Legacy HTTP+SSE fallback)**: leave unimplemented unless we discover a real server in our deployment surface that only speaks 2024-11-05 HTTP+SSE. Document as conscious skip; revisit if a user-reported MCP server fails init with a recognisable 405/404 pattern.
 
 ## Authorization
 
