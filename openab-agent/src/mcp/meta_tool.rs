@@ -1,8 +1,7 @@
 //! Single `mcp` meta-tool the LLM sees. See ADR §5.2 + §5.3.
 //!
-//! Phase 1 scope: action enum + dispatch wiring + all six Phase 1 actions
-//! (`help`, `list_servers`, `list_tools`, `describe_tool`, `call`, `status`).
-//! The Phase 2 `login` / `complete_login` actions land with the OAuth slice.
+//! Dispatches discovery / call actions plus the OAuth login actions from
+//! ADR §6.4.
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
@@ -34,6 +33,15 @@ pub enum Action {
         #[serde(default)]
         server: Option<String>,
     },
+    Login {
+        server: String,
+        #[serde(default)]
+        flow: Option<String>,
+    },
+    CompleteLogin {
+        server: String,
+        redirect_url: String,
+    },
 }
 
 /// Entry point — the LLM tool dispatcher hands us a deserialized `Action`
@@ -50,6 +58,11 @@ pub async fn dispatch(manager: &McpRuntimeManager, action: Action) -> Result<Val
             arguments,
         } => call_tool(manager, &server, &tool, arguments).await,
         Action::Status { server } => Ok(status(manager, server.as_deref()).await),
+        Action::Login { server, flow } => login(manager, &server, flow.as_deref()).await,
+        Action::CompleteLogin {
+            server,
+            redirect_url,
+        } => complete_login(manager, &server, &redirect_url).await,
     }
 }
 
@@ -63,10 +76,61 @@ Actions:
   describe_tool(server, tool)  show input_schema for one tool
   call(server, tool, args)     invoke a tool
   status(server?)              per-server health + last error
+  login(server, flow?)         start OAuth login (auto/paste/device)
+  complete_login(server, redirect_url)
+                               finish paste-back OAuth after user pastes URL
 
 Connections are lazy: the first action that needs a server spawns its \
 child process and runs the handshake. Idle servers are evicted after \
 the configured TTL.";
+
+async fn login(manager: &McpRuntimeManager, server: &str, flow: Option<&str>) -> Result<Value> {
+    match flow {
+        Some("device") => login_device(manager, server).await,
+        Some("paste") => login_paste(manager, server).await,
+        Some(other) => Err(anyhow!(
+            "unsupported mcp login flow {other:?}; expected \"paste\", \"device\", or omit flow for auto"
+        )),
+        None => match manager.preferred_login_flow(server).await? {
+            "device" => login_device(manager, server).await,
+            _ => login_paste(manager, server).await,
+        },
+    }
+}
+
+async fn login_paste(manager: &McpRuntimeManager, server: &str) -> Result<Value> {
+    let start = manager.start_paste_login(server).await?;
+    Ok(json!({
+        "flow": "paste",
+        "server": server,
+        "authorize_url": start.authorize_url,
+        "state": start.state,
+    }))
+}
+
+async fn login_device(manager: &McpRuntimeManager, server: &str) -> Result<Value> {
+    let start = manager.start_device_login(server).await?;
+    Ok(json!({
+        "flow": "device",
+        "server": server,
+        "user_code": start.user_code,
+        "verification_uri": start.verification_uri,
+        "verification_uri_complete": start.verification_uri_complete,
+        "expires_in": start.expires_in,
+    }))
+}
+
+async fn complete_login(
+    manager: &McpRuntimeManager,
+    server: &str,
+    redirect_url: &str,
+) -> Result<Value> {
+    manager.complete_login(server, redirect_url).await?;
+    Ok(json!({
+        "server": server,
+        "status": "completed",
+    }))
+}
 
 async fn call_tool(
     manager: &McpRuntimeManager,
@@ -204,6 +268,32 @@ mod tests {
         McpRuntimeManager::from_config(cfg)
     }
 
+    fn mgr_from_with_temp_auth(json: &str) -> (McpRuntimeManager, tempfile::TempDir) {
+        let cfg: McpConfig = serde_json::from_str(json).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = McpRuntimeManager::from_config_with_auth_path(cfg, dir.path().join("auth.json"));
+        (mgr, dir)
+    }
+
+    fn linear_custom_cfg() -> &'static str {
+        r#"{
+            "mcpServers": {
+                "linear": {
+                    "type": "http",
+                    "url": "https://mcp.linear.app/mcp",
+                    "oauth": {
+                        "provider": "linear",
+                        "authorize_url": "https://linear.app/oauth/authorize",
+                        "token_url": "https://api.linear.app/oauth/token",
+                        "client_id": "linear-client",
+                        "redirect_uri": "https://example.com/callback",
+                        "scopes": ["read"]
+                    }
+                }
+            }
+        }"#
+    }
+
     #[tokio::test]
     async fn help_returns_doc_string() {
         let mgr = mgr_from(r#"{"mcpServers":{}}"#);
@@ -211,6 +301,7 @@ mod tests {
         let s = result.as_str().unwrap();
         assert!(s.contains("list_servers"));
         assert!(s.contains("call(server, tool"));
+        assert!(s.contains("complete_login"));
     }
 
     #[tokio::test]
@@ -437,6 +528,59 @@ mod tests {
         assert!(last_error.contains("spawn"), "got: {last_error}");
     }
 
+    #[tokio::test]
+    async fn login_auto_starts_paste_flow_for_custom_provider() {
+        let (mgr, _dir) = mgr_from_with_temp_auth(linear_custom_cfg());
+        let result = dispatch(
+            &mgr,
+            Action::Login {
+                server: "linear".into(),
+                flow: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["flow"], "paste");
+        assert_eq!(result["server"], "linear");
+        assert!(result["authorize_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://linear.app/oauth/authorize?"));
+        assert!(result["state"].as_str().unwrap().len() > 10);
+    }
+
+    #[tokio::test]
+    async fn login_rejects_unknown_flow() {
+        let (mgr, _dir) = mgr_from_with_temp_auth(linear_custom_cfg());
+        let err = dispatch(
+            &mgr,
+            Action::Login {
+                server: "linear".into(),
+                flow: Some("browser".into()),
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unsupported"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn complete_login_dispatches_to_runtime() {
+        let (mgr, _dir) = mgr_from_with_temp_auth(linear_custom_cfg());
+        let err = dispatch(
+            &mgr,
+            Action::CompleteLogin {
+                server: "linear".into(),
+                redirect_url: "https://example.com/callback?code=c&state=s".into(),
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no pending login"), "got: {err}");
+    }
+
     #[test]
     fn action_deserializes_from_meta_tool_payload() {
         let payload = json!({
@@ -458,6 +602,27 @@ mod tests {
             }
             other => panic!("expected Call, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn action_deserializes_login_and_complete_login() {
+        let action: Action =
+            serde_json::from_value(json!({ "action": "login", "server": "linear" })).unwrap();
+        assert!(matches!(
+            action,
+            Action::Login {
+                flow: None,
+                server
+            } if server == "linear"
+        ));
+
+        let action: Action = serde_json::from_value(json!({
+            "action": "complete_login",
+            "server": "linear",
+            "redirect_url": "https://example.com/cb?code=c&state=s"
+        }))
+        .unwrap();
+        assert!(matches!(action, Action::CompleteLogin { .. }));
     }
 
     #[test]

@@ -25,7 +25,7 @@ pub fn mcp_tool_def() -> ToolDef {
         name: MCP_TOOL_NAME.to_string(),
         description: "Talk to configured MCP servers. Call with \
              {action: 'help'} first to see the available actions \
-             (help, list_servers, list_tools, describe_tool, call, status)."
+             (help, list_servers, list_tools, describe_tool, call, status, login, complete_login)."
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -33,12 +33,13 @@ pub fn mcp_tool_def() -> ToolDef {
                 "action": {
                     "type": "string",
                     "enum": ["help", "list_servers", "list_tools",
-                             "describe_tool", "call", "status"],
+                             "describe_tool", "call", "status", "login",
+                             "complete_login"],
                     "description": "Which meta-tool action to invoke"
                 },
                 "server": {
                     "type": "string",
-                    "description": "Server name (required by list_tools / describe_tool / call; optional filter for status)"
+                    "description": "Server name (required by list_tools / describe_tool / call / login / complete_login; optional filter for status)"
                 },
                 "tool": {
                     "type": "string",
@@ -46,6 +47,15 @@ pub fn mcp_tool_def() -> ToolDef {
                 },
                 "arguments": {
                     "description": "Tool arguments for call — JSON object, or null/omitted for no-arg tools"
+                },
+                "flow": {
+                    "type": "string",
+                    "enum": ["paste", "device"],
+                    "description": "Optional OAuth flow override for login; omit for automatic selection"
+                },
+                "redirect_url": {
+                    "type": "string",
+                    "description": "Full post-authorization redirect URL required by complete_login"
                 }
             },
             "required": ["action"]

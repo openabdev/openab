@@ -29,9 +29,9 @@ use super::config::{McpConfig, ServerConfig};
 use super::flow::{init_paste_authorize, parse_paste_callback};
 use super::oauth::{builtin_client_id, resolve, ResolvedProvider};
 use crate::auth::{
-    auth_path, list_pending_logins_at, load_namespaced_token_at, load_pending_login, pending_key,
-    remove_pending_login, save_namespaced_token_at, save_pending_login, PendingPasteLogin,
-    TokenStore,
+    auth_path, list_pending_logins_at, load_namespaced_token_at, load_pending_login, mcp_token_key,
+    pending_key, remove_pending_login, save_namespaced_token_at, save_pending_login,
+    PendingPasteLogin, TokenStore,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,14 +214,7 @@ impl McpRuntimeManager {
     /// Begin a paste-back OAuth login for an HTTP server with an `oauth:`
     /// block (ADR §6.4). Produces the authorize URL the agent surfaces to
     /// the user; the matching PKCE verifier + `state` nonce are persisted
-    /// under `mcp-pending:<name>` in `auth.json` for `complete_login`
-    /// (next slice) to consume.
-    ///
-    /// Scoped to **built-in** providers this slice. Custom-provider
-    /// paste-back needs runtime port allocation for the callback (§6.4),
-    /// and any provider that advertises a `device_authorization_endpoint`
-    /// should run device-code instead (§6.4 selection logic). Both errors
-    /// are explicit so the LLM can pick a different action.
+    /// under `mcp-pending:<name>` in `auth.json` for `complete_login`.
     pub async fn start_paste_login(&self, name: &str) -> Result<PasteLoginStart> {
         let (provider, client_id, redirect_uri) = self.resolve_paste_client(name).await?;
         let started = init_paste_authorize(&provider, &client_id, &redirect_uri)?;
@@ -253,12 +246,43 @@ impl McpRuntimeManager {
         load_pending_login(&self.auth_path, &pending_key(name)).ok()
     }
 
+    /// Return the OAuth flow the agent should start for `name` when the
+    /// caller does not explicitly choose one. Custom providers with a device
+    /// authorization endpoint prefer RFC 8628; everything else uses
+    /// paste-back PKCE.
+    pub async fn preferred_login_flow(&self, name: &str) -> Result<&'static str> {
+        let oauth_cfg = {
+            let guard = self.handles.read().await;
+            let handle = guard
+                .get(name)
+                .ok_or_else(|| anyhow!("no mcp server named {name:?}"))?;
+            match handle.config.resolved(name)? {
+                ServerConfig::Http {
+                    oauth: Some(oauth), ..
+                } => oauth,
+                ServerConfig::Http { oauth: None, .. } => {
+                    return Err(anyhow!("mcp server {name:?} has no oauth block"));
+                }
+                ServerConfig::Stdio { .. } => {
+                    return Err(anyhow!("mcp server {name:?} is stdio, not http+oauth"));
+                }
+            }
+        };
+        match resolve(&oauth_cfg)? {
+            ResolvedProvider::Custom {
+                device_authorization_endpoint: Some(_),
+                ..
+            } => Ok("device"),
+            _ => Ok("paste"),
+        }
+    }
+
     /// Finish a paste-back OAuth flow (ADR §6.4). Reads the snapshotted
     /// `PendingPasteLogin`, validates the redirect URL's `state` against
     /// the snapshotted nonce (RFC 6749 §10.12), exchanges the auth code
     /// at the snapshotted `token_url`, persists the resulting
-    /// `TokenStore` under `<name>`, and clears the pending entry. Status
-    /// transitions `NeedsAuth → Disconnected` so the next `connect()`
+    /// `TokenStore` under `mcp:<name>`, and clears the pending entry.
+    /// Status transitions `NeedsAuth → Disconnected` so the next `connect()`
     /// dials the now-authenticated transport.
     pub async fn complete_login(&self, name: &str, redirect_url: &str) -> Result<()> {
         let pending =
@@ -294,7 +318,7 @@ impl McpRuntimeManager {
             pending.provider_name.clone(),
             None,
         );
-        save_namespaced_token_at(&self.auth_path, name, &store)?;
+        save_namespaced_token_at(&self.auth_path, &mcp_token_key(name), &store)?;
         remove_pending_login(&self.auth_path, &pending_key(name))?;
         let mut handles = self.handles.write().await;
         if let Some(handle) = handles.get_mut(name) {
@@ -498,7 +522,7 @@ impl McpRuntimeManager {
         resp: TokenExchangeResponse,
     ) {
         let store = build_token_store(resp, token_url.to_string(), provider_name.to_string(), None);
-        if let Err(e) = save_namespaced_token_at(&self.auth_path, name, &store) {
+        if let Err(e) = save_namespaced_token_at(&self.auth_path, &mcp_token_key(name), &store) {
             self.mark_device_login_failed(name, e).await;
             return;
         }
@@ -606,7 +630,7 @@ impl McpRuntimeManager {
                 .clone()
         };
         let _guard = lock.lock().await;
-        if let Ok(cached) = load_namespaced_token_at(&self.auth_path, name) {
+        if let Ok(cached) = load_namespaced_token_at(&self.auth_path, &mcp_token_key(name)) {
             if !cached.is_expired() {
                 return Ok(cached);
             }
@@ -620,7 +644,7 @@ impl McpRuntimeManager {
             store.provider.clone(),
             Some(store.refresh_token.clone()),
         );
-        save_namespaced_token_at(&self.auth_path, name, &new_store)?;
+        save_namespaced_token_at(&self.auth_path, &mcp_token_key(name), &new_store)?;
         Ok(new_store)
     }
 
@@ -647,7 +671,7 @@ impl McpRuntimeManager {
                     url,
                     oauth: Some(_),
                     ..
-                } => match load_namespaced_token_at(&self.auth_path, name) {
+                } => match load_namespaced_token_at(&self.auth_path, &mcp_token_key(name)) {
                     Ok(store) if !store.is_expired() => DialPlan::Dial(Dial::Http {
                         url,
                         auth: Some(store.access_token),
@@ -1457,7 +1481,8 @@ mod tests {
         };
         mgr.finish_login("linear", &pending, resp).await.unwrap();
         assert!(mgr.pending_paste_login("linear").await.is_none());
-        let token = crate::auth::load_namespaced_token_at(&mgr.auth_path, "linear").unwrap();
+        let token = crate::auth::load_namespaced_token_at(&mgr.auth_path, &mcp_token_key("linear"))
+            .unwrap();
         assert_eq!(token.access_token, "atok");
         assert_eq!(token.refresh_token, "rtok");
         assert_eq!(token.token_endpoint, "https://example.test/token");
@@ -1514,7 +1539,7 @@ mod tests {
             token_endpoint: "http://127.0.0.1:1/token".to_string(),
             provider: "linear".to_string(),
         };
-        save_namespaced_token_at(&mgr.auth_path, name, &store).unwrap();
+        save_namespaced_token_at(&mgr.auth_path, &mcp_token_key(name), &store).unwrap();
     }
 
     fn seed_token(mgr: &McpRuntimeManager, name: &str, expires_at: u64) {
@@ -1576,7 +1601,8 @@ mod tests {
             expires_in: None,
         };
         mgr.finish_login("linear", &pending, resp).await.unwrap();
-        let token = crate::auth::load_namespaced_token_at(&mgr.auth_path, "linear").unwrap();
+        let token = crate::auth::load_namespaced_token_at(&mgr.auth_path, &mcp_token_key("linear"))
+            .unwrap();
         assert_eq!(token.access_token, "atok");
         assert!(token.refresh_token.is_empty());
         // Long-lived sentinel: no `expires_in` from the provider must NOT

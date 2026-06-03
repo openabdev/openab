@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Namespace key for the existing Codex single-tenant credential.
@@ -20,6 +21,7 @@ const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/api/accounts/device
 const CODEX_DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
 const CODEX_DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 const REDIRECT_PORT: u16 = 1455;
+static AUTH_FILE_MUTEX: Mutex<()> = Mutex::new(());
 
 fn codex_client_id() -> String {
     std::env::var("OPENAB_AGENT_OAUTH_CLIENT_ID")
@@ -168,6 +170,66 @@ fn write_auth_file(path: &Path, map: &HashMap<String, AuthEntry>) -> Result<()> 
     Ok(())
 }
 
+/// Serialize the whole read-modify-write cycle for `auth.json`. The
+/// process-local mutex prevents async tasks from racing each other; on Unix
+/// the lock file also protects separate `openab-agent` processes sharing the
+/// same durable home directory.
+fn update_auth_file(
+    path: &Path,
+    f: impl FnOnce(&mut HashMap<String, AuthEntry>) -> Result<()>,
+) -> Result<()> {
+    let _guard = AUTH_FILE_MUTEX.lock().expect("auth file mutex poisoned");
+    let _file_lock = lock_auth_file(path)?;
+    let mut map = read_auth_file(path).unwrap_or_default();
+    f(&mut map)?;
+    write_auth_file(path, &map)
+}
+
+#[cfg(unix)]
+struct AuthFileLock(std::fs::File);
+
+#[cfg(unix)]
+impl Drop for AuthFileLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn lock_auth_file(path: &Path) -> Result<AuthFileLock> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let lock_path = dir.join("auth.json.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(AuthFileLock(file))
+}
+
+#[cfg(not(unix))]
+struct AuthFileLock;
+
+#[cfg(not(unix))]
+fn lock_auth_file(path: &Path) -> Result<AuthFileLock> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    Ok(AuthFileLock)
+}
+
 pub fn load_tokens() -> Result<TokenStore> {
     let path = auth_path();
     let map = read_auth_file(&path).map_err(|_| {
@@ -187,9 +249,10 @@ pub fn load_tokens() -> Result<TokenStore> {
 
 fn save_tokens(store: &TokenStore) -> Result<()> {
     let path = auth_path();
-    let mut map = read_auth_file(&path).unwrap_or_default();
-    map.insert(CODEX_NAMESPACE.to_string(), AuthEntry::Token(store.clone()));
-    write_auth_file(&path, &map)
+    update_auth_file(&path, |map| {
+        map.insert(CODEX_NAMESPACE.to_string(), AuthEntry::Token(store.clone()));
+        Ok(())
+    })
 }
 
 /// Look up the credential at `key` (e.g. `mcp:linear`). `path` is injected
@@ -215,9 +278,19 @@ pub fn load_namespaced_token_at(path: &Path, key: &str) -> Result<TokenStore> {
 /// already does per ADR §5.7).
 #[cfg(feature = "mcp")]
 pub fn save_namespaced_token_at(path: &Path, key: &str, store: &TokenStore) -> Result<()> {
-    let mut map = read_auth_file(path).unwrap_or_default();
-    map.insert(key.to_string(), AuthEntry::Token(store.clone()));
-    write_auth_file(path, &map)
+    update_auth_file(path, |map| {
+        map.insert(key.to_string(), AuthEntry::Token(store.clone()));
+        Ok(())
+    })
+}
+
+#[cfg(feature = "mcp")]
+const MCP_TOKEN_PREFIX: &str = "mcp:";
+
+/// `auth.json` key for a durable MCP server token (ADR §6.1 namespace).
+#[cfg(feature = "mcp")]
+pub fn mcp_token_key(name: &str) -> String {
+    format!("{MCP_TOKEN_PREFIX}{name}")
 }
 
 #[cfg(feature = "mcp")]
@@ -274,15 +347,18 @@ pub fn load_pending_login(path: &Path, key: &str) -> Result<PendingPasteLogin> {
 /// Read-modify-write — same serialization caveat as `save_namespaced_token`.
 #[cfg(feature = "mcp")]
 pub fn save_pending_login(path: &Path, key: &str, val: &PendingPasteLogin) -> Result<()> {
-    let mut map = read_auth_file(path).unwrap_or_default();
-    map.insert(key.to_string(), AuthEntry::Pending(val.clone()));
-    write_auth_file(path, &map)
+    update_auth_file(path, |map| {
+        map.insert(key.to_string(), AuthEntry::Pending(val.clone()));
+        Ok(())
+    })
 }
 
 /// Remove a pending-login entry (consumed on successful `complete_login`,
 /// expired entry GC, or `mcp logout`). Idempotent — missing key is OK.
 #[cfg(feature = "mcp")]
 pub fn remove_pending_login(path: &Path, key: &str) -> Result<()> {
+    let _guard = AUTH_FILE_MUTEX.lock().expect("auth file mutex poisoned");
+    let _file_lock = lock_auth_file(path)?;
     let mut map = match read_auth_file(path) {
         Ok(m) => m,
         Err(_) => return Ok(()),
@@ -851,6 +927,45 @@ mod tests {
         assert_eq!(got, make_pending());
         remove_pending_login(&path, key).unwrap();
         assert!(load_pending_login(&path, key).is_err());
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn mcp_token_key_separates_server_names_from_codex_namespace() {
+        assert_eq!(mcp_token_key("linear"), "mcp:linear");
+        assert_eq!(mcp_token_key("codex"), "mcp:codex");
+        assert_ne!(mcp_token_key("codex"), CODEX_NAMESPACE);
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn concurrent_namespaced_token_saves_preserve_all_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::sync::Arc::new(dir.path().join("auth.json"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut threads = Vec::new();
+        for name in ["linear", "figma"] {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                save_namespaced_token_at(&path, &mcp_token_key(name), &make_store(42)).unwrap();
+            }));
+        }
+        barrier.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let map = read_auth_file(&path).unwrap();
+        assert!(matches!(
+            map.get("mcp:linear"),
+            Some(AuthEntry::Token(TokenStore { .. }))
+        ));
+        assert!(matches!(
+            map.get("mcp:figma"),
+            Some(AuthEntry::Token(TokenStore { .. }))
+        ));
     }
 
     #[cfg(feature = "mcp")]
