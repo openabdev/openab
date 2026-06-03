@@ -563,6 +563,7 @@ Source: [`client/elicitation.mdx`](https://github.com/modelcontextprotocol/model
 | 420 | Clients MUST treat absent `mode` as form mode | MUST | | |
 | 421 | Form mode elicitation MUST either specify `mode:"form"` or omit `mode`, and include `requestedSchema` | MUST | | |
 | 422 | `requestedSchema` is restricted: flat object, primitive types (string, number/integer, boolean, enum) | (constraint) | | |
+| 422a | `requestedSchema` also supports multi-select enum: `type: "array"` with `items.enum` or `items.anyOf` (fifth schema kind beyond the primitives in row 422) | (constraint) | | |
 | 423 | Supported string formats: `email`, `uri`, `date`, `date-time` | (constraint) | | |
 | 424 | All primitive types support optional default values | (field) | | |
 | 425 | Clients supporting defaults SHOULD pre-populate form fields with default values | SHOULD | | |
