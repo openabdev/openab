@@ -814,3 +814,6 @@ The "Security and Trust & Safety" section of the spec is meta-governance — low
 | 623 | Implementors SHOULD implement appropriate access controls and data protections | SHOULD | | |
 | 624 | Implementors SHOULD follow security best practices in their integrations | SHOULD | | |
 | 625 | Implementors SHOULD consider privacy implications in their feature designs | SHOULD | | |
+| 626 | Host enforces security policies and consent requirements | (role) | | from `architecture/index.mdx` Core Components |
+| 627 | Host handles user authorization decisions | (role) | | from `architecture/index.mdx` Core Components |
+| 628 | Host controls client connection permissions and lifecycle | (role) | | from `architecture/index.mdx` Core Components |
