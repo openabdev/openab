@@ -386,6 +386,12 @@ pub struct PoolConfig {
     /// more wakeups while the agent is streaming normally.
     #[serde(default = "default_liveness_check_secs")]
     pub liveness_check_secs: u64,
+    /// Cut a prompt turn early if no ACP event (notification or result) has
+    /// arrived for this many seconds. Catches the case where the agent starts
+    /// an LLM call mid-turn and that call hangs silently (e.g. large context +
+    /// slow model response). Set to 0 to disable.
+    #[serde(default = "default_acp_inactivity_timeout_secs")]
+    pub acp_inactivity_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -529,6 +535,9 @@ pub(crate) fn default_prompt_hard_timeout_secs() -> u64 {
 pub(crate) fn default_liveness_check_secs() -> u64 {
     30
 }
+pub(crate) fn default_acp_inactivity_timeout_secs() -> u64 {
+    120
+}
 fn default_true() -> bool {
     true
 }
@@ -578,6 +587,7 @@ impl Default for PoolConfig {
             session_ttl_hours: default_ttl_hours(),
             prompt_hard_timeout_secs: default_prompt_hard_timeout_secs(),
             liveness_check_secs: default_liveness_check_secs(),
+            acp_inactivity_timeout_secs: default_acp_inactivity_timeout_secs(),
         }
     }
 }

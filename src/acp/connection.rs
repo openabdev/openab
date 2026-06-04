@@ -120,6 +120,9 @@ pub struct AcpConnection {
     pub config_options: Vec<ConfigOption>,
     pub last_active: Instant,
     pub session_reset: bool,
+    /// Set to true when the recv loop hard-timeout fires. Signals get_or_create
+    /// to kill this process and start a fresh session rather than reusing it.
+    pub force_recreate: bool,
     _reader_handle: JoinHandle<()>,
     _stderr_handle: Option<JoinHandle<()>>,
 }
@@ -411,6 +414,7 @@ impl AcpConnection {
             config_options: Vec::new(),
             last_active: Instant::now(),
             session_reset: false,
+            force_recreate: false,
             _reader_handle: reader_handle,
             _stderr_handle: stderr_handle,
         })

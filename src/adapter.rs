@@ -273,6 +273,8 @@ pub struct AdapterRouter {
     prompt_hard_timeout: std::time::Duration,
     /// Polling cadence for the recv-loop liveness check (#732).
     liveness_check_interval: std::time::Duration,
+    /// Cut early if no ACP event arrives for this long (0 = disabled).
+    acp_inactivity_timeout: std::time::Duration,
 }
 
 impl AdapterRouter {
@@ -282,6 +284,7 @@ impl AdapterRouter {
         table_mode: TableMode,
         prompt_hard_timeout_secs: u64,
         liveness_check_secs: u64,
+        acp_inactivity_timeout_secs: u64,
     ) -> Self {
         if liveness_check_secs >= prompt_hard_timeout_secs {
             warn!(
@@ -298,6 +301,7 @@ impl AdapterRouter {
             table_mode,
             prompt_hard_timeout: std::time::Duration::from_secs(prompt_hard_timeout_secs),
             liveness_check_interval: std::time::Duration::from_secs(liveness_check_secs),
+            acp_inactivity_timeout: std::time::Duration::from_secs(acp_inactivity_timeout_secs),
         }
     }
 
@@ -464,6 +468,7 @@ impl AdapterRouter {
         let tool_display = self.reactions_config.tool_display;
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
+        let acp_inactivity_timeout = self.acp_inactivity_timeout;
 
         self.pool
             .with_connection(thread_key, |conn| {
@@ -529,7 +534,9 @@ impl AdapterRouter {
                     // messages and abandons cleanly on dead agent / hard ceiling
                     // so late responses cannot leak into the next prompt.
                     let mut response_error: Option<String> = None;
+                    let mut last_tool_failure: Option<(String, String)> = None; // (title, output)
                     let prompt_start = tokio::time::Instant::now();
+                    let mut last_acp_event = tokio::time::Instant::now();
                     loop {
                         let notification = tokio::select! {
                             msg = rx.recv() => match msg {
@@ -543,17 +550,41 @@ impl AdapterRouter {
                                     conn.abandon_request(request_id).await;
                                     break;
                                 }
-                                if prompt_start.elapsed() > prompt_hard_timeout {
+                                // Cut early if no ACP event has arrived for a while.
+                                // Catches mid-turn LLM hangs that produce no notifications
+                                // (e.g. large context → slow / timed-out OpenAI call).
+                                if !acp_inactivity_timeout.is_zero()
+                                    && last_acp_event.elapsed() > acp_inactivity_timeout
+                                {
                                     response_error = Some(format!(
+                                        "Agent stopped responding (no activity for {}s)",
+                                        acp_inactivity_timeout.as_secs()
+                                    ));
+                                    conn.force_recreate = true;
+                                    conn.abandon_request(request_id).await;
+                                    break;
+                                }
+                                if prompt_start.elapsed() > prompt_hard_timeout {
+                                    let base = format!(
                                         "Agent exceeded hard timeout ({}s)",
                                         prompt_hard_timeout.as_secs(),
-                                    ));
+                                    );
+                                    response_error = Some(match &last_tool_failure {
+                                        Some((title, output)) => format!(
+                                            "{base}\nLast failed tool: `{title}`\n```\n{}\n```",
+                                            output.chars().take(400).collect::<String>()
+                                        ),
+                                        None => base,
+                                    });
+                                    conn.force_recreate = true;
                                     conn.abandon_request(request_id).await;
                                     break;
                                 }
                                 continue;
                             }
                         };
+                        // Any ACP event resets the inactivity clock.
+                        last_acp_event = tokio::time::Instant::now();
                         if let Some(notification_id) = notification.id {
                             if notification_id != request_id {
                                 // Stale response from a previously-abandoned prompt.
@@ -607,11 +638,12 @@ impl AdapterRouter {
                                         ));
                                     }
                                 }
-                                AcpEvent::ToolDone { id, title, status } => {
+                                AcpEvent::ToolDone { id, title, status, output } => {
                                     reactions.set_thinking().await;
                                     let new_state = if status == "completed" {
                                         ToolState::Completed
                                     } else {
+                                        last_tool_failure = Some((title.clone(), output.unwrap_or_default()));
                                         ToolState::Failed
                                     };
                                     if let Some(slot) = tool_lines.iter_mut().find(|e| e.id == id) {
@@ -669,6 +701,7 @@ impl AdapterRouter {
                     };
 
                     let final_content = markdown::convert_tables(&final_content, table_mode);
+                    tracing::debug!(content_len = final_content.len(), content_preview = &final_content[..final_content.len().min(80)], "final content before chunking");
                     let chunks = format::split_message(&final_content, message_limit);
                     if let Some(msg) = placeholder_msg {
                         if let Some(ref reply_id) = directives.reply_to {
@@ -701,10 +734,16 @@ impl AdapterRouter {
                         } else {
                             // Normal streaming: edit first chunk into placeholder, send rest
                             if let Some(first) = chunks.first() {
-                                let _ = adapter.edit_message(&msg, first).await;
+                                if let Err(e) = adapter.edit_message(&msg, first).await {
+                                    tracing::warn!(error = ?e, content_len = first.len(), "final edit_message failed");
+                                }
+                            } else {
+                                tracing::warn!("final chunks empty, nothing to edit into placeholder");
                             }
                             for chunk in chunks.iter().skip(1) {
-                                let _ = adapter.send_message(&thread_channel, chunk).await;
+                                if let Err(e) = adapter.send_message(&thread_channel, chunk).await {
+                                    tracing::warn!(error = ?e, "overflow chunk send_message failed");
+                                }
                             }
                         }
                     } else {

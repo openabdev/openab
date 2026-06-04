@@ -128,10 +128,15 @@ impl SessionPool {
         let mut saved_session_id = saved_session_id;
         if let Some(conn) = existing.clone() {
             let conn = conn.lock().await;
-            if conn.alive() {
+            if conn.alive() && !conn.force_recreate {
                 return Ok(());
             }
-            if saved_session_id.is_none() {
+            if conn.force_recreate {
+                // Hard timeout fired: kill this process and start a completely
+                // fresh session. Don't load the old session_id — it may have
+                // pending background work that caused the timeout in the first place.
+                warn!(thread_id, "force_recreate set after hard timeout, discarding stuck session");
+            } else if saved_session_id.is_none() {
                 saved_session_id = conn.acp_session_id.clone();
             }
         }
@@ -220,7 +225,7 @@ impl SessionPool {
             let Ok(existing) = existing.try_lock() else {
                 return Ok(());
             };
-            if existing.alive() {
+            if existing.alive() && !existing.force_recreate {
                 return Ok(());
             }
             warn!(thread_id, "stale connection, rebuilding");
