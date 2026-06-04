@@ -19,10 +19,11 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use rmcp::service::{RoleClient, RunningService};
+use rmcp::model::{ErrorData, ListRootsRequestMethod, ListRootsResult};
+use rmcp::service::{RequestContext, RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
-use rmcp::ServiceExt;
+use rmcp::{ClientHandler, ServiceExt};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::RwLock;
@@ -37,6 +38,27 @@ use crate::auth::{
     remove_pending_login, save_namespaced_token_at, save_pending_login, PendingPasteLogin,
     TokenStore,
 };
+
+/// MCP client-side callback handler. Replaces the unit type `()` so individual
+/// `ClientHandler` callbacks can be overridden (the named struct is the
+/// keystone that unlocks `on_tool_list_changed` / `on_resource_updated` /
+/// `on_prompt_list_changed` / elicitation-complete wiring later). Currently
+/// overrides only `list_roots`, returning JSON-RPC `-32601` (method not found)
+/// instead of the SDK default's empty roots list, because we advertise no
+/// `roots` capability (spec rows 365/370). `get_info()` is deliberately NOT
+/// overridden: inheriting the trait default keeps the advertised ClientInfo +
+/// capabilities byte-identical to the previous `()` handler.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenabClientHandler;
+
+impl ClientHandler for OpenabClientHandler {
+    fn list_roots(
+        &self,
+        _context: RequestContext<RoleClient>,
+    ) -> impl std::future::Future<Output = Result<ListRootsResult, ErrorData>> + Send + '_ {
+        std::future::ready(Err(ErrorData::method_not_found::<ListRootsRequestMethod>()))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerStatus {
@@ -67,7 +89,7 @@ pub struct ServerHandle {
     /// short read lock, drop the guard, and then run `peer.list_all_tools()`
     /// / `peer.call_tool()` without holding any runtime lock across the
     /// I/O `.await` (avoids writer starvation + `Future is not Send` traps).
-    pub client: Option<Arc<RunningService<RoleClient, ()>>>,
+    pub client: Option<Arc<RunningService<RoleClient, OpenabClientHandler>>>,
 }
 
 impl std::fmt::Debug for ServerHandle {
@@ -228,7 +250,10 @@ impl McpRuntimeManager {
     /// Errors if the server isn't configured or isn't currently
     /// `Connected`. Callers that want lazy-connect should run
     /// `connect(name)` first.
-    pub async fn arc_peer(&self, name: &str) -> Result<Arc<RunningService<RoleClient, ()>>> {
+    pub async fn arc_peer(
+        &self,
+        name: &str,
+    ) -> Result<Arc<RunningService<RoleClient, OpenabClientHandler>>> {
         let guard = self.handles.read().await;
         let handle = guard
             .get(name)
@@ -1162,7 +1187,7 @@ enum Dial {
 }
 
 impl Dial {
-    async fn run(self, name: &str) -> Result<RunningService<RoleClient, ()>> {
+    async fn run(self, name: &str) -> Result<RunningService<RoleClient, OpenabClientHandler>> {
         match self {
             Dial::Stdio { command, args, env } => {
                 let cmd = Command::new(&command).configure(|c| {
@@ -1188,7 +1213,7 @@ impl Dial {
                         }
                     });
                 }
-                ().serve(transport)
+                OpenabClientHandler.serve(transport)
                     .await
                     .with_context(|| format!("mcp handshake with {command:?}"))
             }
@@ -1201,7 +1226,7 @@ impl Dial {
                     }
                     None => StreamableHttpClientTransport::from_uri(url.as_str()),
                 };
-                ().serve(transport)
+                OpenabClientHandler.serve(transport)
                     .await
                     .with_context(|| format!("mcp handshake with {url:?}"))
             }
