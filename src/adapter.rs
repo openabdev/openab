@@ -39,7 +39,12 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
                         "reply_to" => {
                             let v = value.trim();
                             // Validate: non-empty, reasonable length, no whitespace/control chars
-                            if !v.is_empty() && v.len() <= 64 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_') {
+                            if !v.is_empty()
+                                && v.len() <= 64
+                                && v.chars().all(|c| {
+                                    c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'
+                                })
+                            {
                                 directives.reply_to = Some(v.to_string());
                             }
                         }
@@ -564,7 +569,12 @@ impl AdapterRouter {
                                 continue;
                             }
                             if let Some(ref err) = notification.error {
-                                response_error = Some(format_coded_error(err.code, &err.message, err.data_message()));
+                                let detail = err.user_detail();
+                                response_error = Some(format_coded_error(
+                                    err.code,
+                                    &err.message,
+                                    detail.as_deref(),
+                                ));
                             }
                             break;
                         }

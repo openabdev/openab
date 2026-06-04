@@ -72,12 +72,41 @@ impl JsonRpcError {
             .and_then(|d| d.get("message"))
             .and_then(|m| m.as_str())
     }
+
+    /// Extract the most useful user-facing detail from `error.data`.
+    ///
+    /// codex-acp may put a JSON-encoded upstream error inside
+    /// `error.data.message`. When that shape is present, prefer the nested
+    /// `error.message`; if parsing fails, fall back to the original string.
+    pub fn user_detail(&self) -> Option<String> {
+        let data = self.data.as_ref()?;
+
+        if let Some(message) = self.data_message() {
+            return Some(extract_nested_error_message(message).unwrap_or_else(|| message.into()));
+        }
+
+        data.get("details")
+            .and_then(|d| d.as_str())
+            .map(str::to_owned)
+    }
+}
+
+fn extract_nested_error_message(message: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(message).ok()?;
+
+    parsed
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .or_else(|| parsed.get("message").and_then(|m| m.as_str()))
+        .filter(|m| !m.is_empty())
+        .map(str::to_owned)
 }
 
 impl std::fmt::Display for JsonRpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "JSON-RPC error {}: {}", self.code, self.message)?;
-        if let Some(detail) = self.data_message() {
+        if let Some(detail) = self.user_detail() {
             write!(f, " — {detail}")?;
         }
         Ok(())
@@ -402,5 +431,45 @@ mod tests {
         let opts = parse_config_options(&result);
         assert_eq!(opts.len(), 1);
         assert_eq!(opts[0].id, "model");
+    }
+
+    #[test]
+    fn user_detail_extracts_codex_nested_error_message() {
+        let err = JsonRpcError {
+            code: -32603,
+            message: "Internal error".into(),
+            data: Some(json!({
+                "message": "{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"model not supported\"}}",
+                "codex_error_info": "other"
+            })),
+        };
+
+        assert_eq!(err.user_detail().as_deref(), Some("model not supported"));
+    }
+
+    #[test]
+    fn user_detail_falls_back_to_raw_message_when_nested_json_parse_fails() {
+        let err = JsonRpcError {
+            code: -32603,
+            message: "Internal error".into(),
+            data: Some(json!({
+                "message": "plain upstream error"
+            })),
+        };
+
+        assert_eq!(err.user_detail().as_deref(), Some("plain upstream error"));
+    }
+
+    #[test]
+    fn user_detail_uses_details_when_message_is_absent() {
+        let err = JsonRpcError {
+            code: -32603,
+            message: "Internal error".into(),
+            data: Some(json!({
+                "details": "gateway disconnected"
+            })),
+        };
+
+        assert_eq!(err.user_detail().as_deref(), Some("gateway disconnected"));
     }
 }
