@@ -256,34 +256,87 @@ async fn fetch_tools(manager: &McpRuntimeManager, server: &str) -> Result<Vec<rm
     Ok(tools)
 }
 
+/// Compact projection of an MCP `Tool` shared by `list_tools` and
+/// `describe_tool`. Surfaces the spec metadata an LLM needs to choose a
+/// tool: display `title`, behavioural `annotations` hints, and the
+/// `task_support` execution mode. `input_schema`/`output_schema`/`icons`
+/// are left for `describe_tool` to attach (progressive disclosure).
+fn tool_summary(t: &rmcp::model::Tool) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert("name".into(), Value::String(t.name.to_string()));
+    if let Some(title) = &t.title {
+        map.insert("title".into(), Value::String(title.clone()));
+    }
+    if let Some(description) = &t.description {
+        map.insert("description".into(), Value::String(description.to_string()));
+    }
+    if let Some(ann) = &t.annotations {
+        let mut a = serde_json::Map::new();
+        if let Some(v) = &ann.title {
+            a.insert("title".into(), Value::String(v.clone()));
+        }
+        if let Some(v) = ann.read_only_hint {
+            a.insert("read_only_hint".into(), Value::Bool(v));
+        }
+        if let Some(v) = ann.destructive_hint {
+            a.insert("destructive_hint".into(), Value::Bool(v));
+        }
+        if let Some(v) = ann.idempotent_hint {
+            a.insert("idempotent_hint".into(), Value::Bool(v));
+        }
+        if let Some(v) = ann.open_world_hint {
+            a.insert("open_world_hint".into(), Value::Bool(v));
+        }
+        if !a.is_empty() {
+            map.insert("annotations".into(), Value::Object(a));
+        }
+    }
+    let ts = serde_json::to_value(t.task_support()).unwrap_or(Value::String("forbidden".into()));
+    map.insert("task_support".into(), ts);
+    Value::Object(map)
+}
+
 async fn list_tools(manager: &McpRuntimeManager, server: &str) -> Result<Value> {
     let entries: Vec<Value> = fetch_tools(manager, server)
         .await?
         .into_iter()
-        .map(|t| {
-            json!({
-                "name": t.name,
-                "description": t.description,
-            })
-        })
+        .map(|t| tool_summary(&t))
         .collect();
     Ok(Value::Array(entries))
 }
 
 async fn describe_tool(manager: &McpRuntimeManager, server: &str, tool: &str) -> Result<Value> {
-    // Progressive disclosure (ADR §5.2): `list_tools` returns compact
-    // `{name, description}`; this action returns the full `input_schema`
-    // for one tool. MCP has no single-tool query, so we list + filter.
+    // Progressive disclosure (ADR §5.2): `list_tools` returns the compact
+    // `tool_summary`; this action adds the full `input_schema` (plus
+    // `output_schema`/`icons` when present) for one tool. MCP has no
+    // single-tool query, so we list + filter.
     let tool_def = fetch_tools(manager, server)
         .await?
         .into_iter()
         .find(|t| t.name.as_ref() == tool)
         .ok_or_else(|| anyhow!("no tool {tool:?} on mcp server {server:?}"))?;
-    Ok(json!({
-        "name": tool_def.name,
-        "description": tool_def.description,
-        "input_schema": tool_def.input_schema,
-    }))
+    let mut summary = tool_summary(&tool_def);
+    let obj = summary
+        .as_object_mut()
+        .expect("tool_summary always returns a JSON object");
+    obj.insert(
+        "input_schema".into(),
+        serde_json::to_value(&tool_def.input_schema)
+            .context("serialize tool input_schema")?,
+    );
+    if let Some(output_schema) = &tool_def.output_schema {
+        obj.insert(
+            "output_schema".into(),
+            serde_json::to_value(output_schema).context("serialize tool output_schema")?,
+        );
+    }
+    if let Some(icons) = &tool_def.icons {
+        obj.insert(
+            "icons".into(),
+            serde_json::to_value(icons).context("serialize tool icons")?,
+        );
+    }
+    Ok(summary)
 }
 
 async fn status(manager: &McpRuntimeManager, filter: Option<&str>) -> Value {
