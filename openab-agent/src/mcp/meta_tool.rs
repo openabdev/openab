@@ -10,12 +10,12 @@ use anyhow::{anyhow, Context, Result};
 use rmcp::model::{
     CallToolRequest, ClientRequest, ListToolsRequest, PaginatedRequestParams, ServerResult,
 };
-use rmcp::service::{PeerRequestOptions, ServiceError};
+use rmcp::service::{PeerRequestOptions, RoleClient, RunningService, ServiceError};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::runtime::{McpRuntimeManager, ServerStatus};
+use super::runtime::{McpRuntimeManager, OpenabClientHandler, ServerStatus};
 
 /// Deserialized form of the meta-tool's input JSON (ADR §5.2). The LLM
 /// sends `{ "action": "...", ... }`; `tag = "action"` routes by that field.
@@ -77,6 +77,25 @@ Connections are lazy: the first action that needs a server spawns its \
 child process and runs the handshake. Idle servers are evicted after \
 the configured TTL.";
 
+/// Fail fast if the server never advertised the `tools` capability in its
+/// `InitializeResult`. Without this guard a `tools/list` or `tools/call`
+/// against such a server surfaces as a generic JSON-RPC error; here we turn
+/// it into a clear, server-named diagnostic (MCP capability gating, Row 65).
+fn ensure_tools_capability(
+    peer: &RunningService<RoleClient, OpenabClientHandler>,
+    server: &str,
+) -> Result<()> {
+    let info = peer
+        .peer_info()
+        .ok_or_else(|| anyhow!("mcp server {server:?} returned no initialize result"))?;
+    if info.capabilities.tools.is_none() {
+        return Err(anyhow!(
+            "mcp server {server:?} does not advertise tools capability"
+        ));
+    }
+    Ok(())
+}
+
 async fn call_tool(
     manager: &McpRuntimeManager,
     server: &str,
@@ -115,6 +134,8 @@ async fn call_tool(
         .await
         .with_context(|| format!("connect mcp server {server:?}"))?;
     let peer = manager.arc_peer(server).await?;
+    ensure_tools_capability(&peer, server)
+        .with_context(|| format!("call_tool {tool:?} on {server:?}"))?;
     let timeout = manager.request_timeout(server).await;
     let params = rmcp::model::CallToolRequestParams::new(tool.to_string()).with_arguments(args_map);
     let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
@@ -202,6 +223,8 @@ async fn fetch_tools(manager: &McpRuntimeManager, server: &str) -> Result<Vec<rm
         .await
         .with_context(|| format!("connect mcp server {server:?}"))?;
     let peer = manager.arc_peer(server).await?;
+    ensure_tools_capability(&peer, server)
+        .with_context(|| format!("list_tools on {server:?}"))?;
     let timeout = manager.request_timeout(server).await;
     // Manual pagination mirroring rmcp's `list_all_tools`, but per-page
     // bounded by the configured request timeout (ADR §5.6). rmcp's helper
