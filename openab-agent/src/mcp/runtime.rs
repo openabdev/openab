@@ -19,8 +19,11 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use rmcp::model::{ErrorData, ListRootsRequestMethod, ListRootsResult};
-use rmcp::service::{RequestContext, RoleClient, RunningService};
+use rmcp::model::{
+    ErrorData, ListRootsRequestMethod, ListRootsResult, LoggingLevel,
+    LoggingMessageNotificationParam,
+};
+use rmcp::service::{NotificationContext, RequestContext, RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{ClientHandler, ServiceExt};
@@ -57,6 +60,63 @@ impl ClientHandler for OpenabClientHandler {
         _context: RequestContext<RoleClient>,
     ) -> impl std::future::Future<Output = Result<ListRootsResult, ErrorData>> + Send + '_ {
         std::future::ready(Err(ErrorData::method_not_found::<ListRootsRequestMethod>()))
+    }
+
+    fn on_logging_message(
+        &self,
+        params: LoggingMessageNotificationParam,
+        context: NotificationContext<RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        let server = context
+            .peer
+            .peer_info()
+            .map(|i| i.server_info.name.clone())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let logger = params.logger.clone().unwrap_or_default();
+
+        // Never log `params.data` contents — a compromised server could smuggle
+        // secrets through its log payloads (row 590 is aspirational). Record only
+        // the JSON shape and, for strings, the byte length.
+        let data_kind = match &params.data {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "bool",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Object(_) => "object",
+        };
+        let data_bytes = match &params.data {
+            serde_json::Value::String(s) => s.len(),
+            _ => 0,
+        };
+
+        match params.level {
+            LoggingLevel::Debug => tracing::debug!(
+                target: "mcp.server_log",
+                server = %server, logger = %logger, level = "debug",
+                data_kind, data_bytes, "mcp server log message"
+            ),
+            LoggingLevel::Info | LoggingLevel::Notice => tracing::info!(
+                target: "mcp.server_log",
+                server = %server, logger = %logger, level = "info",
+                data_kind, data_bytes, "mcp server log message"
+            ),
+            LoggingLevel::Warning => tracing::warn!(
+                target: "mcp.server_log",
+                server = %server, logger = %logger, level = "warning",
+                data_kind, data_bytes, "mcp server log message"
+            ),
+            LoggingLevel::Error
+            | LoggingLevel::Critical
+            | LoggingLevel::Alert
+            | LoggingLevel::Emergency => tracing::error!(
+                target: "mcp.server_log",
+                server = %server, logger = %logger, level = ?params.level,
+                data_kind, data_bytes, "mcp server log message"
+            ),
+        }
+
+        std::future::ready(())
     }
 }
 
