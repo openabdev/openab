@@ -54,8 +54,50 @@ use crate::auth::{
 /// deliberately NOT overridden: inheriting the trait default keeps the
 /// advertised ClientInfo + capabilities byte-identical to the previous `()`
 /// handler.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct OpenabClientHandler;
+/// Per-server cache of the most recent successful `tools/list` page, keyed by
+/// configured server name. Deliberately a sibling `Arc` on the manager rather
+/// than a field on `ServerHandle`: the handler holds a clone of this same `Arc`
+/// and evicts its own entry on `notifications/tools/list_changed`, so parking it
+/// on `ServerHandle` (which transitively owns the handler via `RunningService`)
+/// would close an `Arc` cycle and leak. `StdMutex` is fine — the lock only
+/// guards `HashMap` ops, never held across `.await` (row 503).
+type ToolsCache = Arc<StdMutex<HashMap<String, Vec<rmcp::model::Tool>>>>;
+
+#[derive(Clone, Debug, Default)]
+pub struct OpenabClientHandler {
+    /// Configured server name this connection belongs to. One handler
+    /// instance per connection, so the handler can evict its own cache entry
+    /// without the notification context (which carries no string server id).
+    /// Empty only for the `Default` handler used by `get_info()`-only tests.
+    server_name: String,
+    /// Clone of the manager's per-server tools cache (`ToolsCache`). On
+    /// `tools/list_changed` this handler drops its `server_name` entry so the
+    /// next `fetch_tools` re-fetches (row 503).
+    tools_cache: ToolsCache,
+}
+
+impl OpenabClientHandler {
+    fn new(server_name: String, tools_cache: ToolsCache) -> Self {
+        Self {
+            server_name,
+            tools_cache,
+        }
+    }
+
+    /// Evict this connection's cached `tools/list` page. Called from
+    /// `on_tool_list_changed`; factored out so it can be unit-tested without
+    /// fabricating a `NotificationContext` (row 503).
+    fn invalidate_tools_cache(&self) {
+        if let Ok(mut cache) = self.tools_cache.lock() {
+            cache.remove(&self.server_name);
+        }
+        tracing::debug!(
+            target: "mcp.cache",
+            server = %self.server_name,
+            "tools/list_changed: invalidated tools cache"
+        );
+    }
+}
 
 impl ClientHandler for OpenabClientHandler {
     fn list_roots(
@@ -134,6 +176,18 @@ impl ClientHandler for OpenabClientHandler {
             ),
         }
 
+        std::future::ready(())
+    }
+
+    fn on_tool_list_changed(
+        &self,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        // The server announced its tool set changed: drop the cached page so
+        // the next `fetch_tools` re-fetches (row 503). We identify the server
+        // by this handler's own `server_name` — one handler per connection —
+        // because the notification context carries no string server id.
+        self.invalidate_tools_cache();
         std::future::ready(())
     }
 }
@@ -254,6 +308,11 @@ pub struct McpRuntimeManager {
     /// is safe to read without locking. Used by the system-prompt catalogue
     /// (PR #959 F1 discovery slice).
     catalog: Arc<[CatalogEntry]>,
+    /// Per-server `tools/list` cache (see `ToolsCache`). Populated by
+    /// `fetch_tools`, evicted by `OpenabClientHandler::on_tool_list_changed`
+    /// (which holds a clone of this exact `Arc`). Spares the hot tool-call
+    /// path a `tools/list` round-trip for the task-support guard (row 503).
+    tools_cache: ToolsCache,
 }
 
 impl McpRuntimeManager {
@@ -293,6 +352,21 @@ impl McpRuntimeManager {
             refresh_locks: Arc::new(StdMutex::new(HashMap::new())),
             breaker: Arc::new(ServerBreaker::new()),
             catalog: catalog.into(),
+            tools_cache: Arc::new(StdMutex::new(HashMap::new())),
+        }
+    }
+
+    /// Cached `tools/list` page for `server`, if a prior `fetch_tools`
+    /// populated it and no `tools/list_changed` invalidated it since. Clones
+    /// out so callers hold no lock across the result (row 503).
+    pub(crate) fn cached_tools(&self, server: &str) -> Option<Vec<rmcp::model::Tool>> {
+        self.tools_cache.lock().ok()?.get(server).cloned()
+    }
+
+    /// Store the freshly-fetched `tools/list` page for `server` (row 503).
+    pub(crate) fn store_tools(&self, server: &str, tools: &[rmcp::model::Tool]) {
+        if let Ok(mut cache) = self.tools_cache.lock() {
+            cache.insert(server.to_string(), tools.to_vec());
         }
     }
 
@@ -1035,7 +1109,7 @@ impl McpRuntimeManager {
             }
         };
 
-        let dial_result = dial.run(name).await;
+        let dial_result = dial.run(name, self.tools_cache.clone()).await;
 
         let mut guard = self.handles.write().await;
         let handle = guard
@@ -1376,7 +1450,11 @@ enum Dial {
 }
 
 impl Dial {
-    async fn run(self, name: &str) -> Result<RunningService<RoleClient, OpenabClientHandler>> {
+    async fn run(
+        self,
+        name: &str,
+        tools_cache: ToolsCache,
+    ) -> Result<RunningService<RoleClient, OpenabClientHandler>> {
         match self {
             Dial::Stdio { command, args, env } => {
                 let cmd = Command::new(&command).configure(|c| {
@@ -1402,7 +1480,8 @@ impl Dial {
                         }
                     });
                 }
-                OpenabClientHandler.serve(transport)
+                OpenabClientHandler::new(name.to_string(), tools_cache)
+                    .serve(transport)
                     .await
                     .with_context(|| format!("mcp handshake with {command:?}"))
             }
@@ -1415,7 +1494,8 @@ impl Dial {
                     }
                     None => StreamableHttpClientTransport::from_uri(url.as_str()),
                 };
-                OpenabClientHandler.serve(transport)
+                OpenabClientHandler::new(name.to_string(), tools_cache)
+                    .serve(transport)
                     .await
                     .with_context(|| format!("mcp handshake with {url:?}"))
             }
@@ -1499,11 +1579,31 @@ mod tests {
         // (`create_elicitation`) with -32602. If a future change wires any of
         // them, it MUST flip the corresponding capability — and this test will
         // fail, forcing a deliberate re-audit (spec rows 365/370/439, §390).
-        let caps = OpenabClientHandler.get_info().capabilities;
+        let caps = OpenabClientHandler::default().get_info().capabilities;
         assert!(caps.sampling.is_none(), "must not advertise sampling");
         assert!(caps.roots.is_none(), "must not advertise roots");
         assert!(caps.elicitation.is_none(), "must not advertise elicitation");
         assert!(caps.tasks.is_none(), "must not advertise tasks");
+    }
+
+    #[test]
+    fn on_tool_list_changed_evicts_only_its_own_server() {
+        // Two handlers sharing one cache (as connections do via the manager's
+        // sibling `Arc`): each evicts only its own `server_name` entry, leaving
+        // the others warm (row 503).
+        let cache: ToolsCache = Arc::new(StdMutex::new(HashMap::new()));
+        cache
+            .lock()
+            .unwrap()
+            .insert("alpha".to_string(), Vec::new());
+        cache.lock().unwrap().insert("beta".to_string(), Vec::new());
+
+        let alpha = OpenabClientHandler::new("alpha".to_string(), cache.clone());
+        alpha.invalidate_tools_cache();
+
+        let guard = cache.lock().unwrap();
+        assert!(!guard.contains_key("alpha"), "alpha entry must be evicted");
+        assert!(guard.contains_key("beta"), "beta entry must survive");
     }
 
     #[test]

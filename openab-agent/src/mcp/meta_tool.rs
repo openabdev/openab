@@ -141,8 +141,8 @@ async fn call_tool(
     // the MCP spec mandates such tools be driven through the `tasks` augmentation
     // flow, which openab-agent does not implement. Reject before the wire call so
     // the LLM gets a clear reason instead of a server-side protocol error (rows
-    // 492/289). This costs one extra `tools/list` round-trip per call until the
-    // planned per-server tools cache (Row 503) lands and can serve the lookup.
+    // 492/289). The lookup is served from the per-server tools cache (row 503)
+    // when warm, so it normally costs no extra `tools/list` round-trip.
     if fetch_tools(manager, server)
         .await?
         .iter()
@@ -240,10 +240,15 @@ async fn call_tool(
 }
 
 /// Lazy-connect + list all tools on `server`. Shared by `list_tools` /
-/// `describe_tool` (and the planned `tools_cache` on ServerHandle will plug
-/// in here). The `Arc<RunningService>` clone lets the I/O `.await` run with
-/// no runtime lock held.
+/// `describe_tool` / the `call` task-support guard. Serves from the manager's
+/// per-server tools cache when warm (row 503) — the cache is evicted by
+/// `OpenabClientHandler::on_tool_list_changed`, so a hit is current. On a miss
+/// it paginates `tools/list` and repopulates. The `Arc<RunningService>` clone
+/// lets the I/O `.await` run with no runtime lock held.
 async fn fetch_tools(manager: &McpRuntimeManager, server: &str) -> Result<Vec<rmcp::model::Tool>> {
+    if let Some(cached) = manager.cached_tools(server) {
+        return Ok(cached);
+    }
     manager
         .connect(server)
         .await
@@ -302,6 +307,7 @@ async fn fetch_tools(manager: &McpRuntimeManager, server: &str) -> Result<Vec<rm
             }
         }
     }
+    manager.store_tools(server, &tools);
     Ok(tools)
 }
 
