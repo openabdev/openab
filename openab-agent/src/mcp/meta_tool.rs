@@ -9,6 +9,7 @@ use std::time::Instant;
 use anyhow::{anyhow, Context, Result};
 use rmcp::model::{
     CallToolRequest, ClientRequest, ListToolsRequest, PaginatedRequestParams, ServerResult,
+    TaskSupport,
 };
 use rmcp::service::{PeerRequestOptions, RoleClient, RunningService, ServiceError};
 use serde::Deserialize;
@@ -136,6 +137,31 @@ async fn call_tool(
     let peer = manager.arc_peer(server).await?;
     ensure_tools_capability(&peer, server)
         .with_context(|| format!("call_tool {tool:?} on {server:?}"))?;
+    // Refuse a `call` on a tool that declares execution.taskSupport == "required":
+    // the MCP spec mandates such tools be driven through the `tasks` augmentation
+    // flow, which openab-agent does not implement. Reject before the wire call so
+    // the LLM gets a clear reason instead of a server-side protocol error (rows
+    // 492/289). This costs one extra `tools/list` round-trip per call until the
+    // planned per-server tools cache (Row 503) lands and can serve the lookup.
+    if fetch_tools(manager, server)
+        .await?
+        .iter()
+        .any(|t| t.name.as_ref() == tool && t.task_support() == TaskSupport::Required)
+    {
+        tracing::info!(
+            target: "mcp.audit",
+            server,
+            tool,
+            args_sha256 = %args_sha256,
+            duration_ms = started.elapsed().as_millis() as u64,
+            outcome = "refused",
+            is_error = true,
+            "mcp call_tool exit"
+        );
+        return Err(anyhow!(
+            "tool {tool:?} on {server:?} declares taskSupport=\"required\"; openab-agent does not implement the MCP tasks augmentation flow, so this tool cannot be invoked"
+        ));
+    }
     let timeout = manager.request_timeout(server).await;
     let params = rmcp::model::CallToolRequestParams::new(tool.to_string()).with_arguments(args_map);
     let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
@@ -314,8 +340,20 @@ fn tool_summary(t: &rmcp::model::Tool) -> Value {
             map.insert("annotations".into(), Value::Object(a));
         }
     }
-    let ts = serde_json::to_value(t.task_support()).unwrap_or(Value::String("forbidden".into()));
+    let support = t.task_support();
+    let ts = serde_json::to_value(support).unwrap_or(Value::String("forbidden".into()));
     map.insert("task_support".into(), ts);
+    if support == TaskSupport::Required {
+        // We do not implement the MCP `tasks` augmentation flow, so a tool that
+        // *requires* it cannot be invoked. Mark it unavailable (rather than
+        // dropping it) so the LLM sees the tool exists but knows not to call it,
+        // and why (rows 289/617). The `call` path enforces the same refusal.
+        map.insert("available".into(), Value::Bool(false));
+        map.insert(
+            "unavailable_reason".into(),
+            Value::String("requires task augmentation (not implemented)".into()),
+        );
+    }
     Value::Object(map)
 }
 
@@ -434,6 +472,31 @@ mod tests {
         let s = result.as_str().unwrap();
         assert!(s.contains("list_servers"));
         assert!(s.contains("call(server, tool"));
+    }
+
+    #[test]
+    fn tool_summary_marks_required_task_support_unavailable() {
+        use rmcp::model::{Tool, ToolExecution};
+        use std::sync::Arc;
+        let schema = Arc::new(serde_json::Map::new());
+
+        let required = Tool::new("planner", "long task", schema.clone())
+            .with_execution(ToolExecution::new().with_task_support(TaskSupport::Required));
+        let v = tool_summary(&required);
+        assert_eq!(v["task_support"], Value::String("required".into()));
+        assert_eq!(v["available"], Value::Bool(false));
+        assert_eq!(
+            v["unavailable_reason"],
+            Value::String("requires task augmentation (not implemented)".into())
+        );
+
+        // No execution metadata => defaults to forbidden and stays available
+        // (no diagnostic fields added).
+        let plain = Tool::new("echo", "echoes", schema);
+        let v2 = tool_summary(&plain);
+        assert_eq!(v2["task_support"], Value::String("forbidden".into()));
+        assert!(v2.get("available").is_none());
+        assert!(v2.get("unavailable_reason").is_none());
     }
 
     #[tokio::test]
