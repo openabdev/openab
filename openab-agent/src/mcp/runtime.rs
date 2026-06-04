@@ -970,10 +970,17 @@ impl McpRuntimeManager {
                 Ok(())
             }
             Err(e) => {
-                let msg = format!("{e:#}");
-                handle.status = ServerStatus::Failed(msg.clone());
+                // Full (redacted) chain to tracing for operators; concise
+                // (redacted) message to the caller-facing status + returned
+                // error (row 37b: brevity for the LLM, detail in the logs).
+                tracing::warn!(
+                    server = %name,
+                    "mcp connect failed: {}",
+                    super::redact_secrets(&format!("{e:#}"))
+                );
+                handle.status = ServerStatus::Failed(super::concise_error_message(&e));
                 self.breaker.record_failure(name);
-                Err(anyhow!(msg))
+                Err(anyhow!(super::concise_error_message(&e)))
             }
         }
     }

@@ -187,7 +187,7 @@ impl Agent {
                     Err(e) => {
                         tool_results.push(ContentBlock::ToolResult {
                             tool_use_id: id.clone(),
-                            content: format!("Error: {e}"),
+                            content: format!("Error: {}", crate::mcp::concise_error_message(&e)),
                             is_error: Some(true),
                         });
                     }

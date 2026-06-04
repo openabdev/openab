@@ -15,6 +15,157 @@ use config::{McpConfig, ServerConfig};
 
 pub use runtime::McpRuntimeManager;
 
+/// Secret-key tokens (lowercased) whose following value [`redact_secrets`]
+/// masks. Conservative, always-on built-in set — the env/`redact.toml`
+/// configurable variant from the spec note (Section 17 §4) is deferred as
+/// YAGNI; a fixed list covers the realistic leak vectors without a config
+/// surface or a new dependency.
+const REDACT_KEYS: &[&str] = &[
+    "authorization",
+    "access_token",
+    "refresh_token",
+    "client_secret",
+    "api_key",
+    "apikey",
+    "api-key",
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "bearer",
+];
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// AWS access key id: `AKIA` + 16 upper-alnum, not embedded in a longer token.
+fn is_akia(bytes: &[u8], i: usize) -> bool {
+    if i + 20 > bytes.len() || &bytes[i..i + 4] != b"AKIA" {
+        return false;
+    }
+    if i > 0 && is_word_byte(bytes[i - 1]) {
+        return false;
+    }
+    if !bytes[i + 4..i + 20]
+        .iter()
+        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    {
+        return false;
+    }
+    !(i + 20 < bytes.len() && (bytes[i + 20].is_ascii_uppercase() || bytes[i + 20].is_ascii_digit()))
+}
+
+/// If a [`REDACT_KEYS`] entry starts at `i` (on a word boundary and not part of
+/// a longer identifier), return its byte length + canonical form.
+fn match_key(lower: &[u8], i: usize) -> Option<(usize, &'static str)> {
+    for &k in REDACT_KEYS {
+        let kb = k.as_bytes();
+        let end = i + kb.len();
+        if end <= lower.len() && &lower[i..end] == kb {
+            if end < lower.len() && is_word_byte(lower[end]) {
+                continue; // e.g. "tokenizer" must not match "token"
+            }
+            return Some((kb.len(), k));
+        }
+    }
+    None
+}
+
+/// Mask secret-like values in a string before it is emitted on one of *our own*
+/// tracing / audit / error surfaces (Section 17 §4 / row 624). We can only
+/// enforce this on text we author — inbound server log payloads remain the
+/// server's authorship obligation (rows 590 / 592-594), so this pairs with
+/// (it does not replace) that server-side duty.
+///
+/// Masks: (a) the value after a known secret key + `=`/`:` separator (handling
+/// a quoted JSON key like `"token": "v"`), with `authorization`/`bearer` values
+/// running to end-of-field so `Bearer <jwt>` is fully hidden; (b) AWS access key
+/// IDs. Conservative: it only rewrites runs anchored to a secret keyword, so
+/// ordinary diagnostic text passes through unchanged.
+pub fn redact_secrets(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let lower = input.to_ascii_lowercase();
+    let lb = lower.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n);
+    let mut i = 0;
+    while i < n {
+        if is_akia(bytes, i) {
+            out.push_str("AKIA");
+            out.push_str(&"*".repeat(16));
+            i += 20;
+            continue;
+        }
+        if let Some((klen, key)) = match_key(lb, i) {
+            let at_boundary = i == 0 || !is_word_byte(bytes[i - 1]);
+            if at_boundary {
+                // optional closing quote of a quoted key, then spaces, then sep
+                let mut p = i + klen;
+                if p < n && (bytes[p] == b'"' || bytes[p] == b'\'') {
+                    p += 1;
+                }
+                while p < n && (bytes[p] == b' ' || bytes[p] == b'\t') {
+                    p += 1;
+                }
+                if p < n && (bytes[p] == b'=' || bytes[p] == b':') {
+                    out.push_str(&input[i..=p]); // key + closing-quote/spaces + separator
+                    let mut j = p + 1;
+                    while j < n && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                        out.push(' ');
+                        j += 1;
+                    }
+                    let quote = if j < n && (bytes[j] == b'"' || bytes[j] == b'\'') {
+                        let q = bytes[j];
+                        out.push(q as char);
+                        j += 1;
+                        Some(q)
+                    } else {
+                        None
+                    };
+                    let run_to_eof = matches!(key, "authorization" | "bearer");
+                    let start = j;
+                    while j < n {
+                        let b = bytes[j];
+                        let stop = match quote {
+                            Some(q) => b == q,
+                            None if run_to_eof => {
+                                matches!(b, b',' | b'\n' | b'\r' | b'"' | b'\'' | b'}')
+                            }
+                            None => matches!(
+                                b,
+                                b' ' | b'\t' | b',' | b'&' | b';' | b'\n' | b'\r' | b'}' | b')'
+                                    | b'"' | b'\''
+                            ),
+                        };
+                        if stop {
+                            break;
+                        }
+                        j += 1;
+                    }
+                    if j > start {
+                        out.push_str("***");
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        let ch = input[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Brief, redacted error string for surfaces the caller / LLM sees (row 37b).
+/// Uses anyhow's outermost context line (`{err}`) — NOT the full `{err:#}`
+/// chain, which stays in `tracing` for operators — then runs [`redact_secrets`]
+/// so a credential that leaked into the message text never reaches the model.
+pub fn concise_error_message(err: &anyhow::Error) -> String {
+    redact_secrets(&err.to_string())
+}
+
 /// Shared tool name used by `mcp_tool_def()` and the agent dispatch arm —
 /// keeps the implicit contract between the two call sites explicit.
 pub const MCP_TOOL_NAME: &str = "mcp";
@@ -491,6 +642,42 @@ mod tests {
             s.contains("requires `mcp login linear`"),
             "OAuth servers must surface the login hint; got:\n{s}"
         );
+    }
+
+    #[test]
+    fn redact_secrets_masks_common_patterns() {
+        assert_eq!(redact_secrets("token=abc123"), "token=***");
+        assert_eq!(redact_secrets("api_key: sk-XYZ"), "api_key: ***");
+        assert_eq!(
+            redact_secrets(r#"{"password":"hunter2"}"#),
+            r#"{"password":"***"}"#
+        );
+        assert_eq!(
+            redact_secrets("Authorization: Bearer eyJhbGci.foo"),
+            "Authorization: ***"
+        );
+        assert_eq!(
+            redact_secrets("creds AKIAIOSFODNN7EXAMPLE end"),
+            "creds AKIA**************** end"
+        );
+    }
+
+    #[test]
+    fn redact_secrets_preserves_ordinary_text() {
+        // "token" as a substring of a longer word must not trip the masker.
+        assert_eq!(redact_secrets("tokenizer ran in 5ms"), "tokenizer ran in 5ms");
+        assert_eq!(
+            redact_secrets("connect failed: timeout after 30s"),
+            "connect failed: timeout after 30s"
+        );
+        // UTF-8 passes through untouched.
+        assert_eq!(redact_secrets("連線失敗：逾時"), "連線失敗：逾時");
+    }
+
+    #[test]
+    fn concise_error_message_is_outermost_and_redacted() {
+        let e = anyhow::anyhow!("inner cause").context("token=secret123");
+        assert_eq!(concise_error_message(&e), "token=***");
     }
 
     #[test]
