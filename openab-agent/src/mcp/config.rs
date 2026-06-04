@@ -28,6 +28,8 @@ pub enum ServerConfig {
         tool_filter: Option<ToolFilter>,
         #[serde(default = "default_request_timeout_secs")]
         request_timeout_secs: u64,
+        #[serde(default)]
+        log_level: Option<String>,
     },
     Http {
         url: String,
@@ -37,6 +39,8 @@ pub enum ServerConfig {
         tool_filter: Option<ToolFilter>,
         #[serde(default = "default_request_timeout_secs")]
         request_timeout_secs: u64,
+        #[serde(default)]
+        log_level: Option<String>,
     },
 }
 
@@ -81,6 +85,36 @@ impl ServerConfig {
         };
         std::time::Duration::from_secs(secs)
     }
+
+    /// Connect-time MCP `logging/setLevel` value for this server, if the
+    /// operator pinned one (MCP §16 / row 584). `None` leaves the server at
+    /// its default verbosity.
+    pub fn log_level(&self) -> Option<&str> {
+        match self {
+            ServerConfig::Stdio { log_level, .. } | ServerConfig::Http { log_level, .. } => {
+                log_level.as_deref()
+            }
+        }
+    }
+}
+
+/// Parse an MCP `logging/setLevel` level string (case-insensitive) into the
+/// rmcp `LoggingLevel`. Accepts the eight spec levels plus `warn` as an alias
+/// for `warning`. Returns `None` for unrecognised input (caller skips
+/// `setLevel` rather than failing the connection).
+pub fn parse_logging_level(s: &str) -> Option<rmcp::model::LoggingLevel> {
+    use rmcp::model::LoggingLevel::*;
+    Some(match s.to_ascii_lowercase().as_str() {
+        "debug" => Debug,
+        "info" => Info,
+        "notice" => Notice,
+        "warning" | "warn" => Warning,
+        "error" => Error,
+        "critical" => Critical,
+        "alert" => Alert,
+        "emergency" => Emergency,
+        _ => return None,
+    })
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -389,6 +423,7 @@ mod tests {
             env: HashMap::new(),
             tool_filter: None,
             request_timeout_secs: default_request_timeout_secs(),
+            log_level: None,
         };
         match cfg.resolved_with_env("github", &env).unwrap() {
             ServerConfig::Stdio { args, .. } => {

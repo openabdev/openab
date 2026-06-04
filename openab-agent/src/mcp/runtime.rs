@@ -21,7 +21,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use rmcp::model::{
     ErrorData, ListRootsRequestMethod, ListRootsResult, LoggingLevel,
-    LoggingMessageNotificationParam,
+    LoggingMessageNotificationParam, SetLevelRequestParams,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
@@ -33,7 +33,7 @@ use tokio::sync::RwLock;
 use tokio::task::AbortHandle;
 
 use super::breaker::{ServerBreaker, Verdict};
-use super::config::{McpConfig, ServerConfig};
+use super::config::{parse_logging_level, McpConfig, ServerConfig};
 use super::flow::{canonical_resource, init_paste_authorize, parse_paste_callback};
 use super::oauth::{builtin_client_id, resolve, ResolvedProvider};
 use crate::auth::{
@@ -855,6 +855,11 @@ impl McpRuntimeManager {
     /// `NeedsAuth` and returns an error pointing the caller at the login
     /// subcommand rather than attempting an unauthenticated dial.
     pub async fn connect(&self, name: &str) -> Result<()> {
+        // Connect-time `logging/setLevel` value (MCP §16 / row 584), captured
+        // from config before `resolved` is consumed by the dial-plan match so
+        // we can issue `set_level` once the handshake succeeds below. Assigned
+        // on every path that reaches the dial; earlier paths return.
+        let connect_log_level: Option<LoggingLevel>;
         let plan = {
             let mut guard = self.handles.write().await;
             let handle = guard
@@ -873,6 +878,7 @@ impl McpRuntimeManager {
                 return Ok(());
             }
             let resolved = handle.config.resolved(name)?;
+            connect_log_level = resolved.log_level().and_then(parse_logging_level);
             let plan = match resolved {
                 ServerConfig::Stdio {
                     command, args, env, ..
@@ -946,6 +952,18 @@ impl McpRuntimeManager {
         }
         match dial_result {
             Ok(client) => {
+                // Apply the operator-pinned MCP log level (row 584). Optional
+                // capability — a failure must not abort an otherwise healthy
+                // connection, so we warn and continue.
+                if let Some(level) = connect_log_level {
+                    if let Err(e) = client.set_level(SetLevelRequestParams::new(level)).await {
+                        tracing::warn!(
+                            target: "mcp.server_log",
+                            server = %name,
+                            "logging/setLevel failed: {e:#}"
+                        );
+                    }
+                }
                 handle.status = ServerStatus::Connected;
                 handle.client = Some(Arc::new(client));
                 self.breaker.record_success(name);
