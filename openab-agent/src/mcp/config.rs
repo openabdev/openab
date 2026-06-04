@@ -135,7 +135,56 @@ impl OAuthConfig {
                  a non-empty oauth.discovery_allowlist (ADR §6.3)"
             ));
         }
+        // Custom (non-built-in) providers supply their own endpoint URLs, so
+        // we enforce transport security on them here (MCP 2025-11-25 auth;
+        // rows 217/218): OAuth endpoints must be https://, and the redirect
+        // may only relax to http:// for the loopback interface (RFC 8252
+        // §7.3). Built-ins pin vetted URLs in `ProviderSpec`, so are exempt.
+        let is_custom = self
+            .provider
+            .as_deref()
+            .map(|p| super::oauth::builtin(p).is_none())
+            .unwrap_or(true);
+        if is_custom {
+            for (label, url) in [
+                ("oauth.authorize_url", self.authorize_url.as_deref()),
+                ("oauth.token_url", self.token_url.as_deref()),
+            ] {
+                if let Some(url) = url {
+                    if !url.starts_with("https://") {
+                        return Err(anyhow!(
+                            "mcp server {server:?}: {label} must use https:// for a \
+                             custom oauth provider (got {url:?})"
+                        ));
+                    }
+                }
+            }
+            if let Some(redirect) = self.redirect_uri.as_deref() {
+                if !is_loopback_or_https_redirect(redirect) {
+                    return Err(anyhow!(
+                        "mcp server {server:?}: oauth.redirect_uri must use https:// \
+                         or http://localhost (got {redirect:?})"
+                    ));
+                }
+            }
+        }
         Ok(())
+    }
+}
+
+/// A custom-provider redirect URI is acceptable when it is `https://`, or
+/// `http://` pointing at the loopback interface (RFC 8252 §7.3 native-app
+/// redirect). Host is matched by prefix to keep the check dependency-free.
+fn is_loopback_or_https_redirect(url: &str) -> bool {
+    if url.starts_with("https://") {
+        return true;
+    }
+    match url.strip_prefix("http://") {
+        Some(rest) => {
+            let host = rest.split(['/', ':']).next().unwrap_or(rest);
+            host == "localhost" || host == "127.0.0.1" || rest.starts_with("[::1]")
+        }
+        None => false,
     }
 }
 
@@ -455,5 +504,59 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("discovery_allowlist"), "got: {err}");
+    }
+
+    fn custom(authorize: &str, token: &str) -> OAuthConfig {
+        OAuthConfig {
+            provider: Some("custom".into()),
+            authorize_url: Some(authorize.into()),
+            token_url: Some(token.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn validate_rejects_http_authorize_url() {
+        let oauth = custom("http://issuer.example/authorize", "https://issuer.example/token");
+        let err = oauth.validate("srv").unwrap_err().to_string();
+        assert!(err.contains("oauth.authorize_url"), "got: {err}");
+        assert!(err.contains("https://"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_http_token_url() {
+        let oauth = custom("https://issuer.example/authorize", "http://issuer.example/token");
+        let err = oauth.validate("srv").unwrap_err().to_string();
+        assert!(err.contains("oauth.token_url"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_https_urls() {
+        let oauth = custom(
+            "https://issuer.example/authorize",
+            "https://issuer.example/token",
+        );
+        oauth.validate("srv").unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_non_localhost_http_redirect_uri() {
+        let mut oauth = custom(
+            "https://issuer.example/authorize",
+            "https://issuer.example/token",
+        );
+        oauth.redirect_uri = Some("http://app.example/callback".into());
+        let err = oauth.validate("srv").unwrap_err().to_string();
+        assert!(err.contains("oauth.redirect_uri"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_localhost_http_redirect_uri() {
+        let mut oauth = custom(
+            "https://issuer.example/authorize",
+            "https://issuer.example/token",
+        );
+        oauth.redirect_uri = Some("http://localhost:8765/callback".into());
+        oauth.validate("srv").unwrap();
     }
 }
