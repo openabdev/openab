@@ -11,7 +11,7 @@ every item in a section is derived from that file.
 | Spec version audited | 2025-11-25 |
 | Spec source | [`docs/specification/2025-11-25/`](https://github.com/modelcontextprotocol/modelcontextprotocol/tree/main/docs/specification/2025-11-25) |
 | Codebase | _TBD_ |
-| SDK | _TBD_ |
+| SDK | rmcp 1.7.0 |
 | Last refreshed | 2026-06-04 |
 
 ## Automated conformance
@@ -44,6 +44,49 @@ Rust client is fine.
 | ⚠️ | Partial — present but with gaps vs spec, or spec keyword is RECOMMENDED/MAY and only minimally satisfied |
 | ❌ | Not implemented |
 | N/A | Server-side requirement (we are a client) or otherwise not applicable to this implementation |
+
+## rmcp 1.7.0 Leverage Map
+
+Cross-cuts the per-section Improvement Plans. Classifies the actionable **code** items
+(doc/tracking-only items omitted) by how much rmcp 1.7.0 already provides. Verified
+against the SDK source (`rmcp-1.7.0/src/`) and confirmed by Mira retroactive review
+(2026-06-04). Symbols here are orthogonal to the Legend above.
+
+| Symbol | Meaning |
+|---|---|
+| 🟢 | rmcp-provided — SDK does the heavy lifting; openab-agent effort = adopt / switch callsite / config wiring |
+| 🟡 | wiring-only — peer methods / handler hooks exist in rmcp; effort = ACP bridge + the named `ClientHandler` struct |
+| 🔴 | openab-native — rmcp does not help; full implementation in openab-agent |
+
+### 🟢 rmcp-provided
+
+- **Request timeout + auto-cancellation** (Rows 69-71, 70, 109, 518; Section 4 "consolidate" item) — `PeerRequestOptions { timeout }` + `await_response` auto-emit `CancelledNotification` (`reason="request timeout"`) then return `ServiceError::Timeout` (`service.rs:321-347`). Client side has **no** `call_tool_with_timeout` convenience (server-only); route via `Peer::send_request_with_option`. ~50 LOC callsite switch at `meta_tool.rs:98,122`.
+- **OAuth discovery + step-up + audience binding** (Rows 153-168 PRM/AS-metadata, 161-162/207 `WWW-Authenticate` step-up, 183-190/211/242 RFC 8707 `resource`, 220-223 PKCE-method check) — all collapse into **adopt `AuthorizationManager`** (`transport/auth.rs:602`): ships PRM-first discovery (SEP-985) + RFC 9728/8414/OIDC, `ScopeUpgradeConfig` (default `auto_upgrade:true`, `max_upgrade_attempts:3`) for 401/403 step-up, and RFC 8707 `resource` via `.add_extra_param("resource", …)`. Shrinks the originally-estimated ~300-500 LOC PRM gap to "adopt + wire SSRF allowlist + assert `code_challenge_methods_supported` ⊇ S256".
+- **stdio shutdown ladder** (Row 66) — `TokioChildProcess::graceful_shutdown()` (`child_process.rs:110-136`): close stdin → `select!` `child.wait()` vs 3s sleep → `child.kill()`.
+- **stderr capture** (Row 79) — `TokioChildProcess::stderr(Stdio::piped())`.
+- **Completion `_meta` carry-through** (Section 14 §3) — `CompleteRequestParams.meta` already preserved.
+
+### 🟡 wiring-only (gated behind the named `ClientHandler`)
+
+Replacing the blanket `()` handler at `runtime.rs:1066,1079` with a named struct unblocks
+all of these; every hook already exists in rmcp `handler/client.rs`:
+
+- `create_message` → route to `LlmProvider` (sampling, Row 390 / line 673)
+- `on_tool_list_changed` (Row 503), `on_prompt_list_changed` (prompts §3), `on_resource_updated` (resources §3), `on_url_elicitation_notification_complete` (elicitation §5)
+- `list_roots → -32601` and `create_elicitation → -32602` explicit declines (Rows 614, 763)
+- prompts / resources / completion / logging surfaces (§2 of each) — `peer.get_prompt`, `list_all_prompts`, `read_resource`, `subscribe`, `complete_*`, `set_level` all exist (`service/client.rs:356-535`); effort = call + ACP bridge
+- `progressToken` emission + `on_progress` routing (Row 255); log cancellation reason (Row 252)
+- verify-only: `MCP-Protocol-Version` header on subsequent / GET-stream requests + SSE `retry` honoured (Rows 51, 101, 139)
+
+### 🔴 openab-native (rmcp does not help)
+
+- The named `ClientHandler` struct itself — rmcp provides the trait; we write the impl (keystone for the 🟡 group)
+- `is_error` propagation to outer meta-tool result (Row 506, `agent.rs:184`)
+- capability gating before `call_tool` / `list_all_tools` (Row 65)
+- JSON Schema 2020-12 dialect validation (Rows 18-21 — rmcp confirmed to ship no validator)
+- concise `Error.message` helper (Row 37b); tool projection / `taskSupport` / `outputSchema` validation (Rows 484, 492, 501)
+- HTTPS/localhost provider enforcement (Rows 217-218); keyring token storage (Row 213)
+- audit logging (Row 519); secret scrubbing (§17.4); HITL / consent hooks (Rows 509/515/516, §17.6); receive-side rate limits (Rows 268, 409, Section 15 §3)
 
 ---
 
