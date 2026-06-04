@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "openab-line.fullname" . }}
+  labels:
+    {{- include "openab-line.labels" . | nindent 4 }}
+data:
+  config.toml: |
+    [agent]
+    command = {{ .Values.agent.command | toJson }}
+    args = {{ .Values.agent.args | default list | toJson }}
+    working_dir = {{ .Values.agent.workingDir | default "/home/agent" | toJson }}
+    {{- if .Values.agent.env }}
+    env = { {{ range $i, $k := (.Values.agent.env | keys | sortAlpha) }}{{ if gt $i 0 }}, {{ end }}{{ $k }} = {{ index $.Values.agent.env $k | toJson }}{{ end }} }
+    {{- end }}
+    {{- $secretEnvKeys := list }}
+    {{- range .Values.agent.secretEnv }}{{ $secretEnvKeys = append $secretEnvKeys .name }}{{ end }}
+    {{- if $secretEnvKeys }}
+    inherit_env = {{ $secretEnvKeys | toJson }}
+    {{- end }}
+
+    [pool]
+    max_sessions = {{ .Values.agent.pool.maxSessions | default 10 }}
+    session_ttl_hours = {{ .Values.agent.pool.sessionTtlHours | default 24 }}
+
+    [reactions]
+    enabled = {{ .Values.agent.reactions.enabled }}
+    remove_after_reply = {{ .Values.agent.reactions.removeAfterReply }}
+
+    [gateway]
+    url = "ws://localhost:8080/ws"
+    platform = "line"
+    allow_all_channels = {{ if .Values.platform.allowedChannels }}false{{ else }}true{{ end }}
+    allowed_channels = {{ .Values.platform.allowedChannels | default list | toJson }}
+    allow_all_users = {{ if .Values.platform.allowedUsers }}false{{ else }}true{{ end }}
+    allowed_users = {{ .Values.platform.allowedUsers | default list | toJson }}

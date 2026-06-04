@@ -1,0 +1,63 @@
+🎉 OpenAB LINE bot deployed!
+
+{{- if include "openab-line.tunnelEnabled" . }}
+Pod: {{ include "openab-line.fullname" . }} (3 containers: openab, gateway, cloudflared)
+Exposure: Cloudflare Tunnel
+{{- else }}
+Pod: {{ include "openab-line.fullname" . }} (2 containers: openab, gateway)
+Exposure: bring your own Ingress / LoadBalancer to Service/{{ include "openab-line.fullname" . }}
+{{- end }}
+
+## Post-Install Steps
+
+{{- if include "openab-line.tunnelEnabled" . }}
+### Step 1: Configure Cloudflare Tunnel ingress
+
+In Cloudflare Dashboard:
+  https://one.dash.cloudflare.com/ → Networks → Tunnels → your tunnel → Public Hostname → Add:
+    Hostname: {{ .Values.webhookDomain | default "bot.example.com" }}
+    Type: HTTP
+    URL: localhost:8080
+{{- end }}
+
+{{- if not (include "openab-line.tunnelEnabled" .) }}
+### Step 1: Expose the Service publicly
+
+Create an Ingress / LoadBalancer that routes:
+  https://{{ .Values.webhookDomain | default "YOUR_DOMAIN" }}/webhook/line
+
+to:
+  Service/{{ include "openab-line.fullname" . }}:{{ .Values.service.port }}
+{{- end }}
+
+### Step 2: Set the LINE webhook
+
+In LINE Developers Console → Messaging API:
+  1. Set Webhook URL to:
+     https://{{ .Values.webhookDomain | default "YOUR_DOMAIN" }}/webhook/line
+  2. Turn "Use webhook" ON
+  3. Turn "Auto-reply messages" OFF
+  4. Click "Verify"
+
+### Step 3: Authenticate the agent if your CLI requires it
+
+Examples:
+  # Kiro
+  kubectl exec -it deployment/{{ include "openab-line.fullname" . }} -n {{ .Release.Namespace }} -c openab -- kiro-cli login --use-device-flow
+
+  # GitHub Copilot CLI
+  kubectl exec -it deployment/{{ include "openab-line.fullname" . }} -n {{ .Release.Namespace }} -c openab -- copilot auth login
+
+Then restart to pick up credentials:
+
+  kubectl rollout restart deployment/{{ include "openab-line.fullname" . }} -n {{ .Release.Namespace }}
+
+## Verify
+
+Check logs if the bot does not respond:
+
+  kubectl logs -n {{ .Release.Namespace }} deployment/{{ include "openab-line.fullname" . }} -c openab --tail=20
+  kubectl logs -n {{ .Release.Namespace }} deployment/{{ include "openab-line.fullname" . }} -c gateway --tail=20
+{{- if include "openab-line.tunnelEnabled" . }}
+  kubectl logs -n {{ .Release.Namespace }} deployment/{{ include "openab-line.fullname" . }} -c cloudflared --tail=20
+{{- end }}

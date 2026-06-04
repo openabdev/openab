@@ -1,0 +1,119 @@
+# openab-line values
+#
+# Install (with Cloudflare Tunnel):
+#   helm install my-bot ./charts/openab-line \
+#     --set line.channelSecret="xxx" \
+#     --set line.channelAccessToken="xxx" \
+#     --set tunnel.enabled=true \
+#     --set tunnel.token="eyJ..." \
+#     --set webhookDomain=bot.example.com \
+#     --namespace openab --create-namespace
+#
+# Install (bring your own Ingress / LoadBalancer):
+#   helm install my-bot ./charts/openab-line \
+#     --set line.channelSecret="xxx" \
+#     --set line.channelAccessToken="xxx" \
+#     --namespace openab --create-namespace
+#
+# Required:
+#   line.channelSecret        -- LINE channel secret
+#   line.channelAccessToken   -- LINE channel access token
+#
+# Optional:
+#   existingSecret            -- pre-existing K8s Secret with line-channel-secret,
+#                                line-channel-access-token, and optionally cloudflare-tunnel-token
+#   tunnel.enabled            -- run cloudflared sidecar
+#   tunnel.token              -- Cloudflare Tunnel token (required when tunnel.enabled=true)
+#   webhookDomain             -- shown in post-install notes for webhook setup
+
+# -- LINE Messaging API credentials
+line:
+  # -- (required unless existingSecret is set) Channel secret from LINE Developers Console
+  channelSecret: ""
+  # -- (required unless existingSecret is set) Channel access token
+  channelAccessToken: ""
+
+# -- Use a pre-existing K8s Secret instead of creating one from values.
+# Required keys: line-channel-secret, line-channel-access-token
+# Optional key: cloudflare-tunnel-token
+existingSecret: ""
+
+# -- Optional Cloudflare Tunnel sidecar for webhook exposure
+tunnel:
+  enabled: false
+  token: ""
+  image: cloudflare/cloudflared
+  tag: "2026.5.0"
+
+# -- Webhook domain shown in NOTES.txt (for tunnel or your own ingress)
+webhookDomain: ""
+
+# -- Release channel for the agent image: "stable" or "beta"
+channel: stable
+
+# -- OAB agent image
+image:
+  repository: ghcr.io/openabdev/openab
+  tag: ""  # defaults to channel
+  pullPolicy: IfNotPresent
+
+# -- Gateway image
+gateway:
+  image: ghcr.io/openabdev/openab-gateway
+  tag: ""  # defaults to Chart.AppVersion
+
+# -- Agent configuration
+agent:
+  command: kiro-cli
+  args:
+    - acp
+    - --trust-all-tools
+  workingDir: /home/agent
+  env: {}
+  envFrom: []
+  secretEnv: []
+  pool:
+    maxSessions: 10
+    sessionTtlHours: 24
+  reactions:
+    enabled: false
+    removeAfterReply: false
+
+# -- Gateway access control. Empty lists mean allow all.
+platform:
+  allowedUsers: []
+  allowedChannels: []
+
+# -- Persistence for shared agent working directory / inbound attachments
+persistence:
+  enabled: true
+  existingClaim: ""
+  storageClass: ""
+  size: 1Gi
+
+# -- Service for webhook exposure when using your own Ingress / LB
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+# -- Pod-level settings
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
