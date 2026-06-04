@@ -65,6 +65,13 @@ pub struct PendingPasteLogin {
     pub state: String,
     pub token_url: String,
     pub provider_name: String,
+    /// RFC 8707 audience-binding resource snapshotted at `start_paste_login`
+    /// so `complete_login`'s token exchange sends the same `resource` the
+    /// authorize URL carried (`None` for built-in providers, which skip it).
+    /// `#[serde(default)]` keeps pre-existing `auth.json` pending entries
+    /// (written before this field existed) deserializable.
+    #[serde(default)]
+    pub resource: Option<String>,
 }
 
 /// `auth.json` value type. Untagged Serde enum: `TokenStore` has required
@@ -804,6 +811,7 @@ mod tests {
             state: "test-state".to_string(),
             token_url: "https://example.com/token".to_string(),
             provider_name: "anthropic-mcp".to_string(),
+            resource: None,
         }
     }
 

@@ -17,6 +17,32 @@ fn generate_state() -> String {
     URL_SAFE_NO_PAD.encode(buf)
 }
 
+/// Canonical resource URI for RFC 8707 §2 / MCP 2025-11-25 — the value sent
+/// as `resource=` on the authorize URL and every token request so the AS
+/// can audience-bind the issued token to this one MCP server. Normalizes
+/// per RFC 3986 §6.2: lowercase scheme + host (the `url` crate does this on
+/// parse), drop the default port (likewise normalized away), strip any
+/// trailing slash from the path, and drop the fragment. Query is preserved
+/// (RFC 8707 permits it). A bare-host URL with only a `/` path collapses to
+/// no path so `https://mcp.example.com/` and `https://mcp.example.com` agree.
+pub fn canonical_resource(server_url: &str) -> Result<String> {
+    let url = Url::parse(server_url)
+        .map_err(|e| anyhow!("invalid mcp server url for resource indicator: {e}"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("mcp server url has no host for resource indicator"))?;
+    let mut out = format!("{}://{}", url.scheme(), host);
+    if let Some(port) = url.port() {
+        out.push_str(&format!(":{port}"));
+    }
+    out.push_str(url.path().trim_end_matches('/'));
+    if let Some(query) = url.query() {
+        out.push('?');
+        out.push_str(query);
+    }
+    Ok(out)
+}
+
 /// Result of `init_paste_authorize`: the URL to surface to the user, plus
 /// the `code_verifier` + `state` the caller must persist under the
 /// pending-login key for `complete_login` to validate the callback.
@@ -33,11 +59,15 @@ pub struct PasteAuthorize {
 /// hard-coded helper (mirroring `auth::codex_client_id`); custom
 /// providers carry it on `ResolvedProvider::Custom`. `redirect_uri` is
 /// the provider's pinned callback for built-ins or a runtime-bound
-/// `localhost:<port>` for custom paste-back flows.
+/// `localhost:<port>` for custom paste-back flows. `resource` is the RFC
+/// 8707 audience-binding indicator (`Some` = the canonical MCP server URI
+/// for custom providers; `None` skips the param for built-ins whose AS may
+/// reject an unrecognized `resource` with `invalid_target`).
 pub fn init_paste_authorize(
     provider: &ResolvedProvider,
     client_id: &str,
     redirect_uri: &str,
+    resource: Option<&str>,
 ) -> Result<PasteAuthorize> {
     let (code_verifier, code_challenge) = generate_pkce();
     let state = generate_state();
@@ -50,6 +80,9 @@ pub fn init_paste_authorize(
         .append_pair("code_challenge_method", "S256")
         .append_pair("state", &state)
         .append_pair("scope", &provider.scopes().join(" "));
+    if let Some(resource) = resource {
+        url.query_pairs_mut().append_pair("resource", resource);
+    }
     Ok(PasteAuthorize {
         url: url.to_string(),
         code_verifier,
@@ -114,19 +147,21 @@ mod tests {
     #[test]
     fn init_paste_authorize_threads_pkce_and_state_into_url() {
         let p = builtin_provider();
-        let r = init_paste_authorize(&p, "client-xyz", TEST_REDIRECT).unwrap();
+        let r = init_paste_authorize(&p, "client-xyz", TEST_REDIRECT, None).unwrap();
         assert!(r.url.starts_with("https://claude.ai/oauth/authorize?"));
         assert!(r.url.contains("response_type=code"));
         assert!(r.url.contains("client_id=client-xyz"));
         assert!(r.url.contains("code_challenge_method=S256"));
         assert!(r.url.contains(&format!("state={}", r.state)));
         assert!(!r.code_verifier.is_empty());
+        // Built-in with `None` resource omits the RFC 8707 param entirely.
+        assert!(!r.url.contains("resource="));
     }
 
     #[test]
     fn init_paste_authorize_percent_encodes_redirect_uri() {
         let p = builtin_provider();
-        let r = init_paste_authorize(&p, "c", TEST_REDIRECT).unwrap();
+        let r = init_paste_authorize(&p, "c", TEST_REDIRECT, None).unwrap();
         let want = "redirect_uri=http%3A%2F%2Flocalhost%3A53692%2Fcallback";
         assert!(r.url.contains(want));
     }
@@ -134,7 +169,7 @@ mod tests {
     #[test]
     fn init_paste_authorize_form_encodes_scope_spaces_as_plus() {
         let p = builtin_provider();
-        let r = init_paste_authorize(&p, "c", TEST_REDIRECT).unwrap();
+        let r = init_paste_authorize(&p, "c", TEST_REDIRECT, None).unwrap();
         assert!(r.url.contains("scope=org%3Acreate_api_key"));
         assert!(r.url.contains("user%3Amcp_servers"));
     }
@@ -148,7 +183,7 @@ mod tests {
             ..Default::default()
         };
         let p = resolve(&cfg).unwrap();
-        assert!(init_paste_authorize(&p, "c", TEST_REDIRECT).is_err());
+        assert!(init_paste_authorize(&p, "c", TEST_REDIRECT, None).is_err());
     }
 
     #[test]
@@ -162,9 +197,42 @@ mod tests {
             ..Default::default()
         };
         let p = resolve(&cfg).unwrap();
-        let r = init_paste_authorize(&p, "linear-client", TEST_REDIRECT).unwrap();
+        let r = init_paste_authorize(
+            &p,
+            "linear-client",
+            TEST_REDIRECT,
+            Some("https://mcp.linear.app/sse"),
+        )
+        .unwrap();
         assert!(r.url.starts_with("https://linear.app/oauth/authorize?"));
         assert!(r.url.contains("scope=read+write"));
+        // RFC 8707: custom provider carries the audience-binding resource.
+        assert!(r
+            .url
+            .contains("resource=https%3A%2F%2Fmcp.linear.app%2Fsse"));
+    }
+
+    #[test]
+    fn canonical_resource_lowercases_and_strips_default_port_and_trailing_slash() {
+        let r = canonical_resource("HTTPS://MCP.Example.COM:443/mcp/").unwrap();
+        assert_eq!(r, "https://mcp.example.com/mcp");
+    }
+
+    #[test]
+    fn canonical_resource_drops_fragment_keeps_explicit_port_and_query() {
+        let r = canonical_resource("http://localhost:8080/sse?tenant=acme#frag").unwrap();
+        assert_eq!(r, "http://localhost:8080/sse?tenant=acme");
+    }
+
+    #[test]
+    fn canonical_resource_bare_host_has_no_trailing_slash() {
+        let r = canonical_resource("https://mcp.example.com").unwrap();
+        assert_eq!(r, "https://mcp.example.com");
+    }
+
+    #[test]
+    fn canonical_resource_rejects_unparseable_url() {
+        assert!(canonical_resource("not a url").is_err());
     }
 
     #[test]

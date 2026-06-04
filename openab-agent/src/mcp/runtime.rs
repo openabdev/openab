@@ -30,7 +30,7 @@ use tokio::task::AbortHandle;
 
 use super::breaker::{ServerBreaker, Verdict};
 use super::config::{McpConfig, ServerConfig};
-use super::flow::{init_paste_authorize, parse_paste_callback};
+use super::flow::{canonical_resource, init_paste_authorize, parse_paste_callback};
 use super::oauth::{builtin_client_id, resolve, ResolvedProvider};
 use crate::auth::{
     auth_path, list_pending_logins_at, load_namespaced_token_at, load_pending_login, pending_key,
@@ -309,13 +309,16 @@ impl McpRuntimeManager {
     /// should run device-code instead (§6.4 selection logic). Both errors
     /// are explicit so the LLM can pick a different action.
     pub async fn start_paste_login(&self, name: &str) -> Result<PasteLoginStart> {
-        let (provider, client_id, redirect_uri) = self.resolve_paste_client(name).await?;
-        let started = init_paste_authorize(&provider, &client_id, &redirect_uri)?;
+        let (provider, client_id, redirect_uri, resource) =
+            self.resolve_paste_client(name).await?;
+        let started =
+            init_paste_authorize(&provider, &client_id, &redirect_uri, resource.as_deref())?;
         let pending = PendingPasteLogin {
             verifier: started.code_verifier,
             state: started.state.clone(),
             token_url: provider.token_url().to_string(),
             provider_name: provider_name_of(&provider),
+            resource,
         };
         save_pending_login(&self.auth_path, &pending_key(name), &pending)?;
         {
@@ -352,13 +355,18 @@ impl McpRuntimeManager {
                 format!("no pending login for {name:?}; run `mcp login {name}` first")
             })?;
         let code = parse_paste_callback(redirect_url, &pending.state)?;
-        let (_provider, client_id, redirect_uri) = self.resolve_paste_client(name).await?;
+        let (_provider, client_id, redirect_uri, _resource) =
+            self.resolve_paste_client(name).await?;
+        // Use the snapshotted `resource` (RFC 8707) so a config edit between
+        // init and finish can't redirect the token's audience binding —
+        // matching the same snapshot rule as `token_url`/`provider_name`.
         let resp = post_token_exchange(
             &pending.token_url,
             &client_id,
             &redirect_uri,
             &code,
             &pending.verifier,
+            pending.resource.as_deref(),
         )
         .await?;
         self.finish_login(name, &pending, resp).await
@@ -408,10 +416,15 @@ impl McpRuntimeManager {
     /// `connect()` reads the cached token via the oauth-aware `DialPlan`
     /// branch and reaches `Connected` through the normal lifecycle.
     pub async fn start_device_login(&self, name: &str) -> Result<DeviceLoginStart> {
-        let (device_endpoint, client_id, token_url, scopes, provider_name) =
+        let (device_endpoint, client_id, token_url, scopes, provider_name, resource) =
             self.resolve_device_client(name).await?;
-        let auth =
-            post_device_authorization(&device_endpoint, &client_id, &scopes.join(" ")).await?;
+        let auth = post_device_authorization(
+            &device_endpoint,
+            &client_id,
+            &scopes.join(" "),
+            resource.as_deref(),
+        )
+        .await?;
         {
             let mut handles = self.handles.write().await;
             if let Some(handle) = handles.get_mut(name) {
@@ -426,6 +439,7 @@ impl McpRuntimeManager {
         let token_url_owned = token_url;
         let client_id_owned = client_id;
         let provider_name_owned = provider_name;
+        let resource_owned = resource;
         let task_name = name.to_string();
         let handle = tokio::spawn(async move {
             manager
@@ -435,6 +449,7 @@ impl McpRuntimeManager {
                     &client_id_owned,
                     &device_code,
                     &provider_name_owned,
+                    resource_owned.as_deref(),
                     initial_interval,
                     expires_in,
                 )
@@ -465,16 +480,18 @@ impl McpRuntimeManager {
     async fn resolve_device_client(
         &self,
         name: &str,
-    ) -> Result<(String, String, String, Vec<String>, String)> {
-        let oauth_cfg = {
+    ) -> Result<(String, String, String, Vec<String>, String, Option<String>)> {
+        let (oauth_cfg, server_url) = {
             let guard = self.handles.read().await;
             let handle = guard
                 .get(name)
                 .ok_or_else(|| anyhow!("no mcp server named {name:?}"))?;
             match handle.config.resolved(name)? {
                 ServerConfig::Http {
-                    oauth: Some(oauth), ..
-                } => oauth,
+                    url,
+                    oauth: Some(oauth),
+                    ..
+                } => (oauth, url),
                 ServerConfig::Http { oauth: None, .. } => {
                     return Err(anyhow!("mcp server {name:?} has no oauth block"));
                 }
@@ -499,7 +516,18 @@ impl McpRuntimeManager {
                  set in mcp.json"
             ));
         };
-        Ok((device_endpoint, client_id, token_url, scopes, provider_name))
+        // RFC 8707 resource indicator — device flow only fires for Custom
+        // providers (the `let-else` above), so the server URL is always the
+        // audience here (see `resolve_paste_client` for the gating rationale).
+        let resource = Some(canonical_resource(&server_url)?);
+        Ok((
+            device_endpoint,
+            client_id,
+            token_url,
+            scopes,
+            provider_name,
+            resource,
+        ))
     }
 
     /// RFC 8628 §3.4 polling loop. Runs detached in `tokio::spawn`; the
@@ -514,6 +542,7 @@ impl McpRuntimeManager {
         client_id: &str,
         device_code: &str,
         provider_name: &str,
+        resource: Option<&str>,
         initial_interval: u64,
         expires_in_secs: u64,
     ) {
@@ -541,8 +570,11 @@ impl McpRuntimeManager {
                 .await;
                 return;
             }
-            let outcome =
-                match post_device_token_poll(&client, token_url, client_id, device_code).await {
+            let outcome = match post_device_token_poll(
+                &client, token_url, client_id, device_code, resource,
+            )
+            .await
+            {
                     Ok(o) => o,
                     Err(e) => {
                         self.mark_device_login_failed(name, e).await;
@@ -606,16 +638,21 @@ impl McpRuntimeManager {
     /// from the server's config. Shared by `start_paste_login` and
     /// `complete_login` so a config drift between init and finish surfaces
     /// the same error from both entry points.
-    async fn resolve_paste_client(&self, name: &str) -> Result<(ResolvedProvider, String, String)> {
-        let oauth_cfg = {
+    async fn resolve_paste_client(
+        &self,
+        name: &str,
+    ) -> Result<(ResolvedProvider, String, String, Option<String>)> {
+        let (oauth_cfg, server_url) = {
             let guard = self.handles.read().await;
             let handle = guard
                 .get(name)
                 .ok_or_else(|| anyhow!("no mcp server named {name:?}"))?;
             match handle.config.resolved(name)? {
                 ServerConfig::Http {
-                    oauth: Some(oauth), ..
-                } => oauth,
+                    url,
+                    oauth: Some(oauth),
+                    ..
+                } => (oauth, url),
                 ServerConfig::Http { oauth: None, .. } => {
                     return Err(anyhow!("mcp server {name:?} has no oauth block"));
                 }
@@ -625,6 +662,17 @@ impl McpRuntimeManager {
             }
         };
         let provider = resolve(&oauth_cfg)?;
+        // RFC 8707 resource indicator. Gated to custom providers: a built-in's
+        // authorize/token endpoints point at the vendor AS (claude.ai), not the
+        // MCP server's own URL, and there's no evidence the built-in AS honors
+        // `resource` — sending it risks an `invalid_target` rejection that would
+        // break the shipping built-in login. Custom providers are
+        // self-hosted-resource-server style where the server URL *is* the
+        // audience. Revisit once PRM/discovery (Rows 153-168) lands.
+        let resource = match &provider {
+            ResolvedProvider::Builtin { .. } => None,
+            ResolvedProvider::Custom { .. } => Some(canonical_resource(&server_url)?),
+        };
         let (client_id, redirect_uri) = match &provider {
             ResolvedProvider::Builtin {
                 provider_name,
@@ -660,7 +708,7 @@ impl McpRuntimeManager {
                 ));
             }
         };
-        Ok((provider, client_id, redirect_uri))
+        Ok((provider, client_id, redirect_uri, resource))
     }
 
     /// RFC 6749 §6 refresh-grant — exchange a cached `refresh_token` for a
@@ -697,9 +745,15 @@ impl McpRuntimeManager {
                 return Ok(cached);
             }
         }
-        let (_provider, client_id, _redirect_uri) = self.resolve_paste_client(name).await?;
-        let resp =
-            post_token_refresh(&store.token_endpoint, &client_id, &store.refresh_token).await?;
+        let (_provider, client_id, _redirect_uri, resource) =
+            self.resolve_paste_client(name).await?;
+        let resp = post_token_refresh(
+            &store.token_endpoint,
+            &client_id,
+            &store.refresh_token,
+            resource.as_deref(),
+        )
+        .await?;
         let new_store = build_token_store(
             resp,
             store.token_endpoint.clone(),
@@ -928,36 +982,36 @@ async fn post_token_exchange(
     redirect_uri: &str,
     code: &str,
     code_verifier: &str,
+    resource: Option<&str>,
 ) -> Result<TokenExchangeResponse> {
-    post_token_form(
-        token_url,
-        &[
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("code_verifier", code_verifier),
-            ("client_id", client_id),
-            ("redirect_uri", redirect_uri),
-        ],
-        "token exchange",
-    )
-    .await
+    let mut form = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("code_verifier", code_verifier),
+        ("client_id", client_id),
+        ("redirect_uri", redirect_uri),
+    ];
+    if let Some(resource) = resource {
+        form.push(("resource", resource));
+    }
+    post_token_form(token_url, &form, "token exchange").await
 }
 
 async fn post_token_refresh(
     token_url: &str,
     client_id: &str,
     refresh_token: &str,
+    resource: Option<&str>,
 ) -> Result<TokenExchangeResponse> {
-    post_token_form(
-        token_url,
-        &[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("client_id", client_id),
-        ],
-        "token refresh",
-    )
-    .await
+    let mut form = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("client_id", client_id),
+    ];
+    if let Some(resource) = resource {
+        form.push(("resource", resource));
+    }
+    post_token_form(token_url, &form, "token refresh").await
 }
 
 /// RFC 8628 §3.2 device authorization response. `verification_uri_complete`
@@ -1026,13 +1080,18 @@ async fn post_device_authorization(
     device_endpoint: &str,
     client_id: &str,
     scopes: &str,
+    resource: Option<&str>,
 ) -> Result<DeviceAuthResponse> {
     let client = reqwest::Client::builder()
         .build()
         .context("build reqwest client")?;
+    let mut form = vec![("client_id", client_id), ("scope", scopes)];
+    if let Some(resource) = resource {
+        form.push(("resource", resource));
+    }
     let resp = client
         .post(device_endpoint)
-        .form(&[("client_id", client_id), ("scope", scopes)])
+        .form(&form)
         .send()
         .await
         .with_context(|| format!("POST {device_endpoint} (device authorization)"))?;
@@ -1056,14 +1115,19 @@ async fn post_device_token_poll(
     token_url: &str,
     client_id: &str,
     device_code: &str,
+    resource: Option<&str>,
 ) -> Result<DevicePollOutcome> {
+    let mut form = vec![
+        ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+        ("device_code", device_code),
+        ("client_id", client_id),
+    ];
+    if let Some(resource) = resource {
+        form.push(("resource", resource));
+    }
     let resp = client
         .post(token_url)
-        .form(&[
-            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-            ("device_code", device_code),
-            ("client_id", client_id),
-        ])
+        .form(&form)
         .send()
         .await
         .with_context(|| format!("POST {token_url} (device token poll)"))?;
@@ -1606,6 +1670,7 @@ mod tests {
             state: state.to_string(),
             token_url: "https://example.test/token".to_string(),
             provider_name: "linear".to_string(),
+            resource: Some("https://mcp.linear.app/sse".to_string()),
         };
         save_pending_login(&mgr.auth_path, &pending_key(name), &pending).unwrap();
         pending
