@@ -564,7 +564,13 @@ impl AdapterRouter {
                                 continue;
                             }
                             if let Some(ref err) = notification.error {
-                                response_error = Some(format_coded_error(err.code, &err.message, err.data_message()));
+                                let stderr_tail = conn.stderr_tail_snapshot().await;
+                                response_error = Some(format_coded_error(
+                                    err.code,
+                                    &err.message,
+                                    err.data_message(),
+                                    &stderr_tail,
+                                ));
                             }
                             break;
                         }
