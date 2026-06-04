@@ -343,18 +343,49 @@ fn tool_summary(t: &rmcp::model::Tool) -> Value {
     let support = t.task_support();
     let ts = serde_json::to_value(support).unwrap_or(Value::String("forbidden".into()));
     map.insert("task_support".into(), ts);
+    // Collect advisory unavailability reasons so the LLM sees the tool exists
+    // but knows not to call it, and why. Additive: a tool can be both
+    // `taskSupport=required` and declare an unsupported schema dialect.
+    let mut reasons: Vec<String> = Vec::new();
     if support == TaskSupport::Required {
         // We do not implement the MCP `tasks` augmentation flow, so a tool that
-        // *requires* it cannot be invoked. Mark it unavailable (rather than
-        // dropping it) so the LLM sees the tool exists but knows not to call it,
-        // and why (rows 289/617). The `call` path enforces the same refusal.
+        // *requires* it cannot be invoked (rows 289/617). The `call` path
+        // enforces the same refusal.
+        reasons.push("requires task augmentation (not implemented)".into());
+    }
+    if let Some(dialect) = unsupported_schema_dialect(&t.input_schema) {
+        // MCP 2025-11-25 mandates draft 2020-12 for tool `inputSchema`
+        // (rows 18-21). rmcp 1.7.0 ships no JSON Schema validator, so rather
+        // than silently passing a foreign dialect through we surface it as
+        // NeedsAttention (rows 19-20, MUST-handle-gracefully). Advisory only:
+        // we never validate `arguments` against the schema, so this does not
+        // hard-block the `call` path — a working tool stays callable.
+        reasons.push(format!(
+            "input_schema declares JSON Schema dialect {dialect:?}; \
+             openab-agent supports only draft 2020-12"
+        ));
+    }
+    if !reasons.is_empty() {
         map.insert("available".into(), Value::Bool(false));
-        map.insert(
-            "unavailable_reason".into(),
-            Value::String("requires task augmentation (not implemented)".into()),
-        );
+        map.insert("unavailable_reason".into(), Value::String(reasons.join("; ")));
     }
     Value::Object(map)
+}
+
+/// Returns the declared `$schema` dialect URI when a tool's `inputSchema`
+/// pins a dialect other than JSON Schema draft 2020-12 (the MCP-mandated
+/// dialect, rows 18-21), else `None`. An absent `$schema` is the common
+/// server case and is treated as the implied 2020-12 default — it passes
+/// through. Match is scheme- and fragment-insensitive
+/// (`http`/`https`, optional trailing `#`).
+fn unsupported_schema_dialect(schema: &serde_json::Map<String, Value>) -> Option<String> {
+    let declared = schema.get("$schema")?.as_str()?;
+    let normalized = declared.trim().trim_end_matches('#');
+    if normalized.ends_with("json-schema.org/draft/2020-12/schema") {
+        None
+    } else {
+        Some(declared.to_string())
+    }
 }
 
 async fn list_tools(manager: &McpRuntimeManager, server: &str) -> Result<Value> {
@@ -497,6 +528,39 @@ mod tests {
         assert_eq!(v2["task_support"], Value::String("forbidden".into()));
         assert!(v2.get("available").is_none());
         assert!(v2.get("unavailable_reason").is_none());
+    }
+
+    #[test]
+    fn tool_summary_flags_unsupported_schema_dialect() {
+        use rmcp::model::Tool;
+        use std::sync::Arc;
+
+        // Foreign dialect (draft-07) => surfaced as unavailable, advisory.
+        let mut d07 = serde_json::Map::new();
+        d07.insert(
+            "$schema".into(),
+            Value::String("http://json-schema.org/draft-07/schema#".into()),
+        );
+        let foreign = Tool::new("legacy", "old schema", Arc::new(d07));
+        let v = tool_summary(&foreign);
+        assert_eq!(v["available"], Value::Bool(false));
+        assert!(v["unavailable_reason"]
+            .as_str()
+            .unwrap()
+            .contains("draft 2020-12"));
+
+        // Explicit 2020-12 (with trailing '#') => passes through.
+        let mut ok = serde_json::Map::new();
+        ok.insert(
+            "$schema".into(),
+            Value::String("https://json-schema.org/draft/2020-12/schema#".into()),
+        );
+        let v_ok = tool_summary(&Tool::new("modern", "ok", Arc::new(ok)));
+        assert!(v_ok.get("available").is_none());
+
+        // Absent $schema => implied 2020-12 default => passes through.
+        let v_absent = tool_summary(&Tool::new("plain", "ok", Arc::new(serde_json::Map::new())));
+        assert!(v_absent.get("available").is_none());
     }
 
     #[tokio::test]
