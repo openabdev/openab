@@ -861,7 +861,7 @@ Source: [`server/tools.mdx`](https://github.com/modelcontextprotocol/modelcontex
 | 515 | Clients SHOULD prompt for confirmation on sensitive operations | SHOULD | ❌ | no confirmation prompt path; dispatch goes straight to `peer.call_tool` (`src/mcp/meta_tool.rs:98`) |
 | 516 | Clients SHOULD show tool inputs to user before calling server | SHOULD | ❌ | headless; no pre-call display of `arguments` to user. ACP frame surfaces afterward, not before |
 | 517 | Clients SHOULD validate tool results before passing to LLM | SHOULD | ❌ | `call_tool` only `serde_json::to_value` then returns (`src/mcp/meta_tool.rs:109`); no schema check / sanitization |
-| 518 | Clients SHOULD implement timeouts for tool calls | SHOULD | ❌ | no `tokio::time::timeout` around `peer.call_tool` / `list_all_tools` (`src/mcp/meta_tool.rs:98,122`); only OAuth device-flow has wall-clock timeout (`src/mcp/mod.rs`) |
+| 518 | Clients SHOULD implement timeouts for tool calls | SHOULD | ✅ | implemented via `PeerRequestOptions { timeout }` around both `tools/call` and `tools/list` in `meta_tool.rs` (`request_timeout_secs` per-server, default 60s); on expiry breaker-fed error + rmcp auto-cancel |
 | 519 | Clients SHOULD log tool usage for audit | SHOULD | ❌ | `meta_tool.rs` has no `tracing::info!` for call/list invocations; only `record_tool_call_outcome` updates breaker state (`:100,104`) |
 
 ### Improvement Plan (Jelly draft, pending Mira retroactive review)
