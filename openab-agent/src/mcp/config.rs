@@ -13,6 +13,12 @@ use serde::{Deserialize, Serialize};
 pub struct McpConfig {
     #[serde(rename = "mcpServers", default)]
     pub servers: HashMap<String, ServerConfig>,
+    /// Extra directories to advertise as MCP client `roots`, in addition to
+    /// the agent's working directory. Absolute paths; entries that don't
+    /// canonicalize to an existing directory are skipped at startup (roots
+    /// capability, spec rows 363-384).
+    #[serde(default)]
+    pub roots: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,6 +278,7 @@ impl McpConfig {
             }
             let layer = Self::load_file(path)?;
             merged.servers.extend(layer.servers);
+            merged.roots.extend(layer.roots);
         }
         merged.validate()?;
         Ok(merged)

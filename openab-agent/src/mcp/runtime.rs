@@ -20,8 +20,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use rmcp::model::{
-    CreateElicitationRequestParams, CreateElicitationResult, ErrorData, ListRootsRequestMethod,
-    ListRootsResult, LoggingLevel, LoggingMessageNotificationParam, SetLevelRequestParams,
+    ClientInfo, CreateElicitationRequestParams, CreateElicitationResult, ErrorData,
+    ListRootsResult, LoggingLevel, LoggingMessageNotificationParam, Root, RootsCapabilities,
+    SetLevelRequestParams,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
@@ -46,14 +47,12 @@ use crate::auth::{
 /// `ClientHandler` callbacks can be overridden (the named struct is the
 /// keystone that unlocks `on_tool_list_changed` / `on_resource_updated` /
 /// `on_prompt_list_changed` / elicitation-complete wiring later). Overrides
-/// `list_roots`, returning JSON-RPC `-32601` (method not found) instead of the
-/// SDK default's empty roots list, because we advertise no `roots` capability
-/// (spec rows 365/370); and `create_elicitation`, returning `-32602`
-/// (invalid params) instead of the SDK default's silent decline, because we
-/// advertise no `elicitation` capability (spec row 439). `get_info()` is
-/// deliberately NOT overridden: inheriting the trait default keeps the
-/// advertised ClientInfo + capabilities byte-identical to the previous `()`
-/// handler.
+/// `get_info`, advertising the `roots` capability (without `listChanged`: the
+/// root set is the agent's static working directory plus a fixed config
+/// allow-list, so it never changes mid-session), and `list_roots`, returning
+/// that set as `file://` URIs (spec rows 363-384); and `create_elicitation`,
+/// returning `-32602` (invalid params) instead of the SDK default's silent
+/// decline, because we advertise no `elicitation` capability (spec row 439).
 /// Per-server cache of the most recent successful `tools/list` page, keyed by
 /// configured server name. Deliberately a sibling `Arc` on the manager rather
 /// than a field on `ServerHandle`: the handler holds a clone of this same `Arc`
@@ -74,13 +73,18 @@ pub struct OpenabClientHandler {
     /// `tools/list_changed` this handler drops its `server_name` entry so the
     /// next `fetch_tools` re-fetches (row 503).
     tools_cache: ToolsCache,
+    /// The `roots` this client advertises and returns from `list_roots`.
+    /// Shared (`Arc`) read-only across every connection's handler; computed
+    /// once at manager construction (spec rows 363-384).
+    roots: Arc<Vec<Root>>,
 }
 
 impl OpenabClientHandler {
-    fn new(server_name: String, tools_cache: ToolsCache) -> Self {
+    fn new(server_name: String, tools_cache: ToolsCache, roots: Arc<Vec<Root>>) -> Self {
         Self {
             server_name,
             tools_cache,
+            roots,
         }
     }
 
@@ -100,11 +104,22 @@ impl OpenabClientHandler {
 }
 
 impl ClientHandler for OpenabClientHandler {
+    fn get_info(&self) -> ClientInfo {
+        // Advertise the `roots` capability so servers know they may call
+        // `roots/list`. No `listChanged`: the root set is fixed for the
+        // session (working dir + config allow-list), so we never emit
+        // `notifications/roots/list_changed` (spec rows 363-384). Everything
+        // else stays at the SDK default, byte-identical to the prior posture.
+        let mut info = ClientInfo::default();
+        info.capabilities.roots = Some(RootsCapabilities { list_changed: None });
+        info
+    }
+
     fn list_roots(
         &self,
         _context: RequestContext<RoleClient>,
     ) -> impl std::future::Future<Output = Result<ListRootsResult, ErrorData>> + Send + '_ {
-        std::future::ready(Err(ErrorData::method_not_found::<ListRootsRequestMethod>()))
+        std::future::ready(Ok(ListRootsResult::new((*self.roots).clone())))
     }
 
     fn create_elicitation(
@@ -313,6 +328,11 @@ pub struct McpRuntimeManager {
     /// (which holds a clone of this exact `Arc`). Spares the hot tool-call
     /// path a `tools/list` round-trip for the task-support guard (row 503).
     tools_cache: ToolsCache,
+    /// `roots` advertised to every server (spec rows 363-384). Computed once
+    /// from the working directory + `McpConfig.roots` allow-list; cloned into
+    /// each connection's `OpenabClientHandler`. Static for the session, so no
+    /// `notifications/roots/list_changed` is ever sent.
+    roots: Arc<Vec<Root>>,
 }
 
 impl McpRuntimeManager {
@@ -331,6 +351,7 @@ impl McpRuntimeManager {
             })
             .collect();
         catalog.sort_by(|a, b| a.name.cmp(&b.name));
+        let roots = Arc::new(compute_roots(std::env::current_dir().ok(), &cfg.roots));
         let handles: HashMap<_, _> = cfg
             .servers
             .into_iter()
@@ -353,6 +374,7 @@ impl McpRuntimeManager {
             breaker: Arc::new(ServerBreaker::new()),
             catalog: catalog.into(),
             tools_cache: Arc::new(StdMutex::new(HashMap::new())),
+            roots,
         }
     }
 
@@ -1109,7 +1131,9 @@ impl McpRuntimeManager {
             }
         };
 
-        let dial_result = dial.run(name, self.tools_cache.clone()).await;
+        let dial_result = dial
+            .run(name, self.tools_cache.clone(), self.roots.clone())
+            .await;
 
         let mut guard = self.handles.write().await;
         let handle = guard
@@ -1454,6 +1478,7 @@ impl Dial {
         self,
         name: &str,
         tools_cache: ToolsCache,
+        roots: Arc<Vec<Root>>,
     ) -> Result<RunningService<RoleClient, OpenabClientHandler>> {
         match self {
             Dial::Stdio { command, args, env } => {
@@ -1480,7 +1505,7 @@ impl Dial {
                         }
                     });
                 }
-                OpenabClientHandler::new(name.to_string(), tools_cache)
+                OpenabClientHandler::new(name.to_string(), tools_cache, roots)
                     .serve(transport)
                     .await
                     .with_context(|| format!("mcp handshake with {command:?}"))
@@ -1494,13 +1519,48 @@ impl Dial {
                     }
                     None => StreamableHttpClientTransport::from_uri(url.as_str()),
                 };
-                OpenabClientHandler::new(name.to_string(), tools_cache)
+                OpenabClientHandler::new(name.to_string(), tools_cache, roots)
                     .serve(transport)
                     .await
                     .with_context(|| format!("mcp handshake with {url:?}"))
             }
         }
     }
+}
+
+/// Build the MCP `roots` advertised to servers: the agent's working directory
+/// followed by any `McpConfig.roots` allow-list entries (spec rows 363-384).
+/// Each candidate is `canonicalize`d — which resolves `..` and symlinks to a
+/// real absolute path, neutralizing path traversal (#372) — and kept only if
+/// it resolves to an existing directory. Duplicates (after canonicalization)
+/// are dropped so a config entry equal to the cwd isn't advertised twice.
+/// Roots are returned as `file://` URIs named by their final path component.
+fn compute_roots(cwd: Option<PathBuf>, extra: &[String]) -> Vec<Root> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let candidates = cwd
+        .into_iter()
+        .chain(extra.iter().map(|s| PathBuf::from(s.as_str())));
+    for raw in candidates {
+        let Ok(canonical) = raw.canonicalize() else {
+            continue;
+        };
+        if !canonical.is_dir() {
+            continue;
+        }
+        // An absolute path renders as `/a/b`, so `file://` + `/a/b` yields the
+        // correct three-slash `file:///a/b` form.
+        let uri = format!("file://{}", canonical.display());
+        if !seen.insert(uri.clone()) {
+            continue;
+        }
+        let name = canonical
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| uri.clone());
+        out.push(Root::new(uri).with_name(name));
+    }
+    out
 }
 
 fn stdio_child_env(explicit: &HashMap<String, String>) -> HashMap<String, String> {
@@ -1572,16 +1632,21 @@ mod tests {
     }
 
     #[test]
-    fn client_handler_advertises_no_optional_capabilities() {
-        // Pins the "vacuously compliant by abstention" posture: because we
-        // declare none of these capabilities, sampling (`create_message`) and
-        // roots (`list_roots`) abstain with -32601 and elicitation
-        // (`create_elicitation`) with -32602. If a future change wires any of
-        // them, it MUST flip the corresponding capability — and this test will
-        // fail, forcing a deliberate re-audit (spec rows 365/370/439, §390).
+    fn client_handler_advertises_only_roots_capability() {
+        // Pins the capability posture: we declare `roots` (and serve it from
+        // `list_roots`), but still abstain from sampling (`create_message`)
+        // and elicitation (`create_elicitation`, -32602). `roots` carries no
+        // `listChanged` — the root set is static for the session. If a future
+        // change wires sampling/elicitation/tasks it MUST flip the matching
+        // capability, and this test will fail, forcing a deliberate re-audit
+        // (spec rows 363-384/439, §390).
         let caps = OpenabClientHandler::default().get_info().capabilities;
+        let roots = caps.roots.expect("must advertise roots");
+        assert_eq!(
+            roots.list_changed, None,
+            "roots must not advertise listChanged (static root set)"
+        );
         assert!(caps.sampling.is_none(), "must not advertise sampling");
-        assert!(caps.roots.is_none(), "must not advertise roots");
         assert!(caps.elicitation.is_none(), "must not advertise elicitation");
         assert!(caps.tasks.is_none(), "must not advertise tasks");
     }
@@ -1598,12 +1663,65 @@ mod tests {
             .insert("alpha".to_string(), Vec::new());
         cache.lock().unwrap().insert("beta".to_string(), Vec::new());
 
-        let alpha = OpenabClientHandler::new("alpha".to_string(), cache.clone());
+        let alpha =
+            OpenabClientHandler::new("alpha".to_string(), cache.clone(), Arc::new(Vec::new()));
         alpha.invalidate_tools_cache();
 
         let guard = cache.lock().unwrap();
         assert!(!guard.contains_key("alpha"), "alpha entry must be evicted");
         assert!(guard.contains_key("beta"), "beta entry must survive");
+    }
+
+    #[test]
+    fn compute_roots_canonicalizes_dedups_and_drops_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let sub = cwd.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let file = cwd.join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+
+        let extra = vec![
+            sub.to_string_lossy().into_owned(),
+            // `cwd/sub/..` canonicalizes back to `cwd` — a duplicate of the
+            // working-directory root, must be dropped.
+            sub.join("..").to_string_lossy().into_owned(),
+            // A regular file: not a directory, dropped.
+            file.to_string_lossy().into_owned(),
+            // Non-existent path: fails to canonicalize, dropped.
+            cwd.join("nope").to_string_lossy().into_owned(),
+        ];
+        let roots = compute_roots(Some(cwd.clone()), &extra);
+
+        let uris: Vec<&str> = roots.iter().map(|r| r.uri.as_str()).collect();
+        assert_eq!(
+            uris,
+            vec![
+                format!("file://{}", cwd.display()),
+                format!("file://{}", sub.display()),
+            ],
+            "only cwd + sub survive, in order, deduped"
+        );
+        assert!(roots.iter().all(|r| r.name.is_some()), "roots are named");
+    }
+
+    #[test]
+    fn handler_carries_advertised_roots() {
+        // `list_roots` returns `ListRootsResult::new((*self.roots).clone())`,
+        // but its `RequestContext` can't be fabricated without a live `Peer`
+        // (same harness gap as the capability test), so assert on the field
+        // the override closes over — that is what gets returned verbatim.
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let roots = Arc::new(compute_roots(Some(cwd.clone()), &[]));
+        let handler = OpenabClientHandler::new(
+            "srv".to_string(),
+            Arc::new(StdMutex::new(HashMap::new())),
+            roots.clone(),
+        );
+        assert_eq!(*handler.roots, *roots);
+        assert_eq!(handler.roots.len(), 1);
+        assert_eq!(handler.roots[0].uri, format!("file://{}", cwd.display()));
     }
 
     #[test]
