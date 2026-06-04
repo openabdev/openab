@@ -230,6 +230,13 @@ pub struct McpRuntimeManager {
     /// finalize the same server. `std::sync::Mutex` is fine: the lock
     /// is only held for `HashMap` ops, never across `.await`.
     device_login_tasks: Arc<StdMutex<HashMap<String, AbortHandle>>>,
+    /// Abort handle of the per-server periodic liveness-ping loop (rows
+    /// 273-279). Installed when `connect()` succeeds for a server whose
+    /// config opted in via `ping_interval_secs`; aborted on `disconnect`
+    /// and on a fresh `connect` (so a reconnect replaces, not duplicates,
+    /// the loop). Same `StdMutex` discipline as `device_login_tasks`: the
+    /// lock only guards `HashMap` ops, never held across `.await`.
+    ping_tasks: Arc<StdMutex<HashMap<String, AbortHandle>>>,
     /// Per-server single-flight gate for refresh-grant requests. The
     /// outer `StdMutex` guards the map (held only for `entry().or_insert`
     /// ops, never across `.await`); the inner `tokio::Mutex` is held
@@ -282,6 +289,7 @@ impl McpRuntimeManager {
             handles: Arc::new(RwLock::new(handles)),
             auth_path,
             device_login_tasks: Arc::new(StdMutex::new(HashMap::new())),
+            ping_tasks: Arc::new(StdMutex::new(HashMap::new())),
             refresh_locks: Arc::new(StdMutex::new(HashMap::new())),
             breaker: Arc::new(ServerBreaker::new()),
             catalog: catalog.into(),
@@ -379,10 +387,81 @@ impl McpRuntimeManager {
             handle.status = ServerStatus::Disconnected;
             handle.client.take()
         };
+        self.abort_ping(name);
         if let Some(client) = client {
             client.cancellation_token().cancel();
         }
         Ok(())
+    }
+
+    /// Abort any in-flight periodic-ping loop for `name` (rows 273-279).
+    /// Lock held only for the `HashMap::remove`, never across `.await`.
+    fn abort_ping(&self, name: &str) {
+        if let Some(handle) = self.ping_tasks.lock().unwrap().remove(name) {
+            handle.abort();
+        }
+    }
+
+    /// Spawn a per-server liveness-ping loop (MCP §5 ping / rows 273-279).
+    /// Fires `ping` every `interval`, bounding each request by `timeout` via
+    /// rmcp's cancellable-request path (auto-emits `notifications/cancelled`
+    /// on expiry). A timeout or transport error is a liveness fault: it warns
+    /// on `mcp.ping` and feeds the breaker `record_failure` so a hung server
+    /// trips the circuit even when no foreground tool call is in flight. A
+    /// healthy reply is genuine transport-level success → `record_success`.
+    /// The loop holds an `Arc<RunningService>`; on `disconnect` the
+    /// `AbortHandle` (stored in `ping_tasks`) is aborted and the Arc drops.
+    fn spawn_ping_loop(
+        &self,
+        name: String,
+        client: Arc<RunningService<RoleClient, OpenabClientHandler>>,
+        interval: Duration,
+        timeout: Duration,
+    ) {
+        let manager = self.clone();
+        let key = name.clone();
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // First tick fires immediately; skip it so the first ping waits a
+            // full interval after connect rather than racing the handshake.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let mut options = rmcp::service::PeerRequestOptions::no_options();
+                options.timeout = Some(timeout);
+                let request =
+                    rmcp::model::ClientRequest::PingRequest(rmcp::model::PingRequest::default());
+                let outcome = match client.send_request_with_option(request, options).await {
+                    Ok(handle) => handle.await_response().await,
+                    Err(e) => Err(e),
+                };
+                match outcome {
+                    Ok(rmcp::model::ServerResult::EmptyResult(_)) => {
+                        manager.breaker.record_success(&name);
+                    }
+                    Ok(other) => {
+                        tracing::warn!(
+                            target: "mcp.ping",
+                            server = %name,
+                            "unexpected ping response: {other:?}"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "mcp.ping",
+                            server = %name,
+                            "ping failed: {}",
+                            super::redact_secrets(&format!("{e}"))
+                        );
+                        manager.breaker.record_failure(&name);
+                    }
+                }
+            }
+        });
+        if let Some(prev) = self.ping_tasks.lock().unwrap().insert(key, task.abort_handle()) {
+            prev.abort();
+        }
     }
 
     /// Snapshot of `(name, status, transport_label)` sorted by name. Used
@@ -983,8 +1062,15 @@ impl McpRuntimeManager {
                     }
                 }
                 handle.status = ServerStatus::Connected;
-                handle.client = Some(Arc::new(client));
+                let client = Arc::new(client);
+                handle.client = Some(client.clone());
                 self.breaker.record_success(name);
+                // Opt-in periodic liveness ping (rows 273-279). A reconnect
+                // installs a fresh loop; `spawn_ping_loop` aborts any prior
+                // one for this server so loops never accumulate.
+                if let Some((interval, timeout)) = handle.config.ping_config() {
+                    self.spawn_ping_loop(name.to_string(), client, interval, timeout);
+                }
                 Ok(())
             }
             Err(e) => {

@@ -30,6 +30,10 @@ pub enum ServerConfig {
         request_timeout_secs: u64,
         #[serde(default)]
         log_level: Option<String>,
+        #[serde(default)]
+        ping_interval_secs: Option<u64>,
+        #[serde(default)]
+        ping_timeout_secs: Option<u64>,
     },
     Http {
         url: String,
@@ -41,6 +45,10 @@ pub enum ServerConfig {
         request_timeout_secs: u64,
         #[serde(default)]
         log_level: Option<String>,
+        #[serde(default)]
+        ping_interval_secs: Option<u64>,
+        #[serde(default)]
+        ping_timeout_secs: Option<u64>,
     },
 }
 
@@ -95,6 +103,28 @@ impl ServerConfig {
                 log_level.as_deref()
             }
         }
+    }
+
+    /// Opt-in per-server liveness ping (MCP §5 ping / rows 273-279). Returns
+    /// `Some((interval, timeout))` only when the operator set
+    /// `ping_interval_secs`; `None` disables pinging entirely. The timeout
+    /// bounds a single `PingRequest` and defaults to 5s when unset.
+    pub fn ping_config(&self) -> Option<(std::time::Duration, std::time::Duration)> {
+        let (interval_secs, timeout_secs) = match self {
+            ServerConfig::Stdio {
+                ping_interval_secs,
+                ping_timeout_secs,
+                ..
+            }
+            | ServerConfig::Http {
+                ping_interval_secs,
+                ping_timeout_secs,
+                ..
+            } => (*ping_interval_secs, *ping_timeout_secs),
+        };
+        let interval = std::time::Duration::from_secs(interval_secs?);
+        let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(5));
+        Some((interval, timeout))
     }
 }
 
@@ -424,6 +454,8 @@ mod tests {
             tool_filter: None,
             request_timeout_secs: default_request_timeout_secs(),
             log_level: None,
+            ping_interval_secs: None,
+            ping_timeout_secs: None,
         };
         match cfg.resolved_with_env("github", &env).unwrap() {
             ServerConfig::Stdio { args, .. } => {
@@ -431,6 +463,36 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn ping_config_opt_in_and_default_timeout() {
+        // Absent ping_interval_secs => pinging disabled.
+        let off: ServerConfig =
+            serde_json::from_str(r#"{"type":"stdio","command":"x"}"#).unwrap();
+        assert!(off.ping_config().is_none());
+
+        // interval set, timeout omitted => 5s default timeout.
+        let on: ServerConfig = serde_json::from_str(
+            r#"{"type":"http","url":"https://e.com/mcp","ping_interval_secs":30}"#,
+        )
+        .unwrap();
+        let (interval, timeout) = on.ping_config().unwrap();
+        assert_eq!(interval, std::time::Duration::from_secs(30));
+        assert_eq!(timeout, std::time::Duration::from_secs(5));
+
+        // both set => both honoured.
+        let both: ServerConfig = serde_json::from_str(
+            r#"{"type":"stdio","command":"x","ping_interval_secs":15,"ping_timeout_secs":3}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            both.ping_config().unwrap(),
+            (
+                std::time::Duration::from_secs(15),
+                std::time::Duration::from_secs(3)
+            )
+        );
     }
 
     #[test]
