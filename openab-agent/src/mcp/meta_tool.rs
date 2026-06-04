@@ -156,6 +156,10 @@ async fn fetch_tools(manager: &McpRuntimeManager, server: &str) -> Result<Vec<rm
     // bounded by the configured request timeout (ADR §5.6). rmcp's helper
     // takes no options, so we drive `list_tools` ourselves.
     let mut tools = Vec::new();
+    // The cursor is an opaque server token (MCP 2025-11-25 pagination): we
+    // round-trip `next_cursor` verbatim into the next request's `cursor` and
+    // never parse, synthesize, or persist it — its format is the server's
+    // private concern and may change between pages.
     let mut cursor = None;
     loop {
         let request = ClientRequest::ListToolsRequest(ListToolsRequest::with_param(
