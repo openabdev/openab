@@ -20,8 +20,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use rmcp::model::{
-    ErrorData, ListRootsRequestMethod, ListRootsResult, LoggingLevel,
-    LoggingMessageNotificationParam, SetLevelRequestParams,
+    CreateElicitationRequestParams, CreateElicitationResult, ErrorData, ListRootsRequestMethod,
+    ListRootsResult, LoggingLevel, LoggingMessageNotificationParam, SetLevelRequestParams,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
@@ -45,12 +45,15 @@ use crate::auth::{
 /// MCP client-side callback handler. Replaces the unit type `()` so individual
 /// `ClientHandler` callbacks can be overridden (the named struct is the
 /// keystone that unlocks `on_tool_list_changed` / `on_resource_updated` /
-/// `on_prompt_list_changed` / elicitation-complete wiring later). Currently
-/// overrides only `list_roots`, returning JSON-RPC `-32601` (method not found)
-/// instead of the SDK default's empty roots list, because we advertise no
-/// `roots` capability (spec rows 365/370). `get_info()` is deliberately NOT
-/// overridden: inheriting the trait default keeps the advertised ClientInfo +
-/// capabilities byte-identical to the previous `()` handler.
+/// `on_prompt_list_changed` / elicitation-complete wiring later). Overrides
+/// `list_roots`, returning JSON-RPC `-32601` (method not found) instead of the
+/// SDK default's empty roots list, because we advertise no `roots` capability
+/// (spec rows 365/370); and `create_elicitation`, returning `-32602`
+/// (invalid params) instead of the SDK default's silent decline, because we
+/// advertise no `elicitation` capability (spec row 439). `get_info()` is
+/// deliberately NOT overridden: inheriting the trait default keeps the
+/// advertised ClientInfo + capabilities byte-identical to the previous `()`
+/// handler.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OpenabClientHandler;
 
@@ -60,6 +63,21 @@ impl ClientHandler for OpenabClientHandler {
         _context: RequestContext<RoleClient>,
     ) -> impl std::future::Future<Output = Result<ListRootsResult, ErrorData>> + Send + '_ {
         std::future::ready(Err(ErrorData::method_not_found::<ListRootsRequestMethod>()))
+    }
+
+    fn create_elicitation(
+        &self,
+        _request: CreateElicitationRequestParams,
+        _context: RequestContext<RoleClient>,
+    ) -> impl std::future::Future<Output = Result<CreateElicitationResult, ErrorData>> + Send + '_
+    {
+        // We advertise no `elicitation` capability, so a server MUST NOT send
+        // this request. Reject explicitly with -32602 instead of inheriting the
+        // SDK default's silent decline, so the violation is observable (row 439).
+        std::future::ready(Err(ErrorData::invalid_params(
+            "elicitation capability not declared",
+            None,
+        )))
     }
 
     fn on_logging_message(
@@ -1385,6 +1403,21 @@ mod tests {
         assert!(mgr.is_empty().await);
         assert!(mgr.statuses().await.is_empty());
         assert!(mgr.catalog().is_empty());
+    }
+
+    #[test]
+    fn client_handler_advertises_no_optional_capabilities() {
+        // Pins the "vacuously compliant by abstention" posture: because we
+        // declare none of these capabilities, sampling (`create_message`) and
+        // roots (`list_roots`) abstain with -32601 and elicitation
+        // (`create_elicitation`) with -32602. If a future change wires any of
+        // them, it MUST flip the corresponding capability — and this test will
+        // fail, forcing a deliberate re-audit (spec rows 365/370/439, §390).
+        let caps = OpenabClientHandler.get_info().capabilities;
+        assert!(caps.sampling.is_none(), "must not advertise sampling");
+        assert!(caps.roots.is_none(), "must not advertise roots");
+        assert!(caps.elicitation.is_none(), "must not advertise elicitation");
+        assert!(caps.tasks.is_none(), "must not advertise tasks");
     }
 
     #[test]
