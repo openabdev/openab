@@ -4,6 +4,8 @@
 //! (`help`, `list_servers`, `list_tools`, `describe_tool`, `call`, `status`).
 //! The Phase 2 `login` / `complete_login` actions land with the OAuth slice.
 
+use std::time::Instant;
+
 use anyhow::{anyhow, Context, Result};
 use rmcp::model::{
     CallToolRequest, ClientRequest, ListToolsRequest, PaginatedRequestParams, ServerResult,
@@ -11,6 +13,7 @@ use rmcp::model::{
 use rmcp::service::{PeerRequestOptions, ServiceError};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use super::runtime::{McpRuntimeManager, ServerStatus};
 
@@ -93,6 +96,20 @@ async fn call_tool(
             ));
         }
     };
+    // Audit trail: hash the args actually sent on the wire (never the
+    // plaintext — could carry secrets). sha2 is already a dep (auth.rs).
+    let args_sha256 = Sha256::digest(serde_json::to_vec(&args_map).unwrap_or_default())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let started = Instant::now();
+    tracing::info!(
+        target: "mcp.audit",
+        server,
+        tool,
+        args_sha256 = %args_sha256,
+        "mcp call_tool entry"
+    );
     manager
         .connect(server)
         .await
@@ -121,6 +138,16 @@ async fn call_tool(
         }
         Ok(_) => {
             manager.record_tool_call_outcome(server, false);
+            tracing::info!(
+                target: "mcp.audit",
+                server,
+                tool,
+                args_sha256 = %args_sha256,
+                duration_ms = started.elapsed().as_millis() as u64,
+                outcome = "err",
+                is_error = true,
+                "mcp call_tool exit"
+            );
             return Err(anyhow!(
                 "call_tool {tool:?} on {server:?}: unexpected non-CallToolResult response"
             ));
@@ -136,10 +163,30 @@ async fn call_tool(
                 );
             }
             manager.record_tool_call_outcome(server, false);
+            tracing::info!(
+                target: "mcp.audit",
+                server,
+                tool,
+                args_sha256 = %args_sha256,
+                duration_ms = started.elapsed().as_millis() as u64,
+                outcome = "err",
+                is_error = true,
+                "mcp call_tool exit"
+            );
             return Err(anyhow::Error::new(e))
                 .with_context(|| format!("call_tool {tool:?} on {server:?}"));
         }
     };
+    tracing::info!(
+        target: "mcp.audit",
+        server,
+        tool,
+        args_sha256 = %args_sha256,
+        duration_ms = started.elapsed().as_millis() as u64,
+        outcome = "ok",
+        is_error = result.is_error.unwrap_or(false),
+        "mcp call_tool exit"
+    );
     let is_error = result.is_error;
     let value = serde_json::to_value(&result).context("serialize CallToolResult")?;
     Ok((value, is_error))
