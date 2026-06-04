@@ -42,18 +42,20 @@ pub enum Action {
 
 /// Entry point — the LLM tool dispatcher hands us a deserialized `Action`
 /// and we return the JSON payload that becomes the tool result.
-pub async fn dispatch(manager: &McpRuntimeManager, action: Action) -> Result<Value> {
+pub async fn dispatch(manager: &McpRuntimeManager, action: Action) -> Result<(Value, Option<bool>)> {
     match action {
-        Action::Help => Ok(json!(HELP)),
-        Action::ListServers => Ok(list_servers(manager).await),
-        Action::ListTools { server } => list_tools(manager, &server).await,
-        Action::DescribeTool { server, tool } => describe_tool(manager, &server, &tool).await,
+        Action::Help => Ok((json!(HELP), None)),
+        Action::ListServers => Ok((list_servers(manager).await, None)),
+        Action::ListTools { server } => list_tools(manager, &server).await.map(|v| (v, None)),
+        Action::DescribeTool { server, tool } => {
+            describe_tool(manager, &server, &tool).await.map(|v| (v, None))
+        }
         Action::Call {
             server,
             tool,
             arguments,
         } => call_tool(manager, &server, &tool, arguments).await,
-        Action::Status { server } => Ok(status(manager, server.as_deref()).await),
+        Action::Status { server } => Ok((status(manager, server.as_deref()).await, None)),
     }
 }
 
@@ -77,7 +79,7 @@ async fn call_tool(
     server: &str,
     tool: &str,
     arguments: Value,
-) -> Result<Value> {
+) -> Result<(Value, Option<bool>)> {
     // Lenient arg coercion: LLMs often send `null` or omit `arguments`
     // for no-arg tools; rejecting those would make zero-arg calls
     // fragile. Only real type errors (string, number, array, bool)
@@ -138,7 +140,9 @@ async fn call_tool(
                 .with_context(|| format!("call_tool {tool:?} on {server:?}"));
         }
     };
-    serde_json::to_value(&result).context("serialize CallToolResult")
+    let is_error = result.is_error;
+    let value = serde_json::to_value(&result).context("serialize CallToolResult")?;
+    Ok((value, is_error))
 }
 
 /// Lazy-connect + list all tools on `server`. Shared by `list_tools` /
@@ -303,7 +307,7 @@ mod tests {
     #[tokio::test]
     async fn help_returns_doc_string() {
         let mgr = mgr_from(r#"{"mcpServers":{}}"#);
-        let result = dispatch(&mgr, Action::Help).await.unwrap();
+        let (result, _) = dispatch(&mgr, Action::Help).await.unwrap();
         let s = result.as_str().unwrap();
         assert!(s.contains("list_servers"));
         assert!(s.contains("call(server, tool"));
@@ -319,7 +323,7 @@ mod tests {
                 }
             }"#,
         );
-        let result = dispatch(&mgr, Action::ListServers).await.unwrap();
+        let (result, _) = dispatch(&mgr, Action::ListServers).await.unwrap();
         let entries = result.as_array().unwrap();
         assert_eq!(entries.len(), 2);
         let by_name: std::collections::HashMap<_, _> = entries
@@ -334,7 +338,7 @@ mod tests {
     #[tokio::test]
     async fn list_servers_empty_yields_empty_array() {
         let mgr = mgr_from(r#"{"mcpServers":{}}"#);
-        let result = dispatch(&mgr, Action::ListServers).await.unwrap();
+        let (result, _) = dispatch(&mgr, Action::ListServers).await.unwrap();
         assert!(result.as_array().unwrap().is_empty());
     }
 
@@ -449,7 +453,7 @@ mod tests {
                 }
             }"#,
         );
-        let result = dispatch(&mgr, Action::Status { server: None })
+        let (result, _) = dispatch(&mgr, Action::Status { server: None })
             .await
             .unwrap();
         let entries = result.as_array().unwrap();
@@ -485,7 +489,7 @@ mod tests {
             },
         )
         .await;
-        let result = dispatch(&mgr, Action::Status { server: None })
+        let (result, _) = dispatch(&mgr, Action::Status { server: None })
             .await
             .unwrap();
         let entries = result.as_array().unwrap();
@@ -507,7 +511,7 @@ mod tests {
                 }
             }"#,
         );
-        let result = dispatch(
+        let (result, _) = dispatch(
             &mgr,
             Action::Status {
                 server: Some("fs".into()),
@@ -530,7 +534,7 @@ mod tests {
                 }
             }"#,
         );
-        let result = dispatch(
+        let (result, _) = dispatch(
             &mgr,
             Action::Status {
                 server: Some("nope".into()),
@@ -560,7 +564,7 @@ mod tests {
             },
         )
         .await;
-        let result = dispatch(&mgr, Action::Status { server: None })
+        let (result, _) = dispatch(&mgr, Action::Status { server: None })
             .await
             .unwrap();
         let entries = result.as_array().unwrap();

@@ -177,11 +177,11 @@ impl Agent {
                 info!("executing tool: {name}");
                 let result = self.execute_tool_call(name, input).await;
                 match result {
-                    Ok(output) => {
+                    Ok((output, is_error)) => {
                         tool_results.push(ContentBlock::ToolResult {
                             tool_use_id: id.clone(),
                             content: output,
-                            is_error: None,
+                            is_error,
                         });
                     }
                     Err(e) => {
@@ -223,7 +223,11 @@ impl Agent {
     /// everything else goes to the stateless `tools::execute_tool`. Keeping
     /// the routing here (rather than inside `tools.rs`) lets `tools.rs` stay
     /// stateless and free of MCP/feature plumbing.
-    async fn execute_tool_call(&self, name: &str, input: &serde_json::Value) -> Result<String> {
+    async fn execute_tool_call(
+        &self,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> Result<(String, Option<bool>)> {
         if name == mcp::MCP_TOOL_NAME {
             let Some(manager) = self.mcp_manager.as_ref() else {
                 return Err(anyhow::anyhow!(
@@ -232,10 +236,12 @@ impl Agent {
             };
             let action = mcp::meta_tool::Action::deserialize(input)
                 .map_err(|e| anyhow::anyhow!("invalid mcp action payload: {e}"))?;
-            let value = mcp::meta_tool::dispatch(manager, action).await?;
-            return Ok(serde_json::to_string(&value)?);
+            let (value, is_error) = mcp::meta_tool::dispatch(manager, action).await?;
+            return Ok((serde_json::to_string(&value)?, is_error));
         }
-        tools::execute_tool(name, input, &self.working_dir).await
+        tools::execute_tool(name, input, &self.working_dir)
+            .await
+            .map(|s| (s, None))
     }
 
     async fn call_llm(&self) -> Result<Vec<LlmEvent>> {
