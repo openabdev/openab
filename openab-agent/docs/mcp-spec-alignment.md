@@ -12,7 +12,7 @@ every item in a section is derived from that file.
 | Spec source | [`docs/specification/2025-11-25/`](https://github.com/modelcontextprotocol/modelcontextprotocol/tree/main/docs/specification/2025-11-25) |
 | Codebase | _TBD_ |
 | SDK | _TBD_ |
-| Last refreshed | 2026-06-03 |
+| Last refreshed | 2026-06-04 |
 
 ## Automated conformance
 
@@ -91,7 +91,7 @@ Source: [`basic/index.mdx`](https://github.com/modelcontextprotocol/modelcontext
 | 36 | MAY disallow file types | MAY | N/A | same |
 | 37 | Validate MIME via magic bytes / allowlist | (security) | N/A | same |
 | 37a | Verify icon URIs same-origin | (security) | N/A | same |
-| 37b | JSON-RPC `Error.message` SHOULD be concise single sentence | SHOULD | ⚠️ | wrapped via `anyhow::Context` + `format!`; multi-clause sites confirmed: `src/mcp/runtime.rs:1753` (HTTP error body format), `src/mcp/config.rs:155-157` (spec config `read_to_string` + `serde_json::from_str` with two `with_context` layers), `src/mcp/config.rs:170-173` (env var resolve via `interpolate_value` + `with_context`), `src/mcp/meta_tool.rs:95+` (tool-call params), `src/mcp/oauth.rs:57,63` (PKCE/OAuth `anyhow!` sites) — Mira-extended inventory; Jelly fact-check 2026-06-03 dropped stale `runtime.rs:272` (not an error site, struct-literal line) + repointed `config.rs:149-150` → `155-157`, `config.rs:166` → `170-173` |
+| 37b | JSON-RPC `Error.message` SHOULD be concise single sentence | SHOULD | ⚠️ | wrapped via `anyhow::Context` + `format!`; multi-clause sites confirmed: `src/mcp/runtime.rs:875, 972` (HTTP error body format), `src/mcp/config.rs:155-157` (spec config `read_to_string` + `serde_json::from_str` with two `with_context` layers), `src/mcp/config.rs:170-173` (env var resolve via `interpolate_value` + `with_context`), `src/mcp/meta_tool.rs:95+` (tool-call params), `src/mcp/oauth.rs:57,63` (PKCE/OAuth `anyhow!` sites) — Mira-extended inventory; Jelly fact-check 2026-06-03 dropped stale `runtime.rs:272` (not an error site, struct-literal line) + repointed `config.rs:149-150` → `155-157`, `config.rs:166` → `170-173` |
 
 ### Improvement Plan (Jelly + Mira consensus, section 0)
 
@@ -99,7 +99,7 @@ Source: [`basic/index.mdx`](https://github.com/modelcontextprotocol/modelcontext
   - **Eval**: openab-agent layer (rmcp doesn't own schema-dialect validation and probably shouldn't — it's a serialization SDK) · option (a) drop-in with `jsonschema` crate (~100 LOC) but compliance theatre because we pass schemas straight to the LLM which tolerates any dialect; option (b) docs only · **fit: borderline — recommend (b)**. Adding a validator for tool-schemas we just relay isn't a meaningful gate.
 - [ ] **Rows 19-20**: surface unsupported-dialect tool entries as `NeedsAttention` rather than silently passing through; covers MUST-handle-gracefully.
   - **Eval**: openab-agent only (extends our existing `ServerStatus` model, mirrors `NeedsAuth`) · drop-in (~30 LOC) · **fit: in-scope**. Even if we skip row 18 validation, surfacing "we don't know this dialect" is the bare-minimum graceful handling the MUST asks for.
-- [ ] **Row 37b (`Error.message` brevity)**: introduce a `concise_error_message(err: &anyhow::Error) -> String` helper that takes the top-level cause's `to_string()` (not the chained one) for the JSON-RPC error payload, and keep the full chain only in `tracing` logs. Audit sites: `runtime.rs:1753`, `config.rs:155-157`, `config.rs:170-173`, `meta_tool.rs:95+`, `oauth.rs:57,63`.
+- [ ] **Row 37b (`Error.message` brevity)**: introduce a `concise_error_message(err: &anyhow::Error) -> String` helper that takes the top-level cause's `to_string()` (not the chained one) for the JSON-RPC error payload, and keep the full chain only in `tracing` logs. Audit sites: `runtime.rs:875, 972`, `config.rs:155-157`, `config.rs:170-173`, `meta_tool.rs:95+`, `oauth.rs:57,63`.
   - **Eval**: openab-agent only · drop-in (one helper + call-site touch-ups, ~80 LOC) · **fit: defer — low value**. SHOULD, not MUST. anyhow chains are arguably useful debug context; only do this if a real server / LLM complains about verbose `error.message`s.
 - [ ] **Documentation**: README MCP section should explicitly call out (a) JSON Schema dialect support / passthrough behavior, (b) that `_meta` keys are passed through opaquely, (c) icon-rendering is N/A (we're not a UI client).
   - **Eval**: docs only · drop-in · **fit: in-scope**. Cheap; sets reader expectation.
