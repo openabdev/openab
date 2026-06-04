@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+const INTERNAL_ERROR_CHECK_LOGS: &str = "Internal error. Check OpenAB logs for details.";
+
 // --- Outgoing ---
 
 #[derive(Debug, Serialize)]
@@ -72,12 +74,76 @@ impl JsonRpcError {
             .and_then(|d| d.get("message"))
             .and_then(|m| m.as_str())
     }
+
+    /// Extract the most useful user-facing detail from `error.data`.
+    ///
+    /// Agents may put a JSON-encoded upstream error inside `error.data.message`.
+    /// When that shape is present, prefer the nested `error.message`. If the
+    /// nested payload cannot be parsed, log the raw value at ERROR level so the
+    /// details are not only visible in DEBUG `acp_recv` logs.
+    pub fn user_detail(&self) -> Option<String> {
+        let data = self.data.as_ref()?;
+
+        if let Some(message) = self.data_message() {
+            return Some(self.extract_message_detail(message));
+        }
+
+        data.get("details")
+            .and_then(|d| d.as_str())
+            .map(str::to_owned)
+    }
+
+    fn extract_message_detail(&self, message: &str) -> String {
+        if !looks_like_json(message) {
+            return message.into();
+        }
+
+        match extract_nested_error_message(message) {
+            Ok(Some(detail)) => detail,
+            Ok(None) => {
+                tracing::error!(
+                    code = self.code,
+                    error_message = %self.message,
+                    data_message = %message,
+                    "JSON-RPC error data.message contained JSON without a user-facing message"
+                );
+                INTERNAL_ERROR_CHECK_LOGS.into()
+            }
+            Err(err) => {
+                tracing::error!(
+                    code = self.code,
+                    error_message = %self.message,
+                    data_message = %message,
+                    parse_error = %err,
+                    "failed to parse JSON-RPC error data.message"
+                );
+                INTERNAL_ERROR_CHECK_LOGS.into()
+            }
+        }
+    }
+}
+
+fn looks_like_json(message: &str) -> bool {
+    let trimmed = message.trim_start();
+    trimmed.starts_with('{') || trimmed.starts_with('[')
+}
+
+fn extract_nested_error_message(message: &str) -> Result<Option<String>, serde_json::Error> {
+    let parsed: Value = serde_json::from_str(message)?;
+
+    Ok(parsed
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .or_else(|| parsed.get("message").and_then(|m| m.as_str()))
+        .filter(|m| !m.is_empty())
+        .map(str::to_owned))
 }
 
 impl std::fmt::Display for JsonRpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "JSON-RPC error {}: {}", self.code, self.message)?;
-        if let Some(detail) = self.data_message() {
+        if let Some(detail) = self.user_detail() {
             write!(f, " — {detail}")?;
         }
         Ok(())
@@ -402,5 +468,63 @@ mod tests {
         let opts = parse_config_options(&result);
         assert_eq!(opts.len(), 1);
         assert_eq!(opts[0].id, "model");
+    }
+
+    #[test]
+    fn user_detail_extracts_nested_json_error_message() {
+        let err = JsonRpcError {
+            code: -32603,
+            message: "Internal error".into(),
+            data: Some(json!({
+                "message": "{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"model not supported\"}}"
+            })),
+        };
+
+        assert_eq!(err.user_detail().as_deref(), Some("model not supported"));
+    }
+
+    #[test]
+    fn user_detail_uses_raw_message_when_it_is_not_json() {
+        let err = JsonRpcError {
+            code: -32603,
+            message: "Internal error".into(),
+            data: Some(json!({
+                "message": "plain upstream error"
+            })),
+        };
+
+        assert_eq!(err.user_detail().as_deref(), Some("plain upstream error"));
+    }
+
+    #[test]
+    fn user_detail_logs_json_parse_failure_and_shows_check_logs_message() {
+        let err = JsonRpcError {
+            code: -32603,
+            message: "Internal error".into(),
+            data: Some(json!({
+                "message": "{\"error\":{\"message\":"
+            })),
+        };
+
+        assert_eq!(
+            err.user_detail().as_deref(),
+            Some(INTERNAL_ERROR_CHECK_LOGS)
+        );
+    }
+
+    #[test]
+    fn user_detail_logs_json_without_nested_message_and_shows_check_logs_message() {
+        let err = JsonRpcError {
+            code: -32603,
+            message: "Internal error".into(),
+            data: Some(json!({
+                "message": "{\"error\":{\"type\":\"invalid_request_error\"}}"
+            })),
+        };
+
+        assert_eq!(
+            err.user_detail().as_deref(),
+            Some(INTERNAL_ERROR_CHECK_LOGS)
+        );
     }
 }

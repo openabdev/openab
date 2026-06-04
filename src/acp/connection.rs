@@ -3,14 +3,17 @@ use crate::acp::protocol::{
 };
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
+
+const DIAGNOSTIC_LINE_LIMIT: usize = 8;
+const DIAGNOSTIC_LINE_MAX_CHARS: usize = 2_000;
 
 /// Pick the most permissive selectable permission option from ACP options.
 fn pick_best_option(options: &[Value]) -> Option<String> {
@@ -115,6 +118,7 @@ pub struct AcpConnection {
     next_id: AtomicU64,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
     notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
+    diagnostics: Arc<Mutex<AgentDiagnostics>>,
     pub acp_session_id: Option<String>,
     pub supports_load_session: bool,
     pub config_options: Vec<ConfigOption>,
@@ -122,6 +126,62 @@ pub struct AcpConnection {
     pub session_reset: bool,
     _reader_handle: JoinHandle<()>,
     _stderr_handle: Option<JoinHandle<()>>,
+}
+
+#[derive(Default)]
+pub(crate) struct AgentDiagnostics {
+    stderr: VecDeque<String>,
+    malformed_stdout: VecDeque<String>,
+}
+
+#[derive(Default)]
+struct AgentDiagnosticSnapshot {
+    stderr: Vec<String>,
+    malformed_stdout: Vec<String>,
+}
+
+impl AgentDiagnostics {
+    fn push_stderr(&mut self, line: String) {
+        push_limited(&mut self.stderr, line);
+    }
+
+    fn push_malformed_stdout(&mut self, line: String) {
+        push_limited(&mut self.malformed_stdout, line);
+    }
+
+    fn snapshot(&self) -> AgentDiagnosticSnapshot {
+        AgentDiagnosticSnapshot {
+            stderr: self.stderr.iter().cloned().collect(),
+            malformed_stdout: self.malformed_stdout.iter().cloned().collect(),
+        }
+    }
+}
+
+impl AgentDiagnosticSnapshot {
+    fn is_empty(&self) -> bool {
+        self.stderr.is_empty() && self.malformed_stdout.is_empty()
+    }
+}
+
+fn push_limited(lines: &mut VecDeque<String>, line: String) {
+    if lines.len() == DIAGNOSTIC_LINE_LIMIT {
+        lines.pop_front();
+    }
+    lines.push_back(line);
+}
+
+fn sanitize_diagnostic_line(line: &str) -> String {
+    let mut out = String::new();
+    for ch in line.trim().chars() {
+        if out.len() >= DIAGNOSTIC_LINE_MAX_CHARS {
+            out.push_str("...");
+            break;
+        }
+        if !ch.is_control() || ch == '\t' {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// Build the final set of env vars for the agent subprocess.
@@ -160,6 +220,7 @@ pub(crate) async fn run_reader_loop<R, W>(
     writer: Arc<Mutex<W>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
     notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
+    diagnostics: Arc<Mutex<AgentDiagnostics>>,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -178,7 +239,18 @@ pub(crate) async fn run_reader_loop<R, W>(
         }
         let msg: JsonRpcMessage = match serde_json::from_str(line.trim()) {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) => {
+                let sanitized = sanitize_diagnostic_line(&line);
+                if !sanitized.is_empty() {
+                    warn!(
+                        parse_error = %e,
+                        line = %sanitized,
+                        "agent stdout was not valid JSON-RPC"
+                    );
+                    diagnostics.lock().await.push_malformed_stdout(sanitized);
+                }
+                continue;
+            }
         };
         debug!(line = line.trim(), "acp_recv");
 
@@ -356,11 +428,13 @@ impl AcpConnection {
         let stdout = proc.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         let stdin = proc.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
         let stdin = Arc::new(Mutex::new(stdin));
+        let diagnostics = Arc::new(Mutex::new(AgentDiagnostics::default()));
 
         // Capture agent stderr and log it (ACP spec: agents MAY write to stderr
         // for logging; clients MAY capture or ignore it).
         let stderr_handle = if let Some(stderr) = proc.stderr.take() {
             let cmd_name = command.to_string();
+            let diagnostics = diagnostics.clone();
             Some(tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
                 let mut line = String::new();
@@ -369,14 +443,10 @@ impl AcpConnection {
                     match reader.read_line(&mut line).await {
                         Ok(0) => break,
                         Ok(_) => {
-                            let trimmed = line.trim();
-                            if !trimmed.is_empty() {
-                                let sanitized: String = trimmed.chars()
-                                    .filter(|c| !c.is_control() || *c == '\t')
-                                    .collect();
-                                if !sanitized.is_empty() {
-                                    tracing::warn!(agent = %cmd_name, "{sanitized}");
-                                }
+                            let sanitized = sanitize_diagnostic_line(&line);
+                            if !sanitized.is_empty() {
+                                tracing::warn!(agent = %cmd_name, "{sanitized}");
+                                diagnostics.lock().await.push_stderr(sanitized);
                             }
                         }
                         Err(_) => break,
@@ -397,6 +467,7 @@ impl AcpConnection {
             stdin.clone(),
             pending.clone(),
             notify_tx.clone(),
+            diagnostics.clone(),
         ));
 
         Ok(Self {
@@ -406,6 +477,7 @@ impl AcpConnection {
             next_id: AtomicU64::new(1),
             pending,
             notify_tx,
+            diagnostics,
             acp_session_id: None,
             supports_load_session: false,
             config_options: Vec::new(),
@@ -638,6 +710,26 @@ impl AcpConnection {
         !self._reader_handle.is_finished()
     }
 
+    pub async fn log_diagnostics(&self, reason: &str, request_id: Option<u64>) {
+        let snapshot = self.diagnostics.lock().await.snapshot();
+        if snapshot.is_empty() {
+            error!(
+                reason,
+                ?request_id,
+                "agent request failed without JSON-RPC error"
+            );
+            return;
+        }
+
+        error!(
+            reason,
+            ?request_id,
+            recent_stderr = ?snapshot.stderr,
+            recent_malformed_stdout = ?snapshot.malformed_stdout,
+            "agent request failed without JSON-RPC error"
+        );
+    }
+
     /// Resume a previous session by ID. Returns Ok(()) if the agent accepted
     /// the load, or an error if it failed (caller should fall back to session/new).
     pub async fn session_load(&mut self, session_id: &str, cwd: &str) -> Result<()> {
@@ -856,6 +948,7 @@ mod reader_loop_tests {
             Arc::new(Mutex::new(HashMap::new()));
         let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(None));
+        let diagnostics = Arc::new(Mutex::new(AgentDiagnostics::default()));
 
         let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
         *notify_tx.lock().await = Some(sub_tx);
@@ -866,19 +959,17 @@ mod reader_loop_tests {
             writer,
             pending.clone(),
             notify_tx.clone(),
+            diagnostics,
         ));
 
         let stale = b"{\"jsonrpc\":\"2.0\",\"id\":42,\"result\":{\"stopReason\":\"ok\"}}\n";
         agent_stdout_writer.write_all(stale).await.unwrap();
         agent_stdout_writer.flush().await.unwrap();
 
-        let forwarded = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            sub_rx.recv(),
-        )
-        .await
-        .expect("subscriber should receive stale message before timeout")
-        .expect("subscriber channel should not be closed");
+        let forwarded = tokio::time::timeout(std::time::Duration::from_secs(2), sub_rx.recv())
+            .await
+            .expect("subscriber should receive stale message before timeout")
+            .expect("subscriber channel should not be closed");
         assert_eq!(forwarded.id, Some(42));
         assert!(pending.lock().await.is_empty());
 
@@ -899,6 +990,7 @@ mod reader_loop_tests {
             Arc::new(Mutex::new(HashMap::new()));
         let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(None));
+        let diagnostics = Arc::new(Mutex::new(AgentDiagnostics::default()));
 
         let (resp_tx, resp_rx) = oneshot::channel();
         pending.lock().await.insert(7, resp_tx);
@@ -912,6 +1004,7 @@ mod reader_loop_tests {
             writer,
             pending.clone(),
             notify_tx.clone(),
+            diagnostics,
         ));
 
         let payload = b"{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"stopReason\":\"end_turn\"}}\n";
@@ -933,5 +1026,38 @@ mod reader_loop_tests {
 
         drop(agent_stdout_writer);
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_stdout_is_recorded_in_diagnostics() {
+        let (mut agent_stdout_writer, agent_stdout_reader) = duplex(8 * 1024);
+        let (agent_stdin_writer, _agent_stdin_reader) = duplex(8 * 1024);
+
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(None));
+        let diagnostics = Arc::new(Mutex::new(AgentDiagnostics::default()));
+
+        let writer = Arc::new(Mutex::new(agent_stdin_writer));
+        let handle = tokio::spawn(run_reader_loop(
+            agent_stdout_reader,
+            writer,
+            pending,
+            notify_tx,
+            diagnostics.clone(),
+        ));
+
+        agent_stdout_writer
+            .write_all(b"provider rejected request\n")
+            .await
+            .unwrap();
+        agent_stdout_writer.flush().await.unwrap();
+
+        drop(agent_stdout_writer);
+        handle.await.unwrap();
+
+        let snapshot = diagnostics.lock().await.snapshot();
+        assert_eq!(snapshot.malformed_stdout, vec!["provider rejected request"]);
     }
 }

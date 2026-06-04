@@ -11,6 +11,8 @@ use crate::format;
 use crate::markdown::{self, TableMode};
 use crate::reactions::StatusReactionController;
 
+const INTERNAL_ERROR_CHECK_LOGS: &str = "Internal error. Check OpenAB logs for details.";
+
 // --- Output directive parsing ---
 
 /// Parsed directives from agent output header block.
@@ -39,7 +41,12 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
                         "reply_to" => {
                             let v = value.trim();
                             // Validate: non-empty, reasonable length, no whitespace/control chars
-                            if !v.is_empty() && v.len() <= 64 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_') {
+                            if !v.is_empty()
+                                && v.len() <= 64
+                                && v.chars().all(|c| {
+                                    c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'
+                                })
+                            {
                                 directives.reply_to = Some(v.to_string());
                             }
                         }
@@ -529,24 +536,34 @@ impl AdapterRouter {
                     // messages and abandons cleanly on dead agent / hard ceiling
                     // so late responses cannot leak into the next prompt.
                     let mut response_error: Option<String> = None;
+                    let mut failure_without_json_rpc: Option<String> = None;
                     let prompt_start = tokio::time::Instant::now();
                     loop {
                         let notification = tokio::select! {
                             msg = rx.recv() => match msg {
                                 Some(n) => n,
-                                // Reader saw EOF and already drained pending; nothing to abandon.
-                                None => break,
+                                None => {
+                                    // Reader saw EOF and already drained pending; no JSON-RPC
+                                    // error reached the adapter, so diagnostics are in logs.
+                                    response_error = Some(INTERNAL_ERROR_CHECK_LOGS.into());
+                                    failure_without_json_rpc = Some(
+                                        "agent connection closed before JSON-RPC response".into(),
+                                    );
+                                    break;
+                                }
                             },
                             _ = tokio::time::sleep(liveness_check_interval) => {
                                 if !conn.alive() {
-                                    response_error = Some("Agent process died".into());
+                                    response_error = Some(INTERNAL_ERROR_CHECK_LOGS.into());
+                                    failure_without_json_rpc = Some("agent process died".into());
                                     conn.abandon_request(request_id).await;
                                     break;
                                 }
                                 if prompt_start.elapsed() > prompt_hard_timeout {
-                                    response_error = Some(format!(
-                                        "Agent exceeded hard timeout ({}s)",
-                                        prompt_hard_timeout.as_secs(),
+                                    response_error = Some(INTERNAL_ERROR_CHECK_LOGS.into());
+                                    failure_without_json_rpc = Some(format!(
+                                        "agent exceeded hard timeout ({}s) without JSON-RPC response",
+                                        prompt_hard_timeout.as_secs()
                                     ));
                                     conn.abandon_request(request_id).await;
                                     break;
@@ -564,7 +581,12 @@ impl AdapterRouter {
                                 continue;
                             }
                             if let Some(ref err) = notification.error {
-                                response_error = Some(format_coded_error(err.code, &err.message, err.data_message()));
+                                let detail = err.user_detail();
+                                response_error = Some(format_coded_error(
+                                    err.code,
+                                    &err.message,
+                                    detail.as_deref(),
+                                ));
                             }
                             break;
                         }
@@ -641,6 +663,10 @@ impl AdapterRouter {
                                 _ => {}
                             }
                         }
+                    }
+
+                    if let Some(reason) = failure_without_json_rpc.as_deref() {
+                        conn.log_diagnostics(reason, Some(request_id)).await;
                     }
 
                     conn.prompt_done().await;
