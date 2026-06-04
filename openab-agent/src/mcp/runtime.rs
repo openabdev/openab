@@ -250,6 +250,36 @@ impl McpRuntimeManager {
             .unwrap_or_else(|| Duration::from_secs(60))
     }
 
+    /// Tear down a live server connection (ADR §5.4 shutdown ladder).
+    ///
+    /// Takes the `Arc<RunningService>` out under a short write lock and flips
+    /// the status to `Disconnected`, then drops the lock before signalling the
+    /// cancellation token so no runtime lock is held across teardown. Cancelling
+    /// the token breaks rmcp's serve loop (`QuitReason::Cancelled`), which calls
+    /// `transport.close()` → `TokioChildProcess::graceful_shutdown`: stdin is
+    /// closed, the child is given a fixed grace window, then SIGKILLed.
+    ///
+    /// Best-effort: `cancellation_token().cancel()` is the only teardown path
+    /// reachable through the shared `Arc` (rmcp's `close()`/`cancel()` need
+    /// owned/`&mut` access). It is fire-and-forget — we cannot `await` the
+    /// child reap here — and rmcp emits no SIGTERM rung, so this is the partial
+    /// ladder the SDK exposes today.
+    #[allow(dead_code)] // shutdown entry point wired by the eviction/quit path next slice
+    pub async fn disconnect(&self, name: &str) -> Result<()> {
+        let client = {
+            let mut handles = self.handles.write().await;
+            let handle = handles
+                .get_mut(name)
+                .ok_or_else(|| anyhow!("no mcp server named {name:?}"))?;
+            handle.status = ServerStatus::Disconnected;
+            handle.client.take()
+        };
+        if let Some(client) = client {
+            client.cancellation_token().cancel();
+        }
+        Ok(())
+    }
+
     /// Snapshot of `(name, status, transport_label)` sorted by name. Used
     /// by the `list_servers` meta-tool action; the static transport label
     /// avoids cloning the `Stdio { args, env, .. }` payload.
