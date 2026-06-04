@@ -529,6 +529,9 @@ impl AdapterRouter {
                     // messages and abandons cleanly on dead agent / hard ceiling
                     // so late responses cannot leak into the next prompt.
                     let mut response_error: Option<String> = None;
+                    let mut last_tool_failure: Option<(String, String)> = None; // (title, output)
+                    let mut tool_failure_deadline: Option<tokio::time::Instant> = None;
+                    let tool_failure_grace = std::time::Duration::from_secs(90);
                     let prompt_start = tokio::time::Instant::now();
                     loop {
                         let notification = tokio::select! {
@@ -543,11 +546,38 @@ impl AdapterRouter {
                                     conn.abandon_request(request_id).await;
                                     break;
                                 }
+                                // If a tool failed and the agent hasn't streamed any
+                                // text within the grace window, cut early instead of
+                                // waiting the full hard timeout.
+                                if let Some(deadline) = tool_failure_deadline {
+                                    if tokio::time::Instant::now() >= deadline {
+                                        let (title, output) = last_tool_failure.as_ref().unwrap();
+                                        response_error = Some(if output.is_empty() {
+                                            format!("Tool failed: `{title}`")
+                                        } else {
+                                            format!(
+                                                "Tool failed: `{title}`\n```\n{}\n```",
+                                                output.chars().take(400).collect::<String>()
+                                            )
+                                        });
+                                        conn.force_recreate = true;
+                                        conn.abandon_request(request_id).await;
+                                        break;
+                                    }
+                                }
                                 if prompt_start.elapsed() > prompt_hard_timeout {
-                                    response_error = Some(format!(
+                                    let base = format!(
                                         "Agent exceeded hard timeout ({}s)",
                                         prompt_hard_timeout.as_secs(),
-                                    ));
+                                    );
+                                    response_error = Some(match &last_tool_failure {
+                                        Some((title, output)) => format!(
+                                            "{base}\nLast failed tool: `{title}`\n```\n{}\n```",
+                                            output.chars().take(400).collect::<String>()
+                                        ),
+                                        None => base,
+                                    });
+                                    conn.force_recreate = true;
                                     conn.abandon_request(request_id).await;
                                     break;
                                 }
@@ -572,6 +602,8 @@ impl AdapterRouter {
                         if let Some(event) = classify_notification(&notification) {
                             match event {
                                 AcpEvent::Text(t) => {
+                                    // Agent is responding — cancel any tool-failure early-exit deadline.
+                                    tool_failure_deadline = None;
                                     text_buf.push_str(&t);
                                     if let Some(tx) = &buf_tx {
                                         let _ = tx.send(compose_display(
@@ -607,11 +639,16 @@ impl AdapterRouter {
                                         ));
                                     }
                                 }
-                                AcpEvent::ToolDone { id, title, status } => {
+                                AcpEvent::ToolDone { id, title, status, output } => {
                                     reactions.set_thinking().await;
                                     let new_state = if status == "completed" {
                                         ToolState::Completed
                                     } else {
+                                        let out = output.unwrap_or_default();
+                                        last_tool_failure = Some((title.clone(), out));
+                                        tool_failure_deadline = Some(
+                                            tokio::time::Instant::now() + tool_failure_grace
+                                        );
                                         ToolState::Failed
                                     };
                                     if let Some(slot) = tool_lines.iter_mut().find(|e| e.id == id) {
@@ -669,6 +706,7 @@ impl AdapterRouter {
                     };
 
                     let final_content = markdown::convert_tables(&final_content, table_mode);
+                    tracing::debug!(content_len = final_content.len(), content_preview = &final_content[..final_content.len().min(80)], "final content before chunking");
                     let chunks = format::split_message(&final_content, message_limit);
                     if let Some(msg) = placeholder_msg {
                         if let Some(ref reply_id) = directives.reply_to {
@@ -701,10 +739,16 @@ impl AdapterRouter {
                         } else {
                             // Normal streaming: edit first chunk into placeholder, send rest
                             if let Some(first) = chunks.first() {
-                                let _ = adapter.edit_message(&msg, first).await;
+                                if let Err(e) = adapter.edit_message(&msg, first).await {
+                                    tracing::warn!(error = ?e, content_len = first.len(), "final edit_message failed");
+                                }
+                            } else {
+                                tracing::warn!("final chunks empty, nothing to edit into placeholder");
                             }
                             for chunk in chunks.iter().skip(1) {
-                                let _ = adapter.send_message(&thread_channel, chunk).await;
+                                if let Err(e) = adapter.send_message(&thread_channel, chunk).await {
+                                    tracing::warn!(error = ?e, "overflow chunk send_message failed");
+                                }
                             }
                         }
                     } else {

@@ -214,6 +214,8 @@ pub enum AcpEvent {
         id: String,
         title: String,
         status: String,
+        /// Captured from rawOutput.aggregated_output (codex-acp) on failure.
+        output: Option<String>,
     },
     ConfigUpdate {
         options: Vec<ConfigOption>,
@@ -265,10 +267,21 @@ pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
                 .unwrap_or("")
                 .to_string();
             if status == "completed" || status == "failed" {
+                let output = if status == "failed" {
+                    update
+                        .get("rawOutput")
+                        .and_then(|r| r.get("aggregated_output"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                } else {
+                    None
+                };
                 Some(AcpEvent::ToolDone {
                     id: tool_id,
                     title,
                     status,
+                    output,
                 })
             } else {
                 Some(AcpEvent::ToolStart { id: tool_id, title })
