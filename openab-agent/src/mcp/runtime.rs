@@ -20,9 +20,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use rmcp::model::{
-    ClientInfo, CreateElicitationRequestParams, CreateElicitationResult, ErrorData,
-    ListRootsResult, LoggingLevel, LoggingMessageNotificationParam, Root, RootsCapabilities,
-    SetLevelRequestParams,
+    ClientInfo, CreateElicitationRequestParams, CreateElicitationResult, CreateMessageRequestParams,
+    CreateMessageResult, ErrorData, ListRootsResult, LoggingLevel, LoggingMessageNotificationParam,
+    Root, RootsCapabilities, SamplingCapability, SetLevelRequestParams,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
@@ -77,14 +77,26 @@ pub struct OpenabClientHandler {
     /// Shared (`Arc`) read-only across every connection's handler; computed
     /// once at manager construction (spec rows 363-384).
     roots: Arc<Vec<Root>>,
+    /// Provider used to serve server-initiated `sampling/createMessage`
+    /// (spec §390). `None` when no LLM credentials are configured — in which
+    /// case `get_info` does not advertise the `sampling` capability, so a
+    /// well-behaved server never sends a sampling request. Shared (`Arc` via
+    /// `SharedLlmProvider`) so the handler stays `Clone` per connection.
+    provider: Option<crate::llm::SharedLlmProvider>,
 }
 
 impl OpenabClientHandler {
-    fn new(server_name: String, tools_cache: ToolsCache, roots: Arc<Vec<Root>>) -> Self {
+    fn new(
+        server_name: String,
+        tools_cache: ToolsCache,
+        roots: Arc<Vec<Root>>,
+        provider: Option<crate::llm::SharedLlmProvider>,
+    ) -> Self {
         Self {
             server_name,
             tools_cache,
             roots,
+            provider,
         }
     }
 
@@ -112,6 +124,13 @@ impl ClientHandler for OpenabClientHandler {
         // else stays at the SDK default, byte-identical to the prior posture.
         let mut info = ClientInfo::default();
         info.capabilities.roots = Some(RootsCapabilities { list_changed: None });
+        // Advertise `sampling` only when an LLM provider is configured — the
+        // capability is a promise we can actually serve `create_message`. No
+        // `tools` sub-capability: text-only baseline (`sampling.tools` is a
+        // known gap), so tool-enabled requests are rejected (spec §390).
+        if self.provider.is_some() {
+            info.capabilities.sampling = Some(SamplingCapability::default());
+        }
         info
     }
 
@@ -135,6 +154,41 @@ impl ClientHandler for OpenabClientHandler {
             "elicitation capability not declared",
             None,
         )))
+    }
+
+    fn create_message(
+        &self,
+        request: CreateMessageRequestParams,
+        _context: RequestContext<RoleClient>,
+    ) -> impl std::future::Future<Output = Result<CreateMessageResult, ErrorData>> + Send + '_ {
+        async move {
+            // We advertise `sampling` only when a provider is configured, so a
+            // request without one is a protocol violation (row 439 analog).
+            let Some(provider) = self.provider.clone() else {
+                return Err(ErrorData::invalid_params(
+                    "sampling capability not declared",
+                    None,
+                ));
+            };
+            // Non-interactive consent gate (locked SamplingApproval env-var).
+            super::sampling::approval_gate(super::sampling::SamplingApproval::from_env())?;
+            // Text-only baseline: reject tool-enabled requests — we declare no
+            // `sampling.tools` sub-capability (spec row 387a analog).
+            if request.tools.as_ref().is_some_and(|t| !t.is_empty()) {
+                return Err(ErrorData::invalid_params(
+                    "tool-enabled sampling not supported (no sampling.tools capability)",
+                    None,
+                ));
+            }
+            let messages = super::sampling::convert_messages(&request.messages)?;
+            let system = request.system_prompt.unwrap_or_default();
+            let events = provider
+                .chat(&system, &messages, &[])
+                .await
+                .map_err(|e| ErrorData::internal_error(super::concise_error_message(&e), None))?;
+            let text = super::sampling::collect_text(events)?;
+            Ok(super::sampling::build_result(text, provider.model()))
+        }
     }
 
     fn on_logging_message(
@@ -333,6 +387,11 @@ pub struct McpRuntimeManager {
     /// each connection's `OpenabClientHandler`. Static for the session, so no
     /// `notifications/roots/list_changed` is ever sent.
     roots: Arc<Vec<Root>>,
+    /// Shared LLM provider used to serve server-initiated sampling (spec §390).
+    /// Resolved once at construction from `OPENAB_AGENT_PROVIDER` + credentials;
+    /// `None` when none are available, in which case connections do not
+    /// advertise the `sampling` capability. Cloned into each handler.
+    provider: Option<crate::llm::SharedLlmProvider>,
 }
 
 impl McpRuntimeManager {
@@ -352,6 +411,7 @@ impl McpRuntimeManager {
             .collect();
         catalog.sort_by(|a, b| a.name.cmp(&b.name));
         let roots = Arc::new(compute_roots(std::env::current_dir().ok(), &cfg.roots));
+        let provider = crate::llm::default_provider();
         let handles: HashMap<_, _> = cfg
             .servers
             .into_iter()
@@ -375,6 +435,7 @@ impl McpRuntimeManager {
             catalog: catalog.into(),
             tools_cache: Arc::new(StdMutex::new(HashMap::new())),
             roots,
+            provider,
         }
     }
 
@@ -1132,7 +1193,12 @@ impl McpRuntimeManager {
         };
 
         let dial_result = dial
-            .run(name, self.tools_cache.clone(), self.roots.clone())
+            .run(
+                name,
+                self.tools_cache.clone(),
+                self.roots.clone(),
+                self.provider.clone(),
+            )
             .await;
 
         let mut guard = self.handles.write().await;
@@ -1479,6 +1545,7 @@ impl Dial {
         name: &str,
         tools_cache: ToolsCache,
         roots: Arc<Vec<Root>>,
+        provider: Option<crate::llm::SharedLlmProvider>,
     ) -> Result<RunningService<RoleClient, OpenabClientHandler>> {
         match self {
             Dial::Stdio { command, args, env } => {
@@ -1505,7 +1572,7 @@ impl Dial {
                         }
                     });
                 }
-                OpenabClientHandler::new(name.to_string(), tools_cache, roots)
+                OpenabClientHandler::new(name.to_string(), tools_cache, roots, provider)
                     .serve(transport)
                     .await
                     .with_context(|| format!("mcp handshake with {command:?}"))
@@ -1519,7 +1586,7 @@ impl Dial {
                     }
                     None => StreamableHttpClientTransport::from_uri(url.as_str()),
                 };
-                OpenabClientHandler::new(name.to_string(), tools_cache, roots)
+                OpenabClientHandler::new(name.to_string(), tools_cache, roots, provider)
                     .serve(transport)
                     .await
                     .with_context(|| format!("mcp handshake with {url:?}"))
@@ -1646,9 +1713,52 @@ mod tests {
             roots.list_changed, None,
             "roots must not advertise listChanged (static root set)"
         );
-        assert!(caps.sampling.is_none(), "must not advertise sampling");
+        assert!(
+            caps.sampling.is_none(),
+            "no provider configured (Default handler) → must not advertise sampling"
+        );
         assert!(caps.elicitation.is_none(), "must not advertise elicitation");
         assert!(caps.tasks.is_none(), "must not advertise tasks");
+    }
+
+    #[derive(Debug)]
+    struct StubProvider;
+    impl crate::llm::LlmProvider for StubProvider {
+        fn model(&self) -> &str {
+            "stub-model"
+        }
+        fn chat<'a>(
+            &'a self,
+            _system: &'a str,
+            _messages: &'a [crate::llm::Message],
+            _tools: &'a [crate::llm::ToolDef],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<crate::llm::LlmEvent>>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(vec![crate::llm::LlmEvent::Text("ok".into())]) })
+        }
+    }
+
+    #[test]
+    fn handler_with_provider_advertises_text_only_sampling() {
+        // When a provider IS configured, the handler advertises `sampling`
+        // (text-only — no `tools` sub-capability) alongside `roots`. Flipping
+        // this on with the provider is what makes `create_message` reachable
+        // (spec §390); the no-provider case stays asserted above.
+        let provider = crate::llm::SharedLlmProvider(Arc::new(StubProvider));
+        let handler = OpenabClientHandler::new(
+            "srv".to_string(),
+            Arc::new(StdMutex::new(HashMap::new())),
+            Arc::new(Vec::new()),
+            Some(provider),
+        );
+        let caps = handler.get_info().capabilities;
+        let sampling = caps.sampling.expect("provider present → advertise sampling");
+        assert!(
+            sampling.tools.is_none(),
+            "text-only baseline must not advertise sampling.tools"
+        );
+        assert!(caps.roots.is_some(), "still advertises roots");
     }
 
     #[test]
@@ -1663,8 +1773,12 @@ mod tests {
             .insert("alpha".to_string(), Vec::new());
         cache.lock().unwrap().insert("beta".to_string(), Vec::new());
 
-        let alpha =
-            OpenabClientHandler::new("alpha".to_string(), cache.clone(), Arc::new(Vec::new()));
+        let alpha = OpenabClientHandler::new(
+            "alpha".to_string(),
+            cache.clone(),
+            Arc::new(Vec::new()),
+            None,
+        );
         alpha.invalidate_tools_cache();
 
         let guard = cache.lock().unwrap();
@@ -1718,6 +1832,7 @@ mod tests {
             "srv".to_string(),
             Arc::new(StdMutex::new(HashMap::new())),
             roots.clone(),
+            None,
         );
         assert_eq!(*handler.roots, *roots);
         assert_eq!(handler.roots.len(), 1);

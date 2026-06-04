@@ -273,6 +273,10 @@ mod tests {
     }
 
     impl LlmProvider for MockLlmProvider {
+        fn model(&self) -> &str {
+            "mock-model"
+        }
+
         fn chat<'a>(
             &'a self,
             _system: &'a str,

@@ -1,5 +1,4 @@
 use crate::agent::Agent;
-use crate::llm::AnthropicProvider;
 use crate::mcp::{self, McpRuntimeManager};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -128,34 +127,14 @@ impl AcpServer {
     fn handle_session_new(&mut self, id: u64) -> String {
         let session_id = Uuid::new_v4().to_string();
 
-        // Respect OPENAB_AGENT_PROVIDER if set, otherwise auto-detect
+        // Respect OPENAB_AGENT_PROVIDER if set, otherwise auto-detect. Shared
+        // with the MCP sampling path via `llm::select_provider`.
         let provider_choice = std::env::var("OPENAB_AGENT_PROVIDER").unwrap_or_default();
-        let provider: Box<dyn crate::llm::LlmProvider> = match provider_choice.as_str() {
-            "anthropic" => match AnthropicProvider::from_env() {
-                Ok(p) => Box::new(p),
+        let provider: Box<dyn crate::llm::LlmProvider> =
+            match crate::llm::select_provider(&provider_choice) {
+                Ok(p) => p,
                 Err(e) => return self.error_response(id, -32000, &e),
-            },
-            "openai" | "codex" => match crate::llm::OpenAiProvider::from_auth_store() {
-                Ok(p) => Box::new(p),
-                Err(e) => return self.error_response(id, -32000, &e),
-            },
-            _ => {
-                // Auto-detect: try API key first, then OAuth token
-                match AnthropicProvider::from_env() {
-                    Ok(p) => Box::new(p),
-                    Err(_) => match crate::llm::OpenAiProvider::from_auth_store() {
-                        Ok(p) => Box::new(p),
-                        Err(e) => {
-                            return self.error_response(
-                                id,
-                                -32000,
-                                &format!("No credentials: set ANTHROPIC_API_KEY or run `openab-agent auth codex-oauth`. {e}"),
-                            )
-                        }
-                    },
-                }
-            }
-        };
+            };
 
         let agent = Agent::new_boxed(provider, self.working_dir.clone(), self.mcp_manager.clone());
         self.sessions.insert(session_id.clone(), agent);
