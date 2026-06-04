@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -22,6 +23,7 @@ use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::ServiceExt;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::RwLock;
 use tokio::task::AbortHandle;
@@ -791,7 +793,7 @@ impl McpRuntimeManager {
             }
         };
 
-        let dial_result = dial.run().await;
+        let dial_result = dial.run(name).await;
 
         let mut guard = self.handles.write().await;
         let handle = guard
@@ -1096,7 +1098,7 @@ enum Dial {
 }
 
 impl Dial {
-    async fn run(self) -> Result<RunningService<RoleClient, ()>> {
+    async fn run(self, name: &str) -> Result<RunningService<RoleClient, ()>> {
         match self {
             Dial::Stdio { command, args, env } => {
                 let cmd = Command::new(&command).configure(|c| {
@@ -1104,8 +1106,24 @@ impl Dial {
                     c.envs(stdio_child_env(&env));
                     c.args(&args);
                 });
-                let transport = TokioChildProcess::new(cmd)
+                // rmcp's `TokioChildProcess::new` inherits the child's stderr,
+                // so `npx`/server startup errors vanish into container stderr.
+                // Pipe it and tee each line into `tracing` tagged by server
+                // (ADR §5.4 observability; spec Row 79). The reader task ends
+                // on child exit (stderr EOF → `next_line` → `Ok(None)`).
+                let (transport, stderr) = TokioChildProcess::builder(cmd)
+                    .stderr(Stdio::piped())
+                    .spawn()
                     .with_context(|| format!("spawn mcp child process {command:?}"))?;
+                if let Some(stderr) = stderr {
+                    let server = name.to_string();
+                    tokio::spawn(async move {
+                        let mut lines = BufReader::new(stderr).lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            tracing::warn!(server = %server, "mcp stderr: {line}");
+                        }
+                    });
+                }
                 ().serve(transport)
                     .await
                     .with_context(|| format!("mcp handshake with {command:?}"))
