@@ -26,6 +26,8 @@ pub enum ServerConfig {
         env: HashMap<String, String>,
         #[serde(default, rename = "tool_filter")]
         tool_filter: Option<ToolFilter>,
+        #[serde(default = "default_request_timeout_secs")]
+        request_timeout_secs: u64,
     },
     Http {
         url: String,
@@ -33,7 +35,16 @@ pub enum ServerConfig {
         oauth: Option<OAuthConfig>,
         #[serde(default, rename = "tool_filter")]
         tool_filter: Option<ToolFilter>,
+        #[serde(default = "default_request_timeout_secs")]
+        request_timeout_secs: u64,
     },
+}
+
+/// Default per-request timeout for MCP `tools/call` and `tools/list`
+/// (ADR §5.6). Bounds a hung server so the agent turn can't stall
+/// indefinitely; rmcp auto-emits a `notifications/cancelled` on expiry.
+fn default_request_timeout_secs() -> u64 {
+    60
 }
 
 impl ServerConfig {
@@ -53,6 +64,22 @@ impl ServerConfig {
     /// the LLM should ask the user to run `mcp login <name>` before calling.
     pub fn requires_oauth(&self) -> bool {
         matches!(self, ServerConfig::Http { oauth: Some(_), .. })
+    }
+
+    /// Per-request timeout for `tools/call` / `tools/list` against this
+    /// server (ADR §5.6). Bounds a single MCP request, not the connection.
+    pub fn request_timeout(&self) -> std::time::Duration {
+        let secs = match self {
+            ServerConfig::Stdio {
+                request_timeout_secs,
+                ..
+            }
+            | ServerConfig::Http {
+                request_timeout_secs,
+                ..
+            } => *request_timeout_secs,
+        };
+        std::time::Duration::from_secs(secs)
     }
 }
 
@@ -312,6 +339,7 @@ mod tests {
             args: vec!["--token".into(), "${env:MCP_TEST_TOKEN}".into()],
             env: HashMap::new(),
             tool_filter: None,
+            request_timeout_secs: default_request_timeout_secs(),
         };
         match cfg.resolved_with_env("github", &env).unwrap() {
             ServerConfig::Stdio { args, .. } => {

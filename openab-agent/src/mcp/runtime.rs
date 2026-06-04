@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use rmcp::service::{RoleClient, RunningService};
@@ -235,6 +236,18 @@ impl McpRuntimeManager {
             .as_ref()
             .cloned()
             .ok_or_else(|| anyhow!("mcp server {name:?} is not connected"))
+    }
+
+    /// Per-request timeout configured for `name` (ADR §5.6). Read out from
+    /// under a short read lock so call sites can pass it to rmcp's
+    /// `send_request_with_option` without holding a runtime lock across the
+    /// request. Falls back to the schema default for an unknown server.
+    pub async fn request_timeout(&self, name: &str) -> Duration {
+        let guard = self.handles.read().await;
+        guard
+            .get(name)
+            .map(|h| h.config.request_timeout())
+            .unwrap_or_else(|| Duration::from_secs(60))
     }
 
     /// Snapshot of `(name, status, transport_label)` sorted by name. Used

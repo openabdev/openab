@@ -5,6 +5,10 @@
 //! The Phase 2 `login` / `complete_login` actions land with the OAuth slice.
 
 use anyhow::{anyhow, Context, Result};
+use rmcp::model::{
+    CallToolRequest, ClientRequest, ListToolsRequest, PaginatedRequestParams, ServerResult,
+};
+use rmcp::service::{PeerRequestOptions, ServiceError};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -92,15 +96,43 @@ async fn call_tool(
         .await
         .with_context(|| format!("connect mcp server {server:?}"))?;
     let peer = manager.arc_peer(server).await?;
+    let timeout = manager.request_timeout(server).await;
     let params = rmcp::model::CallToolRequestParams::new(tool.to_string()).with_arguments(args_map);
+    let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
+    let mut options = PeerRequestOptions::no_options();
+    options.timeout = Some(timeout);
     // Wire-level Err = transport failure → trips the breaker; wire-level
     // Ok (even with `isError: true`) resets it. See ADR §5.9 / #966 Q2.
-    let result = match peer.call_tool(params).await {
-        Ok(r) => {
+    // On timeout rmcp auto-emits notifications/cancelled (reason "request
+    // timeout") before surfacing ServiceError::Timeout (ADR §5.6).
+    let send_result = async {
+        peer.send_request_with_option(request, options)
+            .await?
+            .await_response()
+            .await
+    }
+    .await;
+    let result = match send_result {
+        Ok(ServerResult::CallToolResult(r)) => {
             manager.record_tool_call_outcome(server, true);
             r
         }
+        Ok(_) => {
+            manager.record_tool_call_outcome(server, false);
+            return Err(anyhow!(
+                "call_tool {tool:?} on {server:?}: unexpected non-CallToolResult response"
+            ));
+        }
         Err(e) => {
+            if let ServiceError::Timeout { timeout } = e {
+                tracing::info!(
+                    target: "mcp.cancel",
+                    server,
+                    tool,
+                    timeout_secs = timeout.as_secs(),
+                    "mcp tools/call timed out; sent notifications/cancelled"
+                );
+            }
             manager.record_tool_call_outcome(server, false);
             return Err(anyhow::Error::new(e))
                 .with_context(|| format!("call_tool {tool:?} on {server:?}"));
@@ -119,16 +151,54 @@ async fn fetch_tools(manager: &McpRuntimeManager, server: &str) -> Result<Vec<rm
         .await
         .with_context(|| format!("connect mcp server {server:?}"))?;
     let peer = manager.arc_peer(server).await?;
-    match peer.list_all_tools().await {
-        Ok(tools) => {
-            manager.record_tool_call_outcome(server, true);
-            Ok(tools)
+    let timeout = manager.request_timeout(server).await;
+    // Manual pagination mirroring rmcp's `list_all_tools`, but per-page
+    // bounded by the configured request timeout (ADR §5.6). rmcp's helper
+    // takes no options, so we drive `list_tools` ourselves.
+    let mut tools = Vec::new();
+    let mut cursor = None;
+    loop {
+        let request = ClientRequest::ListToolsRequest(ListToolsRequest::with_param(
+            PaginatedRequestParams::default().with_cursor(cursor),
+        ));
+        let mut options = PeerRequestOptions::no_options();
+        options.timeout = Some(timeout);
+        let page = async {
+            peer.send_request_with_option(request, options)
+                .await?
+                .await_response()
+                .await
         }
-        Err(e) => {
-            manager.record_tool_call_outcome(server, false);
-            Err(anyhow::Error::new(e)).with_context(|| format!("list_all_tools on {server:?}"))
+        .await;
+        match page {
+            Ok(ServerResult::ListToolsResult(result)) => {
+                manager.record_tool_call_outcome(server, true);
+                tools.extend(result.tools);
+                cursor = result.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            Ok(_) => {
+                manager.record_tool_call_outcome(server, false);
+                return Err(anyhow!("list_tools on {server:?}: unexpected response"));
+            }
+            Err(e) => {
+                if let ServiceError::Timeout { timeout } = e {
+                    tracing::info!(
+                        target: "mcp.cancel",
+                        server,
+                        timeout_secs = timeout.as_secs(),
+                        "mcp tools/list timed out; sent notifications/cancelled"
+                    );
+                }
+                manager.record_tool_call_outcome(server, false);
+                return Err(anyhow::Error::new(e))
+                    .with_context(|| format!("list_tools on {server:?}"));
+            }
         }
     }
+    Ok(tools)
 }
 
 async fn list_tools(manager: &McpRuntimeManager, server: &str) -> Result<Value> {
