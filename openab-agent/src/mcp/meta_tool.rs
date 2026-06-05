@@ -13,6 +13,7 @@ use rmcp::model::{
     TaskSupport,
 };
 use rmcp::service::{PeerRequestOptions, RoleClient, RunningService, ServiceError};
+use rmcp::transport::streamable_http_client::StreamableHttpError;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -96,6 +97,46 @@ fn ensure_tools_capability(
         ));
     }
     Ok(())
+}
+
+/// Classify a request-time `ServiceError` as an MCP-server OAuth challenge.
+/// rmcp flattens the transport's HTTP 401/403 + `WWW-Authenticate` into
+/// `ServiceError::TransportSend(DynamicTransportError)` with the structured
+/// `StreamableHttpError` boxed inside, so we downcast to the one concrete
+/// transport error type both dial paths use (`StreamableHttpError<reqwest013::Error>`:
+/// the OAuth dial wraps `AuthClient<reqwest013::Client>` whose `Error = reqwest013::Error`,
+/// and the plain dial uses rmcp's reqwest-0.13 client directly). Returns
+/// `Some(required_scope)` on a challenge — the scope from a 403
+/// `insufficient_scope`, or `None` for a plain 401 — and `None` when `e` is
+/// not an auth challenge.
+fn auth_challenge_scope(e: &ServiceError) -> Option<Option<String>> {
+    let ServiceError::TransportSend(dyn_err) = e else {
+        return None;
+    };
+    match dyn_err
+        .error
+        .downcast_ref::<StreamableHttpError<reqwest013::Error>>()?
+    {
+        StreamableHttpError::AuthRequired(_) => Some(None),
+        StreamableHttpError::InsufficientScope(s) => Some(s.required_scope.clone()),
+        _ => None,
+    }
+}
+
+/// Build the caller-facing error for a request-time OAuth challenge. The MCP
+/// login flow is interactive (`mcp login <server>`, stdin paste-back), so an
+/// automatic in-band reauth-and-retry is impossible here (row 424 ⚠️): the
+/// best we can do is set `NeedsAuth` and tell the operator to re-login,
+/// surfacing the challenge-provided scope when the server sent one.
+fn needs_reauth_error(server: &str, required_scope: &Option<String>) -> anyhow::Error {
+    match required_scope {
+        Some(scope) if !scope.is_empty() => anyhow!(
+            "mcp server {server:?} rejected the request — insufficient scope (server requires {scope:?}); re-authenticate with `mcp login {server}`"
+        ),
+        _ => anyhow!(
+            "mcp server {server:?} rejected the request (HTTP 401) — (re)authenticate with `mcp login {server}`"
+        ),
+    }
 }
 
 async fn call_tool(
@@ -210,6 +251,24 @@ async fn call_tool(
                     "mcp tools/call timed out; sent notifications/cancelled"
                 );
             }
+            // An OAuth challenge (HTTP 401/403) is not a transport fault, so it
+            // must not trip the circuit breaker. Flag the server NeedsAuth and
+            // return an actionable re-login error instead (row 424).
+            if let Some(required_scope) = auth_challenge_scope(&e) {
+                manager.mark_needs_auth(server).await;
+                tracing::info!(
+                    target: "mcp.audit",
+                    server,
+                    tool,
+                    args_sha256 = %args_sha256,
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    outcome = "auth_required",
+                    is_error = true,
+                    "mcp call_tool exit"
+                );
+                return Err(needs_reauth_error(server, &required_scope))
+                    .with_context(|| format!("call_tool {tool:?} on {server:?}"));
+            }
             manager.record_tool_call_outcome(server, false);
             tracing::info!(
                 target: "mcp.audit",
@@ -301,6 +360,13 @@ async fn fetch_tools(manager: &McpRuntimeManager, server: &str) -> Result<Vec<rm
                         timeout_secs = timeout.as_secs(),
                         "mcp tools/list timed out; sent notifications/cancelled"
                     );
+                }
+                // OAuth challenge (HTTP 401/403): not a transport fault — don't
+                // trip the breaker. Flag NeedsAuth + return a re-login error (row 424).
+                if let Some(required_scope) = auth_challenge_scope(&e) {
+                    manager.mark_needs_auth(server).await;
+                    return Err(needs_reauth_error(server, &required_scope))
+                        .with_context(|| format!("list_tools on {server:?}"));
                 }
                 manager.record_tool_call_outcome(server, false);
                 return Err(anyhow::Error::new(e))
@@ -510,6 +576,61 @@ mod tests {
         let s = result.as_str().unwrap();
         assert!(s.contains("list_servers"));
         assert!(s.contains("call(server, tool"));
+    }
+
+    fn transport_send_error(
+        inner: StreamableHttpError<reqwest013::Error>,
+    ) -> ServiceError {
+        use rmcp::transport::DynamicTransportError;
+        use std::any::TypeId;
+        ServiceError::TransportSend(DynamicTransportError::from_parts(
+            "test",
+            TypeId::of::<()>(),
+            Box::new(inner),
+        ))
+    }
+
+    #[test]
+    fn auth_challenge_scope_classifies_401_403_and_ignores_others() {
+        use rmcp::transport::streamable_http_client::{AuthRequiredError, InsufficientScopeError};
+
+        // Plain 401 → challenge with no scope.
+        let e = transport_send_error(StreamableHttpError::AuthRequired(AuthRequiredError::new(
+            "Bearer".into(),
+        )));
+        assert_eq!(auth_challenge_scope(&e), Some(None));
+
+        // 403 insufficient_scope carrying a scope → challenge with that scope.
+        let e = transport_send_error(StreamableHttpError::InsufficientScope(
+            InsufficientScopeError::new("Bearer".into(), Some("repo:write".into())),
+        ));
+        assert_eq!(auth_challenge_scope(&e), Some(Some("repo:write".into())));
+
+        // 403 without a parseable scope → challenge with no scope.
+        let e = transport_send_error(StreamableHttpError::InsufficientScope(
+            InsufficientScopeError::new("Bearer".into(), None),
+        ));
+        assert_eq!(auth_challenge_scope(&e), Some(None));
+
+        // A non-auth ServiceError is not a challenge.
+        assert_eq!(
+            auth_challenge_scope(&ServiceError::Timeout {
+                timeout: std::time::Duration::from_secs(1)
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn needs_reauth_error_mentions_login_and_scope() {
+        let plain = needs_reauth_error("linear", &None).to_string();
+        assert!(plain.contains("mcp login linear"), "got: {plain}");
+        assert!(plain.contains("401"), "got: {plain}");
+
+        let scoped = needs_reauth_error("linear", &Some("repo:write".into())).to_string();
+        assert!(scoped.contains("mcp login linear"), "got: {scoped}");
+        assert!(scoped.contains("repo:write"), "got: {scoped}");
+        assert!(scoped.contains("insufficient scope"), "got: {scoped}");
     }
 
     #[test]

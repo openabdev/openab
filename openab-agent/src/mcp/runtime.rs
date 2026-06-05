@@ -662,6 +662,18 @@ impl McpRuntimeManager {
             .ok_or_else(|| anyhow!("mcp server {name:?} is not connected"))
     }
 
+    /// Flag a server as needing (re)authentication after a request-time OAuth
+    /// challenge (HTTP 401/403). The `connect` path only sets `NeedsAuth` on
+    /// dial failure; a token that is valid-by-clock but rejected or
+    /// under-scoped by the server only surfaces at the tool-call layer, so
+    /// this lets that path move the handle to `NeedsAuth` too (row 424).
+    pub async fn mark_needs_auth(&self, name: &str) {
+        let mut handles = self.handles.write().await;
+        if let Some(handle) = handles.get_mut(name) {
+            handle.status = ServerStatus::NeedsAuth;
+        }
+    }
+
     /// Per-request timeout configured for `name` (ADR §5.6). Read out from
     /// under a short read lock so call sites can pass it to rmcp's
     /// `send_request_with_option` without holding a runtime lock across the
