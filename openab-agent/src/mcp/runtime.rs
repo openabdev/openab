@@ -32,6 +32,12 @@ use rmcp::transport::{
     StreamableHttpClientTransport, TokioChildProcess,
 };
 use rmcp::{ClientHandler, ServiceExt};
+use oauth2::basic::BasicClient;
+use oauth2::{
+    AuthType, ClientId, DeviceAuthorizationUrl, DeviceCodeErrorResponse,
+    DeviceCodeErrorResponseType, RequestTokenError, Scope, StandardDeviceAuthorizationResponse,
+    TokenResponse, TokenUrl,
+};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::RwLock;
@@ -848,24 +854,35 @@ impl McpRuntimeManager {
     pub async fn start_device_login(&self, name: &str) -> Result<DeviceLoginStart> {
         let (device_endpoint, client_id, token_url, scopes, resource) =
             self.resolve_device_client(name).await?;
-        let auth = post_device_authorization(
-            &device_endpoint,
-            &client_id,
-            &scopes.join(" "),
-            resource.as_deref(),
-        )
-        .await?;
+        let client = build_device_oauth_client(&client_id, &token_url, &device_endpoint)?;
+        let rq = oauth_http_client()?;
+        let http = move |req: oauth2::HttpRequest| oauth_http_send(rq.clone(), req);
+        let mut req = client
+            .exchange_device_code()
+            .add_scopes(scopes.iter().cloned().map(Scope::new));
+        if let Some(resource) = resource.as_deref() {
+            req = req.add_extra_param("resource", resource.to_string());
+        }
+        let dev_resp: StandardDeviceAuthorizationResponse = req
+            .request_async(&http)
+            .await
+            .map_err(|e| anyhow!("device authorization request failed: {e}"))?;
         {
             let mut handles = self.handles.write().await;
             if let Some(handle) = handles.get_mut(name) {
                 handle.status = ServerStatus::Connecting;
             }
         }
+        let bundle = DeviceLoginStart {
+            user_code: dev_resp.user_code().secret().clone(),
+            verification_uri: dev_resp.verification_uri().to_string(),
+            verification_uri_complete: dev_resp
+                .verification_uri_complete()
+                .map(|u| u.secret().clone()),
+            expires_in: dev_resp.expires_in().as_secs(),
+        };
         let manager = self.clone();
         let name_owned = name.to_string();
-        let device_code = auth.device_code.clone();
-        let initial_interval = auth.interval;
-        let expires_in = auth.expires_in;
         let token_url_owned = token_url;
         let client_id_owned = client_id;
         let resource_owned = resource;
@@ -874,12 +891,10 @@ impl McpRuntimeManager {
             manager
                 .run_device_poll_loop(
                     &name_owned,
-                    &token_url_owned,
                     &client_id_owned,
-                    &device_code,
+                    &token_url_owned,
+                    dev_resp,
                     resource_owned.as_deref(),
-                    initial_interval,
-                    expires_in,
                 )
                 .await;
         });
@@ -893,12 +908,7 @@ impl McpRuntimeManager {
         if let Some(prior) = prior {
             prior.abort();
         }
-        Ok(DeviceLoginStart {
-            user_code: auth.user_code,
-            verification_uri: auth.verification_uri,
-            verification_uri_complete: auth.verification_uri_complete,
-            expires_in: auth.expires_in,
-        })
+        Ok(bundle)
     }
 
     /// Resolve `(device_endpoint, client_id, token_url, scopes, resource)`
@@ -950,75 +960,54 @@ impl McpRuntimeManager {
         Ok((device_endpoint, client_id, token_url, scopes, resource))
     }
 
-    /// RFC 8628 §3.4 polling loop. Runs detached in `tokio::spawn`; the
-    /// only observable side-effect is `auth.json` (on Success) + the
-    /// `ServerHandle.status` transition. Errors are logged via `tracing`
-    /// and surface to the user via `mcp status` (Failed/NeedsAuth).
-    #[allow(clippy::too_many_arguments)]
+    /// RFC 8628 §3.4 access-token polling. Runs detached in `tokio::spawn`;
+    /// the entire poll loop (initial `interval`, `slow_down` back-off,
+    /// `authorization_pending` retry, connection-error backoff, and the
+    /// `expires_in` deadline) lives inside oauth2's
+    /// `DeviceAccessTokenRequest::request_async`. The only observable side-
+    /// effects are `auth.json` (on success) + the `ServerHandle.status`
+    /// transition; errors surface to the user via `mcp status` (NeedsAuth).
     async fn run_device_poll_loop(
         &self,
         name: &str,
-        token_url: &str,
         client_id: &str,
-        device_code: &str,
+        token_url: &str,
+        dev_resp: StandardDeviceAuthorizationResponse,
         resource: Option<&str>,
-        initial_interval: u64,
-        expires_in_secs: u64,
     ) {
-        // One client across the whole loop — `reqwest::Client` is an
-        // `Arc`-backed connection pool, so reusing it keeps TLS / TCP
-        // handshakes amortized across the dozens-to-hundreds of polls a
-        // 30-minute device-flow window can produce.
-        let client = match reqwest::Client::builder().build() {
+        // token_url is required for the access-token exchange; the device
+        // endpoint isn't used again here, so a placeholder keeps the
+        // type-state happy without a second resolve round-trip.
+        let client = match build_device_oauth_client(client_id, token_url, token_url) {
             Ok(c) => c,
             Err(e) => {
-                self.mark_device_login_failed(name, anyhow!("build reqwest client: {e}"))
-                    .await;
+                self.mark_device_login_failed(name, e).await;
                 return;
             }
         };
-        let deadline = now_secs().saturating_add(expires_in_secs);
-        let mut interval = initial_interval;
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-            if now_secs() >= deadline {
-                self.mark_device_login_failed(
-                    name,
-                    anyhow!("device-flow expired before user authorized"),
-                )
-                .await;
+        let rq = match oauth_http_client() {
+            Ok(c) => c,
+            Err(e) => {
+                self.mark_device_login_failed(name, e).await;
                 return;
             }
-            let outcome =
-                match post_device_token_poll(&client, token_url, client_id, device_code, resource)
-                    .await
-                {
-                    Ok(o) => o,
-                    Err(e) => {
-                        self.mark_device_login_failed(name, e).await;
-                        return;
-                    }
-                };
-            match outcome {
-                DevicePollOutcome::Success(resp) => {
-                    self.finalize_device_login(name, client_id, resp).await;
-                    return;
-                }
-                DevicePollOutcome::AuthorizationPending => continue,
-                DevicePollOutcome::SlowDown => {
-                    // RFC 8628 §3.5: SlowDown means add 5s to the interval.
-                    interval = interval.saturating_add(5);
-                }
-                DevicePollOutcome::AccessDenied => {
-                    self.mark_device_login_failed(name, anyhow!("device-flow denied by user"))
-                        .await;
-                    return;
-                }
-                DevicePollOutcome::ExpiredToken => {
-                    self.mark_device_login_failed(name, anyhow!("device_code expired"))
-                        .await;
-                    return;
-                }
+        };
+        let http = move |req: oauth2::HttpRequest| oauth_http_send(rq.clone(), req);
+        let mut req = client.exchange_device_access_token(&dev_resp);
+        if let Some(resource) = resource {
+            req = req.add_extra_param("resource", resource.to_string());
+        }
+        match req
+            .request_async(&http, |d| tokio::time::sleep(d), None)
+            .await
+        {
+            Ok(token) => {
+                let resp = lift_oauth_token(&token);
+                self.finalize_device_login(name, client_id, resp).await;
+            }
+            Err(e) => {
+                self.mark_device_login_failed(name, device_poll_error(&e))
+                    .await;
             }
         }
     }
@@ -1395,126 +1384,104 @@ async fn post_token_exchange(
     post_token_form(token_url, &form, "token exchange").await
 }
 
-/// RFC 8628 §3.2 device authorization response. `verification_uri_complete`
-/// is the §3.3.1 extension (`verification_uri` + `user_code` is the always-
-/// present fallback the agent relays to the user). `interval` defaults to
-/// 5s per RFC 8628 §3.5 when omitted by the provider.
-#[derive(Debug, serde::Deserialize)]
-struct DeviceAuthResponse {
-    device_code: String,
-    user_code: String,
-    verification_uri: String,
-    #[serde(default)]
-    verification_uri_complete: Option<String>,
-    expires_in: u64,
-    #[serde(default = "default_device_poll_interval")]
-    interval: u64,
-}
+/// Build a public (no-secret) oauth2 device-flow client. `AuthType::RequestBody`
+/// places `client_id` in the form body (RFC 6749 §2.3.1 public-client style).
+/// Both the device-authorization and token endpoints are set so one client
+/// drives the §3.1 code request and the §3.4 token poll. The endpoint type-
+/// state (`auth`/`introspection`/`revocation` = `EndpointNotSet`) reflects the
+/// two endpoints the device flow actually needs.
+type DeviceOauthClient = BasicClient<
+    oauth2::EndpointNotSet,
+    oauth2::EndpointSet,
+    oauth2::EndpointNotSet,
+    oauth2::EndpointNotSet,
+    oauth2::EndpointSet,
+>;
 
-fn default_device_poll_interval() -> u64 {
-    5
-}
-
-/// RFC 8628 §3.5 polling outcome. The four named "errors"
-/// (`authorization_pending`, `slow_down`, `access_denied`, `expired_token`)
-/// are flow-level states NOT real failures — they drive the polling loop.
-/// Everything else folds into a fatal `Err` at the call site.
-#[derive(Debug)]
-enum DevicePollOutcome {
-    Success(TokenExchangeResponse),
-    AuthorizationPending,
-    SlowDown,
-    AccessDenied,
-    ExpiredToken,
-}
-
-/// Pure response classifier — split from the HTTP path so the RFC 8628
-/// §3.5 error-code mapping is unit-testable without a mock server. 2xx
-/// parses as a token response; 4xx parses `{"error": "..."}` and maps the
-/// four flow-state codes to enum variants; everything else (including
-/// non-JSON / unknown error codes) folds into `Err`.
-fn classify_device_poll(status: reqwest::StatusCode, body: &str) -> Result<DevicePollOutcome> {
-    if status.is_success() {
-        return serde_json::from_str(body)
-            .map(DevicePollOutcome::Success)
-            .map_err(|e| anyhow!("invalid token response: {e}; body={body}"));
-    }
-    #[derive(serde::Deserialize)]
-    struct ErrBody {
-        error: String,
-    }
-    let err_code = serde_json::from_str::<ErrBody>(body).ok().map(|e| e.error);
-    match err_code.as_deref() {
-        Some("authorization_pending") => Ok(DevicePollOutcome::AuthorizationPending),
-        Some("slow_down") => Ok(DevicePollOutcome::SlowDown),
-        Some("access_denied") => Ok(DevicePollOutcome::AccessDenied),
-        Some("expired_token") => Ok(DevicePollOutcome::ExpiredToken),
-        _ => Err(anyhow!("token endpoint returned {status}: {body}")),
-    }
-}
-
-/// POST to the RFC 8628 §3.1 device authorization endpoint. Public client
-/// — no `client_secret`. Returns the `{device_code, user_code, ...}`
-/// bundle the runtime relays to the user and polls against the token
-/// endpoint via `post_device_token_poll`.
-async fn post_device_authorization(
-    device_endpoint: &str,
+fn build_device_oauth_client(
     client_id: &str,
-    scopes: &str,
-    resource: Option<&str>,
-) -> Result<DeviceAuthResponse> {
-    let client = reqwest::Client::builder()
-        .build()
-        .context("build reqwest client")?;
-    let mut form = vec![("client_id", client_id), ("scope", scopes)];
-    if let Some(resource) = resource {
-        form.push(("resource", resource));
-    }
-    let resp = client
-        .post(device_endpoint)
-        .form(&form)
-        .send()
-        .await
-        .with_context(|| format!("POST {device_endpoint} (device authorization)"))?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(anyhow!(
-            "device authorization endpoint returned {status}: {body}"
-        ));
-    }
-    serde_json::from_str(&body)
-        .map_err(|e| anyhow!("invalid device authorization response: {e}; body={body}"))
-}
-
-/// POST one polling tick to the token endpoint per RFC 8628 §3.4. Caller
-/// owns the polling loop (interval, expires_in deadline, SlowDown back-
-/// off). Returns a `DevicePollOutcome` so the loop can distinguish the
-/// four RFC 8628 §3.5 flow states from real errors.
-async fn post_device_token_poll(
-    client: &reqwest::Client,
     token_url: &str,
-    client_id: &str,
-    device_code: &str,
-    resource: Option<&str>,
-) -> Result<DevicePollOutcome> {
-    let mut form = vec![
-        ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-        ("device_code", device_code),
-        ("client_id", client_id),
-    ];
-    if let Some(resource) = resource {
-        form.push(("resource", resource));
-    }
+    device_endpoint: &str,
+) -> Result<DeviceOauthClient> {
+    Ok(BasicClient::new(ClientId::new(client_id.to_string()))
+        .set_auth_type(AuthType::RequestBody)
+        .set_token_uri(TokenUrl::new(token_url.to_string()).context("token_url")?)
+        .set_device_authorization_url(
+            DeviceAuthorizationUrl::new(device_endpoint.to_string())
+                .context("device_authorization_endpoint")?,
+        ))
+}
+
+/// Build the reqwest client backing oauth2's device-flow HTTP. Stays on the
+/// crate's reqwest 0.12 (oauth2 talks to it through the `AsyncHttpClient`
+/// closure in `oauth_http_send`, so no oauth2 reqwest feature / version
+/// coupling is needed).
+fn oauth_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .build()
+        .context("build reqwest client")
+}
+
+/// Adapt oauth2's `HttpRequest`/`HttpResponse` (the `http` crate types) onto
+/// reqwest 0.12. Used as the `AsyncHttpClient` closure body — the closure
+/// hands ownership of a cloned `reqwest::Client` in per call so the returned
+/// future borrows nothing from the closure.
+async fn oauth_http_send(
+    client: reqwest::Client,
+    req: oauth2::HttpRequest,
+) -> std::result::Result<oauth2::HttpResponse, reqwest::Error> {
+    let (parts, body) = req.into_parts();
     let resp = client
-        .post(token_url)
-        .form(&form)
+        .request(parts.method, parts.uri.to_string())
+        .headers(parts.headers)
+        .body(body)
         .send()
-        .await
-        .with_context(|| format!("POST {token_url} (device token poll)"))?;
+        .await?;
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    classify_device_poll(status, &body)
+    let headers = resp.headers().clone();
+    let bytes = resp.bytes().await?;
+    let mut builder = oauth2::http::Response::builder().status(status);
+    if let Some(dst) = builder.headers_mut() {
+        *dst = headers;
+    }
+    Ok(builder
+        .body(bytes.to_vec())
+        .expect("status + headers always build a valid response"))
+}
+
+/// Lift an oauth2 `BasicTokenResponse` into the local `TokenExchangeResponse`
+/// shape `build_stored_credentials` consumes. `expires_in` flattens to whole
+/// seconds (None → long-lived); `refresh_token` carries through so the no-
+/// refresh bounce only engages when the AS truly omits one.
+fn lift_oauth_token(token: &oauth2::basic::BasicTokenResponse) -> TokenExchangeResponse {
+    TokenExchangeResponse {
+        access_token: token.access_token().secret().clone(),
+        refresh_token: token.refresh_token().map(|t| t.secret().clone()),
+        expires_in: token.expires_in().map(|d| d.as_secs()),
+    }
+}
+
+/// Translate an oauth2 device-flow polling error into a user-facing
+/// `anyhow::Error`. The whole RFC 8628 §3.4 poll loop (interval, `slow_down`
+/// back-off, `authorization_pending` retry, connection-error backoff, expiry
+/// deadline) runs inside oauth2; only its terminal outcomes reach here. The
+/// §3.5 user-actionable states get friendly text; everything else folds the
+/// oauth2 `Display`.
+fn device_poll_error(
+    e: &RequestTokenError<reqwest::Error, DeviceCodeErrorResponse>,
+) -> anyhow::Error {
+    if let RequestTokenError::ServerResponse(resp) = e {
+        match resp.error() {
+            DeviceCodeErrorResponseType::AccessDenied => {
+                return anyhow!("device-flow denied by user");
+            }
+            DeviceCodeErrorResponseType::ExpiredToken => {
+                return anyhow!("device_code expired before user authorized");
+            }
+            _ => {}
+        }
+    }
+    anyhow!("device-flow polling failed: {e}")
 }
 
 /// Two-phase plan for `connect()`: most server types resolve directly to a
@@ -2495,70 +2462,6 @@ mod tests {
         // near expiry), not as immediately-expired → no NeedsAuth bounce or
         // refresh loop on first use.
         assert!(!near_expiry);
-    }
-
-    #[test]
-    fn classify_device_poll_decodes_success_into_token() {
-        let body = r#"{"access_token": "atk", "refresh_token": "rtk", "expires_in": 3600}"#;
-        let outcome = classify_device_poll(reqwest::StatusCode::OK, body).unwrap();
-        let DevicePollOutcome::Success(token) = outcome else {
-            panic!("expected Success");
-        };
-        assert_eq!(token.access_token, "atk");
-        assert_eq!(token.refresh_token.as_deref(), Some("rtk"));
-        assert_eq!(token.expires_in, Some(3600));
-    }
-
-    #[test]
-    fn classify_device_poll_maps_rfc8628_flow_states() {
-        let cases = [
-            ("authorization_pending", "AuthorizationPending"),
-            ("slow_down", "SlowDown"),
-            ("access_denied", "AccessDenied"),
-            ("expired_token", "ExpiredToken"),
-        ];
-        for (code, want) in cases {
-            let body = format!(r#"{{"error": "{code}"}}"#);
-            let outcome = classify_device_poll(reqwest::StatusCode::BAD_REQUEST, &body).unwrap();
-            let got = match outcome {
-                DevicePollOutcome::AuthorizationPending => "AuthorizationPending",
-                DevicePollOutcome::SlowDown => "SlowDown",
-                DevicePollOutcome::AccessDenied => "AccessDenied",
-                DevicePollOutcome::ExpiredToken => "ExpiredToken",
-                DevicePollOutcome::Success(_) => "Success",
-            };
-            assert_eq!(got, want, "code={code}");
-        }
-    }
-
-    #[test]
-    fn classify_device_poll_folds_unknown_error_into_err() {
-        let body = r#"{"error": "invalid_grant"}"#;
-        let err = classify_device_poll(reqwest::StatusCode::BAD_REQUEST, body)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("invalid_grant"), "got: {err}");
-    }
-
-    #[test]
-    fn classify_device_poll_folds_non_json_5xx_into_err() {
-        let err = classify_device_poll(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "<html>")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("500"), "got: {err}");
-    }
-
-    #[test]
-    fn device_auth_response_defaults_interval_to_rfc8628_value() {
-        let body = r#"{
-            "device_code": "dc",
-            "user_code": "AAAA-BBBB",
-            "verification_uri": "https://example.com/device",
-            "expires_in": 1800
-        }"#;
-        let resp: DeviceAuthResponse = serde_json::from_str(body).unwrap();
-        assert_eq!(resp.interval, 5);
-        assert!(resp.verification_uri_complete.is_none());
     }
 
     fn linear_device_cfg() -> &'static str {
