@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use rmcp::transport::{AuthError, CredentialStore, StoredCredentials};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -85,6 +86,14 @@ pub struct PendingPasteLogin {
 pub enum AuthEntry {
     Token(TokenStore),
     Pending(PendingPasteLogin),
+    /// rmcp-native MCP-server credential (ADR §6.1 storage-format decision A).
+    /// Stored under the bare server name, sharing `auth.json` with the `codex`
+    /// tenant. `Mcp` MUST stay last in this untagged enum: `StoredCredentials`
+    /// only *requires* `client_id`, the loosest field set, so an earlier
+    /// position would let it shadow `Token`/`Pending`. Disjointness holds
+    /// because `TokenStore` requires `access_token` and `PendingPasteLogin`
+    /// requires `verifier`, neither of which `StoredCredentials` carries.
+    Mcp(StoredCredentials),
 }
 
 /// Default location of `auth.json`. Exposed so `McpRuntimeManager` can
@@ -207,6 +216,7 @@ pub fn load_namespaced_token_at(path: &Path, key: &str) -> Result<TokenStore> {
     match map.get(key) {
         Some(AuthEntry::Token(t)) => Ok(t.clone()),
         Some(AuthEntry::Pending(_)) => Err(anyhow!("{key:?} is a pending login, not a token")),
+        Some(AuthEntry::Mcp(_)) => Err(anyhow!("{key:?} is an rmcp-native credential, not a TokenStore")),
         None => Err(anyhow!("no credentials stored for {key:?}")),
     }
 }
@@ -220,6 +230,71 @@ pub fn save_namespaced_token_at(path: &Path, key: &str, store: &TokenStore) -> R
     let mut map = read_auth_file(path).unwrap_or_default();
     map.insert(key.to_string(), AuthEntry::Token(store.clone()));
     write_auth_file(path, &map)
+}
+
+/// rmcp [`CredentialStore`] backed by the shared `auth.json` file (ADR §6.1
+/// storage-format decision A). One instance is bound to a single MCP server's
+/// bare-name key (e.g. `linear`); rmcp's `AuthorizationManager` owns the
+/// load/save/clear lifecycle. Reuses the atomic `read_auth_file` /
+/// `write_auth_file` so MCP credentials inherit the same tmp+rename+fsync,
+/// 0o600 durability the Codex tenant relies on, without disturbing it.
+///
+/// The filesystem reads/writes are synchronous: `auth.json` holds a handful of
+/// entries, so blocking the executor for the duration is trivial (mirrors the
+/// existing `list_pending_logins_at` rationale) and avoids a `spawn_blocking`
+/// round-trip.
+#[derive(Debug, Clone)]
+pub struct McpCredentialStore {
+    path: PathBuf,
+    key: String,
+}
+
+impl McpCredentialStore {
+    pub fn new(path: PathBuf, server_name: impl Into<String>) -> Self {
+        Self {
+            path,
+            key: server_name.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CredentialStore for McpCredentialStore {
+    async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
+        // Missing / unreadable file → "no credentials yet", not an error: the
+        // first login is the write that creates it.
+        let Ok(map) = read_auth_file(&self.path) else {
+            return Ok(None);
+        };
+        match map.get(&self.key) {
+            Some(AuthEntry::Mcp(c)) => Ok(Some(c.clone())),
+            // A non-Mcp entry under this key (e.g. a legacy `Token` from the
+            // pre-rmcp paste flow) is treated as absent → triggers re-login,
+            // matching the accepted one-time re-auth migration.
+            _ => Ok(None),
+        }
+    }
+
+    async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
+        let mut map = read_auth_file(&self.path).unwrap_or_default();
+        map.insert(self.key.clone(), AuthEntry::Mcp(credentials));
+        write_auth_file(&self.path, &map).map_err(|e| AuthError::InternalError(e.to_string()))
+    }
+
+    async fn clear(&self) -> Result<(), AuthError> {
+        let mut map = match read_auth_file(&self.path) {
+            Ok(m) => m,
+            Err(_) => return Ok(()),
+        };
+        if map.remove(&self.key).is_none() {
+            return Ok(());
+        }
+        if map.is_empty() {
+            let _ = std::fs::remove_file(&self.path);
+            return Ok(());
+        }
+        write_auth_file(&self.path, &map).map_err(|e| AuthError::InternalError(e.to_string()))
+    }
 }
 
 const PENDING_PREFIX: &str = "mcp-pending:";
@@ -246,7 +321,7 @@ pub fn list_pending_logins_at(path: &Path) -> Vec<String> {
         .iter()
         .filter_map(|(k, v)| match v {
             AuthEntry::Pending(_) => k.strip_prefix(PENDING_PREFIX).map(str::to_string),
-            AuthEntry::Token(_) => None,
+            AuthEntry::Token(_) | AuthEntry::Mcp(_) => None,
         })
         .collect();
     names.sort();
@@ -264,6 +339,7 @@ pub fn load_pending_login(path: &Path, key: &str) -> Result<PendingPasteLogin> {
     match map.get(key) {
         Some(AuthEntry::Pending(p)) => Ok(p.clone()),
         Some(AuthEntry::Token(_)) => Err(anyhow!("{key:?} is a token, not a pending login")),
+        Some(AuthEntry::Mcp(_)) => Err(anyhow!("{key:?} is an rmcp-native credential, not a pending login")),
         None => Err(anyhow!("no pending login for {key:?}")),
     }
 }
@@ -833,6 +909,100 @@ mod tests {
             Some(AuthEntry::Pending(p)) => assert_eq!(p.verifier, "test-verifier"),
             other => panic!("expected Pending, got {other:?}"),
         }
+    }
+
+    fn make_mcp_creds() -> StoredCredentials {
+        StoredCredentials::new(
+            "client-xyz".to_string(),
+            None,
+            vec!["read".to_string(), "write".to_string()],
+            Some(1234),
+        )
+    }
+
+    #[test]
+    fn auth_entry_mcp_variant_round_trips_and_is_disjoint() {
+        // Token + Pending + Mcp in one file: each must deserialize back to its
+        // own variant, proving the untagged shapes stay disjoint with `Mcp`
+        // added (the loosest-required-field variant) last.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut input = HashMap::new();
+        input.insert("codex".to_string(), AuthEntry::Token(make_store(7)));
+        input.insert(
+            "mcp-pending:linear".to_string(),
+            AuthEntry::Pending(make_pending()),
+        );
+        input.insert("github".to_string(), AuthEntry::Mcp(make_mcp_creds()));
+        write_auth_file(&path, &input).unwrap();
+        let map = read_auth_file(&path).unwrap();
+        assert_eq!(map.len(), 3);
+        assert_eq!(token_of(map.get("codex")).expires_at, 7);
+        assert!(matches!(
+            map.get("mcp-pending:linear"),
+            Some(AuthEntry::Pending(_))
+        ));
+        match map.get("github") {
+            Some(AuthEntry::Mcp(c)) => {
+                assert_eq!(c.client_id, "client-xyz");
+                assert_eq!(c.granted_scopes, vec!["read", "write"]);
+                assert_eq!(c.token_received_at, Some(1234));
+                assert!(c.token_response.is_none());
+            }
+            other => panic!("expected Mcp, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_credential_store_load_save_clear_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let store = McpCredentialStore::new(path.clone(), "linear");
+
+        assert!(store.load().await.unwrap().is_none(), "empty → None");
+
+        store.save(make_mcp_creds()).await.unwrap();
+        let loaded = store.load().await.unwrap().expect("creds present after save");
+        assert_eq!(loaded.client_id, "client-xyz");
+        assert_eq!(loaded.granted_scopes, vec!["read", "write"]);
+        assert_eq!(loaded.token_received_at, Some(1234));
+
+        store.clear().await.unwrap();
+        assert!(store.load().await.unwrap().is_none(), "cleared → None");
+        // Last entry removed → file is gone, not left as an empty map.
+        assert!(!path.exists(), "auth.json removed once last entry cleared");
+    }
+
+    #[tokio::test]
+    async fn mcp_store_clear_preserves_other_tenants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        // Seed a codex Token alongside the MCP cred.
+        let mut input = HashMap::new();
+        input.insert("codex".to_string(), AuthEntry::Token(make_store(1)));
+        write_auth_file(&path, &input).unwrap();
+
+        let store = McpCredentialStore::new(path.clone(), "linear");
+        store.save(make_mcp_creds()).await.unwrap();
+        store.clear().await.unwrap();
+
+        // codex tenant survives the MCP clear.
+        let map = read_auth_file(&path).unwrap();
+        assert_eq!(token_of(map.get("codex")).expires_at, 1);
+        assert!(store.load().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn mcp_store_load_returns_none_for_token_keyed_entry() {
+        // A legacy `Token` under the server's bare key must read as absent so
+        // the manager triggers the accepted one-time re-login.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut input = HashMap::new();
+        input.insert("linear".to_string(), AuthEntry::Token(make_store(9)));
+        write_auth_file(&path, &input).unwrap();
+        let store = McpCredentialStore::new(path, "linear");
+        assert!(store.load().await.unwrap().is_none());
     }
 
     #[test]
