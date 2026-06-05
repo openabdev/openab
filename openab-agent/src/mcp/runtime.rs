@@ -45,13 +45,10 @@ use tokio::task::AbortHandle;
 
 use super::breaker::{ServerBreaker, Verdict};
 use super::config::{parse_logging_level, McpConfig, ServerConfig};
-use super::flow::{canonical_resource, init_paste_authorize, parse_paste_callback};
+use super::flow::{canonical_resource, parse_redirect_params};
 use super::oauth::{builtin_client_id, resolve, ResolvedProvider};
-use crate::auth::{
-    auth_path, list_pending_logins_at, load_pending_login, pending_key, remove_pending_login,
-    save_pending_login, McpCredentialStore,
-    PendingPasteLogin,
-};
+use crate::auth::{auth_path, McpCredentialStore};
+use rmcp::transport::auth::OAuthClientConfig;
 
 /// MCP client-side callback handler. Replaces the unit type `()` so individual
 /// `ClientHandler` callbacks can be overridden (the named struct is the
@@ -373,12 +370,12 @@ impl std::fmt::Debug for ServerHandle {
 }
 
 /// Public return of `start_paste_login`. The caller relays `authorize_url`
-/// to the user; `state` is echoed so the agent can show / log it without
-/// reaching into runtime internals.
+/// to the user. The PKCE verifier + CSRF `state` now live inside rmcp's
+/// in-memory `StateStore` (keyed off the same cached `AuthorizationManager`
+/// that `complete_login` reuses), so they're no longer surfaced here.
 #[derive(Debug, Clone)]
 pub struct PasteLoginStart {
     pub authorize_url: String,
-    pub state: String,
 }
 
 /// Public return of `start_device_login` (RFC 8628 §3.2 user-facing
@@ -642,14 +639,6 @@ impl McpRuntimeManager {
         self.handles.read().await.is_empty()
     }
 
-    /// Sorted server names with an in-flight `mcp-pending:<name>` entry in
-    /// `auth.json`. Lets `mcp status` surface "you started a login but
-    /// haven't finished" — including for servers no longer in config
-    /// (caller cross-references against `statuses()` to spot orphans).
-    pub fn pending_logins(&self) -> Vec<String> {
-        list_pending_logins_at(&self.auth_path)
-    }
-
     /// Clone the live MCP client handle for `name` out from under a short
     /// read lock. The caller `.await`s on the returned `Arc` with no
     /// runtime lock held, so background writers (idle eviction, new
@@ -807,98 +796,73 @@ impl McpRuntimeManager {
     }
 
     /// Begin a paste-back OAuth login for an HTTP server with an `oauth:`
-    /// block (ADR §6.4). Produces the authorize URL the agent surfaces to
-    /// the user; the matching PKCE verifier + `state` nonce are persisted
-    /// under `mcp-pending:<name>` in `auth.json` for `complete_login`
-    /// (next slice) to consume.
+    /// block (ADR §6.4), driven entirely by rmcp's `AuthorizationManager`.
+    /// Runs SEP-985 PRM / RFC 8414 metadata discovery against the server URL,
+    /// configures the OAuth client from the resolved `client_id` + redirect,
+    /// and returns the authorize URL the agent surfaces to the user. PKCE
+    /// (S256) + the CSRF `state` are generated and stashed in the manager's
+    /// in-memory `StateStore`.
     ///
-    /// Scoped to **built-in** providers this slice. Custom-provider
-    /// paste-back needs runtime port allocation for the callback (§6.4),
-    /// and any provider that advertises a `device_authorization_endpoint`
-    /// should run device-code instead (§6.4 selection logic). Both errors
-    /// are explicit so the LLM can pick a different action.
+    /// Single-invocation by design (Brett 2026-06-05): the verifier/state live
+    /// only in the cached `AuthorizationManager`, so `complete_login` must run
+    /// in the same process. `get_or_init_auth_client` returns that cached
+    /// manager so the exchange finds the stashed PKCE/CSRF.
+    ///
+    /// Discovery is a network call — unlike the old offline URL-builder, this
+    /// requires the server's metadata endpoint to be reachable before it can
+    /// emit an authorize URL.
     pub async fn start_paste_login(&self, name: &str) -> Result<PasteLoginStart> {
-        let (provider, client_id, redirect_uri, resource) = self.resolve_paste_client(name).await?;
-        let started =
-            init_paste_authorize(&provider, &client_id, &redirect_uri, resource.as_deref())?;
-        let pending = PendingPasteLogin {
-            verifier: started.code_verifier,
-            state: started.state.clone(),
-            token_url: provider.token_url().to_string(),
-            provider_name: provider_name_of(&provider),
-            resource,
+        let (provider, client_id, redirect_uri, server_url) =
+            self.resolve_paste_client(name).await?;
+        let scopes: Vec<String> = provider.scopes().to_vec();
+        let client = self.get_or_init_auth_client(name, &server_url).await?;
+        let authorize_url = {
+            let mut mgr = client.auth_manager.lock().await;
+            let metadata = mgr
+                .discover_metadata()
+                .await
+                .map_err(|e| anyhow!("mcp server {name:?} oauth discovery failed: {e}"))?;
+            mgr.set_metadata(metadata);
+            mgr.configure_client(
+                OAuthClientConfig::new(client_id, redirect_uri).with_scopes(scopes.clone()),
+            )
+            .map_err(|e| anyhow!("mcp server {name:?} oauth client config failed: {e}"))?;
+            let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
+            mgr.get_authorization_url(&scope_refs)
+                .await
+                .map_err(|e| anyhow!("mcp server {name:?} authorize url build failed: {e}"))?
         };
-        save_pending_login(&self.auth_path, &pending_key(name), &pending)?;
         {
             let mut handles = self.handles.write().await;
             if let Some(handle) = handles.get_mut(name) {
                 handle.status = ServerStatus::NeedsAuth;
             }
         }
-        Ok(PasteLoginStart {
-            authorize_url: started.url,
-            state: started.state,
-        })
+        Ok(PasteLoginStart { authorize_url })
     }
 
-    /// Read the on-disk pending paste-login for `name`. `None` if there's
-    /// no entry or the file is unreadable. `mcp status` surfaces in-flight
-    /// logins via `list_pending_logins_at`; this accessor is the single-
-    /// entry counterpart for callers that need the full snapshot.
-    #[allow(dead_code)] // accessor for future per-entry status detail
-    pub async fn pending_paste_login(&self, name: &str) -> Option<PendingPasteLogin> {
-        load_pending_login(&self.auth_path, &pending_key(name)).ok()
-    }
-
-    /// Finish a paste-back OAuth flow (ADR §6.4). Reads the snapshotted
-    /// `PendingPasteLogin`, validates the redirect URL's `state` against
-    /// the snapshotted nonce (RFC 6749 §10.12), exchanges the auth code
-    /// at the snapshotted `token_url`, persists the resulting
-    /// `TokenStore` under `<name>`, and clears the pending entry. Status
-    /// transitions `NeedsAuth → Disconnected` so the next `connect()`
+    /// Finish a paste-back OAuth flow (ADR §6.4). Parses the pasted redirect
+    /// for `(code, state)` and hands them to rmcp's `exchange_code_for_token`,
+    /// which validates the CSRF `state` against its in-memory `StateStore`
+    /// entry (RFC 6749 §10.12), exchanges the code, and auto-persists the
+    /// resulting `StoredCredentials` through the configured
+    /// [`McpCredentialStore`] (which re-splices a rotated-away refresh token).
+    /// Status transitions `NeedsAuth → Disconnected` so the next `connect()`
     /// dials the now-authenticated transport.
+    ///
+    /// Reuses the same cached `AuthClient` that `start_paste_login` built, so
+    /// it must run in the same process invocation as the start.
     pub async fn complete_login(&self, name: &str, redirect_url: &str) -> Result<()> {
-        let pending =
-            load_pending_login(&self.auth_path, &pending_key(name)).with_context(|| {
-                format!("no pending login for {name:?}; run `mcp login {name}` first")
-            })?;
-        let code = parse_paste_callback(redirect_url, &pending.state)?;
-        let (_provider, client_id, redirect_uri, _resource) =
+        let (code, state) = parse_redirect_params(redirect_url)?;
+        let (_provider, _client_id, _redirect_uri, server_url) =
             self.resolve_paste_client(name).await?;
-        // Use the snapshotted `resource` (RFC 8707) so a config edit between
-        // init and finish can't redirect the token's audience binding —
-        // matching the same snapshot rule as `token_url`/`provider_name`.
-        let resp = post_token_exchange(
-            &pending.token_url,
-            &client_id,
-            &redirect_uri,
-            &code,
-            &pending.verifier,
-            pending.resource.as_deref(),
-        )
-        .await?;
-        self.finish_login(name, resp, &client_id).await
-    }
-
-    /// Pure-persistence tail of `complete_login`. Split out so tests can
-    /// drive the state-machine + on-disk transition without a real token
-    /// endpoint. Persists a native rmcp `StoredCredentials` via
-    /// `McpCredentialStore` — the same format `connect()` reads back — so a
-    /// finished login unblocks the next dial. Errors leave the pending entry
-    /// intact so the user can retry the same flow.
-    async fn finish_login(
-        &self,
-        name: &str,
-        resp: TokenExchangeResponse,
-        client_id: &str,
-    ) -> Result<()> {
-        use rmcp::transport::CredentialStore;
-        let creds = build_stored_credentials(client_id, &resp)?;
-        McpCredentialStore::new(self.auth_path.clone(), name.to_string())
-            .save(creds)
-            .await
-            .map_err(|e| anyhow!("persist mcp credentials for {name:?}: {e}"))?;
-        remove_pending_login(&self.auth_path, &pending_key(name))?;
+        let client = self.get_or_init_auth_client(name, &server_url).await?;
+        {
+            let mgr = client.auth_manager.lock().await;
+            mgr.exchange_code_for_token(&code, &state)
+                .await
+                .map_err(|e| anyhow!("mcp server {name:?} token exchange failed: {e}"))?;
+        }
         let mut handles = self.handles.write().await;
         if let Some(handle) = handles.get_mut(name) {
             handle.status = ServerStatus::Disconnected;
@@ -1126,14 +1090,16 @@ impl McpRuntimeManager {
         }
     }
 
-    /// Resolve a paste-back OAuth client `(provider, client_id, redirect_uri)`
-    /// from the server's config. Shared by `start_paste_login` and
-    /// `complete_login` so a config drift between init and finish surfaces
-    /// the same error from both entry points.
+    /// Resolve a paste-back OAuth client `(provider, client_id, redirect_uri,
+    /// server_url)` from the server's config. Shared by `start_paste_login` and
+    /// `complete_login` so a config drift between init and finish surfaces the
+    /// same error from both entry points. `server_url` is returned so the
+    /// caller can build/reuse the rmcp `AuthorizationManager` (which discovers
+    /// metadata from it and hardcodes it as the RFC 8707 `resource`).
     async fn resolve_paste_client(
         &self,
         name: &str,
-    ) -> Result<(ResolvedProvider, String, String, Option<String>)> {
+    ) -> Result<(ResolvedProvider, String, String, String)> {
         let (oauth_cfg, server_url) = {
             let guard = self.handles.read().await;
             let handle = guard
@@ -1154,17 +1120,12 @@ impl McpRuntimeManager {
             }
         };
         let provider = resolve(&oauth_cfg)?;
-        // RFC 8707 resource indicator. Gated to custom providers: a built-in's
-        // authorize/token endpoints point at the vendor AS (claude.ai), not the
-        // MCP server's own URL, and there's no evidence the built-in AS honors
-        // `resource` — sending it risks an `invalid_target` rejection that would
-        // break the shipping built-in login. Custom providers are
-        // self-hosted-resource-server style where the server URL *is* the
-        // audience. Revisit once PRM/discovery (Rows 153-168) lands.
-        let resource = match &provider {
-            ResolvedProvider::Builtin { .. } => None,
-            ResolvedProvider::Custom { .. } => Some(canonical_resource(&server_url)?),
-        };
+        // NOTE: rmcp's `get_authorization_url`/`exchange_code_for_token`
+        // hardcode `resource = base_url` (the server URL), so the prior
+        // per-provider RFC 8707 gating (built-ins sent no `resource` to dodge
+        // a possible `invalid_target`) is no longer expressible. Built-in
+        // `client_id` is env-gated, so that path is theoretical; flagged for
+        // the OAuth revamp follow-up.
         let (client_id, redirect_uri) = match &provider {
             ResolvedProvider::Builtin {
                 provider_name,
@@ -1200,7 +1161,7 @@ impl McpRuntimeManager {
                 ));
             }
         };
-        Ok((provider, client_id, redirect_uri, resource))
+        Ok((provider, client_id, redirect_uri, server_url))
     }
 
     /// Lazy-connect the named server (ADR §5.7). Idempotent if already
@@ -1351,15 +1312,6 @@ impl McpRuntimeManager {
     }
 }
 
-/// Stringified provider name for the pending-state record. `Builtin` keeps
-/// its `&'static str` static; `Custom` already owns a `String`.
-fn provider_name_of(provider: &ResolvedProvider) -> String {
-    match provider {
-        ResolvedProvider::Builtin { provider_name, .. } => (*provider_name).to_string(),
-        ResolvedProvider::Custom { provider_name, .. } => provider_name.clone(),
-    }
-}
-
 /// Map a host reply to our `session/request_input` elicitation request into a
 /// `CreateElicitationResult`. The host returns `{ action, content }`; a missing
 /// or unrecognized `action` defaults to `accept` when `content` is present (so a
@@ -1428,53 +1380,6 @@ fn build_stored_credentials(
         "token_received_at": now_secs(),
     }))
     .context("build StoredCredentials")
-}
-
-/// Shared POST helper for `post_token_exchange` (RFC 6749 §4.1.3).
-/// Public client — no `client_secret`. Errors fold body text into the
-/// message so transient 4xx from the provider land in the user's
-/// terminal verbatim.
-async fn post_token_form(
-    token_url: &str,
-    form: &[(&str, &str)],
-    grant_label: &str,
-) -> Result<TokenExchangeResponse> {
-    let client = reqwest::Client::builder()
-        .build()
-        .context("build reqwest client")?;
-    let resp = client
-        .post(token_url)
-        .form(form)
-        .send()
-        .await
-        .with_context(|| format!("POST {token_url} ({grant_label})"))?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(anyhow!("token endpoint returned {status}: {body}"));
-    }
-    serde_json::from_str(&body).map_err(|e| anyhow!("invalid token response: {e}; body={body}"))
-}
-
-async fn post_token_exchange(
-    token_url: &str,
-    client_id: &str,
-    redirect_uri: &str,
-    code: &str,
-    code_verifier: &str,
-    resource: Option<&str>,
-) -> Result<TokenExchangeResponse> {
-    let mut form = vec![
-        ("grant_type", "authorization_code"),
-        ("code", code),
-        ("code_verifier", code_verifier),
-        ("client_id", client_id),
-        ("redirect_uri", redirect_uri),
-    ];
-    if let Some(resource) = resource {
-        form.push(("resource", resource));
-    }
-    post_token_form(token_url, &form, "token exchange").await
 }
 
 /// Build a public (no-secret) oauth2 device-flow client. `AuthType::RequestBody`
@@ -2215,36 +2120,11 @@ mod tests {
         (mgr, dir)
     }
 
-    #[tokio::test]
-    async fn start_paste_login_builtin_returns_authorize_url_and_pins_pending() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: serialized via ENV_LOCK; isolated env key.
-        unsafe {
-            std::env::set_var("OPENAB_MCP_ANTHROPIC_CLIENT_ID", "anth-cid");
-        }
-        let cfg: McpConfig = serde_json::from_str(anthropic_builtin_cfg()).unwrap();
-        let (mgr, _dir) = mgr_with_tempdir(cfg);
-        let start = mgr.start_paste_login("anthro").await.unwrap();
-        assert!(start
-            .authorize_url
-            .starts_with("https://claude.ai/oauth/authorize?"));
-        assert!(start.authorize_url.contains("client_id=anth-cid"));
-        assert!(start
-            .authorize_url
-            .contains(&format!("state={}", start.state)));
-        let pending = mgr.pending_paste_login("anthro").await.unwrap();
-        assert_eq!(pending.state, start.state);
-        assert!(!pending.verifier.is_empty());
-        assert_eq!(
-            pending.token_url,
-            "https://platform.claude.com/v1/oauth/token"
-        );
-        assert_eq!(pending.provider_name, "anthropic-mcp");
-        assert_eq!(mgr.statuses().await[0].1, ServerStatus::NeedsAuth);
-        unsafe {
-            std::env::remove_var("OPENAB_MCP_ANTHROPIC_CLIENT_ID");
-        }
-    }
+    // NOTE: the happy-path `start_paste_login` success cases (builtin + custom)
+    // are no longer unit-testable offline — rmcp owns the authorize-URL build
+    // behind a live PRM/RFC8414 discovery call. The config-validation error
+    // paths below stay offline (they fail in `resolve_paste_client` before any
+    // network I/O); end-to-end login is covered by manual / integration runs.
 
     #[tokio::test]
     async fn start_paste_login_rejects_custom_without_redirect_uri() {
@@ -2252,7 +2132,6 @@ mod tests {
         let (mgr, _dir) = mgr_with_tempdir(cfg);
         let err = start_login_err(&mgr, "linear").await;
         assert!(err.contains("oauth.redirect_uri"), "got: {err}");
-        assert!(mgr.pending_paste_login("linear").await.is_none());
     }
 
     #[tokio::test]
@@ -2275,35 +2154,6 @@ mod tests {
         let (mgr, _dir) = mgr_with_tempdir(cfg);
         let err = start_login_err(&mgr, "linear").await;
         assert!(err.contains("oauth.client_id"), "got: {err}");
-        assert!(mgr.pending_paste_login("linear").await.is_none());
-    }
-
-    #[tokio::test]
-    async fn start_paste_login_custom_with_client_id_and_redirect_uri_succeeds() {
-        let json = r#"{
-            "mcpServers": {
-                "linear": {
-                    "type": "http",
-                    "url": "https://mcp.linear.app/mcp",
-                    "oauth": {
-                        "provider": "linear",
-                        "authorize_url": "https://linear.app/oauth/authorize",
-                        "token_url": "https://api.linear.app/oauth/token",
-                        "client_id": "linear-client",
-                        "redirect_uri": "https://example.com/cb",
-                        "scopes": ["read"]
-                    }
-                }
-            }
-        }"#;
-        let cfg: McpConfig = serde_json::from_str(json).unwrap();
-        let (mgr, _dir) = mgr_with_tempdir(cfg);
-        let start = mgr.start_paste_login("linear").await.unwrap();
-        assert!(start.authorize_url.contains("client_id=linear-client"));
-        assert!(start.authorize_url.contains("redirect_uri=https"));
-        let pending = mgr.pending_paste_login("linear").await.unwrap();
-        assert_eq!(pending.state, start.state);
-        assert_eq!(pending.provider_name, "linear");
     }
 
     #[tokio::test]
@@ -2397,98 +2247,13 @@ mod tests {
         assert!(!env.contains_key("ANTHROPIC_API_KEY"));
     }
 
-    fn seed_pending(mgr: &McpRuntimeManager, name: &str, state: &str) -> PendingPasteLogin {
-        let pending = PendingPasteLogin {
-            verifier: "v3rifier".to_string(),
-            state: state.to_string(),
-            token_url: "https://example.test/token".to_string(),
-            provider_name: "linear".to_string(),
-            resource: Some("https://mcp.linear.app/sse".to_string()),
-        };
-        save_pending_login(&mgr.auth_path, &pending_key(name), &pending).unwrap();
-        pending
-    }
-
-    #[tokio::test]
-    async fn complete_login_rejects_when_no_pending_entry() {
-        let cfg: McpConfig = serde_json::from_str(linear_custom_cfg()).unwrap();
-        let (mgr, _dir) = mgr_with_tempdir(cfg);
-        let err = mgr
-            .complete_login("linear", "http://localhost/cb?code=c&state=s")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("no pending login"), "expected hint in {err}");
-        assert!(err.contains("mcp login"), "expected CLI hint in {err}");
-    }
-
-    #[tokio::test]
-    async fn complete_login_rejects_state_mismatch_and_keeps_pending() {
-        let cfg: McpConfig = serde_json::from_str(linear_custom_cfg()).unwrap();
-        let (mgr, _dir) = mgr_with_tempdir(cfg);
-        let pending = seed_pending(&mgr, "linear", "want");
-        let url = "http://localhost/cb?code=c&state=other";
-        let err = mgr
-            .complete_login("linear", url)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("state mismatch"),
-            "expected CSRF guard in {err}"
-        );
-        // Pending entry must survive a rejected attempt so the user can
-        // re-issue the same paste without going through `mcp login` again.
-        let got = mgr.pending_paste_login("linear").await.unwrap();
-        assert_eq!(got, pending);
-    }
-
-    #[tokio::test]
-    async fn finish_login_persists_creds_clears_pending_and_unblocks_connect() {
-        use rmcp::transport::CredentialStore;
-        let cfg: McpConfig = serde_json::from_str(linear_custom_cfg()).unwrap();
-        let (mgr, _dir) = mgr_with_tempdir(cfg);
-        seed_pending(&mgr, "linear", "s");
-        // Pre-set NeedsAuth so we can observe the transition.
-        {
-            let mut h = mgr.handles.write().await;
-            h.get_mut("linear").unwrap().status = ServerStatus::NeedsAuth;
-        }
-        let resp = TokenExchangeResponse {
-            access_token: "atok".to_string(),
-            refresh_token: Some("rtok".to_string()),
-            expires_in: Some(3600),
-        };
-        mgr.finish_login("linear", resp, "linear-client")
-            .await
-            .unwrap();
-        assert!(mgr.pending_paste_login("linear").await.is_none());
-        // The connect() read-path reads native StoredCredentials — assert the
-        // login wrote exactly that, so the bridge is closed.
-        let creds = McpCredentialStore::new(mgr.auth_path.clone(), "linear")
-            .load()
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(creds.client_id, "linear-client");
-        let (has_token, has_refresh, _near) = classify_stored_creds(&creds);
-        assert!(has_token && has_refresh);
-        assert_eq!(mgr.statuses().await[0].1, ServerStatus::Disconnected);
-    }
-
-    #[tokio::test]
-    async fn pending_logins_returns_sorted_names_and_includes_orphans() {
-        // `linear` is in cfg; `zed-mcp` + `ghost` are not — surfacing all
-        // three is the point (orphans get separately filed by cli_show_status).
-        let cfg: McpConfig = serde_json::from_str(linear_custom_cfg()).unwrap();
-        let (mgr, _dir) = mgr_with_tempdir(cfg);
-        assert!(mgr.pending_logins().is_empty());
-        seed_pending(&mgr, "zed-mcp", "s1");
-        seed_pending(&mgr, "linear", "s2");
-        seed_pending(&mgr, "ghost", "s3");
-        let names = mgr.pending_logins();
-        assert_eq!(names, vec!["ghost", "linear", "zed-mcp"]);
-    }
+    // The paste-login exchange tail (CSRF validation, code exchange, credential
+    // persistence) now lives inside rmcp's `exchange_code_for_token` against an
+    // in-memory `StateStore`, so it can't be driven offline from a seeded
+    // on-disk pending entry. The refresh-token rotation fallback that used to be
+    // asserted here is covered directly at the `McpCredentialStore::save` layer
+    // in `auth.rs` tests; the credential read-path is covered by the
+    // `connect_oauth_*` cases below.
 
     fn dead_oauth_cfg() -> &'static str {
         // 127.0.0.1:1 dials hermetically (no reachable MCP server) so
@@ -2589,34 +2354,6 @@ mod tests {
         let err = mgr.connect("linear").await.unwrap_err().to_string();
         assert!(err.contains("oauth refresh failed"), "got: {err}");
         assert_eq!(mgr.statuses().await[0].1, ServerStatus::NeedsAuth);
-    }
-
-    #[tokio::test]
-    async fn finish_login_tolerates_provider_omitting_refresh_token() {
-        use rmcp::transport::CredentialStore;
-        let cfg: McpConfig = serde_json::from_str(linear_custom_cfg()).unwrap();
-        let (mgr, _dir) = mgr_with_tempdir(cfg);
-        seed_pending(&mgr, "linear", "s");
-        let resp = TokenExchangeResponse {
-            access_token: "atok".to_string(),
-            refresh_token: None,
-            expires_in: None,
-        };
-        mgr.finish_login("linear", resp, "linear-client")
-            .await
-            .unwrap();
-        let creds = McpCredentialStore::new(mgr.auth_path.clone(), "linear")
-            .load()
-            .await
-            .unwrap()
-            .unwrap();
-        let (has_token, has_refresh, near_expiry) = classify_stored_creds(&creds);
-        assert!(has_token);
-        assert!(!has_refresh);
-        // No `expires_in` from the provider must read as long-lived (never
-        // near expiry), not as immediately-expired → no NeedsAuth bounce or
-        // refresh loop on first use.
-        assert!(!near_expiry);
     }
 
     fn linear_device_cfg() -> &'static str {

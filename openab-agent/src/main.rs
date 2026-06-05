@@ -55,23 +55,17 @@ enum McpAction {
     /// ADR §6.4). Prints the authorize URL, then reads the post-redirect
     /// URL from stdin.
     ///
-    /// For non-interactive use, prefer piping the URL via stdin
-    /// (`echo "<url>" | openab-agent mcp login <name>`) over `--paste` —
-    /// pipes leave no trace in shell history or `ps` output. PKCE makes
-    /// either route safe in theory; the pipe form is defense-in-depth.
+    /// Single-invocation by design: the PKCE/CSRF state lives in-memory for
+    /// this run only, so the authorize URL and the pasted redirect must be
+    /// handled in the same process. Paste interactively at the prompt.
     Login {
         /// Server name as configured in mcp.json
         name: String,
-        /// Pre-fill the redirect URL (skip the stdin prompt). Convenient
-        /// for ad-hoc testing; CI / scripts should prefer the stdin pipe
-        /// form to keep `code` + `state` out of shell history and `ps`.
-        #[arg(long, value_name = "URL")]
-        paste: Option<String>,
         /// Use RFC 8628 device-code flow instead of paste-back. Requires
         /// the server's `oauth:` block to declare a
         /// `device_authorization_endpoint`. Useful for headless / remote
         /// hosts where the browser redirect target isn't reachable.
-        #[arg(long, conflicts_with = "paste")]
+        #[arg(long)]
         device: bool,
     },
 }
@@ -127,15 +121,11 @@ async fn main() {
             McpAction::Status => mcp::cli_show_status().await,
             McpAction::Doctor => mcp::cli_doctor().await,
             McpAction::Connect { name } => mcp::cli_connect(name).await,
-            McpAction::Login {
-                name,
-                paste,
-                device,
-            } => {
+            McpAction::Login { name, device } => {
                 if device {
                     mcp::cli_login_device(name).await;
                 } else {
-                    mcp::cli_login(name, paste).await;
+                    mcp::cli_login(name).await;
                 }
             }
         },

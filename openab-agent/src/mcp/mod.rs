@@ -331,10 +331,9 @@ fn print_json<T: serde::Serialize>(status: &str, name: &str, value: &T) {
 ///
 /// Prints per-server runtime status. Servers start `Disconnected` and only
 /// advance after `mcp connect <name>` (or, later, lazy dial from the agent
-/// path). Servers with an in-flight `mcp-pending:<name>` entry get a
-/// `(login pending — run mcp login <name>)` suffix so the user knows the
-/// flow stalled mid-paste-back. Orphaned pending entries (no matching
-/// config) get listed under a separator so they're visible for cleanup.
+/// path). A server in `NeedsAuth` carries a `(run mcp login <name>)` hint.
+/// The paste-back login is now single-invocation (PKCE/CSRF live in rmcp's
+/// in-memory `StateStore`), so there are no on-disk pending entries to surface.
 pub async fn cli_show_status() {
     let manager = McpRuntimeManager::from_config(load_config_or_exit());
     if manager.is_empty().await {
@@ -342,27 +341,12 @@ pub async fn cli_show_status() {
         return;
     }
     let statuses = manager.statuses().await;
-    let mut pending: std::collections::HashSet<String> =
-        manager.pending_logins().into_iter().collect();
     for (name, status) in &statuses {
         let mut line = format!("{} {name}", status.icon());
-        if pending.remove(name) {
-            line.push_str(&format!(
-                " (login pending — run `mcp login {name}` to finish)"
-            ));
-        } else if matches!(status, runtime::ServerStatus::NeedsAuth) {
+        if matches!(status, runtime::ServerStatus::NeedsAuth) {
             line.push_str(&format!(" (run `mcp login {name}`)"));
         }
         println!("{line}");
-    }
-    if !pending.is_empty() {
-        println!();
-        println!("Orphaned pending logins (no matching server in mcp.json):");
-        let mut orphans: Vec<String> = pending.into_iter().collect();
-        orphans.sort();
-        for name in orphans {
-            println!("  ⏳ {name}");
-        }
     }
 }
 
@@ -381,22 +365,22 @@ pub async fn cli_connect(name: String) {
     }
 }
 
-/// `openab-agent mcp login <name> [--paste URL]`. Drives the §6.4
-/// paste-back flow end-to-end:
+/// `openab-agent mcp login <name>`. Drives the §6.4 paste-back flow
+/// end-to-end in a single invocation:
 ///
-/// 1. `start_paste_login` builds the authorize URL + pins PKCE state to
-///    `auth.json` under `mcp-pending:<name>`
-/// 2. The CLI prints the URL for the user to open in a browser, then
-///    blocks on stdin waiting for the redirect URL to be pasted back
-///    (or skips the prompt when `--paste` was supplied)
-/// 3. `complete_login` validates the `state` nonce, exchanges the auth
-///    code, persists the resulting `TokenStore`, and clears the pending
-///    entry — leaving the server `Disconnected` and ready for `connect`
+/// 1. `start_paste_login` runs rmcp OAuth discovery and builds the authorize
+///    URL; the PKCE verifier + CSRF `state` are held in the manager's
+///    in-memory `StateStore`
+/// 2. The CLI prints the URL for the user to open in a browser, then blocks
+///    on stdin waiting for the post-redirect URL to be pasted back
+/// 3. `complete_login` exchanges the auth code (rmcp validates the `state`
+///    against the stashed entry), auto-persists the `StoredCredentials`, and
+///    leaves the server `Disconnected` and ready for `connect`
 ///
-/// Errors at any step exit non-zero; the pending entry is preserved on
-/// state-mismatch / network failure so the user can retry with a fresh
-/// paste of the same redirect URL without re-running this command.
-pub async fn cli_login(name: String, paste: Option<String>) {
+/// Single-invocation by design: the PKCE/CSRF state lives only in this
+/// process, so the URL print and the paste-back must happen in the same run.
+/// Errors at any step exit non-zero; re-run the command to start a fresh flow.
+pub async fn cli_login(name: String) {
     let manager = McpRuntimeManager::from_config(load_config_or_exit());
     let start = match manager.start_paste_login(&name).await {
         Ok(s) => s,
@@ -409,17 +393,12 @@ pub async fn cli_login(name: String, paste: Option<String>) {
     println!();
     println!("    {}", start.authorize_url);
     println!();
-    println!("State nonce (pinned): {}", start.state);
-    println!();
-    let redirect = match paste {
-        Some(u) => u,
-        None => match read_redirect_from_stdin() {
-            Ok(u) => u,
-            Err(e) => {
-                eprintln!("✗ failed to read redirect URL: {e}");
-                std::process::exit(1);
-            }
-        },
+    let redirect = match read_redirect_from_stdin() {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("✗ failed to read redirect URL: {e}");
+            std::process::exit(1);
+        }
     };
     if redirect.is_empty() {
         eprintln!("✗ empty redirect URL — aborting");

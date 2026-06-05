@@ -101,23 +101,6 @@ pub enum ResolvedProvider {
 }
 
 impl ResolvedProvider {
-    /// Accessor for the shared `authorize_url` field. Callers that don't
-    /// need to distinguish built-in vs custom can skip the `match`.
-    pub fn authorize_url(&self) -> &str {
-        match self {
-            Self::Builtin { authorize_url, .. } => authorize_url,
-            Self::Custom { authorize_url, .. } => authorize_url,
-        }
-    }
-
-    /// Accessor for the shared `token_url` field.
-    pub fn token_url(&self) -> &str {
-        match self {
-            Self::Builtin { token_url, .. } => token_url,
-            Self::Custom { token_url, .. } => token_url,
-        }
-    }
-
     /// Accessor for the shared scope list.
     pub fn scopes(&self) -> &[String] {
         match self {

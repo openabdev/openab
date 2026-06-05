@@ -55,11 +55,12 @@ impl TokenStore {
     }
 }
 
-/// Transient per-server state captured at `start_paste_login` and consumed
-/// by `complete_login` (ADR §6.4). Lives in `auth.json` under
-/// `mcp-pending:<server>`. `token_url` + `provider_name` are snapshotted
-/// up front so a config edit between init and finish can't redirect the
-/// token exchange.
+/// Legacy read-tolerant tombstone for the pre-rmcp cross-process paste flow.
+/// The paste login now runs entirely in one invocation through rmcp's
+/// `AuthorizationManager` (PKCE/CSRF in its in-memory `StateStore`), so
+/// nothing writes this anymore. The variant is retained only so a stray
+/// `mcp-pending:<server>` entry left in a shared `auth.json` (which also holds
+/// the Codex token) still deserializes instead of failing the whole-map parse.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingPasteLogin {
     pub verifier: String,
@@ -309,78 +310,6 @@ impl CredentialStore for McpCredentialStore {
         }
         write_auth_file(&self.path, &map).map_err(|e| AuthError::InternalError(e.to_string()))
     }
-}
-
-const PENDING_PREFIX: &str = "mcp-pending:";
-
-/// `auth.json` key for an in-flight paste-back login (ADR §6.4 namespace).
-/// Single construction site so read/write callers can't drift on the literal.
-pub fn pending_key(name: &str) -> String {
-    format!("{PENDING_PREFIX}{name}")
-}
-
-/// Enumerate the server names of all in-flight `mcp-pending:<name>` entries
-/// — surfaces partially completed paste-back logins to `mcp status`. Returns
-/// sorted names with the prefix stripped. Missing / unreadable `auth.json`
-/// → empty Vec; this is a best-effort status view, not a load-bearing path.
-///
-/// Synchronous filesystem read: the pending map is tiny (~one entry per
-/// concurrent login), so blocking is trivial and avoids `spawn_blocking`
-/// overhead — callers may invoke this from an async context directly.
-pub fn list_pending_logins_at(path: &Path) -> Vec<String> {
-    let Ok(map) = read_auth_file(path) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = map
-        .iter()
-        .filter_map(|(k, v)| match v {
-            AuthEntry::Pending(_) => k.strip_prefix(PENDING_PREFIX).map(str::to_string),
-            AuthEntry::Token(_) | AuthEntry::Mcp(_) => None,
-        })
-        .collect();
-    names.sort();
-    names
-}
-
-/// Read a `mcp-pending:<server>` entry from `auth.json` (ADR §6.4). Errors
-/// if the key holds a token instead — the two namespaces shouldn't
-/// collide, but a hand-edited file would. `path` is injected so the
-/// runtime manager can point tests at a tempdir; production callers pass
-/// `auth_path()`.
-pub fn load_pending_login(path: &Path, key: &str) -> Result<PendingPasteLogin> {
-    let map =
-        read_auth_file(path).map_err(|_| anyhow!("No credentials found at {}", path.display()))?;
-    match map.get(key) {
-        Some(AuthEntry::Pending(p)) => Ok(p.clone()),
-        Some(AuthEntry::Token(_)) => Err(anyhow!("{key:?} is a token, not a pending login")),
-        Some(AuthEntry::Mcp(_)) => Err(anyhow!("{key:?} is an rmcp-native credential, not a pending login")),
-        None => Err(anyhow!("no pending login for {key:?}")),
-    }
-}
-
-/// Persist a `PendingPasteLogin` under `mcp-pending:<server>` (ADR §6.4).
-/// Read-modify-write — same serialization caveat as `save_namespaced_token`.
-pub fn save_pending_login(path: &Path, key: &str, val: &PendingPasteLogin) -> Result<()> {
-    let mut map = read_auth_file(path).unwrap_or_default();
-    map.insert(key.to_string(), AuthEntry::Pending(val.clone()));
-    write_auth_file(path, &map)
-}
-
-/// Remove a pending-login entry (consumed on successful `complete_login`,
-/// expired entry GC, or `mcp logout`). Idempotent — missing key is OK.
-pub fn remove_pending_login(path: &Path, key: &str) -> Result<()> {
-    let mut map = match read_auth_file(path) {
-        Ok(m) => m,
-        Err(_) => return Ok(()),
-    };
-    if map.remove(key).is_none() {
-        return Ok(());
-    }
-    if map.is_empty() {
-        let _ = std::fs::remove_file(path);
-        return Ok(());
-    }
-    write_auth_file(path, &map)
 }
 
 pub async fn get_valid_token() -> Result<String> {
@@ -1081,47 +1010,6 @@ mod tests {
         write_auth_file(&path, &input).unwrap();
         let store = McpCredentialStore::new(path, "linear");
         assert!(store.load().await.unwrap().is_none());
-    }
-
-    #[test]
-    fn pending_login_helpers_round_trip_via_injected_path() {
-        // Tempdir path injected directly — no HOME-env shimming, so this
-        // test can't race auth-touching tests in other modules.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("auth.json");
-        let key = "mcp-pending:test-srv";
-        save_pending_login(&path, key, &make_pending()).unwrap();
-        let got = load_pending_login(&path, key).unwrap();
-        assert_eq!(got, make_pending());
-        remove_pending_login(&path, key).unwrap();
-        assert!(load_pending_login(&path, key).is_err());
-    }
-
-    #[test]
-    fn list_pending_logins_strips_prefix_sorts_and_skips_tokens() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("auth.json");
-        let mut input = HashMap::new();
-        input.insert("codex".to_string(), AuthEntry::Token(make_store(0)));
-        input.insert(
-            "mcp-pending:zed-mcp".to_string(),
-            AuthEntry::Pending(make_pending()),
-        );
-        input.insert(
-            "mcp-pending:linear".to_string(),
-            AuthEntry::Pending(make_pending()),
-        );
-        input.insert("mcp:linear".to_string(), AuthEntry::Token(make_store(1)));
-        write_auth_file(&path, &input).unwrap();
-        let names = list_pending_logins_at(&path);
-        assert_eq!(names, vec!["linear".to_string(), "zed-mcp".to_string()]);
-    }
-
-    #[test]
-    fn list_pending_logins_returns_empty_on_missing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("missing.json");
-        assert!(list_pending_logins_at(&path).is_empty());
     }
 
     #[test]
