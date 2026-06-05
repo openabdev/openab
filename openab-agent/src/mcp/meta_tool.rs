@@ -1,8 +1,9 @@
 //! Single `mcp` meta-tool the LLM sees. See ADR §5.2 + §5.3.
 //!
-//! Phase 1 scope: action enum + dispatch wiring + all six Phase 1 actions
+//! Scope: action enum + dispatch wiring + all six actions
 //! (`help`, `list_servers`, `list_tools`, `describe_tool`, `call`, `status`).
-//! The Phase 2 `login` / `complete_login` actions land with the OAuth slice.
+//! OAuth `login` / `complete_login` are CLI-only (`mcp login`), not
+//! LLM-facing meta-tool actions.
 
 use std::time::Instant;
 
