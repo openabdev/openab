@@ -42,9 +42,9 @@ use super::config::{parse_logging_level, McpConfig, ServerConfig};
 use super::flow::{canonical_resource, init_paste_authorize, parse_paste_callback};
 use super::oauth::{builtin_client_id, resolve, ResolvedProvider};
 use crate::auth::{
-    auth_path, list_pending_logins_at, load_namespaced_token_at, load_pending_login, pending_key,
-    remove_pending_login, save_namespaced_token_at, save_pending_login, McpCredentialStore,
-    PendingPasteLogin, TokenStore,
+    auth_path, list_pending_logins_at, load_pending_login, pending_key, remove_pending_login,
+    save_pending_login, McpCredentialStore,
+    PendingPasteLogin,
 };
 
 /// MCP client-side callback handler. Replaces the unit type `()` so individual
@@ -345,16 +345,6 @@ pub struct McpRuntimeManager {
     /// the loop). `StdMutex` discipline: the lock only guards `HashMap`
     /// ops, never held across `.await`.
     ping_tasks: Arc<StdMutex<HashMap<String, AbortHandle>>>,
-    /// Per-server single-flight gate for refresh-grant requests. The
-    /// outer `StdMutex` guards the map (held only for `entry().or_insert`
-    /// ops, never across `.await`); the inner `tokio::Mutex` is held
-    /// across the network round-trip + disk write so concurrent waiters
-    /// observe the winner's rotated token instead of replaying a stale
-    /// refresh_token (which providers like Google would cascade-revoke).
-    // Legacy custom-provider refresh path; replaced by the rmcp AuthClient
-    // refresh in resolve_oauth_dial. Removed wholesale in S4.
-    #[allow(dead_code)]
-    refresh_locks: Arc<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Per-server circuit breaker (ADR §5.9). Counts consecutive
     /// transport-level failures; once tripped, short-circuits `connect`
     /// and tool-call dispatch until the cooldown elapses and a
@@ -426,7 +416,6 @@ impl McpRuntimeManager {
             handles: Arc::new(RwLock::new(handles)),
             auth_path,
             ping_tasks: Arc::new(StdMutex::new(HashMap::new())),
-            refresh_locks: Arc::new(StdMutex::new(HashMap::new())),
             breaker: Arc::new(ServerBreaker::new()),
             catalog: catalog.into(),
             tools_cache: Arc::new(StdMutex::new(HashMap::new())),
@@ -895,62 +884,6 @@ impl McpRuntimeManager {
         Ok((provider, client_id, redirect_uri, resource))
     }
 
-    /// RFC 6749 §6 refresh-grant — exchange a cached `refresh_token` for a
-    /// new `access_token`. Resolves `client_id` from current config (so a
-    /// rotated builtin catalog entry is picked up automatically). Per
-    /// ADR §6.6 rotation contract: if the provider omits a new
-    /// `refresh_token` in the response, the previous one is preserved
-    /// (Google-style rotation); the agent fsyncs `auth.json` before
-    /// returning so deployment-side mtime watchers can sync the rotated
-    /// token to peer replicas.
-    ///
-    /// Per-server single-flight: concurrent `connect()` callers serialize
-    /// on `refresh_locks[name]`. After acquiring the lock, the function
-    /// re-reads the on-disk token; if a prior waiter already refreshed,
-    /// the cached store is returned without a second POST. This prevents
-    /// replayed-refresh cascade-revokes on providers like Google.
-    // Legacy custom-provider refresh; superseded by the rmcp AuthClient path.
-    // Test-only until S4 deletes it.
-    #[allow(dead_code)]
-    async fn try_refresh_oauth_token(&self, name: &str, store: &TokenStore) -> Result<TokenStore> {
-        if store.refresh_token.is_empty() {
-            return Err(anyhow!("no refresh_token cached for {name:?}"));
-        }
-        let lock = {
-            let mut locks = self
-                .refresh_locks
-                .lock()
-                .expect("refresh_locks mutex poisoned");
-            locks
-                .entry(name.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
-        };
-        let _guard = lock.lock().await;
-        if let Ok(cached) = load_namespaced_token_at(&self.auth_path, name) {
-            if !cached.is_expired() {
-                return Ok(cached);
-            }
-        }
-        let (_provider, client_id, _redirect_uri, resource) =
-            self.resolve_paste_client(name).await?;
-        let resp = post_token_refresh(
-            &store.token_endpoint,
-            &client_id,
-            &store.refresh_token,
-            resource.as_deref(),
-        )
-        .await?;
-        let new_store = build_token_store(
-            resp,
-            store.token_endpoint.clone(),
-            store.provider.clone(),
-            Some(store.refresh_token.clone()),
-        );
-        save_namespaced_token_at(&self.auth_path, name, &new_store)?;
-        Ok(new_store)
-    }
-
     /// Lazy-connect the named server (ADR §5.7). Idempotent if already
     /// `Connected` with a live client. HTTP servers with an `oauth:` block
     /// are routed through `mcp login` first — `connect` marks them
@@ -1130,34 +1063,6 @@ struct TokenExchangeResponse {
     expires_in: Option<u64>,
 }
 
-/// Lift a token-endpoint response into the on-disk `TokenStore` shape.
-/// `expires_in: None` → `u64::MAX` sentinel (treated as never-expires by
-/// `TokenStore::is_expired`); a `now + 0` would mark the token already
-/// expired and bounce the user back through login on the next connect().
-/// `fallback_refresh` preserves the previous refresh token on rotation
-/// when the provider omits one (ADR §6.6 Google-style); fresh logins
-/// pass `None` so an omitted refresh token records as empty.
-#[allow(dead_code)] // only reached from dead try_refresh_oauth_token; removed with it
-fn build_token_store(
-    resp: TokenExchangeResponse,
-    token_endpoint: String,
-    provider: String,
-    fallback_refresh: Option<String>,
-) -> TokenStore {
-    let expires_at = match resp.expires_in {
-        Some(secs) => now_secs().saturating_add(secs),
-        None => u64::MAX,
-    };
-    let refresh_token = resp.refresh_token.or(fallback_refresh).unwrap_or_default();
-    TokenStore {
-        access_token: resp.access_token,
-        refresh_token,
-        expires_at,
-        token_endpoint,
-        provider,
-    }
-}
-
 /// Lift a token-endpoint response into the native rmcp `StoredCredentials`
 /// shape that `connect()` reads back via `McpCredentialStore`. An absent
 /// `expires_in` is left off so `classify_stored_creds` treats the token as
@@ -1186,10 +1091,10 @@ fn build_stored_credentials(
     .context("build StoredCredentials")
 }
 
-/// Shared POST helper for both `post_token_exchange` (RFC 6749 §4.1.3)
-/// and `post_token_refresh` (RFC 6749 §6). Public client — no
-/// `client_secret`. Errors fold body text into the message so transient
-/// 4xx from the provider land in the user's terminal verbatim.
+/// Shared POST helper for `post_token_exchange` (RFC 6749 §4.1.3).
+/// Public client — no `client_secret`. Errors fold body text into the
+/// message so transient 4xx from the provider land in the user's
+/// terminal verbatim.
 async fn post_token_form(
     token_url: &str,
     form: &[(&str, &str)],
@@ -1231,25 +1136,6 @@ async fn post_token_exchange(
         form.push(("resource", resource));
     }
     post_token_form(token_url, &form, "token exchange").await
-}
-
-// Legacy custom-provider refresh POST; superseded by rmcp. Removed in S4.
-#[allow(dead_code)]
-async fn post_token_refresh(
-    token_url: &str,
-    client_id: &str,
-    refresh_token: &str,
-    resource: Option<&str>,
-) -> Result<TokenExchangeResponse> {
-    let mut form = vec![
-        ("grant_type", "refresh_token"),
-        ("refresh_token", refresh_token),
-        ("client_id", client_id),
-    ];
-    if let Some(resource) = resource {
-        form.push(("resource", resource));
-    }
-    post_token_form(token_url, &form, "token refresh").await
 }
 
 /// Two-phase plan for `connect()`: most server types resolve directly to a
@@ -2125,26 +2011,6 @@ mod tests {
         }"#
     }
 
-    fn seed_token_with_refresh(
-        mgr: &McpRuntimeManager,
-        name: &str,
-        expires_at: u64,
-        refresh_token: &str,
-    ) {
-        let store = TokenStore {
-            access_token: format!("atok-{name}"),
-            refresh_token: refresh_token.to_string(),
-            expires_at,
-            token_endpoint: "http://127.0.0.1:1/token".to_string(),
-            provider: "linear".to_string(),
-        };
-        save_namespaced_token_at(&mgr.auth_path, name, &store).unwrap();
-    }
-
-    fn seed_token(mgr: &McpRuntimeManager, name: &str, expires_at: u64) {
-        seed_token_with_refresh(mgr, name, expires_at, "rtok");
-    }
-
     /// Seed a native rmcp `StoredCredentials` entry (what the post-S2b connect
     /// read-path consumes) via `McpCredentialStore`. `expires_in`/`received_at`
     /// drive the near-expiry classification; `refresh_token = None` exercises
@@ -2250,29 +2116,6 @@ mod tests {
         // near expiry), not as immediately-expired → no NeedsAuth bounce or
         // refresh loop on first use.
         assert!(!near_expiry);
-    }
-
-    #[tokio::test]
-    async fn try_refresh_short_circuits_when_disk_has_fresh_token() {
-        // Single-flight contract: if another waiter has already refreshed
-        // (fresh token on disk), `try_refresh_oauth_token` must return the
-        // cached store without POSTing to the dead `token_endpoint`. The
-        // input `store` is intentionally stale (zero `expires_at`) and
-        // points at 127.0.0.1:1 — any POST attempt would surface a connect
-        // error, so a successful return proves the re-check ran.
-        let cfg: McpConfig = serde_json::from_str(dead_oauth_cfg()).unwrap();
-        let (mgr, _dir) = mgr_with_tempdir(cfg);
-        seed_token(&mgr, "linear", u64::MAX);
-        let stale = TokenStore {
-            access_token: "stale".to_string(),
-            refresh_token: "rtok".to_string(),
-            expires_at: 0,
-            token_endpoint: "http://127.0.0.1:1/token".to_string(),
-            provider: "linear".to_string(),
-        };
-        let fresh = mgr.try_refresh_oauth_token("linear", &stale).await.unwrap();
-        assert_eq!(fresh.access_token, "atok-linear");
-        assert!(!fresh.is_expired());
     }
 
     #[tokio::test]

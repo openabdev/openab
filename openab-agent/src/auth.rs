@@ -221,17 +221,6 @@ pub fn load_namespaced_token_at(path: &Path, key: &str) -> Result<TokenStore> {
     }
 }
 
-/// Insert or replace the credential at `key`, preserving all other entries.
-/// `path` is injected so the runtime manager + tests can target a tempdir
-/// without `$HOME` overrides. Read-modify-write on a single file: callers
-/// in the same process must serialize themselves (the lifecycle manager
-/// already does per ADR §5.7).
-pub fn save_namespaced_token_at(path: &Path, key: &str, store: &TokenStore) -> Result<()> {
-    let mut map = read_auth_file(path).unwrap_or_default();
-    map.insert(key.to_string(), AuthEntry::Token(store.clone()));
-    write_auth_file(path, &map)
-}
-
 /// rmcp [`CredentialStore`] backed by the shared `auth.json` file (ADR §6.1
 /// storage-format decision A). One instance is bound to a single MCP server's
 /// bare-name key (e.g. `linear`); rmcp's `AuthorizationManager` owns the
