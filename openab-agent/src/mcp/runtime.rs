@@ -20,15 +20,16 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use rmcp::model::{
-    ClientInfo, CreateElicitationRequestParams, CreateElicitationResult, CreateMessageRequestParams,
-    CreateMessageResult, ErrorData, ListRootsResult, LoggingLevel, LoggingMessageNotificationParam,
-    Root, RootsCapabilities, SamplingCapability, SetLevelRequestParams,
+    ClientInfo, CreateElicitationRequestParams, CreateElicitationResult,
+    CreateMessageRequestParams, CreateMessageResult, ErrorData, ListRootsResult, LoggingLevel,
+    LoggingMessageNotificationParam, Root, RootsCapabilities, SamplingCapability,
+    SetLevelRequestParams,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{
-    AuthClient, AuthorizationManager, ConfigureCommandExt, StreamableHttpClientTransport,
-    TokioChildProcess,
+    AuthClient, AuthorizationManager, ConfigureCommandExt, CredentialStore,
+    StreamableHttpClientTransport, TokioChildProcess,
 };
 use rmcp::{ClientHandler, ServiceExt};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -369,6 +370,9 @@ pub struct McpRuntimeManager {
     /// across the network round-trip + disk write so concurrent waiters
     /// observe the winner's rotated token instead of replaying a stale
     /// refresh_token (which providers like Google would cascade-revoke).
+    // Legacy custom-provider refresh path; replaced by the rmcp AuthClient
+    // refresh in resolve_oauth_dial. Removed wholesale in S4.
+    #[allow(dead_code)]
     refresh_locks: Arc<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Per-server circuit breaker (ADR §5.9). Counts consecutive
     /// transport-level failures; once tripped, short-circuits `connect`
@@ -403,8 +407,7 @@ pub struct McpRuntimeManager {
     /// refresh_token (which providers like Google cascade-revoke). The outer
     /// `tokio::Mutex` is held only for `HashMap` get/insert, never across the
     /// inner manager's network work.
-    #[allow(dead_code)] // wired into connect() in S2b
-    auth_clients: Arc<tokio::sync::Mutex<HashMap<String, AuthClient<reqwest::Client>>>>,
+    auth_clients: Arc<tokio::sync::Mutex<HashMap<String, AuthClient<reqwest013::Client>>>>,
 }
 
 impl McpRuntimeManager {
@@ -461,12 +464,11 @@ impl McpRuntimeManager {
     /// `AuthorizationManager` (and thus one single-flight refresh) across every
     /// reconnect for this server. Construction performs no network I/O — the
     /// first discovery/refresh happens lazily inside `get_access_token`.
-    #[allow(dead_code)] // wired into connect() in S2b
     async fn get_or_init_auth_client(
         &self,
         name: &str,
         server_url: &str,
-    ) -> Result<AuthClient<reqwest::Client>> {
+    ) -> Result<AuthClient<reqwest013::Client>> {
         let mut cache = self.auth_clients.lock().await;
         if let Some(client) = cache.get(name) {
             return Ok(client.clone());
@@ -478,9 +480,60 @@ impl McpRuntimeManager {
             self.auth_path.clone(),
             name.to_string(),
         ));
-        let client = AuthClient::new(reqwest::Client::new(), manager);
+        let client = AuthClient::new(reqwest013::Client::new(), manager);
         cache.insert(name.to_string(), client.clone());
         Ok(client)
+    }
+
+    /// Resolve an `oauth:` HTTP server to a `Dial` (no lock held).
+    ///
+    /// Reads the stored credentials via [`McpCredentialStore`] and decides:
+    /// no/empty token → `NeedsAuth` (run `mcp login`); a still-valid token →
+    /// dial straight away (the cached `AuthClient` injects the bearer per
+    /// request); an expired token with a refresh token → let rmcp discover the
+    /// authorization server and refresh, dialing on success and bouncing to
+    /// `NeedsAuth` on failure. An expired token with no refresh token bounces
+    /// directly without a network round-trip. All bounces are returned as
+    /// `Err` so the caller flips status to `NeedsAuth` without touching the
+    /// circuit breaker.
+    async fn resolve_oauth_dial(&self, name: &str, url: &str) -> Result<Dial> {
+        let needs_login =
+            || anyhow!("mcp server {name:?} needs oauth login — run `mcp login {name}`");
+        let store = McpCredentialStore::new(self.auth_path.clone(), name.to_string());
+        let Some(creds) = store.load().await.ok().flatten() else {
+            return Err(needs_login());
+        };
+        let (has_token, has_refresh, near_expiry) = classify_stored_creds(&creds);
+        if !has_token {
+            return Err(needs_login());
+        }
+        let client = self.get_or_init_auth_client(name, url).await?;
+        if !near_expiry {
+            return Ok(Dial::Http {
+                url: url.to_string(),
+                client: Some(client),
+            });
+        }
+        if !has_refresh {
+            return Err(needs_login());
+        }
+        // Expired but refreshable: rmcp needs the authorization server's
+        // metadata configured before it can exchange the refresh token, so
+        // discover it now (network) and let `get_access_token` perform the
+        // rotation. Any failure surfaces as user-actionable `NeedsAuth`.
+        {
+            let mut mgr = client.auth_manager.lock().await;
+            mgr.initialize_from_store().await.map_err(|e| {
+                anyhow!("mcp server {name:?} oauth refresh failed: {e} — run `mcp login {name}`")
+            })?;
+        }
+        client.get_access_token().await.map_err(|e| {
+            anyhow!("mcp server {name:?} oauth refresh failed: {e} — run `mcp login {name}`")
+        })?;
+        Ok(Dial::Http {
+            url: url.to_string(),
+            client: Some(client),
+        })
     }
 
     /// Cached `tools/list` page for `server`, if a prior `fetch_tools`
@@ -660,7 +713,12 @@ impl McpRuntimeManager {
                 }
             }
         });
-        if let Some(prev) = self.ping_tasks.lock().unwrap().insert(key, task.abort_handle()) {
+        if let Some(prev) = self
+            .ping_tasks
+            .lock()
+            .unwrap()
+            .insert(key, task.abort_handle())
+        {
             prev.abort();
         }
     }
@@ -692,8 +750,7 @@ impl McpRuntimeManager {
     /// should run device-code instead (§6.4 selection logic). Both errors
     /// are explicit so the LLM can pick a different action.
     pub async fn start_paste_login(&self, name: &str) -> Result<PasteLoginStart> {
-        let (provider, client_id, redirect_uri, resource) =
-            self.resolve_paste_client(name).await?;
+        let (provider, client_id, redirect_uri, resource) = self.resolve_paste_client(name).await?;
         let started =
             init_paste_authorize(&provider, &client_id, &redirect_uri, resource.as_deref())?;
         let pending = PendingPasteLogin {
@@ -953,11 +1010,10 @@ impl McpRuntimeManager {
                 .await;
                 return;
             }
-            let outcome = match post_device_token_poll(
-                &client, token_url, client_id, device_code, resource,
-            )
-            .await
-            {
+            let outcome =
+                match post_device_token_poll(&client, token_url, client_id, device_code, resource)
+                    .await
+                {
                     Ok(o) => o,
                     Err(e) => {
                         self.mark_device_login_failed(name, e).await;
@@ -1108,6 +1164,9 @@ impl McpRuntimeManager {
     /// re-reads the on-disk token; if a prior waiter already refreshed,
     /// the cached store is returned without a second POST. This prevents
     /// replayed-refresh cascade-revokes on providers like Google.
+    // Legacy custom-provider refresh; superseded by the rmcp AuthClient path.
+    // Test-only until S4 deletes it.
+    #[allow(dead_code)]
     async fn try_refresh_oauth_token(&self, name: &str, store: &TokenStore) -> Result<TokenStore> {
         if store.refresh_token.is_empty() {
             return Err(anyhow!("no refresh_token cached for {name:?}"));
@@ -1185,55 +1244,36 @@ impl McpRuntimeManager {
                     url,
                     oauth: Some(_),
                     ..
-                } => match load_namespaced_token_at(&self.auth_path, name) {
-                    Ok(store) if !store.is_expired() => DialPlan::Dial(Dial::Http {
-                        url,
-                        auth: Some(store.access_token),
-                    }),
-                    Ok(store) if !store.refresh_token.is_empty() => {
-                        DialPlan::NeedsRefresh { url, store }
-                    }
-                    _ => {
-                        handle.status = ServerStatus::NeedsAuth;
-                        return Err(anyhow!(
-                            "mcp server {name:?} needs oauth login — run `mcp login {name}`"
-                        ));
-                    }
-                },
-                ServerConfig::Http { url, .. } => DialPlan::Dial(Dial::Http { url, auth: None }),
+                } => DialPlan::OauthHttp { url },
+                ServerConfig::Http { url, .. } => DialPlan::Dial(Dial::Http { url, client: None }),
             };
             handle.status = ServerStatus::Connecting;
             plan
         };
 
-        // Resolve `NeedsRefresh` outside the write lock so a slow refresh
-        // doesn't block concurrent `mcp status` reads. Failed refresh →
-        // `NeedsAuth` (matching the missing-token bounce inside the lock).
+        // Resolve the oauth dial outside the write lock so credential I/O and
+        // a (possible) refresh round-trip don't block concurrent `mcp status`
+        // reads. A missing/expired-unrefreshable token → `NeedsAuth` (the bounce
+        // is an auth-level state, not a transport failure, so the breaker is
+        // untouched). rmcp's `AuthClient` injects the bearer per request, so a
+        // valid token resolves straight to a `Dial::Http` with the cached client.
         let dial = match plan {
             DialPlan::Dial(d) => d,
-            DialPlan::NeedsRefresh { url, store } => {
-                match self.try_refresh_oauth_token(name, &store).await {
-                    Ok(new_store) => Dial::Http {
-                        url,
-                        auth: Some(new_store.access_token),
-                    },
-                    Err(e) => {
-                        let mut guard = self.handles.write().await;
-                        if let Some(h) = guard.get_mut(name) {
-                            // A concurrent connect() may have refreshed +
-                            // dialed successfully while we were awaiting
-                            // our (failed) refresh. Don't clobber the
-                            // winner's Connected status with NeedsAuth.
-                            if !matches!(h.status, ServerStatus::Connected) {
-                                h.status = ServerStatus::NeedsAuth;
-                            }
+            DialPlan::OauthHttp { url } => match self.resolve_oauth_dial(name, &url).await {
+                Ok(d) => d,
+                Err(e) => {
+                    let mut guard = self.handles.write().await;
+                    if let Some(h) = guard.get_mut(name) {
+                        // A concurrent connect() may have finished a fresh login +
+                        // dial while we were resolving. Don't clobber the winner's
+                        // Connected status with NeedsAuth.
+                        if !matches!(h.status, ServerStatus::Connected) {
+                            h.status = ServerStatus::NeedsAuth;
                         }
-                        return Err(anyhow!(
-                            "mcp server {name:?} oauth refresh failed: {e:#} — run `mcp login {name}`"
-                        ));
                     }
+                    return Err(e);
                 }
-            }
+            },
         };
 
         let dial_result = dial
@@ -1419,6 +1459,8 @@ async fn post_token_exchange(
     post_token_form(token_url, &form, "token exchange").await
 }
 
+// Legacy custom-provider refresh POST; superseded by rmcp. Removed in S4.
+#[allow(dead_code)]
 async fn post_token_refresh(
     token_url: &str,
     client_id: &str,
@@ -1558,13 +1600,14 @@ async fn post_device_token_poll(
     classify_device_poll(status, &body)
 }
 
-/// Two-phase plan for `connect()`: most server types resolve directly to
-/// a `Dial`, but HTTP+oauth with an expired-but-refreshable token needs
-/// async work (the refresh POST) before a `Dial` can be built. Keeping
-/// the variant lets us release the write lock before the refresh.
+/// Two-phase plan for `connect()`: most server types resolve directly to a
+/// `Dial` under the write lock, but an `oauth:` HTTP server needs async
+/// credential I/O (and possibly a refresh round-trip) that must not run while
+/// the lock is held. `OauthHttp` defers that to `resolve_oauth_dial` after the
+/// lock is released.
 enum DialPlan {
     Dial(Dial),
-    NeedsRefresh { url: String, store: TokenStore },
+    OauthHttp { url: String },
 }
 
 /// Per-transport dial parameters, extracted under the manager's write lock
@@ -1578,10 +1621,47 @@ enum Dial {
     },
     Http {
         url: String,
-        /// Bearer token for oauth-protected servers; `None` for anonymous HTTP.
-        auth: Option<String>,
+        /// rmcp OAuth client for oauth-protected servers (injects the bearer
+        /// per request and refreshes as needed); `None` for anonymous HTTP.
+        client: Option<AuthClient<reqwest013::Client>>,
     },
 }
+
+/// Classify a stored OAuth credential without depending on oauth2's
+/// `TokenResponse` trait (not re-exported by rmcp): round-trips through JSON
+/// and inspects the standard token-response fields. Returns
+/// `(has_access_token, has_refresh_token, near_expiry)`. A credential with no
+/// `expires_in` is treated as long-lived (never near expiry), matching the
+/// `u64::MAX` sentinel the login path records for providers that omit it.
+fn classify_stored_creds(creds: &rmcp::transport::StoredCredentials) -> (bool, bool, bool) {
+    let v = serde_json::to_value(creds).unwrap_or(serde_json::Value::Null);
+    let tr = &v["token_response"];
+    let nonempty = |key: &str| {
+        tr.get(key)
+            .and_then(|x| x.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+    };
+    let has_token = nonempty("access_token");
+    let has_refresh = nonempty("refresh_token");
+    let near_expiry = match (
+        tr.get("expires_in").and_then(|x| x.as_u64()),
+        v.get("token_received_at").and_then(|x| x.as_u64()),
+    ) {
+        (Some(expires_in), Some(received_at)) => {
+            now_secs()
+                .saturating_sub(received_at)
+                .saturating_add(OAUTH_REFRESH_BUFFER_SECS)
+                >= expires_in
+        }
+        _ => false,
+    };
+    (has_token, has_refresh, near_expiry)
+}
+
+/// Refresh a token this many seconds before its nominal expiry, so a dial
+/// doesn't race a token that lapses mid-handshake.
+const OAUTH_REFRESH_BUFFER_SECS: u64 = 60;
 
 impl Dial {
     async fn run(
@@ -1621,20 +1701,26 @@ impl Dial {
                     .await
                     .with_context(|| format!("mcp handshake with {command:?}"))
             }
-            Dial::Http { url, auth } => {
-                let transport = match auth {
-                    Some(token) => {
-                        let cfg = StreamableHttpClientTransportConfig::with_uri(url.as_str())
-                            .auth_header(token);
-                        StreamableHttpClientTransport::from_config(cfg)
-                    }
-                    None => StreamableHttpClientTransport::from_uri(url.as_str()),
-                };
-                OpenabClientHandler::new(name.to_string(), tools_cache, roots, provider)
-                    .serve(transport)
-                    .await
-                    .with_context(|| format!("mcp handshake with {url:?}"))
-            }
+            // `with_client` yields a transport parameterised by the OAuth client,
+            // a different type than the default `from_uri` transport, so each arm
+            // runs `serve` itself rather than unifying to a single value.
+            Dial::Http { url, client } => match client {
+                Some(client) => {
+                    let cfg = StreamableHttpClientTransportConfig::with_uri(url.as_str());
+                    let transport = StreamableHttpClientTransport::with_client(client, cfg);
+                    OpenabClientHandler::new(name.to_string(), tools_cache, roots, provider)
+                        .serve(transport)
+                        .await
+                        .with_context(|| format!("mcp handshake with {url:?}"))
+                }
+                None => {
+                    let transport = StreamableHttpClientTransport::from_uri(url.as_str());
+                    OpenabClientHandler::new(name.to_string(), tools_cache, roots, provider)
+                        .serve(transport)
+                        .await
+                        .with_context(|| format!("mcp handshake with {url:?}"))
+                }
+            },
         }
     }
 }
@@ -1797,7 +1883,9 @@ mod tests {
             Some(provider),
         );
         let caps = handler.get_info().capabilities;
-        let sampling = caps.sampling.expect("provider present → advertise sampling");
+        let sampling = caps
+            .sampling
+            .expect("provider present → advertise sampling");
         assert!(
             sampling.tools.is_none(),
             "text-only baseline must not advertise sampling.tools"
@@ -2397,6 +2485,41 @@ mod tests {
         seed_token_with_refresh(mgr, name, expires_at, "rtok");
     }
 
+    /// Seed a native rmcp `StoredCredentials` entry (what the post-S2b connect
+    /// read-path consumes) via `McpCredentialStore`. `expires_in`/`received_at`
+    /// drive the near-expiry classification; `refresh_token = None` exercises
+    /// the no-refresh bounce.
+    async fn seed_mcp_creds(
+        mgr: &McpRuntimeManager,
+        name: &str,
+        expires_in: Option<u64>,
+        received_at: u64,
+        refresh_token: Option<&str>,
+    ) {
+        use rmcp::transport::CredentialStore;
+        let mut tr = serde_json::json!({
+            "access_token": format!("atok-{name}"),
+            "token_type": "bearer",
+        });
+        if let Some(e) = expires_in {
+            tr["expires_in"] = serde_json::json!(e);
+        }
+        if let Some(rt) = refresh_token {
+            tr["refresh_token"] = serde_json::json!(rt);
+        }
+        let creds: rmcp::transport::StoredCredentials = serde_json::from_value(serde_json::json!({
+            "client_id": "linear-client",
+            "token_response": tr,
+            "granted_scopes": ["read"],
+            "token_received_at": received_at,
+        }))
+        .unwrap();
+        McpCredentialStore::new(mgr.auth_path.clone(), name.to_string())
+            .save(creds)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn connect_oauth_with_valid_cached_token_attempts_dial_not_needs_auth() {
         // Valid token cached → connect() must NOT bounce at NeedsAuth.
@@ -2404,7 +2527,7 @@ mod tests {
         // failure surface is the proof the bearer was injected.
         let cfg: McpConfig = serde_json::from_str(dead_oauth_cfg()).unwrap();
         let (mgr, _dir) = mgr_with_tempdir(cfg);
-        seed_token(&mgr, "linear", u64::MAX);
+        seed_mcp_creds(&mgr, "linear", Some(100_000), now_secs(), Some("rtok")).await;
         let err = mgr.connect("linear").await.unwrap_err().to_string();
         assert!(err.contains("handshake"), "expected 'handshake' in {err}");
         match &mgr.statuses().await[0].1 {
@@ -2420,7 +2543,7 @@ mod tests {
         // short-circuits before the refresh POST.
         let cfg: McpConfig = serde_json::from_str(dead_oauth_cfg()).unwrap();
         let (mgr, _dir) = mgr_with_tempdir(cfg);
-        seed_token_with_refresh(&mgr, "linear", 0, "");
+        seed_mcp_creds(&mgr, "linear", Some(1), 0, None).await;
         let err = mgr.connect("linear").await.unwrap_err().to_string();
         assert!(err.contains("needs oauth login"), "got: {err}");
         assert_eq!(mgr.statuses().await[0].1, ServerStatus::NeedsAuth);
@@ -2435,7 +2558,7 @@ mod tests {
         // surfaces as user-actionable NeedsAuth.
         let cfg: McpConfig = serde_json::from_str(dead_oauth_cfg()).unwrap();
         let (mgr, _dir) = mgr_with_tempdir(cfg);
-        seed_token(&mgr, "linear", 0);
+        seed_mcp_creds(&mgr, "linear", Some(1), 0, Some("rtok")).await;
         let err = mgr.connect("linear").await.unwrap_err().to_string();
         assert!(err.contains("oauth refresh failed"), "got: {err}");
         assert_eq!(mgr.statuses().await[0].1, ServerStatus::NeedsAuth);

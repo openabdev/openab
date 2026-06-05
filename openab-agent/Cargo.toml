@@ -10,6 +10,10 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# rmcp 1.7 is on reqwest 0.13; its `StreamableHttpClient`/`AuthClient` impls are
+# for the 0.13 `Client`, so the OAuth transport must hold that type. The rest of
+# the crate stays on 0.12.
+reqwest013 = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
 anyhow = "1"
 async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
