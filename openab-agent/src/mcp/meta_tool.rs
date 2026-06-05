@@ -179,17 +179,17 @@ async fn call_tool(
     let peer = manager.arc_peer(server).await?;
     ensure_tools_capability(&peer, server)
         .with_context(|| format!("call_tool {tool:?} on {server:?}"))?;
-    // Refuse a `call` on a tool that declares execution.taskSupport == "required":
-    // the MCP spec mandates such tools be driven through the `tasks` augmentation
-    // flow, which openab-agent does not implement. Reject before the wire call so
-    // the LLM gets a clear reason instead of a server-side protocol error (rows
-    // 492/289). The lookup is served from the per-server tools cache (row 503)
-    // when warm, so it normally costs no extra `tools/list` round-trip.
-    if fetch_tools(manager, server)
-        .await?
-        .iter()
-        .any(|t| t.name.as_ref() == tool && t.task_support() == TaskSupport::Required)
-    {
+    // Look up the tool definition once (served from the per-server tools cache,
+    // row 503, when warm — normally no extra `tools/list` round-trip) and use it
+    // for both pre-flight guards below. Both reject before any wire traffic, so
+    // neither must touch the circuit breaker.
+    let tools = fetch_tools(manager, server).await?;
+    let tool_def = tools.iter().find(|t| t.name.as_ref() == tool);
+    // Guard 1 — taskSupport == "required": the MCP spec mandates such tools be
+    // driven through the `tasks` augmentation flow, which openab-agent does not
+    // implement. Reject so the LLM gets a clear reason instead of a server-side
+    // protocol error (rows 492/289).
+    if tool_def.map(|t| t.task_support()) == Some(TaskSupport::Required) {
         tracing::info!(
             target: "mcp.audit",
             server,
@@ -203,6 +203,26 @@ async fn call_tool(
         return Err(anyhow!(
             "tool {tool:?} on {server:?} declares taskSupport=\"required\"; openab-agent does not implement the MCP tasks augmentation flow, so this tool cannot be invoked"
         ));
+    }
+    // Guard 2 — validate arguments against the tool's declared `inputSchema`
+    // using the schema's own JSON Schema dialect (MCP rows 19-20). A dialect the
+    // validator cannot compile, or arguments that violate a compilable schema,
+    // are refused here rather than relayed — the model gets the precise reason
+    // and can self-correct, and no malformed call reaches the server.
+    if let Some(t) = tool_def {
+        if let Err(e) = validate_args(t.input_schema.as_ref(), &args_map) {
+            tracing::info!(
+                target: "mcp.audit",
+                server,
+                tool,
+                args_sha256 = %args_sha256,
+                duration_ms = started.elapsed().as_millis() as u64,
+                outcome = "refused",
+                is_error = true,
+                "mcp call_tool exit"
+            );
+            return Err(e).with_context(|| format!("call_tool {tool:?} on {server:?}"));
+        }
     }
     let timeout = manager.request_timeout(server).await;
     let params = rmcp::model::CallToolRequestParams::new(tool.to_string()).with_arguments(args_map);
@@ -416,48 +436,68 @@ fn tool_summary(t: &rmcp::model::Tool) -> Value {
     let support = t.task_support();
     let ts = serde_json::to_value(support).unwrap_or(Value::String("forbidden".into()));
     map.insert("task_support".into(), ts);
-    // Collect advisory unavailability reasons so the LLM sees the tool exists
-    // but knows not to call it, and why. Additive: a tool can be both
-    // `taskSupport=required` and declare an unsupported schema dialect.
-    let mut reasons: Vec<String> = Vec::new();
+    // Only genuine hard-blocks — ones the `call` path actually refuses — set
+    // `available:false`. A tool's `$schema` dialect is NOT reflected here: any
+    // dialect the validator can compile (draft-07, 2020-12, …) is honoured at
+    // the `call` path via `validate_args`, and a dialect it cannot compile is
+    // reported only when the tool is actually invoked. Surfacing dialect detail
+    // in the LLM-facing summary previously made models decline callable tools
+    // (exa/fs draft-07, 2026-06-05), so it stays out of this view.
+    let mut blocking: Vec<String> = Vec::new();
     if support == TaskSupport::Required {
         // We do not implement the MCP `tasks` augmentation flow, so a tool that
         // *requires* it cannot be invoked (rows 289/617). The `call` path
         // enforces the same refusal.
-        reasons.push("requires task augmentation (not implemented)".into());
+        blocking.push("requires task augmentation (not implemented)".into());
     }
-    if let Some(dialect) = unsupported_schema_dialect(&t.input_schema) {
-        // MCP 2025-11-25 mandates draft 2020-12 for tool `inputSchema`
-        // (rows 18-21). rmcp 1.7.0 ships no JSON Schema validator, so rather
-        // than silently passing a foreign dialect through we surface it as
-        // NeedsAttention (rows 19-20, MUST-handle-gracefully). Advisory only:
-        // we never validate `arguments` against the schema, so this does not
-        // hard-block the `call` path — a working tool stays callable.
-        reasons.push(format!(
-            "input_schema declares JSON Schema dialect {dialect:?}; \
-             openab-agent supports only draft 2020-12"
-        ));
-    }
-    if !reasons.is_empty() {
+    if !blocking.is_empty() {
         map.insert("available".into(), Value::Bool(false));
-        map.insert("unavailable_reason".into(), Value::String(reasons.join("; ")));
+        map.insert("unavailable_reason".into(), Value::String(blocking.join("; ")));
     }
     Value::Object(map)
 }
 
-/// Returns the declared `$schema` dialect URI when a tool's `inputSchema`
-/// pins a dialect other than JSON Schema draft 2020-12 (the MCP-mandated
-/// dialect, rows 18-21), else `None`. An absent `$schema` is the common
-/// server case and is treated as the implied 2020-12 default — it passes
-/// through. Match is scheme- and fragment-insensitive
-/// (`http`/`https`, optional trailing `#`).
-fn unsupported_schema_dialect(schema: &serde_json::Map<String, Value>) -> Option<String> {
-    let declared = schema.get("$schema")?.as_str()?;
-    let normalized = declared.trim().trim_end_matches('#');
-    if normalized.ends_with("json-schema.org/draft/2020-12/schema") {
-        None
+/// Validate a `call`'s `arguments` against the tool's declared `inputSchema`
+/// before dispatching `tools/call` (MCP rows 19-20). `validator_for`
+/// auto-selects the JSON Schema draft from the schema's `$schema` keyword
+/// (draft-07, 2020-12, …; absent ⇒ implied 2020-12 default), so every dialect a
+/// server may pin is honoured. A schema whose dialect the validator cannot
+/// compile yields the spec's "unsupported dialect" error (row 20); arguments
+/// that violate a compilable schema are rejected with every failing path so the
+/// model can self-correct (row 19). An empty schema accepts anything.
+fn validate_args(
+    input_schema: &serde_json::Map<String, Value>,
+    args: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    if input_schema.is_empty() {
+        return Ok(());
+    }
+    let schema = Value::Object(input_schema.clone());
+    let validator = jsonschema::validator_for(&schema).map_err(|e| {
+        anyhow!(
+            "tool inputSchema declares a JSON Schema dialect openab-agent cannot validate ({e}); \
+             the dialect is unsupported, so the call is refused (MCP rows 19-20)"
+        )
+    })?;
+    let instance = Value::Object(args.clone());
+    let errors: Vec<String> = validator
+        .iter_errors(&instance)
+        .map(|e| {
+            let path = e.instance_path().to_string();
+            if path.is_empty() {
+                e.to_string()
+            } else {
+                format!("{path}: {e}")
+            }
+        })
+        .collect();
+    if errors.is_empty() {
+        Ok(())
     } else {
-        Some(declared.to_string())
+        Err(anyhow!(
+            "arguments do not satisfy the tool's inputSchema: {}",
+            errors.join("; ")
+        ))
     }
 }
 
@@ -659,11 +699,14 @@ mod tests {
     }
 
     #[test]
-    fn tool_summary_flags_unsupported_schema_dialect() {
+    fn tool_summary_is_dialect_agnostic() {
         use rmcp::model::Tool;
         use std::sync::Arc;
 
-        // Foreign dialect (draft-07) => surfaced as unavailable, advisory.
+        // The LLM-facing summary never reflects the `$schema` dialect: dialect
+        // handling lives at the `call` path (`validate_args`), not in describe /
+        // list. Surfacing it here previously made models decline callable tools
+        // (exa/fs draft-07, 2026-06-05).
         let mut d07 = serde_json::Map::new();
         d07.insert(
             "$schema".into(),
@@ -671,13 +714,10 @@ mod tests {
         );
         let foreign = Tool::new("legacy", "old schema", Arc::new(d07));
         let v = tool_summary(&foreign);
-        assert_eq!(v["available"], Value::Bool(false));
-        assert!(v["unavailable_reason"]
-            .as_str()
-            .unwrap()
-            .contains("draft 2020-12"));
+        assert!(v.get("available").is_none());
+        assert!(v.get("unavailable_reason").is_none());
 
-        // Explicit 2020-12 (with trailing '#') => passes through.
+        // Explicit 2020-12 (with trailing '#') => no diagnostic fields.
         let mut ok = serde_json::Map::new();
         ok.insert(
             "$schema".into(),
@@ -686,9 +726,81 @@ mod tests {
         let v_ok = tool_summary(&Tool::new("modern", "ok", Arc::new(ok)));
         assert!(v_ok.get("available").is_none());
 
-        // Absent $schema => implied 2020-12 default => passes through.
+        // Absent $schema => no diagnostic fields.
         let v_absent = tool_summary(&Tool::new("plain", "ok", Arc::new(serde_json::Map::new())));
         assert!(v_absent.get("available").is_none());
+    }
+
+    fn schema_map(json: Value) -> serde_json::Map<String, Value> {
+        json.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn validate_args_empty_schema_accepts_anything() {
+        let empty = serde_json::Map::new();
+        let mut args = serde_json::Map::new();
+        args.insert("anything".into(), json!(42));
+        assert!(validate_args(&empty, &args).is_ok());
+    }
+
+    #[test]
+    fn validate_args_default_dialect_enforces_constraints() {
+        // No $schema => implied 2020-12 default (MCP rows 18-21).
+        let schema = schema_map(json!({
+            "type": "object",
+            "properties": { "q": { "type": "string" } },
+            "required": ["q"],
+            "additionalProperties": false
+        }));
+
+        // Valid.
+        assert!(validate_args(&schema, &schema_map(json!({ "q": "hi" }))).is_ok());
+
+        // Missing required field.
+        let err = validate_args(&schema, &schema_map(json!({})))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("inputSchema"), "got: {err}");
+        assert!(err.contains("q") || err.contains("required"), "got: {err}");
+
+        // Wrong type.
+        let err = validate_args(&schema, &schema_map(json!({ "q": 123 })))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("inputSchema"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_args_honours_draft07_dialect() {
+        // A server that pins draft-07 must be validated under draft-07, not
+        // rejected (the exa/fs case). `validator_for` auto-selects the draft.
+        let schema = schema_map(json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": { "n": { "type": "integer", "minimum": 1 } },
+            "required": ["n"]
+        }));
+
+        assert!(validate_args(&schema, &schema_map(json!({ "n": 5 }))).is_ok());
+
+        let err = validate_args(&schema, &schema_map(json!({ "n": 0 })))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("inputSchema"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_args_unsupported_dialect_is_refused() {
+        // A dialect the validator cannot compile => the spec's "unsupported
+        // dialect" error (row 20), surfaced at call time.
+        let schema = schema_map(json!({
+            "$schema": "https://example.com/no-such-dialect",
+            "type": "object"
+        }));
+        let err = validate_args(&schema, &serde_json::Map::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unsupported"), "got: {err}");
     }
 
     #[tokio::test]

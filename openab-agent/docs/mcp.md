@@ -27,7 +27,7 @@ where rmcp supports it).
 | Capability | Status | Summary |
 |---|---|---|
 | Tools (list / call / describe) | ✅ | Full; enriched projection (title, annotations, schema, task-support). |
-| JSON Schema dialect | ✅ passthrough | draft 2020-12 supported; foreign dialect surfaced advisory-only; no validator (by design). |
+| JSON Schema dialect | ✅ validated | `call` args validated against `inputSchema` (`jsonschema`); draft auto-detected (draft 4/6/7/2019-09/2020-12, absent ⇒ 2020-12); uncompilable dialect refused. |
 | `_meta` keys | ✅ opaque | Never read or rewritten; passed through untouched. |
 | Icon rendering | N/A | No UI surface. |
 | Authorization (OAuth) | ⚠️ | rmcp `AuthorizationManager`: PRM/discovery ✅; PKCE S256 generated ✅ (server S256-advertisement check is warn-only); step-up detect-only ⚠️; `resource` hardcode caveat. |
@@ -47,19 +47,20 @@ where rmcp supports it).
 
 ### JSON Schema dialect
 
-openab-agent supports tool `inputSchema` declared in **JSON Schema draft 2020-12**.
+openab-agent validates `call` arguments against each tool's declared
+`inputSchema` (via the `jsonschema` crate) before dispatching `tools/call`.
 
-- An **absent `$schema`** is treated as the implied 2020-12 default and passed
-  through unflagged.
-- A **declared non-2020-12 dialect** is surfaced (not silently relayed): the tool
-  is marked `available: false` with an `unavailable_reason` explaining the
-  dialect mismatch, visible through both `list_tools` and `describe_tool`. This is
-  **advisory only** — it does not hard-refuse a `call`, because arguments are
-  never validated locally against the schema, so a tool whose author pinned an
-  older dialect remains callable.
-- There is **no schema validator**, deliberately. The `inputSchema` is relayed
-  straight to the LLM (which tolerates any dialect); a validator for schemas we
-  merely forward would be compliance theatre.
+- The JSON Schema **draft is auto-detected** from the schema's `$schema`
+  keyword, so draft 4 / 6 / 7 / 2019-09 / 2020-12 are all honoured. An
+  **absent `$schema`** validates under the implied **2020-12** default.
+- **Arguments that violate the schema** are refused before any wire traffic; the
+  error names every failing instance path so the model can self-correct.
+- A **dialect the validator cannot compile** is refused as an unsupported
+  dialect (the MCP "handle unsupported dialects gracefully" requirement).
+- The **LLM-facing summary is dialect-agnostic**: `list_tools` / `describe_tool`
+  do not flag the dialect. (An earlier `available: false` advisory for
+  foreign dialects made models decline perfectly callable draft-07 tools, so
+  dialect handling now lives only at the `call` path.)
 
 ### `_meta` keys
 

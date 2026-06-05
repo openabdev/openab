@@ -30,6 +30,13 @@ url = "2.5.8"
 # `OAuthTokenResponse` types unify; used to splice a rotated refresh_token back
 # into rmcp's wholesale-rebuilt credentials (OAuth 2.1 §10.4) in McpCredentialStore.
 oauth2 = { version = "5", default-features = false }
+# Multi-draft JSON Schema validator for MCP tool `inputSchema` (rows 18-21).
+# `validator_for` auto-selects the draft from the schema's `$schema` keyword
+# (draft-07 / 2020-12 / …), so one call covers every dialect a server may pin.
+# default-features off drops the http/file `$ref` resolvers — tool-arg
+# validation must never trigger an outbound fetch, and the resolvers pull a
+# blocking reqwest we don't want.
+jsonschema = { version = "0.46", default-features = false }
 rmcp = { version = "1.7", default-features = false, features = [
     "client",
     "transport-child-process",
