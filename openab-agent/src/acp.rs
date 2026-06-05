@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
-use tokio::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
@@ -29,6 +31,109 @@ pub struct JsonRpcNotification {
     pub jsonrpc: &'static str,
     pub method: String,
     pub params: Value,
+}
+
+/// Pending agent→host requests keyed by the outbound JSON-RPC id. Each entry
+/// is the `oneshot` half that wakes the awaiting caller once the host's
+/// response with the matching id arrives back over stdin.
+type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, Value>>>>>;
+
+/// Duplex channel from the MCP client layer back into the ACP loop.
+///
+/// The ACP transport (`AcpServer::run`) is otherwise half-duplex: it answers
+/// inbound host→agent requests and emits fire-and-forget `session/update`
+/// notifications. `HostBridge` adds the missing agent→host *request/response*
+/// direction so an MCP `ClientHandler` running on an rmcp task can ask the
+/// host a question (e.g. elicitation form) and await a structured reply.
+///
+/// All outbound bytes funnel through `writer` (a single stdout-owning drain
+/// task) to preserve the one-writer invariant; `pending` correlates each
+/// outbound id with its awaiting `oneshot`; `next_id` mints monotonic ids.
+#[derive(Clone)]
+pub struct HostBridge {
+    writer: mpsc::UnboundedSender<String>,
+    pending: PendingMap,
+    next_id: Arc<AtomicU64>,
+}
+
+impl HostBridge {
+    pub fn new(writer: mpsc::UnboundedSender<String>) -> Self {
+        Self {
+            writer,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// Send an outbound agent→host request and await the host's response.
+    /// Returns `Ok(result)` / `Err(error)` mirroring JSON-RPC. Returns `Err`
+    /// (rather than blocking forever) when no host is listening or the channel
+    /// is closed, so callers can degrade gracefully (e.g. auto-decline).
+    #[allow(dead_code)] // wired into create_elicitation in substep 2
+    pub async fn request(&self, method: &str, params: Value) -> Result<Value, Value> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.pending
+            .lock()
+            .expect("host bridge pending map poisoned")
+            .insert(id, reply_tx);
+
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        })
+        .to_string();
+
+        if self.writer.send(line).is_err() {
+            self.pending
+                .lock()
+                .expect("host bridge pending map poisoned")
+                .remove(&id);
+            return Err(json!({ "code": -32603, "message": "host channel closed" }));
+        }
+
+        match reply_rx.await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(json!({ "code": -32603, "message": "host reply dropped" })),
+        }
+    }
+
+    /// If `line` is an inbound JSON-RPC *response* to one of our outbound
+    /// requests, resolve the matching pending `oneshot` and return `true`.
+    /// Returns `false` for anything else (inbound requests, notifications,
+    /// unknown / already-completed ids) so the caller falls through to the
+    /// normal request-dispatch path.
+    pub fn try_resolve_response(&self, line: &str) -> bool {
+        let val: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        // A response carries an id + (result | error) and NO method. A request
+        // or notification has a method — leave those for the dispatch loop.
+        if val.get("method").is_some() {
+            return false;
+        }
+        let Some(id) = val.get("id").and_then(|v| v.as_u64()) else {
+            return false;
+        };
+        let Some(reply_tx) = self
+            .pending
+            .lock()
+            .expect("host bridge pending map poisoned")
+            .remove(&id)
+        else {
+            return false;
+        };
+        let outcome = if let Some(err) = val.get("error") {
+            Err(err.clone())
+        } else {
+            Ok(val.get("result").cloned().unwrap_or(Value::Null))
+        };
+        let _ = reply_tx.send(outcome);
+        true
+    }
 }
 
 pub struct AcpServer {
@@ -68,9 +173,32 @@ impl AcpServer {
             }
         });
 
-        let mut stdout = io::stdout();
+        // Single stdout owner: every outbound line (dispatch responses,
+        // notifications, and agent→host requests from rmcp tasks) funnels
+        // through `out_tx` into this one drain task, preserving the
+        // one-writer invariant the HostBridge relies on.
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let mut stdout = io::stdout();
+            while let Some(line) = out_rx.recv().await {
+                let _ = writeln!(stdout, "{}", line);
+                let _ = stdout.flush();
+            }
+        });
+
+        // Built now so its writer half is shared with the drain task. Dormant
+        // in this substep (no MCP path injects it yet); inbound host replies
+        // are still routed through `try_resolve_response` so the correlation
+        // machinery is exercised end-to-end.
+        let bridge = HostBridge::new(out_tx.clone());
 
         while let Some(line) = rx.recv().await {
+            // Intercept host→agent responses to our outbound requests before
+            // the request-dispatch path; everything else falls through.
+            if bridge.try_resolve_response(&line) {
+                continue;
+            }
+
             let req: JsonRpcRequest = match serde_json::from_str(&line) {
                 Ok(r) => r,
                 Err(_) => continue,
@@ -98,9 +226,8 @@ impl AcpServer {
             };
 
             for line in output {
-                let _ = writeln!(stdout, "{}", line);
+                let _ = out_tx.send(line);
             }
-            let _ = stdout.flush();
         }
     }
 
@@ -255,6 +382,75 @@ mod tests {
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 2);
         assert!(resp["result"]["sessionId"].as_str().unwrap().len() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_host_bridge_request_resolves_on_matching_response() {
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        let bridge = HostBridge::new(out_tx);
+
+        let task = {
+            let bridge = bridge.clone();
+            tokio::spawn(async move { bridge.request("session/request_permission", json!({})).await })
+        };
+
+        // Drain the outbound request line and echo back a response with the
+        // same id, simulating the host.
+        let line = out_rx.recv().await.unwrap();
+        let sent: Value = serde_json::from_str(&line).unwrap();
+        let id = sent["id"].as_u64().unwrap();
+        assert_eq!(sent["method"], "session/request_permission");
+        let resolved = bridge.try_resolve_response(
+            &json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } }).to_string(),
+        );
+        assert!(resolved);
+
+        let outcome = task.await.unwrap();
+        assert_eq!(outcome.unwrap(), json!({ "ok": true }));
+    }
+
+    #[tokio::test]
+    async fn test_host_bridge_request_errors_on_closed_channel() {
+        let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
+        drop(out_rx); // no drain → send fails
+        let bridge = HostBridge::new(out_tx);
+        let outcome = bridge.request("session/request_permission", json!({})).await;
+        let err = outcome.unwrap_err();
+        assert_eq!(err["code"], -32603);
+    }
+
+    #[tokio::test]
+    async fn test_host_bridge_resolves_error_response() {
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        let bridge = HostBridge::new(out_tx);
+        let task = {
+            let bridge = bridge.clone();
+            tokio::spawn(async move { bridge.request("m", json!({})).await })
+        };
+        let line = out_rx.recv().await.unwrap();
+        let id: u64 = serde_json::from_str::<Value>(&line).unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        let resolved = bridge.try_resolve_response(
+            &json!({ "id": id, "error": { "code": -1, "message": "nope" } }).to_string(),
+        );
+        assert!(resolved);
+        let err = task.await.unwrap().unwrap_err();
+        assert_eq!(err["code"], -1);
+    }
+
+    #[test]
+    fn test_host_bridge_ignores_unknown_id_and_requests() {
+        let (out_tx, _out_rx) = mpsc::unbounded_channel::<String>();
+        let bridge = HostBridge::new(out_tx);
+        // Unknown id → not ours.
+        assert!(!bridge.try_resolve_response(&json!({ "id": 999, "result": {} }).to_string()));
+        // Has a method → it's a request/notification, not a response.
+        assert!(!bridge.try_resolve_response(
+            &json!({ "id": 1, "method": "initialize", "params": {} }).to_string()
+        ));
+        // Not JSON → ignored.
+        assert!(!bridge.try_resolve_response("not json"));
     }
 
     #[test]
