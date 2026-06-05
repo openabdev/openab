@@ -114,13 +114,13 @@ interactive (single-process stdin paste-back) and a background retry cannot mint
 new or upgraded token without a human browser round-trip. This is the realistic
 ceiling for an interactive-login client.
 
-### Client registration mechanisms
+### Client registration
 
-| Mechanism | Supported | Notes |
-|---|---|---|
-| Pre-registered client IDs | ✅ | The only supported path. Built-ins inject via env var; custom providers carry an explicit `client_id`. |
-| Client ID Metadata Document (CIMD) | ❌ | Not implemented. |
-| Dynamic Client Registration (RFC 7591, DCR) | ❌ | Not implemented. |
+Only **pre-registered client IDs** are supported: built-ins inject via env var,
+custom providers carry an explicit `client_id`. Client ID Metadata Documents
+(CIMD) and Dynamic Client Registration (RFC 7591, DCR) are **not implemented** —
+the per-row compliance detail is in
+[`mcp-spec-alignment.md`](./mcp-spec-alignment.md) (rows 151 / 152 / 169-180).
 
 ### Built-in providers and their env vars
 
@@ -136,25 +136,24 @@ with a clear error rather than falling back to a hard-coded default. Custom
 providers supply their own `authorize_url` / `token_url` / `client_id` / `scopes`
 via an `oauth:` block in the server config.
 
-### Token storage and known gaps
+### Token storage
 
 - Tokens are persisted to `auth.json` under the **`mcp:<server>`** namespace,
   stored as native rmcp `StoredCredentials` (lossless — client ID, granted
   scopes, and vendor-extra fields all survive). The provider/Codex tenant in the
-  same file is untouched.
-- **Refresh-token rotation fallback**: if an authorization server omits the
-  `refresh_token` on a refresh response (permitted by OAuth 2.1 §10.4), the prior
-  still-valid token is spliced back in rather than dropped.
-- **OS keyring — known gap, no target to exist on.** Tokens live on the
-  filesystem (permission-restricted, not in an OS keyring). The primary deploy
-  target is Kubernetes/containers, which have no keyring daemon; the k8s-native
-  answer to secure storage is a restricted-permission Secret mounted as a file —
-  exactly the `auth.json` path already used.
-- **Single-process interactive login.** Paste-back is single-invocation; the
-  cross-process `--paste` resume was removed by design. This is what caps step-up
-  at "bounce, don't auto-retry."
+  same file is untouched. If a refresh response omits a new `refresh_token`
+  (permitted by OAuth 2.1 §10.4), the prior still-valid token is spliced back in
+  rather than dropped.
 - **Device flow** (RFC 8628) is available for custom providers that advertise a
   device authorization endpoint.
+
+Two known gaps and their rationale are enumerated in
+[`mcp-spec-alignment.md`](./mcp-spec-alignment.md): no OS keyring (tokens live on
+the permission-restricted filesystem — the k8s deploy target has no keyring daemon,
+and a restricted-permission Secret mounted as a file is the canonical equivalent;
+row 213 / 437), and single-process interactive login (paste-back is
+single-invocation; the cross-process `--paste` resume was removed by design — this
+is what caps step-up at "bounce, don't auto-retry").
 
 ## Sampling
 
@@ -230,7 +229,7 @@ hard-refused locally (audited as `refused`) instead of issuing a request the
 server would reject. Tools with `forbidden` or `optional` task support invoke
 normally.
 
-## Other reliability mechanisms
+## Reliability & operational mechanisms
 
 - **Per-request timeout + auto-cancel**: both `tools/call` and `tools/list` run
   under a per-server request timeout; on expiry rmcp auto-emits a cancellation
@@ -253,29 +252,32 @@ normally.
 
 ## How openab-agent compares to other MCP clients
 
-The matrix below positions openab-agent against five other MCP client
-implementations. **Honesty note:** only Gemini CLI and OpenAI Codex could be
-verified against first-party documentation, and even then only transports and the
-existence of OAuth are firmly confirmed; their sampling / roots / progress support
-is undocumented. **Hermes, Pi-agent, and OpenClaw could not be grounded against
-any authoritative first-party source** (Hermes is an inference/OAuth gateway not
-documented as an MCP client; Pi-agent's MCP support is third-party-extension only;
-OpenClaw's public claims are self-contradictory and unverifiable). Their cells are
-left `?` rather than guessed.
+The matrix below positions openab-agent against the two other MCP clients that
+could be **verified against first-party documentation** — Gemini CLI and OpenAI
+Codex. Even for those, only transports and the existence of OAuth are firmly
+confirmed; their sampling / roots / progress support is undocumented and left `?`
+rather than guessed.
+
+Three further clients (Hermes, Pi-agent, OpenClaw) were considered but are **not
+in the matrix**: none could be grounded against an authoritative first-party
+source (Hermes is an inference/OAuth gateway not documented as an MCP client;
+Pi-agent's MCP support is third-party-extension only; OpenClaw's public claims are
+self-contradictory). A row of all-`?` columns carries no signal, so they are
+omitted rather than listed.
 
 Legend: ✅ verified yes · ⚠️ partial / verified-exists-but-limited · ❌ verified no
 · `?` unverifiable.
 
-| Capability | openab-agent | Gemini CLI | OpenAI Codex | Hermes | Pi-agent | OpenClaw |
-|---|---|---|---|---|---|---|
-| Tools (basic calling) | ✅ | ✅ | ✅ | ? | ? | ? |
-| Connection: stdio + streamable HTTP | ✅ | ✅ | ✅ | ? | ? | ? |
-| OAuth / authorization | ⚠️ | ⚠️ | ⚠️ | ? | ? | ? |
-| RFC 8707 `resource` + PRM discovery | ⚠️ | ? | ? | ? | ? | ? |
-| Sampling (`createMessage`) | ✅ text-only | ? | ? | ? | ? | ? |
-| Roots | ✅ | ? | ? | ? | ? | ? |
-| Elicitation | ⚠️ form-only | ? | ⚠️ | ? | ? | ? |
-| Progress notifications | ❌ | ? | ? | ? | ? | ? |
+| Capability | openab-agent | Gemini CLI | OpenAI Codex |
+|---|---|---|---|
+| Tools (basic calling) | ✅ | ✅ | ✅ |
+| Connection: stdio + streamable HTTP | ✅ | ✅ | ✅ |
+| OAuth / authorization | ⚠️ | ⚠️ | ⚠️ |
+| RFC 8707 `resource` + PRM discovery | ⚠️ | ? | ? |
+| Sampling (`createMessage`) | ✅ text-only | ? | ? |
+| Roots | ✅ | ? | ? |
+| Elicitation | ⚠️ form-only | ? | ⚠️ |
+| Progress notifications | ❌ | ? | ? |
 
 Sources for the verified cells: [Gemini CLI MCP
 docs](https://github.com/google-gemini/gemini-cli/blob/main/docs/tools/mcp-server.md),
