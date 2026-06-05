@@ -49,7 +49,7 @@ type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, Value>>>>
 /// All outbound bytes funnel through `writer` (a single stdout-owning drain
 /// task) to preserve the one-writer invariant; `pending` correlates each
 /// outbound id with its awaiting `oneshot`; `next_id` mints monotonic ids.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct HostBridge {
     writer: mpsc::UnboundedSender<String>,
     pending: PendingMap,
@@ -69,7 +69,6 @@ impl HostBridge {
     /// Returns `Ok(result)` / `Err(error)` mirroring JSON-RPC. Returns `Err`
     /// (rather than blocking forever) when no host is listening or the channel
     /// is closed, so callers can degrade gracefully (e.g. auto-decline).
-    #[allow(dead_code)] // wired into create_elicitation in substep 2
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -186,11 +185,15 @@ impl AcpServer {
             }
         });
 
-        // Built now so its writer half is shared with the drain task. Dormant
-        // in this substep (no MCP path injects it yet); inbound host replies
-        // are still routed through `try_resolve_response` so the correlation
-        // machinery is exercised end-to-end.
+        // Built now so its writer half is shared with the drain task, then
+        // injected into the MCP manager *before* the first `session/new` clones
+        // it into an Agent — so every session's MCP connections inherit a live
+        // host bridge for elicitation. Inbound host replies are routed through
+        // `try_resolve_response` below.
         let bridge = HostBridge::new(out_tx.clone());
+        if let Some(manager) = self.mcp_manager.as_mut() {
+            manager.set_host_bridge(bridge.clone());
+        }
 
         while let Some(line) = rx.recv().await {
             // Intercept host→agent responses to our outbound requests before

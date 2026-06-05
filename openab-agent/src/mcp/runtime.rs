@@ -20,10 +20,10 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use rmcp::model::{
-    ClientInfo, CreateElicitationRequestParams, CreateElicitationResult,
-    CreateMessageRequestParams, CreateMessageResult, ErrorData, ListRootsResult, LoggingLevel,
-    LoggingMessageNotificationParam, Root, RootsCapabilities, SamplingCapability,
-    SetLevelRequestParams,
+    ClientInfo, CreateElicitationRequestParams, CreateElicitationResult, CreateMessageRequestParams,
+    CreateMessageResult, ElicitationAction, ElicitationCapability, ErrorData,
+    FormElicitationCapability, ListRootsResult, LoggingLevel, LoggingMessageNotificationParam, Root,
+    RootsCapabilities, SamplingCapability, SetLevelRequestParams,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
@@ -61,8 +61,9 @@ use crate::auth::{
 /// root set is the agent's static working directory plus a fixed config
 /// allow-list, so it never changes mid-session), and `list_roots`, returning
 /// that set as `file://` URIs (spec rows 363-384); and `create_elicitation`,
-/// returning `-32602` (invalid params) instead of the SDK default's silent
-/// decline, because we advertise no `elicitation` capability (spec row 439).
+/// which (when a host bridge is wired) advertises `elicitation.form` and
+/// surfaces server-initiated forms to the host for a structured reply, and
+/// otherwise returns `-32602` (no capability declared, spec §1, row 439).
 /// Per-server cache of the most recent successful `tools/list` page, keyed by
 /// configured server name. Deliberately a sibling `Arc` on the manager rather
 /// than a field on `ServerHandle`: the handler holds a clone of this same `Arc`
@@ -93,6 +94,12 @@ pub struct OpenabClientHandler {
     /// well-behaved server never sends a sampling request. Shared (`Arc` via
     /// `SharedLlmProvider`) so the handler stays `Clone` per connection.
     provider: Option<crate::llm::SharedLlmProvider>,
+    /// Duplex channel back into the ACP loop, used to surface server-initiated
+    /// `elicitation/create` (form mode) to the host and await the user's reply
+    /// (spec §1, row 439). `None` when running headless / before the ACP loop
+    /// injects a bridge — in which case `get_info` does not advertise the
+    /// `elicitation` capability and `create_elicitation` returns -32602.
+    host_bridge: Option<crate::acp::HostBridge>,
 }
 
 impl OpenabClientHandler {
@@ -101,12 +108,14 @@ impl OpenabClientHandler {
         tools_cache: ToolsCache,
         roots: Arc<Vec<Root>>,
         provider: Option<crate::llm::SharedLlmProvider>,
+        host_bridge: Option<crate::acp::HostBridge>,
     ) -> Self {
         Self {
             server_name,
             tools_cache,
             roots,
             provider,
+            host_bridge,
         }
     }
 
@@ -141,6 +150,20 @@ impl ClientHandler for OpenabClientHandler {
         if self.provider.is_some() {
             info.capabilities.sampling = Some(SamplingCapability::default());
         }
+        // Advertise `elicitation.form` only when a host bridge is wired — the
+        // capability promises we can surface a form to a user and return their
+        // structured reply, which requires the ACP duplex channel. Form mode
+        // only (`url: None`); `schema_validation: false` because we relay the
+        // schema to the host UI and do not validate the reply ourselves (spec
+        // §1, row 439).
+        if self.host_bridge.is_some() {
+            info.capabilities.elicitation = Some(ElicitationCapability {
+                form: Some(FormElicitationCapability {
+                    schema_validation: Some(false),
+                }),
+                url: None,
+            });
+        }
         info
     }
 
@@ -153,17 +176,52 @@ impl ClientHandler for OpenabClientHandler {
 
     fn create_elicitation(
         &self,
-        _request: CreateElicitationRequestParams,
+        request: CreateElicitationRequestParams,
         _context: RequestContext<RoleClient>,
     ) -> impl std::future::Future<Output = Result<CreateElicitationResult, ErrorData>> + Send + '_
     {
-        // We advertise no `elicitation` capability, so a server MUST NOT send
-        // this request. Reject explicitly with -32602 instead of inheriting the
-        // SDK default's silent decline, so the violation is observable (row 439).
-        std::future::ready(Err(ErrorData::invalid_params(
-            "elicitation capability not declared",
-            None,
-        )))
+        async move {
+            // Headless / pre-bridge: `get_info` advertised no `elicitation`
+            // capability at all, so any inbound `elicitation/create` is a
+            // mode-not-declared violation — reject with -32602 (spec row 439)
+            // rather than the SDK default's silent decline.
+            let Some(bridge) = self.host_bridge.clone() else {
+                return Err(ErrorData::invalid_params(
+                    "elicitation capability not declared",
+                    None,
+                ));
+            };
+            // We advertise `elicitation.form` only. A URL-mode request targets a
+            // mode we did not declare → -32602 (spec rows 416/439); a compliant
+            // server never sends it (row 417).
+            let (message, requested_schema) = match request {
+                CreateElicitationRequestParams::FormElicitationParams {
+                    message,
+                    requested_schema,
+                    ..
+                } => (message, requested_schema),
+                CreateElicitationRequestParams::UrlElicitationParams { .. } => {
+                    return Err(ErrorData::invalid_params(
+                        "url elicitation mode not declared",
+                        None,
+                    ));
+                }
+            };
+
+            let params = serde_json::json!({
+                "message": message,
+                "requestedSchema": requested_schema,
+            });
+            match bridge.request("session/request_input", params).await {
+                // Host returned a structured reply: map action + content.
+                Ok(reply) => Ok(elicitation_result_from_reply(&reply)),
+                // We advertised the capability but couldn't reach the user
+                // (channel closed / host can't answer / method unknown). Degrade
+                // to decline so the server's operation continues (row 477)
+                // instead of failing the whole tool call.
+                Err(_) => Ok(CreateElicitationResult::new(ElicitationAction::Decline)),
+            }
+        }
     }
 
     fn create_message(
@@ -404,6 +462,12 @@ pub struct McpRuntimeManager {
     /// `tokio::Mutex` is held only for `HashMap` get/insert, never across the
     /// inner manager's network work.
     auth_clients: Arc<tokio::sync::Mutex<HashMap<String, AuthClient<reqwest013::Client>>>>,
+    /// Duplex channel back into the ACP loop for server-initiated elicitation
+    /// (spec §1). `None` until `AcpServer::run` injects it via `set_host_bridge`
+    /// (before the first `session/new` clones the manager into an `Agent`), so
+    /// every session's MCP connections inherit a live bridge. Cloned into each
+    /// `OpenabClientHandler`; `None` in headless contexts (e.g. `mcp` CLI).
+    host_bridge: Option<crate::acp::HostBridge>,
 }
 
 impl McpRuntimeManager {
@@ -448,7 +512,16 @@ impl McpRuntimeManager {
             roots,
             provider,
             auth_clients: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            host_bridge: None,
         }
+    }
+
+    /// Inject the ACP host bridge used to surface elicitation forms (spec §1).
+    /// Called once by `AcpServer::run` before the first `session/new`, so the
+    /// bridge propagates into every session's cloned manager and from there
+    /// into each `OpenabClientHandler`.
+    pub fn set_host_bridge(&mut self, bridge: crate::acp::HostBridge) {
+        self.host_bridge = Some(bridge);
     }
 
     /// Cached `AuthClient` for `name`, built on first use from `server_url`.
@@ -1206,6 +1279,7 @@ impl McpRuntimeManager {
                 self.tools_cache.clone(),
                 self.roots.clone(),
                 self.provider.clone(),
+                self.host_bridge.clone(),
             )
             .await;
 
@@ -1283,6 +1357,25 @@ fn provider_name_of(provider: &ResolvedProvider) -> String {
     match provider {
         ResolvedProvider::Builtin { provider_name, .. } => (*provider_name).to_string(),
         ResolvedProvider::Custom { provider_name, .. } => provider_name.clone(),
+    }
+}
+
+/// Map a host reply to our `session/request_input` elicitation request into a
+/// `CreateElicitationResult`. The host returns `{ action, content }`; a missing
+/// or unrecognized `action` defaults to `accept` when `content` is present (so a
+/// bare content object is treated as an acceptance). `decline` / `cancel` carry
+/// no content per the elicitation result shape.
+fn elicitation_result_from_reply(reply: &serde_json::Value) -> CreateElicitationResult {
+    match reply.get("action").and_then(|a| a.as_str()) {
+        Some("decline") => CreateElicitationResult::new(ElicitationAction::Decline),
+        Some("cancel") => CreateElicitationResult::new(ElicitationAction::Cancel),
+        _ => {
+            let mut result = CreateElicitationResult::new(ElicitationAction::Accept);
+            if let Some(content) = reply.get("content") {
+                result = result.with_content(content.clone());
+            }
+            result
+        }
     }
 }
 
@@ -1554,6 +1647,7 @@ impl Dial {
         tools_cache: ToolsCache,
         roots: Arc<Vec<Root>>,
         provider: Option<crate::llm::SharedLlmProvider>,
+        host_bridge: Option<crate::acp::HostBridge>,
     ) -> Result<RunningService<RoleClient, OpenabClientHandler>> {
         match self {
             Dial::Stdio { command, args, env } => {
@@ -1580,7 +1674,7 @@ impl Dial {
                         }
                     });
                 }
-                OpenabClientHandler::new(name.to_string(), tools_cache, roots, provider)
+                OpenabClientHandler::new(name.to_string(), tools_cache, roots, provider, host_bridge)
                     .serve(transport)
                     .await
                     .with_context(|| format!("mcp handshake with {command:?}"))
@@ -1592,14 +1686,14 @@ impl Dial {
                 Some(client) => {
                     let cfg = StreamableHttpClientTransportConfig::with_uri(url.as_str());
                     let transport = StreamableHttpClientTransport::with_client(client, cfg);
-                    OpenabClientHandler::new(name.to_string(), tools_cache, roots, provider)
+                    OpenabClientHandler::new(name.to_string(), tools_cache, roots, provider, host_bridge)
                         .serve(transport)
                         .await
                         .with_context(|| format!("mcp handshake with {url:?}"))
                 }
                 None => {
                     let transport = StreamableHttpClientTransport::from_uri(url.as_str());
-                    OpenabClientHandler::new(name.to_string(), tools_cache, roots, provider)
+                    OpenabClientHandler::new(name.to_string(), tools_cache, roots, provider, host_bridge)
                         .serve(transport)
                         .await
                         .with_context(|| format!("mcp handshake with {url:?}"))
@@ -1714,11 +1808,13 @@ mod tests {
 
     #[test]
     fn client_handler_advertises_only_roots_capability() {
-        // Pins the capability posture: we declare `roots` (and serve it from
-        // `list_roots`), but still abstain from sampling (`create_message`)
-        // and elicitation (`create_elicitation`, -32602). `roots` carries no
-        // `listChanged` — the root set is static for the session. If a future
-        // change wires sampling/elicitation/tasks it MUST flip the matching
+        // Pins the capability posture of the bare `Default` handler (no provider,
+        // no host bridge): we declare `roots` (and serve it from `list_roots`),
+        // but abstain from sampling (no provider) and elicitation (no host bridge
+        // → no capability advertised; `create_elicitation` returns -32602).
+        // `roots` carries no `listChanged`
+        // — the root set is static for the session. If a future change wires
+        // sampling/elicitation/tasks unconditionally it MUST flip the matching
         // capability, and this test will fail, forcing a deliberate re-audit
         // (spec rows 363-384/439, §390).
         let caps = OpenabClientHandler::default().get_info().capabilities;
@@ -1731,8 +1827,64 @@ mod tests {
             caps.sampling.is_none(),
             "no provider configured (Default handler) → must not advertise sampling"
         );
-        assert!(caps.elicitation.is_none(), "must not advertise elicitation");
+        assert!(
+            caps.elicitation.is_none(),
+            "no host bridge (Default handler) → must not advertise elicitation"
+        );
         assert!(caps.tasks.is_none(), "must not advertise tasks");
+    }
+
+    #[test]
+    fn client_handler_advertises_elicitation_form_when_bridge_wired() {
+        // With a host bridge injected, the handler advertises `elicitation.form`
+        // (the capability is a promise we can surface a form + return the reply).
+        // Form mode only: no `url` sub-capability; `schema_validation` false
+        // because we relay the schema to the host rather than validating locally
+        // (spec §1, row 439).
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let bridge = crate::acp::HostBridge::new(out_tx);
+        let handler = OpenabClientHandler::new(
+            "srv".to_string(),
+            Arc::new(StdMutex::new(HashMap::new())),
+            Arc::new(Vec::new()),
+            None,
+            Some(bridge),
+        );
+        let elicitation = handler
+            .get_info()
+            .capabilities
+            .elicitation
+            .expect("bridge wired → must advertise elicitation");
+        let form = elicitation.form.expect("must advertise form mode");
+        assert_eq!(form.schema_validation, Some(false));
+        assert!(elicitation.url.is_none(), "must not advertise url mode");
+    }
+
+    #[test]
+    fn elicitation_reply_maps_action_and_content() {
+        // Explicit decline / cancel carry no content.
+        assert_eq!(
+            elicitation_result_from_reply(&serde_json::json!({ "action": "decline" })).action,
+            ElicitationAction::Decline
+        );
+        assert_eq!(
+            elicitation_result_from_reply(&serde_json::json!({ "action": "cancel" })).action,
+            ElicitationAction::Cancel
+        );
+        // Explicit accept carries content through verbatim.
+        let accepted = elicitation_result_from_reply(
+            &serde_json::json!({ "action": "accept", "content": { "email": "a@b.c" } }),
+        );
+        assert_eq!(accepted.action, ElicitationAction::Accept);
+        assert_eq!(accepted.content, Some(serde_json::json!({ "email": "a@b.c" })));
+        // A bare content object (no action) is treated as an acceptance.
+        let bare = elicitation_result_from_reply(&serde_json::json!({ "content": { "x": 1 } }));
+        assert_eq!(bare.action, ElicitationAction::Accept);
+        assert_eq!(bare.content, Some(serde_json::json!({ "x": 1 })));
+        // An empty / unrecognized reply accepts with no content.
+        let empty = elicitation_result_from_reply(&serde_json::json!({}));
+        assert_eq!(empty.action, ElicitationAction::Accept);
+        assert_eq!(empty.content, None);
     }
 
     #[derive(Debug)]
@@ -1765,6 +1917,7 @@ mod tests {
             Arc::new(StdMutex::new(HashMap::new())),
             Arc::new(Vec::new()),
             Some(provider),
+            None,
         );
         let caps = handler.get_info().capabilities;
         let sampling = caps
@@ -1793,6 +1946,7 @@ mod tests {
             "alpha".to_string(),
             cache.clone(),
             Arc::new(Vec::new()),
+            None,
             None,
         );
         alpha.invalidate_tools_cache();
@@ -1848,6 +2002,7 @@ mod tests {
             "srv".to_string(),
             Arc::new(StdMutex::new(HashMap::new())),
             roots.clone(),
+            None,
             None,
         );
         assert_eq!(*handler.roots, *roots);
