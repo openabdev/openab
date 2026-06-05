@@ -434,6 +434,70 @@ pub async fn cli_login(name: String, paste: Option<String>) {
     }
 }
 
+/// `openab-agent mcp login <name> --device`. Drives the RFC 8628
+/// device-code flow end-to-end:
+///
+/// 1. `start_device_login` POSTs the §3.1 device authorization request,
+///    prints the verification URL + user code, and spawns the §3.4
+///    polling task in the background
+/// 2. This CLI polls `statuses()` until the server transitions away from
+///    `Connecting` — `Disconnected` means the polling task persisted the
+///    native `StoredCredentials` (next `connect()` picks it up);
+///    `NeedsAuth` means the flow terminally failed (access_denied /
+///    expired_token / network)
+///
+/// Wall-clock timeout = `expires_in` returned by the provider. Polling
+/// happens in the runtime-spawned task; this loop only watches status,
+/// so the user can `Ctrl-C` the CLI without leaking pending state — the
+/// detached task dies with the process and `auth.json` stays clean.
+pub async fn cli_login_device(name: String) {
+    let manager = McpRuntimeManager::from_config(load_config_or_exit());
+    let start = match manager.start_device_login(&name).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("✗ {name}: {e:#}");
+            std::process::exit(1);
+        }
+    };
+    println!();
+    if let Some(complete) = &start.verification_uri_complete {
+        println!("Open this URL in a browser (pre-filled with user code):");
+        println!();
+        println!("    {complete}");
+        println!();
+    }
+    println!("Or open the verification URL and enter the user code:");
+    println!();
+    println!("    URL:       {}", start.verification_uri);
+    println!("    User code: {}", start.user_code);
+    println!();
+    println!(
+        "Waiting for authorization (timeout: {}s)...",
+        start.expires_in
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(start.expires_in);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        if std::time::Instant::now() >= deadline {
+            eprintln!("✗ device-flow timed out (no user authorization)");
+            std::process::exit(1);
+        }
+        let statuses = manager.statuses().await;
+        let status = statuses.iter().find(|(n, _)| n == &name).map(|(_, s)| s);
+        match status {
+            Some(runtime::ServerStatus::Disconnected) => {
+                println!("● logged in: {name}");
+                return;
+            }
+            Some(runtime::ServerStatus::NeedsAuth) => {
+                eprintln!("✗ device-flow failed (run `mcp status` / check logs)");
+                std::process::exit(1);
+            }
+            _ => continue,
+        }
+    }
+}
+
 /// `openab-agent mcp doctor`. Per-server diagnostic that runs a live
 /// `connect()` against every configured server and surfaces the result
 /// plus a remediation hint when something's broken (ADR §8).
