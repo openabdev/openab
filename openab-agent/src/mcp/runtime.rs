@@ -26,7 +26,10 @@ use rmcp::model::{
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
+use rmcp::transport::{
+    AuthClient, AuthorizationManager, ConfigureCommandExt, StreamableHttpClientTransport,
+    TokioChildProcess,
+};
 use rmcp::{ClientHandler, ServiceExt};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -39,8 +42,8 @@ use super::flow::{canonical_resource, init_paste_authorize, parse_paste_callback
 use super::oauth::{builtin_client_id, resolve, ResolvedProvider};
 use crate::auth::{
     auth_path, list_pending_logins_at, load_namespaced_token_at, load_pending_login, pending_key,
-    remove_pending_login, save_namespaced_token_at, save_pending_login, PendingPasteLogin,
-    TokenStore,
+    remove_pending_login, save_namespaced_token_at, save_pending_login, McpCredentialStore,
+    PendingPasteLogin, TokenStore,
 };
 
 /// MCP client-side callback handler. Replaces the unit type `()` so individual
@@ -392,6 +395,16 @@ pub struct McpRuntimeManager {
     /// `None` when none are available, in which case connections do not
     /// advertise the `sampling` capability. Cloned into each handler.
     provider: Option<crate::llm::SharedLlmProvider>,
+    /// Per-server OAuth client cache (rmcp `AuthClient` over an
+    /// `AuthorizationManager`). Built lazily by `get_or_init_auth_client` and
+    /// reused across reconnects: each entry wraps a single `AuthorizationManager`
+    /// behind the client's internal `Arc<Mutex<…>>`, so concurrent `connect()`s
+    /// share one refresh round-trip instead of each replaying a rotated
+    /// refresh_token (which providers like Google cascade-revoke). The outer
+    /// `tokio::Mutex` is held only for `HashMap` get/insert, never across the
+    /// inner manager's network work.
+    #[allow(dead_code)] // wired into connect() in S2b
+    auth_clients: Arc<tokio::sync::Mutex<HashMap<String, AuthClient<reqwest::Client>>>>,
 }
 
 impl McpRuntimeManager {
@@ -436,7 +449,38 @@ impl McpRuntimeManager {
             tools_cache: Arc::new(StdMutex::new(HashMap::new())),
             roots,
             provider,
+            auth_clients: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Cached `AuthClient` for `name`, built on first use from `server_url`.
+    ///
+    /// The manager seeds OAuth discovery (PRM/RFC8414) from `server_url` and
+    /// persists credentials in the shared `auth.json` under the bare server
+    /// name via [`McpCredentialStore`]. Cloning the cached entry shares one
+    /// `AuthorizationManager` (and thus one single-flight refresh) across every
+    /// reconnect for this server. Construction performs no network I/O — the
+    /// first discovery/refresh happens lazily inside `get_access_token`.
+    #[allow(dead_code)] // wired into connect() in S2b
+    async fn get_or_init_auth_client(
+        &self,
+        name: &str,
+        server_url: &str,
+    ) -> Result<AuthClient<reqwest::Client>> {
+        let mut cache = self.auth_clients.lock().await;
+        if let Some(client) = cache.get(name) {
+            return Ok(client.clone());
+        }
+        let mut manager = AuthorizationManager::new(server_url)
+            .await
+            .map_err(|e| anyhow!("mcp server {name:?} oauth init failed: {e}"))?;
+        manager.set_credential_store(McpCredentialStore::new(
+            self.auth_path.clone(),
+            name.to_string(),
+        ));
+        let client = AuthClient::new(reqwest::Client::new(), manager);
+        cache.insert(name.to_string(), client.clone());
+        Ok(client)
     }
 
     /// Cached `tools/list` page for `server`, if a prior `fetch_tools`
@@ -2577,5 +2621,28 @@ mod tests {
         let fresh = mgr.try_refresh_oauth_token("linear", &stale).await.unwrap();
         assert_eq!(fresh.access_token, "atok-linear");
         assert!(!fresh.is_expired());
+    }
+
+    #[tokio::test]
+    async fn auth_client_cache_builds_once_and_reads_credential_store() {
+        let cfg: McpConfig = serde_json::from_str(dead_oauth_cfg()).unwrap();
+        let (mgr, _dir) = mgr_with_tempdir(cfg);
+        // First build: no stored credentials → AuthorizationRequired. Proves the
+        // McpCredentialStore is attached and rmcp's load path runs (no network).
+        let client = mgr
+            .get_or_init_auth_client("linear", "http://127.0.0.1:1/mcp")
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.get_access_token().await,
+            Err(rmcp::transport::AuthError::AuthorizationRequired)
+        ));
+        // Second call returns the cached entry rather than building a new
+        // manager — the cache stays a single shared client per server.
+        let _again = mgr
+            .get_or_init_auth_client("linear", "http://127.0.0.1:1/mcp")
+            .await
+            .unwrap();
+        assert_eq!(mgr.auth_clients.lock().await.len(), 1);
     }
 }
