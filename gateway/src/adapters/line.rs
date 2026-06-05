@@ -44,6 +44,21 @@ struct LineMessage {
 /// Base URL for LINE Messaging API. Overridden in tests via the `api_base` parameter.
 pub const LINE_API_BASE: &str = "https://api.line.me";
 
+/// Decide whether to silently drop a LINE message based on group-mention gating.
+///
+/// LINE webhooks don't expose mention entities, so the gateway gates on a configurable
+/// substring keyword. 1:1 ("user") messages are never gated. When no keyword is configured,
+/// nothing is gated (legacy behavior).
+fn should_drop_group_message(channel_type: &str, text: &str, keyword: Option<&str>) -> bool {
+    if channel_type == "user" {
+        return false;
+    }
+    match keyword {
+        Some(kw) if !kw.is_empty() => !text.contains(kw),
+        _ => false,
+    }
+}
+
 // --- Webhook handler ---
 
 pub async fn webhook(
@@ -134,6 +149,19 @@ pub async fn webhook(
                 continue;
             }
         };
+        if should_drop_group_message(
+            &channel_type,
+            text,
+            state.line_group_mention_keyword.as_deref(),
+        ) {
+            info!(
+                channel = %channel_id,
+                keyword = ?state.line_group_mention_keyword.as_deref(),
+                "line group message dropped (no mention keyword)"
+            );
+            continue;
+        }
+
         let user_id = source
             .and_then(|s| s.user_id.as_deref())
             .unwrap_or("unknown");
@@ -273,4 +301,47 @@ pub async fn dispatch_line_reply(
     }
 
     used_reply
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_drop_group_message;
+
+    #[test]
+    fn user_1on1_never_dropped_even_without_keyword() {
+        assert!(!should_drop_group_message("user", "hello", Some("@Go")));
+        assert!(!should_drop_group_message("user", "hello", None));
+    }
+
+    #[test]
+    fn group_without_keyword_config_is_not_dropped() {
+        assert!(!should_drop_group_message("group", "anything", None));
+        assert!(!should_drop_group_message("room", "anything", None));
+    }
+
+    #[test]
+    fn group_with_keyword_drops_when_missing() {
+        assert!(should_drop_group_message("group", "weather is great", Some("@Go醬")));
+        assert!(should_drop_group_message("room",  "lunch?",            Some("@Go醬")));
+    }
+
+    #[test]
+    fn group_with_keyword_passes_when_present() {
+        assert!(!should_drop_group_message("group", "@Go醬 hi",         Some("@Go醬")));
+        assert!(!should_drop_group_message("group", "hey @Go醬, plan?", Some("@Go醬")));
+        assert!(!should_drop_group_message("room",  "@Go醬",            Some("@Go醬")));
+    }
+
+    #[test]
+    fn empty_keyword_treated_as_unset() {
+        assert!(!should_drop_group_message("group", "anything", Some("")));
+    }
+
+    #[test]
+    fn keyword_match_is_case_and_substring_sensitive() {
+        // Substring match — partial keyword inside a longer token still counts.
+        assert!(!should_drop_group_message("group", "x@Go醬y", Some("@Go醬")));
+        // Case-sensitive — different casing is treated as no match.
+        assert!(should_drop_group_message("group", "@go醬 hi", Some("@Go醬")));
+    }
 }

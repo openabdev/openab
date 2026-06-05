@@ -89,7 +89,7 @@ In the LINE Developers Console → **Messaging API** tab → scan the QR code wi
 
 - **Threads** — LINE has no thread/topic concept. All messages in a chat share one agent session.
 - **Reactions** — LINE Bot API does not support message reactions.
-- **@mention gating** — LINE does not expose mention entities. In groups, the bot responds to all messages. To limit this, use a dedicated group for the bot.
+- **Native @mention gating** — LINE does not expose mention entities. As a workaround, the gateway supports keyword-based gating: set `LINE_GROUP_MENTION_KEYWORD` (e.g. `@Go醬`) and the gateway will only forward group/room messages containing that substring. 1:1 messages are unaffected.
 - **Markdown rendering** — LINE uses its own text formatting. Agent replies are sent as plain text.
 
 ## Environment Variables
@@ -98,6 +98,7 @@ In the LINE Developers Console → **Messaging API** tab → scan the QR code wi
 |---|---|---|
 | `LINE_CHANNEL_SECRET` | Yes | Channel secret for webhook signature validation |
 | `LINE_CHANNEL_ACCESS_TOKEN` | Yes | Channel access token for Push Message API |
+| `LINE_GROUP_MENTION_KEYWORD` | No | If set, only forward group/room messages containing this substring (e.g. `@Go醬`). 1:1 messages are unaffected. Empty/unset = forward all (default). |
 
 ## Troubleshooting
 

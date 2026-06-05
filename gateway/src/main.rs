@@ -44,6 +44,10 @@ pub struct AppState {
     pub line_channel_secret: Option<String>,
     /// LINE channel access token for reply API
     pub line_access_token: Option<String>,
+    /// Optional keyword that gates group/room messages.
+    /// When set, LINE group/room messages must contain this substring to be forwarded.
+    /// 1:1 messages are unaffected. Empty/unset = forward all (legacy behavior).
+    pub line_group_mention_keyword: Option<String>,
     /// Teams adapter (None if Teams disabled)
     pub teams: Option<adapters::teams::TeamsAdapter>,
     /// service_url cache for Teams reply routing (conversation_id → (service_url, last_seen))
@@ -242,6 +246,12 @@ async fn main() -> Result<()> {
     // even without an access token (signature validation only needs LINE_CHANNEL_SECRET).
     let line_channel_secret = std::env::var("LINE_CHANNEL_SECRET").ok();
     let line_access_token = std::env::var("LINE_CHANNEL_ACCESS_TOKEN").ok();
+    let line_group_mention_keyword = std::env::var("LINE_GROUP_MENTION_KEYWORD")
+        .ok()
+        .filter(|s| !s.is_empty());
+    if let Some(ref kw) = line_group_mention_keyword {
+        info!(keyword = %kw, "line group mention gating enabled");
+    }
     info!("line adapter enabled");
     app = app.route("/webhook/line", post(adapters::line::webhook));
 
@@ -358,6 +368,7 @@ async fn main() -> Result<()> {
         telegram_secret_token,
         line_channel_secret,
         line_access_token,
+        line_group_mention_keyword,
         teams,
         teams_service_urls: Mutex::new(HashMap::new()),
         feishu,
