@@ -809,26 +809,27 @@ impl McpRuntimeManager {
             pending.resource.as_deref(),
         )
         .await?;
-        self.finish_login(name, &pending, resp).await
+        self.finish_login(name, resp, &client_id).await
     }
 
     /// Pure-persistence tail of `complete_login`. Split out so tests can
     /// drive the state-machine + on-disk transition without a real token
-    /// endpoint. Errors leave the pending entry intact so the user can
-    /// retry the same flow.
+    /// endpoint. Persists a native rmcp `StoredCredentials` via
+    /// `McpCredentialStore` — the same format `connect()` reads back — so a
+    /// finished login unblocks the next dial. Errors leave the pending entry
+    /// intact so the user can retry the same flow.
     async fn finish_login(
         &self,
         name: &str,
-        pending: &PendingPasteLogin,
         resp: TokenExchangeResponse,
+        client_id: &str,
     ) -> Result<()> {
-        let store = build_token_store(
-            resp,
-            pending.token_url.clone(),
-            pending.provider_name.clone(),
-            None,
-        );
-        save_namespaced_token_at(&self.auth_path, name, &store)?;
+        use rmcp::transport::CredentialStore;
+        let creds = build_stored_credentials(client_id, &resp)?;
+        McpCredentialStore::new(self.auth_path.clone(), name.to_string())
+            .save(creds)
+            .await
+            .map_err(|e| anyhow!("persist mcp credentials for {name:?}: {e}"))?;
         remove_pending_login(&self.auth_path, &pending_key(name))?;
         let mut handles = self.handles.write().await;
         if let Some(handle) = handles.get_mut(name) {
@@ -1410,6 +1411,34 @@ fn build_token_store(
         token_endpoint,
         provider,
     }
+}
+
+/// Lift a token-endpoint response into the native rmcp `StoredCredentials`
+/// shape that `connect()` reads back via `McpCredentialStore`. An absent
+/// `expires_in` is left off so `classify_stored_creds` treats the token as
+/// long-lived (never near expiry); an absent/empty `refresh_token` is left
+/// off so the no-refresh bounce engages once the token does lapse.
+fn build_stored_credentials(
+    client_id: &str,
+    resp: &TokenExchangeResponse,
+) -> Result<rmcp::transport::StoredCredentials> {
+    let mut tr = serde_json::json!({
+        "access_token": resp.access_token,
+        "token_type": "bearer",
+    });
+    if let Some(rt) = resp.refresh_token.as_deref().filter(|s| !s.is_empty()) {
+        tr["refresh_token"] = serde_json::json!(rt);
+    }
+    if let Some(secs) = resp.expires_in {
+        tr["expires_in"] = serde_json::json!(secs);
+    }
+    serde_json::from_value(serde_json::json!({
+        "client_id": client_id,
+        "token_response": tr,
+        "granted_scopes": [],
+        "token_received_at": now_secs(),
+    }))
+    .context("build StoredCredentials")
 }
 
 /// Shared POST helper for both `post_token_exchange` (RFC 6749 §4.1.3)
@@ -2405,10 +2434,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finish_login_persists_token_clears_pending_and_unblocks_connect() {
+    async fn finish_login_persists_creds_clears_pending_and_unblocks_connect() {
+        use rmcp::transport::CredentialStore;
         let cfg: McpConfig = serde_json::from_str(linear_custom_cfg()).unwrap();
         let (mgr, _dir) = mgr_with_tempdir(cfg);
-        let pending = seed_pending(&mgr, "linear", "s");
+        seed_pending(&mgr, "linear", "s");
         // Pre-set NeedsAuth so we can observe the transition.
         {
             let mut h = mgr.handles.write().await;
@@ -2419,13 +2449,20 @@ mod tests {
             refresh_token: Some("rtok".to_string()),
             expires_in: Some(3600),
         };
-        mgr.finish_login("linear", &pending, resp).await.unwrap();
+        mgr.finish_login("linear", resp, "linear-client")
+            .await
+            .unwrap();
         assert!(mgr.pending_paste_login("linear").await.is_none());
-        let token = crate::auth::load_namespaced_token_at(&mgr.auth_path, "linear").unwrap();
-        assert_eq!(token.access_token, "atok");
-        assert_eq!(token.refresh_token, "rtok");
-        assert_eq!(token.token_endpoint, "https://example.test/token");
-        assert_eq!(token.provider, "linear");
+        // The connect() read-path reads native StoredCredentials — assert the
+        // login wrote exactly that, so the bridge is closed.
+        let creds = McpCredentialStore::new(mgr.auth_path.clone(), "linear")
+            .load()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(creds.client_id, "linear-client");
+        let (has_token, has_refresh, _near) = classify_stored_creds(&creds);
+        assert!(has_token && has_refresh);
         assert_eq!(mgr.statuses().await[0].1, ServerStatus::Disconnected);
     }
 
@@ -2566,22 +2603,30 @@ mod tests {
 
     #[tokio::test]
     async fn finish_login_tolerates_provider_omitting_refresh_token() {
+        use rmcp::transport::CredentialStore;
         let cfg: McpConfig = serde_json::from_str(linear_custom_cfg()).unwrap();
         let (mgr, _dir) = mgr_with_tempdir(cfg);
-        let pending = seed_pending(&mgr, "linear", "s");
+        seed_pending(&mgr, "linear", "s");
         let resp = TokenExchangeResponse {
             access_token: "atok".to_string(),
             refresh_token: None,
             expires_in: None,
         };
-        mgr.finish_login("linear", &pending, resp).await.unwrap();
-        let token = crate::auth::load_namespaced_token_at(&mgr.auth_path, "linear").unwrap();
-        assert_eq!(token.access_token, "atok");
-        assert!(token.refresh_token.is_empty());
-        // Long-lived sentinel: no `expires_in` from the provider must NOT
-        // cause an immediate-expiry / refresh-loop / NeedsAuth bounce on
-        // first use.
-        assert_eq!(token.expires_at, u64::MAX);
+        mgr.finish_login("linear", resp, "linear-client")
+            .await
+            .unwrap();
+        let creds = McpCredentialStore::new(mgr.auth_path.clone(), "linear")
+            .load()
+            .await
+            .unwrap()
+            .unwrap();
+        let (has_token, has_refresh, near_expiry) = classify_stored_creds(&creds);
+        assert!(has_token);
+        assert!(!has_refresh);
+        // No `expires_in` from the provider must read as long-lived (never
+        // near expiry), not as immediately-expired → no NeedsAuth bounce or
+        // refresh loop on first use.
+        assert!(!near_expiry);
     }
 
     #[test]
