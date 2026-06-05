@@ -67,12 +67,6 @@ enum McpAction {
         /// form to keep `code` + `state` out of shell history and `ps`.
         #[arg(long, value_name = "URL")]
         paste: Option<String>,
-        /// Use RFC 8628 device-code flow instead of paste-back. Requires
-        /// the server's `oauth:` block to declare a
-        /// `device_authorization_endpoint`. Useful for headless / remote
-        /// hosts where the browser redirect target isn't reachable.
-        #[arg(long, conflicts_with = "paste")]
-        device: bool,
     },
 }
 
@@ -127,17 +121,7 @@ async fn main() {
             McpAction::Status => mcp::cli_show_status().await,
             McpAction::Doctor => mcp::cli_doctor().await,
             McpAction::Connect { name } => mcp::cli_connect(name).await,
-            McpAction::Login {
-                name,
-                paste,
-                device,
-            } => {
-                if device {
-                    mcp::cli_login_device(name).await;
-                } else {
-                    mcp::cli_login(name, paste).await;
-                }
-            }
+            McpAction::Login { name, paste } => mcp::cli_login(name, paste).await,
         },
     }
 }
