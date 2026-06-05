@@ -30,7 +30,7 @@ where rmcp supports it).
 | JSON Schema dialect | ✅ passthrough | draft 2020-12 supported; foreign dialect surfaced advisory-only; no validator (by design). |
 | `_meta` keys | ✅ opaque | Never read or rewritten; passed through untouched. |
 | Icon rendering | N/A | No UI surface. |
-| Authorization (OAuth) | ⚠️ | rmcp `AuthorizationManager`: PRM/discovery + PKCE-S256-check ✅; step-up detect-only ⚠️; `resource` hardcode caveat. |
+| Authorization (OAuth) | ⚠️ | rmcp `AuthorizationManager`: PRM/discovery ✅; PKCE S256 generated ✅ (server S256-advertisement check is warn-only); step-up detect-only ⚠️; `resource` hardcode caveat. |
 | Sampling (`createMessage`) | ✅ text-only | Routed to the agent's LLM provider; env-var approval gate; no `sampling.tools`. |
 | Roots | ✅ | Static set (cwd + config allow-list); no `listChanged`. |
 | Elicitation | ⚠️ form-only | Form-mode via ACP host bridge; URL-mode = known gap. |
@@ -86,7 +86,7 @@ is **not** affected by anything in this section.
 | Area | Status | Notes |
 |---|---|---|
 | PRM / AS-metadata discovery | ✅ | `discover_metadata()` does PRM-first (SEP-985), then RFC 9728 / RFC 8414 / OIDC discovery, with the spec's path-priority order. |
-| PKCE (S256) | ✅ | S256 generated unconditionally; discovery enforces `code_challenge_methods_supported ⊇ S256` (rejects an AS without it). |
+| PKCE (S256) | ✅ generate / ⚠️ check | S256 challenge generated unconditionally on every authorize request. Discovery *inspects* `code_challenge_methods_supported` but only **warns** on a missing/non-S256 advertisement (`validate_server_metadata`, rmcp `transport/auth.rs:860-870`) — it does **not** reject the server. |
 | RFC 8707 `resource` parameter | ⚠️ | Sent on authorize + token requests — but see the hardcode caveat below. |
 | `WWW-Authenticate` step-up | ⚠️ detect-only | Challenge is detected, classified, and surfaced; no automatic reauth-and-retry (see below). |
 | HTTPS / loopback enforcement | ✅ | Custom providers must use `https://` endpoints and a loopback-or-`https` redirect. |
@@ -98,7 +98,11 @@ longer suppress it per-provider. The earlier behaviour, where the built-in
 Anthropic provider deliberately omitted `resource` (its authorization server is
 not the MCP server URL), is no longer expressible. This is accepted because the
 built-in client ID is environment-gated (a theoretical path in practice) and
-flagged for the OAuth-revamp follow-up.
+flagged for the OAuth-revamp follow-up. One further nuance: rmcp emits the raw
+`base_url` string (`self.base_url.to_string()`) on the paste-back path, which is
+**not** trailing-slash-normalized, so the value is not strictly RFC 8707 §2
+canonical there; the hand-rolled device path still canonicalizes the resource
+URI.
 
 **Step-up is detect-only by design.** When a server answers a tool call with a
 401/403 carrying an auth challenge, openab-agent (a) skips the circuit breaker (an
