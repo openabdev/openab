@@ -26,6 +26,10 @@ getrandom = "0.4.2"
 urlencoding = "2.1.3"
 open = "5.3.5"
 url = "2.5.8"
+# Pinned to rmcp's oauth2 (5.0, default-features off) so `StoredCredentials`'
+# `OAuthTokenResponse` types unify; used to splice a rotated refresh_token back
+# into rmcp's wholesale-rebuilt credentials (OAuth 2.1 §10.4) in McpCredentialStore.
+oauth2 = { version = "5", default-features = false }
 rmcp = { version = "1.7", default-features = false, features = [
     "client",
     "transport-child-process",

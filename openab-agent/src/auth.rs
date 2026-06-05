@@ -264,8 +264,33 @@ impl CredentialStore for McpCredentialStore {
         }
     }
 
-    async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
+    async fn save(&self, mut credentials: StoredCredentials) -> Result<(), AuthError> {
+        use oauth2::{RefreshToken, TokenResponse};
         let mut map = read_auth_file(&self.path).unwrap_or_default();
+
+        // OAuth 2.1 §10.4: when a refresh response omits `refresh_token`, the
+        // prior one stays valid. rmcp's `refresh_token()` rebuilds the stored
+        // credentials from the refresh response alone, so a rotating-but-omitting
+        // AS would lose our fallback — splice the prior refresh_token back in.
+        let incoming_has_refresh = credentials
+            .token_response
+            .as_ref()
+            .and_then(|tr| tr.refresh_token())
+            .is_some_and(|rt| !rt.secret().is_empty());
+        if !incoming_has_refresh {
+            if let Some(AuthEntry::Mcp(old)) = map.get(&self.key) {
+                let prior = old
+                    .token_response
+                    .as_ref()
+                    .and_then(|tr| tr.refresh_token())
+                    .map(|rt| rt.secret().to_string())
+                    .filter(|s| !s.is_empty());
+                if let (Some(prior), Some(tr)) = (prior, credentials.token_response.as_mut()) {
+                    tr.set_refresh_token(Some(RefreshToken::new(prior)));
+                }
+            }
+        }
+
         map.insert(self.key.clone(), AuthEntry::Mcp(credentials));
         write_auth_file(&self.path, &map).map_err(|e| AuthError::InternalError(e.to_string()))
     }
@@ -979,6 +1004,70 @@ mod tests {
         let map = read_auth_file(&path).unwrap();
         assert_eq!(token_of(map.get("codex")).expires_at, 1);
         assert!(store.load().await.unwrap().is_none());
+    }
+
+    fn mcp_creds_with_refresh(refresh: Option<&str>) -> StoredCredentials {
+        let mut token = serde_json::json!({ "access_token": "acc", "token_type": "bearer" });
+        if let Some(r) = refresh {
+            token["refresh_token"] = serde_json::Value::String(r.to_string());
+        }
+        serde_json::from_value(serde_json::json!({
+            "client_id": "cid",
+            "token_response": token,
+            "granted_scopes": [],
+            "token_received_at": 1,
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn save_preserves_prior_refresh_token_when_refresh_response_omits_it() {
+        use oauth2::TokenResponse;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let store = McpCredentialStore::new(path, "linear");
+
+        // Initial login carries a refresh_token.
+        store
+            .save(mcp_creds_with_refresh(Some("rt-original")))
+            .await
+            .unwrap();
+        // rmcp's refresh rebuilds creds from a response that omitted refresh_token.
+        store.save(mcp_creds_with_refresh(None)).await.unwrap();
+
+        let loaded = store.load().await.unwrap().expect("creds present");
+        let rt = loaded
+            .token_response
+            .and_then(|tr| tr.refresh_token().map(|r| r.secret().to_string()));
+        assert_eq!(
+            rt.as_deref(),
+            Some("rt-original"),
+            "old refresh_token must survive a refresh response that omits it"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_uses_rotated_refresh_token_when_present() {
+        use oauth2::TokenResponse;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let store = McpCredentialStore::new(path, "linear");
+
+        store
+            .save(mcp_creds_with_refresh(Some("rt-old")))
+            .await
+            .unwrap();
+        // AS rotated and returned a new refresh_token → it replaces the old one.
+        store
+            .save(mcp_creds_with_refresh(Some("rt-new")))
+            .await
+            .unwrap();
+
+        let loaded = store.load().await.unwrap().expect("creds present");
+        let rt = loaded
+            .token_response
+            .and_then(|tr| tr.refresh_token().map(|r| r.secret().to_string()));
+        assert_eq!(rt.as_deref(), Some("rt-new"));
     }
 
     #[tokio::test]
