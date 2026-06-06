@@ -120,8 +120,8 @@ pub struct AcpConnection {
     pub config_options: Vec<ConfigOption>,
     pub last_active: Instant,
     pub session_reset: bool,
-    /// Set to true when the recv loop hard-timeout fires. Signals get_or_create
-    /// to kill this process and start a fresh session rather than reusing it.
+    /// Set when a turn timeout fires. Signals get_or_create to kill this
+    /// process and start a fresh session rather than reusing it.
     pub force_recreate: bool,
     _reader_handle: JoinHandle<()>,
     _stderr_handle: Option<JoinHandle<()>>,

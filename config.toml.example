@@ -129,6 +129,8 @@ session_ttl_hours = 24
 # prompt_hard_timeout_secs = 1800
 # Liveness-check cadence (sec) for the recv loop; see #732. Default: 30.
 # liveness_check_secs = 30
+# Optional no-ACP-event timeout (sec) per prompt. 0 disables it. Default: 0.
+# acp_inactivity_timeout_secs = 120
 
 [markdown]
 tables = "code"  # "code" (default) | "bullets" | "off"

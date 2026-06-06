@@ -173,6 +173,9 @@ Session pool settings for managing concurrent agent sessions.
 |-----|------|---------|-------------|
 | `max_sessions` | usize | `10` | Maximum number of concurrent agent sessions. When full, the oldest idle session is suspended (recoverable); if all sessions are busy, new requests are rejected. |
 | `session_ttl_hours` | u64 | `4` | Session time-to-live in hours. Idle sessions are reclaimed after this period. The example config uses `24`. |
+| `prompt_hard_timeout_secs` | u64 | `1800` | Hard ceiling for a single prompt turn. Checked on the liveness cadence. |
+| `liveness_check_secs` | u64 | `30` | Polling cadence for detecting dead agents and enforcing prompt turn timeouts. Must be greater than `0`. |
+| `acp_inactivity_timeout_secs` | u64 | `0` | Optional no-ACP-event timeout for a prompt turn. `0` disables it and preserves the historical hard-timeout-only behavior. Set to a value such as `120` to recover from silent mid-turn agent hangs sooner. |
 
 ---
 

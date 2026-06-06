@@ -132,10 +132,13 @@ impl SessionPool {
                 return Ok(());
             }
             if conn.force_recreate {
-                // Hard timeout fired: kill this process and start a completely
+                // A turn timeout fired: kill this process and start a completely
                 // fresh session. Don't load the old session_id — it may have
                 // pending background work that caused the timeout in the first place.
-                warn!(thread_id, "force_recreate set after hard timeout, discarding stuck session");
+                warn!(
+                    thread_id,
+                    "force_recreate set after turn timeout, discarding stuck session"
+                );
             } else if saved_session_id.is_none() {
                 saved_session_id = conn.acp_session_id.clone();
             }

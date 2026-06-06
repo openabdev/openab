@@ -534,7 +534,6 @@ impl AdapterRouter {
                     // messages and abandons cleanly on dead agent / hard ceiling
                     // so late responses cannot leak into the next prompt.
                     let mut response_error: Option<String> = None;
-                    let mut last_tool_failure: Option<(String, String)> = None; // (title, output)
                     let prompt_start = tokio::time::Instant::now();
                     let mut last_acp_event = tokio::time::Instant::now();
                     loop {
@@ -565,17 +564,10 @@ impl AdapterRouter {
                                     break;
                                 }
                                 if prompt_start.elapsed() > prompt_hard_timeout {
-                                    let base = format!(
+                                    response_error = Some(format!(
                                         "Agent exceeded hard timeout ({}s)",
                                         prompt_hard_timeout.as_secs(),
-                                    );
-                                    response_error = Some(match &last_tool_failure {
-                                        Some((title, output)) => format!(
-                                            "{base}\nLast failed tool: `{title}`\n```\n{}\n```",
-                                            output.chars().take(400).collect::<String>()
-                                        ),
-                                        None => base,
-                                    });
+                                    ));
                                     conn.force_recreate = true;
                                     conn.abandon_request(request_id).await;
                                     break;
@@ -638,12 +630,11 @@ impl AdapterRouter {
                                         ));
                                     }
                                 }
-                                AcpEvent::ToolDone { id, title, status, output } => {
+                                AcpEvent::ToolDone { id, title, status } => {
                                     reactions.set_thinking().await;
                                     let new_state = if status == "completed" {
                                         ToolState::Completed
                                     } else {
-                                        last_tool_failure = Some((title.clone(), output.unwrap_or_default()));
                                         ToolState::Failed
                                     };
                                     if let Some(slot) = tool_lines.iter_mut().find(|e| e.id == id) {
@@ -701,7 +692,8 @@ impl AdapterRouter {
                     };
 
                     let final_content = markdown::convert_tables(&final_content, table_mode);
-                    tracing::debug!(content_len = final_content.len(), content_preview = &final_content[..final_content.len().min(80)], "final content before chunking");
+                    let content_preview = preview_chars(&final_content, 80);
+                    tracing::debug!(content_len = final_content.len(), content_preview = %content_preview, "final content before chunking");
                     let chunks = format::split_message(&final_content, message_limit);
                     if let Some(msg) = placeholder_msg {
                         if let Some(ref reply_id) = directives.reply_to {
@@ -781,6 +773,10 @@ fn sanitize_title(title: &str) -> String {
         .replace('\r', "")
         .replace('\n', " ; ")
         .replace('`', "'")
+}
+
+fn preview_chars(content: &str, limit: usize) -> String {
+    content.chars().take(limit).collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1020,6 +1016,12 @@ mod tests {
             ..ch.clone()
         };
         assert_eq!(thread_ch.origin_event_id.as_deref(), Some("evt_abc"));
+    }
+
+    #[test]
+    fn preview_chars_does_not_split_utf8() {
+        let input = "1234567890😀中文";
+        assert_eq!(preview_chars(input, 11), "1234567890😀");
     }
 
     fn tool(id: &str, title: &str, state: ToolState) -> ToolEntry {
