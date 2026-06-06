@@ -18,7 +18,7 @@ use serenity::model::application::ButtonStyle;
 use serenity::model::application::{Command, CommandOptionType, ComponentInteractionDataKind, Interaction};
 use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, ReactionType};
 use serenity::model::gateway::Ready;
-use serenity::model::id::{ChannelId, MessageId, UserId};
+use serenity::model::id::{ChannelId, MessageId, RoleId, UserId};
 use serenity::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
@@ -93,7 +93,8 @@ impl ChatAdapter for DiscordAdapter {
         }
         let builder = serenity::builder::CreateMessage::new()
             .content(content)
-            .reference_message((ChannelId::new(ch_id), MessageId::new(msg_id)));
+            .reference_message((ChannelId::new(ch_id), MessageId::new(msg_id)))
+            .allowed_mentions(reply_allowed_mentions());
         match ChannelId::new(ch_id)
             .send_message(&self.http, builder)
             .await
@@ -185,6 +186,14 @@ impl ChatAdapter for DiscordAdapter {
             .await?;
         Ok(())
     }
+}
+
+fn reply_allowed_mentions() -> serenity::builder::CreateAllowedMentions {
+    serenity::builder::CreateAllowedMentions::new()
+        .all_users(true)
+        .all_roles(true)
+        .everyone(true)
+        .replied_user(false)
 }
 
 // --- Handler: serenity EventHandler that delegates to AdapterRouter ---
@@ -447,13 +456,14 @@ impl EventHandler for Handler {
         let in_allowed_channel =
             self.allow_all_channels || self.allowed_channels.contains(&channel_id);
 
-        let is_mentioned = msg.mentions_user_id(bot_id)
-            || msg.content.contains(&format!("<@{}>", bot_id))
-            || (!self.allowed_role_ids.is_empty()
-                && msg
-                    .mention_roles
-                    .iter()
-                    .any(|r| self.allowed_role_ids.contains(&r.get())));
+        let is_mentioned = admission_mentions_bot(
+            &msg.content,
+            msg.mentions_user_id(bot_id),
+            msg.author.bot,
+            bot_id,
+            &msg.mention_roles,
+            &self.allowed_role_ids,
+        );
 
         // Bot message gating (from upstream #321)
         if msg.author.bot {
@@ -2190,6 +2200,44 @@ fn is_denied_user(
     !is_bot && !allow_all_users && !allowed_users.contains(&user_id)
 }
 
+fn content_mentions_user(content: &str, bot_id: UserId) -> bool {
+    content.contains(&format!("<@{}>", bot_id)) || content.contains(&format!("<@!{}>", bot_id))
+}
+
+fn mentions_allowed_role(mention_roles: &[RoleId], allowed_role_ids: &HashSet<u64>) -> bool {
+    !allowed_role_ids.is_empty()
+        && mention_roles
+            .iter()
+            .any(|r| allowed_role_ids.contains(&r.get()))
+}
+
+/// Returns `true` if a Discord message should count as mentioning this bot for
+/// admission-gate purposes.
+///
+/// Discord includes the replied-to user in the payload `mentions` array for
+/// replies unless the sender disables `allowed_mentions.replied_user`. For bot
+/// authors, treat only content-level `<@bot>` / `<@!bot>` mentions and allowed
+/// role mentions as triggers so reply metadata cannot wake another bot and
+/// start a ping-pong loop. Human authors keep the existing broader behavior so
+/// replying to the bot still works naturally.
+fn admission_mentions_bot(
+    content: &str,
+    payload_mentions_bot: bool,
+    author_is_bot: bool,
+    bot_id: UserId,
+    mention_roles: &[RoleId],
+    allowed_role_ids: &HashSet<u64>,
+) -> bool {
+    let explicit_content_mention = content_mentions_user(content, bot_id);
+    let allowed_role_mention = mentions_allowed_role(mention_roles, allowed_role_ids);
+
+    if author_is_bot {
+        explicit_content_mention || allowed_role_mention
+    } else {
+        payload_mentions_bot || explicit_content_mention || allowed_role_mention
+    }
+}
+
 /// Returns `true` if a bot message should bypass the `allow_bot_messages` mode check.
 /// A trusted bot that @mentions this bot is treated the same as a human @mention —
 /// it can pull the bot into a thread regardless of the `allow_bot_messages` setting.
@@ -2270,6 +2318,19 @@ mod tests {
     use super::*;
     use crate::bot_turns::{TurnResult, HARD_BOT_TURN_LIMIT, BOT_TURN_LIMIT_WARNING_PREFIX};
 
+    #[test]
+    fn reply_allowed_mentions_keeps_content_mentions_but_disables_reply_ping() {
+        let value = serde_json::to_value(reply_allowed_mentions()).unwrap();
+        let parse = value
+            .get("parse")
+            .and_then(|v| v.as_array())
+            .expect("allowed mentions should serialize parse modes");
+        assert!(parse.iter().any(|v| v == "users"));
+        assert!(parse.iter().any(|v| v == "roles"));
+        assert!(parse.iter().any(|v| v == "everyone"));
+        assert_eq!(value.get("replied_user").and_then(|v| v.as_bool()), Some(false));
+    }
+
     // --- resolve_mentions tests ---
 
     /// Bot's own <@UID> mention is stripped from the prompt.
@@ -2328,6 +2389,74 @@ mod tests {
         let roles: HashSet<u64> = [999].into_iter().collect();
         let result = resolve_mentions("<@&999> check <@&888>", bot_id, &roles);
         assert_eq!(result, "check @(role)");
+    }
+
+    // --- admission_mentions_bot tests ---
+
+    #[test]
+    fn bot_payload_only_reply_mention_does_not_count_as_admission_mention() {
+        let bot_id = UserId::new(111);
+        assert!(!admission_mentions_bot(
+            "ack",
+            true, // Discord payload mentions this bot via reply metadata
+            true, // author is another bot
+            bot_id,
+            &[],
+            &HashSet::new(),
+        ));
+    }
+
+    #[test]
+    fn bot_content_mention_counts_as_admission_mention() {
+        let bot_id = UserId::new(111);
+        assert!(admission_mentions_bot(
+            "please review <@111>",
+            false,
+            true,
+            bot_id,
+            &[],
+            &HashSet::new(),
+        ));
+    }
+
+    #[test]
+    fn bot_legacy_content_mention_counts_as_admission_mention() {
+        let bot_id = UserId::new(111);
+        assert!(admission_mentions_bot(
+            "please review <@!111>",
+            false,
+            true,
+            bot_id,
+            &[],
+            &HashSet::new(),
+        ));
+    }
+
+    #[test]
+    fn human_payload_only_reply_mention_still_counts_as_admission_mention() {
+        let bot_id = UserId::new(111);
+        assert!(admission_mentions_bot(
+            "following up",
+            true, // humans can still naturally reply to the bot
+            false,
+            bot_id,
+            &[],
+            &HashSet::new(),
+        ));
+    }
+
+    #[test]
+    fn bot_allowed_role_mention_counts_as_admission_mention() {
+        let bot_id = UserId::new(111);
+        let allowed_roles = HashSet::from([999]);
+        assert!(admission_mentions_bot(
+            "team handoff",
+            false,
+            true,
+            bot_id,
+            &[RoleId::new(999)],
+            &allowed_roles,
+        ));
     }
 
     #[test]
@@ -3080,6 +3209,30 @@ mod tests {
     fn bot_admission_mentions_mode_trusted_mention() {
         let trusted = HashSet::from([42]);
         assert!(should_admit_bot_message(AllowBots::Mentions, true, &trusted, 42));
+    }
+
+    /// GIVEN: allow_bot_messages=Mentions and a trusted bot replies to this bot
+    /// without a content-level mention
+    /// THEN:  rejected; Discord reply metadata must not count as a bot trigger.
+    #[test]
+    fn bot_admission_mentions_mode_ignores_reply_induced_mention() {
+        let trusted = HashSet::from([42]);
+        let bot_id = UserId::new(111);
+        let is_mentioned = admission_mentions_bot(
+            "ack",
+            true, // payload mention came from Discord reply metadata
+            true, // author is another bot
+            bot_id,
+            &[],
+            &HashSet::new(),
+        );
+        assert!(!is_mentioned);
+        assert!(!should_admit_bot_message(
+            AllowBots::Mentions,
+            is_mentioned,
+            &trusted,
+            42
+        ));
     }
 
     /// GIVEN: allow_bot_messages=All, untrusted bot (not in trusted_bot_ids)
