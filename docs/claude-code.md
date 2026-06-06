@@ -28,9 +28,8 @@ helm install openab openab/openab \
 
 ```toml
 [agent]
-command = "claude-agent-acp"
-args = []
-working_dir = "/home/node"
+# command defaults from OPENAB_AGENT_COMMAND="claude"
+# Only override if you need non-default behavior
 ```
 
 ## Authentication
@@ -38,7 +37,7 @@ working_dir = "/home/node"
 Sign in interactively using the OAuth device flow. Credentials are stored on disk (persisted via PVC across pod restarts):
 
 ```bash
-kubectl exec -it deployment/openab-claude -- claude auth login
+kubectl exec -it deployment/openab-claude -- sh -c "$OPENAB_AGENT_AUTH_COMMAND"
 ```
 
 After authenticating, restart the pod so the bot process loads the new credentials:

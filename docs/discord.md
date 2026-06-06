@@ -410,6 +410,6 @@ The bot token is wrong or expired. Reset it in the Developer Portal and redeploy
 The agent CLI isn't authenticated. For kiro-cli:
 
 ```bash
-kubectl exec -it deployment/openab-kiro -- kiro-cli login --use-device-flow
+kubectl exec -it deployment/openab-kiro -- sh -c "$OPENAB_AGENT_AUTH_COMMAND"
 kubectl rollout restart deployment/openab-kiro
 ```

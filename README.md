@@ -194,10 +194,8 @@ allowed_channels = ["C0123456789"]   # channel ID allowlist (empty = allow all)
 # allowed_users = ["U0123456789"]    # user ID allowlist (empty = allow all)
 
 [agent]
-command = "kiro-cli"                  # CLI command
-args = ["acp", "--trust-all-tools"]   # ACP mode args
-working_dir = "/tmp"                  # agent working directory
-env = {}                              # extra env vars passed to the agent
+# command, args, and working_dir default from OPENAB_AGENT_COMMAND and $HOME
+# env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
 
 [pool]
 max_sessions = 10                     # max concurrent sessions

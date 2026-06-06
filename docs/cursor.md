@@ -22,9 +22,8 @@ OpenAB spawns `cursor-agent acp` as a child process and communicates via stdio J
 
 ```toml
 [agent]
-command = "cursor-agent"
-args = ["acp"]
-working_dir = "/home/agent"
+# command and args default from OPENAB_AGENT_COMMAND="cursor-agent acp"
+# Only override if you need non-default behavior
 # Auth via: kubectl exec -it <pod> -- cursor-agent login
 ```
 
@@ -85,7 +84,7 @@ To specify a model, pass `--model` as an arg:
 
 ```toml
 [agent]
-command = "cursor-agent"
+# Override args (command defaults from OPENAB_AGENT_COMMAND="cursor-agent acp")
 args = ["acp", "--model", "auto"]
 ```
 
@@ -99,7 +98,7 @@ Cursor Agent CLI supports MCP servers configured via `.cursor/mcp.json` in the a
 
 ```toml
 [agent]
-command = "cursor-agent"
+# Override args (command defaults from OPENAB_AGENT_COMMAND="cursor-agent acp")
 args = ["acp", "--model", "auto", "--workspace", "/home/agent"]
 ```
 

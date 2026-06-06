@@ -31,8 +31,8 @@ helm install openab openab/openab \
 
 ```toml
 [agent]
-command = "hermes-acp"
-working_dir = "/home/agent"
+# command defaults from OPENAB_AGENT_COMMAND="hermes-acp"
+# working_dir = "/home/agent"  # optional — defaults to $HOME
 ```
 
 ## Authentication
@@ -138,8 +138,8 @@ Any provider can also be configured with an API key via environment variables:
 
 ```toml
 [agent]
-command = "hermes-acp"
-working_dir = "/home/agent"
+# command defaults from OPENAB_AGENT_COMMAND="hermes-acp"
+# working_dir = "/home/agent"  # optional — defaults to $HOME
 env = { XAI_API_KEY = "${XAI_API_KEY}" }
 ```
 

@@ -45,6 +45,9 @@ spec:
         - name: openab
           image: {{ include "openab.agentImage" $d | quote }}
           imagePullPolicy: {{ include "openab.agentImagePullPolicy" $d }}
+          {{- if $cfg.configUrl }}
+          args: ["openab", "run", "-c", {{ $cfg.configUrl | quote }}]
+          {{- end }}
           {{- with $.Values.containerSecurityContext }}
           securityContext:
             {{- toYaml . | nindent 12 }}
@@ -108,14 +111,16 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           volumeMounts:
+            {{- if not $cfg.configUrl }}
             - name: config
               mountPath: /etc/openab
               readOnly: true
+            {{- end }}
             {{- if $pvcEnabled }}
             - name: data
               mountPath: {{ $cfg.workingDir | default "/home/agent" }}
             {{- end }}
-            {{- if $cfg.agentsMd }}
+            {{- if and $cfg.agentsMd (not $cfg.configUrl) }}
             - name: config
               mountPath: {{ $cfg.workingDir | default "/home/agent" }}/AGENTS.md
               subPath: AGENTS.md
@@ -147,9 +152,11 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       volumes:
+        {{- if not $cfg.configUrl }}
         - name: config
           configMap:
             name: {{ include "openab.agentFullname" $d }}
+        {{- end }}
         {{- if $pvcEnabled }}
         - name: data
           persistentVolumeClaim:

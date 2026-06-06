@@ -612,6 +612,14 @@ async fn dispatch_batch(
 
     // Anchor reactions on the last message in the batch (before consuming).
     let trigger_msg = batch.last().unwrap().trigger_msg.clone();
+    let dispatch_channel = ChannelRef {
+        // Reply correlation is event-scoped, but the dispatcher consumer is
+        // thread-scoped. Rebuild the per-dispatch channel from the stable
+        // thread route plus the freshest event ID so gateway replies (e.g.
+        // LINE reply-token lookup) target the current inbound event.
+        origin_event_id: trigger_msg.channel.origin_event_id.clone(),
+        ..thread_channel.clone()
+    };
 
     // Pack all arrival events into one Vec<ContentBlock> (§3.3).
     // Uses into_iter() to avoid deep-copying extra_blocks (may contain base64 image data).
@@ -627,7 +635,7 @@ async fn dispatch_batch(
     if let Err(e) = target.ensure_session(&session_key).await {
         let user_msg = format_user_error(&e.to_string());
         let _ = adapter
-            .send_message(thread_channel, &format!("⚠️ {user_msg}"))
+            .send_message(&dispatch_channel, &format!("⚠️ {user_msg}"))
             .await;
         error!("pool error in dispatch_batch: {e}");
         return;
@@ -648,7 +656,7 @@ async fn dispatch_batch(
             adapter,
             &session_key,
             content_blocks,
-            thread_channel,
+            &dispatch_channel,
             reactions.clone(),
             other_bot_present,
         )
@@ -674,7 +682,7 @@ async fn dispatch_batch(
 
     if let Err(ref e) = result {
         let _ = adapter
-            .send_message(thread_channel, &format!("⚠️ {e}"))
+            .send_message(&dispatch_channel, &format!("⚠️ {e}"))
             .await;
     }
 
@@ -1230,6 +1238,7 @@ mod tests {
     struct RecordedDispatch {
         block_count: usize,
         other_bot_present: bool,
+        dispatch_channel: ChannelRef,
     }
 
     /// Mock `DispatchTarget` — records calls; never touches a real session pool.
@@ -1275,13 +1284,14 @@ mod tests {
             _adapter: &Arc<dyn ChatAdapter>,
             _session_key: &str,
             content_blocks: Vec<ContentBlock>,
-            _thread_channel: &ChannelRef,
+            thread_channel: &ChannelRef,
             _reactions: Arc<StatusReactionController>,
             other_bot_present: bool,
         ) -> Result<()> {
             self.calls.lock().unwrap().push(RecordedDispatch {
                 block_count: content_blocks.len(),
                 other_bot_present,
+                dispatch_channel: thread_channel.clone(),
             });
             if let Some(msg) = self.stream_err.lock().unwrap().take() {
                 return Err(anyhow::anyhow!(msg));
@@ -1423,6 +1433,74 @@ mod tests {
         // Each batch holds one arrival → delimiter + prompt = 2 blocks.
         assert_eq!(calls[0].block_count, 2);
         assert_eq!(calls[1].block_count, 2);
+    }
+
+    #[tokio::test]
+    async fn consumer_dispatch_uses_last_event_origin_event_id_for_merged_batch() {
+        let mut first = make_msg("a", 80);
+        first.trigger_msg.channel.origin_event_id = Some("evt-first".into());
+        let mut second = make_msg("b", 80);
+        second.trigger_msg.channel.origin_event_id = Some("evt-second".into());
+
+        let calls = run_consumer_with_messages(vec![first, second], 10, 200).await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].dispatch_channel.origin_event_id.as_deref(),
+            Some("evt-second")
+        );
+    }
+
+    #[tokio::test]
+    async fn consumer_dispatch_preserves_thread_route_while_refreshing_origin_event_id() {
+        let mock = Arc::new(MockDispatchTarget::new());
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(1);
+
+        let mut msg = make_msg("hi", 10);
+        msg.trigger_msg.channel = ChannelRef {
+            platform: "mock".into(),
+            channel_id: "parent-channel".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: Some("evt-fresh".into()),
+        };
+        tx.send(msg).await.unwrap();
+        drop(tx);
+
+        consumer_loop(
+            "mock:topic-42".into(),
+            ChannelRef {
+                platform: "mock".into(),
+                channel_id: "topic-42".into(),
+                thread_id: Some("topic-42".into()),
+                parent_id: Some("parent-channel".into()),
+                origin_event_id: Some("evt-stale".into()),
+            },
+            rx,
+            target,
+            adapter,
+            10,
+            24_000,
+            Duration::from_secs(60),
+        )
+        .await;
+
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].dispatch_channel.channel_id, "topic-42");
+        assert_eq!(
+            calls[0].dispatch_channel.thread_id.as_deref(),
+            Some("topic-42")
+        );
+        assert_eq!(
+            calls[0].dispatch_channel.parent_id.as_deref(),
+            Some("parent-channel")
+        );
+        assert_eq!(
+            calls[0].dispatch_channel.origin_event_id.as_deref(),
+            Some("evt-fresh")
+        );
     }
 
     #[tokio::test]

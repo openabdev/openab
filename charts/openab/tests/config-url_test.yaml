@@ -1,0 +1,55 @@
+suite: configUrl remote config support
+templates:
+  - templates/configmap.yaml
+  - templates/deployment.yaml
+tests:
+  - it: skips ConfigMap when configUrl is set
+    template: templates/configmap.yaml
+    set:
+      agents.kiro.configUrl: "https://example.com/config.toml"
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders ConfigMap when configUrl is not set
+    template: templates/configmap.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+
+  - it: adds run -c args when configUrl is set
+    template: templates/deployment.yaml
+    set:
+      agents.kiro.configUrl: "https://example.com/config.toml"
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].args
+          value: ["openab", "run", "-c", "https://example.com/config.toml"]
+
+  - it: does not set args when configUrl is empty
+    template: templates/deployment.yaml
+    asserts:
+      - isNull:
+          path: spec.template.spec.containers[0].args
+
+  - it: omits config volume when configUrl is set
+    template: templates/deployment.yaml
+    set:
+      agents.kiro.configUrl: "https://example.com/config.toml"
+    asserts:
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            name: config
+          any: true
+
+  - it: omits config volumeMount when configUrl is set
+    template: templates/deployment.yaml
+    set:
+      agents.kiro.configUrl: "https://example.com/config.toml"
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: config
+          any: true
