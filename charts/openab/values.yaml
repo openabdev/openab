@@ -375,6 +375,12 @@ agents:
       line:
         channelSecret: ""      # → LINE_CHANNEL_SECRET (webhook signature validation)
         channelAccessToken: "" # → LINE_CHANNEL_ACCESS_TOKEN (reply/push API)
+        # Optional: gate group/room messages on a substring keyword.
+        # When set (e.g. "@MyBot"), only forward LINE group/room messages containing
+        # this substring (case-sensitive). 1:1 messages are unaffected.
+        # Empty/unset = forward all group messages (default).
+        # → LINE_GROUP_MENTION_KEYWORD
+        groupMentionKeyword: ""
       # MS Teams adapter config (gateway-side env vars)
       # See docs/msteams-enterprise.md for full setup guide
       teams:

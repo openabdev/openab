@@ -83,6 +83,10 @@ spec:
                   name: {{ include "openab.agentFullname" $d }}
                   key: line-channel-access-token
             {{- end }}
+            {{- if (($cfg.gateway).line).groupMentionKeyword }}
+            - name: LINE_GROUP_MENTION_KEYWORD
+              value: {{ (($cfg.gateway).line).groupMentionKeyword | quote }}
+            {{- end }}
             {{- end }}
             {{- if $hasTeams }}
             - name: TEAMS_APP_ID

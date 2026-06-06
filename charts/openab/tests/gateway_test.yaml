@@ -227,6 +227,32 @@ tests:
                 key: line-channel-access-token
         documentIndex: 0
 
+  - it: injects LINE_GROUP_MENTION_KEYWORD when set
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+      agents.kiro.gateway.line.channelSecret: "line-secret"
+      agents.kiro.gateway.line.groupMentionKeyword: "@MyBot"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: LINE_GROUP_MENTION_KEYWORD
+            value: "@MyBot"
+        documentIndex: 0
+
+  - it: omits LINE_GROUP_MENTION_KEYWORD when not set
+    set:
+      agents.kiro.gateway.enabled: true
+      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
+      agents.kiro.gateway.line.channelSecret: "line-secret"
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: LINE_GROUP_MENTION_KEYWORD
+        documentIndex: 0
+
   # --- Google Chat deployment env var rendering ---
 
   - it: enables Google Chat adapter when only audience is set (receive-only mode)

@@ -157,7 +157,7 @@ pub async fn webhook(
             info!(
                 channel = %channel_id,
                 keyword = ?state.line_group_mention_keyword.as_deref(),
-                "line group message dropped (no mention keyword)"
+                "line group message dropped (mention keyword not found in text)"
             );
             continue;
         }

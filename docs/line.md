@@ -98,7 +98,7 @@ In the LINE Developers Console → **Messaging API** tab → scan the QR code wi
 |---|---|---|
 | `LINE_CHANNEL_SECRET` | Yes | Channel secret for webhook signature validation |
 | `LINE_CHANNEL_ACCESS_TOKEN` | Yes | Channel access token for Push Message API |
-| `LINE_GROUP_MENTION_KEYWORD` | No | If set, only forward group/room messages containing this substring (e.g. `@Go醬`). 1:1 messages are unaffected. Empty/unset = forward all (default). |
+| `LINE_GROUP_MENTION_KEYWORD` | No | If set, only forward group/room messages containing this substring (case-sensitive, e.g. `@Go醬`). 1:1 messages are unaffected. Empty/unset = forward all (default). |
 
 ## Troubleshooting
 
