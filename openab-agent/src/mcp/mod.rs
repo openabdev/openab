@@ -335,13 +335,39 @@ fn print_json<T: serde::Serialize>(status: &str, name: &str, value: &T) {
 /// The paste-back login is now single-invocation (PKCE/CSRF live in rmcp's
 /// in-memory `StateStore`), so there are no on-disk pending entries to surface.
 pub async fn cli_show_status() {
-    let manager = McpRuntimeManager::from_config(load_config_or_exit());
+    let cfg = load_config_or_exit();
+    let manager = McpRuntimeManager::from_config(cfg.clone());
     if manager.is_empty().await {
         println!("No MCP servers configured.");
         return;
     }
+    let auth = auth_path();
     let statuses = manager.statuses().await;
     for (name, status) in &statuses {
+        // A fresh CLI process never dials, so `status` is always `Disconnected`
+        // (idle). For HTTP servers with an `oauth:` block, peek the same rmcp
+        // credential store `connect()`/`doctor` read so the line reflects
+        // whether a login is still owed rather than a uniform `○`.
+        if let Some(ServerConfig::Http { oauth: Some(_), .. }) = cfg.servers.get(name) {
+            use rmcp::transport::CredentialStore;
+            let store = McpCredentialStore::new(auth.clone(), name.clone());
+            let cached = match store.load().await {
+                Ok(Some(creds)) => Some(runtime::classify_stored_creds(&creds)),
+                _ => None,
+            };
+            match cached {
+                Some((true, _has_refresh, near_expiry)) => {
+                    let note = if near_expiry {
+                        "authed, near expiry"
+                    } else {
+                        "authed, idle"
+                    };
+                    println!("○ {name} ({note})");
+                }
+                _ => println!("◌ {name} (run `mcp login {name}`)"),
+            }
+            continue;
+        }
         let mut line = format!("{} {name}", status.icon());
         if matches!(status, runtime::ServerStatus::NeedsAuth) {
             line.push_str(&format!(" (run `mcp login {name}`)"));
