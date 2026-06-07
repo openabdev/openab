@@ -426,7 +426,9 @@ async fn download_telegram_media(
     })
 }
 
-/// Download text document from Telegram → store to filesystem.
+/// Download document from Telegram → store to filesystem.
+/// Supports both text and binary files. Text files get attachment_type "text_file",
+/// binary files get "document".
 async fn download_telegram_document(
     client: &reqwest::Client,
     bot_token: &str,
@@ -434,11 +436,6 @@ async fn download_telegram_document(
     file_name: &str,
     mime_type: &str,
 ) -> Option<Attachment> {
-    if !crate::media::is_text_extension(file_name) {
-        tracing::debug!(file_name, "skipping non-text file attachment");
-        return None;
-    }
-
     let get_file_url = format!("{TELEGRAM_API_BASE}/bot{}/getFile", bot_token);
     let resp = client.get(&get_file_url).query(&[("file_id", file_id)]).send().await.ok()?;
     let body: serde_json::Value = resp.json().await.ok()?;
@@ -465,17 +462,19 @@ async fn download_telegram_document(
         return None;
     }
 
-    // Validate UTF-8 — reject binary files
-    if String::from_utf8(bytes.to_vec()).is_err() {
-        warn!(file_id, file_name, "Telegram document is not valid UTF-8, skipping");
-        return None;
-    }
-
     let path = store::store_media(&bytes).await?;
-    info!(file_id, file_name, size = bytes.len(), "Telegram document stored");
+
+    // Determine attachment type: text_file if it's a recognized text format and valid UTF-8
+    let att_type = if crate::media::is_text_extension(file_name) && String::from_utf8(bytes.to_vec()).is_ok() {
+        "text_file"
+    } else {
+        "document"
+    };
+
+    info!(file_id, file_name, size = bytes.len(), att_type, "Telegram document stored");
 
     Some(Attachment {
-        attachment_type: "text_file".into(),
+        attachment_type: att_type.into(),
         filename: file_name.to_string(),
         mime_type: mime_type.to_string(),
         data: String::new(),

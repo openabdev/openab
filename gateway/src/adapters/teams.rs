@@ -656,6 +656,7 @@ mod tests {
             telegram_secret_token: None,
             line_channel_secret: None,
             line_access_token: None,
+            line_webhook_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
             teams: Some(TeamsAdapter::new(make_config(vec![]))),
             teams_service_urls: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             feishu: None,

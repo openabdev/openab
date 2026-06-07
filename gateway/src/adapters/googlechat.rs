@@ -25,22 +25,11 @@ const TEXT_FILE_COUNT_CAP: usize = 5;
 /// Cap on aggregate text file bytes per message (matches Discord/Slack 1 MB).
 const TEXT_TOTAL_CAP: u64 = 1024 * 1024;
 
-// --- Google Chat types ---
-//
-// Google Chat delivers webhooks in two shapes depending on the App's
-// Connection settings in the Cloud Console:
-//   - HTTP endpoint URL mode: top-level fields (message, user, space, ...)
-//   - Pub/Sub mode:           wrapped under `chat.messagePayload`
-// Both are supported via the optional fields below; the handler prefers
-// the wrapped form and falls back to top-level when `chat` is absent.
+// --- Google Chat types (v2 envelope format) ---
 
 #[derive(Debug, Deserialize)]
 pub struct GoogleChatEnvelope {
     pub chat: Option<ChatPayload>,
-    // HTTP endpoint URL top-level fields (used when `chat` is None)
-    pub message: Option<GoogleChatMessage>,
-    pub user: Option<GoogleChatUser>,
-    pub space: Option<GoogleChatSpace>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,20 +132,20 @@ pub struct GoogleChatSpace {
 
 const GOOGLE_CHAT_ISSUER: &str = "https://accounts.google.com";
 const GOOGLE_CHAT_JWKS_URL: &str = "https://www.googleapis.com/oauth2/v3/certs";
-const GOOGLE_CHAT_SIGNER_EMAIL: &str = "chat@system.gserviceaccount.com";
+const GOOGLE_CHAT_EMAIL_SUFFIX: &str = "@gcp-sa-gsuiteaddons.iam.gserviceaccount.com";
 const JWKS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// Verify the JWT's `email` claim belongs to Google Chat.
-/// HTTP endpoint URL webhooks are signed by `chat@system.gserviceaccount.com`.
+/// Verify the JWT's `email` claim belongs to a Google Chat service account.
+/// Google Chat webhooks use `service-{PROJECT_NUMBER}@gcp-sa-gsuiteaddons.iam.gserviceaccount.com`.
 /// Without this check, any Google-issued ID token would be accepted.
 fn verify_email_claim(claims: &serde_json::Value) -> Result<(), String> {
     let email = claims
         .get("email")
         .and_then(|v| v.as_str())
         .ok_or("missing email claim")?;
-    if email != GOOGLE_CHAT_SIGNER_EMAIL {
+    if !email.ends_with(GOOGLE_CHAT_EMAIL_SUFFIX) {
         return Err(format!(
-            "email claim mismatch: expected {GOOGLE_CHAT_SIGNER_EMAIL}, got {email}"
+            "email claim mismatch: expected *{GOOGLE_CHAT_EMAIL_SUFFIX}, got {email}"
         ));
     }
     Ok(())
@@ -495,20 +484,13 @@ pub async fn webhook(
         }
     };
 
-    // Try the Pub/Sub `chat`-wrapped shape first, then fall back to the
-    // HTTP endpoint URL top-level shape.
-    let (msg_opt, top_user, top_space) = if let Some(chat) = envelope.chat {
-        let user = chat.user;
-        let (msg, space) = match chat.message_payload {
-            Some(p) => (p.message, p.space),
-            None => (None, None),
-        };
-        (msg, user, space)
-    } else {
-        (envelope.message, envelope.user, envelope.space)
+    let Some(chat) = envelope.chat else {
+        return empty_json_response();
     };
-
-    let Some(ref msg) = msg_opt else {
+    let Some(payload) = chat.message_payload else {
+        return empty_json_response();
+    };
+    let Some(ref msg) = payload.message else {
         return empty_json_response();
     };
 
@@ -525,8 +507,8 @@ pub async fn webhook(
         return empty_json_response();
     }
 
-    let sender = msg.sender.as_ref().or(top_user.as_ref());
-    let space = msg.space.as_ref().or(top_space.as_ref());
+    let sender = msg.sender.as_ref().or(chat.user.as_ref());
+    let space = msg.space.as_ref().or(payload.space.as_ref());
 
     let is_bot = sender.map(|s| s.user_type == "BOT").unwrap_or(false);
     if is_bot {
@@ -1297,11 +1279,8 @@ pub async fn download_googlechat_file(
     remaining_budget: u64,
 ) -> Option<crate::schema::Attachment> {
     let ext = content_name.rsplit('.').next().unwrap_or("").to_lowercase();
-    if !TEXT_EXTS.contains(&ext.as_str()) {
-        tracing::debug!(content_name, "skipping non-text googlechat file attachment");
-        return None;
-    }
-    let max_size = FILE_MAX_DOWNLOAD.min(remaining_budget);
+    let is_text = TEXT_EXTS.contains(&ext.as_str());
+    let max_size = if is_text { FILE_MAX_DOWNLOAD.min(remaining_budget) } else { remaining_budget.min(20 * 1024 * 1024) };
     let url = media_url(api_base, resource_name);
     let resp = match client.get(&url).bearer_auth(token).timeout(MEDIA_REQUEST_TIMEOUT).send().await {
         Ok(r) => r,
@@ -1328,10 +1307,18 @@ pub async fn download_googlechat_file(
         return None;
     }
     let path = crate::store::store_media(&bytes).await?;
+
+    let att_type = if is_text && String::from_utf8(bytes.to_vec()).is_ok() {
+        "text_file"
+    } else {
+        "document"
+    };
+    let mime = if att_type == "text_file" { "text/plain" } else { "application/octet-stream" };
+
     Some(crate::schema::Attachment {
-        attachment_type: "text_file".into(),
+        attachment_type: att_type.into(),
         filename: content_name.to_string(),
-        mime_type: "text/plain".into(),
+        mime_type: mime.into(),
         data: String::new(),
         size: bytes.len() as u64,
         path: Some(path),
@@ -1659,8 +1646,8 @@ mod tests {
     }
 
     #[test]
-    fn email_claim_accepts_chat_system_account() {
-        let claims = serde_json::json!({"email": "chat@system.gserviceaccount.com"});
+    fn email_claim_accepts_gsuite_addons_account() {
+        let claims = serde_json::json!({"email": "service-123456@gcp-sa-gsuiteaddons.iam.gserviceaccount.com"});
         assert!(verify_email_claim(&claims).is_ok());
     }
 
@@ -2438,33 +2425,5 @@ mod tests {
         )
         .await;
         assert!(result.is_none(), "oversized image must be rejected");
-    }
-
-    #[test]
-    fn parses_http_endpoint_url_top_level_envelope() {
-        let envelope: GoogleChatEnvelope = serde_json::from_value(serde_json::json!({
-            "message": {
-                "name": "spaces/AAAA/messages/BBBB",
-                "text": "hello",
-                "attachment": []
-            },
-            "user": {
-                "name": "users/123",
-                "displayName": "Test User",
-                "type": "HUMAN"
-            },
-            "space": {
-                "name": "spaces/AAAA",
-                "type": "DM"
-            }
-        }))
-        .unwrap();
-        assert!(envelope.chat.is_none());
-        assert!(envelope.message.is_some());
-        assert_eq!(envelope.message.unwrap().name, "spaces/AAAA/messages/BBBB");
-        assert!(envelope.user.is_some());
-        assert_eq!(envelope.user.unwrap().name, "users/123");
-        assert!(envelope.space.is_some());
-        assert_eq!(envelope.space.unwrap().name, "spaces/AAAA");
     }
 }
