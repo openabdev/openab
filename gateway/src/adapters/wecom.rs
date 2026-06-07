@@ -1261,8 +1261,17 @@ async fn download_wecom_file(
     }
 
     if !is_text_file(filename) {
-        info!(filename, "wecom: skipping non-text file");
-        return None;
+        // Binary file — store as document
+        let path = crate::store::store_media(&bytes).await?;
+        info!(filename, size = bytes.len(), "wecom: binary file stored as document");
+        return Some(crate::schema::Attachment {
+            attachment_type: "document".into(),
+            filename: filename.to_string(),
+            mime_type: "application/octet-stream".into(),
+            data: String::new(),
+            size: bytes.len() as u64,
+            path: Some(path),
+        });
     }
 
     let text_content = match String::from_utf8(bytes.to_vec()) {

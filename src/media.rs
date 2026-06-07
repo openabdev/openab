@@ -534,6 +534,226 @@ pub async fn download_and_read_text_file(
     ))
 }
 
+/// Default attachment storage directory.
+const DEFAULT_ATTACHMENTS_DIR: &str = "/tmp/openab-attachments";
+
+/// Default max file size for download-to-disk (200 MB).
+const DISK_MAX_SIZE: u64 = 200 * 1024 * 1024;
+
+/// Default TTL for stored attachments (1 hour).
+pub const DEFAULT_ATTACHMENTS_TTL_SECS: u64 = 3600;
+
+/// Sanitize a filename: strip path separators, null bytes, control chars, `..`.
+fn sanitize_filename(name: &str) -> String {
+    let name = name
+        .replace(['/', '\\', '\0'], "_")
+        .replace("..", "_");
+    let name = name.trim().trim_matches('.');
+    if name.is_empty() {
+        "unnamed_file".to_string()
+    } else {
+        name.chars().take(200).collect()
+    }
+}
+
+/// Format bytes as human-readable size string.
+fn format_size_human(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// Get the attachments directory (creates if needed).
+pub fn attachments_dir() -> std::path::PathBuf {
+    let dir = std::env::var("OPENAB_ATTACHMENTS_DIR")
+        .unwrap_or_else(|_| DEFAULT_ATTACHMENTS_DIR.to_string());
+    std::path::PathBuf::from(dir)
+}
+
+/// Download a file to local disk and return a metadata ContentBlock with the path.
+///
+/// Used for inbound attachments that aren't image/audio/text — PDFs, office docs,
+/// archives, video, etc. The agent can then use file-reading tools to access the file.
+///
+/// `bucket_id` is used as a subdirectory (typically message ID) to namespace files.
+pub async fn download_to_disk(
+    url: &str,
+    filename: &str,
+    mime_type: &str,
+    size: u64,
+    bucket_id: &str,
+    auth_token: Option<&str>,
+) -> Option<ContentBlock> {
+    if url.is_empty() {
+        return None;
+    }
+
+    if size > DISK_MAX_SIZE {
+        warn!(filename, size, "file exceeds 200MB limit, skipping download_to_disk");
+        return None;
+    }
+
+    let mut req = HTTP_CLIENT.get(url);
+    if let Some(token) = auth_token {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(url, error = %e, "download_to_disk: request failed");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        warn!(url, status = %resp.status(), "download_to_disk: HTTP error");
+        return None;
+    }
+
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(url, error = %e, "download_to_disk: body read failed");
+            return None;
+        }
+    };
+
+    if bytes.len() as u64 > DISK_MAX_SIZE {
+        warn!(filename, size = bytes.len(), "download_to_disk: downloaded file exceeds limit");
+        return None;
+    }
+
+    let safe_name = sanitize_filename(filename);
+    let dir = attachments_dir().join(bucket_id);
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        error!(error = %e, "download_to_disk: failed to create directory");
+        return None;
+    }
+
+    let path = dir.join(&safe_name);
+    // Path containment check: ensure the resolved path stays within the bucket dir.
+    // We canonicalize the dir (which exists) and check the filename doesn't escape.
+    let base_resolved = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+    let resolved_path = base_resolved.join(&safe_name);
+    if !resolved_path.starts_with(&base_resolved) {
+        error!(filename, "download_to_disk: path containment violation");
+        return None;
+    }
+
+    if let Err(e) = tokio::fs::write(&path, &bytes).await {
+        error!(error = %e, "download_to_disk: failed to write file");
+        return None;
+    }
+
+    let actual_size = bytes.len() as u64;
+    let path_str = path.to_string_lossy();
+    debug!(filename = safe_name, size = actual_size, path = %path_str, "file saved to disk");
+
+    Some(ContentBlock::Text {
+        text: format!(
+            "<<<EXTERNAL_UNTRUSTED_CONTENT>>>\n\
+             [File attachment received]\n\
+             - filename: {safe_name}\n\
+             - mimetype: {mime_type}\n\
+             - size: {}\n\
+             - local_path: {path_str}\n\n\
+             Use your file-reading tools to access this file if needed.\n\
+             <<<END_EXTERNAL_UNTRUSTED_CONTENT>>>",
+            format_size_human(actual_size),
+        ),
+    })
+}
+
+/// Store file bytes directly to disk (for gateway path — bytes already downloaded).
+/// Returns a metadata ContentBlock with the path.
+pub async fn store_to_disk(
+    bytes: &[u8],
+    filename: &str,
+    mime_type: &str,
+    bucket_id: &str,
+) -> Option<ContentBlock> {
+    if bytes.len() as u64 > DISK_MAX_SIZE {
+        warn!(filename, size = bytes.len(), "store_to_disk: exceeds limit");
+        return None;
+    }
+
+    let safe_name = sanitize_filename(filename);
+    let dir = attachments_dir().join(bucket_id);
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        error!(error = %e, "store_to_disk: failed to create directory");
+        return None;
+    }
+
+    let path = dir.join(&safe_name);
+    if let Err(e) = tokio::fs::write(&path, bytes).await {
+        error!(error = %e, "store_to_disk: failed to write file");
+        return None;
+    }
+
+    let actual_size = bytes.len() as u64;
+    let path_str = path.to_string_lossy();
+    debug!(filename = safe_name, size = actual_size, path = %path_str, "file stored to disk");
+
+    Some(ContentBlock::Text {
+        text: format!(
+            "<<<EXTERNAL_UNTRUSTED_CONTENT>>>\n\
+             [File attachment received]\n\
+             - filename: {safe_name}\n\
+             - mimetype: {mime_type}\n\
+             - size: {}\n\
+             - local_path: {path_str}\n\n\
+             Use your file-reading tools to access this file if needed.\n\
+             <<<END_EXTERNAL_UNTRUSTED_CONTENT>>>",
+            format_size_human(actual_size),
+        ),
+    })
+}
+
+/// Background eviction loop: removes files older than TTL from the attachments directory.
+pub async fn attachments_eviction_loop() {
+    let ttl_secs: u64 = std::env::var("OPENAB_ATTACHMENTS_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_ATTACHMENTS_TTL_SECS);
+
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    loop {
+        interval.tick().await;
+        if let Err(e) = evict_attachments(ttl_secs).await {
+            error!(error = %e, "attachments eviction error");
+        }
+    }
+}
+
+async fn evict_attachments(ttl_secs: u64) -> std::io::Result<()> {
+    let dir = attachments_dir();
+    if !dir.exists() {
+        return Ok(());
+    }
+    let mut entries = tokio::fs::read_dir(&dir).await?;
+    let now = std::time::SystemTime::now();
+    while let Some(entry) = entries.next_entry().await? {
+        let meta = entry.metadata().await?;
+        if meta.is_dir() {
+            // Check bucket directory age
+            if let Ok(modified) = meta.modified() {
+                if let Ok(age) = now.duration_since(modified) {
+                    if age.as_secs() > ttl_secs {
+                        let path = entry.path();
+                        let _ = tokio::fs::remove_dir_all(&path).await;
+                        tracing::debug!(path = %path.display(), "evicted expired attachment bucket");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -842,5 +1062,178 @@ mod tests {
     fn hex_prefix_handles_short_buffer() {
         let bytes = [0xffu8, 0xd8];
         assert_eq!(hex_prefix(&bytes), "ffd8");
+    }
+
+    #[test]
+    fn sanitize_filename_strips_path_separators() {
+        assert_eq!(sanitize_filename("../../../etc/passwd"), "______etc_passwd");
+        assert_eq!(sanitize_filename("foo/bar\\baz"), "foo_bar_baz");
+        assert_eq!(sanitize_filename("normal.pdf"), "normal.pdf");
+    }
+
+    #[test]
+    fn sanitize_filename_handles_empty_and_dots() {
+        assert_eq!(sanitize_filename(""), "unnamed_file");
+        assert_eq!(sanitize_filename("..."), "_");
+        assert_eq!(sanitize_filename(".."), "_");
+    }
+
+    #[test]
+    fn sanitize_filename_truncates_long_names() {
+        let long = "a".repeat(300);
+        assert_eq!(sanitize_filename(&long).len(), 200);
+    }
+
+    #[test]
+    fn sanitize_filename_strips_null_bytes() {
+        assert_eq!(sanitize_filename("file\0name.pdf"), "file_name.pdf");
+    }
+
+    #[test]
+    fn format_size_human_works() {
+        assert_eq!(format_size_human(500), "500 B");
+        assert_eq!(format_size_human(1024), "1.0 KB");
+        assert_eq!(format_size_human(2 * 1024 * 1024), "2.0 MB");
+    }
+
+    #[tokio::test]
+    async fn store_to_disk_creates_file_and_returns_metadata() {
+        let dir = std::env::temp_dir().join("openab-test-store");
+        std::env::set_var("OPENAB_ATTACHMENTS_DIR", dir.to_str().unwrap());
+
+        let result = store_to_disk(b"hello pdf", "test.pdf", "application/pdf", "bucket123").await;
+        assert!(result.is_some());
+
+        let block = result.unwrap();
+        if let ContentBlock::Text { text } = block {
+            assert!(text.contains("test.pdf"));
+            assert!(text.contains("application/pdf"));
+            assert!(text.contains("bucket123"));
+            assert!(text.contains("<<<EXTERNAL_UNTRUSTED_CONTENT>>>"));
+        } else {
+            panic!("expected Text block");
+        }
+
+        // Verify file exists
+        let path = dir.join("bucket123").join("test.pdf");
+        assert!(path.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello pdf");
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var("OPENAB_ATTACHMENTS_DIR");
+    }
+
+    #[tokio::test]
+    async fn store_to_disk_rejects_oversized() {
+        let big = vec![0u8; 201 * 1024 * 1024];
+        let result = store_to_disk(&big, "huge.bin", "application/octet-stream", "bucket").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn download_to_disk_success() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server.mock("GET", "/report.pdf")
+            .with_body(b"fake pdf bytes")
+            .create_async().await;
+
+        let dir = std::env::temp_dir().join(format!("openab-test-dl-{}", std::process::id()));
+        std::env::set_var("OPENAB_ATTACHMENTS_DIR", dir.to_str().unwrap());
+
+        let result = download_to_disk(
+            &format!("{}/report.pdf", server.url()),
+            "report.pdf",
+            "application/pdf",
+            14,
+            "msg001",
+            None,
+        ).await;
+
+        mock.assert_async().await;
+        assert!(result.is_some());
+        let block = result.unwrap();
+        if let ContentBlock::Text { text } = block {
+            assert!(text.contains("report.pdf"));
+            assert!(text.contains("application/pdf"));
+        } else {
+            panic!("expected Text block");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var("OPENAB_ATTACHMENTS_DIR");
+    }
+
+    #[tokio::test]
+    async fn download_to_disk_returns_none_on_404() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server.mock("GET", "/missing.pdf")
+            .with_status(404)
+            .create_async().await;
+
+        let result = download_to_disk(
+            &format!("{}/missing.pdf", server.url()),
+            "missing.pdf",
+            "application/pdf",
+            0,
+            "msg002",
+            None,
+        ).await;
+
+        mock.assert_async().await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn download_to_disk_returns_none_on_empty_url() {
+        let result = download_to_disk(
+            "",
+            "file.pdf",
+            "application/pdf",
+            0,
+            "msg003",
+            None,
+        ).await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn download_to_disk_returns_none_when_size_exceeds_limit() {
+        let result = download_to_disk(
+            "http://example.com/huge.bin",
+            "huge.bin",
+            "application/octet-stream",
+            201 * 1024 * 1024,
+            "msg004",
+            None,
+        ).await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn download_to_disk_sends_auth_header() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server.mock("GET", "/private.pdf")
+            .match_header("Authorization", "Bearer slack-token-123")
+            .with_body(b"private content")
+            .create_async().await;
+
+        let dir = std::env::temp_dir().join(format!("openab-test-auth-{}", std::process::id()));
+        std::env::set_var("OPENAB_ATTACHMENTS_DIR", dir.to_str().unwrap());
+
+        let result = download_to_disk(
+            &format!("{}/private.pdf", server.url()),
+            "private.pdf",
+            "application/pdf",
+            15,
+            "msg005",
+            Some("slack-token-123"),
+        ).await;
+
+        mock.assert_async().await;
+        assert!(result.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var("OPENAB_ATTACHMENTS_DIR");
     }
 }

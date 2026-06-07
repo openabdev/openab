@@ -746,6 +746,16 @@ impl EventHandler for Handler {
                                 u64::from(attachment.size),
                                 &attachment.url,
                             ));
+                        } else if let Some(block) = media::download_to_disk(
+                            &attachment.url,
+                            &attachment.filename,
+                            attachment.content_type.as_deref().unwrap_or("application/octet-stream"),
+                            u64::from(attachment.size),
+                            &msg.id.to_string(),
+                            None,
+                        ).await {
+                            debug!(filename = %attachment.filename, "file saved to disk");
+                            extra_blocks.push(block);
                         }
                     }
                     Err(e) => {

@@ -1279,11 +1279,8 @@ pub async fn download_googlechat_file(
     remaining_budget: u64,
 ) -> Option<crate::schema::Attachment> {
     let ext = content_name.rsplit('.').next().unwrap_or("").to_lowercase();
-    if !TEXT_EXTS.contains(&ext.as_str()) {
-        tracing::debug!(content_name, "skipping non-text googlechat file attachment");
-        return None;
-    }
-    let max_size = FILE_MAX_DOWNLOAD.min(remaining_budget);
+    let is_text = TEXT_EXTS.contains(&ext.as_str());
+    let max_size = if is_text { FILE_MAX_DOWNLOAD.min(remaining_budget) } else { remaining_budget.min(20 * 1024 * 1024) };
     let url = media_url(api_base, resource_name);
     let resp = match client.get(&url).bearer_auth(token).timeout(MEDIA_REQUEST_TIMEOUT).send().await {
         Ok(r) => r,
@@ -1310,10 +1307,18 @@ pub async fn download_googlechat_file(
         return None;
     }
     let path = crate::store::store_media(&bytes).await?;
+
+    let att_type = if is_text && String::from_utf8(bytes.to_vec()).is_ok() {
+        "text_file"
+    } else {
+        "document"
+    };
+    let mime = if att_type == "text_file" { "text/plain" } else { "application/octet-stream" };
+
     Some(crate::schema::Attachment {
-        attachment_type: "text_file".into(),
+        attachment_type: att_type.into(),
         filename: content_name.to_string(),
-        mime_type: "text/plain".into(),
+        mime_type: mime.into(),
         data: String::new(),
         size: bytes.len() as u64,
         path: Some(path),

@@ -1374,7 +1374,7 @@ pub enum MediaRef {
 const IMAGE_MAX_DIMENSION_PX: u32 = 1200;
 const IMAGE_JPEG_QUALITY: u8 = 75;
 const IMAGE_MAX_DOWNLOAD: u64 = 10 * 1024 * 1024; // 10 MB
-const FILE_MAX_DOWNLOAD: u64 = 512 * 1024; // 512 KB
+const FILE_MAX_DOWNLOAD: u64 = 20 * 1024 * 1024; // 20 MB
 
 /// Resize image so longest side <= 1200px, then encode as JPEG.
 /// GIFs are passed through unchanged to preserve animation.
@@ -1470,17 +1470,6 @@ pub async fn download_feishu_file(
     file_key: &str,
     file_name: &str,
 ) -> Option<crate::schema::Attachment> {
-    // Only download text-like files
-    let ext = file_name.rsplit('.').next().unwrap_or("").to_lowercase();
-    const TEXT_EXTS: &[&str] = &[
-        "txt", "csv", "log", "md", "json", "jsonl", "yaml", "yml", "toml", "xml",
-        "rs", "py", "js", "ts", "jsx", "tsx", "go", "java", "c", "cpp", "h", "hpp",
-        "rb", "sh", "bash", "sql", "html", "css", "ini", "cfg", "conf", "env",
-    ];
-    if !TEXT_EXTS.contains(&ext.as_str()) {
-        tracing::debug!(file_name, "skipping non-text file attachment");
-        return None;
-    }
     let url = format!(
         "{}/open-apis/im/v1/messages/{}/resources/{}?type=file",
         api_base, message_id, file_key
@@ -1508,14 +1497,24 @@ pub async fn download_feishu_file(
     let bytes = resp.bytes().await.ok()?;
     // Fallback check (Content-Length may be absent or misreported)
     if bytes.len() as u64 > FILE_MAX_DOWNLOAD {
-        tracing::warn!(file_name, size = bytes.len(), "feishu file exceeds 512KB limit");
+        tracing::warn!(file_name, size = bytes.len(), "feishu file exceeds limit");
         return None;
     }
     let path = crate::store::store_media(&bytes).await?;
+
+    // Determine attachment type: text_file if recognized text extension and valid UTF-8
+    let att_type = if crate::media::is_text_extension(file_name) && String::from_utf8(bytes.to_vec()).is_ok() {
+        "text_file"
+    } else {
+        "document"
+    };
+    let mime = if att_type == "text_file" { "text/plain" } else { "application/octet-stream" };
+
+    tracing::info!(file_name, size = bytes.len(), att_type, "feishu file stored");
     Some(crate::schema::Attachment {
-        attachment_type: "text_file".into(),
+        attachment_type: att_type.into(),
         filename: file_name.to_string(),
-        mime_type: "text/plain".into(),
+        mime_type: mime.into(),
         data: String::new(),
         size: bytes.len() as u64,
         path: Some(path),

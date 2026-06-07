@@ -176,6 +176,9 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Spawn attachments eviction loop (download-to-disk cleanup)
+    tokio::spawn(media::attachments_eviction_loop());
+
     // Pre-build shared adapters for cron scheduler (avoids duplicate Http clients / rate-limit buckets)
     let shared_discord_adapter: Option<Arc<dyn adapter::ChatAdapter>> =
         cfg.discord.as_ref().map(|dc| {

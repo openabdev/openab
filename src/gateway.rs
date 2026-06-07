@@ -785,7 +785,29 @@ pub async fn run_gateway_adapter(
                                             "audio" => {
                                                 tracing::debug!(filename = %att.filename, "audio attachment skipped — STT not enabled");
                                             }
-                                            _ => {}
+                                            // document / unknown types: store to disk
+                                            _ => {
+                                                let bytes_result = if let Some(ref path) = att.path {
+                                                    tokio::fs::read(path).await.map_err(|e| e.to_string())
+                                                } else if !att.data.is_empty() {
+                                                    use base64::Engine;
+                                                    base64::engine::general_purpose::STANDARD
+                                                        .decode(&att.data)
+                                                        .map_err(|e| e.to_string())
+                                                } else {
+                                                    Err("no path or data".into())
+                                                };
+                                                if let Ok(bytes) = bytes_result {
+                                                    if let Some(block) = crate::media::store_to_disk(
+                                                        &bytes,
+                                                        &att.filename,
+                                                        &att.mime_type,
+                                                        &event.message_id,
+                                                    ).await {
+                                                        extra_blocks.push(block);
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
 

@@ -30,9 +30,11 @@ tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
 cron = "0.16.0"
 chrono = { version = "0.4.44", features = ["serde"] }
 chrono-tz = "0.10.4"
+sha2 = "0.10"
+tempfile = "3.27.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
-tempfile = "3.27.0"
+mockito = "1"
