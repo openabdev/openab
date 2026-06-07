@@ -206,22 +206,6 @@ fn save_tokens(store: &TokenStore) -> Result<()> {
     write_auth_file(&path, &map)
 }
 
-/// Look up the credential at `key` (e.g. `mcp:linear`). `path` is injected
-/// so the runtime manager + tests can target a tempdir without `$HOME`
-/// overrides. Returns the codex entry for `key = "codex"`, but prefer
-/// `load_tokens()` for that path — this helper exists for MCP
-/// server-namespaced lookups (ADR §6.1).
-pub fn load_namespaced_token_at(path: &Path, key: &str) -> Result<TokenStore> {
-    let map =
-        read_auth_file(path).map_err(|_| anyhow!("No credentials found at {}", path.display()))?;
-    match map.get(key) {
-        Some(AuthEntry::Token(t)) => Ok(t.clone()),
-        Some(AuthEntry::Pending(_)) => Err(anyhow!("{key:?} is a pending login, not a token")),
-        Some(AuthEntry::Mcp(_)) => Err(anyhow!("{key:?} is an rmcp-native credential, not a TokenStore")),
-        None => Err(anyhow!("no credentials stored for {key:?}")),
-    }
-}
-
 /// rmcp [`CredentialStore`] backed by the shared `auth.json` file (ADR §6.1
 /// storage-format decision A). One instance is bound to a single MCP server's
 /// bare-name key (e.g. `linear`); rmcp's `AuthorizationManager` owns the

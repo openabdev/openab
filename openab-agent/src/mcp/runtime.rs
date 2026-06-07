@@ -1450,6 +1450,23 @@ async fn oauth_http_send(
     let status = resp.status();
     let headers = resp.headers().clone();
     let bytes = resp.bytes().await?;
+    // GitHub's device-flow token endpoint returns HTTP 200 with an
+    // `authorization_pending` / `slow_down` error body, but RFC 8628 §3.5
+    // mandates 4xx for these. The oauth2 crate parses any 2xx as a success
+    // token response, so a 200 carrying `error` fails to deserialize and kills
+    // the poll loop on the first tick. Remap 2xx-with-error to 400 so oauth2
+    // reads it as a DeviceCodeErrorResponse and keeps polling (or terminates
+    // cleanly on access_denied / expired_token).
+    let status = if status.is_success()
+        && serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned))
+            .is_some()
+    {
+        reqwest::StatusCode::BAD_REQUEST
+    } else {
+        status
+    };
     let mut builder = oauth2::http::Response::builder().status(status);
     if let Some(dst) = builder.headers_mut() {
         *dst = headers;
@@ -1527,7 +1544,9 @@ enum Dial {
 /// `(has_access_token, has_refresh_token, near_expiry)`. A credential with no
 /// `expires_in` is treated as long-lived (never near expiry), matching the
 /// `u64::MAX` sentinel the login path records for providers that omit it.
-fn classify_stored_creds(creds: &rmcp::transport::StoredCredentials) -> (bool, bool, bool) {
+pub(crate) fn classify_stored_creds(
+    creds: &rmcp::transport::StoredCredentials,
+) -> (bool, bool, bool) {
     let v = serde_json::to_value(creds).unwrap_or(serde_json::Value::Null);
     let tr = &v["token_response"];
     let nonempty = |key: &str| {

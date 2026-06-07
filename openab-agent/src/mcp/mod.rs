@@ -10,7 +10,7 @@ pub mod sampling;
 
 use serde_json::json;
 
-use crate::auth::{auth_path, load_namespaced_token_at};
+use crate::auth::{auth_path, McpCredentialStore};
 use crate::llm::ToolDef;
 use config::{McpConfig, ServerConfig};
 
@@ -540,14 +540,24 @@ async fn doctor_server(
     }
     println!("    ✓ config: env vars resolved");
     if let ServerConfig::Http { oauth: Some(_), .. } = server {
-        match load_namespaced_token_at(auth, name) {
-            Ok(store) if !store.is_expired() => {
-                println!("    ✓ oauth: valid token cached");
+        // Read the same native rmcp `StoredCredentials` store that `connect()`
+        // uses (device/paste login persist here). The legacy `TokenStore`
+        // reader would miss these and false-report "no token cached".
+        use rmcp::transport::CredentialStore;
+        let store = McpCredentialStore::new(auth.to_path_buf(), name.to_string());
+        let cached = match store.load().await {
+            Ok(Some(creds)) => Some(runtime::classify_stored_creds(&creds)),
+            _ => None,
+        };
+        match cached {
+            Some((true, _has_refresh, near_expiry)) => {
+                if near_expiry {
+                    println!("    ⚠ oauth: token near expiry (connect will attempt refresh)");
+                } else {
+                    println!("    ✓ oauth: valid token cached");
+                }
             }
-            Ok(_) => {
-                println!("    ⚠ oauth: token expired (connect will attempt refresh)");
-            }
-            Err(_) => {
+            _ => {
                 println!("    ✗ oauth: no token cached");
                 println!("    → run `openab-agent mcp login {name}`");
                 return false;
