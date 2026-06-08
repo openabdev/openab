@@ -823,10 +823,31 @@ impl McpRuntimeManager {
     /// Discovery is a network call — unlike the old offline URL-builder, this
     /// requires the server's metadata endpoint to be reachable before it can
     /// emit an authorize URL.
-    pub async fn start_paste_login(&self, name: &str) -> Result<PasteLoginStart> {
+    pub async fn start_paste_login(
+        &self,
+        name: &str,
+        extra_scopes: &[String],
+    ) -> Result<PasteLoginStart> {
         let (provider, client_id, redirect_uri, server_url) =
             self.resolve_paste_client(name).await?;
-        let scopes: Vec<String> = provider.scopes().to_vec();
+        // A3 (step-up): a 403 `insufficient_scope` names the scope the server
+        // wants; the operator re-runs `mcp login <server> --scope <s>` and we
+        // merge it into the configured set so the new authorize URL requests
+        // the upgraded grant. De-dup to keep the URL clean on repeats.
+        let mut scopes: Vec<String> = provider.scopes().to_vec();
+        for s in extra_scopes {
+            if !s.is_empty() && !scopes.contains(s) {
+                scopes.push(s.clone());
+            }
+        }
+        // A2 (confidential client): custom providers may carry a secret for
+        // `client_secret_basic`/`client_secret_post`. DCR-minted clients are
+        // always public, so a secret only applies to the pinned-`client_id`
+        // branch below.
+        let client_secret: Option<String> = match &provider {
+            ResolvedProvider::Custom { client_secret, .. } => client_secret.clone(),
+            ResolvedProvider::Builtin { .. } => None,
+        };
         let client = self.get_or_init_auth_client(name, &server_url).await?;
         let authorize_url = {
             let mut mgr = client.auth_manager.lock().await;
@@ -834,12 +855,50 @@ impl McpRuntimeManager {
                 .discover_metadata()
                 .await
                 .map_err(|e| anyhow!("mcp server {name:?} oauth discovery failed: {e}"))?;
+            // A4 (PKCE S256 hard-check): rmcp only *warns* when the AS advertises
+            // PKCE methods without S256. Reject outright so we never proceed with
+            // a downgraded `plain` challenge. A server that omits the field is
+            // left to the "send PKCE, trust the AS" path (we still send S256).
+            if let Some(methods) = metadata.code_challenge_methods_supported.as_ref() {
+                if !methods.iter().any(|m| m == "S256") {
+                    return Err(anyhow!(
+                        "mcp server {name:?} authorization server does not advertise S256 in \
+                         code_challenge_methods_supported ({methods:?}); refusing to downgrade PKCE"
+                    ));
+                }
+            }
             mgr.set_metadata(metadata);
-            mgr.configure_client(
-                OAuthClientConfig::new(client_id, redirect_uri).with_scopes(scopes.clone()),
-            )
-            .map_err(|e| anyhow!("mcp server {name:?} oauth client config failed: {e}"))?;
             let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
+            match client_id {
+                // Pre-registered client ID (built-ins, or custom with `oauth.client_id`).
+                Some(client_id) => {
+                    let mut client_cfg =
+                        OAuthClientConfig::new(client_id, redirect_uri).with_scopes(scopes.clone());
+                    if let Some(secret) = client_secret {
+                        client_cfg = client_cfg.with_client_secret(secret);
+                    }
+                    mgr.configure_client(client_cfg).map_err(|e| {
+                        anyhow!("mcp server {name:?} oauth client config failed: {e}")
+                    })?;
+                }
+                // A1 (RFC 7591 DCR): no client ID configured → register one against
+                // the discovered `registration_endpoint`. rmcp registers a public
+                // client (`token_endpoint_auth_method: none`) and configures the
+                // manager with the returned ID; the ID then persists inside the
+                // `StoredCredentials` written at exchange, so reconnect/refresh
+                // reuse it without writing back to mcp.json.
+                None => {
+                    mgr.register_client("openab-agent", &redirect_uri, &scope_refs)
+                        .await
+                        .map_err(|e| {
+                            anyhow!(
+                                "mcp server {name:?} dynamic client registration failed \
+                                 (set `oauth.client_id` in mcp.json if the AS has no open \
+                                 registration endpoint): {e}"
+                            )
+                        })?;
+                }
+            }
             mgr.get_authorization_url(&scope_refs)
                 .await
                 .map_err(|e| anyhow!("mcp server {name:?} authorize url build failed: {e}"))?
@@ -1111,7 +1170,7 @@ impl McpRuntimeManager {
     async fn resolve_paste_client(
         &self,
         name: &str,
-    ) -> Result<(ResolvedProvider, String, String, String)> {
+    ) -> Result<(ResolvedProvider, Option<String>, String, String)> {
         let (oauth_cfg, server_url) = {
             let guard = self.handles.read().await;
             let handle = guard
@@ -1138,12 +1197,16 @@ impl McpRuntimeManager {
         // a possible `invalid_target`) is no longer expressible. Built-in
         // `client_id` is env-gated, so that path is theoretical; flagged for
         // the OAuth revamp follow-up.
+        // `client_id` is optional for custom providers: when absent, the caller
+        // attempts RFC 7591 dynamic client registration (A1) against the
+        // discovered `registration_endpoint`. `redirect_uri` stays mandatory —
+        // DCR must register a redirect URI and the exchange replays it.
         let (client_id, redirect_uri) = match &provider {
             ResolvedProvider::Builtin {
                 provider_name,
                 callback,
                 ..
-            } => (builtin_client_id(provider_name)?, (*callback).to_string()),
+            } => (Some(builtin_client_id(provider_name)?), (*callback).to_string()),
             ResolvedProvider::Custom {
                 device_authorization_endpoint: Some(_),
                 ..
@@ -1153,23 +1216,16 @@ impl McpRuntimeManager {
                 ));
             }
             ResolvedProvider::Custom {
-                client_id: Some(client_id),
+                client_id,
                 redirect_uri: Some(redirect_uri),
                 ..
             } => (client_id.clone(), redirect_uri.clone()),
-            ResolvedProvider::Custom {
-                client_id: None, ..
-            } => {
-                return Err(anyhow!(
-                    "mcp server {name:?} custom paste-back requires `oauth.client_id` in mcp.json"
-                ));
-            }
             ResolvedProvider::Custom {
                 redirect_uri: None, ..
             } => {
                 return Err(anyhow!(
                     "mcp server {name:?} custom paste-back requires `oauth.redirect_uri` in mcp.json \
-                     (must match the redirect URL pre-registered with the provider)"
+                     (must match the redirect URL pre-registered with the provider, or used for DCR)"
                 ));
             }
         };
@@ -2142,7 +2198,7 @@ mod tests {
     }
 
     async fn start_login_err(mgr: &McpRuntimeManager, name: &str) -> String {
-        mgr.start_paste_login(name).await.unwrap_err().to_string()
+        mgr.start_paste_login(name, &[]).await.unwrap_err().to_string()
     }
 
     fn mgr_with_tempdir(cfg: McpConfig) -> (McpRuntimeManager, tempfile::TempDir) {
@@ -2165,8 +2221,14 @@ mod tests {
         assert!(err.contains("oauth.redirect_uri"), "got: {err}");
     }
 
+    // A1 (DCR): a custom provider WITHOUT `oauth.client_id` but WITH a
+    // `redirect_uri` is now permitted — `resolve_paste_client` returns
+    // `client_id: None` and `start_paste_login` falls back to RFC 7591 dynamic
+    // registration. We assert the resolver no longer rejects it (the actual
+    // register + authorize-URL build is behind a live discovery call, so it is
+    // not unit-testable offline; covered by manual / integration runs).
     #[tokio::test]
-    async fn start_paste_login_rejects_custom_without_client_id() {
+    async fn resolve_paste_client_allows_missing_client_id_for_dcr() {
         let json = r#"{
             "mcpServers": {
                 "linear": {
@@ -2183,8 +2245,10 @@ mod tests {
         }"#;
         let cfg: McpConfig = serde_json::from_str(json).unwrap();
         let (mgr, _dir) = mgr_with_tempdir(cfg);
-        let err = start_login_err(&mgr, "linear").await;
-        assert!(err.contains("oauth.client_id"), "got: {err}");
+        let (_provider, client_id, redirect_uri, _url) =
+            mgr.resolve_paste_client("linear").await.expect("resolves");
+        assert!(client_id.is_none(), "missing client_id resolves to None for DCR");
+        assert_eq!(redirect_uri, "https://example.com/cb");
     }
 
     #[tokio::test]

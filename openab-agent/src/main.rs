@@ -67,6 +67,12 @@ enum McpAction {
         /// hosts where the browser redirect target isn't reachable.
         #[arg(long)]
         device: bool,
+        /// Extra OAuth scope to request on top of the configured set, for
+        /// step-up re-auth (A3). Repeatable. When a tool call fails with
+        /// `insufficient_scope`, the error names the scope to pass here.
+        /// Ignored by `--device`.
+        #[arg(long)]
+        scope: Vec<String>,
     },
 }
 
@@ -121,11 +127,15 @@ async fn main() {
             McpAction::Status => mcp::cli_show_status().await,
             McpAction::Doctor => mcp::cli_doctor().await,
             McpAction::Connect { name } => mcp::cli_connect(name).await,
-            McpAction::Login { name, device } => {
+            McpAction::Login {
+                name,
+                device,
+                scope,
+            } => {
                 if device {
                     mcp::cli_login_device(name).await;
                 } else {
-                    mcp::cli_login(name).await;
+                    mcp::cli_login(name, scope).await;
                 }
             }
         },

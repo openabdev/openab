@@ -94,6 +94,7 @@ pub enum ResolvedProvider {
         authorize_url: String,
         token_url: String,
         client_id: Option<String>,
+        client_secret: Option<String>,
         device_authorization_endpoint: Option<String>,
         redirect_uri: Option<String>,
         scopes: Vec<String>,
@@ -153,6 +154,7 @@ fn resolve_custom(provider: &str, cfg: &OAuthConfig) -> Result<ResolvedProvider>
         authorize_url,
         token_url,
         client_id: cfg.client_id.clone(),
+        client_secret: cfg.client_secret.clone(),
         device_authorization_endpoint: cfg.device_authorization_endpoint.clone(),
         redirect_uri: cfg.redirect_uri.clone(),
         scopes: cfg.scopes.clone(),
@@ -282,6 +284,22 @@ mod tests {
             Some("https://linear.app/oauth/device"),
         );
         assert_eq!(scopes, vec!["read", "write"]);
+    }
+
+    #[test]
+    fn resolve_custom_propagates_client_secret() {
+        let cfg = OAuthConfig {
+            provider: Some("acme".to_string()),
+            authorize_url: Some("https://acme.example/authorize".to_string()),
+            token_url: Some("https://acme.example/token".to_string()),
+            client_id: Some("cid".to_string()),
+            client_secret: Some("shhh".to_string()),
+            ..Default::default()
+        };
+        let ResolvedProvider::Custom { client_secret, .. } = resolve(&cfg).unwrap() else {
+            panic!("expected Custom variant");
+        };
+        assert_eq!(client_secret.as_deref(), Some("shhh"));
     }
 
     #[test]

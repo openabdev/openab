@@ -180,6 +180,12 @@ pub struct OAuthConfig {
     pub token_url: Option<String>,
     #[serde(default)]
     pub client_id: Option<String>,
+    /// Confidential-client secret (A2). When set, the paste-back flow sends it
+    /// via `client_secret_basic`/`client_secret_post`. Must be obtained by
+    /// manual pre-registration — DCR only mints public clients. Ignored by the
+    /// device-code branch and by public (`none`) clients.
+    #[serde(default)]
+    pub client_secret: Option<String>,
     #[serde(default)]
     pub device_authorization_endpoint: Option<String>,
     /// Required for the paste-back branch of §6.4 on custom providers.

@@ -131,7 +131,7 @@ fn auth_challenge_scope(e: &ServiceError) -> Option<Option<String>> {
 fn needs_reauth_error(server: &str, required_scope: &Option<String>) -> anyhow::Error {
     match required_scope {
         Some(scope) if !scope.is_empty() => anyhow!(
-            "mcp server {server:?} rejected the request — insufficient scope (server requires {scope:?}); re-authenticate with `mcp login {server}`"
+            "mcp server {server:?} rejected the request — insufficient scope (server requires {scope:?}); re-authenticate with `mcp login {server} --scope {scope}`"
         ),
         _ => anyhow!(
             "mcp server {server:?} rejected the request (HTTP 401) — (re)authenticate with `mcp login {server}`"

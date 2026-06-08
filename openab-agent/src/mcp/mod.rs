@@ -406,9 +406,9 @@ pub async fn cli_connect(name: String) {
 /// Single-invocation by design: the PKCE/CSRF state lives only in this
 /// process, so the URL print and the paste-back must happen in the same run.
 /// Errors at any step exit non-zero; re-run the command to start a fresh flow.
-pub async fn cli_login(name: String) {
+pub async fn cli_login(name: String, scopes: Vec<String>) {
     let manager = McpRuntimeManager::from_config(load_config_or_exit());
-    let start = match manager.start_paste_login(&name).await {
+    let start = match manager.start_paste_login(&name, &scopes).await {
         Ok(s) => s,
         Err(e) => {
             eprintln!("✗ {name}: {e:#}");
