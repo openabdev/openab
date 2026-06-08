@@ -30,7 +30,7 @@ where rmcp supports it).
 | JSON Schema dialect | ✅ validated | `call` args validated against `inputSchema` (`jsonschema`); draft auto-detected (draft 4/6/7/2019-09/2020-12, absent ⇒ 2020-12); uncompilable dialect refused. |
 | `_meta` keys | ✅ opaque | Never read or rewritten; passed through untouched. |
 | Icon rendering | N/A | No UI surface. |
-| Authorization (OAuth) | ⚠️ | rmcp `AuthorizationManager`: PRM/discovery ✅; PKCE S256 generated ✅ (server S256-advertisement check is warn-only); step-up detect-only ⚠️; `resource` hardcode caveat. |
+| Authorization (OAuth) | ⚠️ | rmcp `AuthorizationManager`: PRM/discovery ✅; PKCE S256 generated + **hard-rejected when AS advertises non-S256** ✅; client registration — pre-registered / **DCR public** / **confidential** all supported ✅; step-up **detect + scoped re-login** (`--scope`) ✅; `resource` hardcode caveat ⚠️. |
 | Sampling (`createMessage`) | ✅ text-only | Routed to the agent's LLM provider; env-var approval gate; no `sampling.tools`. |
 | Roots | ✅ | Static set (cwd + config allow-list); no `listChanged`. |
 | Elicitation | ⚠️ form-only | Form-mode via ACP host bridge; URL-mode = known gap. |
@@ -87,9 +87,9 @@ is **not** affected by anything in this section.
 | Area | Status | Notes |
 |---|---|---|
 | PRM / AS-metadata discovery | ✅ | `discover_metadata()` does PRM-first (SEP-985), then RFC 9728 / RFC 8414 / OIDC discovery, with the spec's path-priority order. |
-| PKCE (S256) | ✅ generate / ⚠️ check | S256 challenge generated unconditionally on every authorize request. Discovery *inspects* `code_challenge_methods_supported` but only **warns** on a missing/non-S256 advertisement (`validate_server_metadata`, rmcp `transport/auth.rs:860-870`) — it does **not** reject the server. |
+| PKCE (S256) | ✅ generate + check | S256 challenge generated unconditionally on every authorize request. rmcp's `validate_server_metadata` only *warns* on a missing/non-S256 advertisement; on top of that, `start_paste_login` **rejects** the login when the AS advertises `code_challenge_methods_supported` without `S256` (refuses to downgrade to `plain`). A server that omits the field is left to the "send PKCE, trust the AS" path. |
 | RFC 8707 `resource` parameter | ⚠️ | Sent on authorize + token requests — but see the hardcode caveat below. |
-| `WWW-Authenticate` step-up | ⚠️ detect-only | Challenge is detected, classified, and surfaced; no automatic reauth-and-retry (see below). |
+| `WWW-Authenticate` step-up | ⚠️ detect + scoped re-login | Challenge is detected, classified, and surfaced with the required scope; re-login carries it via `mcp login <server> --scope <s>`. No *silent* reauth-and-retry (see below). |
 | HTTPS / loopback enforcement | ✅ | Custom providers must use `https://` endpoints and a loopback-or-`https` redirect. |
 
 **`resource` hardcode caveat.** rmcp hardcodes the RFC 8707 `resource` parameter
@@ -105,22 +105,37 @@ flagged for the OAuth-revamp follow-up. One further nuance: rmcp emits the raw
 canonical there; the hand-rolled device path still canonicalizes the resource
 URI.
 
-**Step-up is detect-only by design.** When a server answers a tool call with a
-401/403 carrying an auth challenge, openab-agent (a) skips the circuit breaker (an
-auth challenge is not a transport fault), (b) flags the server as needing auth,
-and (c) returns an actionable error telling the operator to run
-`mcp login <server>`, including the required scope when the challenge supplied
-one. It does **not** silently reauthenticate and retry, because the login flow is
-interactive (single-process stdin paste-back) and a background retry cannot mint a
-new or upgraded token without a human browser round-trip. This is the realistic
-ceiling for an interactive-login client.
+**Step-up: detect + scoped re-login, no silent retry.** When a server answers a
+tool call with a 401/403 carrying an auth challenge, openab-agent (a) skips the
+circuit breaker (an auth challenge is not a transport fault), (b) flags the server
+as needing auth, and (c) returns an actionable error telling the operator to run
+`mcp login <server> --scope <required>`, naming the scope the challenge supplied.
+The `--scope` values are merged into the configured set so the new authorize URL
+requests the upgraded grant. It does **not** silently reauthenticate and retry,
+because the login flow is interactive (single-process stdin paste-back) and a
+background retry cannot mint a new or upgraded token without a human browser
+round-trip. This is the realistic ceiling for an interactive-login client.
 
 ### Client registration
 
-Only **pre-registered client IDs** are supported: built-ins inject via env var,
-custom providers carry an explicit `client_id`. Client ID Metadata Documents
-(CIMD) and Dynamic Client Registration (RFC 7591, DCR) are **not implemented** —
-the per-row compliance detail is in
+Three modes:
+
+- **Pre-registered client ID** — built-ins inject via env var; custom providers
+  carry an explicit `oauth.client_id`.
+- **Dynamic Client Registration (RFC 7591, DCR)** — when a custom provider omits
+  `oauth.client_id`, `start_paste_login` calls rmcp's `register_client` against the
+  discovered `registration_endpoint` and registers a **public** client
+  (`token_endpoint_auth_method: none`). The minted `client_id` is persisted inside
+  the `StoredCredentials` written at token exchange, so reconnect/refresh reuse it
+  with no write-back to `mcp.json`. This only works against servers that advertise
+  an **open** registration endpoint (e.g. Notion); a `redirect_uri` is still
+  required (DCR registers one). DCR cannot mint a confidential client.
+- **Confidential client** — a custom provider may set `oauth.client_secret`
+  (`client_secret_basic`/`client_secret_post`). Obtain it by manual
+  pre-registration; DCR only produces public clients.
+
+Client ID Metadata Documents (CIMD, SEP-991) remain unimplemented. Per-row
+compliance detail is in
 [`mcp-spec-alignment.md`](./mcp-spec-alignment.md) (rows 151 / 152 / 169-180).
 
 ### Built-in providers and their env vars
@@ -155,6 +170,74 @@ and a restricted-permission Secret mounted as a file is the canonical equivalent
 row 213 / 437), and single-process interactive login (paste-back is
 single-invocation; the cross-process `--paste` resume was removed by design — this
 is what caps step-up at "bounce, don't auto-retry").
+
+### Operator commands
+
+The `mcp` subcommand group inspects and authorizes configured servers:
+
+| Command | What it does |
+|---|---|
+| `mcp list` | Lists configured servers from `mcp.json`. |
+| `mcp status` | Per-server one-line state. For non-OAuth servers it prints the in-memory connection icon (○ disconnected / ◐ connecting / ● connected / ◌ needs-auth). For OAuth servers it instead **peeks the credential store** and reports `authed, idle`, `authed, near expiry`, or `◌ … (run mcp login <server>)`. |
+| `mcp login <server>` | Runs the interactive paste-back OAuth flow (prints the authorize URL, reads the pasted redirect on stdin, exchanges in the same process). Pass `--scope <scope>` (repeatable) to merge extra scopes into the request for a step-up re-authorization. |
+| `mcp login --device <server>` | Device flow (RFC 8628) for servers advertising a device authorization endpoint. |
+| `mcp doctor` | End-to-end health check across **all** servers (takes no server argument): live connect attempt plus, for OAuth servers, a cached-token check read from the rmcp `McpCredentialStore`. |
+
+**Why `mcp status` peeks the store.** Each CLI invocation is a fresh process, so
+the in-memory connection status of an OAuth server is always `Disconnected` until
+something connects in-process — which a bare `status` call doesn't do. Reading the
+credential store directly lets `status` report whether a usable token exists
+without dialing the server, so an already-authorized server no longer looks dead.
+`doctor` is the heavier check that actually connects.
+
+## Verified servers
+
+A non-exhaustive list of MCP servers brought up against openab-agent and what
+each exercised. stdio servers spawn via `npx`; HTTP servers are reached directly.
+The "Auth" column names the flow actually used.
+
+| Server | Transport | Auth | Status | Notes |
+|---|---|---|---|---|
+| filesystem (`@modelcontextprotocol/server-filesystem`) | stdio | none | ✅ | |
+| sequential-thinking (`@modelcontextprotocol/server-sequential-thinking`) | stdio | none | ✅ | |
+| Playwright (`@playwright/mcp`) | stdio | none | ✅ | Headless Chromium; `--isolated` for concurrent sessions and `--image-responses omit` so non-multimodal models aren't fed inline screenshots. |
+| Exa (`mcp.exa.ai`) | HTTP | none | ✅ | |
+| GitHub Copilot (`api.githubcopilot.com/mcp/`) | HTTP | OAuth — device flow | ✅ | Needs the non-compliant-token-endpoint shim below. |
+| Notion (`mcp.notion.com`) | HTTP | OAuth — paste-back | ✅ | AS offers open DCR + public clients + S256; see below. |
+| Figma (`mcp.figma.com`) | HTTP | OAuth | ❌ unsupportable | Catalog DCR returns 403 (confidential-client blocker now resolved by A2); see below. |
+
+**GitHub — non-compliant device token endpoint.** GitHub's device token endpoint
+returns **HTTP 200 with a JSON error body** (`authorization_pending` / `slow_down`)
+instead of the RFC 8628 §3.5-mandated 4xx. The `oauth2` crate treats any 2xx as a
+success token and aborts polling on the parse failure, so device login died on the
+first poll. openab-agent remaps any success response carrying a top-level `"error"`
+field to HTTP 400 so polling continues and terminates correctly on `access_denied`
+/ `expired_token`. The `client_id` comes from a self-registered OAuth app — GitHub
+exposes no DCR.
+
+**Notion — open registration, public client (DCR verified).** `mcp.notion.com` is
+its own authorization server and the smoothest custom OAuth case to date: its
+`registration_endpoint` accepts **unauthenticated** RFC 7591 registration (returns
+a public `client_id` with `token_endpoint_auth_method: none`), it advertises S256,
+and it has no device endpoint, so paste-back is used. This server is what
+**Dynamic Client Registration (A1)** was verified against: with **no `client_id`
+in the `oauth:` block**, `mcp login notion` discovered the
+`registration_endpoint`, called rmcp `register_client`, and minted a fresh public
+client ID on the fly — which was then persisted into the rmcp `StoredCredentials`
+and reused on reconnect (no re-registration). Pinning a `client_id` by hand still
+works and skips registration; DCR is the fallback when the field is absent. rmcp's
+hardcoded `resource` parameter happens to equal Notion's expected resource
+indicator here, so the caveat in §Authorization is benign for this server.
+
+**Figma — still unsupportable, one blocker left.** `mcp.figma.com` cannot
+currently be connected: (1) its DCR endpoint returns **403** — registration is
+gated to an approved "MCP Catalog" client allowlist that openab-agent isn't on; and
+(2) its token endpoint advertises only `client_secret_basic` / `client_secret_post`
+(**no `none`**), i.e. a confidential client with a secret. Blocker (2) is now
+addressed by the `oauth.client_secret` field (A2) — a pre-registered confidential
+client can supply its secret. Blocker (1) remains: without catalog admission there
+is no way to obtain a Figma client at all, so the server stays unsupportable until
+Figma allowlists openab-agent. It also has no device endpoint.
 
 ## Sampling
 
