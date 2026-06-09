@@ -1266,11 +1266,20 @@ impl McpRuntimeManager {
                         "mcp server {name:?} circuit-breaker open — retry in {retry_in_secs}s"
                     ));
                 }
-                // Half-open probe: the installed client tripped the breaker and
-                // may be dead. Bypass the Connected fast-path and fall through
-                // to a fresh dial so the probe actually exercises the wire — the
-                // dial outcome below records success/failure on the breaker.
-                Verdict::AllowProbe => {}
+                // Half-open probe. If the client is still installed and
+                // Connected, reuse it as the probe instead of tearing down a
+                // healthy connection: a transport fault routes through
+                // `disconnect()` (meta_tool / ping loop), which drops the
+                // client and flips status away from Connected — so Connected +
+                // a live handle here means the probe succeeds without a redial.
+                // Close the breaker and return. Otherwise fall through to a
+                // fresh dial, whose outcome records success/failure (#969 C6).
+                Verdict::AllowProbe => {
+                    if matches!(handle.status, ServerStatus::Connected) && handle.client.is_some() {
+                        self.breaker.record_success(name);
+                        return Ok(());
+                    }
+                }
                 Verdict::Allow => {
                     if matches!(handle.status, ServerStatus::Connected) && handle.client.is_some() {
                         return Ok(());
