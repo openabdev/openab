@@ -46,7 +46,7 @@ use tokio::task::AbortHandle;
 
 use super::breaker::{ServerBreaker, Verdict};
 use super::config::{parse_logging_level, McpConfig, ServerConfig};
-use super::flow::{canonical_resource, parse_redirect_params};
+use super::flow::{canonical_resource, ensure_s256_supported, parse_redirect_params};
 use super::oauth::{builtin_client_id, resolve, ResolvedProvider};
 use crate::auth::{auth_path, McpCredentialStore};
 use rmcp::transport::auth::OAuthClientConfig;
@@ -906,14 +906,7 @@ impl McpRuntimeManager {
             // PKCE methods without S256. Reject outright so we never proceed with
             // a downgraded `plain` challenge. A server that omits the field is
             // left to the "send PKCE, trust the AS" path (we still send S256).
-            if let Some(methods) = metadata.code_challenge_methods_supported.as_ref() {
-                if !methods.iter().any(|m| m == "S256") {
-                    return Err(anyhow!(
-                        "mcp server {name:?} authorization server does not advertise S256 in \
-                         code_challenge_methods_supported ({methods:?}); refusing to downgrade PKCE"
-                    ));
-                }
-            }
+            ensure_s256_supported(name, metadata.code_challenge_methods_supported.as_deref())?;
             mgr.set_metadata(metadata);
             let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
             match client_id {

@@ -58,6 +58,23 @@ pub fn parse_redirect_params(redirect_url: &str) -> Result<(String, String)> {
     Ok((code, state))
 }
 
+/// PKCE downgrade gate (ADR §6.4). rmcp only *warns* when an authorization
+/// server advertises `code_challenge_methods_supported` without `S256`; openab
+/// refuses outright so a paste-back login never proceeds on a downgraded
+/// `plain` challenge. A server that omits the field entirely is left to the
+/// "send S256, trust the AS" path (`None` → `Ok`).
+pub fn ensure_s256_supported(name: &str, methods: Option<&[String]>) -> Result<()> {
+    if let Some(methods) = methods {
+        if !methods.iter().any(|m| m == "S256") {
+            return Err(anyhow!(
+                "mcp server {name:?} authorization server does not advertise S256 in \
+                 code_challenge_methods_supported ({methods:?}); refusing to downgrade PKCE"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +144,27 @@ mod tests {
         let url = "not a url";
         let err = parse_redirect_params(url).unwrap_err().to_string();
         assert!(err.contains("invalid redirect URL"), "got: {err}");
+    }
+
+    #[test]
+    fn ensure_s256_rejects_methods_advertised_without_s256() {
+        let methods = vec!["plain".to_string()];
+        let err = ensure_s256_supported("linear", Some(&methods))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("refusing to downgrade PKCE"), "got: {err}");
+        assert!(err.contains("S256"), "got: {err}");
+    }
+
+    #[test]
+    fn ensure_s256_accepts_when_s256_is_among_advertised_methods() {
+        let methods = vec!["plain".to_string(), "S256".to_string()];
+        assert!(ensure_s256_supported("linear", Some(&methods)).is_ok());
+    }
+
+    #[test]
+    fn ensure_s256_accepts_when_field_is_absent() {
+        // AS omits the field entirely → trust-the-AS path, we still send S256.
+        assert!(ensure_s256_supported("linear", None).is_ok());
     }
 }
