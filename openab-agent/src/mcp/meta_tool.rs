@@ -290,6 +290,11 @@ async fn call_tool(
                     .with_context(|| format!("call_tool {tool:?} on {server:?}"));
             }
             manager.record_tool_call_outcome(server, false);
+            // Transport fault: the installed client is dead. Tear it down so the
+            // next connect() redials instead of reusing a dead handle via the
+            // Connected fast-path (#959 F1). Best-effort — teardown failure must
+            // not mask the original transport error returned below.
+            let _ = manager.disconnect(server).await;
             tracing::info!(
                 target: "mcp.audit",
                 server,

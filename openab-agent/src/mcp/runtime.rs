@@ -700,7 +700,6 @@ impl McpRuntimeManager {
     /// owned/`&mut` access). It is fire-and-forget — we cannot `await` the
     /// child reap here — and rmcp emits no SIGTERM rung, so this is the partial
     /// ladder the SDK exposes today.
-    #[allow(dead_code)] // shutdown entry point wired by the eviction/quit path next slice
     pub async fn disconnect(&self, name: &str) -> Result<()> {
         let client = {
             let mut handles = self.handles.write().await;
@@ -1251,14 +1250,25 @@ impl McpRuntimeManager {
             // Check the breaker before the connected fast path. Tool-call
             // transport failures can open the breaker while the client handle
             // remains installed; those calls must still be short-circuited
-            // until the cooldown/probe cycle succeeds.
-            if let Verdict::Reject { retry_in_secs } = self.breaker.check(name) {
-                return Err(anyhow!(
-                    "mcp server {name:?} circuit-breaker open — retry in {retry_in_secs}s"
-                ));
-            }
-            if matches!(handle.status, ServerStatus::Connected) && handle.client.is_some() {
-                return Ok(());
+            // until the cooldown/probe cycle succeeds. `check` is stateful (it
+            // arms `probe_in_flight` on the half-open transition), so capture
+            // the verdict once and branch on it rather than re-checking.
+            match self.breaker.check(name) {
+                Verdict::Reject { retry_in_secs } => {
+                    return Err(anyhow!(
+                        "mcp server {name:?} circuit-breaker open — retry in {retry_in_secs}s"
+                    ));
+                }
+                // Half-open probe: the installed client tripped the breaker and
+                // may be dead. Bypass the Connected fast-path and fall through
+                // to a fresh dial so the probe actually exercises the wire — the
+                // dial outcome below records success/failure on the breaker.
+                Verdict::AllowProbe => {}
+                Verdict::Allow => {
+                    if matches!(handle.status, ServerStatus::Connected) && handle.client.is_some() {
+                        return Ok(());
+                    }
+                }
             }
             let resolved = handle.config.resolved(name)?;
             connect_log_level = resolved.log_level().and_then(parse_logging_level);
