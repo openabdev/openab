@@ -19,6 +19,36 @@ pub struct McpConfig {
     /// capability, spec rows 363-384).
     #[serde(default)]
     pub roots: Vec<String>,
+    /// Idle-eviction TTL in seconds (ADR §5.7). A `Connected` server with no
+    /// tool call for this long is disconnected by the background evictor.
+    /// `None` → [`DEFAULT_IDLE_TTL_SECS`] (10m); `0` disables idle eviction.
+    #[serde(default)]
+    pub idle_ttl_secs: Option<u64>,
+    /// Cap on simultaneously-`Connected` servers (ADR §5.7). When a fresh
+    /// connect would exceed this, the LRU idle (`in_flight == 0`) server is
+    /// evicted first. `None` → [`DEFAULT_MAX_CONCURRENT_SERVERS`] (10). §7
+    /// notes operators on memory-constrained Fargate may lower this to 3.
+    #[serde(default)]
+    pub max_concurrent_servers: Option<usize>,
+}
+
+/// Idle-eviction TTL default (ADR §5.7): 10 minutes.
+pub const DEFAULT_IDLE_TTL_SECS: u64 = 600;
+
+/// Concurrency-cap default (ADR §5.7): 10 simultaneously-connected servers.
+pub const DEFAULT_MAX_CONCURRENT_SERVERS: usize = 10;
+
+impl McpConfig {
+    /// Resolved idle-eviction TTL. A zero duration means idle eviction is off.
+    pub fn idle_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.idle_ttl_secs.unwrap_or(DEFAULT_IDLE_TTL_SECS))
+    }
+
+    /// Resolved concurrency cap.
+    pub fn max_concurrent(&self) -> usize {
+        self.max_concurrent_servers
+            .unwrap_or(DEFAULT_MAX_CONCURRENT_SERVERS)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -358,6 +388,15 @@ impl McpConfig {
             };
             merged.servers.extend(layer.servers);
             merged.roots.extend(layer.roots);
+            // Global runtime settings: a later layer (project) overrides only
+            // when it explicitly sets the value, so an omitted setting in the
+            // project layer doesn't clobber a global one back to the default.
+            if layer.idle_ttl_secs.is_some() {
+                merged.idle_ttl_secs = layer.idle_ttl_secs;
+            }
+            if layer.max_concurrent_servers.is_some() {
+                merged.max_concurrent_servers = layer.max_concurrent_servers;
+            }
         }
         merged.validate()?;
         Ok(merged)

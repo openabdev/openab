@@ -15,8 +15,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use rmcp::model::{
@@ -356,6 +357,16 @@ pub struct ServerHandle {
     /// / `peer.call_tool()` without holding any runtime lock across the
     /// I/O `.await` (avoids writer starvation + `Future is not Send` traps).
     pub client: Option<Arc<RunningService<RoleClient, OpenabClientHandler>>>,
+    /// Last time a tool call entered (or a connect succeeded) for this server
+    /// (ADR §5.7, decision A4). Drives both the idle-eviction age and the LRU
+    /// victim choice for the concurrency cap.
+    pub last_used: Instant,
+    /// In-flight tool calls against this server (decision A4 = Option B). An
+    /// `Arc<AtomicUsize>` rather than a plain `usize` so the RAII call guard in
+    /// `meta_tool` can decrement it from a synchronous `Drop` without
+    /// re-acquiring the async `handles` lock. Eviction/cap exclude any server
+    /// with `in_flight > 0`, so a running call is never torn out from under.
+    pub in_flight: Arc<AtomicUsize>,
 }
 
 impl std::fmt::Debug for ServerHandle {
@@ -365,6 +376,7 @@ impl std::fmt::Debug for ServerHandle {
             .field("config", &self.config)
             .field("status", &self.status)
             .field("client", &self.client.is_some())
+            .field("in_flight", &self.in_flight.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -474,6 +486,18 @@ pub struct McpRuntimeManager {
     /// every session's MCP connections inherit a live bridge. Cloned into each
     /// `OpenabClientHandler`; `None` in headless contexts (e.g. `mcp` CLI).
     host_bridge: Option<crate::acp::HostBridge>,
+    /// Idle-eviction TTL (ADR §5.7). A `Connected` server untouched for this
+    /// long is disconnected by the background evictor. Zero disables it.
+    idle_ttl: Duration,
+    /// Cap on simultaneously-`Connected` servers (ADR §5.7). A fresh connect
+    /// that would exceed this first evicts the LRU idle (`in_flight == 0`)
+    /// server.
+    max_concurrent: usize,
+    /// Abort handle of the background idle-eviction loop. Single handle (unlike
+    /// the per-server `ping_tasks` map); installed once by `start_eviction_loop`
+    /// and aborted on a fresh start so the loop never duplicates. Same
+    /// `StdMutex` discipline — only guards the `Option`, never across `.await`.
+    eviction_task: Arc<StdMutex<Option<AbortHandle>>>,
 }
 
 impl McpRuntimeManager {
@@ -494,6 +518,8 @@ impl McpRuntimeManager {
         catalog.sort_by(|a, b| a.name.cmp(&b.name));
         let roots = Arc::new(compute_roots(std::env::current_dir().ok(), &cfg.roots));
         let provider = crate::llm::default_provider();
+        let idle_ttl = cfg.idle_ttl();
+        let max_concurrent = cfg.max_concurrent();
         let handles: HashMap<_, _> = cfg
             .servers
             .into_iter()
@@ -503,6 +529,8 @@ impl McpRuntimeManager {
                     config,
                     status: ServerStatus::Disconnected,
                     client: None,
+                    last_used: Instant::now(),
+                    in_flight: Arc::new(AtomicUsize::new(0)),
                 };
                 (name, handle)
             })
@@ -520,6 +548,9 @@ impl McpRuntimeManager {
             auth_clients: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             connect_locks: Arc::new(StdMutex::new(HashMap::new())),
             host_bridge: None,
+            idle_ttl,
+            max_concurrent,
+            eviction_task: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -1293,11 +1324,13 @@ impl McpRuntimeManager {
                 Verdict::AllowProbe => {
                     if matches!(handle.status, ServerStatus::Connected) && handle.client.is_some() {
                         self.breaker.record_success(name);
+                        handle.last_used = Instant::now();
                         return Ok(());
                     }
                 }
                 Verdict::Allow => {
                     if matches!(handle.status, ServerStatus::Connected) && handle.client.is_some() {
+                        handle.last_used = Instant::now();
                         return Ok(());
                     }
                 }
@@ -1318,6 +1351,13 @@ impl McpRuntimeManager {
             handle.status = ServerStatus::Connecting;
             plan
         };
+
+        // Concurrency cap (ADR §5.7): this server is now `Connecting`, so a
+        // fresh connection is imminent. Evict the LRU idle server(s) first if
+        // the live `Connected` set is at the cap. Done outside the write lock
+        // above because `disconnect()` re-acquires it; servers with an
+        // in-flight call are excluded so a running call is never torn out.
+        self.enforce_concurrency_cap(name).await;
 
         // Resolve the oauth dial outside the write lock so credential I/O and
         // a (possible) refresh round-trip don't block concurrent `mcp status`
@@ -1379,6 +1419,7 @@ impl McpRuntimeManager {
                     }
                 }
                 handle.status = ServerStatus::Connected;
+                handle.last_used = Instant::now();
                 let client = Arc::new(client);
                 handle.client = Some(client.clone());
                 self.breaker.record_success(name);
@@ -1433,6 +1474,136 @@ impl McpRuntimeManager {
         } else {
             self.breaker.record_failure(name);
         }
+    }
+
+    /// Mark the start of a tool call against `name` (decision A4): bump
+    /// `last_used` and the in-flight counter, returning a guard whose `Drop`
+    /// decrements the counter on every exit path of `meta_tool::call_tool`.
+    /// Call only after `connect()` succeeds, so the handle is present; returns
+    /// `None` if the server vanished in between (caller proceeds without
+    /// accounting).
+    pub async fn begin_call(&self, name: &str) -> Option<InFlightGuard> {
+        let mut guard = self.handles.write().await;
+        let handle = guard.get_mut(name)?;
+        handle.last_used = Instant::now();
+        let counter = handle.in_flight.clone();
+        counter.fetch_add(1, Ordering::Relaxed);
+        Some(InFlightGuard { counter })
+    }
+
+    /// Evict LRU idle servers until the live `Connected` set is below
+    /// `max_concurrent` (ADR §5.7), so the caller — mid-`connect`, already
+    /// `Connecting` — can establish a fresh connection without exceeding the
+    /// cap. Only `in_flight == 0` servers are eligible; if every Connected
+    /// server is busy the cap is exceeded transiently rather than tearing out a
+    /// running call. `connecting` is excluded from the candidate set.
+    async fn enforce_concurrency_cap(&self, connecting: &str) {
+        if self.max_concurrent == 0 {
+            return;
+        }
+        loop {
+            let victim = {
+                let handles = self.handles.read().await;
+                let connected = handles
+                    .values()
+                    .filter(|h| matches!(h.status, ServerStatus::Connected))
+                    .count();
+                if connected < self.max_concurrent {
+                    return;
+                }
+                handles
+                    .iter()
+                    .filter(|(n, h)| {
+                        n.as_str() != connecting
+                            && matches!(h.status, ServerStatus::Connected)
+                            && h.in_flight.load(Ordering::Relaxed) == 0
+                    })
+                    .min_by_key(|(_, h)| h.last_used)
+                    .map(|(n, _)| n.clone())
+            };
+            match victim {
+                Some(v) => {
+                    tracing::info!(
+                        server = %v,
+                        "evicting LRU mcp server to honor concurrency cap"
+                    );
+                    let _ = self.disconnect(&v).await;
+                }
+                // Every Connected server is busy — proceed over the cap rather
+                // than interrupt an in-flight call.
+                None => return,
+            }
+        }
+    }
+
+    /// Start the background idle-eviction loop (ADR §5.7). Idempotent — a fresh
+    /// call aborts any prior loop so it never duplicates. A zero `idle_ttl`
+    /// disables eviction (no loop spawned). Mirrors `spawn_ping_loop`'s task
+    /// discipline. Call once after construction (e.g. from `AcpServer::run`).
+    pub fn start_eviction_loop(&self) {
+        if self.idle_ttl.is_zero() {
+            return;
+        }
+        // Sweep several times per TTL so a server is evicted within ~ttl + one
+        // sweep; clamp so a short (test) TTL still sweeps promptly and a long
+        // one doesn't wake too often.
+        let sweep = (self.idle_ttl / 4).clamp(Duration::from_secs(5), Duration::from_secs(60));
+        let manager = self.clone();
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(sweep);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await; // consume the immediate first tick
+            loop {
+                ticker.tick().await;
+                manager.evict_idle().await;
+            }
+        });
+        let prior = self
+            .eviction_task
+            .lock()
+            .expect("eviction_task mutex poisoned")
+            .replace(task.abort_handle());
+        if let Some(prior) = prior {
+            prior.abort();
+        }
+    }
+
+    /// Disconnect every `Connected`, idle (`in_flight == 0`) server whose
+    /// `last_used` is older than `idle_ttl` (ADR §5.7). Snapshots victims under
+    /// a read lock, then disconnects each (which takes its own write lock).
+    async fn evict_idle(&self) {
+        let now = Instant::now();
+        let victims: Vec<String> = {
+            let handles = self.handles.read().await;
+            handles
+                .iter()
+                .filter(|(_, h)| {
+                    matches!(h.status, ServerStatus::Connected)
+                        && h.in_flight.load(Ordering::Relaxed) == 0
+                        && now.saturating_duration_since(h.last_used) >= self.idle_ttl
+                })
+                .map(|(n, _)| n.clone())
+                .collect()
+        };
+        for v in victims {
+            tracing::info!(server = %v, "evicting idle mcp server (idle_ttl elapsed)");
+            let _ = self.disconnect(&v).await;
+        }
+    }
+}
+
+/// RAII guard from [`McpRuntimeManager::begin_call`]. Decrements the per-server
+/// in-flight counter on drop, covering every exit path of tool-call dispatch
+/// without per-return bookkeeping. `Drop` is synchronous (no `.await`) because
+/// the counter is a standalone `AtomicUsize`, not behind the async `handles`
+/// lock.
+pub struct InFlightGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -2633,5 +2804,104 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mgr.auth_clients.lock().await.len(), 1);
+    }
+
+    fn three_stdio_mgr() -> McpRuntimeManager {
+        let cfg: McpConfig = serde_json::from_str(
+            r#"{ "mcpServers": {
+                "a": { "type": "stdio", "command": "x" },
+                "b": { "type": "stdio", "command": "x" },
+                "c": { "type": "stdio", "command": "x" }
+            } }"#,
+        )
+        .unwrap();
+        McpRuntimeManager::from_config(cfg)
+    }
+
+    /// Mark `name` Connected with a chosen idle age and in-flight count so the
+    /// eviction/cap selectors can be exercised without a live transport.
+    async fn force_connected(mgr: &McpRuntimeManager, name: &str, idle: Duration, in_flight: usize) {
+        let mut handles = mgr.handles.write().await;
+        let h = handles.get_mut(name).unwrap();
+        h.status = ServerStatus::Connected;
+        h.last_used = Instant::now() - idle;
+        h.in_flight = Arc::new(AtomicUsize::new(in_flight));
+    }
+
+    async fn status_of(mgr: &McpRuntimeManager, name: &str) -> ServerStatus {
+        mgr.handles.read().await.get(name).unwrap().status.clone()
+    }
+
+    #[tokio::test]
+    async fn begin_call_guard_bumps_and_releases_in_flight() {
+        let mgr = three_stdio_mgr();
+        force_connected(&mgr, "a", Duration::ZERO, 0).await;
+        let count = || async {
+            mgr.handles
+                .read()
+                .await
+                .get("a")
+                .unwrap()
+                .in_flight
+                .load(Ordering::Relaxed)
+        };
+        assert_eq!(count().await, 0);
+        {
+            let _g = mgr.begin_call("a").await.expect("server present");
+            assert_eq!(count().await, 1);
+        }
+        // Guard dropped → counter back to zero (covers every call-site return).
+        assert_eq!(count().await, 0);
+        // A vanished server yields no guard rather than panicking.
+        assert!(mgr.begin_call("missing").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn evict_idle_drops_only_stale_unbusy_connected_servers() {
+        let mut mgr = three_stdio_mgr();
+        mgr.idle_ttl = Duration::from_secs(600);
+        // a: stale + idle → evicted. b: stale but busy → kept. c: fresh → kept.
+        force_connected(&mgr, "a", Duration::from_secs(700), 0).await;
+        force_connected(&mgr, "b", Duration::from_secs(700), 1).await;
+        force_connected(&mgr, "c", Duration::from_secs(10), 0).await;
+        mgr.evict_idle().await;
+        assert_eq!(status_of(&mgr, "a").await, ServerStatus::Disconnected);
+        assert_eq!(status_of(&mgr, "b").await, ServerStatus::Connected);
+        assert_eq!(status_of(&mgr, "c").await, ServerStatus::Connected);
+    }
+
+    #[tokio::test]
+    async fn enforce_cap_evicts_lru_idle_and_spares_busy() {
+        let mut mgr = three_stdio_mgr();
+        mgr.max_concurrent = 2;
+        // a and b are already Connected; c is mid-connect (Connecting, as the
+        // real caller is at runtime.rs:1351 before its install at :1421), so it
+        // is excluded from the Connected count. Admitting c would make 3 — over
+        // the cap of 2 — so one idle Connected server must go. a is the LRU
+        // (oldest last_used); b is newer.
+        force_connected(&mgr, "a", Duration::from_secs(300), 0).await;
+        force_connected(&mgr, "b", Duration::from_secs(10), 0).await;
+        {
+            let mut h = mgr.handles.write().await;
+            h.get_mut("c").unwrap().status = ServerStatus::Connecting;
+        }
+        mgr.enforce_concurrency_cap("c").await;
+        // a (LRU) evicted so the soon-to-be-Connected c lands at the cap; b kept.
+        assert_eq!(status_of(&mgr, "a").await, ServerStatus::Disconnected);
+        assert_eq!(status_of(&mgr, "b").await, ServerStatus::Connected);
+        assert_eq!(status_of(&mgr, "c").await, ServerStatus::Connecting);
+    }
+
+    #[tokio::test]
+    async fn enforce_cap_tolerates_overage_when_every_candidate_is_busy() {
+        let mut mgr = three_stdio_mgr();
+        mgr.max_concurrent = 1;
+        // Both Connected servers are busy → none evictable; the cap is exceeded
+        // transiently rather than tearing out a running call.
+        force_connected(&mgr, "a", Duration::from_secs(300), 1).await;
+        force_connected(&mgr, "b", Duration::from_secs(300), 1).await;
+        mgr.enforce_concurrency_cap("c").await;
+        assert_eq!(status_of(&mgr, "a").await, ServerStatus::Connected);
+        assert_eq!(status_of(&mgr, "b").await, ServerStatus::Connected);
     }
 }

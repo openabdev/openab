@@ -176,6 +176,10 @@ async fn call_tool(
         .connect(server)
         .await
         .with_context(|| format!("connect mcp server {server:?}"))?;
+    // Mark this server in-flight for the duration of the call so idle eviction
+    // and the concurrency cap never tear out a connection mid-request. The guard
+    // decrements the counter on drop, covering every early-return below.
+    let _call_guard = manager.begin_call(server).await;
     let peer = manager.arc_peer(server).await?;
     ensure_tools_capability(&peer, server)
         .with_context(|| format!("call_tool {tool:?} on {server:?}"))?;
@@ -338,6 +342,7 @@ async fn fetch_tools(manager: &McpRuntimeManager, server: &str) -> Result<Vec<rm
         .connect(server)
         .await
         .with_context(|| format!("connect mcp server {server:?}"))?;
+    let _call_guard = manager.begin_call(server).await;
     let peer = manager.arc_peer(server).await?;
     ensure_tools_capability(&peer, server)
         .with_context(|| format!("list_tools on {server:?}"))?;

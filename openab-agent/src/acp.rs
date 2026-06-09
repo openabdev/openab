@@ -193,6 +193,7 @@ impl AcpServer {
         let bridge = HostBridge::new(out_tx.clone());
         if let Some(manager) = self.mcp_manager.as_mut() {
             manager.set_host_bridge(bridge.clone());
+            manager.start_eviction_loop();
         }
 
         while let Some(line) = rx.recv().await {
