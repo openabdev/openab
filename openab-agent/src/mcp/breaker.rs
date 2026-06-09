@@ -111,10 +111,34 @@ impl ServerBreaker {
     fn record_failure_at(&self, server: &str, now: Instant) {
         let mut entries = self.entries.lock().expect("breaker mutex poisoned");
         let entry = entries.entry(server.to_string()).or_default();
+        let was_probe = entry.probe_in_flight;
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
         entry.probe_in_flight = false;
         if entry.consecutive_failures >= FAIL_THRESHOLD {
-            entry.opened_at = Some(now);
+            // Stamp `opened_at` only on the Closed→Open transition (no
+            // timestamp yet) or when a half-open probe just failed
+            // (`was_probe`), which must re-arm the cooldown. A passive failure
+            // while already Open must NOT re-stamp: doing so restarts the
+            // cooldown clock on every failure so the breaker never reaches
+            // half-open (#969 F1).
+            if entry.opened_at.is_none() || was_probe {
+                entry.opened_at = Some(now);
+            }
+        }
+    }
+
+    /// True while the breaker has tripped for `server` — it has reached
+    /// [`FAIL_THRESHOLD`] consecutive failures and not yet been reset by a
+    /// success (covers both the Open cooldown and the half-open probe window).
+    /// Non-mutating, unlike [`check`](ServerBreaker::check) which arms a probe
+    /// on the half-open transition; callers that only need to gate passive
+    /// failure reporting (the ping loop) use this so they don't disturb the
+    /// foreground probe state.
+    pub fn is_tripped(&self, server: &str) -> bool {
+        let entries = self.entries.lock().expect("breaker mutex poisoned");
+        match entries.get(server) {
+            Some(e) => e.consecutive_failures >= FAIL_THRESHOLD && e.opened_at.is_some(),
+            None => false,
         }
     }
 }
@@ -224,6 +248,42 @@ mod tests {
         }
         assert!(matches!(b.check("foo"), Verdict::Reject { .. }));
         assert_eq!(b.check("bar"), Verdict::Allow);
+    }
+
+    #[test]
+    fn passive_failure_while_open_does_not_restamp_cooldown() {
+        let b = ServerBreaker::new();
+        let t0 = Instant::now();
+        for _ in 0..FAIL_THRESHOLD {
+            b.record_failure_at("foo", t0);
+        }
+        // A passive failure partway through the cooldown must not restart the
+        // clock (it is not a half-open probe).
+        let t_mid = t0 + Duration::from_secs(30);
+        b.record_failure_at("foo", t_mid);
+        // Cooldown is still measured from t0, so the probe is allowed here.
+        // Had the passive failure re-stamped opened_at to t_mid, this would
+        // still Reject.
+        let t_after = t0 + COOLDOWN + Duration::from_secs(1);
+        assert_eq!(b.check_at("foo", t_after), Verdict::AllowProbe);
+    }
+
+    #[test]
+    fn is_tripped_tracks_open_state() {
+        let b = ServerBreaker::new();
+        assert!(!b.is_tripped("foo"));
+        b.record_failure("foo");
+        assert!(!b.is_tripped("foo"), "below threshold is not tripped");
+        for _ in 1..FAIL_THRESHOLD {
+            b.record_failure("foo");
+        }
+        assert!(b.is_tripped("foo"), "tripped once threshold reached");
+        // Half-open window (cooldown elapsed) is still tripped.
+        let t1 = Instant::now() + COOLDOWN + Duration::from_secs(1);
+        assert_eq!(b.check_at("foo", t1), Verdict::AllowProbe);
+        assert!(b.is_tripped("foo"), "still tripped during half-open probe");
+        b.record_success("foo");
+        assert!(!b.is_tripped("foo"), "success resets tripped state");
     }
 
     #[test]

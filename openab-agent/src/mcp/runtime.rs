@@ -776,7 +776,14 @@ impl McpRuntimeManager {
                             "ping failed: {}",
                             super::redact_secrets(&format!("{e}"))
                         );
-                        manager.breaker.record_failure(&name);
+                        // Let a passive ping failure trip the breaker only while
+                        // it is still Closed. Once tripped, the foreground
+                        // connect()/probe path owns failure accounting — passive
+                        // pings here would clobber the in-flight probe flag and
+                        // re-arm the cooldown (C4 / #969 F1).
+                        if !manager.breaker.is_tripped(&name) {
+                            manager.breaker.record_failure(&name);
+                        }
                     }
                 }
             }
