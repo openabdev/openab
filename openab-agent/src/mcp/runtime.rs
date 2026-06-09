@@ -459,6 +459,15 @@ pub struct McpRuntimeManager {
     /// `tokio::Mutex` is held only for `HashMap` get/insert, never across the
     /// inner manager's network work.
     auth_clients: Arc<tokio::sync::Mutex<HashMap<String, AuthClient<reqwest013::Client>>>>,
+    /// Per-server connect serialization (#969 A2/C3). `connect()` holds the
+    /// named server's lock across the whole dial so two concurrent callers
+    /// can't both spawn a child / ping loop; the second waiter proceeds after
+    /// the first finishes and hits the Connected fast-path. The outer
+    /// `StdMutex` only guards `HashMap` get/insert (never across `.await`); the
+    /// inner per-server `tokio::Mutex` is the one held across the dial. Shared
+    /// across manager clones (it is an `Arc`), so serialization holds even when
+    /// two sessions connect the same server concurrently.
+    connect_locks: Arc<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Duplex channel back into the ACP loop for server-initiated elicitation
     /// (spec §1). `None` until `AcpServer::run` injects it via `set_host_bridge`
     /// (before the first `session/new` clones the manager into an `Agent`), so
@@ -509,6 +518,7 @@ impl McpRuntimeManager {
             roots,
             provider,
             auth_clients: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            connect_locks: Arc::new(StdMutex::new(HashMap::new())),
             host_bridge: None,
         }
     }
@@ -1244,6 +1254,12 @@ impl McpRuntimeManager {
     /// `NeedsAuth` and returns an error pointing the caller at the login
     /// subcommand rather than attempting an unauthenticated dial.
     pub async fn connect(&self, name: &str) -> Result<()> {
+        // Serialize connects per server (#969 A2/C3): hold the named server's
+        // lock across the whole dial so two concurrent callers can't both dial
+        // + spawn a duplicate child / ping loop. The second waiter proceeds
+        // once the first releases and hits the Connected fast-path below.
+        let connect_lock = self.connect_lock_for(name);
+        let _connect_guard = connect_lock.lock().await;
         // Connect-time `logging/setLevel` value (MCP §16 / row 584), captured
         // from config before `resolved` is consumed by the dial-plan match so
         // we can issue `set_level` once the handshake succeeds below. Assigned
@@ -1388,6 +1404,20 @@ impl McpRuntimeManager {
                 Err(anyhow!(super::concise_error_message(&e)))
             }
         }
+    }
+
+    /// Fetch (or lazily create) the per-server connect serialization lock
+    /// (#969 A2/C3). The outer `StdMutex` is held only for the `HashMap`
+    /// get/insert — never across the returned lock's `.await`.
+    fn connect_lock_for(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .connect_locks
+            .lock()
+            .expect("connect_locks mutex poisoned");
+        locks
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Record a tool-call outcome on the breaker. Called from
