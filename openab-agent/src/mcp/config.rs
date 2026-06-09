@@ -41,6 +41,10 @@ pub enum ServerConfig {
         #[serde(default)]
         ping_timeout_secs: Option<u64>,
     },
+    // Accept the canonical MCP transport name `"streamable-http"` as well as
+    // the short `"http"` (from `rename_all`) so a config using the spec
+    // spelling isn't silently dropped.
+    #[serde(alias = "streamable-http")]
     Http {
         url: String,
         #[serde(default)]
@@ -227,24 +231,78 @@ impl OAuthConfig {
                 ("oauth.token_url", self.token_url.as_deref()),
             ] {
                 if let Some(url) = url {
-                    if !url.starts_with("https://") {
-                        return Err(anyhow!(
-                            "mcp server {server:?}: {label} must use https:// for a \
-                             custom oauth provider (got {url:?})"
-                        ));
+                    // Defense-in-depth (C5): a `${env:..}` placeholder can't be
+                    // scheme-checked until it's substituted at connect time, so
+                    // tolerate it here (no false-reject) — `resolved_with_env`
+                    // re-checks the substituted value. Literal URLs are checked
+                    // now.
+                    if !url.contains("${env:") {
+                        check_url_scheme(server, label, url, false)?;
                     }
                 }
             }
             if let Some(redirect) = self.redirect_uri.as_deref() {
-                if !is_loopback_or_https_redirect(redirect) {
-                    return Err(anyhow!(
-                        "mcp server {server:?}: oauth.redirect_uri must use https:// \
-                         or http://localhost (got {redirect:?})"
-                    ));
+                if !redirect.contains("${env:") {
+                    check_url_scheme(server, "oauth.redirect_uri", redirect, true)?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Connect-time scheme re-check on the *substituted* URLs (C5
+    /// defense-in-depth). `validate` tolerates `${env:..}` placeholders at
+    /// boot; this guarantees the resolved value still satisfies the
+    /// https/loopback rule, so a malicious env value can't smuggle an
+    /// `http://` endpoint past the boot check. Scheme/loopback only — the
+    /// discovery allowlist check is not repeated here.
+    fn validate_resolved_schemes(&self, server: &str) -> Result<()> {
+        let is_custom = self
+            .provider
+            .as_deref()
+            .map(|p| super::oauth::builtin(p).is_none())
+            .unwrap_or(true);
+        if is_custom {
+            for (label, url) in [
+                ("oauth.authorize_url", self.authorize_url.as_deref()),
+                ("oauth.token_url", self.token_url.as_deref()),
+            ] {
+                if let Some(url) = url {
+                    check_url_scheme(server, label, url, false)?;
+                }
+            }
+            if let Some(redirect) = self.redirect_uri.as_deref() {
+                check_url_scheme(server, "oauth.redirect_uri", redirect, true)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Shared https/loopback scheme check used by both boot-time `validate` (on
+/// literal URLs) and the connect-time resolved path (on substituted URLs).
+/// With `allow_loopback`, `http://` is tolerated for the loopback interface
+/// (RFC 8252 §7.3 native-app redirect); otherwise only `https://` is accepted
+/// (MCP 2025-11-25 auth, rows 217/218).
+fn check_url_scheme(server: &str, label: &str, url: &str, allow_loopback: bool) -> Result<()> {
+    let ok = if allow_loopback {
+        is_loopback_or_https_redirect(url)
+    } else {
+        url.starts_with("https://")
+    };
+    if ok {
+        return Ok(());
+    }
+    if allow_loopback {
+        Err(anyhow!(
+            "mcp server {server:?}: {label} must use https:// \
+             or http://localhost (got {url:?})"
+        ))
+    } else {
+        Err(anyhow!(
+            "mcp server {server:?}: {label} must use https:// for a \
+             custom oauth provider (got {url:?})"
+        ))
     }
 }
 
@@ -282,7 +340,22 @@ impl McpConfig {
             if !path.exists() {
                 continue;
             }
-            let layer = Self::load_file(path)?;
+            // A5: isolate parse failures per layer. A malformed layer (e.g. a
+            // broken project config) must not drop the servers contributed by
+            // the other layers, so a read/parse error warns and skips this
+            // layer. Semantic validation of the merged result below still
+            // hard-fails.
+            let layer = match Self::load_file(path) {
+                Ok(layer) => layer,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "skipping mcp config layer: failed to load"
+                    );
+                    continue;
+                }
+            };
             merged.servers.extend(layer.servers);
             merged.roots.extend(layer.roots);
         }
@@ -324,7 +397,16 @@ impl ServerConfig {
         let json = serde_json::to_value(self)?;
         let resolved = interpolate_value(json, env)
             .with_context(|| format!("resolve env for mcp server {name:?}"))?;
-        Ok(serde_json::from_value(resolved)?)
+        let resolved: Self = serde_json::from_value(resolved)?;
+        // C5 defense-in-depth: re-validate URL schemes on the substituted
+        // values, since boot-time `validate` tolerated `${env:..}` placeholders.
+        if let ServerConfig::Http {
+            oauth: Some(oauth), ..
+        } = &resolved
+        {
+            oauth.validate_resolved_schemes(name)?;
+        }
+        Ok(resolved)
     }
 }
 
@@ -602,6 +684,23 @@ mod tests {
     }
 
     #[test]
+    fn load_layered_skips_malformed_layer() {
+        // A5: a broken layer must not drop the other layer's servers.
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.json");
+        let project = dir.path().join("project.json");
+        std::fs::write(&global, "{ this is not valid json").unwrap();
+        std::fs::write(
+            &project,
+            r#"{"mcpServers":{"fs":{"type":"stdio","command":"project-fs"}}}"#,
+        )
+        .unwrap();
+        let cfg = McpConfig::load_layered(Some(&global), Some(&project)).unwrap();
+        assert_eq!(cfg.servers.len(), 1);
+        assert!(cfg.servers.contains_key("fs"));
+    }
+
+    #[test]
     fn load_layered_rejects_invalid_discovery_config() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project.json");
@@ -668,5 +767,52 @@ mod tests {
         );
         oauth.redirect_uri = Some("http://localhost:8765/callback".into());
         oauth.validate("srv").unwrap();
+    }
+
+    #[test]
+    fn parses_streamable_http_alias() {
+        let cfg: ServerConfig =
+            serde_json::from_str(r#"{"type":"streamable-http","url":"https://e.com/mcp"}"#).unwrap();
+        assert!(matches!(cfg, ServerConfig::Http { .. }));
+    }
+
+    #[test]
+    fn validate_tolerates_env_placeholder_in_urls() {
+        // Boot validation must not false-reject an unresolved placeholder.
+        let oauth = custom("${env:AUTH_URL}", "${env:TOKEN_URL}");
+        oauth.validate("srv").unwrap();
+    }
+
+    fn http_with_oauth(oauth: OAuthConfig) -> ServerConfig {
+        ServerConfig::Http {
+            url: "https://example.com/mcp".into(),
+            oauth: Some(oauth),
+            tool_filter: None,
+            request_timeout_secs: default_request_timeout_secs(),
+            log_level: None,
+            ping_interval_secs: None,
+            ping_timeout_secs: None,
+        }
+    }
+
+    #[test]
+    fn resolved_rejects_http_substituted_authorize_url() {
+        let env = env(&[
+            ("AUTH_URL", "http://evil.example/authorize"),
+            ("TOKEN_URL", "https://issuer.example/token"),
+        ]);
+        let cfg = http_with_oauth(custom("${env:AUTH_URL}", "${env:TOKEN_URL}"));
+        let err = cfg.resolved_with_env("srv", &env).unwrap_err().to_string();
+        assert!(err.contains("oauth.authorize_url"), "got: {err}");
+    }
+
+    #[test]
+    fn resolved_accepts_https_substituted_urls() {
+        let env = env(&[
+            ("AUTH_URL", "https://good.example/authorize"),
+            ("TOKEN_URL", "https://good.example/token"),
+        ]);
+        let cfg = http_with_oauth(custom("${env:AUTH_URL}", "${env:TOKEN_URL}"));
+        cfg.resolved_with_env("srv", &env).unwrap();
     }
 }

@@ -305,6 +305,13 @@ pub fn cli_list_servers(resolve: bool) {
     for (name, server) in servers {
         print_server(name, server, resolve);
     }
+    if !resolve {
+        // Hint to stderr (keeps stdout paste-clean): values are verbatim, so
+        // `${env:..}` placeholders are shown unexpanded unless --resolve is used.
+        eprintln!();
+        eprintln!("Note: values are shown verbatim; ${{env:VAR}} placeholders are not expanded.");
+        eprintln!("      Re-run `mcp list --resolve` to substitute environment variables.");
+    }
 }
 
 fn print_server(name: &str, server: &ServerConfig, resolve: bool) {
