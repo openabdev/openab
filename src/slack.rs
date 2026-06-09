@@ -697,7 +697,22 @@ pub async fn run_slack_adapter(
 
                 loop {
                     tokio::select! {
-                        msg_result = read.next() => {
+                        msg_result = tokio::time::timeout(
+                            std::time::Duration::from_secs(60),
+                            read.next(),
+                        ) => {
+                            // Half-open detection: Slack sends a ping ~every 30s, so 60s with no
+                            // frame means the socket is silently dead (e.g. a NAT/firewall dropped
+                            // the idle TCP connection without a Close frame or RST). Break so the
+                            // outer reconnect loop runs; otherwise read.next() blocks forever here
+                            // and the bot silently stops receiving events.
+                            let msg_result = match msg_result {
+                                Ok(inner) => inner,
+                                Err(_elapsed) => {
+                                    warn!("no frame from Slack for 60s; assuming dead connection, reconnecting");
+                                    break;
+                                }
+                            };
                             let Some(msg_result) = msg_result else { break };
                             match msg_result {
                                 Ok(tungstenite::Message::Text(text)) => {
