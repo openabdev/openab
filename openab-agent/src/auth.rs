@@ -116,9 +116,22 @@ pub fn auth_path() -> PathBuf {
 /// file is the legacy `TokenStore` shape, absent means the new namespaced
 /// map. A single JSON parse gives accurate error context either way.
 fn read_auth_file(path: &Path) -> Result<HashMap<String, AuthEntry>> {
+    // A missing/unreadable file is "no credentials yet", not corruption — let
+    // it propagate so callers fall through to an empty map without quarantine.
     let data = std::fs::read_to_string(path)?;
+    // A successful read that fails to parse is genuine corruption: quarantine
+    // the bad bytes (#969 B6 / decision A3) before propagating, so the
+    // `unwrap_or_default()` save paths recreate a clean file instead of
+    // silently wiping every server's credentials on top of the corruption.
+    parse_auth_data(&data).map_err(|e| {
+        quarantine_corrupt_auth(path, &e);
+        e
+    })
+}
+
+fn parse_auth_data(data: &str) -> Result<HashMap<String, AuthEntry>> {
     let value: serde_json::Value =
-        serde_json::from_str(&data).map_err(|e| anyhow!("Invalid auth.json: {e}"))?;
+        serde_json::from_str(data).map_err(|e| anyhow!("Invalid auth.json: {e}"))?;
     if value.get("access_token").is_some() {
         let legacy: TokenStore = serde_json::from_value(value)
             .map_err(|e| anyhow!("Invalid auth.json (legacy format): {e}"))?;
@@ -127,6 +140,26 @@ fn read_auth_file(path: &Path) -> Result<HashMap<String, AuthEntry>> {
         return Ok(map);
     }
     serde_json::from_value(value).map_err(|e| anyhow!("Invalid auth.json: {e}"))
+}
+
+/// Quarantine a corrupt `auth.json` (#969 B6 / decision A3 = Option 2). Renames
+/// the unparseable file to `auth.json.corrupt-<unix_ts>` so the bad bytes are
+/// preserved for forensics, then warns. Best-effort: a rename failure must NOT
+/// turn a corrupt-file read into a hard failure, or it would wedge every later
+/// save (the opposite of the no-silent-wipe / no-permanent-hard-fail decision).
+fn quarantine_corrupt_auth(path: &Path, err: &anyhow::Error) {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let quarantine = path.with_extension(format!("json.corrupt-{ts}"));
+    tracing::warn!(
+        path = %path.display(),
+        quarantine = %quarantine.display(),
+        error = %err,
+        "auth.json is corrupt; quarantining and continuing with an empty store"
+    );
+    let _ = std::fs::rename(path, &quarantine);
 }
 
 /// Atomically replace `auth.json` with the new map via tmp + `rename(2)` +
@@ -898,6 +931,42 @@ mod tests {
         assert!(store.load().await.unwrap().is_none(), "cleared → None");
         // Last entry removed → file is gone, not left as an empty map.
         assert!(!path.exists(), "auth.json removed once last entry cleared");
+    }
+
+    #[tokio::test]
+    async fn corrupt_auth_json_is_quarantined_not_silently_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        // Seed an unparseable auth.json (decision A3 / #969 B6).
+        std::fs::write(&path, "not json{{").unwrap();
+
+        let store = McpCredentialStore::new(path.clone(), "linear");
+
+        // A save against the corrupt file must succeed (not wedge) and write a
+        // clean file with the new creds rather than silently wiping on top of
+        // the corruption.
+        store.save(make_mcp_creds()).await.unwrap();
+        let loaded = store.load().await.unwrap().expect("creds present after save");
+        assert_eq!(loaded.client_id, "client-xyz");
+
+        // The corrupt bytes are preserved in exactly one quarantine sibling
+        // (auth.json.corrupt-<ts>), not overwritten in place.
+        let quarantined: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("auth.json.corrupt-"))
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "exactly one quarantine file, got {quarantined:?}"
+        );
+        let preserved = std::fs::read_to_string(dir.path().join(&quarantined[0])).unwrap();
+        assert_eq!(
+            preserved, "not json{{",
+            "quarantine preserves the original corrupt bytes"
+        );
     }
 
     #[tokio::test]
