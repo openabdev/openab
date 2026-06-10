@@ -337,7 +337,7 @@ Typical multi-turn usage (lazy connect at first need, idle eviction after TTL):
 - **Turn 1** — LLM calls `mcp(action: "list_servers")`; no IO, served from config cache. Returns `["github (stdio)", ...]`.
 - **Turn 2** — LLM calls `mcp(action: "list_tools", server: "github")`; `lazy_connect("github")` spawns child proc, `peer.list_all_tools()` fetches descriptors. Returns `[{name, description}, ...]`.
 - **Turn 3** — LLM calls `mcp(action: "call", server, tool, arguments)`; `peer.call_tool()` invokes. Returns `CallToolResult`.
-- **Idle (no MCP call for `idle_ttl`)** — `IdleEvictor` shuts down child proc, drops Peer; config + descriptor cache retained for fast re-connect.
+- **Idle (no MCP call for `idle_ttl`)** — the background eviction loop shuts down the child proc and drops the Peer (only if not mid-call); config + descriptor cache retained for fast re-connect.
 
 ### 5.4 Module layout
 
@@ -466,8 +466,8 @@ Single root key `mcpServers` to match Claude Code / Codex / Cursor / Cline conve
 ```
 
 - **Lazy connect**: server is `Disconnected` at boot; transitions to `Connecting → Connected` on first action needing it
-- **Idle eviction**: background task evicts servers idle > `idle_ttl` (default 10m, configurable per server). State drops to `Disconnected`; tools cache retained for fast re-connect
-- **Concurrency cap**: `max_concurrent_servers` bounds simultaneously-`Connected` servers (default 10; see §7 for constrained-env tuning). When at cap, the LRU connected server is force-evicted before connecting a new one
+- **Idle eviction**: a background eviction loop (started at agent run) evicts servers idle > `idle_ttl` (default 10m, configurable) — but only when the server is not mid-call (`in_flight == 0`); a busy server is never torn out from under an in-flight call. State drops to `Disconnected` (surfaced to the LLM as `idle`); tools cache retained for fast re-connect
+- **Concurrency cap**: `max_concurrent_servers` bounds simultaneously-`Connected` servers (default 10; see §7 for constrained-env tuning). When connecting a new server would exceed the cap, the LRU **idle** (`in_flight == 0`) connected server is evicted first; if every connected server is busy, the cap is exceeded transiently rather than evicting an in-use server
 - **Connection reuse**: while connected, all `mcp call` actions reuse the same `Peer`
 
 ### 5.8 Config refresh model
@@ -496,7 +496,7 @@ Adopted from Hermes Agent (the only surveyed project that ships one):
             ┌───────────────────────┼───────────────────────┐
             │                       │                       │
             ▼                       ▼                       ▼
-       3 fails in 30s          60s elapsed             1 success
+       3 consecutive fails     60s elapsed             1 success
        ─────────────►         ─────────────►          ─────────────►
        Closed → Open          Open → HalfOpen         HalfOpen → Closed
                               (allow 1 probe)
@@ -624,13 +624,13 @@ Subcommand placement under existing `openab-agent` binary — no new binary. CLI
 
 ## 9. Rollout Plan
 
-~6 weeks across three phases:
+Delivered across three phases (all landed):
 
-1. **Foundation (3w)** — `rmcp` + stdio + meta-tool + minimal CLI, behind `--features mcp`
-2. **Network & auth (2w)** — Streamable HTTP transport + OAuth providers + `login`/`refresh` CLI; promote flag default-on
-3. **Resilience (1w)** — circuit breaker + `doctor` CLI; remove flag
+1. **Foundation** — `rmcp` + stdio + meta-tool + minimal CLI
+2. **Network & auth** — Streamable HTTP transport + OAuth providers + `login`/`refresh` CLI
+3. **Resilience** — per-server circuit breaker (§5.9), idle eviction + concurrency cap (§5.7), and `doctor` CLI
 
-Week-by-week task breakdown lives on the tracking issue (filed at PR open).
+The runtime's activation contract is described in §5.4.1 (the long-running ACP path calls `load_runtime_or_warn()`, the CLI subcommands use `load_config_or_exit`); there is no Cargo `--features mcp` build flag.
 
 ---
 
