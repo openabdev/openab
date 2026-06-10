@@ -10,7 +10,7 @@ use crate::tools;
 
 const SYSTEM_PROMPT: &str = r#"You are openab-agent, a coding assistant. You help users by reading, writing, and editing files, and running shell commands.
 
-You have these tools available:
+You have these core tools available (when MCP servers are configured, an `mcp` tool and their server tools are listed below in addition to these):
 - read: Read file contents or list a directory
 - write: Create or overwrite a file
 - edit: Replace a string in a file (first occurrence)
