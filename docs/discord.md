@@ -134,6 +134,8 @@ trusted_bot_ids = ["123456789012345678"]  # only this bot's messages pass throug
 
 Empty (default) = any bot can pass through (subject to the mode check).
 
+**Admission override:** A trusted bot that explicitly @mentions this bot bypasses the `allow_bot_messages` mode entirely — the mention is treated the same as a human @mention. This allows trusted bots to pull this bot into threads even when `allow_bot_messages = "off"`. Messages from trusted bots *without* @mention still follow normal gating.
+
 ### `allowed_role_ids`
 
 Role IDs that trigger the bot, same as a direct @mention. This enables users to invoke multiple bots simultaneously with a single role mention (e.g. `@AllBots review this`).
@@ -282,19 +284,23 @@ In a multi-bot setup, every bot enforces an **involvement gate** before processi
 
 **Rule:** A bot must be **involved** (thread owner or has previously replied) before it will process any message in that thread.
 
-**Key constraint:** Only a human @mention can pull a bot into a thread for the first time. A bot @mentioning another bot that is not yet involved will be **silently dropped**.
+**Key constraint:** Only a human @mention — or a @mention from a bot in `trusted_bot_ids` — can pull a bot into a thread for the first time. A @mention from an untrusted bot will be **silently dropped**.
 
 ```
-Bot A's thread (Bot B not yet involved):
+Bot A's thread (Bot B not yet involved, Bot A NOT in Bot B's trusted_bot_ids):
 
-  Bot A: "@Bot_B please review this"     → ❌ dropped (Bot B not involved)
+  Bot A: "@Bot_B please review this"     → ❌ dropped (Bot B not involved, Bot A untrusted)
   Human: "@Bot_B please review this"     → ✅ Bot B replies, now involved
   Bot A: "@Bot_B any updates?"           → ✅ processed (Bot B is involved)
+
+Bot A's thread (Bot B not yet involved, Bot A IS in Bot B's trusted_bot_ids):
+
+  Bot A: "@Bot_B please review this"     → ✅ treated as human @mention, Bot B becomes involved
 ```
 
-**Why:** This prevents bots from pulling other bots into arbitrary threads without human consent, protects session pool resources, and eliminates cross-thread chain reactions.
+**Why:** This prevents untrusted bots from pulling other bots into arbitrary threads without human consent, protects session pool resources, and eliminates cross-thread chain reactions. Trusted bots are explicitly authorized by the admin.
 
-**Workaround:** Pre-involve all needed bots at thread creation by @mentioning them (or using a shared role via `allowed_role_ids`).
+**Workaround (without trusted_bot_ids):** Pre-involve all needed bots at thread creation by @mentioning them (or using a shared role via `allowed_role_ids`).
 
 > 📖 Full design details: [docs/messaging.md — Involvement Gate](messaging.md#involvement-gate)
 
@@ -404,6 +410,6 @@ The bot token is wrong or expired. Reset it in the Developer Portal and redeploy
 The agent CLI isn't authenticated. For kiro-cli:
 
 ```bash
-kubectl exec -it deployment/openab-kiro -- kiro-cli login --use-device-flow
+kubectl exec -it deployment/openab-kiro -- sh -c "$OPENAB_AGENT_AUTH_COMMAND"
 kubectl rollout restart deployment/openab-kiro
 ```

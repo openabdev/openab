@@ -213,6 +213,13 @@ pub async fn webhook(
     axum::http::StatusCode::OK
 }
 
+fn is_markdown_parse_error(description: &str) -> bool {
+    let desc_lower = description.to_lowercase();
+    desc_lower.contains("can't find end")
+        || desc_lower.contains("can't parse")
+        || desc_lower.contains("parse entities")
+}
+
 // --- Reply handler ---
 
 pub async fn handle_reply(
@@ -332,17 +339,55 @@ pub async fn handle_reply(
         "gateway → telegram"
     );
     let url = format!("{TELEGRAM_API_BASE}/bot{bot_token}/sendMessage");
-    let _ = client
+    let resp = client
         .post(&url)
         .json(&serde_json::json!({
             "chat_id": reply.channel.id,
-            "text": reply.content.text,
+            "text": &reply.content.text,
             "message_thread_id": reply.channel.thread_id,
             "parse_mode": "Markdown",
         }))
         .send()
-        .await
-        .map_err(|e| error!("telegram send error: {e}"));
+        .await;
+
+    match resp {
+        Ok(r) => {
+            let body: serde_json::Value = r.json().await.unwrap_or_default();
+            if body["ok"].as_bool() != Some(true) {
+                let desc = body["description"].as_str().unwrap_or("unknown error");
+                if is_markdown_parse_error(desc) {
+                    warn!("Markdown send failed: {desc}, retrying as plain text");
+                    match client
+                        .post(&url)
+                        .json(&serde_json::json!({
+                            "chat_id": reply.channel.id,
+                            "text": &reply.content.text,
+                            "message_thread_id": reply.channel.thread_id,
+                        }))
+                        .send()
+                        .await
+                    {
+                        Ok(retry_r) => {
+                            let retry_body: serde_json::Value =
+                                retry_r.json().await.unwrap_or_default();
+                            if retry_body["ok"].as_bool() != Some(true) {
+                                error!(
+                                    "telegram plain-text retry failed: {}",
+                                    retry_body["description"]
+                                        .as_str()
+                                        .unwrap_or("unknown error")
+                                );
+                            }
+                        }
+                        Err(e) => error!("telegram plain-text send error: {e}"),
+                    }
+                } else {
+                    error!("telegram send failed: {desc}");
+                }
+            }
+        }
+        Err(e) => error!("telegram send error: {e}"),
+    }
 }
 
 /// Download media from Telegram via getFile → store to filesystem (colocate mode).
@@ -482,4 +527,18 @@ async fn download_telegram_document(
         size: bytes.len() as u64,
         path: Some(path),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_markdown_parse_error() {
+        assert!(is_markdown_parse_error("Bad Request: can't find end of italic entity at byte offset 37"));
+        assert!(is_markdown_parse_error("Bad Request: can't parse entities: Can't find end of bold entity"));
+        assert!(is_markdown_parse_error("can't parse entities in message text"));
+        assert!(!is_markdown_parse_error("Unauthorized"));
+        assert!(!is_markdown_parse_error("Bad Request: chat not found"));
+    }
 }

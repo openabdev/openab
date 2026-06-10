@@ -11,8 +11,8 @@ FROM node:22-bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini bubblewrap unzip && rm -rf /var/lib/apt/lists/*
 
 # Pre-install codex-acp and codex CLI globally
-ARG CODEX_ACP_VERSION=0.14.0
-ARG CODEX_VERSION=0.133.0
+ARG CODEX_ACP_VERSION=0.15.0
+ARG CODEX_VERSION=0.137.0
 RUN npm install -g @zed-industries/codex-acp@${CODEX_ACP_VERSION} @openai/codex@${CODEX_VERSION} --retry 3
 
 # Install gh CLI
@@ -33,5 +33,8 @@ RUN mkdir -p /home/node/.codex && chown -R node:node /home/node
 USER node
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="codex-acp"
+ENV OPENAB_AGENT_AUTH_COMMAND="codex login --device-auth"
+
 ENTRYPOINT ["tini", "--"]
 CMD ["openab", "run", "-c", "/etc/openab/config.toml"]

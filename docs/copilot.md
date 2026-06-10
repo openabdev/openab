@@ -22,9 +22,8 @@ OpenAB spawns `copilot --acp --stdio` as a child process and communicates via st
 
 ```toml
 [agent]
-command = "copilot"
-args = ["--acp", "--stdio"]
-working_dir = "/home/node"
+# command and args default from OPENAB_AGENT_COMMAND="copilot --acp --stdio"
+# Only override if you need non-default behavior
 ```
 
 ## Docker

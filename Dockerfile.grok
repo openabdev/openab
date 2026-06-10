@@ -19,9 +19,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install Grok Build CLI — pinned version with SHA256 checksum verification.
 # Binary sourced from xAI's public artifacts bucket (same source the official
 # `https://x.ai/cli/install.sh` resolves to) so the build is reproducible.
-ARG GROK_VERSION=0.1.211
-ARG GROK_SHA256_AMD64=9245f9c921b1f91bfb34ee2ee27715000b65e947723541ff1a612eaece468bd0
-ARG GROK_SHA256_ARM64=b283cb72fdc3143365e044fd7f8630e14845640d4d81404bb36905cc7209abc6
+ARG GROK_VERSION=0.1.220
+ARG GROK_SHA256_AMD64=98d331d64dfc4fb1dae862475218cccdd195f76839b8361a0678af2fd388364b
+ARG GROK_SHA256_ARM64=3b15efc258f4219d01736acee70c575a8167f970cb4d497a3b0c218440db58ff
 ARG TARGETPLATFORM
 RUN set -eux; \
     case "${TARGETPLATFORM:-linux/amd64}" in \
@@ -54,5 +54,8 @@ RUN mkdir -p /home/agent/.grok && chown -R agent:agent /home/agent
 USER agent
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="grok agent stdio"
+ENV OPENAB_AGENT_AUTH_COMMAND="grok login --device-auth"
+
 ENTRYPOINT ["tini", "--"]
 CMD ["openab", "run", "-c", "/etc/openab/config.toml"]

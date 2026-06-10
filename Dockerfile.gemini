@@ -11,7 +11,7 @@ FROM node:22-bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini unzip && rm -rf /var/lib/apt/lists/*
 
 # Install Gemini CLI (native ACP support via --acp)
-ARG GEMINI_CLI_VERSION=0.42.0
+ARG GEMINI_CLI_VERSION=0.44.1
 RUN npm install -g @google/gemini-cli@${GEMINI_CLI_VERSION} --retry 3
 
 # Install gh CLI
@@ -32,6 +32,9 @@ RUN mkdir -p /home/node/.gemini && chown -R node:node /home/node
 USER node
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="gemini --acp"
+ENV OPENAB_AGENT_AUTH_COMMAND="gemini auth"
+
 ENTRYPOINT ["tini", "--"]
 CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 

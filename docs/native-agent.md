@@ -22,8 +22,8 @@ openab-agent
 
 ```toml
 [agent]
-command = "openab-agent"
-working_dir = "/home/agent"
+# command defaults from OPENAB_AGENT_COMMAND="openab-agent"
+# working_dir = "/home/agent"  # optional — defaults to $HOME
 env = { OPENAB_AGENT_OPENAI_MODEL = "gpt-5.4-mini" }
 ```
 
@@ -31,7 +31,7 @@ env = { OPENAB_AGENT_OPENAI_MODEL = "gpt-5.4-mini" }
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OPENAB_AGENT_OPENAI_MODEL` | `gpt-4.1-nano` | Model to use |
+| `OPENAB_AGENT_OPENAI_MODEL` | `gpt-5.4-mini` | Model to use (must be supported by your ChatGPT plan — see [Supported Models](#supported-models-chatgpt-subscription)) |
 | `OPENAB_AGENT_OPENAI_BASE_URL` | `https://chatgpt.com/backend-api` | API base URL |
 | `OPENAB_AGENT_PROVIDER` | auto-detect | Force provider (`anthropic`, `openai`, `codex`) |
 | `OPENAB_AGENT_MAX_TOKENS` | `8192` | Max output tokens |

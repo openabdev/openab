@@ -18,9 +18,8 @@ openab ──ACP JSON-RPC──► agy-acp ──spawns──► agy --add-dir /
 
 ```toml
 [agent]
-command = "agy-acp"
-args = []
-working_dir = "/home/agent"
+# command defaults from OPENAB_AGENT_COMMAND="agy-acp"
+# Only override if you need non-default behavior
 ```
 
 ### Environment Variables
@@ -29,6 +28,7 @@ working_dir = "/home/agent"
 |----------|-------------|---------|
 | `AGY_WORKING_DIR` | Working directory for agy invocations | `/tmp` |
 | `AGY_EXTRA_ARGS` | Extra arguments prepended to every `agy` invocation (optional) | (none) |
+| `OPENAB_TOOL_DISPLAY` | Controls filtering of intermediate thinking narration ("I will..."). `full` or unset keeps all output; `compact`/`none`/`off` drops leading narration-only parts. | `full` |
 
 ## Steering Files
 
@@ -51,7 +51,7 @@ docker build -f Dockerfile.antigravity -t openab-antigravity .
 Antigravity CLI uses Google Sign-In (OAuth). Authenticate inside the container:
 
 ```bash
-kubectl exec -it deployment/openab-antigravity -- /lib64/ld-linux-x86-64.so.2 /usr/local/bin/agy auth
+kubectl exec -it deployment/openab-antigravity -- sh -c "$OPENAB_AGENT_AUTH_COMMAND"
 ```
 
 Complete the device flow in your browser. Auth tokens persist in the PVC at `~/.gemini/`.

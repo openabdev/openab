@@ -34,6 +34,11 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
                                         # "multibot-mentions" = like "involved", but require @mention
                                         #   once another bot has posted in the thread
 # max_bot_turns = 100                  # soft cap on consecutive bot turns per thread (human msg resets)
+# assistant_mode = true                # default true: native streaming (chat.startStream) +
+#                                       # assistant.threads.setStatus status line instead of
+#                                       # post+edit + emoji reactions. Requires the Slack app to be
+#                                       # an AI app with the `assistant:write` scope (plus chat:write).
+#                                       # Set false for non-AI Slack apps to keep emoji reactions.
 
 # [gateway]
 # url = "ws://openab-gateway:8080/ws"  # WebSocket URL of the custom gateway
@@ -177,3 +182,12 @@ error_hold_ms = 2500
 # schedule = "0 0 * * 0"
 # channel = "123456789"
 # message = "generate weekly status report"
+
+# Workspace aliases for control directives: [[ws:@alias]]
+# Users can specify a workspace when starting a session, e.g.:
+#   @Bot [[ws:@openab]] help me debug the tests
+#
+# [workspace.aliases]
+# openab = "~/projects/openab"
+# infra  = "~/projects/infra-cdk"
+# web    = "~/projects/frontend"

@@ -19,15 +19,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install Hermes Agent — pinned to known commit with checksum verification
 # Root install uses FHS layout: binary at /usr/local/bin/hermes, code at /usr/local/lib/hermes-agent
 # HERMES_HOME points to agent user's data dir for OAuth tokens and config
-ARG HERMES_INSTALL_COMMIT=cc07e30f45267c00fac97ea5569c606aca5a1ffb
-ARG HERMES_INSTALL_SHA256=cb94b83b96cc924716bd1651411955da7495912ef68affe6788840e6cf147d41
+ARG HERMES_INSTALL_COMMIT=a5c12f5f593b0d5c11bf0adb15074cc50fbffaee
+ARG HERMES_INSTALL_SHA256=19a04f56496727de6492683bb89fa7e716ed29a22966f022e48679f0e1853652
 RUN curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_INSTALL_COMMIT}/scripts/install.sh" \
       -o /tmp/install-hermes.sh && \
     echo "${HERMES_INSTALL_SHA256}  /tmp/install-hermes.sh" | sha256sum -c - && \
     HERMES_HOME=/home/agent/.hermes bash /tmp/install-hermes.sh && \
     rm /tmp/install-hermes.sh && \
-    chmod -R a+rX /root/.local/share/uv && \
-    chmod a+rx /root /root/.local /root/.local/share && \
+    (test -d /root/.local/share/uv && chmod -R a+rX /root/.local/share/uv && chmod a+rx /root /root/.local /root/.local/share || true) && \
     ln -sf /usr/local/lib/hermes-agent/venv/bin/hermes-acp /usr/local/bin/hermes-acp
 
 # Install gh CLI
@@ -48,5 +47,8 @@ RUN chown -R agent:agent /home/agent
 USER agent
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="hermes-acp"
+ENV OPENAB_AGENT_AUTH_COMMAND="hermes auth add"
+
 ENTRYPOINT ["tini", "--"]
 CMD ["openab", "run", "-c", "/etc/openab/config.toml"]

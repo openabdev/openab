@@ -11,7 +11,7 @@ FROM node:22-bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini unzip && rm -rf /var/lib/apt/lists/*
 
 # Install GitHub Copilot CLI via npm (pinned version)
-ARG COPILOT_VERSION=1.0.51
+ARG COPILOT_VERSION=1.0.60
 RUN npm install -g @github/copilot@${COPILOT_VERSION} --retry 3
 
 # Install gh CLI (for auth and token management)
@@ -32,5 +32,8 @@ RUN mkdir -p /home/node/.copilot && chown -R node:node /home/node
 USER node
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="copilot --acp --stdio"
+ENV OPENAB_AGENT_AUTH_COMMAND="copilot login"
+
 ENTRYPOINT ["tini", "--"]
 CMD ["openab", "run", "-c", "/etc/openab/config.toml"]

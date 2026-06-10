@@ -21,7 +21,7 @@ openab run -c http://internal.example.com/config.toml
 
 Remote config is fetched via HTTP GET with a 10-second timeout and a 1 MiB response size limit. Environment variable expansion (`${VAR}`) works identically on both local and remote config content.
 
-> **Security best practice:** Never hardcode secrets in remote config files. Use environment variable references like `bot_token = "${DISCORD_BOT_TOKEN}"` and inject the actual values via local environment variables or Kubernetes Secrets. OpenAB expands `${VAR}` identically for both local and remote config.
+> **Security best practice:** Never hardcode secrets in remote config files. Use environment variable references like `bot_token = "${DISCORD_BOT_TOKEN}"` and inject the actual values via local environment variables or Kubernetes Secrets. For centralized secret management with rotation and audit, use `[secrets.refs]` with AWS Secrets Manager or an exec provider — see [secrets-management.md](secrets-management.md). OpenAB expands `${VAR}` identically for both local and remote config.
 
 ---
 
@@ -37,7 +37,7 @@ Discord adapter. Requires a Discord bot token.
 | `allow_all_users` | bool \| omit | auto-detect | `true` = any user; `false` = only `allowed_users`. Omitted = inferred from list. |
 | `allowed_users` | string[] | `[]` | User IDs to allow. Only checked when `allow_all_users` resolves to false. |
 | `allow_bot_messages` | string | `"off"` | `"off"` — ignore all bot messages. `"mentions"` — only process bot messages that @mention this bot. `"all"` — process all bot messages (capped by `max_bot_turns`). |
-| `trusted_bot_ids` | string[] | `[]` | When non-empty, only these bot IDs pass the bot gate. Empty = any bot (mode permitting). Ignored when `allow_bot_messages = "off"`. |
+| `trusted_bot_ids` | string[] | `[]` | When non-empty, only these bot IDs pass the bot gate. Empty = any bot (mode permitting). **Admission override:** a trusted bot that @mentions this bot bypasses `allow_bot_messages` mode entirely (treated as human @mention, can pull bot into threads). |
 | `allow_user_messages` | string | `"involved"` | `"involved"` — reply in threads bot has participated in without @mention; channel messages require @mention; DMs always process. `"mentions"` — always require @mention. `"multibot-mentions"` — like `"involved"`, but require @mention once another bot has posted in the thread. |
 | `allow_dm` | bool | `false` | `true` = respond to Discord DMs; `false` = ignore DMs. `allowed_users` still applies in DMs. Each DM user consumes one session slot. |
 | `max_bot_turns` | u32 | `100` | Max consecutive bot turns per thread before throttling (soft limit). Human message resets the counter. A compiled-in hard cap of 1000 consecutive bot messages is always enforced. |
@@ -66,6 +66,7 @@ Slack adapter using Socket Mode. Requires both a Bot User OAuth Token and an App
 | `message_processing_mode` | string | `"per-message"` | Same as Discord. See [Message Dispatch Modes](message-dispatch-modes.md). |
 | `max_buffered_messages` | u32 | `10` | Same as Discord. |
 | `max_batch_tokens` | u32 | `24000` | Same as Discord. |
+| `assistant_mode` | bool | `true` | Use `assistant.threads.setStatus` for status indicators instead of emoji reactions, and native content streaming via `chat.startStream`/`appendStream`/`stopStream` instead of the post+edit loop. Native streaming is suppressed when another bot is present in the thread. Requires an AI-app Slack app with `assistant:write` — set to `false` for non-AI Slack apps to keep emoji-reaction status. When native streaming is active, the `reply_to` output directive is bypassed — the streamed message is itself the in-thread reply. |
 
 ---
 
@@ -93,15 +94,31 @@ Custom Gateway adapter for platforms like Telegram, LINE, Feishu/Lark, and Googl
 
 The AI agent subprocess that OpenAB spawns to handle messages via ACP.
 
+> **This entire section is optional.** If omitted, `command` and `args` default from `$OPENAB_AGENT_COMMAND` (e.g. `"opencode acp"` — first token is command, rest are args). Each Docker image sets this env var so you typically don't need an `[agent]` block unless you want to override `env` or `args`.
+
+**Resolution priority:** config `[agent].command`/`args` > `$OPENAB_AGENT_COMMAND` > `"openab-agent"`
+
+> **Partial override rule:** Setting `command` without `args` resets args to `[]`. This prevents a custom command from inheriting the env var's args. To keep env-var args with a custom command, set both fields explicitly.
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `command` | string | *required* | Agent binary (e.g. `kiro-cli`, `claude-agent-acp`, `codex`, `gemini`, `copilot`, `opencode`, `pi-acp`, `cursor-agent`). |
-| `args` | string[] | `[]` | CLI arguments passed to the agent. |
-| `working_dir` | string | `"/tmp"` | Working directory for the agent process. |
+| `command` | string | from `$OPENAB_AGENT_COMMAND` or `"openab-agent"` | Agent binary. Optional — defaults from image env var. |
+| `args` | string[] | from `$OPENAB_AGENT_COMMAND` or `[]` | CLI arguments. Defaults to env var args only when `command` is also defaulted. |
+| `working_dir` | string | `$HOME` | Working directory for the agent process. Optional — defaults to container's `$HOME`. |
 | `env` | map | `{}` | Extra environment variables (e.g. `{ OPENAI_API_KEY = "${OPENAI_API_KEY}" }`). |
 | `inherit_env` | string[] | `[]` | Env var names to inherit from the OAB process (e.g. vars injected via K8s `envFrom`). Keys in `env` take precedence. |
 
 > **Default inherited vars:** After `env_clear()`, the agent always receives `HOME`, `PATH`, and `USER` (on Windows: `USERPROFILE`, `USERNAME`, `PATH`, `SystemRoot`, `SystemDrive`). Use `inherit_env` to pass additional vars beyond this baseline.
+
+### Authentication
+
+Each image sets `OPENAB_AGENT_AUTH_COMMAND` with the correct auth command. To authenticate any agent:
+
+```bash
+kubectl exec -it deployment/openab-<name> -- sh -c "$OPENAB_AGENT_AUTH_COMMAND"
+```
+
+This works for all agents regardless of backend — no need to remember the specific auth command.
 
 ### Agent examples
 
@@ -122,8 +139,7 @@ working_dir = "/home/node"
 
 # Codex
 [agent]
-command = "codex"
-args = ["--acp"]
+command = "codex-acp"
 working_dir = "/home/node"
 env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
 
@@ -223,6 +239,57 @@ on_failure = "warn"
 
 ---
 
+## `[secrets]`
+
+External secrets management. Secrets are resolved at boot time (after `pre_boot` hooks) and held in memory only — never written to disk. See [secrets-management.md](secrets-management.md) for full documentation.
+
+### `[secrets.refs]`
+
+Secret references. Each key maps to a provider URI. Resolved values are available as `${secrets.<key>}` in other config fields.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `<name>` | string | — | URI referencing an external secret. Supported schemes: `aws-sm://`, `exec://`. |
+
+**URI formats:**
+- `aws-sm://<secret-id>#<json-key>` — fetch from AWS Secrets Manager, extract JSON field
+- `exec://<absolute-script-path> <key> <attribute>` — run script with two arguments, read stdout
+
+### `[secrets.aws]`
+
+AWS Secrets Manager provider configuration (optional).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `region` | string | auto | Override AWS region. Defaults to SDK credential chain (env/IMDS/IRSA). |
+| `endpoint_url` | string | — | Override endpoint URL (for LocalStack or VPC endpoints). |
+
+### `[secrets.exec]`
+
+Exec provider configuration (optional).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `timeout_seconds` | u64 | `10` | Max seconds per script invocation before kill. |
+
+```toml
+[secrets.refs]
+discord_token = "aws-sm://openab/prod#discord_bot_token"
+openai_key    = "aws-sm://openab/prod#openai_api_key"
+github_pat    = "exec:///home/agent/.local/bin/get-secret.sh vault/openab github_pat"
+
+[secrets.aws]
+region = "ap-northeast-1"
+
+[secrets.exec]
+timeout_seconds = 15
+
+[discord]
+bot_token = "${secrets.discord_token}"
+```
+
+---
+
 ## `[reactions]`
 
 Emoji reaction feedback on messages to show agent processing status.
@@ -272,6 +339,30 @@ Speech-to-text transcription for voice messages. Uses an OpenAI-compatible `/aud
 | `model` | string | `"whisper-large-v3-turbo"` | Model name to use for transcription. |
 | `base_url` | string | `"https://api.groq.com/openai/v1"` | Base URL of the STT API. Any OpenAI-compatible `/audio/transcriptions` endpoint works. |
 | `echo_transcript` | bool | `false` | When set to `true` and STT runs, post a `> 🎤 <transcript>` message to the thread before the agent reply so users can verify what was heard. Failures show `(transcription failed)` and add a ⚠️ reaction to the original message. |
+
+---
+
+## `[workspace]`
+
+Workspace aliases for [Control Directives](adr/control-directives.md). Users specify `[[ws:@alias]]` in their first message to set the session's working directory.
+
+```toml
+[workspace.aliases]
+openab = "~/projects/openab"
+infra  = "~/projects/infra-cdk"
+web    = "~/projects/frontend"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `aliases` | map | `{}` | Key-value map of alias name → path. Users reference with `@` prefix: `[[ws:@openab]]`. Paths starting with `~` expand to `$HOME`. All paths must be within the bot's home directory (security boundary). |
+
+**Security:**
+- Relative paths are rejected
+- `~` expands to bot home (`$HOME`)
+- Paths are canonicalized and must be within bot home subtree
+- Symlink escapes are caught by canonicalization
+- Target must be an existing directory (not a file)
 
 ---
 
@@ -409,6 +500,7 @@ Key mapping (`values.yaml` → `config.toml`):
 | `agents.<name>.slack.*` | `[slack] *` (same pattern) |
 | `agents.<name>.pool.maxSessions` | `[pool] max_sessions` |
 | `agents.<name>.pool.sessionTtlHours` | `[pool] session_ttl_hours` |
+| `agents.<name>.workspace.aliases.<alias>` | `[workspace.aliases] <alias>` |
 | `agents.<name>.reactions.enabled` | `[reactions] enabled` |
 | `agents.<name>.reactions.toolDisplay` | `[reactions] tool_display` |
 | `agents.<name>.stt.apiKey` | `[stt] api_key` |

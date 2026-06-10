@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use serenity::builder::{
     CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateCommandOption,
     CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
-    CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditMessage,
-    GetMessages,
+    CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditChannel,
+    EditMessage, GetMessages,
 };
 use serenity::http::Http;
 use serenity::model::application::ButtonStyle;
@@ -182,6 +182,21 @@ impl ChatAdapter for DiscordAdapter {
                 MessageId::new(msg_id),
                 &ReactionType::Unicode(emoji.to_string()),
             )
+            .await?;
+        Ok(())
+    }
+
+    async fn rename_thread(&self, channel: &ChannelRef, title: &str) -> anyhow::Result<()> {
+        let ch_id: u64 = Self::resolve_channel(channel).parse()?;
+        // Truncate at char boundary to avoid panic on multi-byte chars (中文/Emoji).
+        let truncated: &str = if title.chars().count() > 100 {
+            let end = title.char_indices().nth(100).map(|(i, _)| i).unwrap_or(title.len());
+            &title[..end]
+        } else {
+            title
+        };
+        ChannelId::new(ch_id)
+            .edit(&self.http, EditChannel::new().name(truncated))
             .await?;
         Ok(())
     }
@@ -457,68 +472,88 @@ impl EventHandler for Handler {
 
         // Bot message gating (from upstream #321)
         if msg.author.bot {
-            match self.allow_bot_messages {
-                AllowBots::Off => return,
-                AllowBots::Mentions => {
-                    if !is_mentioned {
-                        return;
-                    }
-                }
-                AllowBots::All => {
-                    let cap = MAX_CONSECUTIVE_BOT_TURNS as usize;
-                    let limit = std::cmp::min(MAX_CONSECUTIVE_BOT_TURNS, 100) as u8;
-                    let history = ctx
-                        .cache
-                        .channel_messages(msg.channel_id)
-                        .map(|msgs| {
-                            let mut recent: Vec<_> = msgs
-                                .iter()
-                                .filter(|(mid, _)| **mid < msg.id)
-                                .map(|(_, m)| m.clone())
-                                .collect();
-                            recent.sort_unstable_by_key(|m| std::cmp::Reverse(m.id));
-                            recent.truncate(cap);
-                            recent
-                        })
-                        .filter(|msgs| !msgs.is_empty());
+            // Trusted bot admission override: when a bot listed in `trusted_bot_ids`
+            // explicitly @mentions this bot, bypass the entire `allow_bot_messages`
+            // mode check. This treats the trusted bot's @mention identically to a
+            // human @mention — the bot becomes involved in the thread and the message
+            // is dispatched regardless of the `allow_bot_messages` setting.
+            //
+            // Rationale: `trusted_bot_ids` expresses admin-level trust. A trusted bot
+            // that @mentions this bot is performing a deliberate handoff/coordination
+            // action, equivalent to a human pulling the bot into a conversation.
+            //
+            // Safety: requires both (1) explicit @mention AND (2) sender in
+            // trusted_bot_ids. Messages from trusted bots without @mention still
+            // follow normal gating. Empty trusted_bot_ids (default) disables this
+            // entirely — no behavioral change for existing deployments.
+            let trusted_mention = is_mentioned
+                && !self.trusted_bot_ids.is_empty()
+                && self.trusted_bot_ids.contains(&msg.author.id.get());
 
-                    let recent = if let Some(cached) = history {
-                        cached
-                    } else {
-                        match msg
-                            .channel_id
-                            .messages(
-                                &ctx.http,
-                                serenity::builder::GetMessages::new()
-                                    .before(msg.id)
-                                    .limit(limit),
-                            )
-                            .await
-                        {
-                            Ok(msgs) => msgs,
-                            Err(e) => {
-                                tracing::warn!(channel_id = %msg.channel_id, error = %e, "failed to fetch history for bot turn cap, rejecting (fail-closed)");
-                                return;
-                            }
+            if !trusted_mention {
+                match self.allow_bot_messages {
+                    AllowBots::Off => return,
+                    AllowBots::Mentions => {
+                        if !is_mentioned {
+                            return;
                         }
-                    };
+                    }
+                    AllowBots::All => {
+                        let cap = MAX_CONSECUTIVE_BOT_TURNS as usize;
+                        let limit = std::cmp::min(MAX_CONSECUTIVE_BOT_TURNS, 100) as u8;
+                        let history = ctx
+                            .cache
+                            .channel_messages(msg.channel_id)
+                            .map(|msgs| {
+                                let mut recent: Vec<_> = msgs
+                                    .iter()
+                                    .filter(|(mid, _)| **mid < msg.id)
+                                    .map(|(_, m)| m.clone())
+                                    .collect();
+                                recent.sort_unstable_by_key(|m| std::cmp::Reverse(m.id));
+                                recent.truncate(cap);
+                                recent
+                            })
+                            .filter(|msgs| !msgs.is_empty());
 
-                    let consecutive_bot = recent
-                        .iter()
-                        .take_while(|m| m.author.bot && m.author.id != bot_id)
-                        .count();
-                    if consecutive_bot >= cap {
-                        tracing::warn!(channel_id = %msg.channel_id, cap, "bot turn cap reached, ignoring");
-                        return;
+                        let recent = if let Some(cached) = history {
+                            cached
+                        } else {
+                            match msg
+                                .channel_id
+                                .messages(
+                                    &ctx.http,
+                                    serenity::builder::GetMessages::new()
+                                        .before(msg.id)
+                                        .limit(limit),
+                                )
+                                .await
+                            {
+                                Ok(msgs) => msgs,
+                                Err(e) => {
+                                    tracing::warn!(channel_id = %msg.channel_id, error = %e, "failed to fetch history for bot turn cap, rejecting (fail-closed)");
+                                    return;
+                                }
+                            }
+                        };
+
+                        let consecutive_bot = recent
+                            .iter()
+                            .take_while(|m| m.author.bot && m.author.id != bot_id)
+                            .count();
+                        if consecutive_bot >= cap {
+                            tracing::warn!(channel_id = %msg.channel_id, cap, "bot turn cap reached, ignoring");
+                            return;
+                        }
                     }
                 }
-            }
 
-            if !self.trusted_bot_ids.is_empty()
-                && !self.trusted_bot_ids.contains(&msg.author.id.get())
-            {
-                tracing::debug!(bot_id = %msg.author.id, "bot not in trusted_bot_ids, ignoring");
-                return;
+                if !self.trusted_bot_ids.is_empty()
+                    && !self.trusted_bot_ids.contains(&msg.author.id.get())
+                {
+                    tracing::debug!(bot_id = %msg.author.id, "bot not in trusted_bot_ids, ignoring");
+                    return;
+                }
             }
         }
 
@@ -867,6 +902,7 @@ impl EventHandler for Handler {
                 arrived_at: std::time::Instant::now(),
                 estimated_tokens,
                 other_bot_present: other_bot_present_flag,
+                recipient: None, // Slack-only (assistant mode); N/A for Discord
             };
             if let Err(e) = dispatcher
                 .submit(thread_key, thread_channel, adapter, buf_msg)
@@ -2170,6 +2206,18 @@ fn is_denied_user(
     !is_bot && !allow_all_users && !allowed_users.contains(&user_id)
 }
 
+/// Returns `true` if a bot message should bypass the `allow_bot_messages` mode check.
+/// A trusted bot that @mentions this bot is treated the same as a human @mention —
+/// it can pull the bot into a thread regardless of the `allow_bot_messages` setting.
+#[cfg(test)]
+fn is_trusted_bot_mention(
+    is_mentioned: bool,
+    trusted_bot_ids: &HashSet<u64>,
+    author_id: u64,
+) -> bool {
+    is_mentioned && !trusted_bot_ids.is_empty() && trusted_bot_ids.contains(&author_id)
+}
+
 /// Pure decision function: should a DM be processed?
 /// Returns `true` if the DM should be processed (bot responds).
 /// Mirrors the DM gating logic in EventHandler::message:
@@ -2937,6 +2985,125 @@ mod tests {
     fn denied_user_bot_skips_allowlist() {
         let allowed = HashSet::from([100]);
         assert!(!is_denied_user(true, false, &allowed, 999));
+    }
+
+    // --- Trusted bot mention bypass tests ---
+    // A trusted bot @mentioning this bot bypasses allow_bot_messages mode,
+    // treating the mention the same as a human @mention.
+
+    /// GIVEN: trusted bot @mentions this bot
+    /// THEN:  bypass is granted (treated as human mention)
+    #[test]
+    fn trusted_bot_mention_bypasses_gate() {
+        let trusted = HashSet::from([42]);
+        assert!(is_trusted_bot_mention(true, &trusted, 42));
+    }
+
+    /// GIVEN: untrusted bot @mentions this bot
+    /// THEN:  no bypass (normal bot gating applies)
+    #[test]
+    fn untrusted_bot_mention_no_bypass() {
+        let trusted = HashSet::from([42]);
+        assert!(!is_trusted_bot_mention(true, &trusted, 99));
+    }
+
+    /// GIVEN: trusted bot sends message WITHOUT @mention
+    /// THEN:  no bypass (must explicitly @mention)
+    #[test]
+    fn trusted_bot_no_mention_no_bypass() {
+        let trusted = HashSet::from([42]);
+        assert!(!is_trusted_bot_mention(false, &trusted, 42));
+    }
+
+    /// GIVEN: empty trusted_bot_ids (feature not configured)
+    /// THEN:  no bypass regardless of mention
+    #[test]
+    fn empty_trusted_ids_no_bypass() {
+        let trusted: HashSet<u64> = HashSet::new();
+        assert!(!is_trusted_bot_mention(true, &trusted, 42));
+    }
+
+    // --- Trusted bot admission integration tests ---
+    // These test the full bot gating decision path: allow_bot_messages mode +
+    // trusted_bot_ids + trusted mention bypass, mirroring the actual logic in
+    // EventHandler::message.
+
+    /// Simulates the bot admission decision from EventHandler::message.
+    /// Returns `true` if the bot message would be processed (not dropped).
+    fn should_admit_bot_message(
+        allow_bot_messages: AllowBots,
+        is_mentioned: bool,
+        trusted_bot_ids: &HashSet<u64>,
+        author_id: u64,
+    ) -> bool {
+        let trusted_mention = is_mentioned
+            && !trusted_bot_ids.is_empty()
+            && trusted_bot_ids.contains(&author_id);
+
+        if !trusted_mention {
+            match allow_bot_messages {
+                AllowBots::Off => return false,
+                AllowBots::Mentions => {
+                    if !is_mentioned {
+                        return false;
+                    }
+                }
+                AllowBots::All => {} // would check consecutive cap, skip for unit test
+            }
+
+            if !trusted_bot_ids.is_empty() && !trusted_bot_ids.contains(&author_id) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// GIVEN: allow_bot_messages=Off, trusted bot @mentions this bot
+    /// THEN:  admitted (trusted mention overrides Off mode)
+    #[test]
+    fn bot_admission_trusted_mention_overrides_off() {
+        let trusted = HashSet::from([42]);
+        assert!(should_admit_bot_message(AllowBots::Off, true, &trusted, 42));
+    }
+
+    /// GIVEN: allow_bot_messages=Off, untrusted bot @mentions this bot
+    /// THEN:  rejected (Off mode blocks)
+    #[test]
+    fn bot_admission_untrusted_mention_blocked_by_off() {
+        let trusted = HashSet::from([42]);
+        assert!(!should_admit_bot_message(AllowBots::Off, true, &trusted, 99));
+    }
+
+    /// GIVEN: allow_bot_messages=Off, trusted bot without @mention
+    /// THEN:  rejected (no mention = no bypass)
+    #[test]
+    fn bot_admission_trusted_no_mention_blocked_by_off() {
+        let trusted = HashSet::from([42]);
+        assert!(!should_admit_bot_message(AllowBots::Off, false, &trusted, 42));
+    }
+
+    /// GIVEN: allow_bot_messages=Off, empty trusted_bot_ids, bot @mentions
+    /// THEN:  rejected (feature not configured)
+    #[test]
+    fn bot_admission_empty_trusted_ids_off_mode() {
+        let trusted: HashSet<u64> = HashSet::new();
+        assert!(!should_admit_bot_message(AllowBots::Off, true, &trusted, 42));
+    }
+
+    /// GIVEN: allow_bot_messages=Mentions, trusted bot @mentions
+    /// THEN:  admitted (would pass anyway, but bypass also works)
+    #[test]
+    fn bot_admission_mentions_mode_trusted_mention() {
+        let trusted = HashSet::from([42]);
+        assert!(should_admit_bot_message(AllowBots::Mentions, true, &trusted, 42));
+    }
+
+    /// GIVEN: allow_bot_messages=All, untrusted bot (not in trusted_bot_ids)
+    /// THEN:  rejected by trusted_bot_ids filter
+    #[test]
+    fn bot_admission_all_mode_untrusted_bot_rejected() {
+        let trusted = HashSet::from([42]);
+        assert!(!should_admit_bot_message(AllowBots::All, false, &trusted, 99));
     }
 
     // --- DM gating tests (#656) ---

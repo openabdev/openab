@@ -70,6 +70,7 @@ pub struct Config {
     pub discord: Option<DiscordConfig>,
     pub slack: Option<SlackConfig>,
     pub gateway: Option<GatewayConfig>,
+    #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
     pub pool: PoolConfig,
@@ -83,6 +84,56 @@ pub struct Config {
     pub cron: CronConfig,
     #[serde(default)]
     pub hooks: HooksConfig,
+    #[serde(default)]
+    pub workspace: WorkspaceConfig,
+    #[serde(default)]
+    pub secrets: SecretsConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WorkspaceConfig {
+    /// Workspace aliases: `name = "~/path/to/project"`
+    /// Used with `[[ws:@alias]]` control directives.
+    #[serde(default)]
+    pub aliases: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SecretsConfig {
+    /// AWS Secrets Manager configuration.
+    #[serde(default)]
+    pub aws: AwsSecretsConfig,
+    /// Exec provider configuration.
+    #[serde(default)]
+    pub exec: ExecSecretsConfig,
+    /// Secret references: key = "aws-sm://..." or "exec://..."
+    #[serde(default)]
+    pub refs: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AwsSecretsConfig {
+    /// Override AWS region (otherwise uses default credential chain).
+    pub region: Option<String>,
+    /// Override endpoint URL (for LocalStack or VPC endpoints).
+    pub endpoint_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExecSecretsConfig {
+    /// Per-invocation timeout in seconds (default: 10).
+    #[serde(default = "default_exec_timeout")]
+    pub timeout_seconds: u64,
+}
+
+impl Default for ExecSecretsConfig {
+    fn default() -> Self {
+        Self { timeout_seconds: 10 }
+    }
+}
+
+fn default_exec_timeout() -> u64 {
+    10
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -203,6 +254,10 @@ pub struct DiscordConfig {
     /// the allowlist filters further. Empty = allow any bot (mode permitting).
     /// Only relevant when `allow_bot_messages` is `"mentions"` or `"all"`;
     /// ignored when `"off"` since all bot messages are rejected before this check.
+    ///
+    /// **Admission override**: a trusted bot that explicitly @mentions this bot
+    /// bypasses the `allow_bot_messages` mode entirely (treated as human @mention).
+    /// This allows trusted bots to pull this bot into threads regardless of mode.
     #[serde(default)]
     pub trusted_bot_ids: Vec<String>,
     #[serde(default)]
@@ -308,6 +363,13 @@ pub struct SlackConfig {
     /// Batched mode only: soft token cap for greedy drain. Default: 24000.
     #[serde(default = "default_max_batch_tokens")]
     pub max_batch_tokens: usize,
+    /// Slack "AI app / Assistant" mode: stream replies via chat.startStream +
+    /// assistant.threads.setStatus instead of post+edit + emoji reactions.
+    /// Requires the Slack app to be an AI app (assistant feature enabled) with
+    /// the `assistant:write` scope. Default: true — set to false for Slack apps
+    /// that are not AI apps (no `assistant:write`) to keep emoji-reaction status.
+    #[serde(default = "default_true")]
+    pub assistant_mode: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -349,17 +411,73 @@ fn default_gateway_platform() -> String {
     "telegram".into()
 }
 
+/// Raw intermediate struct for serde — uses `Option` to detect explicit fields.
 #[derive(Debug, Deserialize)]
+#[serde(default)]
+struct AgentConfigRaw {
+    command: Option<String>,
+    args: Option<Vec<String>>,
+    working_dir: String,
+    env: HashMap<String, String>,
+    inherit_env: Vec<String>,
+}
+
+impl Default for AgentConfigRaw {
+    fn default() -> Self {
+        Self {
+            command: None,
+            args: None,
+            working_dir: default_working_dir(),
+            env: HashMap::new(),
+            inherit_env: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct AgentConfig {
     pub command: String,
-    #[serde(default)]
     pub args: Vec<String>,
-    #[serde(default = "default_working_dir")]
     pub working_dir: String,
-    #[serde(default)]
     pub env: HashMap<String, String>,
-    #[serde(default)]
     pub inherit_env: Vec<String>,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            command: default_agent_command(),
+            args: default_agent_args(),
+            working_dir: default_working_dir(),
+            env: HashMap::new(),
+            inherit_env: Vec::new(),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AgentConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = AgentConfigRaw::deserialize(deserializer)?;
+        let cmd_explicit = raw.command.is_some();
+        let command = raw.command.unwrap_or_else(default_agent_command);
+        // If command was explicitly set but args was not, default args to []
+        // to avoid leaking env-var args into a custom command.
+        let args = match (cmd_explicit, raw.args) {
+            (_, Some(args)) => args,           // args explicitly set → use them
+            (true, None) => Vec::new(),        // command set, args omitted → empty
+            (false, None) => default_agent_args(), // neither set → env var
+        };
+        Ok(AgentConfig {
+            command,
+            args,
+            working_dir: raw.working_dir,
+            env: raw.env,
+            inherit_env: raw.inherit_env,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -511,7 +629,24 @@ pub struct ReactionTiming {
 // --- defaults ---
 
 fn default_working_dir() -> String {
-    "/tmp".into()
+    std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
+}
+fn default_agent_command() -> String {
+    if let Ok(val) = std::env::var("OPENAB_AGENT_COMMAND") {
+        if let Some(cmd) = val.split_whitespace().next() {
+            return cmd.to_string();
+        }
+    }
+    "openab-agent".into()
+}
+fn default_agent_args() -> Vec<String> {
+    if let Ok(val) = std::env::var("OPENAB_AGENT_COMMAND") {
+        let parts: Vec<&str> = val.split_whitespace().collect();
+        if parts.len() > 1 {
+            return parts[1..].iter().map(|s| s.to_string()).collect();
+        }
+    }
+    Vec::new()
 }
 fn default_max_sessions() -> usize {
     10
@@ -640,13 +775,15 @@ fn expand_env_vars(raw: &str) -> String {
     .into_owned()
 }
 
-pub fn load_config(path: &Path) -> anyhow::Result<Config> {
+/// Load raw config text from a file path (env vars expanded but secrets NOT resolved).
+pub fn load_config_raw(path: &Path) -> anyhow::Result<String> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
-    parse_config(&raw, path.display().to_string().as_str())
+    Ok(expand_env_vars(&raw))
 }
 
-pub async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
+/// Load raw config text from a URL (env vars expanded but secrets NOT resolved).
+pub async fn load_config_raw_from_url(url: &str) -> anyhow::Result<String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
@@ -663,7 +800,7 @@ pub async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
         .bytes()
         .await
         .map_err(|e| anyhow::anyhow!("failed to read response body from {url}: {e}"))?;
-    const MAX_CONFIG_BYTES: usize = 1024 * 1024; // 1 MiB
+    const MAX_CONFIG_BYTES: usize = 1024 * 1024;
     if bytes.len() > MAX_CONFIG_BYTES {
         anyhow::bail!(
             "remote config from {url} exceeds 1 MiB limit ({} bytes)",
@@ -672,12 +809,52 @@ pub async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
     }
     let raw = String::from_utf8(bytes.to_vec())
         .map_err(|e| anyhow::anyhow!("remote config from {url} is not valid UTF-8: {e}"))?;
+    Ok(expand_env_vars(&raw))
+}
+
+/// Parse config from already-expanded text.
+pub fn parse_config_str(expanded: &str, source: &str) -> anyhow::Result<Config> {
+    parse_config_inner(expanded, source)
+}
+
+#[cfg(test)]
+fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
+    let expanded = expand_env_vars(raw);
+    parse_config_inner(&expanded, source)
+}
+
+#[cfg(test)]
+fn load_config(path: &Path) -> anyhow::Result<Config> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
+    parse_config(&raw, path.display().to_string().as_str())
+}
+
+#[cfg(test)]
+async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to fetch remote config from {url}: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("remote config request to {url} returned HTTP {status}");
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to read response body from {url}: {e}"))?;
+    let raw = String::from_utf8(bytes.to_vec())
+        .map_err(|e| anyhow::anyhow!("remote config from {url} is not valid UTF-8: {e}"))?;
     parse_config(&raw, url)
 }
 
-fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
-    let expanded = expand_env_vars(raw);
-    let config: Config = toml::from_str(&expanded)
+fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
+    let config: Config = toml::from_str(expanded)
         .map_err(|e| anyhow::anyhow!("failed to parse config from {source}: {e}"))?;
 
     // Validate max_buffered_messages > 0 (tokio::sync::mpsc::channel panics on 0)
@@ -987,5 +1164,70 @@ echo_transcript = false
         let cfg = parse_config(toml, "test").unwrap();
         assert!(cfg.stt.enabled);
         assert!(!cfg.stt.echo_transcript);
+    }
+
+    #[test]
+    fn parse_secrets_config() {
+        let toml = r#"
+[discord]
+bot_token = "${secrets.discord_token}"
+
+[agent]
+command = "echo"
+
+[secrets.refs]
+discord_token = "aws-sm://openab/prod#discord_bot_token"
+github_pat = "exec:///home/agent/.local/bin/get-secret.sh vault/openab github_pat"
+
+[secrets.aws]
+region = "ap-northeast-1"
+endpoint_url = "http://localhost:4566"
+
+[secrets.exec]
+timeout_seconds = 15
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(cfg.secrets.refs.len(), 2);
+        assert_eq!(
+            cfg.secrets.refs.get("discord_token").unwrap(),
+            "aws-sm://openab/prod#discord_bot_token"
+        );
+        assert_eq!(
+            cfg.secrets.refs.get("github_pat").unwrap(),
+            "exec:///home/agent/.local/bin/get-secret.sh vault/openab github_pat"
+        );
+        assert_eq!(cfg.secrets.aws.region.as_deref(), Some("ap-northeast-1"));
+        assert_eq!(
+            cfg.secrets.aws.endpoint_url.as_deref(),
+            Some("http://localhost:4566")
+        );
+        assert_eq!(cfg.secrets.exec.timeout_seconds, 15);
+    }
+
+    #[test]
+    fn parse_secrets_config_defaults() {
+        let toml = r#"
+[discord]
+bot_token = "test"
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(cfg.secrets.refs.is_empty());
+        assert!(cfg.secrets.aws.region.is_none());
+        assert!(cfg.secrets.aws.endpoint_url.is_none());
+        assert_eq!(cfg.secrets.exec.timeout_seconds, 10);
+    }
+
+    #[test]
+    fn slack_assistant_mode_defaults_true_and_parses_false() {
+        let cfg: SlackConfig = toml::from_str("bot_token = \"x\"\napp_token = \"y\"\n").unwrap();
+        assert!(cfg.assistant_mode, "assistant_mode must default to true");
+
+        let cfg2: SlackConfig =
+            toml::from_str("bot_token = \"x\"\napp_token = \"y\"\nassistant_mode = false\n")
+                .unwrap();
+        assert!(!cfg2.assistant_mode);
     }
 }

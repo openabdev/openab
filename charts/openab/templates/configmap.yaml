@@ -1,5 +1,6 @@
 {{- range $name, $cfg := .Values.agents }}
 {{- if ne (include "openab.agentEnabled" $cfg) "false" }}
+{{- if not $cfg.configUrl }}
 {{- $d := dict "ctx" $ "agent" $name "cfg" $cfg }}
 ---
 apiVersion: v1
@@ -134,12 +135,19 @@ data:
     {{- if hasKey ($cfg.slack | default dict) "maxBatchTokens" }}
     max_batch_tokens = {{ ($cfg.slack).maxBatchTokens | int }}
     {{- end }}
+    {{- if and (hasKey ($cfg.slack | default dict) "assistantMode") (not ($cfg.slack).assistantMode) }}
+    assistant_mode = false
+    {{- end }}
     {{- end }}
 
     [agent]
+    {{- if $cfg.command }}
     command = {{ $cfg.command | toJson }}
+    {{- end }}
     args = {{ if $cfg.args }}{{ $cfg.args | toJson }}{{ else }}[]{{ end }}
-    working_dir = {{ $cfg.workingDir | default "/home/agent" | toJson }}
+    {{- if $cfg.workingDir }}
+    working_dir = {{ $cfg.workingDir | toJson }}
+    {{- end }}
     {{- if $cfg.env }}
     env = { {{ $first := true }}{{ range $k, $v := $cfg.env }}{{ if not $first }}, {{ end }}{{ $k }} = {{ $v | toJson }}{{ $first = false }}{{ end }} }
     {{- end }}
@@ -246,9 +254,90 @@ data:
     {{- end }}
     {{- end }}
     {{- end }}
+    {{- if ($cfg.hooks).preBoot }}
+    {{- $pb := ($cfg.hooks).preBoot }}
+    {{- $pbSources := 0 }}{{- if $pb.script }}{{- $pbSources = add $pbSources 1 }}{{- end }}{{- if $pb.inline }}{{- $pbSources = add $pbSources 1 }}{{- end }}{{- if $pb.url }}{{- $pbSources = add $pbSources 1 }}{{- end }}
+    {{- if ne (int $pbSources) 1 }}
+    {{- fail (printf "agents.%s.hooks.preBoot must set exactly one of: script, inline, url — got %d sources" $name (int $pbSources)) }}
+    {{- end }}
+    {{- if and $pb.onFailure (not (has $pb.onFailure (list "abort" "warn"))) }}
+    {{- fail (printf "agents.%s.hooks.preBoot.onFailure must be one of: abort, warn — got: %s" $name $pb.onFailure) }}
+    {{- end }}
+    {{- if and $pb.url (not $pb.sha256) }}
+    {{- fail (printf "agents.%s.hooks.preBoot.sha256 is required when url is set" $name) }}
+    {{- end }}
+    {{- if and (hasKey $pb "timeoutSeconds") (lt (int $pb.timeoutSeconds) 1) }}
+    {{- fail (printf "agents.%s.hooks.preBoot.timeoutSeconds must be a positive integer — got: %v" $name $pb.timeoutSeconds) }}
+    {{- end }}
+
+    [hooks.pre_boot]
+    {{- if $pb.script }}
+    script = {{ $pb.script | toJson }}
+    {{- end }}
+    {{- if $pb.inline }}
+    inline = {{ $pb.inline | toJson }}
+    {{- end }}
+    {{- if $pb.url }}
+    url = {{ $pb.url | toJson }}
+    {{- end }}
+    {{- if $pb.sha256 }}
+    sha256 = {{ $pb.sha256 | toJson }}
+    {{- end }}
+    timeout_seconds = {{ $pb.timeoutSeconds | default 60 }}
+    on_failure = {{ $pb.onFailure | default "abort" | toJson }}
+    {{- end }}
+    {{- if ($cfg.hooks).preShutdown }}
+    {{- $ps := ($cfg.hooks).preShutdown }}
+    {{- $psSources := 0 }}{{- if $ps.script }}{{- $psSources = add $psSources 1 }}{{- end }}{{- if $ps.inline }}{{- $psSources = add $psSources 1 }}{{- end }}{{- if $ps.url }}{{- $psSources = add $psSources 1 }}{{- end }}
+    {{- if ne (int $psSources) 1 }}
+    {{- fail (printf "agents.%s.hooks.preShutdown must set exactly one of: script, inline, url — got %d sources" $name (int $psSources)) }}
+    {{- end }}
+    {{- if and $ps.onFailure (not (has $ps.onFailure (list "abort" "warn"))) }}
+    {{- fail (printf "agents.%s.hooks.preShutdown.onFailure must be one of: abort, warn — got: %s" $name $ps.onFailure) }}
+    {{- end }}
+    {{- if and $ps.url (not $ps.sha256) }}
+    {{- fail (printf "agents.%s.hooks.preShutdown.sha256 is required when url is set" $name) }}
+    {{- end }}
+    {{- if and (hasKey $ps "timeoutSeconds") (lt (int $ps.timeoutSeconds) 1) }}
+    {{- fail (printf "agents.%s.hooks.preShutdown.timeoutSeconds must be a positive integer — got: %v" $name $ps.timeoutSeconds) }}
+    {{- end }}
+
+    [hooks.pre_shutdown]
+    {{- if $ps.script }}
+    script = {{ $ps.script | toJson }}
+    {{- end }}
+    {{- if $ps.inline }}
+    inline = {{ $ps.inline | toJson }}
+    {{- end }}
+    {{- if $ps.url }}
+    url = {{ $ps.url | toJson }}
+    {{- end }}
+    {{- if $ps.sha256 }}
+    sha256 = {{ $ps.sha256 | toJson }}
+    {{- end }}
+    timeout_seconds = {{ $ps.timeoutSeconds | default 60 }}
+    on_failure = {{ $ps.onFailure | default "abort" | toJson }}
+    {{- end }}
+    {{- if and ($cfg.workspace) (not (kindIs "map" $cfg.workspace)) }}
+    {{- fail (printf "agents.%s.workspace must be a map — got: %v" $name $cfg.workspace) }}
+    {{- end }}
+    {{- if ($cfg.workspace).aliases }}
+    {{- if not (kindIs "map" ($cfg.workspace).aliases) }}
+    {{- fail (printf "agents.%s.workspace.aliases must be a map — got: %v" $name ($cfg.workspace).aliases) }}
+    {{- end }}
+
+    [workspace.aliases]
+    {{- range $alias, $path := ($cfg.workspace).aliases }}
+    {{- if not (kindIs "string" $path) }}
+    {{- fail (printf "agents.%s.workspace.aliases.%s value must be a string — got: %v" $name $alias $path) }}
+    {{- end }}
+    {{ $alias | toJson }} = {{ $path | toJson }}
+    {{- end }}
+    {{- end }}
   {{- if $cfg.agentsMd }}
   AGENTS.md: |
     {{- $cfg.agentsMd | nindent 4 }}
   {{- end }}
+{{- end }}
 {{- end }}
 {{- end }}

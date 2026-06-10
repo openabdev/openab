@@ -25,7 +25,7 @@ User sends media (photo/voice/file)
 | **Feishu** | ✅ | ✅ (STT) | ✅ (whitelist) | skipped | skipped |
 | **Google Chat** | ✅ | ✅ (STT) | ✅ (whitelist) | skipped | Drive files skipped |
 | **WeCom** | ✅ | — | ✅ (whitelist) | skipped | skipped |
-| **LINE** | planned | planned | — | — | — |
+| **LINE** | ✅ (LINE-hosted only) | — | — | — | — |
 | **Slack** | ✅ | ✅ (STT) | ✅ | — | skipped |
 
 ## Processing Pipeline

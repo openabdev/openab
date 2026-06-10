@@ -187,7 +187,7 @@ BotA in thread: here's my analysis
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `allow_bot_messages` | string | `"off"` | `"off"` — ignore bot messages. `"mentions"` — only process bot messages that @mention this bot. `"all"` — process all bot messages (capped by `max_bot_turns`). |
-| `trusted_bot_ids` | string[] | `[]` | Whitelist of bot IDs. For Slack, entries may be Bot User IDs (`U...`) or Bot IDs (`B...`); `U...` matching requires `users:read` so OpenAB can call `bots.info`. Empty = any bot (mode permitting). Ignored when `allow_bot_messages = "off"`. |
+| `trusted_bot_ids` | string[] | `[]` | Whitelist of bot IDs. For Slack, entries may be Bot User IDs (`U...`) or Bot IDs (`B...`); `U...` matching requires `users:read` so OpenAB can call `bots.info`. Empty = any bot (mode permitting). **Admission override:** a trusted bot that @mentions this bot bypasses `allow_bot_messages` mode entirely (treated as human @mention). |
 | `max_bot_turns` | u32 | `20` | Max consecutive bot turns per thread before throttling. A human message resets the counter. |
 
 > **Safety:** When `allow_bot_messages = "all"`, a separate hardcoded cap of 10 consecutive bot turns applies regardless of `max_bot_turns`.
@@ -267,7 +267,7 @@ All message routing in OpenAB is guarded by the **involvement gate** — a pre-d
 
 ### Design principle
 
-**Humans are the gatekeepers.** A bot cannot participate in a thread until a human explicitly pulls it in via @mention. Bots cannot pull other bots into threads — only humans can.
+**Humans are the gatekeepers.** A bot cannot participate in a thread until a human explicitly pulls it in via @mention. Bots cannot pull other bots into threads — only humans can, **unless** the sending bot is in the target bot's `trusted_bot_ids` (see [Trusted bot admission override](#trusted-bot-admission-override) below).
 
 ### How a bot becomes involved
 
@@ -297,7 +297,11 @@ Inbound message in thread
   │               │
   │               ├─ From a human → pass (bot will reply and become involved)
   │               │
-  │               └─ From another bot → ❌ DROP (bot-to-bot cannot break the gate)
+  │               └─ From another bot:
+  │                     │
+  │                     ├─ Sender in trusted_bot_ids → pass (same as human @mention)
+  │                     │
+  │                     └─ Otherwise → ❌ DROP (bot-to-bot cannot break the gate)
   │
   └─ Message dropped — never reaches Dispatcher or SessionPool
 ```
@@ -318,8 +322,26 @@ This is an intentional safety constraint:
 | Bot A @mentions Bot B (Bot B not yet involved) | ❌ Silently dropped |
 | Bot A @mentions Bot B (Bot B already involved) | ✅ Processed per `allow_bot_messages` mode |
 | Human @mentions Bot B, then Bot A @mentions Bot B | ✅ Works — Bot B is already involved |
+| **Trusted** Bot A @mentions Bot B (Bot A in Bot B's `trusted_bot_ids`) | ✅ Treated as human @mention — Bot B becomes involved |
 
-### Workaround for bot-to-bot handoff
+### Trusted bot admission override
+
+When a bot is listed in another bot's `trusted_bot_ids` and explicitly @mentions that bot, the mention is treated identically to a human @mention:
+
+- The target bot becomes **involved** in the thread
+- The `allow_bot_messages` mode check is **bypassed** entirely
+- The message is dispatched to the session
+
+This enables bot-to-bot coordination (e.g. a coordinator bot pulling reviewer bots into threads) without requiring human intervention for every thread.
+
+**Requirements:**
+- The sending bot must be in the target bot's `trusted_bot_ids` config
+- The sending bot must explicitly @mention the target bot
+- Messages from trusted bots **without** @mention still follow normal `allow_bot_messages` gating
+
+**Safety:** `trusted_bot_ids` defaults to empty — this feature is entirely opt-in. The `max_bot_turns` cap still applies after involvement to prevent runaway loops.
+
+### Workaround for bot-to-bot handoff (without trusted_bot_ids)
 
 If you need Bot A to hand off to Bot B in a thread where Bot B is not yet involved:
 

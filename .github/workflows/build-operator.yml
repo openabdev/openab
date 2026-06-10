@@ -82,6 +82,7 @@ jobs:
           - { suffix: "-antigravity", dockerfile: "Dockerfile.antigravity", artifact: "antigravity" }
           - { suffix: "-pi", dockerfile: "Dockerfile.pi", artifact: "pi" }
           - { suffix: "-native", dockerfile: "Dockerfile.native", artifact: "native" }
+          - { suffix: "-native-sandbox", dockerfile: "openshell/Dockerfile", artifact: "nativesandbox" }
         platform:
           - { os: linux/amd64, runner: ubuntu-latest }
           - { os: linux/arm64, runner: ubuntu-24.04-arm }
@@ -150,6 +151,7 @@ jobs:
           - { suffix: "-antigravity", artifact: "antigravity" }
           - { suffix: "-pi", artifact: "pi" }
           - { suffix: "-native", artifact: "native" }
+          - { suffix: "-native-sandbox", artifact: "nativesandbox" }
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -205,6 +207,8 @@ jobs:
           - { suffix: "-grok" }
           - { suffix: "-antigravity" }
           - { suffix: "-pi" }
+          - { suffix: "-native" }
+          - { suffix: "-native-sandbox" }
     runs-on: ubuntu-latest
     permissions:
       contents: read

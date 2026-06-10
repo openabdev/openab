@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 # URL scheme scraped from Cursor's official downloads page — no apt/yum package exists.
 # If Cursor changes this pattern, the build fails with curl 404. Monitor
 # https://cursor.com/cli or https://docs.cursor.com/cli for version/URL updates.
-ARG CURSOR_VERSION=2026.05.20-2b5dd59
+ARG CURSOR_VERSION=2026.06.04-5fd875e
 RUN ARCH=$(dpkg --print-architecture) && \
     if [ "$ARCH" = "arm64" ]; then ARCH=arm64; else ARCH=x64; fi && \
     curl -fSL "https://downloads.cursor.com/lab/${CURSOR_VERSION}/linux/${ARCH}/agent-cli-package.tar.gz" \
@@ -44,5 +44,8 @@ RUN mkdir -p /home/agent/.cursor && chown -R agent:agent /home/agent
 USER agent
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="cursor-agent acp"
+ENV OPENAB_AGENT_AUTH_COMMAND="cursor-agent login"
+
 ENTRYPOINT ["tini", "--"]
 CMD ["openab", "run", "-c", "/etc/openab/config.toml"]

@@ -1,0 +1,36 @@
+name: "CI: agy-acp"
+
+on:
+  pull_request:
+    paths:
+      - "agy-acp/**"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            agy-acp/target
+          key: agy-acp-${{ runner.os }}-${{ hashFiles('agy-acp/Cargo.lock') }}
+
+      - name: Build
+        working-directory: agy-acp
+        run: cargo build --release
+
+      - name: Run tests
+        working-directory: agy-acp
+        run: cargo test -- --include-ignored --skip e2e

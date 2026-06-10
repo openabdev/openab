@@ -74,4 +74,7 @@ This creates clear visual conversation threads within a Discord thread — essen
 | Hermes Agent | `DISCORD_REPLY_TO_MODE` env var | ❌ Platform decides, always to trigger msg |
 | **OAB** | `[[reply_to:message_id]]` directive | ✅ Agent chooses any message |
 
-> **Note:** `reply_to` is currently implemented for Discord and Feishu (gateway). Slack message IDs (ts format like `1234567890.123456`) are accepted by the parser but the Slack adapter does not yet send threaded replies via this directive — it falls back to plain send. Slack support can be added in a future PR.
+> **Note:** `reply_to` is currently implemented for Discord and Feishu (gateway). Slack behavior depends on `assistant_mode`:
+>
+> - **`assistant_mode = true` (default):** When native streaming is active, the `reply_to` directive is **bypassed** — the streamed message is itself the in-thread reply and cannot target a different message. The directive is silently ignored (no error).
+> - **`assistant_mode = false`:** The Slack adapter does not implement `reply_to` — it falls back to plain send (same as previous behavior). Slack support for targeted replies can be added in a future PR.

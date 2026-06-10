@@ -32,15 +32,14 @@ helm install openab openab/openab \
 
 ```toml
 [agent]
-command = "codex-acp"
-args = []
-working_dir = "/home/node"
+# command defaults from OPENAB_AGENT_COMMAND="codex"
+# Only override if you need non-default behavior
 ```
 
 ## Authentication
 
 ```bash
-kubectl exec -it deployment/openab-codex -- codex login --device-auth
+kubectl exec -it deployment/openab-codex -- sh -c "$OPENAB_AGENT_AUTH_COMMAND"
 ```
 
 Follow the device code flow in your browser, then restart the pod:
@@ -148,9 +147,8 @@ itself, explicitly expose an upload token to the agent:
 
 ```toml
 [agent]
-command = "codex-acp"
-args = []
-working_dir = "/home/node"
+# command defaults from OPENAB_AGENT_COMMAND="codex"
+# Only override if you need non-default behavior
 env = { DISCORD_FILE_BOT_TOKEN = "${DISCORD_FILE_BOT_TOKEN}" }
 ```
 
@@ -205,18 +203,38 @@ manual approval is impractical and Full Access removes all guardrails.
 Enable Auto-review in `/home/node/.codex/config.toml`:
 
 ```toml
-[sandbox]
 approval_policy = "auto-review"
 ```
 
-Or pass it at install time via Helm:
+> `approval_policy` is a **top-level** key in `config.toml`, not under a
+> `[sandbox]` section. Codex silently ignores it if nested.
+
+Or mount a `ConfigMap` containing the codex `config.toml` into the agent via the
+chart's `extraVolumes` / `extraVolumeMounts` (the chart does not expose a
+dedicated `extraConfig` value — anything written into the codex config file has
+to come in as a mounted file or be pre-seeded into the PVC):
 
 ```bash
-helm install openab openab/openab \
-  --set agents.codex.discord.enabled=true \
-  # ... other flags ...
-  --set-json 'agents.codex.extraConfig={"sandbox":{"approval_policy":"auto-review"}}'
+# Create the codex config as a ConfigMap.
+kubectl create configmap codex-config \
+  --from-literal=config.toml='approval_policy = "auto-review"'
+
+# values.yaml — mount it over /home/node/.codex/config.toml
+agents:
+  codex:
+    extraVolumes:
+      - name: codex-config
+        configMap:
+          name: codex-config
+    extraVolumeMounts:
+      - name: codex-config
+        mountPath: /home/node/.codex/config.toml
+        subPath: config.toml
 ```
+
+> Mounting `config.toml` from a ConfigMap makes the file read-only inside the
+> pod. If you also need codex to write back to it (e.g. `codex features enable`
+> persisting flags), pre-seed the config on the PVC instead.
 
 ### What Auto-review does
 
@@ -266,10 +284,24 @@ runtime already provides isolation):
 
 ```toml
 # /home/node/.codex/config.toml
-[sandbox]
 sandbox_mode = "danger-full-access"
-approval_policy = "on-request"
+approval_policy = "auto-review"
 ```
+
+> `sandbox_mode` and `approval_policy` are **top-level** keys in `config.toml`.
+> A `[sandbox]` section header is silently ignored by Codex 0.137+ — verified
+> empirically: with the nested form in place, `codex exec` still fails with
+> `bwrap: No permissions to create new namespace`; moving the same keys to the
+> top level makes `codex exec` report `sandbox: danger-full-access` and run.
+
+> **Do NOT pair `danger-full-access` with `approval_policy = "on-request"` on
+> an OpenAB deployment.** `on-request` pauses each tool call to wait for an
+> interactive human approval, and OpenAB agents have no terminal attached —
+> every tool call hangs in `in_progress` until openab's 1800 s hard timeout
+> fires. Use `"auto-review"` (recommended, see
+> [§Approval Policy](#approval-policy--auto-review)) or `"never"` for trusted
+> and already-isolated pods (`"never"` removes all per-call guardrails — the
+> outer pod isolation is the only remaining boundary).
 
 Or launch with:
 
@@ -277,11 +309,24 @@ Or launch with:
 codex --sandbox danger-full-access
 ```
 
-Or via Helm:
+Or mount a ConfigMap via the chart's `extraVolumes` / `extraVolumeMounts`:
 
 ```bash
-helm install openab openab/openab \
-  --set-json 'agents.codex.extraConfig={"sandbox":{"sandbox_mode":"danger-full-access","approval_policy":"on-request"}}'
+kubectl create configmap codex-config --from-file=config.toml=/path/to/config.toml
+```
+
+```yaml
+# values.yaml
+agents:
+  codex:
+    extraVolumes:
+      - name: codex-config
+        configMap:
+          name: codex-config
+    extraVolumeMounts:
+      - name: codex-config
+        mountPath: /home/node/.codex/config.toml
+        subPath: config.toml
 ```
 
 > **Important:** `danger-full-access` disables only Codex's *inner* sandbox. It

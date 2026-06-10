@@ -76,6 +76,23 @@ impl Agent {
         }
     }
 
+    /// Replace the LLM provider while preserving conversation history.
+    pub fn swap_provider(&mut self, provider: Box<dyn LlmProvider>) {
+        self.provider = provider;
+    }
+
+    /// Number of messages in the conversation (test helper).
+    #[cfg(test)]
+    pub fn message_count(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// Push a message into the conversation (test helper).
+    #[cfg(test)]
+    pub fn push_message(&mut self, msg: Message) {
+        self.messages.push(msg);
+    }
+
     /// Build the system prompt sent on every LLM call. Composition order:
     ///   1. base prompt (`SYSTEM_PROMPT`, optionally prefixed by project-local
     ///      `AGENTS.md`),

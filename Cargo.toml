@@ -1,6 +1,6 @@
 [package]
 name = "openab"
-version = "0.8.4"
+version = "0.8.5"
 edition = "2021"
 license = "MIT"
 
@@ -32,6 +32,12 @@ chrono = { version = "0.4.44", features = ["serde"] }
 chrono-tz = "0.10.4"
 sha2 = "0.10"
 tempfile = "3.27.0"
+aws-sdk-secretsmanager = { version = "1", optional = true }
+aws-config = { version = "1", optional = true }
+
+[features]
+default = ["secrets-aws"]
+secrets-aws = ["dep:aws-sdk-secretsmanager", "dep:aws-config"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

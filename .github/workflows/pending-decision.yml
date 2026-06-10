@@ -1,0 +1,45 @@
+name: Pending Decision
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        required: true
+        type: number
+      decision:
+        required: true
+        type: string  # "maintainer" or "contributor"
+
+jobs:
+  flip:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const MAINTAINER = 'pending-maintainer';
+            const CONTRIBUTOR = 'pending-contributor';
+            const prNumber = ${{ inputs.pr_number }};
+            const decision = '${{ inputs.decision }}';
+
+            const addLabel = decision === 'maintainer' ? MAINTAINER : CONTRIBUTOR;
+            const removeLabel = decision === 'maintainer' ? CONTRIBUTOR : MAINTAINER;
+
+            // Add the target label
+            await github.rest.issues.addLabels({
+              ...context.repo,
+              issue_number: prNumber,
+              labels: [addLabel]
+            });
+
+            // Remove the opposite label
+            await github.rest.issues.removeLabel({
+              ...context.repo,
+              issue_number: prNumber,
+              name: removeLabel
+            }).catch(() => {}); // ignore if not present
+
+            console.log(`#${prNumber} — +${addLabel}, -${removeLabel}`);

@@ -19,8 +19,11 @@ on:
           - copilot
           - cursor
           - gemini
+          - grok
           - hermes
+          - native
           - opencode
+          - pi
         default: 'default'
 
 env:

@@ -25,9 +25,8 @@ helm install openab openab/openab \
 
 ```toml
 [agent]
-command = "kiro-cli"
-args = ["acp", "--trust-all-tools"]
-working_dir = "/home/agent"
+# command and args default from OPENAB_AGENT_COMMAND="kiro-cli acp --trust-all-tools"
+# Only override if you need non-default behavior
 ```
 
 ## Authentication
@@ -35,7 +34,7 @@ working_dir = "/home/agent"
 Kiro CLI requires a one-time OAuth login. The PVC persists tokens across pod restarts.
 
 ```bash
-kubectl exec -it deployment/openab-kiro -- kiro-cli login --use-device-flow
+kubectl exec -it deployment/openab-kiro -- sh -c "$OPENAB_AGENT_AUTH_COMMAND"
 ```
 
 Follow the device code flow in your browser, then restart the pod:

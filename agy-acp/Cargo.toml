@@ -11,3 +11,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 fs2 = "0.4.3"
+rusqlite = { version = "=0.31.0", features = ["bundled"] }

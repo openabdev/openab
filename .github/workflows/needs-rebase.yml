@@ -16,6 +16,7 @@ jobs:
         with:
           script: |
             const REBASE = 'needs-rebase';
+            const MAINTAINER = 'pending-maintainer';
             const CONTRIBUTOR = 'pending-contributor';
 
             const prs = await github.rest.pulls.list({
@@ -25,7 +26,6 @@ jobs:
             });
 
             for (const pr of prs.data) {
-              // Fetch full PR detail for mergeable status
               const { data: detail } = await github.rest.pulls.get({
                 ...context.repo,
                 pull_number: pr.number
@@ -40,7 +40,12 @@ jobs:
                   issue_number: pr.number,
                   labels: [REBASE, CONTRIBUTOR]
                 });
-                console.log(`#${pr.number} — added ${REBASE} + ${CONTRIBUTOR}`);
+                await github.rest.issues.removeLabel({
+                  ...context.repo,
+                  issue_number: pr.number,
+                  name: MAINTAINER
+                }).catch(() => {});
+                console.log(`#${pr.number} — +${REBASE} +${CONTRIBUTOR} -${MAINTAINER}`);
               } else if (!conflicting && hasRebase) {
                 await github.rest.issues.removeLabel({
                   ...context.repo,

@@ -47,6 +47,7 @@ Socket Mode uses a persistent WebSocket connection — no public URL or ingress 
 | `reactions:write` | Add/remove emoji reactions |
 | `files:read` | Download file attachments (images, audio) |
 | `users:read` | Resolve user display names |
+| `assistant:write` | Native streaming + assistant status line (required when `assistant_mode = true`) |
 
 ## 5. Install to Workspace
 
@@ -75,6 +76,21 @@ Set the environment variables:
 export SLACK_BOT_TOKEN="xoxb-..."
 export SLACK_APP_TOKEN="xapp-..."
 ```
+
+### Assistant Mode (default: enabled)
+
+`assistant_mode` is **enabled by default**. This uses Slack's native AI-app APIs for streaming (`chat.startStream`/`appendStream`/`stopStream`) and status indicators (`assistant.threads.setStatus`) instead of the legacy post+edit loop and emoji reactions.
+
+**Requirements:** Your Slack app must be an [AI app](https://api.slack.com/docs/apps/ai) with the `assistant:write` scope. If your app already has `chat:write`, you only need to add `assistant:write` and reinstall.
+
+**Non-AI app compatibility:** If your Slack app is **not** an AI app (or lacks `assistant:write`), set:
+
+```toml
+[slack]
+assistant_mode = false
+```
+
+This keeps the previous behavior: post+edit streaming with emoji reactions (👀 / ✅ / ❌) for status indicators. Without this opt-out, message delivery still works (native streaming degrades to post+edit automatically), but thinking/tool-use indicators will not be visible.
 
 ## 7. Invite the Bot
 
@@ -144,3 +160,17 @@ On Discord, none of these apply: slash commands work in thread-channels, the cha
 
 1. Verify `reactions:write` scope is added
 2. Reinstall the app after adding the scope
+3. If `assistant_mode = true` (the default), emoji reactions are intentionally suppressed — status is shown via the assistant status line instead. Set `assistant_mode = false` if you want emoji reactions back.
+
+### Assistant status line not showing ("Thinking…" / "Using tool…")
+
+1. Verify your Slack app is configured as an [AI app](https://api.slack.com/docs/apps/ai)
+2. Verify `assistant:write` scope is added under **Bot Token Scopes**
+3. Reinstall the app after adding the scope
+4. If your app cannot be an AI app, set `assistant_mode = false` to use emoji reactions instead
+
+### Native streaming not working (replies appear all at once)
+
+1. `chat.startStream` requires the `assistant:write` scope — the adapter automatically degrades to post+edit if the API call fails
+2. Native streaming is also suppressed when another bot is present in the thread (to avoid edit interference)
+3. Check logs for `warn` messages about `stream_begin` failures

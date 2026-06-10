@@ -82,22 +82,32 @@ In the LINE Developers Console → **Messaging API** tab → scan the QR code wi
 ### Supported
 
 - **1:1 chat** — send a message to the bot, get an AI agent response
-- **Group chat** — add the bot to a group, it responds to all messages
+- **Group chat** — add the bot to a group; it responds only when @-mentioned (see @mention gating below)
+- **Inbound images** — user-sent LINE images are downloaded through the LINE Content API and forwarded to OpenAB as image attachments
 - **Webhook signature validation** — HMAC-SHA256 via `LINE_CHANNEL_SECRET`
+
+> **Implementation tradeoff:** OpenAB now acknowledges LINE webhooks before image download/processing so slow attachment work is less likely to trigger webhook redelivery. The follow-up image download and event emission happen asynchronously, which keeps the request path short but also means a crash after the HTTP 200 can still lose that in-flight work. This PR intentionally keeps scope small and does not add a separate background-task durability or duplicate-suppression layer on top of early-ack.
+> Because image processing now happens after the ACK, an earlier image webhook can also reach OpenAB after a later text webhook from the same chat if the image path is slower.
+> OpenAB now also caps how many LINE payloads can enter that post-ACK path concurrently; once the cap is full, new webhooks wait for capacity instead of creating unbounded background backlog.
+> If a LINE-hosted image cannot be downloaded or decoded, OpenAB logs and skips that image event rather than synthesizing a fake text prompt.
 
 ### Not Supported (LINE API limitations)
 
 - **Threads** — LINE has no thread/topic concept. All messages in a chat share one agent session.
 - **Reactions** — LINE Bot API does not support message reactions.
-- **@mention gating** — LINE does not expose mention entities. In groups, the bot responds to all messages. To limit this, use a dedicated group for the bot.
+- **@mention gating** — Supported (zero-config). In group/room chats the gateway only forwards messages where the bot is explicitly @-mentioned (LINE's native `mentionees[].isSelf` signal). 1:1 DMs are always forwarded. No env var is needed.
+  - *Limitation — non-text messages*: LINE only attaches mention data to text messages. Images, videos, stickers, files, and location messages in groups are silently dropped because they cannot carry an @-mention.
+  - *Limitation — `@All`*: A group-wide `@All` mention does **not** trigger the bot; only a direct `@BotName` mention does.
+  - *Breaking change*: This gating is always active. Deployments that previously relied on the bot responding to all group messages will need to @-mention the bot after upgrading.
 - **Markdown rendering** — LINE uses its own text formatting. Agent replies are sent as plain text.
+- **External-content images** — LINE image messages backed by `contentProvider.type = "external"` are not downloaded yet.
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |---|---|---|
 | `LINE_CHANNEL_SECRET` | Yes | Channel secret for webhook signature validation |
-| `LINE_CHANNEL_ACCESS_TOKEN` | Yes | Channel access token for Push Message API |
+| `LINE_CHANNEL_ACCESS_TOKEN` | Yes | Channel access token for Reply/Push Message API and LINE-hosted image downloads |
 
 ## Troubleshooting
 

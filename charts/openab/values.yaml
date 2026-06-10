@@ -143,6 +143,11 @@ agents:
     #   reactions:
     #     enabled: true
     #     removeAfterReply: false
+    #   # workspace.aliases: map alias names to paths for [[ws:@alias]] directives
+    #   workspace:
+    #     aliases:
+    #       myproject: "~/projects/myproject"
+    #       openab: "~/openab"
     #   persistence:
     #     enabled: true
     #     storageClass: ""
@@ -229,6 +234,13 @@ agents:
     #     size: 1Gi
     #   image: "ghcr.io/openabdev/openab-grok"
     image: ""
+    # configUrl: when set, openab uses `-c <URL>` to fetch config remotely
+    # instead of mounting the chart-generated ConfigMap. The ConfigMap and its
+    # volume mount are skipped entirely. Use for externally managed configs.
+    # ⚠️ When configUrl is set, agentsMd has no effect (no ConfigMap to mount from).
+    # Provision AGENTS.md via the PVC, extraVolumes, or include it in the remote config.
+    # Example: "https://raw.githubusercontent.com/myorg/config/main/openab.toml"
+    configUrl: ""
     command: kiro-cli
     args:
       - acp
@@ -285,6 +297,11 @@ agents:
       # When set, botToken and appToken above are ignored. Recommended path for
       # External Secrets Operator / Vault / SealedSecrets deployments.
       existingSecret: ""
+      # assistant_mode: native Slack streaming (chat.startStream) + assistant.threads.setStatus
+      # status line instead of post+edit + emoji reactions. Requires the Slack app to be an
+      # AI app with the `assistant:write` scope (plus chat:write). Default: true — set to
+      # false for non-AI Slack apps (without assistant:write) to keep emoji-reaction status.
+      assistantMode: true
       # allowAllChannels/allowAllUsers: same auto-infer logic as discord
       allowedChannels: []  # empty + no allowAllChannels → allow all (auto-inferred)
       allowedUsers: []     # empty + no allowAllUsers → allow all (auto-inferred)
@@ -428,6 +445,22 @@ agents:
     #       senderName: "DailyOps"
     #       timezone: "Asia/Taipei"
     #       threadId: ""
+    # Lifecycle hooks — run custom scripts at container lifecycle events.
+    # See docs/hooks.md for full reference. Each hook supports exactly ONE of:
+    #   script (absolute path), inline (script content), or url + sha256.
+    # hooks:
+    #   preBoot:
+    #     timeoutSeconds: 120
+    #     onFailure: abort    # "abort" | "warn"
+    #     inline: |
+    #       #!/bin/sh
+    #       set -e
+    #       aws s3 sync "$BOOTSTRAP_URI" "$HOME/"
+    #   preShutdown:
+    #     timeoutSeconds: 30
+    #     onFailure: warn
+    #     script: /etc/openab/pre-shutdown.sh
+    hooks: {}
     cron:
       usercronEnabled: false
       usercronPath: ""

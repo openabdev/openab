@@ -21,7 +21,7 @@ All responses are **ephemeral** — only the user who invoked the command sees t
 |----------|-----------|-------|
 | Discord (guild threads) | ✅ | Commands registered per-guild for instant availability |
 | Discord (DMs) | ✅ | Commands registered globally; may take up to 1 hour to appear after first deploy |
-| Slack | ❌ | Slack blocks third-party slash commands in threads; see [slack-bot-howto.md](slack-bot-howto.md#slash-commands-are-not-supported-on-slack) |
+| Slack | ❌ | Slack blocks third-party slash commands in threads; see [slack.md](slack.md#slash-commands-are-not-supported-on-slack) |
 
 ## How They Work
 
@@ -35,6 +35,7 @@ When the user picks an option, OpenAB sends `session/set_config_option` to the A
 
 | Agent | `/models` | `/agents` |
 |-------|-----------|-----------|
+| openab-agent | ✅ Returns available models via `configOptions` in `session/new` response | ❌ |
 | kiro-cli | ✅ Returns available models via `models` fallback | ✅ Returns modes (`kiro_default`, `kiro_planner`) via `modes` fallback |
 | claude-code | ❌ No `configOptions` emitted | ❌ |
 | codex | ❌ | ❌ |
@@ -43,6 +44,8 @@ When the user picks an option, OpenAB sends `session/set_config_option` to the A
 | copilot | ❌ (tracking: #496) | ❌ |
 
 If the agent doesn't expose options, the user sees: `⚠️ No model options available. Start a conversation first by @mentioning the bot.`
+
+> **Backward compatibility:** `openab-agent` returns `configOptions` in the `session/new` response (alongside `sessionId`). ACP clients that only read `sessionId` will continue to work — `configOptions` is additive. Clients that support `/models` should read `configOptions[].options` to populate the model picker. Each model option includes a `provider` field (`"anthropic"` or `"openai"`) for routing.
 
 > **Note:** Discord Select Menus are limited to 25 items. If the agent returns more, only the first 25 are shown with a count of how many were truncated.
 

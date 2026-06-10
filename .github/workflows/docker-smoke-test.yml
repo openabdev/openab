@@ -24,6 +24,7 @@ jobs:
           - { dockerfile: Dockerfile.grok, suffix: "-grok", agent: "grok", agent_args: "agent stdio" }
           - { dockerfile: Dockerfile.antigravity, suffix: "-antigravity", agent: "agy-acp", agent_args: "" }
           - { dockerfile: Dockerfile.pi, suffix: "-pi", agent: "pi-acp", agent_args: "" }
+          - { dockerfile: openshell/Dockerfile, suffix: "-native-sandbox", agent: "openab-agent", agent_args: "" }
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

@@ -862,6 +862,7 @@ pub async fn run_gateway_adapter(
                                             estimated_tokens,
                                             // TODO: implement gateway multibot detection
                                             other_bot_present: false,
+                                            recipient: None, // Slack-only (assistant mode); N/A for gateway
                                         };
                                         if let Err(e) = dispatcher
                                             .submit(thread_key, thread_channel, adapter, buf_msg)

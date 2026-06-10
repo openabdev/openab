@@ -76,11 +76,17 @@ pub fn format_coded_error(code: i64, message: &str, data_message: Option<&str>) 
     } else {
         format!("{} (code: {})\n{}", prefix, code, message)
     };
-    if let Some(detail) = data_message {
-        if !detail.is_empty() && !message.contains(detail) {
+    let detail = data_message.filter(|s| !s.trim().is_empty());
+    if let Some(detail) = detail {
+        if !message.contains(detail) {
             out.push_str("\n> ");
             out.push_str(detail);
         }
+    } else if code == -32603 {
+        out.push_str(
+            "\n\n_The agent did not return any error details. \
+             Please check the agent's own logs for more information._",
+        );
     }
     out
 }
@@ -237,5 +243,81 @@ mod tests {
         // If data_message is already in message, don't repeat it
         let result = format_coded_error(-32603, "model not supported", Some("model not supported"));
         assert_eq!(result.matches("model not supported").count(), 1);
+    }
+
+    #[test]
+    fn format_coded_error_32603_no_detail_shows_fallback() {
+        let result = format_coded_error(-32603, "Internal error", None);
+        assert!(result.contains("Internal Error"));
+        assert!(result.contains("did not return any error details"));
+        assert!(result.contains("agent's own logs"));
+    }
+
+    #[test]
+    fn format_coded_error_32603_with_detail_no_fallback() {
+        let result = format_coded_error(-32603, "Internal error", Some("model not found"));
+        assert!(result.contains("model not found"));
+        assert!(!result.contains("did not return any error details"));
+    }
+
+    #[test]
+    fn format_coded_error_32603_empty_detail_shows_fallback() {
+        let result = format_coded_error(-32603, "Internal error", Some(""));
+        assert!(result.contains("did not return any error details"));
+    }
+
+    #[test]
+    fn format_coded_error_other_code_no_detail_no_fallback() {
+        // Fallback only applies to -32603
+        let result = format_coded_error(-32602, "bad params", None);
+        assert!(!result.contains("did not return any error details"));
+    }
+
+    #[test]
+    fn format_coded_error_32603_empty_message_still_shows_fallback() {
+        // Even when message is empty, fallback should appear
+        let result = format_coded_error(-32603, "", None);
+        assert!(result.contains("Internal Error"));
+        assert!(result.contains("did not return any error details"));
+    }
+
+    #[test]
+    fn format_coded_error_32603_whitespace_detail_shows_fallback() {
+        // Whitespace-only detail should be treated as empty
+        let result = format_coded_error(-32603, "Internal error", Some("   "));
+        assert!(result.contains("Internal Error"));
+        assert!(result.contains("did not return any error details"));
+    }
+
+    #[test]
+    fn format_coded_error_500_no_detail_no_fallback() {
+        // HTTP 500 without detail should NOT get the ACP-specific hint
+        let result = format_coded_error(500, "server error", None);
+        assert!(result.contains("Internal Server Error"));
+        assert!(!result.contains("did not return any error details"));
+    }
+
+    #[test]
+    fn format_coded_error_32603_fallback_does_not_duplicate_with_detail() {
+        // When detail is present, no fallback appears — mutually exclusive
+        let result = format_coded_error(-32603, "Internal error", Some("rate limit exceeded"));
+        assert!(result.contains("rate limit exceeded"));
+        assert!(!result.contains("did not return any error details"));
+        assert!(!result.contains("agent's own logs"));
+    }
+
+    #[test]
+    fn format_coded_error_server_error_range_no_fallback() {
+        // Other JSON-RPC server error codes should NOT get the hint
+        let result = format_coded_error(-32099, "custom error", None);
+        assert!(!result.contains("did not return any error details"));
+    }
+
+    #[test]
+    fn format_coded_error_32603_fallback_message_is_italic() {
+        // Verify Discord markdown italic formatting
+        let result = format_coded_error(-32603, "Internal error", None);
+        assert!(result.contains("_The agent did not return"));
+        assert!(result.ends_with("_"));
     }
 }
