@@ -57,6 +57,11 @@ const PARTICIPATION_CACHE_MAX: usize = 1000;
 /// aborted turns that begin a stream but never reach stream_finish).
 const STREAM_CACHE_MAX: usize = 1024;
 
+/// Reconnect the Slack Socket Mode socket if no frame arrives within this
+/// window. Slack server-pings ~every 30s, so 60s of silence means the
+/// connection is half-open (dead) — detects silent NAT/firewall drops.
+const SLACK_READ_IDLE_TIMEOUT_SECS: u64 = 60;
+
 #[derive(Default)]
 struct StreamEntry {
     active: bool,
@@ -698,7 +703,7 @@ pub async fn run_slack_adapter(
                 loop {
                     tokio::select! {
                         msg_result = tokio::time::timeout(
-                            std::time::Duration::from_secs(60),
+                        std::time::Duration::from_secs(SLACK_READ_IDLE_TIMEOUT_SECS),
                             read.next(),
                         ) => {
                             // Half-open detection: Slack sends a ping ~every 30s, so 60s with no
@@ -708,7 +713,7 @@ pub async fn run_slack_adapter(
                             // and the bot silently stops receiving events.
                             let msg_result = match msg_result {
                                 Ok(inner) => inner,
-                                Err(_elapsed) => {
+                                Err(_) => {
                                     warn!("no frame from Slack for 60s; assuming dead connection, reconnecting");
                                     break;
                                 }
