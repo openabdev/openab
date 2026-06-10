@@ -173,6 +173,10 @@ impl ClientHandler for OpenabClientHandler {
         std::future::ready(Ok(ListRootsResult::new((*self.roots).clone())))
     }
 
+    // Manual `-> impl Future + Send` (not `async fn`): rmcp's ClientHandler
+    // requires Send futures, and `async fn` in a trait impl desugars to a
+    // RPITIT that drops the explicit `+ Send`. Keep the hand-written form.
+    #[allow(clippy::manual_async_fn)]
     fn create_elicitation(
         &self,
         request: CreateElicitationRequestParams,
@@ -223,6 +227,9 @@ impl ClientHandler for OpenabClientHandler {
         }
     }
 
+    // Manual `-> impl Future + Send` (not `async fn`): same Send-on-RPITIT
+    // reason as create_elicitation above.
+    #[allow(clippy::manual_async_fn)]
     fn create_message(
         &self,
         request: CreateMessageRequestParams,

@@ -123,9 +123,8 @@ fn read_auth_file(path: &Path) -> Result<HashMap<String, AuthEntry>> {
     // the bad bytes (#969 B6 / decision A3) before propagating, so the
     // `unwrap_or_default()` save paths recreate a clean file instead of
     // silently wiping every server's credentials on top of the corruption.
-    parse_auth_data(&data).map_err(|e| {
-        quarantine_corrupt_auth(path, &e);
-        e
+    parse_auth_data(&data).inspect_err(|e| {
+        quarantine_corrupt_auth(path, e);
     })
 }
 
