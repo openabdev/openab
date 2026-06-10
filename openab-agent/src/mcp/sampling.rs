@@ -77,7 +77,11 @@ pub fn approval_gate(policy: SamplingApproval) -> Result<(), ErrorData> {
 /// Text-only: a message carrying any non-text content block (image / audio /
 /// tool-use / tool-result) is rejected with `-32602`, because the text-only
 /// baseline cannot faithfully relay those — they ship with the `sampling.tools`
-/// extension (known gap). Each message's text blocks are concatenated.
+/// extension (known gap). A message's multiple text blocks are joined with `\n`
+/// so block boundaries survive (#969 F7) — bare concatenation would fuse the
+/// last word of one block to the first of the next. (Contrast `collect_text`,
+/// which intentionally concatenates without a separator: those are streaming
+/// token fragments of one block, not separate blocks.)
 pub fn convert_messages(messages: &[SamplingMessage]) -> Result<Vec<Message>, ErrorData> {
     let mut out = Vec::with_capacity(messages.len());
     for m in messages {
@@ -85,10 +89,10 @@ pub fn convert_messages(messages: &[SamplingMessage]) -> Result<Vec<Message>, Er
             Role::User => "user",
             Role::Assistant => "assistant",
         };
-        let mut text = String::new();
+        let mut parts: Vec<&str> = Vec::new();
         for block in m.content.iter() {
             match block.as_text() {
-                Some(t) => text.push_str(&t.text),
+                Some(t) => parts.push(t.text.as_str()),
                 None => {
                     return Err(ErrorData::invalid_params(
                         "text-only sampling: non-text content blocks are not supported",
@@ -99,7 +103,9 @@ pub fn convert_messages(messages: &[SamplingMessage]) -> Result<Vec<Message>, Er
         }
         out.push(Message {
             role: role.to_string(),
-            content: vec![ContentBlock::Text { text }],
+            content: vec![ContentBlock::Text {
+                text: parts.join("\n"),
+            }],
         });
     }
     Ok(out)
@@ -136,6 +142,7 @@ pub fn build_result(text: String, model: &str) -> CreateMessageResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmcp::model::SamplingMessageContent;
 
     #[test]
     fn approval_parse_defaults_closed() {
@@ -167,6 +174,25 @@ mod tests {
         assert_eq!(out[1].role, "assistant");
         match &out[0].content[0] {
             ContentBlock::Text { text } => assert_eq!(text, "hello"),
+            _ => panic!("expected text block"),
+        }
+    }
+
+    #[test]
+    fn convert_messages_joins_multiple_text_blocks_with_newline() {
+        // Two text blocks in one message must keep their boundary (#969 F7):
+        // bare concatenation would yield "firstsecond".
+        let msg = SamplingMessage::new_multiple(
+            Role::User,
+            vec![
+                SamplingMessageContent::text("first"),
+                SamplingMessageContent::text("second"),
+            ],
+        );
+        let out = convert_messages(&[msg]).unwrap();
+        assert_eq!(out.len(), 1);
+        match &out[0].content[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "first\nsecond"),
             _ => panic!("expected text block"),
         }
     }
