@@ -213,11 +213,76 @@ pub async fn webhook(
     axum::http::StatusCode::OK
 }
 
-fn is_markdown_parse_error(description: &str) -> bool {
+fn is_html_parse_error(description: &str) -> bool {
     let desc_lower = description.to_lowercase();
     desc_lower.contains("can't find end")
         || desc_lower.contains("can't parse")
         || desc_lower.contains("parse entities")
+}
+
+/// Convert common Markdown (from LLM output) to Telegram HTML.
+fn markdown_to_telegram_html(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_code_block = false;
+
+    for line in input.split('\n') {
+        if line.starts_with("```") {
+            if in_code_block {
+                out.push_str("</code></pre>");
+            } else {
+                out.push_str("<pre><code>");
+            }
+            in_code_block = !in_code_block;
+            out.push('\n');
+            continue;
+        }
+        if in_code_block {
+            out.push_str(&html_escape(line));
+            out.push('\n');
+            continue;
+        }
+
+        let line = if let Some(stripped) = line.strip_prefix("### ") {
+            format!("<b>{}</b>", html_escape(stripped))
+        } else if let Some(stripped) = line.strip_prefix("## ") {
+            format!("<b>{}</b>", html_escape(stripped))
+        } else if let Some(stripped) = line.strip_prefix("# ") {
+            format!("<b>{}</b>", html_escape(stripped))
+        } else {
+            convert_inline_markdown(line)
+        };
+        out.push_str(&line);
+        out.push('\n');
+    }
+
+    if in_code_block {
+        out.push_str("</code></pre>\n");
+    }
+
+    out.trim_end_matches('\n').to_string()
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn convert_inline_markdown(line: &str) -> String {
+    let escaped = html_escape(line);
+    let mut result = escaped;
+    result = regex_replace_all(&result, "`([^`]+)`", "<code>$1</code>");
+    result = regex_replace_all(&result, r"\*\*([^*]+)\*\*", "<b>$1</b>");
+    result = regex_replace_all(&result, r"\*([^*]+)\*", "<i>$1</i>");
+    result = regex_replace_all(&result, r"\[([^\]]+)\]\(([^)]+)\)", r#"<a href="$2">$1</a>"#);
+    result
+}
+
+fn regex_replace_all(input: &str, pattern: &str, replacement: &str) -> String {
+    match regex::Regex::new(pattern) {
+        Ok(re) => re.replace_all(input, replacement).to_string(),
+        Err(_) => input.to_string(),
+    }
 }
 
 // --- Reply handler ---
@@ -339,13 +404,14 @@ pub async fn handle_reply(
         "gateway → telegram"
     );
     let url = format!("{TELEGRAM_API_BASE}/bot{bot_token}/sendMessage");
+    let html_text = markdown_to_telegram_html(&reply.content.text);
     let resp = client
         .post(&url)
         .json(&serde_json::json!({
             "chat_id": reply.channel.id,
-            "text": &reply.content.text,
+            "text": &html_text,
             "message_thread_id": reply.channel.thread_id,
-            "parse_mode": "Markdown",
+            "parse_mode": "HTML",
         }))
         .send()
         .await;
@@ -355,8 +421,8 @@ pub async fn handle_reply(
             let body: serde_json::Value = r.json().await.unwrap_or_default();
             if body["ok"].as_bool() != Some(true) {
                 let desc = body["description"].as_str().unwrap_or("unknown error");
-                if is_markdown_parse_error(desc) {
-                    warn!("Markdown send failed: {desc}, retrying as plain text");
+                if is_html_parse_error(desc) {
+                    warn!("HTML send failed: {desc}, retrying as plain text");
                     match client
                         .post(&url)
                         .json(&serde_json::json!({
@@ -534,11 +600,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_markdown_parse_error() {
-        assert!(is_markdown_parse_error("Bad Request: can't find end of italic entity at byte offset 37"));
-        assert!(is_markdown_parse_error("Bad Request: can't parse entities: Can't find end of bold entity"));
-        assert!(is_markdown_parse_error("can't parse entities in message text"));
-        assert!(!is_markdown_parse_error("Unauthorized"));
-        assert!(!is_markdown_parse_error("Bad Request: chat not found"));
+    fn test_is_html_parse_error() {
+        assert!(is_html_parse_error("Bad Request: can't find end of italic entity at byte offset 37"));
+        assert!(is_html_parse_error("Bad Request: can't parse entities: Can't find end of bold entity"));
+        assert!(is_html_parse_error("can't parse entities in message text"));
+        assert!(!is_html_parse_error("Unauthorized"));
+        assert!(!is_html_parse_error("Bad Request: chat not found"));
     }
 }

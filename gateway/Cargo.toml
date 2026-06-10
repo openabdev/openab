@@ -28,6 +28,7 @@ sha1 = "0.10"
 quick-xml = "0.37"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 urlencoding = "2"
+regex = "1"
 
 [dev-dependencies]
 wiremock = "0.6"
