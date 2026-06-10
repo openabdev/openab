@@ -703,7 +703,7 @@ pub async fn run_slack_adapter(
                 loop {
                     tokio::select! {
                         msg_result = tokio::time::timeout(
-                        std::time::Duration::from_secs(SLACK_READ_IDLE_TIMEOUT_SECS),
+                            std::time::Duration::from_secs(SLACK_READ_IDLE_TIMEOUT_SECS),
                             read.next(),
                         ) => {
                             // Half-open detection: Slack sends a ping ~every 30s, so 60s with no
@@ -714,7 +714,9 @@ pub async fn run_slack_adapter(
                             let msg_result = match msg_result {
                                 Ok(inner) => inner,
                                 Err(_) => {
-                                    warn!("no frame from Slack for 60s; assuming dead connection, reconnecting");
+                                    warn!(
+                                        timeout_secs = SLACK_READ_IDLE_TIMEOUT_SECS,
+                                        "no frame from Slack within idle timeout; assuming dead connection, reconnecting");
                                     break;
                                 }
                             };
