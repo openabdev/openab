@@ -213,8 +213,10 @@ impl Agent {
     /// first user message and maintaining strict user/assistant alternation.
     fn truncate_context(&mut self) {
         while self.messages.len() > MAX_CONTEXT_MESSAGES {
-            // Drain in pairs (assistant + user) from index 1 to maintain alternation
-            let end = (1 + 2).min(self.messages.len());
+            // Remove the oldest assistant+user pair (indices 1 and 2), never
+            // touching messages[0] (the first user message). The `min` clamp
+            // means a trailing odd element still drains rather than panicking.
+            let end = 3.min(self.messages.len());
             self.messages.drain(1..end);
         }
     }
