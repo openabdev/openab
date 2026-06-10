@@ -300,9 +300,9 @@ pub async fn handle_reply(
             let mut reactions = reaction_state.lock().await;
             let set = reactions.entry(msg_key.clone()).or_default();
             if is_add {
-                if !set.contains(&tg_emoji.to_string()) {
-                    set.push(tg_emoji.to_string());
-                }
+                // Telegram only supports one bot reaction per message — replace instead of accumulate
+                set.clear();
+                set.push(tg_emoji.to_string());
             } else {
                 set.retain(|e| e != tg_emoji);
             }
