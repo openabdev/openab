@@ -346,7 +346,7 @@ class AcpAdapter:
 def main():
     parser = argparse.ArgumentParser(description="ACP adapter for AgentCore Runtime")
     parser.add_argument("--runtime-arn", required=True, help="AgentCore Runtime ARN")
-    parser.add_argument("--region", default="us-west-2", help="AWS region")
+    parser.add_argument("--region", default="us-east-1", help="AWS region")
     parser.add_argument(
         "--cancel-strategy",
         choices=["noop", "stop"],
