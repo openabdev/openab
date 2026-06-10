@@ -31,7 +31,7 @@ where rmcp supports it).
 | `_meta` keys | ✅ opaque | Never read or rewritten; passed through untouched. |
 | Icon rendering | N/A | No UI surface. |
 | Authorization (OAuth) | ⚠️ | rmcp `AuthorizationManager`: PRM/discovery ✅; PKCE S256 generated + **hard-rejected when AS advertises non-S256** ✅; client registration — pre-registered / **DCR public** / **confidential** all supported ✅; step-up **detect + scoped re-login** (`--scope`) ✅; `resource` hardcode caveat ⚠️. |
-| Sampling (`createMessage`) | ✅ text-only | Routed to the agent's LLM provider; env-var approval gate; no `sampling.tools`. |
+| Sampling (`createMessage`) | ✅ text-only (provider-conditional) | Advertised **only when an LLM provider is configured**; routed to that provider; env-var approval gate; no `sampling.tools`. With no provider the capability is not advertised and an inbound request is rejected `-32602`. |
 | Roots | ✅ | Static set (cwd + config allow-list); no `listChanged`. |
 | Elicitation | ⚠️ form-only | Form-mode via ACP host bridge; URL-mode = known gap. |
 | Progress | ❌ | Not emitted, not surfaced — no live-progress consumer. |
@@ -245,8 +245,15 @@ openab-agent serves `sampling/createMessage` requests **text-only**, routing the
 back to the agent's own (already-authenticated) LLM provider. When a provider is
 wired, it advertises the `sampling` capability (without the `tools` sub-capability)
 and converts the request, calls the provider, and returns the result tagged
-`assistant` / `endTurn`.
+`assistant` / `endTurn`. With no provider the capability is not advertised and an
+inbound `createMessage` is rejected with `-32602`.
 
+- **Text-only message conversion**: each inbound message is reduced to plain text.
+  A message carrying multiple text content blocks has them **joined with `\n`** so
+  block boundaries survive (bare concatenation would fuse the last word of one
+  block to the first of the next). Any **non-text** content block (image / audio /
+  tool-use / tool-result) is rejected with `-32602` — those ship with the
+  `sampling.tools` extension, which is a known gap.
 - **Approval gate**: `OPENAB_AGENT_SAMPLING_APPROVAL` (`ask` / `allow` / `deny`,
   **fail-closed** default). `ask` and `deny` reject with a user-rejected result —
   there is no interactive consent UI in a headless agent, so the env var is the
@@ -326,6 +333,15 @@ normally.
   on that server's `notifications/tools/list_changed`.
 - **Capability gating**: tool fetch/call is guarded by the server's advertised
   `tools` capability with a clear error if absent.
+- **Idle eviction** (`idle_ttl_secs`, default 600 = 10 min): a background loop
+  disconnects any `Connected` server that has sat idle (no in-flight calls) for
+  longer than the TTL; a busy server (calls in flight) is spared. Tools cache is
+  retained for fast re-connect. Optional, layered/merged like the rest of the config.
+- **Concurrency cap** (`max_concurrent_servers`, default 10): bounds
+  simultaneously-connected servers. When a fresh connect would exceed the cap, the
+  least-recently-used *idle* server is evicted first; servers with calls in flight
+  are spared. Memory-constrained deploys may lower this (e.g. to 3). Optional,
+  layered/merged like the rest of the config.
 - **Audit logging**: `mcp.audit` events at call entry and every exit, with
   arguments **SHA-256-hashed** — never logged in plaintext.
 - **Circuit breaker**: consecutive transport faults trip the circuit (cooldown +
