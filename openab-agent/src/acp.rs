@@ -395,7 +395,11 @@ mod tests {
 
         let task = {
             let bridge = bridge.clone();
-            tokio::spawn(async move { bridge.request("session/request_permission", json!({})).await })
+            tokio::spawn(async move {
+                bridge
+                    .request("session/request_permission", json!({}))
+                    .await
+            })
         };
 
         // Drain the outbound request line and echo back a response with the
@@ -418,7 +422,9 @@ mod tests {
         let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
         drop(out_rx); // no drain → send fails
         let bridge = HostBridge::new(out_tx);
-        let outcome = bridge.request("session/request_permission", json!({})).await;
+        let outcome = bridge
+            .request("session/request_permission", json!({}))
+            .await;
         let err = outcome.unwrap_err();
         assert_eq!(err["code"], -32603);
     }

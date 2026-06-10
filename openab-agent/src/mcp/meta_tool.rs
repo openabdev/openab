@@ -48,14 +48,17 @@ pub enum Action {
 
 /// Entry point — the LLM tool dispatcher hands us a deserialized `Action`
 /// and we return the JSON payload that becomes the tool result.
-pub async fn dispatch(manager: &McpRuntimeManager, action: Action) -> Result<(Value, Option<bool>)> {
+pub async fn dispatch(
+    manager: &McpRuntimeManager,
+    action: Action,
+) -> Result<(Value, Option<bool>)> {
     match action {
         Action::Help => Ok((json!(HELP), None)),
         Action::ListServers => Ok((list_servers(manager).await, None)),
         Action::ListTools { server } => list_tools(manager, &server).await.map(|v| (v, None)),
-        Action::DescribeTool { server, tool } => {
-            describe_tool(manager, &server, &tool).await.map(|v| (v, None))
-        }
+        Action::DescribeTool { server, tool } => describe_tool(manager, &server, &tool)
+            .await
+            .map(|v| (v, None)),
         Action::Call {
             server,
             tool,
@@ -344,8 +347,7 @@ async fn fetch_tools(manager: &McpRuntimeManager, server: &str) -> Result<Vec<rm
         .with_context(|| format!("connect mcp server {server:?}"))?;
     let _call_guard = manager.begin_call(server).await;
     let peer = manager.arc_peer(server).await?;
-    ensure_tools_capability(&peer, server)
-        .with_context(|| format!("list_tools on {server:?}"))?;
+    ensure_tools_capability(&peer, server).with_context(|| format!("list_tools on {server:?}"))?;
     let timeout = manager.request_timeout(server).await;
     // Manual pagination mirroring rmcp's `list_all_tools`, but per-page
     // bounded by the configured request timeout (ADR §5.6). rmcp's helper
@@ -462,7 +464,10 @@ fn tool_summary(t: &rmcp::model::Tool) -> Value {
     }
     if !blocking.is_empty() {
         map.insert("available".into(), Value::Bool(false));
-        map.insert("unavailable_reason".into(), Value::String(blocking.join("; ")));
+        map.insert(
+            "unavailable_reason".into(),
+            Value::String(blocking.join("; ")),
+        );
     }
     Value::Object(map)
 }
@@ -536,8 +541,7 @@ async fn describe_tool(manager: &McpRuntimeManager, server: &str, tool: &str) ->
         .expect("tool_summary always returns a JSON object");
     obj.insert(
         "input_schema".into(),
-        serde_json::to_value(&tool_def.input_schema)
-            .context("serialize tool input_schema")?,
+        serde_json::to_value(&tool_def.input_schema).context("serialize tool input_schema")?,
     );
     if let Some(output_schema) = &tool_def.output_schema {
         obj.insert(
@@ -628,9 +632,7 @@ mod tests {
         assert!(s.contains("call(server, tool"));
     }
 
-    fn transport_send_error(
-        inner: StreamableHttpError<reqwest013::Error>,
-    ) -> ServiceError {
+    fn transport_send_error(inner: StreamableHttpError<reqwest013::Error>) -> ServiceError {
         use rmcp::transport::DynamicTransportError;
         use std::any::TypeId;
         ServiceError::TransportSend(DynamicTransportError::from_parts(

@@ -11,9 +11,7 @@
 //! rate limiting (row 409) are tracked as known gaps. The non-interactive
 //! approval gate below is the headless-friendly stand-in for the consent UI.
 
-use rmcp::model::{
-    CreateMessageResult, ErrorCode, ErrorData, Role, SamplingMessage,
-};
+use rmcp::model::{CreateMessageResult, ErrorCode, ErrorData, Role, SamplingMessage};
 
 use crate::llm::{ContentBlock, LlmEvent, Message};
 
@@ -146,13 +144,25 @@ mod tests {
 
     #[test]
     fn approval_parse_defaults_closed() {
-        assert_eq!(SamplingApproval::parse(Some("allow")), SamplingApproval::Allow);
-        assert_eq!(SamplingApproval::parse(Some("ALLOW")), SamplingApproval::Allow);
-        assert_eq!(SamplingApproval::parse(Some(" deny ")), SamplingApproval::Deny);
+        assert_eq!(
+            SamplingApproval::parse(Some("allow")),
+            SamplingApproval::Allow
+        );
+        assert_eq!(
+            SamplingApproval::parse(Some("ALLOW")),
+            SamplingApproval::Allow
+        );
+        assert_eq!(
+            SamplingApproval::parse(Some(" deny ")),
+            SamplingApproval::Deny
+        );
         assert_eq!(SamplingApproval::parse(Some("ask")), SamplingApproval::Ask);
         assert_eq!(SamplingApproval::parse(None), SamplingApproval::Ask);
         assert_eq!(SamplingApproval::parse(Some("")), SamplingApproval::Ask);
-        assert_eq!(SamplingApproval::parse(Some("bogus")), SamplingApproval::Ask);
+        assert_eq!(
+            SamplingApproval::parse(Some("bogus")),
+            SamplingApproval::Ask
+        );
     }
 
     #[test]
@@ -217,7 +227,10 @@ mod tests {
 
     #[test]
     fn collect_text_surfaces_provider_error() {
-        let events = vec![LlmEvent::Text("partial".into()), LlmEvent::Error("boom".into())];
+        let events = vec![
+            LlmEvent::Text("partial".into()),
+            LlmEvent::Error("boom".into()),
+        ];
         let err = collect_text(events).unwrap_err();
         assert_eq!(err.code, ErrorCode::INTERNAL_ERROR);
     }

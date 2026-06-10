@@ -20,11 +20,18 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use oauth2::basic::BasicClient;
+use oauth2::{
+    AuthType, ClientId, DeviceAuthorizationUrl, DeviceCodeErrorResponse,
+    DeviceCodeErrorResponseType, RequestTokenError, Scope, StandardDeviceAuthorizationResponse,
+    TokenResponse, TokenUrl,
+};
 use rmcp::model::{
-    ClientInfo, CreateElicitationRequestParams, CreateElicitationResult, CreateMessageRequestParams,
-    CreateMessageResult, ElicitationAction, ElicitationCapability, ErrorData,
-    FormElicitationCapability, ListRootsResult, LoggingLevel, LoggingMessageNotificationParam, Root,
-    RootsCapabilities, SamplingCapability, SetLevelRequestParams,
+    ClientInfo, CreateElicitationRequestParams, CreateElicitationResult,
+    CreateMessageRequestParams, CreateMessageResult, ElicitationAction, ElicitationCapability,
+    ErrorData, FormElicitationCapability, ListRootsResult, LoggingLevel,
+    LoggingMessageNotificationParam, Root, RootsCapabilities, SamplingCapability,
+    SetLevelRequestParams,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
@@ -33,12 +40,6 @@ use rmcp::transport::{
     StreamableHttpClientTransport, TokioChildProcess,
 };
 use rmcp::{ClientHandler, ServiceExt};
-use oauth2::basic::BasicClient;
-use oauth2::{
-    AuthType, ClientId, DeviceAuthorizationUrl, DeviceCodeErrorResponse,
-    DeviceCodeErrorResponseType, RequestTokenError, Scope, StandardDeviceAuthorizationResponse,
-    TokenResponse, TokenUrl,
-};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::RwLock;
@@ -1183,8 +1184,11 @@ impl McpRuntimeManager {
             .save(creds)
             .await
         {
-            self.mark_device_login_failed(name, anyhow!("persist mcp credentials for {name:?}: {e}"))
-                .await;
+            self.mark_device_login_failed(
+                name,
+                anyhow!("persist mcp credentials for {name:?}: {e}"),
+            )
+            .await;
             return;
         }
         let mut handles = self.handles.write().await;
@@ -1246,7 +1250,10 @@ impl McpRuntimeManager {
                 provider_name,
                 callback,
                 ..
-            } => (Some(builtin_client_id(provider_name)?), (*callback).to_string()),
+            } => (
+                Some(builtin_client_id(provider_name)?),
+                (*callback).to_string(),
+            ),
             ResolvedProvider::Custom {
                 device_authorization_endpoint: Some(_),
                 ..
@@ -1886,10 +1893,16 @@ impl Dial {
                         }
                     });
                 }
-                OpenabClientHandler::new(name.to_string(), tools_cache, roots, provider, host_bridge)
-                    .serve(transport)
-                    .await
-                    .with_context(|| format!("mcp handshake with {command:?}"))
+                OpenabClientHandler::new(
+                    name.to_string(),
+                    tools_cache,
+                    roots,
+                    provider,
+                    host_bridge,
+                )
+                .serve(transport)
+                .await
+                .with_context(|| format!("mcp handshake with {command:?}"))
             }
             // `with_client` yields a transport parameterised by the OAuth client,
             // a different type than the default `from_uri` transport, so each arm
@@ -1898,17 +1911,29 @@ impl Dial {
                 Some(client) => {
                     let cfg = StreamableHttpClientTransportConfig::with_uri(url.as_str());
                     let transport = StreamableHttpClientTransport::with_client(client, cfg);
-                    OpenabClientHandler::new(name.to_string(), tools_cache, roots, provider, host_bridge)
-                        .serve(transport)
-                        .await
-                        .with_context(|| format!("mcp handshake with {url:?}"))
+                    OpenabClientHandler::new(
+                        name.to_string(),
+                        tools_cache,
+                        roots,
+                        provider,
+                        host_bridge,
+                    )
+                    .serve(transport)
+                    .await
+                    .with_context(|| format!("mcp handshake with {url:?}"))
                 }
                 None => {
                     let transport = StreamableHttpClientTransport::from_uri(url.as_str());
-                    OpenabClientHandler::new(name.to_string(), tools_cache, roots, provider, host_bridge)
-                        .serve(transport)
-                        .await
-                        .with_context(|| format!("mcp handshake with {url:?}"))
+                    OpenabClientHandler::new(
+                        name.to_string(),
+                        tools_cache,
+                        roots,
+                        provider,
+                        host_bridge,
+                    )
+                    .serve(transport)
+                    .await
+                    .with_context(|| format!("mcp handshake with {url:?}"))
                 }
             },
         }
@@ -2088,7 +2113,10 @@ mod tests {
             &serde_json::json!({ "action": "accept", "content": { "email": "a@b.c" } }),
         );
         assert_eq!(accepted.action, ElicitationAction::Accept);
-        assert_eq!(accepted.content, Some(serde_json::json!({ "email": "a@b.c" })));
+        assert_eq!(
+            accepted.content,
+            Some(serde_json::json!({ "email": "a@b.c" }))
+        );
         // A bare content object (no action) is treated as an acceptance.
         let bare = elicitation_result_from_reply(&serde_json::json!({ "content": { "x": 1 } }));
         assert_eq!(bare.action, ElicitationAction::Accept);
@@ -2418,7 +2446,10 @@ mod tests {
     }
 
     async fn start_login_err(mgr: &McpRuntimeManager, name: &str) -> String {
-        mgr.start_paste_login(name, &[]).await.unwrap_err().to_string()
+        mgr.start_paste_login(name, &[])
+            .await
+            .unwrap_err()
+            .to_string()
     }
 
     fn mgr_with_tempdir(cfg: McpConfig) -> (McpRuntimeManager, tempfile::TempDir) {
@@ -2467,7 +2498,10 @@ mod tests {
         let (mgr, _dir) = mgr_with_tempdir(cfg);
         let (_provider, client_id, redirect_uri, _url) =
             mgr.resolve_paste_client("linear").await.expect("resolves");
-        assert!(client_id.is_none(), "missing client_id resolves to None for DCR");
+        assert!(
+            client_id.is_none(),
+            "missing client_id resolves to None for DCR"
+        );
         assert_eq!(redirect_uri, "https://example.com/cb");
     }
 
@@ -2813,7 +2847,12 @@ mod tests {
 
     /// Mark `name` Connected with a chosen idle age and in-flight count so the
     /// eviction/cap selectors can be exercised without a live transport.
-    async fn force_connected(mgr: &McpRuntimeManager, name: &str, idle: Duration, in_flight: usize) {
+    async fn force_connected(
+        mgr: &McpRuntimeManager,
+        name: &str,
+        idle: Duration,
+        in_flight: usize,
+    ) {
         let mut handles = mgr.handles.write().await;
         let h = handles.get_mut(name).unwrap();
         h.status = ServerStatus::Connected;

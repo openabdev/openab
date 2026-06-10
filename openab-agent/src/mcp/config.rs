@@ -602,8 +602,7 @@ mod tests {
     #[test]
     fn ping_config_opt_in_and_default_timeout() {
         // Absent ping_interval_secs => pinging disabled.
-        let off: ServerConfig =
-            serde_json::from_str(r#"{"type":"stdio","command":"x"}"#).unwrap();
+        let off: ServerConfig = serde_json::from_str(r#"{"type":"stdio","command":"x"}"#).unwrap();
         assert!(off.ping_config().is_none());
 
         // interval set, timeout omitted => 5s default timeout.
@@ -765,7 +764,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_http_authorize_url() {
-        let oauth = custom("http://issuer.example/authorize", "https://issuer.example/token");
+        let oauth = custom(
+            "http://issuer.example/authorize",
+            "https://issuer.example/token",
+        );
         let err = oauth.validate("srv").unwrap_err().to_string();
         assert!(err.contains("oauth.authorize_url"), "got: {err}");
         assert!(err.contains("https://"), "got: {err}");
@@ -773,7 +775,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_http_token_url() {
-        let oauth = custom("https://issuer.example/authorize", "http://issuer.example/token");
+        let oauth = custom(
+            "https://issuer.example/authorize",
+            "http://issuer.example/token",
+        );
         let err = oauth.validate("srv").unwrap_err().to_string();
         assert!(err.contains("oauth.token_url"), "got: {err}");
     }
@@ -811,7 +816,8 @@ mod tests {
     #[test]
     fn parses_streamable_http_alias() {
         let cfg: ServerConfig =
-            serde_json::from_str(r#"{"type":"streamable-http","url":"https://e.com/mcp"}"#).unwrap();
+            serde_json::from_str(r#"{"type":"streamable-http","url":"https://e.com/mcp"}"#)
+                .unwrap();
         assert!(matches!(cfg, ServerConfig::Http { .. }));
     }
 

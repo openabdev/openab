@@ -922,7 +922,11 @@ mod tests {
         assert!(store.load().await.unwrap().is_none(), "empty → None");
 
         store.save(make_mcp_creds()).await.unwrap();
-        let loaded = store.load().await.unwrap().expect("creds present after save");
+        let loaded = store
+            .load()
+            .await
+            .unwrap()
+            .expect("creds present after save");
         assert_eq!(loaded.client_id, "client-xyz");
         assert_eq!(loaded.granted_scopes, vec!["read", "write"]);
         assert_eq!(loaded.token_received_at, Some(1234));
@@ -946,7 +950,11 @@ mod tests {
         // clean file with the new creds rather than silently wiping on top of
         // the corruption.
         store.save(make_mcp_creds()).await.unwrap();
-        let loaded = store.load().await.unwrap().expect("creds present after save");
+        let loaded = store
+            .load()
+            .await
+            .unwrap()
+            .expect("creds present after save");
         assert_eq!(loaded.client_id, "client-xyz");
 
         // The corrupt bytes are preserved in exactly one quarantine sibling

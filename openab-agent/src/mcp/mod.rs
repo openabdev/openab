@@ -54,7 +54,8 @@ fn is_akia(bytes: &[u8], i: usize) -> bool {
     {
         return false;
     }
-    !(i + 20 < bytes.len() && (bytes[i + 20].is_ascii_uppercase() || bytes[i + 20].is_ascii_digit()))
+    !(i + 20 < bytes.len()
+        && (bytes[i + 20].is_ascii_uppercase() || bytes[i + 20].is_ascii_digit()))
 }
 
 /// If a [`REDACT_KEYS`] entry starts at `i` (on a word boundary and not part of
@@ -135,8 +136,16 @@ pub fn redact_secrets(input: &str) -> String {
                             }
                             None => matches!(
                                 b,
-                                b' ' | b'\t' | b',' | b'&' | b';' | b'\n' | b'\r' | b'}' | b')'
-                                    | b'"' | b'\''
+                                b' ' | b'\t'
+                                    | b','
+                                    | b'&'
+                                    | b';'
+                                    | b'\n'
+                                    | b'\r'
+                                    | b'}'
+                                    | b')'
+                                    | b'"'
+                                    | b'\''
                             ),
                         };
                         if stop {
@@ -689,7 +698,10 @@ mod tests {
     #[test]
     fn redact_secrets_preserves_ordinary_text() {
         // "token" as a substring of a longer word must not trip the masker.
-        assert_eq!(redact_secrets("tokenizer ran in 5ms"), "tokenizer ran in 5ms");
+        assert_eq!(
+            redact_secrets("tokenizer ran in 5ms"),
+            "tokenizer ran in 5ms"
+        );
         assert_eq!(
             redact_secrets("connect failed: timeout after 30s"),
             "connect failed: timeout after 30s"
