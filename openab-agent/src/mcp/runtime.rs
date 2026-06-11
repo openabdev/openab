@@ -833,6 +833,19 @@ impl McpRuntimeManager {
                         if !manager.breaker.is_tripped(&name) {
                             manager.breaker.record_failure(&name);
                         }
+                        // Once the breaker is open the transport is presumed
+                        // dead. Tear the stale client down so connect()'s
+                        // Connected fast-path / half-open probe can't fabricate a
+                        // success by reusing a dead handle — every other transport
+                        // fault routes through disconnect() (meta_tool), so the
+                        // ping path must too, or the "Connected ⟹ healthy"
+                        // invariant connect() relies on breaks (#969 F1).
+                        // disconnect() aborts this loop; a later reconnect spawns a
+                        // fresh one, so stop cleanly here.
+                        if manager.breaker.is_tripped(&name) {
+                            let _ = manager.disconnect(&name).await;
+                            return;
+                        }
                     }
                 }
             }

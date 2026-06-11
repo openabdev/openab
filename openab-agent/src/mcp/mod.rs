@@ -576,7 +576,7 @@ async fn doctor_server(
     server: &ServerConfig,
 ) -> bool {
     if let Err(e) = server.resolved(name) {
-        println!("    ✗ config: {e:#}");
+        println!("    ✗ config: {}", redact_secrets(&format!("{e:#}")));
         println!("    → set the missing env var(s) above and re-run");
         return false;
     }
@@ -612,7 +612,7 @@ async fn doctor_server(
             true
         }
         Err(e) => {
-            println!("    ✗ connect: {e:#}");
+            println!("    ✗ connect: {}", redact_secrets(&format!("{e:#}")));
             false
         }
     }

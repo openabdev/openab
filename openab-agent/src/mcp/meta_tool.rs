@@ -296,6 +296,25 @@ async fn call_tool(
                 return Err(needs_reauth_error(server, &required_scope))
                     .with_context(|| format!("call_tool {tool:?} on {server:?}"));
             }
+            // A JSON-RPC error reply (ServiceError::McpError) is a wire-level
+            // response, not a transport fault — same class as `isError: true`.
+            // It must not trip the breaker or tear down the live client. Mirror
+            // the Ok-reset semantics above (ADR §5.9 error model).
+            if matches!(e, ServiceError::McpError(_)) {
+                manager.record_tool_call_outcome(server, true);
+                tracing::info!(
+                    target: "mcp.audit",
+                    server,
+                    tool,
+                    args_sha256 = %args_sha256,
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    outcome = "err",
+                    is_error = true,
+                    "mcp call_tool exit"
+                );
+                return Err(anyhow::Error::new(e))
+                    .with_context(|| format!("call_tool {tool:?} on {server:?}"));
+            }
             manager.record_tool_call_outcome(server, false);
             // Transport fault: the installed client is dead. Tear it down so the
             // next connect() redials instead of reusing a dead handle via the
@@ -398,6 +417,13 @@ async fn fetch_tools(manager: &McpRuntimeManager, server: &str) -> Result<Vec<rm
                 if let Some(required_scope) = auth_challenge_scope(&e) {
                     manager.mark_needs_auth(server).await;
                     return Err(needs_reauth_error(server, &required_scope))
+                        .with_context(|| format!("list_tools on {server:?}"));
+                }
+                // JSON-RPC error reply (McpError) = wire-level response, not a
+                // transport fault — don't trip the breaker (ADR §5.9).
+                if matches!(e, ServiceError::McpError(_)) {
+                    manager.record_tool_call_outcome(server, true);
+                    return Err(anyhow::Error::new(e))
                         .with_context(|| format!("list_tools on {server:?}"));
                 }
                 manager.record_tool_call_outcome(server, false);
