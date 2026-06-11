@@ -22,11 +22,21 @@ RUN touch src/main.rs && cargo build --release
 #
 # Note: opencode does not publish SHA256 checksums for its releases,
 # so checksum verification is not possible at this time.
+#
+# Floor: 1.17.3. Earlier 1.16.x releases (and likely 1.15.x) ship an ACP
+# regression where OpenRouter reasoning models (e.g. google/gemini-3-flash)
+# never emit a final `agent_message_chunk` over ACP — opencode's internal
+# session storage holds the assistant text part, but the ACP server only
+# emits `usage_update` + `stopReason: end_turn`. From OpenAB's side this
+# surfaces as `(no response)` because there is no message content to render.
+# The upstream fix landed in 1.17.0 (sst/opencode#30332,
+# "fix(opencode): generate reasoning variants for all OpenRouter models").
+# 1.17.3 is the latest 1.17.x verified by users to recover correctly.
 FROM node:22-bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini unzip && rm -rf /var/lib/apt/lists/*
 
 # Install opencode
-ARG OPENCODE_VERSION=1.16.2
+ARG OPENCODE_VERSION=1.17.3
 RUN npm install -g opencode-ai@${OPENCODE_VERSION} --retry 3
 
 # Install gh CLI (matches Dockerfile.claude / Dockerfile.gemini / Dockerfile.codex)
