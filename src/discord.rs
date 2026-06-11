@@ -1070,7 +1070,7 @@ impl Handler {
             .map(|o| {
                 let mut item = CreateSelectMenuOption::new(&o.name, &o.value);
                 if let Some(desc) = &o.description {
-                    item = item.description(desc);
+                    item = item.description(truncate_select_option_description(desc));
                 }
                 if o.value == opt.current_value {
                     item = item.default_selection(true);
@@ -1709,6 +1709,30 @@ impl Handler {
 
 // --- Discord-specific helpers ---
 
+/// Discord caps select-menu option descriptions at 100 characters. Exceeding it
+/// makes the API reject the *entire* interaction response with `Invalid Form
+/// Body (... description: Must be 100 or fewer in length.)`, which surfaces to
+/// the user as "This application did not respond".
+const SELECT_OPTION_DESCRIPTION_MAX: usize = 100;
+
+/// Truncate a select-menu option description to Discord's 100-char limit.
+///
+/// Truncates on a char boundary (via `char_indices`) so multi-byte text
+/// (中文 / emoji / accented Latin) never panics and never produces invalid
+/// UTF-8. Returns the input unchanged when it is already within the limit.
+fn truncate_select_option_description(desc: &str) -> &str {
+    if desc.chars().count() > SELECT_OPTION_DESCRIPTION_MAX {
+        let end = desc
+            .char_indices()
+            .nth(SELECT_OPTION_DESCRIPTION_MAX)
+            .map(|(i, _)| i)
+            .unwrap_or(desc.len());
+        &desc[..end]
+    } else {
+        desc
+    }
+}
+
 fn discord_msg_ref(msg: &Message) -> MessageRef {
     MessageRef {
         channel: ChannelRef {
@@ -2284,6 +2308,61 @@ fn turn_limit_warning_present(messages: &[(bool, &str)]) -> bool {
 mod tests {
     use super::*;
     use crate::bot_turns::{TurnResult, HARD_BOT_TURN_LIMIT, BOT_TURN_LIMIT_WARNING_PREFIX};
+
+    // --- truncate_select_option_description tests (regression for the
+    // `/agents` & `/models` "application did not respond" bug) ---
+
+    /// Short ASCII descriptions pass through unchanged.
+    #[test]
+    fn truncate_desc_short_ascii_unchanged() {
+        let s = "Read-only consultant — architecture analysis";
+        assert_eq!(truncate_select_option_description(s), s);
+    }
+
+    /// A description of exactly 100 chars is kept as-is (boundary).
+    #[test]
+    fn truncate_desc_exactly_100_unchanged() {
+        let s: String = "a".repeat(100);
+        assert_eq!(truncate_select_option_description(&s), s);
+        assert_eq!(truncate_select_option_description(&s).chars().count(), 100);
+    }
+
+    /// 101 ASCII chars are trimmed down to 100.
+    #[test]
+    fn truncate_desc_101_ascii_trimmed_to_100() {
+        let s: String = "b".repeat(101);
+        let out = truncate_select_option_description(&s);
+        assert_eq!(out.chars().count(), 100);
+        assert!(s.starts_with(out));
+    }
+
+    /// Multi-byte (CJK) descriptions over the limit are trimmed on a char
+    /// boundary — no panic, output stays valid UTF-8 and ≤100 chars.
+    #[test]
+    fn truncate_desc_multibyte_trimmed_on_char_boundary() {
+        // 200 CJK chars (3 bytes each in UTF-8) — far over the 100-char cap.
+        let s: String = "あ".repeat(200);
+        let out = truncate_select_option_description(&s);
+        assert_eq!(out.chars().count(), 100);
+        // Byte length is a multiple of 3 (clean char boundary), not a panic.
+        assert_eq!(out.len(), 300);
+        assert!(s.starts_with(out));
+    }
+
+    /// Emoji (4-byte scalar values) over the limit also trim cleanly.
+    #[test]
+    fn truncate_desc_emoji_trimmed_on_char_boundary() {
+        let s: String = "🚀".repeat(150);
+        let out = truncate_select_option_description(&s);
+        assert_eq!(out.chars().count(), 100);
+        assert!(s.starts_with(out));
+    }
+
+    /// Empty description is returned unchanged.
+    #[test]
+    fn truncate_desc_empty_unchanged() {
+        assert_eq!(truncate_select_option_description(""), "");
+    }
 
     // --- resolve_mentions tests ---
 
