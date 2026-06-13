@@ -717,10 +717,24 @@ pub async fn run_slack_adapter(
                 info!("Slack Socket Mode connected");
                 let (mut write, mut read) = ws_stream.split();
 
+                // Proactively ping Slack and bail out if the connection goes
+                // silent. Without this, a half-open socket (e.g. the peer is
+                // dropped by a NAT/firewall idle-timeout with no FIN/RST) leaves
+                // `read.next()` blocked forever, so the reconnect logic below
+                // never runs and the adapter stays silently dead. The idle timer
+                // is reset on every inbound frame (including Slack's Pong replies
+                // to our keepalive pings). See issue #1101.
+                let ping_interval = std::time::Duration::from_secs(30);
+                let idle_timeout = std::time::Duration::from_secs(90);
+                let mut last_activity = tokio::time::Instant::now();
+                let mut ping_timer = tokio::time::interval(ping_interval);
+                ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
                 loop {
                     tokio::select! {
                         msg_result = read.next() => {
                             let Some(msg_result) = msg_result else { break };
+                            last_activity = tokio::time::Instant::now();
                             match msg_result {
                                 Ok(tungstenite::Message::Text(text)) => {
                                     let envelope: serde_json::Value =
@@ -1062,6 +1076,23 @@ pub async fn run_slack_adapter(
                             info!("Slack adapter received shutdown signal");
                             let _ = write.send(tungstenite::Message::Close(None)).await;
                             return Ok(());
+                        }
+                        _ = ping_timer.tick() => {
+                            if last_activity.elapsed() > idle_timeout {
+                                warn!(
+                                    idle_secs = idle_timeout.as_secs(),
+                                    "no Slack frames within idle timeout; assuming a \
+                                     half-open connection and reconnecting"
+                                );
+                                break;
+                            }
+                            if let Err(e) = write
+                                .send(tungstenite::Message::Ping(Vec::new()))
+                                .await
+                            {
+                                warn!("failed to send Slack keepalive ping: {e}; reconnecting");
+                                break;
+                            }
                         }
                     }
                 }
