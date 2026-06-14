@@ -142,7 +142,7 @@ helm upgrade --install my-bot ./charts/openab-line \
 | `image.tag` | `""` | Agent image tag (defaults to `channel` value) |
 | `image.pullPolicy` | `IfNotPresent` | Image pull policy |
 | `gateway.image` | `ghcr.io/openabdev/openab-gateway` | Gateway image repository (override for air-gapped / private-registry installs) |
-| `gateway.tag` | `v0.5.1` | Gateway image tag. Pinned to version tested with this chart — change with care |
+| `gateway.tag` | `v0.5.3` | Gateway image tag. Pinned to version tested with this chart — change with care |
 | `agent.command` | `kiro-cli` | Agent entrypoint command |
 | `agent.args` | `["acp","--trust-all-tools"]` | Agent command arguments |
 | `agent.workingDir` | `/home/agent` | Shared HOME and PVC/emptyDir mount path |

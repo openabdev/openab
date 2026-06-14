@@ -63,7 +63,7 @@ gateway:
   image: ghcr.io/openabdev/openab-gateway
   # -- Gateway image tag. Pinned to the version tested with this chart release.
   # Changing this may break compatibility — only override if you know what you are doing.
-  tag: "v0.5.1"
+  tag: "v0.5.3"
 
 # -- Agent configuration
 agent:
