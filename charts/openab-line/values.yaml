@@ -21,7 +21,8 @@
 #
 # Optional:
 #   existingSecret            -- pre-existing K8s Secret with line-channel-secret,
-#                                line-channel-access-token, and optionally cloudflare-tunnel-token
+#                                line-channel-access-token (and cloudflare-tunnel-token
+#                                when tunnel.enabled=true)
 #   tunnel.enabled            -- run cloudflared sidecar
 #   tunnel.token              -- Cloudflare Tunnel token (required when tunnel.enabled=true)
 #   webhookDomain             -- shown in post-install notes for webhook setup
@@ -35,7 +36,7 @@ line:
 
 # -- Use a pre-existing K8s Secret instead of creating one from values.
 # Required keys: line-channel-secret, line-channel-access-token
-# Optional key: cloudflare-tunnel-token
+# Required when tunnel.enabled=true: cloudflare-tunnel-token
 existingSecret: ""
 
 # -- Optional Cloudflare Tunnel sidecar for webhook exposure
@@ -57,10 +58,12 @@ image:
   tag: ""  # defaults to channel
   pullPolicy: IfNotPresent
 
-# -- Gateway image
+# -- Gateway image (override repository for air-gapped / private-registry installs)
 gateway:
   image: ghcr.io/openabdev/openab-gateway
-  tag: ""  # defaults to Chart.AppVersion
+  # -- Gateway image tag. Pinned to the version tested with this chart release.
+  # Changing this may break compatibility — only override if you know what you are doing.
+  tag: "v0.5.1"
 
 # -- Agent configuration
 agent:
@@ -79,9 +82,18 @@ agent:
     enabled: false
     removeAfterReply: false
 
-# -- Gateway access control. Empty lists mean allow all.
+# -- Gateway access control.
 platform:
+  # allowAllUsers: override whether all users are allowed.
+  # null (default) → openab decides: allow all if allowedUsers is empty, restrict if non-empty.
+  # true  → allow all users regardless of allowedUsers list.
+  # false → restrict to allowedUsers list (useful to lock down even with an empty list).
+  allowAllUsers: null
+  # allowAllChannels: same override logic as allowAllUsers, applied to channels/groups.
+  allowAllChannels: null
+  # LINE user IDs allowed (format: Uxxxxxxxxxxxxx). Empty = allow all (when allowAllUsers is null).
   allowedUsers: []
+  # LINE channel/group/room IDs allowed. Empty = allow all (when allowAllChannels is null).
   allowedChannels: []
 
 # -- Persistence for shared agent working directory / inbound attachments

@@ -131,19 +131,43 @@ helm upgrade --install my-bot ./charts/openab-line \
 |-----|---------|-------------|
 | `line.channelSecret` | `""` | **(required)** LINE channel secret |
 | `line.channelAccessToken` | `""` | **(required)** LINE channel access token |
-| `existingSecret` | `""` | Use pre-existing Secret |
+| `existingSecret` | `""` | Use a pre-existing Secret instead of creating one |
+| `channel` | `stable` | Agent release channel (`stable` or `beta`) |
 | `tunnel.enabled` | `false` | Enable cloudflared sidecar |
-| `tunnel.token` | `""` | Cloudflare Tunnel token |
-| `webhookDomain` | `""` | Used in install notes |
-| `image.repository` | `ghcr.io/openabdev/openab` | Agent image |
-| `image.tag` | `channel` | Agent image tag |
-| `gateway.image` | `ghcr.io/openabdev/openab-gateway` | Gateway image |
-| `gateway.tag` | `Chart.AppVersion` | Gateway image tag |
-| `agent.command` | `kiro-cli` | Agent command |
-| `agent.workingDir` | `/home/agent` | Shared HOME / PVC mount |
-| `platform.allowedUsers` | `[]` | Allowed LINE user IDs (empty = all) |
-| `platform.allowedChannels` | `[]` | Allowed LINE chat/group IDs (empty = all) |
+| `tunnel.token` | `""` | Cloudflare Tunnel token (required when `tunnel.enabled=true`) |
+| `tunnel.image` | `cloudflare/cloudflared` | Cloudflared image repository |
+| `tunnel.tag` | `2026.5.0` | Cloudflared image tag |
+| `webhookDomain` | `""` | Domain shown in post-install notes |
+| `image.repository` | `ghcr.io/openabdev/openab` | Agent image repository |
+| `image.tag` | `""` | Agent image tag (defaults to `channel` value) |
+| `image.pullPolicy` | `IfNotPresent` | Image pull policy |
+| `gateway.image` | `ghcr.io/openabdev/openab-gateway` | Gateway image repository (override for air-gapped / private-registry installs) |
+| `gateway.tag` | `v0.5.1` | Gateway image tag. Pinned to version tested with this chart — change with care |
+| `agent.command` | `kiro-cli` | Agent entrypoint command |
+| `agent.args` | `["acp","--trust-all-tools"]` | Agent command arguments |
+| `agent.workingDir` | `/home/agent` | Shared HOME and PVC/emptyDir mount path |
+| `agent.env` | `{}` | Extra environment variables (map) |
+| `agent.envFrom` | `[]` | Extra envFrom sources (ConfigMaps/Secrets) |
+| `agent.secretEnv` | `[]` | Extra environment variables from Secrets |
+| `agent.pool.maxSessions` | `10` | Max concurrent sessions |
+| `agent.pool.sessionTtlHours` | `24` | Session TTL in hours |
+| `agent.reactions.enabled` | `false` | Enable reaction events (LINE does not support reactions) |
+| `agent.reactions.removeAfterReply` | `false` | Remove reaction after agent replies |
+| `platform.allowAllUsers` | `null` | Override allow-all-users (`null` = defer to `allowedUsers` list) |
+| `platform.allowAllChannels` | `null` | Override allow-all-channels (`null` = defer to `allowedChannels` list) |
+| `platform.allowedUsers` | `[]` | Allowed LINE user IDs (`Uxxx…`). Empty = allow all when `allowAllUsers` is null |
+| `platform.allowedChannels` | `[]` | Allowed LINE chat/group IDs. Empty = allow all when `allowAllChannels` is null |
 | `persistence.enabled` | `true` | Enable PVC for agent state and media |
+| `persistence.existingClaim` | `""` | Use an existing PVC instead of creating one |
+| `persistence.storageClass` | `""` | Storage class (`""` = cluster default) |
+| `persistence.size` | `1Gi` | PVC size |
+| `service.type` | `ClusterIP` | Service type |
+| `service.port` | `8080` | Service port |
+| `service.annotations` | `{}` | Extra annotations for the Service |
+| `resources` | `{}` | Container resource requests/limits |
+| `nodeSelector` | `{}` | Node selector |
+| `tolerations` | `[]` | Tolerations |
+| `affinity` | `{}` | Affinity rules |
 
 ## Troubleshooting
 

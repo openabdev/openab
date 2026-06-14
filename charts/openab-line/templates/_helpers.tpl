@@ -24,11 +24,7 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{- define "openab-line.gatewayImage" -}}
-{{- $tag := .Values.gateway.tag -}}
-{{- if not $tag -}}
-  {{- $tag = .Chart.AppVersion -}}
-{{- end -}}
-{{- printf "%s:%s" .Values.gateway.image $tag -}}
+{{- printf "%s:%s" .Values.gateway.image .Values.gateway.tag -}}
 {{- end }}
 
 {{- define "openab-line.secretName" -}}

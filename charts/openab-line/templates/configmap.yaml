@@ -30,7 +30,11 @@ data:
     [gateway]
     url = "ws://localhost:8080/ws"
     platform = "line"
-    allow_all_channels = {{ if .Values.platform.allowedChannels }}false{{ else }}true{{ end }}
+    {{- if not (kindIs "invalid" .Values.platform.allowAllChannels) }}
+    allow_all_channels = {{ .Values.platform.allowAllChannels }}
+    {{- end }}
     allowed_channels = {{ .Values.platform.allowedChannels | default list | toJson }}
-    allow_all_users = {{ if .Values.platform.allowedUsers }}false{{ else }}true{{ end }}
+    {{- if not (kindIs "invalid" .Values.platform.allowAllUsers) }}
+    allow_all_users = {{ .Values.platform.allowAllUsers }}
+    {{- end }}
     allowed_users = {{ .Values.platform.allowedUsers | default list | toJson }}

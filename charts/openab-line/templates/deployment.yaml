@@ -36,9 +36,9 @@ spec:
           env:
             - name: HOME
               value: {{ .Values.agent.workingDir | default "/home/agent" }}
-            {{- range $k, $v := .Values.agent.env }}
+            {{- range $k := (.Values.agent.env | keys | sortAlpha) }}
             - name: {{ $k }}
-              value: {{ $v | quote }}
+              value: {{ get $.Values.agent.env $k | quote }}
             {{- end }}
             {{- range .Values.agent.secretEnv }}
             - name: {{ .name }}
@@ -59,10 +59,8 @@ spec:
             - name: config
               mountPath: /etc/openab
               readOnly: true
-            {{- if .Values.persistence.enabled }}
             - name: data
               mountPath: {{ .Values.agent.workingDir | default "/home/agent" }}
-            {{- end }}
             - name: tmp
               mountPath: /tmp
 
@@ -91,10 +89,8 @@ spec:
                   name: {{ include "openab-line.secretName" . }}
                   key: line-channel-access-token
           volumeMounts:
-            {{- if .Values.persistence.enabled }}
             - name: data
               mountPath: {{ .Values.agent.workingDir | default "/home/agent" }}
-            {{- end }}
             - name: tmp
               mountPath: /tmp
 
@@ -144,10 +140,12 @@ spec:
         - name: config
           configMap:
             name: {{ include "openab-line.fullname" . }}
-        {{- if .Values.persistence.enabled }}
         - name: data
+          {{- if .Values.persistence.enabled }}
           persistentVolumeClaim:
             claimName: {{ .Values.persistence.existingClaim | default (include "openab-line.fullname" .) }}
-        {{- end }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
         - name: tmp
           emptyDir: {}

@@ -1,11 +1,11 @@
 🎉 OpenAB LINE bot deployed!
 
 {{- if include "openab-line.tunnelEnabled" . }}
-Pod: {{ include "openab-line.fullname" . }} (3 containers: openab, gateway, cloudflared)
+Deployment: {{ include "openab-line.fullname" . }} (3 containers: openab, gateway, cloudflared)
 Exposure: Cloudflare Tunnel
 {{- else }}
-Pod: {{ include "openab-line.fullname" . }} (2 containers: openab, gateway)
-Exposure: bring your own Ingress / LoadBalancer to Service/{{ include "openab-line.fullname" . }}
+Deployment: {{ include "openab-line.fullname" . }} (2 containers: openab, gateway)
+Exposure: Service/{{ include "openab-line.fullname" . }} ({{ .Values.service.type }}) — route public traffic to it via Ingress, LoadBalancer, or NodePort
 {{- end }}
 
 ## Post-Install Steps
@@ -23,11 +23,14 @@ In Cloudflare Dashboard:
 {{- if not (include "openab-line.tunnelEnabled" .) }}
 ### Step 1: Expose the Service publicly
 
-Create an Ingress / LoadBalancer that routes:
-  https://{{ .Values.webhookDomain | default "YOUR_DOMAIN" }}/webhook/line
+Route public HTTPS traffic to Service/{{ include "openab-line.fullname" . }}:{{ .Values.service.port }}.
+Options depending on your cluster:
+  - Ingress: point your Ingress controller at the Service
+  - LoadBalancer: set service.type=LoadBalancer and use the external IP
+  - NodePort: set service.type=NodePort and expose via your load balancer
 
-to:
-  Service/{{ include "openab-line.fullname" . }}:{{ .Values.service.port }}
+Target URL:
+  https://{{ .Values.webhookDomain | default "YOUR_DOMAIN" }}/webhook/line
 {{- end }}
 
 ### Step 2: Set the LINE webhook
