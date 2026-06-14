@@ -135,6 +135,10 @@ data:
     {{- if hasKey ($cfg.slack | default dict) "maxBatchTokens" }}
     max_batch_tokens = {{ ($cfg.slack).maxBatchTokens | int }}
     {{- end }}
+    {{- /* mentionDebounceSeconds: quiet window before a mention dispatches one turn (collapses app_mention edit re-fires) */ -}}
+    {{- if hasKey ($cfg.slack | default dict) "mentionDebounceSeconds" }}
+    mention_debounce_seconds = {{ ($cfg.slack).mentionDebounceSeconds | int }}
+    {{- end }}
     {{- if and (hasKey ($cfg.slack | default dict) "assistantMode") (not ($cfg.slack).assistantMode) }}
     assistant_mode = false
     {{- end }}

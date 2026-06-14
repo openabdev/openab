@@ -272,6 +272,7 @@ async fn main() -> anyhow::Result<()> {
         let router = router.clone();
         let stt = cfg.stt.clone();
         let max_bot_turns = slack_cfg.max_bot_turns;
+        let mention_debounce_seconds = slack_cfg.mention_debounce_seconds;
         let slack_shutdown_rx = shutdown_rx.clone();
         let adapter = shared_slack_adapter
             .clone()
@@ -303,6 +304,7 @@ async fn main() -> anyhow::Result<()> {
                 slack_cfg.trusted_bot_ids.into_iter().collect(),
                 slack_cfg.allow_user_messages,
                 max_bot_turns,
+                mention_debounce_seconds,
                 stt,
                 slack_shutdown_rx,
                 slack_dispatcher,

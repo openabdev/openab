@@ -331,6 +331,13 @@ agents:
       # maxBufferedMessages: 10
       # maxBatchTokens: soft token cap per ACP turn for batching modes (default 24000)
       # maxBatchTokens: 24000
+      # mentionDebounceSeconds: quiet window before a mention dispatches one turn.
+      # Slack re-fires app_mention for every edit state of a mention-bearing
+      # message; the adapter holds only the latest state and dispatches once the
+      # message has been quiet this long. Default 4 (Rust-side
+      # `default_mention_debounce_seconds()`). Lower = less latency but higher
+      # risk of acting on a mid-stream edit; 0 dispatches on the first event.
+      # mentionDebounceSeconds: 4
     workingDir: /home/agent
     env: {}
     # Load env vars from existing Secrets or ConfigMaps, e.g. GH_TOKEN.

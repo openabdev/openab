@@ -674,7 +674,9 @@ impl ChatAdapter for SlackAdapter {
 /// Hard cap on consecutive bot messages in a thread. Prevents runaway loops.
 const MAX_CONSECUTIVE_BOT_TURNS: usize = 1000;
 
-/// Quiet window for per-message mention debouncing (see `MentionDebouncer`).
+/// Default quiet window for per-message mention debouncing (see
+/// `MentionDebouncer`), used when `[slack] mention_debounce_ms` is unset.
+/// Overridable per deployment; the live window is a `MentionDebouncer` field.
 const MENTION_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(4);
 /// Bounded memory for per-message dispatch history.
 const MENTION_HISTORY_CAP: usize = 512;
@@ -701,8 +703,10 @@ const MENTION_HISTORY_CAP: usize = 512;
 /// often a mid-stream fragment (observed in prod: a dispatch whose text was
 /// just `"<@U…>  -"`), and responding to fragments is worse than a few
 /// seconds of latency on turns that already take tens of seconds.
-#[derive(Default)]
 struct MentionDebouncer {
+    /// Quiet window each new event state must clear before dispatch. Sourced
+    /// from `[slack] mention_debounce_ms`; defaults to `MENTION_DEBOUNCE`.
+    window: tokio::time::Duration,
     /// key → (event payload, team_id, quiet deadline)
     pending: HashMap<String, (serde_json::Value, String, tokio::time::Instant)>,
     /// key → text of the last dispatched state (FIFO-bounded via `order`)
@@ -710,7 +714,22 @@ struct MentionDebouncer {
     order: std::collections::VecDeque<String>,
 }
 
+impl Default for MentionDebouncer {
+    fn default() -> Self {
+        Self::new(MENTION_DEBOUNCE)
+    }
+}
+
 impl MentionDebouncer {
+    fn new(window: tokio::time::Duration) -> Self {
+        Self {
+            window,
+            pending: HashMap::new(),
+            dispatched: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
     /// Record the latest state of a mention event. Returns true when the
     /// caller should spawn a waiter task for this key (i.e. the key was not
     /// already pending); later states just replace the payload and push the
@@ -719,7 +738,7 @@ impl MentionDebouncer {
         let fresh = !self.pending.contains_key(key);
         self.pending.insert(
             key.to_string(),
-            (event, team_id, tokio::time::Instant::now() + MENTION_DEBOUNCE),
+            (event, team_id, tokio::time::Instant::now() + self.window),
         );
         fresh
     }
@@ -801,13 +820,16 @@ pub async fn run_slack_adapter(
     trusted_bot_ids: HashSet<String>,
     allow_user_messages: AllowUsers,
     max_bot_turns: u32,
+    mention_debounce_seconds: u64,
     stt_config: SttConfig,
     mut shutdown_rx: watch::Receiver<bool>,
     dispatcher: Arc<crate::dispatch::Dispatcher>,
 ) -> Result<()> {
     let bot_token = adapter.bot_token().to_string();
     let bot_turns = Arc::new(tokio::sync::Mutex::new(BotTurnTracker::new(max_bot_turns)));
-    let mention_debounce = Arc::new(tokio::sync::Mutex::new(MentionDebouncer::default()));
+    let mention_debounce = Arc::new(tokio::sync::Mutex::new(MentionDebouncer::new(
+        tokio::time::Duration::from_secs(mention_debounce_seconds),
+    )));
 
     loop {
         // Check for shutdown before (re)connecting

@@ -355,6 +355,9 @@ fn default_max_buffered_messages() -> usize {
 fn default_max_batch_tokens() -> usize {
     24_000
 }
+fn default_mention_debounce_seconds() -> u64 {
+    4
+}
 
 /// Controls whether the bot responds to user messages in threads without @mention.
 ///
@@ -430,6 +433,14 @@ pub struct SlackConfig {
     /// that are not AI apps (no `assistant:write`) to keep emoji-reaction status.
     #[serde(default = "default_true")]
     pub assistant_mode: bool,
+    /// Quiet window (seconds) for per-message `app_mention` debouncing.
+    /// Slack re-fires `app_mention` for every edit state of a mention-bearing
+    /// message; the adapter holds only the latest state and dispatches one turn
+    /// once the message has been quiet for this long. Default: 4. Lower = less
+    /// latency but higher risk of acting on a mid-stream edit; 0 dispatches on
+    /// the first event (effectively disabling debounce).
+    #[serde(default = "default_mention_debounce_seconds")]
+    pub mention_debounce_seconds: u64,
 }
 
 #[derive(Debug, Deserialize)]
