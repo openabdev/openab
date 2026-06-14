@@ -674,6 +674,119 @@ impl ChatAdapter for SlackAdapter {
 /// Hard cap on consecutive bot messages in a thread. Prevents runaway loops.
 const MAX_CONSECUTIVE_BOT_TURNS: usize = 1000;
 
+/// Quiet window for per-message mention debouncing (see `MentionDebouncer`).
+const MENTION_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(4);
+/// Bounded memory for per-message dispatch history.
+const MENTION_HISTORY_CAP: usize = 512;
+
+/// Debounces `app_mention` events per (channel, message ts).
+///
+/// Slack re-fires `app_mention` for every edit state of a mention-bearing
+/// message, and openab's own native streaming (chat.startStream →
+/// N×appendStream → chat.stopStream → final chat.update) makes a single
+/// reply produce several such states. Each state used to dispatch a full
+/// agent turn; the duplicates resolved to no-op replies (one observed
+/// thread had 5 phantom turns for 2 real messages).
+///
+/// Strategy: hold only the *latest* state per message until the message has
+/// been quiet for `MENTION_DEBOUNCE` (each new state pushes the deadline),
+/// then dispatch it only if its text differs from the state last dispatched
+/// for that message. Identical re-fires drop; a material edit re-dispatches
+/// — fail-open, so a late final state is never lost.
+///
+/// Cost: this is trailing-edge, so **every** mention-triggered turn —
+/// including ordinary, never-edited human messages — starts
+/// `MENTION_DEBOUNCE` after the message arrives. Leading-edge dispatch was
+/// rejected deliberately: the first event state of a streamed message is
+/// often a mid-stream fragment (observed in prod: a dispatch whose text was
+/// just `"<@U…>  -"`), and responding to fragments is worse than a few
+/// seconds of latency on turns that already take tens of seconds.
+#[derive(Default)]
+struct MentionDebouncer {
+    /// key → (event payload, team_id, quiet deadline)
+    pending: HashMap<String, (serde_json::Value, String, tokio::time::Instant)>,
+    /// key → text of the last dispatched state (FIFO-bounded via `order`)
+    dispatched: HashMap<String, String>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl MentionDebouncer {
+    /// Record the latest state of a mention event. Returns true when the
+    /// caller should spawn a waiter task for this key (i.e. the key was not
+    /// already pending); later states just replace the payload and push the
+    /// deadline forward.
+    fn note(&mut self, key: &str, event: serde_json::Value, team_id: String) -> bool {
+        let fresh = !self.pending.contains_key(key);
+        self.pending.insert(
+            key.to_string(),
+            (event, team_id, tokio::time::Instant::now() + MENTION_DEBOUNCE),
+        );
+        fresh
+    }
+
+    /// Atomically check the quiet deadline and drain the pending state.
+    /// Checking and taking under one lock closes the race where a new edit
+    /// state arrives (extending the deadline) between a deadline read and
+    /// the drain — the waiter would otherwise dispatch an unsettled state.
+    fn try_take(&mut self, key: &str, now: tokio::time::Instant) -> DebounceOutcome {
+        let Some((_, _, deadline)) = self.pending.get(key) else {
+            return DebounceOutcome::Done;
+        };
+        if now < *deadline {
+            return DebounceOutcome::Wait(*deadline);
+        }
+        match self.take_if_changed(key) {
+            Some((event, team_id)) => DebounceOutcome::Dispatch(event, team_id),
+            None => DebounceOutcome::Done,
+        }
+    }
+
+    /// Remove the pending state and return it for dispatch — unless it is
+    /// indistinguishable from what was already dispatched for this key.
+    fn take_if_changed(&mut self, key: &str) -> Option<(serde_json::Value, String)> {
+        let (event, team_id, _) = self.pending.remove(key)?;
+        let fingerprint = Self::fingerprint(&event);
+        if self.dispatched.get(key) == Some(&fingerprint) {
+            debug!(key, "mention debounce: identical re-fire dropped");
+            return None;
+        }
+        if !self.dispatched.contains_key(key) {
+            self.order.push_back(key.to_string());
+            if self.order.len() > MENTION_HISTORY_CAP {
+                if let Some(old) = self.order.pop_front() {
+                    self.dispatched.remove(&old);
+                }
+            }
+        }
+        self.dispatched.insert(key.to_string(), fingerprint);
+        Some((event, team_id))
+    }
+
+    /// What "the same message state" means for dedup purposes: the text plus
+    /// the attached file IDs. `handle_message` builds image/STT/text blocks
+    /// from `event["files"]`, so an edit that only adds an attachment is a
+    /// material change even when the text is byte-identical.
+    fn fingerprint(event: &serde_json::Value) -> String {
+        let text = event["text"].as_str().unwrap_or("");
+        let mut file_ids: Vec<&str> = event["files"]
+            .as_array()
+            .map(|files| files.iter().filter_map(|f| f["id"].as_str()).collect())
+            .unwrap_or_default();
+        file_ids.sort_unstable();
+        format!("{text}\u{0}{}", file_ids.join(","))
+    }
+}
+
+/// Result of `MentionDebouncer::try_take`.
+enum DebounceOutcome {
+    /// Quiet window satisfied and the state is new — dispatch it.
+    Dispatch(serde_json::Value, String),
+    /// Still pending — sleep until this deadline and re-check.
+    Wait(tokio::time::Instant),
+    /// Nothing to do (drained elsewhere, or an identical re-fire).
+    Done,
+}
+
 /// Run the Slack adapter using Socket Mode (persistent WebSocket, no public URL needed).
 /// Reconnects automatically on disconnect.
 #[allow(clippy::too_many_arguments)]
@@ -694,6 +807,7 @@ pub async fn run_slack_adapter(
 ) -> Result<()> {
     let bot_token = adapter.bot_token().to_string();
     let bot_turns = Arc::new(tokio::sync::Mutex::new(BotTurnTracker::new(max_bot_turns)));
+    let mention_debounce = Arc::new(tokio::sync::Mutex::new(MentionDebouncer::default()));
 
     loop {
         // Check for shutdown before (re)connecting
@@ -779,18 +893,59 @@ pub async fn run_slack_adapter(
                                                         }
                                                     }
                                                 }
-                                                let event = event.clone();
+                                                let team_id = envelope["payload"]["team_id"]
+                                                    .as_str()
+                                                    .unwrap_or("")
+                                                    .to_string();
+                                                // Debounce per (channel, ts): Slack re-fires
+                                                // app_mention for every edit state of a
+                                                // mention-bearing message (native streaming
+                                                // produces several). Hold the latest state
+                                                // until quiet, then dispatch once.
+                                                let debounce_key = format!(
+                                                    "{}:{}",
+                                                    event["channel"].as_str().unwrap_or(""),
+                                                    event["ts"].as_str().unwrap_or(""),
+                                                );
+                                                let spawn_waiter = mention_debounce
+                                                    .lock()
+                                                    .await
+                                                    .note(&debounce_key, event.clone(), team_id);
+                                                if !spawn_waiter {
+                                                    continue;
+                                                }
+                                                let mention_debounce = mention_debounce.clone();
                                                 let adapter = adapter.clone();
                                                 let bot_token = bot_token.clone();
                                                 let allowed_channels = allowed_channels.clone();
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
                                                 let dispatcher = dispatcher.clone();
-                                                let team_id = envelope["payload"]["team_id"]
-                                                    .as_str()
-                                                    .unwrap_or("")
-                                                    .to_string();
                                                 tokio::spawn(async move {
+                                                    // Wait until the message has been quiet for
+                                                    // the debounce window — each new edit state
+                                                    // pushes the deadline forward. Deadline check
+                                                    // and drain happen under one lock (try_take)
+                                                    // so a state arriving mid-check cannot leak
+                                                    // through unsettled.
+                                                    let (event, team_id) = loop {
+                                                        let outcome = mention_debounce
+                                                            .lock()
+                                                            .await
+                                                            .try_take(
+                                                                &debounce_key,
+                                                                tokio::time::Instant::now(),
+                                                            );
+                                                        match outcome {
+                                                            DebounceOutcome::Dispatch(event, team_id) => {
+                                                                break (event, team_id);
+                                                            }
+                                                            DebounceOutcome::Wait(deadline) => {
+                                                                tokio::time::sleep_until(deadline).await;
+                                                            }
+                                                            DebounceOutcome::Done => return,
+                                                        }
+                                                    };
                                                     handle_message(
                                                         &event,
                                                         &team_id,
@@ -1731,6 +1886,85 @@ fn build_set_status_body(channel_id: &str, thread_ts: &str, status: &str) -> ser
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- mention debounce tests ---
+
+    fn mention_event(text: &str) -> serde_json::Value {
+        serde_json::json!({"type": "app_mention", "channel": "C1", "ts": "1700.1", "text": text})
+    }
+
+    #[tokio::test]
+    async fn mention_debounce_latest_state_wins_and_refires_drop() {
+        let mut d = MentionDebouncer::default();
+        // First sighting spawns a waiter; edit states do not.
+        assert!(d.note("C1:1700.1", mention_event("<@U1> -"), "T1".into()));
+        assert!(!d.note("C1:1700.1", mention_event("<@U1> full review"), "T1".into()));
+
+        // Dispatch takes the latest state.
+        let (event, team) = d.take_if_changed("C1:1700.1").expect("first dispatch");
+        assert_eq!(event["text"], "<@U1> full review");
+        assert_eq!(team, "T1");
+
+        // Identical re-fire after dispatch: held, then dropped.
+        assert!(d.note("C1:1700.1", mention_event("<@U1> full review"), "T1".into()));
+        assert!(d.take_if_changed("C1:1700.1").is_none());
+
+        // Material edit after dispatch: re-dispatches (fail-open).
+        assert!(d.note("C1:1700.1", mention_event("<@U1> edited content"), "T1".into()));
+        assert!(d.take_if_changed("C1:1700.1").is_some());
+
+        // Attachment-only edit (same text, new file): also material.
+        let mut with_file = mention_event("<@U1> edited content");
+        with_file["files"] = serde_json::json!([{"id": "F123"}]);
+        assert!(d.note("C1:1700.1", with_file, "T1".into()));
+        assert!(d.take_if_changed("C1:1700.1").is_some());
+
+        // No pending entry → nothing to take.
+        assert!(d.take_if_changed("C1:1700.1").is_none());
+        assert!(matches!(
+            d.try_take("C1:1700.1", tokio::time::Instant::now()),
+            DebounceOutcome::Done
+        ));
+    }
+
+    #[tokio::test]
+    async fn mention_debounce_try_take_respects_extended_deadline() {
+        let mut d = MentionDebouncer::default();
+        let start = tokio::time::Instant::now();
+        d.note("C1:1700.1", mention_event("v1"), "T1".into());
+
+        // Before the quiet window elapses: wait, don't drain.
+        assert!(matches!(
+            d.try_take("C1:1700.1", start),
+            DebounceOutcome::Wait(_)
+        ));
+
+        // A new state arriving pushes the deadline — even a try_take issued
+        // "after" the original deadline must wait for the new one.
+        d.note("C1:1700.1", mention_event("v2"), "T1".into());
+        assert!(matches!(
+            d.try_take("C1:1700.1", start + MENTION_DEBOUNCE),
+            DebounceOutcome::Wait(_)
+        ));
+
+        // Once genuinely quiet, the latest state dispatches.
+        match d.try_take("C1:1700.1", start + MENTION_DEBOUNCE * 3) {
+            DebounceOutcome::Dispatch(event, _) => assert_eq!(event["text"], "v2"),
+            _ => panic!("expected dispatch of settled state"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mention_debounce_history_is_bounded() {
+        let mut d = MentionDebouncer::default();
+        for i in 0..(MENTION_HISTORY_CAP + 10) {
+            let key = format!("C1:{i}");
+            d.note(&key, mention_event("x"), "T1".into());
+            d.take_if_changed(&key);
+        }
+        assert!(d.dispatched.len() <= MENTION_HISTORY_CAP);
+        assert!(d.order.len() <= MENTION_HISTORY_CAP);
+    }
 
     // --- builder tests ---
 
