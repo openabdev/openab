@@ -75,6 +75,18 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
           env:
             - name: HOME
               value: {{ .Values.agent.workingDir | default "/home/agent" }}
@@ -88,6 +100,10 @@ spec:
                 secretKeyRef:
                   name: {{ include "openab-line.secretName" . }}
                   key: line-channel-access-token
+          {{- with .Values.gateway.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           volumeMounts:
             - name: data
               mountPath: {{ .Values.agent.workingDir | default "/home/agent" }}
@@ -111,14 +127,16 @@ spec:
             - tunnel
             - --no-autoupdate
             - run
-            - --token
-            - $(TUNNEL_TOKEN)
           env:
             - name: TUNNEL_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ include "openab-line.secretName" . }}
                   key: cloudflare-tunnel-token
+          {{- with .Values.tunnel.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           volumeMounts:
             - name: tmp
               mountPath: /tmp

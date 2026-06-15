@@ -32,8 +32,7 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{- define "openab-line.tunnelEnabled" -}}
-{{- if .Values.tunnel.enabled -}}
+{{- if and .Values.tunnel (kindIs "bool" .Values.tunnel.enabled) .Values.tunnel.enabled -}}
 true
-{{- else -}}
 {{- end -}}
 {{- end }}

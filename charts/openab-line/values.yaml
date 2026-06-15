@@ -45,6 +45,8 @@ tunnel:
   token: ""
   image: cloudflare/cloudflared
   tag: "2026.5.0"
+  # -- Cloudflared container resource requests/limits
+  resources: {}
 
 # -- Webhook domain shown in NOTES.txt (for tunnel or your own ingress)
 webhookDomain: ""
@@ -64,6 +66,8 @@ gateway:
   # -- Gateway image tag. Pinned to the version tested with this chart release.
   # Changing this may break compatibility — only override if you know what you are doing.
   tag: "v0.5.3"
+  # -- Gateway container resource requests/limits
+  resources: {}
 
 # -- Agent configuration
 agent:

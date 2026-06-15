@@ -24,8 +24,8 @@ data:
     session_ttl_hours = {{ .Values.agent.pool.sessionTtlHours | default 24 }}
 
     [reactions]
-    enabled = {{ .Values.agent.reactions.enabled }}
-    remove_after_reply = {{ .Values.agent.reactions.removeAfterReply }}
+    enabled = {{ .Values.agent.reactions.enabled | default false }}
+    remove_after_reply = {{ .Values.agent.reactions.removeAfterReply | default false }}
 
     [gateway]
     url = "ws://localhost:8080/ws"
