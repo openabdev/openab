@@ -722,7 +722,6 @@ pub async fn run_slack_adapter(
                                     break;
                                 }
                             };
-                            let Some(msg_result) = msg_result else { break };
                             match msg_result {
                                 Ok(tungstenite::Message::Text(text)) => {
                                     let envelope: serde_json::Value =
