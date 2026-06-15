@@ -57,9 +57,10 @@ const PARTICIPATION_CACHE_MAX: usize = 1000;
 /// aborted turns that begin a stream but never reach stream_finish).
 const STREAM_CACHE_MAX: usize = 1024;
 
-/// Reconnect the Slack Socket Mode socket if no frame arrives within this
-/// window. Slack server-pings ~every 30s, so 60s of silence means the
-/// connection is half-open (dead) — detects silent NAT/firewall drops.
+/// Reconnect the Slack Socket Mode socket if no frame (ping, ack, or event)
+/// arrives within this window. A healthy Socket Mode connection is never silent
+/// this long, so 60s of silence means the connection is half-open (dead) —
+/// detects silent NAT/firewall drops.
 const SLACK_READ_IDLE_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Default)]
@@ -702,21 +703,22 @@ pub async fn run_slack_adapter(
 
                 loop {
                     tokio::select! {
-                        msg_result = tokio::time::timeout(
+                        timeout_result = tokio::time::timeout(
                             std::time::Duration::from_secs(SLACK_READ_IDLE_TIMEOUT_SECS),
                             read.next(),
                         ) => {
-                            // Half-open detection: Slack sends a ping ~every 30s, so 60s with no
-                            // frame means the socket is silently dead (e.g. a NAT/firewall dropped
-                            // the idle TCP connection without a Close frame or RST). Break so the
-                            // outer reconnect loop runs; otherwise read.next() blocks forever here
-                            // and the bot silently stops receiving events.
-                            let msg_result = match msg_result {
-                                Ok(inner) => inner,
+                            // Half-open detection: any inbound frame (ping, ack, event, close)
+                            // resets this timer, so a healthy connection is never frame-silent
+                            // this long. 60s of silence is treated as a dead/half-open socket
+                            // (e.g. a NAT/firewall dropped the idle TCP connection without a Close
+                            // frame or RST), which can otherwise block read.next() indefinitely and
+                            // silently stop the bot from receiving events. Break so the outer
+                            // reconnect loop runs.
+                            let msg_result = match timeout_result {
+                                Ok(Some(msg)) => msg,
+                                Ok(None) => break,
                                 Err(_) => {
-                                    warn!(
-                                        timeout_secs = SLACK_READ_IDLE_TIMEOUT_SECS,
-                                        "no frame from Slack within idle timeout; assuming dead connection, reconnecting");
+                                    warn!("no frame from Slack within idle timeout; assuming dead connection, reconnecting");
                                     break;
                                 }
                             };
@@ -732,9 +734,13 @@ pub async fn run_slack_adapter(
                                     // Acknowledge the envelope immediately
                                     if let Some(envelope_id) = envelope["envelope_id"].as_str() {
                                         let ack = serde_json::json!({"envelope_id": envelope_id});
-                                        let _ = write
+                                        if let Err(e) = write
                                             .send(tungstenite::Message::Text(ack.to_string()))
-                                            .await;
+                                            .await
+                                        {
+                                            warn!(error = %e, "failed to ack Slack envelope; connection likely dead, reconnecting");
+                                            break;
+                                        }
                                     }
 
                                     // Slash commands and interactive block_actions aren't
@@ -1045,7 +1051,10 @@ pub async fn run_slack_adapter(
                                     }
                                 }
                                 Ok(tungstenite::Message::Ping(data)) => {
-                                    let _ = write.send(tungstenite::Message::Pong(data)).await;
+                                    if let Err(e) = write.send(tungstenite::Message::Pong(data)).await {
+                                        warn!(error = %e, "failed to send pong; connection likely dead, reconnecting");
+                                        break;
+                                    }
                                 }
                                 Ok(tungstenite::Message::Close(_)) => {
                                     warn!("Slack Socket Mode connection closed by server");
