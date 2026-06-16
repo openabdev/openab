@@ -710,6 +710,12 @@ pub struct FeishuAdapter {
     /// Positive-only cache: thread_id → first_seen for threads where other bots
     /// have posted. Used by multibot-mentions mode to require @mention.
     pub multibot_threads: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    /// Per-message edit count tracker for Feishu's 20-edits-per-message hard cap
+    /// (errcode 230072 — "The message has reached the number of times it can be edited").
+    /// Key: message_id, Value: count of successful edits, or u32::MAX as sentinel
+    /// for "cap reached, do not attempt further edits". Lazily evicted at insert
+    /// when over EDIT_COUNTS_CACHE_MAX.
+    pub edit_counts: Arc<std::sync::Mutex<HashMap<String, u32>>>,
     pub client: reqwest::Client,
 }
 
@@ -728,6 +734,7 @@ impl FeishuAdapter {
             bot_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
             participated_threads: Arc::new(std::sync::Mutex::new(HashMap::new())),
             multibot_threads: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            edit_counts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             client: reqwest::Client::new(),
         }
     }
@@ -1138,12 +1145,86 @@ async fn resolve_user_name(
 // ---------------------------------------------------------------------------
 // Send message
 /// Edit (update) an existing feishu message in-place for streaming.
-async fn edit_feishu_message(adapter: &FeishuAdapter, message_id: &str, text: &str) {
+/// Feishu message edit cap: API returns errcode 230072 after 20 edits per message.
+/// We stop preemptively at 18 to leave a 2-edit safety margin (handles races where
+/// multiple in-flight edits could each push count to the wall) and also catch 230072
+/// defensively in case the local count drifts from server reality.
+const FEISHU_EDIT_CAP: u32 = 18;
+
+/// Maximum entries in the per-adapter edit_counts cache before lazy eviction kicks in.
+const EDIT_COUNTS_CACHE_MAX: usize = 4096;
+
+/// Outcome of an edit_feishu_message attempt. Distinguishes the cap-reached case
+/// from generic failure so the caller can switch to append-new fallback.
+pub enum EditOutcome {
+    /// Edit succeeded; the on-screen message now reflects the new content.
+    Edited,
+    /// The 20-edits-per-message cap is exhausted (either tracked locally or
+    /// signaled by errcode 230072). Caller should switch to append-new.
+    CapReached,
+    /// Generic failure (network, token, other API errors).
+    Failed(String),
+}
+
+/// Increment the edit count for a message_id, evicting half the cache (oldest first)
+/// when over capacity. u32::MAX is a sentinel for "cap reached" — never increment
+/// past that value.
+fn increment_edit_count(
+    cache: &Arc<std::sync::Mutex<HashMap<String, u32>>>,
+    message_id: &str,
+) {
+    let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() > EDIT_COUNTS_CACHE_MAX {
+        let mut entries: Vec<_> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        entries.sort_by_key(|(_, n)| *n);
+        let evict = entries.len() / 2;
+        for (k, _) in entries.into_iter().take(evict) {
+            map.remove(&k);
+        }
+    }
+    let entry = map.entry(message_id.to_string()).or_insert(0);
+    if *entry != u32::MAX {
+        *entry = entry.saturating_add(1);
+    }
+}
+
+/// Mark a message_id as cap-reached; subsequent edit attempts skip the API call
+/// and go straight to append-new fallback.
+fn mark_edit_cap(
+    cache: &Arc<std::sync::Mutex<HashMap<String, u32>>>,
+    message_id: &str,
+) {
+    let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
+    map.insert(message_id.to_string(), u32::MAX);
+}
+
+/// Return true if this message_id has already reached the edit cap (either tracked
+/// locally or marked via 230072 sentinel).
+fn is_edit_cap_reached(
+    cache: &Arc<std::sync::Mutex<HashMap<String, u32>>>,
+    message_id: &str,
+) -> bool {
+    let map = cache.lock().unwrap_or_else(|e| e.into_inner());
+    map.get(message_id).is_some_and(|&n| n >= FEISHU_EDIT_CAP)
+}
+
+async fn edit_feishu_message(
+    adapter: &FeishuAdapter,
+    message_id: &str,
+    text: &str,
+) -> EditOutcome {
+    // Pre-check: if we've already tracked >= FEISHU_EDIT_CAP edits (or the sentinel
+    // u32::MAX from a 230072 response), skip the API call and signal CapReached so
+    // the caller switches to append-new.
+    if is_edit_cap_reached(&adapter.edit_counts, message_id) {
+        return EditOutcome::CapReached;
+    }
+
     let token = match adapter.token_cache.get_token(&adapter.client).await {
         Ok(t) => t,
         Err(e) => {
             tracing::error!(err = %e, "feishu: cannot get token for edit");
-            return;
+            return EditOutcome::Failed(format!("token error: {e}"));
         }
     };
     let api_base = adapter.config.api_base();
@@ -1158,15 +1239,74 @@ async fn edit_feishu_message(adapter: &FeishuAdapter, message_id: &str, text: &s
         .json(&body).send().await
     {
         Ok(resp) if resp.status().is_success() => {
+            increment_edit_count(&adapter.edit_counts, message_id);
             tracing::trace!(message_id = %message_id, "feishu message edited");
+            EditOutcome::Edited
         }
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            tracing::error!(status = %status, body = %body, "feishu edit message failed");
+            // Detect errcode 230072 ("The message has reached the number of times
+            // it can be edited") — server-side confirmation of edit cap. Mark sentinel
+            // so future attempts on this message_id skip the API call entirely.
+            let cap_reached = body.contains("230072")
+                || body.contains("number of times it can be edited");
+            if cap_reached {
+                mark_edit_cap(&adapter.edit_counts, message_id);
+                tracing::warn!(
+                    message_id = %message_id,
+                    status = %status,
+                    "feishu edit cap reached (errcode 230072); switching to append-new fallback"
+                );
+                EditOutcome::CapReached
+            } else {
+                tracing::error!(status = %status, body = %body, "feishu edit message failed");
+                EditOutcome::Failed(format!("HTTP {status}: {body}"))
+            }
         }
         Err(e) => {
             tracing::error!(err = %e, "feishu edit message request failed");
+            EditOutcome::Failed(format!("request error: {e}"))
+        }
+    }
+}
+
+/// Delete a Feishu message via DELETE /open-apis/im/v1/messages/{id}.
+/// Unlike PATCH (edit), DELETE is not subject to the 20-edits-per-message cap,
+/// so this works even on messages that have already exhausted their edit quota.
+/// Used by the streaming finalize path to remove the half-edited placeholder
+/// before sending the full content as fresh messages, avoiding visual overlap.
+async fn delete_feishu_message(
+    adapter: &FeishuAdapter,
+    message_id: &str,
+) -> Result<(), String> {
+    let token = adapter
+        .token_cache
+        .get_token(&adapter.client)
+        .await
+        .map_err(|e| format!("token error: {e}"))?;
+    let api_base = adapter.config.api_base();
+    let url = format!("{}/open-apis/im/v1/messages/{}", api_base, message_id);
+    match adapter
+        .client
+        .delete(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            tracing::info!(message_id = %message_id, "feishu message deleted");
+            Ok(())
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!(status = %status, body = %body, message_id = %message_id, "feishu delete message failed");
+            Err(format!("HTTP {status}: {body}"))
+        }
+        Err(e) => {
+            tracing::warn!(err = %e, message_id = %message_id, "feishu delete message request failed");
+            Err(format!("request error: {e}"))
         }
     }
 }
@@ -1953,11 +2093,83 @@ pub async fn handle_reply(
                 return;
             }
             "edit_message" => {
-                edit_feishu_message(adapter, &reply.reply_to, &reply.content.text).await;
+                let outcome = edit_feishu_message(
+                    adapter,
+                    &reply.reply_to,
+                    &reply.content.text,
+                ).await;
+                // Translate outcome → (success, message_id, error). For CapReached
+                // we attempt an append-new fallback: post the latest content as a
+                // fresh in-thread message so the user gets the rest of the reply
+                // even though the original message can no longer be edited.
+                let (success, message_id, error) = match outcome {
+                    EditOutcome::Edited => {
+                        (true, Some(reply.reply_to.clone()), None)
+                    }
+                    EditOutcome::CapReached => {
+                        // Do NOT append-new fallback at the gateway layer. Core's
+                        // cosmetic streaming loop flushes every ~1500ms — if every
+                        // post-cap edit spawned a new message, the user would be
+                        // spammed with 20+ duplicate continuation messages over the
+                        // remainder of a long reply.
+                        //
+                        // Instead, signal failure so:
+                        //   1. core's mid-stream cosmetic edit loop hits its
+                        //      consecutive-failures break (3 strikes) and stops
+                        //      attempting edits, freezing the placeholder mid-content
+                        //   2. the final delivery path in src/adapter.rs sees the
+                        //      placeholder edit fail and falls back to send_message
+                        //      so the user gets the full reply as a fresh message
+                        //
+                        // Net UX: half-edited placeholder + one complete continuation
+                        // message + ✅ done reaction (vs. today's mid-truncation + 🆗
+                        // false success, or naive append-fallback's 25-message spam).
+                        (
+                            false,
+                            None,
+                            Some("edit_cap_reached".to_string()),
+                        )
+                    }
+                    EditOutcome::Failed(err) => (false, None, Some(err)),
+                };
+                if let Some(ref req_id) = reply.request_id {
+                    let resp = crate::schema::GatewayResponse {
+                        schema: "openab.gateway.response.v1".into(),
+                        request_id: req_id.clone(),
+                        success,
+                        thread_id: None,
+                        message_id,
+                        error,
+                    };
+                    if let Ok(json) = serde_json::to_string(&resp) {
+                        let _ = event_tx.send(json);
+                    }
+                }
                 return;
             }
             "create_topic" | "set_reaction" => {
                 tracing::debug!(command = %cmd, "feishu: skipping unsupported command");
+                return;
+            }
+            "delete_message" => {
+                let result = delete_feishu_message(adapter, &reply.reply_to).await;
+                let (success, error) = match result {
+                    Ok(()) => (true, None),
+                    Err(e) => (false, Some(e)),
+                };
+                if let Some(ref req_id) = reply.request_id {
+                    let resp = crate::schema::GatewayResponse {
+                        schema: "openab.gateway.response.v1".into(),
+                        request_id: req_id.clone(),
+                        success,
+                        thread_id: None,
+                        message_id: None,
+                        error,
+                    };
+                    if let Ok(json) = serde_json::to_string(&resp) {
+                        let _ = event_tx.send(json);
+                    }
+                }
                 return;
             }
             _ => {}
@@ -2046,26 +2258,59 @@ pub async fn handle_reply(
             }
         }
     } else {
-        let mut sent_any = false;
-        for chunk in split_text(text, limit) {
+        // Track per-chunk success so we can report partial-failure back to core.
+        // Previously this branch returned no GatewayResponse at all and used
+        // "any chunk succeeded" as the success criterion — letting core fall
+        // through to a 5s timeout and silently mark the turn delivered. With
+        // request/response now wired through, we propagate exact health.
+        let chunks: Vec<&str> = split_text(text, limit);
+        let total_chunks = chunks.len();
+        let mut succeeded = 0usize;
+        let mut last_msg_id: Option<String> = None;
+        for chunk in &chunks {
             if let Some(msg_id) = send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, reply_target, chunk).await {
                 adapter.dedupe.is_duplicate(&msg_id);
-                sent_any = true;
+                succeeded += 1;
+                last_msg_id = Some(msg_id);
             }
         }
         // Fallback: if quote_message_id caused all chunks to fail, retry without it
-        if !sent_any && reply.quote_message_id.is_some() {
+        if succeeded == 0 && reply.quote_message_id.is_some() {
             tracing::warn!(quote_message_id = ?reply.quote_message_id, channel_id = %reply.channel.id, "chunked reply-to failed, falling back to plain send");
-            for chunk in split_text(text, limit) {
+            for chunk in &chunks {
                 if let Some(msg_id) = send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, thread_id, chunk).await {
                     adapter.dedupe.is_duplicate(&msg_id);
-                    sent_any = true;
+                    succeeded += 1;
+                    last_msg_id = Some(msg_id);
                 }
             }
         }
-        if sent_any {
+        if succeeded > 0 {
             if let Some(tid) = thread_id {
                 record_participation(&adapter.participated_threads, tid, adapter.config.session_ttl_secs);
+            }
+        }
+        // Report back to core. Success requires every chunk delivered — partial
+        // success becomes failure so dispatch surfaces ❌ rather than 🆗.
+        if let Some(ref req_id) = reply.request_id {
+            let success = succeeded == total_chunks && total_chunks > 0;
+            let error = if success {
+                None
+            } else {
+                Some(format!(
+                    "chunked send delivered {succeeded}/{total_chunks} chunks"
+                ))
+            };
+            let resp = crate::schema::GatewayResponse {
+                schema: "openab.gateway.response.v1".into(),
+                request_id: req_id.clone(),
+                success,
+                thread_id: None,
+                message_id: last_msg_id,
+                error,
+            };
+            if let Ok(json) = serde_json::to_string(&resp) {
+                let _ = event_tx.send(json);
             }
         }
     }
