@@ -93,7 +93,12 @@ impl SlackAdapter {
         assistant_mode: bool,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            // Bound every Slack Web API call; an unbounded inline gating call in the
+            // read loop could otherwise stall the Socket Mode idle-timeout watchdog.
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             bot_token,
             bot_user_id: tokio::sync::OnceCell::new(),
             user_cache: tokio::sync::Mutex::new(HashMap::new()),
@@ -716,6 +721,9 @@ pub async fn run_slack_adapter(
 ) -> Result<()> {
     let bot_token = adapter.bot_token().to_string();
     let bot_turns = Arc::new(tokio::sync::Mutex::new(BotTurnTracker::new(max_bot_turns)));
+    // Warm the bot-user-id cache once so the per-message path never does the
+    // cold-cache `auth.test` inline in the read loop.
+    let _ = adapter.get_bot_user_id().await;
     let mut backoff_secs = 1u64;
 
     loop {
@@ -897,34 +905,47 @@ pub async fn run_slack_adapter(
                                                 } else {
                                                     format!("{}:{}", channel_id, event["ts"].as_str().unwrap_or(""))
                                                 };
-                                                {
+                                                // Classify under the lock (order-sensitive, kept in the read
+                                                // loop), but run any warning send AFTER releasing it; holding
+                                                // the tracker mutex across `chat.postMessage` would stall turn
+                                                // tracking for every thread, not just this one.
+                                                let turn_action = {
                                                     let mut tracker = bot_turns.lock().await;
                                                     if is_bot {
-                                                        match tracker.classify_bot_message(&turn_key) {
-                                                            TurnAction::Continue => {}
-                                                            TurnAction::SilentStop => continue,
-                                                            TurnAction::WarnAndStop { severity, turns, user_message } => {
-                                                                match severity {
-                                                                    TurnSeverity::Hard => warn!(channel_id, turns, "hard bot turn limit reached"),
-                                                                    TurnSeverity::Soft => info!(channel_id, turns, max = max_bot_turns, "soft bot turn limit reached"),
-                                                                }
-                                                                let channel_allowed = allow_all_channels
-                                                                    || allowed_channels.contains(channel_id);
-                                                                if !is_own_bot_msg && channel_allowed {
-                                                                    let warn_channel = ChannelRef {
-                                                                        platform: "slack".into(),
-                                                                        channel_id: channel_id.to_string(),
-                                                                        thread_id: event["thread_ts"].as_str().map(|s| s.to_string()),
-                                                                        parent_id: None,
-                                                                        origin_event_id: None,
-                                                                    };
-                                                                    let _ = adapter.send_message(&warn_channel, &user_message).await;
-                                                                }
-                                                                continue;
-                                                            }
+                                                        tracker.classify_bot_message(&turn_key)
+                                                    } else {
+                                                        if is_plain_user_message(subtype, msg_text) {
+                                                            tracker.on_human_message(&turn_key);
                                                         }
-                                                    } else if is_plain_user_message(subtype, msg_text) {
-                                                        tracker.on_human_message(&turn_key);
+                                                        TurnAction::Continue
+                                                    }
+                                                };
+                                                match turn_action {
+                                                    TurnAction::Continue => {}
+                                                    TurnAction::SilentStop => continue,
+                                                    TurnAction::WarnAndStop { severity, turns, user_message } => {
+                                                        match severity {
+                                                            TurnSeverity::Hard => warn!(channel_id, turns, "hard bot turn limit reached"),
+                                                            TurnSeverity::Soft => info!(channel_id, turns, max = max_bot_turns, "soft bot turn limit reached"),
+                                                        }
+                                                        let channel_allowed = allow_all_channels
+                                                            || allowed_channels.contains(channel_id);
+                                                        if !is_own_bot_msg && channel_allowed {
+                                                            let warn_channel = ChannelRef {
+                                                                platform: "slack".into(),
+                                                                channel_id: channel_id.to_string(),
+                                                                thread_id: event["thread_ts"].as_str().map(|s| s.to_string()),
+                                                                parent_id: None,
+                                                                origin_event_id: None,
+                                                            };
+                                                            let adapter = adapter.clone();
+                                                            tokio::spawn(async move {
+                                                                if let Err(e) = adapter.send_message(&warn_channel, &user_message).await {
+                                                                    warn!(error = %e, "failed to send bot turn limit warning");
+                                                                }
+                                                            });
+                                                        }
+                                                        continue;
                                                     }
                                                 }
 
