@@ -674,6 +674,28 @@ impl ChatAdapter for SlackAdapter {
 /// Hard cap on consecutive bot messages in a thread. Prevents runaway loops.
 const MAX_CONSECUTIVE_BOT_TURNS: usize = 1000;
 
+/// Socket Mode keepalive. Slack's inbound WebSocket can go half-open (e.g. a NAT
+/// idle-timeout silently drops inbound frames with no Close/FIN), which leaves
+/// `read.next()` blocked forever, so the reconnect loop never fires and the bot
+/// goes deaf while still showing as connected. We proactively ping and force a
+/// reconnect when no inbound frame (including Slack's own pings) has arrived
+/// within the idle window. Reconnect backoff mirrors the gateway adapter.
+const PING_INTERVAL_SECS: u64 = 30;
+const IDLE_TIMEOUT_SECS: u64 = 75;
+const MAX_BACKOFF_SECS: u64 = 30;
+
+/// Next reconnect delay: double, capped. Reset to 1 on a successful connect.
+fn next_backoff(cur: u64) -> u64 {
+    (cur * 2).min(MAX_BACKOFF_SECS)
+}
+
+/// The socket is considered dead (half-open) when no inbound frame has arrived
+/// within `timeout`; Slack sends periodic pings, so silence past the window
+/// means the inbound path is gone.
+fn socket_idle(since_last_inbound: std::time::Duration, timeout: std::time::Duration) -> bool {
+    since_last_inbound >= timeout
+}
+
 /// Run the Slack adapter using Socket Mode (persistent WebSocket, no public URL needed).
 /// Reconnects automatically on disconnect.
 #[allow(clippy::too_many_arguments)]
@@ -694,6 +716,7 @@ pub async fn run_slack_adapter(
 ) -> Result<()> {
     let bot_token = adapter.bot_token().to_string();
     let bot_turns = Arc::new(tokio::sync::Mutex::new(BotTurnTracker::new(max_bot_turns)));
+    let mut backoff_secs = 1u64;
 
     loop {
         // Check for shutdown before (re)connecting
@@ -705,8 +728,12 @@ pub async fn run_slack_adapter(
         let ws_url = match get_socket_mode_url(&app_token).await {
             Ok(url) => url,
             Err(e) => {
-                error!("failed to get Socket Mode URL: {e}");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                error!(err = %e, backoff = backoff_secs, "failed to get Socket Mode URL, retrying");
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                    _ = shutdown_rx.changed() => { return Ok(()); }
+                }
+                backoff_secs = next_backoff(backoff_secs);
                 continue;
             }
         };
@@ -715,11 +742,17 @@ pub async fn run_slack_adapter(
         match tokio_tungstenite::connect_async(&ws_url).await {
             Ok((ws_stream, _)) => {
                 info!("Slack Socket Mode connected");
+                backoff_secs = 1; // reset on success
                 let (mut write, mut read) = ws_stream.split();
+                let mut ping_interval =
+                    tokio::time::interval(std::time::Duration::from_secs(PING_INTERVAL_SECS));
+                ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut last_inbound = std::time::Instant::now();
 
                 loop {
                     tokio::select! {
                         msg_result = read.next() => {
+                            last_inbound = std::time::Instant::now();
                             let Some(msg_result) = msg_result else { break };
                             match msg_result {
                                 Ok(tungstenite::Message::Text(text)) => {
@@ -1058,6 +1091,22 @@ pub async fn run_slack_adapter(
                                 _ => {}
                             }
                         }
+                        _ = ping_interval.tick() => {
+                            if socket_idle(
+                                last_inbound.elapsed(),
+                                std::time::Duration::from_secs(IDLE_TIMEOUT_SECS),
+                            ) {
+                                warn!(
+                                    idle_secs = last_inbound.elapsed().as_secs(),
+                                    "Slack Socket Mode idle past timeout (likely half-open), forcing reconnect"
+                                );
+                                break;
+                            }
+                            if let Err(e) = write.send(tungstenite::Message::Ping(Vec::new())).await {
+                                warn!(error = %e, "Slack Socket Mode ping failed, reconnecting");
+                                break;
+                            }
+                        }
                         _ = shutdown_rx.changed() => {
                             info!("Slack adapter received shutdown signal");
                             let _ = write.send(tungstenite::Message::Close(None)).await;
@@ -1067,12 +1116,16 @@ pub async fn run_slack_adapter(
                 }
             }
             Err(e) => {
-                error!("failed to connect to Slack Socket Mode: {e}");
+                error!(err = %e, backoff = backoff_secs, "failed to connect to Slack Socket Mode, retrying");
             }
         }
 
-        warn!("reconnecting to Slack Socket Mode in 5s...");
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        warn!(backoff = backoff_secs, "reconnecting to Slack Socket Mode");
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+            _ = shutdown_rx.changed() => { return Ok(()); }
+        }
+        backoff_secs = next_backoff(backoff_secs);
     }
 }
 
@@ -2214,5 +2267,37 @@ mod tests {
         let ttl = std::time::Duration::from_secs(300);
         let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true);
         assert!(adapter.renders_native_tables());
+    }
+}
+
+#[cfg(test)]
+mod socket_keepalive_tests {
+    use super::{next_backoff, socket_idle, IDLE_TIMEOUT_SECS, MAX_BACKOFF_SECS};
+    use std::time::Duration;
+
+    /// Backoff doubles and caps, matching the gateway adapter (1,2,4,8,16,30,30…).
+    #[test]
+    fn backoff_doubles_then_caps() {
+        let mut b = 1u64;
+        let seq: Vec<u64> = (0..8)
+            .map(|_| {
+                let cur = b;
+                b = next_backoff(b);
+                cur
+            })
+            .collect();
+        assert_eq!(seq, vec![1, 2, 4, 8, 16, MAX_BACKOFF_SECS, MAX_BACKOFF_SECS, MAX_BACKOFF_SECS]);
+        assert_eq!(next_backoff(MAX_BACKOFF_SECS), MAX_BACKOFF_SECS);
+    }
+
+    /// A half-open socket (no inbound past the window) is detected; an active one
+    /// (recent inbound, e.g. a Slack ping) is not. This is the deaf-socket guard.
+    #[test]
+    fn idle_detects_half_open_at_boundary() {
+        let timeout = Duration::from_secs(IDLE_TIMEOUT_SECS);
+        assert!(!socket_idle(Duration::from_secs(0), timeout));
+        assert!(!socket_idle(Duration::from_secs(IDLE_TIMEOUT_SECS - 1), timeout));
+        assert!(socket_idle(Duration::from_secs(IDLE_TIMEOUT_SECS), timeout));
+        assert!(socket_idle(Duration::from_secs(IDLE_TIMEOUT_SECS + 10), timeout));
     }
 }
