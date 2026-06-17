@@ -480,6 +480,41 @@ mod tests {
 
     #[test]
     #[ignore]
+    fn test_session_load_returns_config_options_for_models() {
+        let root = std::env::temp_dir().join(format!("agy-acp-load-models-{}", Uuid::new_v4()));
+        let _ = fs::create_dir_all(&root);
+        let selected_model = "Gemini 3.1 Pro (High)";
+        let mut adapter = Adapter {
+            sessions: HashMap::new(), working_dir: root.to_string_lossy().to_string(),
+            conversations_dir: root.join("conversations"), state_file: root.join("sessions.json"),
+            available_models: Some(vec![
+                "Gemini 3.5 Flash (Low)".to_string(),
+                selected_model.to_string(),
+            ]),
+        };
+        adapter.persist_session("sess-1", Some("conv-abc"), 5, Some(selected_model));
+        let response = adapter.handle_session_load(json!(7), &json!({"sessionId": "sess-1"}));
+        assert!(response.error.is_none());
+
+        let result = response.result.expect("session/load should return a result");
+        assert_eq!(result["sessionId"], json!("sess-1"));
+        let config_options = result["configOptions"]
+            .as_array()
+            .expect("session/load should include configOptions");
+        assert_eq!(config_options.len(), 1);
+        assert_eq!(config_options[0]["id"], json!("model"));
+        assert_eq!(config_options[0]["currentValue"], json!(selected_model));
+
+        let options = config_options[0]["options"]
+            .as_array()
+            .expect("model config option should include options");
+        assert_eq!(options.len(), 2);
+        assert!(options.iter().any(|option| option["value"] == json!(selected_model)));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore]
     fn test_persist_and_restore_session() {
         let root = std::env::temp_dir().join(format!("agy-acp-state-{}", Uuid::new_v4()));
         let _ = fs::create_dir_all(&root);

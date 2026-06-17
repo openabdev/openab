@@ -281,8 +281,10 @@ impl Adapter {
                 error: Some(json!({"code":-32602,"message":"missing sessionId"})) };
         }
         if self.restore_session_state(session_id) {
+            let model_id = self.sessions.get(session_id).and_then(|s| s.model_id.clone());
+            let config_options = self.config_options_json(model_id.as_deref());
             return JsonRpcResponse { jsonrpc: "2.0", id,
-                result: Some(json!({ "sessionId": session_id })), error: None };
+                result: Some(json!({ "sessionId": session_id, "configOptions": config_options })), error: None };
         }
         JsonRpcResponse { jsonrpc: "2.0", id, result: None,
             error: Some(json!({"code":-32000,"message":format!("unknown sessionId: {session_id}")})) }
