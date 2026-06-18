@@ -953,7 +953,7 @@ impl AdapterRouter {
                                         if let Err(e) =
                                             adapter.send_message(&thread_channel, chunk).await
                                         {
-                                            tracing::warn!(error = ?e, platform = %thread_channel.platform, "native overflow chunk send failed");
+                                            tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "native overflow chunk send failed");
                                             delivery_failed = true;
                                         }
                                     }

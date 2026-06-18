@@ -1287,6 +1287,12 @@ fn is_edit_cap_reached(
         .is_some_and(|&n| n >= FEISHU_EDIT_CAP)
 }
 
+/// Edit (update) an existing Feishu message in-place for streaming.
+///
+/// Returns [`EditOutcome`] so the caller can distinguish success, cap-reached,
+/// and generic failure. Performs a preemptive local cap check (`FEISHU_EDIT_CAP`)
+/// before hitting the network, and detects the server-side errcode 230072 via
+/// body-code-first parsing if the local count drifts from reality.
 async fn edit_feishu_message(
     adapter: &FeishuAdapter,
     message_id: &str,
@@ -2217,11 +2223,21 @@ pub async fn handle_reply(
             "edit_message" | "delete_message" | "add_reaction" | "remove_reaction"
         );
         if interpolates_message_id && !is_valid_feishu_message_id(&reply.reply_to) {
-            tracing::warn!(
-                command = %cmd,
-                message_id = %reply.reply_to,
-                "feishu: refusing command — message_id failed shape validation"
-            );
+            // "draft" is a known sentinel from core when streaming_placeholder=false;
+            // not a security concern, just a no-op — log at debug to avoid noise.
+            if reply.reply_to == "draft" {
+                tracing::debug!(
+                    command = %cmd,
+                    message_id = %reply.reply_to,
+                    "feishu: skipping command — draft placeholder has no real message_id"
+                );
+            } else {
+                tracing::warn!(
+                    command = %cmd,
+                    message_id = %reply.reply_to,
+                    "feishu: refusing command — message_id failed shape validation"
+                );
+            }
             if let Some(ref req_id) = reply.request_id {
                 let resp = crate::schema::GatewayResponse {
                     schema: "openab.gateway.response.v1".into(),
