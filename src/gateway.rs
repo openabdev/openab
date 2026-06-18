@@ -517,13 +517,18 @@ impl ChatAdapter for GatewayAdapter {
         // signals — cosmetic streaming would keep flushing forever and the final
         // edit fallback to send_message could not trigger.
         //
-        // Timeout is intentionally short (800ms) because we run inside cosmetic
-        // flush loops at ~1.5s cadence. Platforms that don't echo GatewayResponse
-        // for edits (LINE, Teams) hit timeout → treated as success (legacy fire-
-        // and-forget semantics, no behavior change for them).
+        // Scope intentionally limited to Feishu: it is the only adapter that
+        // currently emits `GatewayResponse` for `edit_message` and the only
+        // platform with a known per-message edit cap (errcode 230072). Other
+        // adapters (LINE, Teams, Slack, Discord, …) keep the original
+        // fire-and-forget path so cosmetic streaming on those platforms does
+        // not pay an 800 ms penalty per flush waiting for a response that
+        // never arrives. When more adapters wire request/response feedback,
+        // this allowlist is where to extend.
         const EDIT_RESPONSE_TIMEOUT_MS: u64 = 800;
+        let needs_response = self.streaming && msg.channel.platform == "feishu";
 
-        let req_id = if self.streaming {
+        let req_id = if needs_response {
             Some(format!("req_{}", uuid::Uuid::new_v4()))
         } else {
             None
@@ -575,14 +580,16 @@ impl ChatAdapter for GatewayAdapter {
                     Ok(())
                 }
                 Err(_) => {
-                    // Timeout — most adapters (LINE, Teams) don't emit
-                    // GatewayResponse for edits. Treat as success to preserve
-                    // legacy fire-and-forget behavior.
+                    // Timeout — feishu didn't respond within the window
+                    // (probably a slow API). Treat as success to avoid
+                    // false-positive ❌; the cap-reached path already short-
+                    // circuits much faster (gateway returns immediately).
                     self.pending.lock().await.remove(id);
                     Ok(())
                 }
             }
         } else {
+            // Non-feishu (or non-streaming): fire-and-forget, no added latency.
             Ok(())
         }
     }

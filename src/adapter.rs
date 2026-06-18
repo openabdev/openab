@@ -663,6 +663,8 @@ impl AdapterRouter {
                                             Err(e) => {
                                                 consecutive_failures += 1;
                                                 tracing::debug!(
+                                                    message_id = %edit_msg.message_id,
+                                                    platform = %edit_msg.channel.platform,
                                                     error = ?e,
                                                     consecutive_failures,
                                                     "mid-stream cosmetic edit failed"
@@ -671,6 +673,8 @@ impl AdapterRouter {
                                                     >= MAX_CONSECUTIVE_FAILURES
                                                 {
                                                     tracing::warn!(
+                                                        message_id = %edit_msg.message_id,
+                                                        platform = %edit_msg.channel.platform,
                                                         consecutive_failures,
                                                         "mid-stream cosmetic edit aborted; \
                                                          final content will be delivered at turn end"
@@ -1002,8 +1006,14 @@ impl AdapterRouter {
                             // event since MESSAGE_UPDATE skips notifications (#1110).
                             let mut send_ok = false;
                             if let Some(first) = chunks.first() {
-                                if adapter.send_message(&thread_channel, first).await.is_ok() {
-                                    send_ok = true;
+                                match adapter.send_message(&thread_channel, first).await {
+                                    Ok(_) => {
+                                        send_ok = true;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = ?e, "discord bot-mention first chunk send failed");
+                                        delivery_failed = true;
+                                    }
                                 }
                             }
                             for chunk in chunks.iter().skip(1) {
@@ -1021,7 +1031,12 @@ impl AdapterRouter {
                             // new message instead — the gateway will persist via sendRichMessage.
                             if msg.message_id == "draft" {
                                 for chunk in &chunks {
-                                    let _ = adapter.send_message(&thread_channel, chunk).await;
+                                    if let Err(e) =
+                                        adapter.send_message(&thread_channel, chunk).await
+                                    {
+                                        tracing::warn!(error = ?e, "draft placeholder fallback chunk send failed");
+                                        delivery_failed = true;
+                                    }
                                 }
                             } else if let Some(first) = chunks.first() {
                                 // If the placeholder edit fails (e.g. Feishu's

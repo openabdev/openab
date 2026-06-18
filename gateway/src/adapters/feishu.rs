@@ -2,7 +2,7 @@ use crate::schema::*;
 use axum::extract::State;
 use prost::Message as ProstMessage;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -712,11 +712,25 @@ pub struct FeishuAdapter {
     pub multibot_threads: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
     /// Per-message edit count tracker for Feishu's 20-edits-per-message hard cap
     /// (errcode 230072 — "The message has reached the number of times it can be edited").
-    /// Key: message_id, Value: count of successful edits, or u32::MAX as sentinel
-    /// for "cap reached, do not attempt further edits". Lazily evicted at insert
-    /// when over EDIT_COUNTS_CACHE_MAX.
-    pub edit_counts: Arc<std::sync::Mutex<HashMap<String, u32>>>,
+    /// Insertion-order FIFO eviction: when over `EDIT_COUNTS_CACHE_MAX`, the
+    /// oldest *insertions* are dropped, never the lowest-count entries — so
+    /// active streaming messages (just-started, low count) are never the
+    /// eviction target.
+    pub edit_counts: Arc<std::sync::Mutex<EditCountsCache>>,
     pub client: reqwest::Client,
+}
+
+/// Insertion-order edit-count cache for Feishu's per-message edit cap.
+///
+/// `counts` holds the current edit count (or `u32::MAX` cap-reached sentinel)
+/// for each message_id. `order` records the insertion order so eviction is
+/// FIFO rather than count-ascending; this matters because count-ascending
+/// would target *active* streams (low count = just started) while leaving
+/// stale cap-reached entries in place.
+#[derive(Default)]
+pub struct EditCountsCache {
+    pub counts: HashMap<String, u32>,
+    pub order: VecDeque<String>,
 }
 
 impl FeishuAdapter {
@@ -734,7 +748,7 @@ impl FeishuAdapter {
             bot_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
             participated_threads: Arc::new(std::sync::Mutex::new(HashMap::new())),
             multibot_threads: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            edit_counts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            edit_counts: Arc::new(std::sync::Mutex::new(EditCountsCache::default())),
             client: reqwest::Client::new(),
         }
     }
@@ -1154,58 +1168,119 @@ const FEISHU_EDIT_CAP: u32 = 18;
 /// Maximum entries in the per-adapter edit_counts cache before lazy eviction kicks in.
 const EDIT_COUNTS_CACHE_MAX: usize = 4096;
 
+/// Validates that a Feishu message_id matches the expected `om_<base62>` shape
+/// before it is interpolated into a REST URL path. Feishu's documented
+/// message_id format is the `om_` prefix followed by base62-style characters
+/// (`[A-Za-z0-9_]`). Rejecting anything else stops crafted IDs containing `/`,
+/// `?`, or `#` from altering URL semantics — defence in depth, since the trust
+/// boundary is the core↔gateway WebSocket and not external input.
+fn is_valid_feishu_message_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    if !id.starts_with("om_") || id.len() < 4 || id.len() > 128 {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+}
+
+/// Detect whether a Feishu API response body indicates the per-message edit
+/// cap (errcode 230072). Trusts JSON `code` field when the body parses as
+/// JSON; falls back to substring match only on non-JSON bodies (proxy HTML,
+/// truncated responses, …) so a JSON body with an unrelated `code` cannot be
+/// false-positively flagged just because some inner string contains "230072".
+fn is_feishu_cap_reached_body(body: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(v) => v
+            .get("code")
+            .and_then(|c| c.as_u64())
+            .is_some_and(|code| code == 230072),
+        Err(_) => {
+            body.contains("230072")
+                || body.contains("number of times it can be edited")
+        }
+    }
+}
+
 /// Outcome of an edit_feishu_message attempt. Distinguishes the cap-reached case
-/// from generic failure so the caller can switch to append-new fallback.
+/// from generic failure so the caller can stop attempting edits and let the
+/// core finalize path handle recovery.
 pub enum EditOutcome {
     /// Edit succeeded; the on-screen message now reflects the new content.
     Edited,
     /// The 20-edits-per-message cap is exhausted (either tracked locally or
-    /// signaled by errcode 230072). Caller should switch to append-new.
+    /// signaled by errcode 230072). Caller should stop attempting edits;
+    /// recovery (delete placeholder + send fresh) is handled at the core
+    /// finalize layer in `src/adapter.rs`, not here — appending new messages
+    /// per cosmetic flush would spam the user with continuation messages.
     CapReached,
     /// Generic failure (network, token, other API errors).
     Failed(String),
 }
 
-/// Increment the edit count for a message_id, evicting half the cache (oldest first)
-/// when over capacity. u32::MAX is a sentinel for "cap reached" — never increment
-/// past that value.
+/// Increment the edit count for a message_id. New keys are appended to the
+/// FIFO order queue; existing keys keep their position. When the cache is
+/// over `EDIT_COUNTS_CACHE_MAX`, the oldest *insertions* are evicted (not the
+/// lowest-count entries) so active streams are not bumped out from under
+/// themselves.
 fn increment_edit_count(
-    cache: &Arc<std::sync::Mutex<HashMap<String, u32>>>,
+    cache: &Arc<std::sync::Mutex<EditCountsCache>>,
     message_id: &str,
 ) {
-    let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
-    if map.len() > EDIT_COUNTS_CACHE_MAX {
-        let mut entries: Vec<_> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        entries.sort_by_key(|(_, n)| *n);
-        let evict = entries.len() / 2;
-        for (k, _) in entries.into_iter().take(evict) {
-            map.remove(&k);
-        }
-    }
-    let entry = map.entry(message_id.to_string()).or_insert(0);
+    let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let was_new = !c.counts.contains_key(message_id);
+    let entry = c.counts.entry(message_id.to_string()).or_insert(0);
     if *entry != u32::MAX {
         *entry = entry.saturating_add(1);
     }
+    if was_new {
+        c.order.push_back(message_id.to_string());
+        evict_if_overcap(&mut c);
+    }
 }
 
-/// Mark a message_id as cap-reached; subsequent edit attempts skip the API call
-/// and go straight to append-new fallback.
+/// Mark a message_id as cap-reached; subsequent edit attempts skip the API
+/// call and signal `EditOutcome::CapReached` directly so the core finalize
+/// path can take over.
 fn mark_edit_cap(
-    cache: &Arc<std::sync::Mutex<HashMap<String, u32>>>,
+    cache: &Arc<std::sync::Mutex<EditCountsCache>>,
     message_id: &str,
 ) {
-    let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
-    map.insert(message_id.to_string(), u32::MAX);
+    let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let was_new = !c.counts.contains_key(message_id);
+    c.counts.insert(message_id.to_string(), u32::MAX);
+    if was_new {
+        c.order.push_back(message_id.to_string());
+        evict_if_overcap(&mut c);
+    }
 }
 
-/// Return true if this message_id has already reached the edit cap (either tracked
-/// locally or marked via 230072 sentinel).
+/// FIFO eviction helper: when over `EDIT_COUNTS_CACHE_MAX`, drop the oldest
+/// half by insertion order. Tolerant of `order`/`counts` drift — entries that
+/// only exist in `order` are silently skipped.
+fn evict_if_overcap(c: &mut EditCountsCache) {
+    if c.counts.len() > EDIT_COUNTS_CACHE_MAX {
+        let evict = c.counts.len() / 2;
+        for _ in 0..evict {
+            if let Some(oldest) = c.order.pop_front() {
+                c.counts.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+/// Return true if this message_id has already reached the edit cap (either
+/// tracked locally or marked via 230072 sentinel).
 fn is_edit_cap_reached(
-    cache: &Arc<std::sync::Mutex<HashMap<String, u32>>>,
+    cache: &Arc<std::sync::Mutex<EditCountsCache>>,
     message_id: &str,
 ) -> bool {
-    let map = cache.lock().unwrap_or_else(|e| e.into_inner());
-    map.get(message_id).is_some_and(|&n| n >= FEISHU_EDIT_CAP)
+    let c = cache.lock().unwrap_or_else(|e| e.into_inner());
+    c.counts
+        .get(message_id)
+        .is_some_and(|&n| n >= FEISHU_EDIT_CAP)
 }
 
 async fn edit_feishu_message(
@@ -1215,7 +1290,7 @@ async fn edit_feishu_message(
 ) -> EditOutcome {
     // Pre-check: if we've already tracked >= FEISHU_EDIT_CAP edits (or the sentinel
     // u32::MAX from a 230072 response), skip the API call and signal CapReached so
-    // the caller switches to append-new.
+    // the caller can stop attempting edits and let the core finalize path recover.
     if is_edit_cap_reached(&adapter.edit_counts, message_id) {
         return EditOutcome::CapReached;
     }
@@ -1247,25 +1322,30 @@ async fn edit_feishu_message(
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             // Detect errcode 230072 ("The message has reached the number of times
-            // it can be edited") — server-side confirmation of edit cap. Mark sentinel
-            // so future attempts on this message_id skip the API call entirely.
-            let cap_reached = body.contains("230072")
-                || body.contains("number of times it can be edited");
-            if cap_reached {
+            // it can be edited") — server-side confirmation of edit cap. Trust
+            // JSON `code` field; fall back to substring only for non-JSON bodies
+            // (HTML proxy errors, truncated responses) to avoid false positives
+            // on JSON responses where "230072" appears in an unrelated string.
+            if is_feishu_cap_reached_body(&body) {
                 mark_edit_cap(&adapter.edit_counts, message_id);
                 tracing::warn!(
                     message_id = %message_id,
                     status = %status,
-                    "feishu edit cap reached (errcode 230072); switching to append-new fallback"
+                    "feishu edit cap reached (errcode 230072); signaling core for cap-reached recovery"
                 );
                 EditOutcome::CapReached
             } else {
-                tracing::error!(status = %status, body = %body, "feishu edit message failed");
+                tracing::error!(
+                    message_id = %message_id,
+                    status = %status,
+                    body = %body,
+                    "feishu edit message failed"
+                );
                 EditOutcome::Failed(format!("HTTP {status}: {body}"))
             }
         }
         Err(e) => {
-            tracing::error!(err = %e, "feishu edit message request failed");
+            tracing::error!(message_id = %message_id, err = %e, "feishu edit message request failed");
             EditOutcome::Failed(format!("request error: {e}"))
         }
     }
@@ -1280,6 +1360,18 @@ async fn delete_feishu_message(
     adapter: &FeishuAdapter,
     message_id: &str,
 ) -> Result<(), String> {
+    // Defence-in-depth: validate message_id shape before interpolating into the
+    // REST URL path. The trust boundary is the core↔gateway WebSocket (not
+    // external input), but a crafted ID with `/`, `?`, or `#` could otherwise
+    // alter URL semantics.
+    if !is_valid_feishu_message_id(message_id) {
+        tracing::warn!(
+            message_id = %message_id,
+            "feishu delete refused: message_id failed shape validation"
+        );
+        return Err("invalid message_id format".to_string());
+    }
+
     let token = adapter
         .token_cache
         .get_token(&adapter.client)
@@ -3439,5 +3531,146 @@ mod tests {
         // wiremock expect(1) on both mocks verifies:
         // 1. Reply API was called (and failed)
         // 2. Plain send was called (fallback triggered by quote_message_id.is_some() guard)
+    }
+
+    // --- Edit-cap helpers (F3/F4/F8/F10): no network required ---
+
+    fn fresh_cache() -> Arc<std::sync::Mutex<EditCountsCache>> {
+        Arc::new(std::sync::Mutex::new(EditCountsCache::default()))
+    }
+
+    #[test]
+    fn cap_detect_json_code_match() {
+        // Real-shape Feishu error body: trusted JSON code field == 230072.
+        let body = r#"{"code":230072,"msg":"The message has reached the number of times it can be edited","data":{}}"#;
+        assert!(is_feishu_cap_reached_body(body));
+    }
+
+    #[test]
+    fn cap_detect_json_other_code_no_false_positive() {
+        // JSON parses but code is unrelated; any inner string containing
+        // "230072" must NOT trigger cap detection.
+        let body = r#"{"code":99999,"msg":"some other error 230072 in description"}"#;
+        assert!(!is_feishu_cap_reached_body(body));
+    }
+
+    #[test]
+    fn cap_detect_substring_fallback_for_non_json() {
+        // Proxy-style HTML / non-JSON body — substring fallback kicks in.
+        let html = "<html><body>Error 230072 — number of times it can be edited</body></html>";
+        assert!(is_feishu_cap_reached_body(html));
+
+        let plain = "upstream error: 230072";
+        assert!(is_feishu_cap_reached_body(plain));
+    }
+
+    #[test]
+    fn cap_detect_unrelated_body_returns_false() {
+        let body = r#"{"code":99991,"msg":"rate limited","data":{}}"#;
+        assert!(!is_feishu_cap_reached_body(body));
+        assert!(!is_feishu_cap_reached_body("plain text without the code"));
+        assert!(!is_feishu_cap_reached_body(""));
+    }
+
+    #[test]
+    fn cap_pre_check_below_threshold_does_not_trip() {
+        let cache = fresh_cache();
+        // Cap is FEISHU_EDIT_CAP (18). 17 increments must stay below.
+        for _ in 0..17 {
+            increment_edit_count(&cache, "om_msg1");
+        }
+        assert!(!is_edit_cap_reached(&cache, "om_msg1"));
+    }
+
+    #[test]
+    fn cap_pre_check_at_threshold_trips() {
+        let cache = fresh_cache();
+        for _ in 0..(FEISHU_EDIT_CAP as usize) {
+            increment_edit_count(&cache, "om_msg1");
+        }
+        assert!(is_edit_cap_reached(&cache, "om_msg1"));
+    }
+
+    #[test]
+    fn mark_edit_cap_short_circuits_pre_check() {
+        let cache = fresh_cache();
+        mark_edit_cap(&cache, "om_msg1");
+        // Sentinel u32::MAX >= FEISHU_EDIT_CAP, so pre-check trips immediately.
+        assert!(is_edit_cap_reached(&cache, "om_msg1"));
+    }
+
+    #[test]
+    fn mark_edit_cap_does_not_double_increment() {
+        let cache = fresh_cache();
+        mark_edit_cap(&cache, "om_msg1");
+        increment_edit_count(&cache, "om_msg1");
+        // Increment must not push past u32::MAX sentinel.
+        let map = cache.lock().unwrap();
+        assert_eq!(map.counts.get("om_msg1").copied(), Some(u32::MAX));
+    }
+
+    #[test]
+    fn eviction_drops_oldest_inserts_not_lowest_count() {
+        // Pre-fill cache to over capacity, simulating a long-running adapter.
+        let cache = fresh_cache();
+        // First insert message_id "old_*" with high counts so they would
+        // *survive* a count-ascending eviction (the buggy strategy). They
+        // must instead be the *first* evicted under FIFO.
+        let overcap = EDIT_COUNTS_CACHE_MAX + 100;
+        for i in 0..overcap {
+            let id = format!("om_msg_{i:05}");
+            increment_edit_count(&cache, &id);
+        }
+        // Insert a fresh "active stream" id last — its low count would have
+        // marked it for eviction under count-ascending. With FIFO it must
+        // survive.
+        increment_edit_count(&cache, "om_active_recent");
+
+        let map = cache.lock().unwrap();
+        // FIFO eviction: the newest insert must still be present.
+        assert!(
+            map.counts.contains_key("om_active_recent"),
+            "active recent insert was evicted under FIFO — bug regressed"
+        );
+        // FIFO eviction: at least one of the very first inserts must be gone.
+        let some_oldest_evicted = (0..50).any(|i| {
+            let id = format!("om_msg_{i:05}");
+            !map.counts.contains_key(&id)
+        });
+        assert!(
+            some_oldest_evicted,
+            "no early-insert key was evicted — FIFO not working"
+        );
+        // Cache size bounded.
+        assert!(
+            map.counts.len() <= EDIT_COUNTS_CACHE_MAX,
+            "cache size {} > max {}",
+            map.counts.len(),
+            EDIT_COUNTS_CACHE_MAX
+        );
+    }
+
+    #[test]
+    fn message_id_validation_accepts_valid_shapes() {
+        assert!(is_valid_feishu_message_id("om_dc13264520392907fcq2e6kpngacls"));
+        assert!(is_valid_feishu_message_id("om_abc123"));
+        assert!(is_valid_feishu_message_id("om_A_B_c_1_2_3"));
+    }
+
+    #[test]
+    fn message_id_validation_rejects_path_traversal_and_query() {
+        // The shape guard is the F8 defence: stop crafted IDs containing URL
+        // metachars from altering /im/v1/messages/{id} semantics.
+        assert!(!is_valid_feishu_message_id("../etc/passwd"));
+        assert!(!is_valid_feishu_message_id("om_abc/extra"));
+        assert!(!is_valid_feishu_message_id("om_abc?q=1"));
+        assert!(!is_valid_feishu_message_id("om_abc#frag"));
+        assert!(!is_valid_feishu_message_id("om_abc%2Fextra"));
+        assert!(!is_valid_feishu_message_id(""));
+        assert!(!is_valid_feishu_message_id("om_"));
+        assert!(!is_valid_feishu_message_id("not_om_prefix"));
+        // Length cap (defense against pathological inputs).
+        let too_long = format!("om_{}", "a".repeat(200));
+        assert!(!is_valid_feishu_message_id(&too_long));
     }
 }
