@@ -857,17 +857,29 @@ pub async fn run_gateway_adapter(
                                     // Convert gateway attachments to ContentBlocks
                                     let mut extra_blocks = Vec::new();
                                     for att in &event.content.attachments {
-                                        // Rejected/truncated attachment: surface reason to the user and skip.
+                                        // Rejected/truncated attachment: surface reason to the agent and skip.
                                         if let Some(ref reason) = att.status {
                                             tracing::info!(
                                                 filename = %att.filename,
+                                                mime_type = %att.mime_type,
+                                                size = att.size,
                                                 reason = %reason,
-                                                "gateway attachment rejected, forwarding reason to user"
+                                                "gateway attachment rejected, forwarding reason to agent"
                                             );
+                                            let size_str = {
+                                                let n = att.size;
+                                                if n >= 1024 * 1024 {
+                                                    format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
+                                                } else if n >= 1024 {
+                                                    format!("{:.1} KB", n as f64 / 1024.0)
+                                                } else {
+                                                    format!("{} B", n)
+                                                }
+                                            };
                                             extra_blocks.push(ContentBlock::Text {
                                                 text: format!(
-                                                    "[Attachment `{}` was not delivered: {}]",
-                                                    att.filename, reason
+                                                    "[System: attachment \"{}\" ({}, {}) was not delivered — {}]",
+                                                    att.filename, att.mime_type, size_str, reason
                                                 ),
                                             });
                                             continue;
