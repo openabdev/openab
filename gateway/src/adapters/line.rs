@@ -1,4 +1,4 @@
-use crate::media::{resize_and_compress, IMAGE_MAX_DOWNLOAD};
+use crate::media::{format_bytes, resize_and_compress, IMAGE_MAX_DOWNLOAD};
 use crate::schema::*;
 use crate::store;
 use axum::extract::State;
@@ -192,15 +192,6 @@ async fn process_line_webhook_events(
     }
 }
 
-fn format_bytes(n: u64) -> String {
-    if n >= 1024 * 1024 {
-        format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
-    } else if n >= 1024 {
-        format!("{:.1} KB", n as f64 / 1024.0)
-    } else {
-        format!("{} B", n)
-    }
-}
 
 fn sanitize_line_external_url_for_log(url: &str) -> String {
     reqwest::Url::parse(url)

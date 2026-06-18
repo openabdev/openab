@@ -67,6 +67,17 @@ pub fn is_text_extension(filename: &str) -> bool {
     TEXT_EXTS.contains(&ext.as_str())
 }
 
+/// Format a byte count as a human-readable string (B / KB / MB).
+pub fn format_bytes(n: u64) -> String {
+    if n >= 1024 * 1024 {
+        format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
+    } else if n >= 1024 {
+        format!("{:.1} KB", n as f64 / 1024.0)
+    } else {
+        format!("{} B", n)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

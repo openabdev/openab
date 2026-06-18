@@ -1,3 +1,4 @@
+use crate::media::format_bytes;
 use crate::schema::*;
 use axum::extract::State;
 use prost::Message as ProstMessage;
@@ -1688,19 +1689,44 @@ pub async fn download_feishu_image(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(image_key, error = %e, "feishu image download failed");
-            return None;
+            return Some(crate::schema::Attachment {
+                attachment_type: "image".into(),
+                filename: format!("{}.jpg", image_key),
+                mime_type: "application/octet-stream".into(),
+                data: String::new(),
+                size: 0,
+                path: None,
+                status: Some(format!("rejected: download failed — {}", e)),
+            });
         }
     };
     if !resp.status().is_success() {
-        tracing::warn!(image_key, status = %resp.status(), "feishu image download failed");
-        return None;
+        let status = resp.status();
+        tracing::warn!(image_key, status = %status, "feishu image download failed");
+        return Some(crate::schema::Attachment {
+            attachment_type: "image".into(),
+            filename: format!("{}.jpg", image_key),
+            mime_type: "application/octet-stream".into(),
+            data: String::new(),
+            size: 0,
+            path: None,
+            status: Some(format!("rejected: download failed HTTP {}", status.as_u16())),
+        });
     }
     // Early gate: reject oversized downloads before buffering the full body
     if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
             if size > IMAGE_MAX_DOWNLOAD {
                 tracing::warn!(image_key, size, "feishu image Content-Length exceeds 10MB limit, skipping download");
-                return None;
+                return Some(crate::schema::Attachment {
+                    attachment_type: "image".into(),
+                    filename: format!("{}.jpg", image_key),
+                    mime_type: "application/octet-stream".into(),
+                    data: String::new(),
+                    size,
+                    path: None,
+                    status: Some(format!("rejected: file size {} exceeds {} limit", format_bytes(size), format_bytes(IMAGE_MAX_DOWNLOAD))),
+                });
             }
         }
     }
@@ -1708,7 +1734,15 @@ pub async fn download_feishu_image(
     // Fallback check (Content-Length may be absent or misreported)
     if bytes.len() as u64 > IMAGE_MAX_DOWNLOAD {
         tracing::warn!(image_key, size = bytes.len(), "feishu image exceeds 10MB limit");
-        return None;
+        return Some(crate::schema::Attachment {
+            attachment_type: "image".into(),
+            filename: format!("{}.jpg", image_key),
+            mime_type: "application/octet-stream".into(),
+            data: String::new(),
+            size: bytes.len() as u64,
+            path: None,
+            status: Some(format!("rejected: file size {} exceeds {} limit", format_bytes(bytes.len() as u64), format_bytes(IMAGE_MAX_DOWNLOAD))),
+        });
     }
     let (compressed, mime) = match resize_and_compress(&bytes) {
         Ok(v) => v,
@@ -1748,7 +1782,15 @@ pub async fn download_feishu_file(
     ];
     if !TEXT_EXTS.contains(&ext.as_str()) {
         tracing::debug!(file_name, "skipping non-text file attachment");
-        return None;
+        return Some(crate::schema::Attachment {
+            attachment_type: "text_file".into(),
+            filename: file_name.to_string(),
+            mime_type: "application/octet-stream".into(),
+            data: String::new(),
+            size: 0,
+            path: None,
+            status: Some(format!("rejected: unsupported format .{}", ext)),
+        });
     }
     let url = format!(
         "{}/open-apis/im/v1/messages/{}/resources/{}?type=file",
@@ -1758,19 +1800,44 @@ pub async fn download_feishu_file(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(file_name, error = %e, "feishu file download failed");
-            return None;
+            return Some(crate::schema::Attachment {
+                attachment_type: "text_file".into(),
+                filename: file_name.to_string(),
+                mime_type: "application/octet-stream".into(),
+                data: String::new(),
+                size: 0,
+                path: None,
+                status: Some(format!("rejected: download failed — {}", e)),
+            });
         }
     };
     if !resp.status().is_success() {
-        tracing::warn!(file_name, status = %resp.status(), "feishu file download failed");
-        return None;
+        let status = resp.status();
+        tracing::warn!(file_name, status = %status, "feishu file download failed");
+        return Some(crate::schema::Attachment {
+            attachment_type: "text_file".into(),
+            filename: file_name.to_string(),
+            mime_type: "application/octet-stream".into(),
+            data: String::new(),
+            size: 0,
+            path: None,
+            status: Some(format!("rejected: download failed HTTP {}", status.as_u16())),
+        });
     }
     // Early gate: reject oversized downloads before buffering the full body
     if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
             if size > FILE_MAX_DOWNLOAD {
                 tracing::warn!(file_name, size, "feishu file Content-Length exceeds 512KB limit, skipping download");
-                return None;
+                return Some(crate::schema::Attachment {
+                    attachment_type: "text_file".into(),
+                    filename: file_name.to_string(),
+                    mime_type: "application/octet-stream".into(),
+                    data: String::new(),
+                    size,
+                    path: None,
+                    status: Some(format!("rejected: file size {} exceeds {} limit", format_bytes(size), format_bytes(FILE_MAX_DOWNLOAD))),
+                });
             }
         }
     }
@@ -1778,7 +1845,15 @@ pub async fn download_feishu_file(
     // Fallback check (Content-Length may be absent or misreported)
     if bytes.len() as u64 > FILE_MAX_DOWNLOAD {
         tracing::warn!(file_name, size = bytes.len(), "feishu file exceeds 512KB limit");
-        return None;
+        return Some(crate::schema::Attachment {
+            attachment_type: "text_file".into(),
+            filename: file_name.to_string(),
+            mime_type: "application/octet-stream".into(),
+            data: String::new(),
+            size: bytes.len() as u64,
+            path: None,
+            status: Some(format!("rejected: file size {} exceeds {} limit", format_bytes(bytes.len() as u64), format_bytes(FILE_MAX_DOWNLOAD))),
+        });
     }
     let path = crate::store::store_media(&bytes).await?;
     Some(crate::schema::Attachment {
@@ -1811,12 +1886,29 @@ pub async fn download_feishu_audio(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(file_key, error = %e, "feishu audio download failed");
-            return None;
+            return Some(crate::schema::Attachment {
+                attachment_type: "audio".into(),
+                filename: format!("{}.ogg", file_key),
+                mime_type: "audio/ogg".into(),
+                data: String::new(),
+                size: 0,
+                path: None,
+                status: Some(format!("rejected: download failed — {}", e)),
+            });
         }
     };
     if !resp.status().is_success() {
-        tracing::warn!(file_key, status = %resp.status(), "feishu audio download failed");
-        return None;
+        let status = resp.status();
+        tracing::warn!(file_key, status = %status, "feishu audio download failed");
+        return Some(crate::schema::Attachment {
+            attachment_type: "audio".into(),
+            filename: format!("{}.ogg", file_key),
+            mime_type: "audio/ogg".into(),
+            data: String::new(),
+            size: 0,
+            path: None,
+            status: Some(format!("rejected: download failed HTTP {}", status.as_u16())),
+        });
     }
     let content_type = resp
         .headers()
@@ -1828,14 +1920,30 @@ pub async fn download_feishu_audio(
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
             if size > AUDIO_MAX_DOWNLOAD {
                 tracing::warn!(file_key, size, "feishu audio exceeds 25MB limit");
-                return None;
+                return Some(crate::schema::Attachment {
+                    attachment_type: "audio".into(),
+                    filename: format!("{}.ogg", file_key),
+                    mime_type: "audio/ogg".into(),
+                    data: String::new(),
+                    size,
+                    path: None,
+                    status: Some(format!("rejected: file size {} exceeds {} limit", format_bytes(size), format_bytes(AUDIO_MAX_DOWNLOAD))),
+                });
             }
         }
     }
     let bytes = resp.bytes().await.ok()?;
     if bytes.len() as u64 > AUDIO_MAX_DOWNLOAD {
         tracing::warn!(file_key, size = bytes.len(), "feishu audio exceeds 25MB limit");
-        return None;
+        return Some(crate::schema::Attachment {
+            attachment_type: "audio".into(),
+            filename: format!("{}.ogg", file_key),
+            mime_type: "audio/ogg".into(),
+            data: String::new(),
+            size: bytes.len() as u64,
+            path: None,
+            status: Some(format!("rejected: file size {} exceeds {} limit", format_bytes(bytes.len() as u64), format_bytes(AUDIO_MAX_DOWNLOAD))),
+        });
     }
     tracing::debug!(file_key, size = bytes.len(), "feishu audio downloaded");
     let path = crate::store::store_media(&bytes).await?;

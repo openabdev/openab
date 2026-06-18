@@ -1,4 +1,4 @@
-use crate::media::{resize_and_compress, MediaKind, AUDIO_MAX_DOWNLOAD, FILE_MAX_DOWNLOAD, IMAGE_MAX_DOWNLOAD};
+use crate::media::{format_bytes, resize_and_compress, MediaKind, AUDIO_MAX_DOWNLOAD, FILE_MAX_DOWNLOAD, IMAGE_MAX_DOWNLOAD};
 use crate::schema::*;
 use crate::store;
 use axum::extract::State;
@@ -617,28 +617,51 @@ async fn download_telegram_media(
 
     let download_url = format!("{TELEGRAM_API_BASE}/file/bot{}/{}", bot_token, file_path);
     let resp = client.get(&download_url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
 
+    let att_type = match kind {
+        MediaKind::Image => "image",
+        MediaKind::Audio => "audio",
+    };
+    let default_mime = match kind {
+        MediaKind::Image => "image/jpeg",
+        MediaKind::Audio => "audio/ogg",
+    };
     let max_size = match kind {
         MediaKind::Image => IMAGE_MAX_DOWNLOAD,
         MediaKind::Audio => AUDIO_MAX_DOWNLOAD,
     };
 
+    if !resp.status().is_success() {
+        let status = resp.status();
+        warn!(file_id, status = status.as_u16(), kind = ?kind, "Telegram media HTTP error");
+        return Some(Attachment {
+            attachment_type: att_type.into(),
+            filename: format!("{}.{}", file_id, match kind { MediaKind::Image => "jpg", MediaKind::Audio => "ogg" }),
+            mime_type: default_mime.into(),
+            data: String::new(),
+            size: 0,
+            path: None,
+            status: Some(format!("rejected: download failed HTTP {}", status.as_u16())),
+        });
+    }
+
     if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
             if size > max_size {
                 warn!(file_id, size, kind = ?kind, "Telegram media Content-Length exceeds limit");
-                return None;
+                return Some(Attachment {
+                    attachment_type: att_type.into(),
+                    filename: format!("{}.{}", file_id, match kind { MediaKind::Image => "jpg", MediaKind::Audio => "ogg" }),
+                    mime_type: default_mime.into(),
+                    data: String::new(),
+                    size,
+                    path: None,
+                    status: Some(format!("rejected: file size {} exceeds {} limit", format_bytes(size), format_bytes(max_size))),
+                });
             }
         }
     }
 
-    let default_mime = match kind {
-        MediaKind::Image => "image/jpeg",
-        MediaKind::Audio => "audio/ogg",
-    };
     let content_type = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -649,7 +672,15 @@ async fn download_telegram_media(
     let bytes = resp.bytes().await.ok()?;
     if bytes.len() as u64 > max_size {
         warn!(file_id, size = bytes.len(), kind = ?kind, "Telegram media exceeds limit");
-        return None;
+        return Some(Attachment {
+            attachment_type: att_type.into(),
+            filename: format!("{}.{}", file_id, match kind { MediaKind::Image => "jpg", MediaKind::Audio => "ogg" }),
+            mime_type: default_mime.into(),
+            data: String::new(),
+            size: bytes.len() as u64,
+            path: None,
+            status: Some(format!("rejected: file size {} exceeds {} limit", format_bytes(bytes.len() as u64), format_bytes(max_size))),
+        });
     }
 
     let (data_bytes, mime) = match kind {
@@ -665,10 +696,6 @@ async fn download_telegram_media(
 
     // Store to filesystem instead of base64 encoding
     let path = store::store_media(&data_bytes).await?;
-    let att_type = match kind {
-        MediaKind::Image => "image",
-        MediaKind::Audio => "audio",
-    };
     info!(file_id, size = data_bytes.len(), kind = ?kind, "Telegram media stored");
 
     Some(Attachment {
@@ -695,7 +722,15 @@ async fn download_telegram_document(
 ) -> Option<Attachment> {
     if !crate::media::is_text_extension(file_name) {
         tracing::debug!(file_name, "skipping non-text file attachment");
-        return None;
+        return Some(Attachment {
+            attachment_type: "text_file".into(),
+            filename: file_name.to_string(),
+            mime_type: mime_type.to_string(),
+            data: String::new(),
+            size: 0,
+            path: None,
+            status: Some(format!("rejected: unsupported format {}", mime_type)),
+        });
     }
 
     let get_file_url = format!("{TELEGRAM_API_BASE}/bot{}/getFile", bot_token);
@@ -704,16 +739,48 @@ async fn download_telegram_document(
     let file_path = body["result"]["file_path"].as_str()?;
 
     let download_url = format!("{TELEGRAM_API_BASE}/file/bot{}/{}", bot_token, file_path);
-    let resp = client.get(&download_url).send().await.ok()?;
+    let resp = match client.get(&download_url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(file_id, err = %e, "Telegram document network error");
+            return Some(Attachment {
+                attachment_type: "text_file".into(),
+                filename: file_name.to_string(),
+                mime_type: mime_type.to_string(),
+                data: String::new(),
+                size: 0,
+                path: None,
+                status: Some(format!("rejected: download failed — {}", e)),
+            });
+        }
+    };
     if !resp.status().is_success() {
-        return None;
+        let status = resp.status();
+        warn!(file_id, status = status.as_u16(), "Telegram document HTTP error");
+        return Some(Attachment {
+            attachment_type: "text_file".into(),
+            filename: file_name.to_string(),
+            mime_type: mime_type.to_string(),
+            data: String::new(),
+            size: 0,
+            path: None,
+            status: Some(format!("rejected: download failed HTTP {}", status.as_u16())),
+        });
     }
 
     if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
             if size > FILE_MAX_DOWNLOAD {
                 warn!(file_id, size, "Telegram document Content-Length exceeds limit");
-                return None;
+                return Some(Attachment {
+                    attachment_type: "text_file".into(),
+                    filename: file_name.to_string(),
+                    mime_type: mime_type.to_string(),
+                    data: String::new(),
+                    size,
+                    path: None,
+                    status: Some(format!("rejected: file size {} exceeds {} limit", format_bytes(size), format_bytes(FILE_MAX_DOWNLOAD))),
+                });
             }
         }
     }
@@ -721,13 +788,29 @@ async fn download_telegram_document(
     let bytes = resp.bytes().await.ok()?;
     if bytes.len() as u64 > FILE_MAX_DOWNLOAD {
         warn!(file_id, size = bytes.len(), "Telegram document exceeds limit");
-        return None;
+        return Some(Attachment {
+            attachment_type: "text_file".into(),
+            filename: file_name.to_string(),
+            mime_type: mime_type.to_string(),
+            data: String::new(),
+            size: bytes.len() as u64,
+            path: None,
+            status: Some(format!("rejected: file size {} exceeds {} limit", format_bytes(bytes.len() as u64), format_bytes(FILE_MAX_DOWNLOAD))),
+        });
     }
 
     // Validate UTF-8 — reject binary files
     if String::from_utf8(bytes.to_vec()).is_err() {
         warn!(file_id, file_name, "Telegram document is not valid UTF-8, skipping");
-        return None;
+        return Some(Attachment {
+            attachment_type: "text_file".into(),
+            filename: file_name.to_string(),
+            mime_type: mime_type.to_string(),
+            data: String::new(),
+            size: bytes.len() as u64,
+            path: None,
+            status: Some("rejected: file is not valid UTF-8".into()),
+        });
     }
 
     let path = store::store_media(&bytes).await?;
