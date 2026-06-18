@@ -934,7 +934,7 @@ impl AdapterRouter {
                                 if let Err(e) =
                                     adapter.stream_append(msg, &native_pending).await
                                 {
-                                    tracing::warn!(error = ?e, "native finalize stream_append failed");
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "native finalize stream_append failed");
                                     delivery_failed = true;
                                 }
                             }
@@ -946,14 +946,14 @@ impl AdapterRouter {
                             match chunks.first() {
                                 Some(first) => {
                                     if let Err(e) = adapter.stream_finish(msg, first).await {
-                                        tracing::warn!(error = ?e, "native stream_finish failed");
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "native stream_finish failed");
                                         delivery_failed = true;
                                     }
                                     for chunk in chunks.iter().skip(1) {
                                         if let Err(e) =
                                             adapter.send_message(&thread_channel, chunk).await
                                         {
-                                            tracing::warn!(error = ?e, "native overflow chunk send failed");
+                                            tracing::warn!(error = ?e, platform = %thread_channel.platform, "native overflow chunk send failed");
                                             delivery_failed = true;
                                         }
                                     }
@@ -962,7 +962,7 @@ impl AdapterRouter {
                                     if let Err(e) =
                                         adapter.stream_finish(msg, &final_content).await
                                     {
-                                        tracing::warn!(error = ?e, "native stream_finish (no chunks) failed");
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "native stream_finish (no chunks) failed");
                                         delivery_failed = true;
                                     }
                                 }
@@ -980,7 +980,7 @@ impl AdapterRouter {
                                 if let Err(e) =
                                     adapter.send_message(&thread_channel, chunk).await
                                 {
-                                    tracing::warn!(error = ?e, "native fallback chunk send failed");
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, "native fallback chunk send failed");
                                     delivery_failed = true;
                                 }
                             }
@@ -1000,21 +1000,21 @@ impl AdapterRouter {
                                     ).await {
                                         Ok(_) => { send_ok = true; }
                                         Err(e) => {
-                                            tracing::warn!(error = ?e, "reply_to send failed; preserving placeholder");
+                                            tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "reply_to send failed; preserving placeholder");
                                             delivery_failed = true;
                                         }
                                     }
                                 } else if let Err(e) =
                                     adapter.send_message(&thread_channel, chunk).await
                                 {
-                                    tracing::warn!(error = ?e, "reply_to overflow chunk send failed");
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "reply_to overflow chunk send failed");
                                     delivery_failed = true;
                                 }
                                 first = false;
                             }
                             if send_ok {
                                 if let Err(e) = adapter.delete_message(&msg).await {
-                                    tracing::warn!(error = ?e, "delete placeholder failed; placeholder will remain visible");
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "delete placeholder failed; placeholder will remain visible");
                                 }
                             }
                         } else if adapter.platform() == "discord"
@@ -1031,14 +1031,14 @@ impl AdapterRouter {
                                         send_ok = true;
                                     }
                                     Err(e) => {
-                                        tracing::warn!(error = ?e, "discord bot-mention first chunk send failed");
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "discord bot-mention first chunk send failed");
                                         delivery_failed = true;
                                     }
                                 }
                             }
                             for chunk in chunks.iter().skip(1) {
                                 if let Err(e) = adapter.send_message(&thread_channel, chunk).await {
-                                    tracing::warn!(error = ?e, "streaming overflow chunk send failed");
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "streaming overflow chunk send failed");
                                     delivery_failed = true;
                                 }
                             }
@@ -1054,7 +1054,7 @@ impl AdapterRouter {
                                     if let Err(e) =
                                         adapter.send_message(&thread_channel, chunk).await
                                     {
-                                        tracing::warn!(error = ?e, "draft placeholder fallback chunk send failed");
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "draft placeholder fallback chunk send failed");
                                         delivery_failed = true;
                                     }
                                 }
@@ -1069,14 +1069,14 @@ impl AdapterRouter {
                                 // fails the placeholder simply remains — same
                                 // UX as pre-recovery, not a hard failure.
                                 if let Err(e) = adapter.edit_message(&msg, first).await {
-                                    tracing::warn!(error = ?e, "final streaming edit failed; deleting placeholder and sending fresh");
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "final streaming edit failed; deleting placeholder and sending fresh");
                                     if let Err(de) = adapter.delete_message(&msg).await {
-                                        tracing::warn!(error = ?de, "delete placeholder failed; user will see overlap");
+                                        tracing::warn!(error = ?de, platform = %thread_channel.platform, message_id = %msg.message_id, "delete placeholder failed; user will see overlap");
                                     }
                                     if let Err(e2) =
                                         adapter.send_message(&thread_channel, first).await
                                     {
-                                        tracing::error!(error = ?e2, "fallback send_message also failed");
+                                        tracing::error!(error = ?e2, platform = %thread_channel.platform, message_id = %msg.message_id, "fallback send_message also failed");
                                         delivery_failed = true;
                                     }
                                 }
@@ -1084,7 +1084,7 @@ impl AdapterRouter {
                                     if let Err(e) =
                                         adapter.send_message(&thread_channel, chunk).await
                                     {
-                                        tracing::warn!(error = ?e, "streaming overflow chunk send failed");
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "streaming overflow chunk send failed");
                                         delivery_failed = true;
                                     }
                                 }
@@ -1102,19 +1102,19 @@ impl AdapterRouter {
                                         chunk,
                                         reply_id,
                                     ).await {
-                                        tracing::warn!(error = ?e, "send-once reply_to first chunk failed");
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, "send-once reply_to first chunk failed");
                                         delivery_failed = true;
                                     }
                                 } else if let Err(e) =
                                     adapter.send_message(&thread_channel, chunk).await
                                 {
-                                    tracing::warn!(error = ?e, "send-once first chunk failed");
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, "send-once first chunk failed");
                                     delivery_failed = true;
                                 }
                             } else if let Err(e) =
                                 adapter.send_message(&thread_channel, chunk).await
                             {
-                                tracing::warn!(error = ?e, "send-once subsequent chunk failed");
+                                tracing::warn!(error = ?e, platform = %thread_channel.platform, "send-once subsequent chunk failed");
                                 delivery_failed = true;
                             }
                             first = false;
