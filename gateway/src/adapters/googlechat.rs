@@ -1283,6 +1283,7 @@ pub async fn download_googlechat_image(
         data: String::new(),
         size: compressed.len() as u64,
         path: Some(path),
+        status: None,
     })
 }
 
@@ -1335,6 +1336,7 @@ pub async fn download_googlechat_file(
         data: String::new(),
         size: bytes.len() as u64,
         path: Some(path),
+        status: None,
     })
 }
 
@@ -1381,6 +1383,7 @@ pub async fn download_googlechat_audio(
         data: String::new(),
         size: bytes.len() as u64,
         path: Some(path),
+        status: None,
     })
 }
 

@@ -1156,6 +1156,7 @@ async fn download_wecom_image(
         data: String::new(),
         size: compressed.len() as u64,
         path: Some(path),
+        status: None,
     })
 }
 
@@ -1283,6 +1284,7 @@ async fn download_wecom_file(
         data: String::new(),
         size,
         path: Some(path),
+        status: None,
     })
 }
 

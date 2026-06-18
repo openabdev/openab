@@ -1726,6 +1726,7 @@ pub async fn download_feishu_image(
         data: String::new(),
         size: compressed.len() as u64,
         path: Some(path),
+        status: None,
     })
 }
 
@@ -1787,6 +1788,7 @@ pub async fn download_feishu_file(
         data: String::new(),
         size: bytes.len() as u64,
         path: Some(path),
+        status: None,
     })
 }
 
@@ -1844,6 +1846,7 @@ pub async fn download_feishu_audio(
         data: String::new(),
         size: bytes.len() as u64,
         path: Some(path),
+        status: None,
     })
 }
 

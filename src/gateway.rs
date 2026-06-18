@@ -98,6 +98,9 @@ struct GwAttachment {
     /// Colocate mode: local file path (preferred over base64 `data` when present)
     #[serde(default)]
     path: Option<String>,
+    /// Absent = normal. Present = rejected/truncated; human-readable reason.
+    #[serde(default)]
+    status: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -854,6 +857,22 @@ pub async fn run_gateway_adapter(
                                     // Convert gateway attachments to ContentBlocks
                                     let mut extra_blocks = Vec::new();
                                     for att in &event.content.attachments {
+                                        // Rejected/truncated attachment: surface reason to the user and skip.
+                                        if let Some(ref reason) = att.status {
+                                            tracing::info!(
+                                                filename = %att.filename,
+                                                reason = %reason,
+                                                "gateway attachment rejected, forwarding reason to user"
+                                            );
+                                            extra_blocks.push(ContentBlock::Text {
+                                                text: format!(
+                                                    "[Attachment `{}` was not delivered: {}]",
+                                                    att.filename, reason
+                                                ),
+                                            });
+                                            continue;
+                                        }
+
                                         // Read bytes: prefer file path (colocate), fallback to base64
                                         let bytes_result = if let Some(ref path) = att.path {
                                             tokio::fs::read(path).await.map_err(|e| e.to_string())

@@ -681,6 +681,7 @@ async fn download_telegram_media(
         data: String::new(), // No base64 — using file path
         size: data_bytes.len() as u64,
         path: Some(path),
+        status: None,
     })
 }
 
@@ -739,6 +740,7 @@ async fn download_telegram_document(
         data: String::new(),
         size: bytes.len() as u64,
         path: Some(path),
+        status: None,
     })
 }
 

@@ -57,6 +57,15 @@ pub struct Attachment {
     /// Path format: ~/.openab/media/inbound/<uuid> (no extension, MIME in mime_type).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Absent = attachment delivered normally (path/data available).
+    /// Present = attachment could not be delivered; value is a human-readable reason.
+    /// Examples:
+    ///   "rejected: file size 21.3 MB exceeds 10 MB limit"
+    ///   "rejected: unsupported format — external image content is not supported"
+    ///   "rejected: download failed HTTP 403"
+    /// When set, `data` and `path` are empty; filename, mime_type, and size are preserved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 // --- Reply schema (ADR openab.gateway.reply.v1) ---
