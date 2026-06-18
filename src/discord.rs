@@ -798,6 +798,12 @@ impl EventHandler for Handler {
                             "image attachment failed"
                         );
                         failed_image_files.push(attachment.filename.clone());
+                        extra_blocks.push(ContentBlock::Text {
+                            text: format!(
+                                "[Attachment `{}` was not delivered: {}]",
+                                attachment.filename, e
+                            ),
+                        });
                     }
                 }
             }

@@ -686,6 +686,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn external_image_produces_status_attachment_not_dropped() {
+        let event: LineEvent = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "source": {"type": "user", "userId": "U_human"},
+            "message": {
+                "id": "msg_ext",
+                "type": "image",
+                "contentProvider": {
+                    "type": "external",
+                    "originalContentUrl": "https://example.com/photo.jpg"
+                }
+            }
+        }))
+        .unwrap();
+
+        let result = build_gateway_event_from_line_event(
+            &event,
+            &reqwest::Client::new(),
+            None,
+            LINE_DATA_API_BASE,
+        )
+        .await;
+
+        let gw = result.expect("external image event should not be dropped");
+        assert_eq!(gw.content.attachments.len(), 1);
+        let att = &gw.content.attachments[0];
+        assert!(att.status.is_some(), "external image should have status set");
+        let reason = att.status.as_deref().unwrap();
+        assert!(reason.contains("rejected"), "got: {reason}");
+        assert!(reason.contains("external"), "got: {reason}");
+    }
+
+    #[tokio::test]
+    async fn missing_access_token_produces_status_attachment_not_dropped() {
+        let event: LineEvent = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "source": {"type": "user", "userId": "U_human"},
+            "message": {
+                "id": "msg_notoken",
+                "type": "image",
+                "contentProvider": {"type": "line"}
+            }
+        }))
+        .unwrap();
+
+        let result = build_gateway_event_from_line_event(
+            &event,
+            &reqwest::Client::new(),
+            None, // no access token
+            LINE_DATA_API_BASE,
+        )
+        .await;
+
+        let gw = result.expect("image event with missing token should not be dropped");
+        assert_eq!(gw.content.attachments.len(), 1);
+        let att = &gw.content.attachments[0];
+        assert!(att.status.is_some(), "missing token should have status set");
+        let reason = att.status.as_deref().unwrap();
+        assert!(reason.contains("rejected"), "got: {reason}");
+    }
+
+    #[tokio::test]
     async fn webhook_acknowledges_before_async_event_forwarding() {
         let (event_tx, mut event_rx) = broadcast::channel::<String>(8);
         let state = Arc::new(crate::AppState {
