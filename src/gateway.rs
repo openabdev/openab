@@ -13,6 +13,33 @@ use tracing::{error, info, warn};
 /// Timeout for waiting on gateway reply acknowledgement.
 const GATEWAY_REPLY_TIMEOUT_SECS: u64 = 5;
 
+/// Platforms whose gateway adapter emits a `GatewayResponse` for `edit_message`
+/// so core can observe edit success or failure (used to gate the per-edit
+/// response-wait below).
+///
+/// Today only Feishu does, because it is the only adapter with a known
+/// per-message edit cap (errcode 230072) that requires core-side recovery, and
+/// the only one wired to ack edits.
+///
+/// NOTE: this gates the `edit_message` response-wait only. `delete_message` is
+/// unconditionally fire-and-forget (the recovery path sends fresh content
+/// regardless of the delete outcome), so it does not consult this list.
+///
+/// TECH DEBT: this is platform-identity standing in for a *capability*. The
+/// right model is a capability handshake at gateway-connect time ("does this
+/// adapter acknowledge edits?") rather than a hardcoded platform name. We
+/// accept the hardcode now because there is no handshake protocol yet; when one
+/// lands, replace this allowlist with a negotiated capability flag. Any new
+/// adapter that wires request/response for edits MUST be added here, or its
+/// edit failures stay invisible to core (silent failure mode).
+const EDIT_RESPONSE_PLATFORMS: &[&str] = &["feishu"];
+
+/// Whether `platform` acknowledges `edit_message` with a `GatewayResponse`.
+/// See `EDIT_RESPONSE_PLATFORMS`.
+fn platform_acks_writes(platform: &str) -> bool {
+    EDIT_RESPONSE_PLATFORMS.contains(&platform)
+}
+
 // --- Gateway event/reply schemas (mirrors gateway service) ---
 
 #[derive(Clone, Debug, Deserialize)]
@@ -517,16 +544,12 @@ impl ChatAdapter for GatewayAdapter {
         // signals — cosmetic streaming would keep flushing forever and the final
         // edit fallback to send_message could not trigger.
         //
-        // Scope intentionally limited to Feishu: it is the only adapter that
-        // currently emits `GatewayResponse` for `edit_message` and the only
-        // platform with a known per-message edit cap (errcode 230072). Other
-        // adapters (LINE, Teams, Slack, Discord, …) keep the original
-        // fire-and-forget path so cosmetic streaming on those platforms does
-        // not pay an 800 ms penalty per flush waiting for a response that
-        // never arrives. When more adapters wire request/response feedback,
-        // this allowlist is where to extend.
+        // Scope intentionally limited to platforms that ack writes (see
+        // EDIT_RESPONSE_PLATFORMS). Other adapters (LINE, Teams, Slack, Discord,
+        // …) keep the original fire-and-forget path so cosmetic streaming on
+        // those platforms does not pay a response-wait penalty per flush.
         const EDIT_RESPONSE_TIMEOUT_MS: u64 = 800;
-        let needs_response = self.streaming && msg.channel.platform == "feishu";
+        let needs_response = self.streaming && platform_acks_writes(&msg.channel.platform);
 
         let req_id = if needs_response {
             Some(format!("req_{}", uuid::Uuid::new_v4()))
@@ -604,7 +627,10 @@ impl ChatAdapter for GatewayAdapter {
     ///
     /// Fire-and-forget: gateway adapters that don't implement delete will simply
     /// ignore the command. Failure is non-fatal — if delete fails, the user sees
-    /// the placeholder remain (same behavior as before this override).
+    /// the placeholder remain (same behavior as before this override). We do not
+    /// wait on a response here: the recovery path sends fresh content regardless
+    /// of whether the delete landed, so a response would only buy an extra log
+    /// line at the cost of a per-finalize wait.
     async fn delete_message(&self, msg: &MessageRef) -> Result<()> {
         let reply = GatewayReply {
             schema: "openab.gateway.reply.v1".into(),

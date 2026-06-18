@@ -713,9 +713,12 @@ pub struct FeishuAdapter {
     /// Per-message edit count tracker for Feishu's 20-edits-per-message hard cap
     /// (errcode 230072 — "The message has reached the number of times it can be edited").
     /// Insertion-order FIFO eviction: when over `EDIT_COUNTS_CACHE_MAX`, the
-    /// oldest *insertions* are dropped, never the lowest-count entries — so
-    /// active streaming messages (just-started, low count) are never the
-    /// eviction target.
+    /// oldest *insertions* are dropped, not the lowest-count entries — so a
+    /// just-started active stream is far less likely to be evicted than under a
+    /// count-ascending policy. (A very long-lived stream can still age out once
+    /// 4096 newer messages have been inserted behind it; that resets its count
+    /// to 1, which is acceptable — it only loses the local preemptive margin and
+    /// the on-wire 230072 sentinel still backstops.)
     pub edit_counts: Arc<std::sync::Mutex<EditCountsCache>>,
     pub client: reqwest::Client,
 }
@@ -723,10 +726,11 @@ pub struct FeishuAdapter {
 /// Insertion-order edit-count cache for Feishu's per-message edit cap.
 ///
 /// `counts` holds the current edit count (or `u32::MAX` cap-reached sentinel)
-/// for each message_id. `order` records the insertion order so eviction is
-/// FIFO rather than count-ascending; this matters because count-ascending
-/// would target *active* streams (low count = just started) while leaving
-/// stale cap-reached entries in place.
+/// for each message_id. `order` records insertion order so eviction is FIFO
+/// rather than count-ascending; this matters because count-ascending would
+/// preferentially target *active* streams (low count = just started) while
+/// leaving stale cap-reached entries in place. FIFO instead ages out the
+/// oldest insertions, which strongly favours keeping active streams.
 #[derive(Default)]
 pub struct EditCountsCache {
     pub counts: HashMap<String, u32>,
@@ -1193,7 +1197,7 @@ fn is_feishu_cap_reached_body(body: &str) -> bool {
     match serde_json::from_str::<serde_json::Value>(body) {
         Ok(v) => v
             .get("code")
-            .and_then(|c| c.as_u64())
+            .and_then(|c| c.as_i64())
             .is_some_and(|code| code == 230072),
         Err(_) => {
             body.contains("230072")
@@ -1313,19 +1317,23 @@ async fn edit_feishu_message(
         .header("Content-Type", "application/json; charset=utf-8")
         .json(&body).send().await
     {
-        Ok(resp) if resp.status().is_success() => {
-            increment_edit_count(&adapter.edit_counts, message_id);
-            tracing::trace!(message_id = %message_id, "feishu message edited");
-            EditOutcome::Edited
-        }
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            // Detect errcode 230072 ("The message has reached the number of times
-            // it can be edited") — server-side confirmation of edit cap. Trust
-            // JSON `code` field; fall back to substring only for non-JSON bodies
-            // (HTML proxy errors, truncated responses) to avoid false positives
-            // on JSON responses where "230072" appears in an unrelated string.
+            // Feishu OpenAPI convention: the business result lives in the body
+            // `code` field, and an edit-cap rejection (errcode 230072) can arrive
+            // with HTTP 200. So we decide on the body — consistent with token
+            // refresh and the WS endpoint elsewhere in this file — rather than
+            // trusting HTTP status alone, which would miscount a 200 + non-zero
+            // `code` response as a successful edit and never reach cap detection.
+            //
+            // This relies on Feishu returning `code` as a JSON integer (which it
+            // always does). A non-integer or absent code falls through to the
+            // HTTP-status fallback below, so a malformed 2xx body is treated as
+            // success — acceptable, since Feishu never emits such a body.
+            //
+            // 1. Cap reached? `is_feishu_cap_reached_body` is the sole authority
+            //    (JSON code == 230072, or substring fallback for non-JSON bodies).
             if is_feishu_cap_reached_body(&body) {
                 mark_edit_cap(&adapter.edit_counts, message_id);
                 tracing::warn!(
@@ -1333,15 +1341,45 @@ async fn edit_feishu_message(
                     status = %status,
                     "feishu edit cap reached (errcode 230072); signaling core for cap-reached recovery"
                 );
-                EditOutcome::CapReached
-            } else {
-                tracing::error!(
-                    message_id = %message_id,
-                    status = %status,
-                    body = %body,
-                    "feishu edit message failed"
-                );
-                EditOutcome::Failed(format!("HTTP {status}: {body}"))
+                return EditOutcome::CapReached;
+            }
+            // 2. Otherwise classify by body `code` (0 = success), falling back to
+            //    HTTP status only for non-JSON bodies (proxy HTML, truncated).
+            match serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("code").and_then(|c| c.as_i64()))
+            {
+                Some(0) => {
+                    increment_edit_count(&adapter.edit_counts, message_id);
+                    tracing::trace!(message_id = %message_id, "feishu message edited");
+                    EditOutcome::Edited
+                }
+                Some(code) => {
+                    tracing::error!(
+                        message_id = %message_id,
+                        status = %status,
+                        code,
+                        body = %body,
+                        "feishu edit message failed"
+                    );
+                    EditOutcome::Failed(format!("code {code}: {body}"))
+                }
+                None => {
+                    // Body wasn't JSON-with-code; trust HTTP status as last resort.
+                    if status.is_success() {
+                        increment_edit_count(&adapter.edit_counts, message_id);
+                        tracing::trace!(message_id = %message_id, "feishu message edited (non-JSON 2xx body)");
+                        EditOutcome::Edited
+                    } else {
+                        tracing::error!(
+                            message_id = %message_id,
+                            status = %status,
+                            body = %body,
+                            "feishu edit message failed"
+                        );
+                        EditOutcome::Failed(format!("HTTP {status}: {body}"))
+                    }
+                }
             }
         }
         Err(e) => {
@@ -1356,22 +1394,14 @@ async fn edit_feishu_message(
 /// so this works even on messages that have already exhausted their edit quota.
 /// Used by the streaming finalize path to remove the half-edited placeholder
 /// before sending the full content as fresh messages, avoiding visual overlap.
+///
+/// `message_id` shape is validated by the caller (`handle_reply` dispatch seam,
+/// via `is_valid_feishu_message_id`) before this is reached, so it is safe to
+/// interpolate into the URL path here.
 async fn delete_feishu_message(
     adapter: &FeishuAdapter,
     message_id: &str,
 ) -> Result<(), String> {
-    // Defence-in-depth: validate message_id shape before interpolating into the
-    // REST URL path. The trust boundary is the core↔gateway WebSocket (not
-    // external input), but a crafted ID with `/`, `?`, or `#` could otherwise
-    // alter URL semantics.
-    if !is_valid_feishu_message_id(message_id) {
-        tracing::warn!(
-            message_id = %message_id,
-            "feishu delete refused: message_id failed shape validation"
-        );
-        return Err("invalid message_id format".to_string());
-    }
-
     let token = adapter
         .token_cache
         .get_token(&adapter.client)
@@ -2175,6 +2205,38 @@ pub async fn handle_reply(
 ) {
     // Handle reactions — add/remove emoji on the original message
     if let Some(ref cmd) = reply.command {
+        // Defence-in-depth: every command below interpolates `reply.reply_to`
+        // into a REST URL path (edit/delete → /im/v1/messages/{id}; reactions →
+        // /im/v1/messages/{id}/reactions). Validate the id shape once here, at
+        // the dispatch seam, so a crafted id with URL metacharacters can't alter
+        // request semantics. Trust boundary is the core↔gateway WebSocket, so
+        // this is belt-and-suspenders — but it closes the guard over every
+        // url-path-bearing command instead of just delete.
+        let interpolates_message_id = matches!(
+            cmd.as_str(),
+            "edit_message" | "delete_message" | "add_reaction" | "remove_reaction"
+        );
+        if interpolates_message_id && !is_valid_feishu_message_id(&reply.reply_to) {
+            tracing::warn!(
+                command = %cmd,
+                message_id = %reply.reply_to,
+                "feishu: refusing command — message_id failed shape validation"
+            );
+            if let Some(ref req_id) = reply.request_id {
+                let resp = crate::schema::GatewayResponse {
+                    schema: "openab.gateway.response.v1".into(),
+                    request_id: req_id.clone(),
+                    success: false,
+                    thread_id: None,
+                    message_id: None,
+                    error: Some("invalid message_id format".to_string()),
+                };
+                if let Ok(json) = serde_json::to_string(&resp) {
+                    let _ = event_tx.send(json);
+                }
+            }
+            return;
+        }
         match cmd.as_str() {
             "add_reaction" => {
                 add_reaction(adapter, &reply.reply_to, &reply.content.text).await;
@@ -2190,10 +2252,10 @@ pub async fn handle_reply(
                     &reply.reply_to,
                     &reply.content.text,
                 ).await;
-                // Translate outcome → (success, message_id, error). For CapReached
-                // we attempt an append-new fallback: post the latest content as a
-                // fresh in-thread message so the user gets the rest of the reply
-                // even though the original message can no longer be edited.
+                // Translate outcome → (success, message_id, error). For
+                // CapReached we deliberately do NOT append-new at the gateway
+                // layer (see the rationale on the CapReached arm below); we
+                // signal failure so core's finalize path owns recovery.
                 let (success, message_id, error) = match outcome {
                     EditOutcome::Edited => {
                         (true, Some(reply.reply_to.clone()), None)
@@ -2249,6 +2311,11 @@ pub async fn handle_reply(
                     Ok(()) => (true, None),
                     Err(e) => (false, Some(e)),
                 };
+                // Dormant by design: core's delete_message is fire-and-forget
+                // (request_id = None), so this response branch is currently
+                // never taken. Kept for symmetry with the other handlers and so
+                // delete becomes observable for free if a future caller (or
+                // another gateway client) sets request_id.
                 if let Some(ref req_id) = reply.request_id {
                     let resp = crate::schema::GatewayResponse {
                         schema: "openab.gateway.response.v1".into(),
@@ -3672,5 +3739,174 @@ mod tests {
         // Length cap (defense against pathological inputs).
         let too_long = format!("om_{}", "a".repeat(200));
         assert!(!is_valid_feishu_message_id(&too_long));
+    }
+
+    // --- edit_feishu_message integration (wiremock): proves the cap is detected
+    //     through the HTTP-status gate, including the HTTP-200 + body-code case ---
+
+    async fn mount_token(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "msg": "ok",
+                "tenant_access_token": "t-edit-test",
+                "expire": 7200
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn edit_cap_detected_on_http_200_body_code() {
+        // Feishu returns the edit-cap rejection as HTTP 200 + {"code":230072}.
+        // Regression guard for the body-code-first fix: a status-only success
+        // gate would miscount this as Edited and never trip cap detection.
+        let server = MockServer::start().await;
+        mount_token(&server).await;
+        Mock::given(method("PUT"))
+            .and(path("/open-apis/im/v1/messages/om_capped"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 230072,
+                "msg": "The message has reached the number of times it can be edited."
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = test_config();
+        config.api_base_override = Some(server.uri());
+        let adapter = FeishuAdapter::new(config);
+
+        let outcome = edit_feishu_message(&adapter, "om_capped", "hello").await;
+        assert!(
+            matches!(outcome, EditOutcome::CapReached),
+            "HTTP 200 + code 230072 must yield CapReached, got non-cap outcome"
+        );
+        // Sentinel marked → subsequent pre-check short-circuits.
+        assert!(is_edit_cap_reached(&adapter.edit_counts, "om_capped"));
+    }
+
+    #[tokio::test]
+    async fn edit_success_on_http_200_code_zero() {
+        // HTTP 200 + {"code":0} is a real success → Edited + count incremented.
+        let server = MockServer::start().await;
+        mount_token(&server).await;
+        Mock::given(method("PUT"))
+            .and(path("/open-apis/im/v1/messages/om_ok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "msg": "success",
+                "data": {}
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = test_config();
+        config.api_base_override = Some(server.uri());
+        let adapter = FeishuAdapter::new(config);
+
+        let outcome = edit_feishu_message(&adapter, "om_ok", "hello").await;
+        assert!(
+            matches!(outcome, EditOutcome::Edited),
+            "HTTP 200 + code 0 must yield Edited"
+        );
+        let map = adapter.edit_counts.lock().unwrap();
+        assert_eq!(map.counts.get("om_ok").copied(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn edit_failure_on_http_200_other_code() {
+        // HTTP 200 + non-zero, non-cap code is a genuine failure, not a success.
+        let server = MockServer::start().await;
+        mount_token(&server).await;
+        Mock::given(method("PUT"))
+            .and(path("/open-apis/im/v1/messages/om_err"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 99991,
+                "msg": "rate limited"
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = test_config();
+        config.api_base_override = Some(server.uri());
+        let adapter = FeishuAdapter::new(config);
+
+        let outcome = edit_feishu_message(&adapter, "om_err", "hello").await;
+        assert!(
+            matches!(outcome, EditOutcome::Failed(_)),
+            "HTTP 200 + code 99991 must yield Failed, not Edited"
+        );
+        // Failure must NOT increment the edit count.
+        let map = adapter.edit_counts.lock().unwrap();
+        assert_eq!(map.counts.get("om_err").copied(), None);
+    }
+
+    // --- handle_reply dispatch-seam message_id validation (R3) ---
+    // These exercise the seam reject path directly (the edit_* tests above call
+    // edit_feishu_message and bypass the seam). The guard runs before any
+    // network call, so no mock server is needed.
+
+    #[tokio::test]
+    async fn handle_reply_seam_rejects_invalid_id_with_response() {
+        let adapter = FeishuAdapter::new(test_config());
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(8);
+
+        let reply = crate::schema::GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "draft".into(), // sentinel, not an om_ id → rejected
+            platform: "feishu".into(),
+            channel: crate::schema::ReplyChannel {
+                id: "oc_chat1".into(),
+                thread_id: None,
+            },
+            content: crate::schema::Content {
+                content_type: "text".into(),
+                text: "hello".into(),
+                attachments: vec![],
+            },
+            command: Some("edit_message".into()),
+            request_id: Some("req_seam_1".into()),
+            quote_message_id: None,
+        };
+
+        handle_reply(&reply, &adapter, &event_tx).await;
+
+        let raw = event_rx.try_recv().expect("expected a GatewayResponse");
+        let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(resp["request_id"], "req_seam_1");
+        assert_eq!(resp["success"], false);
+        assert_eq!(resp["error"], "invalid message_id format");
+    }
+
+    #[tokio::test]
+    async fn handle_reply_seam_rejects_invalid_id_silently_without_request_id() {
+        let adapter = FeishuAdapter::new(test_config());
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(8);
+
+        let reply = crate::schema::GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "om_bad/segment".into(), // URL metachar → rejected
+            platform: "feishu".into(),
+            channel: crate::schema::ReplyChannel {
+                id: "oc_chat1".into(),
+                thread_id: None,
+            },
+            content: crate::schema::Content {
+                content_type: "text".into(),
+                text: "hello".into(),
+                attachments: vec![],
+            },
+            command: Some("delete_message".into()),
+            request_id: None,
+            quote_message_id: None,
+        };
+
+        handle_reply(&reply, &adapter, &event_tx).await;
+
+        assert!(
+            event_rx.try_recv().is_err(),
+            "no response expected when request_id is absent"
+        );
     }
 }

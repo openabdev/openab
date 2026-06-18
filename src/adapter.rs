@@ -610,7 +610,7 @@ impl AdapterRouter {
                     const NATIVE_FLUSH_MS: u128 = 400;
 
                     // Streaming edit: send placeholder, spawn edit loop
-                    let (buf_tx, placeholder_msg) = if streaming && !native {
+                    let (buf_tx, placeholder_msg, edit_handle) = if streaming && !native {
                         let initial = if reset {
                             "⚠️ _Session expired, starting fresh..._\n\n…".to_string()
                         } else {
@@ -630,7 +630,7 @@ impl AdapterRouter {
                         let edit_msg = msg.clone();
                         let limit = message_limit;
                         let mut buf_rx = rx;
-                        tokio::spawn(async move {
+                        let edit_handle = tokio::spawn(async move {
                             let mut last = String::new();
                             // Track consecutive edit failures so we can abort cosmetic
                             // streaming when the platform stops accepting edits (e.g.
@@ -690,9 +690,9 @@ impl AdapterRouter {
                                 }
                             }
                         });
-                        (Some(tx), Some(msg))
+                        (Some(tx), Some(msg), Some(edit_handle))
                     } else {
-                        (None, None)
+                        (None, None, None)
                     };
 
                     // (#732) Liveness-aware recv loop. Filters stale id-bearing
@@ -873,8 +873,28 @@ impl AdapterRouter {
                     }
 
                     conn.prompt_done().await;
-                    // Stop the edit loop
+                    // Stop the cosmetic edit loop before the finalize write path
+                    // issues its authoritative edit. Dropping buf_tx closes the watch
+                    // channel so the loop breaks on its next check, but it may be
+                    // mid-edit (a single edit can now block up to the gateway response
+                    // timeout). Without an explicit abort+join, a cosmetic edit issued
+                    // just before close could land *after* the finalize edit and
+                    // overwrite it with stale, mid-stream content (#1122 review NEW-1).
+                    //
+                    // abort() cancels any cosmetic edit that has not yet been put on
+                    // the wire and interrupts the inter-flush sleep immediately; the
+                    // await confirms the task is gone before we proceed. This narrows
+                    // the race to near zero — it does NOT fully eliminate it: a PUT
+                    // already flushed microseconds before abort cannot be recalled,
+                    // and if finalize's PUT travels a different pooled connection the
+                    // server-side arrival order is not strictly guaranteed. That
+                    // residual window is display-only (stale tail briefly shown) and
+                    // far narrower than before this join existed.
                     drop(buf_tx);
+                    if let Some(handle) = edit_handle {
+                        handle.abort();
+                        let _ = handle.await;
+                    }
 
                     // Parse output directives from raw text_buf BEFORE compose_display.
                     // Directives are agent meta-layer, not content — must be stripped
