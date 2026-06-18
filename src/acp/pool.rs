@@ -243,6 +243,7 @@ impl SessionPool {
         new_conn.initialize().await?;
 
         let mut resumed = false;
+        let mut load_failed = false;
         if let Some(ref sid) = saved_session_id {
             if new_conn.supports_load_session {
                 match new_conn.session_load(sid, &effective_workdir).await {
@@ -251,19 +252,32 @@ impl SessionPool {
                         resumed = true;
                     }
                     Err(e) => {
-                        warn!(thread_id, session_id = %sid, error = %e, "session/load failed, creating new session");
+                        let is_timeout = e.to_string().contains("timeout waiting for");
+                        if is_timeout {
+                            warn!(thread_id, session_id = %sid, error = %e,
+                                "session/load timed out, preserving session ID for retry");
+                            load_failed = true;
+                        } else {
+                            warn!(thread_id, session_id = %sid, error = %e,
+                                "session/load failed, creating new session");
+                        }
                     }
                 }
             }
         }
 
+        if load_failed {
+            // session/load timed out transiently. The original session ID is already
+            // in state.persisted (we haven't touched it), so the next message will
+            // retry session/load automatically. Return an error so the current message
+            // is not processed against a context-free session.
+            return Err(anyhow!("session load timeout: could not restore previous session"));
+        }
+
         if !resumed {
             new_conn.session_new(&effective_workdir).await?;
-            // Surface the reset banner both for restored sessions and for stale
-            // live entries that died before we could recover a resumable
-            // session id. In both cases the caller is continuing after an
-            // unexpected session loss.
             if had_existing || saved_session_id.is_some() {
+                // Genuine session loss (agent died, session file gone, etc.).
                 new_conn.session_reset = true;
             }
         }
