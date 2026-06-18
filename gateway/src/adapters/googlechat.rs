@@ -2460,7 +2460,11 @@ mod tests {
             TEXT_TOTAL_CAP,
         )
         .await;
-        assert!(result.is_none(), "non-text extensions must be skipped");
+        let att = result.expect("non-text extension should produce a rejected attachment, not None");
+        assert!(att.status.is_some(), "non-text extension must have status set");
+        let reason = att.status.unwrap();
+        assert!(reason.contains("rejected"), "got: {reason}");
+        assert!(reason.contains("unsupported"), "got: {reason}");
     }
 
     #[tokio::test]
@@ -2548,7 +2552,11 @@ mod tests {
             "huge.png",
         )
         .await;
-        assert!(result.is_none(), "oversized image must be rejected");
+        let att = result.expect("oversized image should produce a rejected attachment, not None");
+        assert!(att.status.is_some(), "oversized image must have status set");
+        let reason = att.status.unwrap();
+        assert!(reason.contains("rejected"), "got: {reason}");
+        assert!(reason.contains("exceeds"), "got: {reason}");
     }
 
     #[test]
