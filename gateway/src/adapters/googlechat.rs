@@ -1249,67 +1249,89 @@ pub async fn download_googlechat_image(
         Ok(r) => r,
         Err(e) => {
             warn!(content_name, error = %e, "googlechat image download failed");
-            return Some(crate::schema::Attachment {
-                attachment_type: "image".into(),
-                filename: content_name.to_string(),
-                mime_type: "image/jpeg".into(),
-                data: String::new(),
-                size: 0,
-                path: None,
-                status: Some(format!("rejected: download failed — {}", e)),
-            });
+            return Some(crate::schema::Attachment::rejected(
+                "image",
+                content_name.to_string(),
+                "image/jpeg",
+                0,
+                "download failed: network error",
+            ));
         }
     };
     if !resp.status().is_success() {
         let status = resp.status();
         warn!(content_name, status = %status, "googlechat image download failed");
-        return Some(crate::schema::Attachment {
-            attachment_type: "image".into(),
-            filename: content_name.to_string(),
-            mime_type: "image/jpeg".into(),
-            data: String::new(),
-            size: 0,
-            path: None,
-            status: Some(format!("rejected: download failed HTTP {}", status.as_u16())),
-        });
+        return Some(crate::schema::Attachment::rejected(
+            "image",
+            content_name.to_string(),
+            "image/jpeg",
+            0,
+            format!("download failed: HTTP {}", status.as_u16()),
+        ));
     }
     if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
             if size > IMAGE_MAX_DOWNLOAD {
                 warn!(content_name, size, "googlechat image Content-Length exceeds 10MB limit");
-                return Some(crate::schema::Attachment {
-                    attachment_type: "image".into(),
-                    filename: content_name.to_string(),
-                    mime_type: "image/jpeg".into(),
-                    data: String::new(),
+                return Some(crate::schema::Attachment::rejected(
+                    "image",
+                    content_name.to_string(),
+                    "image/jpeg",
                     size,
-                    path: None,
-                    status: Some(format!("rejected: file size {} exceeds {} limit", format_bytes(size), format_bytes(IMAGE_MAX_DOWNLOAD))),
-                });
+                    format!("size exceeded: {} exceeds {}", format_bytes(size), format_bytes(IMAGE_MAX_DOWNLOAD)),
+                ));
             }
         }
     }
-    let bytes = resp.bytes().await.ok()?;
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(content_name, error = %e, "googlechat image body read failed");
+            return Some(crate::schema::Attachment::rejected(
+                "image",
+                content_name.to_string(),
+                "image/jpeg",
+                0,
+                "download failed: body read error",
+            ));
+        }
+    };
     if bytes.len() as u64 > IMAGE_MAX_DOWNLOAD {
         warn!(content_name, size = bytes.len(), "googlechat image exceeds 10MB limit");
-        return Some(crate::schema::Attachment {
-            attachment_type: "image".into(),
-            filename: content_name.to_string(),
-            mime_type: "image/jpeg".into(),
-            data: String::new(),
-            size: bytes.len() as u64,
-            path: None,
-            status: Some(format!("rejected: file size {} exceeds {} limit", format_bytes(bytes.len() as u64), format_bytes(IMAGE_MAX_DOWNLOAD))),
-        });
+        return Some(crate::schema::Attachment::rejected(
+            "image",
+            content_name.to_string(),
+            "image/jpeg",
+            bytes.len() as u64,
+            format!("size exceeded: {} exceeds {}", format_bytes(bytes.len() as u64), format_bytes(IMAGE_MAX_DOWNLOAD)),
+        ));
     }
     let (compressed, mime) = match resize_and_compress(&bytes) {
         Ok(v) => v,
         Err(e) => {
             warn!(content_name, error = %e, "googlechat image resize failed");
-            return None;
+            return Some(crate::schema::Attachment::rejected(
+                "image",
+                content_name.to_string(),
+                "image/jpeg",
+                bytes.len() as u64,
+                "processing failed: image encoding error",
+            ));
         }
     };
-    let path = crate::store::store_media(&compressed).await?;
+    let path = match crate::store::store_media(&compressed).await {
+        Some(p) => p,
+        None => {
+            warn!(content_name, "googlechat image store failed");
+            return Some(crate::schema::Attachment::rejected(
+                "image",
+                content_name.to_string(),
+                "image/jpeg",
+                compressed.len() as u64,
+                "processing failed: storage error",
+            ));
+        }
+    };
     Some(crate::schema::Attachment {
         attachment_type: "image".into(),
         filename: content_name.to_string(),
@@ -1334,15 +1356,13 @@ pub async fn download_googlechat_file(
     let ext = content_name.rsplit('.').next().unwrap_or("").to_lowercase();
     if !TEXT_EXTS.contains(&ext.as_str()) {
         tracing::debug!(content_name, "skipping non-text googlechat file attachment");
-        return Some(crate::schema::Attachment {
-            attachment_type: "text_file".into(),
-            filename: content_name.to_string(),
-            mime_type: "text/plain".into(),
-            data: String::new(),
-            size: 0,
-            path: None,
-            status: Some(format!("rejected: unsupported format .{}", ext)),
-        });
+        return Some(crate::schema::Attachment::rejected(
+            "text_file",
+            content_name.to_string(),
+            "text/plain",
+            0,
+            format!("unsupported format: {}", ext),
+        ));
     }
     let max_size = FILE_MAX_DOWNLOAD.min(remaining_budget);
     let url = media_url(api_base, resource_name);
@@ -1350,60 +1370,76 @@ pub async fn download_googlechat_file(
         Ok(r) => r,
         Err(e) => {
             warn!(content_name, error = %e, "googlechat file download failed");
-            return Some(crate::schema::Attachment {
-                attachment_type: "text_file".into(),
-                filename: content_name.to_string(),
-                mime_type: "text/plain".into(),
-                data: String::new(),
-                size: 0,
-                path: None,
-                status: Some(format!("rejected: download failed — {}", e)),
-            });
+            return Some(crate::schema::Attachment::rejected(
+                "text_file",
+                content_name.to_string(),
+                "text/plain",
+                0,
+                "download failed: network error",
+            ));
         }
     };
     if !resp.status().is_success() {
         let status = resp.status();
         warn!(content_name, status = %status, "googlechat file download failed");
-        return Some(crate::schema::Attachment {
-            attachment_type: "text_file".into(),
-            filename: content_name.to_string(),
-            mime_type: "text/plain".into(),
-            data: String::new(),
-            size: 0,
-            path: None,
-            status: Some(format!("rejected: download failed HTTP {}", status.as_u16())),
-        });
+        return Some(crate::schema::Attachment::rejected(
+            "text_file",
+            content_name.to_string(),
+            "text/plain",
+            0,
+            format!("download failed: HTTP {}", status.as_u16()),
+        ));
     }
     if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
             if size > max_size {
                 warn!(content_name, size, limit = max_size, "googlechat file Content-Length exceeds limit");
-                return Some(crate::schema::Attachment {
-                    attachment_type: "text_file".into(),
-                    filename: content_name.to_string(),
-                    mime_type: "text/plain".into(),
-                    data: String::new(),
+                return Some(crate::schema::Attachment::rejected(
+                    "text_file",
+                    content_name.to_string(),
+                    "text/plain",
                     size,
-                    path: None,
-                    status: Some(format!("rejected: file size {} exceeds {} limit", format_bytes(size), format_bytes(max_size))),
-                });
+                    format!("size exceeded: {} exceeds {}", format_bytes(size), format_bytes(max_size)),
+                ));
             }
         }
     }
-    let bytes = resp.bytes().await.ok()?;
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(content_name, error = %e, "googlechat file body read failed");
+            return Some(crate::schema::Attachment::rejected(
+                "text_file",
+                content_name.to_string(),
+                "text/plain",
+                0,
+                "download failed: body read error",
+            ));
+        }
+    };
     if bytes.len() as u64 > max_size {
         warn!(content_name, size = bytes.len(), limit = max_size, "googlechat file exceeds size limit");
-        return Some(crate::schema::Attachment {
-            attachment_type: "text_file".into(),
-            filename: content_name.to_string(),
-            mime_type: "text/plain".into(),
-            data: String::new(),
-            size: bytes.len() as u64,
-            path: None,
-            status: Some(format!("rejected: file size {} exceeds {} limit", format_bytes(bytes.len() as u64), format_bytes(max_size))),
-        });
+        return Some(crate::schema::Attachment::rejected(
+            "text_file",
+            content_name.to_string(),
+            "text/plain",
+            bytes.len() as u64,
+            format!("size exceeded: {} exceeds {}", format_bytes(bytes.len() as u64), format_bytes(max_size)),
+        ));
     }
-    let path = crate::store::store_media(&bytes).await?;
+    let path = match crate::store::store_media(&bytes).await {
+        Some(p) => p,
+        None => {
+            warn!(content_name, "googlechat file store failed");
+            return Some(crate::schema::Attachment::rejected(
+                "text_file",
+                content_name.to_string(),
+                "text/plain",
+                bytes.len() as u64,
+                "processing failed: storage error",
+            ));
+        }
+    };
     Some(crate::schema::Attachment {
         attachment_type: "text_file".into(),
         filename: content_name.to_string(),
@@ -1430,60 +1466,76 @@ pub async fn download_googlechat_audio(
         Ok(r) => r,
         Err(e) => {
             warn!(content_name, error = %e, "googlechat audio download failed");
-            return Some(crate::schema::Attachment {
-                attachment_type: "audio".into(),
-                filename: content_name.to_string(),
-                mime_type: "audio/ogg".into(),
-                data: String::new(),
-                size: 0,
-                path: None,
-                status: Some(format!("rejected: download failed — {}", e)),
-            });
+            return Some(crate::schema::Attachment::rejected(
+                "audio",
+                content_name.to_string(),
+                "audio/ogg",
+                0,
+                "download failed: network error",
+            ));
         }
     };
     if !resp.status().is_success() {
         let status = resp.status();
         warn!(content_name, status = %status, "googlechat audio download failed");
-        return Some(crate::schema::Attachment {
-            attachment_type: "audio".into(),
-            filename: content_name.to_string(),
-            mime_type: "audio/ogg".into(),
-            data: String::new(),
-            size: 0,
-            path: None,
-            status: Some(format!("rejected: download failed HTTP {}", status.as_u16())),
-        });
+        return Some(crate::schema::Attachment::rejected(
+            "audio",
+            content_name.to_string(),
+            "audio/ogg",
+            0,
+            format!("download failed: HTTP {}", status.as_u16()),
+        ));
     }
     if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
             if size > AUDIO_MAX_DOWNLOAD {
                 warn!(content_name, size, "googlechat audio Content-Length exceeds 25MB limit");
-                return Some(crate::schema::Attachment {
-                    attachment_type: "audio".into(),
-                    filename: content_name.to_string(),
-                    mime_type: "audio/ogg".into(),
-                    data: String::new(),
+                return Some(crate::schema::Attachment::rejected(
+                    "audio",
+                    content_name.to_string(),
+                    "audio/ogg",
                     size,
-                    path: None,
-                    status: Some(format!("rejected: file size {} exceeds {} limit", format_bytes(size), format_bytes(AUDIO_MAX_DOWNLOAD))),
-                });
+                    format!("size exceeded: {} exceeds {}", format_bytes(size), format_bytes(AUDIO_MAX_DOWNLOAD)),
+                ));
             }
         }
     }
-    let bytes = resp.bytes().await.ok()?;
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(content_name, error = %e, "googlechat audio body read failed");
+            return Some(crate::schema::Attachment::rejected(
+                "audio",
+                content_name.to_string(),
+                "audio/ogg",
+                0,
+                "download failed: body read error",
+            ));
+        }
+    };
     if bytes.len() as u64 > AUDIO_MAX_DOWNLOAD {
         warn!(content_name, size = bytes.len(), "googlechat audio exceeds 25MB limit");
-        return Some(crate::schema::Attachment {
-            attachment_type: "audio".into(),
-            filename: content_name.to_string(),
-            mime_type: "audio/ogg".into(),
-            data: String::new(),
-            size: bytes.len() as u64,
-            path: None,
-            status: Some(format!("rejected: file size {} exceeds {} limit", format_bytes(bytes.len() as u64), format_bytes(AUDIO_MAX_DOWNLOAD))),
-        });
+        return Some(crate::schema::Attachment::rejected(
+            "audio",
+            content_name.to_string(),
+            "audio/ogg",
+            bytes.len() as u64,
+            format!("size exceeded: {} exceeds {}", format_bytes(bytes.len() as u64), format_bytes(AUDIO_MAX_DOWNLOAD)),
+        ));
     }
-    let path = crate::store::store_media(&bytes).await?;
+    let path = match crate::store::store_media(&bytes).await {
+        Some(p) => p,
+        None => {
+            warn!(content_name, "googlechat audio store failed");
+            return Some(crate::schema::Attachment::rejected(
+                "audio",
+                content_name.to_string(),
+                "audio/ogg",
+                bytes.len() as u64,
+                "processing failed: storage error",
+            ));
+        }
+    };
     Some(crate::schema::Attachment {
         attachment_type: "audio".into(),
         filename: content_name.to_string(),
@@ -2463,8 +2515,7 @@ mod tests {
         let att = result.expect("non-text extension should produce a rejected attachment, not None");
         assert!(att.status.is_some(), "non-text extension must have status set");
         let reason = att.status.unwrap();
-        assert!(reason.contains("rejected"), "got: {reason}");
-        assert!(reason.contains("unsupported"), "got: {reason}");
+        assert!(reason.contains("unsupported format"), "got: {reason}");
     }
 
     #[tokio::test]
@@ -2555,10 +2606,13 @@ mod tests {
         let att = result.expect("oversized image should produce a rejected attachment, not None");
         assert!(att.status.is_some(), "oversized image must have status set");
         let reason = att.status.unwrap();
-        // Either the Content-Length check fires ("exceeds") or the HTTP request itself
-        // fails ("download failed") — both are valid rejections; the key invariant is
+        // Either the Content-Length check fires ("size exceeded") or the body read fails
+        // ("download failed") — both are valid rejections; the key invariant is
         // that a rejected attachment is returned rather than None/silent drop.
-        assert!(reason.contains("rejected"), "got: {reason}");
+        assert!(
+            reason.contains("size exceeded") || reason.contains("download failed"),
+            "got: {reason}"
+        );
     }
 
     #[test]

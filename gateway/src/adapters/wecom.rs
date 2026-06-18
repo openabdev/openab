@@ -1114,82 +1114,102 @@ async fn download_wecom_image(
     // an attacker forges a callback with PicUrl pointing at an internal host.
     if !pic_url.starts_with("https://") {
         warn!(pic_url, "wecom: rejecting non-HTTPS pic_url");
-        return Some(crate::schema::Attachment {
-            attachment_type: "image".into(),
-            filename: "wecom_image.jpg".into(),
-            mime_type: "image/jpeg".into(),
-            data: String::new(),
-            size: 0,
-            path: None,
-            status: Some("rejected: download rejected — URL must use HTTPS".into()),
-        });
+        return Some(crate::schema::Attachment::rejected(
+            "image",
+            "wecom_image.jpg",
+            "image/jpeg",
+            0,
+            "security rejected: URL must use HTTPS",
+        ));
     }
     info!(pic_url, "wecom: downloading image");
     let resp = match client.get(pic_url).send().await {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "wecom image download failed");
-            return Some(crate::schema::Attachment {
-                attachment_type: "image".into(),
-                filename: "wecom_image.jpg".into(),
-                mime_type: "image/jpeg".into(),
-                data: String::new(),
-                size: 0,
-                path: None,
-                status: Some(format!("rejected: download failed — {}", e)),
-            });
+            return Some(crate::schema::Attachment::rejected(
+                "image",
+                "wecom_image.jpg",
+                "image/jpeg",
+                0,
+                "download failed: network error",
+            ));
         }
     };
     if !resp.status().is_success() {
         let status = resp.status();
         warn!(status = %status, "wecom image download failed");
-        return Some(crate::schema::Attachment {
-            attachment_type: "image".into(),
-            filename: "wecom_image.jpg".into(),
-            mime_type: "image/jpeg".into(),
-            data: String::new(),
-            size: 0,
-            path: None,
-            status: Some(format!("rejected: download failed HTTP {}", status.as_u16())),
-        });
+        return Some(crate::schema::Attachment::rejected(
+            "image",
+            "wecom_image.jpg",
+            "image/jpeg",
+            0,
+            format!("download failed: HTTP {}", status.as_u16()),
+        ));
     }
     if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
             if size > IMAGE_MAX_DOWNLOAD {
                 warn!(size, "wecom image exceeds 10MB limit, skipping");
-                return Some(crate::schema::Attachment {
-                    attachment_type: "image".into(),
-                    filename: "wecom_image.jpg".into(),
-                    mime_type: "image/jpeg".into(),
-                    data: String::new(),
+                return Some(crate::schema::Attachment::rejected(
+                    "image",
+                    "wecom_image.jpg",
+                    "image/jpeg",
                     size,
-                    path: None,
-                    status: Some(format!("rejected: file size {} exceeds {} limit", format_bytes(size), format_bytes(IMAGE_MAX_DOWNLOAD))),
-                });
+                    format!("size exceeded: {} exceeds {}", format_bytes(size), format_bytes(IMAGE_MAX_DOWNLOAD)),
+                ));
             }
         }
     }
-    let bytes = resp.bytes().await.ok()?;
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, "wecom image body read failed");
+            return Some(crate::schema::Attachment::rejected(
+                "image",
+                "wecom_image.jpg",
+                "image/jpeg",
+                0,
+                "download failed: body read error",
+            ));
+        }
+    };
     if bytes.len() as u64 > IMAGE_MAX_DOWNLOAD {
         warn!(size = bytes.len(), "wecom image exceeds 10MB limit");
-        return Some(crate::schema::Attachment {
-            attachment_type: "image".into(),
-            filename: "wecom_image.jpg".into(),
-            mime_type: "image/jpeg".into(),
-            data: String::new(),
-            size: bytes.len() as u64,
-            path: None,
-            status: Some(format!("rejected: file size {} exceeds {} limit", format_bytes(bytes.len() as u64), format_bytes(IMAGE_MAX_DOWNLOAD))),
-        });
+        return Some(crate::schema::Attachment::rejected(
+            "image",
+            "wecom_image.jpg",
+            "image/jpeg",
+            bytes.len() as u64,
+            format!("size exceeded: {} exceeds {}", format_bytes(bytes.len() as u64), format_bytes(IMAGE_MAX_DOWNLOAD)),
+        ));
     }
     let (compressed, mime) = match resize_and_compress(&bytes) {
         Ok(v) => v,
         Err(e) => {
             warn!(error = %e, "wecom: image resize/compress failed");
-            return None;
+            return Some(crate::schema::Attachment::rejected(
+                "image",
+                "wecom_image.jpg",
+                "image/jpeg",
+                bytes.len() as u64,
+                "processing failed: image encoding error",
+            ));
         }
     };
-    let path = crate::store::store_media(&compressed).await?;
+    let path = match crate::store::store_media(&compressed).await {
+        Some(p) => p,
+        None => {
+            warn!("wecom image store failed");
+            return Some(crate::schema::Attachment::rejected(
+                "image",
+                "wecom_image.jpg",
+                "image/jpeg",
+                compressed.len() as u64,
+                "processing failed: storage error",
+            ));
+        }
+    };
     let ext = if mime == "image/gif" { "gif" } else { "jpg" };
     Some(crate::schema::Attachment {
         attachment_type: "image".into(),
@@ -1282,90 +1302,102 @@ async fn download_wecom_file(
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "wecom file download failed");
-            return Some(crate::schema::Attachment {
-                attachment_type: "text_file".into(),
-                filename: filename.to_string(),
-                mime_type: "application/octet-stream".into(),
-                data: String::new(),
-                size: 0,
-                path: None,
-                status: Some(format!("rejected: download failed — {}", e)),
-            });
+            return Some(crate::schema::Attachment::rejected(
+                "text_file",
+                filename.to_string(),
+                "application/octet-stream",
+                0,
+                "download failed: network error",
+            ));
         }
     };
     if !resp.status().is_success() {
         let status = resp.status();
         warn!(status = %status, "wecom file download failed");
-        return Some(crate::schema::Attachment {
-            attachment_type: "text_file".into(),
-            filename: filename.to_string(),
-            mime_type: "application/octet-stream".into(),
-            data: String::new(),
-            size: 0,
-            path: None,
-            status: Some(format!("rejected: download failed HTTP {}", status.as_u16())),
-        });
+        return Some(crate::schema::Attachment::rejected(
+            "text_file",
+            filename.to_string(),
+            "application/octet-stream",
+            0,
+            format!("download failed: HTTP {}", status.as_u16()),
+        ));
     }
     if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
             if size > FILE_MAX_DOWNLOAD {
                 warn!(size, "wecom file exceeds 20MB limit, skipping");
-                return Some(crate::schema::Attachment {
-                    attachment_type: "text_file".into(),
-                    filename: filename.to_string(),
-                    mime_type: "application/octet-stream".into(),
-                    data: String::new(),
+                return Some(crate::schema::Attachment::rejected(
+                    "text_file",
+                    filename.to_string(),
+                    "application/octet-stream",
                     size,
-                    path: None,
-                    status: Some(format!("rejected: file size {} exceeds {} limit", format_bytes(size), format_bytes(FILE_MAX_DOWNLOAD))),
-                });
+                    format!("size exceeded: {} exceeds {}", format_bytes(size), format_bytes(FILE_MAX_DOWNLOAD)),
+                ));
             }
         }
     }
-    let bytes = resp.bytes().await.ok()?;
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, "wecom file body read failed");
+            return Some(crate::schema::Attachment::rejected(
+                "text_file",
+                filename.to_string(),
+                "application/octet-stream",
+                0,
+                "download failed: body read error",
+            ));
+        }
+    };
     if bytes.len() as u64 > FILE_MAX_DOWNLOAD {
         warn!(size = bytes.len(), "wecom file exceeds 20MB limit");
-        return Some(crate::schema::Attachment {
-            attachment_type: "text_file".into(),
-            filename: filename.to_string(),
-            mime_type: "application/octet-stream".into(),
-            data: String::new(),
-            size: bytes.len() as u64,
-            path: None,
-            status: Some(format!("rejected: file size {} exceeds {} limit", format_bytes(bytes.len() as u64), format_bytes(FILE_MAX_DOWNLOAD))),
-        });
+        return Some(crate::schema::Attachment::rejected(
+            "text_file",
+            filename.to_string(),
+            "application/octet-stream",
+            bytes.len() as u64,
+            format!("size exceeded: {} exceeds {}", format_bytes(bytes.len() as u64), format_bytes(FILE_MAX_DOWNLOAD)),
+        ));
     }
 
     if !is_text_file(filename) {
         info!(filename, "wecom: skipping non-text file");
-        return Some(crate::schema::Attachment {
-            attachment_type: "text_file".into(),
-            filename: filename.to_string(),
-            mime_type: "application/octet-stream".into(),
-            data: String::new(),
-            size: bytes.len() as u64,
-            path: None,
-            status: Some("rejected: unsupported format — only text files are supported".into()),
-        });
+        return Some(crate::schema::Attachment::rejected(
+            "text_file",
+            filename.to_string(),
+            "application/octet-stream",
+            bytes.len() as u64,
+            "unsupported format: only text files are supported",
+        ));
     }
 
     let text_content = match String::from_utf8(bytes.to_vec()) {
         Ok(s) => s,
         Err(_) => {
             info!(filename, "wecom: file is not valid UTF-8, skipping");
-            return Some(crate::schema::Attachment {
-                attachment_type: "text_file".into(),
-                filename: filename.to_string(),
-                mime_type: "application/octet-stream".into(),
-                data: String::new(),
-                size: bytes.len() as u64,
-                path: None,
-                status: Some("rejected: file is not valid UTF-8".into()),
-            });
+            return Some(crate::schema::Attachment::rejected(
+                "text_file",
+                filename.to_string(),
+                "application/octet-stream",
+                bytes.len() as u64,
+                "invalid content: not valid UTF-8",
+            ));
         }
     };
 
-    let path = crate::store::store_media(text_content.as_bytes()).await?;
+    let path = match crate::store::store_media(text_content.as_bytes()).await {
+        Some(p) => p,
+        None => {
+            warn!(filename, "wecom file store failed");
+            return Some(crate::schema::Attachment::rejected(
+                "text_file",
+                filename.to_string(),
+                "application/octet-stream",
+                text_content.len() as u64,
+                "processing failed: storage error",
+            ));
+        }
+    };
     let size = text_content.len() as u64;
 
     Some(crate::schema::Attachment {

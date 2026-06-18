@@ -243,7 +243,7 @@ async fn build_gateway_event_from_line_event(
                     size: 0,
                     path: None,
                     status: Some(
-                        "rejected: unsupported format — external image content is not yet supported"
+                        "unsupported format: external content not supported"
                             .into(),
                     ),
                 });
@@ -263,7 +263,7 @@ async fn build_gateway_event_from_line_event(
                         size: 0,
                         path: None,
                         status: Some(
-                            "rejected: LINE_CHANNEL_ACCESS_TOKEN is not configured".into(),
+                            "configuration error: service not configured".into(),
                         ),
                     });
                 }
@@ -382,14 +382,14 @@ pub async fn download_line_image(
         Ok(resp) => resp,
         Err(e) => {
             warn!(message_id, error = %e, "LINE image download failed");
-            return rejected(format!("rejected: download failed — {e}"));
+            return rejected("download failed: network error".into());
         }
     };
 
     if !resp.status().is_success() {
         let http_status = resp.status().as_u16();
         warn!(message_id, status = %resp.status(), "LINE image download failed");
-        return rejected(format!("rejected: download failed HTTP {http_status}"));
+        return rejected(format!("download failed: HTTP {http_status}"));
     }
 
     if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
@@ -397,7 +397,7 @@ pub async fn download_line_image(
             if size > IMAGE_MAX_DOWNLOAD {
                 warn!(message_id, size, "LINE image Content-Length exceeds limit");
                 return rejected(format!(
-                    "rejected: file size {} exceeds {} limit",
+                    "size exceeded: {} exceeds {}",
                     format_bytes(size),
                     format_bytes(IMAGE_MAX_DOWNLOAD)
                 ));
@@ -412,14 +412,15 @@ pub async fn download_line_image(
             Ok(None) => break,
             Err(e) => {
                 warn!(message_id, error = %e, "LINE image download failed while reading body");
-                return rejected(format!("rejected: download failed — {e}"));
+                return rejected("download failed: network error".into());
             }
         };
         body.extend_from_slice(&chunk);
         if body.len() as u64 > IMAGE_MAX_DOWNLOAD {
             warn!(message_id, size = body.len(), "LINE image exceeds limit");
             return rejected(format!(
-                "rejected: file size exceeds {} limit",
+                "size exceeded: {} exceeds {}",
+                format_bytes(body.len() as u64),
                 format_bytes(IMAGE_MAX_DOWNLOAD)
             ));
         }
@@ -430,18 +431,18 @@ pub async fn download_line_image(
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
                 warn!(message_id, error = %e, "LINE image resize/compress failed");
-                return rejected(format!("rejected: image processing failed — {e}"));
+                return rejected("processing failed: image encoding error".into());
             }
             Err(e) => {
                 warn!(message_id, error = %e, "LINE image processing task failed");
-                return rejected(format!("rejected: image processing failed — {e}"));
+                return rejected("processing failed: image encoding error".into());
             }
         };
     let path = match store::store_media(&compressed).await {
         Some(p) => p,
         None => {
             warn!(message_id, "LINE image store failed");
-            return rejected("rejected: failed to store image on disk".into());
+            return rejected("processing failed: storage error".into());
         }
     };
     let ext = if mime == "image/gif" { "gif" } else { "jpg" };
@@ -672,7 +673,7 @@ mod tests {
 
         assert!(attachment.status.is_some());
         let reason = attachment.status.unwrap();
-        assert!(reason.contains("rejected"), "expected rejection reason, got: {reason}");
+        assert!(reason.contains("size exceeded"), "expected size exceeded reason, got: {reason}");
         assert!(reason.contains("exceeds"), "expected size limit message, got: {reason}");
     }
 
@@ -705,7 +706,7 @@ mod tests {
         let att = &gw.content.attachments[0];
         assert!(att.status.is_some(), "external image should have status set");
         let reason = att.status.as_deref().unwrap();
-        assert!(reason.contains("rejected"), "got: {reason}");
+        assert!(reason.contains("unsupported format"), "got: {reason}");
         assert!(reason.contains("external"), "got: {reason}");
     }
 
@@ -735,7 +736,7 @@ mod tests {
         let att = &gw.content.attachments[0];
         assert!(att.status.is_some(), "missing token should have status set");
         let reason = att.status.as_deref().unwrap();
-        assert!(reason.contains("rejected"), "got: {reason}");
+        assert!(reason.contains("configuration error"), "got: {reason}");
     }
 
     #[tokio::test]
