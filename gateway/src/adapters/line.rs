@@ -360,12 +360,12 @@ pub async fn download_line_image(
     message_id: &str,
     api_base: &str,
 ) -> Attachment {
-    let rejected = |reason: String| Attachment {
+    let rejected = |size: u64, reason: String| Attachment {
         attachment_type: "image".into(),
         filename: format!("line_{}.jpg", message_id),
         mime_type: "image/jpeg".into(),
         data: String::new(),
-        size: 0,
+        size,
         path: None,
         status: Some(reason),
     };
@@ -382,21 +382,21 @@ pub async fn download_line_image(
         Ok(resp) => resp,
         Err(e) => {
             warn!(message_id, error = %e, "LINE image download failed");
-            return rejected("download failed: network error".into());
+            return rejected(0, "download failed: network error".into());
         }
     };
 
     if !resp.status().is_success() {
         let http_status = resp.status().as_u16();
         warn!(message_id, status = %resp.status(), "LINE image download failed");
-        return rejected(format!("download failed: HTTP {http_status}"));
+        return rejected(0, format!("download failed: HTTP {http_status}"));
     }
 
     if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
             if size > IMAGE_MAX_DOWNLOAD {
                 warn!(message_id, size, "LINE image Content-Length exceeds limit");
-                return rejected(format!(
+                return rejected(size, format!(
                     "size exceeded: {} exceeds {}",
                     format_bytes(size),
                     format_bytes(IMAGE_MAX_DOWNLOAD)
@@ -412,15 +412,16 @@ pub async fn download_line_image(
             Ok(None) => break,
             Err(e) => {
                 warn!(message_id, error = %e, "LINE image download failed while reading body");
-                return rejected("download failed: body read error".into());
+                return rejected(0, "download failed: body read error".into());
             }
         };
         body.extend_from_slice(&chunk);
         if body.len() as u64 > IMAGE_MAX_DOWNLOAD {
-            warn!(message_id, size = body.len(), "LINE image exceeds limit");
-            return rejected(format!(
+            let body_size = body.len() as u64;
+            warn!(message_id, size = body_size, "LINE image exceeds limit");
+            return rejected(body_size, format!(
                 "size exceeded: {} exceeds {}",
-                format_bytes(body.len() as u64),
+                format_bytes(body_size),
                 format_bytes(IMAGE_MAX_DOWNLOAD)
             ));
         }
@@ -431,18 +432,18 @@ pub async fn download_line_image(
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
                 warn!(message_id, error = %e, "LINE image resize/compress failed");
-                return rejected("processing failed: image encoding error".into());
+                return rejected(0, "processing failed: image encoding error".into());
             }
             Err(e) => {
                 warn!(message_id, error = %e, "LINE image processing task failed");
-                return rejected("processing failed: image encoding error".into());
+                return rejected(0, "processing failed: image encoding error".into());
             }
         };
     let path = match store::store_media(&compressed).await {
         Some(p) => p,
         None => {
             warn!(message_id, "LINE image store failed");
-            return rejected("processing failed: storage error".into());
+            return rejected(0, "processing failed: storage error".into());
         }
     };
     let ext = if mime == "image/gif" { "gif" } else { "jpg" };
