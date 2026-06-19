@@ -796,10 +796,19 @@ impl EventHandler for Handler {
                             error = %e,
                             "image attachment failed"
                         );
+                        let reason = match &e {
+                            media::MediaFetchError::SizeExceeded { .. } => "size exceeded".into(),
+                            media::MediaFetchError::Network(_) => "download failed: network error".into(),
+                            media::MediaFetchError::HttpStatus(s) => format!("download failed: HTTP {}", s.as_u16()),
+                            media::MediaFetchError::ProcessingFailed(_) => "processing failed: image encoding error".into(),
+                            media::MediaFetchError::UnsupportedResponseType { .. } => "unsupported format: unexpected content type".into(),
+                            media::MediaFetchError::InvalidImageBody { .. } => "unsupported format: not a valid image".into(),
+                            media::MediaFetchError::NotAnImage => "unsupported format: not an image".into(),
+                        };
                         extra_blocks.push(ContentBlock::Text {
                             text: format!(
-                                "[System: attachment \"{}\" was not delivered — processing failed: {}]",
-                                attachment.filename, e
+                                "[System: attachment \"{}\" was not delivered — {}]",
+                                attachment.filename, reason
                             ),
                         });
                     }
