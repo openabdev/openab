@@ -749,11 +749,7 @@ async fn download_telegram_document(
 ) -> Attachment {
     if !crate::media::is_text_extension(file_name) {
         tracing::debug!(file_name, "skipping non-text file attachment");
-        let ext = std::path::Path::new(file_name)
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| format!(".{e}"))
-            .unwrap_or_else(|| mime_type.to_string());
+        let ext = file_name.rsplit('.').next().unwrap_or("").to_lowercase();
         return Attachment::rejected(
             "text_file",
             file_name.to_string(),
@@ -775,14 +771,14 @@ async fn download_telegram_document(
         Ok(v) => v,
         Err(e) => {
             warn!(file_id, error = %e, "Telegram document getFile JSON parse failed");
-            return Attachment::rejected("text_file", file_name.to_string(), mime_type, 0, "download failed: network error");
+            return Attachment::rejected("text_file", file_name.to_string(), mime_type, 0, "download failed: invalid API response");
         }
     };
     let file_path = match body["result"]["file_path"].as_str() {
         Some(p) => p,
         None => {
             warn!(file_id, "Telegram document getFile response missing file_path");
-            return Attachment::rejected("text_file", file_name.to_string(), mime_type, 0, "download failed: network error");
+            return Attachment::rejected("text_file", file_name.to_string(), mime_type, 0, "download failed: invalid API response");
         }
     };
 
@@ -889,7 +885,7 @@ mod tests {
         assert!(att.status.is_some(), "non-text extension must have status set");
         let reason = att.status.unwrap();
         assert!(reason.contains("unsupported format"), "got: {reason}");
-        assert!(reason.contains(".pdf"), "expected file extension in reason, got: {reason}");
+        assert!(reason.contains("pdf"), "expected file extension in reason, got: {reason}");
     }
 
     #[test]

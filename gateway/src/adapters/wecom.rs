@@ -1357,12 +1357,13 @@ async fn download_wecom_file(
 
     if !is_text_file(filename) {
         info!(filename, "wecom: skipping non-text file");
+        let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
         return crate::schema::Attachment::rejected(
             "text_file",
             filename.to_string(),
             "application/octet-stream",
             bytes.len() as u64,
-            "unsupported format: only text files are supported",
+            format!("unsupported format: {ext}"),
         );
     }
 
