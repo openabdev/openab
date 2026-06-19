@@ -82,6 +82,7 @@ jobs:
           - { suffix: "-grok", dockerfile: "Dockerfile.grok", artifact: "grok" }
           - { suffix: "-antigravity", dockerfile: "Dockerfile.antigravity", artifact: "antigravity" }
           - { suffix: "-pi", dockerfile: "Dockerfile.pi", artifact: "pi" }
+          - { suffix: "-mimocode", dockerfile: "Dockerfile.mimocode", artifact: "mimocode" }
           - { suffix: "-native", dockerfile: "Dockerfile.native", artifact: "native" }
           - { suffix: "-native-sandbox", dockerfile: "openshell/Dockerfile", artifact: "nativesandbox" }
         platform:
@@ -152,6 +153,7 @@ jobs:
           - { suffix: "-grok", artifact: "grok" }
           - { suffix: "-antigravity", artifact: "antigravity" }
           - { suffix: "-pi", artifact: "pi" }
+          - { suffix: "-mimocode", artifact: "mimocode" }
           - { suffix: "-native", artifact: "native" }
           - { suffix: "-native-sandbox", artifact: "nativesandbox" }
     runs-on: ubuntu-latest
@@ -210,6 +212,7 @@ jobs:
           - { suffix: "-grok" }
           - { suffix: "-antigravity" }
           - { suffix: "-pi" }
+          - { suffix: "-mimocode" }
           - { suffix: "-native" }
           - { suffix: "-native-sandbox" }
     runs-on: ubuntu-latest
