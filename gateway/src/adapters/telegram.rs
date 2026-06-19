@@ -131,28 +131,20 @@ pub async fn webhook(
             let client = &state.client;
             if is_photo {
                 if let Some(largest) = msg.photo.iter().max_by_key(|p| p.width * p.height) {
-                    if let Some(att) =
-                        download_telegram_media(client, token, &largest.file_id, MediaKind::Image).await
-                    {
-                        attachments.push(att);
-                    }
+                    let att = download_telegram_media(client, token, &largest.file_id, MediaKind::Image).await;
+                    attachments.push(att);
                 }
             } else if let Some(doc) = msg.document {
                 let file_name = doc.file_name.unwrap_or_else(|| "unknown.txt".to_string());
                 let mime_type = doc.mime_type.unwrap_or_else(|| "text/plain".to_string());
-                if let Some(att) =
-                    download_telegram_document(client, token, &doc.file_id, &file_name, &mime_type).await
-                {
-                    attachments.push(att);
-                }
+                let att = download_telegram_document(client, token, &doc.file_id, &file_name, &mime_type).await;
+                attachments.push(att);
             } else if let Some(voice) = msg.voice {
-                if let Some(att) = download_telegram_media(client, token, &voice.file_id, MediaKind::Audio).await {
-                    attachments.push(att);
-                }
+                let att = download_telegram_media(client, token, &voice.file_id, MediaKind::Audio).await;
+                attachments.push(att);
             } else if let Some(audio) = msg.audio {
-                if let Some(att) = download_telegram_media(client, token, &audio.file_id, MediaKind::Audio).await {
-                    attachments.push(att);
-                }
+                let att = download_telegram_media(client, token, &audio.file_id, MediaKind::Audio).await;
+                attachments.push(att);
             }
         }
     }
@@ -609,7 +601,7 @@ async fn download_telegram_media(
     bot_token: &str,
     file_id: &str,
     kind: MediaKind,
-) -> Option<Attachment> {
+) -> Attachment {
     let att_type = match kind {
         MediaKind::Image => "image",
         MediaKind::Audio => "audio",
@@ -633,21 +625,21 @@ async fn download_telegram_media(
         Ok(r) => r,
         Err(e) => {
             warn!(file_id, error = %e, kind = ?kind, "Telegram getFile request failed");
-            return Some(Attachment::rejected(att_type, fallback_filename, default_mime, 0, "download failed: network error"));
+            return Attachment::rejected(att_type, fallback_filename, default_mime, 0, "download failed: network error");
         }
     };
     let body: serde_json::Value = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
             warn!(file_id, error = %e, kind = ?kind, "Telegram getFile JSON parse failed");
-            return Some(Attachment::rejected(att_type, fallback_filename, default_mime, 0, "download failed: network error"));
+            return Attachment::rejected(att_type, fallback_filename, default_mime, 0, "download failed: invalid API response");
         }
     };
     let file_path = match body["result"]["file_path"].as_str() {
         Some(p) => p,
         None => {
             warn!(file_id, kind = ?kind, "Telegram getFile response missing file_path");
-            return Some(Attachment::rejected(att_type, fallback_filename, default_mime, 0, "download failed: network error"));
+            return Attachment::rejected(att_type, fallback_filename, default_mime, 0, "download failed: invalid API response");
         }
     };
 
@@ -656,33 +648,33 @@ async fn download_telegram_media(
         Ok(r) => r,
         Err(e) => {
             warn!(file_id, error = %e, kind = ?kind, "Telegram media download request failed");
-            return Some(Attachment::rejected(att_type, fallback_filename, default_mime, 0, "download failed: network error"));
+            return Attachment::rejected(att_type, fallback_filename, default_mime, 0, "download failed: network error");
         }
     };
 
     if !resp.status().is_success() {
         let status = resp.status();
         warn!(file_id, status = status.as_u16(), kind = ?kind, "Telegram media HTTP error");
-        return Some(Attachment::rejected(
+        return Attachment::rejected(
             att_type,
             fallback_filename,
             default_mime,
             0,
             format!("download failed: HTTP {}", status.as_u16()),
-        ));
+        );
     }
 
     if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
             if size > max_size {
                 warn!(file_id, size, kind = ?kind, "Telegram media Content-Length exceeds limit");
-                return Some(Attachment::rejected(
+                return Attachment::rejected(
                     att_type,
                     fallback_filename,
                     default_mime,
                     size,
                     format!("size exceeded: {} exceeds {}", format_bytes(size), format_bytes(max_size)),
-                ));
+                );
             }
         }
     }
@@ -698,18 +690,18 @@ async fn download_telegram_media(
         Ok(b) => b,
         Err(e) => {
             warn!(file_id, error = %e, kind = ?kind, "Telegram media body read failed");
-            return Some(Attachment::rejected(att_type, fallback_filename, default_mime, 0, "download failed: body read error"));
+            return Attachment::rejected(att_type, fallback_filename, default_mime, 0, "download failed: body read error");
         }
     };
     if bytes.len() as u64 > max_size {
         warn!(file_id, size = bytes.len(), kind = ?kind, "Telegram media exceeds limit");
-        return Some(Attachment::rejected(
+        return Attachment::rejected(
             att_type,
             fallback_filename,
             default_mime,
             bytes.len() as u64,
             format!("size exceeded: {} exceeds {}", format_bytes(bytes.len() as u64), format_bytes(max_size)),
-        ));
+        );
     }
 
     let (data_bytes, mime) = match kind {
@@ -717,7 +709,7 @@ async fn download_telegram_media(
             Ok((c, m)) => (c, m),
             Err(e) => {
                 error!(err = %e, "Telegram image processing failed");
-                return Some(Attachment::rejected(att_type, fallback_filename, default_mime, bytes.len() as u64, "processing failed: image encoding error"));
+                return Attachment::rejected(att_type, fallback_filename, default_mime, bytes.len() as u64, "processing failed: image encoding error");
             }
         },
         MediaKind::Audio => (bytes.to_vec(), content_type),
@@ -728,12 +720,12 @@ async fn download_telegram_media(
         Some(p) => p,
         None => {
             warn!(file_id, kind = ?kind, "Telegram media store failed");
-            return Some(Attachment::rejected(att_type, fallback_filename, default_mime, data_bytes.len() as u64, "processing failed: storage error"));
+            return Attachment::rejected(att_type, fallback_filename, default_mime, data_bytes.len() as u64, "processing failed: storage error");
         }
     };
     info!(file_id, size = data_bytes.len(), kind = ?kind, "Telegram media stored");
 
-    Some(Attachment {
+    Attachment {
         attachment_type: att_type.into(),
         filename: format!("{}.{}", file_id, match kind {
             MediaKind::Image => "jpg",
@@ -744,7 +736,7 @@ async fn download_telegram_media(
         size: data_bytes.len() as u64,
         path: Some(path),
         status: None,
-    })
+    }
 }
 
 /// Download text document from Telegram → store to filesystem.
@@ -754,16 +746,21 @@ async fn download_telegram_document(
     file_id: &str,
     file_name: &str,
     mime_type: &str,
-) -> Option<Attachment> {
+) -> Attachment {
     if !crate::media::is_text_extension(file_name) {
         tracing::debug!(file_name, "skipping non-text file attachment");
-        return Some(Attachment::rejected(
+        let ext = std::path::Path::new(file_name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!(".{e}"))
+            .unwrap_or_else(|| mime_type.to_string());
+        return Attachment::rejected(
             "text_file",
             file_name.to_string(),
             mime_type,
             0,
-            format!("unsupported format: {}", mime_type),
-        ));
+            format!("unsupported format: {ext}"),
+        );
     }
 
     let get_file_url = format!("{TELEGRAM_API_BASE}/bot{}/getFile", bot_token);
@@ -771,21 +768,21 @@ async fn download_telegram_document(
         Ok(r) => r,
         Err(e) => {
             warn!(file_id, error = %e, "Telegram document getFile request failed");
-            return Some(Attachment::rejected("text_file", file_name.to_string(), mime_type, 0, "download failed: network error"));
+            return Attachment::rejected("text_file", file_name.to_string(), mime_type, 0, "download failed: network error");
         }
     };
     let body: serde_json::Value = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
             warn!(file_id, error = %e, "Telegram document getFile JSON parse failed");
-            return Some(Attachment::rejected("text_file", file_name.to_string(), mime_type, 0, "download failed: network error"));
+            return Attachment::rejected("text_file", file_name.to_string(), mime_type, 0, "download failed: network error");
         }
     };
     let file_path = match body["result"]["file_path"].as_str() {
         Some(p) => p,
         None => {
             warn!(file_id, "Telegram document getFile response missing file_path");
-            return Some(Attachment::rejected("text_file", file_name.to_string(), mime_type, 0, "download failed: network error"));
+            return Attachment::rejected("text_file", file_name.to_string(), mime_type, 0, "download failed: network error");
         }
     };
 
@@ -794,32 +791,32 @@ async fn download_telegram_document(
         Ok(r) => r,
         Err(e) => {
             warn!(file_id, err = %e, "Telegram document network error");
-            return Some(Attachment::rejected("text_file", file_name.to_string(), mime_type, 0, "download failed: network error"));
+            return Attachment::rejected("text_file", file_name.to_string(), mime_type, 0, "download failed: network error");
         }
     };
     if !resp.status().is_success() {
         let status = resp.status();
         warn!(file_id, status = status.as_u16(), "Telegram document HTTP error");
-        return Some(Attachment::rejected(
+        return Attachment::rejected(
             "text_file",
             file_name.to_string(),
             mime_type,
             0,
             format!("download failed: HTTP {}", status.as_u16()),
-        ));
+        );
     }
 
     if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
             if size > FILE_MAX_DOWNLOAD {
                 warn!(file_id, size, "Telegram document Content-Length exceeds limit");
-                return Some(Attachment::rejected(
+                return Attachment::rejected(
                     "text_file",
                     file_name.to_string(),
                     mime_type,
                     size,
                     format!("size exceeded: {} exceeds {}", format_bytes(size), format_bytes(FILE_MAX_DOWNLOAD)),
-                ));
+                );
             }
         }
     }
@@ -828,42 +825,42 @@ async fn download_telegram_document(
         Ok(b) => b,
         Err(e) => {
             warn!(file_id, error = %e, "Telegram document body read failed");
-            return Some(Attachment::rejected("text_file", file_name.to_string(), mime_type, 0, "download failed: body read error"));
+            return Attachment::rejected("text_file", file_name.to_string(), mime_type, 0, "download failed: body read error");
         }
     };
     if bytes.len() as u64 > FILE_MAX_DOWNLOAD {
         warn!(file_id, size = bytes.len(), "Telegram document exceeds limit");
-        return Some(Attachment::rejected(
+        return Attachment::rejected(
             "text_file",
             file_name.to_string(),
             mime_type,
             bytes.len() as u64,
             format!("size exceeded: {} exceeds {}", format_bytes(bytes.len() as u64), format_bytes(FILE_MAX_DOWNLOAD)),
-        ));
+        );
     }
 
     // Validate UTF-8 — reject binary files
     if String::from_utf8(bytes.to_vec()).is_err() {
         warn!(file_id, file_name, "Telegram document is not valid UTF-8, skipping");
-        return Some(Attachment::rejected(
+        return Attachment::rejected(
             "text_file",
             file_name.to_string(),
             mime_type,
             bytes.len() as u64,
             "invalid content: not valid UTF-8",
-        ));
+        );
     }
 
     let path = match store::store_media(&bytes).await {
         Some(p) => p,
         None => {
             warn!(file_id, file_name, "Telegram document store failed");
-            return Some(Attachment::rejected("text_file", file_name.to_string(), mime_type, bytes.len() as u64, "processing failed: storage error"));
+            return Attachment::rejected("text_file", file_name.to_string(), mime_type, bytes.len() as u64, "processing failed: storage error");
         }
     };
     info!(file_id, file_name, size = bytes.len(), "Telegram document stored");
 
-    Some(Attachment {
+    Attachment {
         attachment_type: "text_file".into(),
         filename: file_name.to_string(),
         mime_type: mime_type.to_string(),
@@ -871,12 +868,29 @@ async fn download_telegram_document(
         size: bytes.len() as u64,
         path: Some(path),
         status: None,
-    })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn download_telegram_document_rejects_non_text_extension() {
+        let client = reqwest::Client::new();
+        let att = download_telegram_document(
+            &client,
+            "fake-token",
+            "file123",
+            "report.pdf",
+            "application/pdf",
+        )
+        .await;
+        assert!(att.status.is_some(), "non-text extension must have status set");
+        let reason = att.status.unwrap();
+        assert!(reason.contains("unsupported format"), "got: {reason}");
+        assert!(reason.contains(".pdf"), "expected file extension in reason, got: {reason}");
+    }
 
     #[test]
     fn test_is_markdown_parse_error() {

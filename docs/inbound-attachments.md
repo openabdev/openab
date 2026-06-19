@@ -59,7 +59,7 @@ OpenAB can create the ACP image block, but downstream coding agents and selected
 
 ### Unsupported Types
 
-Binary files (zip, pdf, exe, docx), video, and stickers are **silently skipped**. The agent does not receive any notification that a file was sent.
+Binary files (zip, pdf, exe, docx), video, and stickers are **rejected with a status reason**. The agent receives a `[System: attachment "..." was not delivered — unsupported format: ...]` notification so it can inform the user.
 
 ## Size Limits
 

@@ -800,7 +800,7 @@ impl EventHandler for Handler {
                         failed_image_files.push(attachment.filename.clone());
                         extra_blocks.push(ContentBlock::Text {
                             text: format!(
-                                "[Attachment `{}` was not delivered: {}]",
+                                "[System: attachment \"{}\" was not delivered — processing failed: {}]",
                                 attachment.filename, e
                             ),
                         });

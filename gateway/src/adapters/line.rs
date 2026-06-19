@@ -412,7 +412,7 @@ pub async fn download_line_image(
             Ok(None) => break,
             Err(e) => {
                 warn!(message_id, error = %e, "LINE image download failed while reading body");
-                return rejected("download failed: network error".into());
+                return rejected("download failed: body read error".into());
             }
         };
         body.extend_from_slice(&chunk);
