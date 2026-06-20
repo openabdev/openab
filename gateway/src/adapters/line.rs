@@ -286,7 +286,7 @@ async fn build_gateway_event_from_line_event(
                 );
                 attachments.push(Attachment {
                     attachment_type: "audio".into(),
-                    filename: format!("line_{}.ogg", msg.id),
+                    filename: format!("line_{}.audio", msg.id),
                     mime_type: "audio/ogg".into(),
                     data: String::new(),
                     size: 0,
@@ -303,7 +303,7 @@ async fn build_gateway_event_from_line_event(
                     warn!(message_id = %msg.id, "LINE audio received but LINE_CHANNEL_ACCESS_TOKEN is not configured");
                     attachments.push(Attachment {
                         attachment_type: "audio".into(),
-                        filename: format!("line_{}.ogg", msg.id),
+                        filename: format!("line_{}.audio", msg.id),
                         mime_type: "audio/ogg".into(),
                         data: String::new(),
                         size: 0,
@@ -537,7 +537,7 @@ pub async fn download_line_audio(
         Err(e) => {
             warn!(message_id, error = %e, "LINE audio download failed");
             return rejected(
-                format!("line_{}.ogg", message_id),
+                format!("line_{}.audio", message_id),
                 "audio/ogg".into(),
                 0,
                 "download failed: network error".into(),
@@ -549,7 +549,7 @@ pub async fn download_line_audio(
         let http_status = resp.status().as_u16();
         warn!(message_id, status = %resp.status(), "LINE audio download failed");
         return rejected(
-            format!("line_{}.ogg", message_id),
+            format!("line_{}.audio", message_id),
             "audio/ogg".into(),
             0,
             format!("download failed: HTTP {http_status}"),
