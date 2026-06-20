@@ -84,6 +84,10 @@ https://your-gateway-host/webhook/feishu
 | — | `FEISHU_ALLOW_USER_MESSAGES` | `multibot-mentions` | Thread response mode: `multibot-mentions` / `involved` / `mentions`. See below. |
 | `gateway.botUsername` | — | — | Set to bot's `open_id` for @mention gating |
 | `gateway.streaming` | — | `false` | Enable streaming (typewriter) mode |
+| `cardStreaming.mode` | `FEISHU_CARD_STREAMING_MODE` | `auto` | Card streaming mode: `auto` (short→post, long/code/table→card), `card` (always card), `post` (disable — kill-switch) |
+| `cardStreaming.fallbackToPost` | `FEISHU_CARD_FALLBACK_TO_POST` | `true` | Fall back to a post message if a card API call fails |
+| `cardStreaming.promoteBytes` | `FEISHU_CARD_PROMOTE_BYTES` | `4000` | Byte threshold for auto-promoting a plain-text reply to a card |
+| `cardStreaming.idleFinalizeMs` | `FEISHU_CARD_IDLE_FINALIZE_MS` | `3000` | Idle window (ms) before a streaming card is finalized |
 
 ## @mention Gating
 
@@ -188,6 +192,36 @@ streaming = true
 ```
 
 The gateway platform must support message editing (Feishu/Lark do). Platforms that don't support editing should leave `streaming = false` (default).
+
+## Card Streaming
+
+By default (`FEISHU_CARD_STREAMING_MODE=auto`), streaming replies render as
+**interactive CardKit cards** when the content warrants it. Cards have no
+20-edit cap (errcode 230072) and render markdown — including **tables** and code
+blocks — natively, which a `post` message cannot.
+
+| Mode | Behavior |
+|---|---|
+| `auto` (default) | Short replies stay as a `post` (native reply UI); long replies, or any reply containing a code fence or a markdown table, promote to a card. |
+| `card` | Every reply is sent as a card from the first message. |
+| `post` | Card streaming disabled — post-only behavior (the kill-switch). |
+
+Notes:
+
+- **Auto promotion is one-way**: a reply starts as a post and, once promoted,
+  stays a card. Promotion deletes the post placeholder (shown as "message
+  recalled" in Feishu) and re-sends as a card. In `card` mode the first reply is
+  a card from the start, so there is no placeholder and no recall.
+- **Finalize**: after ~`FEISHU_CARD_IDLE_FINALIZE_MS` ms with no further edits,
+  the card is rebuilt as a static card so the typewriter cursor settles and the
+  markdown re-renders cleanly.
+- **Fallback**: if a card API call fails and `FEISHU_CARD_FALLBACK_TO_POST` is
+  `true` (default), the gateway falls back to the post path (with the edit-cap
+  recovery), so a reply is never lost.
+- **Tables wrapped in a code fence**: agents sometimes wrap a markdown table in a
+  bare ``` fence for monospace alignment in environments that don't render
+  tables. On the card path the gateway unwraps a fence whose body is exactly one
+  table so it renders as a native table.
 
 ## Thread (Topic) Replies
 

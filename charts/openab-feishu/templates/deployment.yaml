@@ -123,6 +123,15 @@ spec:
             - name: FEISHU_ALLOWED_USERS
               value: {{ join "," .Values.platform.allowedUsers | quote }}
             {{- end }}
+            # Card streaming (interactive cards for streaming replies)
+            - name: FEISHU_CARD_STREAMING_MODE
+              value: {{ .Values.cardStreaming.mode | quote }}
+            - name: FEISHU_CARD_FALLBACK_TO_POST
+              value: {{ .Values.cardStreaming.fallbackToPost | quote }}
+            - name: FEISHU_CARD_PROMOTE_BYTES
+              value: {{ .Values.cardStreaming.promoteBytes | quote }}
+            - name: FEISHU_CARD_IDLE_FINALIZE_MS
+              value: {{ .Values.cardStreaming.idleFinalizeMs | quote }}
           volumeMounts:
             {{- if .Values.persistence.enabled }}
             - name: data

@@ -299,6 +299,20 @@ async fn main() -> Result<()> {
     // Resolve feishu bot identity early (needed for mention gating in both modes)
     if let Some(ref f) = feishu {
         f.resolve_bot_identity().await;
+        // Card-streaming idle-finalize reaper: only when streaming is enabled.
+        // With mode=post (default) no sessions are ever created, so spawning it
+        // would just idle — skip entirely to keep the default path untouched.
+        if f.config.streaming_mode != adapters::feishu::StreamingMode::Post {
+            let sessions = f.stream_sessions.clone();
+            let token_cache = f.token_cache.clone();
+            let client = f.client.clone();
+            let api_base = f.config.api_base();
+            let idle_ms = f.config.card_idle_finalize_ms;
+            tokio::spawn(adapters::feishu::run_idle_reaper(
+                sessions, token_cache, client, api_base, idle_ms,
+            ));
+            info!(idle_ms, "feishu card-streaming idle reaper started");
+        }
     }
 
     // Google Chat adapter

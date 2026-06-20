@@ -72,6 +72,7 @@ Under **Permissions & Scopes**, add these scopes:
 | `im:message.p2p_msg:readonly` | Read DM messages |
 | `im:resource` | Download images/files from messages |
 | `contact:user.base:readonly` | Resolve user display names |
+| `cardkit:card:write` | Create/update interactive streaming cards (required for card streaming, on by default) |
 
 ### 5. Publish
 
@@ -189,6 +190,10 @@ helm install my-bot ./charts/openab-feishu \
 | `platform.requireMention` | `true` | Require @mention in groups |
 | `platform.allowedGroups` | `[]` | Allowed group chat IDs |
 | `platform.allowedUsers` | `[]` | Allowed user open_ids |
+| `cardStreaming.mode` | `"auto"` | Card streaming: `auto` / `card` / `post` (kill-switch) |
+| `cardStreaming.fallbackToPost` | `true` | Fall back to post if a card API call fails |
+| `cardStreaming.promoteBytes` | `4000` | Byte threshold for auto-promoting to a card |
+| `cardStreaming.idleFinalizeMs` | `3000` | Idle window (ms) before finalizing a card |
 | `persistence.enabled` | `true` | Enable PVC for agent state |
 | `persistence.size` | `"1Gi"` | PVC size |
 

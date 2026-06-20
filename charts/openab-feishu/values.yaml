@@ -93,6 +93,21 @@ platform:
   # -- Feishu user open_ids allowed (empty = all users)
   allowedUsers: []
 
+# -- Card streaming: render streaming replies as interactive CardKit cards
+# (no 20-edit cap, native markdown / table rendering).
+cardStreaming:
+  # -- "auto" (default: short replies stay as post, long / code / table replies
+  #    promote to a card), "card" (always card), or "post" (kill-switch: disable
+  #    card streaming, back to post-only behavior).
+  mode: "auto"
+  # -- Fall back to a post message if a card API call fails (recommended).
+  fallbackToPost: true
+  # -- Byte threshold at which a plain-text reply auto-promotes to a card.
+  promoteBytes: 4000
+  # -- Idle window (ms) after which a streaming card with no further edits is
+  #    finalized (typewriter cursor settles, markdown re-renders).
+  idleFinalizeMs: 3000
+
 # -- Persistence for agent working directory
 persistence:
   enabled: true
