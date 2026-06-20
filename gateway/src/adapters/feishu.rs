@@ -110,13 +110,15 @@ pub enum StreamingMode {
 impl StreamingMode {
     /// Parse from the `FEISHU_CARD_STREAMING_MODE` env value.
     ///
-    /// Unknown, empty, or unset values fall back to `Post` (today's behavior),
-    /// mirroring the lenient parsing of the other Feishu enums (`AllowBots`,
-    /// `AllowUsers`).
+    /// - `""` or `"auto"` → `Auto` (matches `Default::default()`, so an empty
+    ///   env var and an unset env var have identical semantics).
+    /// - `"card"` → `Card`.
+    /// - Any other value (including unknown strings) → `Post` (safe fallback,
+    ///   preserves today's behavior for operators who set an unrecognised value).
     fn parse(s: &str) -> Self {
         match s.trim().to_lowercase().as_str() {
+            "" | "auto" => StreamingMode::Auto,
             "card" => StreamingMode::Card,
-            "auto" => StreamingMode::Auto,
             _ => StreamingMode::Post,
         }
     }
@@ -639,7 +641,7 @@ pub use event_types::*;
 // ---------------------------------------------------------------------------
 
 pub struct DedupeCache {
-    seen: std::sync::Mutex<HashMap<String, Instant>>,
+    seen: parking_lot::Mutex<HashMap<String, Instant>>,
     ttl_secs: u64,
     max_size: usize,
 }
@@ -647,7 +649,7 @@ pub struct DedupeCache {
 impl DedupeCache {
     pub fn new(ttl_secs: u64) -> Self {
         Self {
-            seen: std::sync::Mutex::new(HashMap::new()),
+            seen: parking_lot::Mutex::new(HashMap::new()),
             ttl_secs,
             max_size: 10_000,
         }
@@ -655,7 +657,7 @@ impl DedupeCache {
 
     /// Returns true if this id was already seen (duplicate).
     pub fn is_duplicate(&self, id: &str) -> bool {
-        let mut map = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.seen.lock();
         // Lazy sweep
         if map.len() >= self.max_size {
             map.retain(|_, ts| ts.elapsed().as_secs() < self.ttl_secs);
@@ -780,17 +782,17 @@ pub struct FeishuAdapter {
     pub bot_open_id: Arc<RwLock<Option<String>>>,
     pub dedupe: Arc<DedupeCache>,
     pub rate_limiter: Arc<RateLimiter>,
-    pub name_cache: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    pub name_cache: Arc<parking_lot::Mutex<HashMap<String, String>>>,
     /// Per-channel bot turn counter. Key = chat_id, Value = (count, last_reset).
     /// Human message resets count to 0. Prevents runaway bot-to-bot loops.
-    pub bot_turns: Arc<std::sync::Mutex<HashMap<String, u32>>>, // eviction: human msg resets; follow-up can add TTL like participated_threads
+    pub bot_turns: Arc<parking_lot::Mutex<HashMap<String, u32>>>, // eviction: human msg resets; follow-up can add TTL like participated_threads
     /// Positive-only cache: thread_id (root_id) → last_replied_at.
     /// When bot has replied in a thread, subsequent messages in that thread
     /// bypass @mention gating (like Discord's "involved" mode).
-    pub participated_threads: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    pub participated_threads: Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
     /// Positive-only cache: thread_id → first_seen for threads where other bots
     /// have posted. Used by multibot-mentions mode to require @mention.
-    pub multibot_threads: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    pub multibot_threads: Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
     /// Per-message edit count tracker for Feishu's 20-edits-per-message hard cap
     /// (errcode 230072 — "The message has reached the number of times it can be edited").
     /// Insertion-order FIFO eviction: when over `EDIT_COUNTS_CACHE_MAX`, the
@@ -800,12 +802,12 @@ pub struct FeishuAdapter {
     /// 4096 newer messages have been inserted behind it; that resets its count
     /// to 1, which is acceptable — it only loses the local preemptive margin and
     /// the on-wire 230072 sentinel still backstops.)
-    pub edit_counts: Arc<std::sync::Mutex<EditCountsCache>>,
+    pub edit_counts: Arc<parking_lot::Mutex<EditCountsCache>>,
     /// Active card-streaming sessions (S5), keyed by the placeholder post
     /// message_id (`om_post`) that core believes it is editing. A session
     /// exists only after a reply is promoted from post to card; empty unless
     /// `streaming_mode` is `card` / `auto`. FIFO eviction lives in the registry.
-    pub stream_sessions: Arc<std::sync::Mutex<feishu_card::FeishuStreamRegistry>>,
+    pub stream_sessions: Arc<parking_lot::Mutex<feishu_card::FeishuStreamRegistry>>,
     pub client: reqwest::Client,
 }
 
@@ -834,12 +836,12 @@ impl FeishuAdapter {
             dedupe,
             rate_limiter,
             bot_open_id: Arc::new(RwLock::new(None)),
-            name_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            bot_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            participated_threads: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            multibot_threads: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            edit_counts: Arc::new(std::sync::Mutex::new(EditCountsCache::default())),
-            stream_sessions: Arc::new(std::sync::Mutex::new(
+            name_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            bot_turns: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            participated_threads: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            multibot_threads: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            edit_counts: Arc::new(parking_lot::Mutex::new(EditCountsCache::default())),
+            stream_sessions: Arc::new(parking_lot::Mutex::new(
                 feishu_card::FeishuStreamRegistry::default(),
             )),
             client: reqwest::Client::new(),
@@ -992,10 +994,10 @@ async fn ws_connect_loop(
     client: &reqwest::Client,
     event_tx: &broadcast::Sender<String>,
     shutdown_rx: &mut watch::Receiver<bool>,
-    name_cache: &Arc<std::sync::Mutex<HashMap<String, String>>>,
-    bot_turns: &Arc<std::sync::Mutex<HashMap<String, u32>>>,
-    participated_threads: &Arc<std::sync::Mutex<HashMap<String, Instant>>>,
-    multibot_threads: &Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    name_cache: &Arc<parking_lot::Mutex<HashMap<String, String>>>,
+    bot_turns: &Arc<parking_lot::Mutex<HashMap<String, u32>>>,
+    participated_threads: &Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
+    multibot_threads: &Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
 ) -> anyhow::Result<()> {
     let api_base = config.api_base();
 
@@ -1081,12 +1083,12 @@ async fn handle_ws_message(
     dedupe: &Arc<DedupeCache>,
     config: &FeishuConfig,
     event_tx: &broadcast::Sender<String>,
-    name_cache: &Arc<std::sync::Mutex<HashMap<String, String>>>,
+    name_cache: &Arc<parking_lot::Mutex<HashMap<String, String>>>,
     token_cache: &Arc<FeishuTokenCache>,
     client: &reqwest::Client,
-    bot_turns: &Arc<std::sync::Mutex<HashMap<String, u32>>>,
-    participated_threads: &Arc<std::sync::Mutex<HashMap<String, Instant>>>,
-    multibot_threads: &Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    bot_turns: &Arc<parking_lot::Mutex<HashMap<String, u32>>>,
+    participated_threads: &Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
+    multibot_threads: &Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
 ) {
     let envelope: FeishuEventEnvelope = match serde_json::from_str(text) {
         Ok(e) => e,
@@ -1140,7 +1142,7 @@ async fn handle_ws_message(
         // Bot turn tracking: prevent runaway bot-to-bot loops
         let channel_id = &gateway_event.channel.id;
         {
-            let mut turns = bot_turns.lock().unwrap_or_else(|e| e.into_inner());
+            let mut turns = bot_turns.lock();
             if gateway_event.sender.is_bot {
                 let count = turns.entry(channel_id.to_string()).or_insert(0);
                 *count += 1;
@@ -1208,13 +1210,13 @@ async fn handle_ws_message(
 /// Resolve user display name from open_id via Contact API, with caching.
 async fn resolve_user_name(
     open_id: &str,
-    name_cache: &Arc<std::sync::Mutex<HashMap<String, String>>>,
+    name_cache: &Arc<parking_lot::Mutex<HashMap<String, String>>>,
     token_cache: &Arc<FeishuTokenCache>,
     client: &reqwest::Client,
     api_base: &str,
 ) -> String {
     {
-        let cache = name_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = name_cache.lock();
         if let Some(name) = cache.get(open_id) {
             return name.clone();
         }
@@ -1239,7 +1241,7 @@ async fn resolve_user_name(
     // Only cache successful resolutions — don't cache fallback open_id
     // so retries can succeed after permissions are granted.
     if let Some(ref name) = resolved {
-        let mut cache = name_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = name_cache.lock();
         if cache.len() < 10_000 {
             cache.insert(open_id.to_string(), name.clone());
         }
@@ -1315,10 +1317,10 @@ pub enum EditOutcome {
 /// lowest-count entries) so active streams are not bumped out from under
 /// themselves.
 fn increment_edit_count(
-    cache: &Arc<std::sync::Mutex<EditCountsCache>>,
+    cache: &Arc<parking_lot::Mutex<EditCountsCache>>,
     message_id: &str,
 ) {
-    let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let mut c = cache.lock();
     let was_new = !c.counts.contains_key(message_id);
     let entry = c.counts.entry(message_id.to_string()).or_insert(0);
     if *entry != u32::MAX {
@@ -1334,10 +1336,10 @@ fn increment_edit_count(
 /// call and signal `EditOutcome::CapReached` directly so the core finalize
 /// path can take over.
 fn mark_edit_cap(
-    cache: &Arc<std::sync::Mutex<EditCountsCache>>,
+    cache: &Arc<parking_lot::Mutex<EditCountsCache>>,
     message_id: &str,
 ) {
-    let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let mut c = cache.lock();
     let was_new = !c.counts.contains_key(message_id);
     c.counts.insert(message_id.to_string(), u32::MAX);
     if was_new {
@@ -1365,10 +1367,10 @@ fn evict_if_overcap(c: &mut EditCountsCache) {
 /// Return true if this message_id has already reached the edit cap (either
 /// tracked locally or marked via 230072 sentinel).
 fn is_edit_cap_reached(
-    cache: &Arc<std::sync::Mutex<EditCountsCache>>,
+    cache: &Arc<parking_lot::Mutex<EditCountsCache>>,
     message_id: &str,
 ) -> bool {
-    let c = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let c = cache.lock();
     c.counts
         .get(message_id)
         .is_some_and(|&n| n >= FEISHU_EDIT_CAP)
@@ -2375,7 +2377,7 @@ async fn remove_reaction(adapter: &FeishuAdapter, message_id: &str, emoji: &str)
 /// (non-expired) participation entry in the cache.
 fn check_thread_participated(
     envelope: &FeishuEventEnvelope,
-    cache: &Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    cache: &Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
     session_ttl_secs: u64,
 ) -> bool {
     envelope
@@ -2386,7 +2388,7 @@ fn check_thread_participated(
         .map(|tid| {
             // Intentionally recover from poisoned mutex — cache data loss is acceptable
             // and preferable to panicking the gateway.
-            let c = cache.lock().unwrap_or_else(|e| e.into_inner());
+            let c = cache.lock();
             c.get(tid).is_some_and(|ts| ts.elapsed().as_secs() < session_ttl_secs)
         })
         .unwrap_or(false)
@@ -2407,8 +2409,8 @@ fn detect_and_mark_multibot(
     envelope: &FeishuEventEnvelope,
     bot_open_id: Option<&str>,
     config: &FeishuConfig,
-    participated_threads: &Arc<std::sync::Mutex<HashMap<String, Instant>>>,
-    multibot_threads: &Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    participated_threads: &Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
+    multibot_threads: &Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
 ) -> bool {
     let self_participated = check_thread_participated(
         envelope, participated_threads, config.session_ttl_secs,
@@ -2449,7 +2451,7 @@ fn detect_and_mark_multibot(
 
                 if mentions_other_bot {
                     info!(thread_id = %tid, "multibot thread detected via @mention");
-                    let mut cache = multibot_threads.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut cache = multibot_threads.lock();
                     cache.entry(tid.to_string()).or_insert_with(Instant::now);
                     if cache.len() > PARTICIPATION_CACHE_MAX {
                         cache.retain(|_, ts| ts.elapsed().as_secs() < config.session_ttl_secs);
@@ -2469,7 +2471,7 @@ fn detect_and_mark_multibot(
             } else {
                 thread_id_for_check
                     .map(|tid| {
-                        let cache = multibot_threads.lock().unwrap_or_else(|e| e.into_inner());
+                        let cache = multibot_threads.lock();
                         cache
                             .get(tid)
                             .is_none_or(|ts| ts.elapsed().as_secs() >= config.session_ttl_secs)
@@ -2483,7 +2485,7 @@ fn detect_and_mark_multibot(
 /// Record that the bot has participated in a thread. Evicts oldest entries
 /// when the cache exceeds PARTICIPATION_CACHE_MAX.
 fn record_participation(
-    cache: &Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    cache: &Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
     thread_id: &str,
     session_ttl_secs: u64,
 ) {
@@ -2492,7 +2494,7 @@ fn record_participation(
     }
     // Intentionally recover from poisoned mutex — cache data loss is acceptable
     // and preferable to panicking the gateway.
-    let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = cache.lock();
     map.insert(thread_id.to_string(), Instant::now());
     // Evict if over capacity: first drop expired entries, then oldest half if still over
     if map.len() > PARTICIPATION_CACHE_MAX {
@@ -2586,8 +2588,7 @@ pub async fn handle_reply(
                 let card_msg = {
                     let mut reg = adapter
                         .stream_sessions
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                        .lock();
                     reg.remove(&reply.reply_to).map(|s| s.card_message_id)
                 };
                 let target = card_msg.as_deref().unwrap_or(&reply.reply_to);
@@ -2814,8 +2815,7 @@ async fn handle_card_edit(
     let existing = {
         let mut reg = adapter
             .stream_sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .lock();
         match reg.get_mut(&om_post) {
             None => Existing::None,
             Some(s) if s.finalized => Existing::Finalized,
@@ -2879,8 +2879,7 @@ async fn handle_card_edit(
                     let card_msg = {
                         let mut reg = adapter
                             .stream_sessions
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
+                            .lock();
                         reg.remove(&om_post).map(|s| s.card_message_id)
                     };
                     if adapter.config.card_fallback_to_post {
@@ -2999,8 +2998,7 @@ async fn promote_and_respond(
     {
         let mut reg = adapter
             .stream_sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .lock();
         reg.promote(&om_post, card_id, card_msg_id, text.to_string());
     }
     tracing::info!(om_post = %om_post, "feishu reply promoted post → card");
@@ -3080,8 +3078,7 @@ async fn try_send_initial_card(
     {
         let mut reg = adapter
             .stream_sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .lock();
         reg.promote(&card_msg_id, card_id, card_msg_id.clone(), text.to_string());
     }
     // Mirror the post path's self-echo dedupe + thread participation tracking.
@@ -3106,7 +3103,7 @@ async fn try_send_initial_card(
 /// them eventually. Spawned once at startup (main.rs), only when
 /// `streaming_mode != post`.
 pub async fn run_idle_reaper(
-    stream_sessions: Arc<std::sync::Mutex<feishu_card::FeishuStreamRegistry>>,
+    stream_sessions: Arc<parking_lot::Mutex<feishu_card::FeishuStreamRegistry>>,
     token_cache: Arc<FeishuTokenCache>,
     client: reqwest::Client,
     api_base: String,
@@ -3116,14 +3113,14 @@ pub async fn run_idle_reaper(
     loop {
         tokio::time::sleep(tick).await;
         let keys = {
-            let reg = stream_sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let reg = stream_sessions.lock();
             reg.idle_keys(idle_ms)
         };
         for key in keys {
             // Mark finalized + grab (card_id, next seq) under the lock so two
             // reaper ticks can't double-finalize the same session.
             let target = {
-                let mut reg = stream_sessions.lock().unwrap_or_else(|e| e.into_inner());
+                let mut reg = stream_sessions.lock();
                 match reg.get_mut(&key) {
                     Some(s) if !s.finalized => {
                         s.mark_finalized();
@@ -3197,7 +3194,7 @@ const WEBHOOK_BODY_LIMIT: usize = 1_048_576;
 
 /// Simple per-IP rate limiter state.
 pub struct RateLimiter {
-    counts: std::sync::Mutex<HashMap<String, (u64, Instant)>>,
+    counts: parking_lot::Mutex<HashMap<String, (u64, Instant)>>,
     window_secs: u64,
     max_requests: u64,
 }
@@ -3205,7 +3202,7 @@ pub struct RateLimiter {
 impl RateLimiter {
     pub fn new(window_secs: u64, max_requests: u64) -> Self {
         Self {
-            counts: std::sync::Mutex::new(HashMap::new()),
+            counts: parking_lot::Mutex::new(HashMap::new()),
             window_secs,
             max_requests,
         }
@@ -3213,7 +3210,7 @@ impl RateLimiter {
 
     /// Returns true if the request should be rejected (rate exceeded).
     pub fn check(&self, key: &str) -> bool {
-        let mut map = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.counts.lock();
         // Lazy cleanup
         if map.len() > 4096 {
             map.retain(|_, (_, ts)| ts.elapsed().as_secs() < self.window_secs);
@@ -3527,8 +3524,11 @@ mod tests {
     }
 
     #[test]
-    fn streaming_mode_parse_falls_back_to_post() {
-        assert_eq!(StreamingMode::parse(""), StreamingMode::Post);
+    fn streaming_mode_parse() {
+        // Empty → Auto, matching Default::default() (unset env var == empty env var).
+        assert_eq!(StreamingMode::parse(""), StreamingMode::Auto);
+        assert_eq!(StreamingMode::parse("auto"), StreamingMode::Auto);
+        assert_eq!(StreamingMode::parse("AUTO"), StreamingMode::Auto);
         assert_eq!(StreamingMode::parse("post"), StreamingMode::Post);
         assert_eq!(StreamingMode::parse("POST"), StreamingMode::Post);
         // Unknown / garbage values must not silently enable the feature.
@@ -3981,7 +3981,7 @@ mod tests {
 
         let config = test_config();
         let token_cache = Arc::new(FeishuTokenCache::with_base(&config, &server.uri()));
-        let name_cache = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let name_cache = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let client = reqwest::Client::new();
 
         let name = resolve_user_name("ou_user1", &name_cache, &token_cache, &client, &server.uri()).await;
@@ -4012,7 +4012,7 @@ mod tests {
 
         let config = test_config();
         let token_cache = Arc::new(FeishuTokenCache::with_base(&config, &server.uri()));
-        let name_cache = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let name_cache = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let client = reqwest::Client::new();
 
         let name = resolve_user_name("ou_unknown", &name_cache, &token_cache, &client, &server.uri()).await;
@@ -4190,16 +4190,16 @@ mod tests {
 
     #[test]
     fn record_participation_and_eviction() {
-        let cache = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let cache = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         // Record a thread
         record_participation(&cache, "thread_1", 86400);
-        assert_eq!(cache.lock().unwrap().len(), 1);
+        assert_eq!(cache.lock().len(), 1);
         // Fill beyond PARTICIPATION_CACHE_MAX
         for i in 0..PARTICIPATION_CACHE_MAX + 10 {
             record_participation(&cache, &format!("thread_{i}"), 86400);
         }
         // After eviction, should be roughly half
-        assert!(cache.lock().unwrap().len() <= PARTICIPATION_CACHE_MAX);
+        assert!(cache.lock().len() <= PARTICIPATION_CACHE_MAX);
     }
 
     // --- Multibot-mentions mode tests ---
@@ -4382,8 +4382,8 @@ mod tests {
 
     // --- Edit-cap helpers (F3/F4/F8/F10): no network required ---
 
-    fn fresh_cache() -> Arc<std::sync::Mutex<EditCountsCache>> {
-        Arc::new(std::sync::Mutex::new(EditCountsCache::default()))
+    fn fresh_cache() -> Arc<parking_lot::Mutex<EditCountsCache>> {
+        Arc::new(parking_lot::Mutex::new(EditCountsCache::default()))
     }
 
     #[test]
@@ -4452,7 +4452,7 @@ mod tests {
         mark_edit_cap(&cache, "om_msg1");
         increment_edit_count(&cache, "om_msg1");
         // Increment must not push past u32::MAX sentinel.
-        let map = cache.lock().unwrap();
+        let map = cache.lock();
         assert_eq!(map.counts.get("om_msg1").copied(), Some(u32::MAX));
     }
 
@@ -4473,7 +4473,7 @@ mod tests {
         // survive.
         increment_edit_count(&cache, "om_active_recent");
 
-        let map = cache.lock().unwrap();
+        let map = cache.lock();
         // FIFO eviction: the newest insert must still be present.
         assert!(
             map.counts.contains_key("om_active_recent"),
@@ -4590,7 +4590,7 @@ mod tests {
             matches!(outcome, EditOutcome::Edited),
             "HTTP 200 + code 0 must yield Edited"
         );
-        let map = adapter.edit_counts.lock().unwrap();
+        let map = adapter.edit_counts.lock();
         assert_eq!(map.counts.get("om_ok").copied(), Some(1));
     }
 
@@ -4618,7 +4618,7 @@ mod tests {
             "HTTP 200 + code 99991 must yield Failed, not Edited"
         );
         // Failure must NOT increment the edit count.
-        let map = adapter.edit_counts.lock().unwrap();
+        let map = adapter.edit_counts.lock();
         assert_eq!(map.counts.get("om_err").copied(), None);
     }
 
@@ -4763,7 +4763,7 @@ mod tests {
         handle_reply(&edit_reply("om_ph1", "short reply", None, Some("r1")), &adapter, &tx).await;
 
         assert!(
-            adapter.stream_sessions.lock().unwrap().is_empty(),
+            adapter.stream_sessions.lock().is_empty(),
             "post mode must not create a session"
         );
         let resp: crate::schema::GatewayResponse =
@@ -4814,7 +4814,7 @@ mod tests {
         .await;
 
         {
-            let reg = adapter.stream_sessions.lock().unwrap();
+            let reg = adapter.stream_sessions.lock();
             let s = reg.get("om_ph2").expect("session created on promote");
             assert_eq!(s.card_id, "card777");
             assert_eq!(s.card_message_id, "om_cardmsg");
@@ -4849,7 +4849,7 @@ mod tests {
         config.api_base_override = Some(server.uri());
         config.streaming_mode = StreamingMode::Card;
         let adapter = FeishuAdapter::new(config);
-        adapter.stream_sessions.lock().unwrap().promote(
+        adapter.stream_sessions.lock().promote(
             "om_ph3",
             "card777".into(),
             "om_cardmsg".into(),
@@ -4898,7 +4898,7 @@ mod tests {
         config.api_base_override = Some(server.uri());
         config.streaming_mode = StreamingMode::Card;
         let adapter = FeishuAdapter::new(config);
-        adapter.stream_sessions.lock().unwrap().promote(
+        adapter.stream_sessions.lock().promote(
             "om_ph4",
             "card_x".into(),
             "om_cardmsg".into(),
@@ -4909,7 +4909,7 @@ mod tests {
         handle_reply(&edit_reply("om_ph4", "v", None, Some("r4")), &adapter, &tx).await;
 
         assert!(
-            !adapter.stream_sessions.lock().unwrap().contains("om_ph4"),
+            !adapter.stream_sessions.lock().contains("om_ph4"),
             "failed card update must drop the session"
         );
         let resp: crate::schema::GatewayResponse =
@@ -4966,7 +4966,7 @@ mod tests {
 
         // Session keyed by the card's own message_id (no post→card swap).
         {
-            let reg = adapter.stream_sessions.lock().unwrap();
+            let reg = adapter.stream_sessions.lock();
             let s = reg.get("om_cardZ").expect("session keyed by card message id");
             assert_eq!(s.card_id, "cardZ");
         }

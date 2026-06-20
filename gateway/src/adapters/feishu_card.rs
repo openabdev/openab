@@ -27,9 +27,7 @@
 // Most of this module is wired in as of S5 (REST client + session registry +
 // idle reaper). A few convenience APIs remain exercised only by tests or
 // reserved for phase two (card splitting): `FeishuStreamRegistry::{get,
-// contains, len, is_empty}`. One module-level allow is cleaner than scattering
-// per-item attributes; revisit when phase two lands.
-#![allow(dead_code)]
+// contains, len, is_empty}`.
 
 use serde_json::Value;
 use std::borrow::Cow;
@@ -565,6 +563,10 @@ impl FeishuStreamRegistry {
         }
     }
 
+    /// Returns the session for `om_post`, if any.
+    ///
+    /// Reserved for phase-two card splitting; production callers use `get_mut`.
+    #[allow(dead_code)]
     pub fn get(&self, om_post: &str) -> Option<&FeishuStreamSession> {
         self.sessions.get(om_post)
     }
@@ -573,6 +575,10 @@ impl FeishuStreamRegistry {
         self.sessions.get_mut(om_post)
     }
 
+    /// Returns `true` if a session for `om_post` exists.
+    ///
+    /// Reserved for phase-two card splitting.
+    #[allow(dead_code)]
     pub fn contains(&self, om_post: &str) -> bool {
         self.sessions.contains_key(om_post)
     }
@@ -583,10 +589,18 @@ impl FeishuStreamRegistry {
         self.sessions.remove(om_post)
     }
 
+    /// Number of active sessions.
+    ///
+    /// Reserved for phase-two card splitting.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.sessions.len()
     }
 
+    /// Returns `true` if no sessions are active.
+    ///
+    /// Reserved for phase-two card splitting.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
     }
