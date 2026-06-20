@@ -341,6 +341,12 @@ impl Adapter {
     pub fn usage_report(&self, on_status: Option<&dyn Fn(&str)>) -> String {
         use std::process::Command;
 
+        let make_progress_bar = |percentage: f64| -> String {
+            let filled = (percentage / 10.0).round().clamp(0.0, 10.0) as usize;
+            let empty = 10 - filled;
+            format!("{}{}", "█".repeat(filled), "░".repeat(empty))
+        };
+
         if let Some(cb) = on_status { cb("Lokal agy portları taranıyor..."); }
 
         // Find active agy ports using lsof
@@ -400,11 +406,13 @@ impl Adapter {
         if let Some(json) = quota_json {
             if let Some(cb) = on_status { cb("Kota bilgileri çözümleniyor..."); }
             
-            let mut report = String::from("Modellerin Kullanım Bilgileri (agy - Canlı API):\n");
+            let mut report = String::from("### Modellerin Kullanım Bilgileri (Canlı API)\n\n");
+            report.push_str("| Grup / Model | Limit Tipi | Kalan Kota | Durum |\n");
+            report.push_str("| :--- | :--- | :---: | :--- |\n");
+            
             if let Some(groups) = json.pointer("/response/groups").and_then(|g| g.as_array()) {
                 for group in groups {
                     let group_name = group.get("displayName").and_then(|v| v.as_str()).unwrap_or("Bilinmeyen Grup");
-                    report.push_str(&format!("\n{}:\n", group_name.to_uppercase()));
                     
                     if let Some(buckets) = group.get("buckets").and_then(|b| b.as_array()) {
                         for bucket in buckets {
@@ -412,13 +420,22 @@ impl Adapter {
                             let desc = bucket.get("description").and_then(|v| v.as_str()).unwrap_or("");
                             let remaining = bucket.get("remainingFraction").and_then(|v| v.as_f64()).unwrap_or(0.0);
                             
-                            // remainingFraction is the fraction remaining (e.g. 0.94 means 94.48% remaining)
                             let percentage = remaining * 100.0;
+                            let bar = make_progress_bar(percentage);
                             
-                            report.push_str(&format!("• {}: %{:.2} kalan\n", bucket_name, percentage));
-                            if !desc.is_empty() {
-                                report.push_str(&format!("  Açıklama: {}\n", desc));
-                            }
+                            let limit_name = if !desc.is_empty() {
+                                format!("{} ({})", bucket_name, desc)
+                            } else {
+                                bucket_name.to_string()
+                            };
+                            
+                            report.push_str(&format!(
+                                "| **{}** | {} | %{:.2} | `{}` |\n",
+                                group_name.to_uppercase(),
+                                limit_name,
+                                percentage,
+                                bar
+                            ));
                         }
                     }
                 }
@@ -608,16 +625,38 @@ impl Adapter {
 
         match (gemini_parsed, claude_parsed) {
             (Some(g), Some(c)) => {
+                let make_progress_bar = |percentage: f64| -> String {
+                    let filled = (percentage / 10.0).round().clamp(0.0, 10.0) as usize;
+                    let empty = 10 - filled;
+                    format!("{}{}", "█".repeat(filled), "░".repeat(empty))
+                };
+
+                let to_pct = |s: &str| -> f64 {
+                    s.replace("%", "").trim().parse::<f64>().unwrap_or(0.0)
+                };
+
+                let g_w_pct = to_pct(&g.0);
+                let g_f_pct = to_pct(&g.2);
+                let c_w_pct = to_pct(&c.0);
+                let c_f_pct = to_pct(&c.2);
+                
+                let g_w_bar = make_progress_bar(g_w_pct);
+                let g_f_bar = make_progress_bar(g_f_pct);
+                let c_w_bar = make_progress_bar(c_w_pct);
+                let c_f_bar = make_progress_bar(c_f_pct);
+                
                 format!(
-                    "Modellerin Kullanım Bilgileri (agy):\n\n\
-                     GEMINI MODELLERİ:\n\
-                     • Haftalık Limit: %{} (Yenilenme süresi: {})\n\
-                     • 5 Saatlik Limit: %{} (Yenilenme süresi: {})\n\n\
-                     CLAUDE VE GPT MODELLERİ:\n\
-                     • Haftalık Limit: %{} (Yenilenme süresi: {})\n\
-                     • 5 Saatlik Limit: %{} (Yenilenme süresi: {})",
-                    g.0.replace("%", ""), g.1, g.2.replace("%", ""), g.3,
-                    c.0.replace("%", ""), c.1, c.2.replace("%", ""), c.3
+                    "### Modellerin Kullanım Bilgileri (Canlı API fallback)\n\n\
+                     | Grup / Model | Limit Tipi | Kalan Kota | Durum | Yenilenme |\n\
+                     | :--- | :--- | :---: | :--- | :--- |\n\
+                     | **GEMINI** | Haftalık Limit | %{:.2} | `{}` | {} |\n\
+                     | **GEMINI** | 5 Saatlik Limit | %{:.2} | `{}` | {} |\n\
+                     | **CLAUDE/GPT** | Haftalık Limit | %{:.2} | `{}` | {} |\n\
+                     | **CLAUDE/GPT** | 5 Saatlik Limit | %{:.2} | `{}` | {} |",
+                    g_w_pct, g_w_bar, g.1,
+                    g_f_pct, g_f_bar, g.3,
+                    c_w_pct, c_w_bar, c.1,
+                    c_f_pct, c_f_bar, c.3
                 )
             }
             _ => {
