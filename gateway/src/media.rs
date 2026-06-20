@@ -59,9 +59,9 @@ pub fn audio_extension(content_type: &str) -> &'static str {
 /// Check if a filename has a text-like extension suitable for reading as UTF-8.
 pub fn is_text_extension(filename: &str) -> bool {
     const TEXT_EXTS: &[&str] = &[
-        "txt", "csv", "log", "md", "json", "jsonl", "yaml", "yml", "toml", "xml", "rs", "py",
-        "js", "ts", "jsx", "tsx", "go", "java", "c", "cpp", "h", "hpp", "rb", "sh", "bash",
-        "sql", "html", "css", "ini", "cfg", "conf",
+        "txt", "csv", "log", "md", "json", "jsonl", "yaml", "yml", "toml", "xml", "rs", "py", "js",
+        "ts", "jsx", "tsx", "go", "java", "c", "cpp", "h", "hpp", "rb", "sh", "bash", "sql",
+        "html", "css", "ini", "cfg", "conf",
     ];
     let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
     TEXT_EXTS.contains(&ext.as_str())
@@ -130,5 +130,13 @@ mod tests {
         assert!(is_text_extension("data.csv"));
         assert!(!is_text_extension("archive.zip"));
         assert!(!is_text_extension("photo.jpg"));
+    }
+
+    #[test]
+    fn audio_extension_detects_common_line_formats() {
+        assert_eq!(audio_extension("audio/ogg"), "ogg");
+        assert_eq!(audio_extension("audio/mpeg"), "mp3");
+        assert_eq!(audio_extension("audio/mp4"), "m4a");
+        assert_eq!(audio_extension("audio/x-m4a"), "m4a");
     }
 }

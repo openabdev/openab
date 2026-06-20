@@ -1,4 +1,6 @@
-use crate::media::{format_bytes, resize_and_compress, IMAGE_MAX_DOWNLOAD};
+use crate::media::{
+    audio_extension, format_bytes, resize_and_compress, AUDIO_MAX_DOWNLOAD, IMAGE_MAX_DOWNLOAD,
+};
 use crate::schema::*;
 use crate::store;
 use axum::extract::State;
@@ -192,7 +194,6 @@ async fn process_line_webhook_events(
     }
 }
 
-
 fn sanitize_line_external_url_for_log(url: &str) -> String {
     reqwest::Url::parse(url)
         .ok()
@@ -211,7 +212,7 @@ async fn build_gateway_event_from_line_event(
     }
 
     let msg = event.message.as_ref()?;
-    if msg.message_type != "text" && msg.message_type != "image" {
+    if msg.message_type != "text" && msg.message_type != "image" && msg.message_type != "audio" {
         return None;
     }
 
@@ -242,10 +243,7 @@ async fn build_gateway_event_from_line_event(
                     data: String::new(),
                     size: 0,
                     path: None,
-                    status: Some(
-                        "unsupported format: external content not supported"
-                            .into(),
-                    ),
+                    status: Some("unsupported format: external content not supported".into()),
                 });
             }
             _ => {
@@ -262,9 +260,55 @@ async fn build_gateway_event_from_line_event(
                         data: String::new(),
                         size: 0,
                         path: None,
-                        status: Some(
-                            "configuration error: service not configured".into(),
-                        ),
+                        status: Some("configuration error: service not configured".into()),
+                    });
+                }
+            }
+        }
+    }
+
+    if msg.message_type == "audio" {
+        match msg
+            .content_provider
+            .as_ref()
+            .map(|provider| provider.provider_type.as_str())
+        {
+            Some("external") => {
+                let original = msg
+                    .content_provider
+                    .as_ref()
+                    .and_then(|provider| provider.original_content_url.as_deref())
+                    .unwrap_or("unknown");
+                warn!(
+                    message_id = %msg.id,
+                    external_content_host = %sanitize_line_external_url_for_log(original),
+                    "LINE external audio content is not supported yet"
+                );
+                attachments.push(Attachment {
+                    attachment_type: "audio".into(),
+                    filename: format!("line_{}.ogg", msg.id),
+                    mime_type: "audio/ogg".into(),
+                    data: String::new(),
+                    size: 0,
+                    path: None,
+                    status: Some("unsupported format: external content not supported".into()),
+                });
+            }
+            _ => {
+                if let Some(access_token) = line_access_token {
+                    attachments.push(
+                        download_line_audio(client, access_token, &msg.id, data_api_base).await,
+                    );
+                } else {
+                    warn!(message_id = %msg.id, "LINE audio received but LINE_CHANNEL_ACCESS_TOKEN is not configured");
+                    attachments.push(Attachment {
+                        attachment_type: "audio".into(),
+                        filename: format!("line_{}.ogg", msg.id),
+                        mime_type: "audio/ogg".into(),
+                        data: String::new(),
+                        size: 0,
+                        path: None,
+                        status: Some("configuration error: service not configured".into()),
                     });
                 }
             }
@@ -396,11 +440,14 @@ pub async fn download_line_image(
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
             if size > IMAGE_MAX_DOWNLOAD {
                 warn!(message_id, size, "LINE image Content-Length exceeds limit");
-                return rejected(size, format!(
-                    "size exceeded: {} exceeds {}",
-                    format_bytes(size),
-                    format_bytes(IMAGE_MAX_DOWNLOAD)
-                ));
+                return rejected(
+                    size,
+                    format!(
+                        "size exceeded: {} exceeds {}",
+                        format_bytes(size),
+                        format_bytes(IMAGE_MAX_DOWNLOAD)
+                    ),
+                );
             }
         }
     }
@@ -419,11 +466,14 @@ pub async fn download_line_image(
         if body.len() as u64 > IMAGE_MAX_DOWNLOAD {
             let body_size = body.len() as u64;
             warn!(message_id, size = body_size, "LINE image exceeds limit");
-            return rejected(body_size, format!(
-                "size exceeded: {} exceeds {}",
-                format_bytes(body_size),
-                format_bytes(IMAGE_MAX_DOWNLOAD)
-            ));
+            return rejected(
+                body_size,
+                format!(
+                    "size exceeded: {} exceeds {}",
+                    format_bytes(body_size),
+                    format_bytes(IMAGE_MAX_DOWNLOAD)
+                ),
+            );
         }
     }
 
@@ -453,6 +503,136 @@ pub async fn download_line_image(
         mime_type: mime,
         data: String::new(),
         size: compressed.len() as u64,
+        path: Some(path),
+        status: None,
+    }
+}
+
+pub async fn download_line_audio(
+    client: &reqwest::Client,
+    access_token: &str,
+    message_id: &str,
+    api_base: &str,
+) -> Attachment {
+    let rejected = |filename: String, mime_type: String, size: u64, reason: String| Attachment {
+        attachment_type: "audio".into(),
+        filename,
+        mime_type,
+        data: String::new(),
+        size,
+        path: None,
+        status: Some(reason),
+    };
+
+    let mut resp = match client
+        .get(format!(
+            "{}/v2/bot/message/{}/content",
+            api_base, message_id
+        ))
+        .bearer_auth(access_token)
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            warn!(message_id, error = %e, "LINE audio download failed");
+            return rejected(
+                format!("line_{}.ogg", message_id),
+                "audio/ogg".into(),
+                0,
+                "download failed: network error".into(),
+            );
+        }
+    };
+
+    if !resp.status().is_success() {
+        let http_status = resp.status().as_u16();
+        warn!(message_id, status = %resp.status(), "LINE audio download failed");
+        return rejected(
+            format!("line_{}.ogg", message_id),
+            "audio/ogg".into(),
+            0,
+            format!("download failed: HTTP {http_status}"),
+        );
+    }
+
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("audio/ogg")
+        .to_string();
+    let filename = format!("line_{}.{}", message_id, audio_extension(&content_type));
+
+    if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
+        if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
+            if size > AUDIO_MAX_DOWNLOAD {
+                warn!(message_id, size, "LINE audio Content-Length exceeds limit");
+                return rejected(
+                    filename.clone(),
+                    content_type.clone(),
+                    size,
+                    format!(
+                        "size exceeded: {} exceeds {}",
+                        format_bytes(size),
+                        format_bytes(AUDIO_MAX_DOWNLOAD)
+                    ),
+                );
+            }
+        }
+    }
+
+    let mut body = Vec::new();
+    loop {
+        let chunk = match resp.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(e) => {
+                warn!(message_id, error = %e, "LINE audio download failed while reading body");
+                return rejected(
+                    filename.clone(),
+                    content_type.clone(),
+                    0,
+                    "download failed: body read error".into(),
+                );
+            }
+        };
+        body.extend_from_slice(&chunk);
+        if body.len() as u64 > AUDIO_MAX_DOWNLOAD {
+            let body_size = body.len() as u64;
+            warn!(message_id, size = body_size, "LINE audio exceeds limit");
+            return rejected(
+                filename.clone(),
+                content_type.clone(),
+                body_size,
+                format!(
+                    "size exceeded: {} exceeds {}",
+                    format_bytes(body_size),
+                    format_bytes(AUDIO_MAX_DOWNLOAD)
+                ),
+            );
+        }
+    }
+
+    let path = match store::store_media(&body).await {
+        Some(p) => p,
+        None => {
+            warn!(message_id, "LINE audio store failed");
+            return rejected(
+                filename,
+                content_type,
+                body.len() as u64,
+                "processing failed: storage error".into(),
+            );
+        }
+    };
+
+    Attachment {
+        attachment_type: "audio".into(),
+        filename,
+        mime_type: content_type,
+        data: String::new(),
+        size: body.len() as u64,
         path: Some(path),
         status: None,
     }
@@ -643,9 +823,156 @@ mod tests {
         assert_eq!(gateway_event.content.attachments.len(), 1);
 
         let att = &gateway_event.content.attachments[0];
-        assert!(att.status.is_none(), "successful download should have no status");
+        assert!(
+            att.status.is_none(),
+            "successful download should have no status"
+        );
         let path = att.path.clone().expect("path should be stored");
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn build_gateway_event_from_line_audio_attaches_downloaded_audio() {
+        let server = MockServer::start().await;
+        let audio_bytes = b"OggS-test-audio".to_vec();
+
+        let _mock = Mock::given(method("GET"))
+            .and(path("/v2/bot/message/msg_audio/content"))
+            .and(header("authorization", "Bearer line_token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "audio/ogg")
+                    .set_body_bytes(audio_bytes),
+            )
+            .mount_as_scoped(&server)
+            .await;
+
+        let event: LineEvent = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "replyToken": "reply123",
+            "source": {"type": "user", "userId": "U123"},
+            "message": {
+                "id": "msg_audio",
+                "type": "audio",
+                "contentProvider": {"type": "line"}
+            }
+        }))
+        .unwrap();
+
+        let gateway_event = build_gateway_event_from_line_event(
+            &event,
+            &reqwest::Client::new(),
+            Some("line_token"),
+            &server.uri(),
+        )
+        .await
+        .expect("audio event should produce a gateway event");
+
+        assert_eq!(gateway_event.platform, "line");
+        assert_eq!(gateway_event.content.text, "");
+        assert_eq!(gateway_event.content.attachments.len(), 1);
+
+        let att = &gateway_event.content.attachments[0];
+        assert_eq!(att.attachment_type, "audio");
+        assert_eq!(att.mime_type, "audio/ogg");
+        assert!(att.filename.ends_with(".ogg"));
+        assert!(
+            att.status.is_none(),
+            "successful download should have no status"
+        );
+        let path = att.path.clone().expect("path should be stored");
+        let stored = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(stored, b"OggS-test-audio");
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn build_gateway_event_from_line_audio_mp4_uses_m4a_filename() {
+        let server = MockServer::start().await;
+        let audio_bytes = b"ftypM4A-test-audio".to_vec();
+
+        let _mock = Mock::given(method("GET"))
+            .and(path("/v2/bot/message/msg_audio_m4a/content"))
+            .and(header("authorization", "Bearer line_token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "audio/mp4")
+                    .set_body_bytes(audio_bytes),
+            )
+            .mount_as_scoped(&server)
+            .await;
+
+        let event: LineEvent = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "replyToken": "reply123",
+            "source": {"type": "user", "userId": "U123"},
+            "message": {
+                "id": "msg_audio_m4a",
+                "type": "audio",
+                "contentProvider": {"type": "line"}
+            }
+        }))
+        .unwrap();
+
+        let gateway_event = build_gateway_event_from_line_event(
+            &event,
+            &reqwest::Client::new(),
+            Some("line_token"),
+            &server.uri(),
+        )
+        .await
+        .expect("audio event should produce a gateway event");
+
+        let att = &gateway_event.content.attachments[0];
+        assert_eq!(att.attachment_type, "audio");
+        assert_eq!(att.mime_type, "audio/mp4");
+        assert!(att.filename.ends_with(".m4a"));
+        assert!(
+            att.status.is_none(),
+            "successful download should have no status"
+        );
+        let path = att.path.clone().expect("path should be stored");
+        let stored = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(stored, b"ftypM4A-test-audio");
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn download_line_audio_rejects_oversized_content_length() {
+        let server = MockServer::start().await;
+
+        let _mock = Mock::given(method("GET"))
+            .and(path("/v2/bot/message/msg_audio_big/content"))
+            .and(header("authorization", "Bearer line_token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "audio/ogg")
+                    .insert_header("content-length", (AUDIO_MAX_DOWNLOAD + 1).to_string())
+                    .set_body_bytes(vec![0u8; AUDIO_MAX_DOWNLOAD as usize + 1]),
+            )
+            .mount_as_scoped(&server)
+            .await;
+
+        let attachment = download_line_audio(
+            &reqwest::Client::new(),
+            "line_token",
+            "msg_audio_big",
+            &server.uri(),
+        )
+        .await;
+
+        assert_eq!(attachment.attachment_type, "audio");
+        assert!(attachment.path.is_none());
+        assert!(attachment.status.is_some());
+        let reason = attachment.status.unwrap();
+        assert!(
+            reason.contains("size exceeded"),
+            "expected size exceeded reason, got: {reason}"
+        );
+        assert!(
+            reason.contains("exceeds"),
+            "expected size limit message, got: {reason}"
+        );
     }
 
     #[tokio::test]
@@ -674,8 +1001,14 @@ mod tests {
 
         assert!(attachment.status.is_some());
         let reason = attachment.status.unwrap();
-        assert!(reason.contains("size exceeded"), "expected size exceeded reason, got: {reason}");
-        assert!(reason.contains("exceeds"), "expected size limit message, got: {reason}");
+        assert!(
+            reason.contains("size exceeded"),
+            "expected size exceeded reason, got: {reason}"
+        );
+        assert!(
+            reason.contains("exceeds"),
+            "expected size limit message, got: {reason}"
+        );
     }
 
     #[tokio::test]
@@ -705,7 +1038,47 @@ mod tests {
         let gw = result.expect("external image event should not be dropped");
         assert_eq!(gw.content.attachments.len(), 1);
         let att = &gw.content.attachments[0];
-        assert!(att.status.is_some(), "external image should have status set");
+        assert!(
+            att.status.is_some(),
+            "external image should have status set"
+        );
+        let reason = att.status.as_deref().unwrap();
+        assert!(reason.contains("unsupported format"), "got: {reason}");
+        assert!(reason.contains("external"), "got: {reason}");
+    }
+
+    #[tokio::test]
+    async fn external_audio_produces_status_attachment_not_dropped() {
+        let event: LineEvent = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "source": {"type": "user", "userId": "U_human"},
+            "message": {
+                "id": "msg_audio_ext",
+                "type": "audio",
+                "contentProvider": {
+                    "type": "external",
+                    "originalContentUrl": "https://example.com/voice.ogg"
+                }
+            }
+        }))
+        .unwrap();
+
+        let result = build_gateway_event_from_line_event(
+            &event,
+            &reqwest::Client::new(),
+            None,
+            LINE_DATA_API_BASE,
+        )
+        .await;
+
+        let gw = result.expect("external audio event should not be dropped");
+        assert_eq!(gw.content.attachments.len(), 1);
+        let att = &gw.content.attachments[0];
+        assert_eq!(att.attachment_type, "audio");
+        assert!(
+            att.status.is_some(),
+            "external audio should have status set"
+        );
         let reason = att.status.as_deref().unwrap();
         assert!(reason.contains("unsupported format"), "got: {reason}");
         assert!(reason.contains("external"), "got: {reason}");
@@ -735,6 +1108,36 @@ mod tests {
         let gw = result.expect("image event with missing token should not be dropped");
         assert_eq!(gw.content.attachments.len(), 1);
         let att = &gw.content.attachments[0];
+        assert!(att.status.is_some(), "missing token should have status set");
+        let reason = att.status.as_deref().unwrap();
+        assert!(reason.contains("configuration error"), "got: {reason}");
+    }
+
+    #[tokio::test]
+    async fn missing_access_token_for_audio_produces_status_attachment_not_dropped() {
+        let event: LineEvent = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "source": {"type": "user", "userId": "U_human"},
+            "message": {
+                "id": "msg_audio_notoken",
+                "type": "audio",
+                "contentProvider": {"type": "line"}
+            }
+        }))
+        .unwrap();
+
+        let result = build_gateway_event_from_line_event(
+            &event,
+            &reqwest::Client::new(),
+            None,
+            LINE_DATA_API_BASE,
+        )
+        .await;
+
+        let gw = result.expect("audio event with missing token should not be dropped");
+        assert_eq!(gw.content.attachments.len(), 1);
+        let att = &gw.content.attachments[0];
+        assert_eq!(att.attachment_type, "audio");
         assert!(att.status.is_some(), "missing token should have status set");
         let reason = att.status.as_deref().unwrap();
         assert!(reason.contains("configuration error"), "got: {reason}");

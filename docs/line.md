@@ -82,6 +82,7 @@ In the LINE Developers Console → **Messaging API** tab → scan the QR code wi
 ### Supported
 
 - **1:1 chat** — send a message to the bot, get an AI agent response
+- **Inbound voice messages in 1:1 chat** — LINE-hosted audio messages are downloaded through the LINE Content API and forwarded to OpenAB as `audio` attachments, so the existing STT flow can transcribe them. This requires `[stt] enabled = true` in OpenAB core. See [STT (Speech-to-Text)](stt.md).
 - **Group chat** — add the bot to a group; it responds only when @-mentioned (see @mention gating below)
 - **Inbound images** — user-sent LINE images are downloaded through the LINE Content API and forwarded to OpenAB as image attachments
 - **Webhook signature validation** — HMAC-SHA256 via `LINE_CHANNEL_SECRET`
@@ -97,17 +98,19 @@ In the LINE Developers Console → **Messaging API** tab → scan the QR code wi
 - **Reactions** — LINE Bot API does not support message reactions.
 - **@mention gating** — Supported (zero-config). In group/room chats the gateway only forwards messages where the bot is explicitly @-mentioned (LINE's native `mentionees[].isSelf` signal). 1:1 DMs are always forwarded. No env var is needed.
   - *Limitation — non-text messages*: LINE only attaches mention data to text messages. Images, videos, stickers, files, and location messages in groups are silently dropped because they cannot carry an @-mention.
+  - *Limitation — group voice messages*: LINE voice/audio messages in groups and rooms are also dropped today because audio messages do not carry mention metadata. This PR only enables inbound voice STT for 1:1 chats.
   - *Limitation — `@All`*: A group-wide `@All` mention does **not** trigger the bot; only a direct `@BotName` mention does.
   - *Breaking change*: This gating is always active. Deployments that previously relied on the bot responding to all group messages will need to @-mention the bot after upgrading.
 - **Markdown rendering** — LINE uses its own text formatting. Agent replies are sent as plain text.
 - **External-content images** — LINE image messages backed by `contentProvider.type = "external"` are not downloaded yet.
+- **External-content audio** — LINE audio messages backed by `contentProvider.type = "external"` are not downloaded yet.
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |---|---|---|
 | `LINE_CHANNEL_SECRET` | Yes | Channel secret for webhook signature validation |
-| `LINE_CHANNEL_ACCESS_TOKEN` | Yes | Channel access token for Reply/Push Message API and LINE-hosted image downloads |
+| `LINE_CHANNEL_ACCESS_TOKEN` | Yes | Channel access token for Reply/Push Message API and LINE-hosted image/audio downloads |
 
 ## Troubleshooting
 
@@ -115,6 +118,12 @@ In the LINE Developers Console → **Messaging API** tab → scan the QR code wi
 - Verify webhook URL is correct and shows ✅ in LINE Developers Console
 - Check **Use webhook** is ON and **Auto-reply messages** is OFF
 - Check gateway logs: `kubectl logs -l app=openab-gateway`
+
+**Voice message doesn't transcribe:**
+- Confirm you sent the voice message in a **1:1 chat**, not a group or room
+- Confirm `[stt] enabled = true` in your OpenAB config
+- Confirm the STT provider is configured correctly; see [STT (Speech-to-Text)](stt.md)
+- Check gateway logs for `media stored` and OpenAB logs for downstream dispatch
 
 **"Invalid signature" in gateway logs:**
 - Verify `LINE_CHANNEL_SECRET` matches the value in LINE Developers Console

@@ -1,6 +1,6 @@
 # Speech-to-Text (STT) for Voice Messages
 
-openab can automatically transcribe voice message attachments (Discord, Feishu, and other gateway platforms) and forward the transcript to your ACP agent as text.
+openab can automatically transcribe voice message attachments (Discord, Feishu, LINE 1:1 chat, and other gateway platforms) and forward the transcript to your ACP agent as text.
 
 ## Quick Start
 
@@ -24,7 +24,7 @@ api_key = "${GROQ_API_KEY}"
 ## How It Works
 
 ```
-Voice message (Discord .ogg, Feishu opus/ogg, etc.)
+Voice message (Discord .ogg, Feishu opus/ogg, LINE .m4a/.ogg, etc.)
        │
        ▼
   openab downloads the audio file
@@ -41,6 +41,9 @@ Voice message (Discord .ogg, Feishu opus/ogg, etc.)
 ```
 
 The transcript is prepended to the prompt as a `ContentBlock::Text`, so the downstream agent (Kiro CLI, Claude Code, etc.) sees it as regular text input.
+
+Platform note:
+- LINE voice-message STT is currently supported in **1:1 chat only**. Group/room audio is still filtered out by LINE mention gating rules.
 
 ## Configuration Reference
 
