@@ -5,6 +5,7 @@ use crate::schema::*;
 use crate::store;
 use axum::extract::State;
 use serde::Deserialize;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -160,6 +161,8 @@ async fn process_line_webhook_events(
             &state.client,
             state.line_access_token.as_deref(),
             LINE_DATA_API_BASE,
+            &state.line_group_context_buffer,
+            &state.line_group_context_config,
         )
         .await
         else {
@@ -206,6 +209,8 @@ async fn build_gateway_event_from_line_event(
     client: &reqwest::Client,
     line_access_token: Option<&str>,
     data_api_base: &str,
+    line_group_context_buffer: &crate::LineGroupContextBuffer,
+    line_group_context_config: &crate::LineGroupContextConfig,
 ) -> Option<GatewayEvent> {
     if event.event_type != "message" {
         return None;
@@ -315,7 +320,7 @@ async fn build_gateway_event_from_line_event(
         }
     }
 
-    let event_text = text;
+    let mut event_text = text.to_string();
 
     if event_text.trim().is_empty() && attachments.is_empty() {
         return None;
@@ -369,7 +374,35 @@ async fn build_gateway_event_from_line_event(
     // LINE sets isSelf=true on the mentionee that is the bot itself — no env var needed.
     // 1:1 DMs always pass through.
     let is_group = channel_type == "group" || channel_type == "room";
-    if is_group && !mentionees.iter().any(|m| m.is_self) {
+    let bot_mentioned = mentionees.iter().any(|m| m.is_self);
+    if is_group && msg.message_type == "text" && line_group_context_config.enabled {
+        if !bot_mentioned {
+            buffer_line_group_context(
+                line_group_context_buffer,
+                line_group_context_config,
+                &channel_id,
+                user_id,
+                &event_text,
+            );
+            info!(
+                channel = %channel_id,
+                "line group text buffered (bot not mentioned)"
+            );
+            return None;
+        }
+        if let Some(buffered) = take_line_group_context(
+            line_group_context_buffer,
+            line_group_context_config,
+            &channel_id,
+        ) {
+            info!(
+                channel = %channel_id,
+                buffered_messages = buffered.len(),
+                "line group context injected into direct mention"
+            );
+            event_text = inject_buffered_group_context(&buffered, &event_text);
+        }
+    } else if is_group && !bot_mentioned {
         info!(
             channel = %channel_id,
             "line group message dropped (@mention gating: bot not mentioned)"
@@ -390,12 +423,86 @@ async fn build_gateway_event_from_line_event(
             display_name: user_id.into(),
             is_bot: false,
         },
-        event_text,
+        &event_text,
         &msg.id,
         mention_ids,
     );
     gateway_event.content.attachments = attachments;
     Some(gateway_event)
+}
+
+fn buffer_line_group_context(
+    buffer: &crate::LineGroupContextBuffer,
+    config: &crate::LineGroupContextConfig,
+    channel_id: &str,
+    sender_id: &str,
+    text: &str,
+) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    let mut guard = buffer.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    let entry = guard.entry(channel_id.to_string()).or_default();
+    entry.retain(|m| now.duration_since(m.buffered_at).as_secs() < config.ttl_secs);
+    let bounded_text: String = trimmed.chars().take(config.max_chars).collect();
+    entry.push_back(crate::LineBufferedText {
+        sender_id: sender_id.to_string(),
+        text: bounded_text,
+        buffered_at: now,
+    });
+    enforce_line_group_context_limits(entry, config);
+}
+
+fn enforce_line_group_context_limits(
+    entry: &mut VecDeque<crate::LineBufferedText>,
+    config: &crate::LineGroupContextConfig,
+) {
+    while entry.len() > config.max_messages {
+        entry.pop_front();
+    }
+    while entry.len() > 1 && line_group_context_char_count(entry) > config.max_chars {
+        entry.pop_front();
+    }
+}
+
+fn line_group_context_char_count(entry: &VecDeque<crate::LineBufferedText>) -> usize {
+    entry
+        .iter()
+        .map(|m| m.sender_id.chars().count() + m.text.chars().count() + 2)
+        .sum()
+}
+
+fn take_line_group_context(
+    buffer: &crate::LineGroupContextBuffer,
+    config: &crate::LineGroupContextConfig,
+    channel_id: &str,
+) -> Option<VecDeque<crate::LineBufferedText>> {
+    let mut guard = buffer.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    let mut entry = guard.remove(channel_id)?;
+    entry.retain(|m| now.duration_since(m.buffered_at).as_secs() < config.ttl_secs);
+    if entry.is_empty() {
+        None
+    } else {
+        Some(entry)
+    }
+}
+
+fn inject_buffered_group_context(
+    buffered: &VecDeque<crate::LineBufferedText>,
+    current_text: &str,
+) -> String {
+    let mut lines = Vec::with_capacity(buffered.len() + 3);
+    lines.push("[Recent group context before this direct mention]".to_string());
+    for entry in buffered {
+        lines.push(format!("{}: {}", entry.sender_id, entry.text));
+    }
+    lines.push("[Current directly mentioned message]".to_string());
+    lines.push(current_text.to_string());
+    lines.join("\n")
 }
 
 pub async fn download_line_image(
@@ -739,6 +846,17 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    fn test_line_group_context_config() -> crate::LineGroupContextConfig {
+        crate::LineGroupContextConfig::default()
+    }
+
+    fn enabled_line_group_context_config() -> crate::LineGroupContextConfig {
+        crate::LineGroupContextConfig {
+            enabled: true,
+            ..crate::LineGroupContextConfig::default()
+        }
+    }
+
     #[tokio::test]
     async fn download_line_image_resizes_and_returns_attachment() {
         let server = MockServer::start().await;
@@ -814,6 +932,8 @@ mod tests {
             &reqwest::Client::new(),
             Some("line_token"),
             &server.uri(),
+            &Arc::new(std::sync::Mutex::new(HashMap::new())),
+            &test_line_group_context_config(),
         )
         .await
         .expect("image event should produce a gateway event");
@@ -1032,6 +1152,8 @@ mod tests {
             &reqwest::Client::new(),
             None,
             LINE_DATA_API_BASE,
+            &Arc::new(std::sync::Mutex::new(HashMap::new())),
+            &test_line_group_context_config(),
         )
         .await;
 
@@ -1068,6 +1190,8 @@ mod tests {
             &reqwest::Client::new(),
             None,
             LINE_DATA_API_BASE,
+            &Arc::new(std::sync::Mutex::new(HashMap::new())),
+            &test_line_group_context_config(),
         )
         .await;
 
@@ -1102,6 +1226,8 @@ mod tests {
             &reqwest::Client::new(),
             None, // no access token
             LINE_DATA_API_BASE,
+            &Arc::new(std::sync::Mutex::new(HashMap::new())),
+            &test_line_group_context_config(),
         )
         .await;
 
@@ -1161,6 +1287,8 @@ mod tests {
             event_tx,
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             line_webhook_semaphore: Arc::new(Semaphore::new(crate::LINE_WEBHOOK_CONCURRENCY_MAX)),
+            line_group_context_buffer: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            line_group_context_config: test_line_group_context_config(),
             client: reqwest::Client::new(),
         });
 
@@ -1228,6 +1356,8 @@ mod tests {
             &reqwest::Client::new(),
             None,
             LINE_DATA_API_BASE,
+            &Arc::new(std::sync::Mutex::new(HashMap::new())),
+            &test_line_group_context_config(),
         )
         .await;
         assert!(result.is_some());
@@ -1236,20 +1366,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn group_message_dropped_when_bot_not_mentioned() {
+    async fn group_message_drops_without_buffer_when_context_disabled() {
+        let buffer = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let event = make_group_text_event("hey everyone", false);
         let result = build_gateway_event_from_line_event(
             &event,
             &reqwest::Client::new(),
             None,
             LINE_DATA_API_BASE,
+            &buffer,
+            &test_line_group_context_config(),
         )
         .await;
         assert!(result.is_none());
+        let guard = buffer.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            guard.get("C001").is_none(),
+            "context disabled should preserve original drop behavior"
+        );
     }
 
     #[tokio::test]
-    async fn group_message_dropped_when_no_mention_at_all() {
+    async fn group_message_buffers_when_bot_not_mentioned_and_context_enabled() {
+        let buffer = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let event = make_group_text_event("hey everyone", false);
+        let result = build_gateway_event_from_line_event(
+            &event,
+            &reqwest::Client::new(),
+            None,
+            LINE_DATA_API_BASE,
+            &buffer,
+            &enabled_line_group_context_config(),
+        )
+        .await;
+        assert!(result.is_none());
+        let guard = buffer.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            guard
+                .get("C001")
+                .and_then(|entry| entry.front())
+                .map(|m| m.text.as_str()),
+            Some("hey everyone")
+        );
+    }
+
+    #[tokio::test]
+    async fn group_message_buffers_when_no_mention_at_all() {
         let event: LineEvent = serde_json::from_value(serde_json::json!({
             "type": "message",
             "source": {"type": "group", "groupId": "C001", "userId": "U_sender"},
@@ -1261,6 +1423,8 @@ mod tests {
             &reqwest::Client::new(),
             None,
             LINE_DATA_API_BASE,
+            &Arc::new(std::sync::Mutex::new(HashMap::new())),
+            &enabled_line_group_context_config(),
         )
         .await;
         assert!(result.is_none());
@@ -1279,8 +1443,309 @@ mod tests {
             &reqwest::Client::new(),
             None,
             LINE_DATA_API_BASE,
+            &Arc::new(std::sync::Mutex::new(HashMap::new())),
+            &test_line_group_context_config(),
         )
         .await;
         assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn group_message_buffers_then_injects_context_on_later_mention() {
+        let buffer = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        let first = make_group_text_event("今天下午兩點開會", false);
+        let first_result = build_gateway_event_from_line_event(
+            &first,
+            &reqwest::Client::new(),
+            None,
+            LINE_DATA_API_BASE,
+            &buffer,
+            &enabled_line_group_context_config(),
+        )
+        .await;
+        assert!(
+            first_result.is_none(),
+            "unmentioned message should only be buffered"
+        );
+
+        let second = make_group_text_event("@Bot 幫我總結一下", true);
+        let second_result = build_gateway_event_from_line_event(
+            &second,
+            &reqwest::Client::new(),
+            None,
+            LINE_DATA_API_BASE,
+            &buffer,
+            &enabled_line_group_context_config(),
+        )
+        .await
+        .expect("mentioned message should produce an event");
+
+        assert!(second_result
+            .content
+            .text
+            .contains("[Recent group context before this direct mention]"));
+        assert!(second_result
+            .content
+            .text
+            .contains("U_sender: 今天下午兩點開會"));
+        assert!(second_result
+            .content
+            .text
+            .contains("[Current directly mentioned message]"));
+        assert!(second_result.content.text.contains("@Bot 幫我總結一下"));
+        let guard = buffer.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            guard.get("C001").is_none(),
+            "buffer should drain after injection"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_mention_without_buffer_keeps_original_text() {
+        let buffer = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        let event = make_group_text_event("@Bot 現在狀況如何", true);
+        let result = build_gateway_event_from_line_event(
+            &event,
+            &reqwest::Client::new(),
+            None,
+            LINE_DATA_API_BASE,
+            &buffer,
+            &enabled_line_group_context_config(),
+        )
+        .await
+        .expect("mentioned message should produce an event");
+
+        assert_eq!(result.content.text, "@Bot 現在狀況如何");
+    }
+
+    #[tokio::test]
+    async fn multiple_buffered_messages_preserve_order_on_injection() {
+        let buffer = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        let first: LineEvent = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "source": {"type": "group", "groupId": "C001", "userId": "U_alice"},
+            "message": {"id": "msg001", "type": "text", "text": "第一句前文"}
+        }))
+        .unwrap();
+        let second: LineEvent = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "source": {"type": "group", "groupId": "C001", "userId": "U_bob"},
+            "message": {"id": "msg002", "type": "text", "text": "第二句前文"}
+        }))
+        .unwrap();
+
+        assert!(build_gateway_event_from_line_event(
+            &first,
+            &reqwest::Client::new(),
+            None,
+            LINE_DATA_API_BASE,
+            &buffer,
+            &enabled_line_group_context_config(),
+        )
+        .await
+        .is_none());
+        assert!(build_gateway_event_from_line_event(
+            &second,
+            &reqwest::Client::new(),
+            None,
+            LINE_DATA_API_BASE,
+            &buffer,
+            &enabled_line_group_context_config(),
+        )
+        .await
+        .is_none());
+
+        let mention = make_group_text_event("@Bot 幫我整理一下", true);
+        let result = build_gateway_event_from_line_event(
+            &mention,
+            &reqwest::Client::new(),
+            None,
+            LINE_DATA_API_BASE,
+            &buffer,
+            &enabled_line_group_context_config(),
+        )
+        .await
+        .expect("mentioned message should produce an event");
+
+        let first_idx = result
+            .content
+            .text
+            .find("U_alice: 第一句前文")
+            .expect("first buffered line present");
+        let second_idx = result
+            .content
+            .text
+            .find("U_bob: 第二句前文")
+            .expect("second buffered line present");
+        let current_idx = result
+            .content
+            .text
+            .find("[Current directly mentioned message]")
+            .expect("current message header present");
+
+        assert!(
+            first_idx < second_idx,
+            "buffered lines should preserve arrival order"
+        );
+        assert!(
+            second_idx < current_idx,
+            "buffered context should appear before current message"
+        );
+    }
+
+    #[test]
+    fn group_context_buffer_keeps_latest_messages_within_bounds() {
+        let buffer = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let config = test_line_group_context_config();
+
+        for i in 0..(config.max_messages + 5) {
+            buffer_line_group_context(
+                &buffer,
+                &config,
+                "C001",
+                "U_sender",
+                &format!("message {i}"),
+            );
+        }
+
+        let guard = buffer.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard.get("C001").expect("buffer should exist");
+
+        assert_eq!(entry.len(), config.max_messages);
+        assert_eq!(entry.front().unwrap().text, "message 5");
+        assert_eq!(
+            entry.back().unwrap().text,
+            format!("message {}", config.max_messages + 4)
+        );
+        assert!(
+            line_group_context_char_count(entry) <= config.max_chars,
+            "buffer should stay within character budget"
+        );
+    }
+
+    #[test]
+    fn group_context_buffer_enforces_total_character_budget() {
+        let buffer = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let config = test_line_group_context_config();
+        let large = "x".repeat(config.max_chars / 2);
+
+        buffer_line_group_context(
+            &buffer,
+            &config,
+            "C001",
+            "U_sender",
+            &format!("old {large}"),
+        );
+        buffer_line_group_context(
+            &buffer,
+            &config,
+            "C001",
+            "U_sender",
+            &format!("middle {large}"),
+        );
+        buffer_line_group_context(
+            &buffer,
+            &config,
+            "C001",
+            "U_sender",
+            &format!("latest {large}"),
+        );
+
+        let guard = buffer.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard.get("C001").expect("buffer should exist");
+
+        assert!(
+            line_group_context_char_count(entry) <= config.max_chars,
+            "buffer should stay within character budget"
+        );
+        assert!(
+            entry.back().unwrap().text.starts_with("latest "),
+            "latest context should be retained when trimming old messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffer_is_chat_local_and_not_reused_after_drain() {
+        let buffer = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        let buffered: LineEvent = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "source": {"type": "group", "groupId": "C001", "userId": "U_sender"},
+            "message": {"id": "msg001", "type": "text", "text": "只屬於 C001 的前文"}
+        }))
+        .unwrap();
+
+        assert!(build_gateway_event_from_line_event(
+            &buffered,
+            &reqwest::Client::new(),
+            None,
+            LINE_DATA_API_BASE,
+            &buffer,
+            &enabled_line_group_context_config(),
+        )
+        .await
+        .is_none());
+
+        let other_chat: LineEvent = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "source": {"type": "group", "groupId": "C002", "userId": "U_sender"},
+            "message": {
+                "id": "msg010",
+                "type": "text",
+                "text": "@Bot 另一個群組的 mention",
+                "mention": {"mentionees": [{"userId": "Ubot123", "type": "user", "isSelf": true}]}
+            }
+        }))
+        .unwrap();
+
+        let other_result = build_gateway_event_from_line_event(
+            &other_chat,
+            &reqwest::Client::new(),
+            None,
+            LINE_DATA_API_BASE,
+            &buffer,
+            &enabled_line_group_context_config(),
+        )
+        .await
+        .expect("other chat mention should produce an event");
+        assert!(
+            !other_result.content.text.contains("只屬於 C001 的前文"),
+            "buffered context must not leak across chats"
+        );
+
+        let same_chat = make_group_text_event("@Bot C001 的 mention", true);
+        let same_result = build_gateway_event_from_line_event(
+            &same_chat,
+            &reqwest::Client::new(),
+            None,
+            LINE_DATA_API_BASE,
+            &buffer,
+            &enabled_line_group_context_config(),
+        )
+        .await
+        .expect("same chat mention should produce an event");
+        assert!(same_result
+            .content
+            .text
+            .contains("U_sender: 只屬於 C001 的前文"));
+
+        let second_same_chat = make_group_text_event("@Bot 再問一次", true);
+        let drained_result = build_gateway_event_from_line_event(
+            &second_same_chat,
+            &reqwest::Client::new(),
+            None,
+            LINE_DATA_API_BASE,
+            &buffer,
+            &enabled_line_group_context_config(),
+        )
+        .await
+        .expect("second same-chat mention should produce an event");
+        assert!(
+            !drained_result.content.text.contains("只屬於 C001 的前文"),
+            "buffer should be one-shot and drain after injection"
+        );
     }
 }
