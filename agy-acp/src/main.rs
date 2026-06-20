@@ -28,9 +28,20 @@ impl Adapter {
         initial_step_idx: i64,
         working_dir: String,
         conversations_dir: PathBuf,
+        temp_files: Vec<String>,
         cancelled: Arc<AtomicBool>,
         out_tx: mpsc::UnboundedSender<Option<String>>,
     ) -> PromptOutput {
+        struct TempFilesCleanupGuard(Vec<String>);
+        impl Drop for TempFilesCleanupGuard {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        let _cleanup_guard = TempFilesCleanupGuard(temp_files);
+
         let spawn_result = Command::new(Adapter::agy_bin())
             .args(&args)
             .env("PATH", Adapter::augmented_path())
@@ -284,7 +295,14 @@ async fn main() {
                 pending_prompts += 1;
                 tokio::spawn(async move {
                     let mut adapter = adapter.lock().await;
-                    let _ = out_tx.send(Some(serde_json::to_string(&adapter.handle_session_new(id)).unwrap()));
+                    let resp = adapter.handle_session_new(id);
+                    let sid = resp.result.as_ref()
+                        .and_then(|r| r.get("sessionId")).and_then(|v| v.as_str()).map(String::from);
+                    let _ = out_tx.send(Some(serde_json::to_string(&resp).unwrap()));
+                    if let Some(sid) = sid {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                        let _ = out_tx.send(Some(serde_json::to_string(&Adapter::available_commands_notification(&sid)).unwrap()));
+                    }
                     let _ = out_tx.send(None);
                 });
                 Vec::new()
@@ -295,7 +313,15 @@ async fn main() {
                 pending_prompts += 1;
                 tokio::spawn(async move {
                     let mut adapter = adapter.lock().await;
-                    let _ = out_tx.send(Some(serde_json::to_string(&adapter.handle_session_load(id, &params)).unwrap()));
+                    let resp = adapter.handle_session_load(id, &params);
+                    let sid = if resp.error.is_none() {
+                        params.get("sessionId").and_then(|v| v.as_str()).map(String::from)
+                    } else { None };
+                    let _ = out_tx.send(Some(serde_json::to_string(&resp).unwrap()));
+                    if let Some(sid) = sid {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                        let _ = out_tx.send(Some(serde_json::to_string(&Adapter::available_commands_notification(&sid)).unwrap()));
+                    }
                     let _ = out_tx.send(None);
                 });
                 Vec::new()
@@ -312,15 +338,54 @@ async fn main() {
                 let out_tx = out_tx.clone();
                 pending_prompts += 1;
                 tokio::spawn(async move {
-                    let (sid, args, snapshot, init_conv, init_idx, wd, cd) = {
+                    // Slash command interception — fulfilled by the bridge, no agy spawn.
+                    let prompt_text = parse_prompt(params.get("prompt"));
+                    let out_tx_clone = out_tx.clone();
+                    let session_id_clone = session_id.clone();
+                    let on_status = move |status_msg: &str| {
+                        let notif = JsonRpcNotification {
+                            jsonrpc: "2.0",
+                            method: "session/update".to_string(),
+                            params: json!({
+                                "sessionId": session_id_clone,
+                                "update": {
+                                    "sessionUpdate": "agent_message_chunk",
+                                    "content": { "type": "text", "text": format!("⏳ *{}*\n\n", status_msg) },
+                                }
+                            }),
+                        };
+                        let _ = out_tx_clone.send(Some(serde_json::to_string(&notif).unwrap()));
+                    };
+
+                    let cmd_output = {
                         let mut adapter = adapter.lock().await;
-                        let (sid, _prompt, args, snapshot, init_conv, init_idx) = adapter.prepare_prompt_state(&params);
+                        adapter.try_handle_command(&session_id, &prompt_text, Some(&on_status))
+                    };
+                    if let Some(text) = cmd_output {
+                        let notif = JsonRpcNotification {
+                            jsonrpc: "2.0", method: "session/update".to_string(),
+                            params: json!({ "sessionId": session_id, "update": {
+                                "sessionUpdate": "agent_message_chunk",
+                                "content": { "type": "text", "text": text },
+                            }}),
+                        };
+                        let _ = out_tx.send(Some(serde_json::to_string(&notif).unwrap()));
+                        let _ = out_tx.send(Some(serde_json::to_string(&JsonRpcResponse {
+                            jsonrpc: "2.0", id, result: Some(json!({ "stopReason": "end_turn" })), error: None,
+                        }).unwrap()));
+                        if !session_id.is_empty() { active_cancellations.lock().unwrap().remove(&session_id); }
+                        let _ = out_tx.send(None);
+                        return;
+                    }
+                    let (sid, args, snapshot, init_conv, init_idx, wd, cd, temp_files) = {
+                        let mut adapter = adapter.lock().await;
+                        let (sid, _prompt, args, snapshot, init_conv, init_idx, temp_files) = adapter.prepare_prompt_state(&params);
                         let wd = adapter.working_dir.clone();
                         let cd = adapter.conversations_dir.clone();
-                        (sid, args, snapshot, init_conv, init_idx, wd, cd)
+                        (sid, args, snapshot, init_conv, init_idx, wd, cd, temp_files)
                     };
                     let output = Adapter::execute_prompt(
-                        id, &sid, args, snapshot, init_conv, init_idx, wd, cd, cancelled, out_tx.clone(),
+                        id, &sid, args, snapshot, init_conv, init_idx, wd, cd, temp_files, cancelled, out_tx.clone(),
                     ).await;
                     if let Some((bound_conv_id, new_step_idx)) = output.session_update {
                         let mut adapter = adapter.lock().await;
@@ -415,8 +480,13 @@ mod tests {
             available_models: Some(vec![]),
         };
         let response = adapter.handle_initialize(json!(1));
-        assert_eq!(response.result.as_ref().and_then(|r| r.get("agentCapabilities"))
-            .and_then(|c| c.get("loadSession")).and_then(|v| v.as_bool()), Some(true));
+        let capabilities = response.result.as_ref().and_then(|r| r.get("agentCapabilities")).unwrap();
+        assert_eq!(capabilities.get("loadSession").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(capabilities.get("streaming").and_then(|v| v.as_bool()), Some(true));
+        
+        let prompt_caps = capabilities.get("promptCapabilities").unwrap();
+        assert_eq!(prompt_caps.get("image").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(prompt_caps.get("embeddedContext").and_then(|v| v.as_bool()), Some(true));
     }
 
     #[test]
@@ -632,5 +702,46 @@ mod tests {
         }
         drop(stdin); let _ = child.wait();
         assert!(got_notif); assert!(text.to_lowercase().contains("pong"));
+    }
+
+    #[test]
+    fn test_base64_decode_clean_header() {
+        let input = "data:image/png;base64,SGVsbG8gd29ybGQ="; // "Hello world" base64
+        let decoded = base64_decode(input).expect("Should decode successfully");
+        assert_eq!(decoded, b"Hello world");
+    }
+
+    #[test]
+    fn test_base64_decode_whitespace() {
+        let input = "SGVsbG8\ngd29y\r\nbGQ="; // "Hello world" base64 with newlines
+        let decoded = base64_decode(input).expect("Should decode successfully");
+        assert_eq!(decoded, b"Hello world");
+    }
+
+    #[test]
+    fn test_parse_prompt_and_extract_media() {
+        let prompt_val = serde_json::json!([
+            {
+                "type": "text",
+                "text": "Check this image: "
+            },
+            {
+                "type": "image",
+                "data": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", // 1x1 png
+                "mimeType": "image/png"
+            }
+        ]);
+
+        let (clean_prompt, temp_files) = parse_prompt_and_extract_media(Some(&prompt_val));
+
+        assert!(clean_prompt.contains("Check this image:"));
+        assert!(clean_prompt.contains("![temp_media_"));
+        assert_eq!(temp_files.len(), 1);
+
+        let file_path = std::path::Path::new(&temp_files[0]);
+        assert!(file_path.exists());
+
+        // Cleanup
+        let _ = std::fs::remove_file(file_path);
     }
 }

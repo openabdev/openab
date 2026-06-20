@@ -13,3 +13,4 @@ uuid = { version = "1", features = ["v4"] }
 fs2 = "0.4.3"
 rusqlite = { version = "=0.31.0", features = ["bundled"] }
 shell-words = "1.1.0"
+base64 = "0.22.1"

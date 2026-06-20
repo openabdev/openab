@@ -5,8 +5,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::db::{is_narration, show_narration};
-use crate::protobuf::{extract_text_from_step_payload, extract_tool_from_step_payload, is_tool_step_type, tool_call_title};
+use crate::db::{is_narration, show_narration, show_tool_output};
+use crate::protobuf::{extract_text_from_step_payload, extract_tool_from_step_payload, extract_tool_output_text, is_tool_step_type, tool_call_title};
 use crate::types::{JsonRpcNotification, StreamingState};
 
 /// Poll the SQLite DB for new text since `base_step_idx` and emit streaming deltas.
@@ -143,18 +143,27 @@ pub fn poll_streaming_delta(
                     .unwrap(),
                 );
 
+                let mut completed = json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": tool_call_id,
+                    "title": title,
+                    "status": "completed",
+                });
+                if show_tool_output() {
+                    if let Some(output) = extract_tool_output_text(&payload) {
+                        completed["content"] = json!([
+                            { "type": "content", "content": { "type": "text", "text": output } }
+                        ]);
+                        completed["rawOutput"] = json!({ "text": output });
+                    }
+                }
                 notifications.push(
                     serde_json::to_string(&JsonRpcNotification {
                         jsonrpc: "2.0",
                         method: "session/update".to_string(),
                         params: json!({
                             "sessionId": session_id,
-                            "update": {
-                                "sessionUpdate": "tool_call_update",
-                                "toolCallId": tool_call_id,
-                                "title": title,
-                                "status": "completed",
-                            },
+                            "update": completed,
                         }),
                     })
                     .unwrap(),

@@ -14,6 +14,22 @@ pub fn show_narration() -> bool {
     false
 }
 
+/// Check if tool call output/result should be attached to tool_call updates.
+///
+/// Enabled by `AGY_SHOW_TOOL_OUTPUT=1` (or `true`), or by the shared
+/// `OPENAB_TOOL_DISPLAY=full` switch. When off, only the tool title + rawInput
+/// are sent (current default behaviour).
+pub fn show_tool_output() -> bool {
+    if let Ok(v) = std::env::var("AGY_SHOW_TOOL_OUTPUT") {
+        return v == "1" || v.eq_ignore_ascii_case("true");
+    }
+    if let Ok(v) = std::env::var("OPENAB_TOOL_DISPLAY") {
+        return v.eq_ignore_ascii_case("full");
+    }
+    false
+}
+
+
 /// A part is considered narration if every non-empty line starts with "I will".
 pub fn is_narration(text: &str) -> bool {
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -24,6 +40,7 @@ pub fn is_narration(text: &str) -> bool {
 }
 
 /// Filter out leading narration from response parts.
+#[allow(dead_code)]
 pub fn filter_narration(parts: &[String]) -> String {
     if show_narration() || parts.len() <= 1 {
         return parts.join("\n");
@@ -34,6 +51,7 @@ pub fn filter_narration(parts: &[String]) -> String {
 
 /// Read the latest response from the SQLite conversation DB.
 /// Returns (response_text, max_step_idx) or None if reading fails.
+#[allow(dead_code)]
 pub fn read_response_from_db(conversations_dir: &PathBuf, conversation_id: &str, after_step_idx: i64) -> Option<(String, i64)> {
     let db_path = conversations_dir.join(format!("{}.db", conversation_id));
     let conn = Connection::open_with_flags(
