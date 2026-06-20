@@ -1,3 +1,4 @@
+use crate::context::{inject_context, ContextFetchRequest, ContextObserveRequest, ContextScope};
 use crate::media::{
     audio_extension, format_bytes, resize_and_compress, AUDIO_MAX_DOWNLOAD, IMAGE_MAX_DOWNLOAD,
 };
@@ -5,7 +6,6 @@ use crate::schema::*;
 use crate::store;
 use axum::extract::State;
 use serde::Deserialize;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -155,14 +155,21 @@ async fn process_line_webhook_events(
     // - Guardrail: a shared semaphore bounds how many LINE payloads can enter the
     //   post-ack path concurrently. When saturated, new webhooks wait for capacity
     //   before spawning background work so bursts do not create unbounded backlog.
+    let line_context_provider = state.context_providers.get("line").cloned();
+    let line_context_bot_id = state
+        .context_bot_ids
+        .get("line")
+        .cloned()
+        .unwrap_or_else(|| "line-default-bot".into());
+
     for event in webhook_body.events {
         let Some(gateway_event) = build_gateway_event_from_line_event(
             &event,
             &state.client,
             state.line_access_token.as_deref(),
             LINE_DATA_API_BASE,
-            &state.line_group_context_buffer,
-            &state.line_group_context_config,
+            line_context_provider.clone(),
+            &line_context_bot_id,
         )
         .await
         else {
@@ -209,8 +216,8 @@ async fn build_gateway_event_from_line_event(
     client: &reqwest::Client,
     line_access_token: Option<&str>,
     data_api_base: &str,
-    line_group_context_buffer: &crate::LineGroupContextBuffer,
-    line_group_context_config: &crate::LineGroupContextConfig,
+    line_context_provider: Option<Arc<dyn crate::context::ContextProvider>>,
+    line_context_bot_id: &str,
 ) -> Option<GatewayEvent> {
     if event.event_type != "message" {
         return None;
@@ -375,32 +382,43 @@ async fn build_gateway_event_from_line_event(
     // 1:1 DMs always pass through.
     let is_group = channel_type == "group" || channel_type == "room";
     let bot_mentioned = mentionees.iter().any(|m| m.is_self);
-    if is_group && msg.message_type == "text" && line_group_context_config.enabled {
+    if is_group
+        && msg.message_type == "text"
+        && line_context_provider
+            .as_ref()
+            .is_some_and(|p| p.is_enabled())
+    {
+        let scope = ContextScope::new("line", &channel_id, None, line_context_bot_id);
         if !bot_mentioned {
-            buffer_line_group_context(
-                line_group_context_buffer,
-                line_group_context_config,
-                &channel_id,
-                user_id,
-                &event_text,
-            );
+            let observed = line_context_provider
+                .as_ref()
+                .expect("checked provider above")
+                .observe(ContextObserveRequest {
+                    scope,
+                    sender_id: user_id.to_string(),
+                    sender_label: user_id.to_string(),
+                    text: event_text.clone(),
+                })
+                .await;
             info!(
                 channel = %channel_id,
+                observed,
                 "line group text buffered (bot not mentioned)"
             );
             return None;
         }
-        if let Some(buffered) = take_line_group_context(
-            line_group_context_buffer,
-            line_group_context_config,
-            &channel_id,
-        ) {
+        if let Some(context) = line_context_provider
+            .as_ref()
+            .expect("checked provider above")
+            .fetch_context(ContextFetchRequest { scope, limit: None })
+            .await
+        {
             info!(
                 channel = %channel_id,
-                buffered_messages = buffered.len(),
+                buffered_messages = context.len(),
                 "line group context injected into direct mention"
             );
-            event_text = inject_buffered_group_context(&buffered, &event_text);
+            event_text = inject_context(&context, &event_text);
         }
     } else if is_group && !bot_mentioned {
         info!(
@@ -429,80 +447,6 @@ async fn build_gateway_event_from_line_event(
     );
     gateway_event.content.attachments = attachments;
     Some(gateway_event)
-}
-
-fn buffer_line_group_context(
-    buffer: &crate::LineGroupContextBuffer,
-    config: &crate::LineGroupContextConfig,
-    channel_id: &str,
-    sender_id: &str,
-    text: &str,
-) {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return;
-    }
-
-    let mut guard = buffer.lock().unwrap_or_else(|e| e.into_inner());
-    let now = std::time::Instant::now();
-    let entry = guard.entry(channel_id.to_string()).or_default();
-    entry.retain(|m| now.duration_since(m.buffered_at).as_secs() < config.ttl_secs);
-    let bounded_text: String = trimmed.chars().take(config.max_chars).collect();
-    entry.push_back(crate::LineBufferedText {
-        sender_id: sender_id.to_string(),
-        text: bounded_text,
-        buffered_at: now,
-    });
-    enforce_line_group_context_limits(entry, config);
-}
-
-fn enforce_line_group_context_limits(
-    entry: &mut VecDeque<crate::LineBufferedText>,
-    config: &crate::LineGroupContextConfig,
-) {
-    while entry.len() > config.max_messages {
-        entry.pop_front();
-    }
-    while entry.len() > 1 && line_group_context_char_count(entry) > config.max_chars {
-        entry.pop_front();
-    }
-}
-
-fn line_group_context_char_count(entry: &VecDeque<crate::LineBufferedText>) -> usize {
-    entry
-        .iter()
-        .map(|m| m.sender_id.chars().count() + m.text.chars().count() + 2)
-        .sum()
-}
-
-fn take_line_group_context(
-    buffer: &crate::LineGroupContextBuffer,
-    config: &crate::LineGroupContextConfig,
-    channel_id: &str,
-) -> Option<VecDeque<crate::LineBufferedText>> {
-    let mut guard = buffer.lock().unwrap_or_else(|e| e.into_inner());
-    let now = std::time::Instant::now();
-    let mut entry = guard.remove(channel_id)?;
-    entry.retain(|m| now.duration_since(m.buffered_at).as_secs() < config.ttl_secs);
-    if entry.is_empty() {
-        None
-    } else {
-        Some(entry)
-    }
-}
-
-fn inject_buffered_group_context(
-    buffered: &VecDeque<crate::LineBufferedText>,
-    current_text: &str,
-) -> String {
-    let mut lines = Vec::with_capacity(buffered.len() + 3);
-    lines.push("[Recent group context before this direct mention]".to_string());
-    for entry in buffered {
-        lines.push(format!("{}: {}", entry.sender_id, entry.text));
-    }
-    lines.push("[Current directly mentioned message]".to_string());
-    lines.push(current_text.to_string());
-    lines.join("\n")
 }
 
 pub async fn download_line_image(
@@ -846,15 +790,53 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn test_line_group_context_config() -> crate::LineGroupContextConfig {
-        crate::LineGroupContextConfig::default()
+    const TEST_LINE_CONTEXT_BOT_ID: &str = "line-default-bot";
+
+    fn test_line_context_config() -> crate::context::ContextConfig {
+        crate::context::ContextConfig::default()
     }
 
-    fn enabled_line_group_context_config() -> crate::LineGroupContextConfig {
-        crate::LineGroupContextConfig {
+    fn enabled_line_context_config() -> crate::context::ContextConfig {
+        crate::context::ContextConfig {
             enabled: true,
-            ..crate::LineGroupContextConfig::default()
+            ..crate::context::ContextConfig::default()
         }
+    }
+
+    fn disabled_line_context_provider() -> Arc<crate::context::BufferedContextProvider> {
+        Arc::new(crate::context::BufferedContextProvider::new(
+            test_line_context_config(),
+        ))
+    }
+
+    fn enabled_line_context_provider() -> Arc<crate::context::BufferedContextProvider> {
+        Arc::new(crate::context::BufferedContextProvider::new(
+            enabled_line_context_config(),
+        ))
+    }
+
+    fn as_context_provider(
+        provider: &Arc<crate::context::BufferedContextProvider>,
+    ) -> Arc<dyn crate::context::ContextProvider> {
+        provider.clone()
+    }
+
+    fn line_context_scope(channel_id: &str) -> crate::context::ContextScope {
+        crate::context::ContextScope::new("line", channel_id, None, TEST_LINE_CONTEXT_BOT_ID)
+    }
+
+    fn context_provider_registry(
+        provider: Arc<dyn crate::context::ContextProvider>,
+    ) -> crate::ContextProviderRegistry {
+        let mut providers = HashMap::new();
+        providers.insert("line".into(), provider);
+        Arc::new(providers)
+    }
+
+    fn context_bot_id_registry() -> crate::ContextBotIdRegistry {
+        let mut bot_ids = HashMap::new();
+        bot_ids.insert("line".into(), TEST_LINE_CONTEXT_BOT_ID.into());
+        Arc::new(bot_ids)
     }
 
     #[tokio::test]
@@ -932,8 +914,8 @@ mod tests {
             &reqwest::Client::new(),
             Some("line_token"),
             &server.uri(),
-            &Arc::new(std::sync::Mutex::new(HashMap::new())),
-            &test_line_group_context_config(),
+            None,
+            TEST_LINE_CONTEXT_BOT_ID,
         )
         .await
         .expect("image event should produce a gateway event");
@@ -984,6 +966,8 @@ mod tests {
             &reqwest::Client::new(),
             Some("line_token"),
             &server.uri(),
+            None,
+            TEST_LINE_CONTEXT_BOT_ID,
         )
         .await
         .expect("audio event should produce a gateway event");
@@ -1039,6 +1023,8 @@ mod tests {
             &reqwest::Client::new(),
             Some("line_token"),
             &server.uri(),
+            None,
+            TEST_LINE_CONTEXT_BOT_ID,
         )
         .await
         .expect("audio event should produce a gateway event");
@@ -1152,8 +1138,8 @@ mod tests {
             &reqwest::Client::new(),
             None,
             LINE_DATA_API_BASE,
-            &Arc::new(std::sync::Mutex::new(HashMap::new())),
-            &test_line_group_context_config(),
+            None,
+            TEST_LINE_CONTEXT_BOT_ID,
         )
         .await;
 
@@ -1190,8 +1176,8 @@ mod tests {
             &reqwest::Client::new(),
             None,
             LINE_DATA_API_BASE,
-            &Arc::new(std::sync::Mutex::new(HashMap::new())),
-            &test_line_group_context_config(),
+            None,
+            TEST_LINE_CONTEXT_BOT_ID,
         )
         .await;
 
@@ -1226,8 +1212,8 @@ mod tests {
             &reqwest::Client::new(),
             None, // no access token
             LINE_DATA_API_BASE,
-            &Arc::new(std::sync::Mutex::new(HashMap::new())),
-            &test_line_group_context_config(),
+            None,
+            TEST_LINE_CONTEXT_BOT_ID,
         )
         .await;
 
@@ -1257,6 +1243,8 @@ mod tests {
             &reqwest::Client::new(),
             None,
             LINE_DATA_API_BASE,
+            None,
+            TEST_LINE_CONTEXT_BOT_ID,
         )
         .await;
 
@@ -1287,8 +1275,10 @@ mod tests {
             event_tx,
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             line_webhook_semaphore: Arc::new(Semaphore::new(crate::LINE_WEBHOOK_CONCURRENCY_MAX)),
-            line_group_context_buffer: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            line_group_context_config: test_line_group_context_config(),
+            context_providers: context_provider_registry(as_context_provider(
+                &disabled_line_context_provider(),
+            )),
+            context_bot_ids: context_bot_id_registry(),
             client: reqwest::Client::new(),
         });
 
@@ -1356,8 +1346,8 @@ mod tests {
             &reqwest::Client::new(),
             None,
             LINE_DATA_API_BASE,
-            &Arc::new(std::sync::Mutex::new(HashMap::new())),
-            &test_line_group_context_config(),
+            None,
+            TEST_LINE_CONTEXT_BOT_ID,
         )
         .await;
         assert!(result.is_some());
@@ -1367,46 +1357,38 @@ mod tests {
 
     #[tokio::test]
     async fn group_message_drops_without_buffer_when_context_disabled() {
-        let buffer = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let provider = disabled_line_context_provider();
         let event = make_group_text_event("hey everyone", false);
         let result = build_gateway_event_from_line_event(
             &event,
             &reqwest::Client::new(),
             None,
             LINE_DATA_API_BASE,
-            &buffer,
-            &test_line_group_context_config(),
+            Some(as_context_provider(&provider)),
+            TEST_LINE_CONTEXT_BOT_ID,
         )
         .await;
         assert!(result.is_none());
-        let guard = buffer.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(
-            guard.get("C001").is_none(),
-            "context disabled should preserve original drop behavior"
-        );
+        assert_eq!(provider.buffered_len(&line_context_scope("C001")), 0);
     }
 
     #[tokio::test]
     async fn group_message_buffers_when_bot_not_mentioned_and_context_enabled() {
-        let buffer = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let provider = enabled_line_context_provider();
         let event = make_group_text_event("hey everyone", false);
         let result = build_gateway_event_from_line_event(
             &event,
             &reqwest::Client::new(),
             None,
             LINE_DATA_API_BASE,
-            &buffer,
-            &enabled_line_group_context_config(),
+            Some(as_context_provider(&provider)),
+            TEST_LINE_CONTEXT_BOT_ID,
         )
         .await;
         assert!(result.is_none());
-        let guard = buffer.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
-            guard
-                .get("C001")
-                .and_then(|entry| entry.front())
-                .map(|m| m.text.as_str()),
-            Some("hey everyone")
+            provider.buffered_texts(&line_context_scope("C001")),
+            vec!["hey everyone"]
         );
     }
 
@@ -1423,8 +1405,8 @@ mod tests {
             &reqwest::Client::new(),
             None,
             LINE_DATA_API_BASE,
-            &Arc::new(std::sync::Mutex::new(HashMap::new())),
-            &enabled_line_group_context_config(),
+            Some(as_context_provider(&enabled_line_context_provider())),
+            TEST_LINE_CONTEXT_BOT_ID,
         )
         .await;
         assert!(result.is_none());
@@ -1443,8 +1425,8 @@ mod tests {
             &reqwest::Client::new(),
             None,
             LINE_DATA_API_BASE,
-            &Arc::new(std::sync::Mutex::new(HashMap::new())),
-            &test_line_group_context_config(),
+            None,
+            TEST_LINE_CONTEXT_BOT_ID,
         )
         .await;
         assert!(result.is_some());
@@ -1452,7 +1434,7 @@ mod tests {
 
     #[tokio::test]
     async fn group_message_buffers_then_injects_context_on_later_mention() {
-        let buffer = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let provider = enabled_line_context_provider();
 
         let first = make_group_text_event("今天下午兩點開會", false);
         let first_result = build_gateway_event_from_line_event(
@@ -1460,8 +1442,8 @@ mod tests {
             &reqwest::Client::new(),
             None,
             LINE_DATA_API_BASE,
-            &buffer,
-            &enabled_line_group_context_config(),
+            Some(as_context_provider(&provider)),
+            TEST_LINE_CONTEXT_BOT_ID,
         )
         .await;
         assert!(
@@ -1475,8 +1457,8 @@ mod tests {
             &reqwest::Client::new(),
             None,
             LINE_DATA_API_BASE,
-            &buffer,
-            &enabled_line_group_context_config(),
+            Some(as_context_provider(&provider)),
+            TEST_LINE_CONTEXT_BOT_ID,
         )
         .await
         .expect("mentioned message should produce an event");
@@ -1484,7 +1466,7 @@ mod tests {
         assert!(second_result
             .content
             .text
-            .contains("[Recent group context before this direct mention]"));
+            .contains("[Recent conversation context before this trigger]"));
         assert!(second_result
             .content
             .text
@@ -1492,18 +1474,14 @@ mod tests {
         assert!(second_result
             .content
             .text
-            .contains("[Current directly mentioned message]"));
+            .contains("[Current message - respond to this]"));
         assert!(second_result.content.text.contains("@Bot 幫我總結一下"));
-        let guard = buffer.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(
-            guard.get("C001").is_none(),
-            "buffer should drain after injection"
-        );
+        assert_eq!(provider.buffered_len(&line_context_scope("C001")), 0);
     }
 
     #[tokio::test]
     async fn direct_mention_without_buffer_keeps_original_text() {
-        let buffer = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let provider = enabled_line_context_provider();
 
         let event = make_group_text_event("@Bot 現在狀況如何", true);
         let result = build_gateway_event_from_line_event(
@@ -1511,8 +1489,8 @@ mod tests {
             &reqwest::Client::new(),
             None,
             LINE_DATA_API_BASE,
-            &buffer,
-            &enabled_line_group_context_config(),
+            Some(as_context_provider(&provider)),
+            TEST_LINE_CONTEXT_BOT_ID,
         )
         .await
         .expect("mentioned message should produce an event");
@@ -1522,7 +1500,7 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_buffered_messages_preserve_order_on_injection() {
-        let buffer = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let provider = enabled_line_context_provider();
 
         let first: LineEvent = serde_json::from_value(serde_json::json!({
             "type": "message",
@@ -1542,8 +1520,8 @@ mod tests {
             &reqwest::Client::new(),
             None,
             LINE_DATA_API_BASE,
-            &buffer,
-            &enabled_line_group_context_config(),
+            Some(as_context_provider(&provider)),
+            TEST_LINE_CONTEXT_BOT_ID,
         )
         .await
         .is_none());
@@ -1552,8 +1530,8 @@ mod tests {
             &reqwest::Client::new(),
             None,
             LINE_DATA_API_BASE,
-            &buffer,
-            &enabled_line_group_context_config(),
+            Some(as_context_provider(&provider)),
+            TEST_LINE_CONTEXT_BOT_ID,
         )
         .await
         .is_none());
@@ -1564,8 +1542,8 @@ mod tests {
             &reqwest::Client::new(),
             None,
             LINE_DATA_API_BASE,
-            &buffer,
-            &enabled_line_group_context_config(),
+            Some(as_context_provider(&provider)),
+            TEST_LINE_CONTEXT_BOT_ID,
         )
         .await
         .expect("mentioned message should produce an event");
@@ -1583,7 +1561,7 @@ mod tests {
         let current_idx = result
             .content
             .text
-            .find("[Current directly mentioned message]")
+            .find("[Current message - respond to this]")
             .expect("current message header present");
 
         assert!(
@@ -1596,80 +1574,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn group_context_buffer_keeps_latest_messages_within_bounds() {
-        let buffer = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let config = test_line_group_context_config();
-
-        for i in 0..(config.max_messages + 5) {
-            buffer_line_group_context(
-                &buffer,
-                &config,
-                "C001",
-                "U_sender",
-                &format!("message {i}"),
-            );
-        }
-
-        let guard = buffer.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = guard.get("C001").expect("buffer should exist");
-
-        assert_eq!(entry.len(), config.max_messages);
-        assert_eq!(entry.front().unwrap().text, "message 5");
-        assert_eq!(
-            entry.back().unwrap().text,
-            format!("message {}", config.max_messages + 4)
-        );
-        assert!(
-            line_group_context_char_count(entry) <= config.max_chars,
-            "buffer should stay within character budget"
-        );
-    }
-
-    #[test]
-    fn group_context_buffer_enforces_total_character_budget() {
-        let buffer = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let config = test_line_group_context_config();
-        let large = "x".repeat(config.max_chars / 2);
-
-        buffer_line_group_context(
-            &buffer,
-            &config,
-            "C001",
-            "U_sender",
-            &format!("old {large}"),
-        );
-        buffer_line_group_context(
-            &buffer,
-            &config,
-            "C001",
-            "U_sender",
-            &format!("middle {large}"),
-        );
-        buffer_line_group_context(
-            &buffer,
-            &config,
-            "C001",
-            "U_sender",
-            &format!("latest {large}"),
-        );
-
-        let guard = buffer.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = guard.get("C001").expect("buffer should exist");
-
-        assert!(
-            line_group_context_char_count(entry) <= config.max_chars,
-            "buffer should stay within character budget"
-        );
-        assert!(
-            entry.back().unwrap().text.starts_with("latest "),
-            "latest context should be retained when trimming old messages"
-        );
-    }
-
     #[tokio::test]
     async fn buffer_is_chat_local_and_not_reused_after_drain() {
-        let buffer = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let provider = enabled_line_context_provider();
 
         let buffered: LineEvent = serde_json::from_value(serde_json::json!({
             "type": "message",
@@ -1683,8 +1590,8 @@ mod tests {
             &reqwest::Client::new(),
             None,
             LINE_DATA_API_BASE,
-            &buffer,
-            &enabled_line_group_context_config(),
+            Some(as_context_provider(&provider)),
+            TEST_LINE_CONTEXT_BOT_ID,
         )
         .await
         .is_none());
@@ -1706,8 +1613,8 @@ mod tests {
             &reqwest::Client::new(),
             None,
             LINE_DATA_API_BASE,
-            &buffer,
-            &enabled_line_group_context_config(),
+            Some(as_context_provider(&provider)),
+            TEST_LINE_CONTEXT_BOT_ID,
         )
         .await
         .expect("other chat mention should produce an event");
@@ -1722,8 +1629,8 @@ mod tests {
             &reqwest::Client::new(),
             None,
             LINE_DATA_API_BASE,
-            &buffer,
-            &enabled_line_group_context_config(),
+            Some(as_context_provider(&provider)),
+            TEST_LINE_CONTEXT_BOT_ID,
         )
         .await
         .expect("same chat mention should produce an event");
@@ -1738,8 +1645,8 @@ mod tests {
             &reqwest::Client::new(),
             None,
             LINE_DATA_API_BASE,
-            &buffer,
-            &enabled_line_group_context_config(),
+            Some(as_context_provider(&provider)),
+            TEST_LINE_CONTEXT_BOT_ID,
         )
         .await
         .expect("second same-chat mention should produce an event");

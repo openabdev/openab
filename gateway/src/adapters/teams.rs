@@ -666,8 +666,8 @@ mod tests {
             event_tx,
             reply_token_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             line_webhook_semaphore: Arc::new(tokio::sync::Semaphore::new(crate::LINE_WEBHOOK_CONCURRENCY_MAX)),
-            line_group_context_buffer: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            line_group_context_config: crate::LineGroupContextConfig::default(),
+            context_providers: Arc::new(std::collections::HashMap::new()),
+            context_bot_ids: Arc::new(std::collections::HashMap::new()),
             client: reqwest::Client::new(),
         })
     }

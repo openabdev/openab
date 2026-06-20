@@ -1,4 +1,5 @@
 mod adapters;
+mod context;
 mod media;
 mod schema;
 pub mod store;
@@ -12,7 +13,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use schema::GatewayReply;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{broadcast, Mutex, Semaphore};
@@ -38,85 +39,8 @@ pub const REPLY_TOKEN_CACHE_MAX: usize = 10_000;
 /// fast 200 OK response path.
 pub const LINE_WEBHOOK_CONCURRENCY_MAX: usize = 8;
 
-pub const LINE_GROUP_CONTEXT_DEFAULT_TTL_HOURS: u64 = 24;
-pub const LINE_GROUP_CONTEXT_DEFAULT_MAX_MESSAGES: usize = 100;
-pub const LINE_GROUP_CONTEXT_DEFAULT_MAX_CHARS: usize = 8_000;
-
-#[derive(Clone, Debug)]
-pub struct LineGroupContextConfig {
-    /// Enables opt-in capture of unmentioned LINE group text.
-    pub enabled: bool,
-    /// How long unmentioned LINE group text stays eligible for later prompt injection.
-    pub ttl_secs: u64,
-    /// Maximum buffered unmentioned LINE text messages per group/room.
-    pub max_messages: usize,
-    /// Maximum total buffered text characters per LINE group/room.
-    pub max_chars: usize,
-}
-
-impl Default for LineGroupContextConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            ttl_secs: LINE_GROUP_CONTEXT_DEFAULT_TTL_HOURS * 60 * 60,
-            max_messages: LINE_GROUP_CONTEXT_DEFAULT_MAX_MESSAGES,
-            max_chars: LINE_GROUP_CONTEXT_DEFAULT_MAX_CHARS,
-        }
-    }
-}
-
-impl LineGroupContextConfig {
-    fn from_env() -> Self {
-        let defaults = Self::default();
-        let ttl_hours = read_positive_env_u64(
-            "LINE_GROUP_CONTEXT_TTL_HOURS",
-            LINE_GROUP_CONTEXT_DEFAULT_TTL_HOURS,
-        );
-        Self {
-            enabled: read_bool_env("LINE_GROUP_CONTEXT_ENABLED", defaults.enabled),
-            ttl_secs: ttl_hours.saturating_mul(60 * 60),
-            max_messages: read_positive_env_usize(
-                "LINE_GROUP_CONTEXT_MAX_MESSAGES",
-                defaults.max_messages,
-            ),
-            max_chars: read_positive_env_usize("LINE_GROUP_CONTEXT_MAX_CHARS", defaults.max_chars),
-        }
-    }
-}
-
-fn read_bool_env(name: &str, default: bool) -> bool {
-    std::env::var(name)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(default)
-}
-
-fn read_positive_env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(default)
-}
-
-fn read_positive_env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(default)
-}
-
-#[derive(Clone, Debug)]
-pub struct LineBufferedText {
-    pub sender_id: String,
-    pub text: String,
-    pub buffered_at: Instant,
-}
-
-/// Short-lived LINE group/room context captured from unmentioned text messages.
-/// Keyed by groupId/roomId. Drained when a later direct mention arrives.
-pub type LineGroupContextBuffer =
-    Arc<std::sync::Mutex<HashMap<String, VecDeque<LineBufferedText>>>>;
+pub type ContextProviderRegistry = Arc<HashMap<String, Arc<dyn context::ContextProvider>>>;
+pub type ContextBotIdRegistry = Arc<HashMap<String, String>>;
 
 // --- App state (shared across all adapters) ---
 
@@ -152,10 +76,10 @@ pub struct AppState {
     /// Limits concurrent post-ack LINE webhook processing so image bursts do not
     /// turn into unbounded download/decode work.
     pub line_webhook_semaphore: Arc<Semaphore>,
-    /// Short-lived unmentioned LINE group text, used to enrich the next direct-mention turn.
-    pub line_group_context_buffer: LineGroupContextBuffer,
-    /// Tuning knobs for LINE group context capture.
-    pub line_group_context_config: LineGroupContextConfig,
+    /// Gateway-level context providers keyed by platform name.
+    pub context_providers: ContextProviderRegistry,
+    /// Stable bot identity per platform for context isolation in shared chats.
+    pub context_bot_ids: ContextBotIdRegistry,
     /// Shared HTTP client for media downloads and API calls
     pub client: reqwest::Client,
 }
@@ -320,9 +244,26 @@ async fn main() -> Result<()> {
 
     let (event_tx, _) = broadcast::channel::<String>(256);
     let reply_token_cache: ReplyTokenCache = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let line_group_context_buffer: LineGroupContextBuffer =
-        Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let line_group_context_config = LineGroupContextConfig::from_env();
+    let line_context_config =
+        context::ContextConfig::from_env_with_prefixes(&["LINE_GROUP", "GATEWAY"]);
+    let line_context_bot_id = std::env::var("LINE_CONTEXT_BOT_ID")
+        .or_else(|_| std::env::var("LINE_BOT_ID"))
+        .unwrap_or_else(|_| "line-default-bot".into());
+    if line_context_config.enabled {
+        info!(
+            ttl_secs = line_context_config.ttl_secs,
+            max_messages = line_context_config.max_messages,
+            max_chars = line_context_config.max_chars,
+            "line buffered context provider enabled"
+        );
+    }
+    let mut context_providers = HashMap::<String, Arc<dyn context::ContextProvider>>::new();
+    context_providers.insert(
+        "line".into(),
+        Arc::new(context::BufferedContextProvider::new(line_context_config)),
+    );
+    let mut context_bot_ids = HashMap::new();
+    context_bot_ids.insert("line".into(), line_context_bot_id);
 
     let mut app = Router::new()
         .route("/ws", get(ws_handler))
@@ -497,8 +438,8 @@ async fn main() -> Result<()> {
         event_tx,
         reply_token_cache,
         line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
-        line_group_context_buffer,
-        line_group_context_config,
+        context_providers: Arc::new(context_providers),
+        context_bot_ids: Arc::new(context_bot_ids),
         client,
     });
 

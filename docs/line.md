@@ -83,7 +83,7 @@ In the LINE Developers Console → **Messaging API** tab → scan the QR code wi
 
 - **1:1 chat** — send a message to the bot, get an AI agent response
 - **Inbound voice messages in 1:1 chat** — LINE-hosted audio messages are downloaded through the LINE Content API and forwarded to OpenAB as `audio` attachments, so the existing STT flow can transcribe them. This requires `[stt] enabled = true` in OpenAB core. See [STT (Speech-to-Text)](stt.md).
-- **Group chat** — add the bot to a group; it responds when directly @-mentioned. Deployments can opt in to folding recent unmentioned text into the next direct-mention turn as short-term context (see @mention gating below)
+- **Group chat** — add the bot to a group; it responds when directly @-mentioned. Deployments can opt in to folding recent unmentioned text into the next direct-mention turn through the gateway ContextProvider buffer (see @mention gating below)
 - **Inbound images** — user-sent LINE images are downloaded through the LINE Content API and forwarded to OpenAB as image attachments
 - **Webhook signature validation** — HMAC-SHA256 via `LINE_CHANNEL_SECRET`
 
@@ -97,11 +97,11 @@ In the LINE Developers Console → **Messaging API** tab → scan the QR code wi
 - **Threads** — LINE has no thread/topic concept. All messages in a chat share one agent session.
 - **Reactions** — LINE Bot API does not support message reactions.
 - **@mention gating** — Supported (zero-config). In group/room chats the gateway only dispatches a visible bot reply when the bot is explicitly @-mentioned (LINE's native `mentionees[].isSelf` signal). 1:1 DMs are always forwarded. No env var is needed.
-  - *Optional short-term text buffering*: when `LINE_GROUP_CONTEXT_ENABLED=true`, unmentioned **text** messages in groups/rooms are buffered locally in the gateway for up to 24 hours and injected into the next directly @-mentioned text turn for the same chat. The buffer is capped per chat by message count and total characters. This improves conversational continuity without making the bot reply to every group message.
+  - *Optional short-term text buffering*: when `LINE_GROUP_CONTEXT_ENABLED=true`, unmentioned **text** messages in groups/rooms are observed by the gateway ContextProvider and buffered locally for up to 24 hours. The next directly @-mentioned text turn for the same chat drains that buffer and prepends it as short-term context. The buffer is capped per chat by message count and total characters. This improves conversational continuity without making the bot reply to every group message.
   - *Limitation — non-text messages*: LINE only attaches mention data to text messages. Images, videos, stickers, files, and location messages in groups are still dropped when not directly @-mentioned because they do not enter the short-term text buffer.
   - *Limitation — group voice messages*: LINE voice/audio messages in groups and rooms are also dropped today because audio messages do not carry mention metadata. LINE inbound voice STT is currently for 1:1 chats.
   - *Limitation — `@All`*: A group-wide `@All` mention does **not** trigger the bot; only a direct `@BotName` mention does.
-  - *Behavior note*: the short-term context buffer is local, bounded, temporary, and drained after injection. It is not a long-term chat archive or GBrain memory store.
+  - *Behavior note*: the short-term context buffer is local, bounded, temporary, scoped by platform/chat/thread/bot, and drained after injection. It is not a long-term chat archive or GBrain memory store.
 - **Markdown rendering** — LINE uses its own text formatting. Agent replies are sent as plain text.
 - **External-content images** — LINE image messages backed by `contentProvider.type = "external"` are not downloaded yet.
 - **External-content audio** — LINE audio messages backed by `contentProvider.type = "external"` are not downloaded yet.
@@ -112,10 +112,13 @@ In the LINE Developers Console → **Messaging API** tab → scan the QR code wi
 |---|---|---|
 | `LINE_CHANNEL_SECRET` | Yes | Channel secret for webhook signature validation |
 | `LINE_CHANNEL_ACCESS_TOKEN` | Yes | Channel access token for Reply/Push Message API and LINE-hosted image/audio downloads |
-| `LINE_GROUP_CONTEXT_ENABLED` | No | Opt in to buffering unmentioned group/room text for the next direct mention. Default: `false` |
-| `LINE_GROUP_CONTEXT_TTL_HOURS` | No | Hours to keep unmentioned group/room text eligible for the next direct mention. Default: `24` |
-| `LINE_GROUP_CONTEXT_MAX_MESSAGES` | No | Maximum buffered unmentioned text messages per group/room. Default: `100` |
-| `LINE_GROUP_CONTEXT_MAX_CHARS` | No | Maximum total buffered text characters per group/room. Default: `8000` |
+| `LINE_GROUP_CONTEXT_ENABLED` | No | Opt in to buffering unmentioned group/room text for the next direct mention. Falls back to `GATEWAY_CONTEXT_ENABLED`. Default: `false` |
+| `LINE_GROUP_CONTEXT_TTL_HOURS` | No | Hours to keep unmentioned group/room text eligible for the next direct mention. Falls back to `GATEWAY_CONTEXT_TTL_HOURS`. Default: `24` |
+| `LINE_GROUP_CONTEXT_MAX_MESSAGES` | No | Maximum buffered unmentioned text messages per group/room. Falls back to `GATEWAY_CONTEXT_MAX_MESSAGES`. Default: `50` |
+| `LINE_GROUP_CONTEXT_MAX_CHARS` | No | Maximum total buffered text characters per group/room. Falls back to `GATEWAY_CONTEXT_MAX_CHARS`. Default: `8000` |
+| `LINE_CONTEXT_BOT_ID` | No | Stable bot identity used for ContextProvider isolation when multiple bots share a LINE group. Falls back to `LINE_BOT_ID`, then `line-default-bot` |
+
+See [Gateway Context Providers](./gateway-context.md) for the shared context buffering model and future API-fetch/hybrid provider direction.
 
 ## Troubleshooting
 
