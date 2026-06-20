@@ -89,11 +89,11 @@ pub enum AllowUsers {
 ///
 /// Controls how the gateway renders streaming (`edit_message`) replies:
 /// - `Post`   — current production behavior: PATCH a `post` message in place,
-///              with the PR #1122 230072 edit-cap recovery as a backstop.
+///   with the PR #1122 230072 edit-cap recovery as a backstop.
 /// - `Card`   — always drive a CardKit v2 interactive streaming card
-///              (no 20-edit cap; native markdown / table rendering).
+///   (no 20-edit cap; native markdown / table rendering).
 /// - `Auto`   — start as `post`, single-direction promote to `card` when the
-///              content warrants it (long text, code fences, or tables).
+///   content warrants it (long text, code fences, or tables).
 ///
 /// Defaults to `Auto` (S6 switched the feature on): short replies stay as a
 /// `post` (native reply UI), while long / code-fence / table replies promote
