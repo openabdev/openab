@@ -74,6 +74,14 @@ pub struct PendingPasteLogin {
     /// (written before this field existed) deserializable.
     #[serde(default)]
     pub resource: Option<String>,
+    /// Unix-seconds stamp set when the pending entry is written; `with_auth_locked`
+    /// expires entries older than 15 min (ADR §7) so an abandoned `/auth` two-step
+    /// (verifier written, code never pasted) doesn't accumulate. The two-step flow
+    /// that *writes* pending state is forthcoming; today this struct is a legacy
+    /// read-tolerant tombstone, so the field exists mainly for the GC. `#[serde(default)]`
+    /// (= 0) reads pre-existing/legacy entries as ancient → swept on the next write.
+    #[serde(default)]
+    pub created_at: u64,
 }
 
 /// `auth.json` value type. Untagged Serde enum: `TokenStore` has required
@@ -298,7 +306,9 @@ fn flock_try_exclusive(lock: &Path) -> Result<Option<AuthFileLock>> {
         return Ok(Some(AuthFileLock { file }));
     }
     let err = std::io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+    // flock can report EWOULDBLOCK or EAGAIN depending on libc/BSD; both map to
+    // `ErrorKind::WouldBlock`, so use the std abstraction (Mira review).
+    if err.kind() == std::io::ErrorKind::WouldBlock {
         Ok(None)
     } else {
         Err(err.into())
@@ -318,8 +328,25 @@ fn with_auth_locked<R>(
     let _guard = flock_exclusive(&lock_path_for(path, "global"))?;
     let mut map = read_auth_file(path).unwrap_or_default();
     let r = f(&mut map);
+    gc_stale_pending(&mut map);
     write_auth_file(path, &map)?;
     Ok(r)
+}
+
+/// Opportunistic GC (ADR §7): drop `AuthEntry::Pending` entries older than 15 min
+/// on every locked write, so abandoned `/auth` two-step attempts don't accumulate.
+/// `created_at == 0` (legacy/unstamped entries) reads as ancient and is swept.
+const PENDING_TTL_SECONDS: u64 = 15 * 60;
+
+fn gc_stale_pending(map: &mut HashMap<String, AuthEntry>) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    map.retain(|_, entry| match entry {
+        AuthEntry::Pending(p) => now.saturating_sub(p.created_at) <= PENDING_TTL_SECONDS,
+        _ => true,
+    });
 }
 
 /// (b) Per-tenant refresh serialisation (ADR §5.4). The returned guard is held by
@@ -1013,6 +1040,7 @@ mod tests {
             token_url: "https://example.com/token".to_string(),
             provider_name: "anthropic-mcp".to_string(),
             resource: None,
+            created_at: 0,
         }
     }
 
@@ -1278,5 +1306,45 @@ mod tests {
         assert_eq!(map.len(), 2, "second write merged, did not lost-update");
         assert_eq!(token_of(map.get("codex")).expires_at, 1);
         assert!(matches!(map.get("github"), Some(AuthEntry::Mcp(_))));
+    }
+
+    #[test]
+    fn with_auth_locked_gcs_stale_pending_but_keeps_fresh_and_tokens() {
+        // ADR §7: a locked write opportunistically sweeps `Pending` entries older
+        // than 15 min, while fresh pending state and real tenants are untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Seed through the un-GC'd writer so the stale entry exists pre-sweep.
+        let mut seed = HashMap::new();
+        seed.insert("codex".to_string(), AuthEntry::Token(make_store(1)));
+        seed.insert(
+            "mcp-pending:stale".to_string(),
+            AuthEntry::Pending(make_pending()), // created_at = 0 → ancient
+        );
+        seed.insert(
+            "mcp-pending:fresh".to_string(),
+            AuthEntry::Pending(PendingPasteLogin {
+                created_at: now,
+                ..make_pending()
+            }),
+        );
+        write_auth_file(&path, &seed).unwrap();
+
+        with_auth_locked(&path, |_m| {}).unwrap();
+
+        let map = read_auth_file(&path).unwrap();
+        assert!(
+            map.get("mcp-pending:stale").is_none(),
+            "stale pending swept"
+        );
+        assert!(
+            matches!(map.get("mcp-pending:fresh"), Some(AuthEntry::Pending(_))),
+            "fresh pending kept"
+        );
+        assert!(map.get("codex").is_some(), "real tenant untouched");
     }
 }
