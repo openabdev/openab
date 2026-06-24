@@ -214,6 +214,145 @@ fn write_auth_file(path: &Path, map: &HashMap<String, AuthEntry>) -> Result<()> 
     Ok(())
 }
 
+// ── auth.json cross-process locking (ADR §5.4) ──────────────────────────────
+//
+// `auth.json` is written by multiple processes (one openab-agent per Discord
+// thread) and by two code paths within each (`save_tokens` for the codex tenant
+// + `McpCredentialStore` for MCP servers). Two hazards, two locks:
+//
+//   (a) File integrity — every read-modify-write funnels through `with_auth_locked`,
+//       which holds an exclusive `flock` on an `auth.json.global.lock` sidecar
+//       across the re-read → mutate → atomic-write. The re-read *inside* the lock
+//       is what makes concurrent writers merge instead of lost-update.
+//   (b) Refresh-token rotation — `lock_tenant_refresh` serialises the network
+//       refresh per tenant so concurrent processes present a rotated `RT_old`
+//       only once, never tripping OAuth 2.1 §10.4 token-family revocation.
+//
+// `flock(2)` (not a sentinel lockfile) so the kernel auto-releases on fd close /
+// process death — no stale lock, no orphan cleanup. The lock lives on a sidecar,
+// never on `auth.json` itself, because the atomic tmp+rename swaps that inode out
+// from under any lock held on it. `#[cfg(unix)]`; a non-unix build is a no-op
+// (openab-agent is de-facto unix-only — see `write_auth_file`).
+
+/// Sidecar lock path `auth.json.<suffix>.lock`, next to the auth file so a
+/// test-injected tempdir locks its own sidecar rather than the real `$HOME` one.
+#[cfg(unix)]
+fn lock_path_for(auth: &Path, suffix: &str) -> PathBuf {
+    let dir = auth.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(format!("auth.json.{suffix}.lock"))
+}
+
+/// RAII guard releasing the advisory lock on drop. The kernel also drops it on
+/// fd close / process death, so a crashed holder never wedges the file.
+#[cfg(unix)]
+struct AuthFileLock {
+    file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl Drop for AuthFileLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: `self.file` owns a valid fd; flock has no memory effects.
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(unix)]
+fn open_lock_file(lock: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(dir) = lock.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    Ok(std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(lock)?)
+}
+
+/// Blocking exclusive lock. Used ONLY for the global file RMW, which performs no
+/// network I/O while held, so acquisition blocks at most for another process's
+/// fast tmp+rename — never for a slow refresh (those take the per-tenant lock).
+#[cfg(unix)]
+fn flock_exclusive(lock: &Path) -> Result<AuthFileLock> {
+    use std::os::unix::io::AsRawFd;
+    let file = open_lock_file(lock)?;
+    // SAFETY: valid fd held by `file`; flock has no memory effects.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(AuthFileLock { file })
+}
+
+/// Non-blocking exclusive lock; `Ok(None)` means another holder owns it.
+#[cfg(unix)]
+fn flock_try_exclusive(lock: &Path) -> Result<Option<AuthFileLock>> {
+    use std::os::unix::io::AsRawFd;
+    let file = open_lock_file(lock)?;
+    // SAFETY: valid fd held by `file`; flock has no memory effects.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(Some(AuthFileLock { file }));
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(None)
+    } else {
+        Err(err.into())
+    }
+}
+
+/// (a) File-integrity funnel (ADR §5.4). Holds the global sidecar lock across a
+/// re-read → mutate → atomic-write so the codex `save_tokens` path AND the MCP
+/// `McpCredentialStore` never lost-update the shared map: each writer merges onto
+/// the latest on-disk state. A corrupt file is quarantined by `read_auth_file`
+/// and treated as empty (`unwrap_or_default`), matching the prior save behaviour.
+fn with_auth_locked<R>(
+    path: &Path,
+    f: impl FnOnce(&mut HashMap<String, AuthEntry>) -> R,
+) -> Result<R> {
+    #[cfg(unix)]
+    let _guard = flock_exclusive(&lock_path_for(path, "global"))?;
+    let mut map = read_auth_file(path).unwrap_or_default();
+    let r = f(&mut map);
+    write_auth_file(path, &map)?;
+    Ok(r)
+}
+
+/// (b) Per-tenant refresh serialisation (ADR §5.4). The returned guard is held by
+/// the caller across the network refresh so concurrent processes do exactly one
+/// real refresh per tenant — never presenting a rotated `RT_old` twice (OAuth 2.1
+/// §10.4 family revocation). Non-blocking acquire + async backoff so a refresh in
+/// flight elsewhere never blocks this executor thread; on timeout we return `None`
+/// and let the caller proceed (degrade to a possible double-refresh, never wedge).
+#[cfg(unix)]
+async fn lock_tenant_refresh(auth: &Path, tenant: &str) -> Option<AuthFileLock> {
+    let lock = lock_path_for(auth, &format!("refresh.{tenant}"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match flock_try_exclusive(&lock) {
+            Ok(Some(guard)) => return Some(guard),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        tenant,
+                        "timed out waiting for refresh lock; proceeding unserialised"
+                    );
+                    return None;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(e) => {
+                tracing::warn!(tenant, error = %e, "refresh lock unavailable; proceeding unserialised");
+                return None;
+            }
+        }
+    }
+}
+
 pub fn load_tokens() -> Result<TokenStore> {
     let path = auth_path();
     let map = read_auth_file(&path).map_err(|_| {
@@ -232,10 +371,9 @@ pub fn load_tokens() -> Result<TokenStore> {
 }
 
 fn save_tokens(store: &TokenStore) -> Result<()> {
-    let path = auth_path();
-    let mut map = read_auth_file(&path).unwrap_or_default();
-    map.insert(CODEX_NAMESPACE.to_string(), AuthEntry::Token(store.clone()));
-    write_auth_file(&path, &map)
+    with_auth_locked(&auth_path(), |map| {
+        map.insert(CODEX_NAMESPACE.to_string(), AuthEntry::Token(store.clone()));
+    })
 }
 
 /// rmcp [`CredentialStore`] backed by the shared `auth.json` file (ADR §6.1
@@ -283,61 +421,89 @@ impl CredentialStore for McpCredentialStore {
 
     async fn save(&self, mut credentials: StoredCredentials) -> Result<(), AuthError> {
         use oauth2::{RefreshToken, TokenResponse};
-        let mut map = read_auth_file(&self.path).unwrap_or_default();
 
         // OAuth 2.1 §10.4: when a refresh response omits `refresh_token`, the
         // prior one stays valid. rmcp's `refresh_token()` rebuilds the stored
         // credentials from the refresh response alone, so a rotating-but-omitting
         // AS would lose our fallback — splice the prior refresh_token back in.
+        // The prior-read happens inside the lock (re-read) so two writers can't
+        // race the splice. The whole RMW funnels through `with_auth_locked` so an
+        // interleaving codex `save_tokens` never lost-updates this MCP entry.
         let incoming_has_refresh = credentials
             .token_response
             .as_ref()
             .and_then(|tr| tr.refresh_token())
             .is_some_and(|rt| !rt.secret().is_empty());
-        if !incoming_has_refresh {
-            if let Some(AuthEntry::Mcp(old)) = map.get(&self.key) {
-                let prior = old
-                    .token_response
-                    .as_ref()
-                    .and_then(|tr| tr.refresh_token())
-                    .map(|rt| rt.secret().to_string())
-                    .filter(|s| !s.is_empty());
+        let key = self.key.clone();
+        with_auth_locked(&self.path, move |map| {
+            if !incoming_has_refresh {
+                let prior = match map.get(&key) {
+                    Some(AuthEntry::Mcp(old)) => old
+                        .token_response
+                        .as_ref()
+                        .and_then(|tr| tr.refresh_token())
+                        .map(|rt| rt.secret().to_string())
+                        .filter(|s| !s.is_empty()),
+                    _ => None,
+                };
                 if let (Some(prior), Some(tr)) = (prior, credentials.token_response.as_mut()) {
                     tr.set_refresh_token(Some(RefreshToken::new(prior)));
                 }
             }
-        }
-
-        map.insert(self.key.clone(), AuthEntry::Mcp(credentials));
-        write_auth_file(&self.path, &map).map_err(|e| AuthError::InternalError(e.to_string()))
+            map.insert(key.clone(), AuthEntry::Mcp(credentials));
+        })
+        .map_err(|e| AuthError::InternalError(e.to_string()))
     }
 
     async fn clear(&self) -> Result<(), AuthError> {
-        let mut map = match read_auth_file(&self.path) {
-            Ok(m) => m,
-            Err(_) => return Ok(()),
+        // Same global lock as every other writer; preserves the "last entry
+        // removed → delete the file" behaviour rather than leaving an empty map.
+        let run = || -> Result<()> {
+            #[cfg(unix)]
+            let _guard = flock_exclusive(&lock_path_for(&self.path, "global"))?;
+            let mut map = match read_auth_file(&self.path) {
+                Ok(m) => m,
+                Err(_) => return Ok(()),
+            };
+            if map.remove(&self.key).is_none() {
+                return Ok(());
+            }
+            if map.is_empty() {
+                let _ = std::fs::remove_file(&self.path);
+                return Ok(());
+            }
+            write_auth_file(&self.path, &map)
         };
-        if map.remove(&self.key).is_none() {
-            return Ok(());
-        }
-        if map.is_empty() {
-            let _ = std::fs::remove_file(&self.path);
-            return Ok(());
-        }
-        write_auth_file(&self.path, &map).map_err(|e| AuthError::InternalError(e.to_string()))
+        run().map_err(|e| AuthError::InternalError(e.to_string()))
     }
 }
 
 pub async fn get_valid_token() -> Result<String> {
-    let mut store = load_tokens()?;
-    if store.is_expired() {
-        store = refresh_token(&store).await?;
-        save_tokens(&store)?;
+    // 1. Fast path: a fresh token needs no lock.
+    let store = load_tokens()?;
+    if !store.is_expired() {
+        return Ok(store.access_token);
     }
-    Ok(store.access_token)
+    // 2. Serialise the refresh for the codex tenant — held across the network
+    //    call so a second process does not present the same RT_old (§5.4 (b)).
+    #[cfg(unix)]
+    let _refresh_guard = lock_tenant_refresh(&auth_path(), CODEX_NAMESPACE).await;
+    // 3. Double-check: another process may have refreshed while we waited.
+    let store = load_tokens()?;
+    if !store.is_expired() {
+        return Ok(store.access_token);
+    }
+    // 4. Exactly one network refresh per tenant per expiry (tenant lock held).
+    let fresh = refresh_token(&store).await?;
+    // 5. Commit under the global file lock.
+    save_tokens(&fresh)?;
+    Ok(fresh.access_token)
 }
 
 pub async fn force_refresh() -> Result<String> {
+    // Serialise even a forced refresh so two of them can't both rotate RT_old.
+    #[cfg(unix)]
+    let _refresh_guard = lock_tenant_refresh(&auth_path(), CODEX_NAMESPACE).await;
     let store = load_tokens()?;
     let new_store = refresh_token(&store).await?;
     save_tokens(&new_store)?;
@@ -1089,5 +1255,28 @@ mod tests {
         // under test.
         let pending = map.get("mcp-pending:srv");
         assert!(matches!(pending, Some(AuthEntry::Pending(_))));
+    }
+
+    #[test]
+    fn with_auth_locked_merges_concurrent_tenants_no_lost_update() {
+        // Two locked RMWs against the same file — the codex tenant and an MCP
+        // tenant — must both survive: the second writer re-reads inside the lock
+        // and merges, instead of clobbering the first (the §5.4 lost-update fix).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+
+        with_auth_locked(&path, |m| {
+            m.insert("codex".to_string(), AuthEntry::Token(make_store(1)));
+        })
+        .unwrap();
+        with_auth_locked(&path, |m| {
+            m.insert("github".to_string(), AuthEntry::Mcp(make_mcp_creds()));
+        })
+        .unwrap();
+
+        let map = read_auth_file(&path).unwrap();
+        assert_eq!(map.len(), 2, "second write merged, did not lost-update");
+        assert_eq!(token_of(map.get("codex")).expires_at, 1);
+        assert!(matches!(map.get("github"), Some(AuthEntry::Mcp(_))));
     }
 }
