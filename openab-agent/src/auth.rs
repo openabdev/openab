@@ -253,7 +253,7 @@ fn lock_path_for(auth: &Path, suffix: &str) -> PathBuf {
 /// RAII guard releasing the advisory lock on drop. The kernel also drops it on
 /// fd close / process death, so a crashed holder never wedges the file.
 #[cfg(unix)]
-struct AuthFileLock {
+pub(crate) struct AuthFileLock {
     file: std::fs::File,
 }
 
@@ -356,7 +356,7 @@ fn gc_stale_pending(map: &mut HashMap<String, AuthEntry>) {
 /// flight elsewhere never blocks this executor thread; on timeout we return `None`
 /// and let the caller proceed (degrade to a possible double-refresh, never wedge).
 #[cfg(unix)]
-async fn lock_tenant_refresh(auth: &Path, tenant: &str) -> Option<AuthFileLock> {
+pub(crate) async fn lock_tenant_refresh(auth: &Path, tenant: &str) -> Option<AuthFileLock> {
     let lock = lock_path_for(auth, &format!("refresh.{tenant}"));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {

@@ -631,10 +631,21 @@ impl McpRuntimeManager {
         if !has_refresh {
             return Err(needs_login());
         }
-        // Expired but refreshable: rmcp needs the authorization server's
-        // metadata configured before it can exchange the refresh token, so
-        // discover it now (network) and let `get_access_token` perform the
-        // rotation. Any failure surfaces as user-actionable `NeedsAuth`.
+        // Expired but refreshable. Serialise the refresh per-server across
+        // processes (ADR §5.4 (b)): openab runs one process per Discord thread,
+        // all sharing this server's stored creds, so two of them would otherwise
+        // present the same `RT_old` and trip OAuth 2.1 §10.4 token-family
+        // revocation. rmcp already single-flights within one process (shared
+        // `AuthorizationManager` `Mutex`); this closes the cross-process gap.
+        // The lock is held across the network refresh below. The double-check is
+        // implicit: rmcp's `get_access_token` re-`load()`s `auth.json` and skips
+        // the network refresh when the token is already fresh, so a process that
+        // loses the race adopts the token the winner wrote. Non-unix = no-op.
+        #[cfg(unix)]
+        let _refresh_guard = crate::auth::lock_tenant_refresh(&self.auth_path, name).await;
+        // rmcp needs the authorization server's metadata configured before it can
+        // exchange the refresh token, so discover it now (network) and let
+        // `get_access_token` perform the rotation. Failures surface as `NeedsAuth`.
         {
             let mut mgr = client.auth_manager.lock().await;
             mgr.initialize_from_store().await.map_err(|e| {

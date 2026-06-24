@@ -207,7 +207,11 @@ fn get_or_refresh(tenant: &str) -> Result<String> {
   `ci-openab-agent.yml` is linux, deploy is always container; Windows binaries are the broker only.)
 - Each MCP `mcp:<server>` tenant takes its own tenant lock by the same rule, so the MCP `CredentialStore`
   refreshes are serialized per server too — the invariant serves it directly (see `openab-agent-mcp.md`
-  §6.1).
+  §6.1). rmcp owns the MCP refresh internally (no pre-refresh `CredentialStore` hook), but openab drives it
+  explicitly at `resolve_oauth_dial` (`mcp/runtime.rs`) via `client.get_access_token()`; the per-server
+  tenant lock wraps that call, and rmcp's `get_access_token` re-`load()`s `auth.json` and skips the network
+  refresh when the token is already fresh, so the lock-loser adopts the winner's token (cross-process
+  single-flight) without a second `RT_old` presentation.
 - **Until this lands**, prefer the `CLAUDE_CODE_OAUTH_TOKEN` env route (§5.3 — no refresh write, no race);
   treat interactive Anthropic OAuth as not-yet-hardened for high concurrency.
 
