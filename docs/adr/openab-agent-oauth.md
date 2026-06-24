@@ -89,10 +89,11 @@ invariant (both flag file locks but for the simpler single-process case).
    exchange/refresh come from the crate, **not hand-rolled**. The few vendor quirks (e.g. Anthropic's JSON
    token body) are applied through the crate's custom http-client hook, not by forking the flow.
 3. **Inference axis = one provider per wire format** (§5.2). Four formats today; no reuse across them.
-4. **Credential storage = single locked-RMW funnel** (§5.4). Establishes the invariant: *every* write to
-   `auth.json` goes through `with_auth_locked`, with refresh performed outside the lock + re-read inside
-   (single-flight). This is a Consequence of the multi-writer/cross-process reality, not an optional perf
-   tweak.
+4. **Credential storage = locked-RMW funnel + per-tenant refresh lock** (§5.4). *Every* write to `auth.json`
+   goes through `with_auth_locked` (global lock — file integrity); *every* token refresh serializes on a
+   **per-tenant** lock so concurrent processes perform exactly one network refresh per tenant and never
+   present a rotated `RT_old` twice (which would trigger OAuth 2.1 §10.4 token-family revocation). A
+   Consequence of the multi-writer/cross-process reality, not an optional perf tweak.
 5. **Credential-source precedence:** explicit API key → pre-provisioned long-lived OAuth token env
    (`CLAUDE_CODE_OAUTH_TOKEN` and equivalents) → stored interactive OAuth tenant. Rationale + why the env
    path is the preferred fleet mode: §5.3.
@@ -109,7 +110,7 @@ trait OAuthVendor {
     fn client_secret(&self) -> Option<String> { None }    // Gemini = Some(bundled); agy TBD (§9 Q2); Anthropic/Codex = None
     fn authorize_url(&self) -> &str;
     fn token_url(&self) -> &str;
-    fn redirect(&self) -> (u16, &str);
+    fn redirect(&self) -> Option<(u16, &'static str)> { None } // Some((port,path)) for loopback PKCE; None for device flow (no redirect endpoint)
     fn scope(&self) -> &str;
     fn extra_authorize_params(&self) -> &[(&str,&str)] { &[] }       // Anthropic: ("code","true")
     fn token_body(&self) -> TokenBodyFormat { TokenBodyFormat::Form } // Anthropic = Json-no-scope
@@ -146,26 +147,56 @@ stored `anthropic-oauth` tenant. This is the recommended fleet mode; interactive
 
 ### 5.4 Concurrency & storage invariant (folds in the flock decision)
 `auth.json` is multi-tenant (`codex`, `anthropic-oauth`, `mcp:<server>`×N) and written by two code paths
-(`save_tokens_for`, `McpCredentialStore`) across **multiple processes** (one per Discord thread). The
-required invariant:
+(`save_tokens_for`, `McpCredentialStore`) across **multiple processes** (one per Discord thread). Two
+distinct hazards demand two locks.
+
+**(a) File integrity — one global lock.** Every write funnels through a single locked RMW so concurrent
+writers never lost-update the shared file:
 ```rust
 // ALL writers funnel through this. auth.rs storage layer.
 fn with_auth_locked<R>(f: impl FnOnce(&mut HashMap<String, AuthEntry>) -> R) -> Result<R> {
     let _g = flock_exclusive("auth.json.lock")?;  // sidecar file (NOT auth.json — rename swaps its inode)
-    let mut map = read_auth_file(&path)?;          // re-read inside lock (anti lost-update + thundering herd)
+    let mut map = read_auth_file(&path)?;          // re-read inside lock (anti lost-update)
     let r = f(&mut map);
     write_auth_file(&path, &map)?;                 // existing atomic tmp+rename
     Ok(r)
 }
 ```
-- **Refresh runs OUTSIDE the lock**, result committed inside (re-read → if file already newer, adopt it →
-  else write) ⟹ N processes do 1 real refresh.
-- **`flock(2)`, not a sentinel lockfile**: kernel auto-releases on fd close / process death → no stale lock.
-- **try-lock + timeout** so a hung holder degrades to a graceful error, never a wedged worker.
+
+**(b) Refresh-token rotation — one lock per tenant.** An earlier draft ran the refresh *outside* the lock
+and committed the result inside, claiming "N processes do 1 real refresh." **That is wrong** (Mira review,
+2026-06-24): re-read-on-commit only prevents a lost *write* — every process has already *sent* a network
+refresh carrying the same `RT_old` before it reaches the commit. Under OAuth 2.1 §10.4 refresh-token
+rotation, the second `RT_old` presentation reads as reuse and the AS **revokes the whole token family** =
+exactly the fleet-wide logout this ADR exists to prevent. Holding the *global* exclusive lock across the
+network refresh would serialize it, but then a slow refresh for one tenant head-of-line-blocks every other
+tenant (MCP servers, Codex). So: **one exclusive lock file per tenant**, network I/O held under the tenant
+lock only — never under the global lock:
+```rust
+fn get_or_refresh(tenant: &str) -> Result<String> {
+    // 1. fast path — fresh token under a shared (read) global lock
+    if let Some(t) = read_fresh(tenant)? { return Ok(t); }
+    // 2. serialize refreshes for THIS tenant only (other tenants unaffected)
+    let _tg = flock_exclusive(&format!("auth.json.{tenant}.lock"))?;
+    // 3. double-check — another process may have refreshed while we waited on the tenant lock
+    if let Some(t) = read_fresh(tenant)? { return Ok(t); }
+    // 4. exactly one network refresh per tenant per expiry — tenant lock held, global lock NOT
+    let fresh = perform_network_refresh(tenant)?;
+    // 5. commit under the global lock (fast inode swap, no network I/O inside)
+    with_auth_locked(|m| m.insert(tenant.into(), fresh.clone()))?;
+    Ok(fresh.access_token)
+}
+```
+- **`flock(2)`, not a sentinel lockfile**: kernel auto-releases on fd close / process death → a hung or
+  killed refresher frees its tenant lock instantly. No stale lock, no manual timeout/orphan cleanup.
+- **try-lock + timeout** on the global lock so a wedged writer degrades to a graceful error, never a wedged
+  worker.
 - **Crate:** `rustix::fs::flock` (already in the tree, safe API), gated `#[cfg(unix)]` with a non-unix
   no-op — mirroring the existing atomic-write cfg split. (openab-agent is de-facto unix-only: its
   `ci-openab-agent.yml` is linux, deploy is always container; Windows binaries are the broker only.)
-- This invariant serves the MCP `CredentialStore` too — see `openab-agent-mcp.md` §6.1.
+- Each MCP `mcp:<server>` tenant takes its own tenant lock by the same rule, so the MCP `CredentialStore`
+  refreshes are serialized per server too — the invariant serves it directly (see `openab-agent-mcp.md`
+  §6.1).
 - **Until this lands**, prefer the `CLAUDE_CODE_OAUTH_TOKEN` env route (§5.3 — no refresh write, no race);
   treat interactive Anthropic OAuth as not-yet-hardened for high concurrency.
 
@@ -211,10 +242,14 @@ it exposes CLI subcommands the relay shells out to via `$OPENAB_AGENT_AUTH_COMMA
   anthropics/claude-code #22992) and #1187's `--no-browser` reads the code from **stdin**, which the relay
   cannot feed → undrivable by `/auth`.
 - **Resolution for interactive Claude self-service = two-step, code-as-CLI-arg:** `/auth claude` persists
-  PKCE verifier+state as a pending entry (reuse the existing `mcp-pending`/`AuthEntry::Pending` machinery) +
-  prints the `code=true` URL (claude.ai shows a copyable code); `/auth claude <code>` →
-  `anthropic-oauth --code <code>` completes. No stdin. (Fallback: broker pipes a follow-up DM/modal to child
-  stdin — #1185 v2.) For pods, the §5.3 env route avoids all of this.
+  the PKCE verifier+state as a pending entry **keyed by the initiating Discord user id**
+  (`pending:claude:<discord_user_id>`, reuse the existing `mcp-pending`/`AuthEntry::Pending` machinery) +
+  prints the `code=true` URL (claude.ai shows a copyable code); `/auth claude <code>` forwards that same user
+  id so `anthropic-oauth --code <code>` loads the matching verifier and completes. No stdin. **Per-user
+  keying is required** (Mira review, 2026-06-24): a single global pending entry lets a second concurrent
+  user's verifier overwrite the first's → PKCE mismatch on exchange, and worse, lets user B complete a flow
+  user A initiated (session hijack). (Fallback: broker pipes a follow-up DM/modal to child stdin — #1185 v2.)
+  For pods, the §5.3 env route avoids all of this.
 
 ---
 
