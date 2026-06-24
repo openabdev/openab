@@ -343,10 +343,11 @@ it exposes CLI subcommands the relay shells out to via `$OPENAB_AGENT_AUTH_COMMA
    (`auth.rs:284-328`) is a co-equal unlocked RMW writer of `auth.json`, and the MCP pending-login finalize
    path writes it too. Introducing `with_auth_locked` therefore requires routing **both** the provider
    (`save_tokens`) and the MCP `CredentialStore` (+ pending finalize) through it — otherwise the lock is
-   bypassed by half the writers and the race persists. Land them in the same change. This also likely
-   subsumes (partially) `openab-agent-mcp.md` open items #1 (reqwest 0.12/0.13 split) and #8 (doctor/runtime
-   two-store split); confirm against that ADR. Connects to the pending OAuth-revamp follow-up flagged on the
-   `feat/openab-agent-mcp-resilience` PR.
+   bypassed by half the writers and the race persists. Land them in the same change. (`McpCredentialStore`
+   reuses the same `TokenStore`/`auth.json` storage that `openab-agent-mcp.md` §6.1 describes, so the lock
+   lands once and serves both.) Connects to the pending OAuth-revamp follow-up flagged on the
+   `feat/openab-agent-mcp-resilience` PR — itself driven by the rmcp/`reqwest` dependency-version conflict its
+   OAuth adoption surfaced.
 
 ---
 
