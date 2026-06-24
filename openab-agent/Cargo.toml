@@ -50,11 +50,3 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 temp-env = "0.3.6"
-
-# openab-agent is a standalone crate (its own version + a dual reqwest 0.12/0.13
-# dep set for rmcp), deliberately NOT a member of the parent `openab` workspace
-# (members = crates/openab-core, openab-gateway). Declare an empty workspace so
-# cargo, run from this directory, treats it as its own root instead of erroring
-# "current package believes it's in a workspace when it's not" — which otherwise
-# breaks every cargo step in ci-openab-agent.yml (working-directory: openab-agent).
-[workspace]
