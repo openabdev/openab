@@ -82,8 +82,13 @@ invariant (both flag file locks but for the simpler single-process case).
 
 1. **Adopt a two-axis model.** Auth (how a credential is obtained/refreshed/stored) and inference (how a
    request is sent) are **orthogonal** and must not be coupled. A vendor that serves Claude over Google's
-   Code Assist envelope (agy — the Antigravity CLI variant; see §6) reuses neither Anthropic's Messages-V1
-   transport nor its auth.
+   Code Assist envelope (agy; see §6) reuses neither Anthropic's Messages-V1 transport nor its auth.
+   **Note — "agy as a GO vendor" ≠ running the agy CLI.** This ADR adds agy as an `OAuthVendor` + Code-Assist
+   inference *provider* consumed by the **native** openab-agent; it does **not** spawn the agy binary. That
+   matters because **agy speaks no ACP** — the existing `antigravity` *runtime variant* (Mira on ECS) only
+   works via a dedicated `agy-acp` adapter that shells out to the agy CLI per prompt and polls its SQLite
+   conversation DB to synthesize ACP events. The vendor/provider path here **sidesteps ACP entirely** and
+   supersedes that CLI-wrapper for native use — agy's lack of ACP is irrelevant to it (see §6).
 2. **Auth axis = one `OAuthVendor` descriptor + a shared driver built on the official `oauth2` crate** (§5.1;
    the crate is already in-tree via the MCP side). New vendor = new descriptor; PKCE/CSRF/auth-code
    exchange/refresh come from the crate, **not hand-rolled**. The few vendor quirks (e.g. Anthropic's JSON
@@ -146,9 +151,15 @@ read it as a Bearer subscription source, precedence: `ANTHROPIC_API_KEY` → `CL
 stored `anthropic-oauth` tenant. This is the recommended fleet mode; interactive OAuth is for self-service.
 
 ### 5.4 Concurrency & storage invariant (folds in the flock decision)
-`auth.json` is multi-tenant (`codex`, `anthropic-oauth`, `mcp:<server>`×N) and written by two code paths
-(`save_tokens_for`, `McpCredentialStore`) across **multiple processes** (one per Discord thread). Two
-distinct hazards demand two locks.
+`auth.json` is multi-tenant (`codex`, `anthropic-oauth`, `mcp:<server>`×N) and written by **two independent
+read-modify-write call sites** across **multiple processes** (one per Discord thread): provider tokens via
+`save_tokens` (`openab-agent/src/auth.rs:234`) and **MCP** OAuth creds via `McpCredentialStore::save`/`clear`
+(`auth.rs:284-328`), plus the MCP pending-login finalize path. **Today there is *no* lock on `auth.json`** —
+only an atomic `tmp+rename` in the shared low-level `write_auth_file`; the two RMW callers each do their own
+unlocked `read_auth_file → mutate map → write_auth_file`, so a concurrent provider-refresh and MCP-save
+last-writer-wins the *entire* map (lost update). Two distinct hazards demand two locks — **and the fix is not
+provider-only: the MCP `CredentialStore` is a co-equal RMW caller that must be routed through the same
+invariant** (see §9 Q4). (`with_auth_locked` below is *new* — the thing this ADR introduces.)
 
 **(a) File integrity — one global lock.** Every write funnels through a single locked RMW so concurrent
 writers never lost-update the shared file:
@@ -327,8 +338,15 @@ it exposes CLI subcommands the relay shells out to via `$OPENAB_AGENT_AUTH_COMMA
      theoretical — reinforcing the opt-in gate.
    - **No-Go:** `cursor` (reverse-engineered proprietary proxy + high ToS/account-ban risk), `kiro` (AWS Q
      event-stream protocol — high maintenance cost). Revisit only on explicit demand.
-4. Does the locked-RMW fix also subsume `openab-agent-mcp.md` open items #1 (reqwest 0.12/0.13 split) and
-   #8 (doctor/runtime two-store split)? Likely partial.
+4. **MCP credential store must be revamped together — IN SCOPE (Brett 2026-06-24).** The locked-RMW +
+   per-tenant-lock invariant (§5.4) is **not** a provider-only change. `McpCredentialStore::save`/`clear`
+   (`auth.rs:284-328`) is a co-equal unlocked RMW writer of `auth.json`, and the MCP pending-login finalize
+   path writes it too. Introducing `with_auth_locked` therefore requires routing **both** the provider
+   (`save_tokens`) and the MCP `CredentialStore` (+ pending finalize) through it — otherwise the lock is
+   bypassed by half the writers and the race persists. Land them in the same change. This also likely
+   subsumes (partially) `openab-agent-mcp.md` open items #1 (reqwest 0.12/0.13 split) and #8 (doctor/runtime
+   two-store split); confirm against that ADR. Connects to the pending OAuth-revamp follow-up flagged on the
+   `feat/openab-agent-mcp-resilience` PR.
 
 ---
 
