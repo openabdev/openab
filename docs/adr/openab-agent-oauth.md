@@ -84,8 +84,10 @@ invariant (both flag file locks but for the simpler single-process case).
    request is sent) are **orthogonal** and must not be coupled. A vendor that serves Claude over Google's
    Code Assist envelope (agy — the Antigravity CLI variant; see §6) reuses neither Anthropic's Messages-V1
    transport nor its auth.
-2. **Auth axis = one `OAuthVendor` descriptor + shared driver** (§5.1). New vendor = new descriptor; the
-   PKCE/state/loopback/paste/device-poll/storage driver is written once.
+2. **Auth axis = one `OAuthVendor` descriptor + a shared driver built on the official `oauth2` crate** (§5.1;
+   the crate is already in-tree via the MCP side). New vendor = new descriptor; PKCE/CSRF/auth-code
+   exchange/refresh come from the crate, **not hand-rolled**. The few vendor quirks (e.g. Anthropic's JSON
+   token body) are applied through the crate's custom http-client hook, not by forking the flow.
 3. **Inference axis = one provider per wire format** (§5.2). Four formats today; no reuse across them.
 4. **Credential storage = single locked-RMW funnel** (§5.4). Establishes the invariant: *every* write to
    `auth.json` goes through `with_auth_locked`, with refresh performed outside the lock + re-read inside
@@ -116,9 +118,13 @@ trait OAuthVendor {
 enum TokenBodyFormat { Form, Json }
 enum AuthGrant { Pkce, DeviceCode }
 ```
-Shared driver handles browser-loopback, no-browser paste, device-code poll, and refresh once. Fold the
-existing Codex flow into the shared `accept_callback_code` helper (its comment already says "fold it in");
-unify the `127.0.0.1` vs `localhost` bind while there.
+The shared driver is built on the **official `oauth2` crate** (already a dependency via the MCP side): it
+supplies PKCE, CSRF `state`, the authorization-code exchange, and refresh; the descriptor only feeds it
+per-vendor config. Hand-rolled code is limited to what the crate does not cover — the loopback/paste/
+device-code callback plumbing (fold the existing Codex flow into the shared `accept_callback_code` helper —
+its comment already says "fold it in"; unify the `127.0.0.1` vs `localhost` bind) and the single
+body-encoding override (Anthropic's JSON-no-scope token request, applied via the crate's custom http-client
+hook rather than a separate flow).
 
 ### 5.2 Inference providers (inference axis — no reuse)
 | Provider | Endpoint | Wire format | Vendors |
@@ -218,9 +224,11 @@ it exposes CLI subcommands the relay shells out to via `$OPENAB_AGENT_AUTH_COMMA
 - **Force everything through rmcp `CredentialStore`:** rejected — lossy. `TokenStore` (provider) and rmcp
   `StoredCredentials` are different on-disk shapes (untagged `AuthEntry`); the translation drops fields
   (see `openab-agent-mcp.md` §6.1). The shared layer must sit *below* both (file RMW), not in one's trait.
-- **`oauth2` crate for the provider flows:** rejected as the primary path — it enforces RFC form-encoded
-  token bodies; Anthropic needs JSON-no-scope, fighting the lib. May still supply PKCE/state primitives.
-  Does **not** solve the race (stateless).
+- **Fully hand-rolled OAuth flow:** rejected — it reimplements PKCE/CSRF/exchange/refresh that the official
+  `oauth2` crate (already in-tree) provides. The crate is the chosen basis (§4 decision 2, §5.1); its one
+  friction — it defaults to RFC form-encoded token bodies while Anthropic needs JSON-no-scope — is handled
+  via the crate's custom http-client hook, not by abandoning it. (`oauth2` is stateless and does **not**
+  solve the auth.json race — that's the storage-layer's job, §5.4.)
 - **In-process `Mutex` / tokio single-flight, or a sentinel lockfile (create→delete), for the race:**
   rejected — see §5.4 (in-process locks are useless across the per-thread processes; a sentinel lockfile
   deadlocks if a holder dies, whereas `flock(2)` auto-releases on death).
