@@ -223,7 +223,7 @@ agentcore    AWS SigV4/IAM (not OAuth)  AWS Bedrock                   ❌ out of
 ```
 Concrete values (verified): codex `app_EMoamEEZ73f0CkXaXp7hrann` (no secret, form); claude
 `9d1c250a-e61b-44d9-88ed-5944d1962f5e` (no secret, JSON no-scope); gemini
-`681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j` (+ bundled `GOCSPX-…`, git-safe); agy
+`681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j` (+ bundled `GOCSPX-…` — non-confidential by spec but **not** safe as raw repo text; storage decided in §9 Q2); agy
 `1071006060591-tmhssin2h21lcre235vtolojh4g403ep` (likely bundled — UNCONFIRMED; redirect `localhost:51121`,
 scopes add `cclog`/`experimentsandconfigs`; inference `cloudcode-pa`, needs GCP `project` field; one OAuth
 unlocks Claude+Gemini+GPT-OSS; agy ≠ Messages V1).
@@ -250,6 +250,9 @@ it exposes CLI subcommands the relay shells out to via `$OPENAB_AGENT_AUTH_COMMA
   user's verifier overwrite the first's → PKCE mismatch on exchange, and worse, lets user B complete a flow
   user A initiated (session hijack). (Fallback: broker pipes a follow-up DM/modal to child stdin — #1185 v2.)
   For pods, the §5.3 env route avoids all of this.
+- **Pending-entry GC** (Mira review, 2026-06-24): stamp each `AuthEntry::Pending` with `created_at`;
+  `with_auth_locked` opportunistically drops pending entries older than 15 min on every write, so abandoned
+  `/auth` attempts (user never pastes a code) don't accumulate stale verifiers in `auth.json`.
 
 ---
 
@@ -282,7 +285,19 @@ it exposes CLI subcommands the relay shells out to via `$OPENAB_AGENT_AUTH_COMMA
    drop the three duplicated default sites (`llm.rs:153`, `acp.rs:385/446`). Consequence: removes the
    zero-config default (deployments set model via values.yaml/env already; needs a clear error message +
    CHANGELOG note). Also eliminates the silent Opus cost bump for API-key users.
-2. agy `client_secret` requirement — confirm from the plugin `src/constants.ts` / agy binary.
+2. **Bundled `client_secret` storage — REFINED (Mira review 2026-06-24).** Google Code-Assist vendors
+   (gemini, agy) ship a `GOCSPX-…` desktop-app secret. By RFC 8252 and Google's own docs this value is
+   **non-confidential** (installed-app secret, "obviously not treated as a secret") — there is no
+   confidentiality to protect, so obscuring it adds zero cryptographic security. But it is **not safe as raw
+   text in a public repo for operational reasons**: GitHub push-protection covers Google secrets **by default**
+   (changelog 2026-03), so a raw `GOCSPX-` literal blocks contributor `git push`, and GitHub↔Google partner
+   token-scanning may **auto-revoke** the credential once it lands in a public commit. Decision: do **not**
+   commit the raw literal; pick per vendor —
+   (a) **encode-at-rest** (split/base64) in source — purely scanner-evasion for an already-public value, *not*
+   a security control; label it as such inline so reviewers aren't misled into treating it as a real secret; or
+   (b) **inject at runtime via env** (no secret in the repo at all) — cleaner provenance, consistent with the
+   §5.3 env-route preference, at the cost of the bundled zero-config UX.
+   Still confirm whether agy actually *requires* a secret, from the plugin `src/constants.ts` / agy binary.
 3. Which heavy/ToS-risk vendors to actually build: kiro (AWS proprietary), cursor (reverse-eng + ToS-risk),
    agy (ToS-risk). Needs an explicit go/no-go.
 4. Does the locked-RMW fix also subsume `openab-agent-mcp.md` open items #1 (reqwest 0.12/0.13 split) and
