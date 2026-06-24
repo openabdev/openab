@@ -80,6 +80,11 @@ pub struct PendingPasteLogin {
     /// that *writes* pending state is forthcoming; today this struct is a legacy
     /// read-tolerant tombstone, so the field exists mainly for the GC. `#[serde(default)]`
     /// (= 0) reads pre-existing/legacy entries as ancient → swept on the next write.
+    ///
+    /// **Any code that writes a fresh `Pending` entry MUST set `created_at` to the
+    /// current Unix time** — an unstamped (0) entry is treated as ancient and is
+    /// swept by `gc_stale_pending` on the very next locked write, so a verifier
+    /// written without stamping would vanish before the user pastes the code.
     #[serde(default)]
     pub created_at: u64,
 }
@@ -352,11 +357,15 @@ fn gc_stale_pending(map: &mut HashMap<String, AuthEntry>) {
 /// we return `None` and let the caller proceed (degrade to a possible
 /// double-refresh, never wedge).
 ///
-/// The lock only *serialises* — it does not decide whether to refresh. Callers
-/// MUST re-check token freshness after acquiring (the double-check) so a process
-/// that lost the race adopts the token the winner wrote instead of refreshing
-/// again: `get_valid_token` does this explicitly; the MCP path relies on rmcp's
-/// `get_access_token` re-`load()`ing the store.
+/// Reuse-safety comes from loading the refresh token *inside* the lock: a
+/// process that waited then loads the token the winner just wrote, so it never
+/// re-presents a rotated `RT_old`. Re-checking expiry after acquiring is an
+/// additional optimisation that skips a redundant network refresh — `get_valid_token`
+/// does this explicitly, and the MCP path gets it free from rmcp's `get_access_token`
+/// (which re-`load()`s and returns early when the token is already fresh).
+/// `force_refresh` intentionally skips that optimisation and always refreshes (it
+/// runs on a 401, where the clock-fresh token is already known-bad); it stays
+/// reuse-safe because it, too, loads inside the lock.
 #[cfg(unix)]
 pub(crate) async fn lock_tenant_refresh(auth: &Path, tenant: &str) -> Option<AuthFileLock> {
     use std::os::unix::io::AsRawFd;
