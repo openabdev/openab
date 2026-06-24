@@ -302,25 +302,30 @@ it exposes CLI subcommands the relay shells out to via `$OPENAB_AGENT_AUTH_COMMA
    drop the three duplicated default sites (`llm.rs:153`, `acp.rs:385/446`). Consequence: removes the
    zero-config default (deployments set model via values.yaml/env already; needs a clear error message +
    CHANGELOG note). Also eliminates the silent Opus cost bump for API-key users.
-2. **Bundled `client_secret` storage — DECIDED (Brett 2026-06-24): env-injection default; encode-at-rest
-   fallback.** Google Code-Assist vendors (gemini, agy) ship a `GOCSPX-…` desktop-app secret. By RFC 8252 and
+2. **Bundled `client_secret` storage — DECIDED (Brett 2026-06-24): encode-at-rest default; env-injection
+   alternative.** Google Code-Assist vendors (gemini, agy) ship a `GOCSPX-…` desktop-app secret. By RFC 8252 and
    Google's own docs this value is **non-confidential** (installed-app secret, "obviously not treated as a
    secret") — there is no confidentiality to protect, so obscuring it adds zero cryptographic security. But it
    is **not safe as raw text in a public repo for operational reasons**: GitHub push-protection covers Google
    secrets **by default** (changelog 2026-03), so a raw `GOCSPX-` literal blocks contributor `git push`, and
    GitHub↔Google partner token-scanning may **auto-revoke** the credential once it lands in a public commit.
    Decision: do **not** commit the raw literal —
-   - **(b) inject at runtime via env is the default** (no secret in the repo at all): cleanest provenance,
-     consistent with the §5.3 env-route preference, removes the ToS/leak surface entirely. Costs the bundled
-     zero-config UX, which fleet/pod deployments don't need (they set env already).
-   - **(a) encode-at-rest** (split/base64) is the **fallback** only where a bundled zero-config binary is
-     genuinely required: it is **scanner-evasion for an already-public value, *not* a security control** —
-     label it as such inline so reviewers aren't misled. This is a well-adopted pattern: **rclone** declares a
-     `rcloneEncryptedClientSecret` constant and calls `obscure.MustReveal()` at runtime for exactly this
-     reason (bypass static scanners / partner auto-revoke, explicitly not encryption) — see §10.
+   - **(a) encode-at-rest is the default** (split/base64, decoded at runtime): keeps the bundled zero-config
+     UX while dodging push-protection and partner auto-revoke. It is **scanner-evasion for an already-public
+     value, *not* a security control** — label it as such inline so reviewers aren't misled into treating it
+     as a real secret. Well-adopted pattern: **rclone** declares a `rcloneEncryptedClientSecret` constant and
+     calls `obscure.MustReveal()` at runtime for exactly this reason (bypass static scanners / partner
+     auto-revoke, explicitly not encryption) — see §10.
+   - **(b) inject at runtime via env is the alternative** (no secret in the repo at all): cleanest provenance,
+     consistent with the §5.3 env-route preference; preferred where a deployment already sets env (fleet/pod)
+     and the bundled zero-config UX isn't needed.
+   Empirically the ecosystem overwhelmingly commits the literal plaintext (survey: 99/107 ≈ 93%; obscure 4,
+   env 1) and the shared secret is **not** being aggressively auto-revoked despite 100+ public copies — so the
+   risk we mitigate is mainly **contributor push-protection friction on the `openabdev/openab` org repo**, not
+   credential loss. Encode-at-rest buys that with zero UX cost, hence the default.
    agy secret requirement is now **CONFIRMED** (2026-06-24): agy *does* require a `GOCSPX-…` client_secret, a
-   public ecosystem constant (≥20 antigravity-auth repos hardcode it — §6). Under the (b) env default it is
-   injected, never committed; (a) applies only if agy is ever shipped as a bundled zero-config binary.
+   public ecosystem constant (≥20 antigravity-auth repos hardcode it — §6); it ships encode-at-rest by default
+   per this decision (or via env where (b) applies).
 3. **Vendor go/no-go — DECIDED (Brett 2026-06-24).**
    - **GO:** `gemini`, `grok` (high value, clean APIs, low ToS risk) — first wave.
    - **GO (experimental, opt-in):** `agy`. Marginal eng cost is low — it shares gemini's Google Code-Assist
