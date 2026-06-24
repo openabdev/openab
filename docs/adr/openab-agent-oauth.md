@@ -232,6 +232,9 @@ unlocks Claude+Gemini+GPT-OSS; agy ≠ Messages V1).
 third-party application (openab-agent) rather than the vendor's own client — which may violate that vendor's
 Terms of Service.
 
+**Build decision (§9 Q3, Brett 2026-06-24):** GO `gemini`/`grok` (first wave) and `agy` (experimental,
+opt-in, ToS caveat); No-Go `cursor`/`kiro`.
+
 ---
 
 ## 7. Auth-trigger UX (PR #1185)
@@ -285,21 +288,36 @@ it exposes CLI subcommands the relay shells out to via `$OPENAB_AGENT_AUTH_COMMA
    drop the three duplicated default sites (`llm.rs:153`, `acp.rs:385/446`). Consequence: removes the
    zero-config default (deployments set model via values.yaml/env already; needs a clear error message +
    CHANGELOG note). Also eliminates the silent Opus cost bump for API-key users.
-2. **Bundled `client_secret` storage — REFINED (Mira review 2026-06-24).** Google Code-Assist vendors
-   (gemini, agy) ship a `GOCSPX-…` desktop-app secret. By RFC 8252 and Google's own docs this value is
-   **non-confidential** (installed-app secret, "obviously not treated as a secret") — there is no
-   confidentiality to protect, so obscuring it adds zero cryptographic security. But it is **not safe as raw
-   text in a public repo for operational reasons**: GitHub push-protection covers Google secrets **by default**
-   (changelog 2026-03), so a raw `GOCSPX-` literal blocks contributor `git push`, and GitHub↔Google partner
-   token-scanning may **auto-revoke** the credential once it lands in a public commit. Decision: do **not**
-   commit the raw literal; pick per vendor —
-   (a) **encode-at-rest** (split/base64) in source — purely scanner-evasion for an already-public value, *not*
-   a security control; label it as such inline so reviewers aren't misled into treating it as a real secret; or
-   (b) **inject at runtime via env** (no secret in the repo at all) — cleaner provenance, consistent with the
-   §5.3 env-route preference, at the cost of the bundled zero-config UX.
-   Still confirm whether agy actually *requires* a secret, from the plugin `src/constants.ts` / agy binary.
-3. Which heavy/ToS-risk vendors to actually build: kiro (AWS proprietary), cursor (reverse-eng + ToS-risk),
-   agy (ToS-risk). Needs an explicit go/no-go.
+2. **Bundled `client_secret` storage — DECIDED (Brett 2026-06-24): env-injection default; encode-at-rest
+   fallback.** Google Code-Assist vendors (gemini, agy) ship a `GOCSPX-…` desktop-app secret. By RFC 8252 and
+   Google's own docs this value is **non-confidential** (installed-app secret, "obviously not treated as a
+   secret") — there is no confidentiality to protect, so obscuring it adds zero cryptographic security. But it
+   is **not safe as raw text in a public repo for operational reasons**: GitHub push-protection covers Google
+   secrets **by default** (changelog 2026-03), so a raw `GOCSPX-` literal blocks contributor `git push`, and
+   GitHub↔Google partner token-scanning may **auto-revoke** the credential once it lands in a public commit.
+   Decision: do **not** commit the raw literal —
+   - **(b) inject at runtime via env is the default** (no secret in the repo at all): cleanest provenance,
+     consistent with the §5.3 env-route preference, removes the ToS/leak surface entirely. Costs the bundled
+     zero-config UX, which fleet/pod deployments don't need (they set env already).
+   - **(a) encode-at-rest** (split/base64) is the **fallback** only where a bundled zero-config binary is
+     genuinely required: it is **scanner-evasion for an already-public value, *not* a security control** —
+     label it as such inline so reviewers aren't misled. This is a well-adopted pattern: **rclone** declares a
+     `rcloneEncryptedClientSecret` constant and calls `obscure.MustReveal()` at runtime for exactly this
+     reason (bypass static scanners / partner auto-revoke, explicitly not encryption) — see §10.
+   Still confirm whether agy actually *requires* a secret, from the plugin `src/constants.ts` / agy binary;
+   under the (b) default this is moot unless agy is shipped as a bundled zero-config binary.
+3. **Vendor go/no-go — DECIDED (Brett 2026-06-24).**
+   - **GO:** `gemini`, `grok` (high value, clean APIs, low ToS risk) — first wave.
+   - **GO (experimental, opt-in):** `agy`. Marginal eng cost is low — it shares gemini's Google Code-Assist
+     `AntigravityProvider`, and one OAuth unlocks Claude+Gemini+GPT-OSS. Its one residual risk is **ToS**
+     (drives Antigravity's official client + the user's subscription quota from a third-party app), which is
+     *independent of* the now-solved secret-storage question and cannot be engineered away — so agy stays
+     behind an **explicit opt-in flag with a documented ToS caveat**, and the user accepts the risk on their
+     own subscription. Watch for `429 RESOURCE_EXHAUSTED` (shared-quota exhaustion) and `cloudcode-pa`
+     endpoint drift (semi-internal Google API; agy auto-updates). openab already runs agy in production via
+     the ECS `antigravity` variant, so the auth/quota behaviour is first-hand-known.
+   - **No-Go:** `cursor` (reverse-engineered proprietary proxy + high ToS/account-ban risk), `kiro` (AWS Q
+     event-stream protocol — high maintenance cost). Revisit only on explicit demand.
 4. Does the locked-RMW fix also subsume `openab-agent-mcp.md` open items #1 (reqwest 0.12/0.13 split) and
    #8 (doctor/runtime two-store split)? Likely partial.
 
@@ -318,8 +336,13 @@ it exposes CLI subcommands the relay shells out to via `$OPENAB_AGENT_AUTH_COMMA
 - Gemini CLI `code_assist/oauth2.ts` · `NoeFabris/opencode-antigravity-auth` (+ `ANTIGRAVITY_API_SPEC.md`)
 - GitHub `copilot-cli` · Kiro CLI / `pi-provider-kiro` / `kiro-gateway` · xAI API / `pi-xai-oauth`
 - Xiaomi `MiMo-Code`
+- **rclone `rclone/rclone`** — `rcloneEncryptedClientSecret` constant + runtime `obscure.MustReveal()`: the
+  canonical real-world precedent for §9 Q2 encode-at-rest (scanner-evasion of a non-confidential bundled
+  OAuth secret, explicitly not encryption).
 
 ### External — specs
 - RFC 8628 (Device Authorization Grant) · OAuth 2.1 §10.4 (refresh-token rotation/reuse)
 - anthropics/claude-code #22992 (device-flow request), #20215 (MCP device flow)
+- GitHub secret-scanning — Google secrets push-protected by default (changelog 2026-03-31); Google
+  google-auth-library-nodejs #959 (desktop client secret is non-confidential)
 - [Documenting Architecture Decisions — Nygard (2011)](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions.html)
