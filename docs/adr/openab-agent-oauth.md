@@ -224,7 +224,10 @@ agentcore    AWS SigV4/IAM (not OAuth)  AWS Bedrock                   ❌ out of
 Concrete values (verified): codex `app_EMoamEEZ73f0CkXaXp7hrann` (no secret, form); claude
 `9d1c250a-e61b-44d9-88ed-5944d1962f5e` (no secret, JSON no-scope); gemini
 `681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j` (+ bundled `GOCSPX-…` — non-confidential by spec but **not** safe as raw repo text; storage decided in §9 Q2); agy
-`1071006060591-tmhssin2h21lcre235vtolojh4g403ep` (likely bundled — UNCONFIRMED; redirect `localhost:51121`,
+`1071006060591-tmhssin2h21lcre235vtolojh4g403ep` (bundled secret **CONFIRMED** 2026-06-24 — the same public
+`GOCSPX-…` constant ≥20 antigravity-auth ecosystem repos hardcode verbatim, e.g. `NoeFabris/opencode-antigravity-auth`,
+`router-for-me/CLIProxyAPI`; **deliberately not reproduced here** — pasting the literal would trip the very
+§9 Q2 push-protection, so we dogfood the env/encode decision; redirect `localhost:51121/oauth-callback`,
 scopes add `cclog`/`experimentsandconfigs`; inference `cloudcode-pa`, needs GCP `project` field; one OAuth
 unlocks Claude+Gemini+GPT-OSS; agy ≠ Messages V1).
 
@@ -304,8 +307,9 @@ it exposes CLI subcommands the relay shells out to via `$OPENAB_AGENT_AUTH_COMMA
      label it as such inline so reviewers aren't misled. This is a well-adopted pattern: **rclone** declares a
      `rcloneEncryptedClientSecret` constant and calls `obscure.MustReveal()` at runtime for exactly this
      reason (bypass static scanners / partner auto-revoke, explicitly not encryption) — see §10.
-   Still confirm whether agy actually *requires* a secret, from the plugin `src/constants.ts` / agy binary;
-   under the (b) default this is moot unless agy is shipped as a bundled zero-config binary.
+   agy secret requirement is now **CONFIRMED** (2026-06-24): agy *does* require a `GOCSPX-…` client_secret, a
+   public ecosystem constant (≥20 antigravity-auth repos hardcode it — §6). Under the (b) env default it is
+   injected, never committed; (a) applies only if agy is ever shipped as a bundled zero-config binary.
 3. **Vendor go/no-go — DECIDED (Brett 2026-06-24).**
    - **GO:** `gemini`, `grok` (high value, clean APIs, low ToS risk) — first wave.
    - **GO (experimental, opt-in):** `agy`. Marginal eng cost is low — it shares gemini's Google Code-Assist
@@ -315,7 +319,12 @@ it exposes CLI subcommands the relay shells out to via `$OPENAB_AGENT_AUTH_COMMA
      behind an **explicit opt-in flag with a documented ToS caveat**, and the user accepts the risk on their
      own subscription. Watch for `429 RESOURCE_EXHAUSTED` (shared-quota exhaustion) and `cloudcode-pa`
      endpoint drift (semi-internal Google API; agy auto-updates). openab already runs agy in production via
-     the ECS `antigravity` variant, so the auth/quota behaviour is first-hand-known.
+     the ECS `antigravity` variant, so the auth/quota behaviour is first-hand-known. **Ecosystem evidence
+     (GitHub survey 2026-06-24):** agy OAuth is widely ported — ≥20 public repos hardcode the identical
+     client_id/secret (opencode/pi/hermes/openclaw plugins, standalone proxies) — so the integration is
+     proven, *and* the same ecosystem is full of "anti-ban", "strict quota locking" and "multi-account
+     rotation" tooling, which empirically confirms the ToS-ban and `429` quota-exhaustion risks are real, not
+     theoretical — reinforcing the opt-in gate.
    - **No-Go:** `cursor` (reverse-engineered proprietary proxy + high ToS/account-ban risk), `kiro` (AWS Q
      event-stream protocol — high maintenance cost). Revisit only on explicit demand.
 4. Does the locked-RMW fix also subsume `openab-agent-mcp.md` open items #1 (reqwest 0.12/0.13 split) and
@@ -334,6 +343,10 @@ it exposes CLI subcommands the relay shells out to via `$OPENAB_AGENT_AUTH_COMMA
 ### External — projects
 - Pi `earendil-works/pi` (ported flow; `CLAUDE_CODE_OAUTH_TOKEN` #3591) · OpenClaw · Hermes Agent
 - Gemini CLI `code_assist/oauth2.ts` · `NoeFabris/opencode-antigravity-auth` (+ `ANTIGRAVITY_API_SPEC.md`)
+- **Antigravity (agy) OAuth ecosystem** (GitHub survey 2026-06-24, ≥20 repos hardcoding the same client_id/
+  secret) — `NoeFabris/opencode-antigravity-auth`, `router-for-me/CLIProxyAPI`, `andyvandaric/opencode-ag-auth`
+  (quota-locking/anti-ban), `Meapri/hermes-google-antigravity-plugin`, `wbbtmusic/openclaw-antigravity-oauth`;
+  evidence the integration is proven and that ToS-ban/quota mitigations are a real ecosystem concern (§9 Q3)
 - GitHub `copilot-cli` · Kiro CLI / `pi-provider-kiro` / `kiro-gateway` · xAI API / `pi-xai-oauth`
 - Xiaomi `MiMo-Code`
 - **rclone `rclone/rclone`** — `rcloneEncryptedClientSecret` constant + runtime `obscure.MustReveal()`: the
