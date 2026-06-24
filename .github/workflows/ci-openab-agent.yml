@@ -24,17 +24,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: openab-agent
+      # openab-agent is a standalone crate, not a member of the parent openab
+      # workspace (members = crates/openab-core, openab-gateway) and not excluded,
+      # so cargo run from this directory errors "believes it's in a workspace when
+      # it's not". Declare an empty workspace, mirroring Dockerfile.unified, so
+      # every cargo step below resolves it as its own root.
+      - run: printf '\n[workspace]\n' >> Cargo.toml
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
       - run: cargo test
       - run: cargo test -- --ignored
         env:
           ANTHROPIC_API_KEY: "fake-key-for-ci"
+      # Build in its own step so a build failure is distinct from a smoke failure
+      # and the timed run below races only the binary, not a concurrent compile.
+      - name: Build release binary
+        run: cargo build --release
       - name: ACP smoke test
         run: |
-          cargo build --release
-          # Test: initialize returns valid ACP response
-          RESP=$(echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | timeout 5 ./target/release/openab-agent 2>/dev/null | head -1)
+          # Generous timeout so a loaded runner doesn't flake the agent's
+          # first-response window (the prior 5s was tight right after a release build).
+          RESP=$(echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | timeout 30 ./target/release/openab-agent 2>/dev/null | head -1)
           echo "Response: $RESP"
           echo "$RESP" | grep -q '"agentInfo"' || (echo "FAIL: no agentInfo in response" && exit 1)
           echo "$RESP" | grep -q '"openab-agent"' || (echo "FAIL: wrong agent name" && exit 1)
