@@ -295,23 +295,19 @@ fn flock_exclusive(lock: &Path) -> Result<AuthFileLock> {
     Ok(AuthFileLock { file })
 }
 
-/// Non-blocking exclusive lock; `Ok(None)` means another holder owns it.
-#[cfg(unix)]
-fn flock_try_exclusive(lock: &Path) -> Result<Option<AuthFileLock>> {
-    use std::os::unix::io::AsRawFd;
-    let file = open_lock_file(lock)?;
-    // SAFETY: valid fd held by `file`; flock has no memory effects.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        return Ok(Some(AuthFileLock { file }));
+/// Acquire the global `auth.json` write lock (a no-op `None` guard off-unix).
+/// Both `with_auth_locked` and `McpCredentialStore::clear` — which needs a
+/// delete-on-empty tail the funnel can't express — acquire here, so the
+/// `"global"` sidecar name and the acquire policy live in exactly one place.
+fn lock_global(path: &Path) -> Result<Option<AuthFileLock>> {
+    #[cfg(unix)]
+    {
+        Ok(Some(flock_exclusive(&lock_path_for(path, "global"))?))
     }
-    let err = std::io::Error::last_os_error();
-    // flock can report EWOULDBLOCK or EAGAIN depending on libc/BSD; both map to
-    // `ErrorKind::WouldBlock`, so use the std abstraction (Mira review).
-    if err.kind() == std::io::ErrorKind::WouldBlock {
+    #[cfg(not(unix))]
+    {
+        let _ = path;
         Ok(None)
-    } else {
-        Err(err.into())
     }
 }
 
@@ -324,8 +320,7 @@ fn with_auth_locked<R>(
     path: &Path,
     f: impl FnOnce(&mut HashMap<String, AuthEntry>) -> R,
 ) -> Result<R> {
-    #[cfg(unix)]
-    let _guard = flock_exclusive(&lock_path_for(path, "global"))?;
+    let _guard = lock_global(path)?;
     let mut map = read_auth_file(path).unwrap_or_default();
     let r = f(&mut map);
     gc_stale_pending(&mut map);
@@ -352,31 +347,51 @@ fn gc_stale_pending(map: &mut HashMap<String, AuthEntry>) {
 /// (b) Per-tenant refresh serialisation (ADR §5.4). The returned guard is held by
 /// the caller across the network refresh so concurrent processes do exactly one
 /// real refresh per tenant — never presenting a rotated `RT_old` twice (OAuth 2.1
-/// §10.4 family revocation). Non-blocking acquire + async backoff so a refresh in
-/// flight elsewhere never blocks this executor thread; on timeout we return `None`
-/// and let the caller proceed (degrade to a possible double-refresh, never wedge).
+/// §10.4 family revocation). Non-blocking acquire on a single fd + async backoff
+/// so a refresh in flight elsewhere never blocks this executor thread; on timeout
+/// we return `None` and let the caller proceed (degrade to a possible
+/// double-refresh, never wedge).
+///
+/// The lock only *serialises* — it does not decide whether to refresh. Callers
+/// MUST re-check token freshness after acquiring (the double-check) so a process
+/// that lost the race adopts the token the winner wrote instead of refreshing
+/// again: `get_valid_token` does this explicitly; the MCP path relies on rmcp's
+/// `get_access_token` re-`load()`ing the store.
 #[cfg(unix)]
 pub(crate) async fn lock_tenant_refresh(auth: &Path, tenant: &str) -> Option<AuthFileLock> {
+    use std::os::unix::io::AsRawFd;
     let lock = lock_path_for(auth, &format!("refresh.{tenant}"));
+    // Open the lock fd once; re-issue `flock` on it each retry instead of
+    // re-opening (and re-`create_dir_all`-ing) the same file every 100 ms.
+    let file = match open_lock_file(&lock) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(tenant, error = %e, "refresh lock unavailable; proceeding unserialised");
+            return None;
+        }
+    };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        match flock_try_exclusive(&lock) {
-            Ok(Some(guard)) => return Some(guard),
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    tracing::warn!(
-                        tenant,
-                        "timed out waiting for refresh lock; proceeding unserialised"
-                    );
-                    return None;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-            Err(e) => {
-                tracing::warn!(tenant, error = %e, "refresh lock unavailable; proceeding unserialised");
-                return None;
-            }
+        // SAFETY: valid fd held by `file`; flock has no memory effects.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Some(AuthFileLock { file });
         }
+        let err = std::io::Error::last_os_error();
+        // EWOULDBLOCK/EAGAIN (both `ErrorKind::WouldBlock`) = another holder is
+        // refreshing; any other errno is a real failure we degrade on.
+        if err.kind() != std::io::ErrorKind::WouldBlock {
+            tracing::warn!(tenant, error = %err, "refresh lock unavailable; proceeding unserialised");
+            return None;
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                tenant,
+                "timed out waiting for refresh lock; proceeding unserialised"
+            );
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
@@ -483,25 +498,23 @@ impl CredentialStore for McpCredentialStore {
     }
 
     async fn clear(&self) -> Result<(), AuthError> {
-        // Same global lock as every other writer; preserves the "last entry
-        // removed → delete the file" behaviour rather than leaving an empty map.
-        let run = || -> Result<()> {
-            #[cfg(unix)]
-            let _guard = flock_exclusive(&lock_path_for(&self.path, "global"))?;
-            let mut map = match read_auth_file(&self.path) {
-                Ok(m) => m,
-                Err(_) => return Ok(()),
-            };
-            if map.remove(&self.key).is_none() {
-                return Ok(());
-            }
-            if map.is_empty() {
-                let _ = std::fs::remove_file(&self.path);
-                return Ok(());
-            }
-            write_auth_file(&self.path, &map)
+        // Same global lock as every other writer, but with a delete-on-empty tail
+        // `with_auth_locked` can't express (it always writes), so `clear` acquires
+        // the shared `lock_global` directly rather than funnelling through it.
+        let _guard =
+            lock_global(&self.path).map_err(|e| AuthError::InternalError(e.to_string()))?;
+        let mut map = match read_auth_file(&self.path) {
+            Ok(m) => m,
+            Err(_) => return Ok(()),
         };
-        run().map_err(|e| AuthError::InternalError(e.to_string()))
+        if map.remove(&self.key).is_none() {
+            return Ok(());
+        }
+        if map.is_empty() {
+            let _ = std::fs::remove_file(&self.path);
+            return Ok(());
+        }
+        write_auth_file(&self.path, &map).map_err(|e| AuthError::InternalError(e.to_string()))
     }
 }
 
