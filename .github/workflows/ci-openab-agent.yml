@@ -42,9 +42,14 @@ jobs:
         run: cargo build --release
       - name: ACP smoke test
         run: |
-          # Generous timeout so a loaded runner doesn't flake the agent's
-          # first-response window (the prior 5s was tight right after a release build).
-          RESP=$(echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | timeout 30 ./target/release/openab-agent 2>/dev/null | head -1)
+          set +e
+          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+            | timeout 30 ./target/release/openab-agent > /tmp/acp_out.txt 2> /tmp/acp_err.txt
+          code=$?
+          echo "exit code: $code"
+          echo "--- stdout ---"; cat /tmp/acp_out.txt
+          echo "--- stderr ---"; cat /tmp/acp_err.txt
+          RESP=$(head -1 /tmp/acp_out.txt)
           echo "Response: $RESP"
           echo "$RESP" | grep -q '"agentInfo"' || (echo "FAIL: no agentInfo in response" && exit 1)
           echo "$RESP" | grep -q '"openab-agent"' || (echo "FAIL: wrong agent name" && exit 1)
