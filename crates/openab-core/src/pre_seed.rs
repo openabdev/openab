@@ -8,10 +8,10 @@ use tracing::{error, info, warn};
 const MAX_SOURCES: usize = 5;
 
 /// Default max extracted (uncompressed) size: 500 MiB.
-const DEFAULT_MAX_EXTRACTED_BYTES: u64 = 500 * 1024 * 1024;
+const DEFAULT_MAX_EXTRACTED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Default max file count per zip.
-const DEFAULT_MAX_FILE_COUNT: usize = 10_000;
+const DEFAULT_MAX_FILE_COUNT: usize = 100_000;
 
 /// Run the pre_seed phase: download zip archives from S3 and extract them in order.
 pub async fn run(cfg: &PreSeedConfig) -> anyhow::Result<()> {
