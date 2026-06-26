@@ -380,10 +380,23 @@ pub(crate) enum RefreshLock {
     TimedOut,
 }
 
-/// Lock-acquire deadline. Strictly greater than [`REFRESH_HTTP_TIMEOUT`] so a live
-/// holder's bounded refresh always releases before a waiter gives up.
+/// Worst-case number of sequential bounded refresh round-trips a single lock-holder
+/// makes while holding the tenant lock. The codex path makes one (the token POST);
+/// the MCP path makes two — rmcp's `initialize_from_store()` (authorization-server
+/// discovery) then `get_access_token()` (the refresh) — each bounded by
+/// [`REFRESH_HTTP_TIMEOUT`].
 #[cfg(unix)]
-const REFRESH_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const MAX_REFRESH_ROUND_TRIPS: u64 = 2;
+
+/// Lock-acquire deadline. Sized strictly above the worst-case lock-hold
+/// (`MAX_REFRESH_ROUND_TRIPS` × [`REFRESH_HTTP_TIMEOUT`]) plus margin, so a waiter
+/// never fails closed on a holder that is still legitimately progressing through its
+/// bounded — and, on the MCP path, multi-call — refresh; only a genuinely stuck
+/// holder trips the timeout. Derived from `REFRESH_HTTP_TIMEOUT` so the relationship
+/// can't silently drift if that bound changes.
+#[cfg(unix)]
+const REFRESH_LOCK_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(REFRESH_HTTP_TIMEOUT.as_secs() * MAX_REFRESH_ROUND_TRIPS + 4);
 
 /// (b) Per-tenant refresh serialisation (ADR §5.4). On success the returned
 /// [`RefreshLock::Held`] guard is kept by the caller across the network refresh so
@@ -392,10 +405,12 @@ const REFRESH_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// on a single fd + async backoff so a refresh in flight elsewhere never blocks this
 /// executor thread.
 ///
-/// **Fail-closed on timeout.** The network refresh is bounded by [`REFRESH_HTTP_TIMEOUT`]
-/// strictly shorter than [`REFRESH_LOCK_TIMEOUT`], and `flock(2)` auto-releases on
-/// holder death, so a live holder always releases well before a waiter's deadline. A
-/// timeout therefore signals a genuinely abnormal state — and proceeding unserialised
+/// **Fail-closed on timeout.** Each refresh round-trip is bounded by
+/// [`REFRESH_HTTP_TIMEOUT`], and [`REFRESH_LOCK_TIMEOUT`] is sized above the worst-case
+/// lock-hold ([`MAX_REFRESH_ROUND_TRIPS`] sequential bounded calls — the MCP path makes
+/// two, codex one); combined with `flock(2)` auto-release on holder death, a live holder
+/// still progressing always releases before a waiter's deadline. A timeout therefore
+/// signals a genuinely abnormal state — and proceeding unserialised
 /// would re-present `RT_old` and risk the exact family revocation this lock exists to
 /// prevent, strictly worse than a transient retry. So we return
 /// [`RefreshLock::TimedOut`] (logged at `error!`) and the caller surfaces a retryable

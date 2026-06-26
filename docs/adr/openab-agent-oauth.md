@@ -202,9 +202,12 @@ fn get_or_refresh(tenant: &str) -> Result<String> {
   killed refresher frees its tenant lock instantly. No stale lock, no manual timeout/orphan cleanup.
 - **try-lock + timeout** on the global lock so a wedged writer degrades to a graceful error, never a wedged
   worker.
-- **Bounded refresh + fail-closed tenant-lock timeout.** The refresh network call is bounded by an explicit
-  HTTP timeout (`REFRESH_HTTP_TIMEOUT` = 8s) **strictly shorter** than the lock-acquire deadline
-  (`REFRESH_LOCK_TIMEOUT` = 10s); combined with `flock(2)` auto-release on holder death, a live holder always
+- **Bounded refresh + fail-closed tenant-lock timeout.** Each refresh round-trip is bounded by an explicit
+  HTTP timeout (`REFRESH_HTTP_TIMEOUT` = 8s), and the lock-acquire deadline is **sized above the worst-case
+  lock-hold**: `REFRESH_LOCK_TIMEOUT = MAX_REFRESH_ROUND_TRIPS × REFRESH_HTTP_TIMEOUT + margin = 20s`. The
+  MCP path holds the lock across **two** sequential bounded calls (rmcp's `initialize_from_store()`
+  authorization-server discovery, then `get_access_token()` refresh); the codex path one. Combined with
+  `flock(2)` auto-release on holder death, a live holder still progressing through its bounded refresh always
   frees the tenant lock before any waiter's deadline. A lock-acquire timeout is therefore *abnormal*, and
   proceeding unserialised would re-present `RT_old` and risk the §10.4 family revocation this lock prevents —
   strictly worse than a transient retry. So the waiter **fails closed**: `lock_tenant_refresh` returns
