@@ -311,6 +311,18 @@ fn lock_global(path: &Path) -> Result<Option<AuthFileLock>> {
     }
     #[cfg(not(unix))]
     {
+        // No flock(2) off-unix: every writer runs unprotected, so concurrent
+        // processes can silently corrupt auth.json (ADR §5.4). openab-agent is
+        // de-facto unix-only; warn once rather than fail silently so a non-unix
+        // build with concurrent processes is at least diagnosable.
+        use std::sync::Once;
+        static WARN_NO_LOCK: Once = Once::new();
+        WARN_NO_LOCK.call_once(|| {
+            tracing::warn!(
+                "auth.json cross-process file locking is unavailable on this non-unix platform; \
+                 concurrent openab-agent processes may corrupt stored credentials (ADR §5.4)"
+            );
+        });
         let _ = path;
         Ok(None)
     }
@@ -354,8 +366,12 @@ fn gc_stale_pending(map: &mut HashMap<String, AuthEntry>) {
 /// real refresh per tenant — never presenting a rotated `RT_old` twice (OAuth 2.1
 /// §10.4 family revocation). Non-blocking acquire on a single fd + async backoff
 /// so a refresh in flight elsewhere never blocks this executor thread; on timeout
-/// we return `None` and let the caller proceed (degrade to a possible
-/// double-refresh, never wedge).
+/// we return `None` and let the caller proceed unserialised — a deliberate
+/// fail-open trade-off prioritising availability over strict single-flight.
+/// Fail-closed (erroring out) would let one stuck lock-holder DoS the whole
+/// tenant, and an AS slow enough to hold the lock >10s would also time out the
+/// refresh itself; the timeout path logs at `error!` so the rare unserialised
+/// refresh is visible to alerting.
 ///
 /// Reuse-safety comes from loading the refresh token *inside* the lock: a
 /// process that waited then loads the token the winner just wrote, so it never
@@ -394,9 +410,12 @@ pub(crate) async fn lock_tenant_refresh(auth: &Path, tenant: &str) -> Option<Aut
             return None;
         }
         if std::time::Instant::now() >= deadline {
-            tracing::warn!(
+            // Fail-open (see fn doc): proceed unserialised rather than wedge. Logged
+            // at error! — not warn! — because this reintroduces the double-refresh
+            // the lock exists to prevent and operators should see it in alerting.
+            tracing::error!(
                 tenant,
-                "timed out waiting for refresh lock; proceeding unserialised"
+                "timed out waiting for refresh lock; proceeding unserialised (possible double-refresh)"
             );
             return None;
         }

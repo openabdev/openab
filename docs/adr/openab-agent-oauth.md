@@ -165,8 +165,8 @@ invariant** (see §9 Q4). (`with_auth_locked` below is *new* — the thing this 
 writers never lost-update the shared file:
 ```rust
 // ALL writers funnel through this. auth.rs storage layer.
-fn with_auth_locked<R>(f: impl FnOnce(&mut HashMap<String, AuthEntry>) -> R) -> Result<R> {
-    let _g = flock_exclusive("auth.json.lock")?;  // sidecar file (NOT auth.json — rename swaps its inode)
+fn with_auth_locked<R>(path: &Path, f: impl FnOnce(&mut HashMap<String, AuthEntry>) -> R) -> Result<R> {
+    let _g = flock_exclusive("auth.json.global.lock")?;  // sidecar file (NOT auth.json — rename swaps its inode)
     let mut map = read_auth_file(&path)?;          // re-read inside lock (anti lost-update)
     let r = f(&mut map);
     write_auth_file(&path, &map)?;                 // existing atomic tmp+rename
@@ -188,7 +188,7 @@ fn get_or_refresh(tenant: &str) -> Result<String> {
     // 1. fast path — fresh token under a shared (read) global lock
     if let Some(t) = read_fresh(tenant)? { return Ok(t); }
     // 2. serialize refreshes for THIS tenant only (other tenants unaffected)
-    let _tg = flock_exclusive(&format!("auth.json.{tenant}.lock"))?;
+    let _tg = flock_exclusive(&format!("auth.json.refresh.{tenant}.lock"))?;
     // 3. double-check — another process may have refreshed while we waited on the tenant lock
     if let Some(t) = read_fresh(tenant)? { return Ok(t); }
     // 4. exactly one network refresh per tenant per expiry — tenant lock held, global lock NOT
@@ -202,16 +202,23 @@ fn get_or_refresh(tenant: &str) -> Result<String> {
   killed refresher frees its tenant lock instantly. No stale lock, no manual timeout/orphan cleanup.
 - **try-lock + timeout** on the global lock so a wedged writer degrades to a graceful error, never a wedged
   worker.
-- **Crate:** `rustix::fs::flock` (already in the tree, safe API), gated `#[cfg(unix)]` with a non-unix
+- **Fail-open on tenant-lock timeout (deliberate trade-off).** If `lock_tenant_refresh` can't acquire within
+  10s it returns `None` and the caller refreshes *unserialised* — prioritising availability over the
+  single-flight guarantee. Fail-closed (erroring out) would let one stuck lock-holder DoS a whole tenant; an
+  AS slow enough to hold the lock >10s would also time out the refresh itself. The timeout path logs at
+  `tracing::error!` (not `warn`) so the rare unserialised refresh is visible to alerting.
+- **Crate:** `libc::flock` directly (`rustix` is **not** in-tree — this ADR's earlier `rustix::fs::flock`
+  text was optimistic), wrapped in a small `unsafe` + RAII guard, gated `#[cfg(unix)]` with a non-unix
   no-op — mirroring the existing atomic-write cfg split. (openab-agent is de-facto unix-only: its
-  `ci-openab-agent.yml` is linux, deploy is always container; Windows binaries are the broker only.)
+  `ci-openab-agent.yml` is linux, deploy is always container; Windows binaries are the broker only. The
+  non-unix `lock_global` no-op emits a one-time `tracing::warn!` so the unprotected state is never silent.)
 - Each MCP `mcp:<server>` tenant takes its own tenant lock by the same rule, so the MCP `CredentialStore`
   refreshes are serialized per server too — the invariant serves it directly (see `openab-agent-mcp.md`
   §6.1). rmcp owns the MCP refresh internally (no pre-refresh `CredentialStore` hook), but openab drives it
   explicitly at `resolve_oauth_dial` (`mcp/runtime.rs`) via `client.get_access_token()`; the per-server
-  tenant lock wraps that call, and rmcp's `get_access_token` re-`load()`s `auth.json` and skips the network
-  refresh when the token is already fresh, so the lock-loser adopts the winner's token (cross-process
-  single-flight) without a second `RT_old` presentation.
+  tenant lock wraps that call, and rmcp's `initialize_from_store()` re-`load()`s `auth.json` from disk
+  (after which `get_access_token` skips the network refresh when the loaded token is already fresh), so the
+  lock-loser adopts the winner's token (cross-process single-flight) without a second `RT_old` presentation.
 - **Until this lands**, prefer the `CLAUDE_CODE_OAUTH_TOKEN` env route (§5.3 — no refresh write, no race);
   treat interactive Anthropic OAuth as not-yet-hardened for high concurrency.
 
@@ -306,6 +313,9 @@ it exposes CLI subcommands the relay shells out to via `$OPENAB_AGENT_AUTH_COMMA
    drop the three duplicated default sites (`llm.rs:153`, `acp.rs:385/446`). Consequence: removes the
    zero-config default (deployments set model via values.yaml/env already; needs a clear error message +
    CHANGELOG note). Also eliminates the silent Opus cost bump for API-key users.
+   **Status — to be implemented in a follow-up PR.** This PR lands the ADR + the §5.4 storage locking only;
+   the hardcoded default-model sites still exist in `llm.rs` / `acp.rs` and are intentionally untouched here
+   to keep the locking change reviewable in isolation.
 2. **Bundled `client_secret` storage — DECIDED (Brett 2026-06-24): encode-at-rest default; env-injection
    alternative.** Google Code-Assist vendors (gemini, agy) ship a `GOCSPX-…` desktop-app secret. By RFC 8252 and
    Google's own docs this value is **non-confidential** (installed-app secret, "obviously not treated as a

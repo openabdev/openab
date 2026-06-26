@@ -638,9 +638,15 @@ impl McpRuntimeManager {
         // revocation. rmcp already single-flights within one process (shared
         // `AuthorizationManager` `Mutex`); this closes the cross-process gap.
         // The lock is held across the network refresh below. The double-check is
-        // implicit: rmcp's `get_access_token` re-`load()`s `auth.json` and skips
-        // the network refresh when the token is already fresh, so a process that
-        // loses the race adopts the token the winner wrote. Non-unix = no-op.
+        // implicit: `mgr.initialize_from_store()` (called below) re-`load()`s
+        // `auth.json` from disk, after which `get_access_token` skips the network
+        // refresh when the loaded token is already fresh, so a process that loses
+        // the race adopts the token the winner wrote. Non-unix = no-op.
+        //
+        // Cross-module invariant: the per-tenant refresh lock and the credential
+        // entry must key off the *same* server identifier. `name` is passed both
+        // to `lock_tenant_refresh` here and to `McpCredentialStore::new` above, so
+        // the lock guards exactly the entry being refreshed — keep them in sync.
         #[cfg(unix)]
         let _refresh_guard = crate::auth::lock_tenant_refresh(&self.auth_path, name).await;
         // rmcp needs the authorization server's metadata configured before it can
