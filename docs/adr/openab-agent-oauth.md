@@ -202,11 +202,18 @@ fn get_or_refresh(tenant: &str) -> Result<String> {
   killed refresher frees its tenant lock instantly. No stale lock, no manual timeout/orphan cleanup.
 - **try-lock + timeout** on the global lock so a wedged writer degrades to a graceful error, never a wedged
   worker.
-- **Fail-open on tenant-lock timeout (deliberate trade-off).** If `lock_tenant_refresh` can't acquire within
-  10s it returns `None` and the caller refreshes *unserialised* — prioritising availability over the
-  single-flight guarantee. Fail-closed (erroring out) would let one stuck lock-holder DoS a whole tenant; an
-  AS slow enough to hold the lock >10s would also time out the refresh itself. The timeout path logs at
-  `tracing::error!` (not `warn`) so the rare unserialised refresh is visible to alerting.
+- **Bounded refresh + fail-closed tenant-lock timeout.** The refresh network call is bounded by an explicit
+  HTTP timeout (`REFRESH_HTTP_TIMEOUT` = 8s) **strictly shorter** than the lock-acquire deadline
+  (`REFRESH_LOCK_TIMEOUT` = 10s); combined with `flock(2)` auto-release on holder death, a live holder always
+  frees the tenant lock before any waiter's deadline. A lock-acquire timeout is therefore *abnormal*, and
+  proceeding unserialised would re-present `RT_old` and risk the §10.4 family revocation this lock prevents —
+  strictly worse than a transient retry. So the waiter **fails closed**: `lock_tenant_refresh` returns
+  `RefreshLock::TimedOut` (logged at `error!`), the codex path surfaces a retryable error, and the MCP path
+  returns a *transient* dial error that leaves the server retryable **without** forcing re-login (`NeedsAuth`)
+  or tripping the circuit breaker. (A filesystem error opening the sidecar returns `RefreshLock::Unavailable`
+  and degrades to a best-effort unserialised refresh rather than blocking every refresh on a broken lock dir.)
+  This bounded-refresh + fail-closed design supersedes the earlier fail-open draft, which reintroduced the
+  double-refresh in exactly the contended case the lock exists for.
 - **Crate:** `libc::flock` directly (`rustix` is **not** in-tree — this ADR's earlier `rustix::fs::flock`
   text was optimistic), wrapped in a small `unsafe` + RAII guard, gated `#[cfg(unix)]` with a non-unix
   no-op — mirroring the existing atomic-write cfg split. (openab-agent is de-facto unix-only: its

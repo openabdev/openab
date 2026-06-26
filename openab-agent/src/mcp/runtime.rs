@@ -594,7 +594,14 @@ impl McpRuntimeManager {
             self.auth_path.clone(),
             name.to_string(),
         ));
-        let client = AuthClient::new(reqwest013::Client::new(), manager);
+        // Bound the refresh round-trip (driven via `get_access_token`) so the
+        // per-tenant lock held across it is provably released before another
+        // process's lock deadline — see `crate::auth::REFRESH_HTTP_TIMEOUT`.
+        let http = reqwest013::Client::builder()
+            .timeout(crate::auth::REFRESH_HTTP_TIMEOUT)
+            .build()
+            .map_err(|e| anyhow!("mcp server {name:?} oauth http client build failed: {e}"))?;
+        let client = AuthClient::new(http, manager);
         cache.insert(name.to_string(), client.clone());
         Ok(client)
     }
@@ -607,12 +614,17 @@ impl McpRuntimeManager {
     /// request); an expired token with a refresh token → let rmcp discover the
     /// authorization server and refresh, dialing on success and bouncing to
     /// `NeedsAuth` on failure. An expired token with no refresh token bounces
-    /// directly without a network round-trip. All bounces are returned as
-    /// `Err` so the caller flips status to `NeedsAuth` without touching the
-    /// circuit breaker.
-    async fn resolve_oauth_dial(&self, name: &str, url: &str) -> Result<Dial> {
-        let needs_login =
-            || anyhow!("mcp server {name:?} needs oauth login — run `mcp login {name}`");
+    /// directly without a network round-trip. Auth-level bounces return
+    /// [`OauthDialError::NeedsAuth`] so the caller flips status to `NeedsAuth`
+    /// without touching the circuit breaker; a contended refresh lock returns
+    /// [`OauthDialError::Transient`] so the caller retries without forcing
+    /// re-login or tripping the breaker.
+    async fn resolve_oauth_dial(&self, name: &str, url: &str) -> Result<Dial, OauthDialError> {
+        let needs_login = || {
+            OauthDialError::NeedsAuth(anyhow!(
+                "mcp server {name:?} needs oauth login — run `mcp login {name}`"
+            ))
+        };
         let store = McpCredentialStore::new(self.auth_path.clone(), name.to_string());
         let Some(creds) = store.load().await.ok().flatten() else {
             return Err(needs_login());
@@ -621,7 +633,10 @@ impl McpRuntimeManager {
         if !has_token {
             return Err(needs_login());
         }
-        let client = self.get_or_init_auth_client(name, url).await?;
+        let client = self
+            .get_or_init_auth_client(name, url)
+            .await
+            .map_err(OauthDialError::NeedsAuth)?;
         if !near_expiry {
             return Ok(Dial::Http {
                 url: url.to_string(),
@@ -647,19 +662,35 @@ impl McpRuntimeManager {
         // entry must key off the *same* server identifier. `name` is passed both
         // to `lock_tenant_refresh` here and to `McpCredentialStore::new` above, so
         // the lock guards exactly the entry being refreshed — keep them in sync.
+        //
+        // Fail closed on a contended-lock timeout: a `Transient` error so the
+        // caller retries WITHOUT forcing re-login (NeedsAuth) or tripping the
+        // breaker. `Held`/`Unavailable` both proceed to drive the refresh.
         #[cfg(unix)]
-        let _refresh_guard = crate::auth::lock_tenant_refresh(&self.auth_path, name).await;
+        let _refresh_guard = match crate::auth::lock_tenant_refresh(&self.auth_path, name).await {
+            crate::auth::RefreshLock::Held(g) => Some(g),
+            crate::auth::RefreshLock::Unavailable => None,
+            crate::auth::RefreshLock::TimedOut => {
+                return Err(OauthDialError::Transient(anyhow!(
+                    "mcp server {name:?} oauth refresh busy (lock contended); retry shortly"
+                )))
+            }
+        };
         // rmcp needs the authorization server's metadata configured before it can
         // exchange the refresh token, so discover it now (network) and let
         // `get_access_token` perform the rotation. Failures surface as `NeedsAuth`.
         {
             let mut mgr = client.auth_manager.lock().await;
             mgr.initialize_from_store().await.map_err(|e| {
-                anyhow!("mcp server {name:?} oauth refresh failed: {e} — run `mcp login {name}`")
+                OauthDialError::NeedsAuth(anyhow!(
+                    "mcp server {name:?} oauth refresh failed: {e} — run `mcp login {name}`"
+                ))
             })?;
         }
         client.get_access_token().await.map_err(|e| {
-            anyhow!("mcp server {name:?} oauth refresh failed: {e} — run `mcp login {name}`")
+            OauthDialError::NeedsAuth(anyhow!(
+                "mcp server {name:?} oauth refresh failed: {e} — run `mcp login {name}`"
+            ))
         })?;
         Ok(Dial::Http {
             url: url.to_string(),
@@ -1406,7 +1437,7 @@ impl McpRuntimeManager {
             DialPlan::Dial(d) => d,
             DialPlan::OauthHttp { url } => match self.resolve_oauth_dial(name, &url).await {
                 Ok(d) => d,
-                Err(e) => {
+                Err(OauthDialError::NeedsAuth(e)) => {
                     let mut guard = self.handles.write().await;
                     if let Some(h) = guard.get_mut(name) {
                         // A concurrent connect() may have finished a fresh login +
@@ -1414,6 +1445,19 @@ impl McpRuntimeManager {
                         // Connected status with NeedsAuth.
                         if !matches!(h.status, ServerStatus::Connected) {
                             h.status = ServerStatus::NeedsAuth;
+                        }
+                    }
+                    return Err(e);
+                }
+                Err(OauthDialError::Transient(e)) => {
+                    // Refresh lock contended (another process holds this server's
+                    // refresh). Not an auth or transport failure — leave the status
+                    // retryable (don't force re-login, don't trip the breaker); the
+                    // next connect() retries cleanly once the holder releases.
+                    let mut guard = self.handles.write().await;
+                    if let Some(h) = guard.get_mut(name) {
+                        if !matches!(h.status, ServerStatus::Connected) {
+                            h.status = ServerStatus::Disconnected;
                         }
                     }
                     return Err(e);
@@ -1839,6 +1883,18 @@ fn device_poll_error(
 enum DialPlan {
     Dial(Dial),
     OauthHttp { url: String },
+}
+
+/// Why [`McpRuntimeManager::resolve_oauth_dial`] couldn't produce a `Dial`.
+enum OauthDialError {
+    /// Auth-level: missing / expired-unrefreshable creds, or a failed refresh.
+    /// The caller moves the server to `NeedsAuth` (run `mcp login`).
+    NeedsAuth(anyhow::Error),
+    /// Transient: the per-tenant refresh lock was contended (another process is
+    /// refreshing this server's token). Not an auth failure and not a transport
+    /// failure — the caller leaves the status retryable, does NOT force re-login
+    /// or trip the circuit breaker.
+    Transient(anyhow::Error),
 }
 
 /// Per-transport dial parameters, extracted under the manager's write lock

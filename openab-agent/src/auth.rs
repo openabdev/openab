@@ -361,29 +361,70 @@ fn gc_stale_pending(map: &mut HashMap<String, AuthEntry>) {
     });
 }
 
-/// (b) Per-tenant refresh serialisation (ADR §5.4). The returned guard is held by
-/// the caller across the network refresh so concurrent processes do exactly one
-/// real refresh per tenant — never presenting a rotated `RT_old` twice (OAuth 2.1
-/// §10.4 family revocation). Non-blocking acquire on a single fd + async backoff
-/// so a refresh in flight elsewhere never blocks this executor thread; on timeout
-/// we return `None` and let the caller proceed unserialised — a deliberate
-/// fail-open trade-off prioritising availability over strict single-flight.
-/// Fail-closed (erroring out) would let one stuck lock-holder DoS the whole
-/// tenant, and an AS slow enough to hold the lock >10s would also time out the
-/// refresh itself; the timeout path logs at `error!` so the rare unserialised
-/// refresh is visible to alerting.
-///
-/// Reuse-safety comes from loading the refresh token *inside* the lock: a
-/// process that waited then loads the token the winner just wrote, so it never
-/// re-presents a rotated `RT_old`. Re-checking expiry after acquiring is an
-/// additional optimisation that skips a redundant network refresh — `get_valid_token`
-/// does this explicitly, and the MCP path gets it free from rmcp's `get_access_token`
-/// (which re-`load()`s and returns early when the token is already fresh).
-/// `force_refresh` intentionally skips that optimisation and always refreshes (it
-/// runs on a 401, where the clock-fresh token is already known-bad); it stays
-/// reuse-safe because it, too, loads inside the lock.
+/// HTTP timeout on the token-refresh network call (codex + MCP). Strictly shorter
+/// than [`REFRESH_LOCK_TIMEOUT`] so the per-tenant lock is provably released before
+/// a waiter's deadline — which is what lets the lock timeout fail *closed* (a
+/// timeout then signals a genuinely abnormal state, not normal slowness).
+pub(crate) const REFRESH_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Outcome of acquiring a tenant's refresh lock. See [`lock_tenant_refresh`].
 #[cfg(unix)]
-pub(crate) async fn lock_tenant_refresh(auth: &Path, tenant: &str) -> Option<AuthFileLock> {
+pub(crate) enum RefreshLock {
+    /// Lock acquired — hold across the refresh.
+    Held(AuthFileLock),
+    /// Sidecar lock file couldn't be opened (filesystem error). Best-effort:
+    /// proceed unserialised rather than block every refresh on a broken lock dir.
+    Unavailable,
+    /// Contended past [`REFRESH_LOCK_TIMEOUT`]. Fail-closed: the caller must NOT
+    /// refresh — surface a transient, retryable error.
+    TimedOut,
+}
+
+/// Lock-acquire deadline. Strictly greater than [`REFRESH_HTTP_TIMEOUT`] so a live
+/// holder's bounded refresh always releases before a waiter gives up.
+#[cfg(unix)]
+const REFRESH_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// (b) Per-tenant refresh serialisation (ADR §5.4). On success the returned
+/// [`RefreshLock::Held`] guard is kept by the caller across the network refresh so
+/// concurrent processes do exactly one real refresh per tenant — never presenting a
+/// rotated `RT_old` twice (OAuth 2.1 §10.4 family revocation). Non-blocking acquire
+/// on a single fd + async backoff so a refresh in flight elsewhere never blocks this
+/// executor thread.
+///
+/// **Fail-closed on timeout.** The network refresh is bounded by [`REFRESH_HTTP_TIMEOUT`]
+/// strictly shorter than [`REFRESH_LOCK_TIMEOUT`], and `flock(2)` auto-releases on
+/// holder death, so a live holder always releases well before a waiter's deadline. A
+/// timeout therefore signals a genuinely abnormal state — and proceeding unserialised
+/// would re-present `RT_old` and risk the exact family revocation this lock exists to
+/// prevent, strictly worse than a transient retry. So we return
+/// [`RefreshLock::TimedOut`] (logged at `error!`) and the caller surfaces a retryable
+/// error instead of refreshing. A filesystem error opening the sidecar returns
+/// [`RefreshLock::Unavailable`] — best-effort degrade (proceed) rather than block
+/// every refresh on a broken lock dir.
+///
+/// Reuse-safety on the happy path comes from loading the refresh token *inside* the
+/// lock: a process that waited then loads the token the winner just wrote, so it
+/// never re-presents a rotated `RT_old`. Re-checking expiry after acquiring is an
+/// additional optimisation that skips a redundant network refresh — `get_valid_token`
+/// does this explicitly, and the MCP path gets it free from rmcp's
+/// `initialize_from_store()` reload + `get_access_token` (which returns early when the
+/// token is already fresh). `force_refresh` intentionally skips that optimisation and
+/// always refreshes (it runs on a 401, where the clock-fresh token is already
+/// known-bad); it stays reuse-safe because it, too, loads inside the lock.
+#[cfg(unix)]
+pub(crate) async fn lock_tenant_refresh(auth: &Path, tenant: &str) -> RefreshLock {
+    lock_tenant_refresh_until(auth, tenant, REFRESH_LOCK_TIMEOUT).await
+}
+
+/// [`lock_tenant_refresh`] with an injectable deadline so tests can drive the
+/// fail-closed timeout path in milliseconds instead of [`REFRESH_LOCK_TIMEOUT`].
+#[cfg(unix)]
+async fn lock_tenant_refresh_until(
+    auth: &Path,
+    tenant: &str,
+    timeout: std::time::Duration,
+) -> RefreshLock {
     use std::os::unix::io::AsRawFd;
     let lock = lock_path_for(auth, &format!("refresh.{tenant}"));
     // Open the lock fd once; re-issue `flock` on it each retry instead of
@@ -392,32 +433,33 @@ pub(crate) async fn lock_tenant_refresh(auth: &Path, tenant: &str) -> Option<Aut
         Ok(f) => f,
         Err(e) => {
             tracing::warn!(tenant, error = %e, "refresh lock unavailable; proceeding unserialised");
-            return None;
+            return RefreshLock::Unavailable;
         }
     };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + timeout;
     loop {
         // SAFETY: valid fd held by `file`; flock has no memory effects.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc == 0 {
-            return Some(AuthFileLock { file });
+            return RefreshLock::Held(AuthFileLock { file });
         }
         let err = std::io::Error::last_os_error();
         // EWOULDBLOCK/EAGAIN (both `ErrorKind::WouldBlock`) = another holder is
         // refreshing; any other errno is a real failure we degrade on.
         if err.kind() != std::io::ErrorKind::WouldBlock {
             tracing::warn!(tenant, error = %err, "refresh lock unavailable; proceeding unserialised");
-            return None;
+            return RefreshLock::Unavailable;
         }
         if std::time::Instant::now() >= deadline {
-            // Fail-open (see fn doc): proceed unserialised rather than wedge. Logged
-            // at error! — not warn! — because this reintroduces the double-refresh
-            // the lock exists to prevent and operators should see it in alerting.
+            // Fail-closed (see fn doc): the refresh is HTTP-bounded shorter than this
+            // deadline, so a timeout is abnormal. Logged at error! so the rare
+            // contended refresh is alertable; the caller turns this into a transient
+            // retryable error rather than re-presenting RT_old.
             tracing::error!(
                 tenant,
-                "timed out waiting for refresh lock; proceeding unserialised (possible double-refresh)"
+                "timed out waiting for refresh lock; failing closed (refresh deferred)"
             );
-            return None;
+            return RefreshLock::TimedOut;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
@@ -554,8 +596,18 @@ pub async fn get_valid_token() -> Result<String> {
     }
     // 2. Serialise the refresh for the codex tenant — held across the network
     //    call so a second process does not present the same RT_old (§5.4 (b)).
+    //    Fail closed on a contended-lock timeout: surface a retryable error rather
+    //    than refresh unserialised (which would risk §10.4 family revocation).
     #[cfg(unix)]
-    let _refresh_guard = lock_tenant_refresh(&auth_path(), CODEX_NAMESPACE).await;
+    let _refresh_guard = match lock_tenant_refresh(&auth_path(), CODEX_NAMESPACE).await {
+        RefreshLock::Held(g) => Some(g),
+        RefreshLock::Unavailable => None,
+        RefreshLock::TimedOut => {
+            return Err(anyhow!(
+                "codex token refresh is busy (refresh lock contended); retry shortly"
+            ))
+        }
+    };
     // 3. Double-check: another process may have refreshed while we waited.
     let store = load_tokens()?;
     if !store.is_expired() {
@@ -570,8 +622,17 @@ pub async fn get_valid_token() -> Result<String> {
 
 pub async fn force_refresh() -> Result<String> {
     // Serialise even a forced refresh so two of them can't both rotate RT_old.
+    // Fail closed on timeout (see get_valid_token) rather than refresh unserialised.
     #[cfg(unix)]
-    let _refresh_guard = lock_tenant_refresh(&auth_path(), CODEX_NAMESPACE).await;
+    let _refresh_guard = match lock_tenant_refresh(&auth_path(), CODEX_NAMESPACE).await {
+        RefreshLock::Held(g) => Some(g),
+        RefreshLock::Unavailable => None,
+        RefreshLock::TimedOut => {
+            return Err(anyhow!(
+                "codex token refresh is busy (refresh lock contended); retry shortly"
+            ))
+        }
+    };
     let store = load_tokens()?;
     let new_store = refresh_token(&store).await?;
     save_tokens(&new_store)?;
@@ -580,7 +641,11 @@ pub async fn force_refresh() -> Result<String> {
 
 async fn refresh_token(store: &TokenStore) -> Result<TokenStore> {
     let client_id = codex_client_id();
-    let client = reqwest::Client::new();
+    // Bound the refresh so the per-tenant lock (held across this call) is provably
+    // released before another process's lock deadline — see REFRESH_HTTP_TIMEOUT.
+    let client = reqwest::Client::builder()
+        .timeout(REFRESH_HTTP_TIMEOUT)
+        .build()?;
     let resp = client
         .post(&store.token_endpoint)
         .form(&[
@@ -1387,5 +1452,33 @@ mod tests {
             "fresh pending kept"
         );
         assert!(map.get("codex").is_some(), "real tenant untouched");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lock_tenant_refresh_fails_closed_when_contended() {
+        // §5.4 (b), fail-closed: while one holder keeps the tenant refresh lock, a
+        // second acquire must hit the deadline and return `TimedOut` — the signal
+        // the caller turns into a retryable error instead of refreshing unserialised
+        // (which would re-present RT_old). Once released, acquisition succeeds again.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+
+        let held = lock_tenant_refresh(&path, "codex").await;
+        assert!(matches!(held, RefreshLock::Held(_)), "first acquire holds");
+
+        let contended =
+            lock_tenant_refresh_until(&path, "codex", std::time::Duration::from_millis(200)).await;
+        assert!(
+            matches!(contended, RefreshLock::TimedOut),
+            "second acquire fails closed while the lock is held"
+        );
+
+        drop(held);
+        let after = lock_tenant_refresh(&path, "codex").await;
+        assert!(
+            matches!(after, RefreshLock::Held(_)),
+            "acquire succeeds once the holder releases"
+        );
     }
 }
