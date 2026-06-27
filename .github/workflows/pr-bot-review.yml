@@ -20,6 +20,13 @@ jobs:
   poll-and-review:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # On pull_request events from forks, GITHUB_TOKEN is read-only, so writing
+    # the commit status 403s and the run fails. Skip the event-driven path for
+    # fork PRs — the scheduled cron (full permissions) still reviews them.
+    # schedule/workflow_dispatch always run; same-repo PRs run on the event.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - name: Find PRs needing review
         id: poll
