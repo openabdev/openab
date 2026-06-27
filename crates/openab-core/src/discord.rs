@@ -775,6 +775,15 @@ impl EventHandler for Handler {
                     Ok(block) => {
                         debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
                         extra_blocks.push(block);
+                        extra_blocks.push(ContentBlock::Text {
+                            text: format!(
+                                "[Image attachment]\nfilename: {}\ncontent_type: {}\nsize_bytes: {}\nurl: {} (expires ~24h)",
+                                attachment.filename,
+                                attachment.content_type.as_deref().unwrap_or("unknown"),
+                                attachment.size,
+                                attachment.url,
+                            ),
+                        });
                     }
                     Err(media::MediaFetchError::NotAnImage) => {
                         if media::is_video_file(
@@ -1846,10 +1855,12 @@ impl Handler {
             // Handle an early exit (the command terminated during the URL window).
             if let Some(res) = early_exit {
                 let _ = tokio::join!(stdout_task, stderr_task);
-                let collected = lines
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .join("\n");
+                let collected = strip_ansi_codes(
+                    &lines
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .join("\n"),
+                );
                 let detail = if collected.trim().is_empty() {
                     String::new()
                 } else {
@@ -1896,7 +1907,7 @@ impl Handler {
             }
 
             // Send the captured output (truncated to Discord's 2000-char limit).
-            let output = collected_lines.join("\n");
+            let output = strip_ansi_codes(&collected_lines.join("\n"));
             let prefix = "🔐 **Agent Authentication**\n```\n";
             let suffix = "\n```\nFollow the instructions above. Waiting for authorization...";
             // Discord enforces the 2000-char limit in UTF-16 code units; budget and
@@ -2848,6 +2859,15 @@ fn turn_limit_warning_present(messages: &[(bool, &str)]) -> bool {
         .any(|(is_bot, content)| *is_bot && content.contains(BOT_TURN_LIMIT_WARNING_PREFIX))
 }
 
+/// Strip ANSI escape sequences (color codes, cursor movement, etc.) from text.
+/// Auth CLIs like `codex` emit these for terminal styling, but they render as
+/// garbage in Discord messages.
+fn strip_ansi_codes(s: &str) -> String {
+    static ANSI_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\([A-Z]").unwrap());
+    ANSI_RE.replace_all(s, "").into_owned()
+}
+
 /// Truncate `body` so that, prefixed by `prefix` and suffixed by `suffix`, the
 /// whole message fits within `limit` measured in **UTF-16 code units** — which
 /// is how Discord enforces its 2000-character message cap. Truncation only ever
@@ -2935,6 +2955,25 @@ mod tests {
         assert!(total <= 2000, "assembled total {total} exceeds 2000");
     }
 
+    // --- strip_ansi_codes tests ---
+
+    #[test]
+    fn strip_ansi_removes_color_codes() {
+        let input = "\x1b[90mOpenAI\x1b[0m \x1b[94mhttps://auth.openai.com\x1b[0m";
+        assert_eq!(strip_ansi_codes(input), "OpenAI https://auth.openai.com");
+    }
+
+    #[test]
+    fn strip_ansi_passthrough_clean_text() {
+        assert_eq!(strip_ansi_codes("no codes here"), "no codes here");
+    }
+
+    #[test]
+    fn strip_ansi_removes_non_sgr_sequences() {
+        let input = "\x1b[?25lhello\x1b[?25h \x1b(Bworld";
+        assert_eq!(strip_ansi_codes(input), "hello world");
+    }
+
     // --- resolve_mentions tests ---
 
     /// Bot's own <@UID> mention is stripped from the prompt.
@@ -3013,6 +3052,44 @@ mod tests {
         assert!(text.contains("content_type: video/mp4"));
         assert!(text.contains("size_bytes: 12345"));
         assert!(text.contains("url: https://cdn.discordapp.com/attachments/demo.mp4"));
+    }
+
+    #[test]
+    fn image_attachment_block_includes_url_and_metadata() {
+        // Simulates the format string used in the image attachment handler.
+        let filename = "screenshot.png";
+        let content_type = Some("image/png");
+        let size: u32 = 142048;
+        let url = "https://cdn.discordapp.com/attachments/123/456/screenshot.png";
+
+        let text = format!(
+            "[Image attachment]\nfilename: {}\ncontent_type: {}\nsize_bytes: {}\nurl: {} (expires ~24h)",
+            filename,
+            content_type.unwrap_or("unknown"),
+            size,
+            url,
+        );
+
+        assert!(text.contains("[Image attachment]"));
+        assert!(text.contains("filename: screenshot.png"));
+        assert!(text.contains("content_type: image/png"));
+        assert!(text.contains("size_bytes: 142048"));
+        assert!(text.contains("url: https://cdn.discordapp.com/attachments/123/456/screenshot.png"));
+        assert!(text.contains("(expires ~24h)"));
+    }
+
+    #[test]
+    fn image_attachment_block_missing_content_type_falls_back() {
+        let content_type: Option<&str> = None;
+        let text = format!(
+            "[Image attachment]\nfilename: {}\ncontent_type: {}\nsize_bytes: {}\nurl: {} (expires ~24h)",
+            "photo.jpg",
+            content_type.unwrap_or("unknown"),
+            99999,
+            "https://cdn.discordapp.com/attachments/1/2/photo.jpg",
+        );
+
+        assert!(text.contains("content_type: unknown"));
     }
 
     // --- thread-race error detection ---

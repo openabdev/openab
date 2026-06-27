@@ -1,0 +1,165 @@
+name: Pre-Beta Build
+
+on:
+  schedule:
+    - cron: '0 * * * *'      # hourly; gate job skips the build if no commit in the last ~70min
+  workflow_dispatch:
+    inputs:
+      agents:
+        description: 'Agents to build (comma-separated, or "all")'
+        required: false
+        type: string
+        default: 'all'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  ALL_AGENTS: 'kiro,claude,codex,copilot,cursor,gemini,grok,hermes,mimocode,opencode,antigravity,pi,native,agentcore'
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Skip scheduled run when no recent commits
+        uses: actions/github-script@v7
+        id: check
+        with:
+          script: |
+            // Manual runs always build.
+            if (context.eventName === 'workflow_dispatch') {
+              core.setOutput('should_run', 'true');
+              return;
+            }
+            // Scheduled run: build only if main got a commit in the last ~70min.
+            // 70 (not 60) absorbs GitHub's cron scheduling drift so a commit just
+            // before the hour isn't missed when the run fires a few minutes late.
+            const since = new Date(Date.now() - 70 * 60 * 1000).toISOString();
+            const { data: commits } = await github.rest.repos.listCommits({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.repository?.default_branch || 'main',
+              since,
+              per_page: 1,
+            });
+            const run = commits.length > 0;
+            core.info(`commits since ${since}: ${commits.length} -> should_run=${run}`);
+            core.setOutput('should_run', run ? 'true' : 'false');
+
+  matrix:
+    needs: gate
+    if: needs.gate.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      agents: ${{ steps.resolve.outputs.agents }}
+    steps:
+      - name: Resolve agent matrix
+        id: resolve
+        run: |
+          if [ "${{ inputs.agents }}" = "all" ] || [ -z "${{ inputs.agents }}" ]; then
+            AGENTS="${{ env.ALL_AGENTS }}"
+          else
+            AGENTS="${{ inputs.agents }}"
+          fi
+          JSON=$(echo "$AGENTS" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | jq -R . | jq -sc .)
+          echo "agents=${JSON}" >> "$GITHUB_OUTPUT"
+          echo "Building: $AGENTS"
+
+  build:
+    needs: matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        agent: ${{ fromJson(needs.matrix.outputs.agents) }}
+        platform:
+          - { os: linux/amd64, runner: ubuntu-latest, arch: amd64 }
+          - { os: linux/arm64, runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.platform.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.unified
+          target: ${{ matrix.agent }}
+          platforms: ${{ matrix.platform.os }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: |
+            type=gha,scope=pre-beta-${{ matrix.agent }}-${{ matrix.platform.arch }}
+          cache-to: type=gha,scope=pre-beta-${{ matrix.agent }}-${{ matrix.platform.arch }},mode=max
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.agent }}-${{ matrix.platform.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  tag:
+    needs: [matrix, build]
+    strategy:
+      matrix:
+        agent: ${{ fromJson(needs.matrix.outputs.agents) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-${{ matrix.agent }}-*
+          merge-multiple: true
+
+      - name: Create manifest and tag
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          AGENT="${{ matrix.agent }}"
+          SHORT_SHA=$(echo "${{ github.sha }}" | head -c 7)
+
+          # Map "default" target name to "kiro" for tagging
+          if [ "$AGENT" = "default" ]; then
+            AGENT="kiro"
+          fi
+
+          DIGESTS=$(printf "${IMAGE}@sha256:%s " $(ls /tmp/digests/))
+
+          docker buildx imagetools create \
+            -t "${IMAGE}:pre-beta-${AGENT}" \
+            -t "${IMAGE}:${SHORT_SHA}-${AGENT}" \
+            ${DIGESTS}
+
+          echo "### 📦 \`${IMAGE}:pre-beta-${AGENT}\`" >> "$GITHUB_STEP_SUMMARY"

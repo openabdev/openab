@@ -239,7 +239,39 @@ Session pool settings for managing concurrent agent sessions.
 
 ## `[hooks]`
 
-Lifecycle hooks that run custom scripts at specific points during the container lifecycle. See [hooks.md](hooks.md) for full documentation and examples.
+Lifecycle hooks that run at specific points during the container lifecycle. See [hooks.md](hooks.md) for full documentation and examples.
+
+### `[hooks.pre_seed]`
+
+Downloads and extracts archives from S3 before `pre_boot`. Seeds the agent environment with configs, tools, and shared memory without requiring AWS CLI in the image.
+
+> `pre-seed` is enabled by default. No feature flag needed.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `sources` | string[] | `[]` | S3 URIs of archives (`.zip`, `.tar.gz`, `.tgz`). Max 5. Extracted in order; later layers overwrite earlier ones. |
+| `target` | string | `$HOME` | Extraction target directory. |
+| `max_bytes` | u64 | `104857600` | Max compressed archive size in bytes (100 MiB). Rejects downloads exceeding this. |
+| `timeout_seconds` | u64 | `300` | Per-source download+extract timeout in seconds. |
+| `on_failure` | string | `"abort"` | `"abort"` exits openab; `"warn"` logs and continues. |
+| `region` | string | — | Override AWS region for S3 access. |
+| `endpoint_url` | string | — | Override S3 endpoint URL (for LocalStack, VPC endpoints). |
+
+**Credential resolution** uses the standard AWS provider chain (same as `config-s3` and `secrets-aws`):
+environment variables, shared credentials, IRSA / EKS Pod Identity, ECS task role.
+
+**Integrity verification:** If S3 objects are uploaded with `--checksum-algorithm SHA256`, OpenAB automatically verifies the checksum on download. No config needed — see [hooks.md](hooks.md) for details.
+
+```toml
+[hooks.pre_seed]
+sources = [
+  "s3://my-bucket/base-env.tar.gz",
+  "s3://my-bucket/shared-memory.zip",
+  "s3://my-bucket/agent-overrides.tgz",
+]
+timeout_seconds = 300
+on_failure = "abort"
+```
 
 ### `[hooks.pre_boot]`
 

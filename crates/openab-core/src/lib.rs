@@ -12,6 +12,8 @@ pub mod hooks;
 pub mod markdown;
 pub mod media;
 pub mod multibot_cache;
+#[cfg(feature = "pre-seed")]
+pub mod pre_seed;
 pub mod reactions;
 #[cfg(feature = "discord")]
 pub mod remind;

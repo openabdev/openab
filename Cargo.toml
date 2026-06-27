@@ -24,7 +24,7 @@ serenity = { version = "0.12", default-features = false, features = ["client", "
 
 [features]
 # Default: core only (Discord + Slack). Gateway ships as separate binary.
-default = ["discord", "slack", "secrets-aws", "agentcore", "config-s3"]
+default = ["discord", "slack", "secrets-aws", "agentcore", "config-s3", "pre-seed"]
 
 # Opt-in: compile all gateway adapters into a single unified binary
 unified = ["telegram", "line", "feishu", "googlechat", "wecom", "teams"]
@@ -37,6 +37,7 @@ slack = ["openab-core/slack"]
 secrets-aws = ["openab-core/secrets-aws"]
 agentcore = ["openab-core/agentcore"]
 config-s3 = ["openab-core/config-s3"]
+pre-seed = ["openab-core/pre-seed"]
 
 # Gateway adapters (each pulls in the gateway crate + axum for embedded server)
 telegram = ["dep:openab-gateway", "dep:axum", "openab-gateway/telegram"]

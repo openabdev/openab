@@ -198,8 +198,56 @@ fn default_exec_timeout() -> u64 {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct HooksConfig {
+    pub pre_seed: Option<PreSeedConfig>,
     pub pre_boot: Option<HookConfig>,
     pub pre_shutdown: Option<HookConfig>,
+}
+
+/// Configuration for the pre_seed phase.
+/// Downloads and extracts zip archives from S3 before pre_boot.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PreSeedConfig {
+    /// S3 URIs of zip archives to download and extract (max 5).
+    /// Extracted in order; later layers overwrite earlier ones.
+    #[serde(default)]
+    pub sources: Vec<String>,
+    /// Extraction target directory. Default: $HOME.
+    pub target: Option<String>,
+    /// Override AWS region for S3 access.
+    pub region: Option<String>,
+    /// Override S3 endpoint URL (for LocalStack, VPC endpoints).
+    pub endpoint_url: Option<String>,
+    /// Maximum compressed zip size in bytes. Default: 100 MiB.
+    #[serde(default = "default_max_zip_bytes")]
+    pub max_bytes: u64,
+    /// Timeout in seconds for each download+extract operation. Default: 300.
+    #[serde(default = "default_pre_seed_timeout")]
+    pub timeout_seconds: u64,
+    /// Failure policy. Default: abort.
+    #[serde(default)]
+    pub on_failure: OnFailure,
+}
+
+impl Default for PreSeedConfig {
+    fn default() -> Self {
+        Self {
+            sources: Vec::new(),
+            target: None,
+            region: None,
+            endpoint_url: None,
+            max_bytes: default_max_zip_bytes(),
+            timeout_seconds: default_pre_seed_timeout(),
+            on_failure: OnFailure::Abort,
+        }
+    }
+}
+
+fn default_max_zip_bytes() -> u64 {
+    100 * 1024 * 1024 // 100 MiB
+}
+
+fn default_pre_seed_timeout() -> u64 {
+    300
 }
 
 /// Failure policy for a hook.

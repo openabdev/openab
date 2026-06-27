@@ -241,3 +241,22 @@ error_hold_ms = 2500
 # openab = "~/projects/openab"
 # infra  = "~/projects/infra-cdk"
 # web    = "~/projects/frontend"
+
+# --- Pre-seed: download & extract S3 zip archives before pre_boot ---
+# Seeds the agent environment (configs, tools, memory) before any hook runs.
+# Archives are extracted in order — later layers overwrite earlier ones (like container layers).
+# Max 5 sources. Only s3:// URIs with .zip format are supported.
+# Requires the `pre-seed` feature flag (opt-in).
+#
+# [hooks.pre_seed]
+# sources = [
+#   "s3://my-bucket/base-env.zip",            # Layer 1: base tools & configs
+#   "s3://my-bucket/shared-memory.zip",       # Layer 2: shared team memory
+#   "s3://my-bucket/agent-specific.zip",      # Layer 3: agent-specific overrides
+# ]
+# target = "/home/agent"                      # extraction target (default: $HOME)
+# max_bytes = 104857600                       # max compressed zip size (default: 100 MiB)
+# timeout_seconds = 300                       # per-source timeout (default: 300)
+# on_failure = "abort"                        # "abort" or "warn" (default: "abort")
+# region = "us-west-2"                        # optional: override AWS region
+# endpoint_url = "http://localhost:4566"      # optional: LocalStack / VPC endpoint

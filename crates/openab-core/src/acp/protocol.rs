@@ -200,6 +200,47 @@ pub fn parse_config_options(result: &Value) -> Vec<ConfigOption> {
     options
 }
 
+// --- ACP prompt result parsing ---
+
+/// Parsed fields from the `session/prompt` final response `result` object.
+/// All fields are optional — agents may omit `usage` entirely.
+#[derive(Debug, Clone, Default)]
+pub struct TurnResult {
+    pub stop_reason: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+}
+
+impl TurnResult {
+    /// Returns true when the turn ended normally but produced zero output —
+    /// a strong signal of silent provider/auth failure.
+    pub fn is_silent_failure(&self) -> bool {
+        matches!(
+            (self.stop_reason.as_deref(), self.output_tokens),
+            (Some("end_turn"), Some(0))
+        )
+    }
+}
+
+/// Parse `stopReason` and `usage` from a `session/prompt` result value.
+pub fn parse_turn_result(result: &Value) -> TurnResult {
+    let stop_reason = result
+        .get("stopReason")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let usage = result.get("usage");
+    let input_tokens = usage.and_then(|u| u.get("inputTokens")).and_then(|v| v.as_u64());
+    let output_tokens = usage.and_then(|u| u.get("outputTokens")).and_then(|v| v.as_u64());
+    let total_tokens = usage.and_then(|u| u.get("totalTokens")).and_then(|v| v.as_u64());
+    TurnResult {
+        stop_reason,
+        input_tokens,
+        output_tokens,
+        total_tokens,
+    }
+}
+
 // --- ACP notification classification ---
 
 #[derive(Debug)]
@@ -402,5 +443,56 @@ mod tests {
         let opts = parse_config_options(&result);
         assert_eq!(opts.len(), 1);
         assert_eq!(opts[0].id, "model");
+    }
+
+    // --- parse_turn_result tests ---
+
+    #[test]
+    fn turn_result_silent_failure() {
+        let result = json!({"stopReason": "end_turn", "usage": {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}});
+        let tr = parse_turn_result(&result);
+        assert_eq!(tr.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(tr.output_tokens, Some(0));
+        assert!(tr.is_silent_failure());
+    }
+
+    #[test]
+    fn turn_result_silent_failure_with_nonzero_input() {
+        let result = json!({"stopReason": "end_turn", "usage": {"inputTokens": 150, "outputTokens": 0, "totalTokens": 150}});
+        let tr = parse_turn_result(&result);
+        assert_eq!(tr.input_tokens, Some(150));
+        assert_eq!(tr.output_tokens, Some(0));
+        assert!(tr.is_silent_failure());
+    }
+
+    #[test]
+    fn turn_result_nonzero_output_not_failure() {
+        let result = json!({"stopReason": "end_turn", "usage": {"inputTokens": 10, "outputTokens": 50, "totalTokens": 60}});
+        let tr = parse_turn_result(&result);
+        assert!(!tr.is_silent_failure());
+    }
+
+    #[test]
+    fn turn_result_missing_usage_not_failure() {
+        let result = json!({"stopReason": "end_turn"});
+        let tr = parse_turn_result(&result);
+        assert_eq!(tr.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(tr.output_tokens, None);
+        assert!(!tr.is_silent_failure());
+    }
+
+    #[test]
+    fn turn_result_empty_object() {
+        let tr = parse_turn_result(&json!({}));
+        assert_eq!(tr.stop_reason, None);
+        assert_eq!(tr.output_tokens, None);
+        assert!(!tr.is_silent_failure());
+    }
+
+    #[test]
+    fn turn_result_different_stop_reason_not_failure() {
+        let result = json!({"stopReason": "max_tokens", "usage": {"inputTokens": 10, "outputTokens": 0, "totalTokens": 10}});
+        let tr = parse_turn_result(&result);
+        assert!(!tr.is_silent_failure());
     }
 }

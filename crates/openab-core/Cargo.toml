@@ -39,6 +39,9 @@ tempfile = "3.27.0"
 aws-sdk-secretsmanager = { version = "1", optional = true }
 aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", optional = true }
+zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+flate2 = { version = "1", optional = true }
+tar = { version = "0.4.45", default-features = false, optional = true }
 aws-sigv4 = { version = "1", optional = true }
 aws-credential-types = { version = "1", optional = true }
 urlencoding = { version = "2", optional = true }
@@ -54,4 +57,5 @@ discord = ["dep:serenity"]
 slack = []
 secrets-aws = ["dep:aws-sdk-secretsmanager", "dep:aws-config"]
 config-s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
+pre-seed = ["dep:aws-sdk-s3", "dep:aws-config", "dep:zip", "dep:hex", "dep:flate2", "dep:tar"]
 agentcore = ["dep:aws-config", "dep:aws-sigv4", "dep:aws-credential-types", "dep:urlencoding", "dep:hex", "dep:http", "dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]

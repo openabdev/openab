@@ -4,7 +4,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use tracing::{error, warn};
 
-use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
+use crate::acp::{classify_notification, parse_turn_result, AcpEvent, ContentBlock, SessionPool, TurnResult};
 use crate::config::{ReactionsConfig, ToolDisplay};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
@@ -807,13 +807,37 @@ impl AdapterRouter {
                     // messages and abandons cleanly on dead agent / hard ceiling
                     // so late responses cannot leak into the next prompt.
                     let mut response_error: Option<String> = None;
+                    let mut turn_result = TurnResult::default();
                     let prompt_start = tokio::time::Instant::now();
                     loop {
                         let notification = tokio::select! {
                             msg = rx.recv() => match msg {
                                 Some(n) => n,
-                                // Reader saw EOF and already drained pending; nothing to abandon.
-                                None => break,
+                                // Reader saw EOF: the agent's stdout closed. A *successful*
+                                // turn is always signalled by the id-bearing JSON-RPC response to
+                                // `session/prompt`, which breaks the loop at the id branch below
+                                // *before* any EOF — so reaching this arm means the turn ended
+                                // without a final response, i.e. the agent terminated abnormally
+                                // (bridged agents that crash on a backend error such as HTTP 500 /
+                                // quota exhausted exit without ever emitting an ACP error
+                                // notification). Surface that as an explicit error instead of
+                                // falling through to "_(no response)_" or, worse, presenting a
+                                // partially-streamed buffer as a complete answer.
+                                //
+                                // Do NOT gate on `text_buf.is_empty()`: the buffer is pre-seeded
+                                // on session reset (the expiry notice) and, in send-once mode,
+                                // carries inter-tool narration that is sliced off before delivery —
+                                // so a non-empty buffer is not evidence the turn completed. When
+                                // partial text *was* streamed, `final_content` prepends the warning
+                                // to it (⚠️ … \n\n <partial>), preserving the output while flagging
+                                // the truncation.
+                                None => {
+                                    if response_error.is_none() {
+                                        response_error =
+                                            Some("Agent process exited unexpectedly".into());
+                                    }
+                                    break;
+                                }
                             },
                             _ = tokio::time::sleep(liveness_check_interval) => {
                                 if !conn.alive() {
@@ -843,6 +867,9 @@ impl AdapterRouter {
                             }
                             if let Some(ref err) = notification.error {
                                 response_error = Some(format_coded_error(err.code, &err.message, err.data_message()));
+                            }
+                            if let Some(ref result) = notification.result {
+                                turn_result = parse_turn_result(result);
                             }
                             break;
                         }
@@ -1031,11 +1058,16 @@ impl AdapterRouter {
                     let final_content =
                         compose_display(&tool_lines, &text_buf, false, tool_display);
                     let final_content = if final_content.is_empty() {
-                        if let Some(err) = response_error {
-                            format!("⚠️ {err}")
-                        } else {
-                            "_(no response)_".to_string()
+                        if turn_result.is_silent_failure() {
+                            warn!(
+                                stop_reason = ?turn_result.stop_reason,
+                                input_tokens = ?turn_result.input_tokens,
+                                output_tokens = ?turn_result.output_tokens,
+                                total_tokens = ?turn_result.total_tokens,
+                                "agent returned empty turn (0 output tokens) — likely provider/model/auth failure"
+                            );
                         }
+                        classify_empty_turn(response_error.as_deref(), &turn_result)
                     } else if let Some(err) = response_error {
                         format!("⚠️ {err}\n\n{final_content}")
                     } else {
@@ -1342,6 +1374,26 @@ impl ToolEntry {
 /// Maximum number of finished tool entries to show individually
 /// during streaming before collapsing into a summary line.
 const TOOL_COLLAPSE_THRESHOLD: usize = 3;
+
+// --- Empty-turn classification (pure helper, unit-testable) ---
+
+/// Message to show the consumer when a silent failure is detected.
+pub(crate) const SILENT_FAILURE_MSG: &str = "⚠️ The agent did not produce a response. This usually indicates a backend configuration issue — not an intentional empty reply. Please try again later.";
+
+/// Classify what to display when the composed body is empty.
+/// Returns the final content string for the consumer.
+pub(crate) fn classify_empty_turn(
+    response_error: Option<&str>,
+    turn_result: &TurnResult,
+) -> String {
+    if let Some(err) = response_error {
+        format!("⚠️ {err}")
+    } else if turn_result.is_silent_failure() {
+        SILENT_FAILURE_MSG.to_string()
+    } else {
+        "_(no response)_".to_string()
+    }
+}
 
 fn compose_display(
     tool_lines: &[ToolEntry],
@@ -1869,6 +1921,8 @@ mod tests {
 #[cfg(test)]
 mod directive_tests {
     use super::parse_output_directives;
+    use super::{classify_empty_turn, SILENT_FAILURE_MSG};
+    use crate::acp::TurnResult;
 
     #[test]
     fn parse_reply_to_directive() {
@@ -2019,5 +2073,74 @@ mod directive_tests {
         let (directives, content) = parse_output_directives(input);
         assert_eq!(directives.reply_to, Some("456".to_string()));
         assert_eq!(content, "看看 [[這個]] 怎麼樣");
+    }
+
+    // --- classify_empty_turn: adapter-level finalization tests ---
+
+    #[test]
+    fn empty_turn_silent_failure_produces_diagnostic() {
+        let tr = TurnResult {
+            stop_reason: Some("end_turn".into()),
+            output_tokens: Some(0),
+            input_tokens: Some(0),
+            total_tokens: Some(0),
+        };
+        let result = classify_empty_turn(None, &tr);
+        assert_eq!(result, SILENT_FAILURE_MSG);
+    }
+
+    #[test]
+    fn empty_turn_silent_failure_nonzero_input_still_diagnostic() {
+        let tr = TurnResult {
+            stop_reason: Some("end_turn".into()),
+            output_tokens: Some(0),
+            input_tokens: Some(150),
+            total_tokens: Some(150),
+        };
+        let result = classify_empty_turn(None, &tr);
+        assert_eq!(result, SILENT_FAILURE_MSG);
+    }
+
+    #[test]
+    fn empty_turn_response_error_takes_precedence() {
+        let tr = TurnResult {
+            stop_reason: Some("end_turn".into()),
+            output_tokens: Some(0),
+            input_tokens: Some(0),
+            total_tokens: Some(0),
+        };
+        let result = classify_empty_turn(Some("Agent process died"), &tr);
+        assert_eq!(result, "⚠️ Agent process died");
+    }
+
+    #[test]
+    fn empty_turn_missing_usage_shows_no_response() {
+        let tr = TurnResult::default();
+        let result = classify_empty_turn(None, &tr);
+        assert_eq!(result, "_(no response)_");
+    }
+
+    #[test]
+    fn empty_turn_nonzero_output_shows_no_response() {
+        let tr = TurnResult {
+            stop_reason: Some("end_turn".into()),
+            output_tokens: Some(50),
+            input_tokens: Some(10),
+            total_tokens: Some(60),
+        };
+        let result = classify_empty_turn(None, &tr);
+        assert_eq!(result, "_(no response)_");
+    }
+
+    #[test]
+    fn empty_turn_different_stop_reason_shows_no_response() {
+        let tr = TurnResult {
+            stop_reason: Some("max_tokens".into()),
+            output_tokens: Some(0),
+            input_tokens: Some(10),
+            total_tokens: Some(10),
+        };
+        let result = classify_empty_turn(None, &tr);
+        assert_eq!(result, "_(no response)_");
     }
 }

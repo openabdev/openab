@@ -2,14 +2,20 @@ name: Docker Smoke Test
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'Dockerfile*'
       - 'src/**'
       - 'crates/**'
       - 'Cargo.*'
 
+concurrency:
+  group: smoke-test-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   smoke-test:
+    if: github.event.pull_request.draft == false
     strategy:
       fail-fast: false
       matrix:

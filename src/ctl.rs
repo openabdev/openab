@@ -175,10 +175,40 @@ impl RuntimeHandler {
     /// Resolve which adapter to use for a given thread_id.
     async fn resolve(&self, thread_id: Option<&str>) -> Option<(Arc<dyn ChatAdapter>, String)> {
         let tid = thread_id?;
-        let platform = self.registry.read().await.get(tid).cloned()?;
+        let platform = {
+            let registry = self.registry.read().await;
+            let platforms: Vec<String> = self.adapters.keys().cloned().collect();
+            resolve_platform(tid, &registry, &platforms)?
+        };
         let adapter = self.adapters.get(&platform)?.clone();
         Some((adapter, tid.to_string()))
     }
+}
+
+/// Decide which platform should handle a control request for `thread_id`.
+///
+/// 1. Exact registry hit — the thread was recorded during message dispatch.
+/// 2. Single-adapter fallback — if exactly one adapter is configured there is
+///    no ambiguity, so resolve to it even without a registry entry. This makes
+///    `openab set/get --thread <id>` work for single-platform bots (the common
+///    case) without depending on the registry being populated.
+///
+/// Returns `None` only when the thread is unknown AND multiple adapters are
+/// configured (genuinely ambiguous), or when no adapters are configured.
+fn resolve_platform(
+    thread_id: &str,
+    registry: &std::collections::HashMap<String, String>,
+    platforms: &[String],
+) -> Option<String> {
+    if let Some(platform) = registry.get(thread_id) {
+        if platforms.contains(platform) {
+            return Some(platform.clone());
+        }
+    }
+    if platforms.len() == 1 {
+        return Some(platforms[0].clone());
+    }
+    None
 }
 
 #[async_trait::async_trait]
@@ -338,6 +368,71 @@ pub async fn send_request_to(path: &PathBuf, req: &Request) -> anyhow::Result<Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reg(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn resolve_platform_registry_hit() {
+        let r = reg(&[("123", "discord")]);
+        let platforms = vec!["discord".to_string(), "slack".to_string()];
+        assert_eq!(
+            resolve_platform("123", &r, &platforms).as_deref(),
+            Some("discord")
+        );
+    }
+
+    #[test]
+    fn resolve_platform_single_adapter_fallback() {
+        // No registry entry, but only one adapter -> resolve to it.
+        let r = reg(&[]);
+        let platforms = vec!["discord".to_string()];
+        assert_eq!(
+            resolve_platform("999", &r, &platforms).as_deref(),
+            Some("discord")
+        );
+    }
+
+    #[test]
+    fn resolve_platform_multi_adapter_miss_is_none() {
+        // No registry entry and multiple adapters -> genuinely ambiguous.
+        let r = reg(&[]);
+        let platforms = vec!["discord".to_string(), "slack".to_string()];
+        assert_eq!(resolve_platform("999", &r, &platforms), None);
+    }
+
+    #[test]
+    fn resolve_platform_no_adapters_is_none() {
+        let r = reg(&[]);
+        let platforms: Vec<String> = vec![];
+        assert_eq!(resolve_platform("999", &r, &platforms), None);
+    }
+
+    #[test]
+    fn resolve_platform_registry_hit_wins_over_fallback() {
+        // Registry takes precedence when the platform is still configured.
+        let r = reg(&[("123", "slack")]);
+        let platforms = vec!["discord".to_string(), "slack".to_string()];
+        assert_eq!(
+            resolve_platform("123", &r, &platforms).as_deref(),
+            Some("slack")
+        );
+    }
+
+    #[test]
+    fn resolve_platform_stale_registry_entry_falls_through() {
+        // Stale registry entry pointing to unconfigured platform falls through to fallback.
+        let r = reg(&[("123", "slack")]);
+        let platforms = vec!["discord".to_string()];
+        assert_eq!(
+            resolve_platform("123", &r, &platforms).as_deref(),
+            Some("discord")
+        );
+    }
 
     #[test]
     fn request_serialization() {
