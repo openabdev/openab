@@ -1,6 +1,8 @@
 name: PR Review (Scheduled)
 
 on:
+  pull_request:
+    types: [opened, synchronize, reopened]
   schedule:
     - cron: '*/5 * * * *'
   workflow_dispatch: {}
