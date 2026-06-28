@@ -16,8 +16,8 @@
 group "default" {
   targets = [
     "kiro", "claude", "codex", "copilot", "cursor",
-    "gemini", "grok", "hermes", "mimocode", "opencode",
-    "antigravity", "pi", "gateway",
+    "devin", "gemini", "grok", "hermes", "mimocode",
+    "opencode", "antigravity", "pi", "gateway",
   ]
 }
 
@@ -62,6 +62,13 @@ target "copilot" {
 target "cursor" {
   dockerfile = "Dockerfile.cursor"
   tags       = ["openab:cursor"]
+  contexts   = { builder = "target:builder" }
+}
+
+target "devin" {
+  dockerfile = "Dockerfile.unified"
+  target     = "devin"
+  tags       = ["openab:devin"]
   contexts   = { builder = "target:builder" }
 }
 

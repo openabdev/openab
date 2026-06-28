@@ -120,6 +120,15 @@ working_dir = "/home/agent"
 # # Run `opencode auth login` once before starting openab.
 
 # [agent]
+# command = "devin"
+# args = ["acp"]
+# working_dir = "/home/agent"
+# # Devin CLI (formerly Windsurf/Codeium) with native ACP support.
+# # Requires a Devin subscription (Enterprise or individual).
+# # Auth: kubectl exec -it <pod> -- devin auth login --force-manual-token-flow
+# # Also accepts WINDSURF_API_KEY env var for legacy Windsurf credentials.
+
+# [agent]
 # command = "mimo"
 # args = ["acp"]
 # working_dir = "/home/node"

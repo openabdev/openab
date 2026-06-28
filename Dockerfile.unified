@@ -288,6 +288,26 @@ ENTRYPOINT ["tini", "--"]
 CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 
 # =============================================================================
+# Target: devin
+# =============================================================================
+FROM base-debian AS devin
+RUN curl -fsSL https://cli.devin.ai/install.sh | bash && \
+    mv /root/.devin/bin/devin /usr/local/bin/devin && \
+    chmod +x /usr/local/bin/devin && \
+    rm -rf /root/.devin
+ENV HOME=/home/agent
+WORKDIR /home/agent
+COPY --from=builder --chown=agent:agent /build/target/release/openab /usr/local/bin/openab
+RUN mkdir -p /home/agent/.config/devin && chown -R agent:agent /home/agent
+USER agent
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="devin acp"
+ENV OPENAB_AGENT_AUTH_COMMAND="devin auth login --force-manual-token-flow"
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
+
+# =============================================================================
 # Target: antigravity
 # =============================================================================
 FROM base-debian AS antigravity
