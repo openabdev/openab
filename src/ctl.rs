@@ -7,12 +7,17 @@
 //! Phase 1 supported keys:
 //! - `thread.name` — rename the current Discord/Slack thread
 
+#[cfg(unix)]
 use openab_core::adapter::{ChannelRef, ChatAdapter};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
+#[cfg(unix)]
 use tracing::{debug, error, info, warn};
 
 /// Default socket path. Overridable via `OPENAB_SOCK` env var.
@@ -53,6 +58,7 @@ pub struct Response {
 
 /// Handler trait — `openab run` provides the concrete implementation that
 /// can access Discord/Slack adapters.
+#[cfg(unix)]
 #[async_trait::async_trait]
 pub trait CtlHandler: Send + Sync + 'static {
     async fn handle_set(&self, thread_id: Option<&str>, key: &str, value: &str) -> Response;
@@ -61,6 +67,7 @@ pub trait CtlHandler: Send + Sync + 'static {
 
 /// Start the control socket server. Call this from `openab run` startup.
 /// Returns a JoinHandle; abort it on shutdown.
+#[cfg(unix)]
 pub fn spawn_server(
     handler: std::sync::Arc<dyn CtlHandler>,
 ) -> tokio::task::JoinHandle<()> {
@@ -68,6 +75,7 @@ pub fn spawn_server(
 }
 
 /// Start the control socket server at a specific path.
+#[cfg(unix)]
 pub fn spawn_server_at(
     path: PathBuf,
     handler: std::sync::Arc<dyn CtlHandler>,
@@ -83,7 +91,6 @@ pub fn spawn_server_at(
             }
         };
         // Restrict socket to owner only (defense-in-depth for shared hosts).
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
@@ -108,6 +115,7 @@ pub fn spawn_server_at(
     })
 }
 
+#[cfg(unix)]
 async fn handle_conn(
     stream: UnixStream,
     handler: &dyn CtlHandler,
@@ -134,14 +142,17 @@ async fn handle_conn(
 
 /// Thread registry: maps thread_id → platform name.
 /// Shared between the message dispatcher (writes) and the ctl handler (reads).
+#[cfg(unix)]
 pub type ThreadRegistry = Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>;
 
 /// Create an empty thread registry.
+#[cfg(unix)]
 pub fn new_registry() -> ThreadRegistry {
     Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()))
 }
 
 /// Register a thread→platform mapping. Called by adapters on message dispatch.
+#[cfg(unix)]
 #[allow(dead_code)]
 pub async fn register_thread(registry: &ThreadRegistry, thread_id: &str, platform: &str) {
     registry.write().await.insert(thread_id.to_string(), platform.to_string());
@@ -149,12 +160,13 @@ pub async fn register_thread(registry: &ThreadRegistry, thread_id: &str, platfor
 
 /// Type-alias for the Discord shard slot. When the discord feature is disabled,
 /// this is a no-op `()` slot that never gets populated.
-#[cfg(feature = "discord")]
+#[cfg(all(unix, feature = "discord"))]
 pub type ShardSlot = Arc<std::sync::OnceLock<serenity::gateway::ShardMessenger>>;
-#[cfg(not(feature = "discord"))]
+#[cfg(all(unix, not(feature = "discord")))]
 pub type ShardSlot = Arc<std::sync::OnceLock<()>>;
 
 /// Concrete handler for `openab run` — dispatches to platform adapters.
+#[cfg(unix)]
 pub struct RuntimeHandler {
     /// Registered adapters by platform name.
     adapters: std::collections::HashMap<String, Arc<dyn ChatAdapter>>,
@@ -163,6 +175,7 @@ pub struct RuntimeHandler {
     shard: ShardSlot,
 }
 
+#[cfg(unix)]
 impl RuntimeHandler {
     pub fn new(
         adapters: std::collections::HashMap<String, Arc<dyn ChatAdapter>>,
@@ -195,6 +208,7 @@ impl RuntimeHandler {
 ///
 /// Returns `None` only when the thread is unknown AND multiple adapters are
 /// configured (genuinely ambiguous), or when no adapters are configured.
+#[cfg(unix)]
 fn resolve_platform(
     thread_id: &str,
     registry: &std::collections::HashMap<String, String>,
@@ -211,6 +225,7 @@ fn resolve_platform(
     None
 }
 
+#[cfg(unix)]
 #[async_trait::async_trait]
 impl CtlHandler for RuntimeHandler {
     async fn handle_set(&self, thread_id: Option<&str>, key: &str, value: &str) -> Response {
@@ -337,11 +352,18 @@ impl CtlHandler for RuntimeHandler {
     }
 }
 
+#[cfg(unix)]
 pub async fn send_request(req: &Request) -> anyhow::Result<Response> {
     send_request_to(&socket_path(), req).await
 }
 
+#[cfg(not(unix))]
+pub async fn send_request(_req: &Request) -> anyhow::Result<Response> {
+    anyhow::bail!("openab set/get is not supported on Windows (requires Unix domain sockets)")
+}
+
 /// Send a request to a specific socket path.
+#[cfg(unix)]
 pub async fn send_request_to(path: &PathBuf, req: &Request) -> anyhow::Result<Response> {
     let stream = UnixStream::connect(&path).await.map_err(|e| {
         anyhow::anyhow!(
@@ -365,7 +387,7 @@ pub async fn send_request_to(path: &PathBuf, req: &Request) -> anyhow::Result<Re
     Ok(resp)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

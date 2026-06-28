@@ -309,12 +309,15 @@ async fn main() -> anyhow::Result<()> {
     let shared_slack_adapter: Option<Arc<dyn adapter::ChatAdapter>> = None;
 
     // Shared slot for Discord ShardMessenger (set in ready handler, used by ctl for agent.status)
+    #[cfg(unix)]
     let ctl_shard: ctl::ShardSlot = Arc::new(std::sync::OnceLock::new());
 
     // Thread registry: thread_id → platform. Populated on message dispatch.
+    #[cfg(unix)]
     let ctl_registry = ctl::new_registry();
 
     // Spawn control socket server for `openab set/get` IPC
+    #[cfg(unix)]
     let ctl_handle = {
         let mut adapters = std::collections::HashMap::new();
         if let Some(ref a) = shared_discord_adapter {
@@ -333,6 +336,8 @@ async fn main() -> anyhow::Result<()> {
             ))))
         }
     };
+    #[cfg(not(unix))]
+    let ctl_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     // Validate cronjob config at startup
     let mut configured_platforms: Vec<&str> = Vec::new();
