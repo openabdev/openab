@@ -373,34 +373,7 @@ async fn send_rich_message(
 ///
 /// Design: ephemeral 30-second preview. Caller must follow up with
 /// sendRichMessage to persist. Same draft_id = animated transition.
-/// Dismiss a thinking draft by sending an empty text via sendMessageDraft.
-/// Per Bot API 10.0: "Pass an empty text to show a Thinking… placeholder",
-/// and sending empty text to an existing draft_id clears it.
-async fn dismiss_draft(
-    client: &reqwest::Client,
-    bot_token: &str,
-    chat_id: &str,
-    thread_id: &Option<String>,
-    draft_id: i64,
-) -> Result<(), String> {
-    let url = format!("{TELEGRAM_API_BASE}/bot{bot_token}/sendMessageDraft");
-    let mut body = serde_json::json!({
-        "chat_id": chat_id,
-        "draft_id": draft_id,
-        "text": "",
-    });
-    if let Some(tid) = thread_id {
-        body["message_thread_id"] = serde_json::json!(tid.parse::<i64>().unwrap_or(0));
-    }
-    let resp = client.post(&url).json(&body).send().await.map_err(|e| e.to_string())?;
-    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    if json["ok"].as_bool() == Some(true) {
-        Ok(())
-    } else {
-        Err(json["description"].as_str().unwrap_or("unknown error").to_string())
-    }
-}
-
+///
 /// Wired but unused until gateway streaming infrastructure integrates.
 #[allow(dead_code)]
 async fn send_rich_message_draft(
@@ -533,35 +506,27 @@ pub async fn handle_reply(
     if reply.command.as_deref() == Some("add_reaction")
         || reply.command.as_deref() == Some("remove_reaction")
     {
-        // Send thinking draft on reaction changes — reflects agent state
+        // Show native "Thinking..." indicator via sendMessageDraft on first thinking emoji.
+        // Uses plain-text draft (not rich) — Telegram auto-clears it when the final
+        // sendMessage/sendRichMessage arrives in the same chat. No explicit dismiss needed.
+        // See: https://core.telegram.org/bots/api#sendmessagedraft
         if rich_messages && reply.command.as_deref() == Some("add_reaction") {
-            let thinking_text = match reply.content.text.as_str() {
-                "👀" => Some("<tg-thinking>Looking...</tg-thinking>"),
-                "🤔" => Some("<tg-thinking>Thinking...</tg-thinking>"),
-                "👨\u{200d}💻" => Some("<tg-thinking>Writing code...</tg-thinking>"),
-                "🔥" => Some("<tg-thinking>Working...</tg-thinking>"),
-                "⚡" => Some("<tg-thinking>Running tools...</tg-thinking>"),
-                _ => None,
-            };
-            if let Some(text) = thinking_text {
+            let is_thinking = matches!(reply.content.text.as_str(), "👀" | "🤔" | "👨\u{200d}💻" | "🔥" | "⚡");
+            if is_thinking {
                 let draft_id = compute_draft_id(&reply.channel.id, &reply.channel.thread_id);
-                let _ = send_rich_message_draft(
-                    client, bot_token, &reply.channel.id, &reply.channel.thread_id, draft_id, text,
-                ).await;
-            }
-        }
-        // Dismiss thinking draft immediately on remove_reaction
-        if rich_messages && reply.command.as_deref() == Some("remove_reaction") {
-            let is_thinking_emoji = matches!(reply.content.text.as_str(), "👀" | "🤔" | "👨\u{200d}💻" | "🔥" | "⚡");
-            if is_thinking_emoji {
-                let draft_id = compute_draft_id(&reply.channel.id, &reply.channel.thread_id);
-                if let Err(e) = dismiss_draft(
-                    client, bot_token, &reply.channel.id, &reply.channel.thread_id, draft_id,
-                ).await {
-                    warn!("failed to dismiss thinking draft: {e}");
+                let url = format!("{TELEGRAM_API_BASE}/bot{bot_token}/sendMessageDraft");
+                let mut body = serde_json::json!({
+                    "chat_id": reply.channel.id,
+                    "draft_id": draft_id,
+                    "text": "",
+                });
+                if let Some(ref tid) = reply.channel.thread_id {
+                    body["message_thread_id"] = serde_json::json!(tid.parse::<i64>().unwrap_or(0));
                 }
+                let _ = client.post(&url).json(&body).send().await;
             }
         }
+        // No explicit dismiss on remove_reaction — the final reply auto-clears the draft.
 
         let msg_key = format!("{}:{}", reply.channel.id, reply.reply_to);
         let emoji = &reply.content.text;
