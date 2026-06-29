@@ -1,0 +1,157 @@
+name: Bundle pre_seed utils
+
+on:
+  workflow_dispatch:
+    inputs:
+      aws_cli_version:
+        description: 'AWS CLI v2 version (e.g. 2.35.12)'
+        required: true
+        default: '2.35.12'
+      ghpool_version:
+        description: 'ghpool version (e.g. 0.3.2)'
+        required: true
+        default: '0.3.2'
+      upload_s3:
+        description: 'Also upload to S3 (openab-state-pahud/shared/utils.tar.gz)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  ARTIFACT_NAME: pre-seed-utils
+
+jobs:
+  bundle:
+    strategy:
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-latest, awscli_arch: x86_64, ghpool_arch: linux-x64 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm, awscli_arch: aarch64, ghpool_arch: linux-arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Install AWS CLI v2
+        run: |
+          curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${{ matrix.awscli_arch }}-${{ inputs.aws_cli_version }}.zip" -o /tmp/awscli.zip
+          unzip -q /tmp/awscli.zip -d /tmp
+          /tmp/aws/install --install-dir ./aws-cli --bin-dir ./bin
+          rm -rf /tmp/aws /tmp/awscli.zip
+          # Verify
+          ./bin/aws --version
+
+      - name: Download ghp from ghpool release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "v${{ inputs.ghpool_version }}" \
+            --repo openabdev/ghpool \
+            --pattern "ghpool-${{ inputs.ghpool_version }}-${{ matrix.ghpool_arch }}.tar.gz" \
+            --dir /tmp
+          tar -xzf /tmp/ghpool-${{ inputs.ghpool_version }}-${{ matrix.ghpool_arch }}.tar.gz -C /tmp
+          # ghpool tarball contains 'ghp' binary
+          cp /tmp/ghp ./bin/ghp
+          chmod +x ./bin/ghp
+
+      - name: Download gh CLI
+        run: |
+          GH_VERSION=$(gh --version | head -1 | awk '{print $3}')
+          # Use the runner's gh binary directly
+          cp $(which gh) ./bin/gh
+          chmod +x ./bin/gh
+
+      - name: Fix symlinks to be relative
+        run: |
+          # AWS CLI installer creates absolute symlinks in bin/ — replace with relative
+          rm -f ./bin/aws ./bin/aws_completer
+
+          # Find the installed version directory
+          VERSION_DIR=$(ls ./aws-cli/v2/ | grep -v current)
+          
+          # Recreate relative symlinks
+          cd aws-cli/v2 && rm -f current && ln -sf "$VERSION_DIR" current && cd ../..
+          cd bin && ln -sf ../aws-cli/v2/current/bin/aws aws && ln -sf ../aws-cli/v2/current/bin/aws_completer aws_completer && cd ..
+
+      - name: Verify symlinks
+        run: |
+          echo "=== bin/ ==="
+          ls -la ./bin/
+          echo "=== aws-cli/v2/ ==="
+          ls -la ./aws-cli/v2/
+          echo "=== resolve test ==="
+          ./bin/aws --version
+          ./bin/ghp --version || true
+
+      - name: Create tarball
+        run: |
+          tar -czf utils-${{ matrix.arch }}.tar.gz ./bin ./aws-cli
+          ls -lh utils-${{ matrix.arch }}.tar.gz
+          echo "### Contents" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tar -tvf utils-${{ matrix.arch }}.tar.gz | grep -E "(\->|bin/)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-${{ matrix.arch }}
+          path: utils-${{ matrix.arch }}.tar.gz
+          retention-days: 30
+
+  release:
+    needs: bundle
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: ${{ env.ARTIFACT_NAME }}-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh artifacts/
+
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="utils-v${{ inputs.aws_cli_version }}-ghp${{ inputs.ghpool_version }}"
+          gh release create "$TAG" \
+            --repo ${{ github.repository }} \
+            --title "pre_seed utils (AWS CLI ${{ inputs.aws_cli_version }} + ghp ${{ inputs.ghpool_version }})" \
+            --notes "Bundled pre_seed utilities for OAB fleet.
+
+          **Contents:**
+          - AWS CLI v${{ inputs.aws_cli_version }}
+          - ghp v${{ inputs.ghpool_version }} (ghpool shim)
+          - gh CLI (from runner)
+
+          **Usage:** Add to \`[hooks.pre_seed].sources\` as S3 URI after uploading." \
+            artifacts/utils-x86_64.tar.gz \
+            artifacts/utils-aarch64.tar.gz
+
+  upload-s3:
+    needs: bundle
+    if: inputs.upload_s3
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Download x86_64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-x86_64
+
+      - name: Upload to S3
+        run: |
+          aws s3 cp utils-x86_64.tar.gz s3://openab-state-pahud/shared/utils.tar.gz
+          echo "✅ Uploaded to s3://openab-state-pahud/shared/utils.tar.gz"
