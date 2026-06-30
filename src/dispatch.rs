@@ -1195,6 +1195,7 @@ mod tests {
             working_dir: "/tmp".into(),
             env: std::collections::HashMap::new(),
             inherit_env: vec![],
+            default_config_options: std::collections::HashMap::new(),
             command_explicit: true,
         };
         let pool = Arc::new(SessionPool::new(agent_cfg, 1));

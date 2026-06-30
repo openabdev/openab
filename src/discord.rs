@@ -919,6 +919,8 @@ impl EventHandler for Handler {
         // Build the shared command list once.
         let commands = vec![
             CreateCommand::new("models").description("Select the AI model for this session"),
+            CreateCommand::new("speed")
+                .description("Toggle Composer Fast mode (on/off) for this session"),
             CreateCommand::new("agents").description("Select the agent mode for this session"),
             CreateCommand::new("cancel").description("Cancel the current operation"),
             CreateCommand::new("cancel-all")
@@ -1008,6 +1010,10 @@ impl EventHandler for Handler {
         match interaction {
             Interaction::Command(cmd) if cmd.data.name == "models" => {
                 self.handle_config_command(&ctx, &cmd, "model", "model")
+                    .await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "speed" => {
+                self.handle_config_command(&ctx, &cmd, "model_config", "speed")
                     .await;
             }
             Interaction::Command(cmd) if cmd.data.name == "agents" => {
@@ -1682,7 +1688,7 @@ impl Handler {
         };
 
         // Only allow known config categories.
-        if !matches!(category, "model" | "agent") {
+        if !matches!(category, "model" | "model_config" | "agent") {
             return;
         }
 

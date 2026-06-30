@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 /// Pick the most permissive selectable permission option from ACP options.
 fn pick_best_option(options: &[Value]) -> Option<String> {
@@ -257,6 +257,21 @@ pub(crate) async fn run_reader_loop<R, W>(
     *sub = None;
 }
 
+/// ACP `initialize` params. Advertises Cursor's parameterized model picker so
+/// agents like cursor-agent expose model parameters (e.g. Composer Fast on/off)
+/// as separate config options instead of collapsing to the fast default variant.
+fn initialize_params() -> Value {
+    json!({
+        "protocolVersion": 1,
+        "clientCapabilities": {
+            "_meta": {
+                "parameterizedModelPicker": true
+            }
+        },
+        "clientInfo": {"name": "openab", "version": "0.1.0"},
+    })
+}
+
 impl AcpConnection {
     pub async fn spawn(
         command: &str,
@@ -453,14 +468,7 @@ impl AcpConnection {
 
     pub async fn initialize(&mut self) -> Result<()> {
         let resp = self
-            .send_request(
-                "initialize",
-                Some(json!({
-                    "protocolVersion": 1,
-                    "clientCapabilities": {},
-                    "clientInfo": {"name": "openab", "version": "0.1.0"},
-                })),
-            )
+            .send_request("initialize", Some(initialize_params()))
             .await?;
 
         let result = resp.result.as_ref();
@@ -474,6 +482,21 @@ impl AcpConnection {
             .and_then(|c| c.get("loadSession"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+
+        if let Some(methods) = result.and_then(|r| r.get("authMethods")).and_then(|m| m.as_array()) {
+            if let Some(method_id) = methods
+                .iter()
+                .find_map(|m| m.get("id").and_then(|id| id.as_str()))
+            {
+                self.send_request(
+                    "authenticate",
+                    Some(json!({ "methodId": method_id })),
+                )
+                .await?;
+                info!(method_id, "agent authenticated");
+            }
+        }
+
         info!(
             agent = agent_name,
             load_session = self.supports_load_session,
@@ -504,6 +527,36 @@ impl AcpConnection {
             }
         }
         Ok(session_id)
+    }
+
+    /// Apply configured defaults after `session/new` when the agent advertises matching
+    /// config options (e.g. Cursor `fast = "false"` for non-fast Composer).
+    pub async fn apply_default_config_options(
+        &mut self,
+        defaults: &HashMap<String, String>,
+    ) -> Result<()> {
+        if defaults.is_empty() {
+            return Ok(());
+        }
+
+        for (config_id, desired) in defaults {
+            let Some(opt) = self.config_options.iter().find(|o| o.id == *config_id) else {
+                continue;
+            };
+            if opt.current_value == *desired {
+                continue;
+            }
+            if !opt.options.iter().any(|o| o.value == *desired) {
+                warn!(
+                    config_id,
+                    desired, "default_config_options value not offered by agent, skipping"
+                );
+                continue;
+            }
+            self.set_config_option(config_id, desired).await?;
+        }
+
+        Ok(())
     }
 
     /// Set a config option (e.g. model, mode) via ACP session/set_config_option.
@@ -831,6 +884,17 @@ mod tests {
 
         assert!(!result.contains_key("OAB_TEST_NONEXISTENT_VAR_12345"));
         assert!(inherited.is_empty());
+    }
+
+    #[test]
+    fn initialize_params_advertises_parameterized_model_picker() {
+        let params = super::initialize_params();
+        assert_eq!(
+            params
+                .pointer("/clientCapabilities/_meta/parameterizedModelPicker")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 }
 

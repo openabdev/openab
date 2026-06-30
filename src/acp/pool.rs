@@ -259,6 +259,12 @@ impl SessionPool {
 
         if !resumed {
             new_conn.session_new(&effective_workdir).await?;
+            if let Err(e) = new_conn
+                .apply_default_config_options(&self.config.default_config_options)
+                .await
+            {
+                warn!(thread_id, error = %e, "failed to apply default ACP config options");
+            }
             // Surface the reset banner both for restored sessions and for stale
             // live entries that died before we could recover a resumable
             // session id. In both cases the caller is continuing after an

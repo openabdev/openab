@@ -472,6 +472,8 @@ struct AgentConfigRaw {
     working_dir: String,
     env: HashMap<String, String>,
     inherit_env: Vec<String>,
+    #[serde(default)]
+    default_config_options: HashMap<String, String>,
 }
 
 impl Default for AgentConfigRaw {
@@ -482,6 +484,7 @@ impl Default for AgentConfigRaw {
             working_dir: default_working_dir(),
             env: HashMap::new(),
             inherit_env: Vec::new(),
+            default_config_options: HashMap::new(),
         }
     }
 }
@@ -493,6 +496,8 @@ pub struct AgentConfig {
     pub working_dir: String,
     pub env: HashMap<String, String>,
     pub inherit_env: Vec<String>,
+    /// ACP session defaults applied after `session/new` (e.g. Cursor `fast = "false"`).
+    pub default_config_options: HashMap<String, String>,
     /// Whether the command was explicitly set in config (vs defaulted from env/fallback).
     pub command_explicit: bool,
 }
@@ -505,6 +510,7 @@ impl Default for AgentConfig {
             working_dir: default_working_dir(),
             env: HashMap::new(),
             inherit_env: Vec::new(),
+            default_config_options: HashMap::new(),
             command_explicit: false,
         }
     }
@@ -531,6 +537,7 @@ impl<'de> serde::Deserialize<'de> for AgentConfig {
             working_dir: raw.working_dir,
             env: raw.env,
             inherit_env: raw.inherit_env,
+            default_config_options: raw.default_config_options,
             command_explicit: cmd_explicit,
         })
     }
@@ -946,6 +953,7 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
                 working_dir: config.agent.working_dir.clone(),
                 env: config.agent.env.clone(),
                 inherit_env: config.agent.inherit_env.clone(),
+                default_config_options: config.agent.default_config_options.clone(),
                 command_explicit: true, // synthesized counts as explicit
             };
         }
@@ -1373,6 +1381,26 @@ runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test"
         let ac = cfg.agentcore.unwrap();
         assert_eq!(ac.region(), "us-east-1");
         assert_eq!(ac.cancel_strategy, AgentCoreCancelStrategy::Stop);
+    }
+
+    #[test]
+    fn agent_default_config_options_parsed() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agent]
+command = "cursor-agent"
+args = ["acp"]
+
+[agent.default_config_options]
+fast = "false"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(
+            cfg.agent.default_config_options.get("fast").map(String::as_str),
+            Some("false")
+        );
     }
 
     #[test]

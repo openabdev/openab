@@ -85,10 +85,27 @@ To specify a model, pass `--model` as an arg:
 ```toml
 [agent]
 # Override args (command defaults from OPENAB_AGENT_COMMAND="cursor-agent acp")
-args = ["acp", "--model", "auto"]
+args = ["acp", "--model", "auto", "--workspace", "/home/agent"]
 ```
 
 In ACP mode, `--model` can be appended after `acp`. If omitted, the account default is used.
+
+OpenAB advertises Cursor's `parameterizedModelPicker` capability during ACP
+`initialize`, which exposes model parameters (e.g. Composer **Fast** on/off) as
+separate session config options. In Discord:
+
+- `/models` — switch the base model (e.g. Composer 2.5)
+- `/speed` — toggle Fast mode on/off for the current session
+
+To default new sessions to non-fast Composer without using `/speed` each time:
+
+```toml
+[agent.default_config_options]
+fast = "false"
+```
+
+After changing model or speed on an existing session, use `/reset` or start a new
+thread for the change to take effect on the next `session/new`.
 
 To verify which model is active, ask the agent "who are you" — the underlying model will typically self-identify (e.g. "I am Gemini, a large language model built by Google.").
 

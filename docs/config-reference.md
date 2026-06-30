@@ -107,6 +107,7 @@ The AI agent subprocess that OpenAB spawns to handle messages via ACP.
 | `working_dir` | string | `$HOME` | Working directory for the agent process. Optional — defaults to container's `$HOME`. |
 | `env` | map | `{}` | Extra environment variables (e.g. `{ OPENAI_API_KEY = "${OPENAI_API_KEY}" }`). |
 | `inherit_env` | string[] | `[]` | Env var names to inherit from the OAB process (e.g. vars injected via K8s `envFrom`). Keys in `env` take precedence. |
+| `default_config_options` | map | `{}` | ACP session defaults applied after `session/new` via `session/set_config_option` (e.g. Cursor `fast = "false"` for non-fast Composer). Ignored when the agent does not advertise the option. |
 
 > **Default inherited vars:** After `env_clear()`, the agent always receives `HOME`, `PATH`, and `USER` (on Windows: `USERPROFILE`, `USERNAME`, `PATH`, `SystemRoot`, `SystemDrive`). Use `inherit_env` to pass additional vars beyond this baseline.
 
