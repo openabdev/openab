@@ -147,7 +147,6 @@ impl SlackAdapter {
         self.multibot_cache.mark_multibot(thread_ts).await;
     }
 
-
     /// Insert a stream entry, bounding the map so aborted turns (begin without a
     /// matching finish) can't leak unboundedly. Normal lifecycle: stream_begin
     /// inserts, stream_finish removes.
@@ -479,7 +478,8 @@ impl ChatAdapter for SlackAdapter {
             // instead of failing outright.
             Err(e) if is_block_payload_rejected(&e) => {
                 warn!(error = %e, "markdown block rejected; retrying chat.postMessage text-only");
-                let fallback = build_post_message_text_only(&channel.channel_id, thread_ts, content);
+                let fallback =
+                    build_post_message_text_only(&channel.channel_id, thread_ts, content);
                 self.api_post("chat.postMessage", fallback).await?
             }
             Err(e) => return Err(e),
@@ -619,7 +619,10 @@ impl ChatAdapter for SlackAdapter {
                     if let Some(ts) = resp["ts"].as_str() {
                         self.insert_stream(
                             ts.to_string(),
-                            StreamEntry { active: true, degraded_buf: String::new() },
+                            StreamEntry {
+                                active: true,
+                                degraded_buf: String::new(),
+                            },
                         )
                         .await;
                         return Ok(make_ref(ts.to_string()));
@@ -633,14 +636,20 @@ impl ChatAdapter for SlackAdapter {
         } else {
             // Expected for bot-authored turns (no recipient bound) and non-user
             // triggers, so warn! rather than error! to avoid on-call noise.
-            warn!(thread_ts, "no recipient for turn; falling back to post+edit");
+            warn!(
+                thread_ts,
+                "no recipient for turn; falling back to post+edit"
+            );
         }
 
         // Degraded fallback: plain placeholder via send_message; mark inactive.
         let msg = self.send_message(channel, "…").await?;
         self.insert_stream(
             msg.message_id.clone(),
-            StreamEntry { active: false, degraded_buf: String::new() },
+            StreamEntry {
+                active: false,
+                degraded_buf: String::new(),
+            },
         )
         .await;
         Ok(msg)
@@ -708,7 +717,10 @@ impl ChatAdapter for SlackAdapter {
             let cancel_ts = self.cancel_buttons.lock().await.remove(thread_ts);
             if let Some(cancel_ts) = cancel_ts {
                 if cancel_ts != "cancelled" {
-                    if let Err(e) = self.delete_message(&msg.channel.channel_id, &cancel_ts).await {
+                    if let Err(e) = self
+                        .delete_message(&msg.channel.channel_id, &cancel_ts)
+                        .await
+                    {
                         warn!(error = %e, "cancel button delete in stream_finish failed (non-fatal)");
                     }
                 }
@@ -1521,9 +1533,7 @@ async fn handle_message(
                         warn!(filename, error = %e, "image post-processing failed");
                         failed_image_files.push(filename.to_string());
                     }
-                    Err(media::MediaFetchError::HttpStatus(status))
-                        if status.is_client_error() =>
-                    {
+                    Err(media::MediaFetchError::HttpStatus(status)) if status.is_client_error() => {
                         warn!(filename, %status, "image download denied");
                         failed_image_files.push(filename.to_string());
                     }
@@ -1725,7 +1735,10 @@ fn strip_mime_params(mimetype: &str) -> &str {
 /// mrkdwn delimiters; without escaping, `<!here>` or `` `<@U123>` `` would render
 /// as mentions or @-here pings.
 pub(crate) fn sanitize_slack_filename(s: &str) -> String {
-    s.replace('&', "&amp;").replace('`', "'").replace('<', "(").replace('>', ")")
+    s.replace('&', "&amp;")
+        .replace('`', "'")
+        .replace('<', "(")
+        .replace('>', ")")
 }
 
 /// Returns `true` if `text` contains a Slack user mention for `uid`.
@@ -1736,8 +1749,12 @@ pub(crate) fn sanitize_slack_filename(s: &str) -> String {
 /// misses it.
 fn text_mentions_uid(text: &str, uid: &str) -> bool {
     let prefix = format!("<@{uid}");
-    text.match_indices(&prefix)
-        .any(|(i, _)| matches!(text.as_bytes().get(i + prefix.len()), Some(b'>') | Some(b'|')))
+    text.match_indices(&prefix).any(|(i, _)| {
+        matches!(
+            text.as_bytes().get(i + prefix.len()),
+            Some(b'>') | Some(b'|')
+        )
+    })
 }
 
 fn bot_id_matches_trusted(
@@ -1906,7 +1923,12 @@ fn markdown_to_mrkdwn(text: &str) -> String {
     text.into_owned()
 }
 
-fn build_start_stream_body(channel: &str, thread_ts: &str, user_id: &str, team_id: &str) -> serde_json::Value {
+fn build_start_stream_body(
+    channel: &str,
+    thread_ts: &str,
+    user_id: &str,
+    team_id: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "channel": channel,
         "thread_ts": thread_ts,
@@ -1996,13 +2018,29 @@ mod tests {
 
     #[tokio::test]
     async fn degraded_stream_append_accumulates() {
-        let adapter = SlackAdapter::new("xoxb-test".into(), std::time::Duration::from_secs(60), AllowBots::Off, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
+        let adapter = SlackAdapter::new(
+            "xoxb-test".into(),
+            std::time::Duration::from_secs(60),
+            AllowBots::Off,
+            true,
+            crate::multibot_cache::MultibotCache::load("/dev/null".into()),
+            true,
+        );
         adapter.streams.lock().await.insert(
             "TS".into(),
-            StreamEntry { active: false, degraded_buf: String::new() },
+            StreamEntry {
+                active: false,
+                degraded_buf: String::new(),
+            },
         );
-        assert_eq!(adapter.accumulate_degraded("TS", "a").await.as_deref(), Some("a"));
-        assert_eq!(adapter.accumulate_degraded("TS", "b").await.as_deref(), Some("ab"));
+        assert_eq!(
+            adapter.accumulate_degraded("TS", "a").await.as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            adapter.accumulate_degraded("TS", "b").await.as_deref(),
+            Some("ab")
+        );
         // missing stream is not resurrected:
         assert_eq!(adapter.accumulate_degraded("MISSING", "x").await, None);
     }
@@ -2093,7 +2131,10 @@ mod tests {
 
     #[test]
     fn mentions_uid_labelled_form_mid_sentence() {
-        assert!(text_mentions_uid("please ask <@U123BOT|handle> to run", "U123BOT"));
+        assert!(text_mentions_uid(
+            "please ask <@U123BOT|handle> to run",
+            "U123BOT"
+        ));
     }
 
     #[test]
@@ -2211,7 +2252,10 @@ mod tests {
     #[test]
     fn sanitize_leaves_normal_filename_unchanged() {
         assert_eq!(sanitize_slack_filename("photo.png"), "photo.png");
-        assert_eq!(sanitize_slack_filename("my file (1).jpg"), "my file (1).jpg");
+        assert_eq!(
+            sanitize_slack_filename("my file (1).jpg"),
+            "my file (1).jpg"
+        );
     }
 
     #[test]
@@ -2229,10 +2273,7 @@ mod tests {
     #[test]
     fn sanitize_combined_injection_attempt() {
         // A filename constructed to inject a Slack @here ping.
-        assert_eq!(
-            sanitize_slack_filename("`<!here>`"),
-            "'(!here)'"
-        );
+        assert_eq!(sanitize_slack_filename("`<!here>`"), "'(!here)'");
     }
 
     #[test]
@@ -2241,8 +2282,14 @@ mod tests {
         // "&lt;@here&gt;" would round-trip back to "<@here>" and trigger a mention
         // ping if & is not escaped. The & must be escaped first so downstream
         // Slack entity decoding cannot reconstruct a mrkdwn delimiter.
-        assert_eq!(sanitize_slack_filename("&lt;@here&gt;"), "&amp;lt;@here&amp;gt;");
-        assert_eq!(sanitize_slack_filename("file&name.png"), "file&amp;name.png");
+        assert_eq!(
+            sanitize_slack_filename("&lt;@here&gt;"),
+            "&amp;lt;@here&amp;gt;"
+        );
+        assert_eq!(
+            sanitize_slack_filename("file&name.png"),
+            "file&amp;name.png"
+        );
     }
 
     // --- strip_mime_params tests ---
@@ -2282,11 +2329,7 @@ mod tests {
     #[test]
     fn trusted_bot_ids_accepts_resolved_bot_user_id() {
         let trusted = HashSet::from(["U123BOT".to_string()]);
-        assert!(bot_id_matches_trusted(
-            &trusted,
-            "B123BOT",
-            Some("U123BOT")
-        ));
+        assert!(bot_id_matches_trusted(&trusted, "B123BOT", Some("U123BOT")));
     }
 
     #[test]
@@ -2305,7 +2348,14 @@ mod tests {
     #[test]
     fn streaming_per_thread() {
         let ttl = std::time::Duration::from_secs(300);
-        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, false, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
+        let adapter = SlackAdapter::new(
+            "xoxb-test".into(),
+            ttl,
+            AllowBots::Mentions,
+            false,
+            crate::multibot_cache::MultibotCache::load("/dev/null".into()),
+            true,
+        );
 
         assert!(
             adapter.use_streaming(false),
@@ -2322,22 +2372,70 @@ mod tests {
         let ttl = std::time::Duration::from_secs(60);
         // assistant_mode=true → status API on; native streaming on (no other bot),
         // off when another bot is present; post+edit streaming on regardless.
-        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
-        assert!(adapter.uses_assistant_status(), "assistant_mode enables status API");
-        assert!(adapter.use_streaming(false), "post+edit streaming on when no other bot");
-        assert!(adapter.uses_native_streaming(false), "native streaming on when no other bot");
-        assert!(!adapter.uses_native_streaming(true), "other bot present disables native");
+        let adapter = SlackAdapter::new(
+            "xoxb-test".into(),
+            ttl,
+            AllowBots::Off,
+            true,
+            crate::multibot_cache::MultibotCache::load("/dev/null".into()),
+            true,
+        );
+        assert!(
+            adapter.uses_assistant_status(),
+            "assistant_mode enables status API"
+        );
+        assert!(
+            adapter.use_streaming(false),
+            "post+edit streaming on when no other bot"
+        );
+        assert!(
+            adapter.uses_native_streaming(false),
+            "native streaming on when no other bot"
+        );
+        assert!(
+            !adapter.uses_native_streaming(true),
+            "other bot present disables native"
+        );
         // assistant_mode=false → no status API, no native streaming; post+edit still streams.
-        let adapter2 = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, false, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
+        let adapter2 = SlackAdapter::new(
+            "xoxb-test".into(),
+            ttl,
+            AllowBots::Off,
+            false,
+            crate::multibot_cache::MultibotCache::load("/dev/null".into()),
+            true,
+        );
         assert!(!adapter2.uses_assistant_status());
-        assert!(adapter2.use_streaming(false), "post+edit streaming independent of assistant_mode");
-        assert!(!adapter2.uses_native_streaming(false), "native streaming requires assistant_mode");
+        assert!(
+            adapter2.use_streaming(false),
+            "post+edit streaming independent of assistant_mode"
+        );
+        assert!(
+            !adapter2.uses_native_streaming(false),
+            "native streaming requires assistant_mode"
+        );
 
         // streaming=false → send-once: neither post+edit nor native, even alone.
-        let adapter3 = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), false);
-        assert!(!adapter3.use_streaming(false), "streaming=false forces send-once (no post+edit)");
-        assert!(!adapter3.uses_native_streaming(false), "streaming=false disables native even with assistant_mode");
-        assert!(adapter3.uses_assistant_status(), "streaming switch does not affect assistant status API");
+        let adapter3 = SlackAdapter::new(
+            "xoxb-test".into(),
+            ttl,
+            AllowBots::Off,
+            true,
+            crate::multibot_cache::MultibotCache::load("/dev/null".into()),
+            false,
+        );
+        assert!(
+            !adapter3.use_streaming(false),
+            "streaming=false forces send-once (no post+edit)"
+        );
+        assert!(
+            !adapter3.uses_native_streaming(false),
+            "streaming=false disables native even with assistant_mode"
+        );
+        assert!(
+            adapter3.uses_assistant_status(),
+            "streaming switch does not affect assistant status API"
+        );
     }
 
     /// chat.postMessage body carries Block Kit `markdown` blocks with the raw
@@ -2350,7 +2448,10 @@ mod tests {
         assert_eq!(b["blocks"][0]["type"], "markdown");
         // Raw markdown preserved — heading is NOT flattened to `*Heading*`.
         assert_eq!(b["blocks"][0]["text"], "## Heading\n- item");
-        assert!(b["text"].is_string(), "text fallback present for a11y/notifs");
+        assert!(
+            b["text"].is_string(),
+            "text fallback present for a11y/notifs"
+        );
     }
 
     /// thread_ts is omitted (top-level post) when the channel has no thread.
@@ -2391,7 +2492,14 @@ mod tests {
     #[test]
     fn typical_long_table_stays_in_one_chunk() {
         let ttl = std::time::Duration::from_secs(300);
-        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
+        let adapter = SlackAdapter::new(
+            "xoxb-test".into(),
+            ttl,
+            AllowBots::Mentions,
+            true,
+            crate::multibot_cache::MultibotCache::load("/dev/null".into()),
+            true,
+        );
         let limit = adapter.message_limit();
         assert_eq!(limit, MARKDOWN_BLOCK_LIMIT);
         let mut table = String::from("| col a | col b | col c |\n|---|---|---|\n");
@@ -2443,7 +2551,9 @@ mod tests {
         // Exact error-code match, not substring: a future code that merely
         // contains `invalid_blocks` must NOT trigger a text-only retry.
         assert!(
-            !is_block_payload_rejected(&anyhow!("Slack API chat.postMessage: invalid_blocks_field")),
+            !is_block_payload_rejected(&anyhow!(
+                "Slack API chat.postMessage: invalid_blocks_field"
+            )),
             "must match the error code exactly, not as a substring"
         );
     }
@@ -2453,7 +2563,14 @@ mod tests {
     #[test]
     fn slack_renders_native_tables() {
         let ttl = std::time::Duration::from_secs(300);
-        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
+        let adapter = SlackAdapter::new(
+            "xoxb-test".into(),
+            ttl,
+            AllowBots::Mentions,
+            true,
+            crate::multibot_cache::MultibotCache::load("/dev/null".into()),
+            true,
+        );
         assert!(adapter.renders_native_tables());
     }
 }
@@ -2474,7 +2591,19 @@ mod socket_keepalive_tests {
                 cur
             })
             .collect();
-        assert_eq!(seq, vec![1, 2, 4, 8, 16, MAX_BACKOFF_SECS, MAX_BACKOFF_SECS, MAX_BACKOFF_SECS]);
+        assert_eq!(
+            seq,
+            vec![
+                1,
+                2,
+                4,
+                8,
+                16,
+                MAX_BACKOFF_SECS,
+                MAX_BACKOFF_SECS,
+                MAX_BACKOFF_SECS
+            ]
+        );
         assert_eq!(next_backoff(MAX_BACKOFF_SECS), MAX_BACKOFF_SECS);
     }
 
@@ -2484,8 +2613,14 @@ mod socket_keepalive_tests {
     fn idle_detects_half_open_at_boundary() {
         let timeout = Duration::from_secs(IDLE_TIMEOUT_SECS);
         assert!(!socket_idle(Duration::from_secs(0), timeout));
-        assert!(!socket_idle(Duration::from_secs(IDLE_TIMEOUT_SECS - 1), timeout));
+        assert!(!socket_idle(
+            Duration::from_secs(IDLE_TIMEOUT_SECS - 1),
+            timeout
+        ));
         assert!(socket_idle(Duration::from_secs(IDLE_TIMEOUT_SECS), timeout));
-        assert!(socket_idle(Duration::from_secs(IDLE_TIMEOUT_SECS + 10), timeout));
+        assert!(socket_idle(
+            Duration::from_secs(IDLE_TIMEOUT_SECS + 10),
+            timeout
+        ));
     }
 }
