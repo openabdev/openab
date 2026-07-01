@@ -137,6 +137,9 @@ pub trait DispatchTarget: Send + Sync + 'static {
     /// Destroy the session for `session_key` (used to rollback on directive failure).
     async fn reset_session(&self, session_key: &str);
 
+    /// Cancel the in-flight ACP operation for `session_key`.
+    async fn cancel_session(&self, session_key: &str) -> Result<()>;
+
     /// Drive one ACP turn with the pre-packed `content_blocks`.
     #[allow(clippy::too_many_arguments)]
     async fn stream_prompt_blocks(
@@ -171,6 +174,10 @@ impl DispatchTarget for AdapterRouter {
 
     async fn reset_session(&self, session_key: &str) {
         let _ = self.pool().reset_session(session_key).await;
+    }
+
+    async fn cancel_session(&self, session_key: &str) -> Result<()> {
+        self.pool().cancel_session(session_key).await
     }
 
     async fn stream_prompt_blocks(
@@ -477,6 +484,11 @@ impl Dispatcher {
             }
         }
         dropped
+    }
+
+    /// Cancel the in-flight ACP operation for the given session key.
+    pub async fn cancel_session(&self, session_key: &str) -> Result<()> {
+        self.target.cancel_session(session_key).await
     }
 
     /// §2.5 race-safe eviction. Caller must hold the `per_thread` mutex.
@@ -1369,6 +1381,7 @@ mod tests {
     struct MockDispatchTarget {
         reactions: ReactionsConfig,
         calls: Mutex<Vec<RecordedDispatch>>,
+        cancel_calls: Mutex<Vec<String>>,
         /// If set, `ensure_session` returns this error once.
         ensure_err: Mutex<Option<String>>,
         /// If set, `stream_prompt_blocks` returns this error once.
@@ -1380,6 +1393,7 @@ mod tests {
             Self {
                 reactions: ReactionsConfig::default(),
                 calls: Mutex::new(Vec::new()),
+                cancel_calls: Mutex::new(Vec::new()),
                 ensure_err: Mutex::new(None),
                 stream_err: Mutex::new(None),
             }
@@ -1387,6 +1401,10 @@ mod tests {
 
         fn calls(&self) -> Vec<RecordedDispatch> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn cancel_calls(&self) -> Vec<String> {
+            self.cancel_calls.lock().unwrap().clone()
         }
     }
 
@@ -1416,6 +1434,14 @@ mod tests {
         }
 
         async fn reset_session(&self, _session_key: &str) {}
+
+        async fn cancel_session(&self, session_key: &str) -> Result<()> {
+            self.cancel_calls
+                .lock()
+                .unwrap()
+                .push(session_key.to_string());
+            Ok(())
+        }
 
         async fn stream_prompt_blocks(
             &self,
@@ -1723,5 +1749,20 @@ mod tests {
         assert_eq!(calls[0].block_count, 2);
 
         parked.abort();
+    }
+
+    #[tokio::test]
+    async fn mock_dispatch_target_records_cancel_session() {
+        let mock = Arc::new(MockDispatchTarget::new());
+        let target: &dyn DispatchTarget = mock.as_ref();
+
+        target
+            .cancel_session("slack:1234567890.123456")
+            .await
+            .expect("cancel_session should succeed");
+
+        let recorded = mock.cancel_calls();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0], "slack:1234567890.123456");
     }
 }

@@ -91,6 +91,9 @@ pub struct SlackAdapter {
     /// Lifecycle: stream_begin inserts, stream_finish removes; insert_stream
     /// bounds the map (STREAM_CACHE_MAX) as a safety net against aborted turns.
     streams: tokio::sync::Mutex<HashMap<String, StreamEntry>>,
+    /// thread_id → cancel button message ts. Posted at set_status, deleted at
+    /// stream_finish or on user click.
+    cancel_buttons: tokio::sync::Mutex<HashMap<String, String>>,
 }
 
 impl SlackAdapter {
@@ -120,6 +123,7 @@ impl SlackAdapter {
             assistant_mode,
             streaming,
             streams: tokio::sync::Mutex::new(HashMap::new()),
+            cancel_buttons: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -229,6 +233,31 @@ impl SlackAdapter {
             return Err(anyhow!("Slack API {method}: {err}"));
         }
         Ok(json)
+    }
+
+    /// Delete a Slack message. Treats `message_not_found` as success (idempotent).
+    async fn delete_message(&self, channel_id: &str, ts: &str) -> Result<()> {
+        let body = serde_json::json!({ "channel": channel_id, "ts": ts });
+        match self.api_post("chat.delete", body).await {
+            Ok(_) => Ok(()),
+            Err(e) if e.to_string().contains("message_not_found") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Replace a cancel button message with "~Cancelled~" text.
+    async fn mark_cancel_button(&self, channel_id: &str, ts: &str) -> Result<()> {
+        let body = serde_json::json!({
+            "channel": channel_id,
+            "ts": ts,
+            "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "~Cancelled~"}}],
+            "text": "Cancelled",
+        });
+        match self.api_post("chat.update", body).await {
+            Ok(_) => Ok(()),
+            Err(e) if e.to_string().contains("message_not_found") => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Resolve a Slack user ID to display name via users.info API.
@@ -672,6 +701,20 @@ impl ChatAdapter for SlackAdapter {
             }
         }
         self.streams.lock().await.remove(ts);
+
+        // Best-effort cancel button cleanup.
+        let thread_ts = msg.channel.thread_id.as_deref().unwrap_or_default();
+        if !thread_ts.is_empty() {
+            let cancel_ts = self.cancel_buttons.lock().await.remove(thread_ts);
+            if let Some(cancel_ts) = cancel_ts {
+                if cancel_ts != "cancelled" {
+                    if let Err(e) = self.delete_message(&msg.channel.channel_id, &cancel_ts).await {
+                        warn!(error = %e, "cancel button delete in stream_finish failed (non-fatal)");
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -681,6 +724,28 @@ impl ChatAdapter for SlackAdapter {
         if let Err(e) = self.api_post("assistant.threads.setStatus", body).await {
             warn!(error = %e, status, "assistant.threads.setStatus failed (cosmetic)");
         }
+
+        // Post cancel button if not already present (or already cancelled) for this thread.
+        if !thread_ts.is_empty() {
+            let existing = self.cancel_buttons.lock().await.get(&thread_ts).cloned();
+            if existing.is_none() {
+                let btn_body = build_cancel_button_body(&channel.channel_id, &thread_ts);
+                match self.api_post("chat.postMessage", btn_body).await {
+                    Ok(resp) => {
+                        if let Some(ts) = resp["ts"].as_str() {
+                            self.cancel_buttons
+                                .lock()
+                                .await
+                                .insert(thread_ts.clone(), ts.to_string());
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "cancel button post failed (non-fatal)");
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -789,17 +854,67 @@ pub async fn run_slack_adapter(
                                             .await;
                                     }
 
-                                    // Slash commands and interactive block_actions aren't
-                                    // handled on Slack: slash commands are blocked by Slack
-                                    // in thread composers, and the channel-level delivery
-                                    // lacks the thread_ts needed to route to a session.
-                                    // Ack only; ignore payload.
+                                    // Slash commands are not supported in Slack threads.
+                                    // Interactive envelopes: only process block_actions
+                                    // with action_id == "openab_cancel".
                                     match envelope["type"].as_str() {
-                                        Some("slash_commands") | Some("interactive") => {
-                                            debug!(
-                                                envelope_type = envelope["type"].as_str().unwrap_or(""),
-                                                "ignoring Slack envelope type (not supported on this adapter)"
-                                            );
+                                        Some("slash_commands") => {
+                                            debug!("ignoring slash_commands envelope");
+                                            continue;
+                                        }
+                                        Some("interactive") => {
+                                            // Socket Mode interactive payloads may be JSON strings
+                                            let parsed_payload;
+                                            let payload = if let Some(s) = envelope["payload"].as_str() {
+                                                parsed_payload = serde_json::from_str::<serde_json::Value>(s)
+                                                    .unwrap_or_default();
+                                                &parsed_payload
+                                            } else {
+                                                &envelope["payload"]
+                                            };
+                                            let payload_type = payload["type"].as_str().unwrap_or("");
+                                            if payload_type == "block_actions" {
+                                                let action_id = payload["actions"][0]["action_id"]
+                                                    .as_str()
+                                                    .unwrap_or("");
+                                                if action_id == "openab_cancel" {
+                                                    let channel_id = match payload["channel"]["id"].as_str() {
+                                                        Some(v) => v.to_string(),
+                                                        None => {
+                                                            warn!("openab_cancel: missing channel.id");
+                                                            continue;
+                                                        }
+                                                    };
+                                                    let thread_ts = match payload["message"]["thread_ts"].as_str() {
+                                                        Some(v) => v.to_string(),
+                                                        None => {
+                                                            warn!("openab_cancel: missing message.thread_ts");
+                                                            continue;
+                                                        }
+                                                    };
+                                                    let cancel_msg_ts = match payload["message"]["ts"].as_str() {
+                                                        Some(v) => v.to_string(),
+                                                        None => {
+                                                            warn!("openab_cancel: missing message.ts");
+                                                            continue;
+                                                        }
+                                                    };
+
+                                                    let session_key = format!("slack:{thread_ts}");
+                                                    info!(session_key, "openab_cancel: dispatching cancel");
+                                                    let disp = dispatcher.clone();
+                                                    let adap = adapter.clone();
+                                                    tokio::spawn(async move {
+                                                        if let Err(e) = disp.cancel_session(&session_key).await {
+                                                            warn!(error = %e, "cancel_session failed (non-fatal)");
+                                                        }
+                                                        if let Err(e) = adap.mark_cancel_button(&channel_id, &cancel_msg_ts).await {
+                                                            warn!(error = %e, "cancel button update failed (non-fatal)");
+                                                        }
+                                                        adap.cancel_buttons.lock().await.insert(thread_ts, "cancelled".to_string());
+                                                    });
+                                                }
+                                            }
                                             continue;
                                         }
                                         _ => {}
@@ -1816,11 +1931,43 @@ fn build_set_status_body(channel_id: &str, thread_ts: &str, status: &str) -> ser
     })
 }
 
+fn build_cancel_button_blocks() -> Vec<serde_json::Value> {
+    vec![serde_json::json!({
+        "type": "actions",
+        "elements": [{
+            "type": "button",
+            "text": { "type": "plain_text", "text": "Cancel" },
+            "style": "danger",
+            "action_id": "openab_cancel",
+        }]
+    })]
+}
+
+fn build_cancel_button_body(channel_id: &str, thread_ts: &str) -> serde_json::Value {
+    serde_json::json!({
+        "channel": channel_id,
+        "thread_ts": thread_ts,
+        "blocks": build_cancel_button_blocks(),
+        "text": "Cancel",
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     // --- builder tests ---
+
+    #[test]
+    fn build_cancel_button_blocks_structure() {
+        let blocks = build_cancel_button_blocks();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "actions");
+        let elements = &blocks[0]["elements"];
+        assert_eq!(elements[0]["type"], "button");
+        assert_eq!(elements[0]["action_id"], "openab_cancel");
+        assert_eq!(elements[0]["style"], "danger");
+    }
 
     #[test]
     fn build_start_stream_body_has_recipient() {
