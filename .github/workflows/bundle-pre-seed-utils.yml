@@ -89,12 +89,9 @@ jobs:
           cp /tmp/ghp ./bin/ghp
           chmod +x ./bin/ghp
 
-      - name: Download gh CLI
+      - name: Symlink gh to ghp
         run: |
-          GH_VERSION=$(gh --version | head -1 | awk '{print $3}')
-          # Use the runner's gh binary directly
-          cp $(which gh) ./bin/gh
-          chmod +x ./bin/gh
+          cd bin && ln -sf ghp gh && cd ..
 
       - name: Fix symlinks to be relative
         run: |
@@ -116,7 +113,9 @@ jobs:
           ls -la ./aws-cli/v2/
           echo "=== resolve test ==="
           ./bin/aws --version
-          ./bin/ghp --version || true
+          ./bin/ghp --version
+          # gh should resolve to ghp
+          test "$(readlink ./bin/gh)" = "ghp"
 
       - name: Create tarball
         run: |
@@ -161,7 +160,7 @@ jobs:
           **Contents:**
           - AWS CLI v${{ needs.resolve.outputs.aws_cli_version }}
           - ghp v${{ needs.resolve.outputs.ghpool_version }} (ghpool shim)
-          - gh CLI (from runner)
+          - gh → ghp symlink
 
           **Usage:** Add to \`[hooks.pre_seed].sources\` as S3 URI after uploading." \
             artifacts/utils-x86_64.tar.gz \

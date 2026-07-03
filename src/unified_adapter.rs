@@ -201,13 +201,13 @@ impl ChatAdapter for UnifiedGatewayAdapter {
     }
 
     fn use_streaming(&self, _other_bot_present: bool) -> bool {
-        // TELEGRAM_STREAMING env var is the explicit override (true/false).
-        // If not set, default to `true` when Telegram Rich Messages are enabled
-        // (implies sendRichMessageDraft support), `false` otherwise.
-        // This ensures Telegram-only deployments get streaming out of the box,
-        // while multi-platform deployments stay safe by default.
-        if let Ok(v) = std::env::var("TELEGRAM_STREAMING") {
-            return v == "1" || v.eq_ignore_ascii_case("true");
+        // Streaming override is resolved once at startup (config `[telegram].streaming`
+        // → `TELEGRAM_STREAMING` env → unset). When unset, default to `true` when
+        // Telegram Rich Messages are enabled (implies sendRichMessageDraft support),
+        // `false` otherwise. This gives Telegram-only deployments streaming out of the
+        // box while multi-platform deployments stay safe by default.
+        if let Some(streaming) = self.gw_state.telegram_streaming {
+            return streaming;
         }
         self.gw_state.telegram_rich_messages
     }

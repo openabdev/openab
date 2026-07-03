@@ -1,0 +1,55 @@
+suite: configToml pass-through
+templates:
+  - templates/configmap.yaml
+
+tests:
+  - it: renders configToml verbatim when set
+    set:
+      agents.kiro.configToml: |
+        [slack]
+        bot_token = "${SLACK_BOT_TOKEN}"
+        allowed_channels = ["C01234567"]
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[slack\]'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'allowed_channels = \["C01234567"\]'
+
+  - it: does not render Helm-templated fields when configToml is set
+    set:
+      agents.kiro.configToml: |
+        [slack]
+        bot_token = "${SLACK_BOT_TOKEN}"
+      agents.kiro.slack.enabled: true
+      agents.kiro.pool.maxSessions: 5
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: '\[pool\]'
+
+  - it: still renders agentsMd alongside configToml
+    set:
+      agents.kiro.configToml: |
+        [slack]
+        bot_token = "${SLACK_BOT_TOKEN}"
+      agents.kiro.agentsMd: "# My Agent\nDo things."
+    asserts:
+      - isNotNull:
+          path: data["AGENTS.md"]
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[slack\]'
+
+  - it: skips ConfigMap entirely when configUrl is set
+    set:
+      agents.kiro.configUrl: "s3://my-bucket/config.toml"
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: fails with a clear error when neither configToml nor configUrl is set
+    asserts:
+      - failedTemplate:
+          errorPattern: "was removed in chart v0.10.0"

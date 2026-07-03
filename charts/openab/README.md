@@ -96,6 +96,22 @@ helm install openab openab/openab \
   --set-file agents.kiro.agentsMd=./AGENTS.md
 ```
 
+### Provide `config.toml` as-is with `--set-file`
+
+`configToml` accepts a raw TOML string, which can be pasted inline into `values.yaml`
+or loaded verbatim from a standalone file. Keeping `config.toml` as a real file gives
+you full IDE syntax highlighting and TOML schema validation, instead of an indented
+YAML block scalar:
+
+```bash
+helm upgrade openab openab/openab \
+  --set-file agents.kiro.configToml=./config.toml
+```
+
+See [`docs/migrate-to-configtoml.md`](../../docs/migrate-to-configtoml.md) for a full before/after guide, and
+[`docs/adr/configurl-over-helm-rendering.md`](../../docs/adr/configurl-over-helm-rendering.md) for when to prefer `configUrl` instead
+(platform-agnostic — works identically on Kubernetes, ECS, Zeabur, and AgentCore).
+
 ### Discord ID precision warning
 
 Discord IDs must be set with `--set-string`, not `--set`. Otherwise Helm may coerce them into numbers and lose precision.

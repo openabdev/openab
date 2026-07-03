@@ -11,8 +11,12 @@ tests:
       - hasDocuments:
           count: 0
 
-  - it: renders ConfigMap when configUrl is not set
+  - it: renders ConfigMap when configUrl is not set (configToml provided)
     template: templates/configmap.yaml
+    set:
+      agents.kiro.configToml: |
+        [agent]
+        command = "kiro-cli"
     asserts:
       - hasDocuments:
           count: 1
@@ -28,6 +32,10 @@ tests:
 
   - it: does not set args when configUrl is empty
     template: templates/deployment.yaml
+    set:
+      agents.kiro.configToml: |
+        [agent]
+        command = "kiro-cli"
     asserts:
       - isNull:
           path: spec.template.spec.containers[0].args

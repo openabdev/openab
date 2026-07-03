@@ -1140,6 +1140,28 @@ pub struct GatewayEventContext {
 ///
 /// This is the core event-handling logic extracted from the WebSocket handler,
 /// made available for the unified binary to call directly from axum webhook handlers.
+/// Throttle for request-access echoes: at most one echo per (platform, sender)
+/// per [`ECHO_WINDOW`], to prevent an untrusted spammer from being amplified by
+/// the bot's replies.
+static ECHO_THROTTLE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+const ECHO_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Returns true if an echo to `key` is allowed now (and records the timestamp).
+fn echo_allowed(key: &str) -> bool {
+    let now = std::time::Instant::now();
+    let mut map = ECHO_THROTTLE.lock().unwrap();
+    match map.get(key) {
+        Some(prev) if now.duration_since(*prev) < ECHO_WINDOW => false,
+        _ => {
+            map.insert(key.to_string(), now);
+            true
+        }
+    }
+}
+
 pub async fn process_gateway_event(
     event_json: &str,
     ctx: &GatewayEventContext,
@@ -1147,18 +1169,74 @@ pub async fn process_gateway_event(
     let event: GatewayEvent = serde_json::from_str(event_json)
         .map_err(|e| anyhow::anyhow!("invalid gateway event JSON: {e}"))?;
 
-    // Shared filter logic
+    // Structural gating (bot filter + @mention) stays in should_skip_event.
+    // L2 (channel) + L3 (identity) are now enforced by the shared ingress gate
+    // (`router.gate_incoming`) below, so we neuter should_skip_event's channel/user
+    // checks here by passing allow-all for them.
+    let no_ids: HashSet<String> = HashSet::new();
     let filter = EventFilterParams {
-        allow_all_channels: ctx.allow_all_channels,
-        allowed_channels: &ctx.allowed_channels,
-        allow_all_users: ctx.allow_all_users,
-        allowed_users: &ctx.allowed_users,
+        allow_all_channels: true,
+        allowed_channels: &no_ids,
+        allow_all_users: true,
+        allowed_users: &no_ids,
         allow_bot_messages: ctx.allow_bot_messages,
         trusted_bot_ids: &ctx.trusted_bot_ids,
         bot_username: ctx.bot_username.as_deref(),
     };
     if should_skip_event(&event, &filter) {
         return Ok(false);
+    }
+
+    // Shared ingress trust gate (L2 scope + L3 identity), keyed by platform.
+    // Phase 1: `is_dm = false` preserves today's behavior where gateway DMs are
+    // evaluated against the channel allowlist like any other channel (the
+    // `allow_dm` surface semantics arrive with the per-platform trust flip).
+    // TODO(phase-2): derive is_dm from the event/ChannelRef carrier so the
+    // `allow_dm` L2 surface can be enforced and tested for gateway platforms.
+    let decision =
+        ctx.router
+            .gate_incoming(&event.platform, &event.channel.id, false, &event.sender.id);
+    match decision {
+        crate::trust::Decision::Allow => {}
+        crate::trust::Decision::DenyIdentity => {
+            // L3 identity deny → echo the sender their ID so they can request
+            // access (throttled to avoid amplification). Bots never reach here
+            // (should_skip_event handles bot admission; L3 is human-only).
+            tracing::info!(
+                platform = %event.platform,
+                sender = %event.sender.id,
+                channel = %event.channel.id,
+                "gateway event denied (identity); echoing request-access"
+            );
+            let throttle_key = format!("{}:{}", event.platform, event.sender.id);
+            if echo_allowed(&throttle_key) {
+                let echo_channel = ChannelRef {
+                    platform: event.platform.clone(),
+                    channel_id: event.channel.id.clone(),
+                    thread_id: event.channel.thread_id.clone(),
+                    parent_id: None,
+                    origin_event_id: Some(event.event_id.clone()),
+                };
+                let echo = format!(
+                    "⚠️ You are not on this bot's trusted list.\nYour ID: {}\nAsk the admin to add it to allowed_users.",
+                    event.sender.id
+                );
+                let _ = ctx.adapter.send_message(&echo_channel, &echo).await;
+            }
+            return Ok(false);
+        }
+        // DenyScope (and any future variant) → silent drop (scope is not a
+        // security boundary; no request-access echo).
+        _ => {
+            tracing::info!(
+                platform = %event.platform,
+                sender = %event.sender.id,
+                channel = %event.channel.id,
+                ?decision,
+                "gateway event denied (scope); silent"
+            );
+            return Ok(false);
+        }
     }
 
     tracing::info!(
@@ -1394,6 +1472,15 @@ fn format_size(n: u64) -> String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn echo_allowed_throttles_repeat_within_window() {
+        // Unique key so we don't collide with other tests touching the global map.
+        let key = "test-platform:test-sender-echo-throttle";
+        assert!(echo_allowed(key), "first echo should be allowed");
+        assert!(!echo_allowed(key), "immediate repeat should be throttled");
+        assert!(!echo_allowed(key), "still throttled within the window");
+    }
 
     fn make_event(is_bot: bool, sender_id: &str, channel_id: &str, channel_type: &str, thread_id: Option<&str>, mentions: Vec<&str>) -> GatewayEvent {
         serde_json::from_value(serde_json::json!({

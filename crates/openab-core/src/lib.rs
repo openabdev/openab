@@ -21,6 +21,7 @@ pub mod secrets;
 pub mod setup;
 pub mod stt;
 pub mod timestamp;
+pub mod trust;
 
 #[cfg(feature = "discord")]
 pub mod discord;

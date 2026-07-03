@@ -59,6 +59,17 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # streaming = true                      # enable streaming (typewriter) mode
 # streaming_placeholder = false         # set false for draft-based platforms (e.g. Telegram Rich Messages)
 
+# --- Telegram (first-class section; alternative to TELEGRAM_* env vars) ---
+# Config-authoritative with ${} expansion; each field falls back to its
+# TELEGRAM_* env var when unset, then to a default. Symmetric with [discord].
+# [telegram]
+# bot_token           = "${TELEGRAM_BOT_TOKEN}"     # env fallback: TELEGRAM_BOT_TOKEN
+# secret_token        = "${TELEGRAM_SECRET_TOKEN}"  # env fallback: TELEGRAM_SECRET_TOKEN
+# trusted_source_only = true            # reject IPs outside Telegram subnets (default false)
+# rich_messages       = true            # sendRichMessage rendering (default true)
+# streaming           = true            # override; defaults to follow rich_messages
+# webhook_path        = "/webhook/telegram"   # default /webhook/telegram
+
 # --- AgentCore Runtime (alternative to [agent]) ---
 # When [agentcore] is set and [agent].command is not explicitly provided,
 # OAB auto-spawns the bundled agentcore-acp adapter. No manual wiring needed.

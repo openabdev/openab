@@ -209,6 +209,110 @@ spec:
       securityGroups: [sg-xxx]
 ```
 
+### Ingress — inbound webhooks (Telegram / LINE)
+
+Discord bots are outbound-only and need no ingress. Webhook platforms (Telegram,
+LINE, ...) POST *into* the task, so they need a public HTTPS endpoint. Adding an
+optional `spec.ingress` block makes `oabctl apply` provision the cheapest
+AWS-native path in one shot — API Gateway HTTP API → VPC Link → Cloud Map → the
+task — instead of running ~7 manual `aws` commands, replacing the manual steps
+implemented here. For a Kubernetes/Cloudflare-Tunnel alternative, see
+[`docs/refarch/telegram-cloudflare-tunnel.md`](../docs/refarch/telegram-cloudflare-tunnel.md).
+A dedicated AWS-native refarch doc covering this path in depth is tracked in
+[#1274](https://github.com/openabdev/openab/pull/1274); once merged it will be
+linked here.
+
+```yaml
+spec:
+  image: public.ecr.aws/oablab/kiro:beta
+  resources: { cpu: "256", memory: "512" }
+  configFrom: s3://.../config.toml
+  runtime:
+    type: ecs
+    capacityProvider: FARGATE_SPOT
+    networking:
+      subnets: [subnet-aaa, subnet-bbb]
+      securityGroups: [sg-xxx]
+  ingress:
+    type: apigateway          # only supported type (default)
+    cloudMapNamespace: oab    # reused across bots in the VPC (default: oab)
+    containerPort: 8080       # OpenAB listen port (default: 8080)
+    paths:
+      - /webhook/telegram
+      - /webhook/line
+```
+
+On `apply` this reconciles (idempotently, reused by name):
+
+1. **Cloud Map** private DNS namespace (`<cloudMapNamespace>-<vpc-id>`, shared per-VPC) + a per-service **SRV** record (carries the container port; a plain A record does not work as a VPC-Link integration target)
+2. **ECS service registry** wiring (attached at service creation)
+3. **VPC Link** (`oab-vpc-link-<vpc-id>`, shared per-VPC), waits until `AVAILABLE`
+4. **API Gateway HTTP API** (`oab-webhook-<ns>-<name>`, one per bot) + `HTTP_PROXY` integration over the VPC Link
+5. One **route** per path + a `prod` auto-deploy **stage**
+6. A self-referencing **security-group** inbound rule on `containerPort`
+
+`apply` then prints the stable webhook URL(s) to register with BotFather / the
+LINE console:
+
+```
+🔗 Webhook URL(s) for my-bot:
+   https://{api-id}.execute-api.{region}.amazonaws.com/prod/webhook/telegram
+   https://{api-id}.execute-api.{region}.amazonaws.com/prod/webhook/line
+```
+
+> **Security note:** the API Gateway endpoint itself is public and unauthenticated
+> at the transport layer (no IAM auth, no API key). OpenAB's webhook handlers add
+> their own app-layer verification on top: Telegram validates the
+> `X-Telegram-Bot-Api-Secret-Token` header (`TELEGRAM_SECRET_TOKEN`) and the
+> request's source IP against Telegram's published webhook subnets; LINE
+> verifies an HMAC-SHA256 signature using `LINE_CHANNEL_SECRET`. Set
+> `TELEGRAM_SECRET_TOKEN` when registering the webhook with BotFather to enable
+> that check.
+>
+> **Adding/fixing service discovery never requires recreating the service:**
+> if an existing ECS service has no Cloud Map registry, or has one pointing at a
+> different Cloud Map service than the one currently resolved for
+> `ingress.cloudMapNamespace` (e.g. the namespace was changed after the service
+> was created), `apply`'s `update_service` call attaches or replaces the
+> registry directly — ECS has supported adding/updating/removing
+> `serviceRegistries` on an existing service via a normal rolling replacement
+> (new tasks start with the new registry, old tasks stop once healthy — no
+> downtime gap) since March 2022. This requires the `AWSServiceRoleForECS`
+> service-linked role, which ECS creates automatically the first time any
+> service in the account uses service discovery — no setup needed.
+>
+> **Shared per-VPC (not per-account):** all ingress-enabled bots in the *same VPC*
+> share one VPC Link (`oab-vpc-link-<vpc-id>`) and one Cloud Map namespace
+> (`<cloudMapNamespace>-<vpc-id>`) — both are named by VPC ID so bots in different
+> VPCs never collide or reuse each other's link/namespace. A VPC Link's
+> subnets/security groups are fixed at creation and cannot be changed, so every
+> ingress bot in a given VPC must use the same `networking.subnets` /
+> `securityGroups` as whichever bot created that VPC's link first. `apply`
+> verifies the reused link's actual security groups match the manifest and warns
+> loudly on a mismatch (subnets aren't exposed by the API, so those can only be
+> reminded, not verified).
+>
+> **Teardown:** `oabctl delete oabservice <name>` permanently removes the bot's
+> per-bot ingress resources — its exact Cloud Map service (resolved by the ECS
+> service's own registry ARN, not a name search, so same-named bots in different
+> VPCs/environments can't collide) and its HTTP API (`oab-webhook-<ns>-<name>`,
+> including the API resource itself this time, since the bot is gone for good) —
+> on a best-effort basis (it never blocks service deletion). If you instead edit
+> a manifest to remove `spec.ingress` while keeping the bot, `apply` runs the same
+> Cloud Map + routes/integration/stage cleanup automatically, but **keeps the HTTP
+> API** in case ingress is re-added later. The **shared** VPC Link and the
+> security-group inbound rule are always left in place for other bots. If the
+> Cloud Map service still has registered instances, teardown retries for ~25s
+> before falling back to a warning with the manual cleanup command.
+>
+> **Changing `paths`:** `apply` prunes routes on the bot's API that are no longer
+> in the manifest's `ingress.paths`, so renaming or removing a webhook path never
+> leaves a dangling route.
+>
+> **Per-bot API, no path collisions:** each ingress bot gets its own HTTP API, so
+> two bots can both use `/webhook/telegram` without clashing — each has a distinct
+> `{api-id}` endpoint URL that stays stable across recreates.
+
 ### OABFleet — batch deploy
 
 ```yaml
@@ -234,7 +338,7 @@ spec:
 ```
 
 **Fleet features:**
-- Template inheritance with per-agent overrides (`image`, `resources`, `bootstrapFrom`, `secrets`)
+- Template inheritance with per-agent overrides (`image`, `resources`, `bootstrapFrom`, `secrets`, `ingress`)
 - `${name}` interpolation in `configFrom`, `bootstrapFrom`
 - Runtime shared across fleet (not overridable per-agent)
 - Validate-all-before-apply (no partial deploys)
@@ -270,10 +374,24 @@ oabctl bootstrap --cluster my-cluster     # import existing resources
 
 ### IAM Task Role Permissions
 
+Attached to `oab-task-role` — the identity the *running container* assumes.
+
 | Policy | Permissions | Resource |
 |--------|------------|----------|
 | `oab-ecs-exec` | ssmmessages:* | * (ECS Exec requirement) |
 | `oab-s3-artifacts` | s3:GetObject, s3:PutObject | `{bucket}/artifacts/*` |
+| `oab-secrets` | secretsmanager:GetSecretValue | `arn:aws:secretsmanager:*:*:secret:oab/*` |
+
+### IAM Execution Role Permissions
+
+Attached to `oab-task-execution` — the identity **ECS itself** assumes to pull
+the image and resolve `spec.secrets` values *before* the container starts.
+This is a different role from the task role above; a manifest's `spec.secrets`
+values are fetched by this role, not by the running container.
+
+| Policy | Permissions | Resource |
+|--------|------------|----------|
+| `AmazonECSTaskExecutionRolePolicy` (AWS managed) | ECR image pulls, CloudWatch log delivery | * |
 | `oab-secrets` | secretsmanager:GetSecretValue | `arn:aws:secretsmanager:*:*:secret:oab/*` |
 
 ### Import Existing Resources
@@ -327,4 +445,21 @@ With `oabctl bootstrap`, most prerequisites are handled automatically. You only 
 
 1. **AWS credentials** — IAM user/role with permissions to create the above resources
 2. **Docker** — to build custom images (optional if using official images)
+
+### Additional permissions for `spec.ingress`
+
+The resources bootstrap creates cover outbound-only (Discord) deployments. If
+any manifest sets `spec.ingress`, the **caller of `oabctl apply`/`delete`**
+(not the task role) also needs:
+
+| Service | Actions |
+|---------|---------|
+| Cloud Map | `servicediscovery:CreatePrivateDnsNamespace`, `CreateService`, `DeleteService`, `ListNamespaces`, `ListServices`, `GetOperation` |
+| API Gateway | `apigateway:CreateVpcLink`, `CreateApi`, `CreateIntegration`, `CreateRoute`, `CreateStage`, `DeleteRoute`, `DeleteIntegration`, `DeleteStage`, `DeleteApi`, `GetVpcLinks`, `GetVpcLink`, `GetApis`, `GetIntegrations`, `GetRoutes`, `GetStages` |
+| EC2 | `ec2:DescribeSubnets`, `AuthorizeSecurityGroupIngress` |
+| ECS | `ecs:UpdateService` with `serviceRegistries` (requires the `AWSServiceRoleForECS` service-linked role, which ECS creates automatically the first time any service in the account uses service discovery) |
+
+`AdministratorAccess`-equivalent or a broad `servicediscovery:*`/`apigateway:*`
+during development is fine; the table above is for scoping a least-privilege
+policy.
 

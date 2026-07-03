@@ -58,7 +58,8 @@
         "configFrom": { "type": "string" },
         "bootstrapFrom": { "type": "string" },
         "secrets": { "type": "object", "additionalProperties": { "type": "string" } },
-        "runtime": { "$ref": "#/$defs/runtime" }
+        "runtime": { "$ref": "#/$defs/runtime" },
+        "ingress": { "$ref": "#/$defs/ingress" }
       },
       "additionalProperties": false
     },
@@ -83,7 +84,8 @@
         "resources": { "$ref": "#/$defs/resources" },
         "bootstrapFrom": { "type": "string" },
         "secrets": { "type": "object", "additionalProperties": { "type": "string" } },
-        "runtime": { "$ref": "#/$defs/runtime" }
+        "runtime": { "$ref": "#/$defs/runtime" },
+        "ingress": { "$ref": "#/$defs/ingress" }
       },
       "additionalProperties": false
     },
@@ -96,7 +98,8 @@
         "image": { "type": "string" },
         "resources": { "$ref": "#/$defs/resources" },
         "bootstrapFrom": { "type": "string" },
-        "secrets": { "type": "object", "additionalProperties": { "type": "string" } }
+        "secrets": { "type": "object", "additionalProperties": { "type": "string" } },
+        "ingress": { "$ref": "#/$defs/ingress" }
       },
       "additionalProperties": false
     },
@@ -106,6 +109,22 @@
       "properties": {
         "cpu": { "type": "string" },
         "memory": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "ingress": {
+      "type": "object",
+      "description": "Inbound HTTPS webhook ingress (API Gateway HTTP API + VPC Link + Cloud Map). ECS runtime only.",
+      "required": ["paths"],
+      "properties": {
+        "type": { "type": "string", "enum": ["apigateway"], "default": "apigateway" },
+        "cloudMapNamespace": { "type": "string", "default": "oab" },
+        "paths": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "pattern": "^/" }
+        },
+        "containerPort": { "type": "integer", "minimum": 1, "maximum": 65535, "default": 8080 }
       },
       "additionalProperties": false
     },

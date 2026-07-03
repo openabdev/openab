@@ -129,6 +129,7 @@ pub struct Config {
     pub discord: Option<DiscordConfig>,
     pub slack: Option<SlackConfig>,
     pub gateway: Option<GatewayConfig>,
+    pub telegram: Option<TelegramConfig>,
     pub agentcore: Option<AgentCoreConfig>,
     #[serde(default)]
     pub agent: AgentConfig,
@@ -575,6 +576,106 @@ pub struct GatewayConfig {
 
 fn default_gateway_platform() -> String {
     "telegram".into()
+}
+
+/// First-class `[telegram]` configuration section (see ADR: first-class
+/// per-platform config). Config-authoritative with `${ENV}` expansion; every
+/// field falls back to its `TELEGRAM_*` environment variable when unset, then to
+/// a built-in default. This keeps env-only deployments working unchanged while
+/// letting `config.toml` be the single source of truth.
+///
+/// Resolution per field: `[telegram].field` (with `${}` expansion) → `TELEGRAM_*`
+/// env var → default.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TelegramConfig {
+    /// Bot token. Env fallback: `TELEGRAM_BOT_TOKEN`.
+    pub bot_token: Option<String>,
+    /// Webhook secret token (L1 auth). Env fallback: `TELEGRAM_SECRET_TOKEN`.
+    pub secret_token: Option<String>,
+    /// Reject webhook requests whose source IP is outside Telegram's published
+    /// subnets (L1). Env fallback: `TELEGRAM_TRUSTED_SOURCE_ONLY` (default false).
+    pub trusted_source_only: Option<bool>,
+    /// Render rich-message drafts. Env fallback: `TELEGRAM_RICH_MESSAGES`
+    /// (default true).
+    pub rich_messages: Option<bool>,
+    /// Streaming override. When unset, streaming follows `rich_messages`.
+    /// Env fallback: `TELEGRAM_STREAMING`.
+    pub streaming: Option<bool>,
+    /// Webhook mount path. Env fallback: `TELEGRAM_WEBHOOK_PATH`
+    /// (default `/webhook/telegram`).
+    pub webhook_path: Option<String>,
+}
+
+/// Fully resolved Telegram settings (config → env → default applied).
+/// Plain types so the binary crate can hand them to the gateway crate without a
+/// type dependency.
+#[derive(Debug, Clone)]
+pub struct ResolvedTelegram {
+    pub bot_token: Option<String>,
+    pub secret_token: Option<String>,
+    pub trusted_source_only: bool,
+    pub rich_messages: bool,
+    pub streaming: Option<bool>,
+    pub webhook_path: String,
+}
+
+impl TelegramConfig {
+    /// Resolve every field: config value (if set) → `TELEGRAM_*` env → default.
+    ///
+    /// String fields filter out empty strings produced by `${}` expansion of
+    /// unset env vars, so `bot_token = "${UNSET_VAR}"` correctly falls through
+    /// to the `TELEGRAM_BOT_TOKEN` env fallback rather than holding `Some("")`.
+    pub fn resolve(&self) -> ResolvedTelegram {
+        ResolvedTelegram {
+            bot_token: self
+                .bot_token
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .or_else(|| std::env::var("TELEGRAM_BOT_TOKEN").ok()),
+            secret_token: self
+                .secret_token
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .or_else(|| std::env::var("TELEGRAM_SECRET_TOKEN").ok()),
+            trusted_source_only: self
+                .trusted_source_only
+                .unwrap_or_else(|| env_flag_true_one("TELEGRAM_TRUSTED_SOURCE_ONLY")),
+            rich_messages: self
+                .rich_messages
+                .unwrap_or_else(|| env_flag_not_false("TELEGRAM_RICH_MESSAGES")),
+            streaming: self.streaming.or_else(|| {
+                std::env::var("TELEGRAM_STREAMING")
+                    .ok()
+                    .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            }),
+            webhook_path: self
+                .webhook_path
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .or_else(|| std::env::var("TELEGRAM_WEBHOOK_PATH").ok())
+                .unwrap_or_else(|| "/webhook/telegram".into()),
+        }
+    }
+}
+
+/// `true` when env var == "1" or "true" (case-insensitive); default `false`.
+/// Matches the legacy `TELEGRAM_TRUSTED_SOURCE_ONLY` semantics.
+fn env_flag_true_one(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// `true` unless env var == "0" or "false" (case-insensitive); default `true`.
+/// Matches the legacy `TELEGRAM_RICH_MESSAGES` semantics.
+fn env_flag_not_false(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
 }
 
 /// Raw intermediate struct for serde — uses `Option` to detect explicit fields.
@@ -1405,6 +1506,144 @@ fn default_ambient_context_flushes() -> usize {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn telegram_resolve_all_scenarios() {
+        // Single serialized test for all TelegramConfig::resolve() scenarios
+        // that touch TELEGRAM_* env vars. Consolidated to avoid race conditions
+        // under Rust's default parallel test execution (std::env is process-global).
+
+        // --- Clear all TELEGRAM_* env vars ---
+        for k in [
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_SECRET_TOKEN",
+            "TELEGRAM_TRUSTED_SOURCE_ONLY",
+            "TELEGRAM_RICH_MESSAGES",
+            "TELEGRAM_STREAMING",
+            "TELEGRAM_WEBHOOK_PATH",
+        ] {
+            std::env::remove_var(k);
+        }
+
+        // --- Scenario 1: Config values win over env ---
+        std::env::set_var("TELEGRAM_BOT_TOKEN", "env-token");
+        let cfg = TelegramConfig {
+            bot_token: Some("cfg-token".into()),
+            secret_token: Some("cfg-secret".into()),
+            trusted_source_only: Some(true),
+            rich_messages: Some(false),
+            streaming: Some(true),
+            webhook_path: Some("/custom/tg".into()),
+        };
+        let r = cfg.resolve();
+        assert_eq!(r.bot_token.as_deref(), Some("cfg-token"));
+        assert_eq!(r.secret_token.as_deref(), Some("cfg-secret"));
+        assert!(r.trusted_source_only);
+        assert!(!r.rich_messages);
+        assert_eq!(r.streaming, Some(true));
+        assert_eq!(r.webhook_path, "/custom/tg");
+        std::env::remove_var("TELEGRAM_BOT_TOKEN");
+
+        // --- Scenario 2: All unset → built-in defaults ---
+        for k in [
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_SECRET_TOKEN",
+            "TELEGRAM_TRUSTED_SOURCE_ONLY",
+            "TELEGRAM_RICH_MESSAGES",
+            "TELEGRAM_STREAMING",
+            "TELEGRAM_WEBHOOK_PATH",
+        ] {
+            std::env::remove_var(k);
+        }
+
+        let r = TelegramConfig::default().resolve();
+        assert_eq!(r.bot_token, None);
+        assert_eq!(r.secret_token, None);
+        assert!(!r.trusted_source_only); // default false
+        assert!(r.rich_messages); // default true
+        assert_eq!(r.streaming, None);
+        assert_eq!(r.webhook_path, "/webhook/telegram");
+
+        // --- Scenario 3: Env set, config unset → env values used (legacy semantics) ---
+        std::env::set_var("TELEGRAM_BOT_TOKEN", "env-token");
+        std::env::set_var("TELEGRAM_SECRET_TOKEN", "env-secret");
+        std::env::set_var("TELEGRAM_TRUSTED_SOURCE_ONLY", "true");
+        std::env::set_var("TELEGRAM_RICH_MESSAGES", "false");
+        std::env::set_var("TELEGRAM_STREAMING", "1");
+        std::env::set_var("TELEGRAM_WEBHOOK_PATH", "/env/tg");
+
+        let r = TelegramConfig::default().resolve();
+        assert_eq!(r.bot_token.as_deref(), Some("env-token"));
+        assert_eq!(r.secret_token.as_deref(), Some("env-secret"));
+        assert!(r.trusted_source_only);
+        assert!(!r.rich_messages); // "false" → false
+        assert_eq!(r.streaming, Some(true)); // "1" → true
+        assert_eq!(r.webhook_path, "/env/tg");
+
+        // --- Scenario 4: RICH_MESSAGES legacy semantics ---
+        std::env::set_var("TELEGRAM_RICH_MESSAGES", "0");
+        assert!(!TelegramConfig::default().resolve().rich_messages);
+        std::env::set_var("TELEGRAM_RICH_MESSAGES", "yes");
+        assert!(TelegramConfig::default().resolve().rich_messages);
+
+        // --- Scenario 5: STREAMING "false" → Some(false) ---
+        std::env::set_var("TELEGRAM_STREAMING", "false");
+        assert_eq!(TelegramConfig::default().resolve().streaming, Some(false));
+
+        // --- Scenario 6: Empty-string expansion edge case ---
+        // When `${}` expands to "" (env var unset at parse time), resolve()
+        // must treat it as absent and fall through to env fallback.
+        std::env::set_var("TELEGRAM_BOT_TOKEN", "real-token");
+        std::env::set_var("TELEGRAM_SECRET_TOKEN", "real-secret");
+        std::env::remove_var("TELEGRAM_WEBHOOK_PATH");
+
+        let cfg = TelegramConfig {
+            bot_token: Some("".into()),       // simulates ${UNSET_VAR} → ""
+            secret_token: Some("".into()),
+            webhook_path: Some("".into()),
+            ..Default::default()
+        };
+        let r = cfg.resolve();
+        assert_eq!(r.bot_token.as_deref(), Some("real-token"));
+        assert_eq!(r.secret_token.as_deref(), Some("real-secret"));
+        assert_eq!(r.webhook_path, "/webhook/telegram"); // env not set → default
+
+        // --- Cleanup ---
+        for k in [
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_SECRET_TOKEN",
+            "TELEGRAM_TRUSTED_SOURCE_ONLY",
+            "TELEGRAM_RICH_MESSAGES",
+            "TELEGRAM_STREAMING",
+            "TELEGRAM_WEBHOOK_PATH",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
+    fn telegram_section_parses_from_toml() {
+        let toml_str = r#"
+[discord]
+bot_token = "x"
+
+[telegram]
+bot_token = "tg-tok"
+secret_token = "tg-sec"
+trusted_source_only = true
+rich_messages = false
+streaming = true
+webhook_path = "/hook/tg"
+"#;
+        let cfg = parse_config_str(toml_str, "test").unwrap();
+        let tg = cfg.telegram.expect("telegram section");
+        assert_eq!(tg.bot_token.as_deref(), Some("tg-tok"));
+        assert_eq!(tg.secret_token.as_deref(), Some("tg-sec"));
+        assert_eq!(tg.trusted_source_only, Some(true));
+        assert_eq!(tg.rich_messages, Some(false));
+        assert_eq!(tg.streaming, Some(true));
+        assert_eq!(tg.webhook_path.as_deref(), Some("/hook/tg"));
+    }
 
     #[test]
     fn hooks_any_configured_false_when_empty() {

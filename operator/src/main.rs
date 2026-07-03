@@ -5,6 +5,7 @@ mod config;
 mod create;
 mod get;
 mod delete;
+mod ingress;
 
 use clap::{Parser, Subcommand};
 

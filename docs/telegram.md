@@ -64,7 +64,58 @@ tables = "off"
 
 Streaming is enabled by default when Rich Messages are active — replies are streamed live via `sendRichMessageDraft` with rich formatting, then finalized with `sendRichMessage`. If `TELEGRAM_RICH_MESSAGES=false`, streaming is also disabled by default. To override, set `TELEGRAM_STREAMING=true` or `TELEGRAM_STREAMING=false` explicitly.
 
-No `[gateway]` section needed — the unified adapter activates automatically when `TELEGRAM_BOT_TOKEN` is set.
+No `[gateway]` section needed — the unified adapter activates automatically when `TELEGRAM_BOT_TOKEN` is set, or when the `[telegram]` section is configured in `config.toml`.
+
+### First-class `[telegram]` config (optional)
+
+Instead of (or in addition to) the `TELEGRAM_*` env vars, you can configure Telegram as a first-class section in `config.toml` — symmetric with `[discord]` / `[slack]`:
+
+**Minimal required** — only `bot_token` is needed to activate the adapter:
+
+```toml
+[telegram]
+bot_token = "${TELEGRAM_BOT_TOKEN}"    # or use aws-sm:// secret ref (see below)
+```
+
+**Full example** with all available fields:
+
+```toml
+[telegram]
+bot_token           = "${TELEGRAM_BOT_TOKEN}"   # ${} env expansion supported
+secret_token        = "${TELEGRAM_SECRET_TOKEN}" # webhook signature validation
+trusted_source_only = true     # reject requests outside Telegram's IP subnets
+rich_messages       = true     # sendRichMessage rendering (default true)
+streaming           = true     # override; defaults to follow rich_messages
+webhook_path        = "/webhook/telegram"
+```
+
+**Precedence (per field):** `[telegram]` value (with `${}` expansion) → `TELEGRAM_*` env var → built-in default. This is config-authoritative and matches `[discord]`/`[slack]`. Any field you omit falls back to its env var, so existing env-only deployments keep working unchanged.
+
+| `[telegram]` field | Env fallback | Default |
+|--------------------|--------------|---------|
+| `bot_token` | `TELEGRAM_BOT_TOKEN` | — |
+| `secret_token` | `TELEGRAM_SECRET_TOKEN` | — |
+| `trusted_source_only` | `TELEGRAM_TRUSTED_SOURCE_ONLY` | `false` |
+| `rich_messages` | `TELEGRAM_RICH_MESSAGES` | `true` |
+| `streaming` | `TELEGRAM_STREAMING` | follows `rich_messages` |
+| `webhook_path` | `TELEGRAM_WEBHOOK_PATH` | `/webhook/telegram` |
+
+> **Tip**: You can run a pure config-only deployment — no `TELEGRAM_*` env vars needed. Just set `bot_token = "your-token"` directly in `[telegram]` and the adapter will activate from config alone.
+
+> **Security hardening**: For production deployments, we highly recommend using `aws-sm://` secret references instead of hardcoding tokens in `config.toml`. This keeps secrets out of version control and enables rotation and audit:
+>
+> ```toml
+> [secrets.refs]
+> tg_token  = "aws-sm://openab/prod#telegram_bot_token"
+> tg_secret = "aws-sm://openab/prod#telegram_secret_token"
+>
+> [telegram]
+> bot_token    = "${secrets.tg_token}"
+> secret_token = "${secrets.tg_secret}"
+> ```
+>
+> See [secrets-management.md](secrets-management.md) for full documentation.
+
 
 ### Set the Webhook
 

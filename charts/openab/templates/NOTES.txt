@@ -71,3 +71,4 @@ Agents deployed:
 ⚠️  SECURITY: The agent subprocess only receives HOME, PATH, and explicitly configured [agent].env vars.
     Any env var passed via [agent].env is accessible to the agent and could be exfiltrated via prompt injection.
     All supported backends use OAuth/file-based auth — avoid passing API keys via env vars when possible.
+
