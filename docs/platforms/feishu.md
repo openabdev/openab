@@ -1,20 +1,12 @@
----
-platform: feishu
-maintainer: "@TBD"
-last_verified: 2026-07-04
-schema_versions:
-  platform-capability: v1
-  openab-feature-support: v1
-  platform-quirks: v1
----
-
 # Feishu / Lark — platform notes
+
+**Schema version:** 2026-07-04
 
 Engineering-facing capability & quirks reference for the Feishu / Lark adapter. For operator setup see `docs/feishu.md`. Follows the schemas in [`README.md`](./README.md).
 
 The adapter lives in the **gateway** crate (`crates/openab-gateway/src/adapters/feishu.rs`), not in a core `ChatAdapter` impl. Core talks to a generic `GatewayAdapter` (`crates/openab-core/src/gateway.rs`) over a WebSocket reply/response protocol; the gateway process runs the actual Feishu API calls. `domain=feishu` → `open.feishu.cn`, `domain=lark` → `open.larksuite.com` (`api_base()` `feishu.rs:290`).
 
-## 1. Platform capability (`platform-capability` v1)
+## 1. Platform capability (`platform-capability`)
 
 | Field | Value | Source |
 |---|---|---|
@@ -37,7 +29,7 @@ The adapter lives in the **gateway** crate (`crates/openab-gateway/src/adapters/
 | bot_to_bot | **Effectively no.** Feishu does **not** push another bot's messages to a bot's WebSocket, and marks other bots' messages as `sender_type="user"`, so a peer bot is indistinguishable without an explicit id allowlist. *(Platform docs are silent on bot→bot event delivery — behavior verified only via the adapter, not an official statement.)* | Adapter comment `feishu.rs:1158`, `parse_message_event` `feishu.rs:412` · [Message FAQ](https://open.feishu.cn/document/server-docs/im-v1/faq) |
 | typing_indicator | **Not exposed** to bots — no public "typing"/"inputting" API is documented (Message FAQ is silent on it). OpenAB signals progress with emoji reactions / a streaming card instead. *(Absence confirmed by omission; cannot be stated as an affirmative platform guarantee.)* | [Message FAQ](https://open.feishu.cn/document/server-docs/im-v1/faq) |
 
-## 2. OpenAB feature support (`openab-feature-support` v1)
+## 2. OpenAB feature support (`openab-feature-support`)
 
 | Feature | Status | Note | Ref |
 |---|---|---|---|
@@ -58,7 +50,7 @@ The adapter lives in the **gateway** crate (`crates/openab-gateway/src/adapters/
 | multibot | partial | `FEISHU_ALLOW_BOTS` (off/mentions/all) + `FEISHU_TRUSTED_BOT_IDS` + per-chat `max_bot_turns` (default 20) loop-guard. **Caveat:** Feishu marks other bots as `sender_type="user"` and doesn't push bot messages over WS, so without `trusted_bot_ids` peer bots can't be identified; `multibot_mentions` detection is done via **@mention of a known bot id**, not sender type. | `parse_message_event` `feishu.rs:417`, bot-turn guard `feishu.rs:1142`, `detect_and_mark_multibot` `feishu.rs:2408` |
 | group_routing | implemented | Routing keyed by `chat_id`; `channel_type` = `direct` (p2p) vs `group`; `thread_id` from `root_id` / `parent_id`. Dedupe by `event_id` + `message_id`; self-echo dedupe on sent `message_id` (Feishu pushes the bot's own messages back). | `parse_message_event` `feishu.rs:557`, dedupe `feishu.rs:1116` / `:1138` |
 
-## 3. Platform quirks (`platform-quirks` v1)
+## 3. Platform quirks (`platform-quirks`)
 
 ### 20-edit-per-message cap → streaming card promotion
 
