@@ -1,20 +1,12 @@
----
-platform: teams
-maintainer: "@TBD"
-last_verified: 2026-07-04
-schema_versions:
-  platform-capability: v1
-  openab-feature-support: v1
-  platform-quirks: v1
----
-
 # MS Teams — platform notes
+
+**Schema version:** 2026-07-04
 
 Engineering-facing capability & quirks reference for the MS Teams adapter. For operator setup see `docs/teams.md`. Follows the schemas in [`README.md`](./README.md).
 
 Teams is reached via the **Bot Framework / Azure Bot Connector**, not a direct Teams API. The OpenAB Teams adapter lives in the gateway (`crates/openab-gateway/src/adapters/teams.rs`) and speaks the Bot Framework REST activity protocol; core treats it as a generic gateway platform through `GatewayAdapter` (`crates/openab-core/src/gateway.rs`). The gateway's per-platform reply dispatch is wired in `crates/openab-gateway/src/lib.rs` (`teams::handle_reply` at lib.rs:616).
 
-## 1. Platform capability (`platform-capability` v1)
+## 1. Platform capability (`platform-capability`)
 
 | Field | Value | Source |
 |---|---|---|
@@ -37,7 +29,7 @@ Teams is reached via the **Bot Framework / Azure Bot Connector**, not a direct T
 | bot_to_bot | No — Teams does not deliver other bots' messages to a bot; bots respond to user activities only (@mention-gated in groups/channels). | [conversations](https://learn.microsoft.com/en-us/microsoftteams/platform/bots/build-conversational-capability) |
 | typing_indicator | Supported — bot can send a `typing` activity via the connector. Not currently emitted by the OpenAB adapter. | [connector API (typing activity)](https://learn.microsoft.com/en-us/azure/bot-service/rest-api/bot-framework-rest-connector-api-reference?view=azure-bot-service-4.0) |
 
-## 2. OpenAB feature support (`openab-feature-support` v1)
+## 2. OpenAB feature support (`openab-feature-support`)
 
 Teams uses the shared `GatewayAdapter` (a `ChatAdapter` impl) in core (`crates/openab-core/src/gateway.rs`); the actual platform I/O is the gateway-side `teams::handle_reply` → `send_activity` (`crates/openab-gateway/src/adapters/teams.rs`), dispatched from `crates/openab-gateway/src/lib.rs:616`. Several core-issued commands (`create_topic`, `edit_message`, `delete_message`, reactions) are **not dispatched** by the Teams gateway `handle_reply` — only reactions are explicitly short-circuited; the rest fall through to `send_activity` and would be mis-sent as plain messages.
 
@@ -60,7 +52,7 @@ Teams uses the shared `GatewayAdapter` (a `ChatAdapter` impl) in core (`crates/o
 | multibot | partial | Core supports multi-bot suppression of streaming (`use_streaming(other_bot_present)`); moot on Teams because streaming edits don't reach it and Teams doesn't deliver other bots' messages anyway. | gateway.rs:701; adapter.rs:415-421 |
 | group_routing | implemented | Session keyed by `conversation.id` (+ `conversation_type`); `serviceUrl` cached per conversation for reply routing, refreshed (timestamp) on each reply, with a periodic TTL cleanup task in the gateway. | teams.rs:493-544, 576-589; lib.rs:481-486 |
 
-## 3. Platform quirks (`platform-quirks` v1)
+## 3. Platform quirks (`platform-quirks`)
 
 ### serviceUrl is per-conversation and must be cached/refreshed
 Teams replies are POSTed to a `serviceUrl` that arrives on each inbound activity and can change over time. The adapter caches `conversation.id → (serviceUrl, timestamp)` on ingress (teams.rs:541-544) and refreshes the timestamp on every reply (teams.rs:581) to avoid TTL expiry mid-conversation; a background task in `lib.rs:481-486` evicts stale entries (4 h TTL). If an inbound activity lacks `serviceUrl`, the event is dropped (can't route replies; teams.rs:517-520).
