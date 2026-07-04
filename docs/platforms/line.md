@@ -1,18 +1,10 @@
----
-platform: line
-maintainer: "@TBD"
-last_verified: 2026-07-04
-schema_versions:
-  platform-capability: v1
-  openab-feature-support: v1
-  platform-quirks: v1
----
-
 # LINE — platform notes
+
+**Schema version:** 2026-07-04
 
 Engineering-facing capability & quirks reference for the LINE adapter. For operator setup see `docs/line.md`. Follows the schemas in [`README.md`](./README.md).
 
-## 1. Platform capability (`platform-capability` v1)
+## 1. Platform capability (`platform-capability`)
 
 | Field | Value | Source |
 |---|---|---|
@@ -35,7 +27,7 @@ Engineering-facing capability & quirks reference for the LINE adapter. For opera
 | bot_to_bot | No — LINE Official Accounts (bots) do not receive messages from other bots; webhook message events are for user-originated content | [Messaging API overview](https://developers.line.biz/en/docs/messaging-api/overview/) |
 | typing_indicator | Yes — "Display a loading animation" endpoint, **1:1 chats only** ("You can't specify group chats or multi-person chats"), rate-limited to 100 req/s. It is a loading animation while the user is viewing the chat, not a per-keystroke typing indicator | [Display a loading indicator](https://developers.line.biz/en/docs/messaging-api/use-loading-indicator/) |
 
-## 2. OpenAB feature support (`openab-feature-support` v1)
+## 2. OpenAB feature support (`openab-feature-support`)
 
 | Feature | Status | Note | Ref |
 |---|---|---|---|
@@ -56,7 +48,7 @@ Engineering-facing capability & quirks reference for the LINE adapter. For opera
 | multibot | n/a | LINE does not deliver other bots' messages, and inbound `is_bot` is hard-coded `false`, so multi-bot coordination cannot trigger on LINE | `crates/openab-gateway/src/adapters/line.rs:391` [PR #1291] |
 | group_routing | implemented | Channel keyed by `groupId` (group) / `roomId` (room) / `userId` (1:1); a group/room missing its ID is skipped. Sender falls back to `"unknown"` when `userId` is absent | `crates/openab-gateway/src/adapters/line.rs:325-354` [PR #1291] |
 
-## 3. Platform quirks (`platform-quirks` v1)
+## 3. Platform quirks (`platform-quirks`)
 
 ### Reply/Push hybrid dispatch (the core LINE model)
 
