@@ -1,18 +1,10 @@
----
-platform: googlechat
-maintainer: "@TBD"
-last_verified: 2026-07-04
-schema_versions:
-  platform-capability: v1
-  openab-feature-support: v1
-  platform-quirks: v1
----
-
 # Google Chat — platform notes
+
+**Schema version:** 2026-07-04
 
 Engineering-facing capability & quirks reference for the Google Chat adapter. For operator setup see `docs/googlechat.md`. Follows the schemas in [`README.md`](./README.md).
 
-## 1. Platform capability (`platform-capability` v1)
+## 1. Platform capability (`platform-capability`)
 
 | Field | Value | Source |
 |---|---|---|
@@ -35,7 +27,7 @@ Engineering-facing capability & quirks reference for the Google Chat adapter. Fo
 | bot_to_bot | Not delivered — the `MESSAGE` interaction event is defined as "A user messages a Chat app"; other apps'/bots' messages are not surfaced to a Chat app. (No doc positively states delivery; treat as unsupported. Adapter also drops `sender.type == "BOT"` inbound.) | [Receive & respond to interactions](https://developers.google.com/workspace/chat/receive-respond-interactions) |
 | typing_indicator | Not supported — Google Chat exposes no typing/composing API for apps; none of the documented app-facing interaction events or send surfaces include a typing signal. (Verified negative against the interactions surface, which enumerates the full set of app capabilities.) | [Receive & respond to interactions](https://developers.google.com/workspace/chat/receive-respond-interactions) |
 
-## 2. OpenAB feature support (`openab-feature-support` v1)
+## 2. OpenAB feature support (`openab-feature-support`)
 
 | Feature | Status | Note | Ref |
 |---|---|---|---|
@@ -56,7 +48,7 @@ Engineering-facing capability & quirks reference for the Google Chat adapter. Fo
 | multibot | partial | Bot senders are dropped inbound (`sender.user_type == "BOT"` → skip, `googlechat.rs:532`); core's multibot/other-bot streaming suppression can't observe other bots since Chat doesn't deliver their messages. `use_streaming` ignores `other_bot_present` for gateway adapters. | adapter `crates/openab-gateway/src/adapters/googlechat.rs:532`; core `crates/openab-core/src/gateway.rs:701` |
 | group_routing | implemented | Session/route keyed on `space.name` + optional `thread_id`; ChannelInfo carries `id`=space, `channel_type`=space type, `thread_id`. | `crates/openab-gateway/src/adapters/googlechat.rs:697` |
 
-## 3. Platform quirks (`platform-quirks` v1)
+## 3. Platform quirks (`platform-quirks`)
 
 ### Auth asymmetry: two independent credential paths
 Inbound webhooks are authenticated by verifying Google's ID-token (`email==chat@system.gserviceaccount.com`, RS256 via JWKS, `iss=accounts.google.com`, audience-checked). Outbound API calls use a *separate* service-account → OAuth2 JWT-bearer exchange (`scope=https://www.googleapis.com/auth/chat.bot`), cached with a 300 s refresh margin. Missing outbound creds degrade to a logged dry-run that still acks failure to core. (`googlechat.rs:150,218,773,831,349`)
