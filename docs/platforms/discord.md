@@ -1,18 +1,10 @@
----
-platform: discord
-maintainer: "@TBD"
-last_verified: 2026-07-04
-schema_versions:
-  platform-capability: v1
-  openab-feature-support: v1
-  platform-quirks: v1
----
-
 # Discord — platform notes
+
+**Schema version:** 2026-07-04
 
 Engineering-facing capability & quirks reference for the Discord adapter. For operator setup see `docs/discord.md`. Follows the schemas in [`README.md`](./README.md).
 
-## 1. Platform capability (`platform-capability` v1)
+## 1. Platform capability (`platform-capability`)
 
 | Field | Value | Source |
 |---|---|---|
@@ -35,7 +27,7 @@ Engineering-facing capability & quirks reference for the Discord adapter. For op
 | bot_to_bot | Yes — the gateway delivers other bots' messages; the `author.bot` flag distinguishes them (the bot's own messages arrive too and must be self-filtered). | [Gateway](https://docs.discord.com/developers/topics/gateway) |
 | typing_indicator | Supported — `POST /channels/{id}/typing` (Trigger Typing); inbound `TYPING_START` event. | [Gateway](https://docs.discord.com/developers/topics/gateway) |
 
-## 2. OpenAB feature support (`openab-feature-support` v1)
+## 2. OpenAB feature support (`openab-feature-support`)
 
 | Feature | Status | Note | Ref |
 |---|---|---|---|
@@ -56,7 +48,7 @@ Engineering-facing capability & quirks reference for the Discord adapter. For op
 | multibot | implemented | Early other-bot detection cached (disk-persisted, irreversible); disables streaming, gates via MultibotMentions, enforces bot-turn limits; `trusted_bot_ids` + @mention admits handoff regardless of `allow_bot_messages`. | `discord.rs:331`, `discord.rs:593`, `discord.rs:2947` |
 | group_routing | implemented | Per-thread dispatch keyed by `dispatcher.key("discord", channel_id, sender_id)`; thread↔parent allowlist via `detect_thread`; ambient mode buffers passive-channel messages. | `discord.rs:1066`, `discord.rs:2901`, `discord.rs:530` |
 
-## 3. Platform quirks (`platform-quirks` v1)
+## 3. Platform quirks (`platform-quirks`)
 
 ### Threads are channels
 A Discord thread has its own `channel_id`; the adapter resolves outbound targets via `thread_id.unwrap_or(channel_id)` (`resolve_channel`, `discord.rs:55`). Thread identity is `thread_metadata.is_some()` — `parent_id` alone is NOT reliable (category children also carry `parent_id`), so `detect_thread` returns early unless `has_thread_metadata`, and only uses `parent_id` for the allowlist check (`discord.rs:2901`).
