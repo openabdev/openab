@@ -1,18 +1,10 @@
----
-platform: slack
-maintainer: "@TBD"
-last_verified: 2026-07-04
-schema_versions:
-  platform-capability: v1
-  openab-feature-support: v1
-  platform-quirks: v1
----
-
 # Slack — platform notes
+
+**Schema version:** 2026-07-04
 
 Engineering-facing capability & quirks reference for the Slack adapter. For operator setup see `docs/slack.md`. Follows the schemas in [`README.md`](./README.md).
 
-## 1. Platform capability (`platform-capability` v1)
+## 1. Platform capability (`platform-capability`)
 
 | Field | Value | Source |
 |---|---|---|
@@ -35,7 +27,7 @@ Engineering-facing capability & quirks reference for the Slack adapter. For oper
 | bot_to_bot | Yes — other bots' messages are delivered as `message` events with `subtype: "bot_message"` and a `bot_id`/`bot_profile`; the receiving app must opt to process them. | [bot_message event](https://docs.slack.dev/reference/events/message/bot_message/) |
 | typing_indicator | Not used as a typing dot. Assistant mode instead surfaces an ephemeral status line via `assistant.threads.setStatus` ("Thinking…"). | [assistant.threads.setStatus](https://docs.slack.dev/reference/methods/assistant.threads.setStatus) |
 
-## 2. OpenAB feature support (`openab-feature-support` v1)
+## 2. OpenAB feature support (`openab-feature-support`)
 
 | Feature | Status | Note | Ref |
 |---|---|---|---|
@@ -56,7 +48,7 @@ Engineering-facing capability & quirks reference for the Slack adapter. For oper
 | multibot | implemented | Eager other-bot detection on inbound bot messages (`note_other_bot_in_thread`, slack.rs:134, invoked at slack.rs:901), persisted to a disk cache (irreversible). Disables streaming (`use_streaming`/`uses_native_streaming` gate on `other_bot_present`) and, with `MultibotMentions`, requires @mention. Consecutive-bot-turn cap (`MAX_CONSECUTIVE_BOT_TURNS` = 1000, enforced at slack.rs:980) + `BotTurnTracker` soft/hard limits guard loops. | slack.rs:134, slack.rs:901, slack.rs:980 |
 | group_routing | implemented | Routed through `Dispatcher`; key is grouping-dependent — `slack:<thread_id>` in `Thread` mode or `slack:<thread_id>:<sender_id>` in `Lane` mode (`Dispatcher::key`, dispatch.rs:295), with `thread_id` falling back to `channel_id` outside a thread (slack.rs:1524). Sender context is serialized with the Slack-native `thread_ts` key (slack.rs:1491) so agents calling the API directly see the right field. | dispatch.rs:295, slack.rs:1524, slack.rs:1491 |
 
-## 3. Platform quirks (`platform-quirks` v1)
+## 3. Platform quirks (`platform-quirks`)
 
 ### Socket Mode keepalive (deaf-socket guard)
 Slack's inbound WebSocket can go half-open (NAT idle-timeout silently drops inbound frames with no Close/FIN), leaving `read.next()` blocked forever so the reconnect loop never fires — the bot appears connected but goes deaf. The adapter pings every 30s (`PING_INTERVAL_SECS`) and force-reconnects if no inbound frame — including Slack's own pings — arrives within 75s (`IDLE_TIMEOUT_SECS`). Backoff doubles to a 30s cap, mirroring the gateway: 1,2,4,8,16,30,30… (slack.rs:699, slack.rs:711).
