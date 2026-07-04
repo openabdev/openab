@@ -57,6 +57,9 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 #                                       # omitted = auto-detect from list (non-empty → false, empty → true)
 # allowed_users = ["U5678"]             # only checked when allow_all_users = false
 # streaming = true                      # enable streaming (typewriter) mode
+#                                       # note: LINE has no message-edit API, so it is always
+#                                       #       send-once (streaming is forced off to avoid
+#                                       #       posting duplicate, growing messages)
 # streaming_placeholder = false         # set false for draft-based platforms (e.g. Telegram Rich Messages)
 
 # --- Telegram (first-class section; alternative to TELEGRAM_* env vars) ---

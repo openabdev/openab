@@ -658,6 +658,22 @@ pub async fn dispatch_line_reply(
         return false;
     }
 
+    // LINE's Messaging API cannot edit or delete a message once it is sent.
+    // In streaming mode the core posts a placeholder then repeatedly calls
+    // edit_message with the growing text; on an editable platform this updates in
+    // place, but on LINE every edit_message would be delivered as a *new* message
+    // — the reply gets reposted several times, each copy longer than the last.
+    // Because the unified adapter uses a "draft" placeholder (no real message), the
+    // final content is delivered separately via send_message, so dropping these
+    // cosmetic edit/delete commands removes the duplicates without losing content.
+    if matches!(
+        reply.command.as_deref(),
+        Some("edit_message") | Some("delete_message")
+    ) {
+        info!(command = ?reply.command.as_deref(), "line: ignoring edit/delete command (LINE cannot edit messages)");
+        return false;
+    }
+
     // Extract token from cache (drop lock before HTTP call)
     let cached_token = {
         let mut cache = reply_cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -1265,5 +1281,53 @@ mod tests {
         )
         .await;
         assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn edit_message_command_is_ignored_not_forwarded() {
+        // LINE cannot edit messages. A streaming `edit_message` reply must be
+        // dropped, never forwarded as a new Reply/Push message — otherwise each
+        // edit posts the growing text as a separate message (duplicate replies).
+        let server = MockServer::start().await;
+        // If the guard fails and the command falls through, the empty reply-token
+        // cache forces the Push API. This expectation forbids that call.
+        let _push = Mock::given(method("POST"))
+            .and(path("/v2/bot/message/push"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount_as_scoped(&server)
+            .await;
+
+        let cache: crate::ReplyTokenCache =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "evt1".into(),
+            platform: "line".into(),
+            channel: ReplyChannel {
+                id: "U123".into(),
+                thread_id: None,
+            },
+            content: Content {
+                content_type: "text".into(),
+                text: "partial streamed text".into(),
+                attachments: vec![],
+            },
+            command: Some("edit_message".into()),
+            request_id: None,
+            quote_message_id: None,
+        };
+
+        let used_reply = dispatch_line_reply(
+            &reqwest::Client::new(),
+            "line_token",
+            &cache,
+            &reply,
+            &server.uri(),
+        )
+        .await;
+
+        assert!(!used_reply, "edit_message must not use the Reply API");
+        // `_push` expect(0) is verified on drop: no push request was sent.
     }
 }

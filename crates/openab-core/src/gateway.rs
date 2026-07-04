@@ -40,6 +40,31 @@ fn platform_acks_writes(platform: &str) -> bool {
     EDIT_RESPONSE_PLATFORMS.contains(&platform)
 }
 
+/// Gateway platforms whose messaging API cannot edit a message after it is sent.
+///
+/// Cosmetic (typewriter) streaming works by posting a placeholder and then
+/// repeatedly editing it in place with the growing text. On a platform with no
+/// edit endpoint, each of those "edits" is delivered as a brand-new message
+/// instead — so the user sees the same reply posted several times, each copy
+/// longer than the last. Streaming is therefore force-disabled (send-once) for
+/// these platforms regardless of the configured `streaming` flag.
+///
+/// LINE's Messaging API only exposes reply/push (no edit), so it lives here.
+/// (The in-process unified adapter additionally hard-drops stray edit_message
+/// commands in the LINE adapter itself — see `dispatch_line_reply`.)
+///
+/// NOTE: like `EDIT_RESPONSE_PLATFORMS`, this is platform-identity standing in
+/// for a *capability*. The right long-term model is a capability handshake at
+/// gateway-connect time ("can this adapter edit messages?"); until that exists,
+/// any new gateway platform that lacks a message-edit API MUST be added here.
+const NON_EDITABLE_PLATFORMS: &[&str] = &["line"];
+
+/// Whether cosmetic streaming (placeholder + in-place edits) is possible on
+/// `platform`. See `NON_EDITABLE_PLATFORMS`.
+fn platform_supports_streaming(platform: &str) -> bool {
+    !NON_EDITABLE_PLATFORMS.contains(&platform)
+}
+
 /// Shared filter parameters for gateway event gating.
 /// Used by both `run_gateway_adapter` (WebSocket) and `process_gateway_event` (unified).
 struct EventFilterParams<'a> {
@@ -743,7 +768,19 @@ pub async fn run_gateway_adapter(
     let allowed_users: HashSet<String> = params.allowed_users.into_iter().collect();
     let allow_bot_messages = params.allow_bot_messages;
     let trusted_bot_ids: HashSet<String> = params.trusted_bot_ids.into_iter().collect();
-    let streaming = params.streaming;
+    // Cosmetic streaming edits a placeholder in place. On platforms without an
+    // edit API (e.g. LINE) every edit lands as a new message — growing
+    // duplicates — so force send-once mode there regardless of config.
+    let streaming = if params.streaming && !platform_supports_streaming(platform) {
+        warn!(
+            platform,
+            "streaming is enabled but this platform cannot edit messages; \
+             forcing send-once mode to avoid duplicate messages"
+        );
+        false
+    } else {
+        params.streaming
+    };
     let streaming_placeholder = params.streaming_placeholder;
     let stt_config = params.stt;
 
@@ -1472,6 +1509,30 @@ fn format_size(n: u64) -> String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn line_cannot_stream_and_is_forced_send_once() {
+        // LINE has no message-edit API, so cosmetic streaming is impossible.
+        assert!(!platform_supports_streaming("line"));
+    }
+
+    #[test]
+    fn editable_platforms_still_allow_streaming() {
+        for platform in [
+            "telegram",
+            "slack",
+            "discord",
+            "feishu",
+            "teams",
+            "googlechat",
+            "wecom",
+        ] {
+            assert!(
+                platform_supports_streaming(platform),
+                "{platform} should still support streaming",
+            );
+        }
+    }
 
     #[test]
     fn echo_allowed_throttles_repeat_within_window() {
