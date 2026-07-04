@@ -1,20 +1,12 @@
----
-platform: wecom
-maintainer: "@TBD"
-last_verified: 2026-07-04
-schema_versions:
-  platform-capability: v1
-  openab-feature-support: v1
-  platform-quirks: v1
----
-
 # WeCom (企業微信) — platform notes
+
+**Schema version:** 2026-07-04
 
 Engineering-facing capability & quirks reference for the WeCom adapter. For operator setup see `docs/wecom.md`. Follows the schemas in [`README.md`](./README.md).
 
 WeCom is integrated via the **self-built app (自建应用 / agentid) callback model**, not the newer "智能机器人 / 群机器人" model. The adapter (`crates/openab-gateway/src/adapters/wecom.rs`) receives a user's 1:1 message via an AES-encrypted callback and replies proactively via `/cgi-bin/message/send`.
 
-## 1. Platform capability (`platform-capability` v1)
+## 1. Platform capability (`platform-capability`)
 
 | Field | Value | Source |
 |---|---|---|
@@ -37,7 +29,7 @@ WeCom is integrated via the **self-built app (自建应用 / agentid) callback m
 | `bot_to_bot` | n/a — self-built app callbacks originate from human members (`FromUserName` UserID); the platform does not deliver other apps'/bots' messages to a self-built app | [receive msg doc](https://developer.work.weixin.qq.com/document/path/90239) |
 | `typing_indicator` | Not supported by the API | [message/send](https://developer.work.weixin.qq.com/document/path/90236) |
 
-## 2. OpenAB feature support (`openab-feature-support` v1)
+## 2. OpenAB feature support (`openab-feature-support`)
 
 | Feature | Status | Note | Ref |
 |---|---|---|---|
@@ -58,7 +50,7 @@ WeCom is integrated via the **self-built app (自建应用 / agentid) callback m
 | `multibot` | n/a | Self-built app 1:1 callbacks come only from human members (`is_bot: false`); no other-bot delivery, no multi-bot channel | `wecom.rs:1067-1072` |
 | `group_routing` | partial | Sessions keyed by `wecom:{corp_id}:{from_user}` (per-user 1:1); no group routing since there are no group callbacks in this model | `wecom.rs:1059` |
 
-## 3. Platform quirks (`platform-quirks` v1)
+## 3. Platform quirks (`platform-quirks`)
 
 ### Send / push model (no reply window)
 
