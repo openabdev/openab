@@ -633,6 +633,39 @@ async fn main() -> anyhow::Result<()> {
                 app = app.route(&path, axum::routing::post(openab_gateway::adapters::feishu::webhook));
             }
 
+            // Feishu bot identity + WebSocket long-connection (unified mode).
+            // Mirrors run_gateway() in openab-gateway/src/lib.rs: identity is
+            // required for @mention gating, and the default connection mode is
+            // websocket — without this spawn the adapter only serves the webhook
+            // route above and never receives events in websocket mode.
+            #[cfg(feature = "feishu")]
+            if let Some(ref f) = gw_state.feishu {
+                use openab_gateway::adapters::feishu;
+                f.resolve_bot_identity().await;
+                if f.config.streaming_mode != feishu::StreamingMode::Post {
+                    let idle_ms = f.config.card_idle_finalize_ms;
+                    tokio::spawn(feishu::run_idle_reaper(
+                        f.stream_sessions.clone(),
+                        f.token_cache.clone(),
+                        f.client.clone(),
+                        f.config.api_base(),
+                        idle_ms,
+                    ));
+                    info!(idle_ms, "unified: feishu card-streaming idle reaper started");
+                }
+                if f.config.connection_mode == feishu::ConnectionMode::Websocket {
+                    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+                    match feishu::start_websocket(f, event_tx.clone(), shutdown_rx).await {
+                        Ok(_handle) => info!("unified: feishu websocket task spawned"),
+                        Err(e) => error!(err = %e, "unified: feishu websocket startup failed"),
+                    }
+                    // Keep the shutdown sender alive for the process lifetime —
+                    // dropping it makes shutdown_rx.changed() fire and ends the
+                    // reconnect loop in start_websocket().
+                    std::mem::forget(shutdown_tx);
+                }
+            }
+
             #[cfg(feature = "wecom")]
             if let Some(ref w) = gw_state.wecom {
                 info!(path = %w.config.webhook_path, "unified: wecom adapter enabled");
