@@ -1,18 +1,10 @@
----
-platform: telegram
-maintainer: "@TBD"
-last_verified: 2026-07-04
-schema_versions:
-  platform-capability: v1
-  openab-feature-support: v1
-  platform-quirks: v1
----
-
 # Telegram — platform notes
+
+**Schema version:** 2026-07-04
 
 Engineering-facing capability & quirks reference for the Telegram adapter. For operator setup see `docs/telegram.md`. Follows the schemas in [`README.md`](./README.md).
 
-## 1. Platform capability (`platform-capability` v1)
+## 1. Platform capability (`platform-capability`)
 
 | Field | Value | Source |
 |---|---|---|
@@ -35,7 +27,7 @@ Engineering-facing capability & quirks reference for the Telegram adapter. For o
 | bot_to_bot | per FAQ, "Bots will not be able to see messages from other bots regardless of mode." `is_bot` is present on `from` for the rare cases forwarded/quoted. | [Bot FAQ](https://core.telegram.org/bots/faq) |
 | typing_indicator | yes: `sendChatAction` (e.g. `typing`), auto-clears after ~5s or on next message. Not used by the OpenAB adapter. | [sendChatAction](https://core.telegram.org/bots/api#sendchataction) |
 
-## 2. OpenAB feature support (`openab-feature-support` v1)
+## 2. OpenAB feature support (`openab-feature-support`)
 
 Telegram runs through the **gateway** path (webhook → `GatewayEvent`; `GatewayReply` → `handle_reply` command dispatch), not a `ChatAdapter` trait impl. So the `ChatAdapter` default-impl semantics (edit/delete/stream) do not directly apply; the gateway reply handler dispatches by `reply.command`. Note: the `MAX_DOWNLOAD` constants used below live in the **gateway** crate (`crates/openab-gateway/src/media.rs:13-15` → IMAGE 10 MB, FILE 20 MB, AUDIO 20 MB), while STT lives in **core**.
 
@@ -58,7 +50,7 @@ Telegram runs through the **gateway** path (webhook → `GatewayEvent`; `Gateway
 | multibot | implemented | `should_skip_event` drops other bots' events unless the sender id is in `trusted_bot_ids`; the adapter forwards `is_bot` from `from`. (Telegram rarely delivers other bots' messages anyway.) | `crates/openab-core/src/gateway.rs:58`; `crates/openab-gateway/src/adapters/telegram.rs:217` |
 | group_routing | implemented | Session keyed by `chat.id` + optional `message_thread_id`; `compute_draft_id` derives a stable per-(chat,thread) draft id to avoid forum-topic collisions. | `crates/openab-gateway/src/adapters/telegram.rs:206`, `:339`, `:484` |
 
-## 3. Platform quirks (`platform-quirks` v1)
+## 3. Platform quirks (`platform-quirks`)
 
 ### "Rich Message" API is real (Bot API 10.1) — but the adapter path is flag-gated and partly dead-code
 The adapter's `sendRichMessage` / `sendRichMessageDraft` / `InputRichMessage.markdown` calls correspond to methods **genuinely added in Bot API 10.1 (2026-06-11)** ([api-changelog](https://core.telegram.org/bots/api-changelog)): "Added the method `sendRichMessage`…", "Added the method `sendRichMessageDraft`, allowing bots to stream partial rich messages", "Added the class `InputRichMessage`…". This corrects an earlier assumption that the path was fictional. Caveats that remain code-side, not API-side:
