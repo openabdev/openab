@@ -14,42 +14,32 @@ Each platform page has three schema-driven sections:
 
 **Sourcing rule:** attach the source that answers *"why should I trust or keep this?"* — intrinsic facts link the **official platform doc**; OpenAB decisions/findings link the **PR/issue**.
 
-## Schema versioning
+## Schema version
 
-Schemas evolve. Each schema carries a version; each platform page declares which versions it was written against, in front-matter:
+The three schemas share **one date-based version**. When any schema changes, bump the date here and re-verify the pages.
 
-```yaml
----
-platform: line
-maintainer: "@handle"
-last_verified: 2026-07-04
-schema_versions:
-  platform-capability: v1
-  openab-feature-support: v1
-  platform-quirks: v1
----
-```
+- **Current schema version: `2026-07-04`**
+- Each platform page records the version it was written against as a single line near the top: `**Schema version:** 2026-07-04`.
+- No per-page front-matter: the platform is the **filename**, page **ownership is tracked separately** (not in these pages), and last-touched is in **git history**.
 
-**Current versions:** `platform-capability: v1` · `openab-feature-support: v1` · `platform-quirks: v1`
-
-The conformance table below shows each page's declared versions — a page lagging the current version is visible at a glance and needs an update pass. When a schema changes, bump its version here and update this table.
+The conformance table below lists each page's version — a page older than the current version is stale and needs an update pass.
 
 ### Conformance
 
-| Platform | capability | feature-support | quirks | last verified |
-|---|---|---|---|---|
-| [line](./line.md) | v1 | v1 | v1 | 2026-07-04 |
-| [slack](./slack.md) | v1 | v1 | v1 | — |
-| [telegram](./telegram.md) | v1 | v1 | v1 | — |
-| [discord](./discord.md) | v1 | v1 | v1 | — |
-| [feishu](./feishu.md) | v1 | v1 | v1 | — |
-| [wecom](./wecom.md) | v1 | v1 | v1 | — |
-| [googlechat](./googlechat.md) | v1 | v1 | v1 | — |
-| [teams](./teams.md) | v1 | v1 | v1 | — |
+| Platform | Schema version |
+|---|---|
+| [line](./line.md) | 2026-07-04 |
+| [slack](./slack.md) | 2026-07-04 |
+| [telegram](./telegram.md) | 2026-07-04 |
+| [discord](./discord.md) | 2026-07-04 |
+| [feishu](./feishu.md) | 2026-07-04 |
+| [wecom](./wecom.md) | 2026-07-04 |
+| [googlechat](./googlechat.md) | 2026-07-04 |
+| [teams](./teams.md) | 2026-07-04 |
 
 ---
 
-## Schema 1 — `platform-capability` (v1)
+## Schema 1 — `platform-capability`
 
 Fixed fields. Every platform fills all of them. Each value carries an official-doc link where the fact isn't self-evident. Use `?` only when genuinely unverified (note what's missing).
 
@@ -74,7 +64,7 @@ Fixed fields. Every platform fills all of them. Each value carries an official-d
 | `bot_to_bot` | does the platform deliver other bots' messages to this bot? |
 | `typing_indicator` | supported? |
 
-## Schema 2 — `openab-feature-support` (v1)
+## Schema 2 — `openab-feature-support`
 
 Fixed fields = the OpenAB capabilities exercised across adapters (derived from the `ChatAdapter` trait in `crates/openab-core/src/adapter.rs` + the trust/ingress layer). For each, give a **status** + note + `file:line` + PR ref.
 
@@ -100,7 +90,7 @@ Always explain `workaround` / `partial` / `limited` — that "why" is the valuab
 | `multibot` | multiple bots in one channel |
 | `group_routing` | group/session routing |
 
-## Schema 3 — `platform-quirks` (v1)
+## Schema 3 — `platform-quirks`
 
 Flexible. Anything not captured by Schema 1/2 — special models, gotchas, structural constraints. Two parts:
 
