@@ -641,6 +641,16 @@ impl SessionPool {
                 }
                 continue;
             };
+            // try_lock success means no turn is streaming under
+            // with_connection, so a true in_flight flag is stale (the turn
+            // aborted without prompt_done). Self-heal it so the session can
+            // never be falsely classified as hung later.
+            if let Some(activity) = activity_map.get(&key) {
+                if activity.in_flight() {
+                    activity.set_in_flight(false);
+                    activity.touch();
+                }
+            }
             if classify_idle(conn.last_active, conn.alive(), cutoff) {
                 stale.push((key, conn_handle, conn.acp_session_id.clone()));
             }
