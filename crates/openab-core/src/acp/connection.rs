@@ -137,20 +137,31 @@ impl SessionActivity {
     }
 
     pub fn touch(&self) {
-        self.last_active_ms.store(Self::now_ms(), Ordering::Relaxed);
+        self.last_active_ms.store(Self::now_ms(), Ordering::Release);
     }
 
     pub fn set_in_flight(&self, in_flight: bool) {
-        self.prompt_in_flight.store(in_flight, Ordering::Relaxed);
+        self.prompt_in_flight.store(in_flight, Ordering::Release);
     }
 
     pub fn last_active(&self) -> std::time::SystemTime {
-        let ms = self.last_active_ms.load(Ordering::Relaxed);
+        let ms = self.last_active_ms.load(Ordering::Acquire);
         std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)
     }
 
+    /// Elapsed time since the last observed activity (saturating at zero).
+    pub fn age(&self) -> std::time::Duration {
+        let last = self.last_active_ms.load(Ordering::Acquire);
+        std::time::Duration::from_millis(Self::now_ms().saturating_sub(last))
+    }
+
     pub fn in_flight(&self) -> bool {
-        self.prompt_in_flight.load(Ordering::Relaxed)
+        self.prompt_in_flight.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_last_active_ms(&self, ms: u64) {
+        self.last_active_ms.store(ms, Ordering::Release);
     }
 }
 
@@ -995,10 +1006,15 @@ mod reader_loop_tests {
     #[test]
     fn session_activity_touch_advances_last_active() {
         let activity = SessionActivity::new();
+        activity.set_last_active_ms(1_000);
         let before = activity.last_active();
-        std::thread::sleep(std::time::Duration::from_millis(5));
         activity.touch();
-        assert!(activity.last_active() >= before);
+        assert!(activity.last_active() > before);
+        // Backdated last_active yields a large age; touch resets it near zero.
+        activity.set_last_active_ms(1_000);
+        assert!(activity.age() > std::time::Duration::from_secs(3600));
+        activity.touch();
+        assert!(activity.age() < std::time::Duration::from_secs(60));
     }
 
     #[test]

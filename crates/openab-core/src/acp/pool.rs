@@ -1,6 +1,6 @@
 use crate::acp::connection::{AcpConnection, SessionActivity};
 use crate::acp::protocol::ConfigOption;
-use crate::config::{default_hung_grace_secs, default_prompt_hard_timeout_secs, AgentConfig};
+use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -44,8 +44,8 @@ pub struct SessionPool {
     state: RwLock<PoolState>,
     config: AgentConfig,
     max_sessions: usize,
-    /// Force-evict sessions stuck in-flight longer than this threshold.
-    /// Default: `prompt_hard_timeout_secs + hung_grace_secs` (main.rs wiring is a follow-up).
+    /// Force-evict sessions stuck in-flight longer than this threshold
+    /// (`prompt_hard_timeout_secs + hung_grace_secs`, wired in main.rs).
     hung_threshold_secs: u64,
     mapping_path: PathBuf,
     meta_path: PathBuf,
@@ -98,27 +98,39 @@ fn better_candidate(current_oldest: Option<Instant>, candidate_last_active: Inst
     }
 }
 
-/// Remove a hung session from active maps and suspend it for resume when possible.
-fn apply_hung_eviction(state: &mut PoolState, key: &str) {
-    let sid = state
-        .persisted
-        .get(key)
-        .cloned()
-        .or_else(|| state.cancel_handles.get(key).map(|(_, sid)| sid.clone()));
-    state.active.remove(key);
+/// Remove every non-`active` pool entry for `key`, reset-style.
+///
+/// Hung eviction must NOT leave the session resumable: the old streaming task
+/// still holds an Arc clone of the connection, so the agent process may be
+/// alive and mid-turn. If the session id stayed in `suspended`/`persisted`,
+/// the next message would `session/load` the same session while the old
+/// process still owns an in-flight turn. Mirror `reset_session` instead.
+fn purge_session_entries(state: &mut PoolState, key: &str) {
     state.cancel_handles.remove(key);
     state.activity.remove(key);
-    if let Some(sid) = sid {
-        state.persisted.insert(key.to_string(), sid.clone());
-        state.suspended.insert(key.to_string(), sid);
-    } else {
-        state.persisted.remove(key);
-        state.session_workdirs.remove(key);
+    state.suspended.remove(key);
+    state.persisted.remove(key);
+    state.creating.remove(key);
+    state.session_workdirs.remove(key);
+}
+
+/// Remove a hung session from all pool maps. Returns true if the exact
+/// connection captured at classification time was still registered; when a
+/// fresh replacement exists for the key, nothing is touched.
+fn apply_hung_eviction(
+    state: &mut PoolState,
+    key: &str,
+    expected: &Arc<Mutex<AcpConnection>>,
+) -> bool {
+    if remove_if_same_handle(&mut state.active, key, expected).is_none() {
+        return false;
     }
+    purge_session_entries(state, key);
+    true
 }
 
 impl SessionPool {
-    pub fn new(config: AgentConfig, max_sessions: usize) -> Self {
+    pub fn new(config: AgentConfig, max_sessions: usize, hung_threshold_secs: u64) -> Self {
         let openab_dir = std::env::var("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/tmp"))
@@ -140,16 +152,10 @@ impl SessionPool {
             }),
             config,
             max_sessions,
-            hung_threshold_secs: default_prompt_hard_timeout_secs() + default_hung_grace_secs(),
+            hung_threshold_secs,
             mapping_path,
             meta_path,
         }
-    }
-
-    /// Override the hung-session force-eviction threshold (seconds).
-    pub fn with_hung_threshold_secs(mut self, secs: u64) -> Self {
-        self.hung_threshold_secs = secs;
-        self
     }
 
     fn load_mapping(path: &Path) -> HashMap<String, String> {
@@ -589,31 +595,41 @@ impl SessionPool {
         };
 
         let mut stale = Vec::new();
-        let mut hung = Vec::new();
+        let mut hung: Vec<(String, Arc<Mutex<AcpConnection>>)> = Vec::new();
         for (key, conn) in snapshot {
             // Skip active sessions for this cleanup round instead of waiting on
             // their per-connection mutex. A busy session is not idle unless hung.
             let conn_handle = Arc::clone(&conn);
             let Ok(conn) = conn.try_lock() else {
                 if let Some(activity) = activity_map.get(&key) {
-                    let age = std::time::SystemTime::now()
-                        .duration_since(activity.last_active())
-                        .unwrap_or_default();
-                    if classify_hung(activity.in_flight(), age, hung_threshold) {
+                    if classify_hung(activity.in_flight(), activity.age(), hung_threshold) {
+                        // Best-effort session/cancel via the lock-free stdin
+                        // handle, detached so a wedged stdin can never block
+                        // cleanup (and never while holding `state`).
                         if let Some((stdin, session_id)) = cancel_map.get(&key).cloned() {
-                            if let Ok(data) = serde_json::to_string(&serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "method": "session/cancel",
-                                "params": {"sessionId": session_id}
-                            })) {
-                                use tokio::io::AsyncWriteExt;
-                                let mut w = stdin.lock().await;
-                                let _ = w.write_all(data.as_bytes()).await;
-                                let _ = w.write_all(b"\n").await;
-                                let _ = w.flush().await;
-                            }
+                            tokio::spawn(async move {
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(5),
+                                    async move {
+                                        if let Ok(data) =
+                                            serde_json::to_string(&serde_json::json!({
+                                                "jsonrpc": "2.0",
+                                                "method": "session/cancel",
+                                                "params": {"sessionId": session_id}
+                                            }))
+                                        {
+                                            use tokio::io::AsyncWriteExt;
+                                            let mut w = stdin.lock().await;
+                                            let _ = w.write_all(data.as_bytes()).await;
+                                            let _ = w.write_all(b"\n").await;
+                                            let _ = w.flush().await;
+                                        }
+                                    },
+                                )
+                                .await;
+                            });
                         }
-                        hung.push(key);
+                        hung.push((key, conn_handle));
                     }
                 }
                 continue;
@@ -642,9 +658,10 @@ impl SessionPool {
                 }
             }
         }
-        for key in hung {
-            warn!(thread_id = %key, "force-evicting hung session");
-            apply_hung_eviction(&mut state, &key);
+        for (key, expected_conn) in hung {
+            if apply_hung_eviction(&mut state, &key, &expected_conn) {
+                warn!(thread_id = %key, "force-evicting hung session");
+            }
         }
         self.save_mapping(&state.persisted);
         self.save_meta(&state.session_workdirs);
@@ -688,7 +705,7 @@ impl SessionPool {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_hung_eviction, better_candidate, classify_hung, classify_idle, get_or_insert_gate,
+        better_candidate, classify_hung, classify_idle, get_or_insert_gate, purge_session_entries,
         remove_if_same_handle, PoolState,
     };
     use crate::acp::connection::SessionActivity;
@@ -801,29 +818,50 @@ mod tests {
     }
 
     #[test]
-    fn apply_hung_eviction_removes_activity_and_suspends_persisted_session() {
+    fn better_candidate_keeps_existing_on_equal_last_active() {
+        let ts = Instant::now() - std::time::Duration::from_secs(60);
+        assert!(!better_candidate(Some(ts), ts));
+    }
+
+    #[test]
+    fn purge_session_entries_drops_all_entries_for_evicted_key_only() {
         let mut state = PoolState {
             active: HashMap::new(),
             cancel_handles: HashMap::new(),
-            activity: HashMap::from([("thread".to_string(), Arc::new(SessionActivity::new()))]),
-            suspended: HashMap::new(),
-            persisted: HashMap::from([("thread".to_string(), "session-1".to_string())]),
+            activity: HashMap::from([
+                ("hung".to_string(), Arc::new(SessionActivity::new())),
+                ("other".to_string(), Arc::new(SessionActivity::new())),
+            ]),
+            suspended: HashMap::from([
+                ("hung".to_string(), "session-hung".to_string()),
+                ("other".to_string(), "session-other".to_string()),
+            ]),
+            persisted: HashMap::from([
+                ("hung".to_string(), "session-hung".to_string()),
+                ("other".to_string(), "session-other".to_string()),
+            ]),
             creating: HashMap::new(),
-            session_workdirs: HashMap::new(),
+            session_workdirs: HashMap::from([("hung".to_string(), "/tmp/ws".to_string())]),
         };
 
-        apply_hung_eviction(&mut state, "thread");
+        purge_session_entries(&mut state, "hung");
 
-        assert!(!state.activity.contains_key("thread"));
-        assert!(!state.cancel_handles.contains_key("thread"));
+        // Evicted key must not be resumable: no suspended/persisted entry left.
+        assert!(!state.activity.contains_key("hung"));
+        assert!(!state.cancel_handles.contains_key("hung"));
+        assert!(!state.suspended.contains_key("hung"));
+        assert!(!state.persisted.contains_key("hung"));
+        assert!(!state.session_workdirs.contains_key("hung"));
+        // Other keys survive untouched.
         assert_eq!(
-            state.persisted.get("thread"),
-            Some(&"session-1".to_string())
+            state.persisted.get("other"),
+            Some(&"session-other".to_string())
         );
         assert_eq!(
-            state.suspended.get("thread"),
-            Some(&"session-1".to_string())
+            state.suspended.get("other"),
+            Some(&"session-other".to_string())
         );
+        assert!(state.activity.contains_key("other"));
     }
 
     #[test]
