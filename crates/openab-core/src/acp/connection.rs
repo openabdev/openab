@@ -994,4 +994,23 @@ mod reader_loop_tests {
         drop(agent_stdout_writer);
         handle.await.unwrap();
     }
+
+    #[test]
+    fn session_activity_touch_advances_last_active() {
+        let activity = SessionActivity::new();
+        let before = activity.last_active();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        activity.touch();
+        assert!(activity.last_active() >= before);
+    }
+
+    #[test]
+    fn session_activity_set_in_flight_round_trips() {
+        let activity = SessionActivity::new();
+        assert!(!activity.in_flight());
+        activity.set_in_flight(true);
+        assert!(activity.in_flight());
+        activity.set_in_flight(false);
+        assert!(!activity.in_flight());
+    }
 }

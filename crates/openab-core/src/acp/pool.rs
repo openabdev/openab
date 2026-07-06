@@ -81,11 +81,35 @@ fn classify_idle(last_active: Instant, alive: bool, cutoff: Instant) -> bool {
     last_active < cutoff || !alive
 }
 
+/// Returns true when a locked, in-flight session has exceeded the hung threshold.
+fn classify_hung(in_flight: bool, last_active_age: std::time::Duration, threshold: std::time::Duration) -> bool {
+    in_flight && last_active_age > threshold
+}
+
 /// Returns true when `candidate_last_active` is a better eviction target than `current_oldest`.
 fn better_candidate(current_oldest: Option<Instant>, candidate_last_active: Instant) -> bool {
     match current_oldest {
         Some(oldest) => candidate_last_active < oldest,
         None => true,
+    }
+}
+
+/// Remove a hung session from active maps and suspend it for resume when possible.
+fn apply_hung_eviction(state: &mut PoolState, key: &str) {
+    let sid = state
+        .persisted
+        .get(key)
+        .cloned()
+        .or_else(|| state.cancel_handles.get(key).map(|(_, sid)| sid.clone()));
+    state.active.remove(key);
+    state.cancel_handles.remove(key);
+    state.activity.remove(key);
+    if let Some(sid) = sid {
+        state.persisted.insert(key.to_string(), sid.clone());
+        state.suspended.insert(key.to_string(), sid);
+    } else {
+        state.persisted.remove(key);
+        state.session_workdirs.remove(key);
     }
 }
 
@@ -568,7 +592,7 @@ impl SessionPool {
                     let age = std::time::SystemTime::now()
                         .duration_since(activity.last_active())
                         .unwrap_or_default();
-                    if activity.in_flight() && age > hung_threshold {
+                    if classify_hung(activity.in_flight(), age, hung_threshold) {
                         if let Some((stdin, session_id)) = cancel_map.get(&key).cloned() {
                             if let Ok(data) = serde_json::to_string(&serde_json::json!({
                                 "jsonrpc": "2.0",
@@ -613,21 +637,7 @@ impl SessionPool {
         }
         for key in hung {
             warn!(thread_id = %key, "force-evicting hung session");
-            let sid = state
-                .persisted
-                .get(&key)
-                .cloned()
-                .or_else(|| state.cancel_handles.get(&key).map(|(_, sid)| sid.clone()));
-            state.active.remove(&key);
-            state.cancel_handles.remove(&key);
-            state.activity.remove(&key);
-            if let Some(sid) = sid {
-                state.persisted.insert(key.clone(), sid.clone());
-                state.suspended.insert(key, sid);
-            } else {
-                state.persisted.remove(&key);
-                state.session_workdirs.remove(&key);
-            }
+            apply_hung_eviction(&mut state, &key);
         }
         self.save_mapping(&state.persisted);
         self.save_meta(&state.session_workdirs);
@@ -670,7 +680,8 @@ impl SessionPool {
 
 #[cfg(test)]
 mod tests {
-    use super::{better_candidate, classify_idle, get_or_insert_gate, remove_if_same_handle};
+    use super::{apply_hung_eviction, better_candidate, classify_hung, classify_idle, get_or_insert_gate, remove_if_same_handle, PoolState};
+    use crate::acp::connection::SessionActivity;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -750,6 +761,65 @@ mod tests {
         let older = Instant::now() - std::time::Duration::from_secs(120);
         let newer = Instant::now() - std::time::Duration::from_secs(30);
         assert!(!better_candidate(Some(older), newer));
+    }
+
+    #[test]
+    fn classify_hung_detects_in_flight_session_past_threshold() {
+        assert!(classify_hung(
+            true,
+            std::time::Duration::from_secs(200),
+            std::time::Duration::from_secs(120),
+        ));
+    }
+
+    #[test]
+    fn classify_hung_ignores_in_flight_session_within_threshold() {
+        assert!(!classify_hung(
+            true,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(120),
+        ));
+    }
+
+    #[test]
+    fn classify_hung_never_marks_idle_sessions() {
+        assert!(!classify_hung(
+            false,
+            std::time::Duration::from_secs(200),
+            std::time::Duration::from_secs(120),
+        ));
+    }
+
+    #[test]
+    fn apply_hung_eviction_removes_activity_and_suspends_persisted_session() {
+        let mut state = PoolState {
+            active: HashMap::new(),
+            cancel_handles: HashMap::new(),
+            activity: HashMap::from([(
+                "thread".to_string(),
+                Arc::new(SessionActivity::new()),
+            )]),
+            suspended: HashMap::new(),
+            persisted: HashMap::from([(
+                "thread".to_string(),
+                "session-1".to_string(),
+            )]),
+            creating: HashMap::new(),
+            session_workdirs: HashMap::new(),
+        };
+
+        apply_hung_eviction(&mut state, "thread");
+
+        assert!(!state.activity.contains_key("thread"));
+        assert!(!state.cancel_handles.contains_key("thread"));
+        assert_eq!(
+            state.persisted.get("thread"),
+            Some(&"session-1".to_string())
+        );
+        assert_eq!(
+            state.suspended.get("thread"),
+            Some(&"session-1".to_string())
+        );
     }
 
     #[test]
