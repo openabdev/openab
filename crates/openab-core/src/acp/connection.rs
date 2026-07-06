@@ -489,10 +489,17 @@ impl AcpConnection {
 
     pub(crate) async fn send_raw(&self, data: &str) -> Result<()> {
         debug!(data = data.trim(), "acp_send");
-        let mut w = self.stdin.lock().await;
-        w.write_all(data.as_bytes()).await?;
-        w.write_all(b"\n").await?;
-        w.flush().await?;
+        // A hung agent can stop draining stdin; bound the write so callers
+        // (and the mutexes they hold) can never block on it indefinitely.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut w = self.stdin.lock().await;
+            w.write_all(data.as_bytes()).await?;
+            w.write_all(b"\n").await?;
+            w.flush().await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|_| anyhow!("stdin write timeout"))??;
         Ok(())
     }
 
