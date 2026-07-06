@@ -69,6 +69,19 @@ fn get_or_insert_gate(map: &mut HashMap<String, Arc<Mutex<()>>>, key: &str) -> A
         .clone()
 }
 
+/// Returns true when a session should be treated as stale during idle cleanup.
+fn classify_idle(last_active: Instant, alive: bool, cutoff: Instant) -> bool {
+    last_active < cutoff || !alive
+}
+
+/// Returns true when `candidate_last_active` is a better eviction target than `current_oldest`.
+fn better_candidate(current_oldest: Option<Instant>, candidate_last_active: Instant) -> bool {
+    match current_oldest {
+        Some(oldest) => candidate_last_active < oldest,
+        None => true,
+    }
+}
+
 impl SessionPool {
     pub fn new(config: AgentConfig, max_sessions: usize) -> Self {
         let openab_dir = std::env::var("HOME")
@@ -213,9 +226,11 @@ impl SessionPool {
                 conn.last_active,
                 conn.acp_session_id.clone(),
             );
-            match &eviction_candidate {
-                Some((_, _, oldest_last_active, _)) if candidate.2 >= *oldest_last_active => {}
-                _ => eviction_candidate = Some(candidate),
+            if better_candidate(
+                eviction_candidate.as_ref().map(|(_, _, t, _)| *t),
+                candidate.2,
+            ) {
+                eviction_candidate = Some(candidate);
             }
         }
 
@@ -519,7 +534,7 @@ impl SessionPool {
             let Ok(conn) = conn.try_lock() else {
                 continue;
             };
-            if conn.last_active < cutoff || !conn.alive() {
+            if classify_idle(conn.last_active, conn.alive(), cutoff) {
                 stale.push((key, conn_handle, conn.acp_session_id.clone()));
             }
         }
@@ -582,10 +597,11 @@ impl SessionPool {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_or_insert_gate, remove_if_same_handle};
+    use super::{better_candidate, classify_idle, get_or_insert_gate, remove_if_same_handle};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+    use tokio::time::Instant;
 
     #[test]
     fn remove_if_same_handle_removes_matching_entry() {
@@ -620,6 +636,47 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn classify_idle_marks_stale_by_time() {
+        let now = Instant::now();
+        let cutoff = now - std::time::Duration::from_secs(60);
+        let last_active = now - std::time::Duration::from_secs(120);
+        assert!(classify_idle(last_active, true, cutoff));
+    }
+
+    #[test]
+    fn classify_idle_marks_stale_by_death() {
+        let now = Instant::now();
+        let cutoff = now - std::time::Duration::from_secs(60);
+        assert!(classify_idle(now, false, cutoff));
+    }
+
+    #[test]
+    fn classify_idle_keeps_fresh_alive_sessions() {
+        let now = Instant::now();
+        let cutoff = now - std::time::Duration::from_secs(60);
+        assert!(!classify_idle(now, true, cutoff));
+    }
+
+    #[test]
+    fn better_candidate_prefers_empty_current() {
+        assert!(better_candidate(None, Instant::now()));
+    }
+
+    #[test]
+    fn better_candidate_prefers_older_last_active() {
+        let older = Instant::now() - std::time::Duration::from_secs(120);
+        let newer = Instant::now() - std::time::Duration::from_secs(30);
+        assert!(better_candidate(Some(newer), older));
+    }
+
+    #[test]
+    fn better_candidate_rejects_newer_last_active() {
+        let older = Instant::now() - std::time::Duration::from_secs(120);
+        let newer = Instant::now() - std::time::Duration::from_secs(30);
+        assert!(!better_candidate(Some(older), newer));
     }
 
     #[test]
