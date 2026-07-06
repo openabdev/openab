@@ -771,6 +771,10 @@ pub struct PoolConfig {
     /// more wakeups while the agent is streaming normally.
     #[serde(default = "default_liveness_check_secs")]
     pub liveness_check_secs: u64,
+    /// Grace period after `prompt_hard_timeout_secs` before a session stuck
+    /// with its connection mutex held is force-evicted from the pool.
+    #[serde(default = "default_hung_grace_secs")]
+    pub hung_grace_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -949,6 +953,9 @@ pub(crate) fn default_prompt_hard_timeout_secs() -> u64 {
 pub(crate) fn default_liveness_check_secs() -> u64 {
     30
 }
+pub(crate) fn default_hung_grace_secs() -> u64 {
+    120
+}
 fn default_true() -> bool {
     true
 }
@@ -998,6 +1005,7 @@ impl Default for PoolConfig {
             session_ttl_hours: default_ttl_hours(),
             prompt_hard_timeout_secs: default_prompt_hard_timeout_secs(),
             liveness_check_secs: default_liveness_check_secs(),
+            hung_grace_secs: default_hung_grace_secs(),
         }
     }
 }

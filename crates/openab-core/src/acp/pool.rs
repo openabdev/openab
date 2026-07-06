@@ -1,6 +1,6 @@
 use crate::acp::connection::{AcpConnection, SessionActivity};
 use crate::acp::protocol::ConfigOption;
-use crate::config::AgentConfig;
+use crate::config::{default_hung_grace_secs, default_prompt_hard_timeout_secs, AgentConfig};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -21,7 +21,7 @@ struct PoolState {
     active: HashMap<String, Arc<Mutex<AcpConnection>>>,
     /// Lock-free cancel handles: thread_key → (stdin, session_id).
     /// Stored separately so cancel can work without locking the connection.
-    cancel_handles: HashMap<String, (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String)>,
+    cancel_handles: HashMap<String, CancelHandle>,
     /// Lock-free activity handles for hung-session detection without the connection mutex.
     activity: HashMap<String, Arc<SessionActivity>>,
     /// Suspended sessions: thread_key → ACP sessionId.
@@ -44,10 +44,15 @@ pub struct SessionPool {
     state: RwLock<PoolState>,
     config: AgentConfig,
     max_sessions: usize,
+    /// Force-evict sessions stuck in-flight longer than this threshold.
+    /// Default: `prompt_hard_timeout_secs + hung_grace_secs` (main.rs wiring is a follow-up).
+    hung_threshold_secs: u64,
     mapping_path: PathBuf,
     meta_path: PathBuf,
 }
 
+type CancelHandle = (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String);
+type ActiveSnapshot = Vec<(String, Arc<Mutex<AcpConnection>>)>;
 type EvictionCandidate = (String, Arc<Mutex<AcpConnection>>, Instant, Option<String>);
 
 fn remove_if_same_handle<T>(
@@ -107,9 +112,16 @@ impl SessionPool {
             }),
             config,
             max_sessions,
+            hung_threshold_secs: default_prompt_hard_timeout_secs() + default_hung_grace_secs(),
             mapping_path,
             meta_path,
         }
+    }
+
+    /// Override the hung-session force-eviction threshold (seconds).
+    pub fn with_hung_threshold_secs(mut self, secs: u64) -> Self {
+        self.hung_threshold_secs = secs;
+        self
     }
 
     fn load_mapping(path: &Path) -> HashMap<String, String> {
@@ -526,22 +538,53 @@ impl SessionPool {
 
     pub async fn cleanup_idle(&self, ttl_secs: u64) {
         let cutoff = Instant::now() - std::time::Duration::from_secs(ttl_secs);
+        let hung_threshold = std::time::Duration::from_secs(self.hung_threshold_secs);
 
-        let snapshot: Vec<(String, Arc<Mutex<AcpConnection>>)> = {
+        let (snapshot, activity_map, cancel_map): (
+            ActiveSnapshot,
+            HashMap<String, Arc<SessionActivity>>,
+            HashMap<String, CancelHandle>,
+        ) = {
             let state = self.state.read().await;
-            state
-                .active
-                .iter()
-                .map(|(k, v)| (k.clone(), Arc::clone(v)))
-                .collect()
+            (
+                state
+                    .active
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                    .collect(),
+                state.activity.clone(),
+                state.cancel_handles.clone(),
+            )
         };
 
         let mut stale = Vec::new();
+        let mut hung = Vec::new();
         for (key, conn) in snapshot {
             // Skip active sessions for this cleanup round instead of waiting on
-            // their per-connection mutex. A busy session is not idle.
+            // their per-connection mutex. A busy session is not idle unless hung.
             let conn_handle = Arc::clone(&conn);
             let Ok(conn) = conn.try_lock() else {
+                if let Some(activity) = activity_map.get(&key) {
+                    let age = std::time::SystemTime::now()
+                        .duration_since(activity.last_active())
+                        .unwrap_or_default();
+                    if activity.in_flight() && age > hung_threshold {
+                        if let Some((stdin, session_id)) = cancel_map.get(&key).cloned() {
+                            if let Ok(data) = serde_json::to_string(&serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "method": "session/cancel",
+                                "params": {"sessionId": session_id}
+                            })) {
+                                use tokio::io::AsyncWriteExt;
+                                let mut w = stdin.lock().await;
+                                let _ = w.write_all(data.as_bytes()).await;
+                                let _ = w.write_all(b"\n").await;
+                                let _ = w.flush().await;
+                            }
+                        }
+                        hung.push(key);
+                    }
+                }
                 continue;
             };
             if classify_idle(conn.last_active, conn.alive(), cutoff) {
@@ -549,7 +592,7 @@ impl SessionPool {
             }
         }
 
-        if stale.is_empty() {
+        if stale.is_empty() && hung.is_empty() {
             return;
         }
 
@@ -566,6 +609,24 @@ impl SessionPool {
                     state.persisted.remove(&key);
                     state.session_workdirs.remove(&key);
                 }
+            }
+        }
+        for key in hung {
+            warn!(thread_id = %key, "force-evicting hung session");
+            let sid = state
+                .persisted
+                .get(&key)
+                .cloned()
+                .or_else(|| state.cancel_handles.get(&key).map(|(_, sid)| sid.clone()));
+            state.active.remove(&key);
+            state.cancel_handles.remove(&key);
+            state.activity.remove(&key);
+            if let Some(sid) = sid {
+                state.persisted.insert(key.clone(), sid.clone());
+                state.suspended.insert(key, sid);
+            } else {
+                state.persisted.remove(&key);
+                state.session_workdirs.remove(&key);
             }
         }
         self.save_mapping(&state.persisted);

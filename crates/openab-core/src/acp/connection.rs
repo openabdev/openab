@@ -115,6 +115,12 @@ pub struct SessionActivity {
     prompt_in_flight: AtomicBool,
 }
 
+impl Default for SessionActivity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SessionActivity {
     pub fn new() -> Self {
         Self {
