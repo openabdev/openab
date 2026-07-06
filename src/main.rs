@@ -237,7 +237,13 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown_hook = cfg.hooks.pre_shutdown.clone();
 
-    let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions));
+    let pool = Arc::new(acp::SessionPool::new(
+        cfg.agent,
+        cfg.pool.max_sessions,
+        cfg.pool
+            .prompt_hard_timeout_secs
+            .saturating_add(cfg.pool.hung_grace_secs),
+    ));
     let ttl_secs = cfg.pool.session_ttl_hours * 3600;
 
     // Resolve STT config (auto-detect GROQ_API_KEY from env)

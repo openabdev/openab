@@ -177,6 +177,9 @@ session_ttl_hours = 24
 # prompt_hard_timeout_secs = 1800
 # Liveness-check cadence (sec) for the recv loop; see #732. Default: 30.
 # liveness_check_secs = 30
+# Grace (sec) past prompt_hard_timeout_secs before a hung in-flight session is
+# force-evicted from the pool. Default: 120.
+# hung_grace_secs = 120
 
 [markdown]
 tables = "code"  # "code" (default) | "bullets" | "off"

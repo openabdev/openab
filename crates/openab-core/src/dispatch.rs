@@ -1197,7 +1197,7 @@ mod tests {
             inherit_env: vec![],
             command_explicit: true,
         };
-        let pool = Arc::new(SessionPool::new(agent_cfg, 1));
+        let pool = Arc::new(SessionPool::new(agent_cfg, 1, 30 * 60 + 120));
         let router = Arc::new(AdapterRouter::new(
             pool,
             crate::config::ReactionsConfig::default(),
