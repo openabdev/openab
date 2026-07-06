@@ -1652,7 +1652,14 @@ fn parse_inline(line: &str) -> Vec<serde_json::Value> {
                     elems.push(serde_json::json!({"tag": "text", "text": buf}));
                     buf.clear();
                 }
-                elems.push(serde_json::json!({"tag": "a", "text": text, "href": url}));
+                // Feishu API only allows http:// and https:// links (error 230001 otherwise).
+                // Non-http links (e.g. file://) are rendered as plain text to avoid rejection.
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    elems.push(serde_json::json!({"tag": "a", "text": text, "href": url}));
+                } else {
+                    // Render as plain bracketed text: [text](url)
+                    elems.push(serde_json::json!({"tag": "text", "text": format!("[{text}]({url})")}));
+                }
                 i = end;
                 continue;
             }
