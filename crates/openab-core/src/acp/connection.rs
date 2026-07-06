@@ -109,7 +109,7 @@ impl ContentBlock {
 
 /// Lock-free view of session activity, readable without the connection mutex.
 pub struct SessionActivity {
-    /// Milliseconds since UNIX_EPOCH of the last observed activity.
+    /// Milliseconds since process boot (monotonic) of the last observed activity.
     last_active_ms: AtomicU64,
     /// True while a prompt turn is in flight (mutex likely held).
     prompt_in_flight: AtomicBool,
@@ -129,10 +129,14 @@ impl SessionActivity {
         }
     }
 
+    /// Monotonic milliseconds since first use (process boot). SystemTime is
+    /// unsuitable here: a wall-clock step (NTP, manual change) could make an
+    /// active session look hours stale and trigger a false hung eviction.
     fn now_ms() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+        use std::sync::OnceLock;
+        static BOOT: OnceLock<std::time::Instant> = OnceLock::new();
+        BOOT.get_or_init(std::time::Instant::now)
+            .elapsed()
             .as_millis() as u64
     }
 
@@ -144,9 +148,9 @@ impl SessionActivity {
         self.prompt_in_flight.store(in_flight, Ordering::Release);
     }
 
-    pub fn last_active(&self) -> std::time::SystemTime {
-        let ms = self.last_active_ms.load(Ordering::Acquire);
-        std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)
+    /// Milliseconds since process boot of the last observed activity.
+    pub fn last_active_ms(&self) -> u64 {
+        self.last_active_ms.load(Ordering::Acquire)
     }
 
     /// Elapsed time since the last observed activity (saturating at zero).
@@ -1006,15 +1010,20 @@ mod reader_loop_tests {
     #[test]
     fn session_activity_touch_advances_last_active() {
         let activity = SessionActivity::new();
-        activity.set_last_active_ms(1_000);
-        let before = activity.last_active();
+        // Warm the monotonic clock past zero so a backdated value is older.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        activity.set_last_active_ms(0);
+        let before = activity.last_active_ms();
         activity.touch();
-        assert!(activity.last_active() > before);
-        // Backdated last_active yields a large age; touch resets it near zero.
-        activity.set_last_active_ms(1_000);
-        assert!(activity.age() > std::time::Duration::from_secs(3600));
+        assert!(activity.last_active_ms() > before);
+        // Backdated last_active yields a positive age; touch resets it near zero.
+        activity.set_last_active_ms(0);
+        assert!(activity.age() >= std::time::Duration::from_millis(10));
         activity.touch();
         assert!(activity.age() < std::time::Duration::from_secs(60));
+        // A future timestamp must not underflow: age saturates at zero.
+        activity.set_last_active_ms(u64::MAX);
+        assert_eq!(activity.age(), std::time::Duration::ZERO);
     }
 
     #[test]
