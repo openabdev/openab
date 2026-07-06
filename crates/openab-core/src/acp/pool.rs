@@ -24,6 +24,9 @@ struct PoolState {
     cancel_handles: HashMap<String, CancelHandle>,
     /// Lock-free activity handles for hung-session detection without the connection mutex.
     activity: HashMap<String, Arc<SessionActivity>>,
+    /// Child process-group ids, captured at insert time so hung eviction can
+    /// kill the agent process without ever locking the connection.
+    pgids: HashMap<String, i32>,
     /// Suspended sessions: thread_key → ACP sessionId.
     /// Used at runtime to decide which thread can be resumed via `session/load`
     /// because it no longer has a live in-memory connection.
@@ -108,10 +111,38 @@ fn better_candidate(current_oldest: Option<Instant>, candidate_last_active: Inst
 fn purge_session_entries(state: &mut PoolState, key: &str) {
     state.cancel_handles.remove(key);
     state.activity.remove(key);
+    state.pgids.remove(key);
     state.suspended.remove(key);
     state.persisted.remove(key);
     state.creating.remove(key);
     state.session_workdirs.remove(key);
+}
+
+/// Escalating kill for a hung agent's process group: wait 10s after the
+/// session/cancel attempt, SIGTERM, wait 2s, SIGKILL. Mirrors
+/// `AcpConnection::kill_process_group`, which cannot run here because the
+/// hung task never drops its connection Arc.
+async fn kill_pgid_after_grace(pgid: Option<i32>) {
+    let Some(pgid) = pgid.filter(|p| *p > 0) else {
+        return;
+    };
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    #[cfg(unix)]
+    {
+        unsafe {
+            libc::kill(-pgid, libc::SIGTERM);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // No process-group kill on non-unix; rely on AcpConnection::Drop's
+        // Windows handling if/when the hung task eventually unwinds.
+        let _ = pgid;
+    }
 }
 
 /// Remove a hung session from all pool maps. Returns true if the exact
@@ -145,6 +176,7 @@ impl SessionPool {
                 active: HashMap::new(),
                 cancel_handles: HashMap::new(),
                 activity: HashMap::new(),
+                pgids: HashMap::new(),
                 persisted: suspended.clone(),
                 suspended,
                 creating: HashMap::new(),
@@ -371,6 +403,7 @@ impl SessionPool {
 
         let cancel_handle = new_conn.cancel_handle();
         let activity_handle = new_conn.activity_handle();
+        let child_pgid = new_conn.child_pgid();
         let cancel_session_id = new_conn.acp_session_id.clone().unwrap_or_default();
         let new_conn = Arc::new(Mutex::new(new_conn));
 
@@ -390,6 +423,7 @@ impl SessionPool {
             state.active.remove(thread_id);
             state.cancel_handles.remove(thread_id);
             state.activity.remove(thread_id);
+            state.pgids.remove(thread_id);
         }
 
         if state.active.len() >= self.max_sessions {
@@ -397,6 +431,7 @@ impl SessionPool {
                 if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
                     state.cancel_handles.remove(&key);
                     state.activity.remove(&key);
+                    state.pgids.remove(&key);
                     info!(evicted = %key, "pool full, suspending oldest idle session");
                     if let Some(sid) = sid {
                         state.persisted.insert(key.clone(), sid.clone());
@@ -432,6 +467,9 @@ impl SessionPool {
         state
             .activity
             .insert(thread_id.to_string(), activity_handle);
+        if let Some(pgid) = child_pgid {
+            state.pgids.insert(thread_id.to_string(), pgid);
+        }
         if !cancel_session_id.is_empty() {
             state
                 .cancel_handles
@@ -566,6 +604,7 @@ impl SessionPool {
         let had_active = state.active.remove(thread_id).is_some();
         state.cancel_handles.remove(thread_id);
         state.activity.remove(thread_id);
+        state.pgids.remove(thread_id);
         state.suspended.remove(thread_id);
         state.persisted.remove(thread_id);
         state.creating.remove(thread_id);
@@ -584,20 +623,18 @@ impl SessionPool {
         let cutoff = Instant::now() - std::time::Duration::from_secs(ttl_secs);
         let hung_threshold = std::time::Duration::from_secs(self.hung_threshold_secs);
 
-        let (snapshot, activity_map, cancel_map): (
-            ActiveSnapshot,
-            HashMap<String, Arc<SessionActivity>>,
-            HashMap<String, CancelHandle>,
-        ) = {
+        let (snapshot, activity_map, cancel_map, pgid_map) = {
             let state = self.state.read().await;
+            let snapshot: ActiveSnapshot = state
+                .active
+                .iter()
+                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .collect();
             (
-                state
-                    .active
-                    .iter()
-                    .map(|(k, v)| (k.clone(), Arc::clone(v)))
-                    .collect(),
+                snapshot,
                 state.activity.clone(),
                 state.cancel_handles.clone(),
+                state.pgids.clone(),
             )
         };
 
@@ -610,11 +647,24 @@ impl SessionPool {
             let Ok(conn) = conn.try_lock() else {
                 if let Some(activity) = activity_map.get(&key) {
                     if classify_hung(activity.in_flight(), activity.age(), hung_threshold) {
+                        let session_id = cancel_map.get(&key).map(|(_, sid)| sid.clone());
+                        warn!(
+                            thread_id = %key,
+                            session_id = session_id.as_deref().unwrap_or(""),
+                            age_secs = activity.age().as_secs(),
+                            threshold_secs = self.hung_threshold_secs,
+                            "force-evicting hung session"
+                        );
                         // Best-effort session/cancel via the lock-free stdin
                         // handle, detached so a wedged stdin can never block
-                        // cleanup (and never while holding `state`).
-                        if let Some((stdin, session_id)) = cancel_map.get(&key).cloned() {
-                            tokio::spawn(async move {
+                        // cleanup (and never while holding `state`). The hung
+                        // task never unwinds, so AcpConnection::Drop never
+                        // fires; after the cancel attempt, kill the child
+                        // process group directly or the agent leaks forever (F4).
+                        let stdin_handle = cancel_map.get(&key).map(|(stdin, _)| Arc::clone(stdin));
+                        let pgid = pgid_map.get(&key).copied();
+                        tokio::spawn(async move {
+                            if let (Some(stdin), Some(session_id)) = (stdin_handle, session_id) {
                                 let _ = tokio::time::timeout(
                                     std::time::Duration::from_secs(5),
                                     async move {
@@ -634,8 +684,9 @@ impl SessionPool {
                                     },
                                 )
                                 .await;
-                            });
-                        }
+                            }
+                            kill_pgid_after_grace(pgid).await;
+                        });
                         hung.push((key, conn_handle));
                     }
                 }
@@ -666,6 +717,7 @@ impl SessionPool {
                 info!(thread_id = %key, "cleaning up idle session");
                 state.cancel_handles.remove(&key);
                 state.activity.remove(&key);
+                state.pgids.remove(&key);
                 if let Some(sid) = sid {
                     state.persisted.insert(key.clone(), sid.clone());
                     state.suspended.insert(key, sid);
@@ -676,8 +728,8 @@ impl SessionPool {
             }
         }
         for (key, expected_conn) in hung {
-            if apply_hung_eviction(&mut state, &key, &expected_conn) {
-                warn!(thread_id = %key, "force-evicting hung session");
+            if !apply_hung_eviction(&mut state, &key, &expected_conn) {
+                warn!(thread_id = %key, "hung session was replaced before eviction; maps untouched");
             }
         }
         self.save_mapping(&state.persisted);
@@ -715,6 +767,7 @@ impl SessionPool {
         state.active.clear();
         state.cancel_handles.clear();
         state.activity.clear();
+        state.pgids.clear();
         info!(count, "pool shutdown complete");
     }
 }
@@ -849,6 +902,7 @@ mod tests {
                 ("hung".to_string(), Arc::new(SessionActivity::new())),
                 ("other".to_string(), Arc::new(SessionActivity::new())),
             ]),
+            pgids: HashMap::from([("hung".to_string(), 1234), ("other".to_string(), 5678)]),
             suspended: HashMap::from([
                 ("hung".to_string(), "session-hung".to_string()),
                 ("other".to_string(), "session-other".to_string()),
@@ -866,6 +920,7 @@ mod tests {
         // Evicted key must not be resumable: no suspended/persisted entry left.
         assert!(!state.activity.contains_key("hung"));
         assert!(!state.cancel_handles.contains_key("hung"));
+        assert!(!state.pgids.contains_key("hung"));
         assert!(!state.suspended.contains_key("hung"));
         assert!(!state.persisted.contains_key("hung"));
         assert!(!state.session_workdirs.contains_key("hung"));

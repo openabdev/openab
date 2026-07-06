@@ -709,6 +709,11 @@ impl AcpConnection {
         Arc::clone(&self.activity)
     }
 
+    /// Process-group id of the agent child, readable without any lock state.
+    pub fn child_pgid(&self) -> Option<i32> {
+        self.child_pgid
+    }
+
     pub fn alive(&self) -> bool {
         !self._reader_handle.is_finished()
     }
