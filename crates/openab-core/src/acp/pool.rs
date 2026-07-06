@@ -114,7 +114,10 @@ fn purge_session_entries(state: &mut PoolState, key: &str) {
     state.pgids.remove(key);
     state.suspended.remove(key);
     state.persisted.remove(key);
-    state.creating.remove(key);
+    // Do NOT remove the creating gate: it is concurrency control, not session
+    // state. Removing it while a holder still owns the old gate Arc would let
+    // a concurrent get_or_create mint a fresh gate and run two creations for
+    // the same key.
     state.session_workdirs.remove(key);
 }
 
@@ -911,7 +914,7 @@ mod tests {
                 ("hung".to_string(), "session-hung".to_string()),
                 ("other".to_string(), "session-other".to_string()),
             ]),
-            creating: HashMap::new(),
+            creating: HashMap::from([("hung".to_string(), Arc::new(Mutex::new(())))]),
             session_workdirs: HashMap::from([("hung".to_string(), "/tmp/ws".to_string())]),
         };
 
@@ -924,6 +927,10 @@ mod tests {
         assert!(!state.suspended.contains_key("hung"));
         assert!(!state.persisted.contains_key("hung"));
         assert!(!state.session_workdirs.contains_key("hung"));
+        // The creating gate is concurrency control, not session state: it must
+        // survive so an in-flight get_or_create holder stays serialized.
+        assert!(state.creating.contains_key("hung"));
+        assert_eq!(state.pgids.get("other"), Some(&5678));
         // Other keys survive untouched.
         assert_eq!(
             state.persisted.get("other"),
