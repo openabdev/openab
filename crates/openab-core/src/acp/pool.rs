@@ -239,7 +239,14 @@ impl SessionPool {
         let had_existing = existing.is_some();
         let mut saved_session_id = saved_session_id;
         if let Some(conn) = existing.clone() {
-            let conn = conn.lock().await;
+            // Never await the existing connection's mutex here: we hold the
+            // per-thread creating gate, so blocking on a hung connection would
+            // permanently jam ALL future messages for this thread_id (F1).
+            // Lock held = busy streaming = alive (same convention as
+            // has_active_session); cleanup_idle owns hung recovery.
+            let Ok(conn) = conn.try_lock() else {
+                return Ok(false);
+            };
             if conn.alive() {
                 return Ok(false);
             }
