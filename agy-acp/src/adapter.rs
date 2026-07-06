@@ -17,7 +17,10 @@ pub struct Adapter {
 
 impl Adapter {
     pub fn new() -> Self {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        // On Windows, HOME is not set; fall back to USERPROFILE.
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| "/tmp".to_string());
         let state_dir = PathBuf::from(&home).join(".openab/agy-acp");
         Self {
             sessions: HashMap::new(),
@@ -65,15 +68,36 @@ impl Adapter {
     }
 
     /// Resolve the `agy` binary path.
+    /// On Windows, "agy" resolves via PATH (no .exe suffix needed on Command::new).
+    /// On Unix, we keep the hardcoded path as a fallback but also accept PATH lookup.
     pub fn agy_bin() -> &'static str {
-        "/usr/local/bin/agy"
+        if cfg!(target_os = "windows") {
+            "agy"
+        } else {
+            "/usr/local/bin/agy"
+        }
     }
 
     /// Build PATH with common agent binary locations prepended.
+    /// Uses OS-appropriate path separator (`;` on Windows, `:` on Unix).
     pub fn augmented_path() -> String {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/agent".to_string());
-        let base = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string());
-        format!("{home}/bin:{home}/.local/bin:{home}/.local/share/fnm/aliases/default/bin:{base}")
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| "/home/agent".to_string());
+        let base = std::env::var("PATH").unwrap_or_else(|_| {
+            if cfg!(target_os = "windows") {
+                "".to_string()
+            } else {
+                "/usr/local/bin:/usr/bin:/bin".to_string()
+            }
+        });
+        if cfg!(target_os = "windows") {
+            let local_bin = PathBuf::from(&home).join(".local").join("bin").to_string_lossy().to_string();
+            let user_bin  = PathBuf::from(&home).join("bin").to_string_lossy().to_string();
+            format!("{user_bin};{local_bin};{base}")
+        } else {
+            format!("{home}/bin:{home}/.local/bin:{home}/.local/share/fnm/aliases/default/bin:{base}")
+        }
     }
 
     pub fn fetch_available_models() -> Vec<String> {
@@ -330,7 +354,29 @@ impl Adapter {
             .and_then(|v| v.as_array())
             .map(|arr| arr.iter().filter_map(|b| b.get("text").and_then(|t| t.as_str())).collect::<Vec<_>>().join("\n"))
             .unwrap_or_default();
-        let clean_prompt = prompt_text.trim().to_string();
+        // Strip <sender_context>...</sender_context> injected by openab gateway (Issue #61).
+        // CLI-based agents like agy don't understand this metadata and see it as prompt noise.
+        let clean_prompt = {
+            let trimmed = prompt_text.trim();
+            // Remove any <sender_context>...</sender_context> block(s) at the start.
+            let without_ctx = {
+                let mut s = trimmed;
+                loop {
+                    let s_trimmed = s.trim_start();
+                    if let Some(start) = s_trimmed.find("<sender_context>") {
+                        if start == 0 {
+                            if let Some(end) = s_trimmed.find("</sender_context>") {
+                                s = &s_trimmed[end + "</sender_context>".len()..];
+                                continue;
+                            }
+                        }
+                    }
+                    break;
+                }
+                s.trim()
+            };
+            without_ctx.to_string()
+        };
 
         let snapshot = if self.sessions.get(&session_id).map(|s| s.conversation_id.is_none()).unwrap_or(false) {
             Some(self.conversation_snapshot())
