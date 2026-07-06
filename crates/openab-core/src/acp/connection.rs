@@ -4,7 +4,7 @@ use crate::acp::protocol::{
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
@@ -107,6 +107,48 @@ impl ContentBlock {
     }
 }
 
+/// Lock-free view of session activity, readable without the connection mutex.
+pub struct SessionActivity {
+    /// Milliseconds since UNIX_EPOCH of the last observed activity.
+    last_active_ms: AtomicU64,
+    /// True while a prompt turn is in flight (mutex likely held).
+    prompt_in_flight: AtomicBool,
+}
+
+impl SessionActivity {
+    pub fn new() -> Self {
+        Self {
+            last_active_ms: AtomicU64::new(Self::now_ms()),
+            prompt_in_flight: AtomicBool::new(false),
+        }
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    pub fn touch(&self) {
+        self.last_active_ms
+            .store(Self::now_ms(), Ordering::Relaxed);
+    }
+
+    pub fn set_in_flight(&self, in_flight: bool) {
+        self.prompt_in_flight.store(in_flight, Ordering::Relaxed);
+    }
+
+    pub fn last_active(&self) -> std::time::SystemTime {
+        let ms = self.last_active_ms.load(Ordering::Relaxed);
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)
+    }
+
+    pub fn in_flight(&self) -> bool {
+        self.prompt_in_flight.load(Ordering::Relaxed)
+    }
+}
+
 pub struct AcpConnection {
     _proc: Child,
     /// PID of the direct child, used as the process group ID for cleanup.
@@ -119,6 +161,7 @@ pub struct AcpConnection {
     pub supports_load_session: bool,
     pub config_options: Vec<ConfigOption>,
     pub last_active: Instant,
+    pub activity: Arc<SessionActivity>,
     pub session_reset: bool,
     _reader_handle: JoinHandle<()>,
     _stderr_handle: Option<JoinHandle<()>>,
@@ -399,6 +442,8 @@ impl AcpConnection {
             notify_tx.clone(),
         ));
 
+        let activity = Arc::new(SessionActivity::new());
+
         Ok(Self {
             _proc: proc,
             child_pgid,
@@ -410,6 +455,7 @@ impl AcpConnection {
             supports_load_session: false,
             config_options: Vec::new(),
             last_active: Instant::now(),
+            activity,
             session_reset: false,
             _reader_handle: reader_handle,
             _stderr_handle: stderr_handle,
@@ -572,6 +618,8 @@ impl AcpConnection {
         content_blocks: Vec<ContentBlock>,
     ) -> Result<(mpsc::UnboundedReceiver<JsonRpcMessage>, u64)> {
         self.last_active = Instant::now();
+        self.activity.touch();
+        self.activity.set_in_flight(true);
 
         let session_id = self
             .acp_session_id
@@ -606,6 +654,8 @@ impl AcpConnection {
     /// Call after prompt streaming is done to clean up subscriber.
     pub async fn prompt_done(&mut self) {
         *self.notify_tx.lock().await = None;
+        self.activity.touch();
+        self.activity.set_in_flight(false);
         self.last_active = Instant::now();
     }
 
@@ -632,6 +682,10 @@ impl AcpConnection {
     /// Return a clone of the stdin handle for lock-free cancel.
     pub fn cancel_handle(&self) -> Arc<Mutex<ChildStdin>> {
         Arc::clone(&self.stdin)
+    }
+
+    pub fn activity_handle(&self) -> Arc<SessionActivity> {
+        Arc::clone(&self.activity)
     }
 
     pub fn alive(&self) -> bool {

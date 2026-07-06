@@ -1,4 +1,4 @@
-use crate::acp::connection::AcpConnection;
+use crate::acp::connection::{AcpConnection, SessionActivity};
 use crate::acp::protocol::ConfigOption;
 use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
@@ -22,6 +22,8 @@ struct PoolState {
     /// Lock-free cancel handles: thread_key → (stdin, session_id).
     /// Stored separately so cancel can work without locking the connection.
     cancel_handles: HashMap<String, (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String)>,
+    /// Lock-free activity handles for hung-session detection without the connection mutex.
+    activity: HashMap<String, Arc<SessionActivity>>,
     /// Suspended sessions: thread_key → ACP sessionId.
     /// Used at runtime to decide which thread can be resumed via `session/load`
     /// because it no longer has a live in-memory connection.
@@ -97,6 +99,7 @@ impl SessionPool {
             state: RwLock::new(PoolState {
                 active: HashMap::new(),
                 cancel_handles: HashMap::new(),
+                activity: HashMap::new(),
                 persisted: suspended.clone(),
                 suspended,
                 creating: HashMap::new(),
@@ -311,6 +314,7 @@ impl SessionPool {
         }
 
         let cancel_handle = new_conn.cancel_handle();
+        let activity_handle = new_conn.activity_handle();
         let cancel_session_id = new_conn.acp_session_id.clone().unwrap_or_default();
         let new_conn = Arc::new(Mutex::new(new_conn));
 
@@ -329,12 +333,14 @@ impl SessionPool {
             drop(existing);
             state.active.remove(thread_id);
             state.cancel_handles.remove(thread_id);
+            state.activity.remove(thread_id);
         }
 
         if state.active.len() >= self.max_sessions {
             if let Some((key, expected_conn, _, sid)) = eviction_candidate {
                 if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
                     state.cancel_handles.remove(&key);
+                    state.activity.remove(&key);
                     info!(evicted = %key, "pool full, suspending oldest idle session");
                     if let Some(sid) = sid {
                         state.persisted.insert(key.clone(), sid.clone());
@@ -367,6 +373,9 @@ impl SessionPool {
         }
         state.suspended.remove(thread_id);
         state.active.insert(thread_id.to_string(), new_conn);
+        state
+            .activity
+            .insert(thread_id.to_string(), activity_handle);
         if !cancel_session_id.is_empty() {
             state
                 .cancel_handles
@@ -500,6 +509,7 @@ impl SessionPool {
         let mut state = self.state.write().await;
         let had_active = state.active.remove(thread_id).is_some();
         state.cancel_handles.remove(thread_id);
+        state.activity.remove(thread_id);
         state.suspended.remove(thread_id);
         state.persisted.remove(thread_id);
         state.creating.remove(thread_id);
@@ -548,6 +558,7 @@ impl SessionPool {
             if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
                 info!(thread_id = %key, "cleaning up idle session");
                 state.cancel_handles.remove(&key);
+                state.activity.remove(&key);
                 if let Some(sid) = sid {
                     state.persisted.insert(key.clone(), sid.clone());
                     state.suspended.insert(key, sid);
@@ -591,6 +602,7 @@ impl SessionPool {
         let count = state.active.len();
         state.active.clear();
         state.cancel_handles.clear();
+        state.activity.clear();
         info!(count, "pool shutdown complete");
     }
 }
