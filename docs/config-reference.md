@@ -234,6 +234,7 @@ Session pool settings for managing concurrent agent sessions.
 |-----|------|---------|-------------|
 | `max_sessions` | usize | `10` | Maximum number of concurrent agent sessions. When full, the oldest idle session is suspended (recoverable); if all sessions are busy, new requests are rejected. |
 | `session_ttl_hours` | u64 | `4` | Session time-to-live in hours. Idle sessions are reclaimed after this period. The example config uses `24`. |
+| `hung_grace_secs` | u64 | `120` | Grace period after `prompt_hard_timeout_secs` before a session stuck with its connection mutex held (in-flight prompt) is force-evicted from the pool. Eviction threshold: `prompt_hard_timeout_secs + hung_grace_secs`. |
 
 ---
 

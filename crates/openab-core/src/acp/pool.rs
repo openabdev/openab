@@ -82,7 +82,11 @@ fn classify_idle(last_active: Instant, alive: bool, cutoff: Instant) -> bool {
 }
 
 /// Returns true when a locked, in-flight session has exceeded the hung threshold.
-fn classify_hung(in_flight: bool, last_active_age: std::time::Duration, threshold: std::time::Duration) -> bool {
+fn classify_hung(
+    in_flight: bool,
+    last_active_age: std::time::Duration,
+    threshold: std::time::Duration,
+) -> bool {
     in_flight && last_active_age > threshold
 }
 
@@ -312,7 +316,8 @@ impl SessionPool {
                     }
                     Err(e) => {
                         let err_str = e.to_string();
-                        let is_transient = TRANSIENT_LOAD_ERRORS.iter().any(|s| err_str.contains(s));
+                        let is_transient =
+                            TRANSIENT_LOAD_ERRORS.iter().any(|s| err_str.contains(s));
                         if is_transient {
                             warn!(thread_id, session_id = %sid, error = %e,
                                 "session/load failed transiently, preserving session ID for retry");
@@ -335,7 +340,9 @@ impl SessionPool {
             // in state.persisted (we haven't touched it), so the next message will
             // retry session/load automatically. Return an error so the current message
             // is not processed against a context-free session.
-            return Err(anyhow!("session load {reason}: could not restore previous session"));
+            return Err(anyhow!(
+                "session load {reason}: could not restore previous session"
+            ));
         }
 
         if !resumed {
@@ -680,7 +687,10 @@ impl SessionPool {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_hung_eviction, better_candidate, classify_hung, classify_idle, get_or_insert_gate, remove_if_same_handle, PoolState};
+    use super::{
+        apply_hung_eviction, better_candidate, classify_hung, classify_idle, get_or_insert_gate,
+        remove_if_same_handle, PoolState,
+    };
     use crate::acp::connection::SessionActivity;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -795,15 +805,9 @@ mod tests {
         let mut state = PoolState {
             active: HashMap::new(),
             cancel_handles: HashMap::new(),
-            activity: HashMap::from([(
-                "thread".to_string(),
-                Arc::new(SessionActivity::new()),
-            )]),
+            activity: HashMap::from([("thread".to_string(), Arc::new(SessionActivity::new()))]),
             suspended: HashMap::new(),
-            persisted: HashMap::from([(
-                "thread".to_string(),
-                "session-1".to_string(),
-            )]),
+            persisted: HashMap::from([("thread".to_string(), "session-1".to_string())]),
             creating: HashMap::new(),
             session_workdirs: HashMap::new(),
         };

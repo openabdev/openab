@@ -137,8 +137,7 @@ impl SessionActivity {
     }
 
     pub fn touch(&self) {
-        self.last_active_ms
-            .store(Self::now_ms(), Ordering::Relaxed);
+        self.last_active_ms.store(Self::now_ms(), Ordering::Relaxed);
     }
 
     pub fn set_in_flight(&self, in_flight: bool) {
@@ -420,7 +419,8 @@ impl AcpConnection {
                         Ok(_) => {
                             let trimmed = line.trim();
                             if !trimmed.is_empty() {
-                                let sanitized: String = trimmed.chars()
+                                let sanitized: String = trimmed
+                                    .chars()
                                     .filter(|c| !c.is_control() || *c == '\t')
                                     .collect();
                                 if !sanitized.is_empty() {
@@ -932,13 +932,10 @@ mod reader_loop_tests {
         agent_stdout_writer.write_all(stale).await.unwrap();
         agent_stdout_writer.flush().await.unwrap();
 
-        let forwarded = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            sub_rx.recv(),
-        )
-        .await
-        .expect("subscriber should receive stale message before timeout")
-        .expect("subscriber channel should not be closed");
+        let forwarded = tokio::time::timeout(std::time::Duration::from_secs(2), sub_rx.recv())
+            .await
+            .expect("subscriber should receive stale message before timeout")
+            .expect("subscriber channel should not be closed");
         assert_eq!(forwarded.id, Some(42));
         assert!(pending.lock().await.is_empty());
 
