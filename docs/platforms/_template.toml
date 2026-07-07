@@ -45,6 +45,13 @@ description   = ""                 # required. one-line "what is this platform"
 # ═══ Schema 1 — platform-capability (source of truth: official docs) ═════════
 # Every field below is required. Each carries a typed value (bool/enum/int) for
 # machine comparison + a freeform `note` + an official-doc `source` URL.
+#
+# How to fill each block:
+#   - Set the typed value(s) to the platform's actual behavior.
+#   - `note`: the concrete platform-specific detail a reviewer needs (the "how").
+#   - `source`: the official-doc URL that proves the fact (one canonical link).
+#   - If a fact is genuinely unverified, still set the typed value to the best
+#     known guess and flag it in `note` with a leading "?" so it's auditable.
 
 [capability.transport]
 # enum: webhook | websocket | socket_mode | long_poll
@@ -70,10 +77,10 @@ note      = ""                     # required. registration / delivery, or "plai
 source    = ""                     # required
 
 [capability.mentions]
-note   = ""                        # required. how the bot detects being addressed
-source = ""                        # required
 # how the bot knows it was addressed. enum: at_mention | username | self_flag | none
 method = "at_mention"              # required
+note   = ""                        # required. the concrete detection mechanism (e.g. isSelf flag)
+source = ""                        # required
 
 [capability.emoji_reactions]
 bot_can_add        = false         # required, bool
@@ -104,8 +111,10 @@ source   = ""                      # required
 [capability.attachments]
 inbound     = []                   # required. subset of: image audio video file  (what CAN arrive)
 outbound    = []                   # required. subset of: image audio video file
-max_size_mb = 0                    # optional. 0/omit = unspecified; note the reason
-note        = ""                   # required. fetch model, provider caveats, expiry
+max_size_mb = 0                    # optional, int. headline cap; 0/omit = unspecified
+# required. fetch model, provider caveats, expiry — AND per-type / per-plan size
+# limits when they differ from the single headline max_size_mb above.
+note        = ""
 source      = ""                   # required
 
 [capability.message_length_limit]
@@ -289,6 +298,7 @@ pr      = ""
 date   = ""                        # required, "YYYY-MM-DD" — when documented
 title  = ""                        # required. short headline
 note   = ""                        # required. freeform prose (may be multi-paragraph)
-kind   = "A"                       # optional, enum: A (intrinsic) | B (openab decision)
+# required, enum: intrinsic (a platform fact) | openab_decision (a choice/finding of ours)
+kind   = "intrinsic"
 source = ""                        # optional. official-doc URL, or "file.rs" / "file.rs#symbol"
 refs   = []                        # optional. ["#1291", ...] PR/ADR links
