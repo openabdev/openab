@@ -6,9 +6,10 @@
 #  snake_case) and fill every field.
 #
 #  This template IS the schema documentation. The authoritative *types* live in
-#  the Rust structs at `crates/.../platform_schema.rs` (serde). A conformance
-#  test deserializes this template + every schema/*.toml into those structs, so
-#  this file must always stay valid — if it drifts from the structs, CI fails.
+#  the Rust structs at `crates/.../platform_schema.rs` (serde). Conformance
+#  fully deserializes every real schema/*.toml into those structs, and checks
+#  this template still enumerates every capability section + every feature key —
+#  so if the structs gain/rename a field, this template must be updated too.
 #
 #  Three schemas, matching docs/platforms/README.md:
 #    [capability.*]        -> Schema 1 platform-capability  (source: official docs)
@@ -150,24 +151,127 @@ source    = ""                     # required
 
 
 # ═══ Schema 2 — openab-feature-support (source of truth: our code + PR) ══════
-# One [[openab_features]] block per OpenAB capability. The full expected feature
-# set (conformance checks all are present):
-#   send_message · message_split · streaming · reply_quote · edit_message ·
-#   delete_message · emoji_reactions · threads_topics · media_inbound ·
-#   voice_stt · trust_gate · deny_echo · mention_gating · slash_commands ·
-#   multibot · group_routing
+# One [[openab_features]] block per OpenAB capability. All 16 blocks below are
+# the complete, closed feature set (conformance checks every one is present and
+# that no unknown feature key is used). Fill each for the platform.
 #
 # status enum: implemented | partial | workaround | not_implemented | n_a
 #   Always explain partial / workaround / limited — the "why" is the value.
 # `source` is an array of "crates/.../file.rs:line" — conformance verifies each
 #   file+line still exists. `pr` is optional (the deciding PR/issue).
+# (status/note/source left blank here — this is a blank form to copy & fill.)
 
 [[openab_features]]
-feature = "send_message"           # required. one of the keys listed above
-status  = "implemented"            # required, enum
-note    = ""                       # required. how it maps; explain any non-"implemented"
-source  = []                       # required. ["crates/.../line.rs:646", ...]
-pr      = ""                       # optional. e.g. "#1291"
+feature = "send_message"           # basic outbound
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "message_split"          # long-message handling (split_delivery / message_limit)
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "streaming"              # stream_begin / stream_append / stream_finish — live vs batched
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "reply_quote"            # send_message_with_reply
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "edit_message"           # own-message edit
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "delete_message"         # delete own / others
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "emoji_reactions"        # add_reaction / remove_reaction
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "threads_topics"         # create_thread / create_topic
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "media_inbound"          # images / files / audio ingestion
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "voice_stt"              # speech-to-text on voice notes
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "trust_gate"             # allowlist / identity-trust enforcement point
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "deny_echo"              # reply-on-deny behavior + delivery constraints
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "mention_gating"         # require @mention in groups
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "slash_commands"         # /reset, /cancel handling
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "multibot"               # multiple bots in one channel
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "group_routing"          # group / session routing
+status  = ""
+note    = ""
+source  = []
+pr      = ""
 
 
 # ═══ Schema 3 — platform-quirks (freeform, dated findings log) ═══════════════
