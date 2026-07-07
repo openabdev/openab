@@ -4,6 +4,11 @@ use serde_json::Value;
 pub fn extract_text_from_step_payload(blob: &[u8]) -> Option<String> {
     let field_20 = get_proto_field(blob, 20)?;
     let field_1 = get_proto_field(&field_20, 1)?;
+    if let Some(field_1_sub) = get_proto_field(&field_1, 1) {
+        if let Ok(text) = String::from_utf8(field_1_sub) {
+            return Some(text);
+        }
+    }
     String::from_utf8(field_1).ok()
 }
 

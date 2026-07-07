@@ -17,10 +17,16 @@ pub struct Adapter {
 
 impl Adapter {
     pub fn new() -> Self {
-        // On Windows, HOME is not set; fall back to USERPROFILE.
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| "/tmp".to_string());
+        // On Windows, prioritize USERPROFILE over HOME because the parent openab
+        // process may have set HOME to the workspace directory.
+        let home = if cfg!(target_os = "windows") {
+            std::env::var("USERPROFILE")
+                .or_else(|_| std::env::var("HOME"))
+        } else {
+            std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+        }
+        .unwrap_or_else(|_| "/tmp".to_string());
         let state_dir = PathBuf::from(&home).join(".openab/agy-acp");
         Self {
             sessions: HashMap::new(),
@@ -81,9 +87,14 @@ impl Adapter {
     /// Build PATH with common agent binary locations prepended.
     /// Uses OS-appropriate path separator (`;` on Windows, `:` on Unix).
     pub fn augmented_path() -> String {
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| "/home/agent".to_string());
+        let home = if cfg!(target_os = "windows") {
+            std::env::var("USERPROFILE")
+                .or_else(|_| std::env::var("HOME"))
+        } else {
+            std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+        }
+        .unwrap_or_else(|_| "/home/agent".to_string());
         let base = std::env::var("PATH").unwrap_or_else(|_| {
             if cfg!(target_os = "windows") {
                 "".to_string()
