@@ -18,7 +18,12 @@
 #
 #  Sourcing rule:
 #    (A) intrinsic facts   -> `source` is an official-doc URL
-#    (B) OpenAB decisions  -> `source` is "crates/.../file.rs:line" (+ optional pr)
+#    (B) OpenAB decisions  -> `source` points to a file, NOT a line number:
+#          "crates/.../file.rs"            (file only), or
+#          "crates/.../file.rs#symbol"     (file + a fn/const name for precision)
+#        Line numbers are deliberately avoided — they go stale on any edit above.
+#        A symbol name is stable (only churns when renamed/deleted — exactly the
+#        drift we want to catch) and is greppable, so conformance can verify it.
 #
 #  Conventions:
 #    required   = must be present, deserialize fails otherwise
@@ -157,15 +162,16 @@ source    = ""                     # required
 #
 # status enum: implemented | partial | workaround | not_implemented | n_a
 #   Always explain partial / workaround / limited — the "why" is the value.
-# `source` is an array of "crates/.../file.rs:line" — conformance verifies each
-#   file+line still exists. `pr` is optional (the deciding PR/issue).
+# `source` is an array of "file.rs" or "file.rs#symbol" (no line numbers) —
+#   conformance verifies each file exists, and greps for the #symbol if given.
+#   `pr` is optional (the deciding PR/issue).
 # (status/note/source left blank here — this is a blank form to copy & fill.)
 
 [[openab_features]]
 feature = "send_message"           # basic outbound
 status  = ""
 note    = ""
-source  = []
+source  = []                       # e.g. ["crates/.../line.rs#dispatch_line_reply"]
 pr      = ""
 
 [[openab_features]]
@@ -284,5 +290,5 @@ date   = ""                        # required, "YYYY-MM-DD" — when documented
 title  = ""                        # required. short headline
 note   = ""                        # required. freeform prose (may be multi-paragraph)
 kind   = "A"                       # optional, enum: A (intrinsic) | B (openab decision)
-source = ""                        # optional. official-doc URL or "file.rs:line"
+source = ""                        # optional. official-doc URL, or "file.rs" / "file.rs#symbol"
 refs   = []                        # optional. ["#1291", ...] PR/ADR links
