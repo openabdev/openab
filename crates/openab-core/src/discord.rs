@@ -774,7 +774,9 @@ impl EventHandler for Handler {
                         return;
                     }
                 }
-                AllowUsers::MultibotMentions => {
+                // MultipartyMentions: multi-human detection is Slack-only for now;
+                // on Discord it behaves like MultibotMentions.
+                AllowUsers::MultibotMentions | AllowUsers::MultipartyMentions => {
                     if !in_thread {
                         return;
                     }
@@ -1204,7 +1206,9 @@ impl EventHandler for Handler {
         let (bot_involved, other_bot_present) = if is_thread
             && matches!(
                 self.allow_user_messages,
-                AllowUsers::Involved | AllowUsers::MultibotMentions
+                AllowUsers::Involved
+                    | AllowUsers::MultibotMentions
+                    | AllowUsers::MultipartyMentions
             ) {
             self.bot_participated_in_thread(&ctx.http, channel_id, bot_id).await
         } else {
@@ -2988,7 +2992,7 @@ fn should_process_user_message(
     match mode {
         AllowUsers::Mentions => false,
         AllowUsers::Involved => in_thread && involved,
-        AllowUsers::MultibotMentions => {
+        AllowUsers::MultibotMentions | AllowUsers::MultipartyMentions => {
             if !in_thread || !involved {
                 return false;
             }
@@ -3018,7 +3022,7 @@ fn should_process_reaction(
     match mode {
         AllowUsers::Mentions => false,
         AllowUsers::Involved => is_thread && bot_involved,
-        AllowUsers::MultibotMentions => {
+        AllowUsers::MultibotMentions | AllowUsers::MultipartyMentions => {
             if !is_thread || !bot_involved {
                 return false;
             }
@@ -3530,6 +3534,35 @@ mod tests {
             true,  // in_thread
             true,  // involved
             true,  // other_bot_present ← another bot posted
+        ));
+    }
+
+    /// GIVEN: multiparty-mentions mode, single-bot thread, bot is involved
+    /// WHEN:  human sends message without @mention
+    /// THEN:  bot responds (on Discord this mode behaves like multibot-mentions;
+    ///        multi-human detection is Slack-only for now)
+    #[test]
+    fn multiparty_mentions_single_bot_thread_no_mention() {
+        assert!(should_process_user_message(
+            AllowUsers::MultipartyMentions,
+            false, // is_mentioned
+            true,  // in_thread
+            true,  // involved
+            false, // other_bot_present
+        ));
+    }
+
+    /// GIVEN: multiparty-mentions mode, multi-bot thread
+    /// WHEN:  human sends message without @mention
+    /// THEN:  bot does NOT respond
+    #[test]
+    fn multiparty_mentions_multi_bot_thread_no_mention() {
+        assert!(!should_process_user_message(
+            AllowUsers::MultipartyMentions,
+            false, // is_mentioned
+            true,  // in_thread
+            true,  // involved
+            true,  // other_bot_present
         ));
     }
 

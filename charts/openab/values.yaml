@@ -337,7 +337,9 @@ agents:
       allowBotMessages: "off"
       # trustedBotIds: Bot User IDs (U...) — find via Slack UI: click bot profile → Copy member ID
       trustedBotIds: []
-      # allowUserMessages: "multibot-mentions" (default) | "involved" | "mentions"
+      # allowUserMessages: "multibot-mentions" (default) | "involved" | "mentions" | "multiparty-mentions"
+      #   multiparty-mentions (Slack): follow 1:1 threads (single human + bot) without
+      #   @mention; require @mention once a second human or another bot joins the thread.
       # "involved" = respond to thread follow-ups without @mention if bot has participated
       # "mentions" = always require @mention
       # "multibot-mentions" = same as "involved" in single-bot threads; require @mention

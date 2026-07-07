@@ -446,12 +446,17 @@ fn default_max_batch_tokens() -> usize {
 /// - `Mentions`: always require @mention, even in threads the bot is participating in.
 /// - `MultibotMentions` (default): same as `Involved` in single-bot threads; falls back to
 ///   `Mentions` when other bots have also posted in the thread.
+/// - `MultipartyMentions`: same as `Involved` while the thread is a 1:1 conversation
+///   (a single human + this bot); falls back to `Mentions` once a second human or
+///   another bot posts in the thread. Multi-human detection is currently implemented
+///   for Slack; on other platforms this behaves like `MultibotMentions`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AllowUsers {
     Involved,
     Mentions,
     #[default]
     MultibotMentions,
+    MultipartyMentions,
 }
 
 impl<'de> Deserialize<'de> for AllowUsers {
@@ -461,9 +466,15 @@ impl<'de> Deserialize<'de> for AllowUsers {
             "involved" => Ok(Self::Involved),
             "mentions" => Ok(Self::Mentions),
             "multibot_mentions" => Ok(Self::MultibotMentions),
+            "multiparty_mentions" => Ok(Self::MultipartyMentions),
             other => Err(serde::de::Error::unknown_variant(
                 other,
-                &["involved", "mentions", "multibot-mentions"],
+                &[
+                    "involved",
+                    "mentions",
+                    "multibot-mentions",
+                    "multiparty-mentions",
+                ],
             )),
         }
     }
@@ -1560,6 +1571,18 @@ fn default_ambient_context_flushes() -> usize {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn allow_users_deserializes_multiparty_mentions() {
+        #[derive(serde::Deserialize)]
+        struct W {
+            v: super::AllowUsers,
+        }
+        let w: W = toml::from_str("v = \"multiparty-mentions\"").unwrap();
+        assert_eq!(w.v, super::AllowUsers::MultipartyMentions);
+        let w: W = toml::from_str("v = \"multiparty_mentions\"").unwrap();
+        assert_eq!(w.v, super::AllowUsers::MultipartyMentions);
+    }
     use super::*;
     use std::io::Write;
 

@@ -83,6 +83,10 @@ pub enum AllowUsers {
     /// require @mention to avoid all bots responding.
     #[default]
     MultibotMentions,
+    /// Like Involved in 1:1 threads (single human + bot); require @mention once
+    /// a second human or another bot joins. Multi-human detection is Slack-only
+    /// for now — on Feishu this behaves like MultibotMentions.
+    MultipartyMentions,
 }
 
 /// Streaming delivery strategy for the Feishu adapter.
@@ -215,6 +219,7 @@ impl FeishuConfig {
         {
             "involved" => AllowUsers::Involved,
             "mentions" => AllowUsers::Mentions,
+            "multiparty-mentions" | "multiparty_mentions" => AllowUsers::MultipartyMentions,
             _ => AllowUsers::MultibotMentions,
         };
         let max_bot_turns = std::env::var("FEISHU_MAX_BOT_TURNS")
@@ -2465,7 +2470,8 @@ fn detect_and_mark_multibot(
     match config.allow_user_messages {
         AllowUsers::Mentions => false,
         AllowUsers::Involved => self_participated,
-        AllowUsers::MultibotMentions => {
+        // MultipartyMentions: multi-human detection is Slack-only for now.
+        AllowUsers::MultibotMentions | AllowUsers::MultipartyMentions => {
             if !self_participated {
                 false
             } else {

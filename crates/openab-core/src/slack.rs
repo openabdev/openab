@@ -75,6 +75,12 @@ pub struct SlackAdapter {
     /// Positive-only cache: thread_ts → cached_at for threads where other bots have posted.
     /// Like participation, a thread becoming multi-bot is irreversible (bot messages don't disappear).
     multibot_threads: tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>,
+    /// Positive-only cache: thread_ts → cached_at for threads with ≥2 distinct human senders.
+    /// Like multibot, a thread becoming multi-human is irreversible. Used by `multiparty-mentions`.
+    multihuman_threads: tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>,
+    /// First human sender seen per thread (thread_ts → (user_id, seen_at)); feeds eager
+    /// multi-human detection from message events without an extra API fetch.
+    thread_first_human: tokio::sync::Mutex<HashMap<String, (String, tokio::time::Instant)>>,
     /// Persistent disk cache for multibot thread detection (survives restarts).
     multibot_cache: crate::multibot_cache::MultibotCache,
     /// TTL for participation cache entries (matches session_ttl_hours from config).
@@ -115,6 +121,8 @@ impl SlackAdapter {
             bot_id_cache: tokio::sync::Mutex::new(HashMap::new()),
             participated_threads: tokio::sync::Mutex::new(HashMap::new()),
             multibot_threads: tokio::sync::Mutex::new(HashMap::new()),
+            multihuman_threads: tokio::sync::Mutex::new(HashMap::new()),
+            thread_first_human: tokio::sync::Mutex::new(HashMap::new()),
             multibot_cache,
             session_ttl,
             assistant_mode,
@@ -143,6 +151,36 @@ impl SlackAdapter {
         self.multibot_cache.mark_multibot(thread_ts).await;
     }
 
+    /// Eagerly record a human sender in a thread. The second distinct human marks the
+    /// thread multi-human (consumed by `multiparty-mentions`). Called from the event
+    /// loop for every human thread message, so detection doesn't depend on fetching
+    /// thread history. Idempotent. In-memory only (rebuilt on restart via the
+    /// history fetch in `bot_participated_in_thread`).
+    async fn note_human_in_thread(&self, thread_ts: &str, user_id: &str) {
+        {
+            let mut first = self.thread_first_human.lock().await;
+            match first.get(thread_ts) {
+                None => {
+                    first.insert(
+                        thread_ts.to_string(),
+                        (user_id.to_string(), tokio::time::Instant::now()),
+                    );
+                    if first.len() > PARTICIPATION_CACHE_MAX {
+                        let ttl = self.session_ttl;
+                        first.retain(|_, (_, ts)| ts.elapsed() < ttl);
+                    }
+                    return;
+                }
+                Some((uid, _)) if uid == user_id => return,
+                Some(_) => {} // second distinct human — fall through to mark multi-human
+            }
+        }
+        let mut cache = self.multihuman_threads.lock().await;
+        cache
+            .entry(thread_ts.to_string())
+            .or_insert_with(tokio::time::Instant::now);
+        enforce_cache_bounds(&mut cache, self.session_ttl);
+    }
 
     /// Insert a stream entry, bounding the map so aborted turns (begin without a
     /// matching finish) can't leak unboundedly. Normal lifecycle: stream_begin
@@ -326,7 +364,12 @@ impl SlackAdapter {
     /// Involved = parent message @mentions the bot OR any message in thread is from the bot.
     /// Fail-closed: returns `(false, false)` on API error (consistent with Discord's approach).
     /// Caches positive results only — both states are irreversible.
-    async fn bot_participated_in_thread(&self, channel: &str, thread_ts: &str) -> (bool, bool) {
+    /// Returns `(involved, other_bot_present, multi_human)` for the thread.
+    async fn bot_participated_in_thread(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+    ) -> (bool, bool, bool) {
         let cached_involved = {
             let cache = self.participated_threads.lock().await;
             cache
@@ -339,18 +382,24 @@ impl SlackAdapter {
                 .get(thread_ts)
                 .is_some_and(|ts| ts.elapsed() < self.session_ttl)
         } || self.multibot_cache.is_multibot(thread_ts);
+        let cached_multihuman = {
+            let cache = self.multihuman_threads.lock().await;
+            cache
+                .get(thread_ts)
+                .is_some_and(|ts| ts.elapsed() < self.session_ttl)
+        };
 
         // Eager multibot detection from message events populates the cache
         // before this runs. When already involved and cached, skip the fetch.
         if cached_involved {
-            return (true, cached_multibot);
+            return (true, cached_multibot, cached_multihuman);
         }
 
         let bot_id = match self.get_bot_user_id().await {
             Some(id) => id,
             None => {
                 warn!("cannot resolve bot user ID, rejecting (fail-closed)");
-                return (false, false);
+                return (false, false, false);
             }
         };
 
@@ -370,11 +419,11 @@ impl SlackAdapter {
             Ok(json) => json,
             Err(e) => {
                 warn!(channel, thread_ts, error = %e, "failed to fetch thread replies, rejecting (fail-closed)");
-                return (false, false);
+                return (false, false, false);
             }
         };
         let Some(messages) = json["messages"].as_array() else {
-            return (false, false);
+            return (false, false, false);
         };
 
         let parent_mentions_bot = messages
@@ -393,7 +442,27 @@ impl SlackAdapter {
             self.cache_participation(thread_ts).await;
         }
 
-        (involved, other_bot_present)
+        // Distinct human senders in the fetched window (multiparty-mentions):
+        // ≥2 → multi-human, cached positively like multibot. Eager per-event
+        // detection (`note_human_in_thread`) covers live traffic; this fetch
+        // covers thread history from before this process started.
+        let mut human_ids: Vec<&str> = messages
+            .iter()
+            .filter(|m| !(m["bot_id"].is_string() || m["subtype"].as_str() == Some("bot_message")))
+            .filter_map(|m| m["user"].as_str())
+            .collect();
+        human_ids.sort_unstable();
+        human_ids.dedup();
+        let multi_human = cached_multihuman || human_ids.len() >= 2;
+        if multi_human && !cached_multihuman {
+            let mut cache = self.multihuman_threads.lock().await;
+            cache
+                .entry(thread_ts.to_string())
+                .or_insert_with(tokio::time::Instant::now);
+            enforce_cache_bounds(&mut cache, self.session_ttl);
+        }
+
+        (involved, other_bot_present, multi_human)
     }
 
     /// Insert a positive participation entry, enforcing cache bounds.
@@ -904,6 +973,18 @@ pub async fn run_slack_adapter(
                                                     }
                                                 }
 
+                                                // --- Eager multi-human detection (multiparty-mentions) ---
+                                                // Track human senders per thread; the second distinct human
+                                                // marks the thread multi-human without an API fetch.
+                                                if !is_bot {
+                                                    if let (Some(thread_ts), Some(uid)) = (
+                                                        event["thread_ts"].as_str(),
+                                                        event["user"].as_str(),
+                                                    ) {
+                                                        adapter.note_human_in_thread(thread_ts, uid).await;
+                                                    }
+                                                }
+
                                                 // --- Bot turn tracking ---
                                                 // Runs before self-check so ALL bot messages (including own)
                                                 // count toward the per-thread limit. Matches Discord #483.
@@ -1039,7 +1120,7 @@ pub async fn run_slack_adapter(
                                                                     continue;
                                                                 }
                                                                 let thread_ts = event["thread_ts"].as_str().unwrap_or("");
-                                                                let (involved, _) = adapter
+                                                                let (involved, _, _) = adapter
                                                                     .bot_participated_in_thread(channel_id, thread_ts)
                                                                     .await;
                                                                 if !involved {
@@ -1052,7 +1133,7 @@ pub async fn run_slack_adapter(
                                                                     continue;
                                                                 }
                                                                 let thread_ts = event["thread_ts"].as_str().unwrap_or("");
-                                                                let (involved, other_bot) = adapter
+                                                                let (involved, other_bot, _) = adapter
                                                                     .bot_participated_in_thread(channel_id, thread_ts)
                                                                     .await;
                                                                 if !involved {
@@ -1068,6 +1149,26 @@ pub async fn run_slack_adapter(
                                                                 // and survives changes to the earlier dedup.
                                                                 if other_bot && !mentions_bot {
                                                                     debug!(channel_id, thread_ts, "multi-bot thread without @mention, ignoring");
+                                                                    continue;
+                                                                }
+                                                            }
+                                                            AllowUsers::MultipartyMentions => {
+                                                                if !has_thread {
+                                                                    continue;
+                                                                }
+                                                                let thread_ts = event["thread_ts"].as_str().unwrap_or("");
+                                                                let (involved, other_bot, multi_human) = adapter
+                                                                    .bot_participated_in_thread(channel_id, thread_ts)
+                                                                    .await;
+                                                                if !involved {
+                                                                    debug!(channel_id, thread_ts, "bot not involved in thread, ignoring");
+                                                                    continue;
+                                                                }
+                                                                // 1:1 thread (single human + this bot): follow the
+                                                                // whole thread like Involved. Once a second human or
+                                                                // another bot has posted, require @mention.
+                                                                if (other_bot || multi_human) && !mentions_bot {
+                                                                    debug!(channel_id, thread_ts, "multiparty thread without @mention, ignoring");
                                                                     continue;
                                                                 }
                                                             }

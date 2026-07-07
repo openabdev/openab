@@ -13,7 +13,7 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # trusted_bot_ids = []         # empty = any bot (mode permitting); set to restrict
 # allowed_role_ids = []        # role IDs that trigger the bot (same as direct @mention)
                                # note: if multiple bots share the same role, all will respond simultaneously
-# allow_user_messages = "multibot-mentions"  # "multibot-mentions" (default) | "involved" | "mentions"
+# allow_user_messages = "multibot-mentions"  # "multibot-mentions" (default) | "involved" | "mentions" | "multiparty-mentions"
                                      # "involved" = reply in threads bot owns or has participated in
                                      # "mentions" = always require @mention
 # allow_dm = false                     # true = respond to Discord DMs; false (default) = ignore DMs
@@ -28,7 +28,7 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # allowed_users = ["U0123456789"]      # only checked when allow_all_users = false
 # allow_bot_messages = "off"           # "off" (default) | "mentions" | "all"
 # trusted_bot_ids = []                 # empty = any bot (mode permitting); set to restrict
-# allow_user_messages = "multibot-mentions"     # "multibot-mentions" (default) | "involved" | "mentions"
+# allow_user_messages = "multibot-mentions"     # "multibot-mentions" (default) | "involved" | "mentions" | "multiparty-mentions" (Slack)
                                         # "involved" = reply in threads bot has participated in
                                         # "mentions" = always require @mention
                                         # "multibot-mentions" = like "involved", but require @mention
