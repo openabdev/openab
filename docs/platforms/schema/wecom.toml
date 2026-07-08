@@ -52,6 +52,7 @@ source    = "https://developer.work.weixin.qq.com/document/path/94867"
 [capability.delete_message]
 supported = true
 scope     = "own"
+window_sec = 86400
 note      = "Own messages only, via recall (/cgi-bin/message/recall), within 24 hours of send; cannot delete users'/others' messages (data already delivered to the WeChat-plugin end also can't be pulled back)."
 source    = "https://developer.work.weixin.qq.com/document/path/94867"
 

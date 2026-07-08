@@ -91,6 +91,7 @@ source             = ""            # required
 
 [capability.edit_message]
 supported = false                  # required, bool. can a bot edit its own sent message?
+max_edits = 0                      # optional, int. cap on edits per message (0/omit = unspecified/unlimited)
 note      = ""                     # required
 source    = ""                     # required
 
@@ -98,6 +99,7 @@ source    = ""                     # required
 supported = false                  # required, bool
 # enum: none | own | others | own_and_others
 scope     = "none"                 # required. what a bot may delete
+window_sec = 0                     # optional, int. deletion time window in seconds (0/omit = none/unlimited)
 note      = ""                     # required
 source    = ""                     # required
 
@@ -112,6 +114,8 @@ source   = ""                      # required
 inbound     = []                   # required. subset of: image audio video file  (what CAN arrive)
 outbound    = []                   # required. subset of: image audio video file
 max_size_mb = 0                    # optional, int. headline cap; 0/omit = unspecified
+max_count   = 0                    # optional, int. max attachments per message (0/omit = unspecified)
+# outbound_delivery = "upload"     # optional, enum: url | upload — how the bot SENDS media
 # required. fetch model, provider caveats, expiry — AND per-type / per-plan size
 # limits when they differ from the single headline max_size_mb above.
 note        = ""

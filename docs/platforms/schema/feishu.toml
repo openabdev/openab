@@ -45,6 +45,7 @@ source              = "https://open.feishu.cn/document/server-docs/im-v1/message
 
 [capability.edit_message]
 supported = true
+max_edits = 20
 note      = "Own message only (calling identity must equal sender, else errcode 230071). PATCH /im/v1/messages/{id} updates text / post. Officially documented hard cap of 20 edits per message (errcode 230072 when exceeded); edit-time window is set by enterprise admin (errcode 230075). Card (interactive) updates use a separate endpoint, not subject to the 20-edit cap. Global API frequency limit 1000/min / 50 QPS (errcode 230020)."
 source    = "https://open.feishu.cn/document/server-docs/im-v1/message/update"
 

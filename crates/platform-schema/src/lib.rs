@@ -193,6 +193,9 @@ pub struct EmojiReactions {
 #[serde(deny_unknown_fields)]
 pub struct EditMessage {
     pub supported: bool,
+    /// Cap on edits per message, if the platform imposes one (e.g. Feishu = 20).
+    #[serde(default)]
+    pub max_edits: Option<u32>,
     pub note: String,
     pub source: String,
 }
@@ -211,6 +214,9 @@ pub enum DeleteScope {
 pub struct DeleteMessage {
     pub supported: bool,
     pub scope: DeleteScope,
+    /// Deletion time window in seconds, if bounded (e.g. WeCom recall = 86400).
+    #[serde(default)]
+    pub window_sec: Option<u32>,
     pub note: String,
     pub source: String,
 }
@@ -234,6 +240,14 @@ pub enum AttachmentKind {
     File,
 }
 
+/// How the bot delivers outbound media: by URL reference, or by uploading bytes.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboundDelivery {
+    Url,
+    Upload,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Attachments {
@@ -241,6 +255,11 @@ pub struct Attachments {
     pub outbound: Vec<AttachmentKind>,
     #[serde(default)]
     pub max_size_mb: Option<u32>,
+    /// Max attachments per message, if the platform caps it (e.g. Discord = 10).
+    #[serde(default)]
+    pub max_count: Option<u32>,
+    #[serde(default)]
+    pub outbound_delivery: Option<OutboundDelivery>,
     pub note: String,
     pub source: String,
 }

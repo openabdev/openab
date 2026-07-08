@@ -65,6 +65,8 @@ source   = "https://docs.discord.com/developers/resources/message"
 inbound     = ["image", "audio", "video", "file"]
 outbound    = ["image", "audio", "video", "file"]
 max_size_mb = 10
+max_count   = 10
+outbound_delivery = "upload"
 note        = "Inbound & outbound arbitrary file types. Default upload cap 10 MiB per file (raised by uploader Nitro status or server Boost tier)."
 source      = "https://docs.discord.com/developers/reference"
 

@@ -66,6 +66,7 @@ source   = "https://developers.line.biz/en/docs/messaging-api/message-types/"
 [capability.attachments]
 inbound  = ["image", "audio", "video", "file"]
 outbound = ["image", "audio", "video", "file"]
+outbound_delivery = "url"
 note     = "Inbound via get-content by message ID (/v2/bot/message/{id}/content on the api-data.line.me host): images, video, audio, files. contentProvider.type is \"line\" (fetchable) or \"external\" (URL only, not fetchable via get-content). User-sent content auto-expires, so fetch promptly. Outbound media is sent by URL, not upload."
 source   = "https://developers.line.biz/en/reference/messaging-api/#get-content"
 
