@@ -6,7 +6,7 @@
 #  snake_case) and fill every field.
 #
 #  This template IS the schema documentation. The authoritative *types* live in
-#  the Rust structs at `crates/.../platform_schema.rs` (serde). Conformance
+#  the Rust structs at `crates/platform-schema/src/lib.rs` (serde). Conformance
 #  fully deserializes every real schema/*.toml into those structs, and checks
 #  this template still enumerates every capability section + every feature key —
 #  so if the structs gain/rename a field, this template must be updated too.

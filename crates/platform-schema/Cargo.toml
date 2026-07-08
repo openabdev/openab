@@ -3,14 +3,14 @@ name = "platform-schema"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Schema definition + conformance tests for docs/platforms/schema/*.toml"
+description = "Authoritative types + conformance tests for docs/platforms/schema/*.toml"
 
 # Standalone crate (excluded from the root workspace) so it builds independently
-# of the heavy adapter crates. Deliberately dependency-light: toml_edit's
-# parse-only mode pulls no proc-macros and no build scripts, so `cargo test`
-# needs no C toolchain — it runs anywhere, including minimal CI images.
+# of the heavy adapter crates. The serde structs below ARE the schema; each
+# schema/<platform>.toml deserializes into `Platform`.
 #
 # Run:  cargo test        (from this directory)
 
 [dependencies]
-toml_edit = { version = "0.22", default-features = false, features = ["parse"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

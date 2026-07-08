@@ -22,6 +22,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # Dependency-light (toml_edit parse-only: no proc-macros, no build
-      # scripts) so this is fast and needs no extra system packages.
+      # Standalone crate (serde + toml only); excluded from the root workspace
+      # so it builds without the heavy adapter crates.
       - run: cargo test --manifest-path crates/platform-schema/Cargo.toml
