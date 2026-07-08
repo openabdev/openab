@@ -135,7 +135,7 @@ jobs:
             if echo "$LABELS" | jq -e 'any(. == "auto-fix")' > /dev/null 2>&1; then
               MODE="\n__mode: auto-fix__"
             fi
-            PAYLOAD=$(printf '<@%s> review %s\n\n__commit: %s__%s' "$BOT_UID" "$PR_URL" "$SHA" "$MODE" | jq -Rs '{content: .}')
+            PAYLOAD=$(printf '<@%s> lead group review %s\n\n__commit: %s__%s' "$BOT_UID" "$PR_URL" "$SHA" "$MODE" | jq -Rs '{content: .}')
             if ! curl -sS --fail-with-body --max-time 10 -X POST "$WEBHOOK_URL" \
               -H "Content-Type: application/json" -d "$PAYLOAD"; then
               gh api "repos/${{ github.repository }}/statuses/${SHA}" \

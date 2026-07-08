@@ -529,7 +529,7 @@ where
             "id": 0,
             "method": "initialize",
             "params": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": 1,
                 "capabilities": {},
                 "clientInfo": {"name": "openab-agentcore-bridge", "version": env!("CARGO_PKG_VERSION")}
             }

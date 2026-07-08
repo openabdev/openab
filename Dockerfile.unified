@@ -42,10 +42,12 @@ RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/li
     && cargo build --release --features unified
 # Build openab-agent (used by native variant) — copied late to avoid cache busts
 COPY openab-agent/ openab-agent/
-RUN cd openab-agent && printf '\n[workspace]\n' >> Cargo.toml && cargo build --release
+RUN cd openab-agent && { grep -q '^\[workspace\]' Cargo.toml || printf '\n[workspace]\n' >> Cargo.toml; } && cargo build --release
 # Build agy-acp adapter (used by antigravity variant) — copied late to avoid cache busts
+# agy-acp/Cargo.toml already declares [workspace] permanently (see its own comment), so no
+# runtime injection is needed here — unlike openab-agent above.
 COPY agy-acp/ agy-acp/
-RUN cd agy-acp && printf '\n[workspace]\n' >> Cargo.toml && cargo build --release
+RUN cd agy-acp && cargo build --release
 
 # =============================================================================
 # Stage: builder — resolves to either local_builder or prebuilt registry image

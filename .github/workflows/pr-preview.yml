@@ -13,6 +13,8 @@ on:
         type: choice
         options:
           - default
+          - kiro
+          - unified
           - agentcore
           - antigravity
           - claude
@@ -43,6 +45,9 @@ jobs:
       repo: ${{ steps.pr.outputs.repo }}
       dockerfile: ${{ steps.df.outputs.file }}
       suffix: ${{ steps.df.outputs.suffix }}
+      build_args: ${{ steps.df.outputs.build_args }}
+      tag_suffix: ${{ steps.df.outputs.tag_suffix }}
+      target: ${{ steps.df.outputs.target }}
     steps:
       - name: Get PR branch
         id: pr
@@ -59,9 +64,37 @@ jobs:
           if [ "${{ inputs.variant }}" = "default" ]; then
             echo "file=Dockerfile" >> "$GITHUB_OUTPUT"
             echo "suffix=" >> "$GITHUB_OUTPUT"
+            echo "build_args=" >> "$GITHUB_OUTPUT"
+            echo "tag_suffix=" >> "$GITHUB_OUTPUT"
+            echo "target=" >> "$GITHUB_OUTPUT"
+          elif [ "${{ inputs.variant }}" = "kiro" ]; then
+            # Unified build (all platforms) tagged as :pr<N>-kiro
+            echo "file=Dockerfile" >> "$GITHUB_OUTPUT"
+            echo "suffix=" >> "$GITHUB_OUTPUT"
+            echo "build_args=BUILD_MODE=unified" >> "$GITHUB_OUTPUT"
+            echo "tag_suffix=-kiro" >> "$GITHUB_OUTPUT"
+            echo "target=" >> "$GITHUB_OUTPUT"
+          elif [ "${{ inputs.variant }}" = "unified" ]; then
+            # Same base Dockerfile as "default", but built with BUILD_MODE=unified
+            # so the telegram/line/feishu/wecom/googlechat/teams gateway adapters
+            # (Cargo feature `unified`) are actually compiled in. The "default"
+            # variant builds with openab's default Cargo features only
+            # (discord/slack/...), which does NOT include telegram — a PR
+            # touching the unified gateway path needs this variant to test
+            # against a real webhook, not "default".
+            echo "file=Dockerfile" >> "$GITHUB_OUTPUT"
+            echo "suffix=" >> "$GITHUB_OUTPUT"
+            echo "build_args=BUILD_MODE=unified" >> "$GITHUB_OUTPUT"
+            echo "tag_suffix=" >> "$GITHUB_OUTPUT"
+            echo "target=" >> "$GITHUB_OUTPUT"
           else
-            echo "file=Dockerfile.${{ inputs.variant }}" >> "$GITHUB_OUTPUT"
-            echo "suffix=-${{ inputs.variant }}" >> "$GITHUB_OUTPUT"
+            # Unified Dockerfile with --target for agent-specific variants.
+            # Image: ghcr.io/openabdev/openab:pr<N>-<variant>
+            echo "file=Dockerfile.unified" >> "$GITHUB_OUTPUT"
+            echo "suffix=" >> "$GITHUB_OUTPUT"
+            echo "build_args=" >> "$GITHUB_OUTPUT"
+            echo "tag_suffix=-${{ inputs.variant }}" >> "$GITHUB_OUTPUT"
+            echo "target=${{ inputs.variant }}" >> "$GITHUB_OUTPUT"
           fi
 
   build:
@@ -95,7 +128,9 @@ jobs:
         with:
           context: .
           file: ${{ needs.resolve-pr.outputs.dockerfile }}
+          target: ${{ needs.resolve-pr.outputs.target || '' }}
           platforms: ${{ matrix.platform.os }}
+          build-args: ${{ needs.resolve-pr.outputs.build_args }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ needs.resolve-pr.outputs.suffix }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=pr-${{ inputs.variant }}-${{ matrix.platform.os }}
           cache-to: type=gha,scope=pr-${{ inputs.variant }}-${{ matrix.platform.os }},mode=max
@@ -139,5 +174,5 @@ jobs:
         run: |
           IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ needs.resolve-pr.outputs.suffix }}"
           docker buildx imagetools create \
-            -t "${IMAGE}:pr${{ inputs.pr_number }}" \
+            -t "${IMAGE}:pr${{ inputs.pr_number }}${{ needs.resolve-pr.outputs.tag_suffix }}" \
             $(printf "${IMAGE}@sha256:%s " $(ls /tmp/digests/))

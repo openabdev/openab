@@ -57,6 +57,9 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 #                                       # omitted = auto-detect from list (non-empty → false, empty → true)
 # allowed_users = ["U5678"]             # only checked when allow_all_users = false
 # streaming = true                      # enable streaming (typewriter) mode
+#                                       # note: LINE has no message-edit API, so it is always
+#                                       #       send-once (streaming is forced off to avoid
+#                                       #       posting duplicate, growing messages)
 # streaming_placeholder = false         # set false for draft-based platforms (e.g. Telegram Rich Messages)
 
 # --- Telegram (first-class section; alternative to TELEGRAM_* env vars) ---
@@ -177,6 +180,9 @@ session_ttl_hours = 24
 # prompt_hard_timeout_secs = 1800
 # Liveness-check cadence (sec) for the recv loop; see #732. Default: 30.
 # liveness_check_secs = 30
+# Grace (sec) past prompt_hard_timeout_secs before a hung in-flight session is
+# force-evicted from the pool. Default: 120.
+# hung_grace_secs = 120
 
 [markdown]
 tables = "code"  # "code" (default) | "bullets" | "off"

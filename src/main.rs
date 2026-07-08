@@ -123,7 +123,10 @@ fn has_unified_platform_env() -> bool {
         || (cfg!(feature = "feishu") && std::env::var("FEISHU_APP_ID").is_ok())
         || (cfg!(feature = "wecom") && std::env::var("WECOM_CORP_ID").is_ok())
         || (cfg!(feature = "teams") && std::env::var("TEAMS_APP_ID").is_ok())
-        || (cfg!(feature = "googlechat") && std::env::var("GOOGLE_CHAT_ENABLED").map(|v| v == "true" || v == "1").unwrap_or(false))
+        || (cfg!(feature = "googlechat")
+            && std::env::var("GOOGLE_CHAT_ENABLED")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false))
 }
 
 #[tokio::main]
@@ -145,7 +148,11 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         #[cfg(feature = "agentcore")]
-        Commands::AgentcoreBridge { runtime_arn, region, command } => {
+        Commands::AgentcoreBridge {
+            runtime_arn,
+            region,
+            command,
+        } => {
             return acp::agentcore::run_bridge(&runtime_arn, &region, &command).await;
         }
         Commands::Set { key, value, thread } => {
@@ -199,7 +206,9 @@ async fn main() -> anyhow::Result<()> {
         "config loaded"
     );
 
-    if cfg.discord.is_none() && cfg.slack.is_none() && cfg.gateway.is_none()
+    if cfg.discord.is_none()
+        && cfg.slack.is_none()
+        && cfg.gateway.is_none()
         && cfg.telegram.is_none()
         && !has_unified_platform_env()
     {
@@ -237,7 +246,14 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown_hook = cfg.hooks.pre_shutdown.clone();
 
-    let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions));
+    let pool = Arc::new(acp::SessionPool::new(
+        cfg.agent,
+        cfg.pool.max_sessions,
+        cfg.pool
+            .prompt_hard_timeout_secs
+            .saturating_add(cfg.pool.hung_grace_secs),
+        cfg.pool.default_config_options,
+    ));
     let ttl_secs = cfg.pool.session_ttl_hours * 3600;
 
     // Resolve STT config (auto-detect GROQ_API_KEY from env)
@@ -311,8 +327,44 @@ async fn main() -> anyhow::Result<()> {
                     Some(true), // L2 open — Discord's own channel/thread/DM logic still applies
                     Vec::<String>::new(),
                     Some(true),
-                    Some(config::resolve_allow_all(d.allow_all_users, &d.allowed_users)),
+                    Some(config::resolve_allow_all(
+                        d.allow_all_users,
+                        &d.allowed_users,
+                    )),
                     d.allowed_users.clone(),
+                ),
+            );
+        }
+
+        // Telegram: L3 (identity) mirrors the resolved
+        // [telegram].allow_all_users/allowed_users, so config.toml can
+        // restrict who can message the bot without needing
+        // GATEWAY_ALLOW_ALL_USERS/GATEWAY_ALLOWED_USERS env vars. L2
+        // (channels) has no Telegram-specific concept distinct from the
+        // generic gateway model, so it stays on the shared GATEWAY_* values
+        // set above.
+        //
+        // Also resolves when running env-only (no [telegram] section but
+        // TELEGRAM_BOT_TOKEN set), so TELEGRAM_ALLOWED_USERS /
+        // TELEGRAM_ALLOW_ALL_USERS are honored in pure-env deployments.
+        let telegram_resolved = if let Some(t) = &cfg.telegram {
+            Some(t.resolve())
+        } else if std::env::var("TELEGRAM_ALLOWED_USERS").is_ok()
+            || std::env::var("TELEGRAM_ALLOW_ALL_USERS").is_ok()
+        {
+            Some(config::TelegramConfig::default().resolve())
+        } else {
+            None
+        };
+        if let Some(r) = telegram_resolved {
+            reg.insert(
+                "telegram",
+                TrustConfig::new(
+                    Some(allow_all_channels),
+                    allowed_channels.clone(),
+                    None,
+                    Some(r.allow_all_users),
+                    r.allowed_users,
                 ),
             );
         }
@@ -430,6 +482,10 @@ async fn main() -> anyhow::Result<()> {
     if cfg.slack.is_some() {
         configured_platforms.push("slack");
     }
+    #[cfg(feature = "telegram")]
+    if cfg.telegram.is_some() || std::env::var("TELEGRAM_BOT_TOKEN").is_ok() {
+        configured_platforms.push("telegram");
+    }
     cron::validate_cronjobs(&cfg.cron.jobs, &configured_platforms)?;
 
     // Spawn Slack adapter (background task)
@@ -535,6 +591,7 @@ async fn main() -> anyhow::Result<()> {
             trusted_bot_ids: gw_cfg.trusted_bot_ids,
             streaming: gw_cfg.streaming,
             streaming_placeholder: gw_cfg.streaming_placeholder,
+            telegram_rich_messages: gw_cfg.telegram_rich_messages,
             stt: cfg.stt.clone(),
         };
         let gw_router = router.clone();
@@ -561,12 +618,12 @@ async fn main() -> anyhow::Result<()> {
         feature = "wecom",
         feature = "teams",
     ))]
-    let _unified_handle = {
-        use openab_core::gateway::{GatewayEventContext, process_gateway_event};
+    let (_unified_handle, shared_unified_adapter) = {
+        use openab_core::gateway::{process_gateway_event, GatewayEventContext};
 
         if has_unified_platform_env() || cfg.telegram.is_some() {
-            let listen_addr = std::env::var("GATEWAY_LISTEN")
-                .unwrap_or_else(|_| "0.0.0.0:8080".into());
+            let listen_addr =
+                std::env::var("GATEWAY_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
 
             // Create a dedicated dispatcher for unified gateway events
             let unified_dispatcher = Arc::new(dispatch::Dispatcher::with_idle_timeout(
@@ -606,8 +663,8 @@ async fn main() -> anyhow::Result<()> {
             let gw_state = Arc::new(gw_state_inner);
 
             // Build axum router with platform webhook routes
-            let mut app = axum::Router::new()
-                .route("/health", axum::routing::get(|| async { "ok" }));
+            let mut app =
+                axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
 
             #[cfg(feature = "telegram")]
             if gw_state.telegram_bot_token.is_some() {
@@ -616,13 +673,19 @@ async fn main() -> anyhow::Result<()> {
                         .unwrap_or_else(|_| "/webhook/telegram".into())
                 });
                 info!(path = %path, "unified: telegram adapter enabled");
-                app = app.route(&path, axum::routing::post(openab_gateway::adapters::telegram::webhook));
+                app = app.route(
+                    &path,
+                    axum::routing::post(openab_gateway::adapters::telegram::webhook),
+                );
             }
 
             #[cfg(feature = "line")]
             {
                 info!("unified: line adapter enabled");
-                app = app.route("/webhook/line", axum::routing::post(openab_gateway::adapters::line::webhook));
+                app = app.route(
+                    "/webhook/line",
+                    axum::routing::post(openab_gateway::adapters::line::webhook),
+                );
             }
 
             #[cfg(feature = "feishu")]
@@ -630,23 +693,35 @@ async fn main() -> anyhow::Result<()> {
                 let path = std::env::var("FEISHU_WEBHOOK_PATH")
                     .unwrap_or_else(|_| "/webhook/feishu".into());
                 info!(path = %path, "unified: feishu adapter enabled");
-                app = app.route(&path, axum::routing::post(openab_gateway::adapters::feishu::webhook));
+                app = app.route(
+                    &path,
+                    axum::routing::post(openab_gateway::adapters::feishu::webhook),
+                );
             }
 
             #[cfg(feature = "wecom")]
             if let Some(ref w) = gw_state.wecom {
                 info!(path = %w.config.webhook_path, "unified: wecom adapter enabled");
                 app = app
-                    .route(&w.config.webhook_path, axum::routing::get(openab_gateway::adapters::wecom::verify))
-                    .route(&w.config.webhook_path, axum::routing::post(openab_gateway::adapters::wecom::webhook));
+                    .route(
+                        &w.config.webhook_path,
+                        axum::routing::get(openab_gateway::adapters::wecom::verify),
+                    )
+                    .route(
+                        &w.config.webhook_path,
+                        axum::routing::post(openab_gateway::adapters::wecom::webhook),
+                    );
             }
 
             #[cfg(feature = "teams")]
             if gw_state.teams.is_some() {
-                let path = std::env::var("TEAMS_WEBHOOK_PATH")
-                    .unwrap_or_else(|_| "/webhook/teams".into());
+                let path =
+                    std::env::var("TEAMS_WEBHOOK_PATH").unwrap_or_else(|_| "/webhook/teams".into());
                 info!(path = %path, "unified: teams adapter enabled");
-                app = app.route(&path, axum::routing::post(openab_gateway::adapters::teams::webhook));
+                app = app.route(
+                    &path,
+                    axum::routing::post(openab_gateway::adapters::teams::webhook),
+                );
             }
 
             #[cfg(feature = "googlechat")]
@@ -654,14 +729,17 @@ async fn main() -> anyhow::Result<()> {
                 let path = std::env::var("GOOGLE_CHAT_WEBHOOK_PATH")
                     .unwrap_or_else(|_| "/webhook/googlechat".into());
                 info!(path = %path, "unified: googlechat adapter enabled");
-                app = app.route(&path, axum::routing::post(openab_gateway::adapters::googlechat::webhook));
+                app = app.route(
+                    &path,
+                    axum::routing::post(openab_gateway::adapters::googlechat::webhook),
+                );
             }
 
             let app = app.with_state(gw_state.clone());
 
             // Bridge task: receive events from adapters via event_tx, dispatch to core
             let unified_adapter: Arc<dyn adapter::ChatAdapter> = Arc::new(
-                unified_adapter::UnifiedGatewayAdapter::new(gw_state.clone())
+                unified_adapter::UnifiedGatewayAdapter::new(gw_state.clone()),
             );
 
             // Read security gating from env (mirrors [gateway] config section)
@@ -697,6 +775,8 @@ async fn main() -> anyhow::Result<()> {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
+
+            let cron_unified_adapter = unified_adapter.clone();
 
             let event_ctx = Arc::new(GatewayEventContext {
                 adapter: unified_adapter,
@@ -742,7 +822,7 @@ async fn main() -> anyhow::Result<()> {
 
             info!(addr = %listen_addr, "unified webhook server starting");
 
-            Some(tokio::spawn(async move {
+            (Some(tokio::spawn(async move {
                 let listener = match tokio::net::TcpListener::bind(&listen_addr).await {
                     Ok(l) => l,
                     Err(e) => {
@@ -754,9 +834,9 @@ async fn main() -> anyhow::Result<()> {
                 if let Err(e) = axum::serve(listener, app).await {
                     error!(error = %e, "unified webhook server error");
                 }
-            }))
+            })), Some(cron_unified_adapter))
         } else {
-            None
+            (None, None)
         }
     };
 
@@ -789,6 +869,10 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "slack")]
         if let Some(ref a) = shared_slack_adapter {
             cron_adapters.insert("slack".into(), a.clone() as Arc<dyn adapter::ChatAdapter>);
+        }
+        #[cfg(feature = "telegram")]
+        if let Some(ref a) = shared_unified_adapter {
+            cron_adapters.insert("telegram".into(), a.clone());
         }
         let cron_platforms: Vec<String> =
             configured_platforms.iter().map(|s| s.to_string()).collect();
@@ -862,14 +946,17 @@ async fn main() -> anyhow::Result<()> {
         let reminder_store = remind::ReminderStore::load(reminder_path);
 
         // Construct ambient dispatcher if enabled and channels configured.
-        let ambient_dispatcher = if cfg.ambient.enabled && !cfg.ambient.discord.channels.is_empty() {
+        let ambient_dispatcher = if cfg.ambient.enabled && !cfg.ambient.discord.channels.is_empty()
+        {
             info!(
                 channels = ?cfg.ambient.discord.channels,
                 flush_interval = cfg.ambient.flush_interval_seconds,
                 flush_max_messages = cfg.ambient.flush_max_messages,
                 "ambient mode enabled"
             );
-            Some(Arc::new(openab_core::ambient::AmbientDispatcher::new(cfg.ambient.clone())))
+            Some(Arc::new(openab_core::ambient::AmbientDispatcher::new(
+                cfg.ambient.clone(),
+            )))
         } else {
             None
         };

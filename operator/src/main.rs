@@ -1,13 +1,15 @@
-mod manifest;
 mod apply;
 mod bootstrap;
 mod config;
 mod create;
-mod get;
 mod delete;
+mod get;
 mod ingress;
+mod manifest;
+mod scale;
 mod secrets;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -48,22 +50,26 @@ enum Commands {
         resource: String,
         /// Optional resource name
         name: Option<String>,
-        /// ECS cluster name
-        #[arg(long, default_value = "default")]
-        cluster: String,
+        /// ECS cluster name (default: from ~/.oabctl/config.toml)
+        #[arg(long)]
+        cluster: Option<String>,
     },
     /// Delete an OAB service
     Delete {
-        /// Resource type
-        resource: String,
-        /// Resource name
-        name: String,
-        /// ECS cluster name
-        #[arg(long, default_value = "default")]
-        cluster: String,
-        /// Namespace
-        #[arg(long, default_value = "prod")]
-        namespace: String,
+        /// Resource type (omit when using -f)
+        resource: Option<String>,
+        /// Resource name (omit when using -f)
+        name: Option<String>,
+        /// Delete all services defined in a manifest file or directory,
+        /// instead of specifying <resource> <name> directly (mirrors `apply -f`)
+        #[arg(short, long, conflicts_with_all = ["resource", "name"])]
+        file: Option<String>,
+        /// ECS cluster name (default: from ~/.oabctl/config.toml; ignored when using -f)
+        #[arg(long)]
+        cluster: Option<String>,
+        /// Namespace (default: from ~/.oabctl/config.toml; ignored when using -f)
+        #[arg(long)]
+        namespace: Option<String>,
     },
     /// Execute a command in an agent container (via ecsctl)
     Exec {
@@ -86,6 +92,26 @@ enum Commands {
         src: String,
         /// Destination: agent:/path or local dir
         dst: String,
+    },
+    /// Scale an OAB service (set desired task count)
+    Scale {
+        /// Agent name or ecsctl alias
+        alias: String,
+        /// Desired task count (0–100)
+        #[arg(value_parser = clap::value_parser!(i32).range(0..=100))]
+        size: i32,
+        /// Create/update a recurring schedule (e.g. "cron(0 8 * * ? *)" or "rate(1 hour)").
+        /// Omit for immediate scaling.
+        #[arg(long)]
+        with_schedule: Option<String>,
+        /// IANA timezone for schedule expression (e.g. "Asia/Taipei", default: UTC)
+        #[arg(long, default_value = "UTC")]
+        timezone: String,
+    },
+    /// Manage scaling schedules
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleAction,
     },
     /// Bootstrap OAB infrastructure (cluster, IAM roles, S3, security group)
     Bootstrap {
@@ -119,17 +145,61 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum ScheduleAction {
+    /// List all scaling schedules
+    List,
+    /// Delete a scaling schedule
+    Delete {
+        /// Schedule name to delete
+        name: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
 
     match cli.command {
-        Commands::Apply { file, no_sync, wait } => apply::run(&config, &file, !no_sync, wait).await,
-        Commands::Create { name, namespace, auto_apply } => create::run(&config, &name, &namespace, auto_apply).await,
-        Commands::Get { resource, name, cluster } => get::run(&config, &resource, name.as_deref(), &cluster).await,
-        Commands::Delete { resource, name, cluster, namespace } => {
-            delete::run(&config, &resource, &name, &cluster, &namespace).await
+        Commands::Apply {
+            file,
+            no_sync,
+            wait,
+        } => apply::run(&config, &file, !no_sync, wait).await,
+        Commands::Create {
+            name,
+            namespace,
+            auto_apply,
+        } => create::run(&config, &name, &namespace, auto_apply).await,
+        Commands::Get {
+            resource,
+            name,
+            cluster,
+        } => {
+            let oab_cfg =
+                config::OabConfig::load().context("failed to load ~/.oabctl/config.toml")?;
+            let cluster = cluster.unwrap_or(oab_cfg.defaults.cluster);
+            get::run(&config, &resource, name.as_deref(), &cluster).await
+        }
+        Commands::Delete {
+            resource,
+            name,
+            file,
+            cluster,
+            namespace,
+        } => {
+            if let Some(file) = file {
+                delete::run_from_file(&config, &file).await
+            } else {
+                let resource = resource.context("<RESOURCE> is required when not using -f")?;
+                let name = name.context("<NAME> is required when not using -f")?;
+                let oab_cfg =
+                    config::OabConfig::load().context("failed to load ~/.oabctl/config.toml")?;
+                let cluster = cluster.unwrap_or(oab_cfg.defaults.cluster);
+                let namespace = namespace.unwrap_or(oab_cfg.defaults.namespace);
+                delete::run(&config, &resource, &name, &cluster, &namespace).await
+            }
         }
         Commands::Exec { agent, command } => {
             let resolved = ecsctl::alias::resolve(&config, &agent).await?;
@@ -137,9 +207,11 @@ async fn main() -> anyhow::Result<()> {
                 None
             } else {
                 // Join args with single-quote escaping to prevent shell interpretation
-                let joined = command.iter().map(|a| {
-                    format!("'{}'", a.replace('\'', "'\\''"))
-                }).collect::<Vec<_>>().join(" ");
+                let joined = command
+                    .iter()
+                    .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 Some(joined)
             };
             ecsctl::exec::run(&config, &resolved, cmd.as_deref()).await
@@ -170,7 +242,34 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("✓ Done");
             Ok(())
         }
-        Commands::Bootstrap { delete, status, region, cluster, vpc, subnets, security_group, execution_role, task_role } => {
+        Commands::Scale {
+            alias,
+            size,
+            with_schedule,
+            timezone,
+        } => {
+            if let Some(schedule_expr) = with_schedule {
+                scale::run_with_schedule(&config, &alias, size, &schedule_expr, Some(&timezone))
+                    .await
+            } else {
+                scale::run(&config, &alias, size).await
+            }
+        }
+        Commands::Schedule { action } => match action {
+            ScheduleAction::List => scale::list_schedules(&config).await,
+            ScheduleAction::Delete { name } => scale::delete_schedule(&config, &name).await,
+        },
+        Commands::Bootstrap {
+            delete,
+            status,
+            region,
+            cluster,
+            vpc,
+            subnets,
+            security_group,
+            execution_role,
+            task_role,
+        } => {
             let cfg = if let Some(ref r) = region {
                 aws_config::defaults(aws_config::BehaviorVersion::latest())
                     .region(aws_config::Region::new(r.clone()))

@@ -52,5 +52,31 @@ jobs:
                 issue_number: issue.number,
                 labels: [CLOSING]
               });
+
+              const marker = '<!-- openab-stale-issue-check -->';
+              const { data: comments } = await github.rest.issues.listComments({
+                ...context.repo,
+                issue_number: issue.number,
+                per_page: 100
+              });
+              const alreadyCommented = comments.some(c => c.body.includes(marker));
+              if (!alreadyCommented) {
+                const msg = [
+                  marker,
+                  '> [!CAUTION]',
+                  `> This issue has been waiting on the author for more than ${STALE_DAYS} days ` +
+                    `(labeled \`${CONTRIBUTOR}\` since ${labeledAt.toISOString().slice(0, 10)}).`,
+                  '> It will be **automatically closed in 24 hours** if there is no update.',
+                  '',
+                  `@${issue.user.login} — You **must add a new comment** on this issue to remove the \`closing-soon\` label ` +
+                    'and keep it open.'
+                ].join('\n');
+                await github.rest.issues.createComment({
+                  ...context.repo,
+                  issue_number: issue.number,
+                  body: msg
+                });
+              }
+
               console.log(`#${issue.number} — ${CONTRIBUTOR} since ${labeledAt.toISOString()}, added ${CLOSING}`);
             }

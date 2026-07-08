@@ -25,29 +25,20 @@ OpenAB spawns `devin acp` as a child process and communicates via stdio JSON-RPC
 command = "devin"
 args = ["acp"]
 working_dir = "/home/agent"
-env = { DEVIN_MODEL = "glm-5.2", DEVIN_PERMISSION_MODE = "dangerous" }
+
+[pool]
+max_sessions = 3
+session_ttl_hours = 1
+default_config_options = { mode = "bypass", model = "swe-1-6" }
 ```
 
-> **Note:** Setting `DEVIN_PERMISSION_MODE = "dangerous"` is recommended for
-> headless/container deployments. Without it, Devin CLI may prompt for permission
-> confirmations on certain operations, causing the agent to get stuck in
-> non-interactive environments.
-
-## Docker
-
-Build with the unified Dockerfile:
-
-```bash
-docker build --target devin -f Dockerfile.unified -t openab-devin .
-```
-
-Or via docker buildx bake:
-
-```bash
-docker buildx bake devin
-```
-
-The Dockerfile installs a pinned version of Devin CLI from `static.devin.ai` with SHA256 checksum verification. The version is controlled by the `DEVIN_VERSION` build arg.
+> **Note:** `devin acp` does not honor `~/.config/devin/config.json` settings for
+> permission mode or model, nor does it read `DEVIN_PERMISSION_MODE` or `DEVIN_MODEL`
+> env vars. The **only** way to set defaults at session start in ACP mode is via
+> `[pool] default_config_options`, which sends `session/set_config_option` after each
+> session creation. Without `mode = "bypass"`, Devin defaults to `accept-edits` mode
+> which prompts for `exec` tool calls, causing the agent to get stuck in headless
+> environments.
 
 ## Authentication
 
@@ -105,49 +96,64 @@ Devin CLI provides:
 
 ## Model Selection
 
-Devin CLI uses its own model routing by default (SWE-1.6 series). To specify a model at startup:
+Devin CLI uses Adaptive routing by default. To specify a model, use `default_config_options`:
 
 ```toml
-[agent]
-command = "devin"
-args = ["acp", "--model", "opus"]
-working_dir = "/home/agent"
+[pool]
+default_config_options = { model = "swe-1-6" }
 ```
 
-Available models can be checked via the interactive CLI with `/model`. In ACP mode, the `--model` flag selects the model for the session.
+Available model values include: `adaptive`, `swe-1-6`, `swe-1-6-fast`, `claude-opus-4-8-medium`,
+`glm-5-2`, `gpt-5-5-medium`, `kimi-k2-7`, and many more. The full list is reported by the
+agent at session creation and visible via the Discord `/model` slash command.
 
-## MCP Usage
-
-Devin CLI supports MCP servers configured via `.devin/config.json` or `devin mcp add`:
-
-```bash
-# Add an MCP server (persists in ~/.config/devin/)
-kubectl exec -it deployment/openab-devin -- devin mcp add github \
-  -- npx -y @modelcontextprotocol/server-github
-
-# List configured servers
-kubectl exec -it deployment/openab-devin -- devin mcp list
-```
-
-MCP configuration can also be placed in the project's `.devin/config.json`:
-
-```json
-{
-  "mcpServers": {
-    "github": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": { "GITHUB_TOKEN": "ghp_xxx" }
-    }
-  }
-}
-```
-
-Devin CLI supports both stdio and HTTP (Streamable HTTP + SSE fallback) transports.
+> **Note:** The `--model` flag and `DEVIN_MODEL` env var are **ignored** in ACP mode.
+> Use `default_config_options` instead.
 
 ## AGENTS.md Compatibility
 
 Devin CLI reads `AGENTS.md` from the project root — the same file OpenAB already uses. It also reads `CLAUDE.md` (for Claude Code compatibility) and rules from `.cursor/rules/` and `.windsurf/rules/`.
+
+## Recommended Permission Config (Headless)
+
+In headless/container deployments, Devin CLI defaults to `accept-edits` mode in ACP
+which prompts for `exec` tool calls. Since `devin acp` does not honor
+`~/.config/devin/config.json`, env vars, or CLI flags for mode/model, the only
+mechanism is OAB's `default_config_options`:
+
+```toml
+[pool]
+default_config_options = { mode = "bypass", model = "swe-1-6" }
+```
+
+This sends `session/set_config_option` after each session creation, switching the
+agent to bypass mode (auto-approve all tool calls) and selecting the model.
+
+**What doesn't work in ACP mode:**
+
+| Method | Result |
+|--------|--------|
+| `DEVIN_PERMISSION_MODE=dangerous` env var | Ignored in ACP mode |
+| `DEVIN_MODEL=swe-1.6` env var | Ignored in ACP mode |
+| `--permission-mode dangerous` CLI flag | Not supported by `devin acp` |
+| `--model opus` CLI flag | Not supported by `devin acp` |
+| `~/.config/devin/config.json` `permission_mode` | Not honored in ACP mode |
+| `~/.config/devin/config.json` `agent.model` | Not honored in ACP mode |
+
+### Full OAB Config Example
+
+```toml
+[agent]
+command = "devin"
+args = ["acp"]
+working_dir = "/home/agent"
+env = { GHPOOL_URL = "http://ghpool.openab.local:8080", PATH = "/home/agent/bin:/usr/local/bin:/usr/bin:/bin" }
+
+[pool]
+max_sessions = 3
+session_ttl_hours = 1
+default_config_options = { mode = "bypass", model = "swe-1-6" }
+```
 
 ## Known Limitations
 

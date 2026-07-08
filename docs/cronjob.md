@@ -44,9 +44,9 @@ thread_id = ""                               # optional: post to existing thread
 |-------|----------|---------|-------------|
 | `enabled` | | `true` | Set `false` to disable without removing the entry |
 | `schedule` | ✅ | — | 5-field POSIX cron expression |
-| `channel` | ✅ | — | Discord channel/thread ID or Slack channel ID |
+| `channel` | ✅ | — | Discord channel/thread ID, Slack channel ID, or Telegram chat ID |
 | `message` | ✅ | — | Message sent to the agent as a prompt |
-| `platform` | | `"discord"` | `"discord"` or `"slack"` |
+| `platform` | | `"discord"` | `"discord"`, `"slack"`, or `"telegram"` (requires `telegram` feature) |
 | `sender_name` | | `"openab-cron"` | Attribution shown in prompt context |
 | `timezone` | | `"UTC"` | IANA timezone (e.g. `"America/New_York"`, `"Europe/Berlin"`) |
 | `thread_id` | | — | Post into an existing thread instead of the channel |
@@ -113,6 +113,13 @@ channel = "C0123456789"
 message = "check for any critical alerts in the last 8 hours"
 platform = "slack"
 sender_name = "OpsBot"
+
+[[cron.jobs]]
+schedule = "* * * * *"
+channel = "176096071"
+message = "講一個冷笑話"
+platform = "telegram"
+sender_name = "JokeBot"
 ```
 
 ## Helm Deployment
@@ -323,6 +330,16 @@ When a cron job fires, the agent sees a sender context like:
 ```
 
 Use `sender_name` to distinguish different scheduled tasks in logs and thread titles. The agent can use this to tailor its response (e.g. "DailyOps asked for a summary" vs "WeeklyReport asked for a report").
+
+## Platform Prerequisites
+
+| Platform | Feature Flag | Config / Env Required |
+|----------|-------------|----------------------|
+| `discord` | (always enabled) | `[discord]` section in config.toml |
+| `slack` | `--features slack` | `[slack]` section in config.toml |
+| `telegram` | `--features telegram` | `[telegram]` section in config.toml **or** `TELEGRAM_BOT_TOKEN` env var |
+
+> **Note:** The `channel` field for Telegram should be the numeric chat ID (e.g. `"176096071"`). Use [@userinfobot](https://t.me/userinfobot) or the Telegram Bot API `getUpdates` to find your chat ID.
 
 ## When to Use External Schedulers Instead
 

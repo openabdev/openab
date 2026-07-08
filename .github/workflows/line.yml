@@ -1,0 +1,103 @@
+name: LINE PR Review Check
+
+on:
+  schedule:
+    - cron: '0 */3 * * *'
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          client-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+      - uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const LINE_LABEL = 'line';
+            const PENDING_COMMUNITY = 'pending-community-review';
+            const PENDING_MAINTAINER = 'pending-maintainer-review';
+
+            // Get openab-line-reviewers team members (team must be associated with repo)
+            const { data: members } = await github.rest.teams.listMembersInOrg({
+              org: 'openabdev',
+              team_slug: 'openab-line-reviewers',
+              per_page: 100
+            });
+            const LINE_REVIEWERS = members.map(m => m.login);
+
+            const prs = await github.rest.pulls.list({
+              ...context.repo,
+              state: 'open',
+              per_page: 100
+            });
+
+            for (const pr of prs.data) {
+              // 1. Check if title contains "LINE" (exact case)
+              if (!/LINE/.test(pr.title)) continue;
+
+              const labels = pr.labels.map(l => l.name);
+
+              // Apply line label if not present
+              if (!labels.includes(LINE_LABEL)) {
+                await github.rest.issues.addLabels({
+                  ...context.repo,
+                  issue_number: pr.number,
+                  labels: [LINE_LABEL]
+                });
+              }
+
+              // 2. Check for approval from a line reviewer
+              const { data: reviews } = await github.rest.pulls.listReviews({
+                ...context.repo,
+                pull_number: pr.number,
+                per_page: 100
+              });
+
+              const hasReviewerApproval = reviews.some(
+                r => r.state === 'APPROVED' && LINE_REVIEWERS.includes(r.user.login)
+              );
+
+              if (hasReviewerApproval) {
+                // Flip to pending-maintainer-review
+                if (!labels.includes(PENDING_MAINTAINER)) {
+                  await github.rest.issues.addLabels({
+                    ...context.repo,
+                    issue_number: pr.number,
+                    labels: [PENDING_MAINTAINER]
+                  });
+                }
+                if (labels.includes(PENDING_COMMUNITY)) {
+                  await github.rest.issues.removeLabel({
+                    ...context.repo,
+                    issue_number: pr.number,
+                    name: PENDING_COMMUNITY
+                  }).catch(() => {});
+                }
+                console.log(`#${pr.number} — approved by line reviewer, set ${PENDING_MAINTAINER}`);
+              } else {
+                // Flip to pending-community-review
+                if (!labels.includes(PENDING_COMMUNITY)) {
+                  await github.rest.issues.addLabels({
+                    ...context.repo,
+                    issue_number: pr.number,
+                    labels: [PENDING_COMMUNITY]
+                  });
+                }
+                if (labels.includes(PENDING_MAINTAINER)) {
+                  await github.rest.issues.removeLabel({
+                    ...context.repo,
+                    issue_number: pr.number,
+                    name: PENDING_MAINTAINER
+                  }).catch(() => {});
+                }
+                console.log(`#${pr.number} — no line reviewer approval, set ${PENDING_COMMUNITY}`);
+              }
+            }

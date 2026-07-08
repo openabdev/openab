@@ -142,6 +142,8 @@
       "properties": {
         "type": { "const": "ecs" },
         "capacityProvider": { "type": "string", "enum": ["FARGATE", "FARGATE_SPOT"] },
+        "architecture": { "type": "string", "enum": ["X86_64", "ARM64"], "default": "X86_64", "description": "CPU architecture for the ECS task. Defaults to X86_64." },
+        "taskRoleArn": { "type": "string", "description": "Optional IAM task role ARN. Overrides the bootstrap shared role for per-service IAM isolation. Must have ecs-tasks.amazonaws.com trust policy." },
         "networking": {
           "type": "object",
           "required": ["subnets", "securityGroups"],

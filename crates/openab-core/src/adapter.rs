@@ -407,7 +407,10 @@ pub trait ChatAdapter: Send + Sync + 'static {
     /// lets the platform render the raw Markdown table itself.
     /// Default: `false` (keep converting). Overridden by Slack (Block Kit
     /// `markdown` blocks / `markdown_text` stream chunks render tables natively).
-    fn renders_native_tables(&self) -> bool {
+    /// The `platform` parameter allows shared adapters (e.g. UnifiedGatewayAdapter)
+    /// to make per-platform decisions.
+    fn renders_native_tables(&self, platform: &str) -> bool {
+        let _ = platform;
         false
     }
 
@@ -697,7 +700,7 @@ impl AdapterRouter {
         // Platforms that render Markdown tables natively (e.g. Slack Block Kit
         // `markdown` blocks / `markdown_text` stream chunks) skip the
         // table→code/bullets pre-pass so the raw table renders natively.
-        let table_mode = if adapter.renders_native_tables() {
+        let table_mode = if adapter.renders_native_tables(&thread_channel.platform) {
             TableMode::Off
         } else {
             self.table_mode
@@ -1794,7 +1797,7 @@ mod tests {
         assert!(!adapter.use_streaming(false));
         // renders_native_tables defaults to false: platforms that don't override
         // it keep the table→code/bullets conversion (e.g. Discord, Gateway).
-        assert!(!adapter.renders_native_tables());
+        assert!(!adapter.renders_native_tables("discord"));
     }
 
     #[test]

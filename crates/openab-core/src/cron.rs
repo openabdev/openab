@@ -238,7 +238,7 @@ pub fn should_fire(schedule: &Schedule, tz: Tz) -> bool {
 }
 
 /// Known platforms that have adapter support.
-const VALID_PLATFORMS: &[&str] = &["discord", "slack"];
+const VALID_PLATFORMS: &[&str] = &["discord", "slack", "telegram"];
 
 /// Validate all cronjob configs (fail-fast on bad cron expressions or timezones).
 pub fn validate_cronjobs(
@@ -1618,7 +1618,7 @@ message = "a"
             schedule: "* * * * *".into(),
             channel: "123".into(),
             message: "hi".into(),
-            platform: "telegram".into(),
+            platform: "matrix".into(),
             sender_name: "test".into(),
             thread_id: None,
             timezone: "UTC".into(),

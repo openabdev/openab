@@ -544,7 +544,7 @@ impl ChatAdapter for SlackAdapter {
         self.streaming && !other_bot_present
     }
 
-    fn renders_native_tables(&self) -> bool {
+    fn renders_native_tables(&self, _platform: &str) -> bool {
         true
     }
 
@@ -2307,7 +2307,7 @@ mod tests {
     fn slack_renders_native_tables() {
         let ttl = std::time::Duration::from_secs(300);
         let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
-        assert!(adapter.renders_native_tables());
+        assert!(adapter.renders_native_tables("slack"));
     }
 }
 

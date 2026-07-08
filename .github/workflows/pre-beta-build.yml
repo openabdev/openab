@@ -105,8 +105,11 @@ jobs:
       - name: Build openab-agent
         run: cd openab-agent && printf '\n[workspace]\n' >> Cargo.toml && cargo build --release
 
+      # agy-acp/Cargo.toml already declares [workspace] permanently, so no runtime
+      # injection is needed here — unlike openab-agent above. Appending it
+      # unconditionally would create a duplicate [workspace] table and break the build.
       - name: Build agy-acp
-        run: cd agy-acp && printf '\n[workspace]\n' >> Cargo.toml && cargo build --release
+        run: cd agy-acp && cargo build --release
 
       - name: Collect binaries
         run: |

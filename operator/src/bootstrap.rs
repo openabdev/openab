@@ -415,9 +415,10 @@ async fn create(config: &aws_config::SdkConfig, imports: ImportOptions) -> Resul
     eprintln!("   State saved to: s3://{bucket}/{STATE_KEY}");
     eprintln!("   You can now run: oabctl apply -f <manifest.yaml>");
 
-    // Save bucket to local config for future commands
+    // Save bucket and cluster to local config for future commands
     let mut local_cfg = crate::config::OabConfig::load().unwrap_or_default();
     local_cfg.bootstrap.bucket = Some(bucket);
+    local_cfg.defaults.cluster = cluster_name.to_string();
     local_cfg.save().ok();
 
     Ok(())

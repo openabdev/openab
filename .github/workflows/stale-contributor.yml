@@ -68,9 +68,9 @@ jobs:
                     `(labeled \`${CONTRIBUTOR}\` since ${labeledAt.toISOString().slice(0, 10)}).`,
                   '> It will be **automatically closed in 24 hours** if there is no update.',
                   '',
-                  'Please push a commit, respond to outstanding review feedback, or comment here ' +
-                    'to keep this PR open. Feel free to reopen a new PR later if it gets closed and ' +
-                    'you want to pick it back up.'
+                  `@${pr.user.login} — You **must add a new comment** on this PR to remove the \`closing-soon\` label ` +
+                    'and keep it open. Pushing commits alone is not sufficient. ' +
+                    'Feel free to reopen a new PR later if it gets closed and you want to pick it back up.'
                 ].join('\n');
                 await github.rest.issues.createComment({
                   ...context.repo,
