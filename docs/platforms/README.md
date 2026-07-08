@@ -9,7 +9,7 @@ This directory is **not a giant table** — it defines a **schema** that every p
 Each `schema/<platform>.toml` has three schema-driven parts:
 
 1. **Platform capability** (`[capability.*]`, fixed fields) — the platform's intrinsic nature and what a bot can/can't do inside it. Same fields for every platform. Source of truth = **official docs** (each field carries a `source` URL).
-2. **OpenAB feature support** (`[[openab_features]]`, the closed 16-feature set) — for each OpenAB capability, a `status` + note + code `source`. Source of truth = **our code + the PR that decided it**.
+2. **OpenAB feature support** (`[[openab_features]]`, the closed 17-feature set) — for each OpenAB capability, a `status` + note + code `source`. Source of truth = **our code + the PR that decided it**.
 3. **Platform quirks** (`[[quirks]]`, freeform dated log) — anything that doesn't fit a fixed field (e.g. LINE's reply/push model), plus a findings log.
 
 **Sourcing rule:** attach the source that answers *"why should I trust or keep this?"* — intrinsic `(A)` facts link the **official platform doc** (a `source` URL); OpenAB `(B)` decisions/findings point at the **code** (`file.rs#symbol`) and, where relevant, the **PR** (`pr` / `refs`). Code refs use a grep-stable `#symbol` (no line numbers), so conformance can confirm they still exist without breaking on unrelated edits above the target.
@@ -18,11 +18,11 @@ Each `schema/<platform>.toml` has three schema-driven parts:
 
 `crates/platform-schema` deserializes every `schema/*.toml` into typed structs and, in CI, enforces:
 
-- **structural validity** — required fields, closed enum sets, the exact 16-feature set, unknown-key rejection;
+- **structural validity** — required fields, closed enum sets, the exact 17-feature set, unknown-key rejection;
 - **version currency** — every file's `schema_version` matches the current one (a stale file fails the build);
 - **anti-drift** — every `source` code-ref still resolves to a real file + `#symbol` in the tree.
 
-- **Current schema version: `2026-07-07`** — the top-line `schema_version` in each file. Bump it when the schema changes; the conformance test then flags every file that hasn't been re-verified.
+- **Current schema version: `2026-07-08`** — the top-line `schema_version` in each file. Bump it when the schema changes; the conformance test then flags every file that hasn't been re-verified.
 
 ## Platforms
 

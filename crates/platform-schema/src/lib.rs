@@ -11,7 +11,7 @@
 use serde::Deserialize;
 
 /// Current schema version. Bump when the schema changes; stale files are flagged.
-pub const SCHEMA_VERSION: &str = "2026-07-07";
+pub const SCHEMA_VERSION: &str = "2026-07-08";
 
 /// The complete, closed OpenAB feature set (Schema 2). Every platform file must
 /// contain exactly these keys, once each.
@@ -32,6 +32,7 @@ pub const EXPECTED_FEATURES: &[&str] = &[
     "slash_commands",
     "multibot",
     "group_routing",
+    "cron_dispatch",
 ];
 
 /// Every `[capability.*]` sub-section name, in template order.

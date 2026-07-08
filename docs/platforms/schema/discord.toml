@@ -1,7 +1,7 @@
 # Discord platform capability schema.
 # Generated from the adapter source + official docs — follows _template.toml.
 
-schema_version = "2026-07-07"
+schema_version = "2026-07-08"
 
 [platform]
 name          = "discord"
@@ -224,6 +224,13 @@ feature = "group_routing"
 status  = "implemented"
 note    = "Per-thread dispatch keyed by dispatcher.key(\"discord\", channel_id, sender_id); thread↔parent allowlist via detect_thread; ambient mode buffers passive-channel messages."
 source  = ["crates/openab-core/src/discord.rs#detect_thread"]
+pr      = ""
+
+[[openab_features]]
+feature = "cron_dispatch"
+status  = "implemented"
+note    = "`cronjob.toml` jobs with `platform = \"discord\"` fire via the shared scheduler: `discord` is in `VALID_PLATFORMS` and `main` registers the Discord adapter under `\"discord\"` in `cron_adapters`, so `fire_cronjob` dispatches through `adapter.send_message`. Cron dispatch intentionally bypasses the L2/L3 ingress trust gate — jobs are operator-authored in config, not untrusted inbound."
+source  = ["crates/openab-core/src/cron.rs#VALID_PLATFORMS", "crates/openab-core/src/cron.rs#fire_cronjob", "src/main.rs#cron_adapters"]
 pr      = ""
 
 

@@ -34,7 +34,7 @@
 
 # Version this file was written against. Bumped when the schema changes.
 # Conformance flags any schema/*.toml older than the current version as stale.
-schema_version = "2026-07-07"      # required, "YYYY-MM-DD"
+schema_version = "2026-07-08"      # required, "YYYY-MM-DD"
 
 [platform]
 name          = ""                 # required. matches filename, snake_case
@@ -169,7 +169,7 @@ source    = ""                     # required
 
 
 # ═══ Schema 2 — openab-feature-support (source of truth: our code + PR) ══════
-# One [[openab_features]] block per OpenAB capability. All 16 blocks below are
+# One [[openab_features]] block per OpenAB capability. All 17 blocks below are
 # the complete, closed feature set (conformance checks every one is present and
 # that no unknown feature key is used). Fill each for the platform.
 #
@@ -290,6 +290,13 @@ feature = "group_routing"          # group / session routing
 status  = ""
 note    = ""
 source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "cron_dispatch"          # scheduled cronjob.toml jobs targeting this platform
+status  = ""
+note    = ""
+source  = []                       # e.g. ["crates/openab-core/src/cron.rs#VALID_PLATFORMS"]
 pr      = ""
 
 

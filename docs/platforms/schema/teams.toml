@@ -3,7 +3,7 @@
 #  Generated from the adapter source + official docs. See _template.toml for the schema.
 # ═══════════════════════════════════════════════════════════════════════════
 
-schema_version = "2026-07-07"
+schema_version = "2026-07-08"
 
 [platform]
 name          = "teams"
@@ -226,6 +226,13 @@ feature = "group_routing"
 status  = "implemented"
 note    = "Session keyed by `conversation.id` (+ `conversation_type`); `serviceUrl` cached per conversation for reply routing, refreshed (timestamp) on each reply, with a periodic TTL cleanup task in the gateway."
 source  = ["crates/openab-gateway/src/adapters/teams.rs#handle_reply", "crates/openab-gateway/src/lib.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "cron_dispatch"
+status  = "not_implemented"
+note    = "Not wired for scheduled cron dispatch: `VALID_PLATFORMS` (cron.rs) covers only discord/slack/telegram and no adapter is registered for this platform in `cron_adapters`, so `cronjob.toml` jobs targeting it are rejected at startup by `validate_cronjobs`."
+source  = []
 pr      = ""
 
 

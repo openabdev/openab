@@ -1,7 +1,7 @@
 # Slack — machine-readable platform schema
 # Converted from the adapter source + official docs. See _template.toml for the schema.
 
-schema_version = "2026-07-07"
+schema_version = "2026-07-08"
 
 [platform]
 name          = "slack"
@@ -222,6 +222,13 @@ feature = "group_routing"
 status  = "implemented"
 note    = "Routed through Dispatcher; key is grouping-dependent — slack:<thread_id> in Thread mode or slack:<thread_id>:<sender_id> in Lane mode (Dispatcher::key), with thread_id falling back to channel_id outside a thread. Sender context is serialized with the Slack-native thread_ts key so agents calling the API directly see the right field."
 source  = ["crates/openab-core/src/dispatch.rs#key", "crates/openab-core/src/slack.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "cron_dispatch"
+status  = "implemented"
+note    = "`cronjob.toml` jobs with `platform = \"slack\"` fire via the shared scheduler: `slack` is in `VALID_PLATFORMS` and `main` registers the Slack adapter under `\"slack\"` in `cron_adapters`, so `fire_cronjob` dispatches through `adapter.send_message`. Cron dispatch intentionally bypasses the L2/L3 ingress trust gate — jobs are operator-authored in config, not untrusted inbound."
+source  = ["crates/openab-core/src/cron.rs#VALID_PLATFORMS", "crates/openab-core/src/cron.rs#fire_cronjob", "src/main.rs#cron_adapters"]
 pr      = ""
 
 

@@ -2,7 +2,7 @@
 #  Platform capability schema — WECOM (WeCom / WeChat Work)
 # ═══════════════════════════════════════════════════════════════════════════
 
-schema_version = "2026-07-07"
+schema_version = "2026-07-08"
 
 [platform]
 name          = "wecom"
@@ -226,6 +226,13 @@ feature = "group_routing"
 status  = "partial"
 note    = "Sessions keyed by wecom:{corp_id}:{from_user} (per-user 1:1); no group routing since there are no group callbacks in this model."
 source  = ["crates/openab-gateway/src/adapters/wecom.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "cron_dispatch"
+status  = "not_implemented"
+note    = "Not wired for scheduled cron dispatch: `VALID_PLATFORMS` (cron.rs) covers only discord/slack/telegram and no adapter is registered for this platform in `cron_adapters`, so `cronjob.toml` jobs targeting it are rejected at startup by `validate_cronjobs`."
+source  = []
 pr      = ""
 
 

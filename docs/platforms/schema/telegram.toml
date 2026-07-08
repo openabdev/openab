@@ -1,6 +1,6 @@
 # Generated from the adapter source + official docs — see docs/platforms/README.md for schemas.
 
-schema_version = "2026-07-07"
+schema_version = "2026-07-08"
 
 [platform]
 name          = "telegram"
@@ -222,6 +222,13 @@ status  = "implemented"
 note    = "Session keyed by `chat.id` + optional `message_thread_id`; `compute_draft_id` derives a stable per-(chat,thread) draft id to avoid forum-topic collisions."
 source  = ["crates/openab-gateway/src/adapters/telegram.rs#compute_draft_id"]
 pr      = ""
+
+[[openab_features]]
+feature = "cron_dispatch"
+status  = "implemented"
+note    = "`cronjob.toml` jobs with `platform = \"telegram\"` fire via the shared scheduler: `telegram` was added to `VALID_PLATFORMS` and the unified adapter registered under `\"telegram\"` in `cron_adapters` (PR #1315), so `fire_cronjob` dispatches through `adapter.send_message`. Like the other platforms, cron dispatch bypasses the L2/L3 ingress trust gate — jobs are operator-authored in config, not untrusted inbound."
+source  = ["crates/openab-core/src/cron.rs#VALID_PLATFORMS", "crates/openab-core/src/cron.rs#fire_cronjob", "src/main.rs#cron_adapters"]
+pr      = "#1315"
 
 
 # ═══ Schema 3 — platform-quirks ══════════════════════════════════════════════
