@@ -193,6 +193,59 @@ fn strip_redundant_table_fence(text: &str) -> Cow<'_, str> {
     }
 }
 
+/// Returns true if the URL scheme is allowed by Feishu (http:// or https://).
+/// Non-http URLs (e.g. file://) are rejected with error 230001.
+pub fn is_allowed_link(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
+/// Rewrite non-http(s) markdown links as plain bracketed text so Feishu's
+/// CardKit API does not reject the card with error 230001 (scheme whitelist).
+/// Matches `[text](url)` patterns where url does NOT start with http:// or https://.
+pub fn sanitize_non_http_links(text: &str) -> Cow<'_, str> {
+    if !text.contains("](") {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    let mut changed = false;
+    while i < len {
+        if chars[i] == '[' {
+            let mut j = i + 1;
+            while j < len && chars[j] != ']' && chars[j] != '[' {
+                j += 1;
+            }
+            if j < len && chars[j] == ']' && j + 1 < len && chars[j + 1] == '(' {
+                let text_part: String = chars[i + 1..j].iter().collect();
+                let mut k = j + 2;
+                while k < len && chars[k] != ')' {
+                    k += 1;
+                }
+                if k < len {
+                    let url: String = chars[j + 2..k].iter().collect();
+                    if is_allowed_link(&url) {
+                        out.extend(chars[i..=k].iter());
+                    } else {
+                        out.push_str(&format!("[{text_part}]({url})"));
+                        changed = true;
+                    }
+                    i = k + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    if changed {
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
 /// Build a CardKit JSON 2.0 card holding a single markdown element.
 ///
 /// - `schema` is pinned to `"2.0"` (the only structure the API accepts).
@@ -200,10 +253,13 @@ fn strip_redundant_table_fence(text: &str) -> Cow<'_, str> {
 ///   `false` for the finalized static card.
 /// - The text is first passed through `strip_redundant_table_fence` so a
 ///   table wrapped in a bare ``` fence renders as a native table.
+/// - Non-http(s) links (e.g. file://) are rewritten to plain bracketed text
+///   to avoid Feishu error 230001 (scheme not in whitelist).
 /// - `update_multi` is left at its default (`true`); setting it `false` is
 ///   rejected in streaming mode (errcode 300302), so we never emit it.
 pub fn markdown_to_card_v2(text: &str, streaming: bool) -> Value {
     let text = strip_redundant_table_fence(text);
+    let text = sanitize_non_http_links(text.as_ref());
     let text = text.as_ref();
     let mut config = serde_json::json!({ "streaming_mode": streaming });
     if streaming {
@@ -405,6 +461,7 @@ pub async fn update_card_stream(
     // closed table fence renders natively mid-stream (no flicker) and matches
     // the create/finalize paths.
     let text = strip_redundant_table_fence(text);
+    let text = sanitize_non_http_links(text.as_ref());
     let url =
         format!("{api_base}/open-apis/cardkit/v1/cards/{card_id}/elements/{element_id}/content");
     let body = serde_json::json!({

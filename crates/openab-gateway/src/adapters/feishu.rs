@@ -1654,7 +1654,7 @@ fn parse_inline(line: &str) -> Vec<serde_json::Value> {
                 }
                 // Feishu API only allows http:// and https:// links (error 230001 otherwise).
                 // Non-http links (e.g. file://) are rendered as plain text to avoid rejection.
-                if url.starts_with("http://") || url.starts_with("https://") {
+                if feishu_card::is_allowed_link(&url) {
                     elems.push(serde_json::json!({"tag": "a", "text": text, "href": url}));
                 } else {
                     // Render as plain bracketed text: [text](url)
@@ -3552,6 +3552,51 @@ mod tests {
         // Surrounding whitespace is tolerated (env values often carry it).
         assert_eq!(StreamingMode::parse("  card  "), StreamingMode::Card);
         assert_eq!(StreamingMode::parse(" auto "), StreamingMode::Auto);
+    }
+
+    // --- file:// link sanitisation (error 230001 regression) ---
+
+    #[test]
+    fn parse_inline_file_url_rendered_as_plain_text() {
+        // Feishu rejects messages with non-http(s) links (error 230001).
+        // parse_inline must convert file:// links to plain bracketed text.
+        let line = "- [gh.exe](file:///C:/Program%20Files/GitHub%20CLI/gh.exe)";
+        let elems = parse_inline(line);
+        for elem in &elems {
+            if let Some(tag) = elem.get("tag").and_then(|t| t.as_str()) {
+                assert_ne!(tag, "a", "file:// link must not be emitted as <a> tag");
+            }
+        }
+        let all_text: String = elems
+            .iter()
+            .filter_map(|e| e.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            all_text.contains("gh.exe") && all_text.contains("file://"),
+            "file:// link should be visible as plain text, got: {all_text}"
+        );
+    }
+
+    #[test]
+    fn markdown_to_post_strips_file_links() {
+        // End-to-end: markdown with file:// links must produce a post body
+        // with no "a" tag elements pointing to file:// URLs.
+        let md = "Here is [my project](file:///C:/Users/Sunny/Projects/openab) and [GitHub](https://github.com/openabdev/openab).";
+        let post = markdown_to_post(md);
+        if let Some(content) = post.pointer("/zh_cn/content") {
+            for row in content.as_array().unwrap_or(&vec![]) {
+                for elem in row.as_array().unwrap_or(&vec![]) {
+                    if elem.get("tag").and_then(|t| t.as_str()) == Some("a") {
+                        let href = elem.get("href").and_then(|h| h.as_str()).unwrap_or("");
+                        assert!(
+                            feishu_card::is_allowed_link(href),
+                            "non-http link slipped through as <a>: {href}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // --- should_use_card tests (S2) ---
