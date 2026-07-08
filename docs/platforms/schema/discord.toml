@@ -1,5 +1,5 @@
 # Discord platform capability schema.
-# Generated from docs/platforms/discord.md — follows _template.toml.
+# Generated from the adapter source + official docs — follows _template.toml.
 
 schema_version = "2026-07-07"
 

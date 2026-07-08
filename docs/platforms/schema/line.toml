@@ -1,6 +1,6 @@
 # ═══════════════════════════════════════════════════════════════════════════
 #  LINE — machine-readable platform schema
-#  Converted from docs/platforms/line.md. Structure follows _template.toml.
+#  Converted from the adapter source + official docs. Structure follows _template.toml.
 # ═══════════════════════════════════════════════════════════════════════════
 
 schema_version = "2026-07-07"

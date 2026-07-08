@@ -1,5 +1,5 @@
 # Slack — machine-readable platform schema
-# Converted from docs/platforms/slack.md. See _template.toml for the schema.
+# Converted from the adapter source + official docs. See _template.toml for the schema.
 
 schema_version = "2026-07-07"
 

@@ -1,6 +1,6 @@
 # ═══════════════════════════════════════════════════════════════════════════
 #  Platform capability schema — MICROSOFT TEAMS
-#  Generated from docs/platforms/teams.md. See _template.toml for the schema.
+#  Generated from the adapter source + official docs. See _template.toml for the schema.
 # ═══════════════════════════════════════════════════════════════════════════
 
 schema_version = "2026-07-07"

@@ -1,4 +1,4 @@
-# Generated from docs/platforms/telegram.md — see docs/platforms/README.md for schemas.
+# Generated from the adapter source + official docs — see docs/platforms/README.md for schemas.
 
 schema_version = "2026-07-07"
 

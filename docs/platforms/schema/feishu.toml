@@ -1,5 +1,5 @@
 # Feishu / Lark — platform capability schema
-# Generated from docs/platforms/feishu.md
+# Generated from the adapter source + official docs
 
 schema_version = "2026-07-07"
 
