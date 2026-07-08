@@ -1,6 +1,6 @@
 # Slack — platform notes
 
-**Schema version:** 2026-07-04
+**Schema version:** 2026-07-07
 
 Engineering-facing capability & quirks reference for the Slack adapter. For operator setup see `docs/slack.md`. Follows the schemas in [`README.md`](./README.md).
 

@@ -1,6 +1,6 @@
 # Discord — platform notes
 
-**Schema version:** 2026-07-04
+**Schema version:** 2026-07-07
 
 Engineering-facing capability & quirks reference for the Discord adapter. For operator setup see `docs/discord.md`. Follows the schemas in [`README.md`](./README.md).
 
@@ -77,4 +77,4 @@ DM channels can't hold threads, so DMs reuse the DM channel directly and are tre
 - 2026-07-04 (A) Message content hard limit is 2000 chars, matching `DiscordAdapter::message_limit()`; the router chunks longer replies. [Channel](https://docs.discord.com/developers/resources/channel)
 - 2026-07-04 (A) Thread channel types are ANNOUNCEMENT_THREAD (10) / PUBLIC_THREAD (11) / PRIVATE_THREAD (12), API v9+; identified by `thread_metadata`, not `parent_id` (category children also carry `parent_id`); `detect_thread` follows this. [Channel](https://docs.discord.com/developers/resources/channel)
 - 2026-07-04 (A) Transport is a bot-initiated persistent WebSocket Gateway (WSS) authenticated by Identify(op 2) + bot token + intents — no per-event inbound signature to verify (unlike webhook platforms). [Gateway](https://docs.discord.com/developers/topics/gateway)
-- 2026-07-04 (B) Section-2 ref audit: chunking lives at `adapter.rs:686`/`:1105` (not the trait def near `:306`); slash-command registration is `set_global_commands` at `discord.rs:1386`; `is_denied_user` at `discord.rs:2922`, trusted-bot bypass at `discord.rs:2947`. Corrected stale line refs. [PR #TBD]
+- 2026-07-04 (B) Section-2 ref audit: chunking lives at `adapter.rs:686`/`:1105` (not the trait def near `:306`); slash-command registration is `set_global_commands` at `discord.rs:1386`; `is_denied_user` at `discord.rs:2922`, trusted-bot bypass at `discord.rs:2947`. Corrected stale line refs. [PR #1295]

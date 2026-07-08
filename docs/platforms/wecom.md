@@ -1,6 +1,6 @@
 # WeCom (企業微信) — platform notes
 
-**Schema version:** 2026-07-04
+**Schema version:** 2026-07-07
 
 Engineering-facing capability & quirks reference for the WeCom adapter. For operator setup see `docs/wecom.md`. Follows the schemas in [`README.md`](./README.md).
 
@@ -78,6 +78,6 @@ Only `text`, `image`, `file` msgtypes are forwarded (`wecom.rs:1022`); `voice` /
 - 2026-07-04 (A) No edit API; only recall (`/cgi-bin/message/recall`) within 24h on this app's own messages (delete, not edit; WeChat-plugin-end data can't be pulled back). [https://developer.work.weixin.qq.com/document/path/94867]
 - 2026-07-04 (A) Media caps: image 10MB (JPG/PNG), voice 2MB/60s (AMR), video 10MB (MP4), file 20MB; min 5 bytes; temp media_id valid 3 days. [https://developer.work.weixin.qq.com/document/path/90253]
 - 2026-07-04 (A) Callback auth = SHA1 msg_signature (sorted token/ts/nonce/encrypt) + AES-256-CBC via 43-char EncodingAESKey, PKCS7 block_size=32, IV = first 16 key bytes. [https://developer.work.weixin.qq.com/document/path/90238]
-- 2026-07-04 (B) All section-2 `file:line` refs verified against the tree at `/tmp/openab-check`; corrected `send_text` / `fetch_media_with_retry` / `gate_incoming` line numbers and the mention-gating range. `WecomAdapter` is a standalone handler (does **not** impl `ChatAdapter`); trait defaults referenced are in `adapter.rs`. [PR: @TBD]
+- 2026-07-04 (B) All section-2 `file:line` refs verified against the tree at `/tmp/openab-check`; corrected `send_text` / `fetch_media_with_retry` / `gate_incoming` line numbers and the mention-gating range. `WecomAdapter` is a standalone handler (does **not** impl `ChatAdapter`); trait defaults referenced are in `adapter.rs`. [PR #1295]
 
-*Sourcing: `(A)` intrinsic facts → official WeCom doc; `(B)` OpenAB decisions/findings → `file:line` (PR link `@TBD`).*
+*Sourcing: `(A)` intrinsic facts → official WeCom doc; `(B)` OpenAB decisions/findings → `file:line` (PR link `#1295`).*

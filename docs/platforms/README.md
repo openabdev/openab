@@ -14,12 +14,20 @@ Each platform page has three schema-driven sections:
 
 **Sourcing rule:** attach the source that answers *"why should I trust or keep this?"* — intrinsic facts link the **official platform doc**; OpenAB decisions/findings link the **PR/issue**.
 
+## Machine-readable schema
+
+Alongside these Markdown pages, each platform has a machine-readable `schema/<platform>.toml`, validated by the `crates/platform-schema` conformance tests (run in CI on any schema change). The TOML files are the **machine-checked source of truth**; the `.md` pages are the **human-readable presentation layer** — neither blocks the other's evolution.
+
+- In `schema/*.toml`, OpenAB code references use `file.rs#symbol` (a grep-stable symbol name, **no line numbers**), so conformance can confirm they still exist without breaking on unrelated edits above the target.
+- The `.md` Section 2 tables use `file:line` as a **point-in-time snapshot** for readability; treat the TOML `#symbol` refs as the durable, machine-checked form.
+- See [`_template.toml`](./_template.toml) for the full schema definition + per-field docs.
+
 ## Schema version
 
 The three schemas share **one date-based version**. When any schema changes, bump the date here and re-verify the pages.
 
-- **Current schema version: `2026-07-04`**
-- Each platform page records the version it was written against as a single line near the top: `**Schema version:** 2026-07-04`.
+- **Current schema version: `2026-07-07`**
+- Each platform page records the version it was written against as a single line near the top: `**Schema version:** 2026-07-07`.
 - No per-page front-matter: the platform is the **filename**, page **ownership is tracked separately** (not in these pages), and last-touched is in **git history**.
 
 The conformance table below lists each page's version — a page older than the current version is stale and needs an update pass.
@@ -28,14 +36,14 @@ The conformance table below lists each page's version — a page older than the 
 
 | Platform | Schema version |
 |---|---|
-| [line](./line.md) | 2026-07-04 |
-| [slack](./slack.md) | 2026-07-04 |
-| [telegram](./telegram.md) | 2026-07-04 |
-| [discord](./discord.md) | 2026-07-04 |
-| [feishu](./feishu.md) | 2026-07-04 |
-| [wecom](./wecom.md) | 2026-07-04 |
-| [googlechat](./googlechat.md) | 2026-07-04 |
-| [teams](./teams.md) | 2026-07-04 |
+| [line](./line.md) | 2026-07-07 |
+| [slack](./slack.md) | 2026-07-07 |
+| [telegram](./telegram.md) | 2026-07-07 |
+| [discord](./discord.md) | 2026-07-07 |
+| [feishu](./feishu.md) | 2026-07-07 |
+| [wecom](./wecom.md) | 2026-07-07 |
+| [googlechat](./googlechat.md) | 2026-07-07 |
+| [teams](./teams.md) | 2026-07-07 |
 
 ---
 

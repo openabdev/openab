@@ -1,6 +1,6 @@
 # <Platform> — platform notes
 
-**Schema version:** 2026-07-04
+**Schema version:** 2026-07-07
 
 Engineering-facing capability & quirks reference for the <Platform> adapter. For operator setup see `docs/<platform>.md`. Follows the schemas in [`README.md`](./README.md).
 

@@ -1,6 +1,6 @@
 # LINE — platform notes
 
-**Schema version:** 2026-07-04
+**Schema version:** 2026-07-07
 
 Engineering-facing capability & quirks reference for the LINE adapter. For operator setup see `docs/line.md`. Follows the schemas in [`README.md`](./README.md).
 

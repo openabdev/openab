@@ -1,6 +1,6 @@
 # MS Teams — platform notes
 
-**Schema version:** 2026-07-04
+**Schema version:** 2026-07-07
 
 Engineering-facing capability & quirks reference for the MS Teams adapter. For operator setup see `docs/teams.md`. Follows the schemas in [`README.md`](./README.md).
 
