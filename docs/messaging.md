@@ -126,6 +126,7 @@ How involved bots behave on subsequent messages is controlled by `allow_user_mes
 | `multibot-mentions` (default) | Like `involved`, but once a second bot has posted in the thread, you must @mention the bot(s) you want to respond. |
 | `involved` | All involved bots respond to every message — no @mention required. |
 | `mentions` | Always require an explicit @mention, even in threads. |
+| `multiparty-mentions` | Like `involved` while the thread is a 1:1 (single human + bot); require @mention once a second human (Slack-only detection; other platforms behave like `multibot-mentions`) or another bot has posted. Irreversible per thread for the cache TTL. |
 
 ```
 # allow_user_messages = "multibot-mentions" (default)
@@ -145,7 +146,7 @@ User in thread: @BotA any other ideas?
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `allow_user_messages` | string | `"multibot-mentions"` | `"multibot-mentions"` — require @mention once 2+ bots are in the thread. `"involved"` — reply without @mention in participated threads. `"mentions"` — always require @mention. |
+| `allow_user_messages` | string | `"multibot-mentions"` | `"multibot-mentions"` — require @mention once 2+ bots are in the thread. `"involved"` — reply without @mention in participated threads. `"mentions"` — always require @mention. `"multiparty-mentions"` — like `"involved"` in 1:1 threads; require @mention once a second human (Slack-only) or another bot posts. |
 
 > **Note:** This is a **global setting** — it cannot be changed per thread. Configure it in `config.toml` or via `values.yaml` for Helm.
 

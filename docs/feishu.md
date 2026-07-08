@@ -135,7 +135,7 @@ To disable mention gating: `feishu.requireMention: false`.
 
 ### Thread Participation (Involved Mode)
 
-Once the bot replies in a thread (topic), it remembers that thread and responds to subsequent messages **without requiring @mention** — similar to Discord's `allow_user_messages: "involved"` mode.
+Once the bot replies in a thread (topic), it remembers that thread and responds to subsequent messages **without requiring @mention** — similar to Discord's `allow_user_messages: "involved"` mode. (`multiparty-mentions` is accepted but behaves like `multibot-mentions` here — multi-human detection is Slack-only.)
 
 - Only applies to threads (messages with `root_id`). Main channel messages always require @mention.
 - Participation is stored in memory. Gateway restart clears the cache; users need to @mention once to re-engage.

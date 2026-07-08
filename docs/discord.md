@@ -69,7 +69,7 @@ bot_token = "${DISCORD_BOT_TOKEN}"
 allowed_channels = ["123456789"]      # channel ID allowlist (empty = all)
 allowed_users = ["987654321"]         # user ID allowlist (empty = all)
 allow_bot_messages = "off"            # off | mentions | all
-allow_user_messages = "multibot-mentions"      # multibot-mentions | involved | mentions
+allow_user_messages = "multibot-mentions"      # multibot-mentions | involved | mentions | multiparty-mentions
 trusted_bot_ids = []                  # bot user IDs allowed through (empty = any)
 ```
 
@@ -106,6 +106,7 @@ Controls whether the bot requires @mention in threads.
 | `"involved"` | Respond in threads the bot owns or has participated in without @mention. Main channel always requires @mention. |
 | `"mentions"` | Always require @mention, even in the bot's own threads. |
 | `"multibot-mentions"` (default) | Same as `involved` in single-bot threads. In threads where other bots have also posted, requires @mention — prevents all bots from responding to every message. |
+| `"multiparty-mentions"` | On Discord, currently behaves like `multibot-mentions` (multi-human detection is implemented for Slack only). |
 
 #### Comparison
 

@@ -77,6 +77,9 @@ pub struct SlackAdapter {
     multibot_threads: tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>,
     /// Positive-only cache: thread_ts → cached_at for threads with ≥2 distinct human senders.
     /// Like multibot, a thread becoming multi-human is irreversible. Used by `multiparty-mentions`.
+    /// In-memory only (unlike `multibot_cache` there is no disk persistence): after a restart the
+    /// state is re-derived in `bot_participated_in_thread` from the fetched history, which covers
+    /// the most recent ~200 messages of a thread — an accepted limitation for typical workspaces.
     multihuman_threads: tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>,
     /// First human sender seen per thread (thread_ts → (user_id, seen_at)); feeds eager
     /// multi-human detection from message events without an extra API fetch.
@@ -157,6 +160,17 @@ impl SlackAdapter {
     /// thread history. Idempotent. In-memory only (rebuilt on restart via the
     /// history fetch in `bot_participated_in_thread`).
     async fn note_human_in_thread(&self, thread_ts: &str, user_id: &str) {
+        // Fast path: already promoted to multi-human — nothing left to learn
+        // about this thread, skip the first-human bookkeeping entirely.
+        {
+            let cache = self.multihuman_threads.lock().await;
+            if cache
+                .get(thread_ts)
+                .is_some_and(|ts| ts.elapsed() < self.session_ttl)
+            {
+                return;
+            }
+        }
         {
             let mut first = self.thread_first_human.lock().await;
             match first.get(thread_ts) {
@@ -165,9 +179,23 @@ impl SlackAdapter {
                         thread_ts.to_string(),
                         (user_id.to_string(), tokio::time::Instant::now()),
                     );
+                    // Same eviction policy as enforce_cache_bounds: drop expired
+                    // first, then the oldest half if still over (retain alone
+                    // would let the map grow unbounded while entries are fresh).
                     if first.len() > PARTICIPATION_CACHE_MAX {
                         let ttl = self.session_ttl;
                         first.retain(|_, (_, ts)| ts.elapsed() < ttl);
+                        if first.len() > PARTICIPATION_CACHE_MAX {
+                            let mut entries: Vec<_> = first
+                                .iter()
+                                .map(|(k, (_, ts))| (k.clone(), *ts))
+                                .collect();
+                            entries.sort_by_key(|(_, ts)| *ts);
+                            let evict_count = entries.len() / 2;
+                            for (key, _) in entries.into_iter().take(evict_count) {
+                                first.remove(&key);
+                            }
+                        }
                     }
                     return;
                 }
@@ -883,6 +911,19 @@ pub async fn run_slack_adapter(
                                                 // Apply bot gating for app_mention events (same rules as message events)
                                                 let is_bot = event["bot_id"].is_string()
                                                     || event["subtype"].as_str() == Some("bot_message");
+                                                // Eager multi-human detection must also see mention-bearing
+                                                // messages: a second human often joins a thread by @mentioning
+                                                // the bot, which arrives as app_mention (deduped from the
+                                                // message branch). Without this, the thread would still look
+                                                // 1:1 to multiparty-mentions.
+                                                if !is_bot {
+                                                    if let (Some(thread_ts), Some(uid)) = (
+                                                        event["thread_ts"].as_str(),
+                                                        event["user"].as_str(),
+                                                    ) {
+                                                        adapter.note_human_in_thread(thread_ts, uid).await;
+                                                    }
+                                                }
                                                 if is_bot {
                                                     match allow_bot_messages {
                                                         AllowBots::Off => { continue; }
@@ -976,6 +1017,10 @@ pub async fn run_slack_adapter(
                                                 // --- Eager multi-human detection (multiparty-mentions) ---
                                                 // Track human senders per thread; the second distinct human
                                                 // marks the thread multi-human without an API fetch.
+                                                // Runs unconditionally (like eager multibot detection above)
+                                                // regardless of allow_user_messages mode: the cost is O(1)
+                                                // map ops, and keeping the cache warm means gating stays
+                                                // correct from the first message after a mode change.
                                                 if !is_bot {
                                                     if let (Some(thread_ts), Some(uid)) = (
                                                         event["thread_ts"].as_str(),
@@ -2253,6 +2298,75 @@ mod tests {
     fn trusted_bot_ids_rejects_empty_event_bot_id() {
         let trusted = HashSet::from(["".to_string()]);
         assert!(!bot_id_matches_trusted(&trusted, "", None));
+    }
+
+    fn test_adapter() -> SlackAdapter {
+        SlackAdapter::new(
+            "xoxb-test".into(),
+            std::time::Duration::from_secs(300),
+            AllowBots::Off,
+            true,
+            crate::multibot_cache::MultibotCache::load("/dev/null".into()),
+            true,
+        )
+    }
+
+    /// GIVEN: a thread where only one human has spoken
+    /// WHEN:  the same human sends more messages
+    /// THEN:  the thread is NOT promoted to multi-human (idempotent)
+    #[tokio::test]
+    async fn note_human_same_user_is_idempotent() {
+        let adapter = test_adapter();
+        adapter.note_human_in_thread("111.222", "U1").await;
+        adapter.note_human_in_thread("111.222", "U1").await;
+        adapter.note_human_in_thread("111.222", "U1").await;
+        assert!(!adapter.multihuman_threads.lock().await.contains_key("111.222"));
+        assert!(adapter.thread_first_human.lock().await.contains_key("111.222"));
+    }
+
+    /// GIVEN: a thread with first human U1
+    /// WHEN:  a second distinct human U2 posts
+    /// THEN:  the thread is promoted to multi-human
+    #[tokio::test]
+    async fn note_human_second_user_promotes() {
+        let adapter = test_adapter();
+        adapter.note_human_in_thread("111.222", "U1").await;
+        adapter.note_human_in_thread("111.222", "U2").await;
+        assert!(adapter.multihuman_threads.lock().await.contains_key("111.222"));
+    }
+
+    /// GIVEN: an already-promoted multi-human thread
+    /// WHEN:  more humans (including new ones) post
+    /// THEN:  fast path keeps the promoted state; first-human map is not touched
+    #[tokio::test]
+    async fn note_human_promoted_thread_takes_fast_path() {
+        let adapter = test_adapter();
+        adapter.note_human_in_thread("111.222", "U1").await;
+        adapter.note_human_in_thread("111.222", "U2").await;
+        adapter.note_human_in_thread("111.222", "U3").await;
+        assert!(adapter.multihuman_threads.lock().await.contains_key("111.222"));
+        // fast path returns before first-human bookkeeping, so U3 never
+        // becomes a "first human" of some other state
+        let first = adapter.thread_first_human.lock().await;
+        assert_eq!(first.get("111.222").map(|(u, _)| u.as_str()), Some("U1"));
+    }
+
+    /// GIVEN: more fresh 1:1 threads than PARTICIPATION_CACHE_MAX
+    /// WHEN:  the first-human map crosses the cap (all entries within TTL)
+    /// THEN:  the oldest-half eviction bounds the map (retain alone would not)
+    #[tokio::test]
+    async fn note_human_first_map_is_bounded_when_fresh() {
+        let adapter = test_adapter();
+        for i in 0..=PARTICIPATION_CACHE_MAX {
+            adapter
+                .note_human_in_thread(&format!("t{i}.0"), "U1")
+                .await;
+        }
+        let len = adapter.thread_first_human.lock().await.len();
+        assert!(
+            len <= PARTICIPATION_CACHE_MAX,
+            "first-human map should be bounded, got {len}"
+        );
     }
 
     /// Per-thread streaming: ON by default, OFF when another bot is present (#534).
