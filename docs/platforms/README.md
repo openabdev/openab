@@ -102,3 +102,53 @@ Freeform dated log — anything not captured by sections 1/2 (special models, go
 - `kind` (required): `intrinsic` (a platform fact) or `openab_decision` (a choice/finding of ours).
 - `source` (optional): official-doc URL, or `file.rs` / `file.rs#symbol`.
 - `refs` (optional): PR/ADR links, e.g. `["#1291"]`.
+
+---
+
+## How to update
+
+### Adding a new feature to the closed set
+
+When OpenAB gains a new capability (e.g. `voice_call`), update in **one PR**:
+
+1. **`crates/platform-schema/src/lib.rs`** — add to `EXPECTED_FEATURES`
+2. **`docs/platforms/_template.toml`** — add a `[[openab_features]]` block
+3. **`docs/platforms/README.md`** — add a row to the feature table above
+4. **All 8 `schema/*.toml` files** — add the feature block with appropriate status:
+   ```toml
+   [[openab_features]]
+   feature = "voice_call"
+   status  = "not_implemented"   # or implemented / partial / workaround / n_a
+   note    = "..."
+   source  = ["crates/openab-gateway/src/adapters/line.rs#handle_voice"]
+   pr      = "#XXXX"
+   ```
+5. **Bump `SCHEMA_VERSION`** in `lib.rs` + update `schema_version` in all `.toml` files
+
+CI enforces completeness: a missing feature block in any platform file fails the build.
+
+### Changing a feature's status on one platform
+
+When an adapter adds or drops support (e.g. LINE gains streaming):
+
+1. Edit only that platform's `schema/<platform>.toml`
+2. Update `status`, `note`, `source`, and `pr` fields
+3. No other files need to change (no version bump required for status-only changes)
+
+### Adding a new platform
+
+1. Copy `_template.toml` to `schema/<platform>.toml`
+2. Fill all `[capability.*]` sections (source: official platform docs)
+3. Fill all 17 `[[openab_features]]` blocks (source: adapter code)
+4. Add `[[quirks]]` for platform-specific behaviors
+5. Add the platform to `EXPECTED_PLATFORMS` in `tests/conformance.rs`
+6. Add a row to the Platforms table in this README
+
+### Architecture: TOML vs Markdown
+
+| Layer | Purpose | Audience |
+|-------|---------|----------|
+| `docs/platforms/schema/*.toml` | Machine-readable facts schema | CI, automation, onboarding |
+| `docs/<platform>.md` | Human-readable setup/operator guide | Operators deploying OAB |
+
+These are **complementary, not overlapping**. TOML captures "what the platform can do + what OpenAB implements"; Markdown captures "how to configure and deploy". Update the TOML when adapter behavior changes; update the Markdown when deployment instructions change.
