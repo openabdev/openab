@@ -92,6 +92,7 @@ The closed set of OpenAB capabilities (derived from the `ChatAdapter` trait in `
 | `slash_commands` | `/reset`, `/cancel` handling |
 | `multibot` | multiple bots in one channel |
 | `group_routing` | group / session routing |
+| `cron_dispatch` | scheduled cron job delivery via `cronjob.toml` |
 
 ### 3 — `[[quirks]]` (platform-quirks)
 
