@@ -105,6 +105,44 @@ Freeform dated log — anything not captured by sections 1/2 (special models, go
 
 ---
 
+## How it all fits together
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  docs/platforms/schema/*.toml  (machine-readable facts, source of truth)│
+│                                                                         │
+│  line.toml │ slack.toml │ discord.toml │ telegram.toml │ feishu.toml │…│
+└──────┬──────────────┬──────────────┬────────────────────────────────────┘
+       │              │              │
+       ▼              ▼              ▼
+┌─────────────┐ ┌──────────┐ ┌───────────────────────────────────────────┐
+│ CI          │ │ Onboard  │ │ Future                                    │
+│             │ │          │ │                                           │
+│ conformance │ │ new      │ │ • runtime capability queries              │
+│ tests       │ │ maintainer│ │ • auto-generated comparison tables       │
+│ (Rust crate)│ │ reads    │ │ • adapter scaffolding from template       │
+│             │ │ schema   │ │                                           │
+└──────┬──────┘ └──────────┘ └───────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────┐
+│ Validates:                              │
+│  • structural correctness (serde)       │
+│  • closed 17-feature set (no gaps)      │
+│  • schema version freshness             │
+│  • code-ref #symbol still exists in tree│
+└─────────────────────────────────────────┘
+
+Separate layer (human-facing):
+┌─────────────────────────────────────────┐
+│  docs/<platform>.md                     │
+│  (operator setup guides — how to deploy)│
+│  NOT duplicated in TOML; lives alongside│
+└─────────────────────────────────────────┘
+```
+
+---
+
 ## How to update
 
 ### Adding a new feature to the closed set
