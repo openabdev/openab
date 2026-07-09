@@ -24,4 +24,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       # Standalone crate (serde + toml only); excluded from the root workspace
       # so it builds without the heavy adapter crates.
-      - run: cargo test --manifest-path crates/platform-schema/Cargo.toml
+      # --locked: build strictly from the committed Cargo.lock; fail if it is
+      # stale or missing rather than silently regenerating it (reproducible CI).
+      - run: cargo test --locked --manifest-path crates/platform-schema/Cargo.toml
