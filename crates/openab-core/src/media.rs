@@ -461,24 +461,6 @@ pub fn is_text_file(filename: &str, content_type: Option<&str>) -> bool {
     TEXT_FILENAMES.contains(&filename.to_lowercase().as_str())
 }
 
-/// Download a text-based file and return it as a `ContentBlock::Text`.
-///
-/// Files at or below 512 KB are downloaded and inlined into the prompt verbatim.
-///
-/// Files above 512 KB are **not** downloaded; instead a URL-hint block is
-/// returned so the agent can fetch the content itself if it has a web-fetch
-/// tool available.  The reported byte count in the hint path is `0` — the
-/// file is not inlined, so it does not contribute to the caller's aggregate
-/// size cap.
-///
-/// Pass `auth_token` for platforms that require per-request authentication
-/// (e.g. Slack private files).  When `needs_auth` is `true` the hint block
-/// will include a note that the URL requires an `Authorization` header, so the
-/// agent is aware that a bare fetch will likely fail.
-///
-/// Note: the caller already guards total size via a 1 MB aggregate cap; the
-/// per-file `MAX_SIZE` check here is intentional defense-in-depth so this
-/// function remains self-contained and safe when called from other contexts.
 /// Maximum size for inlining a text file into the prompt.
 ///
 /// Files at or below this limit are downloaded and embedded verbatim.
@@ -489,11 +471,32 @@ pub fn is_text_file(filename: &str, content_type: Option<&str>) -> bool {
 /// duplicating the magic number.
 pub const TEXT_INLINE_LIMIT: u64 = 512 * 1024; // 512 KB
 
+/// Download a text-based file and return it as a `ContentBlock::Text`.
+///
+/// Files at or below [`TEXT_INLINE_LIMIT`] are downloaded and inlined into
+/// the prompt verbatim.
+///
+/// Files above [`TEXT_INLINE_LIMIT`] are **not** downloaded; instead a
+/// URL-hint block is returned so the agent can fetch the content itself if it
+/// has a web-fetch tool available.  The reported byte count in the hint path
+/// is `0` — the file is not inlined, so it does not contribute to the
+/// caller's aggregate size cap.
+///
+/// Pass `auth_token` for platforms that require per-request authentication
+/// (e.g. Slack private files).  When provided, the hint block will include a
+/// note that the URL requires an `Authorization` header.  Note that for Slack,
+/// this hint is **visibility-only** for most agents — the URL cannot be
+/// fetched without the bot token, which the agent does not hold.
+///
+/// Note: the caller already guards total size via a 1 MB aggregate cap; the
+/// per-file `MAX_SIZE` check here is intentional defense-in-depth so this
+/// function remains self-contained and safe when called from other contexts.
 pub async fn download_and_read_text_file(
     url: &str,
     filename: &str,
     size: u64,
     auth_token: Option<&str>,
+    url_expires: bool,
 ) -> Option<(ContentBlock, u64)> {
     const MAX_SIZE: u64 = TEXT_INLINE_LIMIT;
 
@@ -501,10 +504,13 @@ pub async fn download_and_read_text_file(
         tracing::info!(
             filename,
             size,
-            "text file exceeds 512KB inline limit; returning URL hint for agent-side fetch"
+            "text file exceeds inline limit; returning URL hint for agent-side fetch"
         );
         let needs_auth = auth_token.is_some();
-        return Some((url_hint_block(filename, url, size, needs_auth), 0));
+        return Some((
+            url_hint_block(filename, url, size, needs_auth, url_expires),
+            0,
+        ));
     }
 
     let mut req = HTTP_CLIENT.get(url);
@@ -538,10 +544,13 @@ pub async fn download_and_read_text_file(
         tracing::info!(
             filename,
             size = actual_size,
-            "downloaded text file exceeds 512KB inline limit; returning URL hint"
+            "downloaded text file exceeds inline limit; returning URL hint"
         );
         let needs_auth = auth_token.is_some();
-        return Some((url_hint_block(filename, url, actual_size, needs_auth), 0));
+        return Some((
+            url_hint_block(filename, url, actual_size, needs_auth, url_expires),
+            0,
+        ));
     }
 
     // from_utf8_lossy returns Cow::Borrowed for valid UTF-8 (zero-copy)
@@ -567,22 +576,42 @@ pub async fn download_and_read_text_file(
 ///
 /// `needs_auth` should be `true` for platforms (e.g. Slack) whose download
 /// URLs require an `Authorization: Bearer` header — the hint will include a
-/// note so the agent knows a bare GET will be rejected.
-fn url_hint_block(filename: &str, url: &str, size: u64, needs_auth: bool) -> ContentBlock {
+/// note so the agent knows a bare GET will be rejected.  For Slack this hint
+/// is visibility-only for most agents since they do not hold the bot token.
+///
+/// `url_expires` should be `true` for platforms (e.g. Discord CDN) that
+/// issue time-limited signed URLs — the hint will warn the agent to fetch
+/// promptly before the link expires.
+fn url_hint_block(
+    filename: &str,
+    url: &str,
+    size: u64,
+    needs_auth: bool,
+    url_expires: bool,
+) -> ContentBlock {
     let size_kb = size / 1024;
-    let auth_note = if needs_auth {
-        "\nNote: this URL requires an Authorization header to download \
+    let inline_limit_kb = TEXT_INLINE_LIMIT / 1024;
+    let mut notes = String::new();
+    if url_expires {
+        notes.push_str(
+            "\nNote: this URL is time-limited (Discord CDN links expire in approximately \
+24 hours — fetch promptly).",
+        );
+    }
+    if needs_auth {
+        notes.push_str(
+            "\nNote: this URL requires an Authorization: Bearer header to download \
 (the platform uses authenticated file storage). A bare HTTP GET will likely \
-return 401 Unauthorized."
-    } else {
-        ""
-    };
+return 401 Unauthorized.",
+        );
+    }
     ContentBlock::Text {
         text: format!(
             "[File: {filename}]\n\
-This file ({size_kb} KB) exceeds the 512 KB inline limit and was not downloaded \
-by the bot. If you need its contents, fetch the URL below using a web-fetch tool:\n\
-{url}{auth_note}"
+This file ({size_kb} KB) exceeds the {inline_limit_kb} KB inline limit and was not \
+downloaded by the bot. If you need its contents, fetch the URL below using a \
+web-fetch tool:\n\
+{url}{notes}"
         ),
     }
 }
@@ -595,7 +624,13 @@ mod tests {
 
     #[test]
     fn url_hint_block_no_auth_contains_url_and_size() {
-        let block = url_hint_block("big.txt", "https://example.com/big.txt", 600 * 1024, false);
+        let block = url_hint_block(
+            "big.txt",
+            "https://example.com/big.txt",
+            600 * 1024,
+            false,
+            false,
+        );
         let text = match block {
             ContentBlock::Text { text } => text,
             _ => panic!("expected ContentBlock::Text"),
@@ -619,6 +654,7 @@ mod tests {
             "https://files.slack.com/report.txt",
             540 * 1024,
             true,
+            false, // Slack URLs do not have a TTL
         );
         let text = match block {
             ContentBlock::Text { text } => text,
@@ -631,6 +667,29 @@ mod tests {
         assert!(
             text.contains("401"),
             "should mention 401 so agent understands the risk"
+        );
+    }
+
+    #[test]
+    fn url_hint_block_with_expiry_includes_expiry_note() {
+        let block = url_hint_block(
+            "results.txt",
+            "https://cdn.discordapp.com/results.txt",
+            600 * 1024,
+            false,
+            true, // Discord CDN URLs expire
+        );
+        let text = match block {
+            ContentBlock::Text { text } => text,
+            _ => panic!("expected ContentBlock::Text"),
+        };
+        assert!(
+            text.contains("24 hours"),
+            "expiry note must mention 24-hour window"
+        );
+        assert!(
+            !text.contains("Authorization"),
+            "no auth note for unauthenticated URLs"
         );
     }
 
@@ -670,6 +729,7 @@ mod tests {
             "https://cdn.discordapp.com/large-results.txt",
             large_size,
             false,
+            true, // Discord CDN URLs expire
         );
         let text = match block {
             ContentBlock::Text { text } => text,

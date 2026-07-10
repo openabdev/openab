@@ -931,6 +931,7 @@ impl EventHandler for Handler {
                     &attachment.filename,
                     u64::from(attachment.size),
                     None,
+                    true, // Discord CDN URLs expire after ~24 hours
                 )
                 .await
                 {

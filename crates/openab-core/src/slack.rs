@@ -1370,7 +1370,8 @@ async fn handle_message(
                     continue;
                 }
                 if let Some((block, actual_bytes)) =
-                    media::download_and_read_text_file(url, filename, size, Some(bot_token)).await
+                    media::download_and_read_text_file(url, filename, size, Some(bot_token), false)
+                        .await
                 {
                     if text_file_bytes + actual_bytes > TEXT_TOTAL_CAP {
                         debug!(
