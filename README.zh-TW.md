@@ -1,14 +1,14 @@
 # OpenAB — Open Agent Broker
 
-English | [繁體中文](README.zh-TW.md)
+[English](README.md) | 繁體中文
 
 [![Stars](https://img.shields.io/github/stars/openabdev/openab?style=flat-square)](https://github.com/openabdev/openab) [![GitHub Release](https://img.shields.io/github/v/release/openabdev/openab?style=flat-square&logo=github)](https://github.com/openabdev/openab/releases/latest) ![License](https://img.shields.io/badge/license-MIT-A374ED?style=flat-square)
 
 ![OpenAB banner](images/banner.jpg)
 
-A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**, and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, OpenCode, MiMo-Code, Copilot CLI, Hermes, Grok Build, Devin, Antigravity, Pi, etc.) over stdio JSON-RPC — delivering the next-generation development experience. **Telegram, LINE, Feishu/Lark, Google Chat**, and other webhook-based platforms are supported via the standalone [Custom Gateway](crates/openab-gateway/).
+一個輕量、安全、雲端原生的 ACP harness，透過 stdio JSON-RPC 將 **Discord、Slack** 與任何相容於 [Agent Client Protocol](https://github.com/anthropics/agent-protocol) 的程式開發 CLI（Kiro CLI、Claude Code、Codex、Gemini、OpenCode、MiMo-Code、Copilot CLI、Hermes、Grok Build、Devin、Antigravity、Pi 等）連接起來，帶來新一代的開發體驗。**Telegram、LINE、Feishu/Lark、Google Chat** 以及其他以 webhook 為基礎的平台，則透過獨立的 [Custom Gateway](crates/openab-gateway/) 支援。
 
-🪼 **Join our community!** Come say hi on Discord — we'd love to have you: **[🪼 OpenAB — Official](https://openab.dev/discord)** 🎉
+🪼 **加入我們的社群！** 歡迎到 Discord 和大家打招呼：**[🪼 OpenAB — Official](https://openab.dev/discord)** 🎉
 
 ```
 ┌──────────────┐  Gateway WS   ┌──────────────┐  ACP stdio    ┌──────────────────┐
@@ -32,98 +32,98 @@ A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**,
 └──────────────┘
 ```
 
-## Demo
+## 示範
 
 ![openab demo](images/demo.png)
 
-## Features
+## 功能特色
 
-- **Multi-platform** — supports Discord and Slack, run one or both simultaneously
-- **Custom Gateway** — extend to Telegram, LINE, Feishu/Lark, Google Chat, MS Teams via standalone [gateway](crates/openab-gateway/)
-- **Pluggable agent backend** — swap between Kiro CLI, Claude Code, Codex, Gemini, OpenCode, MiMo-Code, Copilot CLI, Hermes, Grok Build, Devin, Antigravity, Pi via config
-- **@mention trigger** — mention the bot in an allowed channel to start a conversation
-- **Thread-based multi-turn** — auto-creates threads; no @mention needed for follow-ups
-- **Multi-agent collaboration** — bot-to-bot messaging for coordinated workflows ([docs/multi-agent.md](docs/multi-agent.md))
-- **Agent-controlled reply-to** — agents choose which message to reply to via `[[reply_to:id]]` directive, enabling clear conversation threads in multi-bot channels ([docs/output-directives.md](docs/output-directives.md))
-- **Edit-streaming** — live-updates the Discord message every 1.5s as tokens arrive
-- **Emoji status reactions** — 👀→🤔→🔥/👨‍💻/⚡→👍+random mood face
-- **Image & file support** — send images and files through chat ([docs/sendimages.md](docs/sendimages.md), [docs/sendfiles.md](docs/sendfiles.md))
-- **Scheduled messages** — config-driven cron jobs for automated agent prompts ([docs/cronjob.md](docs/cronjob.md))
-- **Slash commands** — built-in slash command support ([docs/slash-commands.md](docs/slash-commands.md))
-- **Session pool** — one CLI process per thread, auto-managed lifecycle
-- **ACP protocol** — JSON-RPC over stdio with tool call, thinking, and permission auto-reply support
-- **Kubernetes-ready** — Dockerfile + k8s manifests with PVC for auth persistence
-- **Voice message STT** — auto-transcribes Discord voice messages via Groq, OpenAI, or local Whisper server ([docs/stt.md](docs/stt.md))
-- **Lifecycle hooks** — run custom scripts at startup (`pre_boot`) and shutdown (`pre_shutdown`) for bootstrapping, S3 sync, and state backup ([docs/hooks.md](docs/hooks.md))
-- **Tailscale integration** — join a private tailnet from an unprivileged container via lifecycle hooks, no custom image needed ([docs/tailscale.md](docs/tailscale.md))
+- **多平台支援** — 支援 Discord 與 Slack，可單獨或同時執行
+- **Custom Gateway** — 透過獨立的 [gateway](crates/openab-gateway/) 擴充至 Telegram、LINE、Feishu/Lark、Google Chat、MS Teams
+- **可替換的 agent backend** — 可透過設定在 Kiro CLI、Claude Code、Codex、Gemini、OpenCode、MiMo-Code、Copilot CLI、Hermes、Grok Build、Devin、Antigravity、Pi 之間切換
+- **@mention 觸發** — 在允許的頻道中 mention bot，即可開始對話
+- **以討論串進行多輪對話** — 自動建立討論串；後續訊息不需再次 @mention
+- **多 agent 協作** — 支援 bot-to-bot 訊息，實現協調式工作流程（[docs/multi-agent.md](docs/multi-agent.md)）
+- **由 agent 控制回覆對象** — agent 可透過 `[[reply_to:id]]` 指令選擇要回覆的訊息，讓多 bot 頻道中的對話脈絡更清楚（[docs/output-directives.md](docs/output-directives.md)）
+- **編輯式串流輸出** — token 產生時每 1.5 秒即時更新 Discord 訊息
+- **Emoji 狀態反應** — 👀→🤔→🔥/👨‍💻/⚡→👍+隨機情緒表情
+- **圖片與檔案支援** — 透過聊天傳送圖片與檔案（[docs/sendimages.md](docs/sendimages.md)、[docs/sendfiles.md](docs/sendfiles.md)）
+- **排程訊息** — 由設定驅動的 cron job，可自動傳送 agent prompt（[docs/cronjob.md](docs/cronjob.md)）
+- **Slash commands** — 內建 slash command 支援（[docs/slash-commands.md](docs/slash-commands.md)）
+- **Session pool** — 每個討論串一個 CLI process，自動管理生命週期
+- **ACP protocol** — 透過 stdio 使用 JSON-RPC，支援 tool call、thinking 與 permission 自動回覆
+- **支援 Kubernetes** — 提供 Dockerfile、k8s manifests 與用於驗證資料持久化的 PVC
+- **語音訊息 STT** — 透過 Groq、OpenAI 或本機 Whisper server 自動轉錄 Discord 語音訊息（[docs/stt.md](docs/stt.md)）
+- **生命週期 hooks** — 在啟動（`pre_boot`）與關閉（`pre_shutdown`）時執行自訂 script，可用於環境初始化、S3 同步與狀態備份（[docs/hooks.md](docs/hooks.md)）
+- **Tailscale 整合** — 透過生命週期 hooks，讓非特權 container 加入私人 tailnet，無需自訂 image（[docs/tailscale.md](docs/tailscale.md)）
 
-## Quick Start
+## 快速開始
 
-### Prerequisites
+### 事前準備
 
-Before running openab, enable these in the [Discord Developer Portal](https://discord.com/developers/applications):
+執行 openab 前，請在 [Discord Developer Portal](https://discord.com/developers/applications) 中啟用以下設定：
 
-1. **Bot → Privileged Gateway Intents**:
+1. **Bot → Privileged Gateway Intents**：
    - ✅ Message Content Intent
    - ✅ Server Members Intent
-2. **OAuth2 → URL Generator → Bot Permissions**:
-   - Send Messages, Embed Links, Attach Files
-   - Read Message History, Add Reactions
+2. **OAuth2 → URL Generator → Bot Permissions**：
+   - Send Messages、Embed Links、Attach Files
+   - Read Message History、Add Reactions
 
-See [docs/discord.md](docs/discord.md) for a detailed step-by-step guide.
+詳細步驟請參閱 [docs/discord.md](docs/discord.md)。
 
-### 1. Create a Bot
+### 1. 建立 Bot
 
 <details>
 <summary><strong>Discord</strong></summary>
 
-See [docs/discord.md](docs/discord.md) for a detailed step-by-step guide.
+詳細步驟請參閱 [docs/discord.md](docs/discord.md)。
 
 </details>
 
 <details>
 <summary><strong>Slack</strong></summary>
 
-See [docs/slack.md](docs/slack.md) for a detailed step-by-step guide.
+詳細步驟請參閱 [docs/slack.md](docs/slack.md)。
 
 </details>
 
 <details>
-<summary><strong>Telegram</strong> (via Custom Gateway)</summary>
+<summary><strong>Telegram</strong>（透過 Custom Gateway）</summary>
 
-See [docs/telegram.md](docs/telegram.md) for the full setup guide. Requires the standalone [Custom Gateway](crates/openab-gateway/) service.
-
-</details>
-
-<details>
-<summary><strong>LINE</strong> (via Custom Gateway)</summary>
-
-See [docs/line.md](docs/line.md) for the full setup guide. Requires the standalone [Custom Gateway](crates/openab-gateway/) service.
+完整設定指南請參閱 [docs/telegram.md](docs/telegram.md)。需要獨立的 [Custom Gateway](crates/openab-gateway/) service。
 
 </details>
 
 <details>
-<summary><strong>Feishu/Lark</strong> (via Custom Gateway)</summary>
+<summary><strong>LINE</strong>（透過 Custom Gateway）</summary>
 
-See [docs/feishu.md](docs/feishu.md) for the full setup guide. Requires the standalone [Custom Gateway](crates/openab-gateway/) service. Supports WebSocket long-connection (default, no public URL needed) and HTTP webhook fallback.
-
-</details>
-
-<details>
-<summary><strong>Google Chat</strong> (via Custom Gateway)</summary>
-
-See [docs/google-chat.md](docs/google-chat.md) for the full setup guide. Requires the standalone [Custom Gateway](crates/openab-gateway/) service.
+完整設定指南請參閱 [docs/line.md](docs/line.md)。需要獨立的 [Custom Gateway](crates/openab-gateway/) service。
 
 </details>
 
 <details>
-<summary><strong>WeCom (企业微信)</strong> (via Custom Gateway)</summary>
+<summary><strong>Feishu/Lark</strong>（透過 Custom Gateway）</summary>
 
-See [docs/wecom.md](docs/wecom.md) for the full setup guide. Requires the standalone [Custom Gateway](crates/openab-gateway/) service.
+完整設定指南請參閱 [docs/feishu.md](docs/feishu.md)。需要獨立的 [Custom Gateway](crates/openab-gateway/) service。支援 WebSocket 長連線（預設，不需要公開 URL）與 HTTP webhook fallback。
 
 </details>
 
-### 2. Install with Helm (Kiro CLI — default)
+<details>
+<summary><strong>Google Chat</strong>（透過 Custom Gateway）</summary>
+
+完整設定指南請參閱 [docs/google-chat.md](docs/google-chat.md)。需要獨立的 [Custom Gateway](crates/openab-gateway/) service。
+
+</details>
+
+<details>
+<summary><strong>WeCom（企業微信）</strong>（透過 Custom Gateway）</summary>
+
+完整設定指南請參閱 [docs/wecom.md](docs/wecom.md)。需要獨立的 [Custom Gateway](crates/openab-gateway/) service。
+
+</details>
+
+### 2. 使用 Helm 安裝（Kiro CLI — 預設）
 
 ```bash
 helm repo add openab https://openabdev.github.io/openab
@@ -141,31 +141,31 @@ helm install openab openab/openab \
   --set-string 'agents.kiro.slack.allowedChannels[0]=C0123456789'
 ```
 
-For additional Helm values such as `fullnameOverride`, `nameOverride`, `envFrom`, and `agentsMd`, see [charts/openab/README.md](charts/openab/README.md).
+如需其他 Helm values，例如 `fullnameOverride`、`nameOverride`、`envFrom` 與 `agentsMd`，請參閱 [charts/openab/README.md](charts/openab/README.md)。
 
-### 3. Authenticate (first time only)
+### 3. 驗證身分（僅首次需要）
 
 ```bash
 kubectl exec -it deployment/openab-kiro -- kiro-cli login --use-device-flow
 kubectl rollout restart deployment/openab-kiro
 ```
 
-### 4. Use
+### 4. 使用方式
 
-In your Discord channel:
+在 Discord 頻道中輸入：
 ```
 @YourBot explain this code
 ```
 
-The bot creates a thread. After that, just type in the thread — no @mention needed.
+bot 會建立一個討論串。之後只要直接在討論串中輸入即可，不需再次 @mention。
 
-**Slack:** `@YourBot explain this code` in a channel — same thread-based workflow as Discord.
+**Slack：** 在頻道中輸入 `@YourBot explain this code`，同樣會使用以討論串為基礎的工作流程。
 
-## Other Agents
+## 其他 Agent
 
-| Agent | CLI | ACP Adapter | Guide |
-|-------|-----|-------------|-------|
-| Kiro (default) | `kiro-cli acp` | Native | [docs/kiro.md](docs/kiro.md) |
+| Agent | CLI | ACP Adapter | 指南 |
+|-------|-----|-------------|------|
+| Kiro（預設） | `kiro-cli acp` | Native | [docs/kiro.md](docs/kiro.md) |
 | Claude Code | `claude-agent-acp` | [@agentclientprotocol/claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp) | [docs/claude-code.md](docs/claude-code.md) |
 | Codex | `codex-acp` | [@zed-industries/codex-acp](https://github.com/zed-industries/codex-acp) | [docs/codex.md](docs/codex.md) |
 | Gemini | `gemini --acp` | Native | [docs/gemini.md](docs/gemini.md) |
@@ -178,13 +178,13 @@ The bot creates a thread. After that, just type in the thread — no @mention ne
 | Devin | `devin acp` | Native | [docs/devin.md](docs/devin.md) |
 | Antigravity | `agy-acp` | [agy-acp](agy-acp/) | [docs/antigravity.md](docs/antigravity.md) |
 | Pi | `pi-acp` | [pi-acp](https://www.npmjs.com/package/pi-acp) | [docs/pi.md](docs/pi.md) |
-| **Native Agent** | `openab-agent` | Built-in (Rust) | [docs/native-agent.md](docs/native-agent.md) |
+| **Native Agent** | `openab-agent` | Built-in（Rust） | [docs/native-agent.md](docs/native-agent.md) |
 
-> 🔧 Running multiple agents? See [docs/multi-agent.md](docs/multi-agent.md)
+> 🔧 同時執行多個 agent？請參閱 [docs/multi-agent.md](docs/multi-agent.md)
 
 ## AgentCore Runtime
 
-Run any coding agent remotely on [Amazon Bedrock AgentCore](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime.html) — no CLI bundled in the OAB image.
+在 [Amazon Bedrock AgentCore](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime.html) 上遠端執行任何 coding agent，OAB image 中不需綑綁 CLI。
 
 ```
 ┌─────────┐       ┌─────────┐        ┌───────────────┐         ┌──────────────────────────┐
@@ -202,11 +202,11 @@ Run any coding agent remotely on [Amazon Bedrock AgentCore](https://docs.aws.ama
 runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent"
 ```
 
-Smaller image (~50MB), persistent filesystem, isolated microVMs, pay-per-use. See [docs/agentcore.md](docs/agentcore.md) for full setup.
+更小的 image（約 50MB）、持久化 filesystem、隔離的 microVM，以及按用量計費。完整設定請參閱 [docs/agentcore.md](docs/agentcore.md)。
 
-## Configuration Reference
+## 設定參考
 
-> 📖 Full reference with all options, defaults, and Helm mapping: [docs/config-reference.md](docs/config-reference.md)
+> 📖 所有選項、預設值與 Helm mapping 的完整參考：[docs/config-reference.md](docs/config-reference.md)
 
 ```toml
 [discord]
@@ -233,9 +233,9 @@ enabled = true                        # enable emoji status reactions
 remove_after_reply = false            # remove reactions after reply
 ```
 
-## Kubernetes Deployment
+## Kubernetes 部署
 
-The Docker image bundles both `openab` and `kiro-cli` in a single container.
+Docker image 將 `openab` 與 `kiro-cli` 綑綁在同一個 container 中。
 
 ```
 ┌─ Kubernetes Pod ──────────────────────────────────────┐
@@ -250,7 +250,7 @@ The Docker image bundles both `openab` and `kiro-cli` in a single container.
 └───────────────────────────────────────────────────────┘
 ```
 
-### Deploy without Helm
+### 不使用 Helm 部署
 
 ```bash
 kubectl create secret generic openab-secret \
@@ -261,34 +261,29 @@ kubectl apply -f k8s/pvc.yaml
 kubectl apply -f k8s/deployment.yaml
 ```
 
-| Manifest | Purpose |
-|----------|---------|
-| `k8s/deployment.yaml` | Single-container pod with config + data volume mounts |
-| `k8s/configmap.yaml` | `config.toml` mounted at `/etc/openab/` |
-| `k8s/secret.yaml` | `DISCORD_BOT_TOKEN` injected as env var |
-| `k8s/pvc.yaml` | Persistent storage for auth + settings |
+| Manifest | 用途 |
+|----------|------|
+| `k8s/deployment.yaml` | 單一 container pod，掛載 config 與 data volume |
+| `k8s/configmap.yaml` | `config.toml` 掛載至 `/etc/openab/` |
+| `k8s/secret.yaml` | 透過 env 注入 `DISCORD_BOT_TOKEN` |
+| `k8s/pvc.yaml` | 持久保存驗證資訊與設定 |
 
-## AWS ECS Deployment
+## AWS ECS 部署
 
-Prefer AWS-native infrastructure over Kubernetes? [`oabctl`](operator/) is a
-CLI that provisions and manages OpenAB agents on Amazon ECS Fargate — one
-command bootstraps the cluster/IAM/S3/networking, and one command deploys an
-agent, including Telegram/LINE webhook ingress (API Gateway → VPC Link →
-Cloud Map) provisioned automatically.
+偏好以 AWS 原生 infrastructure 取代 Kubernetes？[`oabctl`](operator/) 是一個 CLI，可在 Amazon ECS Fargate 上佈建與管理 OpenAB agent——一個 command 即可初始化 cluster、IAM、S3 與 networking，另一個 command 則可部署 agent，包括自動佈建 Telegram/LINE webhook ingress（API Gateway → VPC Link → Cloud Map）。
 
 ```bash
 oabctl bootstrap                            # one-time infra setup
 oabctl create my-bot && oabctl apply -f my-bot/manifest.yaml --wait
 ```
 
-See **[docs/oabctl.md](docs/oabctl.md)** for the full guide — installation,
-manifest schema, ingress/webhooks, secrets, and bootstrap.
+完整指南請參閱 **[docs/oabctl.md](docs/oabctl.md)**，內容涵蓋安裝、manifest schema、ingress/webhooks、secrets 與 bootstrap。
 
-## Inspired By
+## 靈感來源
 
-- [sample-acp-bridge](https://github.com/aws-samples/sample-acp-bridge) — ACP protocol + process pool architecture
+- [sample-acp-bridge](https://github.com/aws-samples/sample-acp-bridge) — ACP protocol 與 process pool 架構
 - [OpenClaw](https://github.com/openclaw/openclaw) — StatusReactionController emoji pattern
 
-## License
+## 授權條款
 
 MIT
