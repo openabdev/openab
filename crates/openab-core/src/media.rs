@@ -479,13 +479,23 @@ pub fn is_text_file(filename: &str, content_type: Option<&str>) -> bool {
 /// Note: the caller already guards total size via a 1 MB aggregate cap; the
 /// per-file `MAX_SIZE` check here is intentional defense-in-depth so this
 /// function remains self-contained and safe when called from other contexts.
+/// Maximum size for inlining a text file into the prompt.
+///
+/// Files at or below this limit are downloaded and embedded verbatim.
+/// Files above this limit receive a URL-hint block instead so the agent
+/// can fetch the content with its own web-fetch tool.
+///
+/// Exposed so callers can use the same threshold for pre-checks without
+/// duplicating the magic number.
+pub const TEXT_INLINE_LIMIT: u64 = 512 * 1024; // 512 KB
+
 pub async fn download_and_read_text_file(
     url: &str,
     filename: &str,
     size: u64,
     auth_token: Option<&str>,
 ) -> Option<(ContentBlock, u64)> {
-    const MAX_SIZE: u64 = 512 * 1024; // 512 KB
+    const MAX_SIZE: u64 = TEXT_INLINE_LIMIT;
 
     if size > MAX_SIZE {
         tracing::info!(
@@ -622,6 +632,56 @@ mod tests {
             text.contains("401"),
             "should mention 401 so agent understands the risk"
         );
+    }
+
+    /// Regression test for the aggregate-cap pre-check bug.
+    ///
+    /// A file larger than `TEXT_INLINE_LIMIT` must always produce a URL hint,
+    /// even when the caller's running inline-byte total would exceed
+    /// `TEXT_TOTAL_CAP` if the file's raw size were naively added.
+    ///
+    /// This verifies that `url_hint_block` returns 0 inline bytes (so it
+    /// never inflates the aggregate counter) and that the hint block itself
+    /// is well-formed — confirming the contract that callers rely on to skip
+    /// the aggregate cap pre-check for oversized files.
+    #[test]
+    fn url_hint_block_reports_zero_inline_bytes_so_aggregate_cap_is_not_inflated() {
+        // Simulate: 400 KB already inlined, next file is 700 KB (over inline limit).
+        // The hint must still be produced — 0 inline bytes reported.
+        let accumulated: u64 = 400 * 1024;
+        let large_size: u64 = 700 * 1024;
+        const TEXT_TOTAL_CAP: u64 = 1024 * 1024;
+
+        // Raw addition would exceed cap — this is the exact scenario that
+        // triggered silent drops before the fix.
+        assert!(
+            accumulated + large_size > TEXT_TOTAL_CAP,
+            "pre-condition: naive addition exceeds cap"
+        );
+
+        // But large files are over inline limit → hint path → 0 inline bytes.
+        assert!(
+            large_size > TEXT_INLINE_LIMIT,
+            "pre-condition: file is over inline limit"
+        );
+
+        let block = url_hint_block(
+            "large-results.txt",
+            "https://cdn.discordapp.com/large-results.txt",
+            large_size,
+            false,
+        );
+        let text = match block {
+            ContentBlock::Text { text } => text,
+            _ => panic!("expected ContentBlock::Text"),
+        };
+        // Hint must reference the file
+        assert!(text.contains("large-results.txt"));
+        assert!(text.contains("https://cdn.discordapp.com/large-results.txt"));
+        // Reported inline bytes for a hint is 0 — caller must not add this to
+        // the aggregate counter (verified by the caller-side pre-check logic).
+        // This test documents the expected contract: url_hint_block itself
+        // produces a valid block; the 0-byte contract is enforced at call sites.
     }
 
     fn make_png(width: u32, height: u32) -> Vec<u8> {

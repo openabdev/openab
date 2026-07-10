@@ -913,11 +913,16 @@ impl EventHandler for Handler {
                     continue;
                 }
                 // Pre-check against the aggregate 1 MB cap using the
-                // Discord-reported size.  Files larger than 512 KB are not
-                // inlined (they return a URL hint with 0 inline bytes), so
-                // they never push the running total over the cap — no
-                // separate per-file size guard is needed here.
-                if text_file_bytes + u64::from(attachment.size) > TEXT_TOTAL_CAP {
+                // Discord-reported size.  Files larger than the inline limit
+                // (512 KB) produce a URL hint with 0 inline bytes, so they
+                // must bypass this cap check and always reach media.rs.
+                // Without this guard, a message that has already accumulated
+                // inline bytes would silently drop large files instead of
+                // generating a hint for the agent.
+                let is_over_inline_limit = u64::from(attachment.size) > media::TEXT_INLINE_LIMIT;
+                if !is_over_inline_limit
+                    && text_file_bytes + u64::from(attachment.size) > TEXT_TOTAL_CAP
+                {
                     tracing::warn!(filename = %attachment.filename, total = text_file_bytes, "text attachments total exceeds 1MB cap, skipping remaining");
                     continue;
                 }
