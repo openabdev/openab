@@ -93,10 +93,7 @@ fn hex_prefix(body: &[u8]) -> String {
 /// (`image/*`) because CDNs commonly serve any file type as `application/octet-stream`;
 /// rejecting that header would silently break real downloads. The magic-byte check
 /// examines the actual bytes regardless of what the server claims.
-fn validate_image_response(
-    content_type: Option<&str>,
-    body: &[u8],
-) -> Result<(), MediaFetchError> {
+fn validate_image_response(content_type: Option<&str>, body: &[u8]) -> Result<(), MediaFetchError> {
     // Reject explicitly-text responses early (e.g. Slack HTML login page at HTTP 200).
     // application/octet-stream and other generic types pass through to magic-byte check.
     if let Some(ct) = content_type {
@@ -339,7 +336,11 @@ pub async fn download_and_transcribe(
     };
 
     if bytes.len() as u64 > MAX_SIZE {
-        error!(filename, size = bytes.len(), "downloaded audio exceeds 25MB limit");
+        error!(
+            filename,
+            size = bytes.len(),
+            "downloaded audio exceeds 25MB limit"
+        );
         return None;
     }
 
@@ -460,14 +461,24 @@ pub fn is_text_file(filename: &str, content_type: Option<&str>) -> bool {
     TEXT_FILENAMES.contains(&filename.to_lowercase().as_str())
 }
 
-/// Download a text-based file and return it as a ContentBlock::Text.
-/// Files larger than 512 KB are skipped to avoid bloating the prompt.
+/// Download a text-based file and return it as a `ContentBlock::Text`.
 ///
-/// Pass `auth_token` for platforms that require authentication (e.g. Slack private files).
+/// Files at or below 512 KB are downloaded and inlined into the prompt verbatim.
 ///
-/// Note: the caller already guards total size via a total cap; the per-file
-/// MAX_SIZE check here is intentional defense-in-depth so this function remains
-/// self-contained and safe when called from other contexts.
+/// Files above 512 KB are **not** downloaded; instead a URL-hint block is
+/// returned so the agent can fetch the content itself if it has a web-fetch
+/// tool available.  The reported byte count in the hint path is `0` — the
+/// file is not inlined, so it does not contribute to the caller's aggregate
+/// size cap.
+///
+/// Pass `auth_token` for platforms that require per-request authentication
+/// (e.g. Slack private files).  When `needs_auth` is `true` the hint block
+/// will include a note that the URL requires an `Authorization` header, so the
+/// agent is aware that a bare fetch will likely fail.
+///
+/// Note: the caller already guards total size via a 1 MB aggregate cap; the
+/// per-file `MAX_SIZE` check here is intentional defense-in-depth so this
+/// function remains self-contained and safe when called from other contexts.
 pub async fn download_and_read_text_file(
     url: &str,
     filename: &str,
@@ -477,8 +488,13 @@ pub async fn download_and_read_text_file(
     const MAX_SIZE: u64 = 512 * 1024; // 512 KB
 
     if size > MAX_SIZE {
-        tracing::warn!(filename, size, "text file exceeds 512KB limit, skipping");
-        return None;
+        tracing::info!(
+            filename,
+            size,
+            "text file exceeds 512KB inline limit; returning URL hint for agent-side fetch"
+        );
+        let needs_auth = auth_token.is_some();
+        return Some((url_hint_block(filename, url, size, needs_auth), 0));
     }
 
     let mut req = HTTP_CLIENT.get(url);
@@ -506,14 +522,16 @@ pub async fn download_and_read_text_file(
     };
     let actual_size = bytes.len() as u64;
 
-    // Defense-in-depth: verify actual download size
+    // Defense-in-depth: verify actual download size matches expectations.
+    // Fall back to a URL hint rather than silently dropping the file.
     if actual_size > MAX_SIZE {
-        tracing::warn!(
+        tracing::info!(
             filename,
             size = actual_size,
-            "downloaded text file exceeds 512KB limit, skipping"
+            "downloaded text file exceeds 512KB inline limit; returning URL hint"
         );
-        return None;
+        let needs_auth = auth_token.is_some();
+        return Some((url_hint_block(filename, url, actual_size, needs_auth), 0));
     }
 
     // from_utf8_lossy returns Cow::Borrowed for valid UTF-8 (zero-copy)
@@ -534,9 +552,77 @@ pub async fn download_and_read_text_file(
     ))
 }
 
+/// Build a `ContentBlock::Text` that tells the agent where to fetch a file
+/// that was too large to inline.
+///
+/// `needs_auth` should be `true` for platforms (e.g. Slack) whose download
+/// URLs require an `Authorization: Bearer` header — the hint will include a
+/// note so the agent knows a bare GET will be rejected.
+fn url_hint_block(filename: &str, url: &str, size: u64, needs_auth: bool) -> ContentBlock {
+    let size_kb = size / 1024;
+    let auth_note = if needs_auth {
+        "\nNote: this URL requires an Authorization header to download \
+(the platform uses authenticated file storage). A bare HTTP GET will likely \
+return 401 Unauthorized."
+    } else {
+        ""
+    };
+    ContentBlock::Text {
+        text: format!(
+            "[File: {filename}]\n\
+This file ({size_kb} KB) exceeds the 512 KB inline limit and was not downloaded \
+by the bot. If you need its contents, fetch the URL below using a web-fetch tool:\n\
+{url}{auth_note}"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----- url_hint_block tests -----
+
+    #[test]
+    fn url_hint_block_no_auth_contains_url_and_size() {
+        let block = url_hint_block("big.txt", "https://example.com/big.txt", 600 * 1024, false);
+        let text = match block {
+            ContentBlock::Text { text } => text,
+            _ => panic!("expected ContentBlock::Text"),
+        };
+        assert!(text.contains("big.txt"), "should mention filename");
+        assert!(
+            text.contains("https://example.com/big.txt"),
+            "should contain URL"
+        );
+        assert!(text.contains("600 KB"), "should show size in KB");
+        assert!(
+            !text.contains("Authorization"),
+            "no auth note for unauthenticated URLs"
+        );
+    }
+
+    #[test]
+    fn url_hint_block_with_auth_includes_auth_note() {
+        let block = url_hint_block(
+            "report.txt",
+            "https://files.slack.com/report.txt",
+            540 * 1024,
+            true,
+        );
+        let text = match block {
+            ContentBlock::Text { text } => text,
+            _ => panic!("expected ContentBlock::Text"),
+        };
+        assert!(
+            text.contains("Authorization"),
+            "auth note must appear for auth-required URLs"
+        );
+        assert!(
+            text.contains("401"),
+            "should mention 401 so agent understands the risk"
+        );
+    }
 
     fn make_png(width: u32, height: u32) -> Vec<u8> {
         let img = image::RgbImage::new(width, height);
