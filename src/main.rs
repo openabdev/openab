@@ -509,6 +509,7 @@ async fn main() -> anyhow::Result<()> {
         );
         let router = router.clone();
         let stt = cfg.stt.clone();
+        let slack_media_config = cfg.media.clone();
         let max_bot_turns = slack_cfg.max_bot_turns;
         let slack_shutdown_rx = shutdown_rx.clone();
         let adapter = shared_slack_adapter
@@ -541,6 +542,7 @@ async fn main() -> anyhow::Result<()> {
                 slack_cfg.allow_user_messages,
                 max_bot_turns,
                 stt,
+                slack_media_config,
                 slack_shutdown_rx,
                 slack_dispatcher,
             )
@@ -968,6 +970,7 @@ async fn main() -> anyhow::Result<()> {
             allowed_channels,
             allowed_users,
             stt_config: cfg.stt.clone(),
+            media_config: cfg.media.clone(),
             adapter: std::sync::OnceLock::new(),
             allow_bot_messages: discord_cfg.allow_bot_messages,
             trusted_bot_ids,

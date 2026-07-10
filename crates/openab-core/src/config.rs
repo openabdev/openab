@@ -140,6 +140,8 @@ pub struct Config {
     #[serde(default)]
     pub stt: SttConfig,
     #[serde(default)]
+    pub media: MediaConfig,
+    #[serde(default)]
     pub markdown: MarkdownConfig,
     #[serde(default)]
     pub cron: CronConfig,
@@ -374,6 +376,41 @@ fn default_stt_base_url() -> String {
 }
 fn default_echo_transcript() -> bool {
     false
+}
+
+/// Media processing configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediaConfig {
+    /// Maximum size in kilobytes for a single text file attachment to be
+    /// inlined into the agent prompt. Files exceeding this limit are silently
+    /// skipped. Default: 512 KB.
+    ///
+    /// Example — allow files up to 2 MB:
+    /// ```toml
+    /// [media]
+    /// max_text_file_kb = 2048
+    /// ```
+    #[serde(default = "default_max_text_file_kb")]
+    pub max_text_file_kb: u64,
+}
+
+impl Default for MediaConfig {
+    fn default() -> Self {
+        Self {
+            max_text_file_kb: default_max_text_file_kb(),
+        }
+    }
+}
+
+fn default_max_text_file_kb() -> u64 {
+    512
+}
+
+impl MediaConfig {
+    /// Returns the limit as bytes for use in size comparisons.
+    pub fn max_text_file_bytes(&self) -> u64 {
+        self.max_text_file_kb * 1024
+    }
 }
 
 #[derive(Debug, Deserialize)]

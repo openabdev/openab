@@ -1,7 +1,7 @@
 use crate::acp::ContentBlock;
 use crate::adapter::{ChannelRef, ChatAdapter, MessageRef, SenderContext};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
-use crate::config::{AllowBots, AllowUsers, SttConfig};
+use crate::config::{AllowBots, AllowUsers, MediaConfig, SttConfig};
 use crate::media;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -727,6 +727,7 @@ pub async fn run_slack_adapter(
     allow_user_messages: AllowUsers,
     max_bot_turns: u32,
     stt_config: SttConfig,
+    media_config: MediaConfig,
     mut shutdown_rx: watch::Receiver<bool>,
     dispatcher: Arc<crate::dispatch::Dispatcher>,
 ) -> Result<()> {
@@ -837,6 +838,7 @@ pub async fn run_slack_adapter(
                                                 let allowed_channels = allowed_channels.clone();
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
+                                                let media_config = media_config.clone();
                                                 let dispatcher = dispatcher.clone();
                                                 let team_id = envelope["payload"]["team_id"]
                                                     .as_str()
@@ -853,6 +855,7 @@ pub async fn run_slack_adapter(
                                                         &allowed_channels,
                                                         &allowed_users,
                                                         &stt_config,
+                                                        &media_config,
                                                         &dispatcher,
                                                     )
                                                     .await;
@@ -1088,6 +1091,7 @@ pub async fn run_slack_adapter(
                                                 let allowed_channels = allowed_channels.clone();
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
+                                                let media_config = media_config.clone();
                                                 let dispatcher = dispatcher.clone();
                                                 tokio::spawn(async move {
                                                     handle_message(
@@ -1100,6 +1104,7 @@ pub async fn run_slack_adapter(
                                                         &allowed_channels,
                                                         &allowed_users,
                                                         &stt_config,
+                                                        &media_config,
                                                         &dispatcher,
                                                     )
                                                     .await;
@@ -1192,6 +1197,7 @@ async fn handle_message(
     allowed_channels: &HashSet<String>,
     allowed_users: &HashSet<String>,
     stt_config: &SttConfig,
+    media_config: &MediaConfig,
     dispatcher: &Arc<crate::dispatch::Dispatcher>,
 ) {
     let channel_id = match event["channel"].as_str() {
@@ -1357,7 +1363,7 @@ async fn handle_message(
                     continue;
                 }
                 if let Some((block, actual_bytes)) =
-                    media::download_and_read_text_file(url, filename, size, Some(bot_token)).await
+                    media::download_and_read_text_file(url, filename, size, Some(bot_token), media_config.max_text_file_bytes()).await
                 {
                     if text_file_bytes + actual_bytes > TEXT_TOTAL_CAP {
                         debug!(

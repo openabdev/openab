@@ -461,23 +461,24 @@ pub fn is_text_file(filename: &str, content_type: Option<&str>) -> bool {
 }
 
 /// Download a text-based file and return it as a ContentBlock::Text.
-/// Files larger than 512 KB are skipped to avoid bloating the prompt.
+/// Files larger than `max_bytes` are skipped to avoid bloating the prompt.
+/// The limit is configurable via `[media] max_text_file_kb` in config.toml
+/// (default: 512 KB).
 ///
 /// Pass `auth_token` for platforms that require authentication (e.g. Slack private files).
 ///
 /// Note: the caller already guards total size via a total cap; the per-file
-/// MAX_SIZE check here is intentional defense-in-depth so this function remains
+/// max_bytes check here is intentional defense-in-depth so this function remains
 /// self-contained and safe when called from other contexts.
 pub async fn download_and_read_text_file(
     url: &str,
     filename: &str,
     size: u64,
     auth_token: Option<&str>,
+    max_bytes: u64,
 ) -> Option<(ContentBlock, u64)> {
-    const MAX_SIZE: u64 = 512 * 1024; // 512 KB
-
-    if size > MAX_SIZE {
-        tracing::warn!(filename, size, "text file exceeds 512KB limit, skipping");
+    if size > max_bytes {
+        tracing::warn!(filename, size, max_bytes, "text file exceeds size limit, skipping");
         return None;
     }
 
@@ -507,11 +508,12 @@ pub async fn download_and_read_text_file(
     let actual_size = bytes.len() as u64;
 
     // Defense-in-depth: verify actual download size
-    if actual_size > MAX_SIZE {
+    if actual_size > max_bytes {
         tracing::warn!(
             filename,
             size = actual_size,
-            "downloaded text file exceeds 512KB limit, skipping"
+            max_bytes,
+            "downloaded text file exceeds size limit, skipping"
         );
         return None;
     }

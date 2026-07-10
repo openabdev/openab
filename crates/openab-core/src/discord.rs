@@ -2,7 +2,7 @@ use crate::acp::protocol::ConfigOption;
 use crate::acp::ContentBlock;
 use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
-use crate::config::{AllowBots, AllowUsers, SttConfig};
+use crate::config::{AllowBots, AllowUsers, MediaConfig, SttConfig};
 use crate::dispatch::DispatchTarget;
 use crate::format;
 use crate::media;
@@ -212,6 +212,7 @@ pub struct Handler {
     pub allowed_channels: HashSet<u64>,
     pub allowed_users: HashSet<u64>,
     pub stt_config: SttConfig,
+    pub media_config: MediaConfig,
     pub adapter: OnceLock<Arc<dyn ChatAdapter>>,
     pub allow_bot_messages: AllowBots,
     pub trusted_bot_ids: HashSet<u64>,
@@ -899,6 +900,7 @@ impl EventHandler for Handler {
                     &attachment.filename,
                     u64::from(attachment.size),
                     None,
+                    self.media_config.max_text_file_bytes(),
                 )
                 .await
                 {
