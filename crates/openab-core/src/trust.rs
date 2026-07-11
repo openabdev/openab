@@ -50,6 +50,17 @@ impl Decision {
     }
 }
 
+/// Whether the shared L3 identity gate (`AdapterRouter::gate_incoming`) should
+/// run for this sender. Bots bypass L3 — mirroring the adapters' inline user
+/// checks' `!is_bot` bypass — because bot admission is a separate concern
+/// (`allow_bot_messages` + `trusted_bot_ids`), and L3 (`allowed_users`) is a
+/// human-identity allowlist. Running L3 on bots would wrongly deny
+/// mode-admitted/trusted bots when `allow_all_users=false` (multi-agent).
+/// See PR #1270 review F1; shared by the Discord and Slack gate call sites.
+pub fn l3_gate_applies(is_bot: bool) -> bool {
+    !is_bot
+}
+
 /// Per-platform trust configuration (L2 scope + L3 identity).
 ///
 /// Construct via [`TrustConfig::new`], which applies the ADR defaults:

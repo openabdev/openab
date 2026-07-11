@@ -1,0 +1,366 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  Platform capability schema — Google Chat
+# ═══════════════════════════════════════════════════════════════════════════
+
+schema_version = "2026-07-08"
+
+[platform]
+name          = "googlechat"
+official_docs = "https://developers.google.com/workspace/chat"
+description   = "Google Chat (Workspace) app — webhook/Pub-Sub interactions with REST send-back, threaded/flat spaces."
+
+
+# ═══ Schema 1 — platform-capability (source of truth: official docs) ═════════
+
+[capability.transport]
+kind   = "webhook"
+note   = "HTTP endpoint URL or Pub/Sub; adapter accepts both envelope shapes. Google Chat calls the app on interaction events; app must respond within ~30 s."
+source = "https://developers.google.com/workspace/chat/receive-respond-interactions"
+
+[capability.inbound_auth]
+scheme = "jwt_rs256"
+note   = "Bearer ID-token (JWT, RS256) in Authorization header, signed by Google, verified against Google JWKS (https://www.googleapis.com/oauth2/v3/certs). iss=https://accounts.google.com; aud verified against the app's configured audience (project number for HTTP-endpoint apps, or app URL); email claim must equal chat@system.gserviceaccount.com."
+source = "https://developers.google.com/workspace/chat/receive-respond-interactions"
+
+[capability.threads]
+model  = "native"
+note   = "Spaces are either threaded or flat (in-line); reply targets a thread.name/threadKey with messageReplyOption (adapter uses REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD). Thread field is ignored in un-threaded spaces."
+source = "https://developers.google.com/workspace/chat/create-messages"
+
+[capability.slash_commands]
+supported = true
+note      = "Registered in Cloud console (APIs & Services → Google Chat API → Configuration → Add a command; /name, commandId 1-1000). Delivered as a MESSAGE event carrying message.slashCommand / message.annotation.slashCommand with the matching commandId."
+source    = "https://developers.google.com/workspace/chat/commands"
+
+[capability.mentions]
+method = "at_mention"
+note   = "In spaces the app is only invoked when @mentioned (or via slash command / app-added); mention text is stripped into argumentText. In DMs every message reaches the app. Mentions encoded as <users/{id}> (<users/all> for @all)."
+source = "https://developers.google.com/workspace/chat/receive-respond-interactions"
+
+[capability.emoji_reactions]
+bot_can_add        = false
+bot_can_remove     = false
+bot_receives_events = true
+note               = "Reaction resource + create/delete/list methods exist, BUT reactions.create/reactions.delete require USER authentication (REST reference lists only chat.messages.reactions.create / chat.messages.reactions / chat.messages scopes; no app-auth alternative). A chat.bot app therefore cannot add or remove reactions. Apps can still receive REACTION_ADDED/REACTION_REMOVED interaction events."
+source             = "https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages.reactions/create"
+
+[capability.edit_message]
+supported = true
+note      = "spaces.messages.patch with updateMask=text; with app auth an app can update only messages it created. Scope chat.bot."
+source    = "https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/patch"
+
+[capability.delete_message]
+supported = true
+scope     = "own"
+note      = "spaces.messages.delete; with app auth an app can delete only messages it created (not user/other-app messages). Scope chat.bot."
+source    = "https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/delete"
+
+[capability.rich_content]
+markdown = true
+cards    = true
+buttons  = true
+note     = "Native text formatting (*bold*, _italic_, ~strike~, `code`, ```block```, <url|text> links, <users/…> mentions, bullet/quote). Cards v2 + interactive widgets/buttons/dialogs (app auth)."
+source   = "https://developers.google.com/workspace/chat/format-messages"
+
+[capability.attachments]
+inbound     = ["image", "audio", "file"]
+outbound    = ["image", "audio", "video", "file"]
+max_size_mb = 200
+note        = "Inbound: user-uploaded attachments downloaded via Media API (UPLOADED_CONTENT; Drive-sourced needs the Drive API, not handled). Upload limit 200 MB; some file types are blocked. Outbound app uploads also up to 200 MB (a message with an attachment can't also carry accessory widgets)."
+source      = "https://developers.google.com/workspace/chat/upload-media-attachments"
+
+[capability.message_length_limit]
+max_chars = 32000
+note      = "Max message payload (text + cards) is 32,000 bytes; larger must be split into multiple messages. Cap is in bytes."
+source    = "https://developers.google.com/workspace/chat/create-messages"
+
+[capability.dm_support]
+supported = true
+note      = "1:1 DM space between a user and the app (space type DM). App receives all DM messages (no mention required)."
+source    = "https://developers.google.com/workspace/chat/receive-respond-interactions"
+
+[capability.group_model]
+kinds  = ["dm", "group_chat", "space"]
+note   = "\"Spaces\": DM (1:1), group chat (unnamed multi-person), and named spaces/rooms. Spaces are threaded or flat. Routing keyed on space.name (e.g. spaces/AAAA)."
+source = "https://developers.google.com/workspace/chat/create-messages"
+
+[capability.group_sender_identity]
+stable_id = "yes"
+note      = "Stable & non-consent-gated — every message event carries sender = user resource name users/{id} + displayName + type (HUMAN/BOT)."
+source    = "https://developers.google.com/workspace/chat/receive-respond-interactions"
+
+[capability.send_model]
+model               = "push_only"
+reply_token_ttl_sec = 0
+max_objects_per_send = 0
+note                = "Push (REST spaces.messages.create) with app auth; no reply-token/TTL window. Interaction responses may also be returned synchronously in the webhook response body."
+source              = "https://developers.google.com/workspace/chat/create-messages"
+
+[capability.proactive_push]
+supported   = true
+quota_model = "metered"
+note        = "App can post proactively to spaces it belongs to. Quota: 3,000 message writes/min per project (create+patch+delete combined), and 1 write/sec per space (shared across all apps in the space; 10/sec only during data import). 429 Too many requests on overflow → truncated exponential backoff."
+source      = "https://developers.google.com/workspace/chat/limits"
+
+[capability.bot_to_bot]
+delivered = false
+note      = "Not delivered — the MESSAGE interaction event is defined as \"A user messages a Chat app\"; other apps'/bots' messages are not surfaced to a Chat app. (No doc positively states delivery; treat as unsupported. Adapter also drops sender.type == BOT inbound.)"
+source    = "https://developers.google.com/workspace/chat/receive-respond-interactions"
+
+[capability.typing_indicator]
+supported = false
+note      = "Not supported — Google Chat exposes no typing/composing API for apps; none of the documented app-facing interaction events or send surfaces include a typing signal. (Verified negative against the interactions surface.)"
+source    = "https://developers.google.com/workspace/chat/receive-respond-interactions"
+
+
+# ═══ Schema 2 — openab-feature-support (source of truth: our code + PR) ══════
+
+[[openab_features]]
+feature = "send_message"
+status  = "implemented"
+note    = "POST {space}/messages with markdown→gchat conversion; returns message name."
+source  = ["crates/openab-gateway/src/adapters/googlechat.rs#send_message"]
+pr      = ""
+
+[[openab_features]]
+feature = "message_split"
+status  = "implemented"
+note    = "Splits at GOOGLE_CHAT_MESSAGE_LIMIT = 4096 (conservative vs the 32 KB API cap) on newline/space boundaries, UTF-8-safe; each chunk a separate message; first message id / first error acked."
+source  = ["crates/openab-gateway/src/adapters/googlechat.rs#split_text"]
+pr      = ""
+
+[[openab_features]]
+feature = "streaming"
+status  = "partial"
+note    = "No native streaming API. Gateway adapter leaves uses_native_streaming=false, so core streams via the post-then-edit_message loop; each edit sends the full accumulated text as a patch call."
+source  = ["crates/openab-gateway/src/adapters/googlechat.rs#edit_message", "crates/openab-core/src/adapter.rs#uses_native_streaming"]
+pr      = ""
+
+[[openab_features]]
+feature = "reply_quote"
+status  = "partial"
+note    = "No dedicated quote/reply-to. send_message_with_reply uses the trait default → plain send_message; thread continuity is via thread_id, not a per-message quote."
+source  = ["crates/openab-core/src/adapter.rs#send_message_with_reply", "crates/openab-gateway/src/adapters/googlechat.rs#send_message"]
+pr      = ""
+
+[[openab_features]]
+feature = "edit_message"
+status  = "implemented"
+note    = "PATCH {message_name}?updateMask=text; core gates the streaming edit rate on the ack. Own messages only (platform rule)."
+source  = ["crates/openab-gateway/src/adapters/googlechat.rs#edit_message", "crates/openab-core/src/gateway.rs#edit_message"]
+pr      = ""
+
+[[openab_features]]
+feature = "delete_message"
+status  = "not_implemented"
+note    = "GatewayAdapter overrides delete_message to emit a fire-and-forget command:\"delete_message\" instead of the trait default (edit-to-zero-width). The googlechat adapter does not match delete_message in handle_reply (only add_reaction/remove_reaction/create_topic/edit_message), so it falls through to the send path with empty text → hits the empty-message short-circuit and sends nothing. Net: delete is a no-op on Google Chat."
+source  = ["crates/openab-gateway/src/adapters/googlechat.rs#handle_reply", "crates/openab-core/src/gateway.rs#delete_message", "crates/openab-core/src/adapter.rs#delete_message"]
+pr      = ""
+
+[[openab_features]]
+feature = "emoji_reactions"
+status  = "not_implemented"
+note    = "Core dispatches add_reaction/remove_reaction commands but the adapter early-returns on them (match … => return). Deliberate: Google Chat reactions require USER auth; the app (chat.bot) cannot react. Status/thinking reactions therefore never render on Google Chat."
+source  = ["crates/openab-gateway/src/adapters/googlechat.rs#handle_reply", "crates/openab-core/src/gateway.rs#add_reaction"]
+pr      = ""
+
+[[openab_features]]
+feature = "threads_topics"
+status  = "partial"
+note    = "Inbound thread.name is captured and used to keep replies in-thread (send sets thread.name + messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD). create_thread→create_topic command is early-returned by the adapter, so explicit topic creation is a no-op and core falls back to the same channel."
+source  = ["crates/openab-gateway/src/adapters/googlechat.rs#handle_reply", "crates/openab-core/src/gateway.rs#create_thread"]
+pr      = ""
+
+[[openab_features]]
+feature = "media_inbound"
+status  = "implemented"
+note    = "Async download via Media API after the 200 response: images (resize longest side ≤1200px, JPEG q75, ≤10 MB; GIF passthrough); text-like files (extension whitelist, ≤512 KB each, ≤5 files / ≤1 MB aggregate); audio (≤25 MB, stored raw). Drive-sourced & video skipped."
+source  = ["crates/openab-gateway/src/adapters/googlechat.rs#parse_attachments", "crates/openab-gateway/src/adapters/googlechat.rs#download_googlechat_image"]
+pr      = ""
+
+[[openab_features]]
+feature = "voice_stt"
+status  = "partial"
+note    = "Adapter downloads audio and emits it as an audio attachment with real MIME; STT happens in core only if stt_config.enabled, else forwarded as a \"transcription failed\" note."
+source  = ["crates/openab-gateway/src/adapters/googlechat.rs#download_googlechat_audio", "crates/openab-core/src/gateway.rs#process_gateway_event"]
+pr      = ""
+
+[[openab_features]]
+feature = "trust_gate"
+status  = "implemented"
+note    = "Two layers: (1) webhook JWT verify — RS256 via Google JWKS + email==chat@system.gserviceaccount.com; (2) shared ingress router.gate_incoming L2 scope + L3 identity in process_gateway_event."
+source  = ["crates/openab-gateway/src/adapters/googlechat.rs#verify_email_claim", "crates/openab-core/src/gateway.rs#process_gateway_event"]
+pr      = ""
+
+[[openab_features]]
+feature = "deny_echo"
+status  = "implemented"
+note    = "DenyIdentity → throttled request-access echo (\"Your ID: …\") via adapter.send_message; DenyScope → silent drop. Platform-agnostic; delivered through the normal Google Chat send path."
+source  = ["crates/openab-core/src/gateway.rs#process_gateway_event"]
+pr      = ""
+
+[[openab_features]]
+feature = "mention_gating"
+status  = "implemented"
+note    = "Platform-native. Google Chat itself only delivers space messages when the app is @mentioned. Core should_skip_event mention-gating only fires for channel_type == group/supergroup; Google Chat spaces surface as ROOM/SPACE/DM, so the core @mention string check never triggers — gating is enforced by the platform, not core."
+source  = ["crates/openab-core/src/gateway.rs#should_skip_event", "crates/openab-gateway/src/adapters/googlechat.rs#send_googlechat_event"]
+pr      = ""
+
+[[openab_features]]
+feature = "slash_commands"
+status  = "implemented"
+note    = "Core-side. /reset, /cancel, /model(s)/agents intercepted in process_gateway_event before dispatch; responses sent via adapter.send_message. Not wired to Google Chat's native slash-command registration — plain-text commands."
+source  = ["crates/openab-core/src/gateway.rs#process_gateway_event"]
+pr      = ""
+
+[[openab_features]]
+feature = "multibot"
+status  = "partial"
+note    = "Bot senders are dropped inbound (sender.user_type == BOT → skip); core's multibot/other-bot streaming suppression can't observe other bots since Chat doesn't deliver their messages. use_streaming ignores other_bot_present for gateway adapters."
+source  = ["crates/openab-gateway/src/adapters/googlechat.rs#send_googlechat_event", "crates/openab-core/src/gateway.rs#use_streaming"]
+pr      = ""
+
+[[openab_features]]
+feature = "group_routing"
+status  = "implemented"
+note    = "Session/route keyed on space.name + optional thread_id; ChannelInfo carries id=space, channel_type=space type, thread_id."
+source  = ["crates/openab-gateway/src/adapters/googlechat.rs#send_googlechat_event"]
+pr      = ""
+
+[[openab_features]]
+feature = "cron_dispatch"
+status  = "not_implemented"
+note    = "Not wired for scheduled cron dispatch: `VALID_PLATFORMS` (cron.rs) covers only discord/slack/telegram and no adapter is registered for this platform in `cron_adapters`, so `cronjob.toml` jobs targeting it are rejected at startup by `validate_cronjobs`."
+source  = []
+pr      = ""
+
+
+# ═══ Schema 3 — platform-quirks (freeform, dated findings log) ═══════════════
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Auth asymmetry: two independent credential paths"
+note   = "Inbound webhooks are authenticated by verifying Google's ID-token (email==chat@system.gserviceaccount.com, RS256 via JWKS, iss=accounts.google.com, audience-checked). Outbound API calls use a *separate* service-account → OAuth2 JWT-bearer exchange (scope=https://www.googleapis.com/auth/chat.bot), cached with a 300 s refresh margin. Missing outbound creds degrade to a logged dry-run that still acks failure to core."
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/googlechat.rs#build_jwt"
+refs   = []
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Reactions are structurally impossible for the bot"
+note   = "The single biggest divergence from other adapters: Google Chat's reaction API is user-auth only (the reactions.create REST reference explicitly lists only user-auth scopes). A chat.bot app cannot add/remove reactions at all, so OpenAB's status-reaction UX (👀 queued / 🤔 thinking / tool emojis / mood face) is silently dropped. The adapter deliberately early-returns on add_reaction/remove_reaction/create_topic rather than issuing doomed API calls. Consider a message-edit-based status line if a progress indicator is needed here."
+kind   = "intrinsic"
+source = "https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages.reactions/create"
+refs   = []
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Markdown must be raw, once"
+note   = "markdown_to_gchat converts CommonMark → Chat syntax (**b**→*b*, *i*→_i_, ~~s~~→~s~, [t](u)→<u|t>, headings→bold, code fences/inline code passthrough). It is applied by *both* send_message and edit_message; passing already-converted text double-converts (e.g. *bold* re-parsed as *italic*). Core must always emit raw markdown on streaming edits."
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/googlechat.rs#markdown_to_gchat"
+refs   = []
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "30-second webhook deadline vs. attachment downloads"
+note   = "Attachment-bearing messages spawn a background (panic-guarded) task and return {} immediately so the webhook meets Chat's ~30 s deadline; the GatewayEvent is emitted only after downloads finish. Text-only messages emit synchronously. Event dropped if both text and all attachments are empty/failed."
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/googlechat.rs#webhook"
+refs   = []
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Two webhook envelope shapes"
+note   = "Google Chat delivers either top-level (message/user/space) for HTTP-endpoint mode or wrapped under chat.messagePayload for Pub/Sub mode. The handler prefers the wrapped form and falls back to top-level."
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/googlechat.rs#webhook"
+refs   = []
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Chunk cap set below the API cap"
+note   = "Adapter chunks at 4096 chars while the API accepts 32,000 bytes — a conservative choice (matches the legacy client-visible limit) that produces more messages than strictly necessary for very long replies."
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/googlechat.rs#GOOGLE_CHAT_MESSAGE_LIMIT"
+refs   = []
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Delete is a silent no-op (not even the edit fallback)"
+note   = "Unlike platforms where delete_message falls back to the trait's edit-to-zero-width, on Google Chat the delete_message command isn't matched in handle_reply, falls through to the send path with empty text, and hits the empty-message short-circuit — so nothing is sent and no edit occurs. Streaming-placeholder cleanup that relies on delete is therefore a no-op here."
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/googlechat.rs#handle_reply"
+refs   = []
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Reaction API requires user auth (findings log)"
+note   = "reactions.create/reactions.delete require user auth (REST ref lists only chat.messages.reactions* / chat.messages, no app-auth); a chat.bot app cannot add/remove reactions → OpenAB status-reaction UX is a no-op on this platform."
+kind   = "intrinsic"
+source = "https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages.reactions/create"
+refs   = []
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Max message payload is 32,000 bytes"
+note   = "Max message payload (text+cards) is 32,000 bytes; longer content must be split into multiple messages (adapter chunks conservatively at 4096 chars)."
+kind   = "intrinsic"
+source = "https://developers.google.com/workspace/chat/create-messages"
+refs   = []
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Edit/delete operate on own messages only"
+note   = "With app auth, messages.patch (edit) and messages.delete operate on only the app's own messages; edit updateMask supports text."
+kind   = "intrinsic"
+source = "https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/patch"
+refs   = []
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Attachment upload limit is 200 MB"
+note   = "Attachment upload limit is 200 MB; some file types are blocked (an attachment message can't also carry accessory widgets). OpenAB downloads far below this (image 10 MB / file 512 KB / audio 25 MB) and skips Drive-sourced & video attachments."
+kind   = "intrinsic"
+source = "https://developers.google.com/workspace/chat/upload-media-attachments"
+refs   = []
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Rate limits: 3,000/min project, 1/sec space"
+note   = "Rate limits: 3,000 message writes/min per project and 1 write/sec per space (shared across apps; 10/sec only during data import); 429 → truncated exponential backoff."
+kind   = "intrinsic"
+source = "https://developers.google.com/workspace/chat/limits"
+refs   = []
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Slash commands registered with commandId 1-1000"
+note   = "Slash commands are registered in the Cloud console with a commandId 1-1000 and delivered as a MESSAGE event carrying message.slashCommand / message.annotation.slashCommand."
+kind   = "intrinsic"
+source = "https://developers.google.com/workspace/chat/commands"
+refs   = []
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Mention-gating is enforced platform-side"
+note   = "In spaces the app is only invoked when @mentioned (mention stripped into argumentText); DMs deliver every message — so mention-gating is enforced platform-side, not by OpenAB's @mention string check."
+kind   = "intrinsic"
+source = "https://developers.google.com/workspace/chat/receive-respond-interactions"
+refs   = []
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "No bot-to-bot delivery and no typing API"
+note   = "The MESSAGE interaction event is defined as \"A user messages a Chat app\"; other bots'/apps' messages are not delivered, and there is no typing/composing API for apps."
+kind   = "intrinsic"
+source = "https://developers.google.com/workspace/chat/receive-respond-interactions"
+refs   = []
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Inbound webhooks signed by chat@system.gserviceaccount.com"
+note   = "Inbound webhooks are signed by chat@system.gserviceaccount.com (RS256, JWKS at oauth2/v3/certs); OpenAB verifies issuer (accounts.google.com), audience, exp, and the email claim."
+kind   = "intrinsic"
+source = "https://developers.google.com/workspace/chat/receive-respond-interactions"
+refs   = []

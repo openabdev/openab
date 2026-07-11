@@ -172,6 +172,7 @@ pub struct Config {
     pub slack: Option<SlackConfig>,
     pub gateway: Option<GatewayConfig>,
     pub telegram: Option<TelegramConfig>,
+    pub line: Option<LineConfig>,
     pub agentcore: Option<AgentCoreConfig>,
     #[serde(default)]
     pub agent: AgentConfig,
@@ -762,6 +763,74 @@ fn env_flag_not_false(key: &str) -> bool {
     std::env::var(key)
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(true)
+}
+
+/// First-class `[line]` section — L3 identity trust for the LINE adapter
+/// (identity-trust-none ADR, Phase 1). Mirrors [`TelegramConfig`]'s trust
+/// fields and resolution order: `[line].field` (with `${}` expansion) →
+/// `LINE_*` env var → default.
+///
+/// Trust-only by design: LINE channel credentials stay on the gateway env vars
+/// (`LINE_CHANNEL_SECRET` / `LINE_CHANNEL_ACCESS_TOKEN`) that the webhook
+/// adapter reads. Group policy (`open`/`members` for `"unknown"` senders) is a
+/// follow-up on #1355.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct LineConfig {
+    /// Explicit flag: true = allow all users, false = check `allowed_users`.
+    /// When not set, defaults to `false` (deny-all, per identity-trust-none ADR).
+    /// Set `true` explicitly to allow all users. Env fallback:
+    /// `LINE_ALLOW_ALL_USERS` (empty string treated as unset).
+    ///
+    /// **Note:** When this resolves to `true`, the `allowed_users` list is
+    /// bypassed entirely — all users are permitted regardless of list contents.
+    pub allow_all_users: Option<bool>,
+    /// LINE user IDs (`U…`, 33 chars) allowed to interact with the bot. Only
+    /// checked when `allow_all_users` resolves to `false`. Env fallback:
+    /// `LINE_ALLOWED_USERS` (comma-separated).
+    /// `None` = not set (fall back to env); `Some([])` = explicit empty (deny all).
+    pub allowed_users: Option<Vec<String>>,
+}
+
+/// Fully resolved LINE trust settings (config → env → default applied).
+#[derive(Debug, Clone)]
+pub struct ResolvedLine {
+    pub allow_all_users: bool,
+    pub allowed_users: Vec<String>,
+}
+
+impl LineConfig {
+    /// Resolve every field: config value (if set) → `LINE_*` env → default.
+    /// Same shape as [`TelegramConfig::resolve`] for the shared trust fields.
+    pub fn resolve(&self) -> ResolvedLine {
+        let allowed_users: Vec<String> = match &self.allowed_users {
+            Some(list) => list.clone(),
+            None => std::env::var("LINE_ALLOWED_USERS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        };
+        ResolvedLine {
+            allow_all_users: self.allow_all_users.unwrap_or_else(|| {
+                std::env::var("LINE_ALLOW_ALL_USERS")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(false)
+            }),
+            allowed_users,
+        }
+    }
+
+    /// Whether any first-class LINE trust configuration exists — a `[line]`
+    /// section or `LINE_ALLOW_ALL_USERS` / `LINE_ALLOWED_USERS` env. Used by
+    /// the binary to decide whether LINE trust still rides on the deprecated
+    /// uniform `GATEWAY_*` seed (and to warn when it does).
+    pub fn env_trust_present() -> bool {
+        std::env::var("LINE_ALLOW_ALL_USERS").is_ok() || std::env::var("LINE_ALLOWED_USERS").is_ok()
+    }
 }
 
 /// Raw intermediate struct for serde — uses `Option` to detect explicit fields.
@@ -1830,6 +1899,92 @@ webhook_path = "/hook/tg"
         assert_eq!(tg.rich_messages, Some(false));
         assert_eq!(tg.streaming, Some(true));
         assert_eq!(tg.webhook_path.as_deref(), Some("/hook/tg"));
+    }
+
+    #[test]
+    fn line_section_parses_from_toml() {
+        let toml_str = r#"
+[discord]
+bot_token = "x"
+
+[line]
+allow_all_users = false
+allowed_users = ["U1234567890abcdef0123456789abcdef"]
+"#;
+        let cfg = parse_config_str(toml_str, "test").unwrap();
+        let line = cfg.line.expect("line section");
+        assert_eq!(line.allow_all_users, Some(false));
+        assert_eq!(
+            line.allowed_users.as_deref(),
+            Some(&["U1234567890abcdef0123456789abcdef".to_string()][..])
+        );
+
+        // Absent section → None (trust falls back to legacy GATEWAY_* seed).
+        let cfg = parse_config_str("[discord]\nbot_token = \"x\"\n", "test").unwrap();
+        assert!(cfg.line.is_none());
+    }
+
+    /// All `LINE_*` env scenarios in ONE test — std::env is process-global and
+    /// cargo runs tests in parallel, so splitting these would race (same
+    /// pattern as `telegram_resolve_all_scenarios`).
+    #[test]
+    fn line_resolve_all_scenarios() {
+        // --- Scenario 1: defaults — deny-all per identity-trust-none ADR ---
+        std::env::remove_var("LINE_ALLOW_ALL_USERS");
+        std::env::remove_var("LINE_ALLOWED_USERS");
+        let r = LineConfig::default().resolve();
+        assert!(!r.allow_all_users);
+        assert!(r.allowed_users.is_empty());
+        assert!(!LineConfig::env_trust_present());
+
+        // --- Scenario 2: config wins over env ---
+        std::env::set_var("LINE_ALLOW_ALL_USERS", "true");
+        std::env::set_var("LINE_ALLOWED_USERS", "Uzzz"); // must be ignored — config list wins
+        let cfg = LineConfig {
+            allow_all_users: Some(false),
+            allowed_users: Some(vec!["Uaaa".into(), "Ubbb".into()]),
+        };
+        let r = cfg.resolve();
+        assert!(!r.allow_all_users);
+        assert_eq!(
+            r.allowed_users,
+            vec!["Uaaa".to_string(), "Ubbb".to_string()]
+        );
+
+        // --- Scenario 3: env fallback when config unset (comma-separated,
+        //     trimmed, empties dropped) ---
+        std::env::set_var("LINE_ALLOWED_USERS", " Uaaa , Ubbb,,Uccc ");
+        let r = LineConfig::default().resolve();
+        assert!(r.allow_all_users); // from LINE_ALLOW_ALL_USERS=true
+        assert_eq!(
+            r.allowed_users,
+            vec!["Uaaa".to_string(), "Ubbb".to_string(), "Uccc".to_string()]
+        );
+        assert!(LineConfig::env_trust_present());
+
+        // --- Scenario 4: empty-string env flag treated as unset → deny-all ---
+        std::env::set_var("LINE_ALLOW_ALL_USERS", "");
+        std::env::remove_var("LINE_ALLOWED_USERS");
+        let r = LineConfig::default().resolve();
+        assert!(!r.allow_all_users);
+
+        // --- Scenario 5: "0"/"false" env values resolve false ---
+        std::env::set_var("LINE_ALLOW_ALL_USERS", "0");
+        assert!(!LineConfig::default().resolve().allow_all_users);
+        std::env::set_var("LINE_ALLOW_ALL_USERS", "false");
+        assert!(!LineConfig::default().resolve().allow_all_users);
+
+        // --- Scenario 6: explicit empty config list = deny-all, ignores env ---
+        std::env::set_var("LINE_ALLOWED_USERS", "Uzzz");
+        let cfg = LineConfig {
+            allow_all_users: None,
+            allowed_users: Some(vec![]),
+        };
+        let r = cfg.resolve();
+        assert!(r.allowed_users.is_empty());
+
+        std::env::remove_var("LINE_ALLOW_ALL_USERS");
+        std::env::remove_var("LINE_ALLOWED_USERS");
     }
 
     #[test]

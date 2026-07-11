@@ -3,6 +3,7 @@ use crate::adapter::{ChannelRef, ChatAdapter, MessageRef, SenderContext};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::media;
+use crate::trust::l3_gate_applies;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -803,6 +804,7 @@ fn socket_idle(since_last_inbound: std::time::Duration, timeout: std::time::Dura
 #[allow(clippy::too_many_arguments)]
 pub async fn run_slack_adapter(
     adapter: Arc<SlackAdapter>,
+    router: Arc<crate::adapter::AdapterRouter>,
     app_token: String,
     allow_all_channels: bool,
     allow_all_users: bool,
@@ -953,6 +955,7 @@ pub async fn run_slack_adapter(
                                                 }
                                                 let event = event.clone();
                                                 let adapter = adapter.clone();
+                                                let router = router.clone();
                                                 let bot_token = bot_token.clone();
                                                 let allowed_channels = allowed_channels.clone();
                                                 let allowed_users = allowed_users.clone();
@@ -969,6 +972,7 @@ pub async fn run_slack_adapter(
                                                         &event,
                                                         &team_id,
                                                         &adapter,
+                                                        &router,
                                                         &bot_token,
                                                         allow_all_channels,
                                                         allow_all_users,
@@ -1208,6 +1212,7 @@ pub async fn run_slack_adapter(
                                                     .to_string();
                                                 let event = event.clone();
                                                 let adapter = adapter.clone();
+                                                let router = router.clone();
                                                 let bot_token = bot_token.clone();
                                                 let allowed_channels = allowed_channels.clone();
                                                 let allowed_users = allowed_users.clone();
@@ -1220,6 +1225,7 @@ pub async fn run_slack_adapter(
                                                         &event,
                                                         &team_id,
                                                         &adapter,
+                                                        &router,
                                                         &bot_token,
                                                         allow_all_channels,
                                                         allow_all_users,
@@ -1365,11 +1371,21 @@ async fn get_socket_mode_url_with_timeout(
     .await
 }
 
+/// Whether a Slack conversation ID denotes a DM. Slack conversation IDs are
+/// prefix-typed: `C…` public channel, `G…` private channel/group, `D…` DM.
+/// Only informational for the gate today — Slack's registry entry is L2-open
+/// with `allow_dm=true`, so the decision is identical either way — but passing
+/// the real surface keeps the gate's inputs truthful (cf. #1270 review F2).
+fn is_dm_channel(channel_id: &str) -> bool {
+    channel_id.starts_with('D')
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_message(
     event: &serde_json::Value,
     team_id: &str,
     adapter: &Arc<SlackAdapter>,
+    router: &Arc<crate::adapter::AdapterRouter>,
     bot_token: &str,
     allow_all_channels: bool,
     allow_all_users: bool,
@@ -1420,6 +1436,32 @@ async fn handle_message(
         };
         let _ = adapter.add_reaction(&msg_ref, "🚫").await;
         return;
+    }
+
+    // Shared ingress trust gate (L3 identity). Redundant-but-matching with
+    // Slack's own user check that already ran above, so it cannot deny anything
+    // already admitted (non-regressive). L2 (channel allowlist) stays in the
+    // adapter for Slack — its registry entry is L2-open.
+    //
+    // Bots are skipped here: the user check above has the same `!is_bot_msg`
+    // bypass (bot admission is handled separately by allow_bot_messages +
+    // trusted_bot_ids), and the shared L3 gate is human-identity only. Running
+    // it on bots would wrongly drop trusted bot-to-bot messages when
+    // allow_all_users=false (multi-agent). Same rationale as Discord (#1270
+    // review F1). Phase 1c makes this authoritative and removes the scattered
+    // check (#1361).
+    if l3_gate_applies(is_bot_msg) {
+        let decision =
+            router.gate_incoming("slack", &channel_id, is_dm_channel(&channel_id), &user_id);
+        if !decision.is_allowed() {
+            tracing::info!(
+                user_id,
+                channel = %channel_id,
+                ?decision,
+                "slack message denied by trust gate"
+            );
+            return;
+        }
     }
 
     // Capture the native-streaming recipient for THIS turn, now that the sender has
@@ -2047,6 +2089,28 @@ fn build_set_status_body(channel_id: &str, thread_ts: &str, status: &str) -> ser
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- trust gate tests ---
+
+    /// Pins the L3 bot-bypass: the shared identity gate must not run for bot
+    /// senders (bot admission = allow_bot_messages + trusted_bot_ids), matching
+    /// the inline user check's `!is_bot_msg` bypass. Regression for #1361
+    /// (mirrors the Discord test for PR #1270 review F4).
+    #[test]
+    fn l3_gate_skips_bots_applies_to_humans() {
+        assert!(!l3_gate_applies(true)); // bot → gate skipped
+        assert!(l3_gate_applies(false)); // human → gate applies
+    }
+
+    /// Pins Slack conversation-ID prefix typing for the gate's `is_dm` input:
+    /// `D…` = DM; `C…` (public) and `G…` (private/group) are not DMs.
+    #[test]
+    fn is_dm_channel_by_prefix() {
+        assert!(is_dm_channel("D0123456789"));
+        assert!(!is_dm_channel("C0123456789"));
+        assert!(!is_dm_channel("G0123456789"));
+        assert!(!is_dm_channel(""));
+    }
 
     // --- builder tests ---
 

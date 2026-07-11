@@ -1,0 +1,315 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  Platform capability schema — TEMPLATE & human-readable schema reference
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#  Copy this file to  schema/<platform>.toml  (filename = platform name,
+#  snake_case) and fill every field.
+#
+#  This template IS the schema documentation. The authoritative *types* live in
+#  the Rust structs at `crates/platform-schema/src/lib.rs` (serde). Conformance
+#  fully deserializes every real schema/*.toml into those structs, and checks
+#  this template still enumerates every capability section + every feature key —
+#  so if the structs gain/rename a field, this template must be updated too.
+#
+#  Three schemas, matching docs/platforms/README.md:
+#    [capability.*]        -> Schema 1 platform-capability  (source: official docs)
+#    [[openab_features]]   -> Schema 2 openab-feature-support (source: our code + PR)
+#    [[quirks]]            -> Schema 3 platform-quirks       (freeform dated log)
+#
+#  Sourcing rule:
+#    (A) intrinsic facts   -> `source` is an official-doc URL
+#    (B) OpenAB decisions  -> `source` points to a file, NOT a line number:
+#          "crates/.../file.rs"            (file only), or
+#          "crates/.../file.rs#symbol"     (file + a fn/const name for precision)
+#        Line numbers are deliberately avoided — they go stale on any edit above.
+#        A symbol name is stable (only churns when renamed/deleted — exactly the
+#        drift we want to catch) and is greppable, so conformance can verify it.
+#
+#  Conventions:
+#    required   = must be present, deserialize fails otherwise
+#    optional   = may be omitted (Rust Option / #[serde(default)])
+#    enum       = closed set; any other value fails to deserialize
+#    Use "?" in a note (not as a value) when a fact is genuinely unverified.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Version this file was written against. Bumped when the schema changes.
+# Conformance flags any schema/*.toml older than the current version as stale.
+schema_version = "2026-07-08"      # required, "YYYY-MM-DD"
+
+[platform]
+name          = ""                 # required. matches filename, snake_case
+official_docs = ""                 # required. URL to the platform's official docs root
+description   = ""                 # required. one-line "what is this platform"
+
+
+# ═══ Schema 1 — platform-capability (source of truth: official docs) ═════════
+# Every field below is required. Each carries a typed value (bool/enum/int) for
+# machine comparison + a freeform `note` + an official-doc `source` URL.
+#
+# How to fill each block:
+#   - Set the typed value(s) to the platform's actual behavior.
+#   - `note`: the concrete platform-specific detail a reviewer needs (the "how").
+#   - `source`: the official-doc URL that proves the fact (one canonical link).
+#   - If a fact is genuinely unverified, still set the typed value to the best
+#     known guess and flag it in `note` with a leading "?" so it's auditable.
+
+[capability.transport]
+# enum: webhook | websocket | socket_mode | long_poll
+kind   = "webhook"                 # required
+note   = ""                        # required. how events arrive
+source = ""                        # required. official-doc URL
+
+[capability.inbound_auth]
+# enum: hmac_sha256 | jwt_rs256 | aes | shared_secret | oauth | none
+scheme = "hmac_sha256"             # required. L1 request-auth / signature scheme
+note   = ""                        # required. e.g. "HMAC over raw body vs x-line-signature"
+source = ""                        # required
+
+[capability.threads]
+# enum: native | reply_to_only | emulated | none
+model  = "none"                    # required
+note   = ""                        # required. the thread/topic model, if any
+source = ""                        # required
+
+[capability.slash_commands]
+supported = false                  # required, bool. platform-level command API?
+note      = ""                     # required. registration / delivery, or "plain text only"
+source    = ""                     # required
+
+[capability.mentions]
+# how the bot knows it was addressed. enum: at_mention | username | self_flag | none
+method = "at_mention"              # required
+note   = ""                        # required. the concrete detection mechanism (e.g. isSelf flag)
+source = ""                        # required
+
+[capability.emoji_reactions]
+bot_can_add        = false         # required, bool
+bot_can_remove     = false         # required, bool
+bot_receives_events = false        # required, bool. does the bot get reaction webhooks?
+note               = ""            # required
+source             = ""            # required
+
+[capability.edit_message]
+supported = false                  # required, bool. can a bot edit its own sent message?
+max_edits = 0                      # optional, int. cap on edits per message (0/omit = unspecified/unlimited)
+note      = ""                     # required
+source    = ""                     # required
+
+[capability.delete_message]
+supported = false                  # required, bool
+# enum: none | own | others | own_and_others
+scope     = "none"                 # required. what a bot may delete
+window_sec = 0                     # optional, int. deletion time window in seconds (0/omit = none/unlimited)
+note      = ""                     # required
+source    = ""                     # required
+
+[capability.rich_content]
+markdown = false                   # required, bool
+cards    = false                   # required, bool. cards / templates / flex
+buttons  = false                   # required, bool. interactive buttons
+note     = ""                      # required. the concrete rich-message types
+source   = ""                      # required
+
+[capability.attachments]
+inbound     = []                   # required. subset of: image audio video file  (what CAN arrive)
+outbound    = []                   # required. subset of: image audio video file
+max_size_mb = 0                    # optional, int. headline cap; 0/omit = unspecified
+max_count   = 0                    # optional, int. max attachments per message (0/omit = unspecified)
+# outbound_delivery = "upload"     # optional, enum: url | upload — how the bot SENDS media
+# required. fetch model, provider caveats, expiry — AND per-type / per-plan size
+# limits when they differ from the single headline max_size_mb above.
+note        = ""
+source      = ""                   # required
+
+[capability.message_length_limit]
+max_chars = 0                      # required, int. hard cap per outbound text object
+note      = ""                     # required. counting unit (e.g. UTF-16 code units)
+source    = ""                     # required
+
+[capability.dm_support]
+supported = false                  # required, bool. 1:1 direct messages?
+note      = ""                     # required
+source    = ""                     # required
+
+[capability.group_model]
+kinds  = []                        # required. taxonomy, e.g. ["group","room","user"]
+note   = ""                        # required
+source = ""                        # required
+
+[capability.group_sender_identity]
+# enum: yes | no | consent_gated  — is a stable per-user id available in group events?
+stable_id = "no"                   # required
+note      = ""                     # required. when present/absent, consent gating
+source    = ""                     # required
+
+[capability.send_model]
+# enum: any_time | reply_only | push_only | hybrid
+model               = "any_time"   # required
+reply_token_ttl_sec = 0            # optional, int. only if reply-token based (e.g. LINE ~60)
+max_objects_per_send = 0           # optional, int. batch cap per request, if any
+note                = ""           # required. reply-vs-push economics / windows
+source              = ""           # required
+
+[capability.proactive_push]
+supported   = false                # required, bool. can the bot message unsolicited?
+# enum: unlimited | metered | none
+quota_model = "none"               # required
+note        = ""                   # required. quota / rate-limit specifics
+source      = ""                   # required
+
+[capability.bot_to_bot]
+delivered = false                  # required, bool. does the platform deliver other bots' msgs?
+note      = ""                     # required
+source    = ""                     # required
+
+[capability.typing_indicator]
+supported = false                  # required, bool
+note      = ""                     # required. scope / rate limits / semantics
+source    = ""                     # required
+
+
+# ═══ Schema 2 — openab-feature-support (source of truth: our code + PR) ══════
+# One [[openab_features]] block per OpenAB capability. All 17 blocks below are
+# the complete, closed feature set (conformance checks every one is present and
+# that no unknown feature key is used). Fill each for the platform.
+#
+# status enum: implemented | partial | workaround | not_implemented | n_a
+#   Always explain partial / workaround / limited — the "why" is the value.
+# `source` is an array of "file.rs" or "file.rs#symbol" (no line numbers) —
+#   conformance verifies each file exists, and greps for the #symbol if given.
+#   `pr` is optional (the deciding PR/issue).
+# (status/note/source left blank here — this is a blank form to copy & fill.)
+
+[[openab_features]]
+feature = "send_message"           # basic outbound
+status  = ""
+note    = ""
+source  = []                       # e.g. ["crates/.../line.rs#dispatch_line_reply"]
+pr      = ""
+
+[[openab_features]]
+feature = "message_split"          # long-message handling (split_delivery / message_limit)
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "streaming"              # stream_begin / stream_append / stream_finish — live vs batched
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "reply_quote"            # send_message_with_reply
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "edit_message"           # own-message edit
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "delete_message"         # delete own / others
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "emoji_reactions"        # add_reaction / remove_reaction
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "threads_topics"         # create_thread / create_topic
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "media_inbound"          # images / files / audio ingestion
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "voice_stt"              # speech-to-text on voice notes
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "trust_gate"             # allowlist / identity-trust enforcement point
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "deny_echo"              # reply-on-deny behavior + delivery constraints
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "mention_gating"         # require @mention in groups
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "slash_commands"         # /reset, /cancel handling
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "multibot"               # multiple bots in one channel
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "group_routing"          # group / session routing
+status  = ""
+note    = ""
+source  = []
+pr      = ""
+
+[[openab_features]]
+feature = "cron_dispatch"          # scheduled cronjob.toml jobs targeting this platform
+status  = ""
+note    = ""
+source  = []                       # e.g. ["crates/openab-core/src/cron.rs#VALID_PLATFORMS"]
+pr      = ""
+
+
+# ═══ Schema 3 — platform-quirks (freeform, dated findings log) ═══════════════
+# One [[quirks]] block per gotcha / special model / structural constraint.
+# `note` is prose and is NOT machine-checked. `source` and `refs` are optional;
+# when present, conformance shell-checks them (URL/file:line exists, PR exists).
+
+[[quirks]]
+date   = ""                        # required, "YYYY-MM-DD" — when documented
+title  = ""                        # required. short headline
+note   = ""                        # required. freeform prose (may be multi-paragraph)
+# required, enum: intrinsic (a platform fact) | openab_decision (a choice/finding of ours)
+kind   = "intrinsic"
+source = ""                        # optional. official-doc URL, or "file.rs" / "file.rs#symbol"
+refs   = []                        # optional. ["#1291", ...] PR/ADR links

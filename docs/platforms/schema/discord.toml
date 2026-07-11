@@ -1,0 +1,355 @@
+# Discord platform capability schema.
+# Generated from the adapter source + official docs — follows _template.toml.
+
+schema_version = "2026-07-08"
+
+[platform]
+name          = "discord"
+official_docs = "https://docs.discord.com/developers/docs/intro"
+description   = "Discord bot adapter over the persistent WebSocket Gateway + REST HTTP API (serenity-based, in openab-core)."
+
+
+# ═══ Schema 1 — platform-capability (source: official docs) ══════════════════
+
+[capability.transport]
+kind   = "websocket"
+note   = "Persistent WSS Gateway (wss://gateway.discord.gg/): the bot opens a persistent gateway connection and receives events; outbound actions use the REST HTTP API."
+source = "https://docs.discord.com/developers/topics/gateway"
+
+[capability.inbound_auth]
+scheme = "none"
+note   = "Gateway handshake via Identify (opcode 2) carrying the bot token + intents; REST calls use `Authorization: Bot <token>`. Gateway is a bot-initiated persistent socket, so there is no per-event inbound signature to verify (unlike webhook platforms)."
+source = "https://docs.discord.com/developers/topics/gateway"
+
+[capability.threads]
+model  = "native"
+note   = "ANNOUNCEMENT_THREAD (10) / PUBLIC_THREAD (11) / PRIVATE_THREAD (12) — temporary sub-channels of a text/forum/announcement channel (API v9+). Threads are themselves channels (own channel_id, thread_metadata, parent_id)."
+source = "https://docs.discord.com/developers/resources/channel"
+
+[capability.slash_commands]
+supported = true
+note      = "Application commands of type CHAT_INPUT (1), registered over HTTP: global POST /applications/{id}/commands or per-guild. Invocations delivered as INTERACTION_CREATE with an interaction token for the response."
+source    = "https://docs.discord.com/developers/interactions/application-commands"
+
+[capability.mentions]
+method = "at_mention"
+note   = "Bot detects being addressed via user mention <@user_id> (and legacy nick form <@!id>) or role mention <@&role_id> in mention_roles. Gateway also flags mentions / mention_everyone."
+source = "https://docs.discord.com/developers/resources/message"
+
+[capability.emoji_reactions]
+bot_can_add        = true
+bot_can_remove     = true
+bot_receives_events = true
+note               = "Add: PUT Create Reaction. Remove: Delete Own Reaction (own) or delete others' with MANAGE_MESSAGES. Receives MESSAGE_REACTION_ADD / MESSAGE_REACTION_REMOVE (needs GUILD_MESSAGE_REACTIONS intent 1<<10; DIRECT_MESSAGE_REACTIONS for DMs)."
+source             = "https://docs.discord.com/developers/resources/message"
+
+[capability.edit_message]
+supported = true
+note      = "A bot may edit its own messages via Edit Message."
+source    = "https://docs.discord.com/developers/resources/message"
+
+[capability.delete_message]
+supported = true
+scope     = "own_and_others"
+note      = "Own: always. Others': requires MANAGE_MESSAGES permission."
+source    = "https://docs.discord.com/developers/resources/message"
+
+[capability.rich_content]
+markdown = true
+cards    = true
+buttons  = true
+note     = "Markdown, embeds, and message components (buttons, string/select menus, action rows)."
+source   = "https://docs.discord.com/developers/resources/message"
+
+[capability.attachments]
+inbound     = ["image", "audio", "video", "file"]
+outbound    = ["image", "audio", "video", "file"]
+max_size_mb = 10
+max_count   = 10
+outbound_delivery = "upload"
+note        = "Inbound & outbound arbitrary file types. Default upload cap 10 MiB per file (raised by uploader Nitro status or server Boost tier)."
+source      = "https://docs.discord.com/developers/reference"
+
+[capability.message_length_limit]
+max_chars = 2000
+note      = "2000 characters per message content."
+source    = "https://docs.discord.com/developers/resources/channel"
+
+[capability.dm_support]
+supported = true
+note      = "1:1 DM channels (private channels)."
+source    = "https://docs.discord.com/developers/resources/channel"
+
+[capability.group_model]
+kinds  = ["guild", "channel", "thread", "dm", "group_dm"]
+note   = "Guild → channels (GUILD_TEXT, forum, announcement, voice) → threads. Plus DM / group-DM private channels. Threads are channels with a parent_id."
+source = "https://docs.discord.com/developers/resources/channel"
+
+[capability.group_sender_identity]
+stable_id = "yes"
+note      = "Stable per-user snowflake author.id on every message; not consent-gated. Requires the MESSAGE_CONTENT intent to also read message text."
+source    = "https://docs.discord.com/developers/resources/message"
+
+[capability.send_model]
+model               = "push_only"
+note                = "No reply-window/TTL — a bot with channel access may send at any time via REST. Replies are opt-in via message_reference{message_id}."
+source              = "https://docs.discord.com/developers/resources/message"
+
+[capability.proactive_push]
+supported   = true
+quota_model = "metered"
+note        = "Unsolicited sends allowed within permissions. Global cap 50 requests/sec/bot; per-route buckets (X-RateLimit-Bucket); invalid-request cap 10,000/10min."
+source      = "https://docs.discord.com/developers/topics/rate-limits"
+
+[capability.bot_to_bot]
+delivered = true
+note      = "The gateway delivers other bots' messages; the author.bot flag distinguishes them (the bot's own messages arrive too and must be self-filtered)."
+source    = "https://docs.discord.com/developers/topics/gateway"
+
+[capability.typing_indicator]
+supported = true
+note      = "POST /channels/{id}/typing (Trigger Typing); inbound TYPING_START event."
+source    = "https://docs.discord.com/developers/topics/gateway"
+
+
+# ═══ Schema 2 — openab-feature-support (source: our code + PR) ═══════════════
+
+[[openab_features]]
+feature = "send_message"
+status  = "implemented"
+note    = "ChannelId::say; resolve_channel prefers thread_id over channel_id; message_limit() = 2000."
+source  = ["crates/openab-core/src/discord.rs#resolve_channel", "crates/openab-core/src/discord.rs#message_limit"]
+pr      = ""
+
+[[openab_features]]
+feature = "message_split"
+status  = "implemented"
+note    = "Router reads message_limit() (2000) then splits: split_delivery handles directive/body, format::split_message chunks the body, mentions are propagated to each chunk."
+source  = ["crates/openab-core/src/adapter.rs#split_delivery", "crates/openab-core/src/format.rs#split_message"]
+pr      = ""
+
+[[openab_features]]
+feature = "streaming"
+status  = "implemented"
+note    = "Post-then-edit, not native. use_streaming returns true only when no other bot is present (!other_bot_present); the router consults it at dispatch. uses_native_streaming stays default false, so the trait's native stream methods only hit their edit-based fallbacks."
+source  = ["crates/openab-core/src/discord.rs#use_streaming", "crates/openab-core/src/adapter.rs#uses_native_streaming"]
+pr      = "#534"
+
+[[openab_features]]
+feature = "reply_quote"
+status  = "implemented"
+note    = "send_message_with_reply sets reference_message; falls back to plain send on invalid id (parses to 0) or reply failure (unknown/cross-channel message)."
+source  = ["crates/openab-core/src/discord.rs#send_message_with_reply"]
+pr      = ""
+
+[[openab_features]]
+feature = "edit_message"
+status  = "implemented"
+note    = "Native EditMessage.content (overrides the trait default that returns \"edit_message not supported\")."
+source  = ["crates/openab-core/src/discord.rs#EditMessage"]
+pr      = ""
+
+[[openab_features]]
+feature = "delete_message"
+status  = "implemented"
+note    = "Native http.delete_message (overrides trait default which edits to a zero-width space \\u{200b})."
+source  = ["crates/openab-core/src/discord.rs#delete_message"]
+pr      = ""
+
+[[openab_features]]
+feature = "emoji_reactions"
+status  = "implemented"
+note    = "add_reaction = create_reaction, remove_reaction = delete_reaction_me. Unicode emoji only."
+source  = ["crates/openab-core/src/discord.rs#add_reaction", "crates/openab-core/src/discord.rs#remove_reaction"]
+pr      = ""
+
+[[openab_features]]
+feature = "threads_topics"
+status  = "implemented"
+note    = "create_thread builds a thread from the trigger message via serenity create_thread_from_message (1-day auto-archive); auto-thread on first channel message via get_or_create_thread. Not the gateway create_topic path — the native adapter creates threads directly."
+source  = ["crates/openab-core/src/discord.rs#create_thread", "crates/openab-core/src/discord.rs#get_or_create_thread"]
+pr      = ""
+
+[[openab_features]]
+feature = "media_inbound"
+status  = "implemented"
+note    = "Attachments processed inline in the per-attachment loop: images encoded (download_and_encode_image), text files (≤1 MB total, ≤5 files), video passed as a URL block; non-image files warned to the user."
+source  = ["crates/openab-core/src/discord.rs#download_and_encode_image"]
+pr      = ""
+
+[[openab_features]]
+feature = "voice_stt"
+status  = "implemented"
+note    = "Audio attachments transcribed via media::download_and_transcribe when stt_config.enabled; transcript injected + echoed; 🎤 reaction when STT disabled."
+source  = ["crates/openab-core/src/discord.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "trust_gate"
+status  = "implemented"
+note    = "Two layers: adapter-level channel/user allowlist (allowed_channels, is_denied_user) + shared L3 identity gate router.gate_incoming (humans only; bots bypass via l3_gate_applies)."
+source  = ["crates/openab-core/src/discord.rs#is_denied_user", "crates/openab-core/src/discord.rs#l3_gate_applies", "crates/openab-core/src/adapter.rs#gate_incoming"]
+pr      = ""
+
+[[openab_features]]
+feature = "deny_echo"
+status  = "partial"
+note    = "On a denied user the bot reacts 🚫 on the offending message and drops it — no text reply (Discord L3 denies drop silently apart from the reaction)."
+source  = ["crates/openab-core/src/discord.rs#is_denied_user"]
+pr      = ""
+
+[[openab_features]]
+feature = "mention_gating"
+status  = "implemented"
+note    = "AllowUsers modes: Mentions (always require @), Involved (skip @ if bot owns/participated in thread), MultibotMentions (require @ when other bots present). DMs treated as an implicit mention."
+source  = ["crates/openab-core/src/discord.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "slash_commands"
+status  = "implemented"
+note    = "Global commands registered on ready via set_global_commands: /models, /agents, /cancel, /cancel-all, /reset, /remind, /auth, /export-thread; dispatched via interaction_create."
+source  = ["crates/openab-core/src/discord.rs#set_global_commands", "crates/openab-core/src/discord.rs#interaction_create"]
+pr      = ""
+
+[[openab_features]]
+feature = "multibot"
+status  = "implemented"
+note    = "Early other-bot detection cached (disk-persisted, irreversible); disables streaming, gates via MultibotMentions, enforces bot-turn limits; trusted_bot_ids + @mention admits handoff regardless of allow_bot_messages."
+source  = ["crates/openab-core/src/discord.rs#MultibotCache", "crates/openab-core/src/discord.rs#BotTurnTracker"]
+pr      = ""
+
+[[openab_features]]
+feature = "group_routing"
+status  = "implemented"
+note    = "Per-thread dispatch keyed by dispatcher.key(\"discord\", channel_id, sender_id); thread↔parent allowlist via detect_thread; ambient mode buffers passive-channel messages."
+source  = ["crates/openab-core/src/discord.rs#detect_thread"]
+pr      = ""
+
+[[openab_features]]
+feature = "cron_dispatch"
+status  = "implemented"
+note    = "`cronjob.toml` jobs with `platform = \"discord\"` fire via the shared scheduler: `discord` is in `VALID_PLATFORMS` and `main` registers the Discord adapter under `\"discord\"` in `cron_adapters`, so `fire_cronjob` dispatches through `adapter.send_message`. Cron dispatch intentionally bypasses the L2/L3 ingress trust gate — jobs are operator-authored in config, not untrusted inbound."
+source  = ["crates/openab-core/src/cron.rs#VALID_PLATFORMS", "crates/openab-core/src/cron.rs#fire_cronjob", "src/main.rs#cron_adapters"]
+pr      = ""
+
+
+# ═══ Schema 3 — platform-quirks (freeform, dated findings log) ═══════════════
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Threads are channels"
+note   = """
+A Discord thread has its own channel_id; the adapter resolves outbound targets via thread_id.unwrap_or(channel_id) (resolve_channel). Thread identity is thread_metadata.is_some() — parent_id alone is NOT reliable (category children also carry parent_id), so detect_thread returns early unless has_thread_metadata, and only uses parent_id for the allowlist check.
+"""
+kind   = "intrinsic"
+source = "crates/openab-core/src/discord.rs#detect_thread"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Self-echo and bot-loop control"
+note   = """
+The bot receives its own messages over the gateway and must self-filter (msg.author.id == bot_id). Because multiple bots can ping-pong, there are layered guards: a hard consecutive-bot cap (MAX_CONSECUTIVE_BOT_TURNS = 1000), a configurable soft per-thread max_bot_turns reset by any human message, and BotTurnTracker. Bot-turn counting deliberately runs before the self-check so all bot messages count, but warning posts respect the channel allowlist + prior participation to avoid uninvolved bots spamming.
+"""
+kind   = "intrinsic"
+source = "crates/openab-core/src/discord.rs#BotTurnTracker"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Multibot detection is irreversible & disk-cached"
+note   = """
+Once any other bot posts in a channel/thread, that thread is permanently "multibot": cached in-memory and persisted to MultibotCache on disk (survives restarts), since bot messages don't disappear. This flips streaming off (the edit-loop interferes across bots) and can require @mention under MultibotMentions.
+"""
+kind   = "intrinsic"
+source = "crates/openab-core/src/discord.rs#MultibotCache"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Streaming is post-then-edit, not native"
+note   = """
+Unlike Slack, Discord has no native streaming API; OpenAB streams by editing a placeholder message. use_streaming disables this whenever another bot is present, to avoid edit interference. uses_native_streaming stays false, so the trait's native stream methods only ever hit their edit-based fallbacks.
+"""
+kind   = "openab_decision"
+source = "crates/openab-core/src/discord.rs#use_streaming"
+refs   = ["#534"]
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "create_topic vs create_thread"
+note   = """
+The shared gateway layer has a create_topic command (gateway.rs) for gateway-protocol adapters. The native Discord adapter does NOT use it — it calls serenity create_thread_from_message directly (create_thread) and auto-creates a thread for top-level channel messages via get_or_create_thread.
+"""
+kind   = "openab_decision"
+source = "crates/openab-core/src/gateway.rs"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Attachment handling caps"
+note   = """
+Text-file attachments are bounded independently of Discord's own 10 MiB upload cap: 1 MB total across all text files (TEXT_TOTAL_CAP) and max 5 files per message (TEXT_FILE_COUNT_CAP), enforced with a Discord-reported-size pre-check before download. Image URLs from Discord expire ~24h, which is surfaced to the agent in the injected block.
+"""
+kind   = "openab_decision"
+source = "crates/openab-core/src/discord.rs"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "DMs cannot hold threads"
+note   = """
+DM channels can't hold threads, so DMs reuse the DM channel directly and are treated as an implicit @mention; gated only by allow_dm + user allowlist (should_process_dm / should_skip_thread_creation).
+"""
+kind   = "openab_decision"
+source = "crates/openab-core/src/discord.rs#should_process_dm"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Finding: default file-upload cap is 10 MiB/file"
+note   = """
+Default file-upload cap is 10 MiB/file (raised by Nitro/Boost); the adapter's own text-attachment caps (1 MB total / 5 files) are stricter.
+"""
+kind   = "intrinsic"
+source = "https://docs.discord.com/developers/reference"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Finding: global REST rate limit is 50 req/sec/bot"
+note   = """
+Global REST rate limit is 50 req/sec/bot plus per-route buckets (X-RateLimit-Bucket); invalid requests capped at 10,000/10min — relevant to proactive-push and streaming edit-loop cadence.
+"""
+kind   = "intrinsic"
+source = "https://docs.discord.com/developers/topics/rate-limits"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Finding: message content hard limit is 2000 chars"
+note   = """
+Message content hard limit is 2000 chars, matching DiscordAdapter::message_limit(); the router chunks longer replies.
+"""
+kind   = "intrinsic"
+source = "https://docs.discord.com/developers/resources/channel"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Finding: thread channel types and identification"
+note   = """
+Thread channel types are ANNOUNCEMENT_THREAD (10) / PUBLIC_THREAD (11) / PRIVATE_THREAD (12), API v9+; identified by thread_metadata, not parent_id (category children also carry parent_id); detect_thread follows this.
+"""
+kind   = "intrinsic"
+source = "https://docs.discord.com/developers/resources/channel"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Finding: transport is a bot-initiated persistent WebSocket Gateway"
+note   = """
+Transport is a bot-initiated persistent WebSocket Gateway (WSS) authenticated by Identify(op 2) + bot token + intents — no per-event inbound signature to verify (unlike webhook platforms).
+"""
+kind   = "intrinsic"
+source = "https://docs.discord.com/developers/topics/gateway"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Finding: Section-2 ref audit (stale line refs corrected)"
+note   = """
+Section-2 ref audit: chunking lives in adapter.rs (split_delivery / format::split_message), not the trait def; slash-command registration is set_global_commands; is_denied_user and trusted-bot bypass live in discord.rs. Corrected stale line refs. PR # not yet assigned (was PR #TBD in the source md).
+"""
+kind   = "openab_decision"
+source = "crates/openab-core/src/discord.rs#is_denied_user"

@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/openab-core", "crates/openab-gateway"]
-exclude = ["openab-agent"]
+exclude = ["openab-agent", "crates/platform-schema"]
 
 [package]
 name = "openab"

@@ -1,0 +1,391 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  LINE — machine-readable platform schema
+#  Converted from the adapter source + official docs. Structure follows _template.toml.
+# ═══════════════════════════════════════════════════════════════════════════
+
+schema_version = "2026-07-08"
+
+[platform]
+name          = "line"
+official_docs = "https://developers.line.biz/en/docs/messaging-api/"
+description   = "LINE Messaging API — bots run as LINE Official Accounts, receiving user events via webhook and sending via Reply/Push APIs."
+
+
+# ═══ Schema 1 — platform-capability ══════════════════════════════════════════
+
+[capability.transport]
+kind   = "webhook"
+note   = "HTTPS POST to the bot's registered endpoint; events arrive as a batched events[] payload."
+source = "https://developers.line.biz/en/docs/messaging-api/receiving-messages/"
+
+[capability.inbound_auth]
+scheme = "hmac_sha256"
+note   = "HMAC-SHA256 over the raw request body, keyed by the channel secret, Base64-encoded, compared to the x-line-signature header."
+source = "https://developers.line.biz/en/reference/messaging-api/#signature-validation"
+
+[capability.threads]
+model  = "none"
+note   = "No native threads/topics. LINE has flat 1:1 chats, group chats and multi-person rooms; there is no thread or topic primitive."
+source = "https://developers.line.biz/en/reference/messaging-api/#source-user"
+
+[capability.slash_commands]
+supported = false
+note      = "Not a platform feature — no command registration/delivery API. Any /cmd is just plain message text."
+source    = "https://developers.line.biz/en/reference/messaging-api/#message-event"
+
+[capability.mentions]
+method = "self_flag"
+note   = "mention.mentionees[] on text message events; each mentionee carries an optional userId and an isSelf flag that is true for the bot itself (no username matching needed)."
+source = "https://developers.line.biz/en/reference/messaging-api/#wh-text"
+
+[capability.emoji_reactions]
+bot_can_add         = false
+bot_can_remove      = false
+bot_receives_events = false
+note                = "Bot cannot add/remove reactions (no API). Bot cannot receive them either: the documented webhook event list (message, unsend, follow/unfollow, join/leave, member join/leave, postback, video-viewing-complete, beacon, account-link, membership) contains no reaction event — verified against the current Messaging API reference, which does not surface a reaction webhook to bots."
+source              = "https://developers.line.biz/en/reference/messaging-api/#webhook-event-objects"
+
+[capability.edit_message]
+supported = false
+note      = "The API has no endpoint to edit an already-sent message."
+source    = "https://developers.line.biz/en/reference/messaging-api/"
+
+[capability.delete_message]
+supported = false
+scope     = "none"
+note      = "No bot-initiated delete. Only the user can unsend, which delivers an unsend webhook to the bot; the bot cannot delete its own or others' messages."
+source    = "https://developers.line.biz/en/reference/messaging-api/#unsend-event"
+
+[capability.rich_content]
+markdown = false
+cards    = true
+buttons  = true
+note     = "Rich messages: stickers, images, imagemap, buttons/confirm/carousel templates, and Flex Messages (JSON-defined layouts). No Markdown; text is plain (LINE emoji via product/emoji IDs)."
+source   = "https://developers.line.biz/en/docs/messaging-api/message-types/"
+
+[capability.attachments]
+inbound  = ["image", "audio", "video", "file"]
+outbound = ["image", "audio", "video", "file"]
+outbound_delivery = "url"
+note     = "Inbound via get-content by message ID (/v2/bot/message/{id}/content on the api-data.line.me host): images, video, audio, files. contentProvider.type is \"line\" (fetchable) or \"external\" (URL only, not fetchable via get-content). User-sent content auto-expires, so fetch promptly. Outbound media is sent by URL, not upload."
+source   = "https://developers.line.biz/en/reference/messaging-api/#get-content"
+
+[capability.message_length_limit]
+max_chars = 5000
+note      = "5000 characters per text message object, counted in UTF-16 code units; chunking required above this."
+source    = "https://developers.line.biz/en/reference/messaging-api/#text-message"
+
+[capability.dm_support]
+supported = true
+note      = "1:1 chat between a user and the LINE Official Account."
+source    = "https://developers.line.biz/en/reference/messaging-api/#source-user"
+
+[capability.group_model]
+kinds  = ["group", "room", "user"]
+note   = "Two multi-user taxonomies: group (groupId) and room / multi-person chat (roomId), plus 1:1 user chats. No channels/spaces."
+source = "https://developers.line.biz/en/docs/messaging-api/group-chats/"
+
+[capability.group_sender_identity]
+stable_id = "consent_gated"
+note      = "Consent-gated and unreliable: userId is optional in group/room source objects and is only present for users on LINE for iOS/Android; it can be absent otherwise."
+source    = "https://developers.line.biz/en/reference/messaging-api/#source-group"
+
+[capability.send_model]
+model                = "hybrid"
+reply_token_ttl_sec  = 60
+max_objects_per_send = 5
+note                 = "Reply API (/v2/bot/message/reply) consumes a one-time replyToken from the inbound webhook and is free; Push API (/v2/bot/message/push) targets a user/group/room ID at any time and counts against quota. Reply token must be used within ~1 minute; LINE explicitly says the limit may change without notice and use beyond one minute isn't guaranteed — don't rely on it. Both endpoints accept up to 5 message objects per request."
+source               = "https://developers.line.biz/en/reference/messaging-api/#send-reply-message"
+
+[capability.proactive_push]
+supported   = true
+quota_model = "metered"
+note        = "Via Push API, but metered: each plan has a monthly free-message quota (amount depends on subscription plan/region), with paid overage. A get-quota/consumption API exists. Up to 5 message objects per request."
+source      = "https://developers.line.biz/en/docs/messaging-api/pricing/"
+
+[capability.bot_to_bot]
+delivered = false
+note      = "LINE Official Accounts (bots) do not receive messages from other bots; webhook message events are for user-originated content."
+source    = "https://developers.line.biz/en/docs/messaging-api/overview/"
+
+[capability.typing_indicator]
+supported = true
+note      = "\"Display a loading animation\" endpoint, 1:1 chats only (\"You can't specify group chats or multi-person chats\"), rate-limited to 100 req/s. It is a loading animation while the user is viewing the chat, not a per-keystroke typing indicator."
+source    = "https://developers.line.biz/en/docs/messaging-api/use-loading-indicator/"
+
+
+# ═══ Schema 2 — openab-feature-support ═══════════════════════════════════════
+
+[[openab_features]]
+feature = "send_message"
+status  = "implemented"
+note    = "Outbound text via hybrid dispatch: tries Reply API first (free), falls back to Push API. Only {\"type\":\"text\"} objects are sent (no rich content)."
+source  = ["crates/openab-gateway/src/adapters/line.rs#dispatch_line_reply"]
+pr      = "#1291"
+
+[[openab_features]]
+feature = "message_split"
+status  = "partial"
+note    = "Router-level split_delivery + per-adapter message_limit handle length bounds generically; the LINE dispatcher itself sends a single text object per reply and does not re-chunk. LINE's own cap is 5000 chars/object."
+source  = ["crates/openab-core/src/adapter.rs#split_delivery", "crates/openab-core/src/adapter.rs#message_limit", "crates/openab-gateway/src/adapters/line.rs#dispatch_line_reply"]
+pr      = ""
+
+[[openab_features]]
+feature = "streaming"
+status  = "not_implemented"
+note    = "No native streaming; adapter does not override uses_native_streaming (trait default false) and LINE has no edit API to drive post+edit streaming. Effectively send-once/batched."
+source  = ["crates/openab-core/src/adapter.rs#uses_native_streaming", "crates/openab-core/src/adapter.rs#edit_message"]
+pr      = ""
+
+[[openab_features]]
+feature = "reply_quote"
+status  = "workaround"
+note    = "LINE \"reply\" is a delivery mechanism (reply-token), not a UI quote. dispatch_line_reply uses the token to answer in-context; there is no message-quote rendering. Reply vs Push chosen by token freshness."
+source  = ["crates/openab-gateway/src/adapters/line.rs#dispatch_line_reply"]
+pr      = "#1291"
+
+[[openab_features]]
+feature = "edit_message"
+status  = "n_a"
+note    = "LINE has no edit endpoint. Trait default edit_message returns \"edit_message not supported\"; adapter does not override."
+source  = ["crates/openab-core/src/adapter.rs#edit_message"]
+pr      = ""
+
+[[openab_features]]
+feature = "delete_message"
+status  = "n_a"
+note    = "No LINE delete endpoint. Trait default delete_message falls back to editing to a zero-width space — which also fails on LINE since edit is unsupported."
+source  = ["crates/openab-core/src/adapter.rs#delete_message"]
+pr      = ""
+
+[[openab_features]]
+feature = "emoji_reactions"
+status  = "n_a"
+note    = "LINE exposes no add/remove-reaction API. The gateway dispatcher explicitly ignores add_reaction/remove_reaction commands (logs \"ignoring unsupported command\", returns false)."
+source  = ["crates/openab-gateway/src/adapters/line.rs#dispatch_line_reply"]
+pr      = "#1291"
+
+[[openab_features]]
+feature = "threads_topics"
+status  = "n_a"
+note    = "LINE has no thread primitive. The create_topic command is explicitly ignored by the dispatcher alongside the reaction commands."
+source  = ["crates/openab-gateway/src/adapters/line.rs#dispatch_line_reply", "crates/openab-core/src/adapter.rs#create_thread"]
+pr      = ""
+
+[[openab_features]]
+feature = "media_inbound"
+status  = "partial"
+note    = "Images and audio are downloaded via get-content (/v2/bot/message/{id}/content), size-guarded (Content-Length pre-check + streaming cap), and stored (images are resized/compressed; audio stored as-is). external-provider content and missing access-token produce a status-only attachment (not dropped); video/files are not ingested (event filter passes only text/image/audio)."
+source  = ["crates/openab-gateway/src/adapters/line.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "voice_stt"
+status  = "not_implemented"
+note    = "Audio is downloaded and stored as an attachment only; no speech-to-text is performed in the LINE path."
+source  = ["crates/openab-gateway/src/adapters/line.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "trust_gate"
+status  = "implemented"
+note    = "L1 signature at ingress (HMAC-SHA256 over raw body vs x-line-signature); shared L2 scope / L3 identity trust gate applies in the gateway ingress path, keyed by platform."
+source  = ["crates/openab-gateway/src/adapters/line.rs", "crates/openab-core/src/gateway.rs#process_gateway_event"]
+pr      = "#1291"
+
+[[openab_features]]
+feature = "deny_echo"
+status  = "workaround"
+note    = "On L3 identity-deny the gateway echoes the sender their ID via adapter.send_message (throttled per platform:sender). On LINE that echo flows through the same hybrid dispatch_line_reply keyed by the original event's reply token, so it is Reply in practice (deny happens at ingress while the token is still fresh); note this is not a hard \"never Push\" guarantee — if the token were expired the shared dispatcher would still fall back to Push. 1:1 echo includes the UID; group/room echo carries no stable ID."
+source  = ["crates/openab-core/src/gateway.rs#process_gateway_event", "crates/openab-gateway/src/adapters/line.rs#dispatch_line_reply"]
+pr      = "#1291"
+
+[[openab_features]]
+feature = "mention_gating"
+status  = "implemented"
+note    = "In group/room events the adapter drops the message unless a mentionee has isSelf=true (the bot). 1:1 DMs always pass. No env var / bot-name matching needed — LINE flags self-mention."
+source  = ["crates/openab-gateway/src/adapters/line.rs"]
+pr      = "#1291"
+
+[[openab_features]]
+feature = "slash_commands"
+status  = "n_a"
+note    = "LINE has no slash-command surface; commands would arrive as plain text. /reset, /cancel handling is not wired in the LINE path (events are filtered to text/image/audio and forwarded as-is)."
+source  = ["crates/openab-gateway/src/adapters/line.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "multibot"
+status  = "n_a"
+note    = "LINE does not deliver other bots' messages, and inbound is_bot is hard-coded false, so multi-bot coordination cannot trigger on LINE."
+source  = ["crates/openab-gateway/src/adapters/line.rs"]
+pr      = "#1291"
+
+[[openab_features]]
+feature = "group_routing"
+status  = "implemented"
+note    = "Channel keyed by groupId (group) / roomId (room) / userId (1:1); a group/room missing its ID is skipped. Sender falls back to \"unknown\" when userId is absent."
+source  = ["crates/openab-gateway/src/adapters/line.rs"]
+pr      = "#1291"
+
+[[openab_features]]
+feature = "cron_dispatch"
+status  = "not_implemented"
+note    = "Not wired for scheduled cron dispatch: `VALID_PLATFORMS` (cron.rs) covers only discord/slack/telegram and no adapter is registered for this platform in `cron_adapters`, so `cronjob.toml` jobs targeting it are rejected at startup by `validate_cronjobs`."
+source  = []
+pr      = ""
+
+
+# ═══ Schema 3 — platform-quirks ══════════════════════════════════════════════
+
+[[quirks]]
+date  = "2026-07-04"
+title = "Reply/Push hybrid dispatch (the core LINE model)"
+note  = """
+LINE splits outbound sending into two APIs with different economics. Every inbound webhook carries a one-time replyToken; using it (/message/reply) is free but the token is short-lived (~1 minute, officially "may change without notice" and not guaranteed beyond one minute). Push (/message/push) works anytime but consumes the monthly quota. OpenAB caches the token at webhook receipt time (TTL tracked from true receipt, REPLY_TOKEN_TTL_SECS = 50 in crates/openab-gateway/src/lib.rs, deliberately under LINE's ~60s), tries Reply first, and only falls back to Push when the token is missing/expired. The cache is bounded (REPLY_TOKEN_CACHE_MAX = 10_000) and swept periodically.
+
+Duplicate-safety bias: on a Reply API error that is not a clearly-unusable-token 400 (e.g. network error, or a non-token 4xx/5xx), the dispatcher does not fall back to Push — it assumes the reply may have landed and returns used_reply=true to avoid double-sending. Only an explicit "invalid … reply token" or "expired" 400 triggers Push fallback.
+"""
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/lib.rs#REPLY_TOKEN_TTL_SECS"
+refs   = ["#1291"]
+
+[[quirks]]
+date  = "2026-07-04"
+title = "Sender identity is best-effort, \"unknown\" is never trusted"
+note  = """
+userId is optional in group/room sources (present only for LINE iOS/Android users). When absent, the sender collapses to the literal "unknown". Decision: "unknown" is never allowlistable — it cannot be added to allowed_users, because it is not a stable identity. Group admission for LINE is instead gated by self-mention.
+"""
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/line.rs"
+refs   = ["#1291"]
+
+[[quirks]]
+date  = "2026-07-04"
+title = "@mention gating in groups/rooms"
+note  = """
+In group/room events the adapter forwards the message only if some mentionee has isSelf=true — i.e. the bot itself was @-mentioned. 1:1 DMs always pass. This relies entirely on LINE's isSelf flag, so no bot-name string matching or env var is needed. A group/room text with no mention object, or one where only other users are mentioned, is dropped.
+"""
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/line.rs"
+refs   = ["#1291"]
+
+[[quirks]]
+date  = "2026-07-04"
+title = "Early-ack webhook processing"
+note  = """
+The webhook handler validates the signature, returns 200 OK, then spawns background processing so slow image/audio downloads don't cause LINE to redeliver. Tradeoff (documented in-code): once acked, a later crash is not retried by LINE, and cross-payload ordering can invert if an image event is slower than a following text event. A shared semaphore (line_webhook_semaphore, LINE_WEBHOOK_CONCURRENCY_MAX) bounds concurrent post-ack work to cap backlog under bursts; a saturated semaphore makes new webhooks wait before spawning.
+"""
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/line.rs"
+refs   = ["#1291"]
+
+[[quirks]]
+date  = "2026-07-04"
+title = "is_bot always false"
+note  = """
+Inbound events hard-code is_bot=false because LINE never delivers other bots' messages to a bot. This means the shared multibot machinery is inert on LINE by construction.
+"""
+kind   = "intrinsic"
+source = "crates/openab-gateway/src/adapters/line.rs"
+refs   = []
+
+[[quirks]]
+date  = "2026-07-04"
+title = "External-content and unsupported media are surfaced, not silently dropped"
+note  = """
+When an image/audio uses contentProvider.type == "external", or the access token is unconfigured, the adapter emits an attachment with a status string (e.g. "unsupported format: external content not supported", "configuration error: service not configured") rather than dropping the event — so the agent still sees that media was present. Video and generic files are filtered out earlier (only text/image/audio pass the type filter).
+"""
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/line.rs"
+refs   = []
+
+[[quirks]]
+date  = "2026-07-04"
+title = "No reaction webhook event; edit/delete endpoints absent"
+note  = """
+No reaction webhook event in the documented Messaging API event list — bots can neither add/remove nor receive reactions; edit/delete endpoints also absent. Confirms reactions/edit/delete are n/a in OpenAB.
+"""
+kind   = "intrinsic"
+source = "https://developers.line.biz/en/reference/messaging-api/#webhook-event-objects"
+refs   = []
+
+[[quirks]]
+date  = "2026-07-04"
+title = "Reply token ~1-minute window; 5 objects per request"
+note  = """
+Reply token must be used within ~1 minute; LINE warns the limit may change without notice and use beyond one minute isn't guaranteed — motivates the conservative 50s TTL. Both Reply and Push accept up to 5 message objects per request.
+"""
+kind   = "intrinsic"
+source = "https://developers.line.biz/en/docs/messaging-api/sending-messages/"
+refs   = []
+
+[[quirks]]
+date  = "2026-07-04"
+title = "Text message objects cap at 5000 chars (UTF-16)"
+note  = """
+LINE text message objects cap at 5000 chars (counted in UTF-16 code units).
+"""
+kind   = "intrinsic"
+source = "https://developers.line.biz/en/reference/messaging-api/#text-message"
+refs   = []
+
+[[quirks]]
+date  = "2026-07-04"
+title = "Loading-animation (typing) indicator is 1:1-only"
+note  = """
+Loading-animation ("typing") indicator is 1:1-only ("You can't specify group chats or multi-person chats"), rate-limited 100 req/s.
+"""
+kind   = "intrinsic"
+source = "https://developers.line.biz/en/docs/messaging-api/use-loading-indicator/"
+refs   = []
+
+[[quirks]]
+date  = "2026-07-04"
+title = "userId optional in group/room sources"
+note  = """
+userId is optional in group/room sources and only present for LINE iOS/Android users — confirms "unknown" sender is intrinsic, not a bug.
+"""
+kind   = "intrinsic"
+source = "https://developers.line.biz/en/reference/messaging-api/#source-group"
+refs   = []
+
+[[quirks]]
+date  = "2026-07-04"
+title = "Inbound media fetched via get-content by message ID"
+note  = """
+Inbound media is fetched via get-content by message ID on the api-data.line.me host; contentProvider.type is line (fetchable) or external (URL only); user content auto-expires — fetch promptly.
+"""
+kind   = "intrinsic"
+source = "https://developers.line.biz/en/reference/messaging-api/#get-content"
+refs   = []
+
+[[quirks]]
+date  = "2026-07-04"
+title = "Push metered by plan-dependent monthly free quota; Reply free"
+note  = """
+Push is metered by a plan-dependent monthly free-message quota; Reply API is free — the economic basis for the hybrid model. Open item (unknowable without running the platform): the exact monthly Push free-message quota is plan/region-dependent and not a fixed documented constant — its numeric value must be read from the account's plan / the get-quota API at runtime rather than stated here.
+"""
+kind   = "intrinsic"
+source = "https://developers.line.biz/en/docs/messaging-api/pricing/"
+refs   = []
+
+[[quirks]]
+date  = "2026-07-04"
+title = "deny-echo reuses hybrid dispatch (Reply in practice)"
+note  = """
+deny-echo on LINE reuses the hybrid dispatch_line_reply keyed by the original event token: Reply in practice (fresh token at ingress), but not a hard "never Push" guarantee — an expired token would fall back to Push like any reply.
+"""
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/line.rs#dispatch_line_reply"
+refs   = ["#1291"]
+
+[[quirks]]
+date  = "2026-07-04"
+title = "LINE adapter design summary"
+note  = """
+LINE adapter design: L1 HMAC-SHA256 at ingress, group two-mode admission via isSelf mention-gating, "unknown" never allowlistable, is_bot always false, early-ack + semaphore-bounded background processing, single text object per reply.
+"""
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/line.rs"
+refs   = ["#1291"]

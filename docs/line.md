@@ -102,6 +102,20 @@ platform = "line"
 
 > **Tip:** To find a LINE user ID, check the gateway logs — the sender ID is logged for each incoming message. By default all users and channels are allowed. Setting `allowed_users` or `allowed_channels` automatically restricts access to only those listed.
 
+### User Trust (`[line]` section)
+
+Identity trust defaults to **deny-all** (identity-trust-none ADR): unknown senders are rejected until explicitly admitted. Configure trust with a first-class `[line]` section:
+
+```toml
+[line]
+allowed_users = ["U1234567890abcdef0123456789abcdef"]  # LINE user IDs (U…, 33 chars)
+# allow_all_users = true   # explicit opt-in only — any user can drive the agent
+```
+
+Each field falls back to its `LINE_ALLOW_ALL_USERS` / `LINE_ALLOWED_USERS` env var when unset. This replaces the uniform `GATEWAY_ALLOW_ALL_USERS` / `GATEWAY_ALLOWED_USERS` env vars for LINE:
+
+> ⚠️ **Deprecated:** driving LINE trust through `GATEWAY_ALLOW_ALL_USERS` / `GATEWAY_ALLOWED_USERS` still works but logs a startup warning; it will become a startup error in a later phase. Migrate to `[line]` (or `LINE_*` env vars).
+
 ## 6. Add the Bot as Friend
 
 In the LINE Developers Console → **Messaging API** tab → scan the QR code with your LINE app, or search for the bot by its LINE ID.
@@ -140,6 +154,8 @@ In the LINE Developers Console → **Messaging API** tab → scan the QR code wi
 |---|---|---|
 | `LINE_CHANNEL_SECRET` | Yes | Channel secret for webhook signature validation |
 | `LINE_CHANNEL_ACCESS_TOKEN` | Yes | Channel access token for Reply/Push Message API and LINE-hosted image/audio downloads |
+| `LINE_ALLOW_ALL_USERS` | No | `true` = any user may interact. Fallback for `[line].allow_all_users`; default deny-all |
+| `LINE_ALLOWED_USERS` | No | Comma-separated LINE user IDs. Fallback for `[line].allowed_users` |
 
 ## Troubleshooting
 

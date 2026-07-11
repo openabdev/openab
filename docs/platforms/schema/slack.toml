@@ -1,0 +1,335 @@
+# Slack — machine-readable platform schema
+# Converted from the adapter source + official docs. See _template.toml for the schema.
+
+schema_version = "2026-07-08"
+
+[platform]
+name          = "slack"
+official_docs = "https://docs.slack.dev/"
+description   = "Slack workspace messaging platform; OpenAB uses a native Socket Mode adapter."
+
+
+# ═══ Schema 1 — platform-capability ══════════════════════════════════════════
+
+[capability.transport]
+kind   = "socket_mode"
+note   = "Persistent WebSocket obtained from apps.connections.open; no public URL."
+source = "https://docs.slack.dev/apis/events-api/using-socket-mode"
+
+[capability.inbound_auth]
+scheme = "none"
+note   = "None per-event. The WebSocket is pre-authenticated by the app-level token (xapp-) sent in the Authorization header to open it; inbound events need no HMAC/signature validation (explicitly unlike the HTTP Events API, where each event must be validated)."
+source = "https://docs.slack.dev/apis/events-api/using-socket-mode"
+
+[capability.threads]
+model  = "native"
+note   = "A thread is implicit: any message posted with thread_ts = a parent message's ts becomes a reply in that thread. reply_broadcast=true optionally also surfaces the reply to the whole channel (default false = thread-only)."
+source = "https://docs.slack.dev/reference/methods/chat.postMessage"
+
+[capability.slash_commands]
+supported = true
+note      = "Supported but HTTP-only — registered in app config with a Request URL; delivered via HTTP POST, not Socket Mode events. Developer slash commands cannot be invoked in message threads (only built-ins like /remind can)."
+source    = "https://docs.slack.dev/interactivity/implementing-slash-commands"
+
+[capability.mentions]
+method = "at_mention"
+note   = "@bot renders in event text as <@BOT_UID> (or labelled <@BOT_UID|handle>); a dedicated app_mention event also fires. DMs are an implicit mention (no app_mention)."
+source = "https://docs.slack.dev/reference/events/message/"
+
+[capability.emoji_reactions]
+bot_can_add        = true
+bot_can_remove     = true
+bot_receives_events = true
+note               = "Bot can add (reactions.add) and remove (reactions.remove) with reactions:write; receives reaction_added/reaction_removed events. Per-item caps on distinct emoji and per-person reactions."
+source             = "https://docs.slack.dev/reference/methods/reactions.add"
+
+[capability.edit_message]
+supported = true
+note      = "chat.update, but only messages the bot itself authored (cant_update_message otherwise). Tier-3 rate limit; edit_window_closed if the workspace's message-edit settings forbid the edit."
+source    = "https://docs.slack.dev/reference/methods/chat.update"
+
+[capability.delete_message]
+supported = true
+scope     = "own"
+note      = "chat.delete with chat:write — with a bot token, deletes only messages posted by that bot; cannot delete users'/other bots' messages (no impersonation accommodation)."
+source    = "https://docs.slack.dev/reference/methods/chat.delete"
+
+[capability.rich_content]
+markdown = true
+cards    = true
+buttons  = true
+note     = "Block Kit (sections, buttons, cards, and a markdown block) + legacy mrkdwn. A Block Kit markdown block renders real headings/lists/tables/code fences."
+source   = "https://docs.slack.dev/reference/methods/chat.postMessage"
+
+[capability.attachments]
+inbound     = ["image", "audio", "video", "file"]
+outbound    = ["image", "audio", "video", "file"]
+max_size_mb = 1024
+note        = "Inbound: any file the bot can see, downloaded with the bot token (files:read). Outbound uploads capped at 1 GB per file (hard limit on all plans); free workspaces additionally cap total storage at 5 GB. Note: files.upload is deprecated — sunset 2025-11-12, replaced by files.getUploadURLExternal + files.completeUploadExternal."
+source      = "https://docs.slack.dev/changelog/2019-03-wild-west-for-files-no-more/"
+
+[capability.message_length_limit]
+max_chars = 12000
+note      = "text: recommended <= 4,000 chars, hard-truncated by Slack at 40,000. markdown_text (and the Block Kit markdown block the adapter uses): up to 12,000 chars."
+source    = "https://docs.slack.dev/reference/methods/chat.postMessage"
+
+[capability.dm_support]
+supported = true
+note      = "1:1 IM channels (channel IDs start with D)."
+source    = "https://docs.slack.dev/reference/events/message/"
+
+[capability.group_model]
+kinds  = ["channel_public", "channel_private", "im", "mpim", "thread"]
+note   = "workspace → channels (public C… / private G…), plus IM (D…) and multi-party IM (mpim); threads inside channels."
+source = "https://docs.slack.dev/reference/events/message/"
+
+[capability.group_sender_identity]
+stable_id = "yes"
+note      = "Stable per-user user (U…) ID on every message event; resolvable to display/real name via users.info. Bot senders carry bot_id (B…) instead. Not consent-gated within an authorized workspace."
+source    = "https://docs.slack.dev/reference/events/message/"
+
+[capability.send_model]
+model               = "push_only"
+note                = "Push — no reply-window/token TTL. Any chat.postMessage targeting a channel the bot is in; threading is thread_ts, not a time-bounded reply token."
+source              = "https://docs.slack.dev/reference/methods/chat.postMessage"
+
+[capability.proactive_push]
+supported   = true
+quota_model = "metered"
+note        = "Bot may post unsolicited to channels it's a member of. Rate: no more than 1 message/second/channel (short bursts tolerated). chat.postMessage is a Special Tier method carrying both this per-channel limit and a workspace-wide limit."
+source      = "https://docs.slack.dev/apis/web-api/rate-limits/"
+
+[capability.bot_to_bot]
+delivered = true
+note      = "Other bots' messages are delivered as message events with subtype: bot_message and a bot_id/bot_profile; the receiving app must opt to process them."
+source    = "https://docs.slack.dev/reference/events/message/bot_message/"
+
+[capability.typing_indicator]
+supported = false
+note      = "Not used as a typing dot. Assistant mode instead surfaces an ephemeral status line via assistant.threads.setStatus (Thinking…)."
+source    = "https://docs.slack.dev/reference/methods/assistant.threads.setStatus"
+
+
+# ═══ Schema 2 — openab-feature-support ═══════════════════════════════════════
+
+[[openab_features]]
+feature = "send_message"
+status  = "implemented"
+note    = "chat.postMessage with Block Kit markdown blocks + text/mrkdwn fallback. Graceful degrade to text-only on invalid_blocks/msg_blocks_too_long."
+source  = ["crates/openab-core/src/slack.rs#send_message"]
+pr      = ""
+
+[[openab_features]]
+feature = "message_split"
+status  = "implemented"
+note    = "message_limit() = 11,900 (Block Kit markdown cap 12k minus ~100 headroom, MARKDOWN_BLOCK_LIMIT); router splits at that bound and each chunk is one markdown block via format::split_message. Known gap: split_message isn't table-aware, so a single table > 11,900 splits mid-table into raw pipes (continuation blocks lack the header/separator rows)."
+source  = ["crates/openab-core/src/slack.rs#message_limit", "crates/openab-core/src/slack.rs#MARKDOWN_BLOCK_LIMIT"]
+pr      = ""
+
+[[openab_features]]
+feature = "streaming"
+status  = "implemented"
+note    = "Native streaming via chat.startStream/appendStream/stopStream when streaming && assistant_mode && !other_bot_present (uses_native_streaming); otherwise degrades to a post+edit placeholder; streaming=false = send-once. stopStream closes content-free (append semantics would duplicate — #1055), then chat.update writes the clean finalized Block Kit copy."
+source  = ["crates/openab-core/src/slack.rs#uses_native_streaming"]
+pr      = "#1055"
+
+[[openab_features]]
+feature = "reply_quote"
+status  = "partial"
+note    = "No send_message_with_reply override → uses the trait default (adapter.rs) = plain send_message (reply_to ignored). Slack threading is instead expressed via thread_ts on the channel ref."
+source  = ["crates/openab-core/src/adapter.rs#send_message_with_reply", "crates/openab-core/src/slack.rs#send_message"]
+pr      = ""
+
+[[openab_features]]
+feature = "edit_message"
+status  = "implemented"
+note    = "chat.update with the same block payload + text-only degrade on invalid_blocks/msg_blocks_too_long. Also the substrate for degraded-stream mid-edits and stream finalization."
+source  = ["crates/openab-core/src/slack.rs#edit_message"]
+pr      = ""
+
+[[openab_features]]
+feature = "delete_message"
+status  = "workaround"
+note    = "No delete_message override → the trait default (adapter.rs) edits the message to a zero-width space (\\u{200b}) via edit_message rather than calling chat.delete. Effectively blanks, doesn't remove."
+source  = ["crates/openab-core/src/adapter.rs#delete_message"]
+pr      = ""
+
+[[openab_features]]
+feature = "emoji_reactions"
+status  = "implemented"
+note    = "reactions.add/reactions.remove; treats already_reacted/no_reaction as success (idempotent). Unicode→Slack shortname map is limited to a default set; unmapped emoji fall back to grey_question."
+source  = ["crates/openab-core/src/slack.rs#add_reaction", "crates/openab-core/src/slack.rs#remove_reaction"]
+pr      = ""
+
+[[openab_features]]
+feature = "threads_topics"
+status  = "implemented"
+note    = "create_thread is a no-op mapping: returns a channel ref with thread_id = trigger ts (Slack threads are implicit, created by posting with thread_ts). No gateway create_topic (native adapter)."
+source  = ["crates/openab-core/src/slack.rs#create_thread"]
+pr      = ""
+
+[[openab_features]]
+feature = "media_inbound"
+status  = "implemented"
+note    = "Images (download+encode), text files (5-file / 1 MB total cap, TEXT_FILE_COUNT_CAP/TEXT_TOTAL_CAP, mirroring Discord #291), audio → STT. Private files fetched with the bot token; failed images trigger a files:read/format hint message."
+source  = ["crates/openab-core/src/slack.rs#TEXT_FILE_COUNT_CAP", "crates/openab-core/src/slack.rs#TEXT_TOTAL_CAP"]
+pr      = ""
+
+[[openab_features]]
+feature = "voice_stt"
+status  = "implemented"
+note    = "Audio attachments transcribed via media::download_and_transcribe when stt.enabled; transcript injected as a leading text block + best-effort echo (stt::post_echo). STT disabled → 🎤 reaction ack."
+source  = ["crates/openab-core/src/media.rs#download_and_transcribe", "crates/openab-core/src/stt.rs#post_echo"]
+pr      = ""
+
+[[openab_features]]
+feature = "trust_gate"
+status  = "implemented"
+note    = "Two layers, mirroring Discord Phase 1 (#1270): adapter-level inline allowlists (allowed_channels, allowed_users, plus trusted_bot_ids resolution B…→U… via bots.info for bot senders) + shared L3 identity gate router.gate_incoming after the inline check (redundant-but-matching; humans only — bots bypass via trust::l3_gate_applies; is_dm from the D… conversation-ID prefix). Registry entry seeded from resolved [slack] config (L2 open, L3 mirrors allow_all_users/allowed_users)."
+source  = ["crates/openab-core/src/slack.rs#l3_gate_applies", "crates/openab-core/src/slack.rs#is_dm_channel", "crates/openab-core/src/adapter.rs#gate_incoming", "crates/openab-core/src/trust.rs#l3_gate_applies"]
+pr      = ""
+
+[[openab_features]]
+feature = "deny_echo"
+status  = "partial"
+note    = "On a denied user, no text reply — reacts 🚫 to the offending message (add_reaction, inside the allowed_users deny branch). This is the native adapter's own deny UX, not the gateway's DenyIdentity ID-echo path."
+source  = ["crates/openab-core/src/slack.rs#add_reaction", "crates/openab-core/src/slack.rs#allowed_users"]
+pr      = ""
+
+[[openab_features]]
+feature = "mention_gating"
+status  = "implemented"
+note    = "Per allow_user_messages: Mentions requires <@bot>; Involved requires bot participation in the thread; MultibotMentions additionally requires an @mention once another bot is in the thread. DMs are implicit mentions. app_mention handles the @-path (deduped against message)."
+source  = ["crates/openab-core/src/slack.rs#bot_participated_in_thread"]
+pr      = ""
+
+[[openab_features]]
+feature = "slash_commands"
+status  = "not_implemented"
+note    = "slash_commands and interactive envelopes are ack'd and dropped: slash commands are blocked in thread composers and channel-level delivery lacks the thread_ts needed to route to a session. No in-text /reset//cancel parsing in the native path either (that lives in the gateway path)."
+source  = ["crates/openab-core/src/slack.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "multibot"
+status  = "implemented"
+note    = "Eager other-bot detection on inbound bot messages (note_other_bot_in_thread), persisted to a disk cache (irreversible). Disables streaming (use_streaming/uses_native_streaming gate on other_bot_present) and, with MultibotMentions, requires @mention. Consecutive-bot-turn cap (MAX_CONSECUTIVE_BOT_TURNS = 1000) + BotTurnTracker soft/hard limits guard loops."
+source  = ["crates/openab-core/src/slack.rs#note_other_bot_in_thread", "crates/openab-core/src/slack.rs#MAX_CONSECUTIVE_BOT_TURNS"]
+pr      = ""
+
+[[openab_features]]
+feature = "group_routing"
+status  = "implemented"
+note    = "Routed through Dispatcher; key is grouping-dependent — slack:<thread_id> in Thread mode or slack:<thread_id>:<sender_id> in Lane mode (Dispatcher::key), with thread_id falling back to channel_id outside a thread. Sender context is serialized with the Slack-native thread_ts key so agents calling the API directly see the right field."
+source  = ["crates/openab-core/src/dispatch.rs#key", "crates/openab-core/src/slack.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "cron_dispatch"
+status  = "implemented"
+note    = "`cronjob.toml` jobs with `platform = \"slack\"` fire via the shared scheduler: `slack` is in `VALID_PLATFORMS` and `main` registers the Slack adapter under `\"slack\"` in `cron_adapters`, so `fire_cronjob` dispatches through `adapter.send_message`. Cron dispatch intentionally bypasses the L2/L3 ingress trust gate — jobs are operator-authored in config, not untrusted inbound."
+source  = ["crates/openab-core/src/cron.rs#VALID_PLATFORMS", "crates/openab-core/src/cron.rs#fire_cronjob", "src/main.rs#cron_adapters"]
+pr      = ""
+
+
+# ═══ Schema 3 — platform-quirks ══════════════════════════════════════════════
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Socket Mode keepalive (deaf-socket guard)"
+note   = "Slack's inbound WebSocket can go half-open (NAT idle-timeout silently drops inbound frames with no Close/FIN), leaving read.next() blocked forever so the reconnect loop never fires — the bot appears connected but goes deaf. The adapter pings every 30s (PING_INTERVAL_SECS) and force-reconnects if no inbound frame — including Slack's own pings — arrives within 75s (IDLE_TIMEOUT_SECS). Backoff doubles to a 30s cap, mirroring the gateway: 1,2,4,8,16,30,30…"
+kind   = "openab_decision"
+source = "crates/openab-core/src/slack.rs#PING_INTERVAL_SECS"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Native streaming duplication trap (#1055)"
+note   = "chat.stopStream's markdown_text appends, it does not replace. Passing the full reply at finish would duplicate the entire message. The adapter closes the stream content-free, then chat.updates the finalized Block Kit copy. On the active path a failed final chat.update must NOT fall back to postMessage (would post a duplicate); on the degraded (post+edit) path it must, since no streamed content exists."
+kind   = "openab_decision"
+source = "crates/openab-core/src/slack.rs#uses_native_streaming"
+refs   = ["#1055"]
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Block Kit markdown vs legacy mrkdwn"
+note   = "Messages are sent as Block Kit markdown blocks (12k cap; real headings/tables/code fences), with a markdown_to_mrkdwn text fallback for notifications/a11y. message_limit is bumped 4000→11,900 to keep typical Markdown tables in one block; renders_native_tables()=true tells the router to skip the convert_tables pre-pass. Workspaces that reject the block (invalid_blocks/msg_blocks_too_long) get an automatic text-only retry (is_block_payload_rejected matches the trailing error code exactly, so invalid_blocks_field does not falsely trigger)."
+kind   = "openab_decision"
+source = "crates/openab-core/src/slack.rs#is_block_payload_rejected"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "app_mention vs message dedup"
+note   = "Both app_mention and message events can fire for one @mention. The adapter routes the @-path through app_mention and skips mention-bearing message events (except in DMs, where app_mention doesn't fire). Eager multibot detection and bot-turn tracking run BEFORE the self/bot gates (own-message skip) so own and filtered-out bot messages still count and are still detected (mirrors Discord #481/#483)."
+kind   = "openab_decision"
+source = "crates/openab-core/src/slack.rs#note_other_bot_in_thread"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Positive-only, fail-closed caches"
+note   = "Participation and multibot are irreversible states, so their caches store positive results only; multibot is also disk-persisted (multibot_cache) to survive restarts. Thread-history checks (bot_participated_in_thread, and the AllowBots::All consecutive-bot loop cap) fail closed — an API error rejects the message rather than risk an unauthorized/looping response."
+kind   = "openab_decision"
+source = "crates/openab-core/src/slack.rs#bot_participated_in_thread"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Native trust divergence"
+note   = "The Slack adapter predates the unified trust gate and enforced access only with inline allowed_channels/allowed_users/trusted_bot_ids checks. Since the Slack Phase 1 wiring (#1361/#1363), the shared AdapterRouter::gate_incoming also runs after the inline user check (redundant-but-matching, non-regressive). Deny UX remains the adapter's 🚫 reaction, not the gateway's DenyIdentity identity-echo. Phase 1c makes the shared gate authoritative and removes the inline checks."
+kind   = "openab_decision"
+source = "crates/openab-core/src/adapter.rs#with_trust"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "files.upload sunset; separate 1 GB / 5 GB caps"
+note   = "files.upload sunsets 2025-11-12, replaced by files.getUploadURLExternal+files.completeUploadExternal; the 1 GB/file and 5 GB/free-workspace caps are separate, longstanding limits (the 5 GB cap dates to the 2019-03 changelog)."
+kind   = "intrinsic"
+source = "https://docs.slack.dev/changelog/2024-04-a-better-way-to-upload-files-is-here-to-stay/"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Socket Mode needs no per-event signature validation"
+note   = "Socket Mode is pre-authenticated by the xapp- app-level token (sent in the Authorization header to apps.connections.open); inbound events need no per-event HMAC/signature validation — the docs state this explicitly, unlike the HTTP Events API."
+kind   = "intrinsic"
+source = "https://docs.slack.dev/apis/events-api/using-socket-mode"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Developer slash commands are HTTP-only, not usable in threads"
+note   = "Developer slash commands cannot be invoked in message threads and are delivered over HTTP only — matching the adapter's decision to ack-and-drop slash_commands envelopes."
+kind   = "intrinsic"
+source = "https://docs.slack.dev/interactivity/implementing-slash-commands"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "chat.update / chat.delete own-message-only constraints"
+note   = "chat.update fails with cant_update_message on non-own messages and edit_window_closed under workspace edit settings (Tier 3); chat.delete with a bot token deletes only that bot's own messages — which is why OpenAB's delete uses a zero-width-space edit fallback rather than assuming cross-author delete."
+kind   = "intrinsic"
+source = "https://docs.slack.dev/reference/methods/chat.delete"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "chat.postMessage length limits (basis for 11,900 message_limit)"
+note   = "chat.postMessage limits: text recommended <=4,000 / truncated at 40,000; markdown_text (and the Block Kit markdown block) up to 12,000 — the basis for the 11,900 message_limit."
+kind   = "intrinsic"
+source = "https://docs.slack.dev/reference/methods/chat.postMessage"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Other bots' messages delivered as bot_message events"
+note   = "Other bots' messages ARE delivered as message events with subtype: bot_message + bot_id; OpenAB gates them via allow_bot_messages and trusted_bot_ids."
+kind   = "intrinsic"
+source = "https://docs.slack.dev/reference/events/message/bot_message/"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Proactive posting rate limit (1 msg/sec/channel)"
+note   = "Proactive posting rate = no more than 1 message/second/channel (bursts tolerated; chat.postMessage is a Special Tier method); relevant to multibot loop caps."
+kind   = "intrinsic"
+source = "https://docs.slack.dev/apis/web-api/rate-limits/"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "chat.stopStream appends rather than replaces"
+note   = "chat.stopStream appends rather than replaces — passing full content at finish duplicated the whole reply; fixed by close-then-chat.update."
+kind   = "openab_decision"
+source = "https://docs.slack.dev/reference/methods/chat.postMessage"
+refs   = ["#1055"]

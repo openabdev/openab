@@ -135,6 +135,25 @@ Custom Gateway adapter for platforms like Telegram, LINE, Feishu/Lark, and Googl
 
 ---
 
+## `[line]`
+
+First-class L3 identity trust for the LINE adapter (identity-trust-none ADR, Phase 1). Replaces the uniform `GATEWAY_ALLOW_ALL_USERS` / `GATEWAY_ALLOWED_USERS` env vars for LINE — relying on those for LINE is deprecated and warns at startup. Channel credentials remain on the `LINE_CHANNEL_SECRET` / `LINE_CHANNEL_ACCESS_TOKEN` env vars.
+
+Each field resolves: config value → `LINE_*` env var → default (deny-all).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `allow_all_users` | bool \| omit | `false` (deny-all) | `true` = any user may interact (bypasses `allowed_users` entirely); `false`/omitted = only `allowed_users`. Env fallback: `LINE_ALLOW_ALL_USERS`. |
+| `allowed_users` | string[] | `[]` | LINE user IDs (`U…`, 33 chars) allowed to interact. Only checked when `allow_all_users` resolves to false. Env fallback: `LINE_ALLOWED_USERS` (comma-separated). |
+
+```toml
+[line]
+allowed_users = ["U1234567890abcdef0123456789abcdef"]
+# allow_all_users = true   # explicit opt-in only — any user can drive the agent
+```
+
+---
+
 ## `[agent]`
 
 The AI agent subprocess that OpenAB spawns to handle messages via ACP.

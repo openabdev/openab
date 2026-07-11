@@ -1,0 +1,360 @@
+# Generated from the adapter source + official docs — see docs/platforms/README.md for schemas.
+
+schema_version = "2026-07-08"
+
+[platform]
+name          = "telegram"
+official_docs = "https://core.telegram.org/bots/api"
+description   = "Telegram Bot API — webhook-delivered Update objects for bots in DMs, groups, supergroups (with forum topics), and channels."
+
+
+# ═══ Schema 1 — platform-capability ══════════════════════════════════════════
+
+[capability.transport]
+kind   = "webhook"
+note   = "JSON POST of `Update`; long-poll `getUpdates` also exists but OpenAB uses webhook."
+source = "https://core.telegram.org/bots/api#getting-updates"
+
+[capability.inbound_auth]
+scheme = "shared_secret"
+note   = "L1 only: `X-Telegram-Bot-Api-Secret-Token` header (opaque shared secret set on `setWebhook`) + optional source-IP allowlist (149.154.160.0/20, 91.108.4.0/22). No HMAC/body signature."
+source = "https://core.telegram.org/bots/webhooks"
+
+[capability.threads]
+model  = "native"
+note   = "Native forum topics only: supergroups with topics enabled carry `message_thread_id`, created via `createForumTopic`. Non-forum chats have no threading (reply-to quoting exists separately)."
+source = "https://core.telegram.org/bots/api#createforumtopic"
+
+[capability.slash_commands]
+supported = true
+note      = "`/command` text arrives as a `bot_command` entity; discoverable list registered via `setMyCommands`. Command names ≤32 chars, Latin letters/digits/underscores. Delivery is just message text — the bot parses it."
+source    = "https://core.telegram.org/bots/api#setmycommands"
+
+[capability.mentions]
+method = "username"
+note   = "Two entity types: `mention` (`@username`) and `text_mention` (users without a username, carries a `User`). Privacy mode ON limits which messages a group bot sees (commands meant for it, replies, service messages, etc.)."
+source = "https://core.telegram.org/bots/api#messageentity"
+
+[capability.emoji_reactions]
+bot_can_add        = true
+bot_can_remove     = true
+bot_receives_events = true
+note               = "Add/set via `setMessageReaction` (replaces the bot's whole reaction set; non-premium limited to one emoji from the allowed set); remove = set to empty. Receiving `message_reaction` requires the bot be a chat admin + explicit `message_reaction` in `allowed_updates`, and 'The update isn't received for reactions set by bots.'"
+source             = "https://core.telegram.org/bots/api#setmessagereaction"
+
+[capability.edit_message]
+supported = true
+note      = "`editMessageText` (also `editMessageCaption`/`editMessageMedia`) on the bot's own messages."
+source    = "https://core.telegram.org/bots/api#editmessagetext"
+
+[capability.delete_message]
+supported = true
+scope     = "own_and_others"
+note      = "`deleteMessage`: a bot can delete its own outgoing messages; others' only with admin `can_delete_messages`. A message can only be deleted if sent less than 48 hours ago (with narrow exceptions: service messages / a bot's own messages / channel/anonymous-admin cases)."
+source    = "https://core.telegram.org/bots/api#deletemessage"
+
+[capability.rich_content]
+markdown = true
+cards    = false
+buttons  = true
+note     = "Markdown/MarkdownV2 + HTML `parse_mode`; inline keyboards / reply keyboards / callback buttons. Bot API 10.1 (2026-06-11) added `sendRichMessage` + `InputRichMessage` for GFM-style rich blocks (tables, headings, syntax-highlighted code) — see quirks. No legacy 'card' object beyond keyboards."
+source   = "https://core.telegram.org/bots/api#formatting-options"
+
+[capability.attachments]
+inbound     = ["image", "audio", "video", "file"]
+outbound    = ["image", "audio", "video", "file"]
+max_size_mb = 20
+note        = "inbound: photo, document, voice, audio, video, etc.; outbound: photo/document/etc. Download via `getFile` capped at 20 MB on the cloud Bot API (up to 2 GB only with a self-hosted local Bot API server). Send caps: photos ~10 MB, other files 50 MB."
+source      = "https://core.telegram.org/bots/api#getfile"
+
+[capability.message_length_limit]
+max_chars = 4096
+note      = "`sendMessage` text: 1–4096 UTF-8 chars; captions 1024. Longer plain text must be chunked. Rich messages via `sendRichMessage` accept larger content — see quirks; exact ceiling ? (unverified from truncated docs)."
+source    = "https://core.telegram.org/bots/api#sendmessage"
+
+[capability.dm_support]
+supported = true
+note      = "1:1 private chat; the user must `/start` the bot first — bots cannot initiate a private chat."
+source    = "https://core.telegram.org/bots/faq"
+
+[capability.group_model]
+kinds  = ["private", "group", "supergroup", "channel"]
+note   = "private (DM), group, supergroup (optionally forum = topics), channel. `chat.type` distinguishes them."
+source = "https://core.telegram.org/bots/api#chat"
+
+[capability.group_sender_identity]
+stable_id = "yes"
+note      = "Stable numeric `from.id` present on group messages (not consent-gated), unless sent on behalf of a chat (`sender_chat`). Privacy mode limits which messages the bot sees, not the identity of the ones it does."
+source    = "https://core.telegram.org/bots/api#message"
+
+[capability.send_model]
+model               = "push_only"
+note                = "Push model: the bot may send to any chat it shares with the user at any time (no reply-window/TTL). Reply/quote via `reply_parameters`. Rate-limited (see proactive_push)."
+source              = "https://core.telegram.org/bots/api#sendmessage"
+
+[capability.proactive_push]
+supported   = true
+quota_model = "metered"
+note        = "Allowed to any user who has started the bot / any group it's in. Rate limits (per FAQ): avoid >1 msg/s per chat; bulk broadcast not more than ~30 msg/s overall; not more than 20 msg/min in a group. No reply-window gating."
+source      = "https://core.telegram.org/bots/faq"
+
+[capability.bot_to_bot]
+delivered = false
+note      = "Per FAQ, 'Bots will not be able to see messages from other bots regardless of mode.' `is_bot` is present on `from` for the rare forwarded/quoted cases."
+source    = "https://core.telegram.org/bots/faq"
+
+[capability.typing_indicator]
+supported = true
+note      = "`sendChatAction` (e.g. `typing`) auto-clears after ~5s or on next message. Not used by the OpenAB adapter."
+source    = "https://core.telegram.org/bots/api#sendchataction"
+
+
+# ═══ Schema 2 — openab-feature-support ═══════════════════════════════════════
+
+[[openab_features]]
+feature = "send_message"
+status  = "implemented"
+note    = "`sendMessage` with `parse_mode: Markdown`; on a Markdown parse error (`is_markdown_parse_error`) retries once as plain text."
+source  = ["crates/openab-gateway/src/adapters/telegram.rs#handle_reply", "crates/openab-gateway/src/adapters/telegram.rs#is_markdown_parse_error"]
+pr      = ""
+
+[[openab_features]]
+feature = "message_split"
+status  = "implemented"
+note    = "`chunk_text` splits at 4096 chars, preferring newline boundaries; hard-splits a single over-limit line char-by-char. (Adapter-local, not the trait's `split_delivery`.)"
+source  = ["crates/openab-gateway/src/adapters/telegram.rs#chunk_text"]
+pr      = ""
+
+[[openab_features]]
+feature = "streaming"
+status  = "partial"
+note    = "No legacy streaming API; streaming maps onto `editMessageText` when `reply_to` is a real message_id. When `reply_to == \"draft\"` and `rich_messages` is on, it calls `sendRichMessageDraft` (skips updates <30 chars, truncates at 32768 via `floor_char_boundary`). That draft fn `send_rich_message_draft` is `#[allow(dead_code)]` — 'Wired but unused until gateway streaming infrastructure integrates' — so the draft path is not yet driven by gateway streaming."
+source  = ["crates/openab-gateway/src/adapters/telegram.rs#send_rich_message_draft"]
+pr      = ""
+
+[[openab_features]]
+feature = "reply_quote"
+status  = "partial"
+note    = "`GatewayReply` carries a `quote_message_id`, but the Telegram send path does not attach `reply_to_message_id`/`reply_parameters`; outbound only sets `message_thread_id` (forum-topic routing). So agent quote-replies aren't rendered as native quotes."
+source  = ["crates/openab-gateway/src/adapters/telegram.rs#handle_reply", "crates/openab-core/src/gateway.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "edit_message"
+status  = "implemented"
+note    = "`command == \"edit_message\"` → `editMessageText` (real msg_id) or, for a `\"draft\"` ref with `rich_messages` on, `sendRichMessageDraft`."
+source  = ["crates/openab-gateway/src/adapters/telegram.rs#handle_reply"]
+pr      = ""
+
+[[openab_features]]
+feature = "delete_message"
+status  = "not_implemented"
+note    = "No `deleteMessage` call anywhere in the adapter and no delete command handled in `handle_reply` (dispatch covers only create_topic / edit_message / reactions / send). Telegram supports it natively; simply not wired. The trait's default `delete_message` returns an unsupported error."
+source  = ["crates/openab-gateway/src/adapters/telegram.rs#handle_reply", "crates/openab-core/src/adapter.rs#delete_message"]
+pr      = ""
+
+[[openab_features]]
+feature = "emoji_reactions"
+status  = "workaround"
+note    = "`add_reaction`/`remove_reaction` → `setMessageReaction`. Because non-premium chats allow only ONE reaction, the adapter keeps a local `reaction_state` map and always sends the full replacing set; the mood-face emojis (😊😎🫡🤓😏✌️💪🦾) are dropped so the terminal 👍 'done' marker isn't clobbered, and 🆗→👍 is remapped."
+source  = ["crates/openab-gateway/src/adapters/telegram.rs#handle_reply"]
+pr      = ""
+
+[[openab_features]]
+feature = "threads_topics"
+status  = "implemented"
+note    = "`command == \"create_topic\"` → `createForumTopic`, returns `message_thread_id` in a `GatewayResponse`. The trait's `create_thread` issues that command with a 5s timeout and falls back to the same channel on failure/timeout; core ingress only creates a topic for supergroups with no existing `thread_id`."
+source  = ["crates/openab-gateway/src/adapters/telegram.rs#handle_reply", "crates/openab-core/src/gateway.rs#create_thread"]
+pr      = ""
+
+[[openab_features]]
+feature = "media_inbound"
+status  = "implemented"
+note    = "photo (largest by `width*height`), document (text-only, extension-checked + UTF-8 validated), voice, audio downloaded via `getFile`; size-gated against `IMAGE/AUDIO/FILE_MAX_DOWNLOAD` (Content-Length pre-check and post-read); images resized/compressed; non-text or binary docs rejected with a reason."
+source  = ["crates/openab-gateway/src/adapters/telegram.rs#download_telegram_media", "crates/openab-gateway/src/media.rs#FILE_MAX_DOWNLOAD"]
+pr      = ""
+
+[[openab_features]]
+feature = "voice_stt"
+status  = "partial"
+note    = "The adapter only downloads voice/audio as an `audio` attachment (`MediaKind::Audio`, `download_telegram_media`); it does no transcription. STT happens downstream in core: batched / per-message paths call `download_and_transcribe` when `stt_config.enabled`, injecting a `[Voice message transcript]:` block."
+source  = ["crates/openab-gateway/src/adapters/telegram.rs#download_telegram_media", "crates/openab-core/src/media.rs#download_and_transcribe"]
+pr      = ""
+
+[[openab_features]]
+feature = "trust_gate"
+status  = "partial"
+note    = "Adapter enforces L1 only: `secret_token` header + optional Telegram source-subnet check (`telegram_trusted_source_only`; IP extraction is phase-1 'observe', trusting CF/X-Real-IP then the spoofable leftmost XFF). L2 scope / L3 identity allowlists are enforced by the shared core ingress trust gate, not the adapter."
+source  = ["crates/openab-gateway/src/adapters/telegram.rs#handle_reply", "crates/openab-core/src/gateway.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "deny_echo"
+status  = "implemented"
+note    = "Not in the adapter — handled by core ingress: an L3 `DenyIdentity` decision echoes the sender their ID ('Your ID: … Ask the admin to add it to allowed_users'), throttled to one echo per (platform, sender) per `ECHO_WINDOW` (300s). `DenyScope` is a silent drop."
+source  = ["crates/openab-core/src/gateway.rs#ECHO_WINDOW"]
+pr      = ""
+
+[[openab_features]]
+feature = "mention_gating"
+status  = "implemented"
+note    = "In groups/supergroups without a thread, core `should_skip_event` requires an `@bot_username` mention; in-thread events bypass the gate. The adapter extracts `mention` entities into `event.mentions`."
+source  = ["crates/openab-core/src/gateway.rs#should_skip_event", "crates/openab-gateway/src/adapters/telegram.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "slash_commands"
+status  = "implemented"
+note    = "`/reset` and `/cancel` handled in core gateway (both the batched consumer path and the per-message path). The adapter has no per-command parsing beyond forwarding text."
+source  = ["crates/openab-core/src/gateway.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "multibot"
+status  = "implemented"
+note    = "`should_skip_event` drops other bots' events unless the sender id is in `trusted_bot_ids`; the adapter forwards `is_bot` from `from`. (Telegram rarely delivers other bots' messages anyway.)"
+source  = ["crates/openab-core/src/gateway.rs#should_skip_event", "crates/openab-gateway/src/adapters/telegram.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "group_routing"
+status  = "implemented"
+note    = "Session keyed by `chat.id` + optional `message_thread_id`; `compute_draft_id` derives a stable per-(chat,thread) draft id to avoid forum-topic collisions."
+source  = ["crates/openab-gateway/src/adapters/telegram.rs#compute_draft_id"]
+pr      = ""
+
+[[openab_features]]
+feature = "cron_dispatch"
+status  = "implemented"
+note    = "`cronjob.toml` jobs with `platform = \"telegram\"` fire via the shared scheduler: `telegram` was added to `VALID_PLATFORMS` and the unified adapter registered under `\"telegram\"` in `cron_adapters` (PR #1315), so `fire_cronjob` dispatches through `adapter.send_message`. Like the other platforms, cron dispatch bypasses the L2/L3 ingress trust gate — jobs are operator-authored in config, not untrusted inbound."
+source  = ["crates/openab-core/src/cron.rs#VALID_PLATFORMS", "crates/openab-core/src/cron.rs#fire_cronjob", "src/main.rs#cron_adapters"]
+pr      = "#1315"
+
+
+# ═══ Schema 3 — platform-quirks ══════════════════════════════════════════════
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "'Rich Message' API is real (Bot API 10.1) — but the adapter path is flag-gated and partly dead-code"
+note   = """
+The adapter's `sendRichMessage` / `sendRichMessageDraft` / `InputRichMessage.markdown` calls correspond to methods genuinely added in Bot API 10.1 (2026-06-11): 'Added the method `sendRichMessage`…', 'Added the method `sendRichMessageDraft`, allowing bots to stream partial rich messages', 'Added the class `InputRichMessage`…'. This corrects an earlier assumption that the path was fictional. Caveats that remain code-side, not API-side:
+- The path is gated behind the adapter's `rich_messages` flag and falls back to legacy chunked `sendMessage` on any error (`is_complex_markdown` picks headings/GFM tables/over-4096-char text as candidates; code blocks are deliberately routed to legacy `sendMessage` to keep syntax highlighting).
+- `send_rich_message_draft` is `#[allow(dead_code)]` and not yet driven by gateway streaming.
+- The exact 32768-char limit and the precise `InputRichMessage` field names (`markdown` vs `html`) the adapter assumes could not be confirmed from the official page (method-body sections were truncated on fetch); confirm against a full 10.1 docs / Bot API server before relying on the 32768 truncation and the html/markdown branch.
+"""
+kind   = "intrinsic"
+source = "https://core.telegram.org/bots/api-changelog"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Reactions are single-slot, non-additive"
+note   = """
+Telegram non-premium chats allow only one reaction per message. The adapter maintains `reaction_state` and always PUTs the full replacing set via `setMessageReaction`; multi-emoji 'mood' reactions used on Discord are deliberately dropped so the terminal 👍 isn't clobbered. Consequence: OpenAB's add/remove reaction semantics are emulated, not literal. Separately, inbound reaction events (`message_reaction`) require the bot be a chat admin + opt in via `allowed_updates`, and are never delivered for reactions set by bots — the adapter does not subscribe to them.
+"""
+kind   = "intrinsic"
+source = "https://core.telegram.org/bots/api#setmessagereaction"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Auth is L1-only and IP extraction is phase-1"
+note   = """
+Only `secret_token` + an optional source-subnet check gate the webhook. Subnet enforcement is opt-in (`telegram_trusted_source_only`), and IP extraction trusts `CF-Connecting-IP` / `X-Real-IP` then falls back to the spoofable leftmost `X-Forwarded-For` — a documented phase-2 gap. Real identity/scope trust lives in core ingress (L2 scope / L3 identity), and the deny-echo lives there too.
+"""
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/telegram.rs#handle_reply"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "20 MB inbound download ceiling"
+note   = """
+`getFile` on the cloud Bot API can't serve files >20 MB; large media will fail to download regardless of OpenAB's own `*_MAX_DOWNLOAD` limits (10/20/20 MB). A self-hosted local Bot API server is required for up to 2 GB. STT downstream imposes its own 25 MB (Whisper) cap in core.
+"""
+kind   = "intrinsic"
+source = "https://core.telegram.org/bots/api#getfile"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Outbound quotes aren't native"
+note   = """
+`GatewayReply.quote_message_id` exists, but the Telegram send path never sets `reply_to_message_id`/`reply_parameters` — it only sets `message_thread_id`. Agent quote-replies therefore land in the right topic but aren't rendered as native Telegram quotes.
+"""
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/telegram.rs#handle_reply"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Findings-log: Bot API 10.1 rich-message methods are real"
+note   = "Bot API 10.1 (2026-06-11) added `sendRichMessage`, `sendRichMessageDraft`, and `InputRichMessage` — the adapter's 'rich' path targets a REAL API, not a fictional one (corrects prior draft). Exact 32768 limit / field names still unverified (docs truncated on fetch)."
+kind   = "intrinsic"
+source = "https://core.telegram.org/bots/api-changelog"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Findings-log: getFile 20 MB cloud cap"
+note   = "Telegram cloud `getFile` caps downloads at 20 MB; up to 2 GB needs a self-hosted local Bot API server."
+kind   = "intrinsic"
+source = "https://core.telegram.org/bots/api#getfile"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Findings-log: deleteMessage 48h window"
+note   = "`deleteMessage` generally only works within 48h for a bot's outgoing messages; deleting others' needs admin `can_delete_messages`."
+kind   = "intrinsic"
+source = "https://core.telegram.org/bots/api#deletemessage"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Findings-log: message_reaction delivery constraints"
+note   = "`message_reaction` updates require the bot be a chat admin + opt-in via `allowed_updates`, and 'The update isn't received for reactions set by bots.'"
+kind   = "intrinsic"
+source = "https://core.telegram.org/bots/api#update"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Findings-log: sendMessage 4096 char limit"
+note   = "`sendMessage` text limit is 1–4096 UTF-8 chars; adapter chunks at 4096."
+kind   = "intrinsic"
+source = "https://core.telegram.org/bots/api#sendmessage"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Findings-log: broadcasting rate limits"
+note   = "Broadcasting limits: ~1 msg/s per chat, ~30 msg/s overall bulk, 20 msg/min per group."
+kind   = "intrinsic"
+source = "https://core.telegram.org/bots/faq"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Findings-log: privacy mode group visibility"
+note   = "With privacy mode ON, a group bot receives only `/cmd@bot` commands, general commands if it messaged last, replies to it, inline messages via it, and all service messages."
+kind   = "intrinsic"
+source = "https://core.telegram.org/bots/features#privacy-mode"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Findings-log: delete_message unimplemented despite native support"
+note   = "`delete_message` is unimplemented in the Telegram adapter despite native support — no `deleteMessage` call or command handler; trait default returns unsupported."
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/telegram.rs#handle_reply"
+refs   = []
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Findings-log: outbound send never sets reply_to_message_id"
+note   = "Outbound send sets `message_thread_id` for topic routing but never `reply_to_message_id`, so agent quote-replies aren't native quotes."
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/telegram.rs#handle_reply"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Findings-log: MAX_DOWNLOAD constants live in gateway crate"
+note   = "MAX_DOWNLOAD constants (IMAGE 10 / FILE 20 / AUDIO 20 MB) live in the gateway crate, not core; core adds a separate 25 MB Whisper STT cap."
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/media.rs#FILE_MAX_DOWNLOAD"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Findings-log: STT done in core, not the adapter"
+note   = "Voice/audio STT is not done in the adapter; core transcribes `audio` attachments via `download_and_transcribe` when `stt_config.enabled`."
+kind   = "openab_decision"
+source = "crates/openab-core/src/media.rs#download_and_transcribe"

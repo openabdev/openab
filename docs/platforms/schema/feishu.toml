@@ -1,0 +1,380 @@
+# Feishu / Lark — platform capability schema
+# Generated from the adapter source + official docs
+
+schema_version = "2026-07-08"
+
+[platform]
+name          = "feishu"
+official_docs = "https://open.feishu.cn/document/home/index"
+description   = "Feishu / Lark enterprise IM bot platform (feishu.cn / larksuite.com); adapter lives in the openab-gateway crate."
+
+
+# ═══ Schema 1 — platform-capability ══════════════════════════════════════════
+
+[capability.transport]
+kind   = "websocket"
+note   = "Both: WebSocket long-connection (default; protobuf pbbp2.Frame, ACK per event) and webhook (FEISHU_CONNECTION_MODE=webhook). Ingested event: im.message.receive_v1."
+source = "https://open.feishu.cn/document/server-docs/im-v1/message/events/receive"
+
+[capability.inbound_auth]
+scheme = "aes"
+note   = "Webhook L1 = SHA256(timestamp + nonce + encrypt_key + body) header signature (verify_signature) + optional constant-time verification_token; event body AES-256-CBC with key = SHA256(encrypt_key), IV = first 16 bytes of ciphertext (decrypt_event). WS: auth via AppID+AppSecret handshake to fetch endpoint."
+source = "https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/event-subscription-guide/event-subscription-configure-/encrypt-key-encryption-configuration-case"
+
+[capability.threads]
+model  = "native"
+note   = "Messages carry root_id / parent_id; reply via POST /im/v1/messages/{id}/reply with optional reply_in_thread=true (default false). If parent is already a thread, replies stay in-thread automatically. parent_id for a thread always points at the thread root."
+source = "https://open.feishu.cn/document/server-docs/im-v1/message/reply"
+
+[capability.slash_commands]
+supported = false
+note      = "No native slash commands. Bots have a custom menu (application.bot.menu_v6 / menu-click event; <=3 main + <=5 sub, DM-only, no group support). Command-style input is just plain text."
+source    = "https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/bot-v3/bot-customized-menu"
+
+[capability.mentions]
+method = "at_mention"
+note   = "@mention via event.message.mentions[] (each has a key placeholder like @_user_1 in text + id.open_id). Bot detects itself by matching its own open_id (resolved via /bot/v3/info)."
+source = "https://open.feishu.cn/document/server-docs/im-v1/message/events/receive"
+
+[capability.emoji_reactions]
+bot_can_add         = true
+bot_can_remove      = true
+bot_receives_events = true
+note                = "Bot can add (POST /im/v1/messages/{id}/reactions) and remove (list -> find own reaction_id -> DELETE). Bot can receive reaction events via im.message.reaction.created_v1 / im.message.reaction.deleted_v1 (subscription required)."
+source              = "https://open.feishu.cn/document/server-docs/im-v1/message-reaction/create"
+
+[capability.edit_message]
+supported = true
+max_edits = 20
+note      = "Own message only (calling identity must equal sender, else errcode 230071). PATCH /im/v1/messages/{id} updates text / post. Officially documented hard cap of 20 edits per message (errcode 230072 when exceeded); edit-time window is set by enterprise admin (errcode 230075). Card (interactive) updates use a separate endpoint, not subject to the 20-edit cap. Global API frequency limit 1000/min / 50 QPS (errcode 230020)."
+source    = "https://open.feishu.cn/document/server-docs/im-v1/message/update"
+
+[capability.delete_message]
+supported = true
+scope     = "own"
+note      = "Own message, DELETE /im/v1/messages/{id} (recall). Not subject to the edit cap. Deleting others' messages is admin/permission-gated, not a bot capability."
+source    = "https://open.feishu.cn/document/server-docs/im-v1/message/delete"
+
+[capability.rich_content]
+markdown = false
+cards    = true
+buttons  = true
+note     = "post (rich text: text/link/at/img/code_block), interactive CardKit v2 cards (buttons, markdown, tables, streaming). Plain markdown is NOT natively rendered as a text message — must be converted to post or a card."
+source   = "https://open.feishu.cn/document/server-docs/im-v1/message-content-description/create_json"
+
+[capability.attachments]
+inbound     = ["image", "audio", "video", "file"]
+outbound    = ["image", "file"]
+max_size_mb = 100
+note        = "Inbound: image / file / audio / media / post-embedded images; downloaded via /im/v1/messages/{id}/resources/{key}. Outbound: images/files uploaded first, then referenced by key. ? Feishu file-size limits are large (image ~10 MB, file ~30-100 MB tier-dependent) — exact tiers unverified."
+source      = "https://open.feishu.cn/document/server-docs/im-v1/message/get-2"
+
+[capability.message_length_limit]
+max_chars = 150000
+note      = "text <= 150 KB; post / card <= 30 KB (per content JSON; card templates / style tags can inflate rendered size beyond the request body). Cap here counts bytes of the text content JSON, not chars."
+source    = "https://open.feishu.cn/document/server-docs/im-v1/message/create"
+
+[capability.dm_support]
+supported = true
+note      = "Yes — chat_type = \"p2p\"."
+source    = "https://open.feishu.cn/document/server-docs/im-v1/message/events/receive"
+
+[capability.group_model]
+kinds  = ["group", "user"]
+note   = "chat (group). Event chat_type: p2p (DM) vs group; each has a stable chat_id (oc_...). No separate channel/thread taxonomy — threads are message-level (root_id)."
+source = "https://open.feishu.cn/document/server-docs/group/chat/chat-overview"
+
+[capability.group_sender_identity]
+stable_id = "yes"
+note      = "Stable & always present. sender.sender_id.open_id (ou_...) is a per-app stable user id delivered in every group event; not consent-gated (display-name lookup via Contact API may need scope)."
+source    = "https://open.feishu.cn/document/server-docs/im-v1/message/events/receive"
+
+[capability.send_model]
+model               = "push_only"
+note                = "Push model — POST /im/v1/messages (or /reply) with a tenant_access_token (TTL ~7200 s, auto-refreshed). No per-message reply-window / token TTL like LINE; any message can be sent as long as the bot is in scope / in the group. The reply API's uuid is only a 1-hour idempotency window, not a reply deadline."
+source              = "https://open.feishu.cn/document/server-docs/im-v1/message/create"
+
+[capability.proactive_push]
+supported   = true
+quota_model = "metered"
+note        = "Yes, to users within the bot's availability scope and groups the bot has joined (with speaking permission). Rate limits: 5 QPS per same-user, 5 QPS shared per same-group, global 1000/min / 50 QPS. User opt-out -> errcode 230053; user outside availability scope / disabled -> errcode 230013. No hard daily quota."
+source      = "https://open.feishu.cn/document/server-docs/im-v1/message/create"
+
+[capability.bot_to_bot]
+delivered = false
+note      = "Effectively no. Feishu does NOT push another bot's messages to a bot's WebSocket, and marks other bots' messages as sender_type=\"user\", so a peer bot is indistinguishable without an explicit id allowlist. (Platform docs are silent on bot->bot event delivery — behavior verified only via the adapter, not an official statement.)"
+source    = "https://open.feishu.cn/document/server-docs/im-v1/faq"
+
+[capability.typing_indicator]
+supported = false
+note      = "Not exposed to bots — no public typing/inputting API is documented (Message FAQ is silent on it). OpenAB signals progress with emoji reactions / a streaming card instead. (Absence confirmed by omission; cannot be stated as an affirmative platform guarantee.)"
+source    = "https://open.feishu.cn/document/server-docs/im-v1/faq"
+
+
+# ═══ Schema 2 — openab-feature-support ═══════════════════════════════════════
+
+[[openab_features]]
+feature = "send_message"
+status  = "implemented"
+note    = "Replies sent as post (rich text) so markdown renders; send_post_message. send_text_message kept only for webhook fallback/tests (#[allow(dead_code)])."
+source  = ["crates/openab-gateway/src/adapters/feishu.rs#send_post_message", "crates/openab-gateway/src/adapters/feishu.rs#send_text_message"]
+pr      = ""
+
+[[openab_features]]
+feature = "message_split"
+status  = "implemented"
+note    = "Long replies chunked at message_limit (default 4000, FEISHU_MESSAGE_LIMIT) via split_text (UTF-8-safe, breaks on newline/space); partial-chunk failure is reported as failure to core."
+source  = ["crates/openab-gateway/src/adapters/feishu.rs#split_text"]
+pr      = ""
+
+[[openab_features]]
+feature = "streaming"
+status  = "workaround"
+note    = "No native content-streaming API. Emulated by PATCH-editing a post in place, with an auto post->card promotion: StreamingMode::Auto (default) promotes to a CardKit v2 streaming card when text is large (card_promote_bytes, default 4000), or contains a code fence / markdown table (should_use_card), or when the 20-edit post cap is hit (in handle_card_edit). post mode = kill-switch. Idle reaper finalizes cards."
+source  = ["crates/openab-gateway/src/adapters/feishu.rs#should_use_card", "crates/openab-gateway/src/adapters/feishu.rs#handle_card_edit", "crates/openab-gateway/src/adapters/feishu.rs#run_idle_reaper"]
+pr      = ""
+
+[[openab_features]]
+feature = "reply_quote"
+status  = "implemented"
+note    = "send_message_with_reply -> gateway quote_message_id; adapter prefers quote_message_id over thread_id, uses /messages/{id}/reply, and falls back to a plain send if reply-to fails."
+source  = ["crates/openab-core/src/gateway.rs#send_message_with_reply", "crates/openab-gateway/src/adapters/feishu.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "edit_message"
+status  = "implemented"
+note    = "Real in-place PATCH (edit_feishu_message). Core overrides the trait default (which returns \"unsupported\") because Feishu acks writes: edit_message uses an 800 ms request/response so it can see cap signals. Preemptive local cap at 18 edits (FEISHU_EDIT_CAP, 2-edit safety margin) + server errcode 230072 detection."
+source  = ["crates/openab-gateway/src/adapters/feishu.rs#edit_feishu_message", "crates/openab-core/src/adapter.rs#edit_message"]
+pr      = ""
+
+[[openab_features]]
+feature = "delete_message"
+status  = "implemented"
+note    = "Native DELETE /im/v1/messages/{id} (delete_feishu_message); core overrides the trait default (edit-to-zero-width) because Feishu has a real delete. Used to remove the half-edited placeholder during cap-recovery / card-promotion."
+source  = ["crates/openab-gateway/src/adapters/feishu.rs#delete_feishu_message", "crates/openab-core/src/adapter.rs#delete_message"]
+pr      = ""
+
+[[openab_features]]
+feature = "emoji_reactions"
+status  = "partial"
+note    = "add_reaction implemented; remove_reaction implemented via list->match-own-reaction_id->DELETE. Limited to an 8-emoji hard-coded map (eyes/thinking/fire/technologist/zap/ok/thumbsup/scream); anything else is silently dropped. Inbound reaction events are NOT ingested (adapter only parses im.message.receive_v1)."
+source  = ["crates/openab-gateway/src/adapters/feishu.rs#emoji_to_feishu_reaction", "crates/openab-gateway/src/adapters/feishu.rs#add_reaction", "crates/openab-gateway/src/adapters/feishu.rs#remove_reaction"]
+pr      = ""
+
+[[openab_features]]
+feature = "threads_topics"
+status  = "partial"
+note    = "Native thread replies work (via root_id / reply). But the gateway create_topic command (from core create_thread) is a no-op — the Feishu adapter explicitly skips it and core falls back to replying in the same channel."
+source  = ["crates/openab-gateway/src/adapters/feishu.rs", "crates/openab-core/src/gateway.rs#create_thread"]
+pr      = ""
+
+[[openab_features]]
+feature = "media_inbound"
+status  = "implemented"
+note    = "Images (resized to <=1200 px, JPEG q75, <=10 MB; GIF passthrough), text files (extension-allowlisted, <=512 KB), audio (<=25 MB, Whisper cap), and post-embedded images. Oversized/unsupported -> Attachment::rejected."
+source  = ["crates/openab-gateway/src/adapters/feishu.rs#download_feishu_image", "crates/openab-gateway/src/adapters/feishu.rs#download_feishu_file", "crates/openab-gateway/src/adapters/feishu.rs#download_feishu_audio"]
+pr      = ""
+
+[[openab_features]]
+feature = "voice_stt"
+status  = "partial"
+note    = "Adapter only downloads audio into an audio attachment (<=25 MB); actual speech-to-text is done downstream (Whisper) by core, not in the adapter."
+source  = ["crates/openab-gateway/src/adapters/feishu.rs#download_feishu_audio"]
+pr      = ""
+
+[[openab_features]]
+feature = "trust_gate"
+status  = "implemented"
+note    = "Two layers: adapter-side allowed_users / allowed_groups allowlists + bot/self filtering in parse_message_event; core-side shared ingress gate_incoming (L2 scope + L3 identity) before dispatch."
+source  = ["crates/openab-gateway/src/adapters/feishu.rs#parse_message_event", "crates/openab-core/src/adapter.rs#gate_incoming"]
+pr      = ""
+
+[[openab_features]]
+feature = "deny_echo"
+status  = "implemented"
+note    = "On core L3 DenyIdentity, gateway echoes a throttled deny message (\"You are not on this bot's trusted list. Your ID: ... Ask the admin to add it to allowed_users.\"), <=1 echo per platform:sender per window. DenyScope -> silent drop."
+source  = ["crates/openab-core/src/gateway.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "mention_gating"
+status  = "implemented"
+note    = "Groups require @mention unless bot has participated in the thread (Discord-style \"involved\"). Modes via FEISHU_ALLOW_USER_MESSAGES: involved / mentions / multibot_mentions (default — require @mention if another bot is in the thread). Participation cache TTL = FEISHU_SESSION_TTL_HOURS (24 h)."
+source  = ["crates/openab-gateway/src/adapters/feishu.rs#parse_message_event", "crates/openab-gateway/src/adapters/feishu.rs#detect_and_mark_multibot"]
+pr      = ""
+
+[[openab_features]]
+feature = "slash_commands"
+status  = "n_a"
+note    = "Platform has no slash-command system; /reset and /cancel arrive as plain text and are intercepted by core (not the adapter). Adapter does no slash parsing."
+source  = ["crates/openab-core/src/gateway.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "multibot"
+status  = "partial"
+note    = "FEISHU_ALLOW_BOTS (off/mentions/all) + FEISHU_TRUSTED_BOT_IDS + per-chat max_bot_turns (default 20) loop-guard. Caveat: Feishu marks other bots as sender_type=\"user\" and doesn't push bot messages over WS, so without trusted_bot_ids peer bots can't be identified; multibot_mentions detection is done via @mention of a known bot id, not sender type."
+source  = ["crates/openab-gateway/src/adapters/feishu.rs#parse_message_event", "crates/openab-gateway/src/adapters/feishu.rs#detect_and_mark_multibot"]
+pr      = ""
+
+[[openab_features]]
+feature = "group_routing"
+status  = "implemented"
+note    = "Routing keyed by chat_id; channel_type = direct (p2p) vs group; thread_id from root_id / parent_id. Dedupe by event_id + message_id; self-echo dedupe on sent message_id (Feishu pushes the bot's own messages back)."
+source  = ["crates/openab-gateway/src/adapters/feishu.rs#parse_message_event"]
+pr      = ""
+
+[[openab_features]]
+feature = "cron_dispatch"
+status  = "not_implemented"
+note    = "Not wired for scheduled cron dispatch: `VALID_PLATFORMS` (cron.rs) covers only discord/slack/telegram and no adapter is registered for this platform in `cron_adapters`, so `cronjob.toml` jobs targeting it are rejected at startup by `validate_cronjobs`."
+source  = []
+pr      = ""
+
+
+# ═══ Schema 3 — platform-quirks ══════════════════════════════════════════════
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "20-edit-per-message cap -> streaming card promotion"
+note   = """
+Feishu officially documents a hard limit of 20 edits per message: PATCH /im/v1/messages/{id} for text/post returns errcode 230072 once exceeded ("一条消息最多可编辑 20 次" / "the message has reached the number of times it can be edited"). This is the central constraint shaping OpenAB streaming. The adapter (a) preemptively stops at 18 edits (FEISHU_EDIT_CAP, 2-edit safety margin for in-flight races), (b) parses the body code (JSON-code-first, substring fallback) to catch server-side 230072 even on HTTP 200, and (c) on cap, promotes to a CardKit v2 streaming card (no such cap) or, in post mode, lets core's finalize path delete the placeholder and send fresh content. Card-update uses its own 5-QPS/message frequency limit (errcode 230020) instead. (The edit-time window is separately admin-configured, errcode 230075.)
+"""
+kind   = "intrinsic"
+source = "https://open.feishu.cn/document/server-docs/im-v1/message/update"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "post-vs-card streaming state machine"
+note   = """
+FEISHU_CARD_STREAMING_MODE = auto (default) | card | post. In auto, short replies stay a native post reply (nicer thread UI); long / code-fence / table replies (which markdown_to_post degrades — tables are dropped entirely, Issue #1124) promote to a card (should_use_card, with has_code_fence / has_markdown_table). The post->card swap is invisible to core: the gateway keeps reporting the original om_post message_id back so core's edit loop is oblivious. FEISHU_CARD_FALLBACK_TO_POST=true (default) is a second safety net back to the post path on any card failure.
+"""
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/feishu.rs#should_use_card"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "markdown rendering is lossy"
+note   = """
+markdown_to_post converts to Feishu post: code fences -> code_block, [t](url) -> a, and bold/italic/strike markers are stripped (not rendered). Markdown tables are not representable in post at all — that's a primary reason the auto-promotion to CardKit exists (cards render tables/markdown natively).
+"""
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/feishu.rs#markdown_to_post"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "message_id shape validation (defence-in-depth)"
+note   = """
+Any command that interpolates a message_id into a REST path (edit_message, delete_message, add_reaction, remove_reaction) is gated by is_valid_feishu_message_id (om_ + [A-Za-z0-9_], len 4-128), rejecting crafted ids containing / ? #. Internal card message_ids from trusted gateway session state bypass the check. The "draft" sentinel is a benign no-op skip.
+"""
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/feishu.rs#is_valid_feishu_message_id"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "bot identity & self/peer-bot handling"
+note   = """
+Bot open_id is resolved at startup and on WS reconnect via /bot/v3/info; without it, mention gating can't work. Feishu pushes the bot's own sent messages back over WS (handled by self-echo dedupe on the returned message_id) and does NOT push other bots' messages to a bot — so multibot detection relies on @mentions of known bot ids, not on sender_type (which is user for peer bots).
+"""
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/feishu.rs#parse_message_event"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "webhook security posture"
+note   = """
+Webhook path enforces: 1 MB body cap, per-IP rate limit, SHA256 signature (only if FEISHU_ENCRYPT_KEY set — a warning is logged and verification is skipped if unset), AES-256-CBC decrypt of encrypt payloads (key = SHA256(encrypt_key), IV = first 16 bytes), constant-time verification_token check, and the URL-verification challenge handshake.
+"""
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/feishu.rs#verify_signature"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "20-edit hard cap officially documented (edit errcodes)"
+note   = """
+20-edit-per-message hard cap is officially documented (errcode 230072); edit is sender-only (230071); edit-time window is admin-configured (230075) — not a fixed 14-day/230031 limit as previously drafted. Global 1000/min / 50 QPS, per-message 5 QPS (230020).
+"""
+kind   = "intrinsic"
+source = "https://open.feishu.cn/document/server-docs/im-v1/message/update"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "message size & send rate limits"
+note   = """
+Text content <=150 KB; post/card <=30 KB; 5 QPS/user & 5 QPS/group shared, 1000/min / 50 QPS global; user opt-out -> 230053, out-of-scope -> 230013.
+"""
+kind   = "intrinsic"
+source = "https://open.feishu.cn/document/server-docs/im-v1/message/create"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "native threads via reply API, no reply deadline"
+note   = """
+Reply API supports native threads via reply_in_thread (default false) + root_id/parent_id; no reply-time deadline (the uuid is a 1-hour idempotency window only).
+"""
+kind   = "intrinsic"
+source = "https://open.feishu.cn/document/server-docs/im-v1/message/reply"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "inbound reaction events exist but not yet ingested"
+note   = """
+Bot can add reactions and remove by reaction_id; inbound reaction events exist as im.message.reaction.created_v1/deleted_v1 (subscription required) — OpenAB adapter does not yet ingest them.
+"""
+kind   = "intrinsic"
+source = "https://open.feishu.cn/document/server-docs/im-v1/message-reaction/create"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "no native slash commands, DM-only bot menu"
+note   = """
+No native slash commands; only a DM-only custom bot menu (<=3 main/<=5 sub). OpenAB treats /reset etc. as plain text, intercepted in core.
+"""
+kind   = "intrinsic"
+source = "https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/bot-v3/bot-customized-menu"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "no typing-indicator or bot->bot delivery documented"
+note   = """
+No public bot typing-indicator API and no documented bot->bot event delivery — Message FAQ is silent on both; OpenAB uses reactions/streaming card for progress and infers peer bots via @mention only.
+"""
+kind   = "intrinsic"
+source = "https://open.feishu.cn/document/server-docs/im-v1/faq"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "adapter relies on 230072 cap -> CardKit streaming-card promotion"
+note   = """
+Adapter relies on the 230072 cap -> CardKit streaming-card promotion; card streaming (S6) defaults to auto.
+"""
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/feishu.rs#should_use_card"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "create_topic is a deliberate no-op"
+note   = """
+create_topic (from core create_thread) is a deliberate no-op in the Feishu adapter — core falls back to same-channel reply.
+"""
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/feishu.rs"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "reaction emoji support limited to 8-entry map"
+note   = """
+Reaction emoji support limited to an 8-entry hard-coded map; unmapped emojis are silently dropped.
+"""
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/feishu.rs#emoji_to_feishu_reaction"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "slash commands intercepted in core, not adapter"
+note   = """
+Slash commands /reset and /cancel are intercepted in core gateway.rs, not the adapter; dispatch.rs does not hold the literals.
+"""
+kind   = "openab_decision"
+source = "crates/openab-core/src/gateway.rs"

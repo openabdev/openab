@@ -1,0 +1,29 @@
+name: platform-schema conformance
+
+# Verify docs/platforms/schema/*.toml stays in sync with the code: structural
+# schema validation + that every `source` code-ref still exists in the tree.
+# Runs on any change to the schema files, the template, or the checker itself.
+on:
+  pull_request:
+    paths:
+      - "docs/platforms/schema/**"
+      - "docs/platforms/_template.toml"
+      - "crates/platform-schema/**"
+  push:
+    branches: [main]
+    paths:
+      - "docs/platforms/schema/**"
+      - "docs/platforms/_template.toml"
+      - "crates/platform-schema/**"
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Standalone crate (serde + toml only); excluded from the root workspace
+      # so it builds without the heavy adapter crates.
+      # --locked: build strictly from the committed Cargo.lock; fail if it is
+      # stale or missing rather than silently regenerating it (reproducible CI).
+      - run: cargo test --locked --manifest-path crates/platform-schema/Cargo.toml

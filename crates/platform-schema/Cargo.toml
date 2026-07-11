@@ -1,0 +1,16 @@
+[package]
+name = "platform-schema"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Authoritative types + conformance tests for docs/platforms/schema/*.toml"
+
+# Standalone crate (excluded from the root workspace) so it builds independently
+# of the heavy adapter crates. The serde structs below ARE the schema; each
+# schema/<platform>.toml deserializes into `Platform`.
+#
+# Run:  cargo test        (from this directory)
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

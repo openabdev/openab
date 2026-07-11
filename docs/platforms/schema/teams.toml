@@ -1,0 +1,344 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  Platform capability schema — MICROSOFT TEAMS
+#  Generated from the adapter source + official docs. See _template.toml for the schema.
+# ═══════════════════════════════════════════════════════════════════════════
+
+schema_version = "2026-07-08"
+
+[platform]
+name          = "teams"
+official_docs = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/build-conversational-capability"
+description   = "Microsoft Teams bot reached via the Bot Framework / Azure Bot Connector REST activity protocol (not a direct Teams API)."
+
+
+# ═══ Schema 1 — platform-capability (source of truth: official docs) ═════════
+
+[capability.transport]
+kind   = "webhook"
+note   = "Bot Framework POSTs an `Activity` JSON to the bot's `/api/messages` messaging endpoint (one endpoint only)."
+source = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/build-conversational-capability"
+
+[capability.inbound_auth]
+scheme = "jwt_rs256"
+note   = "JWT bearer, RS256/RS384, signed by Bot Framework. L1 = OpenID Connect: fetch JWKS from `login.botframework.com` well-known config; validate `aud`=app_id, `iss`=`https://api.botframework.com`, `exp`, the `serviceurl` claim vs `activity.serviceUrl`, and channel endorsements."
+source = "https://learn.microsoft.com/en-us/azure/bot-service/rest-api/bot-framework-rest-connector-authentication?view=azure-bot-service-4.0"
+
+[capability.threads]
+model  = "native"
+note   = "Mixed: channel posts form native reply chains — `conversation.id` encodes the root message ID and replies land in that chain. 1:1 and group chats are flat (no sub-threads). `replyToId` is used for context/reply-target, not routing."
+source = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/conversations/channel-and-group-conversations"
+
+[capability.slash_commands]
+supported = false
+note      = "No native `/`-command protocol for bots. A static command menu can be declared in the app manifest; selections arrive as ordinary `message` activities (plain text). Bots must parse commands from message text."
+source    = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/create-a-bot-commands-menu"
+
+[capability.mentions]
+method = "at_mention"
+note   = "`@mention` via `entities[]` of type `mention`; each mention entity carries `mentioned.id` + `mentioned.name`. In channel/group scope the bot only receives messages where it is @mentioned (unless RSC grants broader access). Bot detects itself by matching a mention's `mentioned.id` to `recipient.id`. Don't trust the text markup (`<at>…</at>`) — use `entities`."
+source = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/conversations/channel-and-group-conversations"
+
+[capability.emoji_reactions]
+bot_can_add        = true
+bot_can_remove     = true
+bot_receives_events = true
+note               = "Bot receives reaction events via `messageReaction` activities (`reactionsAdded`/`reactionsRemoved`). Bot add/remove own reactions supported via SDK reaction APIs / connector."
+source             = "https://learn.microsoft.com/en-us/microsoftteams/platform/teams-sdk/in-depth-guides/message-reactions"
+
+[capability.edit_message]
+supported = true
+note      = "Bot can update its own already-sent message: `PUT /v3/conversations/{conversationId}/activities/{activityId}`. Requires caching the activityId returned by the original post."
+source    = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/update-and-delete-bot-messages"
+
+[capability.delete_message]
+supported = true
+scope     = "own"
+note      = "Own messages only: `DELETE /v3/conversations/{conversationId}/activities/{activityId}`. A bot cannot update or delete messages sent by users."
+source    = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/update-and-delete-bot-messages"
+
+[capability.rich_content]
+markdown = true
+cards    = true
+buttons  = true
+note     = "Markdown (`textFormat: markdown`), a subset of XML/HTML tags, and Adaptive Cards (buttons, inputs, images). Text-only messages don't support table formatting; rich cards support formatting in the `text` property only and don't support Markdown or tables. `suggestedActions` (`imBack` only, ≤6) work only in 1:1 chats and not alongside attachments."
+source   = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/format-your-bot-messages"
+
+[capability.attachments]
+inbound     = ["image", "file"]
+outbound    = ["image", "file"]
+max_size_mb = 1
+note        = "Inbound: user can attach pictures/files. Outbound pictures ≤ 1024×1024 px and ≤ 1 MB, PNG/JPEG/GIF (animated GIF not supported); Markdown inline image renders at 256×256 by default (override via XML width/height). Non-image files are shared via attachment/card links (Graph/SharePoint), not raw upload in the activity. The 1 MB cap is the outbound-picture limit."
+source      = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/build-conversational-capability"
+
+[capability.message_length_limit]
+max_chars = 0
+note      = "No fixed character count — a byte/UTF-16 budget, not a char cap. ~100 KB per bot message (approximate; UTF-16, includes text + image links + @mentions + reactions; excludes base64-encoded images). Recommend keeping the message ≤ 80 KB to guarantee delivery. Over-limit → `413 RequestEntityTooLarge` with error code `MessageSizeTooBig`."
+source    = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/format-your-bot-messages"
+
+[capability.dm_support]
+supported = true
+note      = "1:1 personal chat (`conversationType: personal`)."
+source    = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/build-conversational-capability"
+
+[capability.group_model]
+kinds  = ["personal", "groupChat", "channel"]
+note   = "Taxonomy: `personal` (1:1), `groupChat` (group chat), `channel` (team channel, has reply chains + `channelData.team`/`channel`). Bot install scopes: `personal`, `groupChat`/`groupchat`, `team`."
+source = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/conversations/channel-and-group-conversations"
+
+[capability.group_sender_identity]
+stable_id = "yes"
+note      = "`activity.from.id` (`29:1...`) is a stable, always-present per-user id in group/channel events. `from.aadObjectId` (Entra object id) is also provided but may be absent for guests/anonymous; not consent-gated for basic id."
+source    = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/conversations/channel-and-group-conversations"
+
+[capability.send_model]
+model               = "hybrid"
+reply_token_ttl_sec = 0
+max_objects_per_send = 0
+note                = "Reply + proactive. Reply: POST activity to `v3/conversations/{id}/activities` using the per-conversation `serviceUrl`. `serviceUrl` can change and should be refreshed per inbound activity (no fixed reply-window token; OAuth token TTL ~ `expires_in`)."
+source              = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/build-conversational-capability"
+
+[capability.proactive_push]
+supported   = true
+quota_model = "metered"
+note        = "Allowed if the app is installed for the target scope (else `403 ForbiddenOperationException`/`BotNotInConversationRoster`). Per-bot-per-thread send-to-conversation: 7/1s, 8/2s, 60/30s, 1800/3600s; per-app-per-tenant global 50 RPS. Over-limit → `429 Too Many Requests` (also retry `412`/`502`/`504`); use exponential backoff."
+source      = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/rate-limit"
+
+[capability.bot_to_bot]
+delivered = false
+note      = "Teams does not deliver other bots' messages to a bot; bots respond to user activities only (@mention-gated in groups/channels)."
+source    = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/build-conversational-capability"
+
+[capability.typing_indicator]
+supported = true
+note      = "Bot can send a `typing` activity via the connector. Not currently emitted by the OpenAB adapter."
+source    = "https://learn.microsoft.com/en-us/azure/bot-service/rest-api/bot-framework-rest-connector-api-reference?view=azure-bot-service-4.0"
+
+
+# ═══ Schema 2 — openab-feature-support (source of truth: our code + PR) ══════
+
+[[openab_features]]
+feature = "send_message"
+status  = "implemented"
+note    = "Core `GatewayAdapter::send_message` → `send_gateway_reply` → gateway `handle_reply` → `send_activity` POSTs a `message` activity with `textFormat: markdown`."
+source  = ["crates/openab-core/src/gateway.rs#send_message", "crates/openab-gateway/src/adapters/teams.rs#send_activity"]
+pr      = ""
+
+[[openab_features]]
+feature = "message_split"
+status  = "partial"
+note    = "Core splits via `split_delivery`; `GatewayAdapter::message_limit()` returns 4096 (hardcoded 'Telegram limit', not Teams' ~100 KB / UTF-16 budget) — chunking works but the bound is generic, not Teams-tuned."
+source  = ["crates/openab-core/src/adapter.rs#message_limit", "crates/openab-core/src/gateway.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "streaming"
+status  = "workaround"
+note    = "Gateway platforms use core's post+edit cosmetic streaming (`use_streaming` just returns the configured `streaming` flag; no native streaming API). But the Teams gateway never dispatches `edit_message`, so streaming edits don't actually reach Teams — effectively send-once. `update_activity` (PUT) exists in the adapter but is unwired dead code."
+source  = ["crates/openab-core/src/gateway.rs#use_streaming", "crates/openab-gateway/src/adapters/teams.rs#update_activity"]
+pr      = ""
+
+[[openab_features]]
+feature = "reply_quote"
+status  = "not_implemented"
+note    = "`GatewayAdapter::send_message_with_reply` puts the target id into `quote_message_id` (the visual-quote field via `send_gateway_reply`), not `reply_to`. The Teams adapter reads only `reply.reply_to` (the triggering-event/origin id) → `replyToId`, and ignores `quote_message_id` entirely — so the intended visual quote never reaches Teams. `replyToId` is a reply-target/context id, not a visual quote."
+source  = ["crates/openab-core/src/gateway.rs#send_message_with_reply", "crates/openab-gateway/src/adapters/teams.rs#handle_reply"]
+pr      = ""
+
+[[openab_features]]
+feature = "edit_message"
+status  = "not_implemented"
+note    = "Core default/`GatewayAdapter::edit_message` emits an `edit_message` command, but Teams is not in `EDIT_RESPONSE_PLATFORMS` (fire-and-forget) AND `handle_reply` has no `edit_message` branch — it falls through to `send_activity`, posting the new text as a fresh message."
+source  = ["crates/openab-core/src/gateway.rs#edit_message", "crates/openab-gateway/src/adapters/teams.rs#handle_reply"]
+pr      = ""
+
+[[openab_features]]
+feature = "delete_message"
+status  = "not_implemented"
+note    = "The `delete_message` command is not handled in `handle_reply`; it falls through to `send_activity`. Platform supports DELETE, but the adapter never calls it."
+source  = ["crates/openab-core/src/gateway.rs#delete_message", "crates/openab-gateway/src/adapters/teams.rs#handle_reply"]
+pr      = ""
+
+[[openab_features]]
+feature = "emoji_reactions"
+status  = "not_implemented"
+note    = "`handle_reply` explicitly early-returns (silently ignores) `add_reaction`/`remove_reaction`. Platform supports bot reactions, but OpenAB does not send them for Teams."
+source  = ["crates/openab-gateway/src/adapters/teams.rs#handle_reply"]
+pr      = ""
+
+[[openab_features]]
+feature = "threads_topics"
+status  = "not_implemented"
+note    = "The `create_topic` command from `GatewayAdapter::create_thread` is not handled by Teams `handle_reply` (falls through to plain send). Inbound events set `thread_id: None` ('Teams conversations don't have sub-threads in the same way'). Core `create_thread` falls back to the same channel on timeout anyway."
+source  = ["crates/openab-core/src/gateway.rs#create_thread", "crates/openab-gateway/src/adapters/teams.rs#handle_reply"]
+pr      = ""
+
+[[openab_features]]
+feature = "media_inbound"
+status  = "not_implemented"
+note    = "Webhook only reads `activity.text`; attachments are neither parsed nor forwarded (`mentions` passed as empty `vec![]`; no attachment extraction). The `ChannelAccount`/`Activity` DTOs don't even model `attachments`."
+source  = ["crates/openab-gateway/src/adapters/teams.rs#Activity"]
+pr      = ""
+
+[[openab_features]]
+feature = "voice_stt"
+status  = "n_a"
+note    = "No voice-note ingestion path in the adapter; not applicable."
+source  = ["crates/openab-gateway/src/adapters/teams.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "trust_gate"
+status  = "implemented"
+note    = "Two layers: platform-level `check_tenant` (optional `allowed_tenants` allowlist) at ingress, plus core's shared `gate_incoming` (L2 scope + L3 identity) applied to all gateway events in `process_gateway_event`."
+source  = ["crates/openab-gateway/src/adapters/teams.rs#check_tenant", "crates/openab-core/src/adapter.rs#gate_incoming"]
+pr      = ""
+
+[[openab_features]]
+feature = "deny_echo"
+status  = "implemented"
+note    = "On `DenyIdentity`, core echoes the sender their ID (throttled via `echo_allowed`). Delivered through the gateway send path, so subject to the same reply constraints as normal sends."
+source  = ["crates/openab-core/src/gateway.rs#echo_allowed"]
+pr      = ""
+
+[[openab_features]]
+feature = "mention_gating"
+status  = "partial"
+note    = "Core `should_skip_event` enforces @mention gating in groups when `bot_username` is set — but the Teams webhook forwards `mentions: vec![]` ('@mentions parsing deferred to future PR'), so gating can't match a Teams mention. It also only fires for `channel_type` `group`/`supergroup`; Teams sends `groupChat`/`channel`, which don't match. Teams itself only delivers @mentioned messages in channels, which mitigates this at the platform layer."
+source  = ["crates/openab-core/src/gateway.rs#should_skip_event", "crates/openab-gateway/src/adapters/teams.rs#handle_reply"]
+pr      = ""
+
+[[openab_features]]
+feature = "slash_commands"
+status  = "implemented"
+note    = "`/reset` and `/cancel` are parsed from message text by core's gateway loops (WS path + unified `process_gateway_event`); no native Teams slash protocol needed."
+source  = ["crates/openab-core/src/gateway.rs#process_gateway_event"]
+pr      = ""
+
+[[openab_features]]
+feature = "multibot"
+status  = "partial"
+note    = "Core supports multi-bot suppression of streaming (`use_streaming(other_bot_present)`); moot on Teams because streaming edits don't reach it and Teams doesn't deliver other bots' messages anyway."
+source  = ["crates/openab-core/src/gateway.rs#use_streaming", "crates/openab-core/src/adapter.rs#use_streaming"]
+pr      = ""
+
+[[openab_features]]
+feature = "group_routing"
+status  = "implemented"
+note    = "Session keyed by `conversation.id` (+ `conversation_type`); `serviceUrl` cached per conversation for reply routing, refreshed (timestamp) on each reply, with a periodic TTL cleanup task in the gateway."
+source  = ["crates/openab-gateway/src/adapters/teams.rs#handle_reply", "crates/openab-gateway/src/lib.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "cron_dispatch"
+status  = "not_implemented"
+note    = "Not wired for scheduled cron dispatch: `VALID_PLATFORMS` (cron.rs) covers only discord/slack/telegram and no adapter is registered for this platform in `cron_adapters`, so `cronjob.toml` jobs targeting it are rejected at startup by `validate_cronjobs`."
+source  = []
+pr      = ""
+
+
+# ═══ Schema 3 — platform-quirks (freeform, dated findings log) ═══════════════
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "serviceUrl is per-conversation and must be cached/refreshed"
+note   = "Teams replies are POSTed to a `serviceUrl` that arrives on each inbound activity and can change over time. The adapter caches `conversation.id → (serviceUrl, timestamp)` on ingress and refreshes the timestamp on every reply to avoid TTL expiry mid-conversation; a background task in the gateway evicts stale entries (4 h TTL). If an inbound activity lacks `serviceUrl`, the event is dropped (can't route replies)."
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/teams.rs#handle_reply"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Sender identity: from.id vs aadObjectId"
+note   = "Verified: the adapter uses `activity.from.id` (the `29:1abc...` Bot Framework/Teams user id) as `SenderInfo.id`, not `from.aadObjectId`. `aadObjectId` (Entra object id) is deserialized but unused — it can be null for guests/anonymous users, whereas `from.id` is always present and stable, so it's the correct trust-gate key. Tenant is resolved with fallbacks: top-level `tenant.id` → `channelData.tenant.id` → `conversation.tenantId` because Teams places it differently for personal vs channel webhooks (tests pin this)."
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/teams.rs#handle_reply"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "The reply/quote target is dropped"
+note   = "`GatewayAdapter::send_message_with_reply` carries the visual-quote target in `quote_message_id` (set from `reply_to_message_id`), but the Teams adapter only reads `reply.reply_to` (the origin/triggering-event id) and maps it to `replyToId`. It never reads `quote_message_id`, so a caller asking for a visual reply/quote gets a plain reply-target `replyToId` at best and no visual quote. This is a distinct gap from the write-side commands."
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/teams.rs#handle_reply"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Auth is heavier than most adapters (endorsements + serviceUrl claim)"
+note   = "JWT validation goes beyond signature/aud/iss/exp: it also enforces (B2) that the signing JWK endorses the activity's `channelId` and (B1) that the token's `serviceurl` claim equals the activity's `serviceUrl` — binding the token to the specific channel/service origin. JWKS keys are cached (1 h TTL) with a force-refresh-on-cache-miss path for Microsoft key rotation. The activity body is parsed before JWT auth (Bot Framework needs `serviceUrl`/`channelId` from the body to validate) — this is why the pre-auth body is capped at 256 KB."
+kind   = "intrinsic"
+source = "https://learn.microsoft.com/en-us/azure/bot-service/rest-api/bot-framework-rest-connector-authentication?view=azure-bot-service-4.0"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Write-side commands are largely unimplemented"
+note   = "`edit_message`, `delete_message`, `create_topic`, and reactions are all issued by core but the Teams `handle_reply` only special-cases reactions (drop) — everything non-reaction is treated as a plain send. This means streaming (post+edit), thread creation, and message edit/delete are effectively no-ops or mis-sends on Teams today, despite the platform supporting all of them (and despite `update_activity` existing as dead code). This is the main gap for a future PR."
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/teams.rs#handle_reply"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Bot message budget is ~100 KB UTF-16"
+note   = "Bot message budget is ~100 KB UTF-16 (text + image links + mentions + reactions, excl. base64 images); recommend ≤80 KB, over-limit returns `413 RequestEntityTooLarge` / `MessageSizeTooBig`."
+kind   = "intrinsic"
+source = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/format-your-bot-messages"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Send rate limits"
+note   = "Per-bot-per-thread send limits 7/1s, 8/2s, 60/30s, 1800/3600s; global 50 RPS per app per tenant; throttle → `429` (retry `412`/`502`/`504` too), use exponential backoff."
+kind   = "intrinsic"
+source = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/rate-limit"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "suggestedActions constraints"
+note   = "`suggestedActions` support `imBack` only, ≤6 buttons, one-on-one chats only, and not alongside attachments (any conversation type)."
+kind   = "intrinsic"
+source = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/build-conversational-capability"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Outbound picture limits"
+note   = "Outbound pictures ≤1024×1024 px, ≤1 MB, PNG/JPEG/GIF; animated GIF unsupported; Markdown inline image defaults to 256×256."
+kind   = "intrinsic"
+source = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/build-conversational-capability"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Reactions supported by platform, unused by OpenAB"
+note   = "Bots can add/remove reactions and receive `messageReaction` (`reactionsAdded`/`reactionsRemoved`) events; OpenAB uses neither for Teams."
+kind   = "intrinsic"
+source = "https://learn.microsoft.com/en-us/microsoftteams/platform/teams-sdk/in-depth-guides/message-reactions"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Bot can edit/delete only its own messages"
+note   = "Bot can edit (`PUT .../activities/{activityId}`) and delete (`DELETE .../activities/{activityId}`) its own messages but never user messages."
+kind   = "intrinsic"
+source = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/update-and-delete-bot-messages"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "No native bot slash-command protocol"
+note   = "No native bot slash-command protocol; command menus arrive as plain `message` activities and must be text-parsed."
+kind   = "intrinsic"
+source = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/create-a-bot-commands-menu"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Bot only receives @mentioned messages in channels/group chats"
+note   = "In channels/group chats a bot only receives messages where it is @mentioned (unless RSC); mentions live in `entities[]` (`type: mention`, `mentioned.id`/`.name`), not the text markup."
+kind   = "intrinsic"
+source = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/conversations/channel-and-group-conversations"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Verified sender id = activity.from.id"
+note   = "Verified sender id = `activity.from.id` (`29:...`), not `aadObjectId`; adapter forwards `from.id` as trust-gate key."
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/teams.rs"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "handle_reply only plain sends + drops reactions"
+note   = "Teams `handle_reply` only handles plain sends + drops reactions; `edit_message`/`delete_message`/`create_topic` are undispatched (fall through to `send_activity`), `quote_message_id` is ignored, and inbound attachments/mentions are not parsed — main gaps for a follow-up PR."
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/teams.rs"

@@ -73,6 +73,18 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # streaming           = true            # override; defaults to follow rich_messages
 # webhook_path        = "/webhook/telegram"   # default /webhook/telegram
 
+# --- LINE (first-class trust section; replaces uniform GATEWAY_* env for LINE) ---
+# L3 identity trust for the LINE adapter (identity-trust-none ADR). Each field
+# falls back to its LINE_* env var when unset, then to deny-all. Channel
+# credentials stay on LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN env vars.
+# NOTE: relying on GATEWAY_ALLOW_ALL_USERS / GATEWAY_ALLOWED_USERS for LINE is
+# deprecated (warns at startup; becomes an error in Phase 2).
+# [line]
+# allow_all_users = false               # true = any user; omitted/false = deny-all except allowed_users
+#                                       # env fallback: LINE_ALLOW_ALL_USERS
+# allowed_users = ["U1234567890abcdef0123456789abcdef"]  # LINE user IDs (U…, 33 chars)
+#                                       # env fallback: LINE_ALLOWED_USERS (comma-separated)
+
 # --- AgentCore Runtime (alternative to [agent]) ---
 # When [agentcore] is set and [agent].command is not explicitly provided,
 # OAB auto-spawns the bundled agentcore-acp adapter. No manual wiring needed.

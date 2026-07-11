@@ -336,6 +336,30 @@ async fn main() -> anyhow::Result<()> {
             );
         }
 
+        // Slack: gate L3 (identity) only via the shared gate, mirroring the
+        // Discord entry above. Slack's L2 (channel allowlist) stays in the
+        // adapter — its registry entry is L2-open — and L3 mirrors the resolved
+        // [slack].allow_all_users/allowed_users, so the gate agrees with
+        // Slack's existing user check (behavior-preserving). Without this
+        // entry, Slack was the only configured platform absent from the
+        // registry, falling back to the deny-all default if the gate ever ran
+        // for it (#1361).
+        if let Some(s) = &cfg.slack {
+            reg.insert(
+                "slack",
+                TrustConfig::new(
+                    Some(true), // L2 open — Slack's own channel check still applies
+                    Vec::<String>::new(),
+                    Some(true),
+                    Some(config::resolve_allow_all(
+                        s.allow_all_users,
+                        &s.allowed_users,
+                    )),
+                    s.allowed_users.clone(),
+                ),
+            );
+        }
+
         // Telegram: L3 (identity) mirrors the resolved
         // [telegram].allow_all_users/allowed_users, so config.toml can
         // restrict who can message the bot without needing
@@ -367,6 +391,58 @@ async fn main() -> anyhow::Result<()> {
                     r.allowed_users,
                 ),
             );
+        }
+
+        // LINE: L3 (identity) mirrors the resolved
+        // [line].allow_all_users/allowed_users, so config.toml can restrict
+        // who can message the bot without the uniform
+        // GATEWAY_ALLOW_ALL_USERS/GATEWAY_ALLOWED_USERS env vars (#1355). L2
+        // (channels) has no LINE-specific concept distinct from the generic
+        // gateway model yet (group policy is a follow-up), so it stays on the
+        // shared GATEWAY_* values set above.
+        //
+        // Also resolves when running env-only (no [line] section but
+        // LINE_ALLOW_ALL_USERS / LINE_ALLOWED_USERS set), matching the
+        // Telegram pattern.
+        let line_resolved = if let Some(l) = &cfg.line {
+            Some(l.resolve())
+        } else if config::LineConfig::env_trust_present() {
+            Some(config::LineConfig::default().resolve())
+        } else {
+            None
+        };
+        match line_resolved {
+            Some(r) => {
+                reg.insert(
+                    "line",
+                    TrustConfig::new(
+                        Some(allow_all_channels),
+                        allowed_channels.clone(),
+                        None,
+                        Some(r.allow_all_users),
+                        r.allowed_users,
+                    ),
+                );
+            }
+            None => {
+                // Phase 1 deprecation (#1355/#1356): LINE trust still rides on
+                // the uniform GATEWAY_* seed. Warn when the unified LINE
+                // adapter is active and the legacy env is what admits users,
+                // so operators migrate before Phase 2 turns this into an error.
+                let line_active =
+                    cfg!(feature = "line") && std::env::var("LINE_CHANNEL_SECRET").is_ok();
+                let legacy_env_set = std::env::var("GATEWAY_ALLOW_ALL_USERS").is_ok()
+                    || std::env::var("GATEWAY_ALLOWED_USERS").is_ok();
+                if line_active && legacy_env_set {
+                    warn!(
+                        "LINE trust is driven by deprecated GATEWAY_ALLOW_ALL_USERS/\
+                         GATEWAY_ALLOWED_USERS env vars — migrate to a [line] section \
+                         (allow_all_users/allowed_users) or LINE_ALLOW_ALL_USERS/\
+                         LINE_ALLOWED_USERS; the uniform GATEWAY_* fallback will \
+                         become a startup error in Phase 2 (#1356)"
+                    );
+                }
+            }
         }
         reg
     };
@@ -547,11 +623,13 @@ async fn main() -> anyhow::Result<()> {
         dispatchers.lock().unwrap().push(slack_dispatcher.clone());
         let slack_allowed_users: std::collections::HashSet<String> =
             slack_cfg.allowed_users.into_iter().collect();
+        let slack_router = router.clone();
         #[cfg(feature = "filestore")]
         let slack_filestore = filestore.clone();
         Some(tokio::spawn(async move {
             if let Err(e) = slack::run_slack_adapter(
                 adapter,
+                slack_router,
                 slack_cfg.app_token,
                 allow_all_channels,
                 allow_all_users,

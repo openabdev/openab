@@ -7,6 +7,7 @@ use crate::dispatch::DispatchTarget;
 use crate::format;
 use crate::media;
 use crate::remind::{self, ReminderStore};
+use crate::trust::l3_gate_applies;
 use async_trait::async_trait;
 use serenity::builder::{
     CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateCommandOption,
@@ -2966,16 +2967,6 @@ fn is_denied_user(
     user_id: u64,
 ) -> bool {
     !is_bot && !allow_all_users && !allowed_users.contains(&user_id)
-}
-
-/// Whether the shared L3 identity gate (`AdapterRouter::gate_incoming`) should run
-/// for this sender. Bots bypass L3 — mirroring [`is_denied_user`]'s `!is_bot`
-/// bypass — because bot admission is a separate concern (`allow_bot_messages` +
-/// `trusted_bot_ids`), and L3 (`allowed_users`) is a human-identity allowlist.
-/// Running L3 on bots would wrongly deny mode-admitted/trusted bots when
-/// `allow_all_users=false` (multi-agent). See PR #1270 review.
-fn l3_gate_applies(is_bot: bool) -> bool {
-    !is_bot
 }
 
 /// Returns `true` if a bot message should bypass the `allow_bot_messages` mode check.

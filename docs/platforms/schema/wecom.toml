@@ -1,0 +1,315 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  Platform capability schema — WECOM (WeCom / WeChat Work)
+# ═══════════════════════════════════════════════════════════════════════════
+
+schema_version = "2026-07-08"
+
+[platform]
+name          = "wecom"
+official_docs = "https://developer.work.weixin.qq.com/document/path/90664"
+description   = "WeCom (企業微信 / WeChat Work) self-built app (自建应用 / agentid) callback integration — AES-encrypted 1:1 member callbacks, proactive push via message/send."
+
+
+# ═══ Schema 1 — platform-capability (source of truth: official docs) ═════════
+
+[capability.transport]
+kind   = "webhook"
+note   = "HTTP callback: WeCom POSTs AES-encrypted XML to the configured self-built-app callback URL."
+source = "https://developer.work.weixin.qq.com/document/path/90238"
+
+[capability.inbound_auth]
+scheme = "aes"
+note   = "L1: msg_signature = SHA1 of sort(token, timestamp, nonce, encrypt).concat(); body is AES-256-CBC decrypted with the 43-char EncodingAESKey (base64→32 bytes), IV = first 16 key bytes, WeCom PKCS7 block_size=32; inner corp_id suffix validated."
+source = "https://developer.work.weixin.qq.com/document/path/90238"
+
+[capability.threads]
+model  = "none"
+note   = "Self-built app callback is a flat 1:1 conversation; no thread/topic primitive."
+source = "https://developer.work.weixin.qq.com/document/path/90239"
+
+[capability.slash_commands]
+supported = false
+note      = "Not a platform primitive. No command registration/delivery; text like /reset arrives as ordinary text content and any interpretation is OpenAB-side."
+source    = "https://developer.work.weixin.qq.com/document/path/90239"
+
+[capability.mentions]
+method = "none"
+note   = "n/a in the self-built app 1:1 model — every callback is a direct message from one FromUserName; no @mention concept. (Group @mention exists only under the separate 智能机器人 model, which this adapter does not use.)"
+source = "https://developer.work.weixin.qq.com/document/path/90239"
+
+[capability.emoji_reactions]
+bot_can_add         = false
+bot_can_remove      = false
+bot_receives_events = false
+note                = "No reaction API for self-built apps: bot cannot add or remove reactions, and reaction events are not delivered. The receive doc enumerates only six inbound callback types: text, image, voice, video, location, link (no reaction, no edit)."
+source              = "https://developer.work.weixin.qq.com/document/path/90239"
+
+[capability.edit_message]
+supported = false
+note      = "No edit API. The only mutation is recall (/cgi-bin/message/recall), which deletes rather than edits, and only within 24h on messages this app sent."
+source    = "https://developer.work.weixin.qq.com/document/path/94867"
+
+[capability.delete_message]
+supported = true
+scope     = "own"
+window_sec = 86400
+note      = "Own messages only, via recall (/cgi-bin/message/recall), within 24 hours of send; cannot delete users'/others' messages (data already delivered to the WeChat-plugin end also can't be pulled back)."
+source    = "https://developer.work.weixin.qq.com/document/path/94867"
+
+[capability.rich_content]
+markdown = true
+cards    = true
+buttons  = false
+note     = "Supported outbound msgtypes: text, image, voice, video, file, textcard, news (图文), mpnews, markdown, miniprogram_notice, template_card. Adapter uses only text."
+source   = "https://developer.work.weixin.qq.com/document/path/90236"
+
+[capability.attachments]
+inbound     = ["image", "audio", "video", "file"]
+outbound    = ["image", "audio", "video", "file"]
+max_size_mb = 20
+note        = "Outbound media upload caps (media/upload): image ≤10MB (JPG/PNG), voice ≤2MB/60s (AMR), video ≤10MB (MP4), general file ≤20MB; min 5 bytes; temp media_id valid 3 days. Inbound: image/voice/video callbacks carry a MediaId pulled via media/get (same 3-day validity). Note: the receive doc's six enumerated inbound types are text/image/voice/video/location/link — inbound file (MediaId + FileName) is not in that list yet is delivered in practice and handled by the adapter."
+source      = "https://developer.work.weixin.qq.com/document/path/90253"
+
+[capability.message_length_limit]
+max_chars = 2048
+note      = "text content ≤ 2048 bytes (超过将截断 — server truncates; ~680 CJK chars at 3 bytes each). Counting unit is UTF-8 bytes, not chars. Chunking required for long replies."
+source    = "https://developer.work.weixin.qq.com/document/path/90236"
+
+[capability.dm_support]
+supported = true
+note      = "Yes — the self-built app model is 1:1 (app ↔ member via touser)."
+source    = "https://developer.work.weixin.qq.com/document/path/90236"
+
+[capability.group_model]
+kinds  = ["user"]
+note   = "Self-built app has no group callback. A separate appchat (群聊) send API and the 智能机器人 model exist but are not used by this adapter."
+source = "https://developer.work.weixin.qq.com/document/path/90248"
+
+[capability.group_sender_identity]
+stable_id = "yes"
+note      = "n/a for group in this adapter (1:1 only). In 1:1, the stable sender id is FromUserName (member UserID), always present, no consent gate."
+source    = "https://developer.work.weixin.qq.com/document/path/90239"
+
+[capability.send_model]
+model                = "push_only"
+reply_token_ttl_sec  = 0
+max_objects_per_send = 0
+note                 = "Push — app calls message/send with access_token + agentid + touser. No reply-window / reply-token; a user need not have messaged first."
+source               = "https://developer.work.weixin.qq.com/document/path/90236"
+
+[capability.proactive_push]
+supported   = true
+quota_model = "metered"
+note        = "Allowed and unsolicited. Quotas: per app ≤ (account cap × 200) person-times/day; per app→member ≤ 30/min and 1000/hour (excess 会被丢弃不下发 — silently dropped)."
+source      = "https://developer.work.weixin.qq.com/document/path/90236"
+
+[capability.bot_to_bot]
+delivered = false
+note      = "n/a — self-built app callbacks originate from human members (FromUserName UserID); the platform does not deliver other apps'/bots' messages to a self-built app."
+source    = "https://developer.work.weixin.qq.com/document/path/90239"
+
+[capability.typing_indicator]
+supported = false
+note      = "Not supported by the API."
+source    = "https://developer.work.weixin.qq.com/document/path/90236"
+
+
+# ═══ Schema 2 — openab-feature-support (source of truth: our code + PR) ══════
+
+[[openab_features]]
+feature = "send_message"
+status  = "implemented"
+note    = "message/send msgtype=text with agentid + touser; token cached & auto-refreshed, retries once on errcode 42001."
+source  = ["crates/openab-gateway/src/adapters/wecom.rs#send_text", "crates/openab-gateway/src/adapters/wecom.rs#post_with_token_retry"]
+pr      = ""
+
+[[openab_features]]
+feature = "message_split"
+status  = "implemented"
+note    = "Byte-aware split at 2048 (WeCom's server-side byte cap); prefers \\n boundaries, splits over-long lines at UTF-8 char boundaries (char_indices) so multibyte chars aren't severed. Uses local split_text_lines, not the trait split_delivery."
+source  = ["crates/openab-gateway/src/adapters/wecom.rs#split_text_lines", "crates/openab-core/src/adapter.rs#split_delivery"]
+pr      = ""
+
+[[openab_features]]
+feature = "streaming"
+status  = "workaround"
+note    = "No edit API in callback mode, so streaming = optional ⏳... placeholder + debounce-buffer chunks into a watch channel + recall placeholder + resend consolidated text (flush_thinking). Causes client flicker → default OFF (WECOM_STREAMING_ENABLED, debounce_secs=3). With streaming off, chunks buffer silently and one consolidated message is sent."
+source  = ["crates/openab-gateway/src/adapters/wecom.rs#flush_thinking"]
+pr      = ""
+
+[[openab_features]]
+feature = "reply_quote"
+status  = "n_a"
+note    = "No reply/quote primitive in the self-built app model. The trait send_message_with_reply default just falls back to plain send; adapter never wires it."
+source  = ["crates/openab-core/src/adapter.rs#send_message_with_reply"]
+pr      = ""
+
+[[openab_features]]
+feature = "edit_message"
+status  = "workaround"
+note    = "reply.command == edit_message only pushes new text into an in-flight streaming watch channel (handle_edit_message); there is no real WeCom edit. Outside a pending stream it is a no-op. The trait edit_message default (returns not supported) otherwise applies."
+source  = ["crates/openab-gateway/src/adapters/wecom.rs#handle_edit_message", "crates/openab-core/src/adapter.rs#edit_message"]
+pr      = ""
+
+[[openab_features]]
+feature = "delete_message"
+status  = "not_implemented"
+note    = "Recall API exists (24h window) but adapter never calls /cgi-bin/message/recall for user-facing delete — only internally to remove the thinking placeholder. Trait delete_message default edits to zero-width space, which WeCom can't honor."
+source  = ["crates/openab-gateway/src/adapters/wecom.rs#flush_thinking", "crates/openab-core/src/adapter.rs#delete_message"]
+pr      = ""
+
+[[openab_features]]
+feature = "emoji_reactions"
+status  = "n_a"
+note    = "reply.command add_reaction / remove_reaction are explicitly matched and ignored with a log line — WeCom self-built apps have no reaction API."
+source  = ["crates/openab-gateway/src/adapters/wecom.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "threads_topics"
+status  = "n_a"
+note    = "create_topic command explicitly ignored (logged). No thread primitive on platform."
+source  = ["crates/openab-gateway/src/adapters/wecom.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "media_inbound"
+status  = "partial"
+note    = "Inbound image → download over HTTPS-only (SSRF guard), reject >10MB, resize ≤1200px + JPEG q75 (GIF passthrough). file → media/get (retry on 42001), reject >20MB, text files only (extension/filename allowlist) and must be valid UTF-8; binary/office files rejected. voice/video/location/link msgtypes are dropped (only text/image/file forwarded)."
+source  = ["crates/openab-gateway/src/adapters/wecom.rs#download_wecom_image", "crates/openab-gateway/src/adapters/wecom.rs#fetch_media_with_retry", "crates/openab-gateway/src/adapters/wecom.rs#download_wecom_file", "crates/openab-gateway/src/adapters/wecom.rs#is_text_file", "crates/openab-gateway/src/adapters/wecom.rs#resize_and_compress"]
+pr      = ""
+
+[[openab_features]]
+feature = "voice_stt"
+status  = "not_implemented"
+note    = "voice msgtype is not in the accepted set (text|image|file); voice callbacks are dropped, no STT."
+source  = ["crates/openab-gateway/src/adapters/wecom.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "trust_gate"
+status  = "implemented"
+note    = "Shared. Gateway ingress gate gate_incoming (L2 scope + L3 identity) runs before dispatch; wecom events carry sender.id = FromUserName (UserID) and channel.id = wecom:{corp_id}:{from_user} for keying."
+source  = ["crates/openab-gateway/src/adapters/wecom.rs", "crates/openab-core/src/gateway.rs", "crates/openab-core/src/adapter.rs#gate_incoming"]
+pr      = ""
+
+[[openab_features]]
+feature = "deny_echo"
+status  = "implemented"
+note    = "Shared. On DenyIdentity the gateway echoes the sender their UserID with a request-access hint (throttled via echo_allowed); DenyScope silently drops. Platform-agnostic path, applies to wecom replies."
+source  = ["crates/openab-core/src/gateway.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "mention_gating"
+status  = "n_a"
+note    = "Shared @mention gating only fires for group/supergroup channel_type; wecom events are channel_type=direct, so gating is bypassed by design."
+source  = ["crates/openab-gateway/src/adapters/wecom.rs", "crates/openab-core/src/gateway.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "slash_commands"
+status  = "partial"
+note    = "Shared. No platform slash mechanism; commands arrive as plain text and are handled by OpenAB's generic command layer, not in the wecom adapter."
+source  = ["crates/openab-gateway/src/adapters/wecom.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "multibot"
+status  = "n_a"
+note    = "Self-built app 1:1 callbacks come only from human members (is_bot: false); no other-bot delivery, no multi-bot channel."
+source  = ["crates/openab-gateway/src/adapters/wecom.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "group_routing"
+status  = "partial"
+note    = "Sessions keyed by wecom:{corp_id}:{from_user} (per-user 1:1); no group routing since there are no group callbacks in this model."
+source  = ["crates/openab-gateway/src/adapters/wecom.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "cron_dispatch"
+status  = "not_implemented"
+note    = "Not wired for scheduled cron dispatch: `VALID_PLATFORMS` (cron.rs) covers only discord/slack/telegram and no adapter is registered for this platform in `cron_adapters`, so `cronjob.toml` jobs targeting it are rejected at startup by `validate_cronjobs`."
+source  = []
+pr      = ""
+
+
+# ═══ Schema 3 — platform-quirks (freeform, dated findings log) ═══════════════
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Send / push model (no reply window)"
+note   = "WeCom self-built apps are pure push: given a valid access_token + agentid, the app can message any member via touser at any time — there is no LINE-style reply token or reply window. access_token (7200s TTL) is cached with a 300s refresh margin (TOKEN_REFRESH_MARGIN_SECS) and force-refreshed on errcode 42001 across both message/send and media/get."
+kind   = "intrinsic"
+source = "https://developer.work.weixin.qq.com/document/path/90236"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Crypto / callback specifics"
+note   = """
+EncodingAESKey is 43 base64 chars without padding; adapter appends = and decodes with Indifferent padding + allow_trailing_bits (the 43rd char's last 2 bits are not payload). Result must be exactly 32 bytes (decode_aes_key).
+WeCom uses PKCS7 with block_size=32 (not 16); adapter decrypts AES-256-CBC with NoPadding and strips padding manually (pad value 1–32). Plaintext = random(16) + msg_len(4 BE) + msg + corp_id; inner corp_id must equal configured CORP_ID. IV = first 16 key bytes.
+Defense-in-depth: outer envelope ToUserName must equal CORP_ID; msg_signature compared in constant time (subtle::ConstantTimeEq); stale callbacks (>300s timestamp skew) rejected; 30s TTL / 10k-entry dedupe cache on MsgId absorbs WeCom's ~5s retries.
+gettoken requires corpsecret as a query param (protocol-mandated) — operators must redact query strings on /cgi-bin/gettoken in proxy logs; gateway never logs that URL.
+"""
+kind   = "intrinsic"
+source = "https://developer.work.weixin.qq.com/document/path/90238"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "\"Streaming\" is recall + resend"
+note   = "Because callback mode has no message-edit API, streaming is emulated: optional ⏳... placeholder, debounce-buffer deltas into a tokio::sync::watch channel (default 3s), then recall the placeholder and send the consolidated final text via flush_thinking. This flickers, so it is off by default (WECOM_STREAMING_ENABLED). With it off, deltas are buffered silently and one message is sent when the debounce settles — no flicker, no recall. A 300s idle cap on the debounce task prevents an orphaned pending entry."
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/wecom.rs#flush_thinking"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Inbound filtering is aggressive"
+note   = "Only text, image, file msgtypes are forwarded; voice / video / location / link are dropped. Files must pass a text-extension/filename allowlist AND be valid UTF-8 — office/binary files are rejected (no doc parsing). Images are HTTPS-only, ≤10MB, downscaled to ≤1200px JPEG q75 (GIF passthrough). Placeholder prompts are injected for media: image → \"Describe this image.\", file → \"User sent a file: {name}\"."
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/wecom.rs#is_text_file"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Inbound types: six enumerated, file delivered anyway"
+note   = "Self-built app receive doc enumerates six inbound types: text/image/voice/video/location/link — file is not listed there (yet delivered & handled by the adapter). FromUserName = member UserID, MsgId = 64-bit; no group/@mention/reaction/edit in this model."
+kind   = "intrinsic"
+source = "https://developer.work.weixin.qq.com/document/path/90239"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Text cap and push quotas"
+note   = "text content capped at 2048 bytes (truncated); push quota per app→member 30/min, 1000/hr, per-app (account-cap×200)/day, excess silently dropped. msgtypes: text/image/voice/video/file/textcard/news/mpnews/markdown/miniprogram_notice/template_card."
+kind   = "intrinsic"
+source = "https://developer.work.weixin.qq.com/document/path/90236"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "No edit API; recall only"
+note   = "No edit API; only recall (/cgi-bin/message/recall) within 24h on this app's own messages (delete, not edit; WeChat-plugin-end data can't be pulled back)."
+kind   = "intrinsic"
+source = "https://developer.work.weixin.qq.com/document/path/94867"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Media caps"
+note   = "Media caps: image 10MB (JPG/PNG), voice 2MB/60s (AMR), video 10MB (MP4), file 20MB; min 5 bytes; temp media_id valid 3 days."
+kind   = "intrinsic"
+source = "https://developer.work.weixin.qq.com/document/path/90253"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Callback auth summary"
+note   = "Callback auth = SHA1 msg_signature (sorted token/ts/nonce/encrypt) + AES-256-CBC via 43-char EncodingAESKey, PKCS7 block_size=32, IV = first 16 key bytes."
+kind   = "intrinsic"
+source = "https://developer.work.weixin.qq.com/document/path/90238"
+
+[[quirks]]
+date   = "2026-07-04"
+title  = "Section-2 refs verified; WecomAdapter is a standalone handler"
+note   = "All section-2 refs verified against the tree; WecomAdapter is a standalone handler (does not impl ChatAdapter); trait defaults referenced (split_delivery, send_message_with_reply, edit_message, delete_message, gate_incoming) live in openab-core/src/adapter.rs."
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/wecom.rs"
+refs   = []
