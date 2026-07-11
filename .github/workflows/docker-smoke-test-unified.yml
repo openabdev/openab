@@ -88,10 +88,15 @@ jobs:
       - name: Verify Codex runtime versions
         if: matrix.target.name == 'codex'
         run: |
+          # Expected versions come from the Dockerfile ARG defaults (single
+          # source of truth) so a version bump only touches the Dockerfiles.
+          CODEX_ACP_VERSION=$(awk -F= '$1 == "ARG CODEX_ACP_VERSION" {print $2; exit}' Dockerfile.unified)
+          CODEX_VERSION=$(awk -F= '$1 == "ARG CODEX_VERSION" {print $2; exit}' Dockerfile.unified)
+          test -n "$CODEX_ACP_VERSION" && test -n "$CODEX_VERSION"
           docker run --rm --entrypoint codex-acp openab-unified-codex:test --version \
-            | grep -F '@agentclientprotocol/codex-acp 1.1.2'
+            | grep -F "@agentclientprotocol/codex-acp ${CODEX_ACP_VERSION}"
           docker run --rm --entrypoint codex openab-unified-codex:test --version \
-            | grep -F 'codex-cli 0.144.1'
+            | grep -F "codex-cli ${CODEX_VERSION}"
 
       - name: Verify Codex ACP handshake
         if: matrix.target.name == 'codex'

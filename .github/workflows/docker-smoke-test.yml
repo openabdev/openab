@@ -57,10 +57,15 @@ jobs:
       - name: Verify Codex runtime versions
         if: matrix.variant.suffix == '-codex'
         run: |
+          # Expected versions come from the Dockerfile ARG defaults (single
+          # source of truth) so a version bump only touches the Dockerfiles.
+          CODEX_ACP_VERSION=$(awk -F= '$1 == "ARG CODEX_ACP_VERSION" {print $2; exit}' Dockerfile.codex)
+          CODEX_VERSION=$(awk -F= '$1 == "ARG CODEX_VERSION" {print $2; exit}' Dockerfile.codex)
+          test -n "$CODEX_ACP_VERSION" && test -n "$CODEX_VERSION"
           docker run --rm --entrypoint codex-acp openab-test-codex --version \
-            | grep -F '@agentclientprotocol/codex-acp 1.1.2'
+            | grep -F "@agentclientprotocol/codex-acp ${CODEX_ACP_VERSION}"
           docker run --rm --entrypoint codex openab-test-codex --version \
-            | grep -F 'codex-cli 0.144.1'
+            | grep -F "codex-cli ${CODEX_VERSION}"
 
       - name: Verify agent responds
         run: |
