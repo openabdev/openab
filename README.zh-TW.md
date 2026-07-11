@@ -6,31 +6,34 @@
 
 ![OpenAB banner](images/banner.jpg)
 
-一個輕量、安全、雲端原生的 ACP harness，透過 stdio JSON-RPC 將 **Discord、Slack** 與任何相容於 [Agent Client Protocol](https://github.com/anthropics/agent-protocol) 的程式開發 CLI（Kiro CLI、Claude Code、Codex、Gemini、OpenCode、MiMo-Code、Copilot CLI、Hermes、Grok Build、Devin、Antigravity、Pi 等）連接起來，帶來新一代的開發體驗。**Telegram、LINE、Feishu/Lark、Google Chat** 以及其他以 webhook 為基礎的平台，則透過獨立的 [Custom Gateway](crates/openab-gateway/) 支援。
+一個輕量、安全、雲端原生的 ACP harness，透過 stdio JSON-RPC 將 **Discord、Slack** 與任何相容於 [Agent Client Protocol](https://github.com/anthropics/agent-protocol) 的程式開發 CLI（Kiro CLI、Claude Code、Codex、Gemini、OpenCode、MiMo-Code、Copilot CLI、Hermes、Grok Build、Devin、Antigravity、Pi 等）連接起來，帶來新一代的開發體驗。**Telegram、LINE、Feishu/Lark、Google Chat、WeCom 與 Microsoft Teams** 則由 gateway adapters 支援；可將 adapters 編入 unified binary，或部署為獨立的 [Custom Gateway](crates/openab-gateway/)。
 
 🪼 **加入我們的社群！** 歡迎到 Discord 和大家打招呼：**[🪼 OpenAB — Official](https://openab.dev/discord)** 🎉
 
 ```
-┌──────────────┐  Gateway WS   ┌──────────────┐  ACP stdio    ┌──────────────────┐
-│   Discord    │◄─────────────►│              │──────────────►│   coding CLI     │
-│   User       │               │    openab    │◄── JSON-RPC ──│   (acp mode)     │
-├──────────────┤  Socket Mode  │    (Rust)    │               ├──────────────────┤
-│   Slack      │◄─────────────►│              │               │ kiro-cli acp     │
-│   User       │               └──────┬───────┘               │ claude-agent-acp │
-├──────────────┤                      │  WebSocket            │ codex-acp        │
-│   Telegram   │◄──webhook──┐         │   (outbound)          │ gemini --acp     │
-│   User       │            │         │                       │ copilot --acp    │
-├──────────────┤            ▼         ▼                       │ hermes-acp       │
-│   LINE       │◄──webhook──┌──────────────────┐              │ opencode acp     │
-│   User       │            │  Custom Gateway  │              │ mimo acp         │
-├──────────────┤            │  (standalone)    │              │ grok agent stdio │
-│  Feishu/Lark │◄───WS──────│                  │              │ devin acp        │
-│   User       │            │                  │              │ agy-acp          │
-├──────────────┤            │                  │              │ pi-acp           │
-│ Google Chat  │◄──webhook──│                  │              └──────────────────┘
-│   User       │            └──────────────────┘
-└──────────────┘
+Discord（Gateway WS）─┐
+Slack（Socket Mode）──┴─► 內建 adapters ────────────────────────┐
+                                                                  │
+Telegram · LINE · Feishu/Lark · Google Chat · WeCom · MS Teams    │
+  ├─► 內嵌 gateway adapters（unified mode）───────────────────────┤
+  └─► openab-gateway（standalone 預設）── outbound WebSocket ─────┤
+                                                                  ▼
+┌────────────────────────────────────────────────────────────────────┐
+│ openab（Rust）                                                     │
+│ ChatAdapter → Dispatcher → SessionPool                             │
+└─────────────────────────────────┬──────────────────────────────────┘
+                                  │ ACP JSON-RPC over stdio
+                                  ▼
+┌────────────────────────────────────────────────────────────────────┐
+│ Agent process                                                      │
+│ 本機：coding CLIs 與 openab-agent                                  │
+│ 遠端：agentcore-acp → AWS AgentCore Runtime                        │
+└────────────────────────────────────────────────────────────────────┘
 ```
+
+對 gateway platforms 而言，standalone gateway 仍是預設的 companion；
+unified build 則將相同 adapters 直接編入 `openab`。兩條路徑最後都會進入
+同一套 dispatcher、session pool 與 ACP agent-process boundary。
 
 ## 示範
 
@@ -39,7 +42,7 @@
 ## 功能特色
 
 - **多平台支援** — 支援 Discord 與 Slack，可單獨或同時執行
-- **Custom Gateway** — 透過獨立的 [gateway](crates/openab-gateway/) 擴充至 Telegram、LINE、Feishu/Lark、Google Chat、MS Teams
+- **Gateway adapters** — 可透過獨立的 [gateway](crates/openab-gateway/) 或 opt-in unified build 擴充至 Telegram、LINE、Feishu/Lark、Google Chat、WeCom 與 Microsoft Teams
 - **可替換的 agent backend** — 可透過設定在 Kiro CLI、Claude Code、Codex、Gemini、OpenCode、MiMo-Code、Copilot CLI、Hermes、Grok Build、Devin、Antigravity、Pi 之間切換
 - **@mention 觸發** — 在允許的頻道中 mention bot，即可開始對話
 - **以討論串進行多輪對話** — 自動建立討論串；後續訊息不需再次 @mention

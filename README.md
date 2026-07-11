@@ -6,31 +6,34 @@ English | [繁體中文](README.zh-TW.md)
 
 ![OpenAB banner](images/banner.jpg)
 
-A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**, and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, OpenCode, MiMo-Code, Copilot CLI, Hermes, Grok Build, Devin, Antigravity, Pi, etc.) over stdio JSON-RPC — delivering the next-generation development experience. **Telegram, LINE, Feishu/Lark, Google Chat**, and other webhook-based platforms are supported via the standalone [Custom Gateway](crates/openab-gateway/).
+A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**, and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, OpenCode, MiMo-Code, Copilot CLI, Hermes, Grok Build, Devin, Antigravity, Pi, etc.) over stdio JSON-RPC — delivering the next-generation development experience. **Telegram, LINE, Feishu/Lark, Google Chat, WeCom, and Microsoft Teams** are available through gateway adapters, either compiled into the unified binary or deployed as the standalone [Custom Gateway](crates/openab-gateway/).
 
 🪼 **Join our community!** Come say hi on Discord — we'd love to have you: **[🪼 OpenAB — Official](https://openab.dev/discord)** 🎉
 
 ```
-┌──────────────┐  Gateway WS   ┌──────────────┐  ACP stdio    ┌──────────────────┐
-│   Discord    │◄─────────────►│              │──────────────►│   coding CLI     │
-│   User       │               │    openab    │◄── JSON-RPC ──│   (acp mode)     │
-├──────────────┤  Socket Mode  │    (Rust)    │               ├──────────────────┤
-│   Slack      │◄─────────────►│              │               │ kiro-cli acp     │
-│   User       │               └──────┬───────┘               │ claude-agent-acp │
-├──────────────┤                      │  WebSocket            │ codex-acp        │
-│   Telegram   │◄──webhook──┐         │   (outbound)          │ gemini --acp     │
-│   User       │            │         │                       │ copilot --acp    │
-├──────────────┤            ▼         ▼                       │ hermes-acp       │
-│   LINE       │◄──webhook──┌──────────────────┐              │ opencode acp     │
-│   User       │            │  Custom Gateway  │              │ mimo acp         │
-├──────────────┤            │  (standalone)    │              │ grok agent stdio │
-│  Feishu/Lark │◄───WS──────│                  │              │ devin acp        │
-│   User       │            │                  │              │ agy-acp          │
-├──────────────┤            │                  │              │ pi-acp           │
-│ Google Chat  │◄──webhook──│                  │              └──────────────────┘
-│   User       │            └──────────────────┘
-└──────────────┘
+Discord (Gateway WS) ─┐
+Slack (Socket Mode) ──┴─► built-in adapters ────────────────────┐
+                                                                  │
+Telegram · LINE · Feishu/Lark · Google Chat · WeCom · MS Teams    │
+  ├─► embedded gateway adapters (unified mode) ───────────────────┤
+  └─► openab-gateway (standalone default) ── outbound WebSocket ──┤
+                                                                  ▼
+┌────────────────────────────────────────────────────────────────────┐
+│ openab (Rust)                                                      │
+│ ChatAdapter → Dispatcher → SessionPool                             │
+└─────────────────────────────────┬──────────────────────────────────┘
+                                  │ ACP JSON-RPC over stdio
+                                  ▼
+┌────────────────────────────────────────────────────────────────────┐
+│ Agent process                                                      │
+│ Local: coding CLIs and openab-agent                                │
+│ Remote: agentcore-acp → AWS AgentCore Runtime                      │
+└────────────────────────────────────────────────────────────────────┘
 ```
+
+The standalone gateway remains the default companion for gateway platforms;
+unified builds embed the same adapters in `openab`. Both paths converge on the
+same dispatcher, session pool, and ACP agent-process boundary.
 
 ## Demo
 
@@ -39,7 +42,7 @@ A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**,
 ## Features
 
 - **Multi-platform** — supports Discord and Slack, run one or both simultaneously
-- **Custom Gateway** — extend to Telegram, LINE, Feishu/Lark, Google Chat, MS Teams via standalone [gateway](crates/openab-gateway/)
+- **Gateway adapters** — extend to Telegram, LINE, Feishu/Lark, Google Chat, WeCom, and Microsoft Teams through the standalone [gateway](crates/openab-gateway/) or an opt-in unified build
 - **Pluggable agent backend** — swap between Kiro CLI, Claude Code, Codex, Gemini, OpenCode, MiMo-Code, Copilot CLI, Hermes, Grok Build, Devin, Antigravity, Pi via config
 - **@mention trigger** — mention the bot in an allowed channel to start a conversation
 - **Thread-based multi-turn** — auto-creates threads; no @mention needed for follow-ups
