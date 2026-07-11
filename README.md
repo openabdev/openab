@@ -11,29 +11,37 @@ A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**,
 🪼 **Join our community!** Come say hi on Discord — we'd love to have you: **[🪼 OpenAB — Official](https://openab.dev/discord)** 🎉
 
 ```
-Discord (Gateway WS) ─┐
-Slack (Socket Mode) ──┴─► built-in adapters ────────────────────┐
-                                                                  │
-Telegram · LINE · Feishu/Lark · Google Chat · WeCom · MS Teams    │
-  ├─► embedded gateway adapters (unified mode) ───────────────────┤
-  └─► openab-gateway (standalone default) ── outbound WebSocket ──┤
-                                                                  ▼
-┌────────────────────────────────────────────────────────────────────┐
-│ openab (Rust)                                                      │
-│ ChatAdapter → Dispatcher → SessionPool                             │
-└─────────────────────────────────┬──────────────────────────────────┘
-                                  │ ACP JSON-RPC over stdio
-                                  ▼
-┌────────────────────────────────────────────────────────────────────┐
-│ Agent process                                                      │
-│ Local: coding CLIs and openab-agent                                │
-│ Remote: agentcore-acp → AWS AgentCore Runtime                      │
-└────────────────────────────────────────────────────────────────────┘
+┌──────────────┐  Gateway WS  ┌─────────────────┐  ACP stdio   ┌─────────────────────────┐
+│ Discord      │◄────────────►│                 │─────────────►│ agent runtime           │
+│ User         │              │ openab (Rust)   │◄──JSON-RPC──│ (ACP process)           │
+├──────────────┤  Socket Mode │ thin ACP broker │             ├─────────────────────────┤
+│ Slack        │◄────────────►│                 │             │ kiro-cli acp            │
+│ User         │              └────────┬────────┘             │ claude-agent-acp        │
+├──────────────┤                       ▲                      │ codex-acp               │
+│ Telegram     │◄────HTTP────►┐        │                      │  └─ Codex app-server    │
+│ User         │              │        │ WebSocket            │ gemini --acp            │
+├──────────────┤              │        │ (standalone)         │ copilot --acp           │
+│ LINE         │◄────HTTP────►┤        │ or in-process        │ cursor-agent acp        │
+│ User         │              │        │ (unified)            │ hermes-acp              │
+├──────────────┤              │ ┌──────┴───────────┐          │ opencode acp            │
+│ Feishu/Lark  │◄──WS/HTTP───►┼►│ gateway adapters │          │ mimo acp                │
+│ User         │              │ │ standalone or    │          │ grok agent stdio        │
+├──────────────┤              │ │ embedded unified │          │ devin acp               │
+│ Google Chat  │◄────HTTP────►┤ └──────────────────┘          │ agy-acp                 │
+│ User         │              │                               │ pi-acp                  │
+├──────────────┤              │                               │ openab-agent            │
+│ WeCom        │◄────HTTP────►┤                               │ agentcore-acp           │
+│ User         │              │                               │  └─ AWS AgentCore       │
+├──────────────┤              │                               │ custom ACP agent        │
+│ MS Teams     │◄────HTTP────►┘                               └─────────────────────────┘
+│ User         │
+└──────────────┘
 ```
 
-The standalone gateway remains the default companion for gateway platforms;
-unified builds embed the same adapters in `openab`. Both paths converge on the
-same dispatcher, session pool, and ACP agent-process boundary.
+OpenAB remains a thin broker: platform adapters converge on the same
+dispatcher and session pool, then cross one ACP stdio boundary to the selected
+agent runtime. Gateway adapters can run as a standalone companion or be
+embedded in a unified build without changing that boundary.
 
 ## Demo
 

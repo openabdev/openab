@@ -11,29 +11,37 @@
 🪼 **加入我們的社群！** 歡迎到 Discord 和大家打招呼：**[🪼 OpenAB — Official](https://openab.dev/discord)** 🎉
 
 ```
-Discord（Gateway WS）─┐
-Slack（Socket Mode）──┴─► 內建 adapters ────────────────────────┐
-                                                                  │
-Telegram · LINE · Feishu/Lark · Google Chat · WeCom · MS Teams    │
-  ├─► 內嵌 gateway adapters（unified mode）───────────────────────┤
-  └─► openab-gateway（standalone 預設）── outbound WebSocket ─────┤
-                                                                  ▼
-┌────────────────────────────────────────────────────────────────────┐
-│ openab（Rust）                                                     │
-│ ChatAdapter → Dispatcher → SessionPool                             │
-└─────────────────────────────────┬──────────────────────────────────┘
-                                  │ ACP JSON-RPC over stdio
-                                  ▼
-┌────────────────────────────────────────────────────────────────────┐
-│ Agent process                                                      │
-│ 本機：coding CLIs 與 openab-agent                                  │
-│ 遠端：agentcore-acp → AWS AgentCore Runtime                        │
-└────────────────────────────────────────────────────────────────────┘
+┌──────────────┐  Gateway WS  ┌─────────────────┐  ACP stdio   ┌─────────────────────────┐
+│ Discord      │◄────────────►│                 │─────────────►│ agent runtime           │
+│ User         │              │ openab (Rust)   │◄──JSON-RPC──│ (ACP process)           │
+├──────────────┤  Socket Mode │ thin ACP broker │             ├─────────────────────────┤
+│ Slack        │◄────────────►│                 │             │ kiro-cli acp            │
+│ User         │              └────────┬────────┘             │ claude-agent-acp        │
+├──────────────┤                       ▲                      │ codex-acp               │
+│ Telegram     │◄────HTTP────►┐        │                      │  └─ Codex app-server    │
+│ User         │              │        │ WebSocket            │ gemini --acp            │
+├──────────────┤              │        │ (standalone)         │ copilot --acp           │
+│ LINE         │◄────HTTP────►┤        │ or in-process        │ cursor-agent acp        │
+│ User         │              │        │ (unified)            │ hermes-acp              │
+├──────────────┤              │ ┌──────┴───────────┐          │ opencode acp            │
+│ Feishu/Lark  │◄──WS/HTTP───►┼►│ gateway adapters │          │ mimo acp                │
+│ User         │              │ │ standalone or    │          │ grok agent stdio        │
+├──────────────┤              │ │ embedded unified │          │ devin acp               │
+│ Google Chat  │◄────HTTP────►┤ └──────────────────┘          │ agy-acp                 │
+│ User         │              │                               │ pi-acp                  │
+├──────────────┤              │                               │ openab-agent            │
+│ WeCom        │◄────HTTP────►┤                               │ agentcore-acp           │
+│ User         │              │                               │  └─ AWS AgentCore       │
+├──────────────┤              │                               │ custom ACP agent        │
+│ MS Teams     │◄────HTTP────►┘                               └─────────────────────────┘
+│ User         │
+└──────────────┘
 ```
 
-對 gateway platforms 而言，standalone gateway 仍是預設的 companion；
-unified build 則將相同 adapters 直接編入 `openab`。兩條路徑最後都會進入
-同一套 dispatcher、session pool 與 ACP agent-process boundary。
+OpenAB 仍是 thin broker：所有 platform adapters 都會進入同一套
+dispatcher 與 session pool，再透過單一 ACP stdio boundary 連接所選的
+agent runtime。Gateway adapters 可作為 standalone companion 執行，也可
+內嵌於 unified build，兩種部署方式都不會改變這個 boundary。
 
 ## 示範
 
