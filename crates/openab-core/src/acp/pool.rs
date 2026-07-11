@@ -80,40 +80,6 @@ fn get_or_insert_gate(map: &mut HashMap<String, Arc<Mutex<()>>>, key: &str) -> A
         .clone()
 }
 
-/// Preserve default Codex mode selections across the upstream adapter's mode-id rename.
-///
-/// The mapping is capability-gated so other ACP agents, and older Codex adapters that still
-/// advertise the legacy ids, continue receiving the exact configured value.
-fn compatible_default_config_value<'a>(
-    config_options: &[ConfigOption],
-    config_id: &str,
-    value: &'a str,
-) -> &'a str {
-    if config_id != "mode" {
-        return value;
-    }
-
-    let Some(mode_option) = config_options.iter().find(|option| option.id == config_id) else {
-        return value;
-    };
-    let supports = |candidate: &str| {
-        mode_option
-            .options
-            .iter()
-            .any(|option| option.value == candidate)
-    };
-
-    if supports(value) {
-        return value;
-    }
-
-    match value {
-        "auto" if supports("agent") => "agent",
-        "full-access" if supports("agent-full-access") => "agent-full-access",
-        _ => value,
-    }
-}
-
 /// Returns true when a session should be treated as stale during idle cleanup.
 fn classify_idle(last_active: Instant, alive: bool, cutoff: Instant) -> bool {
     last_active < cutoff || !alive
@@ -439,26 +405,8 @@ impl SessionPool {
 
             // Apply default config options (e.g. mode=bypass, model=swe-1-6)
             for (config_id, value) in &self.default_config_options {
-                let compatible_value =
-                    compatible_default_config_value(&new_conn.config_options, config_id, value);
-                if compatible_value != value {
-                    warn!(
-                        config_id,
-                        old_value = value,
-                        new_value = compatible_value,
-                        "legacy ACP config value mapped; update [pool].default_config_options"
-                    );
-                }
-                if let Err(e) = new_conn
-                    .set_config_option(config_id, compatible_value)
-                    .await
-                {
-                    warn!(
-                        config_id,
-                        value = compatible_value,
-                        error = %e,
-                        "failed to set default config option"
-                    );
+                if let Err(e) = new_conn.set_config_option(config_id, value).await {
+                    warn!(config_id, value, error = %e, "failed to set default config option");
                 }
             }
 
@@ -845,82 +793,14 @@ impl SessionPool {
 #[cfg(test)]
 mod tests {
     use super::{
-        better_candidate, classify_hung, classify_idle, compatible_default_config_value,
-        get_or_insert_gate, purge_session_entries, remove_if_same_handle, PoolState,
+        better_candidate, classify_hung, classify_idle, get_or_insert_gate, purge_session_entries,
+        remove_if_same_handle, PoolState,
     };
     use crate::acp::connection::SessionActivity;
-    use crate::acp::protocol::{ConfigOption, ConfigOptionValue};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
     use tokio::time::Instant;
-
-    fn mode_option(values: &[&str]) -> ConfigOption {
-        ConfigOption {
-            id: "mode".to_string(),
-            name: "Mode".to_string(),
-            description: None,
-            category: Some("mode".to_string()),
-            option_type: "select".to_string(),
-            current_value: "agent".to_string(),
-            options: values
-                .iter()
-                .map(|value| ConfigOptionValue {
-                    value: (*value).to_string(),
-                    name: (*value).to_string(),
-                    description: None,
-                })
-                .collect(),
-        }
-    }
-
-    #[test]
-    fn maps_legacy_codex_mode_ids_when_replacement_is_advertised() {
-        let options = [mode_option(&["read-only", "agent", "agent-full-access"])];
-
-        assert_eq!(
-            compatible_default_config_value(&options, "mode", "auto"),
-            "agent"
-        );
-        assert_eq!(
-            compatible_default_config_value(&options, "mode", "full-access"),
-            "agent-full-access"
-        );
-    }
-
-    #[test]
-    fn preserves_legacy_mode_ids_when_agent_still_advertises_them() {
-        let options = [mode_option(&["read-only", "auto", "full-access"])];
-
-        assert_eq!(
-            compatible_default_config_value(&options, "mode", "auto"),
-            "auto"
-        );
-        assert_eq!(
-            compatible_default_config_value(&options, "mode", "full-access"),
-            "full-access"
-        );
-    }
-
-    #[test]
-    fn preserves_unrelated_config_values() {
-        let options = [mode_option(&["read-only", "agent", "agent-full-access"])];
-
-        for mode in ["read-only", "agent", "agent-full-access"] {
-            assert_eq!(
-                compatible_default_config_value(&options, "mode", mode),
-                mode
-            );
-        }
-        assert_eq!(
-            compatible_default_config_value(&options, "model", "auto"),
-            "auto"
-        );
-        assert_eq!(
-            compatible_default_config_value(&options, "mode", "custom"),
-            "custom"
-        );
-    }
 
     #[test]
     fn remove_if_same_handle_removes_matching_entry() {

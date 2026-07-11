@@ -110,21 +110,21 @@ service accounts, and network access to the agent's actual needs. Select
 > `[agent].args` only. Prefer the `[pool]` mechanism above; if you need the
 > env route, deliver it with `[agent] env = { INITIAL_AGENT_MODE = "…" }`.
 
-The previous Zed adapter used `auto` and `full-access`. OpenAB maps those
-legacy values when `[pool].default_config_options` targets an adapter that
-advertises the replacement modes:
+> [!WARNING]
+> **Breaking change — mode IDs renamed.** The previous Zed adapter used `auto`
+> and `full-access`; this adapter uses `agent` and `agent-full-access`. OpenAB
+> does **not** translate the old values: a `[pool].default_config_options`
+> entry like `mode = "full-access"` fails to apply on upgrade (OpenAB logs
+> `failed to set default config option` and the session stays on the adapter's
+> conservative `agent` default — it fails safe, never escalates). Update your
+> config to the new IDs:
+>
+> ```text
+> auto        -> agent
+> full-access -> agent-full-access
+> ```
 
-```text
-auto        -> agent
-full-access -> agent-full-access
-```
-
-Legacy values remain valid OpenAB configuration aliases. When OpenAB applies
-one to a new session, it logs a warning with the old and replacement values so
-operators can update `[pool].default_config_options`; the adapter receives only
-the replacement value.
-
-Custom ACP clients that call `session/set_config_option` directly must send
+Custom ACP clients that call `session/set_config_option` directly must also send
 the new mode IDs. If canary validation finds a regression, roll back to the
 previous OpenAB Codex image tag; existing Codex credentials and session data
 remain under `/home/node/.codex/`.
