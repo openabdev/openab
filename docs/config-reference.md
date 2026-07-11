@@ -207,6 +207,12 @@ command = "codex-acp"
 working_dir = "/home/node"
 env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
 
+# Recommended for containerized OpenAB deployments: the outer container is the
+# security boundary; Codex's inner sandbox needs user namespaces containers
+# typically don't grant. See docs/codex.md §ACP Modes and Migration.
+[pool]
+default_config_options = { mode = "agent-full-access" }
+
 # Gemini CLI
 [agent]
 command = "gemini"

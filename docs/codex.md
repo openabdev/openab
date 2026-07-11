@@ -16,10 +16,9 @@ globally in the same npm transaction. The global Codex CLI keeps
 `codex login --device-auth` available, while npm deduplicates the adapter's
 compatible Codex dependency to the pinned CLI version.
 
-OpenAB starts the adapter through `/usr/bin/env` with
-`INITIAL_AGENT_MODE=agent-full-access`. This makes the outer container or VM
-the default security boundary and avoids requiring a nested Linux user
-namespace for Codex's inner sandbox.
+For containerized deployments where the outer container or VM is the security
+boundary, set `[pool] default_config_options = { mode = "agent-full-access" }`
+— see [ACP Modes and Migration](#acp-modes-and-migration).
 
 ## Helm Install
 
@@ -82,28 +81,34 @@ and approval policy for each ACP turn:
 | Mode | Sandbox | Approval policy | Network |
 |------|---------|-----------------|---------|
 | `read-only` | read-only | on-request | disabled |
-| `agent` | workspace-write | on-request | disabled |
-| `agent-full-access` (OpenAB image default) | danger-full-access | never | enabled |
+| `agent` (adapter default) | workspace-write | on-request | disabled |
+| `agent-full-access` (recommended for OpenAB deployments) | danger-full-access | never | enabled |
 
-The upstream adapter defaults to `agent` when it is launched directly. OpenAB's
-Codex images default to `agent-full-access` so a user can start working without
-requiring `bubblewrap` inside an already isolated container. To override the
-image default for newly created OpenAB sessions, use the standard ACP config
-option mechanism:
+The adapter defaults to `agent`. For OpenAB deployments the outer container or
+VM is normally the intended security boundary, and Codex's inner sandbox needs
+`bubblewrap` (user namespaces) that containers typically don't grant — so the
+**recommended deployment default** is `agent-full-access`, set through the
+standard ACP config option mechanism:
 
 ```toml
 [pool]
-default_config_options = { mode = "agent" }
+default_config_options = { mode = "agent-full-access" }
 ```
 
-An explicit pool mode is sent after `session/new` and takes precedence over the
-image default. `agent-full-access` removes Codex's inner sandbox and approval
-prompts; it can read or modify mounted files and use the container's network.
-Do not use the OpenAB image default without a dedicated outer isolation
-boundary. Avoid host filesystem and Docker socket mounts, and scope mounted
-credentials, persistent volumes, service accounts, and network access to the
-agent's actual needs. Select `agent` or `read-only` when those conditions are
-not met.
+OpenAB sends this after `session/new` on the ACP session, so it is explicit,
+visible in config, and overridable per deployment — nothing is baked into the
+image. `agent-full-access` removes Codex's inner sandbox and approval prompts;
+it can read or modify mounted files and use the container's network. Use it
+only with a dedicated outer isolation boundary. Avoid host filesystem and
+Docker socket mounts, and scope mounted credentials, persistent volumes,
+service accounts, and network access to the agent's actual needs. Select
+`agent` or `read-only` when those conditions are not met.
+
+> The adapter also honors an `INITIAL_AGENT_MODE` environment variable, but
+> OpenAB spawns agents with a cleared environment, and packing it into
+> `OPENAB_AGENT_COMMAND` via `/usr/bin/env` breaks configs that override
+> `[agent].args` only. Prefer the `[pool]` mechanism above; if you need the
+> env route, deliver it with `[agent] env = { INITIAL_AGENT_MODE = "…" }`.
 
 The previous Zed adapter used `auto` and `full-access`. OpenAB maps those
 legacy values when `[pool].default_config_options` targets an adapter that
@@ -356,8 +361,7 @@ This commonly happens in OpenAB deployments where Codex already runs inside an
 isolated container or VM — the outer runtime provides the desired isolation, so
 the inner sandbox is redundant.
 
-**For ACP sessions**, the OpenAB Codex images already select
-`agent-full-access`. If an explicit pool setting selects another mode, update
+**For ACP sessions**, set `agent-full-access` through
 `[pool].default_config_options` as described in
 [ACP Modes and Migration](#acp-modes-and-migration).
 

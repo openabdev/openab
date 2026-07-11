@@ -1,0 +1,42 @@
+apiVersion: ecsctl/v1
+kind: Service
+metadata:
+  name: openab-telegram
+  cluster: openab
+spec:
+  cpu: "4096"
+  memory: "8192"
+  arch: X86_64
+  capacity: FARGATE_SPOT
+  desiredCount: 1
+  execEnabled: true
+  executionRoleArn: arn:aws:iam::903779448426:role/openab-ecs-execution-role
+  taskRoleArn: arn:aws:iam::903779448426:role/openab-ecs-task-chaodu
+  subnets:
+    - subnet-0564da5939b9f37e8
+  securityGroups:
+    - sg-0bc22bce7e98d79b0
+  assignPublicIp: true
+  containers:
+    - name: openab
+      image: ghcr.io/openabdev/openab:beta
+      essential: true
+      command: ["sh", "-c", "exec /usr/local/bin/openab run -c https://gist.githubusercontent.com/chaodu-agent/a1fa98981df18c305fe23b4708109043/raw/config-telegram.toml"]
+      env:
+        OPENAB_AGENT_NAME: telegram
+        OPENAB_BACKEND_AGENT: openab
+        STATE_BUCKET: openab-state-pahud
+      logGroup: /ecs/openab
+    - name: gateway
+      image: ghcr.io/openabdev/openab-gateway:pr1106
+      essential: true
+      port: 8080
+      secrets:
+        TELEGRAM_BOT_TOKEN: "arn:aws:secretsmanager:us-east-1:903779448426:secret:oab-telegram-demo-3ZEs2y:telegramBotToken::"
+      logGroup: /ecs/openab
+    - name: cloudflared
+      image: cloudflare/cloudflared:2026.5.0
+      essential: false
+      command: ["tunnel", "--no-autoupdate", "run"]
+      secrets:
+        TUNNEL_TOKEN: "arn:aws:secretsmanager:us-east-1:903779448426:secret:oab-telegram-demo-3ZEs2y:cloudflareTunnelToken::"

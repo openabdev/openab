@@ -67,14 +67,15 @@ jobs:
           docker run --rm --entrypoint codex openab-test-codex --version \
             | grep -F "codex-cli ${CODEX_VERSION}"
 
-      - name: Verify Codex image mode default
+      - name: Verify Codex agent command is a single token
         if: matrix.variant.suffix == '-codex'
         run: |
+          # Regression guard: OPENAB_AGENT_COMMAND must stay a plain binary.
+          # Packing env-var prefixes (e.g. "/usr/bin/env K=V codex-acp") breaks
+          # configs that override [agent].args only — OAB keeps token 1 as the
+          # command and replaces the rest, yielding "/usr/bin/env <user args>".
           docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' openab-test-codex \
-            | grep -Fx 'OPENAB_AGENT_COMMAND=/usr/bin/env INITIAL_AGENT_MODE=agent-full-access codex-acp'
-          docker run --rm --entrypoint /usr/bin/env openab-test-codex \
-            INITIAL_AGENT_MODE=agent-full-access printenv INITIAL_AGENT_MODE \
-            | grep -Fx 'agent-full-access'
+            | grep -Fx 'OPENAB_AGENT_COMMAND=codex-acp'
 
       - name: Verify agent responds
         run: |

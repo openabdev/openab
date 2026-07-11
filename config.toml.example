@@ -119,10 +119,12 @@ working_dir = "/home/agent"
 # inherit_env = ["API_BASE_URL", "MODEL_NAME"]
 
 # [agent]
-# command = "codex"
-# args = ["--acp"]
+# command = "codex-acp"
 # working_dir = "/home/node"
 # env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
+# Recommended for containerized deployments (outer container = security boundary):
+# [pool]
+# default_config_options = { mode = "agent-full-access" }
 
 # [agent]
 # command = "gemini"
