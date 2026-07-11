@@ -124,6 +124,19 @@ service accounts, and network access to the agent's actual needs. Select
 > full-access -> agent-full-access
 > ```
 
+> [!WARNING]
+> **Breaking change — `-c` CLI overrides are silently ignored.** The Zed
+> adapter accepted Codex-style `-c key=value` arguments (e.g.
+> `[agent] args = ["-c", "model=\"gpt-5.5\""]` to pin a model). This adapter's
+> CLI only recognizes `--version`, `login`, and `cli` — anything else is
+> ignored without error, so a carried-over model pin silently stops applying.
+> Pin the model through the ACP config option instead:
+>
+> ```toml
+> [pool]
+> default_config_options = { mode = "agent-full-access", model = "gpt-5.5" }
+> ```
+
 Custom ACP clients that call `session/set_config_option` directly must also send
 the new mode IDs. If canary validation finds a regression, roll back to the
 previous OpenAB Codex image tag; existing Codex credentials and session data
