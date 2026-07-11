@@ -906,6 +906,12 @@ mod tests {
     fn preserves_unrelated_config_values() {
         let options = [mode_option(&["read-only", "agent", "agent-full-access"])];
 
+        for mode in ["read-only", "agent", "agent-full-access"] {
+            assert_eq!(
+                compatible_default_config_value(&options, "mode", mode),
+                mode
+            );
+        }
         assert_eq!(
             compatible_default_config_value(&options, "model", "auto"),
             "auto"

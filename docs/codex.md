@@ -16,6 +16,11 @@ globally in the same npm transaction. The global Codex CLI keeps
 `codex login --device-auth` available, while npm deduplicates the adapter's
 compatible Codex dependency to the pinned CLI version.
 
+OpenAB starts the adapter through `/usr/bin/env` with
+`INITIAL_AGENT_MODE=agent-full-access`. This makes the outer container or VM
+the default security boundary and avoids requiring a nested Linux user
+namespace for Codex's inner sandbox.
+
 ## Helm Install
 
 ```bash
@@ -24,7 +29,6 @@ helm install openab openab/openab \
   --set agents.codex.discord.enabled=true \
   --set agents.codex.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.codex.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
-  --set agents.codex.command=codex-acp \
   --set agents.codex.workingDir=/home/node \
   --set image.tag=beta
 ```
@@ -54,7 +58,7 @@ To override a single agent's image instead of the global tag:
 
 ```toml
 [agent]
-# command defaults from OPENAB_AGENT_COMMAND="codex-acp"
+# command defaults from the image's OPENAB_AGENT_COMMAND
 # Only override if you need non-default behavior
 ```
 
@@ -78,19 +82,28 @@ and approval policy for each ACP turn:
 | Mode | Sandbox | Approval policy | Network |
 |------|---------|-----------------|---------|
 | `read-only` | read-only | on-request | disabled |
-| `agent` (default) | workspace-write | on-request | disabled |
-| `agent-full-access` | danger-full-access | never | enabled |
+| `agent` | workspace-write | on-request | disabled |
+| `agent-full-access` (OpenAB image default) | danger-full-access | never | enabled |
 
-To choose a default for newly created OpenAB sessions, use the standard ACP
-config option mechanism:
+The upstream adapter defaults to `agent` when it is launched directly. OpenAB's
+Codex images default to `agent-full-access` so a user can start working without
+requiring `bubblewrap` inside an already isolated container. To override the
+image default for newly created OpenAB sessions, use the standard ACP config
+option mechanism:
 
 ```toml
 [pool]
-default_config_options = { mode = "agent-full-access" }
+default_config_options = { mode = "agent" }
 ```
 
-`agent-full-access` removes Codex's inner sandbox and approval prompts. Use it
-only when the outer container or VM is the intended security boundary.
+An explicit pool mode is sent after `session/new` and takes precedence over the
+image default. `agent-full-access` removes Codex's inner sandbox and approval
+prompts; it can read or modify mounted files and use the container's network.
+Do not use the OpenAB image default without a dedicated outer isolation
+boundary. Avoid host filesystem and Docker socket mounts, and scope mounted
+credentials, persistent volumes, service accounts, and network access to the
+agent's actual needs. Select `agent` or `read-only` when those conditions are
+not met.
 
 The previous Zed adapter used `auto` and `full-access`. OpenAB maps those
 legacy values when `[pool].default_config_options` targets an adapter that
@@ -210,7 +223,7 @@ itself, explicitly expose an upload token to the agent:
 
 ```toml
 [agent]
-# command defaults from OPENAB_AGENT_COMMAND="codex-acp"
+# command defaults from the image's OPENAB_AGENT_COMMAND
 # Only override if you need non-default behavior
 env = { DISCORD_FILE_BOT_TOKEN = "${DISCORD_FILE_BOT_TOKEN}" }
 ```
@@ -340,7 +353,8 @@ This commonly happens in OpenAB deployments where Codex already runs inside an
 isolated container or VM — the outer runtime provides the desired isolation, so
 the inner sandbox is redundant.
 
-**For ACP sessions**, select `agent-full-access` through
+**For ACP sessions**, the OpenAB Codex images already select
+`agent-full-access`. If an explicit pool setting selects another mode, update
 `[pool].default_config_options` as described in
 [ACP Modes and Migration](#acp-modes-and-migration).
 

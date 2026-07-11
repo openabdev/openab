@@ -67,6 +67,15 @@ jobs:
           docker run --rm --entrypoint codex openab-test-codex --version \
             | grep -F "codex-cli ${CODEX_VERSION}"
 
+      - name: Verify Codex image mode default
+        if: matrix.variant.suffix == '-codex'
+        run: |
+          docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' openab-test-codex \
+            | grep -Fx 'OPENAB_AGENT_COMMAND=/usr/bin/env INITIAL_AGENT_MODE=agent-full-access codex-acp'
+          docker run --rm --entrypoint /usr/bin/env openab-test-codex \
+            INITIAL_AGENT_MODE=agent-full-access printenv INITIAL_AGENT_MODE \
+            | grep -Fx 'agent-full-access'
+
       - name: Verify agent responds
         run: |
           if [ "${{ matrix.variant.suffix }}" = "-codex" ]; then
