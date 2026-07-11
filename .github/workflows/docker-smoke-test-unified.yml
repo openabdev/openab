@@ -84,3 +84,26 @@ jobs:
 
       - name: Verify agent CLI exists
         run: docker run --rm --entrypoint which openab-unified-${{ matrix.target.name }}:test ${{ matrix.target.agent }}
+
+      - name: Verify Codex runtime versions
+        if: matrix.target.name == 'codex'
+        run: |
+          docker run --rm --entrypoint codex-acp openab-unified-codex:test --version \
+            | grep -F '@agentclientprotocol/codex-acp 1.1.2'
+          docker run --rm --entrypoint codex openab-unified-codex:test --version \
+            | grep -F 'codex-cli 0.144.1'
+
+      - name: Verify Codex ACP handshake
+        if: matrix.target.name == 'codex'
+        run: |
+          INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"ci-test","version":"0.0.1"}}}'
+          CID=$(docker run -d -i --entrypoint codex-acp openab-unified-codex:test)
+          echo "$INIT" | docker attach --no-stdin=false "$CID" &
+          sleep 5
+          RESPONSE=$(docker logs "$CID" 2>/dev/null | grep -m1 '^{' || true)
+          docker rm -f "$CID" >/dev/null 2>&1
+
+          echo "Response: $RESPONSE"
+          echo "$RESPONSE" | jq -e \
+            '.result.agentInfo.name == "@agentclientprotocol/codex-acp"' \
+            >/dev/null

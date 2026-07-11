@@ -91,9 +91,9 @@ CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 # Target: codex
 # =============================================================================
 FROM base-node AS codex
-ARG CODEX_ACP_VERSION=0.16.0
-ARG CODEX_VERSION=0.141.0
-RUN npm install -g @zed-industries/codex-acp@${CODEX_ACP_VERSION} @openai/codex@${CODEX_VERSION} --retry 3
+ARG CODEX_ACP_VERSION=1.1.2
+ARG CODEX_VERSION=0.144.1
+RUN npm install -g @agentclientprotocol/codex-acp@${CODEX_ACP_VERSION} @openai/codex@${CODEX_VERSION} --fetch-retries=3
 ENV HOME=/home/node
 WORKDIR /home/node
 COPY --from=bins --chown=node:node /openab /usr/local/bin/openab

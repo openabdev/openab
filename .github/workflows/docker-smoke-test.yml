@@ -54,9 +54,21 @@ jobs:
       - name: Verify agent CLI exists
         run: docker run --rm --entrypoint which openab-test${{ matrix.variant.suffix }} ${{ matrix.variant.agent }}
 
+      - name: Verify Codex runtime versions
+        if: matrix.variant.suffix == '-codex'
+        run: |
+          docker run --rm --entrypoint codex-acp openab-test-codex --version \
+            | grep -F '@agentclientprotocol/codex-acp 1.1.2'
+          docker run --rm --entrypoint codex openab-test-codex --version \
+            | grep -F 'codex-cli 0.144.1'
+
       - name: Verify agent responds
         run: |
-          INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientCapabilities":{},"clientInfo":{"name":"ci-test","version":"0.0.1"}}}'
+          if [ "${{ matrix.variant.suffix }}" = "-codex" ]; then
+            INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"ci-test","version":"0.0.1"}}}'
+          else
+            INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientCapabilities":{},"clientInfo":{"name":"ci-test","version":"0.0.1"}}}'
+          fi
 
           # Start agent in background, send init, capture output with timeout
           CID=$(docker run -d -i --entrypoint sh openab-test${{ matrix.variant.suffix }} -c 'exec ${{ matrix.variant.agent }} ${{ matrix.variant.agent_args }} 2>/dev/null')
@@ -70,6 +82,9 @@ jobs:
           if [ -n "$RESPONSE" ] && echo "$RESPONSE" | jq -e '.result.agentInfo.name' > /dev/null 2>&1; then
             AGENT_NAME=$(echo "$RESPONSE" | jq -r '.result.agentInfo.name')
             echo "✅ ACP handshake ok — agent=$AGENT_NAME"
+          elif [ "${{ matrix.variant.suffix }}" = "-codex" ]; then
+            echo "❌ Codex ACP handshake failed"
+            exit 1
           else
             echo "⚠️ ACP handshake returned no response — falling back to CLI check"
             docker run --rm --entrypoint ${{ matrix.variant.agent }} \
