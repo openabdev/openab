@@ -124,6 +124,9 @@ the new mode IDs. If canary validation finds a regression, roll back to the
 previous OpenAB Codex image tag; existing Codex credentials and session data
 remain under `/home/node/.codex/`.
 
+For preview-image validation, mode-matrix checks, evidence reporting, and
+post-merge rollout, follow [Canary Testing Pull Requests](canary-tests.md).
+
 ### Persisted Paths (PVC)
 
 | Path | Contents |

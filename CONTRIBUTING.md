@@ -147,13 +147,16 @@ Command::new("/usr/local/bin/agy")
 
 ### E2E testing PRs
 
-Use the PR Preview Build workflow for fast iteration:
+Use the PR Preview Build workflow for fast iteration. For the complete
+workflow, safety requirements, acceptance criteria, evidence template, and
+cleanup steps, see [Canary Testing Pull Requests](/docs/canary-tests.md).
 
 ```bash
 # 1. Push code to PR branch
-# 2. Build the image
-gh workflow run "PR Preview Build" --repo openabdev/openab \
-  --ref <branch> -f pr_number=<N> -f variant=<antigravity|codex|claude|default>
+# 2. A maintainer builds the image from the upstream workflow on main.
+#    The workflow resolves and checks out the PR head automatically.
+gh workflow run pr-preview.yml --repo openabdev/openab \
+  --ref main -f pr_number=<N> -f variant=<antigravity|codex|claude|default>
 
 # 3. Wait for build
 gh run view <run_id> --repo openabdev/openab --json conclusion -q .conclusion
