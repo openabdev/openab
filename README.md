@@ -6,44 +6,31 @@ English | [繁體中文](README.zh-TW.md)
 
 ![OpenAB banner](images/banner.jpg)
 
-A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**, and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, OpenCode, MiMo-Code, Copilot CLI, Hermes, Grok Build, Devin, Antigravity, Pi, etc.) over stdio JSON-RPC — delivering the next-generation development experience. **Telegram, LINE, Feishu/Lark, Google Chat, WeCom, and Microsoft Teams** are available through gateway adapters, either compiled into the unified binary or deployed as the standalone [Custom Gateway](crates/openab-gateway/).
+A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**, and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, OpenCode, MiMo-Code, Copilot CLI, Hermes, Grok Build, Devin, Antigravity, Pi, etc.) over stdio JSON-RPC — delivering the next-generation development experience. **Telegram, LINE, Feishu/Lark, Google Chat**, and other webhook-based platforms are supported via the standalone [Custom Gateway](crates/openab-gateway/).
 
 🪼 **Join our community!** Come say hi on Discord — we'd love to have you: **[🪼 OpenAB — Official](https://openab.dev/discord)** 🎉
 
 ```
-┌──────────────┐  Gateway WS  ┌─────────────────┐  ACP stdio   ┌─────────────────────────┐
-│ Discord      │◄────────────►│                 │─────────────►│ agent runtime           │
-│ User         │              │ openab (Rust)   │◄──JSON-RPC──│ (ACP process)           │
-├──────────────┤  Socket Mode │ thin ACP broker │             ├─────────────────────────┤
-│ Slack        │◄────────────►│                 │             │ kiro-cli acp            │
-│ User         │              └────────┬────────┘             │ claude-agent-acp        │
-├──────────────┤                       ▲                      │ codex-acp               │
-│ Telegram     │◄webhook/API─►┐        │                      │  └─ Codex app-server    │
-│ User         │              │        │ WebSocket            │ gemini --acp            │
-├──────────────┤              │        │ (standalone)         │ copilot --acp           │
-│ LINE         │◄webhook/API─►┤        │ or in-process        │ cursor-agent acp        │
-│ User         │              │        │ (unified)            │ hermes-acp              │
-├──────────────┤              │ ┌──────┴───────────┐          │ opencode acp            │
-│ Feishu/Lark  │◄─WS/webhook─►┼►│ gateway adapters │          │ mimo acp                │
-│ User         │              │ │ standalone or    │          │ grok agent stdio        │
-├──────────────┤              │ │ embedded unified │          │ devin acp               │
-│ Google Chat  │◄webhook/API─►┤ └──────────────────┘          │ agy-acp                 │
-│ User         │              │                               │ pi-acp                  │
-├──────────────┤              │                               │ openab-agent            │
-│ WeCom        │◄webhook/API─►┤                               │ agentcore-acp           │
-│ User         │              │                               │  └─ AWS AgentCore       │
-├──────────────┤              │                               │ custom ACP agent        │
-│ MS Teams     │◄webhook/API─►┘                               └─────────────────────────┘
-│ User         │
+┌──────────────┐  Gateway WS   ┌──────────────┐  ACP stdio    ┌──────────────────┐
+│   Discord    │◄─────────────►│              │──────────────►│   coding CLI     │
+│   User       │               │    openab    │◄── JSON-RPC ──│   (acp mode)     │
+├──────────────┤  Socket Mode  │    (Rust)    │               ├──────────────────┤
+│   Slack      │◄─────────────►│              │               │ kiro-cli acp     │
+│   User       │               └──────┬───────┘               │ claude-agent-acp │
+├──────────────┤                      │  WebSocket            │ codex-acp        │
+│   Telegram   │◄──webhook──┐         │   (outbound)          │ gemini --acp     │
+│   User       │            │         │                       │ copilot --acp    │
+├──────────────┤            ▼         ▼                       │ hermes-acp       │
+│   LINE       │◄──webhook──┌──────────────────┐              │ opencode acp     │
+│   User       │            │  Custom Gateway  │              │ mimo acp         │
+├──────────────┤            │  (standalone)    │              │ grok agent stdio │
+│  Feishu/Lark │◄───WS──────│                  │              │ devin acp        │
+│   User       │            │                  │              │ agy-acp          │
+├──────────────┤            │                  │              │ pi-acp           │
+│ Google Chat  │◄──webhook──│                  │              └──────────────────┘
+│   User       │            └──────────────────┘
 └──────────────┘
 ```
-
-OpenAB remains a thin broker: platform adapters converge on the same
-dispatcher and session pool, then cross one ACP stdio boundary to the selected
-agent runtime. Gateway adapters can run as a standalone companion or be
-embedded in a unified build without changing that boundary. Platform-edge
-labels distinguish inbound delivery from outbound replies: `webhook/API` for
-webhook platforms and `WS/webhook` for Feishu/Lark.
 
 ## Demo
 
@@ -52,7 +39,7 @@ webhook platforms and `WS/webhook` for Feishu/Lark.
 ## Features
 
 - **Multi-platform** — supports Discord and Slack, run one or both simultaneously
-- **Gateway adapters** — extend to Telegram, LINE, Feishu/Lark, Google Chat, WeCom, and Microsoft Teams through the standalone [gateway](crates/openab-gateway/) or an opt-in unified build
+- **Custom Gateway** — extend to Telegram, LINE, Feishu/Lark, Google Chat, MS Teams via standalone [gateway](crates/openab-gateway/)
 - **Pluggable agent backend** — swap between Kiro CLI, Claude Code, Codex, Gemini, OpenCode, MiMo-Code, Copilot CLI, Hermes, Grok Build, Devin, Antigravity, Pi via config
 - **@mention trigger** — mention the bot in an allowed channel to start a conversation
 - **Thread-based multi-turn** — auto-creates threads; no @mention needed for follow-ups
