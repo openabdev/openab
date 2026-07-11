@@ -18,22 +18,22 @@ A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**,
 │ Slack        │◄────────────►│                 │             │ kiro-cli acp            │
 │ User         │              └────────┬────────┘             │ claude-agent-acp        │
 ├──────────────┤                       ▲                      │ codex-acp               │
-│ Telegram     │◄────HTTP────►┐        │                      │  └─ Codex app-server    │
+│ Telegram     │◄webhook/API─►┐        │                      │  └─ Codex app-server    │
 │ User         │              │        │ WebSocket            │ gemini --acp            │
 ├──────────────┤              │        │ (standalone)         │ copilot --acp           │
-│ LINE         │◄────HTTP────►┤        │ or in-process        │ cursor-agent acp        │
+│ LINE         │◄webhook/API─►┤        │ or in-process        │ cursor-agent acp        │
 │ User         │              │        │ (unified)            │ hermes-acp              │
 ├──────────────┤              │ ┌──────┴───────────┐          │ opencode acp            │
-│ Feishu/Lark  │◄──WS/HTTP───►┼►│ gateway adapters │          │ mimo acp                │
+│ Feishu/Lark  │◄─WS/webhook─►┼►│ gateway adapters │          │ mimo acp                │
 │ User         │              │ │ standalone or    │          │ grok agent stdio        │
 ├──────────────┤              │ │ embedded unified │          │ devin acp               │
-│ Google Chat  │◄────HTTP────►┤ └──────────────────┘          │ agy-acp                 │
+│ Google Chat  │◄webhook/API─►┤ └──────────────────┘          │ agy-acp                 │
 │ User         │              │                               │ pi-acp                  │
 ├──────────────┤              │                               │ openab-agent            │
-│ WeCom        │◄────HTTP────►┤                               │ agentcore-acp           │
+│ WeCom        │◄webhook/API─►┤                               │ agentcore-acp           │
 │ User         │              │                               │  └─ AWS AgentCore       │
 ├──────────────┤              │                               │ custom ACP agent        │
-│ MS Teams     │◄────HTTP────►┘                               └─────────────────────────┘
+│ MS Teams     │◄webhook/API─►┘                               └─────────────────────────┘
 │ User         │
 └──────────────┘
 ```
@@ -41,7 +41,9 @@ A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**,
 OpenAB remains a thin broker: platform adapters converge on the same
 dispatcher and session pool, then cross one ACP stdio boundary to the selected
 agent runtime. Gateway adapters can run as a standalone companion or be
-embedded in a unified build without changing that boundary.
+embedded in a unified build without changing that boundary. Platform-edge
+labels distinguish inbound delivery from outbound replies: `webhook/API` for
+webhook platforms and `WS/webhook` for Feishu/Lark.
 
 ## Demo
 

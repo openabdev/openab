@@ -18,22 +18,22 @@
 │ Slack        │◄────────────►│                 │             │ kiro-cli acp            │
 │ User         │              └────────┬────────┘             │ claude-agent-acp        │
 ├──────────────┤                       ▲                      │ codex-acp               │
-│ Telegram     │◄────HTTP────►┐        │                      │  └─ Codex app-server    │
+│ Telegram     │◄webhook/API─►┐        │                      │  └─ Codex app-server    │
 │ User         │              │        │ WebSocket            │ gemini --acp            │
 ├──────────────┤              │        │ (standalone)         │ copilot --acp           │
-│ LINE         │◄────HTTP────►┤        │ or in-process        │ cursor-agent acp        │
+│ LINE         │◄webhook/API─►┤        │ or in-process        │ cursor-agent acp        │
 │ User         │              │        │ (unified)            │ hermes-acp              │
 ├──────────────┤              │ ┌──────┴───────────┐          │ opencode acp            │
-│ Feishu/Lark  │◄──WS/HTTP───►┼►│ gateway adapters │          │ mimo acp                │
+│ Feishu/Lark  │◄─WS/webhook─►┼►│ gateway adapters │          │ mimo acp                │
 │ User         │              │ │ standalone or    │          │ grok agent stdio        │
 ├──────────────┤              │ │ embedded unified │          │ devin acp               │
-│ Google Chat  │◄────HTTP────►┤ └──────────────────┘          │ agy-acp                 │
+│ Google Chat  │◄webhook/API─►┤ └──────────────────┘          │ agy-acp                 │
 │ User         │              │                               │ pi-acp                  │
 ├──────────────┤              │                               │ openab-agent            │
-│ WeCom        │◄────HTTP────►┤                               │ agentcore-acp           │
+│ WeCom        │◄webhook/API─►┤                               │ agentcore-acp           │
 │ User         │              │                               │  └─ AWS AgentCore       │
 ├──────────────┤              │                               │ custom ACP agent        │
-│ MS Teams     │◄────HTTP────►┘                               └─────────────────────────┘
+│ MS Teams     │◄webhook/API─►┘                               └─────────────────────────┘
 │ User         │
 └──────────────┘
 ```
@@ -41,7 +41,9 @@
 OpenAB 仍是 thin broker：所有 platform adapters 都會進入同一套
 dispatcher 與 session pool，再透過單一 ACP stdio boundary 連接所選的
 agent runtime。Gateway adapters 可作為 standalone companion 執行，也可
-內嵌於 unified build，兩種部署方式都不會改變這個 boundary。
+內嵌於 unified build，兩種部署方式都不會改變這個 boundary。Platform
+edge 的 labels 會分別呈現 inbound delivery 與 outbound reply：webhook
+platforms 使用 `webhook/API`，Feishu/Lark 則使用 `WS/webhook`。
 
 ## 示範
 
