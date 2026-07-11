@@ -101,6 +101,11 @@ auto        -> agent
 full-access -> agent-full-access
 ```
 
+Legacy values remain valid OpenAB configuration aliases. When OpenAB applies
+one to a new session, it logs a warning with the old and replacement values so
+operators can update `[pool].default_config_options`; the adapter receives only
+the replacement value.
+
 Custom ACP clients that call `session/set_config_option` directly must send
 the new mode IDs. If canary validation finds a regression, roll back to the
 previous OpenAB Codex image tag; existing Codex credentials and session data

@@ -442,11 +442,11 @@ impl SessionPool {
                 let compatible_value =
                     compatible_default_config_value(&new_conn.config_options, config_id, value);
                 if compatible_value != value {
-                    info!(
+                    warn!(
                         config_id,
                         old_value = value,
                         new_value = compatible_value,
-                        "mapped legacy default config option"
+                        "legacy ACP config value mapped; update [pool].default_config_options"
                     );
                 }
                 if let Err(e) = new_conn
