@@ -1,6 +1,6 @@
 # Codex
 
-Codex uses the [@zed-industries/codex-acp](https://github.com/zed-industries/codex-acp) adapter for ACP support.
+Codex uses the [@agentclientprotocol/codex-acp](https://github.com/agentclientprotocol/codex-acp) adapter for ACP support.
 The recommended working directory for the Codex image is `/home/node`; this is
 also the container `HOME`, so Codex auth, sessions, generated images, and skills
 live under `/home/node/.codex/`.
@@ -11,7 +11,10 @@ live under `/home/node/.codex/`.
 docker build -f Dockerfile.codex -t openab-codex:latest .
 ```
 
-The image installs `@zed-industries/codex-acp` and `@openai/codex` globally via npm.
+The image installs `@agentclientprotocol/codex-acp` and `@openai/codex`
+globally in the same npm transaction. The global Codex CLI keeps
+`codex login --device-auth` available, while npm deduplicates the adapter's
+compatible Codex dependency to the pinned CLI version.
 
 ## Helm Install
 
@@ -51,7 +54,7 @@ To override a single agent's image instead of the global tag:
 
 ```toml
 [agent]
-# command defaults from OPENAB_AGENT_COMMAND="codex"
+# command defaults from OPENAB_AGENT_COMMAND="codex-acp"
 # Only override if you need non-default behavior
 ```
 
@@ -66,6 +69,42 @@ Follow the device code flow in your browser, then restart the pod:
 ```bash
 kubectl rollout restart deployment/openab-codex
 ```
+
+## ACP Modes and Migration
+
+The adapter exposes three ACP modes. The selected mode controls the sandbox
+and approval policy for each ACP turn:
+
+| Mode | Sandbox | Approval policy | Network |
+|------|---------|-----------------|---------|
+| `read-only` | read-only | on-request | disabled |
+| `agent` (default) | workspace-write | on-request | disabled |
+| `agent-full-access` | danger-full-access | never | enabled |
+
+To choose a default for newly created OpenAB sessions, use the standard ACP
+config option mechanism:
+
+```toml
+[pool]
+default_config_options = { mode = "agent-full-access" }
+```
+
+`agent-full-access` removes Codex's inner sandbox and approval prompts. Use it
+only when the outer container or VM is the intended security boundary.
+
+The previous Zed adapter used `auto` and `full-access`. OpenAB maps those
+legacy values when `[pool].default_config_options` targets an adapter that
+advertises the replacement modes:
+
+```text
+auto        -> agent
+full-access -> agent-full-access
+```
+
+Custom ACP clients that call `session/set_config_option` directly must send
+the new mode IDs. If canary validation finds a regression, roll back to the
+previous OpenAB Codex image tag; existing Codex credentials and session data
+remain under `/home/node/.codex/`.
 
 ### Persisted Paths (PVC)
 
@@ -166,7 +205,7 @@ itself, explicitly expose an upload token to the agent:
 
 ```toml
 [agent]
-# command defaults from OPENAB_AGENT_COMMAND="codex"
+# command defaults from OPENAB_AGENT_COMMAND="codex-acp"
 # Only override if you need non-default behavior
 env = { DISCORD_FILE_BOT_TOKEN = "${DISCORD_FILE_BOT_TOKEN}" }
 ```
@@ -204,7 +243,12 @@ Example user prompt after creating such a skill:
 Use $discord-imagegen-deliver to generate a warm hand-painted sky with birds and send it back to this Discord thread.
 ```
 
-## Approval Policy & Auto-review
+## Direct Codex CLI Approval Policy & Auto-review
+
+The settings in this section apply to direct Codex CLI commands such as
+`codex exec`. For OpenAB ACP turns, select an ACP mode as described in
+[ACP Modes and Migration](#acp-modes-and-migration); the adapter supplies the
+turn's sandbox and approval policy.
 
 Codex separates **when** to ask for approval (`approval_policy`) from **who**
 reviews the request (`approvals_reviewer`):
@@ -214,9 +258,10 @@ reviews the request (`approvals_reviewer`):
 | `approval_policy` | `untrusted`, `on-failure` (deprecated), `on-request`, `granular`, `never` | When Codex must request approval before acting |
 | `approvals_reviewer` | `"user"` (default), `"auto_review"` | Who handles the approval — human or GPT-5.4 Thinking reviewer |
 
-For OpenAB deployments, **Auto-review is the recommended mode**. OpenAB agents
-run as long-lived background processes with no human watching the terminal, so
-manual approval is impractical and `"never"` removes all guardrails.
+For unattended direct CLI commands, **Auto-review is the recommended mode**.
+OpenAB agents run as long-lived background processes with no human watching the
+terminal, so manual approval is impractical and `"never"` removes all
+guardrails.
 
 Enable Auto-review in `/home/node/.codex/config.toml`:
 
@@ -290,8 +335,12 @@ This commonly happens in OpenAB deployments where Codex already runs inside an
 isolated container or VM — the outer runtime provides the desired isolation, so
 the inner sandbox is redundant.
 
-**Solution — Disable Codex's inner sandbox** (recommended when the outer OpenAB
-runtime already provides isolation):
+**For ACP sessions**, select `agent-full-access` through
+`[pool].default_config_options` as described in
+[ACP Modes and Migration](#acp-modes-and-migration).
+
+**For direct Codex CLI commands**, disable Codex's inner sandbox when the outer
+OpenAB runtime already provides isolation:
 
 ```toml
 # /home/node/.codex/config.toml
@@ -313,7 +362,7 @@ approvals_reviewer = "auto_review"
 > and OpenAB agents have no terminal attached — every tool call hangs in
 > `in_progress` until openab's 1800 s hard timeout fires. Use
 > `approvals_reviewer = "auto_review"` (recommended, see
-> [§Approval Policy](#approval-policy--auto-review)) or
+> [§Direct Codex CLI Approval Policy](#direct-codex-cli-approval-policy--auto-review)) or
 > `approval_policy = "never"` for trusted and already-isolated pods (`"never"`
 > removes all per-call guardrails — the outer pod isolation is the only
 > remaining boundary).
@@ -324,7 +373,7 @@ Or launch with:
 codex --sandbox danger-full-access
 ```
 
-Or seed via `kubectl cp` (see [above](#approval-policy--auto-review) for why
+Or seed via `kubectl cp` (see [above](#direct-codex-cli-approval-policy--auto-review) for why
 ConfigMap mounts should not be used for `.codex/config.toml`):
 
 ```bash

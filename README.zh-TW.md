@@ -167,7 +167,7 @@ bot 會建立一個討論串。之後只要直接在討論串中輸入即可，�
 |-------|-----|-------------|------|
 | Kiro（預設） | `kiro-cli acp` | Native | [docs/kiro.md](docs/kiro.md) |
 | Claude Code | `claude-agent-acp` | [@agentclientprotocol/claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp) | [docs/claude-code.md](docs/claude-code.md) |
-| Codex | `codex-acp` | [@zed-industries/codex-acp](https://github.com/zed-industries/codex-acp) | [docs/codex.md](docs/codex.md) |
+| Codex | `codex-acp` | [@agentclientprotocol/codex-acp](https://github.com/agentclientprotocol/codex-acp) | [docs/codex.md](docs/codex.md) |
 | Gemini | `gemini --acp` | Native | [docs/gemini.md](docs/gemini.md) |
 | OpenCode | `opencode acp` | Native | [docs/opencode.md](docs/opencode.md) |
 | MiMo-Code | `mimo acp` | Native | [docs/mimocode.md](docs/mimocode.md) |

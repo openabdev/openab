@@ -381,7 +381,7 @@ fn section_agent() -> (String, String, bool) {
         "",
         "claude:  npm install -g @anthropic-ai/claude-code",
         "kiro:    npm install -g @koryhutchison/kiro-cli",
-        "codex:   npm install -g openai-codex (requires OpenAI API key)",
+        "codex:   npm install -g @openai/codex @agentclientprotocol/codex-acp",
         "gemini:  npm install -g @google/gemini-cli",
         "",
         "Make sure the agent is in your PATH before continuing.",
@@ -518,7 +518,7 @@ fn print_next_steps(agent: &str, output_path: &Path, is_local: bool) {
             }
             "codex" => {
                 cprintln!(C.cyan, "  1. Install Codex CLI + ACP adapter:");
-                println!("       npm install -g @openai/codex @zed-industries/codex-acp");
+                println!("       npm install -g @openai/codex @agentclientprotocol/codex-acp");
                 cprintln!(C.cyan, "  2. Authenticate:");
                 println!("       codex login --device-auth");
             }
