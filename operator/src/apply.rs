@@ -436,18 +436,7 @@ async fn apply_manifests_prepared(
     let mut report = ApplyReport::default();
     for manifest in manifests {
         println!("  Applying {} (ECS)...", manifest.metadata.name);
-        match apply_ecs(
-            ecs,
-            s3,
-            aws_config,
-            manifest,
-            cluster,
-            wait,
-            &prepared.bucket,
-            &prepared.bootstrap,
-        )
-        .await
-        {
+        match apply_ecs(ecs, s3, aws_config, manifest, cluster, wait, prepared).await {
             Ok(service) => report.services.push(service),
             Err(error) => {
                 return Err(ApplyError::reconciliation(
@@ -515,9 +504,10 @@ async fn apply_ecs(
     m: &OABServiceManifest,
     cluster: &str,
     wait: bool,
-    bucket: &str,
-    bootstrap: &BootstrapResolution,
+    prepared: &PreparedApply,
 ) -> Result<AppliedService> {
+    let bucket = prepared.bucket.as_str();
+    let bootstrap = &prepared.bootstrap;
     let ecs_rt = match &m.spec.runtime {
         Runtime::Ecs(rt) => rt,
         _ => unreachable!(),
