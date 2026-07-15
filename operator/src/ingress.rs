@@ -30,6 +30,14 @@ use aws_sdk_apigatewayv2::types::{ConnectionType, IntegrationType, ProtocolType}
 use aws_sdk_servicediscovery::types::{DnsConfig, DnsRecord, RecordType};
 use std::collections::HashMap;
 
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        if crate::apply::progress_enabled() {
+            std::eprintln!($($arg)*);
+        }
+    }};
+}
+
 const STAGE_NAME: &str = "prod";
 
 /// VPC Link name, scoped per-VPC. A VPC Link's ENIs live in one VPC and cannot
@@ -113,7 +121,9 @@ pub async fn ensure_gateway(
     ensure_sg_ingress(&ec2, security_groups, ingress.container_port).await?;
 
     // ── VPC Link (shared per-VPC, waits for AVAILABLE) ──────────────────────
-    let subnet = subnets.first().context("ingress requires at least one subnet")?;
+    let subnet = subnets
+        .first()
+        .context("ingress requires at least one subnet")?;
     let vpc_id = resolve_vpc_id_from_subnet(&ec2, subnet).await?;
     let vpc_link_id = ensure_vpc_link(&api, &vpc_id, subnets, security_groups).await?;
 
@@ -195,7 +205,9 @@ pub async fn register_telegram_webhook(
 
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("https://api.telegram.org/bot{bot_token}/setWebhook"))
+        .post(format!(
+            "https://api.telegram.org/bot{bot_token}/setWebhook"
+        ))
         .form(&form)
         .send()
         .await
@@ -222,7 +234,6 @@ pub async fn register_telegram_webhook(
     ))
 }
 
-
 /// API Gateway route key for a webhook path (POST only).
 fn route_key(path: &str) -> String {
     format!("POST {path}")
@@ -244,7 +255,10 @@ fn has_stage_path_override(request_parameters: Option<&HashMap<String, String>>)
 /// Extract the Cloud Map service ID from its ARN
 /// (`arn:aws:servicediscovery:<region>:<account>:service/<id>`).
 fn cloud_map_service_id_from_arn(arn: &str) -> Option<String> {
-    arn.rsplit('/').next().filter(|s| !s.is_empty()).map(|s| s.to_string())
+    arn.rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 /// Build the public webhook URL(s) from the API endpoint and paths.
@@ -267,13 +281,16 @@ fn webhook_urls(api_endpoint: &str, paths: &[String]) -> Vec<String> {
 /// The shared resources (the VPC Link and the security-group inbound rule) are
 /// intentionally left in place since other bots may still use them. Safe to
 /// call for bots that never had ingress — it simply finds nothing and returns.
-/// Errors are logged, not propagated, so teardown never blocks service deletion.
+/// Errors that prevent teardown are propagated. Degraded cleanup that can be
+/// completed manually is returned as warning text so apply can include it in
+/// its structured report while the CLI still renders it.
 pub async fn teardown(
     config: &aws_config::SdkConfig,
     namespace: &str,
     name: &str,
     known_registry_arn: Option<&str>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
     let service_name = format!("oab-{namespace}-{name}");
     let api = aws_sdk_apigatewayv2::Client::new(config);
 
@@ -300,7 +317,19 @@ pub async fn teardown(
             }
         }
         for route_id in &route_ids {
-            api.delete_route().api_id(&api_id).route_id(route_id).send().await.ok();
+            if let Err(error) = api
+                .delete_route()
+                .api_id(&api_id)
+                .route_id(route_id)
+                .send()
+                .await
+            {
+                let warning = format!(
+                    "failed to delete ingress route {route_id} from HTTP API {api_id}: {error}"
+                );
+                eprintln!("  ⚠ {warning}");
+                warnings.push(warning);
+            }
         }
 
         // Delete integrations (there's normally just one, but clean up all).
@@ -323,22 +352,49 @@ pub async fn teardown(
             }
         }
         for integration_id in &integration_ids {
-            api.delete_integration()
+            if let Err(error) = api
+                .delete_integration()
                 .api_id(&api_id)
                 .integration_id(integration_id)
                 .send()
                 .await
-                .ok();
+            {
+                let warning = format!(
+                    "failed to delete ingress integration {integration_id} from HTTP API {api_id}: {error}"
+                );
+                eprintln!("  ⚠ {warning}");
+                warnings.push(warning);
+            }
         }
 
-        api.delete_stage().api_id(&api_id).stage_name(STAGE_NAME).send().await.ok();
+        if let Err(error) = api
+            .delete_stage()
+            .api_id(&api_id)
+            .stage_name(STAGE_NAME)
+            .send()
+            .await
+        {
+            let warning = format!(
+                "failed to delete ingress stage {STAGE_NAME} from HTTP API {api_id}: {error}"
+            );
+            eprintln!("  ⚠ {warning}");
+            warnings.push(warning);
+        }
 
-        eprintln!(
-            "  ✓ Cleared ingress wiring on HTTP API {} ({} route(s), {} integration(s)) — API itself kept so its URL survives a recreate",
-            api_name(namespace, name),
-            route_ids.len(),
-            integration_ids.len()
-        );
+        if warnings.is_empty() {
+            eprintln!(
+                "  ✓ Cleared ingress wiring on HTTP API {} ({} route(s), {} integration(s)) — API itself kept so its URL survives a recreate",
+                api_name(namespace, name),
+                route_ids.len(),
+                integration_ids.len()
+            );
+        } else {
+            eprintln!(
+                "  ⚠ Ingress wiring cleanup on HTTP API {} completed with {} warning(s)",
+                api_name(namespace, name),
+                warnings.len()
+            );
+        }
     }
 
     // ── Cloud Map: delete the per-bot service (needs no live instances) ──────
@@ -386,14 +442,16 @@ pub async fn teardown(
             }
         }
         if !deleted {
-            eprintln!(
-                "  ⚠ Cloud Map service '{service_name}' not deleted after retrying — it still\n    has registered instances. It will be orphaned until manually removed:\n      aws servicediscovery delete-service --id {service_id}\n    ({})",
-                last_err.map(|e| e.to_string()).unwrap_or_default()
+            let warning = format!(
+                "Cloud Map service '{service_name}' was not deleted after retrying; it still has registered instances. Remove it manually with `aws servicediscovery delete-service --id {service_id}` ({})",
+                last_err.map(|error| error.to_string()).unwrap_or_default()
             );
+            eprintln!("  ⚠ {warning}");
+            warnings.push(warning);
         }
     }
 
-    Ok(())
+    Ok(warnings)
 }
 
 /// Permanently delete the bot's per-bot HTTP API (`oab-webhook-<ns>-<name>`),
@@ -665,7 +723,9 @@ async fn ensure_vpc_link(
             Some(VpcLinkStatus::Available) => 0,
             _ => 1,
         };
-        rank(a_status).cmp(&rank(b_status)).then_with(|| a_id.cmp(b_id))
+        rank(a_status)
+            .cmp(&rank(b_status))
+            .then_with(|| a_id.cmp(b_id))
     });
     if candidates.len() > 1 {
         eprintln!(
@@ -742,8 +802,11 @@ async fn validate_vpc_link_config(
         .send()
         .await
         .context("failed to describe VPC Link for validation")?;
-    let actual_sgs: std::collections::HashSet<&str> =
-        resp.security_group_ids().iter().map(|s| s.as_str()).collect();
+    let actual_sgs: std::collections::HashSet<&str> = resp
+        .security_group_ids()
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
     let wanted_sgs: std::collections::HashSet<&str> =
         security_groups.iter().map(|s| s.as_str()).collect();
     if actual_sgs != wanted_sgs {
@@ -825,7 +888,8 @@ async fn ensure_integration(
         }
         let resp = req.send().await.context("failed to list integrations")?;
         for i in resp.items() {
-            if i.integration_uri() == Some(integration_uri) && i.connection_id() == Some(vpc_link_id)
+            if i.integration_uri() == Some(integration_uri)
+                && i.connection_id() == Some(vpc_link_id)
             {
                 let id = i
                     .integration_id()
@@ -956,7 +1020,13 @@ async fn prune_stale_routes(
     }
 
     for (route_id, key) in stale {
-        match api.delete_route().api_id(api_id).route_id(&route_id).send().await {
+        match api
+            .delete_route()
+            .api_id(api_id)
+            .route_id(&route_id)
+            .send()
+            .await
+        {
             Ok(_) => eprintln!("  ⊖ Removed stale route (no longer in manifest): {key}"),
             Err(e) => eprintln!("  ⚠ Failed to remove stale route {key}: {e}"),
         }
@@ -1031,10 +1101,17 @@ mod tests {
 
     #[test]
     fn find_telegram_webhook_finds_url_and_token() {
-        let secrets = HashMap::from([("TELEGRAM_BOT_TOKEN".to_string(), "arn:aws:...".to_string())]);
+        let secrets =
+            HashMap::from([("TELEGRAM_BOT_TOKEN".to_string(), "arn:aws:...".to_string())]);
         let urls = vec![
-            ("/webhook/line".to_string(), "https://x/prod/webhook/line".to_string()),
-            ("/webhook/telegram".to_string(), "https://x/prod/webhook/telegram".to_string()),
+            (
+                "/webhook/line".to_string(),
+                "https://x/prod/webhook/line".to_string(),
+            ),
+            (
+                "/webhook/telegram".to_string(),
+                "https://x/prod/webhook/telegram".to_string(),
+            ),
         ];
         let (url, token) = find_telegram_webhook(&secrets, &urls).unwrap();
         assert_eq!(url, "https://x/prod/webhook/telegram");
@@ -1043,8 +1120,12 @@ mod tests {
 
     #[test]
     fn find_telegram_webhook_none_without_telegram_path() {
-        let secrets = HashMap::from([("TELEGRAM_BOT_TOKEN".to_string(), "arn:aws:...".to_string())]);
-        let urls = vec![("/webhook/line".to_string(), "https://x/prod/webhook/line".to_string())];
+        let secrets =
+            HashMap::from([("TELEGRAM_BOT_TOKEN".to_string(), "arn:aws:...".to_string())]);
+        let urls = vec![(
+            "/webhook/line".to_string(),
+            "https://x/prod/webhook/line".to_string(),
+        )];
         assert!(find_telegram_webhook(&secrets, &urls).is_none());
     }
 
@@ -1102,10 +1183,7 @@ mod tests {
 
     #[test]
     fn webhook_urls_join_endpoint_stage_and_path() {
-        let paths = vec![
-            "/webhook/telegram".to_string(),
-            "/webhook/line".to_string(),
-        ];
+        let paths = vec!["/webhook/telegram".to_string(), "/webhook/line".to_string()];
         let urls = webhook_urls("https://abc123.execute-api.us-east-1.amazonaws.com", &paths);
         assert_eq!(
             urls,
@@ -1120,6 +1198,9 @@ mod tests {
     fn webhook_urls_trim_trailing_slash_on_endpoint() {
         let paths = vec!["/webhook/telegram".to_string()];
         let urls = webhook_urls("https://abc123.example.com/", &paths);
-        assert_eq!(urls, vec!["https://abc123.example.com/prod/webhook/telegram"]);
+        assert_eq!(
+            urls,
+            vec!["https://abc123.example.com/prod/webhook/telegram"]
+        );
     }
 }

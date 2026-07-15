@@ -6,163 +6,463 @@ use aws_sdk_ecs::types::{
     KeyValuePair, NetworkConfiguration, RuntimePlatform, Secret,
 };
 use aws_sdk_s3::primitives::ByteStream;
+use std::fmt;
 use std::path::Path;
 
-/// Load bootstrap state to resolve the task execution role ARN (and other
-/// networking defaults). Required on `register_task_definition` whenever the
-/// task uses ECS-injected secrets (or pulls from a private registry) — ECS
-/// rejects the request with "you must also specify a value for
-/// 'executionRoleArn'" otherwise.
-pub(crate) async fn load_bootstrap_state(config: &aws_config::SdkConfig) -> Option<BootstrapState> {
-    let bucket = if let Some(b) = crate::config::OabConfig::load().ok().and_then(|c| c.bucket()) {
-        b
-    } else {
-        let sts = aws_sdk_sts::Client::new(config);
-        let identity = match sts.get_caller_identity().send().await {
-            Ok(id) => id,
-            Err(e) => {
-                eprintln!("  ⚠ load_bootstrap_state: STS get_caller_identity failed: {e}");
-                return None;
-            }
-        };
-        let account = match identity.account() {
-            Some(a) => a.to_string(),
-            None => {
-                eprintln!("  ⚠ load_bootstrap_state: STS response missing account field");
-                return None;
-            }
-        };
-        format!("oab-control-plane-{account}")
-    };
-    let s3 = aws_sdk_s3::Client::new(config);
-    match crate::bootstrap::load_state_pub(&s3, &bucket).await {
-        Ok(Some(state)) => Some(state),
-        Ok(None) => {
-            eprintln!("  ⚠ load_bootstrap_state: no bootstrap state found in s3://{bucket}/bootstrap-state.json (run `oabctl bootstrap` first)");
-            None
-        }
-        Err(e) => {
-            eprintln!("  ⚠ load_bootstrap_state: failed to read bootstrap state from s3://{bucket}: {e}");
-            None
+// Progress rendering is scoped to the current async task. Library calls set it
+// to false, while CLI/delete callers retain the existing rendering behavior.
+tokio::task_local! {
+    static PROGRESS_ENABLED: bool;
+}
+
+pub(crate) fn progress_enabled() -> bool {
+    PROGRESS_ENABLED
+        .try_with(|enabled| *enabled)
+        .unwrap_or(true)
+}
+
+macro_rules! println {
+    ($($arg:tt)*) => {{ if progress_enabled() { std::println!($($arg)*); } }};
+}
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{ if progress_enabled() { std::eprintln!($($arg)*); } }};
+}
+macro_rules! eprint {
+    ($($arg:tt)*) => {{ if progress_enabled() { std::eprint!($($arg)*); } }};
+}
+
+/// Whether a service was created or updated by reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyAction {
+    Created,
+    Updated,
+}
+
+/// Stable identity for a service targeted by apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceTarget {
+    pub namespace: String,
+    pub name: String,
+    pub ecs_service_name: String,
+}
+
+impl From<&OABServiceManifest> for ServiceTarget {
+    fn from(manifest: &OABServiceManifest) -> Self {
+        Self {
+            namespace: manifest.metadata.namespace.clone(),
+            name: manifest.metadata.name.clone(),
+            ecs_service_name: manifest.ecs_service_name(),
         }
     }
 }
 
-pub async fn run(aws_config: &aws_config::SdkConfig, file_path: &str, sync_config: bool, wait: bool) -> Result<()> {
-    let path = Path::new(file_path);
-    let manifests = load_manifests(path)?;
+/// Reconciliation outcome for one service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedService {
+    pub namespace: String,
+    pub name: String,
+    pub ecs_service_name: String,
+    pub action: ApplyAction,
+    pub webhook_urls: Vec<String>,
+    pub warnings: Vec<String>,
+}
 
-    if manifests.is_empty() {
-        anyhow::bail!("no manifests found at {}", file_path);
+/// Structured result of a successful (or partially completed) apply.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApplyReport {
+    pub services: Vec<AppliedService>,
+}
+
+/// High-level phase in which apply failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyErrorKind {
+    Validation,
+    Target,
+    Reconciliation,
+}
+
+/// Structured apply failure. Reconciliation failures identify the failed
+/// service and retain the report for all services completed before it.
+#[derive(Debug)]
+pub struct ApplyError {
+    pub kind: ApplyErrorKind,
+    pub failed_service: Option<ServiceTarget>,
+    pub completed: ApplyReport,
+    source: anyhow::Error,
+}
+
+impl ApplyError {
+    fn validation(source: impl Into<anyhow::Error>) -> Self {
+        Self {
+            kind: ApplyErrorKind::Validation,
+            failed_service: None,
+            completed: ApplyReport::default(),
+            source: source.into(),
+        }
     }
 
-    // --sync: upload local config.toml to S3 configFrom path
+    fn target(source: impl Into<anyhow::Error>) -> Self {
+        Self {
+            kind: ApplyErrorKind::Target,
+            failed_service: None,
+            completed: ApplyReport::default(),
+            source: source.into(),
+        }
+    }
+
+    fn reconciliation(
+        failed_service: ServiceTarget,
+        completed: ApplyReport,
+        source: impl Into<anyhow::Error>,
+    ) -> Self {
+        Self {
+            kind: ApplyErrorKind::Reconciliation,
+            failed_service: Some(failed_service),
+            completed,
+            source: source.into(),
+        }
+    }
+
+    pub fn source_error(&self) -> &anyhow::Error {
+        &self.source
+    }
+}
+
+impl fmt::Display for ApplyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.failed_service {
+            Some(service) => write!(
+                f,
+                "apply {:?} error for {}/{}: {}",
+                self.kind, service.namespace, service.name, self.source
+            ),
+            None => write!(f, "apply {:?} error: {}", self.kind, self.source),
+        }
+    }
+}
+
+impl std::error::Error for ApplyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.root_cause())
+    }
+}
+
+/// Target options for [`apply_manifests`]. The cluster is deliberately
+/// required; the library never guesses a default deployment target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyOptions {
+    /// ECS cluster name or ARN. The cluster must already exist and be active.
+    pub cluster: String,
+    /// Optional control-plane bucket override. When absent, the library uses
+    /// `OAB_CONTROL_PLANE_BUCKET`, then derives `oab-control-plane-{account}`
+    /// from the caller's AWS identity. It never reads CLI home configuration.
+    pub control_plane_bucket: Option<String>,
+    /// Wait for every reconciled ECS service to stabilize before returning.
+    pub wait: bool,
+}
+
+impl ApplyOptions {
+    /// Create apply options for an explicit ECS cluster.
+    pub fn new(cluster: impl Into<String>) -> Self {
+        Self {
+            cluster: cluster.into(),
+            control_plane_bucket: None,
+            wait: false,
+        }
+    }
+
+    /// Override the S3 bucket used for bootstrap state and desired manifests.
+    pub fn with_control_plane_bucket(mut self, bucket: impl Into<String>) -> Self {
+        self.control_plane_bucket = Some(bucket.into());
+        self
+    }
+
+    /// Configure whether apply waits for ECS deployment stabilization.
+    pub fn with_wait(mut self, wait: bool) -> Self {
+        self.wait = wait;
+        self
+    }
+}
+
+struct BootstrapResolution {
+    state: Option<BootstrapState>,
+    warning: Option<String>,
+}
+
+struct PreparedApply {
+    bucket: String,
+    bootstrap: BootstrapResolution,
+}
+
+async fn load_bootstrap_state(s3: &aws_sdk_s3::Client, bucket: &str) -> BootstrapResolution {
+    match crate::bootstrap::load_state_pub(s3, bucket).await {
+        Ok(Some(state)) => BootstrapResolution {
+            state: Some(state),
+            warning: None,
+        },
+        Ok(None) => BootstrapResolution {
+            state: None,
+            warning: Some(format!(
+                "no bootstrap state found in s3://{bucket}/bootstrap-state.json (run `oabctl bootstrap` first)"
+            )),
+        },
+        Err(error) => BootstrapResolution {
+            state: None,
+            warning: Some(format!(
+                "failed to read bootstrap state from s3://{bucket}: {error}"
+            )),
+        },
+    }
+}
+
+fn validate_apply_request(
+    manifests: &[OABServiceManifest],
+    cluster: &str,
+) -> std::result::Result<(), ApplyError> {
+    if manifests.is_empty() {
+        return Err(ApplyError::validation(anyhow::anyhow!(
+            "no manifests to apply (empty manifest set)"
+        )));
+    }
+    if cluster.trim().is_empty() {
+        return Err(ApplyError::validation(anyhow::anyhow!(
+            "ApplyOptions.cluster must not be empty or whitespace"
+        )));
+    }
+    for manifest in manifests {
+        manifest.validate().map_err(|error| {
+            ApplyError::validation(error.context(format!(
+                "invalid manifest {}/{}",
+                manifest.metadata.namespace, manifest.metadata.name
+            )))
+        })?;
+        if matches!(&manifest.spec.runtime, Runtime::Kubernetes(_)) {
+            return Err(ApplyError::validation(anyhow::anyhow!(
+                "Kubernetes runtime not yet implemented (manifest: {})",
+                manifest.metadata.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn classify_cluster_response(
+    requested: &str,
+    clusters: &[(&str, &str, &str)],
+    failures: &[String],
+) -> std::result::Result<(), String> {
+    if !failures.is_empty() {
+        return Err(format!(
+            "ECS rejected cluster '{requested}': {}",
+            failures.join("; ")
+        ));
+    }
+    let Some((_, _, status)) = clusters
+        .iter()
+        .find(|(name, arn, _)| *name == requested || *arn == requested)
+    else {
+        return Err(format!(
+            "ECS cluster '{requested}' was not returned by DescribeClusters"
+        ));
+    };
+    if *status != "ACTIVE" {
+        return Err(format!(
+            "ECS cluster '{requested}' is not reachable for apply (status: {})",
+            if status.is_empty() { "unknown" } else { status }
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_cluster(
+    ecs: &aws_sdk_ecs::Client,
+    cluster: &str,
+) -> std::result::Result<(), ApplyError> {
+    let response = ecs
+        .describe_clusters()
+        .clusters(cluster)
+        .send()
+        .await
+        .map_err(|error| {
+            ApplyError::target(
+                anyhow::Error::new(error)
+                    .context(format!("failed to describe ECS cluster '{cluster}'")),
+            )
+        })?;
+    let clusters: Vec<(&str, &str, &str)> = response
+        .clusters()
+        .iter()
+        .map(|item| {
+            (
+                item.cluster_name().unwrap_or_default(),
+                item.cluster_arn().unwrap_or_default(),
+                item.status().unwrap_or_default(),
+            )
+        })
+        .collect();
+    let failures: Vec<String> = response
+        .failures()
+        .iter()
+        .map(|failure| {
+            let target = failure.arn().unwrap_or(cluster);
+            let reason = failure.reason().unwrap_or("unknown failure");
+            match failure.detail() {
+                Some(detail) if !detail.is_empty() => format!("{target}: {reason} ({detail})"),
+                _ => format!("{target}: {reason}"),
+            }
+        })
+        .collect();
+    classify_cluster_response(cluster, &clusters, &failures)
+        .map_err(|message| ApplyError::target(anyhow::anyhow!(message)))
+}
+
+async fn prepare_apply(
+    aws_config: &aws_config::SdkConfig,
+    ecs: &aws_sdk_ecs::Client,
+    s3: &aws_sdk_s3::Client,
+    manifests: &[OABServiceManifest],
+    cluster: &str,
+    configured_bucket: Option<&str>,
+) -> std::result::Result<PreparedApply, ApplyError> {
+    validate_apply_request(manifests, cluster)?;
+    validate_cluster(ecs, cluster).await?;
+    let bucket = crate::control_plane::resolve_bucket(aws_config, configured_bucket)
+        .await
+        .map_err(ApplyError::target)?;
+    let bootstrap = load_bootstrap_state(s3, &bucket).await;
+    Ok(PreparedApply { bucket, bootstrap })
+}
+
+pub(crate) async fn run(
+    aws_config: &aws_config::SdkConfig,
+    file_path: &str,
+    sync_config: bool,
+    wait: bool,
+) -> Result<()> {
+    let path = Path::new(file_path);
+    let manifests = load_manifests(path)?;
+    let oab_cfg = crate::config::OabConfig::load()
+        .context("failed to load ~/.oabctl/config.toml (run `oabctl bootstrap` first)")?;
+    let cluster = &oab_cfg.defaults.cluster;
+    let ecs = aws_sdk_ecs::Client::new(aws_config);
+    let s3 = aws_sdk_s3::Client::new(aws_config);
+
+    // Local validation and DescribeClusters happen before config sync or any
+    // other mutating request.
+    let prepared = prepare_apply(
+        aws_config,
+        &ecs,
+        &s3,
+        &manifests,
+        cluster,
+        oab_cfg.bootstrap.bucket.as_deref(),
+    )
+    .await?;
+
     if sync_config {
-        let s3 = aws_sdk_s3::Client::new(aws_config);
-        for m in &manifests {
+        for manifest in &manifests {
             let config_path = path.parent().unwrap_or(Path::new(".")).join("config.toml");
-            if config_path.exists() && !m.spec.config_from.is_empty() {
-                let body = aws_sdk_s3::primitives::ByteStream::from_path(&config_path).await
+            if config_path.exists() && !manifest.spec.config_from.is_empty() {
+                let body = ByteStream::from_path(&config_path)
+                    .await
                     .context("failed to read local config.toml")?;
-                // Parse s3://bucket/key from configFrom
-                if let Some(s3_path) = m.spec.config_from.strip_prefix("s3://") {
-                    let (bucket, key) = s3_path.split_once('/').context("invalid configFrom S3 URI")?;
-                    s3.put_object().bucket(bucket).key(key).body(body).send().await
+                if let Some(s3_path) = manifest.spec.config_from.strip_prefix("s3://") {
+                    let (bucket, key) = s3_path
+                        .split_once('/')
+                        .context("invalid configFrom S3 URI")?;
+                    s3.put_object()
+                        .bucket(bucket)
+                        .key(key)
+                        .body(body)
+                        .send()
+                        .await
                         .context("failed to sync config.toml to S3")?;
-                    eprintln!("  ⬆ Synced config.toml → {}", m.spec.config_from);
+                    eprintln!("  ⬆ Synced config.toml → {}", manifest.spec.config_from);
                 }
             }
         }
     }
 
-    let ecs = aws_sdk_ecs::Client::new(aws_config);
-    let s3 = aws_sdk_s3::Client::new(aws_config);
-
-    // CLI path: resolve the cluster from ~/.oabctl/config.toml (same source
-    // as `get` and `delete`). Load errors propagate — silently defaulting on
-    // a malformed config could target the wrong cluster.
-    let oab_cfg = crate::config::OabConfig::load()
-        .context("failed to load ~/.oabctl/config.toml (run `oabctl bootstrap` first)")?;
-    let cluster = oab_cfg.defaults.cluster;
-
-    apply_manifests_with(aws_config, &ecs, &s3, &manifests, &cluster, wait).await
+    apply_manifests_prepared(aws_config, &ecs, &s3, &manifests, cluster, wait, &prepared).await?;
+    Ok(())
 }
 
-/// Target options for the programmatic apply API ([`apply_manifests`]).
-#[derive(Debug, Clone, Default)]
-pub struct ApplyOptions {
-    /// ECS cluster to reconcile into. **Required** for library callers —
-    /// there is deliberately no `~/.oabctl/config.toml` fallback here, so a
-    /// containerized control plane without CLI home configuration cannot
-    /// silently target a default cluster. (The `oabctl` CLI resolves its
-    /// cluster from the config file as before.)
-    pub cluster: Option<String>,
-    /// Wait for each service deployment to stabilize before returning.
-    pub wait: bool,
-}
-
-/// Validate and reconcile OAB services from in-memory manifests.
-///
-/// This is the library entry point for programmatic consumers (control
-/// planes, provisioners) that construct [`OABServiceManifest`] values
-/// directly instead of loading them from YAML files. All manifests are
-/// validated before any is applied (no partial apply on invalid input).
-///
-/// Contract (enforced before any AWS call):
-/// - an empty manifest set is rejected rather than reported as success
-/// - [`ApplyOptions::cluster`] must be set to a non-empty cluster name
+/// Validate and reconcile in-memory manifests without writing progress to
+/// process-global stdout or stderr.
 pub async fn apply_manifests(
     aws_config: &aws_config::SdkConfig,
     manifests: &[OABServiceManifest],
     opts: &ApplyOptions,
-) -> Result<()> {
-    if manifests.is_empty() {
-        anyhow::bail!("no manifests to apply (empty manifest set)");
-    }
-    let cluster = opts
-        .cluster
-        .as_deref()
-        .context("ApplyOptions.cluster is required: pass the target ECS cluster explicitly (the library has no ~/.oabctl/config.toml fallback)")?;
-    anyhow::ensure!(!cluster.is_empty(), "ApplyOptions.cluster must not be empty");
-
-    let ecs = aws_sdk_ecs::Client::new(aws_config);
-    let s3 = aws_sdk_s3::Client::new(aws_config);
-    apply_manifests_with(aws_config, &ecs, &s3, manifests, cluster, opts.wait).await
+) -> std::result::Result<ApplyReport, ApplyError> {
+    PROGRESS_ENABLED
+        .scope(false, async {
+            validate_apply_request(manifests, &opts.cluster)?;
+            let ecs = aws_sdk_ecs::Client::new(aws_config);
+            let s3 = aws_sdk_s3::Client::new(aws_config);
+            validate_cluster(&ecs, &opts.cluster).await?;
+            let bucket = crate::control_plane::resolve_bucket(
+                aws_config,
+                opts.control_plane_bucket.as_deref(),
+            )
+            .await
+            .map_err(ApplyError::target)?;
+            let prepared = PreparedApply {
+                bootstrap: load_bootstrap_state(&s3, &bucket).await,
+                bucket,
+            };
+            apply_manifests_prepared(
+                aws_config,
+                &ecs,
+                &s3,
+                manifests,
+                &opts.cluster,
+                opts.wait,
+                &prepared,
+            )
+            .await
+        })
+        .await
 }
 
-async fn apply_manifests_with(
+async fn apply_manifests_prepared(
     aws_config: &aws_config::SdkConfig,
     ecs: &aws_sdk_ecs::Client,
     s3: &aws_sdk_s3::Client,
     manifests: &[OABServiceManifest],
     cluster: &str,
     wait: bool,
-) -> Result<()> {
-    if manifests.is_empty() {
-        anyhow::bail!("no manifests to apply (empty manifest set)");
-    }
-
-    // Validate ALL manifests before applying any (prevent partial apply)
-    for m in manifests {
-        m.validate()?;
-        if matches!(&m.spec.runtime, Runtime::Kubernetes(_)) {
-            anyhow::bail!(
-                "Kubernetes runtime not yet implemented (manifest: {})",
-                m.metadata.name
-            );
+    prepared: &PreparedApply,
+) -> std::result::Result<ApplyReport, ApplyError> {
+    let mut report = ApplyReport::default();
+    for manifest in manifests {
+        println!("  Applying {} (ECS)...", manifest.metadata.name);
+        match apply_ecs(
+            ecs,
+            s3,
+            aws_config,
+            manifest,
+            cluster,
+            wait,
+            &prepared.bucket,
+            &prepared.bootstrap,
+        )
+        .await
+        {
+            Ok(service) => report.services.push(service),
+            Err(error) => {
+                return Err(ApplyError::reconciliation(
+                    ServiceTarget::from(manifest),
+                    report,
+                    error,
+                ));
+            }
         }
     }
-
-    for m in manifests {
-        println!("  Applying {} (ECS)...", m.metadata.name);
-        apply_ecs(ecs, s3, aws_config, m, cluster, wait).await?;
-    }
-
-    println!("\n{} service(s) applied.", manifests.len());
-    Ok(())
+    println!("\n{} service(s) applied.", report.services.len());
+    Ok(report)
 }
 
-pub fn load_manifests(path: &Path) -> Result<Vec<OABServiceManifest>> {
+pub(crate) fn load_manifests(path: &Path) -> Result<Vec<OABServiceManifest>> {
     let mut manifests = Vec::new();
     if path.is_dir() {
         for entry in std::fs::read_dir(path)? {
@@ -197,7 +497,11 @@ fn parse_manifest_file(path: &Path) -> Result<Vec<OABServiceManifest>> {
             let fleet: OABFleetManifest = serde_yaml::from_str(&content)
                 .with_context(|| format!("failed to parse OABFleet {}", path.display()))?;
             fleet.validate()?;
-            println!("  Fleet '{}': expanding {} agents...", fleet.metadata.name, fleet.spec.agents.len());
+            println!(
+                "  Fleet '{}': expanding {} agents...",
+                fleet.metadata.name,
+                fleet.spec.agents.len()
+            );
             Ok(fleet.expand())
         }
         other => anyhow::bail!("unsupported kind '{}' in {}", other, path.display()),
@@ -211,23 +515,20 @@ async fn apply_ecs(
     m: &OABServiceManifest,
     cluster: &str,
     wait: bool,
-) -> Result<()> {
+    bucket: &str,
+    bootstrap: &BootstrapResolution,
+) -> Result<AppliedService> {
     let ecs_rt = match &m.spec.runtime {
         Runtime::Ecs(rt) => rt,
         _ => unreachable!(),
     };
 
     let service_name = m.ecs_service_name();
-    let bucket = if let Some(b) = crate::config::OabConfig::load().ok().and_then(|c| c.bucket()) {
-        b
-    } else {
-        // Fallback: derive from account ID
-        let sts = aws_sdk_sts::Client::new(config);
-        let account = sts.get_caller_identity().send().await
-            .ok().and_then(|r| r.account().map(|a| a.to_string()))
-            .unwrap_or_else(|| "unknown".to_string());
-        format!("oab-control-plane-{account}")
-    };
+    let mut warnings = bootstrap.warning.iter().cloned().collect::<Vec<_>>();
+    if let Some(warning) = &bootstrap.warning {
+        eprintln!("  ⚠ {warning}");
+    }
+    let bootstrap_state = bootstrap.state.as_ref();
 
     // Read current generation from S3 manifest (if exists), increment.
     // Also capture whether the *previous* apply had ingress configured, so we
@@ -235,16 +536,27 @@ async fn apply_ecs(
     // below — apply only ever provisioned ingress resources before this, so a
     // manifest edit that drops `spec.ingress` used to orphan the per-bot HTTP
     // API and Cloud Map service.
-    let manifest_key = format!("manifests/{}/{}.yaml", m.metadata.namespace, m.metadata.name);
-    let (current_gen, previously_had_ingress) =
-        match s3.get_object().bucket(&bucket).key(&manifest_key).send().await {
-            Ok(resp) => {
-                let bytes = resp.body.collect().await?.into_bytes();
-                let existing: OABServiceManifest = serde_yaml::from_slice(&bytes)?;
-                (existing.metadata.generation, existing.spec.ingress.is_some())
-            }
-            Err(_) => (0, false),
-        };
+    let manifest_key = format!(
+        "manifests/{}/{}.yaml",
+        m.metadata.namespace, m.metadata.name
+    );
+    let (current_gen, previously_had_ingress) = match s3
+        .get_object()
+        .bucket(bucket)
+        .key(&manifest_key)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let bytes = resp.body.collect().await?.into_bytes();
+            let existing: OABServiceManifest = serde_yaml::from_slice(&bytes)?;
+            (
+                existing.metadata.generation,
+                existing.spec.ingress.is_some(),
+            )
+        }
+        Err(_) => (0, false),
+    };
     let generation = current_gen + 1;
 
     // Look up the ECS service's current registry ARN(s) up front so both the
@@ -257,16 +569,17 @@ async fn apply_ecs(
         .cluster(cluster)
         .services(&service_name)
         .send()
-        .await;
+        .await
+        .context("failed to describe ECS service")?;
     let existing_registry_arns: Vec<String> = describe_resp
-        .as_ref()
-        .ok()
-        .and_then(|r| r.services().first())
-        .map(|s| {
-            s.service_registries()
+        .services()
+        .first()
+        .map(|service| {
+            service
+                .service_registries()
                 .iter()
-                .filter_map(|r| r.registry_arn())
-                .map(|a| a.to_string())
+                .filter_map(|registry| registry.registry_arn())
+                .map(str::to_owned)
                 .collect()
         })
         .unwrap_or_default();
@@ -281,15 +594,20 @@ async fn apply_ecs(
     // teardown() is about to delete.
     if previously_had_ingress && m.spec.ingress.is_none() {
         eprintln!("  🌐 ingress removed from manifest — tearing down orphaned resources...");
-        if let Err(e) = crate::ingress::teardown(
+        match crate::ingress::teardown(
             config,
             &m.metadata.namespace,
             &m.metadata.name,
-            existing_registry_arns.first().map(|s| s.as_str()),
+            existing_registry_arns.first().map(String::as_str),
         )
         .await
         {
-            eprintln!("  ⚠ ingress teardown skipped: {e}");
+            Ok(teardown_warnings) => warnings.extend(teardown_warnings),
+            Err(error) => {
+                let warning = format!("ingress teardown skipped: {error}");
+                eprintln!("  ⚠ {warning}");
+                warnings.push(warning);
+            }
         }
     }
 
@@ -298,7 +616,7 @@ async fn apply_ecs(
     manifest_to_store["metadata"]["generation"] = serde_yaml::Value::Number(generation.into());
     let manifest_yaml = serde_yaml::to_string(&manifest_to_store)?;
     s3.put_object()
-        .bucket(&bucket)
+        .bucket(bucket)
         .key(&manifest_key)
         .body(ByteStream::from(manifest_yaml.into_bytes()))
         .send()
@@ -307,8 +625,14 @@ async fn apply_ecs(
 
     // 2. Build environment variables
     let mut env_vars = vec![
-        KeyValuePair::builder().name("NAMESPACE").value(&m.metadata.namespace).build(),
-        KeyValuePair::builder().name("NAME").value(&m.metadata.name).build(),
+        KeyValuePair::builder()
+            .name("NAMESPACE")
+            .value(&m.metadata.namespace)
+            .build(),
+        KeyValuePair::builder()
+            .name("NAME")
+            .value(&m.metadata.name)
+            .build(),
     ];
     // openab's own AWS SDK calls (config-s3 loading, secrets resolution, etc.)
     // resolve region via the standard chain: AWS_REGION env var → profile →
@@ -317,7 +641,12 @@ async fn apply_ecs(
     // Region is injected below after bootstrap_state is loaded (to allow
     // fallback to bootstrap_state.region when config.region() is None).
     if let Some(ref bootstrap) = m.spec.bootstrap_from {
-        env_vars.push(KeyValuePair::builder().name("BOOTSTRAP_FROM").value(bootstrap).build());
+        env_vars.push(
+            KeyValuePair::builder()
+                .name("BOOTSTRAP_FROM")
+                .value(bootstrap)
+                .build(),
+        );
     }
 
     // 3. Build secrets from map. Values can be either the ECS-native
@@ -330,21 +659,29 @@ async fn apply_ecs(
     let mut secrets: Vec<Secret> = Vec::with_capacity(m.spec.secrets.len());
     for (name, value) in &m.spec.secrets {
         let value_from = crate::secrets::resolve_value_from(&sm, value).await?;
-        secrets.push(Secret::builder().name(name).value_from(value_from).build().unwrap());
+        secrets.push(
+            Secret::builder()
+                .name(name)
+                .value_from(value_from)
+                .build()
+                .unwrap(),
+        );
     }
-
-    // Load bootstrap state — supplies CloudWatch log group, execution role
-    // ARN, task role ARN, and region fallback.
-    let bootstrap_state = load_bootstrap_state(config).await;
 
     // Resolve effective region: prefer SDK config, fall back to bootstrap
     // state's recorded region. Fargate has no IMDS, so without AWS_REGION the
     // container's SDK calls will fail to resolve endpoints entirely.
-    let effective_region: Option<String> = config.region()
+    let effective_region: Option<String> = config
+        .region()
         .map(|r| r.as_ref().to_string())
         .or_else(|| bootstrap_state.as_ref().map(|s| s.region.clone()));
     if let Some(ref region) = effective_region {
-        env_vars.push(KeyValuePair::builder().name("AWS_REGION").value(region).build());
+        env_vars.push(
+            KeyValuePair::builder()
+                .name("AWS_REGION")
+                .value(region)
+                .build(),
+        );
     }
 
     let mut container = ContainerDefinition::builder()
@@ -352,7 +689,11 @@ async fn apply_ecs(
         .image(&m.spec.image)
         .essential(true)
         .set_environment(Some(env_vars))
-        .set_secrets(if secrets.is_empty() { None } else { Some(secrets) });
+        .set_secrets(if secrets.is_empty() {
+            None
+        } else {
+            Some(secrets)
+        });
 
     // The image's default CMD points `openab` at a local
     // /etc/openab/config.toml that nothing populates. openab has native
@@ -415,14 +756,21 @@ async fn apply_ecs(
     // through envvar/profile/webidentity/ECS providers and finally tries
     // IMDS, which doesn't exist on Fargate, and fails with a generic
     // "dispatch failure". This was previously never set at all.
-    let execution_role_arn = bootstrap_state.as_ref().map(|s| s.resources.execution_role_arn.clone());
+    let execution_role_arn = bootstrap_state
+        .as_ref()
+        .map(|s| s.resources.execution_role_arn.clone());
     // Manifest task_role_arn takes precedence over bootstrap shared role.
     // Filter empty strings so a blank value falls through to bootstrap.
     let task_role_arn = resolve_task_role_arn(
         &ecs_rt.task_role_arn,
-        bootstrap_state.as_ref().map(|s| s.resources.task_role_arn.as_str()),
+        bootstrap_state
+            .as_ref()
+            .map(|s| s.resources.task_role_arn.as_str()),
     );
-    match (&task_role_arn, ecs_rt.task_role_arn.as_deref().filter(|s| !s.is_empty())) {
+    match (
+        &task_role_arn,
+        ecs_rt.task_role_arn.as_deref().filter(|s| !s.is_empty()),
+    ) {
         (Some(arn), Some(_)) => eprintln!("  ℹ taskRoleArn: {arn} (from manifest)"),
         (Some(arn), None) => eprintln!("  ℹ taskRoleArn: {arn} (from bootstrap)"),
         (None, _) => eprintln!("  ⚠ no taskRoleArn resolved — task will have no IAM role"),
@@ -456,7 +804,9 @@ async fn apply_ecs(
     let cpu_arch = match ecs_rt.architecture.as_str() {
         "ARM64" => aws_sdk_ecs::types::CpuArchitecture::Arm64,
         "X86_64" => aws_sdk_ecs::types::CpuArchitecture::X8664,
-        other => anyhow::bail!("unsupported architecture '{other}' — should be caught by manifest validation"),
+        other => anyhow::bail!(
+            "unsupported architecture '{other}' — should be caught by manifest validation"
+        ),
     };
     register_req = register_req.runtime_platform(
         RuntimePlatform::builder()
@@ -510,12 +860,13 @@ async fn apply_ecs(
     // the ingress-removal teardown) — `ensure_cloud_map` above doesn't touch
     // the ECS service, so its ACTIVE status can't have changed since then.
     let service_active = describe_resp
-        .as_ref()
-        .ok()
-        .and_then(|r| r.services().first())
-        .is_some_and(|s| s.status() == Some("ACTIVE"));
+        .services()
+        .first()
+        .is_some_and(|service| service.status() == Some("ACTIVE"));
+    let action;
 
     if service_active {
+        action = ApplyAction::Updated;
         // Recreate is NOT required to attach/fix service discovery: ECS's
         // UpdateService API has supported adding/updating/removing
         // serviceRegistries since March 2022 (rolling replacement — new tasks
@@ -523,9 +874,9 @@ async fn apply_ecs(
         // healthy, no downtime gap). It does require the AWSServiceRoleForECS
         // service-linked role, which ECS creates automatically the first time
         // any account uses ECS service discovery — no action needed here.
-        let registry_mismatch = cloud_map.as_ref().is_some_and(|cm| {
-            has_registries && !existing_registry_arns.contains(&cm.registry_arn)
-        });
+        let registry_mismatch = cloud_map
+            .as_ref()
+            .is_some_and(|cm| has_registries && !existing_registry_arns.contains(&cm.registry_arn));
         // `ingress` was removed from the manifest (cloud_map is None here)
         // but the ECS service still has a registry attached from a previous
         // apply — must explicitly detach it. `UpdateService` treats an
@@ -545,8 +896,8 @@ async fn apply_ecs(
 
         if let Some(cm) = &cloud_map {
             if !has_registries || registry_mismatch {
-                let mut registry = aws_sdk_ecs::types::ServiceRegistry::builder()
-                    .registry_arn(&cm.registry_arn);
+                let mut registry =
+                    aws_sdk_ecs::types::ServiceRegistry::builder().registry_arn(&cm.registry_arn);
                 if let Some(ingress) = &m.spec.ingress {
                     registry = registry
                         .container_name("openab")
@@ -584,6 +935,7 @@ async fn apply_ecs(
             println!("  ✓ {} updated", m.metadata.name);
         }
     } else {
+        action = ApplyAction::Created;
         let cap_strategy = CapacityProviderStrategyItem::builder()
             .capacity_provider(&ecs_rt.capacity_provider)
             .weight(1)
@@ -600,8 +952,8 @@ async fn apply_ecs(
             .network_configuration(network_config);
 
         if let Some(cm) = &cloud_map {
-            let mut registry = aws_sdk_ecs::types::ServiceRegistry::builder()
-                .registry_arn(&cm.registry_arn);
+            let mut registry =
+                aws_sdk_ecs::types::ServiceRegistry::builder().registry_arn(&cm.registry_arn);
             // SRV records require the container name + port so ECS registers the
             // task's port alongside its IP.
             if let Some(ingress) = &m.spec.ingress {
@@ -671,9 +1023,10 @@ async fn apply_ecs(
     }
 
     // Ingress step 2: VPC Link + API Gateway + routes + SG rule.
+    let mut webhook_urls = Vec::new();
     if let (Some(ingress), Some(cm)) = (&m.spec.ingress, &cloud_map) {
         eprintln!("  🌐 Reconciling ingress (VPC Link + API Gateway)...");
-        let urls = crate::ingress::ensure_gateway(
+        webhook_urls = crate::ingress::ensure_gateway(
             config,
             &m.metadata.namespace,
             &m.metadata.name,
@@ -684,23 +1037,28 @@ async fn apply_ecs(
         )
         .await?;
         println!("  🔗 Webhook URL(s) for {}:", m.metadata.name);
-        for u in &urls {
-            println!("     {u}");
+        for url in &webhook_urls {
+            println!("     {url}");
         }
 
-        // Best-effort: register the Telegram webhook so the bot starts
-        // receiving updates without a manual `curl setWebhook` step. Only
-        // fires when `/webhook/telegram` is one of the ingress paths and
-        // spec.secrets has a TELEGRAM_BOT_TOKEN entry; a no-op otherwise.
-        // Never fails `apply` — the AWS provisioning above already
-        // succeeded, and this is a convenience on top of it.
-        let path_urls: Vec<(String, String)> =
-            ingress.paths.iter().cloned().zip(urls.iter().cloned()).collect();
-        match crate::ingress::register_telegram_webhook(config, &m.spec.secrets, &path_urls).await
-        {
-            Ok(Some(desc)) => eprintln!("  ✓ Telegram webhook registered: {desc}"),
+        let path_urls: Vec<(String, String)> = ingress
+            .paths
+            .iter()
+            .cloned()
+            .zip(webhook_urls.iter().cloned())
+            .collect();
+        match crate::ingress::register_telegram_webhook(config, &m.spec.secrets, &path_urls).await {
+            Ok(Some(description)) => {
+                eprintln!("  ✓ Telegram webhook registered: {description}")
+            }
             Ok(None) => {}
-            Err(e) => eprintln!("  ⚠ Telegram webhook registration failed (apply still succeeded): {e}"),
+            Err(error) => {
+                let warning = format!(
+                    "Telegram webhook registration failed (apply still succeeded): {error}"
+                );
+                eprintln!("  ⚠ {warning}");
+                warnings.push(warning);
+            }
         }
     }
 
@@ -710,7 +1068,14 @@ async fn apply_ecs(
         eprintln!("  ✓ {} is stable", m.metadata.name);
     }
 
-    Ok(())
+    Ok(AppliedService {
+        namespace: m.metadata.namespace.clone(),
+        name: m.metadata.name.clone(),
+        ecs_service_name: service_name,
+        action,
+        webhook_urls,
+        warnings,
+    })
 }
 
 /// Poll until the ECS service's deployment stabilizes, printing each
@@ -724,10 +1089,12 @@ async fn apply_ecs(
 async fn wait_for_stable(ecs: &aws_sdk_ecs::Client, cluster: &str, service: &str) -> Result<()> {
     for i in 0..60 {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        let resp = ecs.describe_services()
+        let resp = ecs
+            .describe_services()
             .cluster(cluster)
             .services(service)
-            .send().await?;
+            .send()
+            .await?;
         let elapsed = (i + 1) * 5;
 
         let Some(svc) = resp.services().first() else {
@@ -803,6 +1170,19 @@ fn resolve_task_role_arn(
 mod tests {
     use super::*;
 
+    #[test]
+    fn apply_options_accepts_explicit_control_plane_bucket() {
+        let options = ApplyOptions::new("prod-cluster")
+            .with_control_plane_bucket("prod-control-plane")
+            .with_wait(true);
+        assert_eq!(options.cluster, "prod-cluster");
+        assert_eq!(
+            options.control_plane_bucket.as_deref(),
+            Some("prod-control-plane")
+        );
+        assert!(options.wait);
+    }
+
     fn test_sdk_config() -> aws_config::SdkConfig {
         aws_config::SdkConfig::builder()
             .behavior_version(aws_config::BehaviorVersion::latest())
@@ -834,45 +1214,109 @@ spec:
     }
 
     #[tokio::test]
+    async fn programmatic_apply_progress_scope_is_disabled() {
+        PROGRESS_ENABLED
+            .scope(false, async { assert!(!progress_enabled()) })
+            .await;
+        assert!(progress_enabled());
+    }
+
+    #[tokio::test]
     async fn apply_manifests_rejects_empty_set() {
         let cfg = test_sdk_config();
-        let opts = ApplyOptions {
-            cluster: Some("test-cluster".to_string()),
-            wait: false,
-        };
-        let err = apply_manifests(&cfg, &[], &opts).await.unwrap_err();
-        assert!(
-            err.to_string().contains("empty manifest set"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn apply_manifests_requires_explicit_cluster() {
-        let cfg = test_sdk_config();
-        let m = minimal_manifest();
-        let err = apply_manifests(&cfg, &[m], &ApplyOptions::default())
+        let err = apply_manifests(&cfg, &[], &ApplyOptions::new("test-cluster"))
             .await
             .unwrap_err();
-        assert!(
-            err.to_string().contains("ApplyOptions.cluster is required"),
-            "unexpected error: {err}"
-        );
+        assert_eq!(err.kind, ApplyErrorKind::Validation);
+        assert!(err.to_string().contains("empty manifest set"));
     }
 
     #[tokio::test]
-    async fn apply_manifests_rejects_empty_cluster_name() {
+    async fn apply_manifests_rejects_empty_cluster_name_locally() {
         let cfg = test_sdk_config();
-        let m = minimal_manifest();
-        let opts = ApplyOptions {
-            cluster: Some(String::new()),
-            wait: false,
+        let manifest = minimal_manifest();
+        let err = apply_manifests(&cfg, &[manifest], &ApplyOptions::new(""))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ApplyErrorKind::Validation);
+        assert!(err.to_string().contains("empty or whitespace"));
+    }
+
+    #[tokio::test]
+    async fn apply_manifests_rejects_whitespace_cluster_name_locally() {
+        let cfg = test_sdk_config();
+        let manifest = minimal_manifest();
+        let err = apply_manifests(&cfg, &[manifest], &ApplyOptions::new("  \t\n"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ApplyErrorKind::Validation);
+        assert!(err.to_string().contains("empty or whitespace"));
+    }
+
+    #[test]
+    fn cluster_response_accepts_requested_active_cluster() {
+        assert!(classify_cluster_response(
+            "prod",
+            &[("prod", "arn:aws:ecs:us-east-1:123:cluster/prod", "ACTIVE")],
+            &[],
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn cluster_response_accepts_requested_cluster_arn() {
+        let arn = "arn:aws:ecs:us-east-1:123:cluster/prod";
+        assert!(classify_cluster_response(arn, &[("prod", arn, "ACTIVE")], &[],).is_ok());
+    }
+
+    #[test]
+    fn cluster_response_rejects_empty_cluster_list() {
+        let error = classify_cluster_response("prod", &[], &[]).unwrap_err();
+        assert!(error.contains("not returned"));
+    }
+
+    #[test]
+    fn cluster_response_rejects_service_failures() {
+        let error =
+            classify_cluster_response("prod", &[], &["prod: MISSING".to_string()]).unwrap_err();
+        assert!(error.contains("MISSING"));
+    }
+
+    #[test]
+    fn cluster_response_rejects_inactive_cluster() {
+        let error = classify_cluster_response(
+            "prod",
+            &[("prod", "arn:aws:ecs:us-east-1:123:cluster/prod", "INACTIVE")],
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.contains("INACTIVE"));
+    }
+
+    #[test]
+    fn reconciliation_error_exposes_failed_service_and_completed_report() {
+        let completed_service = AppliedService {
+            namespace: "prod".to_string(),
+            name: "done".to_string(),
+            ecs_service_name: "oab-prod-done".to_string(),
+            action: ApplyAction::Updated,
+            webhook_urls: vec!["https://example.test/webhook".to_string()],
+            warnings: vec!["degraded".to_string()],
         };
-        let err = apply_manifests(&cfg, &[m], &opts).await.unwrap_err();
-        assert!(
-            err.to_string().contains("must not be empty"),
-            "unexpected error: {err}"
-        );
+        let completed = ApplyReport {
+            services: vec![completed_service.clone()],
+        };
+        let failed = ServiceTarget {
+            namespace: "prod".to_string(),
+            name: "failed".to_string(),
+            ecs_service_name: "oab-prod-failed".to_string(),
+        };
+        let error =
+            ApplyError::reconciliation(failed.clone(), completed.clone(), anyhow::anyhow!("boom"));
+        assert_eq!(error.kind, ApplyErrorKind::Reconciliation);
+        assert_eq!(error.failed_service, Some(failed));
+        assert_eq!(error.completed, completed);
+        assert_eq!(error.completed.services[0], completed_service);
     }
 
     #[test]

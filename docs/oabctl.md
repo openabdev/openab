@@ -530,6 +530,12 @@ as well be written `"aws-sm://oab/telegram/mybot#TELEGRAM_BOT_TOKEN"`, and
 `TELEGRAM_SECRET_TOKEN` could just as well use the full ARN form. The choice
 is per-value, not tied to which secret it is.
 
+> **Permission required for shorthand names:** when `<secret-id>` in an
+> `aws-sm://<secret-id>#<json-key>` value is not already a full ARN, the apply
+> caller must have `secretsmanager:DescribeSecret`. oabctl uses that API to
+> resolve the name to the full ARN required by ECS. ARN-form shorthand skips
+> this lookup.
+
 ### IAM Execution Role Permissions
 
 Attached to `oab-task-execution` — the identity **ECS itself** assumes to pull

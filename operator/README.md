@@ -73,20 +73,56 @@ the full manifest schema (including ingress/webhooks for Telegram and LINE),
 secrets formats, bootstrap details, IAM permission tables, and the complete
 commands reference.
 
+## Library API
+
+The crate exposes a deliberately narrow manifest + apply facade for control
+planes that should not shell out to the CLI:
+
+```rust,no_run
+use oabctl::{apply_manifests, ApplyOptions, OABServiceManifest};
+
+async fn deploy(
+    aws: &aws_config::SdkConfig,
+    manifest: OABServiceManifest,
+) -> Result<(), oabctl::ApplyError> {
+    let report = apply_manifests(
+        aws,
+        &[manifest],
+        &ApplyOptions::new("production-cluster").with_wait(true),
+    )
+    .await?;
+    for service in report.services {
+        println!("{}: {:?}", service.ecs_service_name, service.action);
+    }
+    Ok(())
+}
+```
+
+Programmatic apply emits no progress to process-global stdout/stderr. Success
+returns per-service actions, webhook URLs, and warnings; reconciliation errors
+identify the failed service and include the report completed before the failure.
+The library never reads `~/.oabctl/config.toml`: set
+`with_control_plane_bucket(...)` explicitly when needed, otherwise bucket
+resolution uses `OAB_CONTROL_PLANE_BUCKET` and then the caller's AWS account.
+For `aws-sm://<secret-id>#<json-key>`, a non-ARN `<secret-id>` requires the
+caller to have `secretsmanager:DescribeSecret`; full-ARN shorthand does not
+need that lookup.
+
 ## Source Layout
 
 ```
 operator/
 ├── src/
-│   ├── main.rs        # CLI entrypoint, subcommand dispatch
-│   ├── manifest.rs     # OABService/OABFleet manifest parsing + validation
-│   ├── apply.rs        # apply: ECS task def registration, service create/update
-│   ├── bootstrap.rs    # bootstrap: cluster/IAM/S3/SG/log-group provisioning
-│   ├── ingress.rs       # ingress: Cloud Map + VPC Link + API Gateway reconciliation
-│   ├── secrets.rs      # spec.secrets value resolution (ECS-native + aws-sm:// shorthand)
-│   ├── create.rs       # create: interactive wizard
-│   ├── get.rs           # get: list/describe agents
-│   └── delete.rs       # delete: teardown
+│   ├── main.rs        # Thin binary entrypoint (`oabctl::run_cli()`)
+│   ├── cli.rs         # Private CLI definitions and subcommand dispatch
+│   ├── manifest.rs    # Publicly re-exported manifest model + validation
+│   ├── apply.rs       # apply: ECS task def registration, service create/update
+│   ├── bootstrap.rs   # bootstrap: cluster/IAM/S3/SG/log-group provisioning
+│   ├── ingress.rs     # ingress: Cloud Map + VPC Link + API Gateway reconciliation
+│   ├── secrets.rs     # spec.secrets value resolution (ECS-native + aws-sm:// shorthand)
+│   ├── create.rs      # create: interactive wizard
+│   ├── get.rs         # get: list/describe agents
+│   └── delete.rs      # delete: teardown
 └── schema/
     └── oabservice-v2.json  # JSON Schema for IDE validation
 ```
