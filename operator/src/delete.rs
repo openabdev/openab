@@ -1,5 +1,22 @@
 use anyhow::{Context, Result};
+use aws_sdk_ecs::error::ProvideErrorMetadata;
 use std::path::Path;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EcsDeletePhase {
+    Delete,
+    Drain,
+    Cleanup,
+}
+
+fn ecs_delete_phase(status: Option<&str>) -> Result<EcsDeletePhase> {
+    match status {
+        Some("ACTIVE") => Ok(EcsDeletePhase::Delete),
+        Some("DRAINING") => Ok(EcsDeletePhase::Drain),
+        Some("INACTIVE") | None => Ok(EcsDeletePhase::Cleanup),
+        Some(other) => anyhow::bail!("unexpected ECS service status during delete: {other}"),
+    }
+}
 
 /// Delete every OABService defined in a manifest file or directory.
 pub(crate) async fn run_from_file(
@@ -85,75 +102,93 @@ async fn run_with_bucket(
 
     println!("Deleting {name}...");
 
-    let registry_arn: Option<String> = ecs
+    let describe_response = ecs
         .describe_services()
         .cluster(cluster)
         .services(&service_name)
         .send()
         .await
-        .ok()
-        .and_then(|response| response.services().first().cloned())
-        .and_then(|service| {
-            service
-                .service_registries()
-                .first()
-                .and_then(|registry| registry.registry_arn())
-                .map(str::to_owned)
-        });
+        .context("failed to describe ECS service before delete")?;
+    let service = describe_response.services().first();
+    let registry_arn: Option<String> = service.and_then(|service| {
+        service
+            .service_registries()
+            .first()
+            .and_then(|registry| registry.registry_arn())
+            .map(str::to_owned)
+    });
+    let service_status = service.and_then(|service| service.status());
+    let delete_phase = ecs_delete_phase(service_status)?;
+    let service_needs_delete = delete_phase == EcsDeletePhase::Delete;
+    let service_is_draining = delete_phase == EcsDeletePhase::Drain;
 
-    let _ = ecs
-        .update_service()
-        .cluster(cluster)
-        .service(&service_name)
-        .desired_count(0)
-        .send()
-        .await;
-    println!("  ✓ Scaled to 0");
-
-    ecs.delete_service()
-        .cluster(cluster)
-        .service(&service_name)
-        .force(true)
-        .send()
-        .await
-        .context("failed to delete ECS service")?;
-    println!("  ✓ ECS service deleted");
-
-    const DRAIN_POLL_ATTEMPTS: u32 = 12;
-    const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-    eprint!("  ⏳ Waiting for drain to complete...");
-    for attempt in 0..DRAIN_POLL_ATTEMPTS {
-        let response = ecs
-            .describe_services()
+    if service_needs_delete {
+        let _ = ecs
+            .update_service()
             .cluster(cluster)
-            .services(&service_name)
+            .service(&service_name)
+            .desired_count(0)
             .send()
             .await;
-        let is_gone = match response {
-            Ok(response) => response
-                .services()
-                .first()
-                .map(|service| service.status() == Some("INACTIVE"))
-                .unwrap_or(true),
-            Err(error) => {
-                eprintln!("\n  ⚠ describe_services error (retrying): {error}");
-                false
+        println!("  ✓ Scaled to 0");
+
+        match ecs
+            .delete_service()
+            .cluster(cluster)
+            .service(&service_name)
+            .force(true)
+            .send()
+            .await
+        {
+            Ok(_) => println!("  ✓ ECS service deleted"),
+            Err(error) if error.code() == Some("ServiceNotFoundException") => {
+                println!("  ✓ ECS service already absent")
             }
-        };
-        if is_gone {
-            if attempt == 0 {
-                eprintln!(" done (immediate)");
-            } else {
-                let elapsed = u64::from(attempt) * DRAIN_POLL_INTERVAL.as_secs();
-                eprintln!(" done ({elapsed}s)");
-            }
-            break;
+            Err(error) => return Err(error).context("failed to delete ECS service"),
         }
-        if attempt == DRAIN_POLL_ATTEMPTS - 1 {
-            eprintln!(" timed out (service may still be draining)");
-        } else {
-            eprint!(".");
-            tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+    } else if service_is_draining {
+        println!("  ✓ ECS service is already draining; resuming delete cleanup");
+    } else {
+        println!("  ✓ ECS service already absent; resuming dependent cleanup");
+    }
+
+    if service_needs_delete || service_is_draining {
+        const DRAIN_POLL_ATTEMPTS: u32 = 12;
+        const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+        eprint!("  ⏳ Waiting for drain to complete...");
+        for attempt in 0..DRAIN_POLL_ATTEMPTS {
+            let response = ecs
+                .describe_services()
+                .cluster(cluster)
+                .services(&service_name)
+                .send()
+                .await;
+            let is_gone = match response {
+                Ok(response) => response
+                    .services()
+                    .first()
+                    .map(|service| service.status() == Some("INACTIVE"))
+                    .unwrap_or(true),
+                Err(error) => {
+                    eprintln!("\n  ⚠ describe_services error (retrying): {error}");
+                    false
+                }
+            };
+            if is_gone {
+                if attempt == 0 {
+                    eprintln!(" done (immediate)");
+                } else {
+                    let elapsed = u64::from(attempt) * DRAIN_POLL_INTERVAL.as_secs();
+                    eprintln!(" done ({elapsed}s)");
+                }
+                break;
+            }
+            if attempt == DRAIN_POLL_ATTEMPTS - 1 {
+                eprintln!(" timed out (service may still be draining)");
+            } else {
+                eprint!(".");
+                tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+            }
         }
     }
 
@@ -166,36 +201,52 @@ async fn run_with_bucket(
         eprintln!("  ⚠ HTTP API cleanup skipped: {error}");
     }
 
+    let mut cleanup_failures = Vec::new();
     let manifest_key = format!("manifests/{namespace}/{name}.yaml");
-    s3.delete_object()
+    match s3
+        .delete_object()
         .bucket(bucket)
         .key(&manifest_key)
         .send()
         .await
-        .with_context(|| format!("failed to delete s3://{bucket}/{manifest_key}"))?;
-    println!("  ✓ Manifest removed from S3");
+    {
+        Ok(_) => println!("  ✓ Manifest removed from S3"),
+        Err(error) => cleanup_failures.push(format!(
+            "failed to delete s3://{bucket}/{manifest_key}: {error}"
+        )),
+    }
 
     let artifact_prefix = format!("artifacts/{namespace}/{name}/");
     let mut continuation_token = None;
     loop {
-        let response = s3
+        let response = match s3
             .list_objects_v2()
             .bucket(bucket)
             .prefix(&artifact_prefix)
             .set_continuation_token(continuation_token)
             .send()
             .await
-            .with_context(|| {
-                format!("failed to list config artifacts under s3://{bucket}/{artifact_prefix}")
-            })?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                cleanup_failures.push(format!(
+                    "failed to list config artifacts under s3://{bucket}/{artifact_prefix}: {error}"
+                ));
+                break;
+            }
+        };
         for object in response.contents() {
             if let Some(key) = object.key() {
-                s3.delete_object()
+                if let Err(error) = s3
+                    .delete_object()
                     .bucket(bucket)
                     .key(key)
                     .send()
                     .await
-                    .with_context(|| format!("failed to delete s3://{bucket}/{key}"))?;
+                {
+                    cleanup_failures
+                        .push(format!("failed to delete s3://{bucket}/{key}: {error}"));
+                }
             }
         }
         continuation_token = response.next_continuation_token().map(str::to_owned);
@@ -203,8 +254,42 @@ async fn run_with_bucket(
             break;
         }
     }
-    println!("  ✓ Config artifacts removed from S3");
+    if cleanup_failures.is_empty() {
+        println!("  ✓ Config artifacts removed from S3");
+    } else {
+        anyhow::bail!(
+            "post-delete cleanup incomplete (safe to retry): {}",
+            cleanup_failures.join("; ")
+        );
+    }
 
     println!("\n✓ {name} deleted");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delete_phase_requests_delete_only_for_active_service() {
+        assert_eq!(
+            ecs_delete_phase(Some("ACTIVE")).unwrap(),
+            EcsDeletePhase::Delete
+        );
+        assert_eq!(
+            ecs_delete_phase(Some("DRAINING")).unwrap(),
+            EcsDeletePhase::Drain
+        );
+        assert_eq!(
+            ecs_delete_phase(Some("INACTIVE")).unwrap(),
+            EcsDeletePhase::Cleanup
+        );
+        assert_eq!(ecs_delete_phase(None).unwrap(), EcsDeletePhase::Cleanup);
+    }
+
+    #[test]
+    fn delete_phase_rejects_unknown_status() {
+        assert!(ecs_delete_phase(Some("UNKNOWN")).is_err());
+    }
 }

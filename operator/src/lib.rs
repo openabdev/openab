@@ -33,6 +33,11 @@
 //! # }
 //! ```
 //!
+//! Both CLI and programmatic apply perform an ECS cluster preflight. The
+//! caller identity therefore requires `ecs:DescribeClusters`; this ECS action
+//! does not support resource-level permissions, so its IAM statement must use
+//! `Resource: "*"` even though the request targets the configured cluster.
+//!
 //! `aws-sm://<secret-id>#<json-key>` values whose `<secret-id>` is not already
 //! an ARN require the apply caller to have `secretsmanager:DescribeSecret`, so
 //! oabctl can resolve the name to the full ARN required by ECS.

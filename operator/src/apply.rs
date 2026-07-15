@@ -143,7 +143,7 @@ impl fmt::Display for ApplyError {
 
 impl std::error::Error for ApplyError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.source.root_cause())
+        Some(self.source.as_ref())
     }
 }
 
@@ -1016,7 +1016,7 @@ async fn apply_ecs(
     let mut webhook_urls = Vec::new();
     if let (Some(ingress), Some(cm)) = (&m.spec.ingress, &cloud_map) {
         eprintln!("  🌐 Reconciling ingress (VPC Link + API Gateway)...");
-        webhook_urls = crate::ingress::ensure_gateway(
+        let gateway = crate::ingress::ensure_gateway(
             config,
             &m.metadata.namespace,
             &m.metadata.name,
@@ -1026,6 +1026,8 @@ async fn apply_ecs(
             &cm.registry_arn,
         )
         .await?;
+        webhook_urls = gateway.webhook_urls;
+        warnings.extend(gateway.warnings);
         println!("  🔗 Webhook URL(s) for {}:", m.metadata.name);
         for url in &webhook_urls {
             println!("     {url}");
@@ -1307,6 +1309,17 @@ spec:
         assert_eq!(error.failed_service, Some(failed));
         assert_eq!(error.completed, completed);
         assert_eq!(error.completed.services[0], completed_service);
+    }
+
+    #[test]
+    fn apply_error_source_preserves_immediate_anyhow_context() {
+        let error = ApplyError::target(anyhow::anyhow!("root cause").context("target lookup"));
+        let source = std::error::Error::source(&error).expect("apply error source");
+        assert_eq!(source.to_string(), "target lookup");
+        assert_eq!(
+            source.source().expect("root source").to_string(),
+            "root cause"
+        );
     }
 
     #[test]

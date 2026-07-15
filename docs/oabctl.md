@@ -479,6 +479,20 @@ oabctl bootstrap --cluster my-cluster     # import existing resources
 | Security Group | `oab-agents` | Outbound-only |
 | Log Group | `/oab/agents` | CloudWatch logs |
 
+### Apply Caller Permissions
+
+The IAM identity running either `oabctl apply` or the library's
+`apply_manifests` API needs this preflight permission:
+
+| Action | Resource | Purpose |
+|--------|----------|---------|
+| `ecs:DescribeClusters` | `*` | Verify the configured target exists and is `ACTIVE` before mutation |
+
+`DescribeClusters` does not support resource-level IAM permissions, so the
+policy statement must use `Resource: "*"` even though oabctl sends only the
+configured cluster name or ARN. This caller permission is separate from the
+task and task-execution roles described below.
+
 ### IAM Task Role Permissions
 
 Attached to `oab-task-role` — the identity the *running container* assumes.

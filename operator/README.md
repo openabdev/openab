@@ -101,6 +101,10 @@ async fn deploy(
 Programmatic apply emits no progress to process-global stdout/stderr. Success
 returns per-service actions, webhook URLs, and warnings; reconciliation errors
 identify the failed service and include the report completed before the failure.
+Both CLI and programmatic apply verify that the target cluster exists and is
+`ACTIVE` before mutation, so the caller identity requires
+`ecs:DescribeClusters`. This ECS action does not support resource-level
+permissions; its IAM statement must use `Resource: "*"`.
 The library never reads `~/.oabctl/config.toml`: set
 `with_control_plane_bucket(...)` explicitly when needed, otherwise bucket
 resolution uses `OAB_CONTROL_PLANE_BUCKET` and then the caller's AWS account.

@@ -68,6 +68,12 @@ pub struct CloudMapResult {
     pub registry_arn: String,
 }
 
+/// Structured outcome from API Gateway reconciliation.
+pub struct GatewayResult {
+    pub webhook_urls: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
 /// Step 1: ensure the Cloud Map private DNS namespace and service exist.
 ///
 /// Returns the registry ARN to attach to the ECS service and the DNS name the
@@ -103,7 +109,9 @@ pub async fn ensure_cloud_map(
 }
 
 /// Step 2: ensure VPC Link, HTTP API, integration, routes, stage, and the
-/// security-group inbound rule. Returns the public webhook URLs (one per path).
+/// security-group inbound rule. Best-effort inconsistencies are returned as
+/// warnings so programmatic callers do not lose diagnostics when rendering is
+/// disabled.
 pub async fn ensure_gateway(
     config: &aws_config::SdkConfig,
     namespace: &str,
@@ -112,7 +120,7 @@ pub async fn ensure_gateway(
     subnets: &[String],
     security_groups: &[String],
     cloud_map_service_arn: &str,
-) -> Result<Vec<String>> {
+) -> Result<GatewayResult> {
     let api = aws_sdk_apigatewayv2::Client::new(config);
     let ec2 = aws_sdk_ec2::Client::new(config);
     let api_name = api_name(namespace, name);
@@ -125,7 +133,8 @@ pub async fn ensure_gateway(
         .first()
         .context("ingress requires at least one subnet")?;
     let vpc_id = resolve_vpc_id_from_subnet(&ec2, subnet).await?;
-    let vpc_link_id = ensure_vpc_link(&api, &vpc_id, subnets, security_groups).await?;
+    let (vpc_link_id, mut warnings) =
+        ensure_vpc_link(&api, &vpc_id, subnets, security_groups).await?;
 
     // ── HTTP API (one per bot — avoids cross-bot path collisions) ──────────
     let (api_id, api_endpoint) = ensure_api(&api, &api_name).await?;
@@ -141,12 +150,15 @@ pub async fn ensure_gateway(
     }
 
     // ── Prune routes for paths no longer in the manifest (rename/removal) ───
-    prune_stale_routes(&api, &api_id, &ingress.paths).await?;
+    warnings.extend(prune_stale_routes(&api, &api_id, &ingress.paths).await?);
 
     // ── Stage (auto-deploy) ────────────────────────────────────────────────
     ensure_stage(&api, &api_id).await?;
 
-    Ok(webhook_urls(&api_endpoint, &ingress.paths))
+    Ok(GatewayResult {
+        webhook_urls: webhook_urls(&api_endpoint, &ingress.paths),
+        warnings,
+    })
 }
 
 /// Find the `/webhook/telegram` URL among the resolved webhook URLs, and
@@ -676,9 +688,10 @@ async fn ensure_vpc_link(
     vpc_id: &str,
     subnets: &[String],
     security_groups: &[String],
-) -> Result<String> {
+) -> Result<(String, Vec<String>)> {
     use aws_sdk_apigatewayv2::types::VpcLinkStatus;
     let link_name = vpc_link_name(vpc_id);
+    let mut warnings = Vec::new();
 
     // Reuse an existing, non-failed VPC Link with our per-VPC name. VPC Link
     // names are NOT unique to the API — if two `oabctl apply` invocations race
@@ -728,6 +741,15 @@ async fn ensure_vpc_link(
             .then_with(|| a_id.cmp(b_id))
     });
     if candidates.len() > 1 {
+        let extra_ids = candidates[1..]
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let warning = format!(
+            "found {} VPC Links named '{link_name}'; using the preferred candidate and leaving duplicate IDs for manual cleanup: {extra_ids}",
+            candidates.len()
+        );
         eprintln!(
             "  ⚠ Found {} VPC Links named '{link_name}' (a race between concurrent\n    `apply` runs can create duplicates — AWS does not enforce name\n    uniqueness). Using the first AVAILABLE one (or lexicographically first\n    if none are ready yet); consider deleting the extras:",
             candidates.len()
@@ -735,6 +757,7 @@ async fn ensure_vpc_link(
         for (id, _) in &candidates[1..] {
             eprintln!("      aws apigatewayv2 delete-vpc-link --vpc-link-id {id}");
         }
+        warnings.push(warning);
     }
     let found = candidates.into_iter().next();
 
@@ -745,7 +768,7 @@ async fn ensure_vpc_link(
         // (not just remind) that this manifest's subnets/SGs actually match
         // what the link was created with — otherwise its ENIs won't cover
         // this task's subnets and integrations may 503.
-        validate_vpc_link_config(api, &id, subnets, security_groups).await?;
+        warnings.extend(validate_vpc_link_config(api, &id, subnets, security_groups).await?);
         id
     } else {
         eprintln!("  ⊕ Creating VPC Link: {link_name}");
@@ -769,7 +792,7 @@ async fn ensure_vpc_link(
             .await
             .context("failed to poll VPC Link")?;
         match resp.vpc_link_status() {
-            Some(VpcLinkStatus::Available) => return Ok(link_id),
+            Some(VpcLinkStatus::Available) => return Ok((link_id, warnings)),
             Some(VpcLinkStatus::Failed) => anyhow::bail!(
                 "VPC Link {link_id} entered FAILED state: {}",
                 resp.vpc_link_status_message().unwrap_or("unknown")
@@ -795,7 +818,8 @@ async fn validate_vpc_link_config(
     link_id: &str,
     subnets: &[String],
     security_groups: &[String],
-) -> Result<()> {
+) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
     let resp = api
         .get_vpc_link()
         .vpc_link_id(link_id)
@@ -810,10 +834,14 @@ async fn validate_vpc_link_config(
     let wanted_sgs: std::collections::HashSet<&str> =
         security_groups.iter().map(|s| s.as_str()).collect();
     if actual_sgs != wanted_sgs {
+        let warning = format!(
+            "VPC Link {link_id} security groups {actual_sgs:?} do not match the manifest's {wanted_sgs:?}; integrations may not reach the task"
+        );
         eprintln!(
             "  ⚠ VPC Link {link_id}'s actual security groups {:?} do NOT match this\n    manifest's {:?}. The link's SGs are fixed at creation — integrations may\n    fail to reach this task. All ingress bots in this VPC must share the\n    same securityGroups as whichever bot created the link.",
             actual_sgs, wanted_sgs
         );
+        warnings.push(warning);
     }
     // Subnets aren't exposed by GetVpcLink; remind the operator this is the
     // one part of the config we can't directly verify.
@@ -821,7 +849,7 @@ async fn validate_vpc_link_config(
         "    ↳ reusing this VPC's shared link (subnets fixed at creation, not verifiable via\n      the API); ensure this manifest's subnets {:?} match whichever bot created it",
         subnets
     );
-    Ok(())
+    Ok(warnings)
 }
 
 // ─── HTTP API ───────────────────────────────────────────────────────────────
@@ -992,7 +1020,8 @@ async fn prune_stale_routes(
     api: &aws_sdk_apigatewayv2::Client,
     api_id: &str,
     current_paths: &[String],
-) -> Result<()> {
+) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
     let current_keys: std::collections::HashSet<String> =
         current_paths.iter().map(|p| route_key(p)).collect();
 
@@ -1028,10 +1057,14 @@ async fn prune_stale_routes(
             .await
         {
             Ok(_) => eprintln!("  ⊖ Removed stale route (no longer in manifest): {key}"),
-            Err(e) => eprintln!("  ⚠ Failed to remove stale route {key}: {e}"),
+            Err(error) => {
+                let warning = format!("failed to remove stale route {key}: {error}");
+                eprintln!("  ⚠ {warning}");
+                warnings.push(warning);
+            }
         }
     }
-    Ok(())
+    Ok(warnings)
 }
 
 async fn ensure_stage(api: &aws_sdk_apigatewayv2::Client, api_id: &str) -> Result<()> {
