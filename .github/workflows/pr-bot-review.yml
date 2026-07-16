@@ -22,7 +22,9 @@ concurrency:
 permissions:
   statuses: write
   issues: write
-  pull-requests: read
+  # write needed for the 👀 ack reaction on /review comments — reactions on
+  # PR comments are pull-request scope (403 with read-only)
+  pull-requests: write
 
 jobs:
   poll-and-review:
