@@ -341,6 +341,7 @@ fn checkpoint_key(namespace: &str, name: &str) -> String {
     format!("delete-checkpoints/{namespace}/{name}.json")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_checkpoint(
     checkpoint: &DeleteCheckpoint,
     namespace: &str,
@@ -666,9 +667,10 @@ fn single_described_service(
     }
 }
 enum PreparedIdentity {
-    Exact(DeleteCheckpoint, ServiceIdentityState),
+    Exact(Box<(DeleteCheckpoint, ServiceIdentityState)>),
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepare_identity(
     aws_config: &aws_config::SdkConfig,
     ecs: &aws_sdk_ecs::Client,
@@ -705,7 +707,7 @@ async fn prepare_identity(
             &reasons,
         )
         .map_err(anyhow::Error::msg)?;
-        return Ok(PreparedIdentity::Exact(checkpoint, state));
+        return Ok(PreparedIdentity::Exact(Box::new((checkpoint, state))));
     }
 
     let service_name = format!("oab-{namespace}-{name}");
@@ -774,7 +776,7 @@ async fn prepare_identity(
         &checkpoint.region,
     )?;
     save_checkpoint(s3, &checkpoint).await?;
-    Ok(PreparedIdentity::Exact(checkpoint, state))
+    Ok(PreparedIdentity::Exact(Box::new((checkpoint, state))))
 }
 
 fn validate_service_incarnation(expected: i128, actual: Option<i128>) -> Result<()> {
@@ -1025,7 +1027,8 @@ async fn run_with_bucket(
         aws_config, &ecs, &s3, namespace, name, cluster, bucket,
     )
     .await? {
-        PreparedIdentity::Exact(checkpoint, state) => {
+        PreparedIdentity::Exact(boxed) => {
+            let (checkpoint, state) = *boxed;
             delete_checkpointed_ecs(&ecs, &checkpoint, state).await?;
             crate::ingress::delete_exact(
                 aws_config,

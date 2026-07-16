@@ -510,6 +510,7 @@ pub(crate) async fn resolve_api_id_for_registry(
 /// Permanently delete only checkpointed dependent identities. Exact-ID
 /// NotFound is idempotent success; every other failure is fatal so the caller
 /// retains its durable checkpoint for retry.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn delete_exact(
     config: &aws_config::SdkConfig,
     namespace: &str,

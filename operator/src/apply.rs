@@ -1421,7 +1421,7 @@ async fn apply_ecs(
         let expected = expected_identity
             .as_ref()
             .context("missing exact identity for ingress detach wait")?;
-        wait_for_registry_detach(&ecs, expected).await?;
+        wait_for_registry_detach(ecs, expected).await?;
         for registry_arn in &checkpoint.registry_arns {
             crate::ingress::delete_cloud_map_exact(config, registry_arn, &service_name)
                 .await
