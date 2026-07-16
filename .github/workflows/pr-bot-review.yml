@@ -6,9 +6,19 @@ on:
   schedule:
     - cron: '*/5 * * * *'
   workflow_dispatch: {}
+  # Targeted review trigger: a maintainer (or maintainer agent) fires
+  #   gh api repos/<repo>/dispatches -f event_type=pr-review \
+  #     -F 'client_payload[pr_number]=<N>'
+  # repository_dispatch requires repo write access, so the sender is trusted.
+  # Unlike the cron path this is immediate and reliable, and unlike the
+  # pull_request path it carries a full-permission GITHUB_TOKEN for fork PRs.
+  repository_dispatch:
+    types: [pr-review]
 
 concurrency:
-  group: pr-review-poller
+  # Targeted dispatches get their own group per PR so they neither cancel
+  # nor get cancelled by the poller (or other PRs' dispatches).
+  group: pr-review-poller-${{ github.event_name == 'repository_dispatch' && github.event.client_payload.pr_number || 'poll' }}
   cancel-in-progress: true
 
 permissions:
@@ -35,18 +45,40 @@ jobs:
         run: |
           set -eo pipefail
 
-          # Collect eligible open PRs (non-draft, no review-limit-reached label)
-          # Include safe-to-review labeled PRs regardless of author_association
-          # Note: --paginate with array jq emits one array per page; stream objects then collect
-          PRS=$(gh api --paginate "repos/${{ github.repository }}/pulls?state=open&per_page=100" \
-            --jq '.[] | select(
-              .draft == false and
-              (any(.labels[]; .name == "review-limit-reached") | not) and
-              (
-                (.author_association | IN("OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR")) or
-                any(.labels[]; .name == "safe-to-review")
-              )
-            ) | {number, sha: .head.sha, labels: [.labels[].name]}' | jq -s '.')
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            # Targeted path: review exactly one PR, explicitly requested by a
+            # maintainer via repository_dispatch (sender has write access, so
+            # the author_association / safe-to-review gate is bypassed).
+            PR_NUMBER='${{ github.event.client_payload.pr_number }}'
+            if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+              echo "::error::repository_dispatch payload missing numeric pr_number"
+              exit 1
+            fi
+            FORCE=1
+            PRS=$(gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}" \
+              --jq 'select(
+                .state == "open" and
+                .draft == false and
+                (any(.labels[]; .name == "review-limit-reached") | not)
+              ) | {number, sha: .head.sha, labels: [.labels[].name]}' | jq -s '.')
+            if [ "$(echo "$PRS" | jq 'length')" -eq 0 ]; then
+              echo "PR #${PR_NUMBER}: not eligible (closed, draft, or review-limit-reached)"
+            fi
+          else
+            FORCE=0
+            # Collect eligible open PRs (non-draft, no review-limit-reached label)
+            # Include safe-to-review labeled PRs regardless of author_association
+            # Note: --paginate with array jq emits one array per page; stream objects then collect
+            PRS=$(gh api --paginate "repos/${{ github.repository }}/pulls?state=open&per_page=100" \
+              --jq '.[] | select(
+                .draft == false and
+                (any(.labels[]; .name == "review-limit-reached") | not) and
+                (
+                  (.author_association | IN("OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR")) or
+                  any(.labels[]; .name == "safe-to-review")
+                )
+              ) | {number, sha: .head.sha, labels: [.labels[].name]}' | jq -s '.')
+          fi
 
           TARGETS="[]"
           while IFS= read -r ROW; do
@@ -76,7 +108,9 @@ jobs:
 
             # Skip if already reviewed this exact SHA (success or failure)
             # failure = CHANGES REQUESTED — only re-review when new commits are pushed (new SHA)
-            if [ "$STATE" = "success" ] || [ "$STATE" = "failure" ]; then
+            # Targeted dispatch (FORCE=1) bypasses this: an explicit maintainer
+            # request means re-review even if this SHA was already reviewed.
+            if [ "$FORCE" -eq 0 ] && { [ "$STATE" = "success" ] || [ "$STATE" = "failure" ]; }; then
               echo "PR #${NUMBER}: already reviewed on HEAD (${STATE}), skipping"
               continue
             fi
