@@ -1,0 +1,54 @@
+name: Close stale issues with no linked PR
+
+on:
+  schedule:
+    - cron: '30 9 * * *'  # daily at 09:30 UTC (after close-stale-issues at 09:00)
+  workflow_dispatch: {}
+
+jobs:
+  close-unlinked-stale:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const STALE_DAYS = 14;
+            const MAX_CLOSES_PER_RUN = 50; // safety cap against mass closure
+            const cutoff = new Date(Date.now() - STALE_DAYS * 24 * 60 * 60 * 1000)
+              .toISOString().slice(0, 10);
+
+            // -linked:pr is a search-only qualifier (not available in the
+            // issues list API), so use the search endpoint.
+            const query = `repo:${context.repo.owner}/${context.repo.repo} is:issue state:open -linked:pr created:<${cutoff}`;
+            core.info(`query: ${query}`);
+
+            const { data: result } = await github.rest.search.issuesAndPullRequests({
+              q: query,
+              per_page: 100,
+            });
+            core.info(`found ${result.total_count} stale issue(s) with no linked PR`);
+
+            let closed = 0;
+            for (const issue of result.items) {
+              if (closed >= MAX_CLOSES_PER_RUN) {
+                core.warning(`safety cap reached (${MAX_CLOSES_PER_RUN}); remaining issues will be handled on the next run`);
+                break;
+              }
+
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: issue.number,
+                body: `Closing this issue for staleness over ${STALE_DAYS} days with no linked PR. Feel free to open a new issue when the PR is ready.`,
+              });
+              await github.rest.issues.update({
+                ...context.repo,
+                issue_number: issue.number,
+                state: 'closed',
+                state_reason: 'not_planned',
+              });
+              core.info(`closed #${issue.number}: ${issue.title}`);
+              closed++;
+            }
+            core.info(`done — closed ${closed} issue(s)`);
