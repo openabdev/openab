@@ -1188,7 +1188,7 @@ async fn apply_ecs(
     }
 
     if let Some(checkpoint) = &teardown_checkpoint {
-        wait_for_registry_detach(&ecs, cluster, &service_name).await?;
+        wait_for_registry_detach(ecs, cluster, &service_name).await?;
         for registry_arn in &checkpoint.registry_arns {
             crate::ingress::delete_cloud_map_exact(config, registry_arn, &service_name)
                 .await
