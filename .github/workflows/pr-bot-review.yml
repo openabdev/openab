@@ -6,9 +6,17 @@ on:
   schedule:
     - cron: '*/5 * * * *'
   workflow_dispatch: {}
+  # Slash command: a maintainer comments "/review" on a PR to trigger an
+  # immediate targeted review. issue_comment always runs in the base repo
+  # with a full-permission GITHUB_TOKEN, so fork PRs work too (unlike the
+  # pull_request path) and there is no dependency on the best-effort cron.
+  issue_comment:
+    types: [created]
 
 concurrency:
-  group: pr-review-poller
+  # /review commands get their own group per PR so they neither cancel
+  # nor get cancelled by the scheduled poller (or other PRs' commands).
+  group: pr-review-poller-${{ github.event_name == 'issue_comment' && github.event.issue.number || 'poll' }}
   cancel-in-progress: true
 
 permissions:
@@ -24,9 +32,17 @@ jobs:
     # the commit status 403s and the run fails. Skip the event-driven path for
     # fork PRs — the scheduled cron (full permissions) still reviews them.
     # schedule/workflow_dispatch always run; same-repo PRs run on the event.
+    # issue_comment runs only for "/review" comments on PRs from maintainers
+    # (OWNER/MEMBER/COLLABORATOR) — comment body is never interpolated into
+    # shell, only the numeric issue number is used.
     if: >-
-      github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       startsWith(github.event.comment.body, '/review') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name != 'issue_comment' &&
+       (github.event_name != 'pull_request' ||
+        github.event.pull_request.head.repo.full_name == github.repository))
     steps:
       - name: Find PRs needing review
         id: poll
@@ -35,18 +51,38 @@ jobs:
         run: |
           set -eo pipefail
 
-          # Collect eligible open PRs (non-draft, no review-limit-reached label)
-          # Include safe-to-review labeled PRs regardless of author_association
-          # Note: --paginate with array jq emits one array per page; stream objects then collect
-          PRS=$(gh api --paginate "repos/${{ github.repository }}/pulls?state=open&per_page=100" \
-            --jq '.[] | select(
-              .draft == false and
-              (any(.labels[]; .name == "review-limit-reached") | not) and
-              (
-                (.author_association | IN("OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR")) or
-                any(.labels[]; .name == "safe-to-review")
-              )
-            ) | {number, sha: .head.sha, labels: [.labels[].name]}' | jq -s '.')
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            # Targeted path: "/review" comment on a PR from a maintainer
+            # (association gated at the job level). Ack with 👀 so the
+            # requester knows the command was picked up.
+            PR_NUMBER=${{ github.event.issue.number }}
+            FORCE=1
+            gh api "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+              -f content=eyes >/dev/null || true
+            PRS=$(gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}" \
+              --jq 'select(
+                .state == "open" and
+                .draft == false and
+                (any(.labels[]; .name == "review-limit-reached") | not)
+              ) | {number, sha: .head.sha, labels: [.labels[].name]}' | jq -s '.')
+            if [ "$(echo "$PRS" | jq 'length')" -eq 0 ]; then
+              echo "PR #${PR_NUMBER}: not eligible (closed, draft, or review-limit-reached)"
+            fi
+          else
+            FORCE=0
+            # Collect eligible open PRs (non-draft, no review-limit-reached label)
+            # Include safe-to-review labeled PRs regardless of author_association
+            # Note: --paginate with array jq emits one array per page; stream objects then collect
+            PRS=$(gh api --paginate "repos/${{ github.repository }}/pulls?state=open&per_page=100" \
+              --jq '.[] | select(
+                .draft == false and
+                (any(.labels[]; .name == "review-limit-reached") | not) and
+                (
+                  (.author_association | IN("OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR")) or
+                  any(.labels[]; .name == "safe-to-review")
+                )
+              ) | {number, sha: .head.sha, labels: [.labels[].name]}' | jq -s '.')
+          fi
 
           TARGETS="[]"
           while IFS= read -r ROW; do
@@ -76,7 +112,9 @@ jobs:
 
             # Skip if already reviewed this exact SHA (success or failure)
             # failure = CHANGES REQUESTED — only re-review when new commits are pushed (new SHA)
-            if [ "$STATE" = "success" ] || [ "$STATE" = "failure" ]; then
+            # An explicit /review command (FORCE=1) bypasses this: a maintainer
+            # asking again means re-review even if this SHA was already reviewed.
+            if [ "$FORCE" -eq 0 ] && { [ "$STATE" = "success" ] || [ "$STATE" = "failure" ]; }; then
               echo "PR #${NUMBER}: already reviewed on HEAD (${STATE}), skipping"
               continue
             fi
