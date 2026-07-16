@@ -1,0 +1,109 @@
+name: Close stale issues with no linked PR
+
+on:
+  schedule:
+    - cron: '30 9 * * *'  # daily at 09:30 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Report only, do not comment or close'
+        type: boolean
+        default: false
+
+jobs:
+  close-unlinked-stale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const STALE_DAYS = 14;
+            const MAX_ITEMS_PER_RUN = 50;
+            const DRY_RUN = ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }};
+            const cutoff = new Date(Date.now() - STALE_DAYS * 24 * 60 * 60 * 1000)
+              .toISOString().slice(0, 10);
+
+            // Maintainer policy: an open issue with no linked PR after
+            // STALE_DAYS signals insufficient priority — close it with a
+            // comment. Closing is cheap to reverse: reopen or file a new
+            // issue if it still matters.
+            const CLOSE_COMMENT = [
+              `This issue has been open for more than ${STALE_DAYS} days with no linked pull request, so it is being closed as not planned.`,
+              '',
+              'If this is still needed, feel free to reopen it or file a new issue with updated context — a linked PR is the strongest signal that the work matters.',
+            ].join('\n');
+
+            const query = `repo:${context.repo.owner}/${context.repo.repo} is:issue state:open -linked:pr created:<${cutoff}`;
+            core.info(`query: ${query}${DRY_RUN ? ' (dry run)' : ''}`);
+
+            const { data: result } = await github.rest.search.issuesAndPullRequests({
+              q: query,
+              sort: 'created',
+              order: 'asc',
+              per_page: MAX_ITEMS_PER_RUN,
+            });
+
+            const candidates = result.items.filter((item) => !item.pull_request);
+            const escapeCell = (value) => String(value)
+              .replace(/\\/g, '\\\\')
+              .replace(/\|/g, '\\|')
+              .replace(/\r?\n/g, ' ');
+
+            const rows = [];
+            let closed = 0;
+            let failed = 0;
+
+            for (const issue of candidates) {
+              let outcome = 'dry run — skipped';
+              if (!DRY_RUN) {
+                try {
+                  await github.rest.issues.createComment({
+                    ...context.repo,
+                    issue_number: issue.number,
+                    body: CLOSE_COMMENT,
+                  });
+                  await github.rest.issues.update({
+                    ...context.repo,
+                    issue_number: issue.number,
+                    state: 'closed',
+                    state_reason: 'not_planned',
+                  });
+                  outcome = 'closed';
+                  closed += 1;
+                } catch (error) {
+                  outcome = `failed: ${error.message}`;
+                  failed += 1;
+                  core.warning(`#${issue.number}: ${error.message}`);
+                }
+              }
+              rows.push(`| [#${issue.number}](${issue.html_url}) | ${escapeCell(issue.title)} | ${issue.created_at.slice(0, 10)} | ${escapeCell(outcome)} |`);
+            }
+
+            if (rows.length === 0) {
+              rows.push('| — | No candidates found | — | — |');
+            }
+
+            const remaining = Math.max(result.total_count - candidates.length, 0);
+            const summary = [
+              `Query: \`${query}\``,
+              '',
+              `Found **${result.total_count}** open issue(s) created more than ${STALE_DAYS} days ago with no closing-reference PR.`,
+              `${DRY_RUN ? 'Dry run — no changes made to' : `Closed **${closed}** of`} the oldest **${candidates.length}** candidate(s).${failed > 0 ? ` **${failed}** failed.` : ''}${remaining > 0 ? ` **${remaining}** additional candidate(s) will be handled on subsequent runs.` : ''}`,
+              '',
+              '| Issue | Title | Created | Outcome |',
+              '|---|---|---|---|',
+              ...rows,
+            ];
+
+            await core.summary
+              .addHeading('Unlinked stale issue closure report')
+              .addRaw(summary.join('\n'))
+              .write();
+
+            core.info(`${DRY_RUN ? 'dry run: would close' : 'closed'} ${DRY_RUN ? candidates.length : closed} of ${result.total_count} candidate issue(s)`);
+            if (failed > 0) {
+              core.setFailed(`${failed} issue(s) could not be closed`);
+            }
