@@ -75,16 +75,19 @@ commands reference.
 
 ## Library API
 
-The crate exposes a deliberately narrow manifest + apply facade for control
-planes that should not shell out to the CLI:
+The crate exposes a deliberately narrow manifest + apply/delete facade for
+control planes that should not shell out to the CLI:
 
 ```rust,no_run
-use oabctl::{apply_manifests, ApplyOptions, OABServiceManifest};
+use oabctl::{
+    apply_manifests, delete_services, ApplyOptions, DeleteOptions, DeleteTarget,
+    OABServiceManifest,
+};
 
-async fn deploy(
+async fn reconcile(
     aws: &aws_config::SdkConfig,
     manifest: OABServiceManifest,
-) -> Result<(), oabctl::ApplyError> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let report = apply_manifests(
         aws,
         &[manifest],
@@ -94,20 +97,40 @@ async fn deploy(
     for service in report.services {
         println!("{}: {:?}", service.ecs_service_name, service.action);
     }
+
+    delete_services(
+        aws,
+        &[DeleteTarget::new("prod", "bot")],
+        &DeleteOptions::new("production-cluster", "my-control-plane-bucket"),
+    )
+    .await?;
     Ok(())
 }
 ```
 
-Programmatic apply emits no progress to process-global stdout/stderr. Success
-returns per-service actions, webhook URLs, and warnings; reconciliation errors
-identify the failed service and include the report completed before the failure.
-Both CLI and programmatic apply verify that the target cluster exists and is
-`ACTIVE` before mutation, so the caller identity requires
-`ecs:DescribeClusters`. This ECS action does not support resource-level
+Programmatic apply/delete emit no progress to process-global stdout/stderr.
+Apply success returns per-service actions, webhook URLs, and warnings;
+reconciliation errors identify the failed service and include the report
+completed before the failure. Both CLI and programmatic apply verify that the
+target cluster exists and is `ACTIVE` before mutation, so the caller identity
+requires `ecs:DescribeClusters`. This ECS action does not support resource-level
 permissions; its IAM statement must use `Resource: "*"`.
-The library never reads `~/.oabctl/config.toml`: set
-`with_control_plane_bucket(...)` explicitly when needed, otherwise bucket
-resolution uses `OAB_CONTROL_PLANE_BUCKET` and then the caller's AWS account.
+
+The library never reads `~/.oabctl/config.toml`. Apply can explicitly override
+its bucket with `ApplyOptions::with_control_plane_bucket(...)`; otherwise it
+uses `OAB_CONTROL_PLANE_BUCKET` and then the caller account. Programmatic delete
+is intentionally stricter and requires the exact bucket in
+`DeleteOptions::new(cluster, bucket)` before any AWS call. Before deleting ECS,
+it stores `delete-checkpoints/<namespace>/<name>.json` in that bucket with the
+caller partition/account/region, canonical ECS cluster/service ARNs, registry ARN, and
+matching API ID. Duplicate API names fail closed; the sole same-name API is
+checkpointed only when its integration URI equals the registry ARN. Missing or
+ambiguous ECS identity fails closed without this record; retries use only its
+immutable IDs and delete the checkpoint last.
+The CLI resolves its configured bucket privately. Its compatibility cleanup for
+pre-checkpoint orphans is isolated from `delete_services`, refuses duplicate API
+names, and never guesses a Cloud Map service by name.
+
 For `aws-sm://<secret-id>#<json-key>`, a non-ARN `<secret-id>` requires the
 caller to have `secretsmanager:DescribeSecret`; full-ARN shorthand does not
 need that lookup.

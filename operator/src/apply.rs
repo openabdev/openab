@@ -506,6 +506,129 @@ fn parse_manifest_file(path: &Path) -> Result<Vec<OABServiceManifest>> {
     }
 }
 
+
+const INGRESS_TEARDOWN_CHECKPOINT_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct IngressTeardownCheckpoint {
+    version: u8,
+    cluster: String,
+    service_name: String,
+    registry_arns: Vec<String>,
+}
+
+fn ingress_teardown_checkpoint_key(namespace: &str, name: &str) -> String {
+    format!("ingress-teardown-checkpoints/{namespace}/{name}.json")
+}
+
+async fn load_ingress_teardown_checkpoint(
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<IngressTeardownCheckpoint>> {
+    use aws_sdk_s3::error::ProvideErrorMetadata;
+
+    let key = ingress_teardown_checkpoint_key(namespace, name);
+    match s3.get_object().bucket(bucket).key(&key).send().await {
+        Ok(response) => {
+            let bytes = response
+                .body
+                .collect()
+                .await
+                .context("failed to read ingress teardown checkpoint")?
+                .into_bytes();
+            Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
+                format!("invalid ingress teardown checkpoint s3://{bucket}/{key}")
+            })?))
+        }
+        Err(error) if matches!(error.code(), Some("NoSuchKey" | "NotFound")) => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!("failed to read ingress teardown checkpoint s3://{bucket}/{key}")
+        }),
+    }
+}
+
+async fn save_ingress_teardown_checkpoint(
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
+    namespace: &str,
+    name: &str,
+    checkpoint: &IngressTeardownCheckpoint,
+) -> Result<()> {
+    let key = ingress_teardown_checkpoint_key(namespace, name);
+    let body = serde_json::to_vec_pretty(checkpoint)?;
+    s3.put_object()
+        .bucket(bucket)
+        .key(&key)
+        .body(ByteStream::from(body))
+        .content_type("application/json")
+        .send()
+        .await
+        .with_context(|| format!("failed to persist s3://{bucket}/{key}"))?;
+    Ok(())
+}
+
+async fn remove_ingress_teardown_checkpoint(
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
+    namespace: &str,
+    name: &str,
+) -> Result<()> {
+    let key = ingress_teardown_checkpoint_key(namespace, name);
+    s3.delete_object()
+        .bucket(bucket)
+        .key(&key)
+        .send()
+        .await
+        .with_context(|| format!("failed to remove s3://{bucket}/{key}"))?;
+    Ok(())
+}
+
+async fn wait_for_registry_detach(
+    ecs: &aws_sdk_ecs::Client,
+    cluster: &str,
+    service_name: &str,
+) -> Result<()> {
+    const ATTEMPTS: u32 = 12;
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+    for attempt in 0..ATTEMPTS {
+        let response = ecs
+            .describe_services()
+            .cluster(cluster)
+            .services(service_name)
+            .send()
+            .await
+            .context("failed to verify ECS service registry detach")?;
+        if !response.failures().is_empty() {
+            anyhow::bail!(
+                "ECS returned failure(s) while verifying registry detach: {:?}",
+                response.failures()
+            );
+        }
+        let service = match response.services() {
+            [service] => service,
+            [] => anyhow::bail!(
+                "ECS service disappeared while verifying registry detach"
+            ),
+            services => anyhow::bail!(
+                "ECS returned {} services for one registry-detach target",
+                services.len()
+            ),
+        };
+        if service.service_registries().is_empty() {
+            return Ok(());
+        }
+        if attempt + 1 < ATTEMPTS {
+            tokio::time::sleep(INTERVAL).await;
+        }
+    }
+
+    anyhow::bail!(
+        "ECS service {service_name} still reports service registries after waiting; Cloud Map cleanup was not started"
+    )
+}
 async fn apply_ecs(
     ecs: &aws_sdk_ecs::Client,
     s3: &aws_sdk_s3::Client,
@@ -529,17 +652,14 @@ async fn apply_ecs(
     }
     let bootstrap_state = bootstrap.state.as_ref();
 
-    // Read current generation from S3 manifest (if exists), increment.
-    // Also capture whether the *previous* apply had ingress configured, so we
-    // can detect "ingress was removed from the manifest" and tear it down
-    // below — apply only ever provisioned ingress resources before this, so a
-    // manifest edit that drops `spec.ingress` used to orphan the per-bot HTTP
-    // API and Cloud Map service.
+    // Read the current generation from the stored desired-state manifest.
+    // Ingress teardown retry state is kept separately in an exact-identity
+    // checkpoint, so writing a newer manifest cannot lose pending cleanup.
     let manifest_key = format!(
         "manifests/{}/{}.yaml",
         m.metadata.namespace, m.metadata.name
     );
-    let (current_gen, previously_had_ingress) = match s3
+    let current_gen = match s3
         .get_object()
         .bucket(bucket)
         .key(&manifest_key)
@@ -549,20 +669,13 @@ async fn apply_ecs(
         Ok(resp) => {
             let bytes = resp.body.collect().await?.into_bytes();
             let existing: OABServiceManifest = serde_yaml::from_slice(&bytes)?;
-            (
-                existing.metadata.generation,
-                existing.spec.ingress.is_some(),
-            )
+            existing.metadata.generation
         }
-        Err(_) => (0, false),
+        Err(_) => 0,
     };
     let generation = current_gen + 1;
 
-    // Look up the ECS service's current registry ARN(s) up front so both the
-    // ingress-removal teardown below and the update/create logic further down
-    // can use the *exact* registry rather than falling back to a name-only
-    // Cloud Map scan (which can collide across VPCs/environments that share
-    // an account and reuse the same namespace/name).
+    // Resolve the current ECS registry identities without first-match behavior.
     let describe_resp = ecs
         .describe_services()
         .cluster(cluster)
@@ -570,43 +683,96 @@ async fn apply_ecs(
         .send()
         .await
         .context("failed to describe ECS service")?;
-    let existing_registry_arns: Vec<String> = describe_resp
-        .services()
-        .first()
-        .map(|service| {
-            service
-                .service_registries()
-                .iter()
-                .filter_map(|registry| registry.registry_arn())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
+    if !describe_resp.failures().is_empty() {
+        anyhow::bail!(
+            "ECS returned failure(s) while resolving apply identity: {:?}",
+            describe_resp.failures()
+        );
+    }
+    let existing_service = match describe_resp.services() {
+        [] => None,
+        [service] => Some(service),
+        services => anyhow::bail!(
+            "ECS returned {} services for one apply target",
+            services.len()
+        ),
+    };
+    let mut existing_registry_arns = Vec::new();
+    if let Some(service) = existing_service {
+        for registry in service.service_registries() {
+            existing_registry_arns.push(
+                registry
+                    .registry_arn()
+                    .filter(|value| !value.trim().is_empty())
+                    .context("ECS returned a service registry without an ARN")?
+                    .to_string(),
+            );
+        }
+    }
+    existing_registry_arns.sort();
+    existing_registry_arns.dedup();
     let has_registries = !existing_registry_arns.is_empty();
 
-    // If ingress was configured before but is absent now, tear down the
-    // orphaned per-bot ingress resources (best-effort, mirrors `oabctl delete`)
-    // and detach the stale registry from the ECS service itself — omitting
-    // `serviceRegistries` on `UpdateService` leaves the existing configuration
-    // untouched (AWS only clears it when explicitly passed an empty list), so
-    // without this the service would keep pointing at a Cloud Map service that
-    // teardown() is about to delete.
-    if previously_had_ingress && m.spec.ingress.is_none() {
-        eprintln!("  🌐 ingress removed from manifest — tearing down orphaned resources...");
-        match crate::ingress::teardown(
-            config,
-            &m.metadata.namespace,
-            &m.metadata.name,
-            existing_registry_arns.first().map(String::as_str),
-        )
-        .await
-        {
-            Ok(teardown_warnings) => warnings.extend(teardown_warnings),
-            Err(error) => {
-                let warning = format!("ingress teardown skipped: {error}");
-                eprintln!("  ⚠ {warning}");
-                warnings.push(warning);
+    let stored_teardown = load_ingress_teardown_checkpoint(
+        s3,
+        bucket,
+        &m.metadata.namespace,
+        &m.metadata.name,
+    )
+    .await?;
+    if m.spec.ingress.is_some() && stored_teardown.is_some() {
+        anyhow::bail!(
+            "a previous ingress teardown is still pending; apply the ingress-free manifest again before re-enabling ingress"
+        );
+    }
+    let teardown_checkpoint = if m.spec.ingress.is_none() {
+        match stored_teardown {
+            Some(checkpoint) => {
+                if checkpoint.version != INGRESS_TEARDOWN_CHECKPOINT_VERSION
+                    || checkpoint.cluster != cluster
+                    || checkpoint.service_name != service_name
+                    || checkpoint.registry_arns.is_empty()
+                {
+                    anyhow::bail!("ingress teardown checkpoint does not match this apply target");
+                }
+                Some(checkpoint)
             }
+            None if has_registries => {
+                let checkpoint = IngressTeardownCheckpoint {
+                    version: INGRESS_TEARDOWN_CHECKPOINT_VERSION,
+                    cluster: cluster.to_string(),
+                    service_name: service_name.clone(),
+                    registry_arns: existing_registry_arns.clone(),
+                };
+                save_ingress_teardown_checkpoint(
+                    s3,
+                    bucket,
+                    &m.metadata.namespace,
+                    &m.metadata.name,
+                    &checkpoint,
+                )
+                .await?;
+                Some(checkpoint)
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    if let Some(checkpoint) = &teardown_checkpoint {
+        eprintln!("  🌐 ingress removed from manifest — tearing down exact API wiring...");
+        for registry_arn in &checkpoint.registry_arns {
+            warnings.extend(
+                crate::ingress::teardown(
+                    config,
+                    &m.metadata.namespace,
+                    &m.metadata.name,
+                    Some(registry_arn),
+                )
+                .await
+                .context("failed to tear down exact ingress API wiring")?,
+            );
         }
     }
 
@@ -1021,6 +1187,17 @@ async fn apply_ecs(
         );
     }
 
+    if let Some(checkpoint) = &teardown_checkpoint {
+        wait_for_registry_detach(&ecs, cluster, &service_name).await?;
+        for registry_arn in &checkpoint.registry_arns {
+            crate::ingress::delete_cloud_map_exact(config, registry_arn, &service_name)
+                .await
+                .with_context(|| {
+                    format!("failed exact Cloud Map cleanup for {registry_arn}")
+                })?;
+        }
+    }
+
     // Ingress step 2: VPC Link + API Gateway + routes + SG rule.
     let mut webhook_urls = Vec::new();
     if let (Some(ingress), Some(cm)) = (&m.spec.ingress, &cloud_map) {
@@ -1067,6 +1244,16 @@ async fn apply_ecs(
         eprintln!("  ⏳ Waiting for {} to stabilize...", m.metadata.name);
         wait_for_stable(ecs, cluster, &service_name).await?;
         eprintln!("  ✓ {} is stable", m.metadata.name);
+    }
+
+    if teardown_checkpoint.is_some() {
+        remove_ingress_teardown_checkpoint(
+            s3,
+            bucket,
+            &m.metadata.namespace,
+            &m.metadata.name,
+        )
+        .await?;
     }
 
     Ok(AppliedService {

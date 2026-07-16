@@ -26,6 +26,7 @@
 
 use crate::manifest::{Ingress, OABServiceManifest};
 use anyhow::{Context, Result};
+use aws_sdk_apigatewayv2::error::ProvideErrorMetadata;
 use aws_sdk_apigatewayv2::types::{ConnectionType, IntegrationType, ProtocolType};
 use aws_sdk_servicediscovery::types::{DnsConfig, DnsRecord, RecordType};
 use std::collections::HashMap;
@@ -266,11 +267,44 @@ fn has_stage_path_override(request_parameters: Option<&HashMap<String, String>>)
 
 /// Extract the Cloud Map service ID from its ARN
 /// (`arn:aws:servicediscovery:<region>:<account>:service/<id>`).
-fn cloud_map_service_id_from_arn(arn: &str) -> Option<String> {
-    arn.rsplit('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+pub(crate) fn cloud_map_service_id_from_arn(arn: &str) -> Option<String> {
+    let mut parts = arn.splitn(6, ':');
+    if parts.next() != Some("arn")
+        || parts.next().filter(|part| !part.is_empty()).is_none()
+        || parts.next() != Some("servicediscovery")
+        || parts.next().filter(|part| !part.is_empty()).is_none()
+        || parts.next().filter(|part| !part.is_empty()).is_none()
+    {
+        return None;
+    }
+    let resource = parts.next()?;
+    let service_id = resource.strip_prefix("service/")?;
+    if service_id.is_empty() || service_id.contains('/') {
+        return None;
+    }
+    Some(service_id.to_string())
+}
+
+fn cloud_map_service_id_for_boundary(
+    arn: &str,
+    expected_partition: &str,
+    expected_account: &str,
+    expected_region: &str,
+) -> Option<String> {
+    let mut parts = arn.splitn(6, ':');
+    if parts.next() != Some("arn")
+        || parts.next() != Some(expected_partition)
+        || parts.next() != Some("servicediscovery")
+        || parts.next() != Some(expected_region)
+        || parts.next() != Some(expected_account)
+    {
+        return None;
+    }
+    let service_id = parts.next()?.strip_prefix("service/")?;
+    if service_id.is_empty() || service_id.contains('/') {
+        return None;
+    }
+    Some(service_id.to_string())
 }
 
 /// Build the public webhook URL(s) from the API endpoint and paths.
@@ -283,205 +317,207 @@ fn webhook_urls(api_endpoint: &str, paths: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Best-effort teardown of the *per-bot ingress wiring* for `namespace/name`:
-/// its routes, integration, and stage on the per-bot HTTP API, plus its Cloud
-/// Map service. Deliberately does NOT delete the HTTP API resource itself —
-/// only what points at the now-gone task — so the API's `api-id` (and thus the
-/// public webhook URL's hostname) survives an ECS-service recreate cycle. Use
-/// [`delete_api`] separately when the bot is being permanently removed.
+/// Exact-identity teardown of per-bot API Gateway wiring for apply-time ingress
+/// removal. The ECS registry ARN selects the unique same-name HTTP API whose
+/// integration URI equals that ARN. Without an ECS registry ARN this function
+/// returns a warning and leaves resources untouched; it never falls back to a
+/// name-only match.
 ///
-/// The shared resources (the VPC Link and the security-group inbound rule) are
-/// intentionally left in place since other bots may still use them. Safe to
-/// call for bots that never had ingress — it simply finds nothing and returns.
-/// Errors that prevent teardown are propagated. Degraded cleanup that can be
-/// completed manually is returned as warning text so apply can include it in
-/// its structured report while the CLI still renders it.
+/// The HTTP API resource itself is retained so its endpoint survives if ingress
+/// is re-enabled. Cloud Map must be deleted separately with
+/// [`delete_cloud_map_exact`] only after ECS has detached the registry. Shared
+/// VPC Link and security-group resources are also left in place.
 pub async fn teardown(
     config: &aws_config::SdkConfig,
     namespace: &str,
     name: &str,
     known_registry_arn: Option<&str>,
 ) -> Result<Vec<String>> {
-    let mut warnings = Vec::new();
-    let service_name = format!("oab-{namespace}-{name}");
-    let api = aws_sdk_apigatewayv2::Client::new(config);
-
-    // ── API Gateway: strip routes + integration + stage, keep the API itself ─
-    if let Some((api_id, _)) = find_api(&api, &api_name(namespace, name)).await? {
-        // Delete all routes on this API first (integrations can't be deleted
-        // while a route still targets them).
-        let mut route_ids = Vec::new();
-        let mut next: Option<String> = None;
-        loop {
-            let mut req = api.get_routes().api_id(&api_id);
-            if let Some(t) = &next {
-                req = req.next_token(t);
-            }
-            let resp = req.send().await.context("failed to list routes")?;
-            for r in resp.items() {
-                if let Some(id) = r.route_id() {
-                    route_ids.push(id.to_string());
-                }
-            }
-            match resp.next_token() {
-                Some(t) => next = Some(t.to_string()),
-                None => break,
-            }
-        }
-        for route_id in &route_ids {
-            if let Err(error) = api
-                .delete_route()
-                .api_id(&api_id)
-                .route_id(route_id)
-                .send()
-                .await
-            {
-                let warning = format!(
-                    "failed to delete ingress route {route_id} from HTTP API {api_id}: {error}"
-                );
-                eprintln!("  ⚠ {warning}");
-                warnings.push(warning);
-            }
-        }
-
-        // Delete integrations (there's normally just one, but clean up all).
-        let mut integration_ids = Vec::new();
-        let mut next: Option<String> = None;
-        loop {
-            let mut req = api.get_integrations().api_id(&api_id);
-            if let Some(t) = &next {
-                req = req.next_token(t);
-            }
-            let resp = req.send().await.context("failed to list integrations")?;
-            for i in resp.items() {
-                if let Some(id) = i.integration_id() {
-                    integration_ids.push(id.to_string());
-                }
-            }
-            match resp.next_token() {
-                Some(t) => next = Some(t.to_string()),
-                None => break,
-            }
-        }
-        for integration_id in &integration_ids {
-            if let Err(error) = api
-                .delete_integration()
-                .api_id(&api_id)
-                .integration_id(integration_id)
-                .send()
-                .await
-            {
-                let warning = format!(
-                    "failed to delete ingress integration {integration_id} from HTTP API {api_id}: {error}"
-                );
-                eprintln!("  ⚠ {warning}");
-                warnings.push(warning);
-            }
-        }
-
-        if let Err(error) = api
-            .delete_stage()
-            .api_id(&api_id)
-            .stage_name(STAGE_NAME)
-            .send()
-            .await
-        {
-            let warning = format!(
-                "failed to delete ingress stage {STAGE_NAME} from HTTP API {api_id}: {error}"
-            );
-            eprintln!("  ⚠ {warning}");
-            warnings.push(warning);
-        }
-
-        if warnings.is_empty() {
-            eprintln!(
-                "  ✓ Cleared ingress wiring on HTTP API {} ({} route(s), {} integration(s)) — API itself kept so its URL survives a recreate",
-                api_name(namespace, name),
-                route_ids.len(),
-                integration_ids.len()
-            );
-        } else {
-            eprintln!(
-                "  ⚠ Ingress wiring cleanup on HTTP API {} completed with {} warning(s)",
-                api_name(namespace, name),
-                warnings.len()
-            );
-        }
-    }
-
-    // ── Cloud Map: delete the per-bot service (needs no live instances) ──────
-    // Prefer resolving the exact service from the ECS service's own registry
-    // ARN (passed by the caller when known) over a name-only account-wide
-    // scan — two bots with the same namespace/name in different VPCs (e.g.
-    // staging vs. prod sharing an account) would otherwise collide and the
-    // wrong one could be deleted.
-    let sd = aws_sdk_servicediscovery::Client::new(config);
-    let service_id: Option<String> = if let Some(arn) = known_registry_arn {
-        cloud_map_service_id_from_arn(arn)
-    } else {
-        let mut found: Option<String> = None;
-        let mut pages = sd.list_services().into_paginator().send();
-        'svc: while let Some(page) = pages.next().await {
-            let page = page.context("failed to list Cloud Map services")?;
-            for s in page.services() {
-                if s.name() == Some(service_name.as_str()) {
-                    found = s.id().map(|x| x.to_string());
-                    break 'svc;
-                }
-            }
-        }
-        found
+    let Some(registry_arn) = known_registry_arn else {
+        let warning = format!(
+            "ingress teardown left resources untouched for {namespace}/{name}: ECS returned no exact registry ARN"
+        );
+        eprintln!("  ⚠ {warning}");
+        return Ok(vec![warning]);
     };
-    if let Some(service_id) = service_id {
-        // ECS deregisters the task's Cloud Map instance asynchronously when a
-        // service scales to 0 / is deleted, so `delete_service` can fail with
-        // "still has registered instances" for a short window even though the
-        // task is already gone. Retry briefly instead of giving up on the
-        // first attempt — this is the common case, not an edge case.
-        let mut last_err = None;
-        let mut deleted = false;
-        for attempt in 0..6 {
-            if attempt > 0 {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            }
-            match sd.delete_service().id(&service_id).send().await {
-                Ok(_) => {
-                    eprintln!("  ✓ Deleted Cloud Map service: {service_name}");
-                    deleted = true;
-                    break;
-                }
-                Err(e) => last_err = Some(e),
-            }
-        }
-        if !deleted {
-            let warning = format!(
-                "Cloud Map service '{service_name}' was not deleted after retrying; it still has registered instances. Remove it manually with `aws servicediscovery delete-service --id {service_id}` ({})",
-                last_err.map(|error| error.to_string()).unwrap_or_default()
-            );
-            eprintln!("  ⚠ {warning}");
-            warnings.push(warning);
-        }
-    }
 
-    Ok(warnings)
+    let api_id = resolve_api_id_for_registry(config, namespace, name, registry_arn).await?;
+    if let Some(api_id) = api_id.as_deref() {
+        clear_api_wiring(config, api_id).await?;
+        eprintln!("  ✓ Cleared exact ingress wiring on HTTP API {api_id}");
+    }
+    Ok(Vec::new())
 }
 
-/// Permanently delete the bot's per-bot HTTP API (`oab-webhook-<ns>-<name>`),
-/// cascading its routes/integration/stage with it. This DESTROYS the `api-id`
-/// and therefore the public webhook URL's hostname — only call this when the
-/// bot itself is being permanently removed (`oabctl delete`), never from the
-/// `apply` recreate path, which relies on the API surviving so its URL stays
-/// stable across an ECS-service recreate.
+async fn clear_api_wiring(config: &aws_config::SdkConfig, api_id: &str) -> Result<()> {
+    let api = aws_sdk_apigatewayv2::Client::new(config);
+    let mut route_ids = Vec::new();
+    let mut next = None;
+    loop {
+        let mut request = api.get_routes().api_id(api_id);
+        if let Some(token) = &next { request = request.next_token(token); }
+        let response = request.send().await.context("failed to list exact API routes")?;
+        route_ids.extend(response.items().iter().filter_map(|route| route.route_id().map(str::to_owned)));
+        next = response.next_token().map(str::to_owned);
+        if next.is_none() { break; }
+    }
+    for route_id in route_ids {
+        match api.delete_route().api_id(api_id).route_id(&route_id).send().await {
+            Ok(_) => {}
+            Err(error) if error.code() == Some("NotFoundException") => {}
+            Err(error) => return Err(error).context("failed to delete exact API route"),
+        }
+    }
+
+    let mut integration_ids = Vec::new();
+    let mut next = None;
+    loop {
+        let mut request = api.get_integrations().api_id(api_id);
+        if let Some(token) = &next { request = request.next_token(token); }
+        let response = request.send().await.context("failed to list exact API integrations")?;
+        integration_ids.extend(response.items().iter().filter_map(|item| item.integration_id().map(str::to_owned)));
+        next = response.next_token().map(str::to_owned);
+        if next.is_none() { break; }
+    }
+    for integration_id in integration_ids {
+        match api.delete_integration().api_id(api_id).integration_id(&integration_id).send().await {
+            Ok(_) => {}
+            Err(error) if error.code() == Some("NotFoundException") => {}
+            Err(error) => return Err(error).context("failed to delete exact API integration"),
+        }
+    }
+    match api.delete_stage().api_id(api_id).stage_name(STAGE_NAME).send().await {
+        Ok(_) => {}
+        Err(error) if error.code() == Some("NotFoundException") => {}
+        Err(error) => return Err(error).context("failed to delete exact API stage"),
+    }
+    Ok(())
+}
+
+async fn delete_cloud_map_by_arn(
+    config: &aws_config::SdkConfig,
+    registry_arn: &str,
+    service_name: &str,
+    expected_boundary: Option<(&str, &str, &str)>,
+) -> Result<()> {
+    let service_id = match expected_boundary {
+        Some((partition, account, region)) => {
+            cloud_map_service_id_for_boundary(registry_arn, partition, account, region)
+        }
+        None => cloud_map_service_id_from_arn(registry_arn),
+    }
+    .context("Cloud Map service ARN is outside the exact delete boundary")?;
+    let discovery = aws_sdk_servicediscovery::Client::new(config);
+    let mut last_error = None;
+    for attempt in 0..6 {
+        if attempt > 0 { tokio::time::sleep(std::time::Duration::from_secs(5)).await; }
+        match discovery.delete_service().id(&service_id).send().await {
+            Ok(_) => {
+                eprintln!("  ✓ Deleted Cloud Map service: {service_name} ({service_id})");
+                return Ok(());
+            }
+            Err(error) if error.code() == Some("ResourceNotFoundException") => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(anyhow::Error::new(last_error.expect("delete attempt always records an error")))
+        .with_context(|| format!("failed to delete exact Cloud Map service {service_id}"))
+}
+
+
+/// Delete the exact Cloud Map service selected by an ECS registry ARN.
+/// Apply calls this only after it has observed the registry detached from ECS.
+pub(crate) async fn delete_cloud_map_exact(
+    config: &aws_config::SdkConfig,
+    registry_arn: &str,
+    service_name: &str,
+) -> Result<()> {
+    delete_cloud_map_by_arn(config, registry_arn, service_name, None).await
+}
+/// Resolve a same-name API only when the name identifies exactly one resource
+/// and that API has an integration URI equal to the exact ECS registry ARN.
+/// Duplicate names are rejected before inspecting integrations, even if only
+/// one duplicate currently points at the registry.
+pub(crate) async fn resolve_api_id_for_registry(
+    config: &aws_config::SdkConfig,
+    namespace: &str,
+    name: &str,
+    registry_arn: &str,
+) -> Result<Option<String>> {
+    let api = aws_sdk_apigatewayv2::Client::new(config);
+    let expected_name = api_name(namespace, name);
+    let candidates = find_apis(&api, &expected_name).await?;
+    let Some((api_id, _)) = select_unique_named_api(&expected_name, &candidates)? else {
+        return Ok(None);
+    };
+
+    let mut next = None;
+    let mut matched = false;
+    loop {
+        let mut request = api.get_integrations().api_id(&api_id);
+        if let Some(token) = &next {
+            request = request.next_token(token);
+        }
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("failed to list integrations for API {api_id}"))?;
+        matched |= response
+            .items()
+            .iter()
+            .any(|integration| integration.integration_uri() == Some(registry_arn));
+        next = response.next_token().map(str::to_owned);
+        if next.is_none() {
+            break;
+        }
+    }
+
+    Ok(matched.then_some(api_id))
+}
+
+/// Permanently delete only checkpointed dependent identities. Exact-ID
+/// NotFound is idempotent success; every other failure is fatal so the caller
+/// retains its durable checkpoint for retry.
+pub(crate) async fn delete_exact(
+    config: &aws_config::SdkConfig,
+    namespace: &str,
+    name: &str,
+    api_id: Option<&str>,
+    registry_arn: Option<&str>,
+    partition: &str,
+    account: &str,
+    region: &str,
+) -> Result<()> {
+    if let Some(api_id) = api_id {
+        let api = aws_sdk_apigatewayv2::Client::new(config);
+        match api.delete_api().api_id(api_id).send().await {
+            Ok(_) => eprintln!("  ✓ Deleted exact HTTP API: {api_id}"),
+            Err(error) if error.code() == Some("NotFoundException") => {}
+            Err(error) => return Err(error).context("failed to delete exact HTTP API"),
+        }
+    }
+    if let Some(registry_arn) = registry_arn {
+        delete_cloud_map_by_arn(
+            config,
+            registry_arn,
+            &format!("oab-{namespace}-{name}"),
+            Some((partition, account, region)),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// CLI-only legacy orphan cleanup by name. Duplicate names fail closed.
 pub async fn delete_api(config: &aws_config::SdkConfig, namespace: &str, name: &str) -> Result<()> {
     let api = aws_sdk_apigatewayv2::Client::new(config);
     let name_str = api_name(namespace, name);
     if let Some((api_id, _)) = find_api(&api, &name_str).await? {
-        api.delete_api()
-            .api_id(&api_id)
-            .send()
-            .await
-            .with_context(|| format!("failed to delete HTTP API {api_id}"))?;
-        eprintln!("  ✓ Deleted HTTP API: {name_str}");
+        match api.delete_api().api_id(&api_id).send().await {
+            Ok(_) => eprintln!("  ✓ Deleted HTTP API: {name_str}"),
+            Err(error) if error.code() == Some("NotFoundException") => {}
+            Err(error) => return Err(error).with_context(|| format!("failed to delete HTTP API {api_id}")),
+        }
     }
     Ok(())
 }
@@ -877,12 +913,21 @@ async fn ensure_api(
     Ok((id, endpoint))
 }
 
-/// Find an HTTP API by name, returning `(api_id, api_endpoint)`.
+/// Find an HTTP API by name, rejecting duplicate names instead of selecting
+/// whichever candidate AWS happens to return first.
 async fn find_api(
     api: &aws_sdk_apigatewayv2::Client,
     api_name: &str,
 ) -> Result<Option<(String, String)>> {
-    // apigatewayv2 has no smithy paginator for GetApis; page manually.
+    let candidates = find_apis(api, api_name).await?;
+    select_unique_named_api(api_name, &candidates)
+}
+
+async fn find_apis(
+    api: &aws_sdk_apigatewayv2::Client,
+    api_name: &str,
+) -> Result<Vec<(String, String)>> {
+    let mut candidates = Vec::new();
     let mut next: Option<String> = None;
     loop {
         let mut req = api.get_apis();
@@ -890,17 +935,47 @@ async fn find_api(
             req = req.next_token(t);
         }
         let resp = req.send().await.context("failed to list APIs")?;
-        for a in resp.items() {
-            if a.name() == Some(api_name) {
-                let id = a.api_id().context("api missing id")?.to_string();
-                let endpoint = a.api_endpoint().unwrap_or_default().to_string();
-                return Ok(Some((id, endpoint)));
+        for candidate in resp.items() {
+            if is_matching_http_api(
+                candidate.name(),
+                candidate.protocol_type().map(ProtocolType::as_str),
+                api_name,
+            ) {
+                let id = candidate.api_id().context("api missing id")?.to_string();
+                let endpoint = candidate.api_endpoint().unwrap_or_default().to_string();
+                candidates.push((id, endpoint));
             }
         }
         match resp.next_token() {
-            Some(t) => next = Some(t.to_string()),
-            None => return Ok(None),
+            Some(token) => next = Some(token.to_string()),
+            None => return Ok(candidates),
         }
+    }
+}
+
+fn is_matching_http_api(
+    candidate_name: Option<&str>,
+    candidate_protocol: Option<&str>,
+    expected_name: &str,
+) -> bool {
+    candidate_name == Some(expected_name) && candidate_protocol == Some("HTTP")
+}
+
+fn select_unique_named_api(
+    api_name: &str,
+    candidates: &[(String, String)],
+) -> Result<Option<(String, String)>> {
+    match candidates {
+        [] => Ok(None),
+        [candidate] => Ok(Some(candidate.clone())),
+        _ => anyhow::bail!(
+            "multiple HTTP APIs named '{api_name}' exist; refusing first-match selection: {}",
+            candidates
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -1185,9 +1260,21 @@ mod tests {
     }
 
     #[test]
-    fn cloud_map_service_id_from_arn_rejects_empty() {
+    fn cloud_map_service_id_from_arn_rejects_non_service_arns() {
         assert_eq!(cloud_map_service_id_from_arn(""), None);
-        assert_eq!(cloud_map_service_id_from_arn("trailing/"), None);
+        assert_eq!(cloud_map_service_id_from_arn("srv-abc123"), None);
+        assert_eq!(
+            cloud_map_service_id_from_arn(
+                "arn:aws:servicediscovery:us-east-1:123456789012:namespace/ns-123"
+            ),
+            None
+        );
+        assert_eq!(
+            cloud_map_service_id_from_arn(
+                "arn:aws:servicediscovery:us-east-1:123456789012:service/"
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1236,6 +1323,31 @@ mod tests {
         assert_eq!(
             urls,
             vec!["https://abc123.example.com/prod/webhook/telegram"]
+        );
+    }
+
+    #[test]
+    fn api_candidates_require_http_protocol() {
+        let name = "oab-webhook-prod-bot";
+        assert!(is_matching_http_api(Some(name), Some("HTTP"), name));
+        assert!(!is_matching_http_api(Some(name), Some("WEBSOCKET"), name));
+        assert!(!is_matching_http_api(Some("other"), Some("HTTP"), name));
+        assert!(!is_matching_http_api(Some(name), None, name));
+    }
+
+    #[test]
+    fn duplicate_named_apis_fail_closed() {
+        let candidates = vec![
+            ("api-a".to_string(), "https://a".to_string()),
+            ("api-b".to_string(), "https://b".to_string()),
+        ];
+        assert!(select_unique_named_api("oab-webhook-prod-bot", &candidates).is_err());
+        assert_eq!(
+            select_unique_named_api("oab-webhook-prod-bot", &candidates[..1])
+                .unwrap()
+                .unwrap()
+                .0,
+            "api-a"
         );
     }
 }
