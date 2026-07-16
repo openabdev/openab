@@ -1,6 +1,250 @@
 use anyhow::{Context, Result};
 use aws_sdk_ecs::error::ProvideErrorMetadata;
+use std::fmt;
 use std::path::Path;
+
+// Route all human-readable progress through the same task-local gate as
+// apply: CLI callers keep today's output, programmatic callers are silent.
+macro_rules! println {
+    ($($arg:tt)*) => {{ if crate::apply::progress_enabled() { std::println!($($arg)*); } }};
+}
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{ if crate::apply::progress_enabled() { std::eprintln!($($arg)*); } }};
+}
+macro_rules! eprint {
+    ($($arg:tt)*) => {{ if crate::apply::progress_enabled() { std::eprint!($($arg)*); } }};
+}
+
+/// Identity of a service targeted for deletion.
+///
+/// Deletion does not require the original manifest: the control-plane copy
+/// under `manifests/{namespace}/{name}.yaml` (and every other resource) is
+/// addressed by `namespace` + `name` alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteTarget {
+    pub namespace: String,
+    pub name: String,
+}
+
+impl DeleteTarget {
+    pub fn new(namespace: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            name: name.into(),
+        }
+    }
+
+    /// ECS service name derived from the target (`oab-{namespace}-{name}`).
+    pub fn ecs_service_name(&self) -> String {
+        format!("oab-{}-{}", self.namespace, self.name)
+    }
+}
+
+/// Target options for [`delete_services`]. Mirrors
+/// [`ApplyOptions`](crate::apply::ApplyOptions): the cluster is required and
+/// the library never reads `~/.oabctl/config.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteOptions {
+    /// ECS cluster name or ARN the services were deployed into.
+    pub cluster: String,
+    /// Optional control-plane bucket override. When absent, resolution uses
+    /// `OAB_CONTROL_PLANE_BUCKET`, then `oab-control-plane-{account}` from
+    /// the caller's AWS identity — the same chain as apply, so delete always
+    /// cleans the bucket apply wrote to.
+    pub control_plane_bucket: Option<String>,
+}
+
+impl DeleteOptions {
+    pub fn new(cluster: impl Into<String>) -> Self {
+        Self {
+            cluster: cluster.into(),
+            control_plane_bucket: None,
+        }
+    }
+
+    pub fn with_control_plane_bucket(mut self, bucket: impl Into<String>) -> Self {
+        self.control_plane_bucket = Some(bucket.into());
+        self
+    }
+}
+
+/// Teardown outcome for one service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedService {
+    pub namespace: String,
+    pub name: String,
+    pub ecs_service_name: String,
+    /// Best-effort steps that were skipped (e.g. ingress teardown pieces
+    /// already gone). The core teardown (ECS service, S3 manifest and
+    /// artifacts) either completed or the whole target failed.
+    pub warnings: Vec<String>,
+}
+
+/// Structured result of a successful (or partially completed) delete.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeleteReport {
+    pub services: Vec<DeletedService>,
+}
+
+/// High-level phase in which delete failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteErrorKind {
+    /// Contract violation caught before any AWS call.
+    Validation,
+    /// The deployment target (bucket resolution) could not be established.
+    Target,
+    /// Teardown of a specific service failed. Cleanup is resumable: calling
+    /// [`delete_services`] again with the same target continues from the
+    /// remaining resources.
+    Teardown,
+}
+
+/// Structured delete failure. Teardown failures identify the failed service
+/// and retain the report for all services completed before it.
+#[derive(Debug)]
+pub struct DeleteError {
+    pub kind: DeleteErrorKind,
+    pub failed_service: Option<DeleteTarget>,
+    pub completed: DeleteReport,
+    source: anyhow::Error,
+}
+
+impl DeleteError {
+    fn validation(source: impl Into<anyhow::Error>) -> Self {
+        Self {
+            kind: DeleteErrorKind::Validation,
+            failed_service: None,
+            completed: DeleteReport::default(),
+            source: source.into(),
+        }
+    }
+
+    fn target(source: impl Into<anyhow::Error>) -> Self {
+        Self {
+            kind: DeleteErrorKind::Target,
+            failed_service: None,
+            completed: DeleteReport::default(),
+            source: source.into(),
+        }
+    }
+
+    fn teardown(
+        failed_service: DeleteTarget,
+        completed: DeleteReport,
+        source: impl Into<anyhow::Error>,
+    ) -> Self {
+        Self {
+            kind: DeleteErrorKind::Teardown,
+            failed_service: Some(failed_service),
+            completed,
+            source: source.into(),
+        }
+    }
+
+    pub fn source_error(&self) -> &anyhow::Error {
+        &self.source
+    }
+}
+
+impl fmt::Display for DeleteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.failed_service {
+            Some(service) => write!(
+                f,
+                "delete {:?} error for {}/{}: {}",
+                self.kind, service.namespace, service.name, self.source
+            ),
+            None => write!(f, "delete {:?} error: {}", self.kind, self.source),
+        }
+    }
+}
+
+impl std::error::Error for DeleteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+fn validate_delete_request(
+    targets: &[DeleteTarget],
+    cluster: &str,
+) -> std::result::Result<(), DeleteError> {
+    if targets.is_empty() {
+        return Err(DeleteError::validation(anyhow::anyhow!(
+            "no targets to delete (empty target set)"
+        )));
+    }
+    if cluster.trim().is_empty() {
+        return Err(DeleteError::validation(anyhow::anyhow!(
+            "DeleteOptions.cluster must not be empty"
+        )));
+    }
+    for target in targets {
+        if target.namespace.trim().is_empty() || target.name.trim().is_empty() {
+            return Err(DeleteError::validation(anyhow::anyhow!(
+                "delete target namespace and name must not be empty (got '{}'/'{}')",
+                target.namespace,
+                target.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Tear down OAB services programmatically, without reading CLI home
+/// configuration or writing progress to process-global stdout/stderr.
+///
+/// Contract (enforced before any AWS call):
+/// - the target set must be non-empty
+/// - [`DeleteOptions::cluster`] must be a non-empty cluster name
+/// - every target's `namespace`/`name` must be non-empty
+///
+/// Teardown per target is resumable: an `ACTIVE` service is scaled down and
+/// deleted, a `DRAINING` service resumes its drain wait, and an absent one
+/// proceeds straight to ingress/S3 cleanup. Best-effort ingress steps are
+/// reported through [`DeletedService::warnings`]; S3 cleanup failures fail
+/// the target (safe to retry).
+pub async fn delete_services(
+    aws_config: &aws_config::SdkConfig,
+    targets: &[DeleteTarget],
+    opts: &DeleteOptions,
+) -> std::result::Result<DeleteReport, DeleteError> {
+    crate::apply::with_progress_suppressed(async {
+        validate_delete_request(targets, &opts.cluster)?;
+        let bucket = crate::control_plane::resolve_bucket(
+            aws_config,
+            opts.control_plane_bucket.as_deref(),
+        )
+        .await
+        .map_err(DeleteError::target)?;
+
+        let mut report = DeleteReport::default();
+        for target in targets {
+            match run_with_bucket(
+                aws_config,
+                "oabservice",
+                &target.name,
+                &opts.cluster,
+                &target.namespace,
+                &bucket,
+            )
+            .await
+            {
+                Ok(warnings) => report.services.push(DeletedService {
+                    namespace: target.namespace.clone(),
+                    name: target.name.clone(),
+                    ecs_service_name: target.ecs_service_name(),
+                    warnings,
+                }),
+                Err(error) => {
+                    return Err(DeleteError::teardown(target.clone(), report, error));
+                }
+            }
+        }
+        Ok(report)
+    })
+    .await
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EcsDeletePhase {
@@ -81,7 +325,9 @@ pub(crate) async fn run(
     let bucket =
         crate::control_plane::resolve_bucket(aws_config, oab_cfg.bootstrap.bucket.as_deref())
             .await?;
-    run_with_bucket(aws_config, resource, name, cluster, namespace, &bucket).await
+    run_with_bucket(aws_config, resource, name, cluster, namespace, &bucket)
+        .await
+        .map(|_warnings| ())
 }
 
 async fn run_with_bucket(
@@ -91,10 +337,12 @@ async fn run_with_bucket(
     cluster: &str,
     namespace: &str,
     bucket: &str,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     if resource != "oabservice" {
         anyhow::bail!("unknown resource type: {resource}. Use 'oabservice'");
     }
+
+    let mut warnings = Vec::new();
 
     let service_name = format!("oab-{namespace}-{name}");
     let ecs = aws_sdk_ecs::Client::new(aws_config);
@@ -195,10 +443,14 @@ async fn run_with_bucket(
     if let Err(error) =
         crate::ingress::teardown(aws_config, namespace, name, registry_arn.as_deref()).await
     {
-        eprintln!("  ⚠ ingress teardown skipped: {error}");
+        let w = format!("ingress teardown skipped: {error}");
+        eprintln!("  ⚠ {w}");
+        warnings.push(w);
     }
     if let Err(error) = crate::ingress::delete_api(aws_config, namespace, name).await {
-        eprintln!("  ⚠ HTTP API cleanup skipped: {error}");
+        let w = format!("HTTP API cleanup skipped: {error}");
+        eprintln!("  ⚠ {w}");
+        warnings.push(w);
     }
 
     let mut cleanup_failures = Vec::new();
@@ -264,12 +516,57 @@ async fn run_with_bucket(
     }
 
     println!("\n✓ {name} deleted");
-    Ok(())
+    Ok(warnings)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_sdk_config() -> aws_config::SdkConfig {
+        aws_config::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .build()
+    }
+
+    #[tokio::test]
+    async fn delete_services_rejects_empty_target_set() {
+        let cfg = test_sdk_config();
+        let err = delete_services(&cfg, &[], &DeleteOptions::new("cluster"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, DeleteErrorKind::Validation);
+        assert!(err.to_string().contains("empty target set"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn delete_services_rejects_empty_cluster() {
+        let cfg = test_sdk_config();
+        let targets = [DeleteTarget::new("prod", "bot")];
+        let err = delete_services(&cfg, &targets, &DeleteOptions::new(""))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, DeleteErrorKind::Validation);
+        assert!(err.to_string().contains("cluster must not be empty"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn delete_services_rejects_blank_target_fields() {
+        let cfg = test_sdk_config();
+        let targets = [DeleteTarget::new("prod", "  ")];
+        let err = delete_services(&cfg, &targets, &DeleteOptions::new("cluster"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, DeleteErrorKind::Validation);
+    }
+
+    #[test]
+    fn delete_target_derives_ecs_service_name() {
+        assert_eq!(
+            DeleteTarget::new("prod", "nest-my-oab").ecs_service_name(),
+            "oab-prod-nest-my-oab"
+        );
+    }
 
     #[test]
     fn delete_phase_requests_delete_only_for_active_service() {

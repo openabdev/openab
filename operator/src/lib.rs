@@ -1,7 +1,7 @@
 //! Programmatic OAB manifest validation and ECS reconciliation.
 //!
-//! The public facade intentionally contains only the manifest model and the
-//! structured apply API. CLI implementation details and resource-management
+//! The public facade contains the manifest model and the structured apply
+//! and delete APIs. CLI implementation details and other resource-management
 //! helpers remain private.
 //!
 //! # Example
@@ -42,9 +42,15 @@
 //! an ARN require the apply caller to have `secretsmanager:DescribeSecret`, so
 //! oabctl can resolve the name to the full ARN required by ECS.
 //!
-//! Programmatic apply never reads `~/.oabctl/config.toml`. Use
-//! [`ApplyOptions::with_control_plane_bucket`] for an explicit bucket; otherwise
-//! resolution uses `OAB_CONTROL_PLANE_BUCKET` and then the caller's AWS account.
+//! Programmatic apply and delete never read `~/.oabctl/config.toml`. Use
+//! [`ApplyOptions::with_control_plane_bucket`] / [`DeleteOptions::with_control_plane_bucket`]
+//! for an explicit bucket; otherwise resolution uses `OAB_CONTROL_PLANE_BUCKET`
+//! and then the caller's AWS account — the same chain for both, so delete
+//! always cleans the bucket apply wrote to.
+//!
+//! [`delete_services`] tears down by `namespace`+`name` ([`DeleteTarget`]) with
+//! the same explicit-cluster contract as apply. Teardown is resumable: rerun
+//! the same target to continue after a partial failure.
 
 pub mod apply;
 mod bootstrap;
@@ -52,7 +58,7 @@ mod cli;
 mod config;
 mod control_plane;
 mod create;
-mod delete;
+pub mod delete;
 mod get;
 mod ingress;
 pub mod manifest;
@@ -62,6 +68,10 @@ mod secrets;
 pub use apply::{
     apply_manifests, AppliedService, ApplyAction, ApplyError, ApplyErrorKind, ApplyOptions,
     ApplyReport, ServiceTarget,
+};
+pub use delete::{
+    delete_services, DeleteError, DeleteErrorKind, DeleteOptions, DeleteReport, DeleteTarget,
+    DeletedService,
 };
 pub use manifest::{
     AgentOverride, EcsNetworking, EcsRuntime, FleetMetadata, FleetSpec, FleetTemplate, Ingress,

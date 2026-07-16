@@ -21,6 +21,15 @@ pub(crate) fn progress_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Run `future` with human-readable progress output suppressed (library
+/// callers). Shared by the programmatic apply and delete entry points.
+pub(crate) async fn with_progress_suppressed<F>(future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    PROGRESS_ENABLED.scope(false, future).await
+}
+
 macro_rules! println {
     ($($arg:tt)*) => {{ if progress_enabled() { std::println!($($arg)*); } }};
 }
