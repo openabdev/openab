@@ -536,7 +536,7 @@ fn classify_apply_service_response(
         (0, [reason]) if reason.eq_ignore_ascii_case("MISSING") => {
             Ok(ApplyServicePresence::Absent)
         }
-        (0, failures) if failures.is_empty() => {
+        (0, []) => {
             anyhow::bail!("ECS returned no service and no MISSING failure for apply")
         }
         _ => anyhow::bail!(

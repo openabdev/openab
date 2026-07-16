@@ -267,7 +267,12 @@ fn has_stage_path_override(request_parameters: Option<&HashMap<String, String>>)
 
 /// Extract the Cloud Map service ID from its ARN
 /// (`arn:aws:servicediscovery:<region>:<account>:service/<id>`).
-pub(crate) fn cloud_map_service_id_from_arn(arn: &str) -> Option<String> {
+///
+/// Test-only reference parser: every production path resolves IDs through
+/// [`cloud_map_service_id_for_boundary`], which additionally pins the
+/// caller's partition/account/region (exact-identity delete contract).
+#[cfg(test)]
+fn cloud_map_service_id_from_arn(arn: &str) -> Option<String> {
     let mut parts = arn.splitn(6, ':');
     if parts.next() != Some("arn")
         || parts.next().filter(|part| !part.is_empty()).is_none()
