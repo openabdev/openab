@@ -78,6 +78,10 @@ jobs:
                   failed += 1;
                   core.warning(`#${issue.number}: ${error.message}`);
                 }
+                // Pace mutative requests: GitHub's secondary rate limit caps
+                // content-generating requests (~80/min); 2 writes per issue
+                // at full speed would exceed it at the 50-issue cap.
+                await new Promise((resolve) => setTimeout(resolve, 1000));
               }
               rows.push(`| [#${issue.number}](${issue.html_url}) | ${escapeCell(issue.title)} | ${issue.created_at.slice(0, 10)} | ${escapeCell(outcome)} |`);
             }
