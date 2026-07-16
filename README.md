@@ -13,7 +13,7 @@ A Helm chart for deploying [openab](https://github.com/openabdev/openab) — a l
 
 - Kubernetes 1.21+
 - Helm 3.0+
-- A Discord bot token ([setup guide](https://github.com/openabdev/openab/blob/main/docs/discord-bot-howto.md))
+- A Discord bot token ([setup guide](https://github.com/openabdev/openab/blob/main/docs/discord.md))
 
 ## Installation
 
