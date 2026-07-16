@@ -262,6 +262,40 @@ fn ecs_delete_phase(status: Option<&str>) -> Result<EcsDeletePhase> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainPollAction {
+    Complete,
+    Retry,
+    TimedOut,
+}
+
+fn drain_poll_action(is_gone: bool, attempt: u32, max_attempts: u32) -> DrainPollAction {
+    debug_assert!(max_attempts > 0);
+    debug_assert!(attempt < max_attempts);
+    if is_gone {
+        DrainPollAction::Complete
+    } else if attempt + 1 == max_attempts {
+        DrainPollAction::TimedOut
+    } else {
+        DrainPollAction::Retry
+    }
+}
+
+fn collect_best_effort_warnings(
+    warnings: &mut Vec<String>,
+    result: Result<Vec<String>>,
+    failure_context: &str,
+) {
+    match result {
+        Ok(step_warnings) => warnings.extend(step_warnings),
+        Err(error) => {
+            let warning = format!("{failure_context}: {error}");
+            eprintln!("  ⚠ {warning}");
+            warnings.push(warning);
+        }
+    }
+}
+
 /// Delete every OABService defined in a manifest file or directory.
 pub(crate) async fn run_from_file(
     aws_config: &aws_config::SdkConfig,
@@ -422,36 +456,39 @@ async fn run_with_bucket(
                     false
                 }
             };
-            if is_gone {
-                if attempt == 0 {
-                    eprintln!(" done (immediate)");
-                } else {
-                    let elapsed = u64::from(attempt) * DRAIN_POLL_INTERVAL.as_secs();
-                    eprintln!(" done ({elapsed}s)");
+            match drain_poll_action(is_gone, attempt, DRAIN_POLL_ATTEMPTS) {
+                DrainPollAction::Complete => {
+                    if attempt == 0 {
+                        eprintln!(" done (immediate)");
+                    } else {
+                        let elapsed = u64::from(attempt) * DRAIN_POLL_INTERVAL.as_secs();
+                        eprintln!(" done ({elapsed}s)");
+                    }
+                    break;
                 }
-                break;
-            }
-            if attempt == DRAIN_POLL_ATTEMPTS - 1 {
-                eprintln!(" timed out (service may still be draining)");
-            } else {
-                eprint!(".");
-                tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+                DrainPollAction::Retry => {
+                    eprint!(".");
+                    tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+                }
+                DrainPollAction::TimedOut => {
+                    let elapsed = u64::from(attempt) * DRAIN_POLL_INTERVAL.as_secs();
+                    eprintln!(" timed out ({elapsed}s)");
+                    anyhow::bail!(
+                        "ECS service {service_name} is still draining after {elapsed}s; dependent cleanup was not started (safe to retry)"
+                    );
+                }
             }
         }
     }
 
-    if let Err(error) =
-        crate::ingress::teardown(aws_config, namespace, name, registry_arn.as_deref()).await
-    {
-        let w = format!("ingress teardown skipped: {error}");
-        eprintln!("  ⚠ {w}");
-        warnings.push(w);
-    }
-    if let Err(error) = crate::ingress::delete_api(aws_config, namespace, name).await {
-        let w = format!("HTTP API cleanup skipped: {error}");
-        eprintln!("  ⚠ {w}");
-        warnings.push(w);
-    }
+    let ingress_result =
+        crate::ingress::teardown(aws_config, namespace, name, registry_arn.as_deref()).await;
+    collect_best_effort_warnings(&mut warnings, ingress_result, "ingress teardown skipped");
+
+    let delete_api_result = crate::ingress::delete_api(aws_config, namespace, name)
+        .await
+        .map(|()| Vec::new());
+    collect_best_effort_warnings(&mut warnings, delete_api_result, "HTTP API cleanup skipped");
 
     let mut cleanup_failures = Vec::new();
     let manifest_key = format!("manifests/{namespace}/{name}.yaml");
@@ -565,6 +602,36 @@ mod tests {
         assert_eq!(
             DeleteTarget::new("prod", "nest-my-oab").ecs_service_name(),
             "oab-prod-nest-my-oab"
+        );
+    }
+
+    #[test]
+    fn drain_poll_action_requires_completion_before_cleanup() {
+        assert_eq!(drain_poll_action(true, 0, 12), DrainPollAction::Complete);
+        assert_eq!(drain_poll_action(false, 0, 12), DrainPollAction::Retry);
+        assert_eq!(drain_poll_action(false, 11, 12), DrainPollAction::TimedOut);
+    }
+
+    #[test]
+    fn best_effort_warnings_preserve_step_warnings_and_errors() {
+        let mut warnings = Vec::new();
+        collect_best_effort_warnings(
+            &mut warnings,
+            Ok(vec!["route cleanup incomplete".to_string()]),
+            "ingress teardown skipped",
+        );
+        collect_best_effort_warnings(
+            &mut warnings,
+            Err(anyhow::anyhow!("access denied")),
+            "HTTP API cleanup skipped",
+        );
+
+        assert_eq!(
+            warnings,
+            vec![
+                "route cleanup incomplete",
+                "HTTP API cleanup skipped: access denied",
+            ]
         );
     }
 

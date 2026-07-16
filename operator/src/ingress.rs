@@ -476,10 +476,12 @@ pub async fn delete_api(config: &aws_config::SdkConfig, namespace: &str, name: &
     let api = aws_sdk_apigatewayv2::Client::new(config);
     let name_str = api_name(namespace, name);
     if let Some((api_id, _)) = find_api(&api, &name_str).await? {
-        match api.delete_api().api_id(&api_id).send().await {
-            Ok(_) => eprintln!("  ✓ Deleted HTTP API: {name_str}"),
-            Err(e) => eprintln!("  ⚠ Failed to delete HTTP API {api_id}: {e}"),
-        }
+        api.delete_api()
+            .api_id(&api_id)
+            .send()
+            .await
+            .with_context(|| format!("failed to delete HTTP API {api_id}"))?;
+        eprintln!("  ✓ Deleted HTTP API: {name_str}");
     }
     Ok(())
 }
