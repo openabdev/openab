@@ -42,23 +42,30 @@ impl DeleteTarget {
     }
 }
 
-/// Target options for [`delete_services`]. The library never reads CLI
-/// configuration or guesses which control-plane bucket owns a deployment.
+/// Target options for [`delete_services`]. Mirrors
+/// [`ApplyOptions`](crate::apply::ApplyOptions): the cluster is required and
+/// the library never reads `~/.oabctl/config.toml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteOptions {
     /// ECS cluster name or ARN the services were deployed into.
     pub cluster: String,
-    /// Exact S3 bucket that owns the deployment and its delete checkpoint.
-    pub control_plane_bucket: String,
+    /// Optional control-plane bucket override. When absent, resolution uses
+    /// `OAB_CONTROL_PLANE_BUCKET`, then `oab-control-plane-{account}` from
+    /// the caller's AWS identity, matching apply's shared resolver.
+    pub control_plane_bucket: Option<String>,
 }
 
 impl DeleteOptions {
-    /// Bind a delete request to both its ECS cluster and control-plane bucket.
-    pub fn new(cluster: impl Into<String>, control_plane_bucket: impl Into<String>) -> Self {
+    pub fn new(cluster: impl Into<String>) -> Self {
         Self {
             cluster: cluster.into(),
-            control_plane_bucket: control_plane_bucket.into(),
+            control_plane_bucket: None,
         }
+    }
+
+    pub fn with_control_plane_bucket(mut self, bucket: impl Into<String>) -> Self {
+        self.control_plane_bucket = Some(bucket.into());
+        self
     }
 }
 
@@ -85,6 +92,8 @@ pub struct DeleteReport {
 pub enum DeleteErrorKind {
     /// Contract violation caught before any AWS call.
     Validation,
+    /// The deployment target (bucket resolution) could not be established.
+    Target,
     /// Teardown of a specific service failed. Cleanup is resumable: calling
     /// [`delete_services`] again with the same target continues from the
     /// remaining resources.
@@ -105,6 +114,15 @@ impl DeleteError {
     fn validation(source: impl Into<anyhow::Error>) -> Self {
         Self {
             kind: DeleteErrorKind::Validation,
+            failed_service: None,
+            completed: DeleteReport::default(),
+            source: source.into(),
+        }
+    }
+
+    fn target(source: impl Into<anyhow::Error>) -> Self {
+        Self {
+            kind: DeleteErrorKind::Target,
             failed_service: None,
             completed: DeleteReport::default(),
             source: source.into(),
@@ -150,12 +168,6 @@ impl std::error::Error for DeleteError {
 
 const DELETE_CHECKPOINT_VERSION: u8 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeletePolicy {
-    ExactIdentity,
-    CliLegacyOrphanCleanup,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct DeleteCheckpoint {
     version: u8,
@@ -168,6 +180,8 @@ struct DeleteCheckpoint {
     requested_cluster: String,
     cluster_arn: String,
     service_arn: String,
+    /// ECS `createdAt` as epoch nanoseconds; distinguishes a recreated same-name service.
+    service_created_at: i128,
     registry_arn: Option<String>,
     api_id: Option<String>,
 }
@@ -290,9 +304,8 @@ fn classify_service_identity(
     if !failure_reasons.is_empty() {
         if has_checkpoint
             && !service_present
-            && failure_reasons
-                .iter()
-                .all(|reason| reason.eq_ignore_ascii_case("MISSING"))
+            && failure_reasons.len() == 1
+            && failure_reasons[0].eq_ignore_ascii_case("MISSING")
         {
             return Ok(ServiceIdentityState::RetryGone);
         }
@@ -303,14 +316,18 @@ fn classify_service_identity(
     }
 
     match (service_present, status) {
-        (true, Some("ACTIVE")) | (true, Some("DRAINING")) => {
-            Ok(ServiceIdentityState::Live)
-        }
+        (true, Some("ACTIVE")) | (true, Some("DRAINING")) => Ok(ServiceIdentityState::Live),
+        // INACTIVE is retry-gone only after the caller has validated the exact
+        // service ARN, cluster ARN, and incarnation discriminator.
         (true, Some("INACTIVE")) if has_checkpoint => Ok(ServiceIdentityState::RetryGone),
-        (false, None) if has_checkpoint => Ok(ServiceIdentityState::RetryGone),
-        (false, None) | (true, Some("INACTIVE")) => Err(
-            "ECS service was not positively identified and no matching delete checkpoint exists"
+        // An empty successful response is ambiguous, and a checkpoint only
+        // authorizes exactly zero services plus one MISSING failure.
+        (false, None) => Err(
+            "ECS returned no service without an explicit MISSING failure; refusing cleanup"
                 .to_string(),
+        ),
+        (true, Some("INACTIVE")) => Err(
+            "ECS returned INACTIVE without a matching delete checkpoint".to_string(),
         ),
         (true, None) => Err("ECS returned a service without status".to_string()),
         (true, Some(other)) => Err(format!(
@@ -356,8 +373,11 @@ fn validate_checkpoint(
     {
         anyhow::bail!("delete checkpoint canonical cluster does not match the requested cluster");
     }
-    if checkpoint.cluster_arn.trim().is_empty() || checkpoint.service_arn.trim().is_empty() {
-        anyhow::bail!("delete checkpoint is missing exact ECS identity");
+    if checkpoint.cluster_arn.trim().is_empty()
+        || checkpoint.service_arn.trim().is_empty()
+        || checkpoint.service_created_at <= 0
+    {
+        anyhow::bail!("delete checkpoint is missing exact ECS identity or service incarnation");
     }
     validate_checkpoint_arns(
         checkpoint,
@@ -390,11 +410,6 @@ fn validate_delete_request(
             "DeleteOptions.cluster must not be empty"
         )));
     }
-    if opts.control_plane_bucket.trim().is_empty() {
-        return Err(DeleteError::validation(anyhow::anyhow!(
-            "DeleteOptions.control_plane_bucket must not be empty"
-        )));
-    }
     for target in targets {
         if target.namespace.trim().is_empty() || target.name.trim().is_empty() {
             return Err(DeleteError::validation(anyhow::anyhow!(
@@ -412,8 +427,8 @@ fn validate_delete_request(
 ///
 /// Contract (enforced before any AWS call):
 /// - the target set must be non-empty
-/// - [`DeleteOptions::cluster`] and the explicitly bound control-plane bucket
-///   must be non-empty
+/// - [`DeleteOptions::cluster`] must be non-empty; its optional bucket override
+///   follows the shared control-plane resolver
 /// - every target's `namespace`/`name` must be non-empty
 ///
 /// Before ECS mutation, delete persists an exact-identity checkpoint containing
@@ -429,7 +444,12 @@ pub async fn delete_services(
 ) -> std::result::Result<DeleteReport, DeleteError> {
     crate::apply::with_progress_suppressed(async {
         validate_delete_request(targets, opts)?;
-        let bucket = opts.control_plane_bucket.trim();
+        let bucket = crate::control_plane::resolve_bucket(
+            aws_config,
+            opts.control_plane_bucket.as_deref(),
+        )
+        .await
+        .map_err(DeleteError::target)?;
 
         let mut report = DeleteReport::default();
         for target in targets {
@@ -439,8 +459,7 @@ pub async fn delete_services(
                 &target.name,
                 &opts.cluster,
                 &target.namespace,
-                bucket,
-                DeletePolicy::ExactIdentity,
+                &bucket,
             )
             .await
             {
@@ -527,7 +546,6 @@ pub(crate) async fn run_from_file(
             cluster,
             &manifest.metadata.namespace,
             &bucket,
-            DeletePolicy::CliLegacyOrphanCleanup,
         )
         .await
         {
@@ -566,7 +584,6 @@ pub(crate) async fn run(
         cluster,
         namespace,
         &bucket,
-        DeletePolicy::CliLegacyOrphanCleanup,
     )
     .await
     .map(|_warnings| ())
@@ -650,7 +667,6 @@ fn single_described_service(
 }
 enum PreparedIdentity {
     Exact(DeleteCheckpoint, ServiceIdentityState),
-    LegacyOrphan,
 }
 
 async fn prepare_identity(
@@ -661,7 +677,6 @@ async fn prepare_identity(
     name: &str,
     cluster: &str,
     bucket: &str,
-    policy: DeletePolicy,
 ) -> Result<PreparedIdentity> {
     let (partition, account, region) = caller_context(aws_config).await?;
     if let Some(checkpoint) = load_checkpoint(s3, bucket, namespace, name).await? {
@@ -680,15 +695,16 @@ async fn prepare_identity(
             .send().await.context("failed to describe checkpointed ECS service")?;
         let service = single_described_service(&response)?;
         let reasons = failure_reasons(&response);
+        if let Some(service) = service {
+            validate_returned_service(&checkpoint, service)?;
+        }
         let state = classify_service_identity(
             true,
             service.is_some(),
             service.and_then(|service| service.status()),
             &reasons,
-        ).map_err(anyhow::Error::msg)?;
-        if let Some(service) = service {
-            validate_returned_service(&checkpoint, service)?;
-        }
+        )
+        .map_err(anyhow::Error::msg)?;
         return Ok(PreparedIdentity::Exact(checkpoint, state));
     }
 
@@ -697,26 +713,22 @@ async fn prepare_identity(
         .send().await.context("failed to describe ECS service before delete")?;
     let service = single_described_service(&response)?;
     let reasons = failure_reasons(&response);
-    let state = match classify_service_identity(
+    let state = classify_service_identity(
         false,
         service.is_some(),
         service.and_then(|service| service.status()),
         &reasons,
-    ) {
-        Ok(state) => state,
-        Err(_) if policy == DeletePolicy::CliLegacyOrphanCleanup
-            && service.is_none()
-            && (reasons.is_empty() || reasons.iter().all(|reason| reason.eq_ignore_ascii_case("MISSING"))) =>
-        {
-            return Ok(PreparedIdentity::LegacyOrphan);
-        }
-        Err(message) => anyhow::bail!(message),
-    };
+    )
+    .map_err(anyhow::Error::msg)?;
     let service = service.context("ECS service identity unexpectedly absent")?;
     let service_arn = service.service_arn().filter(|value| !value.trim().is_empty())
         .context("ECS service response missing service ARN")?.to_string();
     let cluster_arn = service.cluster_arn().filter(|value| !value.trim().is_empty())
         .context("ECS service response missing canonical cluster ARN")?.to_string();
+    let service_created_at = service
+        .created_at()
+        .map(|created_at| created_at.as_nanos())
+        .context("ECS service response missing createdAt incarnation")?;
     let registry_arn = match service.service_registries() {
         [] => None,
         [registry] => Some(
@@ -747,6 +759,7 @@ async fn prepare_identity(
         requested_cluster: cluster.to_string(),
         cluster_arn,
         service_arn,
+        service_created_at,
         registry_arn,
         api_id,
     };
@@ -764,28 +777,68 @@ async fn prepare_identity(
     Ok(PreparedIdentity::Exact(checkpoint, state))
 }
 
+fn validate_service_incarnation(expected: i128, actual: Option<i128>) -> Result<()> {
+    if actual != Some(expected) {
+        anyhow::bail!(
+            "ECS response belongs to a recreated same-name service (createdAt mismatch)"
+        );
+    }
+    Ok(())
+}
+
 fn validate_returned_service(
-    checkpoint: &DeleteCheckpoint, service: &aws_sdk_ecs::types::Service,
+    checkpoint: &DeleteCheckpoint,
+    service: &aws_sdk_ecs::types::Service,
 ) -> Result<()> {
     if service.service_arn() != Some(checkpoint.service_arn.as_str())
         || service.cluster_arn() != Some(checkpoint.cluster_arn.as_str())
     {
-        anyhow::bail!("ECS drain poll returned a conflicting service identity");
+        anyhow::bail!("ECS response returned a conflicting service identity");
     }
+    let created_at = service
+        .created_at()
+        .map(|created_at| created_at.as_nanos());
+    validate_service_incarnation(checkpoint.service_created_at, created_at)?;
     let registry_arn = match service.service_registries() {
         [] => None,
         [registry] => Some(
             registry
                 .registry_arn()
                 .filter(|value| !value.trim().is_empty())
-                .context("ECS drain poll returned a registry without an ARN")?,
+                .context("ECS response returned a registry without an ARN")?,
         ),
-        _ => anyhow::bail!("ECS drain poll returned multiple registry identities"),
+        _ => anyhow::bail!("ECS response returned multiple registry identities"),
     };
     if registry_arn != checkpoint.registry_arn.as_deref() {
-        anyhow::bail!("ECS drain poll returned a conflicting registry identity");
+        anyhow::bail!("ECS response returned a conflicting registry identity");
     }
     Ok(())
+}
+
+async fn refresh_checkpointed_ecs(
+    ecs: &aws_sdk_ecs::Client,
+    checkpoint: &DeleteCheckpoint,
+    context: &str,
+) -> Result<ServiceIdentityState> {
+    let response = ecs
+        .describe_services()
+        .cluster(&checkpoint.cluster_arn)
+        .services(&checkpoint.service_arn)
+        .send()
+        .await
+        .with_context(|| context.to_string())?;
+    let reasons = failure_reasons(&response);
+    let service = single_described_service(&response)?;
+    if let Some(service) = service {
+        validate_returned_service(checkpoint, service)?;
+    }
+    classify_service_identity(
+        true,
+        service.is_some(),
+        service.and_then(|service| service.status()),
+        &reasons,
+    )
+    .map_err(anyhow::Error::msg)
 }
 
 async fn delete_checkpointed_ecs(
@@ -798,36 +851,81 @@ async fn delete_checkpointed_ecs(
         return Ok(());
     }
 
-    let response = ecs.describe_services()
-        .cluster(&checkpoint.cluster_arn).services(&checkpoint.service_arn)
-        .send().await.context("failed to refresh ECS service before mutation")?;
+    let response = ecs
+        .describe_services()
+        .cluster(&checkpoint.cluster_arn)
+        .services(&checkpoint.service_arn)
+        .send()
+        .await
+        .context("failed to refresh ECS service before mutation")?;
     let reasons = failure_reasons(&response);
     let service = single_described_service(&response)?;
+    if let Some(service) = service {
+        validate_returned_service(checkpoint, service)?;
+    }
     let state = classify_service_identity(
         true,
         service.is_some(),
         service.and_then(|service| service.status()),
         &reasons,
-    ).map_err(anyhow::Error::msg)?;
+    )
+    .map_err(anyhow::Error::msg)?;
     if state == ServiceIdentityState::RetryGone {
         return Ok(());
     }
     let service = service.context("checkpointed ECS service disappeared ambiguously")?;
-    validate_returned_service(checkpoint, service)?;
     let delete_phase = ecs_delete_phase(service.status())?;
 
     if delete_phase == EcsDeletePhase::Delete {
-        match ecs.update_service().cluster(&checkpoint.cluster_arn)
-            .service(&checkpoint.service_arn).desired_count(0).send().await {
-            Ok(_) => println!("  ✓ Scaled to 0"),
-            Err(error) if error.code() == Some("ServiceNotFoundException") => {}
+        match ecs
+            .update_service()
+            .cluster(&checkpoint.cluster_arn)
+            .service(&checkpoint.service_arn)
+            .desired_count(0)
+            .send()
+            .await
+        {
+            Ok(_) => {
+                println!("  ✓ Scaled to 0");
+                // The service may disappear or be recreated between scale and
+                // delete. Re-describe the exact checkpointed ARN/incarnation
+                // immediately before issuing delete_service.
+                match refresh_checkpointed_ecs(
+                    ecs,
+                    checkpoint,
+                    "failed to revalidate ECS service before delete",
+                )
+                .await?
+                {
+                    ServiceIdentityState::RetryGone => {
+                        println!("  ✓ ECS service disappeared after scaling; skipping delete")
+                    }
+                    ServiceIdentityState::Live => {
+                        match ecs
+                            .delete_service()
+                            .cluster(&checkpoint.cluster_arn)
+                            .service(&checkpoint.service_arn)
+                            .force(true)
+                            .send()
+                            .await
+                        {
+                            Ok(_) => println!("  ✓ ECS service deleted"),
+                            Err(error) if error.code() == Some("ServiceNotFoundException") => {
+                                println!("  ✓ ECS service disappeared while deleting")
+                            }
+                            Err(error) => {
+                                return Err(error).context("failed to delete ECS service");
+                            }
+                        }
+                    }
+                }
+            }
+            Err(error) if error.code() == Some("ServiceNotFoundException") => {
+                // A successful scale is not a prerequisite for exact polling;
+                // never follow this response with delete_service.
+                println!("  ✓ ECS service disappeared while scaling; skipping delete")
+            }
             Err(error) => return Err(error).context("failed to scale ECS service to zero"),
-        }
-        match ecs.delete_service().cluster(&checkpoint.cluster_arn)
-            .service(&checkpoint.service_arn).force(true).send().await {
-            Ok(_) => println!("  ✓ ECS service deleted"),
-            Err(error) if error.code() == Some("ServiceNotFoundException") => {}
-            Err(error) => return Err(error).context("failed to delete ECS service"),
         }
     } else {
         println!("  ✓ ECS service is already draining; resuming delete cleanup");
@@ -843,6 +941,9 @@ async fn delete_checkpointed_ecs(
             Ok(response) => {
                 let reasons = failure_reasons(&response);
                 let service = single_described_service(&response)?;
+                if let Some(service) = service {
+                    validate_returned_service(checkpoint, service)?;
+                }
                 match classify_service_identity(
                     true,
                     service.is_some(),
@@ -850,12 +951,7 @@ async fn delete_checkpointed_ecs(
                     &reasons,
                 ) {
                     Ok(ServiceIdentityState::RetryGone) => true,
-                    Ok(ServiceIdentityState::Live) => {
-                        if let Some(service) = service {
-                            validate_returned_service(checkpoint, service)?;
-                        }
-                        false
-                    }
+                    Ok(ServiceIdentityState::Live) => false,
                     Err(error) => {
                         eprintln!("\n  ⚠ ambiguous DescribeServices response (retrying): {error}");
                         false
@@ -917,7 +1013,6 @@ async fn run_with_bucket(
     cluster: &str,
     namespace: &str,
     bucket: &str,
-    policy: DeletePolicy,
 ) -> Result<Vec<String>> {
     if resource != "oabservice" {
         anyhow::bail!("unknown resource type: {resource}. Use 'oabservice'");
@@ -927,8 +1022,9 @@ async fn run_with_bucket(
     println!("Deleting {name}...");
 
     match prepare_identity(
-        aws_config, &ecs, &s3, namespace, name, cluster, bucket, policy,
-    ).await? {
+        aws_config, &ecs, &s3, namespace, name, cluster, bucket,
+    )
+    .await? {
         PreparedIdentity::Exact(checkpoint, state) => {
             delete_checkpointed_ecs(&ecs, &checkpoint, state).await?;
             crate::ingress::delete_exact(
@@ -949,11 +1045,6 @@ async fn run_with_bucket(
                     "cleanup completed but failed to remove s3://{bucket}/{key}"
                 ))?;
             println!("  ✓ Delete checkpoint removed");
-        }
-        PreparedIdentity::LegacyOrphan => {
-            // CLI-only compatibility. Never delete Cloud Map without an ECS registry ARN.
-            crate::ingress::delete_api(aws_config, namespace, name).await?;
-            cleanup_s3(&s3, bucket, namespace, name).await?;
         }
     }
     println!("\n✓ {name} deleted");
@@ -981,6 +1072,7 @@ mod tests {
             requested_cluster: "cluster".to_string(),
             cluster_arn: "arn:aws:ecs:us-east-1:123456789012:cluster/cluster".to_string(),
             service_arn: "arn:aws:ecs:us-east-1:123456789012:service/cluster/oab-prod-bot".to_string(),
+            service_created_at: 1_700_000_000,
             registry_arn: Some(
                 "arn:aws:servicediscovery:us-east-1:123456789012:service/srv-123".to_string(),
             ),
@@ -994,7 +1086,7 @@ mod tests {
         let err = delete_services(
             &cfg,
             &[],
-            &DeleteOptions::new("cluster", "control-plane"),
+            &DeleteOptions::new("cluster").with_control_plane_bucket("control-plane"),
         )
         .await
         .unwrap_err();
@@ -1009,7 +1101,7 @@ mod tests {
         let err = delete_services(
             &cfg,
             &targets,
-            &DeleteOptions::new("", "control-plane"),
+            &DeleteOptions::new("").with_control_plane_bucket("control-plane"),
         )
         .await
         .unwrap_err();
@@ -1017,15 +1109,11 @@ mod tests {
         assert!(err.to_string().contains("cluster must not be empty"), "{err}");
     }
 
-    #[tokio::test]
-    async fn delete_services_rejects_blank_bucket_before_aws() {
-        let cfg = test_sdk_config();
-        let targets = [DeleteTarget::new("prod", "bot")];
-        let err = delete_services(&cfg, &targets, &DeleteOptions::new("cluster", "  "))
-            .await
-            .unwrap_err();
-        assert_eq!(err.kind, DeleteErrorKind::Validation);
-        assert!(err.to_string().contains("control_plane_bucket"), "{err}");
+    #[test]
+    fn delete_options_support_optional_bucket_override() {
+        let options = DeleteOptions::new("cluster").with_control_plane_bucket("control-plane");
+        assert_eq!(options.cluster, "cluster");
+        assert_eq!(options.control_plane_bucket.as_deref(), Some("control-plane"));
     }
 
     #[tokio::test]
@@ -1035,7 +1123,7 @@ mod tests {
         let err = delete_services(
             &cfg,
             &targets,
-            &DeleteOptions::new("cluster", "control-plane"),
+            &DeleteOptions::new("cluster").with_control_plane_bucket("control-plane"),
         )
         .await
         .unwrap_err();
@@ -1076,7 +1164,18 @@ mod tests {
             &["MISSING"]
         )
         .is_err());
+        assert!(classify_service_identity(
+            true,
+            false,
+            None,
+            &["MISSING", "MISSING"]
+        )
+        .is_err());
+        assert!(classify_service_identity(true, false, None, &[]).is_err());
         assert!(classify_service_identity(true, true, None, &[]).is_err());
+        assert!(validate_service_incarnation(1_700_000_000, Some(1_700_000_001)).is_err());
+        assert!(validate_service_incarnation(1_700_000_000, None).is_err());
+        assert!(validate_service_incarnation(1_700_000_000, Some(1_700_000_000)).is_ok());
         assert_eq!(
             classify_service_identity(true, true, Some("DRAINING"), &[]).unwrap(),
             ServiceIdentityState::Live
@@ -1188,6 +1287,20 @@ mod tests {
         invalid_dependency.registry_arn = Some("srv-not-an-arn".to_string());
         assert!(validate_checkpoint(
             &invalid_dependency,
+            "prod",
+            "bot",
+            "cluster",
+            "control-plane",
+            "aws",
+            "123456789012",
+            "us-east-1",
+        )
+        .is_err());
+
+        let mut invalid_incarnation = checkpoint.clone();
+        invalid_incarnation.service_created_at = 0;
+        assert!(validate_checkpoint(
+            &invalid_incarnation,
             "prod",
             "bot",
             "cluster",

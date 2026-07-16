@@ -5,6 +5,7 @@ use aws_sdk_ecs::types::{
     AssignPublicIp, AwsVpcConfiguration, CapacityProviderStrategyItem, ContainerDefinition,
     KeyValuePair, NetworkConfiguration, RuntimePlatform, Secret,
 };
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use std::fmt;
 use std::path::Path;
@@ -512,9 +513,74 @@ const INGRESS_TEARDOWN_CHECKPOINT_VERSION: u8 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct IngressTeardownCheckpoint {
     version: u8,
+    bucket: String,
     cluster: String,
     service_name: String,
+    service_arn: String,
+    service_created_at: i128,
     registry_arns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyServicePresence {
+    Absent,
+    Present,
+}
+
+fn classify_apply_service_response(
+    service_count: usize,
+    failure_reasons: &[&str],
+) -> Result<ApplyServicePresence> {
+    match (service_count, failure_reasons) {
+        (1, []) => Ok(ApplyServicePresence::Present),
+        (0, [reason]) if reason.eq_ignore_ascii_case("MISSING") => {
+            Ok(ApplyServicePresence::Absent)
+        }
+        (0, failures) if failures.is_empty() => {
+            anyhow::bail!("ECS returned no service and no MISSING failure for apply")
+        }
+        _ => anyhow::bail!(
+            "ECS returned an ambiguous apply response: {service_count} service(s), {} failure(s)",
+            failure_reasons.len()
+        ),
+    }
+}
+
+fn ingress_teardown_is_owned(previously_had_ingress: bool, checkpoint_present: bool) -> bool {
+    previously_had_ingress || checkpoint_present
+}
+
+fn validate_apply_service_identity(
+    service_arn: &str,
+    cluster_arn: &str,
+    expected_service_name: &str,
+) -> Result<()> {
+    let service_resource = service_arn
+        .split_once(":service/")
+        .and_then(|(_, resource)| resource.rsplit_once('/'))
+        .filter(|(_, name)| *name == expected_service_name)
+        .context("ECS apply response has a conflicting service ARN")?;
+    let service_parts: Vec<&str> = service_arn.splitn(6, ':').collect();
+    let cluster_parts: Vec<&str> = cluster_arn.splitn(6, ':').collect();
+    if service_parts.len() != 6
+        || cluster_parts.len() != 6
+        || service_parts[0] != "arn"
+        || cluster_parts[0] != "arn"
+        || service_parts[2] != "ecs"
+        || cluster_parts[2] != "ecs"
+        || service_parts[1..5] != cluster_parts[1..5]
+    {
+        anyhow::bail!("ECS apply response has an invalid cluster/service ARN boundary");
+    }
+    let cluster_resource = cluster_arn
+        .split_once(":cluster/")
+        .map(|(_, resource)| resource)
+        .filter(|resource| !resource.is_empty() && !resource.contains('/'))
+        .context("ECS apply response has an invalid cluster ARN")?;
+    if service_resource.0 != cluster_resource {
+        anyhow::bail!("ECS apply response service ARN targets another cluster");
+    }
+    Ok(())
 }
 
 fn ingress_teardown_checkpoint_key(namespace: &str, name: &str) -> String {
@@ -585,10 +651,94 @@ async fn remove_ingress_teardown_checkpoint(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ApplyServiceIdentity {
+    service_arn: String,
+    cluster_arn: String,
+    service_name: String,
+    created_at: i128,
+}
+
+fn resolve_apply_service_identity(
+    service: &aws_sdk_ecs::types::Service,
+    expected_service_name: &str,
+) -> Result<ApplyServiceIdentity> {
+    let service_arn = service
+        .service_arn()
+        .filter(|value| !value.trim().is_empty())
+        .context("ECS apply response missing service ARN")?
+        .to_string();
+    let cluster_arn = service
+        .cluster_arn()
+        .filter(|value| !value.trim().is_empty())
+        .context("ECS apply response missing cluster ARN")?
+        .to_string();
+    validate_apply_service_identity(&service_arn, &cluster_arn, expected_service_name)?;
+    let service_name = service
+        .service_name()
+        .filter(|value| !value.trim().is_empty())
+        .context("ECS apply response missing service name")?;
+    if service_name != expected_service_name {
+        anyhow::bail!("ECS apply response has a conflicting service name");
+    }
+    let created_at = service
+        .created_at()
+        .map(|value| value.as_nanos())
+        .context("ECS apply response missing createdAt incarnation")?;
+    Ok(ApplyServiceIdentity {
+        service_arn,
+        cluster_arn,
+        service_name: expected_service_name.to_string(),
+        created_at,
+    })
+}
+
+fn validate_expected_apply_service_identity(
+    expected: &ApplyServiceIdentity,
+    service: &aws_sdk_ecs::types::Service,
+) -> Result<()> {
+    let actual = resolve_apply_service_identity(service, &expected.service_name)?;
+    if actual != *expected {
+        anyhow::bail!(
+            "ECS apply response belongs to a recreated same-name service or different cluster"
+        );
+    }
+    Ok(())
+}
+
+async fn revalidate_apply_service_identity(
+    ecs: &aws_sdk_ecs::Client,
+    expected: &ApplyServiceIdentity,
+) -> Result<()> {
+    let response = ecs
+        .describe_services()
+        .cluster(&expected.cluster_arn)
+        .services(&expected.service_arn)
+        .send()
+        .await
+        .context("failed to revalidate ECS service identity before update")?;
+    if !response.failures().is_empty() {
+        anyhow::bail!(
+            "ECS returned failure(s) while revalidating service identity before update: {:?}",
+            response.failures()
+        );
+    }
+    let service = match response.services() {
+        [service] => service,
+        [] => anyhow::bail!(
+            "ECS service disappeared while revalidating identity before update"
+        ),
+        services => anyhow::bail!(
+            "ECS returned {} services while revalidating one update target",
+            services.len()
+        ),
+    };
+    validate_expected_apply_service_identity(expected, service)
+}
+
 async fn wait_for_registry_detach(
     ecs: &aws_sdk_ecs::Client,
-    cluster: &str,
-    service_name: &str,
+    expected: &ApplyServiceIdentity,
 ) -> Result<()> {
     const ATTEMPTS: u32 = 12;
     const INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
@@ -596,8 +746,8 @@ async fn wait_for_registry_detach(
     for attempt in 0..ATTEMPTS {
         let response = ecs
             .describe_services()
-            .cluster(cluster)
-            .services(service_name)
+            .cluster(&expected.cluster_arn)
+            .services(&expected.service_arn)
             .send()
             .await
             .context("failed to verify ECS service registry detach")?;
@@ -609,14 +759,13 @@ async fn wait_for_registry_detach(
         }
         let service = match response.services() {
             [service] => service,
-            [] => anyhow::bail!(
-                "ECS service disappeared while verifying registry detach"
-            ),
+            [] => anyhow::bail!("ECS service disappeared while verifying registry detach"),
             services => anyhow::bail!(
                 "ECS returned {} services for one registry-detach target",
                 services.len()
             ),
         };
+        validate_expected_apply_service_identity(expected, service)?;
         if service.service_registries().is_empty() {
             return Ok(());
         }
@@ -626,9 +775,11 @@ async fn wait_for_registry_detach(
     }
 
     anyhow::bail!(
-        "ECS service {service_name} still reports service registries after waiting; Cloud Map cleanup was not started"
+        "ECS service {} still reports service registries after waiting; Cloud Map cleanup was not started",
+        expected.service_name
     )
 }
+
 async fn apply_ecs(
     ecs: &aws_sdk_ecs::Client,
     s3: &aws_sdk_s3::Client,
@@ -659,7 +810,7 @@ async fn apply_ecs(
         "manifests/{}/{}.yaml",
         m.metadata.namespace, m.metadata.name
     );
-    let current_gen = match s3
+    let (current_gen, previously_had_ingress) = match s3
         .get_object()
         .bucket(bucket)
         .key(&manifest_key)
@@ -669,9 +820,17 @@ async fn apply_ecs(
         Ok(resp) => {
             let bytes = resp.body.collect().await?.into_bytes();
             let existing: OABServiceManifest = serde_yaml::from_slice(&bytes)?;
-            existing.metadata.generation
+            (
+                existing.metadata.generation,
+                existing.spec.ingress.is_some(),
+            )
         }
-        Err(_) => 0,
+        Err(error) if matches!(error.code(), Some("NoSuchKey" | "NotFound")) => (0, false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to read existing manifest s3://{bucket}/{manifest_key}")
+            });
+        }
     };
     let generation = current_gen + 1;
 
@@ -683,19 +842,34 @@ async fn apply_ecs(
         .send()
         .await
         .context("failed to describe ECS service")?;
-    if !describe_resp.failures().is_empty() {
-        anyhow::bail!(
-            "ECS returned failure(s) while resolving apply identity: {:?}",
-            describe_resp.failures()
-        );
-    }
-    let existing_service = match describe_resp.services() {
-        [] => None,
-        [service] => Some(service),
-        services => anyhow::bail!(
-            "ECS returned {} services for one apply target",
-            services.len()
-        ),
+    let failure_reasons: Vec<&str> = describe_resp
+        .failures()
+        .iter()
+        .map(|failure| failure.reason().unwrap_or("UNKNOWN"))
+        .collect();
+    let existing_service = match classify_apply_service_response(
+        describe_resp.services().len(),
+        &failure_reasons,
+    )? {
+        ApplyServicePresence::Absent => None,
+        ApplyServicePresence::Present => {
+            let service = &describe_resp.services()[0];
+            validate_apply_service_identity(
+                service
+                    .service_arn()
+                    .filter(|value| !value.trim().is_empty())
+                    .context("ECS apply response missing service ARN")?,
+                service
+                    .cluster_arn()
+                    .filter(|value| !value.trim().is_empty())
+                    .context("ECS apply response missing cluster ARN")?,
+                &service_name,
+            )?;
+            if !matches!(service.status(), Some("ACTIVE" | "DRAINING")) {
+                anyhow::bail!("ECS apply response has unexpected service status");
+            }
+            Some(service)
+        }
     };
     let mut existing_registry_arns = Vec::new();
     if let Some(service) = existing_service {
@@ -712,6 +886,10 @@ async fn apply_ecs(
     existing_registry_arns.sort();
     existing_registry_arns.dedup();
     let has_registries = !existing_registry_arns.is_empty();
+    let service_active = existing_service.is_some();
+    let existing_identity = existing_service
+        .map(|service| resolve_apply_service_identity(service, &service_name))
+        .transpose()?;
 
     let stored_teardown = load_ingress_teardown_checkpoint(
         s3,
@@ -725,23 +903,43 @@ async fn apply_ecs(
             "a previous ingress teardown is still pending; apply the ingress-free manifest again before re-enabling ingress"
         );
     }
-    let teardown_checkpoint = if m.spec.ingress.is_none() {
+    let teardown_checkpoint = if m.spec.ingress.is_none()
+        && ingress_teardown_is_owned(previously_had_ingress, stored_teardown.is_some())
+    {
         match stored_teardown {
             Some(checkpoint) => {
                 if checkpoint.version != INGRESS_TEARDOWN_CHECKPOINT_VERSION
+                    || checkpoint.bucket != bucket
                     || checkpoint.cluster != cluster
                     || checkpoint.service_name != service_name
+                    || checkpoint.service_arn.trim().is_empty()
+                    || checkpoint.service_created_at <= 0
                     || checkpoint.registry_arns.is_empty()
                 {
                     anyhow::bail!("ingress teardown checkpoint does not match this apply target");
                 }
+                if let Some(identity) = &existing_identity {
+                    if identity.service_arn != checkpoint.service_arn
+                        || identity.created_at != checkpoint.service_created_at
+                    {
+                        anyhow::bail!(
+                            "ingress teardown checkpoint belongs to a different ECS service incarnation"
+                        );
+                    }
+                }
                 Some(checkpoint)
             }
-            None if has_registries => {
+            None if previously_had_ingress && has_registries => {
+                let identity = existing_identity
+                    .clone()
+                    .context("cannot checkpoint ingress teardown without an identified ECS service")?;
                 let checkpoint = IngressTeardownCheckpoint {
                     version: INGRESS_TEARDOWN_CHECKPOINT_VERSION,
+                    bucket: bucket.to_string(),
                     cluster: cluster.to_string(),
                     service_name: service_name.clone(),
+                    service_arn: identity.service_arn,
+                    service_created_at: identity.created_at,
                     registry_arns: existing_registry_arns.clone(),
                 };
                 save_ingress_teardown_checkpoint(
@@ -757,6 +955,29 @@ async fn apply_ecs(
             None => None,
         }
     } else {
+        None
+    };
+
+    let expected_identity = if service_active {
+        let identity = existing_identity
+            .clone()
+            .context("cannot update ECS service without an exact identity")?;
+        if let Some(checkpoint) = &teardown_checkpoint {
+            if identity.service_arn != checkpoint.service_arn
+                || identity.created_at != checkpoint.service_created_at
+            {
+                anyhow::bail!(
+                    "ingress teardown checkpoint belongs to a different ECS service incarnation"
+                );
+            }
+        }
+        Some(identity)
+    } else {
+        if teardown_checkpoint.is_some() {
+            anyhow::bail!(
+                "cannot detach ingress from an absent ECS service; exact service identity is unavailable"
+            );
+        }
         None
     };
 
@@ -1024,10 +1245,6 @@ async fn apply_ecs(
     // Check if service exists. Reuses `describe_resp` captured above (before
     // the ingress-removal teardown) — `ensure_cloud_map` above doesn't touch
     // the ECS service, so its ACTIVE status can't have changed since then.
-    let service_active = describe_resp
-        .services()
-        .first()
-        .is_some_and(|service| service.status() == Some("ACTIVE"));
     let action;
 
     if service_active {
@@ -1049,12 +1266,20 @@ async fn apply_ecs(
         // "clear"; only an explicit empty list detaches it. Without this the
         // service keeps pointing at the Cloud Map service that the
         // ingress-removal teardown (above) just deleted.
-        let needs_detach = cloud_map.is_none() && has_registries;
+        let needs_detach = teardown_checkpoint.is_some() && cloud_map.is_none() && has_registries;
 
+        let update_cluster = expected_identity
+            .as_ref()
+            .map(|identity| identity.cluster_arn.as_str())
+            .unwrap_or(cluster);
+        let update_service = expected_identity
+            .as_ref()
+            .map(|identity| identity.service_arn.as_str())
+            .unwrap_or(service_name.as_str());
         let mut update_req = ecs
             .update_service()
-            .cluster(cluster)
-            .service(&service_name)
+            .cluster(update_cluster)
+            .service(update_service)
             .task_definition(&task_def_arn)
             .enable_execute_command(true)
             .network_configuration(network_config);
@@ -1074,6 +1299,11 @@ async fn apply_ecs(
             update_req = update_req.set_service_registries(Some(Vec::new()));
         }
 
+        if let Some(expected) = &expected_identity {
+            // Revalidate immediately before the mutation. In particular, a
+            // recreated same-name service must never receive this update.
+            revalidate_apply_service_identity(ecs, expected).await?;
+        }
         update_req
             .send()
             .await
@@ -1188,7 +1418,10 @@ async fn apply_ecs(
     }
 
     if let Some(checkpoint) = &teardown_checkpoint {
-        wait_for_registry_detach(&ecs, cluster, &service_name).await?;
+        let expected = expected_identity
+            .as_ref()
+            .context("missing exact identity for ingress detach wait")?;
+        wait_for_registry_detach(&ecs, expected).await?;
         for registry_arn in &checkpoint.registry_arns {
             crate::ingress::delete_cloud_map_exact(config, registry_arn, &service_name)
                 .await
@@ -1285,10 +1518,25 @@ async fn wait_for_stable(ecs: &aws_sdk_ecs::Client, cluster: &str, service: &str
             .await?;
         let elapsed = (i + 1) * 5;
 
-        let Some(svc) = resp.services().first() else {
-            eprintln!("    [{elapsed}s] service not found in describe-services response yet");
-            continue;
+        if !resp.failures().is_empty() {
+            anyhow::bail!("ECS returned failure(s) while waiting for service stability: {:?}", resp.failures());
+        }
+        let svc = match resp.services() {
+            [service] => service,
+            [] => {
+                eprintln!("    [{elapsed}s] service not found in describe-services response yet");
+                continue;
+            }
+            services => anyhow::bail!(
+                "ECS returned {} services while waiting for one apply target",
+                services.len()
+            ),
         };
+        validate_apply_service_identity(
+            svc.service_arn().context("ECS stability response missing service ARN")?,
+            svc.cluster_arn().context("ECS stability response missing cluster ARN")?,
+            service,
+        )?;
 
         let running = svc.running_count() as usize;
         let desired = svc.desired_count() as usize;
@@ -1577,5 +1825,55 @@ spec:
         let bootstrap: Option<&str> = None;
         let result = resolve_task_role_arn(&manifest, bootstrap);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn apply_accepts_only_single_missing_failure_as_first_absence() {
+        assert_eq!(
+            classify_apply_service_response(0, &["MISSING"]).unwrap(),
+            ApplyServicePresence::Absent
+        );
+        assert!(classify_apply_service_response(0, &[]).is_err());
+        assert!(classify_apply_service_response(0, &["MISSING", "ACCESS_DENIED"]).is_err());
+        assert!(classify_apply_service_response(1, &["MISSING"]).is_err());
+    }
+
+    #[test]
+    fn apply_requires_one_service_for_present_identity() {
+        assert_eq!(
+            classify_apply_service_response(1, &[]).unwrap(),
+            ApplyServicePresence::Present
+        );
+        assert!(classify_apply_service_response(2, &[]).is_err());
+        assert!(validate_apply_service_identity(
+            "arn:aws:ecs:us-east-1:123456789012:service/cluster/oab-prod-bot",
+            "arn:aws:ecs:us-east-1:123456789012:cluster/cluster",
+            "oab-prod-bot",
+        )
+        .is_ok());
+        assert!(validate_apply_service_identity(
+            "arn:aws:ecs:us-east-1:123456789012:service/cluster/oab-prod-other",
+            "arn:aws:ecs:us-east-1:123456789012:cluster/cluster",
+            "oab-prod-bot",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn apply_teardown_requires_manifest_ownership_or_checkpoint() {
+        assert!(ingress_teardown_is_owned(true, false));
+        assert!(ingress_teardown_is_owned(false, true));
+        assert!(!ingress_teardown_is_owned(false, false));
+    }
+
+    #[tokio::test]
+    async fn progress_gate_suppresses_nested_progress() {
+        assert!(progress_enabled());
+        PROGRESS_ENABLED
+            .scope(false, async {
+                assert!(!progress_enabled());
+            })
+            .await;
+        assert!(progress_enabled());
     }
 }

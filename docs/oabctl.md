@@ -367,26 +367,26 @@ must still be registered manually in the LINE Developers console.
 > **Teardown:** `oabctl delete oabservice <name>` (or `oabctl delete -f <manifest>`,
 > using the same file `apply -f` deployed it from) first captures the exact ECS
 > cluster/service ARNs, ECS registry ARN, matching HTTP API ID, configured
-> control-plane bucket, and caller partition/account/region in
-> `delete-checkpoints/<namespace>/<name>.json`. The checkpoint is written before
-> ECS mutation and removed only after all dependent and S3 cleanup succeeds, so
-> rerunning the same command safely resumes a partial delete. ECS HTTP-200
-> failures, ambiguous drain responses, and a missing service fail closed unless
-> a matching checkpoint already authorizes that exact retry.
+> control-plane bucket, caller partition/account/region, and ECS service
+> incarnation (`createdAt`) in `delete-checkpoints/<namespace>/<name>.json`. The
+> checkpoint is written before ECS mutation and removed only after all
+> dependent and S3 cleanup succeeds, so rerunning the same command safely
+> resumes a partial delete. ECS HTTP-200 failures, ambiguous drain responses,
+> empty service responses, and a missing service fail closed; a matching checkpoint
+> authorizes retry only when ECS explicitly reports exactly one `MISSING`
+> failure with zero services, or an `INACTIVE` response from the original
+> service incarnation.
 >
 > API cleanup never selects the first same-named API: duplicate names fail
 > closed, and the sole candidate is checkpointed only when its integration URI
 > equals the ECS registry ARN. Cloud Map is deleted only by the service ID
-> parsed from a validated Cloud Map service ARN. Exact-ID NotFound is
-> treated as already complete; other cleanup errors remain fatal so the
-> checkpoint survives. For old CLI-created orphans that predate checkpoints,
-> the CLI has an isolated compatibility path: it may remove a uniquely named
-> API and S3 data, but refuses duplicate API names and never guesses a Cloud Map
-> service by name. This compatibility behavior is not available through the
-> programmatic `delete_services` API.
->
-> If you edit a manifest to remove `spec.ingress` while keeping the bot, `apply`
-> first stores every exact ECS registry ARN in
+> parsed from a structurally and boundary-validated Cloud Map service ARN.
+> Exact-ID NotFound is idempotent; other cleanup errors retain the checkpoint.
+> There is no name-only API, Cloud Map, or S3 orphan cleanup path. If you edit
+> a manifest to remove `spec.ingress` while keeping the bot, `apply` first
+> stores every exact ECS registry ARN only when the previously stored OAB
+> manifest owned ingress (or resumes an already-valid checkpoint); an arbitrary
+> attached registry is never enough.
 > `ingress-teardown-checkpoints/<namespace>/<name>.json`, clears only API wiring
 > bound to those ARNs, detaches all registries from ECS, waits until the detach
 > is observable, and only then deletes each exact Cloud Map service. It keeps

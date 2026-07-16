@@ -101,7 +101,8 @@ async fn reconcile(
     delete_services(
         aws,
         &[DeleteTarget::new("prod", "bot")],
-        &DeleteOptions::new("production-cluster", "my-control-plane-bucket"),
+        &DeleteOptions::new("production-cluster")
+            .with_control_plane_bucket("my-control-plane-bucket"),
     )
     .await?;
     Ok(())
@@ -116,20 +117,21 @@ target cluster exists and is `ACTIVE` before mutation, so the caller identity
 requires `ecs:DescribeClusters`. This ECS action does not support resource-level
 permissions; its IAM statement must use `Resource: "*"`.
 
-The library never reads `~/.oabctl/config.toml`. Apply can explicitly override
-its bucket with `ApplyOptions::with_control_plane_bucket(...)`; otherwise it
-uses `OAB_CONTROL_PLANE_BUCKET` and then the caller account. Programmatic delete
-is intentionally stricter and requires the exact bucket in
-`DeleteOptions::new(cluster, bucket)` before any AWS call. Before deleting ECS,
-it stores `delete-checkpoints/<namespace>/<name>.json` in that bucket with the
-caller partition/account/region, canonical ECS cluster/service ARNs, registry ARN, and
-matching API ID. Duplicate API names fail closed; the sole same-name API is
-checkpointed only when its integration URI equals the registry ARN. Missing or
-ambiguous ECS identity fails closed without this record; retries use only its
-immutable IDs and delete the checkpoint last.
-The CLI resolves its configured bucket privately. Its compatibility cleanup for
-pre-checkpoint orphans is isolated from `delete_services`, refuses duplicate API
-names, and never guesses a Cloud Map service by name.
+The library never reads `~/.oabctl/config.toml`. Apply and delete resolve the
+control-plane bucket through the shared chain: an explicit
+`with_control_plane_bucket(...)` override, then `OAB_CONTROL_PLANE_BUCKET`, then
+`oab-control-plane-{account}` from the caller identity. Before deleting ECS,
+`delete_services` stores the resolved bucket, caller partition/account/region,
+canonical ECS cluster/service ARNs, the service `createdAt` incarnation, and
+exact ingress IDs in `delete-checkpoints/<namespace>/<name>.json`. The checkpoint
+is written before ECS mutation and removed last. Initial DescribeServices
+responses must identify exactly one expected live service; missing, empty-success,
+ambiguous, or mixed-failure responses fail closed. Retries use only checkpointed
+IDs after ECS explicitly reports exactly one `MISSING` failure with zero services
+or a matching original `INACTIVE` incarnation. Duplicate APIs fail closed,
+and a sole same-name API is checkpointed only when an integration URI exactly
+matches the ECS registry ARN.
+There is no name-only API, Cloud Map, or S3 orphan cleanup fallback.
 
 For `aws-sm://<secret-id>#<json-key>`, a non-ARN `<secret-id>` requires the
 caller to have `secretsmanager:DescribeSecret`; full-ARN shorthand does not

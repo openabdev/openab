@@ -42,17 +42,18 @@
 //! an ARN require the apply caller to have `secretsmanager:DescribeSecret`, so
 //! oabctl can resolve the name to the full ARN required by ECS.
 //!
-//! Programmatic apply and delete never read `~/.oabctl/config.toml`.
-//! Apply may use [`ApplyOptions::with_control_plane_bucket`] or its documented
-//! resolution chain. Delete is intentionally stricter: construct
-//! [`DeleteOptions`] with both the cluster and exact control-plane bucket so a
-//! destructive request cannot drift to another account-derived bucket.
+//! Programmatic apply and delete never read `~/.oabctl/config.toml`. Use
+//! [`ApplyOptions::with_control_plane_bucket`] or
+//! [`DeleteOptions::with_control_plane_bucket`] for an explicit bucket;
+//! otherwise both use the shared `OAB_CONTROL_PLANE_BUCKET` then caller-account
+//! resolution chain.
 //!
 //! [`delete_services`] tears down by `namespace`+`name` ([`DeleteTarget`]).
-//! Before mutating ECS it durably records the caller partition/account/region, bucket,
-//! canonical cluster/service ARNs, and exact ingress IDs in S3. Missing or
-//! ambiguous ECS identity fails closed unless that matching checkpoint already
-//! exists; retries use only checkpointed IDs and remove the checkpoint last.
+//! Before ECS mutation it durably records the resolved bucket, caller
+//! partition/account/region, canonical cluster/service ARNs, the ECS service
+//! `createdAt` incarnation, and exact ingress IDs in S3. Initial identity
+//! ambiguity fails closed; retries use only checkpointed IDs and remove the
+//! checkpoint last. There is no name-only orphan cleanup fallback.
 
 pub mod apply;
 mod bootstrap;

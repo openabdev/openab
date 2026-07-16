@@ -398,14 +398,15 @@ async fn delete_cloud_map_by_arn(
     config: &aws_config::SdkConfig,
     registry_arn: &str,
     service_name: &str,
-    expected_boundary: Option<(&str, &str, &str)>,
+    expected_boundary: (&str, &str, &str),
 ) -> Result<()> {
-    let service_id = match expected_boundary {
-        Some((partition, account, region)) => {
-            cloud_map_service_id_for_boundary(registry_arn, partition, account, region)
-        }
-        None => cloud_map_service_id_from_arn(registry_arn),
-    }
+    let (partition, account, region) = expected_boundary;
+    let service_id = cloud_map_service_id_for_boundary(
+        registry_arn,
+        partition,
+        account,
+        region,
+    )
     .context("Cloud Map service ARN is outside the exact delete boundary")?;
     let discovery = aws_sdk_servicediscovery::Client::new(config);
     let mut last_error = None;
@@ -432,8 +433,39 @@ pub(crate) async fn delete_cloud_map_exact(
     registry_arn: &str,
     service_name: &str,
 ) -> Result<()> {
-    delete_cloud_map_by_arn(config, registry_arn, service_name, None).await
+    let identity = aws_sdk_sts::Client::new(config)
+        .get_caller_identity()
+        .send()
+        .await
+        .context("failed to identify Cloud Map delete caller")?;
+    let account = identity
+        .account()
+        .context("STS response missing caller account")?;
+    let caller_arn = identity.arn().context("STS response missing caller ARN")?;
+    let mut arn_parts = caller_arn.splitn(3, ':');
+    if arn_parts.next() != Some("arn") {
+        anyhow::bail!("STS returned an invalid caller ARN");
+    }
+    let partition = arn_parts
+        .next()
+        .filter(|value| !value.is_empty())
+        .context("STS caller ARN is missing its partition")?;
+    let region = config
+        .region()
+        .map(|region| region.as_ref().to_string())
+        .context("AWS region must be resolved before Cloud Map delete")?;
+    delete_cloud_map_by_arn(
+        config,
+        registry_arn,
+        service_name,
+        (partition, account, &region),
+    )
+    .await
 }
+fn integration_uri_matches(actual: Option<&str>, expected: &str) -> bool {
+    actual == Some(expected)
+}
+
 /// Resolve a same-name API only when the name identifies exactly one resource
 /// and that API has an integration URI equal to the exact ECS registry ARN.
 /// Duplicate names are rejected before inspecting integrations, even if only
@@ -465,7 +497,7 @@ pub(crate) async fn resolve_api_id_for_registry(
         matched |= response
             .items()
             .iter()
-            .any(|integration| integration.integration_uri() == Some(registry_arn));
+            .any(|integration| integration_uri_matches(integration.integration_uri(), registry_arn));
         next = response.next_token().map(str::to_owned);
         if next.is_none() {
             break;
@@ -501,23 +533,9 @@ pub(crate) async fn delete_exact(
             config,
             registry_arn,
             &format!("oab-{namespace}-{name}"),
-            Some((partition, account, region)),
+            (partition, account, region),
         )
         .await?;
-    }
-    Ok(())
-}
-
-/// CLI-only legacy orphan cleanup by name. Duplicate names fail closed.
-pub async fn delete_api(config: &aws_config::SdkConfig, namespace: &str, name: &str) -> Result<()> {
-    let api = aws_sdk_apigatewayv2::Client::new(config);
-    let name_str = api_name(namespace, name);
-    if let Some((api_id, _)) = find_api(&api, &name_str).await? {
-        match api.delete_api().api_id(&api_id).send().await {
-            Ok(_) => eprintln!("  ✓ Deleted HTTP API: {name_str}"),
-            Err(error) if error.code() == Some("NotFoundException") => {}
-            Err(error) => return Err(error).with_context(|| format!("failed to delete HTTP API {api_id}")),
-        }
     }
     Ok(())
 }
@@ -1348,6 +1366,34 @@ mod tests {
                 .unwrap()
                 .0,
             "api-a"
+        );
+    }
+
+    #[test]
+    fn sole_api_requires_exact_registry_integration_uri() {
+        let registry = "arn:aws:servicediscovery:us-east-1:123456789012:service/srv-1";
+        assert!(integration_uri_matches(Some(registry), registry));
+        assert!(!integration_uri_matches(
+            Some("arn:aws:servicediscovery:us-east-1:123456789012:service/srv-other"),
+            registry
+        ));
+        assert!(!integration_uri_matches(None, registry));
+    }
+
+    #[test]
+    fn cloud_map_arn_requires_exact_boundary() {
+        let arn = "arn:aws:servicediscovery:us-east-1:123456789012:service/srv-1";
+        assert_eq!(
+            cloud_map_service_id_for_boundary(arn, "aws", "123456789012", "us-east-1"),
+            Some("srv-1".to_string())
+        );
+        assert_eq!(
+            cloud_map_service_id_for_boundary(arn, "aws-cn", "123456789012", "us-east-1"),
+            None
+        );
+        assert_eq!(
+            cloud_map_service_id_for_boundary(arn, "aws", "999999999999", "us-east-1"),
+            None
         );
     }
 }
