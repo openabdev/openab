@@ -50,12 +50,13 @@ jobs:
 
             // Maintainer policy: an open issue with no linked PR after
             // STALE_DAYS signals insufficient priority — close it with a
-            // comment. Reopening is a durable exemption.
+            // comment directing any follow-up to a new, referencing issue.
+            // Reopening remains a defensive durable exemption.
             const CLOSE_COMMENT = [
               MARKER,
               `This issue has been open for more than ${STALE_DAYS} days with no linked pull request, so it is being closed as not planned.`,
               '',
-              'If this is still needed, feel free to reopen it — reopened issues are exempt from this automation — or file a new issue with updated context. A linked PR is the strongest signal that the work matters.',
+              'If this is still needed, please open a new issue with updated context and reference this closed issue instead of reopening it. A linked PR is the strongest signal that the work matters.',
             ].join('\n');
 
             const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
