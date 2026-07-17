@@ -66,3 +66,31 @@ kubectl rollout restart deployment/openab-claude
 ```
 
 > **Note:** `claude setup-token` is a different command — it generates a long-lived token for CI/scripts and prints it without saving locally. For container-based deployments, `claude auth login` is the correct approach as it persists credentials to the filesystem.
+
+## Troubleshooting
+
+### `Login failed: Request failed with status code 400` at "Paste code here if prompted"
+
+The `Paste code here if prompted >` prompt is Claude Code's manual OAuth flow — the
+claude-agent-acp adapter delegates authentication to the underlying `claude` binary,
+so the 400 comes from the token exchange with Anthropic's OAuth server, not from the
+ACP adapter or OpenAB.
+
+Check these in order:
+
+1. **Stale or partial code (most common).** The auth code is single-use and
+   short-lived. Get a fresh code and paste the **entire** string, including
+   everything after the `#` (the format is `code#state`).
+2. **Old Claude Code version.** Claude Code v2.1.105–v2.1.107 had a bracketed-paste
+   regression that truncated the pasted code, causing the token exchange to fail
+   with 400. Fixed in v2.1.108. Upgrade inside the container:
+   ```bash
+   npm install -g @anthropic-ai/claude-code@latest @agentclientprotocol/claude-agent-acp@latest
+   ```
+   Or use a newer image tag (see [Image Tag](#image-tag)).
+3. **Anthropic OAuth outage.** Waves of OAuth 400/500 errors have been server-side
+   incidents (see [anthropics/claude-code#10719](https://github.com/anthropics/claude-code/issues/10719)).
+   Check [status.claude.com](https://status.claude.com) before debugging further.
+
+Always authenticate interactively via `kubectl exec` (as shown above) rather than
+through the ACP stdio session, then restart the pod to load the new credentials.
