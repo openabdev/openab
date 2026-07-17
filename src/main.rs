@@ -419,7 +419,7 @@ async fn main() -> anyhow::Result<()> {
         let allow_all_users = env_bool("GATEWAY_ALLOW_ALL_USERS", false);
         let allowed_users = env_set("GATEWAY_ALLOWED_USERS");
         let mut reg = PlatformTrustConfigs::new();
-        for platform in ["telegram", "line", "feishu", "wecom", "googlechat", "teams"] {
+        for platform in ["telegram", "line", "feishu", "wecom", "googlechat", "teams", "acp"] {
             reg.insert(
                 platform,
                 TrustConfig::new(
@@ -910,7 +910,14 @@ async fn main() -> anyhow::Result<()> {
     let (_unified_handle, shared_unified_adapter) = {
         use openab_core::gateway::{process_gateway_event, GatewayEventContext};
 
-        if unified_platform_enabled || cfg.telegram.is_some() {
+        // The ACP endpoint (mounted below) needs this embedded HTTP server too —
+        // start it even when only non-webhook platforms (e.g. Discord, which the
+        // core connects to directly) are configured.
+        let acp_enabled = cfg!(feature = "acp")
+            && std::env::var("OPENAB_ACP_ENABLED")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false);
+        if unified_platform_enabled || cfg.telegram.is_some() || acp_enabled {
             let listen_addr =
                 std::env::var("GATEWAY_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
 
@@ -1110,6 +1117,20 @@ async fn main() -> anyhow::Result<()> {
                 app = app.route(
                     &gw_state.googlechat_webhook_path,
                     axum::routing::post(openab_gateway::adapters::googlechat::webhook),
+                );
+            }
+
+            // ACP server endpoint — mount on the embedded gateway so `openab run`
+            // (not just the standalone gateway binary) serves ACP over WebSocket.
+            #[cfg(feature = "acp")]
+            if std::env::var("OPENAB_ACP_ENABLED")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false)
+            {
+                info!("unified: ACP server endpoint enabled at /acp");
+                app = app.route(
+                    "/acp",
+                    axum::routing::get(openab_gateway::adapters::acp_server::ws_upgrade),
                 );
             }
 

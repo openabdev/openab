@@ -25,9 +25,28 @@ third-party ACP clients (Zed, JetBrains, …) interoperate — no custom method 
 
 ## 2. Decision — Phase 1 primitive surface (ACP-conformant)
 
-Transport: `GET /acp`, feature-gated `acp` + runtime `OPENAB_ACP_ENABLED`. Token auth
-on the WS upgrade via timing-safe compare (`subtle::ConstantTimeEq`,
-`OPENAB_ACP_AUTH_KEY`). JSON-RPC 2.0; non-`"2.0"` rejected with `-32600`.
+Transport: `GET /acp`, feature-gated `acp` + runtime `OPENAB_ACP_ENABLED`. Mounted on
+**both** the standalone `openab-gateway` binary (`serve()`) **and** the embedded
+gateway of `openab run` (the unified binary) — so fleet deployments that run
+`openab run` (not the standalone gateway) serve ACP too. The embedded HTTP server
+starts whenever `OPENAB_ACP_ENABLED` is set (or any platform / `[gateway]` is
+configured) — so an ACP-only deployment, or one whose only platform is Discord (which
+the core connects to directly, without the webhook server), still binds the listener.
+ACP replies are routed back via the unified adapter's `dispatch_reply`
+(`platform == "acp"`).
+
+**Two independent auth layers:**
+
+1. **Transport** — token on the WS upgrade, timing-safe compare (`OPENAB_ACP_AUTH_KEY`;
+   unset ⇒ unauthenticated).
+2. **Identity** — ACP events carry a fixed synthetic sender id `acp_client` and pass
+   through the gateway trust registry (the `acp` platform is seeded there alongside
+   telegram/line/…). Admit the sender with `GATEWAY_ALLOW_ALL_USERS=true` or
+   `GATEWAY_ALLOWED_USERS=acp_client`; otherwise every prompt is denied with a
+   "request-access" echo. (These must be **process** env on the broker, not
+   `[agent].env`.)
+
+JSON-RPC 2.0; non-`"2.0"` rejected with `-32600`.
 
 ### Client → Agent (requests)
 

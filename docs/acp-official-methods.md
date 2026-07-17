@@ -47,7 +47,7 @@ Directions use the ACP roles: the **Agent** answers prompts (here, OpenAB); the
 | Method | Direction | Purpose | OpenAB Phase 1 |
 |---|---|---|---|
 | `session/cancel` | Client → Agent | Cancel in-flight work (one-way, no response) | ✅ conformant (notification; prompt ends `stopReason:"cancelled"`) |
-| `session/update` | Agent → Client | Stream session events | ✅ `agent_message_chunk` (text). Other variants (`tool_call`, `tool_call_update`, `plan`, …) are Phase 2 |
+| `session/update` | Agent → Client | Stream session events | ✅ `agent_message_chunk` (text). Other variants (`agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, `available_commands_update`, `usage_update`, …) are Phase 2 / not forwarded |
 | `$/cancel_request` | Bidirectional | Cancel an in-flight JSON-RPC request | ⛔ |
 
 ## Client methods (Agent → Client, request/response)
@@ -80,8 +80,13 @@ The chat subset is **wire-conformant** with ACP Schema v1.19.0:
   `request_permission`, fs/terminal, session admin (`list`/`delete`/config/mode)** —
   deferred to later phases per the roadmap.
 
-### To verify against a live client
+### Live verification status
 
-- Field-level exactness of `agentCapabilities` / `clientCapabilities` sub-objects and
-  the `ContentBlock` variants beyond `text`, by connecting a real ACP client (e.g.
-  Zed) and diffing the `initialize` + `session/prompt` exchange against the schema.
+- **Verified end-to-end (2026-07-17)** — the chat subset (`initialize` → `session/new`
+  / `session/resume` → `session/prompt` → streamed `session/update` `agent_message_chunk`
+  → `{stopReason}`, plus `session/cancel`) drives a real backend (cursor-agent) and
+  streams replies to a WebSocket client (a Chrome side-panel extension + a raw
+  `ws` client).
+- **Still unverified** — field-level exactness of `agentCapabilities` /
+  `clientCapabilities` sub-objects against a *third-party* ACP client (e.g. Zed), and
+  `ContentBlock` variants beyond `text` (image / audio / resource).

@@ -89,6 +89,12 @@ impl UnifiedGatewayAdapter {
                     .await;
                 }
             }
+            #[cfg(feature = "acp")]
+            "acp" => {
+                if let Some(ref registry) = self.gw_state.acp_reply_registry {
+                    openab_gateway::adapters::acp_server::handle_reply(reply, registry).await;
+                }
+            }
             other => {
                 tracing::warn!(platform = other, "unified adapter: unknown platform, cannot route reply");
             }
