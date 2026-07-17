@@ -37,6 +37,7 @@ jobs:
             //     on this label, and the candidate query excludes it.
             const PENDING_LABEL = 'stale-close-pending';
             const HANDLED_LABEL = 'auto-closed-stale';
+            const CLOSING_LABEL = 'closing-soon';
             const MARKER = '<!-- openab-close-unlinked-stale -->';
             // The GITHUB_TOKEN posts comments as this identity; markers from
             // any other author are untrusted (the marker string is public).
@@ -97,11 +98,13 @@ jobs:
               return issue;
             };
             // Fail closed: never destroy an issue that is closed, has a
-            // closing-reference PR, or already carries the handled label.
+            // closing-reference PR, already carries the handled label, or is
+            // in the repository's existing closing-soon grace lifecycle.
             const isEligible = (live) =>
               live.state === 'OPEN'
               && live.closedByPullRequestsReferences.totalCount === 0
-              && !live.labelNames.includes(HANDLED_LABEL);
+              && !live.labelNames.includes(HANDLED_LABEL)
+              && !live.labelNames.includes(CLOSING_LABEL);
 
             // Trusted, transaction-bound marker lookup over ALL comments:
             // only comments authored by the workflow identity count, and when
@@ -147,6 +150,25 @@ jobs:
                 core.warning(`#${number} cleanup (${what}): ${error.message}`);
                 return false;
               }
+            };
+            // A final eligibility recheck can reject an issue after the
+            // transaction label and notification were written. Roll both
+            // side effects back immediately so an open issue is not left with
+            // a false closure notice. Failures remain recoverable cleanup debt.
+            const rollbackCancelledClose = async (number, commentId) => {
+              // Keep PENDING_LABEL as the durable retry handle until the false
+              // notice is gone. If notice deletion fails, phase 1 retries both.
+              const noticeRemoved = !commentId || await tryCleanup(
+                number, 'remove notice after cancelled close',
+                () => pacedWrite(() => github.rest.issues.deleteComment({
+                  ...context.repo, comment_id: commentId,
+                }).catch((e) => { if (e.status !== 404) throw e; })),
+              );
+              const pendingRemoved = noticeRemoved && await tryCleanup(
+                number, 'remove pending label after cancelled close',
+                () => removePendingLabel(number),
+              );
+              return noticeRemoved && pendingRemoved;
             };
             // Close only through this gate: re-verify eligibility (including
             // the fail-closed handled label) at the destructive boundary.
@@ -246,7 +268,7 @@ jobs:
                 const labelAnchor = events
                   .filter((e) => e.event === 'labeled' && e.label?.name === PENDING_LABEL)
                   .map((e) => e.created_at).pop();
-                const marker = await findTrustedMarker(issue.number, labelAnchor);
+                let marker = await findTrustedMarker(issue.number, labelAnchor);
                 const anchor = labelAnchor ?? marker?.created_at;
                 const reopenedAfterAnchor = anchor && events.some(
                   (e) => e.event === 'reopened' && e.created_at > anchor,
@@ -260,21 +282,23 @@ jobs:
                 }
                 if (!isEligible(live)) {
                   counts.skipped += 1;  // terminal decision needs no mutation
-                  if (DRY_RUN) { report(issue.number, issue.title, 'dry run — gained a linked PR, would remove pending label'); continue; }
-                  const ok = await tryCleanup(issue.number, 'remove pending label', () => removePendingLabel(issue.number));
-                  report(issue.number, issue.title, `skipped — gained a linked PR${ok ? '; pending label removed' : '; pending-label cleanup deferred'}`);
+                  if (DRY_RUN) { report(issue.number, issue.title, 'dry run — became ineligible, would roll back pending transaction'); continue; }
+                  const rolledBack = await rollbackCancelledClose(issue.number, marker?.id);
+                  report(issue.number, issue.title, `skipped — gained a linked PR or entered closing-soon grace; ${rolledBack ? 'transaction rolled back' : 'rollback cleanup deferred'}`);
                   continue;
                 }
                 if (DRY_RUN) { counts.recovered += 1; report(issue.number, issue.title, 'dry run — would recover close'); continue; }
                 if (!marker) {
-                  await pacedWrite(() => github.rest.issues.createComment({
+                  const { data } = await pacedWrite(() => github.rest.issues.createComment({
                     ...context.repo, issue_number: issue.number, body: CLOSE_COMMENT,
                   }));
+                  marker = data;
                 }
                 const outcome = await verifyAndClose(issue.number);
                 if (outcome === 'ineligible') {
                   counts.skipped += 1;
-                  report(issue.number, issue.title, 'skipped at close boundary — eligibility changed');
+                  const rolledBack = await rollbackCancelledClose(issue.number, marker?.id);
+                  report(issue.number, issue.title, `skipped at close boundary — eligibility changed; ${rolledBack ? 'transaction rolled back' : 'rollback cleanup deferred'}`);
                 } else {
                   counts.recovered += 1;
                   report(issue.number, issue.title, `closed (recovered from interrupted run)${outcome === 'closed-unsettled' ? ' — label settlement deferred' : ''}`);
@@ -287,7 +311,7 @@ jobs:
             }
 
             // ── Phase 2: process new candidates ──
-            const query = `${repoQ} is:issue state:open -linked:pr -label:${HANDLED_LABEL} -label:${PENDING_LABEL} created:<${cutoff}`;
+            const query = `${repoQ} is:issue state:open -linked:pr -label:${HANDLED_LABEL} -label:${PENDING_LABEL} -label:${CLOSING_LABEL} created:<${cutoff}`;
             core.info(`query: ${query}${DRY_RUN ? ' (dry run)' : ''}`);
             const result = await searchIssues(query, { sort: 'created', order: 'asc' });
             for (const issue of result.items) {
@@ -298,7 +322,7 @@ jobs:
                 const live = await inspect(issue.number);
                 if (!isEligible(live)) {
                   counts.skipped += 1;
-                  report(issue.number, issue.title, live.state !== 'OPEN' ? 'skipped — already closed' : 'skipped — gained a linked PR or handled label');
+                  report(issue.number, issue.title, live.state !== 'OPEN' ? 'skipped — already closed' : 'skipped — gained a linked PR, handled label, or closing-soon grace');
                   continue;
                 }
                 if (DRY_RUN) { counts.closed += 1; report(issue.number, issue.title, 'dry run — would close'); continue; }
@@ -307,13 +331,14 @@ jobs:
                 await pacedWrite(() => github.rest.issues.addLabels({
                   ...context.repo, issue_number: issue.number, labels: [PENDING_LABEL],
                 }));
-                await pacedWrite(() => github.rest.issues.createComment({
+                const { data: closeNotice } = await pacedWrite(() => github.rest.issues.createComment({
                   ...context.repo, issue_number: issue.number, body: CLOSE_COMMENT,
                 }));
                 const outcome = await verifyAndClose(issue.number);
                 if (outcome === 'ineligible') {
                   counts.skipped += 1;
-                  report(issue.number, issue.title, 'skipped at close boundary — eligibility changed (recovery will re-check)');
+                  const rolledBack = await rollbackCancelledClose(issue.number, closeNotice.id);
+                  report(issue.number, issue.title, `skipped at close boundary — eligibility changed; ${rolledBack ? 'transaction rolled back' : 'rollback cleanup deferred'}`);
                 } else {
                   counts.closed += 1;
                   report(issue.number, issue.title, `closed${outcome === 'closed-unsettled' ? ' — label settlement deferred' : ''}`);
