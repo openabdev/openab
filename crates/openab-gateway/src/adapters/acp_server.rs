@@ -26,6 +26,10 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+/// ACP wire protocol MAJOR version (an integer), returned from `initialize`.
+/// Tracks the official schema — see `docs/acp-official-methods.md`.
+const ACP_PROTOCOL_VERSION: u32 = 1;
+
 // ---------------------------------------------------------------------------
 // ACP Configuration
 // ---------------------------------------------------------------------------
@@ -60,6 +64,11 @@ struct AcpSession {
     channel_id: String,
     /// Whether a prompt is currently in-flight for this session
     busy: bool,
+    /// Cancel signal for the in-flight prompt, if any. `session/cancel` fires
+    /// this so the streaming task stops gracefully and returns `stopReason:
+    /// "cancelled"` to the prompt's own request id (rather than hard-aborting
+    /// the task and orphaning that id).
+    cancel: Option<Arc<tokio::sync::Notify>>,
 }
 
 pub enum ReplyChunk {
@@ -238,7 +247,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
 
         match req.method.as_str() {
             "initialize" => {
-                let resp = handle_initialize(&connection_id, &req);
+                let resp = handle_initialize(&req);
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
                 initialized = true;
             }
@@ -249,6 +258,15 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                     continue;
                 }
                 let resp = handle_session_new(&sessions, id.clone()).await;
+                let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+            }
+            "session/resume" => {
+                if !initialized {
+                    let resp = JsonRpcResponse::error(id, -32002, "Not initialized");
+                    let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+                    continue;
+                }
+                let resp = handle_session_resume(&sessions, id.clone(), req.params.as_ref()).await;
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
             }
             "session/prompt" => {
@@ -274,9 +292,21 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 prompt_tasks.push(handle);
             }
             "session/cancel" => {
-                // TODO: implement cancellation in Phase 2
-                let resp = JsonRpcResponse::success(id, json!({}));
-                let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+                // Per ACP, session/cancel is a one-way NOTIFICATION — no response.
+                // Fire the session's cancel signal; the in-flight prompt observes
+                // it, cleans up, and returns stopReason:"cancelled" to the prompt's
+                // own request id.
+                let sess_key = req
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("sessionId"))
+                    .and_then(|v| v.as_str());
+                if let Some(k) = sess_key {
+                    let notify = sessions.lock().await.get(k).and_then(|s| s.cancel.clone());
+                    if let Some(n) = notify {
+                        n.notify_one();
+                    }
+                }
             }
             _ => {
                 let resp = JsonRpcResponse::error(
@@ -326,15 +356,21 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
 // Method handlers
 // ---------------------------------------------------------------------------
 
-fn handle_initialize(connection_id: &str, _req: &JsonRpcRequest) -> JsonRpcResponse {
-    let id = _req.id.clone().unwrap_or(Value::Null);
+fn handle_initialize(req: &JsonRpcRequest) -> JsonRpcResponse {
+    let id = req.id.clone().unwrap_or(Value::Null);
+    // ACP initialize response. protocolVersion is an integer MAJOR version.
+    // We advertise `sessionCapabilities.resume` (we support session/resume) but
+    // NOT `loadSession` — the gateway cannot replay conversation history to the
+    // client (it lives inside the downstream agent CLI), so load is unsupported.
     JsonRpcResponse::success(
         id,
         json!({
-            "protocolVersion": "v1",
-            "connectionId": connection_id,
+            "protocolVersion": ACP_PROTOCOL_VERSION,
             "agentCapabilities": {
-                "streaming": true,
+                "loadSession": false,
+                "sessionCapabilities": {
+                    "resume": {}
+                },
                 "promptCapabilities": {
                     "image": false,
                     "audio": false,
@@ -343,8 +379,10 @@ fn handle_initialize(connection_id: &str, _req: &JsonRpcRequest) -> JsonRpcRespo
             },
             "agentInfo": {
                 "name": "openab",
+                "title": "OpenAB",
                 "version": env!("CARGO_PKG_VERSION")
-            }
+            },
+            "authMethods": []
         }),
     )
 }
@@ -353,32 +391,86 @@ async fn handle_session_new(
     sessions: &Arc<tokio::sync::Mutex<HashMap<String, AcpSession>>>,
     id: Value,
 ) -> JsonRpcResponse {
-    let session_id = format!("sess_{}", Uuid::new_v4());
-    let channel_id = format!("acp_{}", Uuid::new_v4());
+    // sessionId and channel_id share one uuid so channel_id is always
+    // re-derivable from a persisted sessionId (see session/resume).
+    let uuid = Uuid::new_v4();
+    let session_id = format!("sess_{uuid}");
+    let channel_id = format!("acp_{uuid}");
 
-    // Store session locally (reply channel is created lazily in session/prompt)
     sessions.lock().await.insert(
         session_id.clone(),
         AcpSession {
             channel_id,
             busy: false,
+            cancel: None,
         },
     );
 
     info!(session = %session_id, "ACP session created");
 
-    JsonRpcResponse::success(
-        id,
-        json!({
-            "sessionId": session_id,
-            "models": {
-                "current": "openab",
-                "available": [
-                    {"id": "openab", "name": "OpenAB Default Agent"}
-                ]
-            }
-        }),
-    )
+    // ACP session/new response is just { sessionId }.
+    JsonRpcResponse::success(id, json!({ "sessionId": session_id }))
+}
+
+/// `session/resume` — re-attach to a session the client persisted, WITHOUT
+/// replaying history (per ACP: the agent MUST NOT replay via session/update).
+///
+/// The client re-presents its `sessionId`; we derive the same deterministic
+/// `channel_id`, so the next prompt's GatewayEvent maps to the same core
+/// `session_key` (`acp:<channel_id>`) and the existing conversation continues.
+/// The core recovers the underlying agent session via its own persisted mapping
+/// plus a downstream `session/load` (survives process restart within the agent's
+/// retention / `session_ttl_hours`). Whether that succeeds is not observable
+/// here — an expired session simply starts fresh, and the core prefixes its
+/// first reply with a "Session expired" notice the client can surface.
+///
+/// Security: `sessionId` is a server-minted, high-entropy capability;
+/// `derive_channel_id` requires a well-formed `sess_<uuid>`, keeping the channel
+/// inside the `acp_` namespace and rejecting forged ids.
+async fn handle_session_resume(
+    sessions: &Arc<tokio::sync::Mutex<HashMap<String, AcpSession>>>,
+    id: Value,
+    params: Option<&Value>,
+) -> JsonRpcResponse {
+    let session_id = match params.and_then(|p| p.get("sessionId")).and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return JsonRpcResponse::error(id, -32602, "Missing sessionId"),
+    };
+
+    let channel_id = match derive_channel_id(&session_id) {
+        Some(cid) => cid,
+        None => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                "Invalid sessionId: expected the form sess_<uuid>",
+            );
+        }
+    };
+
+    sessions.lock().await.insert(
+        session_id.clone(),
+        AcpSession {
+            channel_id,
+            busy: false,
+            cancel: None,
+        },
+    );
+
+    info!(session = %session_id, "ACP session resumed");
+
+    // ACP session/resume response is an empty object (no history replay).
+    JsonRpcResponse::success(id, json!({}))
+}
+
+/// Derive the deterministic `channel_id` (`acp_<uuid>`) from a client-supplied
+/// `sessionId` (`sess_<uuid>`). Returns `None` if malformed — the uuid must
+/// parse, which keeps a resumed channel inside the `acp_` namespace and rejects
+/// forged ids.
+fn derive_channel_id(session_id: &str) -> Option<String> {
+    let uuid = session_id.strip_prefix("sess_")?;
+    Uuid::parse_str(uuid).ok()?;
+    Some(format!("acp_{uuid}"))
 }
 
 async fn handle_session_prompt(
@@ -398,6 +490,10 @@ async fn handle_session_prompt(
         }
     };
 
+    // Cancel signal for this prompt; `session/cancel` fires it to stop the
+    // stream gracefully.
+    let cancel = Arc::new(tokio::sync::Notify::new());
+
     // Look up session and acquire busy lock
     let channel_id = {
         let mut guard = sessions.lock().await;
@@ -414,6 +510,7 @@ async fn handle_session_prompt(
                     return;
                 }
                 s.busy = true;
+                s.cancel = Some(cancel.clone());
                 s.channel_id.clone()
             }
             None => {
@@ -492,62 +589,73 @@ async fn handle_session_prompt(
 
     info!(session = %session_id, channel = %channel_id, "ACP: prompt dispatched");
 
-    // Stream replies back as ACP notifications
+    // Stream replies back as ACP `session/update` notifications.
     let mut sent_len = 0usize;
     let timeout = tokio::time::Duration::from_secs(180);
+    let mut stop_reason = "end_turn";
+    let mut timed_out = false;
 
     loop {
-        match tokio::time::timeout(timeout, reply_rx.recv()).await {
-            Ok(Some(ReplyChunk::Text(full_text))) => {
-                // Send delta as AgentMessageChunk notification
-                let delta = if full_text.len() > sent_len {
-                    &full_text[sent_len..]
-                } else {
-                    continue;
-                };
-                sent_len = full_text.len();
+        tokio::select! {
+            // session/cancel fired — stop gracefully.
+            _ = cancel.notified() => {
+                stop_reason = "cancelled";
+                break;
+            }
+            recv = tokio::time::timeout(timeout, reply_rx.recv()) => {
+                match recv {
+                    Ok(Some(ReplyChunk::Text(full_text))) => {
+                        // Emit new text as an `agent_message_chunk` update.
+                        // Slice via `get` (not byte-index `[..]`) so a `sent_len`
+                        // that lands mid-codepoint — possible with CJK / 顏文字 /
+                        // emoji if a snapshot is ever non-append — skips this frame
+                        // instead of panicking; the next snapshot re-covers it.
+                        let delta = match full_text.get(sent_len..) {
+                            Some(d) if !d.is_empty() => d,
+                            _ => continue,
+                        };
+                        sent_len = full_text.len();
 
-                let notification = JsonRpcNotification {
-                    jsonrpc: "2.0",
-                    method: "session/notification".into(),
-                    params: json!({
-                        "sessionId": session_id,
-                        "update": {
-                            "sessionUpdate": "agentMessageChunk",
-                            "chunk": {
-                                "content": {"type": "text", "text": delta}
-                            }
-                        }
-                    }),
-                };
-                let _ = out_tx.send(serde_json::to_string(&notification).unwrap());
-            }
-            Ok(Some(ReplyChunk::Done)) | Ok(None) => {
-                break;
-            }
-            Err(_) => {
-                warn!(session = %session_id, "ACP: prompt timed out waiting for reply");
-                break;
+                        let notification = JsonRpcNotification {
+                            jsonrpc: "2.0",
+                            method: "session/update".into(),
+                            params: json!({
+                                "sessionId": session_id,
+                                "update": {
+                                    "sessionUpdate": "agent_message_chunk",
+                                    "content": {"type": "text", "text": delta}
+                                }
+                            }),
+                        };
+                        let _ = out_tx.send(serde_json::to_string(&notification).unwrap());
+                    }
+                    Ok(Some(ReplyChunk::Done)) | Ok(None) => break,
+                    Err(_) => {
+                        warn!(session = %session_id, "ACP: prompt timed out waiting for reply");
+                        timed_out = true;
+                        break;
+                    }
+                }
             }
         }
     }
 
-    // Cleanup: remove from registry and release busy flag
+    // Cleanup: remove from registry, release busy flag, clear cancel signal.
     if let Some(ref registry) = state.acp_reply_registry {
         registry.lock().unwrap_or_else(|e| e.into_inner()).remove(&channel_id);
     }
     if let Some(s) = sessions.lock().await.get_mut(&session_id) {
         s.busy = false;
+        s.cancel = None;
     }
 
-    // Send the final response
-    let resp = JsonRpcResponse::success(
-        id,
-        json!({
-            "sessionId": session_id,
-            "stopReason": "endTurn"
-        }),
-    );
+    // Final response. A backend timeout has no ACP stopReason, so it is an error;
+    // otherwise return the turn's PromptResponse { stopReason }.
+    let resp = if timed_out {
+        JsonRpcResponse::error(id, -32603, "Timed out waiting for agent backend")
+    } else {
+        JsonRpcResponse::success(id, json!({ "stopReason": stop_reason }))
+    };
     let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
 }
 
