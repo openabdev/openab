@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Report only, do not comment or close'
+        description: 'Report only (default). Set to false to actually comment and close.'
         type: boolean
-        default: false
+        default: true
 
 # Serialize mutating runs: a scheduled run and a manual dispatch must not
 # interleave comment/close operations on the same candidates.
@@ -31,12 +31,15 @@ jobs:
             // Two-label state machine:
             //   PENDING_LABEL — transaction in progress; open+pending = a run
             //     was interrupted mid-close and needs recovery.
-            //   HANDLED_LABEL — applied at successful close. If a human later
-            //     reopens the issue it stays open+handled: permanently exempt
-            //     via query exclusion, never re-entering any queue.
+            //   HANDLED_LABEL — applied at successful close. An OPEN issue
+            //     carrying it (reopened by a human, or settlement interrupted)
+            //     is permanently exempt: every destructive gate fails closed
+            //     on this label, and the candidate query excludes it.
             const PENDING_LABEL = 'stale-close-pending';
             const HANDLED_LABEL = 'auto-closed-stale';
             const MARKER = '<!-- openab-close-unlinked-stale -->';
+            // Manual dispatch defaults to dry-run; only scheduled runs (or an
+            // explicit dry_run=false dispatch) mutate.
             const DRY_RUN = ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }};
             const cutoff = new Date(Date.now() - STALE_DAYS * 24 * 60 * 60 * 1000)
               .toISOString().slice(0, 10);
@@ -73,7 +76,8 @@ jobs:
               }
             };
 
-            // Live read of the fields every destructive decision depends on.
+            // Live read of the fields every destructive decision depends on,
+            // including current labels so HANDLED_LABEL can fail closed.
             const inspect = async (number) => {
               const { repository } = await github.graphql(`
                 query($owner: String!, $repo: String!, $number: Int!) {
@@ -81,20 +85,20 @@ jobs:
                     issue(number: $number) {
                       state
                       closedByPullRequestsReferences(first: 1, includeClosedPrs: true) { totalCount }
-                      timelineItems(itemTypes: [REOPENED_EVENT, LABELED_EVENT], last: 50) {
-                        nodes {
-                          __typename
-                          ... on ReopenedEvent { createdAt }
-                          ... on LabeledEvent { createdAt label { name } }
-                        }
-                      }
+                      labels(first: 100) { nodes { name } }
                     }
                   }
                 }`, { owner: context.repo.owner, repo: context.repo.repo, number });
-              return repository.issue;
+              const issue = repository.issue;
+              issue.labelNames = issue.labels.nodes.map((l) => l.name);
+              return issue;
             };
+            // Fail closed: never destroy an issue that is closed, has a
+            // closing-reference PR, or already carries the handled label.
             const isEligible = (live) =>
-              live.state === 'OPEN' && live.closedByPullRequestsReferences.totalCount === 0;
+              live.state === 'OPEN'
+              && live.closedByPullRequestsReferences.totalCount === 0
+              && !live.labelNames.includes(HANDLED_LABEL);
 
             // Authoritative marker lookup: paginate ALL comments — a bounded
             // window can miss the marker under later comment activity.
@@ -104,9 +108,25 @@ jobs:
               });
               return comments.find((c) => c.body?.includes(MARKER)) ?? null;
             };
+            // Full event history (paginated) — never a bounded window.
+            const listAllEvents = async (number) => github.paginate(
+              github.rest.issues.listEvents,
+              { ...context.repo, issue_number: number, per_page: 100 },
+            );
 
-            // Close only through this gate: re-verify eligibility at the
-            // destructive boundary, then close and settle labels.
+            const removePendingLabel = async (number) => {
+              await pacedWrite(() => github.rest.issues.removeLabel({
+                ...context.repo, issue_number: number, name: PENDING_LABEL,
+              }).catch((e) => { if (e.status !== 404) throw e; }));
+            };
+            const settleLabels = async (number) => {
+              await pacedWrite(() => github.rest.issues.addLabels({
+                ...context.repo, issue_number: number, labels: [HANDLED_LABEL],
+              }));
+              await removePendingLabel(number);
+            };
+            // Close only through this gate: re-verify eligibility (including
+            // the fail-closed handled label) at the destructive boundary.
             const verifyAndClose = async (number) => {
               const live = await inspect(number);
               if (!isEligible(live)) return false;
@@ -117,23 +137,9 @@ jobs:
               await settleLabels(number);
               return true;
             };
-            const settleLabels = async (number) => {
-              await pacedWrite(() => github.rest.issues.addLabels({
-                ...context.repo, issue_number: number, labels: [HANDLED_LABEL],
-              }));
-              await pacedWrite(async () => {
-                try {
-                  await github.rest.issues.removeLabel({
-                    ...context.repo, issue_number: number, name: PENDING_LABEL,
-                  });
-                } catch (error) {
-                  if (error.status !== 404) throw error;
-                }
-              });
-            };
 
             const rows = [];
-            const counts = { closed: 0, recovered: 0, exempt: 0, skipped: 0, failed: 0, deferred: 0 };
+            const counts = { closed: 0, recovered: 0, exempt: 0, settled: 0, skipped: 0, failed: 0 };
             const escapeCell = (value) => String(value)
               .replace(/\\/g, '\\\\')
               .replace(/\|/g, '\\|')
@@ -160,9 +166,9 @@ jobs:
 
             const searchIssues = async (q, extra = {}) => {
               const { data } = await github.rest.search.issuesAndPullRequests({
-                q, per_page: Math.min(budget, MAX_ITEMS_PER_RUN) || 1, ...extra,
+                q, per_page: Math.max(Math.min(budget, MAX_ITEMS_PER_RUN), 1), ...extra,
               });
-              return { total: data.total_count, items: data.items.filter((i) => !i.pull_request) };
+              return { total: data.total_count, items: data.items.filter((i) => !i.pull_request), processed: 0 };
             };
             const repoQ = `repo:${context.repo.owner}/${context.repo.repo}`;
 
@@ -170,11 +176,13 @@ jobs:
             // (interrupted between close and label settlement; non-destructive)
             const stuck = await searchIssues(`${repoQ} is:issue state:closed label:${PENDING_LABEL}`);
             for (const issue of stuck.items) {
-              if (budget <= 0) { counts.deferred += 1; continue; }
+              if (budget <= 0) break;
               budget -= 1;
-              if (DRY_RUN) { report(issue.number, issue.title, 'dry run — would settle labels'); continue; }
+              stuck.processed += 1;
+              if (DRY_RUN) { counts.settled += 1; report(issue.number, issue.title, 'dry run — would settle labels'); continue; }
               try {
                 await settleLabels(issue.number);
+                counts.settled += 1;
                 report(issue.number, issue.title, 'labels settled (was closed mid-transaction)');
               } catch (error) {
                 counts.failed += 1;
@@ -186,21 +194,34 @@ jobs:
             // ── Phase 1: recover interrupted transactions ──
             const pending = await searchIssues(`${repoQ} is:issue state:open label:${PENDING_LABEL}`);
             for (const issue of pending.items) {
-              if (budget <= 0) { counts.deferred += 1; continue; }
+              if (budget <= 0) break;
               budget -= 1;
+              pending.processed += 1;
               try {
                 const live = await inspect(issue.number);
                 if (live.state !== 'OPEN') { counts.skipped += 1; report(issue.number, issue.title, 'skipped — already closed'); continue; }
 
-                // Reopen ordering (not lifetime count): exempt only if a
-                // reopen happened AFTER this transaction's anchor — the
-                // marker comment, or failing that, the pending-label event.
+                // Fail closed: an OPEN issue already carrying the handled
+                // label (reopened by a human, or settlement interrupted) is
+                // permanently exempt — only tidy up the stray pending label.
+                if (live.labelNames.includes(HANDLED_LABEL)) {
+                  counts.exempt += 1;
+                  if (DRY_RUN) { report(issue.number, issue.title, 'dry run — handled label present, would remove stray pending label (exempt)'); continue; }
+                  await removePendingLabel(issue.number);
+                  report(issue.number, issue.title, 'exempt — handled label present; stray pending label removed');
+                  continue;
+                }
+
+                // Reopen ordering over the FULL event history (paginated):
+                // exempt only if a reopen postdates this transaction's anchor
+                // — the marker comment, else the pending-label event.
                 const marker = await findMarker(issue.number);
-                const events = live.timelineItems.nodes;
+                const events = await listAllEvents(issue.number);
                 const anchor = marker?.created_at
-                  ?? events.filter((e) => e.__typename === 'LabeledEvent' && e.label?.name === PENDING_LABEL).map((e) => e.createdAt).pop();
+                  ?? events.filter((e) => e.event === 'labeled' && e.label?.name === PENDING_LABEL)
+                    .map((e) => e.created_at).pop();
                 const reopenedAfterAnchor = anchor && events.some(
-                  (e) => e.__typename === 'ReopenedEvent' && e.createdAt > anchor,
+                  (e) => e.event === 'reopened' && e.created_at > anchor,
                 );
                 if (reopenedAfterAnchor) {
                   counts.exempt += 1;
@@ -211,15 +232,11 @@ jobs:
                 }
                 if (!isEligible(live)) {
                   counts.skipped += 1;
-                  if (!DRY_RUN) {
-                    await pacedWrite(() => github.rest.issues.removeLabel({
-                      ...context.repo, issue_number: issue.number, name: PENDING_LABEL,
-                    }).catch((e) => { if (e.status !== 404) throw e; }));
-                  }
+                  if (!DRY_RUN) await removePendingLabel(issue.number);
                   report(issue.number, issue.title, 'skipped — gained a linked PR; pending label removed');
                   continue;
                 }
-                if (DRY_RUN) { report(issue.number, issue.title, 'dry run — would recover close'); continue; }
+                if (DRY_RUN) { counts.recovered += 1; report(issue.number, issue.title, 'dry run — would recover close'); continue; }
                 if (!marker) {
                   await pacedWrite(() => github.rest.issues.createComment({
                     ...context.repo, issue_number: issue.number, body: CLOSE_COMMENT,
@@ -244,16 +261,17 @@ jobs:
             core.info(`query: ${query}${DRY_RUN ? ' (dry run)' : ''}`);
             const result = await searchIssues(query, { sort: 'created', order: 'asc' });
             for (const issue of result.items) {
-              if (budget <= 0) { counts.deferred += 1; continue; }
+              if (budget <= 0) break;
               budget -= 1;
+              result.processed += 1;
               try {
                 const live = await inspect(issue.number);
                 if (!isEligible(live)) {
                   counts.skipped += 1;
-                  report(issue.number, issue.title, live.state !== 'OPEN' ? 'skipped — already closed' : 'skipped — gained a linked PR');
+                  report(issue.number, issue.title, live.state !== 'OPEN' ? 'skipped — already closed' : 'skipped — gained a linked PR or handled label');
                   continue;
                 }
-                if (DRY_RUN) { report(issue.number, issue.title, 'dry run — would close'); continue; }
+                if (DRY_RUN) { counts.closed += 1; report(issue.number, issue.title, 'dry run — would close'); continue; }
                 // Transaction: pending label → notification → verified close.
                 // Any interruption leaves open+pending for phase-1 recovery.
                 await pacedWrite(() => github.rest.issues.addLabels({
@@ -280,13 +298,18 @@ jobs:
               rows.push('| — | No candidates found | — |');
             }
 
+            // Reconciling accounting: every budget decrement lands in exactly
+            // one named outcome; per-phase backlog = matches minus processed.
             const processed = MAX_ITEMS_PER_RUN - budget;
-            const unqueried = Math.max(result.total - result.items.length, 0);
+            const outcomeSum = Object.values(counts).reduce((a, b) => a + b, 0);
+            const deferred = Math.max(stuck.total - stuck.processed, 0)
+              + Math.max(pending.total - pending.processed, 0)
+              + Math.max(result.total - result.processed, 0);
             const summary = [
               `Query: \`${query}\``,
               '',
               `Matches: **${result.total}** new candidate(s), **${pending.total}** pending recovery, **${stuck.total}** label-settlement.`,
-              `Processed **${processed}** (budget ${MAX_ITEMS_PER_RUN})${DRY_RUN ? ' — dry run, no changes made' : ''}: closed **${counts.closed}**, recovered **${counts.recovered}**, exempt **${counts.exempt}**, skipped **${counts.skipped}**, failed **${counts.failed}**. Deferred to next run: **${counts.deferred + unqueried}**.`,
+              `Processed **${processed}** of budget ${MAX_ITEMS_PER_RUN}${DRY_RUN ? ' — **dry run, no changes made**' : ''}: closed **${counts.closed}**, recovered **${counts.recovered}**, exempt **${counts.exempt}**, settled **${counts.settled}**, skipped **${counts.skipped}**, failed **${counts.failed}**. Remaining for next run: **${deferred}**.`,
               '',
               '| Issue | Title | Outcome |',
               '|---|---|---|',
@@ -298,7 +321,10 @@ jobs:
               .addRaw(summary.join('\n'))
               .write();
 
-            core.info(`processed ${processed}; closed ${counts.closed + counts.recovered}; failed ${counts.failed}`);
+            core.info(`processed ${processed}; outcomes ${outcomeSum}; deferred ${deferred}`);
+            if (outcomeSum !== processed) {
+              core.warning(`accounting mismatch: processed ${processed} but outcomes sum to ${outcomeSum}`);
+            }
             if (counts.failed > 0) {
               core.setFailed(`${counts.failed} issue(s) could not be processed`);
             }
