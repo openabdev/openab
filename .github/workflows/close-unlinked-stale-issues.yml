@@ -38,6 +38,9 @@ jobs:
             const PENDING_LABEL = 'stale-close-pending';
             const HANDLED_LABEL = 'auto-closed-stale';
             const MARKER = '<!-- openab-close-unlinked-stale -->';
+            // The GITHUB_TOKEN posts comments as this identity; markers from
+            // any other author are untrusted (the marker string is public).
+            const MARKER_AUTHOR = 'github-actions[bot]';
             // Manual dispatch defaults to dry-run; only scheduled runs (or an
             // explicit dry_run=false dispatch) mutate.
             const DRY_RUN = ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }};
@@ -100,13 +103,19 @@ jobs:
               && live.closedByPullRequestsReferences.totalCount === 0
               && !live.labelNames.includes(HANDLED_LABEL);
 
-            // Authoritative marker lookup: paginate ALL comments — a bounded
-            // window can miss the marker under later comment activity.
-            const findMarker = async (number) => {
+            // Trusted, transaction-bound marker lookup over ALL comments:
+            // only comments authored by the workflow identity count, and when
+            // a transaction anchor is known the marker must not predate it —
+            // an old or user-pasted marker string must neither suppress the
+            // official notice nor shift the reopen-exemption anchor.
+            const findTrustedMarker = async (number, notBefore) => {
               const comments = await github.paginate(github.rest.issues.listComments, {
                 ...context.repo, issue_number: number, per_page: 100,
               });
-              return comments.find((c) => c.body?.includes(MARKER)) ?? null;
+              return comments.find((c) =>
+                c.body?.includes(MARKER)
+                && c.user?.login === MARKER_AUTHOR
+                && (!notBefore || c.created_at >= notBefore)) ?? null;
             };
             // Full event history (paginated) — never a bounded window.
             const listAllEvents = async (number) => github.paginate(
@@ -125,17 +134,34 @@ jobs:
               }));
               await removePendingLabel(number);
             };
+            // Cleanup debt: label-hygiene failures after a terminal outcome
+            // has been decided. Tracked separately from the mutually
+            // exclusive terminal counters; phase 0/1 recover it next run.
+            let cleanupDebt = 0;
+            const tryCleanup = async (number, what, fn) => {
+              try {
+                await fn();
+                return true;
+              } catch (error) {
+                cleanupDebt += 1;
+                core.warning(`#${number} cleanup (${what}): ${error.message}`);
+                return false;
+              }
+            };
             // Close only through this gate: re-verify eligibility (including
             // the fail-closed handled label) at the destructive boundary.
+            // Returns 'ineligible' | 'closed' | 'closed-unsettled'. A label
+            // settlement failure after a successful close is cleanup debt,
+            // not a failure — the close DID happen and phase 0 settles later.
             const verifyAndClose = async (number) => {
               const live = await inspect(number);
-              if (!isEligible(live)) return false;
+              if (!isEligible(live)) return 'ineligible';
               await pacedWrite(() => github.rest.issues.update({
                 ...context.repo, issue_number: number,
                 state: 'closed', state_reason: 'not_planned',
               }));
-              await settleLabels(number);
-              return true;
+              const settled = await tryCleanup(number, 'settle labels', () => settleLabels(number));
+              return settled ? 'closed' : 'closed-unsettled';
             };
 
             const rows = [];
@@ -181,7 +207,7 @@ jobs:
               stuck.processed += 1;
               if (DRY_RUN) { counts.settled += 1; report(issue.number, issue.title, 'dry run — would settle labels'); continue; }
               try {
-                await settleLabels(issue.number);
+                await settleLabels(issue.number);  // primary operation: outcome recorded only on success
                 counts.settled += 1;
                 report(issue.number, issue.title, 'labels settled (was closed mid-transaction)');
               } catch (error) {
@@ -205,35 +231,38 @@ jobs:
                 // label (reopened by a human, or settlement interrupted) is
                 // permanently exempt — only tidy up the stray pending label.
                 if (live.labelNames.includes(HANDLED_LABEL)) {
-                  counts.exempt += 1;
-                  if (DRY_RUN) { report(issue.number, issue.title, 'dry run — handled label present, would remove stray pending label (exempt)'); continue; }
-                  await removePendingLabel(issue.number);
-                  report(issue.number, issue.title, 'exempt — handled label present; stray pending label removed');
+                  counts.exempt += 1;  // terminal decision needs no mutation
+                  if (DRY_RUN) { report(issue.number, issue.title, 'dry run — handled label present, exempt'); continue; }
+                  const ok = await tryCleanup(issue.number, 'remove pending label', () => removePendingLabel(issue.number));
+                  report(issue.number, issue.title, `exempt — handled label present${ok ? '; stray pending label removed' : '; pending-label cleanup deferred'}`);
                   continue;
                 }
 
-                // Reopen ordering over the FULL event history (paginated):
-                // exempt only if a reopen postdates this transaction's anchor
-                // — the marker comment, else the pending-label event.
-                const marker = await findMarker(issue.number);
+                // Transaction anchor: the latest pending-label event when one
+                // exists; a trusted marker bound to that anchor otherwise.
+                // Exempt only if a reopen postdates the anchor, over the FULL
+                // paginated event history.
                 const events = await listAllEvents(issue.number);
-                const anchor = marker?.created_at
-                  ?? events.filter((e) => e.event === 'labeled' && e.label?.name === PENDING_LABEL)
-                    .map((e) => e.created_at).pop();
+                const labelAnchor = events
+                  .filter((e) => e.event === 'labeled' && e.label?.name === PENDING_LABEL)
+                  .map((e) => e.created_at).pop();
+                const marker = await findTrustedMarker(issue.number, labelAnchor);
+                const anchor = labelAnchor ?? marker?.created_at;
                 const reopenedAfterAnchor = anchor && events.some(
                   (e) => e.event === 'reopened' && e.created_at > anchor,
                 );
                 if (reopenedAfterAnchor) {
-                  counts.exempt += 1;
+                  counts.exempt += 1;  // terminal decision needs no mutation
                   if (DRY_RUN) { report(issue.number, issue.title, 'dry run — reopened after close, would mark exempt'); continue; }
-                  await settleLabels(issue.number);  // open+handled = durable exemption
-                  report(issue.number, issue.title, 'reopened by a user — permanently exempt');
+                  const ok = await tryCleanup(issue.number, 'settle exemption labels', () => settleLabels(issue.number));
+                  report(issue.number, issue.title, `reopened by a user — permanently exempt${ok ? '' : ' (label settlement deferred)'}`);
                   continue;
                 }
                 if (!isEligible(live)) {
-                  counts.skipped += 1;
-                  if (!DRY_RUN) await removePendingLabel(issue.number);
-                  report(issue.number, issue.title, 'skipped — gained a linked PR; pending label removed');
+                  counts.skipped += 1;  // terminal decision needs no mutation
+                  if (DRY_RUN) { report(issue.number, issue.title, 'dry run — gained a linked PR, would remove pending label'); continue; }
+                  const ok = await tryCleanup(issue.number, 'remove pending label', () => removePendingLabel(issue.number));
+                  report(issue.number, issue.title, `skipped — gained a linked PR${ok ? '; pending label removed' : '; pending-label cleanup deferred'}`);
                   continue;
                 }
                 if (DRY_RUN) { counts.recovered += 1; report(issue.number, issue.title, 'dry run — would recover close'); continue; }
@@ -242,12 +271,13 @@ jobs:
                     ...context.repo, issue_number: issue.number, body: CLOSE_COMMENT,
                   }));
                 }
-                if (await verifyAndClose(issue.number)) {
-                  counts.recovered += 1;
-                  report(issue.number, issue.title, 'closed (recovered from interrupted run)');
-                } else {
+                const outcome = await verifyAndClose(issue.number);
+                if (outcome === 'ineligible') {
                   counts.skipped += 1;
                   report(issue.number, issue.title, 'skipped at close boundary — eligibility changed');
+                } else {
+                  counts.recovered += 1;
+                  report(issue.number, issue.title, `closed (recovered from interrupted run)${outcome === 'closed-unsettled' ? ' — label settlement deferred' : ''}`);
                 }
               } catch (error) {
                 counts.failed += 1;
@@ -280,12 +310,13 @@ jobs:
                 await pacedWrite(() => github.rest.issues.createComment({
                   ...context.repo, issue_number: issue.number, body: CLOSE_COMMENT,
                 }));
-                if (await verifyAndClose(issue.number)) {
-                  counts.closed += 1;
-                  report(issue.number, issue.title, 'closed');
-                } else {
+                const outcome = await verifyAndClose(issue.number);
+                if (outcome === 'ineligible') {
                   counts.skipped += 1;
                   report(issue.number, issue.title, 'skipped at close boundary — eligibility changed (recovery will re-check)');
+                } else {
+                  counts.closed += 1;
+                  report(issue.number, issue.title, `closed${outcome === 'closed-unsettled' ? ' — label settlement deferred' : ''}`);
                 }
               } catch (error) {
                 counts.failed += 1;
@@ -298,8 +329,9 @@ jobs:
               rows.push('| — | No candidates found | — |');
             }
 
-            // Reconciling accounting: every budget decrement lands in exactly
-            // one named outcome; per-phase backlog = matches minus processed.
+            // Accounting invariant: every budget decrement lands in exactly
+            // one terminal outcome; cleanup debt is tracked separately.
+            // Per-phase backlog = matches minus processed.
             const processed = MAX_ITEMS_PER_RUN - budget;
             const outcomeSum = Object.values(counts).reduce((a, b) => a + b, 0);
             const deferred = Math.max(stuck.total - stuck.processed, 0)
@@ -309,7 +341,7 @@ jobs:
               `Query: \`${query}\``,
               '',
               `Matches: **${result.total}** new candidate(s), **${pending.total}** pending recovery, **${stuck.total}** label-settlement.`,
-              `Processed **${processed}** of budget ${MAX_ITEMS_PER_RUN}${DRY_RUN ? ' — **dry run, no changes made**' : ''}: closed **${counts.closed}**, recovered **${counts.recovered}**, exempt **${counts.exempt}**, settled **${counts.settled}**, skipped **${counts.skipped}**, failed **${counts.failed}**. Remaining for next run: **${deferred}**.`,
+              `Processed **${processed}** of budget ${MAX_ITEMS_PER_RUN}${DRY_RUN ? ' — **dry run, no changes made**' : ''}: closed **${counts.closed}**, recovered **${counts.recovered}**, exempt **${counts.exempt}**, settled **${counts.settled}**, skipped **${counts.skipped}**, failed **${counts.failed}**. Cleanup deferred to next run: **${cleanupDebt}**. Remaining backlog: **${deferred}**.`,
               '',
               '| Issue | Title | Outcome |',
               '|---|---|---|',
@@ -321,10 +353,9 @@ jobs:
               .addRaw(summary.join('\n'))
               .write();
 
-            core.info(`processed ${processed}; outcomes ${outcomeSum}; deferred ${deferred}`);
+            core.info(`processed ${processed}; outcomes ${outcomeSum}; cleanup debt ${cleanupDebt}; deferred ${deferred}`);
             if (outcomeSum !== processed) {
-              core.warning(`accounting mismatch: processed ${processed} but outcomes sum to ${outcomeSum}`);
-            }
-            if (counts.failed > 0) {
+              core.setFailed(`accounting invariant violated: processed ${processed} but terminal outcomes sum to ${outcomeSum}`);
+            } else if (counts.failed > 0) {
               core.setFailed(`${counts.failed} issue(s) could not be processed`);
             }
