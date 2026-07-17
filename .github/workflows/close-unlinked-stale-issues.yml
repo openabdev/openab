@@ -27,7 +27,14 @@ jobs:
         with:
           script: |
             const STALE_DAYS = 14;
-            const MAX_ITEMS_PER_RUN = 50;
+            const MAX_ITEMS_PER_RUN = 50;  // global budget shared by all phases
+            // Two-label state machine:
+            //   PENDING_LABEL — transaction in progress; open+pending = a run
+            //     was interrupted mid-close and needs recovery.
+            //   HANDLED_LABEL — applied at successful close. If a human later
+            //     reopens the issue it stays open+handled: permanently exempt
+            //     via query exclusion, never re-entering any queue.
+            const PENDING_LABEL = 'stale-close-pending';
             const HANDLED_LABEL = 'auto-closed-stale';
             const MARKER = '<!-- openab-close-unlinked-stale -->';
             const DRY_RUN = ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }};
@@ -36,8 +43,7 @@ jobs:
 
             // Maintainer policy: an open issue with no linked PR after
             // STALE_DAYS signals insufficient priority — close it with a
-            // comment. The HANDLED_LABEL survives reopening, so a human
-            // reopening an issue permanently exempts it from this automation.
+            // comment. Reopening is a durable exemption.
             const CLOSE_COMMENT = [
               MARKER,
               `This issue has been open for more than ${STALE_DAYS} days with no linked pull request, so it is being closed as not planned.`,
@@ -46,6 +52,7 @@ jobs:
             ].join('\n');
 
             const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            let budget = MAX_ITEMS_PER_RUN;
 
             // Pace every content-generating request to stay under GitHub's
             // secondary rate limit (~80/min), and honor Retry-After on
@@ -66,128 +73,206 @@ jobs:
               }
             };
 
-            // Revalidate a candidate immediately before mutating: the search
-            // result is point-in-time, and an issue can be closed or gain a
-            // closing-reference PR while earlier candidates are processed.
-            const revalidate = async (number) => {
+            // Live read of the fields every destructive decision depends on.
+            const inspect = async (number) => {
               const { repository } = await github.graphql(`
                 query($owner: String!, $repo: String!, $number: Int!) {
                   repository(owner: $owner, name: $repo) {
                     issue(number: $number) {
                       state
                       closedByPullRequestsReferences(first: 1, includeClosedPrs: true) { totalCount }
-                      timelineItems(itemTypes: [REOPENED_EVENT], first: 1) { totalCount }
-                      comments(last: 30) { nodes { body } }
+                      timelineItems(itemTypes: [REOPENED_EVENT, LABELED_EVENT], last: 50) {
+                        nodes {
+                          __typename
+                          ... on ReopenedEvent { createdAt }
+                          ... on LabeledEvent { createdAt label { name } }
+                        }
+                      }
                     }
                   }
-                }`, { ...context.repo, owner: context.repo.owner, repo: context.repo.repo, number });
+                }`, { owner: context.repo.owner, repo: context.repo.repo, number });
               return repository.issue;
             };
+            const isEligible = (live) =>
+              live.state === 'OPEN' && live.closedByPullRequestsReferences.totalCount === 0;
 
-            const closeIssue = async (number) => {
+            // Authoritative marker lookup: paginate ALL comments — a bounded
+            // window can miss the marker under later comment activity.
+            const findMarker = async (number) => {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                ...context.repo, issue_number: number, per_page: 100,
+              });
+              return comments.find((c) => c.body?.includes(MARKER)) ?? null;
+            };
+
+            // Close only through this gate: re-verify eligibility at the
+            // destructive boundary, then close and settle labels.
+            const verifyAndClose = async (number) => {
+              const live = await inspect(number);
+              if (!isEligible(live)) return false;
               await pacedWrite(() => github.rest.issues.update({
-                ...context.repo,
-                issue_number: number,
-                state: 'closed',
-                state_reason: 'not_planned',
+                ...context.repo, issue_number: number,
+                state: 'closed', state_reason: 'not_planned',
               }));
+              await settleLabels(number);
+              return true;
+            };
+            const settleLabels = async (number) => {
+              await pacedWrite(() => github.rest.issues.addLabels({
+                ...context.repo, issue_number: number, labels: [HANDLED_LABEL],
+              }));
+              await pacedWrite(async () => {
+                try {
+                  await github.rest.issues.removeLabel({
+                    ...context.repo, issue_number: number, name: PENDING_LABEL,
+                  });
+                } catch (error) {
+                  if (error.status !== 404) throw error;
+                }
+              });
             };
 
             const rows = [];
-            let closed = 0;
-            let failed = 0;
+            const counts = { closed: 0, recovered: 0, exempt: 0, skipped: 0, failed: 0, deferred: 0 };
             const escapeCell = (value) => String(value)
               .replace(/\\/g, '\\\\')
               .replace(/\|/g, '\\|')
               .replace(/\r?\n/g, ' ');
-            const report = (issue, outcome) => rows.push(
-              `| [#${issue.number}](${issue.html_url ?? `https://github.com/${context.repo.owner}/${context.repo.repo}/issues/${issue.number}`}) | ${escapeCell(issue.title ?? '')} | ${escapeCell(outcome)} |`,
+            const report = (number, title, outcome) => rows.push(
+              `| [#${number}](https://github.com/${context.repo.owner}/${context.repo.repo}/issues/${number}) | ${escapeCell(title ?? '')} | ${escapeCell(outcome)} |`,
             );
 
-            // Ensure the marker label exists (no-op if it already does).
+            // Ensure state labels exist (422 = already exists).
             if (!DRY_RUN) {
-              try {
-                await github.rest.issues.createLabel({
-                  ...context.repo,
-                  name: HANDLED_LABEL,
-                  color: 'ededed',
-                  description: 'Closed by stale automation; survives reopening as an exemption marker',
-                });
-              } catch (error) {
-                if (error.status !== 422) throw error;
+              for (const [name, description] of [
+                [PENDING_LABEL, 'Stale-close transaction in progress; recovered on next run if interrupted'],
+                [HANDLED_LABEL, 'Closed by stale automation; reopening grants a permanent exemption'],
+              ]) {
+                try {
+                  await github.rest.issues.createLabel({
+                    ...context.repo, name, color: 'ededed', description,
+                  });
+                } catch (error) {
+                  if (error.status !== 422) throw error;
+                }
               }
             }
 
-            // ── Phase 1: reconcile previously handled issues that are open ──
-            // label present + open means either (a) a human reopened it →
-            // permanently exempt, or (b) a previous run was interrupted
-            // between labeling and closing → finish the close phase.
-            const { data: pending } = await github.rest.search.issuesAndPullRequests({
-              q: `repo:${context.repo.owner}/${context.repo.repo} is:issue state:open label:${HANDLED_LABEL}`,
-              per_page: MAX_ITEMS_PER_RUN,
-            });
-            for (const issue of pending.items.filter((item) => !item.pull_request)) {
+            const searchIssues = async (q, extra = {}) => {
+              const { data } = await github.rest.search.issuesAndPullRequests({
+                q, per_page: Math.min(budget, MAX_ITEMS_PER_RUN) || 1, ...extra,
+              });
+              return { total: data.total_count, items: data.items.filter((i) => !i.pull_request) };
+            };
+            const repoQ = `repo:${context.repo.owner}/${context.repo.repo}`;
+
+            // ── Phase 0: label hygiene — closed issues stuck in pending ──
+            // (interrupted between close and label settlement; non-destructive)
+            const stuck = await searchIssues(`${repoQ} is:issue state:closed label:${PENDING_LABEL}`);
+            for (const issue of stuck.items) {
+              if (budget <= 0) { counts.deferred += 1; continue; }
+              budget -= 1;
+              if (DRY_RUN) { report(issue.number, issue.title, 'dry run — would settle labels'); continue; }
               try {
-                const live = await revalidate(issue.number);
-                if (live.state !== 'OPEN') { continue; }
-                if (live.timelineItems.totalCount > 0) {
-                  report(issue, 'reopened by a user — exempt');
+                await settleLabels(issue.number);
+                report(issue.number, issue.title, 'labels settled (was closed mid-transaction)');
+              } catch (error) {
+                counts.failed += 1;
+                core.warning(`#${issue.number}: ${error.message}`);
+                report(issue.number, issue.title, `failed: ${error.message}`);
+              }
+            }
+
+            // ── Phase 1: recover interrupted transactions ──
+            const pending = await searchIssues(`${repoQ} is:issue state:open label:${PENDING_LABEL}`);
+            for (const issue of pending.items) {
+              if (budget <= 0) { counts.deferred += 1; continue; }
+              budget -= 1;
+              try {
+                const live = await inspect(issue.number);
+                if (live.state !== 'OPEN') { counts.skipped += 1; report(issue.number, issue.title, 'skipped — already closed'); continue; }
+
+                // Reopen ordering (not lifetime count): exempt only if a
+                // reopen happened AFTER this transaction's anchor — the
+                // marker comment, or failing that, the pending-label event.
+                const marker = await findMarker(issue.number);
+                const events = live.timelineItems.nodes;
+                const anchor = marker?.created_at
+                  ?? events.filter((e) => e.__typename === 'LabeledEvent' && e.label?.name === PENDING_LABEL).map((e) => e.createdAt).pop();
+                const reopenedAfterAnchor = anchor && events.some(
+                  (e) => e.__typename === 'ReopenedEvent' && e.createdAt > anchor,
+                );
+                if (reopenedAfterAnchor) {
+                  counts.exempt += 1;
+                  if (DRY_RUN) { report(issue.number, issue.title, 'dry run — reopened after close, would mark exempt'); continue; }
+                  await settleLabels(issue.number);  // open+handled = durable exemption
+                  report(issue.number, issue.title, 'reopened by a user — permanently exempt');
                   continue;
                 }
-                if (DRY_RUN) { report(issue, 'dry run — would recover close'); continue; }
-                if (!live.comments.nodes.some((c) => c.body.includes(MARKER))) {
+                if (!isEligible(live)) {
+                  counts.skipped += 1;
+                  if (!DRY_RUN) {
+                    await pacedWrite(() => github.rest.issues.removeLabel({
+                      ...context.repo, issue_number: issue.number, name: PENDING_LABEL,
+                    }).catch((e) => { if (e.status !== 404) throw e; }));
+                  }
+                  report(issue.number, issue.title, 'skipped — gained a linked PR; pending label removed');
+                  continue;
+                }
+                if (DRY_RUN) { report(issue.number, issue.title, 'dry run — would recover close'); continue; }
+                if (!marker) {
                   await pacedWrite(() => github.rest.issues.createComment({
                     ...context.repo, issue_number: issue.number, body: CLOSE_COMMENT,
                   }));
                 }
-                await closeIssue(issue.number);
-                closed += 1;
-                report(issue, 'closed (recovered from interrupted run)');
+                if (await verifyAndClose(issue.number)) {
+                  counts.recovered += 1;
+                  report(issue.number, issue.title, 'closed (recovered from interrupted run)');
+                } else {
+                  counts.skipped += 1;
+                  report(issue.number, issue.title, 'skipped at close boundary — eligibility changed');
+                }
               } catch (error) {
-                failed += 1;
+                counts.failed += 1;
                 core.warning(`#${issue.number}: ${error.message}`);
-                report(issue, `failed: ${error.message}`);
+                report(issue.number, issue.title, `failed: ${error.message}`);
               }
             }
 
-            // ── Phase 2: close new candidates ──
-            const query = `repo:${context.repo.owner}/${context.repo.repo} is:issue state:open -linked:pr -label:${HANDLED_LABEL} created:<${cutoff}`;
+            // ── Phase 2: process new candidates ──
+            const query = `${repoQ} is:issue state:open -linked:pr -label:${HANDLED_LABEL} -label:${PENDING_LABEL} created:<${cutoff}`;
             core.info(`query: ${query}${DRY_RUN ? ' (dry run)' : ''}`);
-            const { data: result } = await github.rest.search.issuesAndPullRequests({
-              q: query,
-              sort: 'created',
-              order: 'asc',
-              per_page: MAX_ITEMS_PER_RUN,
-            });
-            const candidates = result.items.filter((item) => !item.pull_request);
-
-            for (const issue of candidates) {
+            const result = await searchIssues(query, { sort: 'created', order: 'asc' });
+            for (const issue of result.items) {
+              if (budget <= 0) { counts.deferred += 1; continue; }
+              budget -= 1;
               try {
-                const live = await revalidate(issue.number);
-                if (live.state !== 'OPEN') {
-                  report(issue, 'skipped — already closed');
+                const live = await inspect(issue.number);
+                if (!isEligible(live)) {
+                  counts.skipped += 1;
+                  report(issue.number, issue.title, live.state !== 'OPEN' ? 'skipped — already closed' : 'skipped — gained a linked PR');
                   continue;
                 }
-                if (live.closedByPullRequestsReferences.totalCount > 0) {
-                  report(issue, 'skipped — gained a linked PR');
-                  continue;
-                }
-                if (DRY_RUN) { report(issue, 'dry run — would close'); continue; }
-                // Label first: if interrupted, phase 1 finishes the close on
-                // the next run instead of posting a duplicate notification.
+                if (DRY_RUN) { report(issue.number, issue.title, 'dry run — would close'); continue; }
+                // Transaction: pending label → notification → verified close.
+                // Any interruption leaves open+pending for phase-1 recovery.
                 await pacedWrite(() => github.rest.issues.addLabels({
-                  ...context.repo, issue_number: issue.number, labels: [HANDLED_LABEL],
+                  ...context.repo, issue_number: issue.number, labels: [PENDING_LABEL],
                 }));
                 await pacedWrite(() => github.rest.issues.createComment({
                   ...context.repo, issue_number: issue.number, body: CLOSE_COMMENT,
                 }));
-                await closeIssue(issue.number);
-                closed += 1;
-                report(issue, 'closed');
+                if (await verifyAndClose(issue.number)) {
+                  counts.closed += 1;
+                  report(issue.number, issue.title, 'closed');
+                } else {
+                  counts.skipped += 1;
+                  report(issue.number, issue.title, 'skipped at close boundary — eligibility changed (recovery will re-check)');
+                }
               } catch (error) {
-                failed += 1;
+                counts.failed += 1;
                 core.warning(`#${issue.number}: ${error.message}`);
-                report(issue, `failed: ${error.message}`);
+                report(issue.number, issue.title, `failed: ${error.message}`);
               }
             }
 
@@ -195,12 +280,13 @@ jobs:
               rows.push('| — | No candidates found | — |');
             }
 
-            const remaining = Math.max(result.total_count - candidates.length, 0);
+            const processed = MAX_ITEMS_PER_RUN - budget;
+            const unqueried = Math.max(result.total - result.items.length, 0);
             const summary = [
               `Query: \`${query}\``,
               '',
-              `Found **${result.total_count}** candidate(s); processed the oldest **${candidates.length}** plus **${pending.total_count}** pending reconciliation.`,
-              `${DRY_RUN ? 'Dry run — no changes made.' : `Closed **${closed}**.`}${failed > 0 ? ` **${failed}** failed.` : ''}${remaining > 0 ? ` **${remaining}** additional candidate(s) will be handled on subsequent runs.` : ''}`,
+              `Matches: **${result.total}** new candidate(s), **${pending.total}** pending recovery, **${stuck.total}** label-settlement.`,
+              `Processed **${processed}** (budget ${MAX_ITEMS_PER_RUN})${DRY_RUN ? ' — dry run, no changes made' : ''}: closed **${counts.closed}**, recovered **${counts.recovered}**, exempt **${counts.exempt}**, skipped **${counts.skipped}**, failed **${counts.failed}**. Deferred to next run: **${counts.deferred + unqueried}**.`,
               '',
               '| Issue | Title | Outcome |',
               '|---|---|---|',
@@ -212,7 +298,7 @@ jobs:
               .addRaw(summary.join('\n'))
               .write();
 
-            core.info(`${DRY_RUN ? 'dry run complete' : `closed ${closed} issue(s)`}; ${failed} failure(s)`);
-            if (failed > 0) {
-              core.setFailed(`${failed} issue(s) could not be processed`);
+            core.info(`processed ${processed}; closed ${counts.closed + counts.recovered}; failed ${counts.failed}`);
+            if (counts.failed > 0) {
+              core.setFailed(`${counts.failed} issue(s) could not be processed`);
             }
