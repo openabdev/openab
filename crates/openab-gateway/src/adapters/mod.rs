@@ -12,3 +12,5 @@ pub mod googlechat;
 pub mod wecom;
 #[cfg(feature = "teams")]
 pub mod teams;
+#[cfg(feature = "acp")]
+pub mod acp_server;
