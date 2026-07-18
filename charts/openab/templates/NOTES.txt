@@ -32,7 +32,7 @@ Agents deployed:
     kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- codex login --device-auth
 {{- else if eq (toString $cfg.command) "claude-agent-acp" }}
     Authenticate:
-    kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- claude auth login
+    kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- claude auth login --sso
 {{- else if eq (toString $cfg.command) "gemini" }}
     Authenticate:
     kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- gemini

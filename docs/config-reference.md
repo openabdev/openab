@@ -315,7 +315,7 @@ working_dir = "/home/agent"
 command = "claude-agent-acp"
 args = []
 working_dir = "/home/node"
-# Auth: kubectl exec -it deploy/openab-claude -- claude auth login
+# Auth: kubectl exec -it deploy/openab-claude -- claude auth login --sso
 # Credentials persist in HOME PVC across restarts. See docs/claude-code.md.
 
 # Codex

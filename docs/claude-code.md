@@ -65,7 +65,7 @@ After authenticating, restart the pod so the bot process loads the new credentia
 kubectl rollout restart deployment/openab-claude
 ```
 
-> **Note:** `claude setup-token` is a different command — it generates a long-lived token for CI/scripts and prints it without saving locally. For container-based deployments, `claude auth login` is the correct approach as it persists credentials to the filesystem.
+> **Note:** `claude setup-token` is a different command — it generates a long-lived token for CI/scripts and prints it without saving locally. For container-based deployments, `claude auth login --sso` is the correct approach as it persists credentials to the filesystem.
 
 ## Troubleshooting
 

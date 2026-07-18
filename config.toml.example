@@ -168,7 +168,7 @@ working_dir = "/home/agent"
 # command = "claude-agent-acp"
 # args = []
 # working_dir = "/home/node"
-# # Auth: kubectl exec -it deploy/openab-claude -- claude auth login
+# # Auth: kubectl exec -it deploy/openab-claude -- claude auth login --sso
 # #       (credentials persist in HOME PVC across restarts; see docs/claude-code.md)
 # ⚠️ SECURITY WARNING: Any env var listed here is accessible to the agent.
 # A user could trick the agent into leaking these values via prompt injection.
