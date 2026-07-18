@@ -1069,9 +1069,15 @@ impl LlmProvider for XaiProvider {
         Box::pin(async move {
             let body = xai_request_body(&self.model, self.max_tokens, system, messages, tools);
 
-            let max_retries = 3u32;
+            // Retry budgets are independent (round-4 F2): rate-limit retries
+            // are capped, while the one-time 401 refresh always gets its own
+            // follow-up request — a successful refresh must never be consumed
+            // by an exhausted budget. Every other outcome returns, so the
+            // loop is bounded at (rate-limit cap + refresh + terminal).
+            const MAX_RATE_LIMIT_RETRIES: u32 = 3;
+            let mut rate_limit_retries = 0u32;
             let mut refreshed_after_401 = false;
-            for attempt in 0..=max_retries {
+            loop {
                 let token = crate::auth::get_valid_token_for(crate::auth::XAI_NAMESPACE).await?;
                 let resp = self
                     .client
@@ -1084,8 +1090,12 @@ impl LlmProvider for XaiProvider {
                     .map_err(|e| anyhow!("HTTP request failed: {e}"))?;
 
                 let status = resp.status();
-                if (status.as_u16() == 429 || status.as_u16() == 529) && attempt < max_retries {
-                    let delay = std::time::Duration::from_millis(1000 * 2u64.pow(attempt));
+                if (status.as_u16() == 429 || status.as_u16() == 529)
+                    && rate_limit_retries < MAX_RATE_LIMIT_RETRIES
+                {
+                    let delay =
+                        std::time::Duration::from_millis(1000 * 2u64.pow(rate_limit_retries));
+                    rate_limit_retries += 1;
                     tokio::time::sleep(delay).await;
                     continue;
                 }
@@ -1115,7 +1125,6 @@ impl LlmProvider for XaiProvider {
                 // Chat Completions shape → parse_openai_response's fallback path.
                 return parse_openai_response(&payload);
             }
-            Err(anyhow!("xAI API: max retries exceeded"))
         })
     }
 }
@@ -1834,6 +1843,48 @@ mod tests {
         let refresh_reqs = refresh_handle.join().unwrap();
         assert!(refresh_reqs[0].contains("grant_type=refresh_token"));
         assert!(refresh_reqs[0].contains("rt1"));
+    }
+
+    #[test]
+    fn xai_chat_rate_limits_then_401_still_gets_refreshed_request() {
+        // Review round-4 F2: three 429s exhaust the rate-limit budget, then a
+        // 401 triggers the one-time refresh — the refreshed token must still
+        // get its follow-up request instead of dying on "max retries exceeded".
+        let home = tempfile::tempdir().unwrap();
+        let (chat_url, chat_handle) = spawn_canned_http(vec![
+            http_resp("429 Too Many Requests", r#"{"error":"rate"}"#),
+            http_resp("429 Too Many Requests", r#"{"error":"rate"}"#),
+            http_resp("429 Too Many Requests", r#"{"error":"rate"}"#),
+            http_resp("401 Unauthorized", r#"{"error":"unauthorized"}"#),
+            http_resp(
+                "200 OK",
+                r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#,
+            ),
+        ]);
+        let (refresh_url, _refresh_handle) = spawn_canned_http(vec![http_resp(
+            "200 OK",
+            r#"{"access_token":"fresh-token","refresh_token":"rt2","expires_in":3600}"#,
+        )]);
+        write_xai_auth(home.path(), &refresh_url);
+
+        temp_env::with_var("HOME", Some(home.path().to_str().unwrap()), || {
+            let provider = XaiProvider {
+                base_url: chat_url.clone(),
+                model: "grok-4.5".to_string(),
+                max_tokens: 8192,
+                client: reqwest::Client::new(),
+            };
+            let events = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(provider.chat("sys", &[], &[]))
+                .unwrap();
+            assert!(matches!(&events[0], LlmEvent::Text(t) if t == "ok"));
+        });
+
+        let chat_reqs = chat_handle.join().unwrap();
+        assert_eq!(chat_reqs.len(), 5);
+        // The post-refresh request carries the rotated token.
+        assert!(chat_reqs[4].contains("Bearer fresh-token"));
     }
 
     #[test]
