@@ -55,7 +55,7 @@ tolerated for forward-compatibility.
 | `OPENAB_AGENT_OPENAI_MODEL` | `gpt-5.4-mini` | Model to use (must be supported by your ChatGPT plan — see [Supported Models](#supported-models-chatgpt-subscription)) |
 | `OPENAB_AGENT_OPENAI_BASE_URL` | `https://chatgpt.com/backend-api` | API base URL |
 | `OPENAB_AGENT_XAI_MODEL` | `grok-4.5` | xAI model to use (see [xAI credentials](#xai-credentials-supergrok--x-premium)) |
-| `OPENAB_AGENT_XAI_BASE_URL` | `https://api.x.ai/v1` | xAI API base URL |
+| `OPENAB_AGENT_XAI_BASE_URL` | `https://api.x.ai/v1` | xAI API base URL. Must be an `https://` URL on an `x.ai` host — the OAuth bearer is never sent elsewhere. |
 | `OPENAB_AGENT_PROVIDER` | auto-detect | Force provider (`anthropic`, `openai`, `codex`, `xai`, `grok`) |
 | `OPENAB_AGENT_MAX_TOKENS` | `8192` | Max output tokens. Overrides `max_tokens` in config.json. |
 | `OPENAB_AGENT_OAUTH_CLIENT_ID` | Pi's client | Custom Codex OAuth client ID |

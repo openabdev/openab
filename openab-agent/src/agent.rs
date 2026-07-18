@@ -63,12 +63,29 @@ pub struct Agent {
     system_prompt: String,
     tools: Vec<ToolDef>,
     mcp_manager: Option<McpRuntimeManager>,
+    /// Sticky per-session auth policy for Anthropic (review round-3 F2): set
+    /// whenever an Anthropic provider is active, and *retained* while other
+    /// providers (xAI, Codex) are active, so an Anthropic-OAuth → xAI →
+    /// Anthropic round trip switches back to OAuth instead of silently
+    /// preferring `ANTHROPIC_API_KEY` (a different account/billing context).
+    anthropic_oauth_preferred: bool,
+}
+
+/// The sticky-preference update shared by construction and provider swap:
+/// only an *active Anthropic* provider rewrites the remembered policy.
+fn anthropic_oauth_preference(provider: &dyn LlmProvider, previous: bool) -> bool {
+    if provider.provider_name() == "anthropic" {
+        provider.is_oauth()
+    } else {
+        previous
+    }
 }
 
 impl Agent {
     #[cfg(test)]
     pub fn new(provider: impl LlmProvider + 'static, working_dir: String) -> Self {
         let system_prompt = Self::build_system_prompt(&working_dir, None);
+        let anthropic_oauth_preferred = anthropic_oauth_preference(&provider, false);
         Self {
             provider: Box::new(provider),
             messages: Vec::new(),
@@ -76,6 +93,7 @@ impl Agent {
             system_prompt,
             tools: tools::tool_definitions(),
             mcp_manager: None,
+            anthropic_oauth_preferred,
         }
     }
 
@@ -92,6 +110,7 @@ impl Agent {
             }
             t
         };
+        let anthropic_oauth_preferred = anthropic_oauth_preference(provider.as_ref(), false);
         Self {
             provider,
             messages: Vec::new(),
@@ -99,25 +118,23 @@ impl Agent {
             system_prompt,
             tools,
             mcp_manager,
+            anthropic_oauth_preferred,
         }
     }
 
-    /// Replace the LLM provider while preserving conversation history.
+    /// Replace the LLM provider while preserving conversation history (and the
+    /// sticky Anthropic auth policy — see `anthropic_oauth_preferred`).
     pub fn swap_provider(&mut self, provider: Box<dyn LlmProvider>) {
+        self.anthropic_oauth_preferred =
+            anthropic_oauth_preference(provider.as_ref(), self.anthropic_oauth_preferred);
         self.provider = provider;
     }
 
-    /// True if the current provider authenticates via OAuth. Used on model
-    /// switch to rebuild with the same auth mode.
-    pub fn provider_is_oauth(&self) -> bool {
-        self.provider.is_oauth()
-    }
-
-    /// Canonical family name of the current provider (`anthropic` / `openai` /
-    /// `xai`). Combined with `provider_is_oauth` on model switch so auth-mode
-    /// preservation is provider-specific (review F2).
-    pub fn provider_name(&self) -> String {
-        self.provider.provider_name().to_string()
+    /// Sticky Anthropic auth policy for this session (review round-3 F2):
+    /// true when the session most recently ran Anthropic in OAuth mode, even
+    /// if another provider is active right now.
+    pub fn prefers_anthropic_oauth(&self) -> bool {
+        self.anthropic_oauth_preferred
     }
 
     /// The model id the current provider will use. Authoritative source for the
@@ -380,6 +397,73 @@ mod tests {
         let mut agent = Agent::new(mock, tmp.path().to_string_lossy().to_string());
         let result = agent.run("hi").await.unwrap();
         assert_eq!(result, "Hello!");
+    }
+
+    /// Stub provider with a fixed identity, for auth-policy tests.
+    struct StubProvider {
+        name: &'static str,
+        oauth: bool,
+    }
+    impl LlmProvider for StubProvider {
+        fn model(&self) -> &str {
+            "stub"
+        }
+        fn is_oauth(&self) -> bool {
+            self.oauth
+        }
+        fn provider_name(&self) -> &str {
+            self.name
+        }
+        fn chat<'a>(
+            &'a self,
+            _system: &'a str,
+            _messages: &'a [Message],
+            _tools: &'a [ToolDef],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<LlmEvent>>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(vec![]) })
+        }
+    }
+
+    #[test]
+    fn anthropic_oauth_preference_is_sticky_across_provider_round_trips() {
+        // Review round-3 F2: Anthropic-OAuth → xAI → Anthropic must remember
+        // the OAuth policy; only an *active Anthropic* provider rewrites it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut agent = Agent::new_boxed(
+            Box::new(StubProvider {
+                name: "anthropic",
+                oauth: true,
+            }),
+            tmp.path().to_string_lossy().to_string(),
+            None,
+        );
+        assert!(agent.prefers_anthropic_oauth());
+
+        // Switching away to xAI keeps the remembered Anthropic policy.
+        agent.swap_provider(Box::new(StubProvider {
+            name: "xai",
+            oauth: true,
+        }));
+        assert!(agent.prefers_anthropic_oauth(), "policy lost on round trip");
+
+        // Explicitly running Anthropic on an API key rewrites the policy…
+        agent.swap_provider(Box::new(StubProvider {
+            name: "anthropic",
+            oauth: false,
+        }));
+        assert!(!agent.prefers_anthropic_oauth());
+
+        // …and a session that never chose Anthropic OAuth never prefers it.
+        let agent2 = Agent::new_boxed(
+            Box::new(StubProvider {
+                name: "xai",
+                oauth: true,
+            }),
+            tmp.path().to_string_lossy().to_string(),
+            None,
+        );
+        assert!(!agent2.prefers_anthropic_oauth());
     }
 
     #[tokio::test]

@@ -865,6 +865,7 @@ impl LlmProvider for OpenAiProvider {
 pub struct XaiProvider {
     base_url: String,
     model: String,
+    max_tokens: u32,
     client: reqwest::Client,
 }
 
@@ -891,6 +892,28 @@ fn xai_model() -> String {
     "grok-4.5".to_string()
 }
 
+/// Validate `OPENAB_AGENT_XAI_BASE_URL` before the OAuth bearer is attached
+/// (review round-3 F1): the stored subscription token is a refreshable
+/// credential, so it may only ever be sent over https to an xAI-owned host
+/// (`api.x.ai` or another `*.x.ai` subdomain). A typo'd, plaintext, or
+/// non-xAI proxy value fails loud instead of silently leaking the token.
+fn validate_xai_base_url(raw: &str) -> Result<String, String> {
+    let parsed = url::Url::parse(raw)
+        .map_err(|e| format!("invalid OPENAB_AGENT_XAI_BASE_URL `{raw}`: {e}"))?;
+    if parsed.scheme() != "https" {
+        return Err(format!(
+            "refusing OPENAB_AGENT_XAI_BASE_URL `{raw}`: the xAI OAuth bearer may only be sent over https"
+        ));
+    }
+    let host = parsed.host_str().unwrap_or_default();
+    if host != "x.ai" && !host.ends_with(".x.ai") {
+        return Err(format!(
+            "refusing OPENAB_AGENT_XAI_BASE_URL `{raw}`: the xAI OAuth bearer may only be sent to an x.ai host (got `{host}`)"
+        ));
+    }
+    Ok(raw.trim_end_matches('/').to_string())
+}
+
 impl XaiProvider {
     /// Create provider using the stored xAI OAuth token from
     /// `~/.openab/agent/auth.json` (run `openab-agent auth xai-device` first).
@@ -898,10 +921,16 @@ impl XaiProvider {
         // Just verify tokens exist; the live token is fetched (and refreshed)
         // per call, mirroring `OpenAiProvider`.
         crate::auth::load_tokens_for(crate::auth::XAI_NAMESPACE).map_err(|e| e.to_string())?;
+        let base_url = match std::env::var("OPENAB_AGENT_XAI_BASE_URL") {
+            Ok(raw) if !raw.is_empty() => validate_xai_base_url(&raw)?,
+            _ => "https://api.x.ai/v1".to_string(),
+        };
         Ok(Self {
-            base_url: std::env::var("OPENAB_AGENT_XAI_BASE_URL")
-                .unwrap_or_else(|_| "https://api.x.ai/v1".to_string()),
+            base_url,
             model: xai_model(),
+            // Same documented env-over-config resolution as Anthropic:
+            // OPENAB_AGENT_MAX_TOKENS → config.json max_tokens → 8192.
+            max_tokens: anthropic_max_tokens(),
             client: reqwest::Client::new(),
         })
     }
@@ -982,6 +1011,42 @@ fn xai_chat_messages(system: &str, messages: &[Message]) -> Vec<Value> {
     out
 }
 
+/// Build the Chat Completions request body. Pure so the wire shape — including
+/// the documented `OPENAB_AGENT_MAX_TOKENS` output limit (review round-3 F3) —
+/// is unit-testable.
+fn xai_request_body(
+    model: &str,
+    max_tokens: u32,
+    system: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+) -> Value {
+    let mut body = json!({
+        "model": model,
+        "messages": xai_chat_messages(system, messages),
+        "max_tokens": max_tokens,
+        "stream": false,
+    });
+    if !tools.is_empty() {
+        let cc_tools: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": &t.name,
+                        "description": &t.description,
+                        "parameters": &t.input_schema,
+                    }
+                })
+            })
+            .collect();
+        body["tools"] = json!(cc_tools);
+        body["tool_choice"] = json!("auto");
+    }
+    body
+}
+
 impl LlmProvider for XaiProvider {
     fn model(&self) -> &str {
         &self.model
@@ -1002,28 +1067,7 @@ impl LlmProvider for XaiProvider {
         tools: &'a [ToolDef],
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<LlmEvent>>> + Send + 'a>> {
         Box::pin(async move {
-            let mut body = json!({
-                "model": &self.model,
-                "messages": xai_chat_messages(system, messages),
-                "stream": false,
-            });
-            if !tools.is_empty() {
-                let cc_tools: Vec<Value> = tools
-                    .iter()
-                    .map(|t| {
-                        json!({
-                            "type": "function",
-                            "function": {
-                                "name": &t.name,
-                                "description": &t.description,
-                                "parameters": &t.input_schema,
-                            }
-                        })
-                    })
-                    .collect();
-                body["tools"] = json!(cc_tools);
-                body["tool_choice"] = json!("auto");
-            }
+            let body = xai_request_body(&self.model, self.max_tokens, system, messages, tools);
 
             let max_retries = 3u32;
             let mut refreshed_after_401 = false;
@@ -1620,6 +1664,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validate_xai_base_url_allows_only_https_x_ai_hosts() {
+        // Review round-3 F1: the OAuth bearer must never leave the x.ai trust
+        // boundary or travel over plaintext.
+        assert_eq!(
+            validate_xai_base_url("https://api.x.ai/v1").unwrap(),
+            "https://api.x.ai/v1"
+        );
+        // Trailing slash normalised; other x.ai subdomains allowed.
+        assert_eq!(
+            validate_xai_base_url("https://staging.x.ai/v1/").unwrap(),
+            "https://staging.x.ai/v1"
+        );
+        // Plaintext, non-xAI hosts, lookalike suffixes, and garbage all fail.
+        assert!(validate_xai_base_url("http://api.x.ai/v1").is_err());
+        assert!(validate_xai_base_url("https://api.evil.example/v1").is_err());
+        assert!(validate_xai_base_url("https://notx.ai/v1").is_err());
+        assert!(validate_xai_base_url("https://apix.ai/v1").is_err());
+        assert!(validate_xai_base_url("not a url").is_err());
+    }
+
+    #[test]
+    fn xai_request_body_carries_max_tokens_and_tools() {
+        // Review round-3 F3: the documented OPENAB_AGENT_MAX_TOKENS contract
+        // must reach the wire.
+        let tools = vec![ToolDef {
+            name: "bash".to_string(),
+            description: "run".to_string(),
+            input_schema: json!({"type": "object"}),
+        }];
+        let body = xai_request_body("grok-4.5", 4096, "sys", &[], &tools);
+        assert_eq!(body["model"], "grok-4.5");
+        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["tools"][0]["function"]["name"], "bash");
+        assert_eq!(body["tool_choice"], "auto");
+        // No tools → the tool fields are absent entirely.
+        let body = xai_request_body("grok-4.5", 4096, "sys", &[], &[]);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+    }
+
     // ── XaiProvider 401 reactive-refresh loop (review F3) ─────────────────
     // Deterministic coverage via canned local HTTP servers: no live xAI, no
     // real credentials. HOME is redirected to a tempdir so auth.json reads and
@@ -1731,6 +1817,7 @@ mod tests {
             let provider = XaiProvider {
                 base_url: chat_url.clone(),
                 model: "grok-4.5".to_string(),
+                max_tokens: 8192,
                 client: reqwest::Client::new(),
             };
             let events = tokio::runtime::Runtime::new()
@@ -1768,6 +1855,7 @@ mod tests {
             let provider = XaiProvider {
                 base_url: chat_url.clone(),
                 model: "grok-4.5".to_string(),
+                max_tokens: 8192,
                 client: reqwest::Client::new(),
             };
             let err = tokio::runtime::Runtime::new()
