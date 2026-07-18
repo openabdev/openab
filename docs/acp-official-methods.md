@@ -1,8 +1,8 @@
 # ACP — Official Method Surface & OpenAB Coverage
 
 Reference list of the **official** Agent Client Protocol methods/notifications, and
-how OpenAB's Phase 1 ACP server (`docs/adr/acp-server-websocket-phase1.md`) maps onto
-them. Phase 1 targets **wire conformance** for the chat subset, so standard ACP
+how OpenAB's base ACP server (`docs/adr/acp-server-websocket-base.md`) maps onto
+them. The base targets **wire conformance** for the chat subset, so standard ACP
 clients (Zed, JetBrains, …) interoperate.
 
 ### Provenance / version pin
@@ -27,7 +27,7 @@ Directions use the ACP roles: the **Agent** answers prompts (here, OpenAB); the
 
 ## Agent methods (Client → Agent, request/response)
 
-| Method | Purpose | OpenAB Phase 1 |
+| Method | Purpose | OpenAB base |
 |---|---|---|
 | `initialize` | Negotiate protocol + capabilities | ✅ conformant (`protocolVersion:1`, `agentCapabilities`, `authMethods:[]`) |
 | `authenticate` | Authenticate via a declared auth method | ⛔ (we use a pre-connect token on the WS upgrade; `authMethods:[]`) |
@@ -44,7 +44,7 @@ Directions use the ACP roles: the **Agent** answers prompts (here, OpenAB); the
 
 ## Notifications
 
-| Method | Direction | Purpose | OpenAB Phase 1 |
+| Method | Direction | Purpose | OpenAB base |
 |---|---|---|---|
 | `session/cancel` | Client → Agent | Cancel in-flight work (one-way, no response) | ✅ conformant (notification; prompt ends `stopReason:"cancelled"`) |
 | `session/update` | Agent → Client | Stream session events | ✅ `agent_message_chunk` (text). Other variants (`agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, `available_commands_update`, `usage_update`, …) are Phase 2 / not forwarded |
@@ -53,15 +53,15 @@ Directions use the ACP roles: the **Agent** answers prompts (here, OpenAB); the
 ## Client methods (Agent → Client, request/response)
 
 The agent runs server-side with its own fs/terminal, so OpenAB does not call any of
-these in Phase 1.
+these in the base.
 
-| Method | Purpose | OpenAB Phase 1 |
+| Method | Purpose | OpenAB base |
 |---|---|---|
 | `session/request_permission` | Ask the client to approve a tool call | ⛔ (Phase 2) |
 | `fs/read_text_file` / `fs/write_text_file` | Read/write a text file on the client | ⛔ |
 | `terminal/create` / `output` / `wait_for_exit` / `kill` / `release` | Drive a client terminal | ⛔ |
 
-## Conformance status (Phase 1)
+## Conformance status (base)
 
 The chat subset is **wire-conformant** with ACP Schema v1.19.0:
 
@@ -72,7 +72,7 @@ The chat subset is **wire-conformant** with ACP Schema v1.19.0:
 - `session/cancel` → one-way notification.
 - Resume → `session/resume` (no replay), gated by `sessionCapabilities.resume`.
 
-### Intentional non-support (documented, not a gap to close in Phase 1)
+### Intentional non-support (documented, not a gap to close in the base)
 
 - **`session/load`** — needs an upstream conversation transcript OpenAB does not keep
   (history lives in the downstream agent CLI). Advertised as `loadSession:false`.

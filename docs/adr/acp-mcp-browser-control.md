@@ -3,7 +3,7 @@
 - **Status:** Proposed (design only — not implemented)
 - **Date:** 2026-07-18
 - **Author:** @brettchien
-- **Related:** [ACP Server over WebSocket — Phase 1 (as-built)](./acp-server-websocket-phase1.md),
+- **Related:** [ACP Server over WebSocket — Base (as-built)](./acp-server-websocket-base.md),
   [ACP Server with WebSocket Transport](./acp-server-websocket.md) (Phase 2: Tool Calls &
   Permissions), [openab-agent MCP](./openab-agent-mcp.md)
 
@@ -11,7 +11,7 @@
 
 ## 1. Context
 
-Phase 1 ships a 1:1 streaming chat ACP server at `GET /acp`; a browser side-panel
+The base ships a 1:1 streaming chat ACP server at `GET /acp`; a browser side-panel
 extension connects as an ACP client and drives an OpenAB agent. The next goal is for the
 agent's **LLM to autonomously operate the user's browser** (click, read the DOM, navigate)
 — i.e. browser "computer use", but targeting the user's real, logged-in Chrome session
@@ -66,7 +66,7 @@ distinguished by ACP method namespace. No second connection.
 
 ## 3. Protocol gap to close first
 
-Phase 1 does only client→agent (prompt) and agent→client **notifications** (streaming
+The base does only client→agent (prompt) and agent→client **notifications** (streaming
 text). Browser control needs the **agent→client REQUEST** direction (request/response:
 the agent asks the client to do X and awaits a result). The WS is already bidirectional;
 `acp_server`'s dispatch loop must add the agent-initiated-request path. This is also the

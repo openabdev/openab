@@ -1,4 +1,4 @@
-# ADR: ACP Server over WebSocket — Phase 1 (as-built)
+# ADR: ACP Server over WebSocket — Base (as-built)
 
 - **Status:** Accepted
 - **Date:** 2026-07-17
@@ -13,17 +13,17 @@
 
 The original proposal ([acp-server-websocket.md](./acp-server-websocket.md)) defines
 the full ACP-server vision across five phases. This ADR is the **as-built record of
-Phase 1** — the concrete, **wire-conformant** primitive surface the implementation
+the base** — the concrete, **wire-conformant** primitive surface the implementation
 ships and that future work should follow.
 
 Scope: a standard-ACP **1:1 streaming chat** endpoint for real ACP clients (browser,
-desktop, IDE, CLI) over WebSocket. Not in Phase 1: tool calls / permissions, client
+desktop, IDE, CLI) over WebSocket. Not in the base: tool calls / permissions, client
 fs/terminal methods, multi-agent fan-out, Streamable HTTP.
 
 Design goal (per decision on 2026-07-17): **follow the official ACP guide** so
 third-party ACP clients (Zed, JetBrains, …) interoperate — no custom method names.
 
-## 2. Decision — Phase 1 primitive surface (ACP-conformant)
+## 2. Decision — the base primitive surface (ACP-conformant)
 
 Transport: `GET /acp`, feature-gated `acp` + runtime `OPENAB_ACP_ENABLED`. Mounted on
 **both** the standalone `openab-gateway` binary (`serve()`) **and** the embedded
@@ -59,7 +59,7 @@ JSON-RPC 2.0; non-`"2.0"` rejected with `-32600`.
 
 `agentCapabilities` advertises `sessionCapabilities.resume` (we support resume) and
 `loadSession: false` (we cannot replay history — see §3). `promptCapabilities` are
-all `false` in Phase 1 (text only). `protocolVersion` is the integer `1`.
+all `false` in the base (text only). `protocolVersion` is the integer `1`.
 
 ### Client → Agent (notification)
 
@@ -111,11 +111,11 @@ and rejecting forged ids.
 
 ## 4. Divergences from the original proposal
 
-| Proposal (Phase 1) | As-built | Why |
+| Proposal (the base) | As-built | Why |
 |---|---|---|
 | Add `agent-client-protocol` crate dep | removed — hand-rolled JSON-RPC | fewer deps; small surface |
 | "Bearer token auth" | `subtle::ConstantTimeEq` + `OPENAB_ACP_AUTH_KEY` | timing-safe, no new dep |
-| Resume in **Phase 3** | `session/resume` in **Phase 1** | core continuity is already channel-keyed + persisted, so a gateway-only change buys reconnect resume cheaply |
+| Resume in **Phase 3** | `session/resume` in **the base** | core continuity is already channel-keyed + persisted, so a gateway-only change buys reconnect resume cheaply |
 
 ## 5. Consequences & limits
 
@@ -123,11 +123,11 @@ and rejecting forged ids.
   assumes one monotonic text. Multi-agent fan-out is Phase 4 (would corrupt this).
 - **cwd / mcpServers** — accepted on `session/new` / `session/resume` for wire
   conformance but not yet propagated into the agent (follow-up).
-- **Emoji** — inline 顏文字 flow through as text; reaction emoji stay no-op in Phase 1.
+- **Emoji** — inline 顏文字 flow through as text; reaction emoji stay no-op in the base.
 - **Reconnect** — on WS disconnect the per-connection session map is dropped; the
   client reconnects with `session/resume` + its persisted `sessionId`.
 
-## 6. Roadmap (from proposal; resume pulled into Phase 1)
+## 6. Roadmap (from proposal; resume pulled into the base)
 
 - **Phase 2** — tool calls: `session/update` variants `tool_call` / `tool_call_update`,
   and `session/request_permission`; reaction emoji → updates. Also enables browser
