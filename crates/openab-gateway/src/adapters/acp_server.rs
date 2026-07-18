@@ -1197,3 +1197,71 @@ mod acp_streaming {
         assert_eq!(stream_delta(0, ""), None);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Handler-level tests — call the real handlers (not just literal round-trips) and
+// assert their actual output + side effects.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod acp_handlers {
+    use super::{
+        handle_initialize, handle_session_new, handle_session_resume, AcpSession, JsonRpcRequest,
+    };
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    fn new_sessions() -> Arc<tokio::sync::Mutex<HashMap<String, AcpSession>>> {
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()))
+    }
+
+    #[test]
+    fn initialize_returns_conformant_capabilities() {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            method: "initialize".into(),
+            id: Some(json!(1)),
+            params: None,
+        };
+        let v = serde_json::to_value(handle_initialize(&req)).unwrap();
+        assert_eq!(v["id"], json!(1));
+        let result = &v["result"];
+        assert_eq!(result["protocolVersion"], json!(1));
+        assert_eq!(result["agentCapabilities"]["loadSession"], json!(false));
+        assert!(result["agentCapabilities"]["sessionCapabilities"]["resume"].is_object());
+        assert!(result["authMethods"].is_array());
+    }
+
+    #[tokio::test]
+    async fn session_new_mints_and_stores_a_session() {
+        let sessions = new_sessions();
+        let v = serde_json::to_value(handle_session_new(&sessions, json!(2)).await).unwrap();
+        let sid = v["result"]["sessionId"].as_str().unwrap();
+        assert!(sid.starts_with("sess_"), "sessionId must be sess_<uuid>: {sid}");
+        assert!(sessions.lock().await.contains_key(sid), "session must be stored");
+    }
+
+    #[tokio::test]
+    async fn session_resume_valid_stores_and_invalid_errors() {
+        let sessions = new_sessions();
+        // valid sess_<uuid> → {} and the session is (re)stored
+        let sid = format!("sess_{}", Uuid::new_v4());
+        let params = json!({"sessionId": sid, "cwd": "/w", "mcpServers": []});
+        let v = serde_json::to_value(handle_session_resume(&sessions, json!(3), Some(&params)).await)
+            .unwrap();
+        assert_eq!(v["result"], json!({}));
+        assert!(sessions.lock().await.contains_key(&sid));
+        // malformed sessionId shape → -32602
+        let bad = json!({"sessionId": "not-a-session", "cwd": "/w", "mcpServers": []});
+        let v = serde_json::to_value(handle_session_resume(&sessions, json!(4), Some(&bad)).await)
+            .unwrap();
+        assert_eq!(v["error"]["code"], json!(-32602));
+        // missing sessionId → -32602
+        let v = serde_json::to_value(
+            handle_session_resume(&sessions, json!(5), Some(&json!({"cwd": "/w"}))).await,
+        )
+        .unwrap();
+        assert_eq!(v["error"]["code"], json!(-32602));
+    }
+}
