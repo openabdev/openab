@@ -102,7 +102,15 @@ impl std::ops::Deref for SharedLlmProvider {
 /// the whole string is the model id — so a HuggingFace-style `org/model` id
 /// (e.g. `meta-llama/Llama-3-8B`) for a custom/OpenAI-compatible endpoint stays
 /// intact instead of mis-parsing `org` as a provider. Extend as vendors land.
-const KNOWN_PROVIDERS: &[&str] = &["anthropic", "anthropic-oauth", "claude", "openai", "codex"];
+const KNOWN_PROVIDERS: &[&str] = &[
+    "anthropic",
+    "anthropic-oauth",
+    "claude",
+    "openai",
+    "codex",
+    "xai",
+    "grok",
+];
 
 /// A model reference, optionally provider-qualified. Accepts the canonical
 /// `provider/model_id` form (e.g. `anthropic/claude-sonnet-4-6`) as well as a
@@ -163,6 +171,7 @@ pub fn select_provider(choice: &str) -> Result<Box<dyn LlmProvider>, String> {
         "anthropic" => Ok(Box::new(AnthropicProvider::auto()?)),
         "anthropic-oauth" | "claude" => Ok(Box::new(AnthropicProvider::from_oauth_auto()?)),
         "openai" | "codex" => Ok(Box::new(OpenAiProvider::from_auth_store()?)),
+        "xai" | "grok" => Ok(Box::new(XaiProvider::from_auth_store()?)),
         _ => match AnthropicProvider::auto() {
             Ok(p) => Ok(Box::new(p)),
             // F3 — don't let a *present-but-misconfigured* Anthropic credential
@@ -179,7 +188,7 @@ pub fn select_provider(choice: &str) -> Result<Box<dyn LlmProvider>, String> {
                     OpenAiProvider::from_auth_store()
                         .map(|p| Box::new(p) as Box<dyn LlmProvider>)
                         .map_err(|codex_err| format!(
-                            "No credentials: set ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN, or run `openab-agent auth anthropic-oauth` / `openab-agent auth codex-oauth`. ({codex_err})"
+                            "No credentials: set ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN, or run `openab-agent auth anthropic-oauth` / `openab-agent auth codex-oauth` / `openab-agent auth xai-device`. ({codex_err})"
                         ))
                 }
             }
@@ -829,6 +838,198 @@ impl LlmProvider for OpenAiProvider {
     }
 }
 
+// === xAI Provider (SuperGrok / X Premium subscription via device OAuth) ===
+//
+// xAI's API is OpenAI Chat Completions-compatible at `api.x.ai/v1`; the OAuth
+// access token from the `xai-oauth` tenant acts as a plain Bearer API key
+// (scope `api:access`), so no bespoke wire format is needed — requests go to
+// `/chat/completions` and responses reuse `parse_openai_response`'s
+// Chat Completions path.
+
+pub struct XaiProvider {
+    base_url: String,
+    model: String,
+    client: reqwest::Client,
+}
+
+impl XaiProvider {
+    /// Create provider using the stored xAI OAuth token from
+    /// `~/.openab/agent/auth.json` (run `openab-agent auth xai-device` first).
+    pub fn from_auth_store() -> Result<Self, String> {
+        // Just verify tokens exist; the live token is fetched (and refreshed)
+        // per call, mirroring `OpenAiProvider`.
+        crate::auth::load_tokens_for(crate::auth::XAI_NAMESPACE).map_err(|e| e.to_string())?;
+        Ok(Self {
+            base_url: std::env::var("OPENAB_AGENT_XAI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.x.ai/v1".to_string()),
+            model: ModelRef::parse(
+                &std::env::var("OPENAB_AGENT_XAI_MODEL")
+                    .or_else(|_| std::env::var("OPENAB_AGENT_MODEL"))
+                    .unwrap_or_else(|_| "grok-4.5".to_string()),
+            )
+            .model,
+            client: reqwest::Client::new(),
+        })
+    }
+
+    /// Create provider with a specific model override.
+    pub fn from_auth_store_with_model(model: &str) -> Result<Self, String> {
+        let mut p = Self::from_auth_store()?;
+        p.model = ModelRef::parse(model).model;
+        Ok(p)
+    }
+}
+
+/// Convert the internal transcript to Chat Completions `messages`. Pure so the
+/// mapping (tool_use → assistant `tool_calls`, tool_result → `role: tool`) is
+/// unit-testable. Tool results are emitted *before* any user text from the same
+/// message: Chat Completions requires `tool` messages to directly follow the
+/// assistant message carrying the corresponding `tool_calls`.
+fn xai_chat_messages(system: &str, messages: &[Message]) -> Vec<Value> {
+    let mut out: Vec<Value> = vec![json!({"role": "system", "content": system})];
+    for m in messages {
+        if m.role == "user" {
+            for b in &m.content {
+                if let ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } = b
+                {
+                    out.push(json!({
+                        "role": "tool",
+                        "tool_call_id": tool_use_id,
+                        "content": content,
+                    }));
+                }
+            }
+            let texts: Vec<&str> = m
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if !texts.is_empty() {
+                out.push(json!({"role": "user", "content": texts.join("")}));
+            }
+        } else if m.role == "assistant" {
+            let mut text_parts: Vec<&str> = Vec::new();
+            let mut tool_calls: Vec<Value> = Vec::new();
+            for b in &m.content {
+                match b {
+                    ContentBlock::Text { text } => text_parts.push(text.as_str()),
+                    ContentBlock::ToolUse { id, name, input } => {
+                        tool_calls.push(json!({
+                            "id": id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": input.to_string()},
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+            if text_parts.is_empty() && tool_calls.is_empty() {
+                continue;
+            }
+            let mut msg = json!({"role": "assistant"});
+            msg["content"] = if text_parts.is_empty() {
+                Value::Null
+            } else {
+                Value::String(text_parts.join(""))
+            };
+            if !tool_calls.is_empty() {
+                msg["tool_calls"] = json!(tool_calls);
+            }
+            out.push(msg);
+        }
+    }
+    out
+}
+
+impl LlmProvider for XaiProvider {
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn is_oauth(&self) -> bool {
+        true
+    }
+
+    fn chat<'a>(
+        &'a self,
+        system: &'a str,
+        messages: &'a [Message],
+        tools: &'a [ToolDef],
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<LlmEvent>>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut body = json!({
+                "model": &self.model,
+                "messages": xai_chat_messages(system, messages),
+                "stream": false,
+            });
+            if !tools.is_empty() {
+                let cc_tools: Vec<Value> = tools
+                    .iter()
+                    .map(|t| {
+                        json!({
+                            "type": "function",
+                            "function": {
+                                "name": &t.name,
+                                "description": &t.description,
+                                "parameters": &t.input_schema,
+                            }
+                        })
+                    })
+                    .collect();
+                body["tools"] = json!(cc_tools);
+                body["tool_choice"] = json!("auto");
+            }
+
+            let max_retries = 3u32;
+            for attempt in 0..=max_retries {
+                let token = crate::auth::get_valid_token_for(crate::auth::XAI_NAMESPACE).await?;
+                let resp = self
+                    .client
+                    .post(format!("{}/chat/completions", self.base_url))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow!("HTTP request failed: {e}"))?;
+
+                let status = resp.status();
+                if (status.as_u16() == 429 || status.as_u16() == 529) && attempt < max_retries {
+                    let delay = std::time::Duration::from_millis(1000 * 2u64.pow(attempt));
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+
+                // 401: token may have expired mid-request, force refresh and retry
+                if status.as_u16() == 401 && attempt < max_retries {
+                    let _ = crate::auth::force_refresh_for(crate::auth::XAI_NAMESPACE).await;
+                    continue;
+                }
+
+                if !status.is_success() {
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(anyhow!("xAI API error {status}: {text}"));
+                }
+
+                let payload: Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| anyhow!("Failed to parse xAI response: {e}"))?;
+                // Chat Completions shape → parse_openai_response's fallback path.
+                return parse_openai_response(&payload);
+            }
+            Err(anyhow!("xAI API: max retries exceeded"))
+        })
+    }
+}
+
 fn extract_account_id_from_jwt(token: &str) -> Option<String> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
@@ -1235,5 +1436,96 @@ mod tests {
     fn test_parse_openai_empty_choices() {
         let resp = json!({"choices": []});
         assert!(parse_openai_response(&resp).is_err());
+    }
+
+    #[test]
+    fn test_model_ref_parses_xai_and_grok_prefixes() {
+        let r = ModelRef::parse("xai/grok-4.5");
+        assert_eq!(r.provider.as_deref(), Some("xai"));
+        assert_eq!(r.model, "grok-4.5");
+        let r = ModelRef::parse("grok/grok-4.3");
+        assert_eq!(r.provider.as_deref(), Some("grok"));
+        assert_eq!(r.model, "grok-4.3");
+        // Bare grok model id: no provider split.
+        let r = ModelRef::parse("grok-4.5");
+        assert_eq!(r.provider, None);
+        assert_eq!(r.model, "grok-4.5");
+    }
+
+    #[test]
+    fn test_xai_chat_messages_maps_transcript_to_chat_completions() {
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "list files".to_string(),
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![
+                    ContentBlock::Text {
+                        text: "Listing.".to_string(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "bash".to_string(),
+                        input: json!({"command": "ls"}),
+                    },
+                ],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![
+                    // Text alongside a tool result: the tool message must still
+                    // directly follow the assistant tool_calls message.
+                    ContentBlock::Text {
+                        text: "thanks".to_string(),
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: "a.txt".to_string(),
+                        is_error: None,
+                    },
+                ],
+            },
+        ];
+        let out = xai_chat_messages("sys", &messages);
+        assert_eq!(out[0]["role"], "system");
+        assert_eq!(out[0]["content"], "sys");
+        assert_eq!(out[1]["role"], "user");
+        assert_eq!(out[1]["content"], "list files");
+        // Assistant text + tool_calls in one message, arguments stringified.
+        assert_eq!(out[2]["role"], "assistant");
+        assert_eq!(out[2]["content"], "Listing.");
+        assert_eq!(out[2]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(out[2]["tool_calls"][0]["type"], "function");
+        assert_eq!(out[2]["tool_calls"][0]["function"]["name"], "bash");
+        assert_eq!(
+            out[2]["tool_calls"][0]["function"]["arguments"],
+            "{\"command\":\"ls\"}"
+        );
+        // Tool result emitted before the trailing user text (adjacency rule).
+        assert_eq!(out[3]["role"], "tool");
+        assert_eq!(out[3]["tool_call_id"], "call_1");
+        assert_eq!(out[3]["content"], "a.txt");
+        assert_eq!(out[4]["role"], "user");
+        assert_eq!(out[4]["content"], "thanks");
+    }
+
+    #[test]
+    fn test_xai_chat_messages_tool_only_assistant_has_null_content() {
+        let messages = vec![Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: "call_2".to_string(),
+                name: "read".to_string(),
+                input: json!({"path": "x"}),
+            }],
+        }];
+        let out = xai_chat_messages("s", &messages);
+        assert_eq!(out[1]["role"], "assistant");
+        assert!(out[1]["content"].is_null());
+        assert_eq!(out[1]["tool_calls"][0]["function"]["name"], "read");
     }
 }

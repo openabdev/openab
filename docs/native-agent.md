@@ -54,10 +54,13 @@ tolerated for forward-compatibility.
 | `OPENAB_AGENT_MODEL` | — (required for Anthropic) | Anthropic model id, optionally `provider/`-qualified (e.g. `claude-opus-4-8`, `anthropic/claude-opus-4-8`). No hardcoded default — dateless 4.6+ IDs are fixed canonical IDs that retire each generation, so the agent fails loud if unset rather than pin a model that will eventually 404. Overrides `model` in [config.json](#configuration-file-configjson). |
 | `OPENAB_AGENT_OPENAI_MODEL` | `gpt-5.4-mini` | Model to use (must be supported by your ChatGPT plan — see [Supported Models](#supported-models-chatgpt-subscription)) |
 | `OPENAB_AGENT_OPENAI_BASE_URL` | `https://chatgpt.com/backend-api` | API base URL |
-| `OPENAB_AGENT_PROVIDER` | auto-detect | Force provider (`anthropic`, `openai`, `codex`) |
+| `OPENAB_AGENT_XAI_MODEL` | `grok-4.5` | xAI model to use (see [xAI credentials](#xai-credentials-supergrok--x-premium)) |
+| `OPENAB_AGENT_XAI_BASE_URL` | `https://api.x.ai/v1` | xAI API base URL |
+| `OPENAB_AGENT_PROVIDER` | auto-detect | Force provider (`anthropic`, `openai`, `codex`, `xai`, `grok`) |
 | `OPENAB_AGENT_MAX_TOKENS` | `8192` | Max output tokens. Overrides `max_tokens` in config.json. |
 | `OPENAB_AGENT_OAUTH_CLIENT_ID` | Pi's client | Custom Codex OAuth client ID |
 | `OPENAB_AGENT_ANTHROPIC_CLIENT_ID` | Claude Code's client | Custom Anthropic OAuth client ID |
+| `OPENAB_AGENT_XAI_CLIENT_ID` | grok CLI's client | Custom xAI OAuth client ID |
 | `OPENAB_AGENT_MAX_TOOL_LOOPS` | `50` | Max tool-call iterations per prompt before the agent gives up |
 | `ANTHROPIC_API_KEY` | — | Anthropic API key. Highest-precedence Anthropic credential (see [Anthropic credentials](#anthropic-credentials)). |
 | `CLAUDE_CODE_OAUTH_TOKEN` | — | Pre-provisioned long-lived Claude Pro/Max subscription token (from `claude setup-token`). Fleet route — no interactive login, no `auth.json` write. |
@@ -113,6 +116,22 @@ Three ways to authenticate Anthropic, resolved in this **precedence** (ADR §5.3
 
 A higher-precedence source's own errors (e.g. a key set but no model) surface
 rather than silently falling through to a lower one.
+
+### xAI credentials (SuperGrok / X Premium)
+
+Sign in with a SuperGrok or X Premium subscription via the RFC 8628 device-code
+flow — no `XAI_API_KEY` to provision, and headless-friendly (approve on any
+device; ideal for pods via `kubectl exec`):
+
+```bash
+openab-agent auth xai-device
+```
+
+Prints a user code and an `https://auth.x.ai/...` verification link (prefilled
+when the server provides one). Tokens are stored under the `xai-oauth` tenant in
+`auth.json` and refreshed automatically. Select the provider with
+`OPENAB_AGENT_PROVIDER=xai` or a `xai/`-prefixed model (e.g.
+`OPENAB_AGENT_MODEL=xai/grok-4.5`); xAI is not part of auto-detection.
 
 ### Adding an OAuth vendor
 

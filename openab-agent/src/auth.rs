@@ -14,6 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const CODEX_NAMESPACE: &str = "codex";
 /// Namespace key for the Anthropic (Claude Pro/Max) OAuth credential.
 pub const ANTHROPIC_NAMESPACE: &str = "anthropic-oauth";
+/// Namespace key for the xAI (SuperGrok / X Premium) OAuth credential.
+pub const XAI_NAMESPACE: &str = "xai-oauth";
 
 const REFRESH_SKEW_SECONDS: u64 = 120;
 
@@ -32,6 +34,15 @@ const ANTHROPIC_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const ANTHROPIC_REDIRECT_PORT: u16 = 53692;
 const ANTHROPIC_SCOPE: &str =
     "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+
+// xAI OAuth (SuperGrok / X Premium subscription) — RFC 8628 device-code flow.
+// The client_id is the official grok CLI public client (no secret; appears in
+// xai-org/grok-build and is reused by OpenClaw, Hermes, litellm, Warp, Pi, …).
+// xAI exposes no public OAuth client registration, so reusing the CLI client is
+// the ecosystem convention; `referrer` marks the requester (Pi sends "pi").
+const XAI_DEVICE_CODE_URL: &str = "https://auth.x.ai/oauth2/device/code";
+const XAI_TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
+const XAI_SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
 
 // ── OAuthVendor (auth axis — ADR §5.1) ──────────────────────────────────────
 //
@@ -59,9 +70,10 @@ enum TokenBodyFormat {
 }
 
 /// OAuth grant a vendor's *primary* login uses. Codex additionally exposes a
-/// device-code subcommand, but its browser login — like Anthropic's — is PKCE.
+/// device-code subcommand (non-standard `device_auth_id` protocol, kept as a
+/// bespoke flow), but its browser login — like Anthropic's — is PKCE. xAI is
+/// the first device-primary vendor (RFC 8628 via `login_device_code_flow`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // `DeviceCode` lands with the first device-primary vendor (copilot/kiro).
 enum AuthGrant {
     Pkce,
     DeviceCode,
@@ -96,11 +108,21 @@ trait OAuthVendor: Send + Sync {
     fn token_body(&self) -> TokenBodyFormat {
         TokenBodyFormat::Form
     }
-    /// ADR §5.1 surface — `DeviceCode` lands with the first device-primary vendor
-    /// (copilot/kiro); both current vendors log in via PKCE, so unused until then.
-    #[allow(dead_code)]
+    /// Which grant the vendor's primary login uses. `login_device_code_flow`
+    /// guards on `DeviceCode` the same way `login_pkce_flow` guards on
+    /// `redirect()`, so a mis-wired vendor fails loud instead of half-flowing.
     fn grant(&self) -> AuthGrant {
         AuthGrant::Pkce
+    }
+    /// RFC 8628 device authorization endpoint. `Some` for `DeviceCode`-grant
+    /// vendors; `None` for PKCE vendors (no device endpoint).
+    fn device_authorization_url(&self) -> Option<&str> {
+        None
+    }
+    /// Extra form fields on the device authorization request (xAI's `referrer`
+    /// requester tag — the device-flow analogue of `extra_authorize_params`).
+    fn extra_device_params(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
     }
     /// Full loopback redirect URI, derived from `redirect()`.
     fn redirect_uri(&self) -> Option<String> {
@@ -168,12 +190,48 @@ impl OAuthVendor for AnthropicVendor {
     }
 }
 
+/// xAI (SuperGrok / X Premium subscription) — device-code-primary vendor.
+/// Access tokens act as plain Bearer API keys against `api.x.ai/v1`.
+struct XaiVendor;
+impl OAuthVendor for XaiVendor {
+    fn namespace(&self) -> &str {
+        XAI_NAMESPACE
+    }
+    fn client_id(&self) -> String {
+        std::env::var("OPENAB_AGENT_XAI_CLIENT_ID")
+            .unwrap_or_else(|_| "b1a00492-073a-47ea-816f-4c329264a828".to_string())
+    }
+    /// Device-primary vendor: no PKCE authorize endpoint exists. `redirect()`
+    /// is `None`, so `build_authorize_url` rejects this vendor before ever
+    /// reading this value; the device endpoint is returned as the least-wrong
+    /// stand-in for the mandatory trait method.
+    fn authorize_url(&self) -> &str {
+        XAI_DEVICE_CODE_URL
+    }
+    fn token_url(&self) -> &str {
+        XAI_TOKEN_URL
+    }
+    fn scope(&self) -> &str {
+        XAI_SCOPE
+    }
+    fn grant(&self) -> AuthGrant {
+        AuthGrant::DeviceCode
+    }
+    fn device_authorization_url(&self) -> Option<&str> {
+        Some(XAI_DEVICE_CODE_URL)
+    }
+    fn extra_device_params(&self) -> &'static [(&'static str, &'static str)] {
+        &[("referrer", "openab")]
+    }
+}
+
 /// Resolve a vendor descriptor by `auth.json` namespace. `None` for non-OAuth
 /// tenants (e.g. `mcp:<server>`, whose refresh rmcp owns).
 fn vendor_for(namespace: &str) -> Option<Box<dyn OAuthVendor>> {
     match namespace {
         CODEX_NAMESPACE => Some(Box::new(CodexVendor)),
         ANTHROPIC_NAMESPACE => Some(Box::new(AnthropicVendor)),
+        XAI_NAMESPACE => Some(Box::new(XaiVendor)),
         _ => None,
     }
 }
@@ -477,6 +535,8 @@ fn write_auth_file(path: &Path, map: &HashMap<String, AuthEntry>) -> Result<()> 
 fn auth_subcommand(namespace: &str) -> &'static str {
     if namespace == ANTHROPIC_NAMESPACE {
         "openab-agent auth anthropic-oauth"
+    } else if namespace == XAI_NAMESPACE {
+        "openab-agent auth xai-device"
     } else {
         "openab-agent auth codex-oauth"
     }
@@ -1220,6 +1280,217 @@ pub async fn login_codex_device_flow() -> Result<()> {
     }
 }
 
+// ── RFC 8628 device-code login driver (ADR §5.1, device axis) ──────────────
+//
+// Standards-compliant counterpart of `login_pkce_flow`: every `DeviceCode`-grant
+// vendor reuses this one flow, parameterised by the descriptor. (The codex
+// device flow above stays bespoke — OpenAI's `device_auth_id` protocol is not
+// RFC 8628.) Parsing/classification are pure functions so the edge cases that
+// bit other implementations (interval 0, absent `expires_in`, `slow_down`
+// without a new interval, non-https verification URIs) are unit-tested without
+// a live authorization server.
+
+/// Default poll interval when the AS omits `interval` or sends a non-positive
+/// value (RFC 8628 §3.2 default).
+const DEVICE_DEFAULT_INTERVAL_SECS: u64 = 5;
+/// Deadline fallback when the AS omits `expires_in` (defensive; RFC 8628
+/// requires it, but a lenient default beats hard-failing an otherwise valid
+/// grant).
+const DEVICE_DEFAULT_EXPIRES_IN_SECS: u64 = 900;
+
+/// Parsed RFC 8628 §3.2 device authorization response.
+struct DeviceAuthorization {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    verification_uri_complete: Option<String>,
+    interval_secs: u64,
+    expires_in_secs: u64,
+}
+
+/// The verification URI is shown to (and possibly opened by) the user; force
+/// https so a malicious/tampered response can't direct them to an arbitrary
+/// scheme or plaintext endpoint.
+fn validate_https_url(raw: &str) -> Result<String> {
+    let parsed = url::Url::parse(raw)
+        .map_err(|_| anyhow!("Untrusted verification URI in device authorization response"))?;
+    if parsed.scheme() != "https" {
+        return Err(anyhow!(
+            "Untrusted verification URI (non-https) in device authorization response"
+        ));
+    }
+    Ok(parsed.to_string())
+}
+
+fn required_device_field<'a>(body: &'a serde_json::Value, field: &str) -> Result<&'a str> {
+    body[field]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("No {field} in device authorization response"))
+}
+
+fn parse_device_authorization(body: &serde_json::Value) -> Result<DeviceAuthorization> {
+    let verification_uri_complete = match body["verification_uri_complete"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => Some(validate_https_url(raw)?),
+        None => None,
+    };
+    Ok(DeviceAuthorization {
+        device_code: required_device_field(body, "device_code")?.to_string(),
+        user_code: required_device_field(body, "user_code")?.to_string(),
+        verification_uri: validate_https_url(required_device_field(body, "verification_uri")?)?,
+        verification_uri_complete,
+        // RFC 8628 allows interval 0 (no minimum wait) and some ASes send
+        // strings/garbage — fall back to the default rather than failing.
+        interval_secs: body["interval"]
+            .as_u64()
+            .filter(|v| *v > 0)
+            .unwrap_or(DEVICE_DEFAULT_INTERVAL_SECS),
+        expires_in_secs: body["expires_in"]
+            .as_u64()
+            .filter(|v| *v > 0)
+            .unwrap_or(DEVICE_DEFAULT_EXPIRES_IN_SECS),
+    })
+}
+
+/// What a non-2xx token poll means (RFC 8628 §3.5).
+#[derive(Debug, PartialEq, Eq)]
+enum DevicePollDisposition {
+    /// User hasn't approved yet — keep polling.
+    Pending,
+    /// Poll slower; the AS may supply a replacement interval.
+    SlowDown(Option<u64>),
+    /// Terminal — stop polling and surface the message.
+    Fatal(String),
+}
+
+fn classify_device_poll_error(payload: &serde_json::Value) -> DevicePollDisposition {
+    let code = payload["error"].as_str().unwrap_or_default();
+    match code {
+        "authorization_pending" => DevicePollDisposition::Pending,
+        "slow_down" => {
+            DevicePollDisposition::SlowDown(payload["interval"].as_u64().filter(|v| *v > 0))
+        }
+        // xAI has been observed emitting the non-standard `authorization_denied`.
+        "access_denied" | "authorization_denied" => {
+            DevicePollDisposition::Fatal("authorization was denied".to_string())
+        }
+        "expired_token" => {
+            DevicePollDisposition::Fatal("device code expired before authorization".to_string())
+        }
+        other => {
+            let desc = payload["error_description"].as_str().unwrap_or_default();
+            DevicePollDisposition::Fatal(if desc.is_empty() {
+                format!("unexpected device-code error: {other}")
+            } else {
+                format!("unexpected device-code error: {other} — {desc}")
+            })
+        }
+    }
+}
+
+/// Shared RFC 8628 login: request a device code, show the user code +
+/// verification link (preferring the prefilled `verification_uri_complete`),
+/// poll the token endpoint until approval, persist under the vendor namespace.
+async fn login_device_code_flow(vendor: &dyn OAuthVendor) -> Result<()> {
+    if vendor.grant() != AuthGrant::DeviceCode {
+        return Err(anyhow!(
+            "{} is not a device-code vendor",
+            vendor.namespace()
+        ));
+    }
+    let device_url = vendor.device_authorization_url().ok_or_else(|| {
+        anyhow!(
+            "{} has no device authorization endpoint",
+            vendor.namespace()
+        )
+    })?;
+    let client_id = vendor.client_id();
+    let client = reqwest::Client::new();
+
+    let mut fields: Vec<(&str, &str)> =
+        vec![("client_id", client_id.as_str()), ("scope", vendor.scope())];
+    fields.extend_from_slice(vendor.extra_device_params());
+    let resp = client.post(device_url).form(&fields).send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "Device authorization request failed (HTTP {status}): {body}"
+        ));
+    }
+    let payload: serde_json::Value = resp.json().await?;
+    let device = parse_device_authorization(&payload)?;
+
+    println!(
+        "  Go to:      {}",
+        device
+            .verification_uri_complete
+            .as_deref()
+            .unwrap_or(&device.verification_uri)
+    );
+    println!("  Enter code: {}\n", device.user_code);
+    println!("Waiting for authorization...");
+
+    let deadline =
+        tokio::time::Instant::now() + tokio::time::Duration::from_secs(device.expires_in_secs);
+    let mut poll_interval = device.interval_secs;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(poll_interval)).await;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "Device flow timed out after {} seconds.",
+                device.expires_in_secs
+            ));
+        }
+        let resp = client
+            .post(vendor.token_url())
+            .form(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("client_id", client_id.as_str()),
+                ("device_code", device.device_code.as_str()),
+            ])
+            .send()
+            .await?;
+        let status = resp.status();
+        // Errors may arrive as non-JSON (proxies, HTML error pages) — treat an
+        // unparseable body as an empty object so classification still runs.
+        let text = resp.text().await.unwrap_or_default();
+        let payload: serde_json::Value =
+            serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({}));
+        if status.is_success() {
+            let store = token_store_from_payload(&payload, vendor.token_url(), vendor.namespace())?;
+            save_tokens_for(&store)?;
+            println!(
+                "\n\u{2705} Login successful! Token saved to {:?}",
+                auth_path()
+            );
+            return Ok(());
+        }
+        match classify_device_poll_error(&payload) {
+            DevicePollDisposition::Pending => continue,
+            DevicePollDisposition::SlowDown(server_interval) => {
+                // RFC 8628 §3.5: bump by 5s unless the AS supplied a new interval.
+                poll_interval = server_interval.unwrap_or(poll_interval + 5);
+            }
+            DevicePollDisposition::Fatal(msg) => {
+                return Err(anyhow!(
+                    "{} device authorization failed (HTTP {status}): {msg}",
+                    vendor.namespace()
+                ));
+            }
+        }
+    }
+}
+
+/// xAI (SuperGrok / X Premium) RFC 8628 device-code login.
+pub async fn login_xai_device_flow() -> Result<()> {
+    println!("Starting xAI (SuperGrok / X Premium) device-code login...\n");
+    login_device_code_flow(&XaiVendor).await
+}
+
 pub fn show_status() {
     let path = auth_path();
     let tokens: Vec<TokenStore> = read_auth_file(&path)
@@ -1238,7 +1509,7 @@ pub fn show_status() {
 
     if tokens.is_empty() {
         println!(
-            "Not authenticated.\nRun: openab-agent auth codex-oauth  |  openab-agent auth anthropic-oauth"
+            "Not authenticated.\nRun: openab-agent auth codex-oauth  |  openab-agent auth anthropic-oauth  |  openab-agent auth xai-device"
         );
         return;
     }
@@ -1349,6 +1620,219 @@ mod tests {
             AnthropicVendor.redirect_uri().as_deref(),
             Some("http://localhost:53692/callback")
         );
+    }
+
+    // ── XaiVendor descriptor + RFC 8628 device-flow helpers ───────────────
+
+    #[test]
+    fn xai_vendor_descriptor_pins_wire_contract() {
+        assert_eq!(XaiVendor.namespace(), XAI_NAMESPACE);
+        assert_eq!(XaiVendor.grant(), AuthGrant::DeviceCode);
+        // Device-primary: no loopback redirect, form-encoded token bodies.
+        assert!(XaiVendor.redirect().is_none());
+        assert!(XaiVendor.redirect_uri().is_none());
+        assert_eq!(XaiVendor.token_body(), TokenBodyFormat::Form);
+        assert_eq!(
+            XaiVendor.device_authorization_url(),
+            Some("https://auth.x.ai/oauth2/device/code")
+        );
+        assert_eq!(XaiVendor.token_url(), "https://auth.x.ai/oauth2/token");
+        // grok-cli:access + api:access are what make the token usable as an
+        // API key against api.x.ai; offline_access is what yields a refresh token.
+        for scope in ["offline_access", "grok-cli:access", "api:access"] {
+            assert!(XaiVendor.scope().contains(scope), "missing scope {scope}");
+        }
+        assert_eq!(XaiVendor.extra_device_params(), &[("referrer", "openab")]);
+    }
+
+    #[test]
+    fn xai_vendor_is_not_a_pkce_vendor() {
+        // The PKCE driver must reject a device-primary vendor loudly.
+        let err = build_authorize_url(&XaiVendor, "CH", "ST").unwrap_err();
+        assert!(err.to_string().contains("no loopback redirect"), "{err}");
+    }
+
+    #[test]
+    fn test_xai_client_id_default() {
+        temp_env::with_var("OPENAB_AGENT_XAI_CLIENT_ID", None::<&str>, || {
+            assert_eq!(
+                XaiVendor.client_id(),
+                "b1a00492-073a-47ea-816f-4c329264a828"
+            );
+        });
+    }
+
+    #[test]
+    fn test_xai_client_id_override() {
+        temp_env::with_var("OPENAB_AGENT_XAI_CLIENT_ID", Some("custom_xai"), || {
+            assert_eq!(XaiVendor.client_id(), "custom_xai");
+        });
+    }
+
+    #[test]
+    fn vendor_for_resolves_xai() {
+        assert_eq!(
+            vendor_for(XAI_NAMESPACE).unwrap().namespace(),
+            XAI_NAMESPACE
+        );
+    }
+
+    #[test]
+    fn auth_subcommand_per_namespace() {
+        assert_eq!(
+            auth_subcommand(XAI_NAMESPACE),
+            "openab-agent auth xai-device"
+        );
+        assert_eq!(
+            auth_subcommand(ANTHROPIC_NAMESPACE),
+            "openab-agent auth anthropic-oauth"
+        );
+        assert_eq!(
+            auth_subcommand(CODEX_NAMESPACE),
+            "openab-agent auth codex-oauth"
+        );
+    }
+
+    #[test]
+    fn validate_https_url_accepts_https_only() {
+        assert!(validate_https_url("https://auth.x.ai/device").is_ok());
+        // Non-https schemes and garbage are untrusted — the URI is shown to /
+        // opened by the user.
+        assert!(validate_https_url("http://auth.x.ai/device").is_err());
+        assert!(validate_https_url("file:///etc/passwd").is_err());
+        assert!(validate_https_url("javascript:alert(1)").is_err());
+        assert!(validate_https_url("not a url").is_err());
+    }
+
+    #[test]
+    fn parse_device_authorization_full_response() {
+        let d = parse_device_authorization(&serde_json::json!({
+            "device_code": "dev123",
+            "user_code": "ABCD-EFGH",
+            "verification_uri": "https://auth.x.ai/device",
+            "verification_uri_complete": "https://auth.x.ai/device?code=ABCD-EFGH",
+            "interval": 7,
+            "expires_in": 600,
+        }))
+        .unwrap();
+        assert_eq!(d.device_code, "dev123");
+        assert_eq!(d.user_code, "ABCD-EFGH");
+        assert_eq!(d.verification_uri, "https://auth.x.ai/device");
+        assert_eq!(
+            d.verification_uri_complete.as_deref(),
+            Some("https://auth.x.ai/device?code=ABCD-EFGH")
+        );
+        assert_eq!(d.interval_secs, 7);
+        assert_eq!(d.expires_in_secs, 600);
+    }
+
+    #[test]
+    fn parse_device_authorization_defaults_interval_and_expiry() {
+        // RFC 8628 allows interval 0; expires_in absent is tolerated with a
+        // lenient default rather than a hard failure.
+        let d = parse_device_authorization(&serde_json::json!({
+            "device_code": "d",
+            "user_code": "u",
+            "verification_uri": "https://auth.x.ai/device",
+            "interval": 0,
+        }))
+        .unwrap();
+        assert_eq!(d.interval_secs, DEVICE_DEFAULT_INTERVAL_SECS);
+        assert_eq!(d.expires_in_secs, DEVICE_DEFAULT_EXPIRES_IN_SECS);
+        assert!(d.verification_uri_complete.is_none());
+    }
+
+    #[test]
+    fn parse_device_authorization_rejects_missing_or_untrusted_fields() {
+        // Missing device_code.
+        assert!(parse_device_authorization(&serde_json::json!({
+            "user_code": "u",
+            "verification_uri": "https://auth.x.ai/device",
+        }))
+        .is_err());
+        // Non-https verification_uri.
+        assert!(parse_device_authorization(&serde_json::json!({
+            "device_code": "d",
+            "user_code": "u",
+            "verification_uri": "http://auth.x.ai/device",
+        }))
+        .is_err());
+        // Non-https verification_uri_complete poisons an otherwise valid response.
+        assert!(parse_device_authorization(&serde_json::json!({
+            "device_code": "d",
+            "user_code": "u",
+            "verification_uri": "https://auth.x.ai/device",
+            "verification_uri_complete": "http://evil.example/device",
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn classify_device_poll_error_dispositions() {
+        use DevicePollDisposition::*;
+        assert_eq!(
+            classify_device_poll_error(&serde_json::json!({"error": "authorization_pending"})),
+            Pending
+        );
+        assert_eq!(
+            classify_device_poll_error(&serde_json::json!({"error": "slow_down"})),
+            SlowDown(None)
+        );
+        assert_eq!(
+            classify_device_poll_error(&serde_json::json!({"error": "slow_down", "interval": 10})),
+            SlowDown(Some(10))
+        );
+        // Non-positive replacement interval is ignored (caller falls back to +5).
+        assert_eq!(
+            classify_device_poll_error(&serde_json::json!({"error": "slow_down", "interval": 0})),
+            SlowDown(None)
+        );
+        for denied in ["access_denied", "authorization_denied"] {
+            assert!(matches!(
+                classify_device_poll_error(&serde_json::json!({"error": denied})),
+                Fatal(m) if m.contains("denied")
+            ));
+        }
+        assert!(matches!(
+            classify_device_poll_error(&serde_json::json!({"error": "expired_token"})),
+            Fatal(m) if m.contains("expired")
+        ));
+        assert!(matches!(
+            classify_device_poll_error(
+                &serde_json::json!({"error": "kaboom", "error_description": "detail"})
+            ),
+            Fatal(m) if m.contains("kaboom") && m.contains("detail")
+        ));
+        // Unparseable/empty error body is terminal, not an infinite poll.
+        assert!(matches!(
+            classify_device_poll_error(&serde_json::json!({})),
+            Fatal(_)
+        ));
+    }
+
+    #[test]
+    fn token_store_from_payload_defaults_expires_in() {
+        // xAI may omit expires_in on token responses — default 3600, not a failure.
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let store = token_store_from_payload(
+            &serde_json::json!({"access_token": "at", "refresh_token": "rt"}),
+            XAI_TOKEN_URL,
+            XAI_NAMESPACE,
+        )
+        .unwrap();
+        assert_eq!(store.provider, XAI_NAMESPACE);
+        assert!(store.expires_at >= before + 3600);
+        // A refresh_token-less login response is a hard error (offline_access
+        // should always yield one on the initial device grant).
+        assert!(token_store_from_payload(
+            &serde_json::json!({"access_token": "at"}),
+            XAI_TOKEN_URL,
+            XAI_NAMESPACE,
+        )
+        .is_err());
     }
 
     #[test]

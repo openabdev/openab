@@ -335,6 +335,16 @@ impl AcpServer {
                         Err(e) => return self.error_response(id, -32000, &e),
                     }
                 }
+                "xai" | "grok" => {
+                    let res = match model_override {
+                        Some(m) => crate::llm::XaiProvider::from_auth_store_with_model(m),
+                        None => crate::llm::XaiProvider::from_auth_store(),
+                    };
+                    match res {
+                        Ok(p) => (Box::new(p), "xai"),
+                        Err(e) => return self.error_response(id, -32000, &e),
+                    }
+                }
                 _ => {
                     // Auto-detect: Anthropic (API key or OAuth) first, then codex.
                     let anthropic_res = match model_override {
@@ -462,6 +472,9 @@ impl AcpServer {
         if crate::auth::load_tokens().is_ok() {
             models.extend(Self::static_openai_models());
         }
+        if crate::auth::load_tokens_for(crate::auth::XAI_NAMESPACE).is_ok() {
+            models.extend(Self::static_xai_models());
+        }
         if models.is_empty() {
             models.push(ModelOption::new(
                 "none",
@@ -502,6 +515,16 @@ impl AcpServer {
             ModelOption::new("gpt-5.4", "GPT-5.4", "openai"),
             ModelOption::new("gpt-5.4-mini", "GPT-5.4 mini", "openai"),
             ModelOption::new("gpt-5.5", "GPT-5.5", "openai"),
+        ]
+    }
+
+    fn static_xai_models() -> Vec<ModelOption> {
+        // Static list matching Pi's trimmed xAI built-in models (earendil-works/pi
+        // #6734); grok-4.5 is the default the provider falls back to.
+        vec![
+            ModelOption::new("grok-4.5", "Grok 4.5", "xai"),
+            ModelOption::new("grok-4.3", "Grok 4.3", "xai"),
+            ModelOption::new("grok-build-0.1", "Grok Build 0.1", "xai"),
         ]
     }
 
@@ -603,6 +626,8 @@ impl AcpServer {
                     AnthropicProvider::from_oauth_auto_with_model(value).map(|p| Box::new(p) as _)
                 }
                 "anthropic" => AnthropicProvider::auto_with_model(value).map(|p| Box::new(p) as _),
+                "xai" => crate::llm::XaiProvider::from_auth_store_with_model(value)
+                    .map(|p| Box::new(p) as _),
                 _ => crate::llm::OpenAiProvider::from_auth_store_with_model(value)
                     .map(|p| Box::new(p) as _),
             };

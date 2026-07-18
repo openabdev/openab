@@ -93,6 +93,8 @@ enum AuthProvider {
         #[arg(long)]
         no_browser: bool,
     },
+    /// xAI SuperGrok / X Premium via device code (RFC 8628, headless-friendly)
+    XaiDevice,
     /// Show stored credentials
     Status,
 }
@@ -127,6 +129,12 @@ async fn main() {
             }
             AuthProvider::AnthropicOauth { no_browser } => {
                 if let Err(e) = auth::login_anthropic_browser_flow(no_browser).await {
+                    eprintln!("❌ Authentication failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+            AuthProvider::XaiDevice => {
+                if let Err(e) = auth::login_xai_device_flow().await {
                     eprintln!("❌ Authentication failed: {e}");
                     std::process::exit(1);
                 }
