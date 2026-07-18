@@ -785,18 +785,30 @@ fn extract_prompt_params(params: Option<&Value>) -> Result<(String, String), Str
         .to_string();
     let prompt = params.get("prompt").ok_or("Missing prompt")?;
 
-    // Prompt can be an array of content blocks or a simple string
+    // Prompt can be an array of content blocks or a simple string. The base is
+    // text-only: an unsupported block type (image / audio / resource / resource_link)
+    // is rejected explicitly rather than silently dropped, so the client knows its
+    // content was not delivered.
     let text = if let Some(arr) = prompt.as_array() {
-        arr.iter()
-            .filter_map(|block| {
-                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    block.get("text").and_then(|t| t.as_str())
-                } else {
-                    None
+        let mut parts = Vec::with_capacity(arr.len());
+        for block in arr {
+            match block.get("type").and_then(|t| t.as_str()) {
+                Some("text") => {
+                    let t = block
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .ok_or("Text content block missing 'text'")?;
+                    parts.push(t);
                 }
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+                Some(other) => {
+                    return Err(format!(
+                        "Unsupported prompt content block type '{other}' — the base accepts only 'text'"
+                    ));
+                }
+                None => return Err("Prompt content block missing 'type'".into()),
+            }
+        }
+        parts.join("\n")
     } else if let Some(s) = prompt.as_str() {
         s.to_string()
     } else {
@@ -1043,6 +1055,37 @@ mod acp_conformance {
         assert!(validate_params::<sc::ResumeSessionRequest>(Some(&json!({"sessionId": "sess_x", "cwd": "/w", "mcpServers": []}))).is_ok());
         assert!(validate_params::<sc::ResumeSessionRequest>(Some(&json!({"cwd": "/w"}))).is_err(), "missing sessionId");
         assert!(validate_params::<sc::ResumeSessionRequest>(Some(&json!({"sessionId": "sess_x"}))).is_err(), "missing cwd");
+    }
+
+    // --- prompt content blocks (F10): unsupported block types rejected, not dropped ---
+
+    #[test]
+    fn prompt_rejects_non_text_blocks() {
+        use super::extract_prompt_params;
+        // text blocks accepted and concatenated
+        let (_, text) = extract_prompt_params(Some(&json!({
+            "sessionId": "sess_x",
+            "prompt": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
+        })))
+        .unwrap();
+        assert_eq!(text, "a\nb");
+        // a non-text block (resource_link / image) is an explicit error, never dropped
+        assert!(
+            extract_prompt_params(Some(&json!({
+                "sessionId": "sess_x",
+                "prompt": [{"type": "text", "text": "hi"}, {"type": "resource_link", "uri": "file:///x"}]
+            })))
+            .is_err(),
+            "resource_link must be rejected, not silently dropped"
+        );
+        assert!(extract_prompt_params(Some(&json!({
+            "sessionId": "sess_x",
+            "prompt": [{"type": "image", "data": "..", "mimeType": "image/png"}]
+        })))
+        .is_err());
+        // a plain-string prompt still works
+        let (_, s) = extract_prompt_params(Some(&json!({"sessionId": "sess_x", "prompt": "hello"}))).unwrap();
+        assert_eq!(s, "hello");
     }
 }
 
