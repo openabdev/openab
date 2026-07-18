@@ -46,7 +46,7 @@ Directions use the ACP roles: the **Agent** answers prompts (here, OpenAB); the
 
 | Method | Direction | Purpose | OpenAB base |
 |---|---|---|---|
-| `session/cancel` | Client → Agent | Cancel in-flight work (one-way, no response) | ✅ conformant (notification; prompt ends `stopReason:"cancelled"`) |
+| `session/cancel` | Client → Agent | Cancel in-flight work (one-way, no response) | ⚠️ partial — the one-way notification is accepted and the gateway waiter ends with `stopReason:"cancelled"`, but cancellation is **not propagated to the backend** agent/model, which keeps running. Backend-propagating cancel is a tracked follow-up (review F3). |
 | `session/update` | Agent → Client | Stream session events | ✅ `agent_message_chunk` (text). Other variants (`agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, `available_commands_update`, `usage_update`, …) are Phase 2 / not forwarded |
 | `$/cancel_request` | Bidirectional | Cancel an in-flight JSON-RPC request | ⛔ |
 
@@ -82,11 +82,19 @@ The chat subset is **wire-conformant** with ACP Schema v1.19.0:
 
 ### Live verification status
 
-- **Verified end-to-end (2026-07-17)** — the chat subset (`initialize` → `session/new`
-  / `session/resume` → `session/prompt` → streamed `session/update` `agent_message_chunk`
-  → `{stopReason}`, plus `session/cancel`) drives a real backend (cursor-agent) and
-  streams replies to a WebSocket client (a Chrome side-panel extension + a raw
-  `ws` client).
+- **Verified end-to-end (2026-07-17; re-checked 2026-07-18)** — the chat subset
+  (`initialize` → `session/new` / `session/resume` → `session/prompt` → streamed
+  `session/update` `agent_message_chunk` → `{stopReason}`) drives a real backend
+  (cursor-agent) and streams replies to a WebSocket client (a Chrome side-panel
+  extension + a raw `ws` client). `scripts/acp-ws-smoke.py` reproduces this.
+- **Known limits (verified 2026-07-18; tracked follow-ups, not yet fixed)** —
+  - **Long replies truncate.** A reply larger than the adapter's message limit is
+    split into several messages, but the ACP reply route is closed after the first
+    one, so overflow chunks are dropped (a 900-line reply arrived as ~413 lines).
+    Review F2.
+  - **Cancel does not stop the backend.** `session/cancel` returns
+    `stopReason:"cancelled"` to the waiter, but the downstream model/tool work
+    continues. Review F3.
 - **Still unverified** — field-level exactness of `agentCapabilities` /
   `clientCapabilities` sub-objects against a *third-party* ACP client (e.g. Zed), and
   `ContentBlock` variants beyond `text` (image / audio / resource).
