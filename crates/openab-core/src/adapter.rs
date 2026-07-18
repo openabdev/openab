@@ -21,6 +21,20 @@ pub struct OutputDirectives {
     pub reply_to: Option<String>,
 }
 
+/// Chunk limit for delivering a reply on `platform`. ACP is a WebSocket transport with
+/// no small per-message limit, and its reply route is closed after the first delivered
+/// message — so splitting a long reply into multiple messages truncates it over ACP
+/// (review F2). ACP therefore delivers whole (`usize::MAX` → a single chunk); every
+/// other platform keeps the adapter's chunk limit. Overflow-safe: the only arithmetic on
+/// the result is `saturating_sub` (mention-footer reserve).
+fn reply_message_limit(platform: &str, adapter_limit: usize) -> usize {
+    if platform == "acp" {
+        usize::MAX
+    } else {
+        adapter_limit
+    }
+}
+
 /// Parse `[[key:value]]` directives from the beginning of agent output.
 /// Returns parsed directives and the remaining content (directives stripped).
 pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
@@ -686,7 +700,7 @@ impl AdapterRouter {
     ) -> Result<()> {
         let adapter = adapter.clone();
         let thread_channel = thread_channel.clone();
-        let message_limit = adapter.message_limit();
+        let message_limit = reply_message_limit(&thread_channel.platform, adapter.message_limit());
         let streaming = adapter.use_streaming(other_bot_present);
         // Keep the full turn text (incl. inter-tool narration) when streaming
         // (it was already shown live) OR when `[reactions] narration_display` is
@@ -1685,6 +1699,18 @@ fn propagate_mentions_to_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acp_reply_limit_is_unbounded_others_use_adapter_limit() {
+        // ACP delivers whole (no chunking → no truncation, review F2); other platforms
+        // keep the adapter's limit.
+        assert_eq!(reply_message_limit("acp", 4096), usize::MAX);
+        assert_eq!(reply_message_limit("discord", 2000), 2000);
+        assert_eq!(reply_message_limit("slack", 4096), 4096);
+        // and a long reply under the ACP limit is a single chunk (delivered whole)
+        let long = "x".repeat(50_000);
+        assert_eq!(crate::format::split_message(&long, reply_message_limit("acp", 4096)).len(), 1);
+    }
 
     #[test]
     fn select_delivery_text_send_once_keeps_only_final_block() {
