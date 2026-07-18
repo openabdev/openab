@@ -130,7 +130,18 @@ and rejecting forged ids.
   includes them in a prompt — no ACP-specific work required. A typed UI for them
   (`authenticate` / `available_commands_update`) is an optional later nicety.
 - **cwd / mcpServers** — accepted on `session/new` / `session/resume` for wire
-  conformance but not yet propagated into the agent (follow-up).
+  conformance but **deliberately not propagated** into the agent working dir in the base.
+  This is a security decision, not just a TODO: the downstream plumbing already exists
+  (`openab-core` `pool.get_or_create(working_dir_override)`), but its only source is the
+  `[[ws:…]]` message-text directive, resolved by `resolve_workspace` which **contains every
+  path under the bot's home** (`canonical_target.starts_with(bot_home)`, must exist, must be
+  a dir). Honoring a raw client-supplied `cwd` as the process `current_dir` would bypass that
+  containment — unacceptable for an endpoint that is **unauthenticated by default** (§2). And
+  for the base's real clients (a browser side-panel) `cwd` is meaningless: they don't know a
+  valid pod-side path under `bot_home`, so it would fall back to the config default anyway.
+  When it is actually wanted (an authenticated IDE-style client), the safe wiring is to route
+  the ACP `cwd` **through** the same `resolve_workspace` containment (arbitrary paths rejected,
+  only existing dirs under `bot_home` honored) — not straight into `current_dir`.
 - **Emoji** — inline 顏文字 flow through as text; reaction emoji stay no-op in the base.
 - **Reconnect** — on WS disconnect the per-connection session map is dropped; the
   client reconnects with `session/resume` + its persisted `sessionId`.
