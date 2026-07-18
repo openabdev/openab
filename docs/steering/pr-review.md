@@ -1,8 +1,29 @@
 # PR Review Guide for openabdev/openab
 
-## Review Framework
+## Review Contract Boundary
 
-When reviewing a PR, always address these four questions:
+Read the PR's [`Review Contract`](../review-contract.md) before reviewing the
+implementation. Round 1 is the only unrestricted full review: challenge missing
+scope, unsafe residual risks, and untestable acceptance criteria, then obtain a
+maintainer/owner freeze.
+
+After the freeze, review only unresolved findings, the incremental diff,
+regressions, and the frozen Acceptance Criteria. Label every post-freeze blocker
+as `ORIGINAL`, `REGRESSION`, or `NEW EVIDENCE` and cite the affected contract
+clause. A `SCOPE EXPANSION` is a non-blocking Follow-up unless concrete,
+reproducible correctness, security, or data-loss evidence within the frozen
+scope passes the Late Blocker Gate.
+
+Use the default stopping sequence: full review and freeze, fix verification,
+then final regression check. Do not keep raising the acceptance bar. If the PR
+still cannot meet its contract, ask the maintainer/owner to authorize another
+focused round, revise or split the contract, or close the PR. Never treat the
+round cap as automatic LGTM, and never suppress a blocker that passes the Late
+Blocker Gate.
+
+## Round 1 Review Framework
+
+During the unrestricted first review, address these four questions:
 
 1. **What problem does it solve** — What pain point or requirement does this PR address? Explain the background in plain language.
 2. **How does it solve it** — The specific technical approach, architecture decisions, and key implementation details.

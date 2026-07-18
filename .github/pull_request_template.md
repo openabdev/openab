@@ -6,6 +6,39 @@ Closes #
 
 Discord Discussion URL: <!-- Strongly recommended. Link the Discord thread where this was discussed. -->
 
+## Review Contract
+
+<!--
+The contract is the review boundary for this PR. Read docs/review-contract.md.
+Every subsection must contain meaningful content; template comments and empty
+checkboxes do not count. Use "None — [reason]" for a genuinely empty section.
+-->
+
+### Goal
+
+<!-- What user problem must this PR solve? -->
+
+### Non-goals
+
+<!-- What does this PR intentionally not attempt to solve? -->
+
+### Accepted Residual Risks
+
+<!--
+List known failure modes or trade-offs accepted for this version, including
+mitigations and recovery procedures. Maintainer/owner approval is required.
+-->
+
+### Acceptance Criteria
+
+<!-- Concrete, testable conditions required for LGTM. -->
+
+- [ ]
+
+### Follow-ups
+
+<!-- Hardening or broader designs explicitly deferred and non-blocking. -->
+
 ## At a Glance
 
 <!-- ASCII diagram showing the high-level flow or where this change fits in the system. For docs-only or trivial changes, write "N/A". -->

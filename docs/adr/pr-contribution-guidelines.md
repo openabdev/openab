@@ -23,6 +23,21 @@ This front-loads research cost onto the contributor (who understands the problem
 
 Establish a standard PR template and tiered contribution guidelines. All PRs document the problem, approach, tradeoffs, and alternatives. Architectural and runtime changes additionally require prior art research (at minimum OpenClaw and Hermes Agent). Docs-only, chore, CI, release, and trivial bug fixes use a lighter process.
 
+### Review Contract Amendment (2026-07-18)
+
+Every PR also defines a Review Contract with five required fields: Goal,
+Non-goals, Accepted Residual Risks, Acceptance Criteria, and Follow-ups. The
+contract is proposed by the author, challenged and frozen in the first review
+round by a maintainer/owner, and then used as the boundary for incremental
+review. Authors cannot unilaterally accept correctness, security, operational,
+or data-loss risks.
+
+The canonical policy is [`docs/review-contract.md`](../review-contract.md). It
+defines finding lineage, the Late Blocker Gate, contract revision rules, a
+default three-stage stopping rule, and structural workflow validation. This ADR
+continues to define the surrounding contribution fields and tiered prior-art
+requirements.
+
 ### Required PR Sections
 
 Every PR must include these sections in its description:

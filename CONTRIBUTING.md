@@ -54,6 +54,28 @@ To fix an `incomplete` issue, simply edit the issue body to add the missing sect
 
 Every PR must address the following in its description. The [PR template](/.github/pull_request_template.md) will prompt you for each section.
 
+### Review Contract
+
+Every PR must include the exact `## Review Contract` structure defined in the
+[Review Contract policy](/docs/review-contract.md): Goal, Non-goals, Accepted
+Residual Risks, Acceptance Criteria, and Follow-ups. Each subsection must
+contain meaningful content. For small changes, `None` or `Not applicable` must
+include a brief reason.
+
+The author proposes the contract, reviewers challenge it during the first full
+review, and a maintainer/owner freezes it. The author cannot unilaterally accept
+correctness, security, operational, or data-loss risks. After the freeze,
+review is incremental: unresolved findings, new changes, regressions, and the
+frozen Acceptance Criteria. Broader hardening is a non-blocking Follow-up
+unless it passes the policy's Late Blocker Gate.
+
+The default stopping sequence is full review and freeze, fix verification, then
+a final regression check. Contract revisions and additional rounds require an
+explicit maintainer/owner decision. The `Review Contract` workflow validates
+structure only; maintainers remain responsible for semantic approval. A
+maintainer may document an exceptional case and apply the
+`review-contract-exempt` label.
+
 ### 0. Discord Discussion URL
 
 All PRs **must** include a Discord Discussion URL in the PR body (e.g. `https://discord.com/channels/...`). Discussing your idea in Discord before opening a PR helps align on direction and avoids wasted effort. PRs without a Discord Discussion URL will be **automatically closed in 24 hours**.
