@@ -54,6 +54,16 @@ impl AcpConfig {
     }
 }
 
+/// Whether ACP frame tracing is on (`OPENAB_ACP_TRACE=1|true`). When set, every
+/// JSON-RPC frame on the upstream client↔gateway hop is logged in both directions
+/// (`dir="in"` / `dir="out"`). Off by default; enable to capture real traffic — e.g.
+/// to validate the generated-type round-trip against what clients/agents actually emit.
+pub(crate) fn acp_trace_enabled() -> bool {
+    std::env::var("OPENAB_ACP_TRACE")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // ACP Session tracking
 // ---------------------------------------------------------------------------
@@ -193,6 +203,9 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
 
     info!(connection = %connection_id, "ACP client connected");
 
+    // Frame tracing (OPENAB_ACP_TRACE) — read once per connection.
+    let trace = acp_trace_enabled();
+
     // Session state for this connection
     let sessions: Arc<tokio::sync::Mutex<HashMap<String, AcpSession>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -204,9 +217,14 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
     // Channel for sending messages back to the client
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
 
-    // Forward outbound messages to WebSocket
+    // Forward outbound messages to WebSocket. Single choke point for every outbound
+    // frame, so trace here rather than at each send site.
+    let send_conn = connection_id.clone();
     let send_task = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
+            if trace {
+                info!(connection = %send_conn, dir = "out", frame = %msg, "ACP frame");
+            }
             if ws_tx.send(Message::Text(msg.into())).await.is_err() {
                 break;
             }
@@ -218,6 +236,10 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
         let Message::Text(text) = msg else {
             continue;
         };
+
+        if trace {
+            info!(connection = %connection_id, dir = "in", frame = %text, "ACP frame");
+        }
 
         let req: JsonRpcRequest = match serde_json::from_str(&text) {
             Ok(r) => r,
