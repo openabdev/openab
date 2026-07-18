@@ -128,22 +128,24 @@ async def main() -> int:
         r = await call("session/resume", {"sessionId": sid, "cwd": "/home/agent", "mcpServers": []})
         check("result" in r and not r.get("error"), "session/resume", f"result={r.get('result')}")
 
-        # 6. /model — config command reply renders back over ACP
+        # 6. /model — config command reply renders back over ACP.
+        # A JSON-RPC error or a timeout is a FAILURE, not a pass: a check passes only
+        # on a real rendered reply (chunks present with the expected text).
         r = await call("session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": "/model"}]}, timeout=30)
-        body = "".join(r.get("chunks", [])) or json.dumps(r.get("result") or r.get("error") or {})
+        text = "".join(r.get("chunks", []))
         check(
-            bool(r.get("chunks")) or "model" in body.lower() or bool(r.get("error")),
+            not r.get("error") and not r.get("_timeout") and bool(r.get("chunks")) and "model" in text.lower(),
             "/model reply renders back to ACP",
-            f"chunks={len(r.get('chunks', []))} body={body[:60]!r}",
+            f"chunks={len(r.get('chunks', []))} err={r.get('error')} timeout={r.get('_timeout', False)} body={text[:60]!r}",
         )
 
-        # 7. /reset — session command reply renders back over ACP
+        # 7. /reset — session command reply renders back over ACP.
         r = await call("session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": "/reset"}]}, timeout=30)
-        body = "".join(r.get("chunks", [])) or json.dumps(r.get("result") or r.get("error") or {})
+        text = "".join(r.get("chunks", []))
         check(
-            bool(r.get("chunks")) or "reset" in body.lower() or bool(r.get("error")),
+            not r.get("error") and not r.get("_timeout") and bool(r.get("chunks")) and "reset" in text.lower(),
             "/reset reply renders back to ACP",
-            f"chunks={len(r.get('chunks', []))} body={body[:60]!r}",
+            f"chunks={len(r.get('chunks', []))} err={r.get('error')} timeout={r.get('_timeout', False)} body={text[:60]!r}",
         )
 
     passed = sum(1 for ok, _ in results if ok)
