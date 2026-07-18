@@ -1,9 +1,14 @@
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Byte length of the first grapheme cluster of `s` (0 if empty). Used to guarantee
-/// forward progress when a single grapheme is wider than the target width.
-fn first_grapheme_len(s: &str) -> usize {
-    s.graphemes(true).next().map_or(0, str::len)
+/// Byte index after at most `max_chars` (>=1) Unicode scalar values — a last-resort
+/// split used ONLY when a single grapheme cluster is itself wider than the target width.
+/// It splits inside the cluster by codepoint (unavoidable: a cluster wider than the
+/// whole limit cannot be both kept intact and fit) so every emitted chunk still honors
+/// the caller's hard char limit. Guarantees forward progress (>=1 char).
+fn codepoint_split_point(s: &str, max_chars: usize) -> usize {
+    s.char_indices()
+        .nth(max_chars.max(1))
+        .map_or(s.len(), |(i, _)| i)
 }
 
 /// Byte index at which to cut `s` so the prefix is at most `max_chars` Unicode scalar
@@ -44,8 +49,9 @@ fn split_point(s: &str, max_chars: usize, word_wrap: bool) -> usize {
 /// mid-emoji / ZWJ sequence / combining mark / CJK codepoint); outside code fences it
 /// also prefers whitespace boundaries so words stay intact.
 ///
-/// Invariant: every returned chunk satisfies `chunk.chars().count() <= limit`, except a
-/// single grapheme cluster wider than `limit` (pathological), which is emitted whole.
+/// Invariant: every returned chunk satisfies `chunk.chars().count() <= limit`. A single
+/// grapheme cluster wider than `limit` is split by codepoint as a last resort so the
+/// limit still holds (such a cluster cannot be kept intact and also fit).
 pub fn split_message(text: &str, limit: usize) -> Vec<String> {
     if text.chars().count() <= limit {
         return vec![text.to_string()];
@@ -170,7 +176,8 @@ pub fn split_message(text: &str, limit: usize) -> Vec<String> {
                     current_len = opener_len + 1;
                     let mut cut = split_point(rest, capacity, false);
                     if cut == 0 {
-                        cut = first_grapheme_len(rest); // grapheme wider than capacity
+                        // grapheme wider than capacity → codepoint-split to stay <= limit
+                        cut = codepoint_split_point(rest, capacity);
                     }
                     current.push_str(&rest[..cut]);
                     current_len += rest[..cut].chars().count();
@@ -186,7 +193,8 @@ pub fn split_message(text: &str, limit: usize) -> Vec<String> {
                     let mut cut = split_point(rest, avail, true);
                     if cut == 0 {
                         if current.is_empty() {
-                            cut = first_grapheme_len(rest); // grapheme wider than limit
+                            // grapheme wider than limit → codepoint-split to stay <= limit
+                            cut = codepoint_split_point(rest, avail);
                         } else {
                             // Nothing more fits in this chunk — flush and retry fresh.
                             chunks.push(std::mem::take(&mut current));
@@ -385,7 +393,10 @@ mod tests {
         // ZWJ family, flag, VS16, astral CJK, plus plain BMP chars.
         let graphemes = ["🎉", "👨‍👩‍👧‍👦", "🇹🇼", "❤️", "𠀀", "a", "你", "🙂"];
         let line: String = graphemes.iter().copied().cycle().take(48).collect();
-        for limit in [5, 8, 13, 20] {
+        // Limits >= the widest grapheme (the 7-scalar ZWJ family) so every grapheme fits
+        // and none is split. Graphemes WIDER than the limit are the last-resort codepoint
+        // split, covered by `oversized_grapheme_still_respects_limit`.
+        for limit in [8, 13, 20] {
             let chunks = split_message(&line, limit);
             // No grapheme split: flattening chunk graphemes reproduces the original
             // grapheme sequence exactly (a split grapheme would re-segment differently).
@@ -429,5 +440,32 @@ mod tests {
         assert_length_invariant(&chunks, 20);
         let party: usize = chunks.iter().map(|c| c.matches('🎉').count()).sum();
         assert_eq!(party, 20, "emoji lost across fenced hard-split");
+    }
+
+    #[test]
+    fn oversized_grapheme_still_respects_limit() {
+        // A single grapheme wider than the limit must still be bounded to <= limit
+        // (last-resort codepoint split) so every chunk stays deliverable; content is
+        // preserved byte-exact.
+        let family = "👨‍👩‍👧‍👦"; // one grapheme, 7 scalar values
+        for limit in [2, 3, 5] {
+            let chunks = split_message(family, limit);
+            assert_length_invariant(&chunks, limit);
+            assert_eq!(chunks.concat(), family, "content lost at limit {limit}");
+        }
+    }
+
+    #[test]
+    fn oversized_grapheme_with_mention_reserve() {
+        // Discord path: the caller reduces the limit by a mention-footer reserve before
+        // calling split_message; the reduced limit must still hold even when a single
+        // grapheme is wider than it, so the footer's reserved capacity is never eaten.
+        let text = format!("❤️{fam}{fam}", fam = "👨‍👩‍👧‍👦");
+        let limit = 10;
+        let reserve = 4;
+        let effective = limit - reserve; // 6
+        let chunks = split_message(&text, effective);
+        assert_length_invariant(&chunks, effective);
+        assert_eq!(chunks.concat(), text, "content lost with mention reserve");
     }
 }
