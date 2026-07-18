@@ -47,7 +47,7 @@ To override a single agent's image instead of the global tag:
 
 ```toml
 [agent]
-# command defaults from OPENAB_AGENT_COMMAND="claude"
+# command defaults from OPENAB_AGENT_COMMAND="claude-agent-acp"
 # Only override if you need non-default behavior
 ```
 
