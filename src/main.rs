@@ -6,6 +6,7 @@ mod ctl;
     feature = "googlechat",
     feature = "wecom",
     feature = "teams",
+    feature = "acp",
 ))]
 mod unified_adapter;
 use openab_core::acp;
@@ -360,6 +361,7 @@ async fn main() -> anyhow::Result<()> {
         feature = "googlechat",
         feature = "wecom",
         feature = "teams",
+        feature = "acp",
     ))]
     let unified_platform_enabled = has_unified_platform(&cfg);
 
@@ -906,6 +908,7 @@ async fn main() -> anyhow::Result<()> {
         feature = "googlechat",
         feature = "wecom",
         feature = "teams",
+        feature = "acp",
     ))]
     let (_unified_handle, shared_unified_adapter) = {
         use openab_core::gateway::{process_gateway_event, GatewayEventContext};
