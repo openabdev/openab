@@ -175,14 +175,36 @@ North star: the agent's LLM autonomously operating the user's real browser (gene
   reveals the variant surface downstream agents actually emit, informs which of the
   Optional variants to forward, and validates the generated-type round-trip.
 
-## 7. Typing & dependency decision (hand-rolled now → generated later)
+## 7. Typing & dependency decision (as-built: generated types vendored; trivial payloads hand-rolled + conformance-pinned)
 
-Both sides of OpenAB's ACP are currently **hand-rolled, untyped** (`serde_json::Value` +
-manual string matching on `sessionUpdate` variants): the upstream server here (~740
-lines, chat only) and the downstream client in `openab-core/src/acp/` (`protocol.rs` +
-`connection.rs`, ~1800 lines, many variants). Hand-rolling caused the exact conformance
-bugs fixed during the base build (`agentMessageChunk`→`agent_message_chunk`, `stopReason`
-snake_case, integer `protocolVersion: 1`).
+Both sides of OpenAB's ACP started **hand-rolled, untyped** (`serde_json::Value` + manual
+string matching on `sessionUpdate` variants): the upstream server here (~740 lines, chat
+only) and the downstream client in `openab-core/src/acp/` (`protocol.rs` + `connection.rs`,
+~1800 lines, many variants). Hand-rolling caused the exact conformance bugs fixed during the
+base build (`agentMessageChunk`→`agent_message_chunk`, `stopReason` snake_case, integer
+`protocolVersion: 1`).
+
+**As-built (this PR).** The generated types now exist and are committed, but the switch was
+made surgically per the rule below rather than as a blanket rewrite:
+
+- **Generated types vendored + committed** — `crates/openab-gateway/src/adapters/acp_schema.rs`
+  (feature-gated `acp`), produced by `cargo-typify 0.7.0` from the vendored ACP v1 schema
+  (`crates/openab-gateway/schemas/acp-v1.schema.json`, pinned to upstream `schema.json`
+  @ `eb88e992` / ACP Schema v1.19.0). Plain serde, **0** `schemars`/`serde_with` in the
+  generated body (verified). The full v1 surface is generated (one closed dep graph — a
+  hand-trimmed subset would not be meaningfully smaller and would diverge from the schema);
+  the remainder beyond the chat subset is inert `dead_code` until the roadmap consumes it.
+- **Trivial chat payloads stay hand-rolled** (`json!`) — they are correct and readable, and
+  the typify construction ergonomics for them are poor (`AgentCapabilities` has no `Default`;
+  `ContentBlock` is an untagged `VariantN`). Per the rule, we did **not** churn them into
+  builder chains.
+- **Conformance is pinned, not asserted by construction** — the `acp_conformance` test module
+  in `acp_server.rs` deserializes every hand-rolled payload the server emits/accepts through
+  the generated types and proves serde is a stable fixed point. Any casing/field/shape drift
+  (the original bug class) now fails CI. This is the round-trip validation §6 called for.
+- **Full typed *construction* migration is deferred** to the bidirectional / MCP-over-ACP
+  surface (roadmap §6 Critical path), where hand-rolling actually breaks and the generated
+  types earn their keep. The trivial base does not need it.
 
 Options weighed for typing the wire:
 
@@ -191,15 +213,19 @@ Options weighed for typing the wire:
 | Hand-roll (current) | 0 | Fine for the trivial chat subset; error-prone for the big bidirectional surface |
 | Full `agent-client-protocol` crate | ~105 (incl. a 2nd async runtime, async-io/smol) | **Never** — connection/role machinery unneeded (we have our own WS + GatewayEvent bridge) |
 | `agent-client-protocol-schema` (types) | **+24** (measured 376→400), schemars-dominated | schemars is for `JsonSchema` derive we don't use at runtime; `serde_with`/`strum` mandatory (no feature to drop); floor is fixed |
-| **Offline codegen (typify) → committed serde-only `.rs`** | **~0 runtime** | **Chosen for the expanded surface** — typed conformance without the schemars tree |
+| **Offline codegen (typify) → committed serde-only `.rs`** | **~0 runtime** | **Chosen & shipped** — `acp_schema.rs` generated + committed; typed conformance without the schemars tree |
 
 Notes:
 - **v1 only.** `v2` is experimental (`unstable_protocol_v2`, adds `diffy`), currently
   wire-identical to v1, "may change at any time". We negotiate `protocolVersion 1`.
-- **Caveat:** ACP types lean on `serde_with` (MaybeUndefined tri-state, ~600 uses across
-  the crate's v1 source) — so a naive vendor-and-strip-`JsonSchema` is not clean, and
-  typify's plain-serde output must be **round-trip validated** (simple chat fields are
-  fine; advanced patterns need checking — hence the ACP trace mode in §6).
+- **Caveat (resolved for the chat subset):** ACP types lean on `serde_with` (MaybeUndefined
+  tri-state, ~600 uses across the crate's v1 source), so a naive vendor-and-strip-`JsonSchema`
+  is not clean and typify's plain-serde output must be **round-trip validated**. For the chat
+  subset this is now **done** — the PoC and the `acp_conformance` test show the generated types
+  round-trip the real wire exactly, with **no** `serde_with`/MaybeUndefined divergence (the one
+  nuance: typify materializes schema-default capability booleans explicitly, which is
+  semantically identical). Advanced bidirectional variants still warrant the same check via the
+  §6 ACP trace mode before they are wired.
 - **Rule:** hand-roll only the trivial; **generate the complex.** The switch point is the
   bidirectional/MCP surface. Highest ROI if unifying: the downstream core client
   (~1800 lines of manual variant matching), not this small upstream server.
