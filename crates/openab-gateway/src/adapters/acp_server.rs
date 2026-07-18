@@ -96,6 +96,17 @@ fn trace_frame(s: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(format!("{}…(+{} chars)", &s[..end], total - CAP))
 }
 
+/// Validate a request's `params` against a generated ACP request type `T`, returning a
+/// JSON-RPC `-32602` message when a required field is missing or malformed. This checks
+/// shape only — the base validates `cwd`/`mcpServers` for conformance but does not yet
+/// propagate them (see the base ADR §5); missing `params` is itself invalid.
+fn validate_params<T: serde::de::DeserializeOwned>(params: Option<&Value>) -> Result<(), String> {
+    let value = params.cloned().unwrap_or(Value::Null);
+    serde_json::from_value::<T>(value)
+        .map(|_| ())
+        .map_err(|e| format!("Invalid params: {e}"))
+}
+
 // ---------------------------------------------------------------------------
 // ACP Session tracking
 // ---------------------------------------------------------------------------
@@ -340,12 +351,29 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                     let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
                     continue;
                 }
+                // Required params per schema: { cwd, mcpServers }.
+                if let Err(msg) =
+                    validate_params::<crate::adapters::acp_schema::NewSessionRequest>(req.params.as_ref())
+                {
+                    let resp = JsonRpcResponse::error(id, -32602, msg);
+                    let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+                    continue;
+                }
                 let resp = handle_session_new(&sessions, id.clone()).await;
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
             }
             "session/resume" => {
                 if !initialized {
                     let resp = JsonRpcResponse::error(id, -32002, "Not initialized");
+                    let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+                    continue;
+                }
+                // Required params per schema: { sessionId, cwd, mcpServers? }. The
+                // sessionId's `sess_<uuid>` shape is checked further in the handler.
+                if let Err(msg) =
+                    validate_params::<crate::adapters::acp_schema::ResumeSessionRequest>(req.params.as_ref())
+                {
+                    let resp = JsonRpcResponse::error(id, -32602, msg);
                     let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
                     continue;
                 }
@@ -999,6 +1027,22 @@ mod acp_conformance {
         let req_num: Value =
             serde_json::from_str(r#"{"jsonrpc":"2.0","method":"initialize","id":7}"#).unwrap();
         assert_eq!(req_num.get("id"), Some(&json!(7)));
+    }
+
+    // --- required-param validation (F9): reject malformed session/new & resume ---
+
+    #[test]
+    fn session_param_validation() {
+        use super::validate_params;
+        // session/new requires { cwd, mcpServers }
+        assert!(validate_params::<sc::NewSessionRequest>(Some(&json!({"cwd": "/w", "mcpServers": []}))).is_ok());
+        assert!(validate_params::<sc::NewSessionRequest>(Some(&json!({"mcpServers": []}))).is_err(), "missing cwd");
+        assert!(validate_params::<sc::NewSessionRequest>(Some(&json!({"cwd": "/w"}))).is_err(), "missing mcpServers");
+        assert!(validate_params::<sc::NewSessionRequest>(None).is_err(), "missing params");
+        // session/resume requires { sessionId, cwd }
+        assert!(validate_params::<sc::ResumeSessionRequest>(Some(&json!({"sessionId": "sess_x", "cwd": "/w", "mcpServers": []}))).is_ok());
+        assert!(validate_params::<sc::ResumeSessionRequest>(Some(&json!({"cwd": "/w"}))).is_err(), "missing sessionId");
+        assert!(validate_params::<sc::ResumeSessionRequest>(Some(&json!({"sessionId": "sess_x"}))).is_err(), "missing cwd");
     }
 }
 
