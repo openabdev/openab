@@ -53,19 +53,85 @@ To override a single agent's image instead of the global tag:
 
 ## Authentication
 
-Sign in interactively using the OAuth device flow. Credentials are stored on disk (persisted via PVC across pod restarts):
+There are two ways to authenticate the Claude backend. **For container deployments,
+the long-lived token is preferred** — see the comparison below.
+
+### Option A (preferred): long-lived token via `claude setup-token`
+
+Generate the token once on any machine where you can open a browser:
+
+```bash
+claude setup-token   # interactive OAuth, prints an sk-ant-oat01-... token
+```
+
+Inject it into the agent process as the `CLAUDE_CODE_OAUTH_TOKEN` environment
+variable — ideally from a secret store rather than inline:
+
+```toml
+[secrets.refs]
+claude_token = "aws-sm://my-secret#CLAUDE_CODE_OAUTH_TOKEN"
+
+[agent]
+env = { CLAUDE_CODE_OAUTH_TOKEN = "${secrets.claude_token}" }
+```
+
+The SDK reads the env var directly — no `.credentials.json` on disk is needed.
+
+> ⚠️ Make sure you use the `setup-token` output (`sk-ant-oat01-...`), which bills
+> against your Claude Pro/Max subscription — **not** an `ANTHROPIC_API_KEY`
+> (`sk-ant-api03-...`), which bills per token on the API console.
+
+### Option B: interactive OAuth session login
+
+Sign in interactively; short-lived credentials are stored at
+`~/.claude/.credentials.json` (persist via PVC across pod restarts):
 
 ```bash
 kubectl exec -it deployment/openab-claude -- sh -c "$OPENAB_AGENT_AUTH_COMMAND"
-```
-
-After authenticating, restart the pod so the bot process loads the new credentials:
-
-```bash
 kubectl rollout restart deployment/openab-claude
 ```
 
-> **Note:** `claude setup-token` is a different command — it generates a long-lived token for CI/scripts and prints it without saving locally. For container-based deployments, `claude auth login --sso` is the correct approach as it persists credentials to the filesystem.
+### Comparison
+
+| | A: `setup-token` + env var | B: `claude auth login --sso` |
+|---|---|---|
+| Credential lifetime | ~1 year, static | Access token ~8 h + rotating refresh token |
+| Storage | Env var (secret store) | `~/.claude/.credentials.json` on disk |
+| Survives restarts/backup-restore | ✅ Always | ⚠️ Only if the restored file holds the *latest* token pair |
+| Concurrent agent processes | ✅ Safe | ⚠️ Refresh race can invalidate tokens ([#24317](https://github.com/anthropics/claude-code/issues/24317)) |
+| Failure mode | Token expires after ~1 year → regenerate | Refresh with a rotated-out token **wipes the credentials file** to an empty template ([#37402](https://github.com/anthropics/claude-code/issues/37402), [#65761](https://github.com/anthropics/claude-code/issues/65761)) |
+| Renewal | Manual, yearly | Automatic while the file stays current |
+| Exposure | Visible in the agent subprocess env (OpenAB logs a prompt-injection warning) | File readable by the agent process anyway |
+
+### Why the long-lived token is preferred for containers
+
+Anthropic **rotates the refresh token on every use** — each refresh invalidates
+the previous one. This interacts badly with how containers manage state:
+
+- **Snapshot/restore drift**: any backup of `.credentials.json` goes stale the
+  moment the live file refreshes (~every 8 h). Seeding a new pod/task from a
+  stale backup means the first inference attempts a refresh with a dead token,
+  fails, and the SDK **zeroes out the credentials file** — the bot is locked out
+  until a human re-authenticates.
+- **Rolling deploys**: the new task typically starts before the old one's
+  shutdown backup completes, so it seeds pre-rotation state by construction.
+- **Session pools**: multiple concurrent agent processes sharing one credentials
+  file can race on refresh and invalidate each other.
+
+> ⚠️ **If your CD flow is a rolling update — ECS rolling deployments, Kubernetes
+> rolling updates, or any strategy that starts the new instance before
+> terminating the old one — use the long-lived token (Option A).** During the
+> overlap window two instances share the same account: either can rotate the
+> refresh token out from under the other, and the replacement instance seeds
+> its credentials from a backup taken before the final rotation. Session-login
+> credentials (Option B) are only reliable with stop-then-start deployments
+> where the old instance fully shuts down (and backs up its state) before the
+> new one boots.
+
+The `setup-token` credential has no refresh dance at all, so none of these
+failure modes exist. The trade-offs — yearly manual renewal and the token being
+visible in the agent's environment — are minor by comparison, and the exposure
+is equivalent to any other secret passed via `[agent].env`.
 
 ## Troubleshooting
 
