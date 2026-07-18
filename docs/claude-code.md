@@ -58,10 +58,11 @@ the long-lived token is preferred** — see the comparison below.
 
 ### Option A (preferred): long-lived token via `claude setup-token`
 
-Generate the token once on any machine where you can open a browser:
+Generate the token once on any machine where you can open a browser. Supported
+for Claude Pro, Max, Team, and Enterprise plans:
 
 ```bash
-claude setup-token   # interactive OAuth, prints an sk-ant-oat01-... token
+claude setup-token   # interactive OAuth, prints a long-lived token (~1 year)
 ```
 
 Inject it into the agent process as the `CLAUDE_CODE_OAUTH_TOKEN` environment
@@ -77,9 +78,9 @@ env = { CLAUDE_CODE_OAUTH_TOKEN = "${secrets.claude_token}" }
 
 The SDK reads the env var directly — no `.credentials.json` on disk is needed.
 
-> ⚠️ Make sure you use the `setup-token` output (`sk-ant-oat01-...`), which bills
-> against your Claude Pro/Max subscription — **not** an `ANTHROPIC_API_KEY`
-> (`sk-ant-api03-...`), which bills per token on the API console.
+> ⚠️ Make sure you use the token printed by `claude setup-token`, which bills
+> against your Claude subscription — **not** an `ANTHROPIC_API_KEY` from the
+> API console, which bills per token.
 
 ### Option B: interactive OAuth session login
 
@@ -95,21 +96,25 @@ kubectl rollout restart deployment/openab-claude
 
 | | A: `setup-token` + env var | B: `claude auth login --sso` |
 |---|---|---|
-| Credential lifetime | ~1 year, static | Access token ~8 h + rotating refresh token |
+| Credential lifetime | ~1 year, static | Short-lived access token (hours, observed ~8 h) + rotating refresh token |
 | Storage | Env var (secret store) | `~/.claude/.credentials.json` on disk |
 | Survives restarts/backup-restore | ✅ Always | ⚠️ Only if the restored file holds the *latest* token pair |
 | Concurrent agent processes | ✅ Safe | ⚠️ Refresh race can invalidate tokens ([#24317](https://github.com/anthropics/claude-code/issues/24317)) |
-| Failure mode | Token expires after ~1 year → regenerate | Refresh with a rotated-out token **wipes the credentials file** to an empty template ([#37402](https://github.com/anthropics/claude-code/issues/37402), [#65761](https://github.com/anthropics/claude-code/issues/65761)) |
+| Failure mode | Token expires after ~1 year → regenerate | Refresh with a rotated-out token **has been observed to wipe the credentials file** to an empty template ([#37402](https://github.com/anthropics/claude-code/issues/37402), [#65761](https://github.com/anthropics/claude-code/issues/65761)) |
 | Renewal | Manual, yearly | Automatic while the file stays current |
 | Exposure | Visible in the agent subprocess env (OpenAB logs a prompt-injection warning) | File readable by the agent process anyway |
 
 ### Why the long-lived token is preferred for containers
 
-Anthropic **rotates the refresh token on every use** — each refresh invalidates
-the previous one. This interacts badly with how containers manage state:
+As observed with Claude Code 2.1.212, the OAuth session flow **rotates the
+refresh token on use** — a refresh invalidates the previous token — and access
+tokens are short-lived (hours). Anthropic does not document these internals as
+a stable contract, so exact intervals and failure behavior may change between
+versions, but the observed behavior interacts badly with how containers manage
+state:
 
 - **Snapshot/restore drift**: any backup of `.credentials.json` goes stale the
-  moment the live file refreshes (~every 8 h). Seeding a new pod/task from a
+  moment the live file refreshes (hours, observed ~8 h). Seeding a new pod/task from a
   stale backup means the first inference attempts a refresh with a dead token,
   fails, and the SDK **zeroes out the credentials file** — the bot is locked out
   until a human re-authenticates.
