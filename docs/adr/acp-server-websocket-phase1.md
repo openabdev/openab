@@ -130,7 +130,9 @@ and rejecting forged ids.
 ## 6. Roadmap (from proposal; resume pulled into Phase 1)
 
 - **Phase 2** — tool calls: `session/update` variants `tool_call` / `tool_call_update`,
-  and `session/request_permission`; reaction emoji → updates
+  and `session/request_permission`; reaction emoji → updates. Also enables browser
+  control (LLM operates the user's browser via MCP-over-ACP) —
+  see [Browser control via MCP-over-ACP](./acp-mcp-browser-control.md).
 - **Phase 3** — `session/load` with history replay (needs an upstream transcript store)
 - **Phase 4** — multi-agent fan-out
 - **Phase 5** — Streamable HTTP (POST + SSE) on the same `/acp`
