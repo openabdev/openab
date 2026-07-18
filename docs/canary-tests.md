@@ -10,6 +10,7 @@ The goal is to produce evidence that another contributor or maintainer can revie
 - [Build the Preview Image](#build-the-preview-image)
 - [Layer 1: Image Inspection](#layer-1-image-inspection)
 - [Layer 2: ACP Protocol Smoke](#layer-2-acp-protocol-smoke)
+  - [WebSocket transport (`/acp`)](#websocket-transport-acp)
   - [Transport Method](#transport-method)
 - [Layer 3: Runtime Isolation Probe](#layer-3-runtime-isolation-probe)
 - [Layer 4: Interactive Validation](#layer-4-interactive-validation)
@@ -146,6 +147,19 @@ Avoid printing the live container environment because it may include injected cr
 ## Layer 2: ACP Protocol Smoke
 
 For an ACP adapter change, use a minimal bidirectional JSON-RPC client to exercise the same stdio boundary OpenAB uses. The client may be written in any language; JavaScript is not required. A one-way shell pipeline is insufficient for multi-turn and permission tests because the adapter can send requests back to the client while a prompt is running.
+
+### WebSocket transport (`/acp`)
+
+OpenAB also serves ACP over a WebSocket (`GET /acp`, feature `acp` + `OPENAB_ACP_ENABLED`) — the upstream client↔gateway hop, distinct from the downstream stdio hop below. `scripts/acp-ws-smoke.py` is a ready-to-run client for it: it drives `initialize → session/new → session/prompt` (stream + `stopReason`) `→ session/resume`, and confirms OpenAB slash-command replies (`/model`, `/reset`) render back over ACP. It needs a live deployment (the prompt turns hit the real model).
+
+```bash
+# default ws://localhost:8080/acp; pass another URL as $1
+uv run scripts/acp-ws-smoke.py ws://<host>:8080/acp
+# if the endpoint sets OPENAB_ACP_AUTH_KEY:
+OPENAB_ACP_TOKEN=<key> uv run scripts/acp-ws-smoke.py ws://<host>:8080/acp
+```
+
+Exits non-zero unless all checks pass. For the in-repo `cargo test` counterpart (offline wire-conformance of the same payloads against the generated types), see the `acp_conformance` module in `crates/openab-gateway/src/adapters/acp_server.rs`.
 
 ### Transport Method
 
