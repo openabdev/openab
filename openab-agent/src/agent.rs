@@ -232,8 +232,11 @@ impl Agent {
                 content: assistant_content,
             });
 
-            if tool_calls.is_empty() || !text_parts.is_empty() {
-                // No tool calls — we're done
+            // Done only when the turn carries no tool calls. A turn with BOTH
+            // text and tool_calls (common on Chat Completions — commentary
+            // before the call) must keep looping so the tools actually run;
+            // the text is already preserved in the assistant message above.
+            if tool_calls.is_empty() {
                 final_text = text_parts.join("");
                 break;
             }
@@ -370,6 +373,53 @@ mod tests {
         let mut agent = Agent::new(mock, tmp.path().to_string_lossy().to_string());
         let result = agent.run("hi").await.unwrap();
         assert_eq!(result, "Hello!");
+    }
+
+    #[tokio::test]
+    async fn test_agent_mixed_text_and_tool_call_still_executes_tools() {
+        // Review F1: a turn carrying BOTH commentary text and tool_calls (common
+        // on Chat Completions) must keep looping so the tools actually run — not
+        // end the turn with the commentary while the calls sit unexecuted in
+        // history. The unknown tool name fails fast without touching the fs, so
+        // this exercises the full round-trip as a unit test.
+        let mock = MockLlmProvider::new(vec![
+            vec![
+                LlmEvent::Text("Let me check.".to_string()),
+                LlmEvent::ToolUse {
+                    id: "tu_1".to_string(),
+                    name: "no_such_tool".to_string(),
+                    input: serde_json::json!({}),
+                },
+            ],
+            vec![LlmEvent::Text("Done.".to_string()), LlmEvent::Stop],
+        ]);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut agent = Agent::new(mock, tmp.path().to_string_lossy().to_string());
+        let result = agent.run("go").await.unwrap();
+        // The second LLM turn's text is the final reply — proof the loop continued.
+        assert_eq!(result, "Done.");
+
+        // user, assistant(text+tool_use), user(tool_result), assistant(text)
+        assert_eq!(agent.messages.len(), 4);
+        match &agent.messages[1].content[..] {
+            [ContentBlock::Text { text }, ContentBlock::ToolUse { name, .. }] => {
+                assert_eq!(text, "Let me check.");
+                assert_eq!(name, "no_such_tool");
+            }
+            other => panic!("unexpected assistant content: {other:?}"),
+        }
+        match &agent.messages[2].content[0] {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                is_error,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "tu_1");
+                assert_eq!(*is_error, Some(true));
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
     }
 
     #[tokio::test]

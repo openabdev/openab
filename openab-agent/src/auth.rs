@@ -1391,6 +1391,13 @@ fn classify_device_poll_error(payload: &serde_json::Value) -> DevicePollDisposit
     }
 }
 
+/// RFC 8628 §3.5: after `slow_down` the client MUST increase its poll interval
+/// by 5 seconds. A server-supplied replacement interval is honored only when it
+/// slows polling down further — never to poll faster than before.
+fn next_slow_down_interval(current: u64, server: Option<u64>) -> u64 {
+    (current + 5).max(server.unwrap_or(0))
+}
+
 /// Shared RFC 8628 login: request a device code, show the user code +
 /// verification link (preferring the prefilled `verification_uri_complete`),
 /// poll the token endpoint until approval, persist under the vendor namespace.
@@ -1472,8 +1479,7 @@ async fn login_device_code_flow(vendor: &dyn OAuthVendor) -> Result<()> {
         match classify_device_poll_error(&payload) {
             DevicePollDisposition::Pending => continue,
             DevicePollDisposition::SlowDown(server_interval) => {
-                // RFC 8628 §3.5: bump by 5s unless the AS supplied a new interval.
-                poll_interval = server_interval.unwrap_or(poll_interval + 5);
+                poll_interval = next_slow_down_interval(poll_interval, server_interval);
             }
             DevicePollDisposition::Fatal(msg) => {
                 return Err(anyhow!(
@@ -1808,6 +1814,19 @@ mod tests {
             classify_device_poll_error(&serde_json::json!({})),
             Fatal(_)
         ));
+    }
+
+    #[test]
+    fn next_slow_down_interval_is_monotonic() {
+        // RFC 8628 §3.5 (review F2): slow_down must never speed polling up.
+        // No replacement interval → +5.
+        assert_eq!(next_slow_down_interval(5, None), 10);
+        // Replacement below the current delay is ignored in favor of +5.
+        assert_eq!(next_slow_down_interval(10, Some(3)), 15);
+        // Replacement equal to the bumped value is a no-op either way.
+        assert_eq!(next_slow_down_interval(10, Some(15)), 15);
+        // A genuinely slower server interval is honored.
+        assert_eq!(next_slow_down_interval(5, Some(30)), 30);
     }
 
     #[test]
