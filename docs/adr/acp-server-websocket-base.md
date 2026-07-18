@@ -175,7 +175,37 @@ North star: the agent's LLM autonomously operating the user's real browser (gene
   reveals the variant surface downstream agents actually emit, informs which of the
   Optional variants to forward, and validates the generated-type round-trip.
 
-## 7. References
+## 7. Typing & dependency decision (hand-rolled now → generated later)
+
+Both sides of OpenAB's ACP are currently **hand-rolled, untyped** (`serde_json::Value` +
+manual string matching on `sessionUpdate` variants): the upstream server here (~740
+lines, chat only) and the downstream client in `openab-core/src/acp/` (`protocol.rs` +
+`connection.rs`, ~1800 lines, many variants). Hand-rolling caused the exact conformance
+bugs fixed during the base build (`agentMessageChunk`→`agent_message_chunk`, `stopReason`
+snake_case, integer `protocolVersion: 1`).
+
+Options weighed for typing the wire:
+
+| Option | New deps | Verdict |
+|---|---|---|
+| Hand-roll (current) | 0 | Fine for the trivial chat subset; error-prone for the big bidirectional surface |
+| Full `agent-client-protocol` crate | ~105 (incl. a 2nd async runtime, async-io/smol) | **Never** — connection/role machinery unneeded (we have our own WS + GatewayEvent bridge) |
+| `agent-client-protocol-schema` (types) | **+24** (measured 376→400), schemars-dominated | schemars is for `JsonSchema` derive we don't use at runtime; `serde_with`/`strum` mandatory (no feature to drop); floor is fixed |
+| **Offline codegen (typify) → committed serde-only `.rs`** | **~0 runtime** | **Chosen for the expanded surface** — typed conformance without the schemars tree |
+
+Notes:
+- **v1 only.** `v2` is experimental (`unstable_protocol_v2`, adds `diffy`), currently
+  wire-identical to v1, "may change at any time". We negotiate `protocolVersion 1`.
+- **Caveat:** ACP types lean on `serde_with` (MaybeUndefined tri-state, ~600 uses across
+  the crate's v1 source) — so a naive vendor-and-strip-`JsonSchema` is not clean, and
+  typify's plain-serde output must be **round-trip validated** (simple chat fields are
+  fine; advanced patterns need checking — hence the ACP trace mode in §6).
+- **Rule:** hand-roll only the trivial; **generate the complex.** The switch point is the
+  bidirectional/MCP surface. Highest ROI if unifying: the downstream core client
+  (~1800 lines of manual variant matching), not this small upstream server.
+
+## 8. References
 
 - Original proposal: [acp-server-websocket.md](./acp-server-websocket.md)
 - Official method surface + coverage: [acp-official-methods.md](../acp-official-methods.md)
+- MCP-over-ACP browser control: [acp-server-websocket-mcp-browser.md](./acp-server-websocket-mcp-browser.md)
