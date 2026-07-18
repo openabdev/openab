@@ -70,13 +70,30 @@ fn stream_delta(sent_len: usize, full_text: &str) -> Option<&str> {
 }
 
 /// Whether ACP frame tracing is on (`OPENAB_ACP_TRACE=1|true`). When set, every
-/// JSON-RPC frame on the upstream client↔gateway hop is logged in both directions
-/// (`dir="in"` / `dir="out"`). Off by default; enable to capture real traffic — e.g.
-/// to validate the generated-type round-trip against what clients/agents actually emit.
+/// JSON-RPC frame on the upstream client↔gateway hop is logged (at `debug!`) in both
+/// directions (`dir="in"` / `dir="out"`).
+///
+/// **This is an opt-in debugging tool that records message CONTENT** — prompts, replies,
+/// and negotiated capabilities appear in the logs (truncated, see `trace_frame`). It is
+/// off by default and emits at `debug!` so it never surfaces at the default log level;
+/// only enable it in a trusted environment when you need to inspect real ACP traffic
+/// (e.g. to validate the generated-type round-trip against what clients/agents emit).
 pub(crate) fn acp_trace_enabled() -> bool {
     std::env::var("OPENAB_ACP_TRACE")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false)
+}
+
+/// Truncate a frame for trace logging so a large prompt/reply doesn't dump a huge line
+/// (and doesn't record the *complete* content). Keeps the first `CAP` scalar values.
+fn trace_frame(s: &str) -> std::borrow::Cow<'_, str> {
+    const CAP: usize = 512;
+    let total = s.chars().count();
+    if total <= CAP {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let end = s.char_indices().nth(CAP).map_or(s.len(), |(i, _)| i);
+    std::borrow::Cow::Owned(format!("{}…(+{} chars)", &s[..end], total - CAP))
 }
 
 // ---------------------------------------------------------------------------
@@ -238,7 +255,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
     let send_task = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
             if trace {
-                info!(connection = %send_conn, dir = "out", frame = %msg, "ACP frame");
+                debug!(connection = %send_conn, dir = "out", frame = %trace_frame(&msg), "ACP frame");
             }
             if ws_tx.send(Message::Text(msg.into())).await.is_err() {
                 break;
@@ -253,7 +270,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
         };
 
         if trace {
-            info!(connection = %connection_id, dir = "in", frame = %text, "ACP frame");
+            debug!(connection = %connection_id, dir = "in", frame = %trace_frame(&text), "ACP frame");
         }
 
         let req: JsonRpcRequest = match serde_json::from_str(&text) {
