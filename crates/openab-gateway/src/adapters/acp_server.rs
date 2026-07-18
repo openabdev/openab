@@ -54,6 +54,21 @@ impl AcpConfig {
     }
 }
 
+/// Incremental text to stream, given the bytes already sent (`sent_len`) and the
+/// latest full-text snapshot. Slices via `str::get` (never byte-index `[..]`), so a
+/// `sent_len` that lands mid-codepoint — possible with CJK / 顏文字 / emoji only on a
+/// non-append snapshot rewrite — yields `None` (caller skips the frame; the next
+/// snapshot re-covers) instead of panicking. In the normal append case `sent_len` is
+/// always the byte length of a prior valid snapshot and therefore a char boundary of
+/// the new text, so a multi-byte codepoint is always emitted whole, never split.
+/// Returns `None` when there is nothing new to send.
+fn stream_delta(sent_len: usize, full_text: &str) -> Option<&str> {
+    match full_text.get(sent_len..) {
+        Some(d) if !d.is_empty() => Some(d),
+        _ => None,
+    }
+}
+
 /// Whether ACP frame tracing is on (`OPENAB_ACP_TRACE=1|true`). When set, every
 /// JSON-RPC frame on the upstream client↔gateway hop is logged in both directions
 /// (`dir="in"` / `dir="out"`). Off by default; enable to capture real traffic — e.g.
@@ -627,14 +642,11 @@ async fn handle_session_prompt(
             recv = tokio::time::timeout(timeout, reply_rx.recv()) => {
                 match recv {
                     Ok(Some(ReplyChunk::Text(full_text))) => {
-                        // Emit new text as an `agent_message_chunk` update.
-                        // Slice via `get` (not byte-index `[..]`) so a `sent_len`
-                        // that lands mid-codepoint — possible with CJK / 顏文字 /
-                        // emoji if a snapshot is ever non-append — skips this frame
-                        // instead of panicking; the next snapshot re-covers it.
-                        let delta = match full_text.get(sent_len..) {
-                            Some(d) if !d.is_empty() => d,
-                            _ => continue,
+                        // Emit new text as an `agent_message_chunk` update. See
+                        // `stream_delta` for the char-boundary safety guarantee.
+                        let delta = match stream_delta(sent_len, &full_text) {
+                            Some(d) => d,
+                            None => continue,
                         };
                         sent_len = full_text.len();
 
@@ -846,5 +858,141 @@ mod acp_conformance {
             "sessionId": "sess_00000000-0000-0000-0000-000000000000",
             "prompt": [{ "type": "text", "text": "PING" }]
         }));
+    }
+
+    // --- edge cases: emoji / Unicode / boundary strings (round-trip) ---
+
+    // The multi-byte / multi-codepoint cases a naive wire handler mangles:
+    // astral-plane emoji, ZWJ sequence, regional-indicator flag, VS16 emoji,
+    // astral-plane CJK, and a mixed run.
+    const EDGE_TEXT: &[&str] = &[
+        "🎉",                     // U+1F389, 4-byte astral emoji
+        "👨‍👩‍👧‍👦",                 // ZWJ family (7 codepoints joined by ZWJ)
+        "🇹🇼",                     // regional-indicator pair (flag)
+        "❤️",                     // U+2764 + U+FE0F (VS16)
+        "𠀀",                     // U+20000, astral-plane CJK
+        "🎉 你好 (๑•̀ㅂ•́)و ❤️",      // mixed emoji + CJK + kaomoji + VS16
+    ];
+
+    #[test]
+    fn content_block_emoji_and_unicode() {
+        for e in EDGE_TEXT {
+            conforms::<sc::ContentBlock>(json!({ "type": "text", "text": e }));
+        }
+    }
+
+    #[test]
+    fn session_update_emoji_chunk() {
+        for e in EDGE_TEXT {
+            conforms::<sc::SessionNotification>(json!({
+                "sessionId": "sess_00000000-0000-0000-0000-000000000000",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": e }
+                }
+            }));
+        }
+    }
+
+    #[test]
+    fn content_block_boundary_strings() {
+        // empty, whitespace/newlines/tabs, JSON-special chars, control chars, and a
+        // long string — all must round-trip as plain text.
+        let long = "x".repeat(4096);
+        for s in [
+            "",
+            "   \n\t  ",
+            "quote:\" backslash:\\ slash:/ braces:{}[]",
+            "ctrl:\u{0001}\u{001f} unit-sep",
+            long.as_str(),
+        ] {
+            conforms::<sc::ContentBlock>(json!({ "type": "text", "text": s }));
+        }
+    }
+
+    #[test]
+    fn prompt_response_all_stop_reasons() {
+        for sr in ["end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"] {
+            conforms::<sc::PromptResponse>(json!({ "stopReason": sr }));
+        }
+    }
+
+    #[test]
+    fn prompt_request_multi_block_emoji() {
+        conforms::<sc::PromptRequest>(json!({
+            "sessionId": "sess_00000000-0000-0000-0000-000000000000",
+            "prompt": [
+                { "type": "text", "text": "line 1 🎉" },
+                { "type": "text", "text": "你好 ❤️" }
+            ]
+        }));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming slicer — the char-boundary-safe incremental delta logic. A multi-byte
+// codepoint (emoji, CJK) would be split here if the wire used byte indexing; these
+// pin that it never happens.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod acp_streaming {
+    use super::stream_delta;
+
+    /// Replay a sequence of full-text snapshots through the exact loop logic
+    /// (`stream_delta` + advancing `sent_len`) and return the concatenated deltas.
+    fn replay(snapshots: &[&str]) -> String {
+        let mut sent = 0usize;
+        let mut out = String::new();
+        for snap in snapshots {
+            if let Some(delta) = stream_delta(sent, snap) {
+                out.push_str(delta);
+                sent = snap.len();
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn append_reconstructs_exactly() {
+        assert_eq!(replay(&["", "H", "Hi", "Hi ", "Hi there"]), "Hi there");
+    }
+
+    #[test]
+    fn multibyte_codepoints_never_split() {
+        // each snapshot appends a whole multi-byte grapheme; reconstruction is exact
+        let snaps = [
+            "a",
+            "a🎉",
+            "a🎉你",
+            "a🎉你👨‍👩‍👧‍👦",
+            "a🎉你👨‍👩‍👧‍👦🇹🇼",
+            "a🎉你👨‍👩‍👧‍👦🇹🇼❤️",
+        ];
+        assert_eq!(replay(&snaps), *snaps.last().unwrap());
+    }
+
+    #[test]
+    fn emoji_appears_whole_in_one_delta() {
+        // "ab" already sent; next snapshot adds a 4-byte emoji → delta is the whole emoji
+        assert_eq!(stream_delta(2, "ab🎉"), Some("🎉"));
+    }
+
+    #[test]
+    fn mid_codepoint_sent_len_is_skipped_not_panicked() {
+        // sent_len inside the 4-byte emoji (a non-append rewrite) → None, never a panic
+        assert_eq!(stream_delta(1, "🎉"), None);
+        assert_eq!(stream_delta(2, "🎉"), None);
+        assert_eq!(stream_delta(3, "🎉"), None);
+    }
+
+    #[test]
+    fn no_new_text_returns_none() {
+        assert_eq!(stream_delta(5, "hello"), None); // sent == len
+        assert_eq!(stream_delta(9, "hello"), None); // sent beyond len (shrink/rewrite)
+    }
+
+    #[test]
+    fn empty_snapshot_returns_none() {
+        assert_eq!(stream_delta(0, ""), None);
     }
 }
