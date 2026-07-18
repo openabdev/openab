@@ -30,6 +30,15 @@ use uuid::Uuid;
 /// Tracks the official schema — see `docs/acp-official-methods.md`.
 const ACP_PROTOCOL_VERSION: u32 = 1;
 
+/// Lightweight per-connection resource caps: turn unbounded client-driven growth into
+/// a deterministic overload error. Full backpressure (bounded outbound channel), idle
+/// eviction, and global connection/worker limits are a follow-up (review F6, roadmap).
+const MAX_SESSIONS_PER_CONNECTION: usize = 128;
+const MAX_INFLIGHT_PROMPTS: usize = 32;
+const MAX_FRAME_BYTES: usize = 1 << 20; // 1 MiB per inbound JSON-RPC frame
+/// JSON-RPC implementation-defined server error for a hit resource cap.
+const ACP_OVERLOADED: i32 = -32000;
+
 // ---------------------------------------------------------------------------
 // ACP Configuration
 // ---------------------------------------------------------------------------
@@ -280,6 +289,17 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
             continue;
         };
 
+        // Bound inbound frame size before parsing (deterministic overload, not OOM).
+        if text.len() > MAX_FRAME_BYTES {
+            let resp = JsonRpcResponse::error(
+                Value::Null,
+                ACP_OVERLOADED,
+                format!("Frame too large ({} bytes; max {MAX_FRAME_BYTES})", text.len()),
+            );
+            let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+            continue;
+        }
+
         if trace {
             debug!(connection = %connection_id, dir = "in", frame = %trace_frame(&text), "ACP frame");
         }
@@ -359,6 +379,16 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                     let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
                     continue;
                 }
+                // Cap sessions per connection (deterministic overload, not unbounded).
+                if sessions.lock().await.len() >= MAX_SESSIONS_PER_CONNECTION {
+                    let resp = JsonRpcResponse::error(
+                        id,
+                        ACP_OVERLOADED,
+                        format!("Too many sessions on this connection (max {MAX_SESSIONS_PER_CONNECTION})"),
+                    );
+                    let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+                    continue;
+                }
                 let resp = handle_session_new(&sessions, id.clone()).await;
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
             }
@@ -383,6 +413,17 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
             "session/prompt" => {
                 if !initialized {
                     let resp = JsonRpcResponse::error(id, -32002, "Not initialized");
+                    let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+                    continue;
+                }
+                // Cap concurrent in-flight prompts per connection (drop finished first).
+                prompt_tasks.retain(|h| !h.is_finished());
+                if prompt_tasks.len() >= MAX_INFLIGHT_PROMPTS {
+                    let resp = JsonRpcResponse::error(
+                        id,
+                        ACP_OVERLOADED,
+                        format!("Too many in-flight prompts (max {MAX_INFLIGHT_PROMPTS})"),
+                    );
                     let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
                     continue;
                 }
