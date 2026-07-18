@@ -149,11 +149,12 @@ Check these in order:
    everything after the `#` (the format is `code#state`).
 2. **Old Claude Code version.** Claude Code v2.1.105–v2.1.107 had a bracketed-paste
    regression that truncated the pasted code, causing the token exchange to fail
-   with 400. Fixed in v2.1.108. Upgrade inside the container:
-   ```bash
-   npm install -g @anthropic-ai/claude-code@latest @agentclientprotocol/claude-agent-acp@latest
-   ```
-   Or use a newer image tag (see [Image Tag](#image-tag)).
+   with 400. Fixed in v2.1.108. Deploy an image tag whose pinned Claude Code version
+   is ≥ 2.1.108 (see [Image Tag](#image-tag)) — the default chart security context
+   is non-root with a read-only root filesystem, so packages cannot be upgraded
+   inside a running container, and a live install would not survive pod recreation
+   anyway. If you build your own image, bump the `CLAUDE_CODE_VERSION` /
+   `CLAUDE_AGENT_ACP_VERSION` build args to explicit pinned versions.
 3. **Anthropic OAuth outage.** Waves of OAuth 400/500 errors have been server-side
    incidents (see [anthropics/claude-code#10719](https://github.com/anthropics/claude-code/issues/10719)).
    Check [status.claude.com](https://status.claude.com) before debugging further.

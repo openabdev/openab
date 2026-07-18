@@ -49,7 +49,7 @@ jobs:
       matrix:
         target:
           - { name: kiro, agent: "kiro-cli" }
-          - { name: claude, agent: "claude" }
+          - { name: claude, agent: "claude-agent-acp" }
           - { name: codex, agent: "codex-acp" }
           - { name: copilot, agent: "copilot" }
           - { name: cursor, agent: "cursor-agent" }
@@ -121,4 +121,42 @@ jobs:
           echo "Response: $RESPONSE"
           echo "$RESPONSE" | jq -e \
             '.result.agentInfo.name == "@agentclientprotocol/codex-acp"' \
+            >/dev/null
+
+      - name: Verify Claude runtime versions
+        if: matrix.target.name == 'claude'
+        run: |
+          # Expected versions come from the Dockerfile ARG defaults (single
+          # source of truth) so a version bump only touches the Dockerfiles.
+          CLAUDE_AGENT_ACP_VERSION=$(awk -F= '$1 == "ARG CLAUDE_AGENT_ACP_VERSION" {print $2; exit}' Dockerfile.unified)
+          CLAUDE_CODE_VERSION=$(awk -F= '$1 == "ARG CLAUDE_CODE_VERSION" {print $2; exit}' Dockerfile.unified)
+          test -n "$CLAUDE_AGENT_ACP_VERSION" && test -n "$CLAUDE_CODE_VERSION"
+          docker run --rm --entrypoint claude openab-unified-claude:test --version \
+            | grep -F "${CLAUDE_CODE_VERSION}"
+          docker run --rm --entrypoint node openab-unified-claude:test \
+            -e 'console.log(require("/usr/local/lib/node_modules/@agentclientprotocol/claude-agent-acp/package.json").version)' \
+            | grep -Fx "${CLAUDE_AGENT_ACP_VERSION}"
+
+      - name: Verify Claude agent command is the ACP adapter
+        if: matrix.target.name == 'claude'
+        run: |
+          # Regression guard: bare `claude` is the interactive REPL — it has no
+          # ACP mode and the session pool times out on initialize. The default
+          # command must be the claude-agent-acp adapter (see #1419).
+          docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' openab-unified-claude:test \
+            | grep -Fx 'OPENAB_AGENT_COMMAND=claude-agent-acp'
+
+      - name: Verify Claude ACP handshake
+        if: matrix.target.name == 'claude'
+        run: |
+          INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"ci-test","version":"0.0.1"}}}'
+          CID=$(docker run -d -i --entrypoint claude-agent-acp openab-unified-claude:test)
+          echo "$INIT" | docker attach --no-stdin=false "$CID" &
+          sleep 5
+          RESPONSE=$(docker logs "$CID" 2>/dev/null | grep -m1 '^{' || true)
+          docker rm -f "$CID" >/dev/null 2>&1
+
+          echo "Response: $RESPONSE"
+          echo "$RESPONSE" | jq -e \
+            '.result.agentInfo.name == "@agentclientprotocol/claude-agent-acp"' \
             >/dev/null
