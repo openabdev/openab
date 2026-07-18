@@ -399,6 +399,14 @@ pub(crate) async fn run(
 
 /// Validate and reconcile in-memory manifests without writing progress to
 /// process-global stdout or stderr.
+///
+/// # Concurrency
+///
+/// This function is not serialized with [`crate::delete::delete_services`].
+/// Callers must serialize mutations for the same AWS account, Region,
+/// control-plane bucket, ECS cluster, namespace, and name. If that precondition
+/// is violated, stop concurrent writers and re-apply the intended desired state
+/// before resuming other mutations.
 pub async fn apply_manifests(
     aws_config: &aws_config::SdkConfig,
     manifests: &[OABServiceManifest],
@@ -587,6 +595,15 @@ fn ingress_teardown_checkpoint_key(namespace: &str, name: &str) -> String {
     format!("ingress-teardown-checkpoints/{namespace}/{name}.json")
 }
 
+pub(crate) fn require_no_pending_ingress_teardown(checkpoint_present: bool) -> Result<()> {
+    if checkpoint_present {
+        anyhow::bail!(
+            "a previous apply ingress teardown is still pending; re-run the ingress-free apply before delete"
+        );
+    }
+    Ok(())
+}
+
 async fn load_ingress_teardown_checkpoint(
     s3: &aws_sdk_s3::Client,
     bucket: &str,
@@ -613,6 +630,16 @@ async fn load_ingress_teardown_checkpoint(
             format!("failed to read ingress teardown checkpoint s3://{bucket}/{key}")
         }),
     }
+}
+
+pub(crate) async fn ensure_no_pending_ingress_teardown(
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
+    namespace: &str,
+    name: &str,
+) -> Result<()> {
+    let checkpoint = load_ingress_teardown_checkpoint(s3, bucket, namespace, name).await?;
+    require_no_pending_ingress_teardown(checkpoint.is_some())
 }
 
 async fn save_ingress_teardown_checkpoint(

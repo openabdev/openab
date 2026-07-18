@@ -131,7 +131,21 @@ IDs after ECS explicitly reports exactly one `MISSING` failure with zero service
 or a matching original `INACTIVE` incarnation. Duplicate APIs fail closed,
 and a sole same-name API is checkpointed only when an integration URI exactly
 matches the ECS registry ARN.
-There is no name-only API, Cloud Map, or S3 orphan cleanup fallback.
+There is no name-only API, Cloud Map, or S3 orphan cleanup fallback. If a
+per-target apply-side `ingress-teardown-checkpoints/<namespace>/<name>.json`
+record exists, delete fails before destructive mutation so it cannot discard
+unfinished exact cleanup identity. Re-run the ingress-free apply to completion,
+then retry delete.
+
+Delete namespaces must not contain `-`; names may contain it. This makes the
+existing `oab-{namespace}-{name}` physical identity injective for every target
+accepted by the programmatic delete API.
+
+Programmatic apply and delete do not provide an internal same-target lock.
+Callers must serialize mutations for the same AWS account, Region, control-plane
+bucket, ECS cluster, namespace, and name. If overlapping calls occur, stop
+concurrent writers, inspect the retained checkpoint, then explicitly re-apply
+the desired state or retry delete.
 
 For `aws-sm://<secret-id>#<json-key>`, a non-ARN `<secret-id>` requires the
 caller to have `secretsmanager:DescribeSecret`; full-ARN shorthand does not

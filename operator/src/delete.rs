@@ -21,7 +21,11 @@ macro_rules! eprint {
 ///
 /// Deletion does not require the original manifest: the control-plane copy
 /// under `manifests/{namespace}/{name}.yaml` (and every other resource) is
-/// addressed by `namespace` + `name` alone.
+/// addressed by `namespace` + `name` alone. Because physical resource names
+/// use `-` as the component delimiter, [`delete_services`] accepts namespaces
+/// without `-`; names may still contain it. This keeps every accepted logical
+/// target's physical delete identity injective without renaming existing
+/// deployments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteTarget {
     pub namespace: String,
@@ -419,8 +423,33 @@ fn validate_delete_request(
                 target.name
             )));
         }
+        if target.namespace.contains('-') {
+            return Err(DeleteError::validation(anyhow::anyhow!(
+                "delete target namespace must not contain '-' because it is the physical identity delimiter (got '{}')",
+                target.namespace
+            )));
+        }
     }
     Ok(())
+}
+
+fn record_delete_result(
+    mut report: DeleteReport,
+    target: &DeleteTarget,
+    outcome: Result<Vec<String>>,
+) -> std::result::Result<DeleteReport, DeleteError> {
+    match outcome {
+        Ok(warnings) => {
+            report.services.push(DeletedService {
+                namespace: target.namespace.clone(),
+                name: target.name.clone(),
+                ecs_service_name: target.ecs_service_name(),
+                warnings,
+            });
+            Ok(report)
+        }
+        Err(error) => Err(DeleteError::teardown(target.clone(), report, error)),
+    }
 }
 
 /// Tear down OAB services programmatically, without reading CLI home
@@ -431,6 +460,17 @@ fn validate_delete_request(
 /// - [`DeleteOptions::cluster`] must be non-empty; its optional bucket override
 ///   follows the shared control-plane resolver
 /// - every target's `namespace`/`name` must be non-empty
+/// - target namespaces must not contain `-`; that delimiter may appear in names,
+///   so this restriction makes `oab-{namespace}-{name}` injective for every
+///   accepted target
+///
+/// # Concurrency
+///
+/// This function is not serialized with [`crate::apply::apply_manifests`].
+/// Callers must serialize mutations for the same AWS account, Region,
+/// control-plane bucket, ECS cluster, namespace, and name. If that precondition
+/// is violated, stop concurrent writers, inspect the retained checkpoint, then
+/// either re-apply the intended desired state or retry delete.
 ///
 /// Before ECS mutation, delete persists an exact-identity checkpoint containing
 /// the caller account/region, bucket, canonical cluster and service ARNs, and
@@ -454,7 +494,7 @@ pub async fn delete_services(
 
         let mut report = DeleteReport::default();
         for target in targets {
-            match run_with_bucket(
+            let outcome = run_with_bucket(
                 aws_config,
                 "oabservice",
                 &target.name,
@@ -462,18 +502,8 @@ pub async fn delete_services(
                 &target.namespace,
                 &bucket,
             )
-            .await
-            {
-                Ok(warnings) => report.services.push(DeletedService {
-                    namespace: target.namespace.clone(),
-                    name: target.name.clone(),
-                    ecs_service_name: target.ecs_service_name(),
-                    warnings,
-                }),
-                Err(error) => {
-                    return Err(DeleteError::teardown(target.clone(), report, error));
-                }
-            }
+            .await;
+            report = record_delete_result(report, target, outcome)?;
         }
         Ok(report)
     })
@@ -1021,6 +1051,8 @@ async fn run_with_bucket(
     }
     let ecs = aws_sdk_ecs::Client::new(aws_config);
     let s3 = aws_sdk_s3::Client::new(aws_config);
+    crate::apply::ensure_no_pending_ingress_teardown(&s3, bucket, namespace, name)
+        .await?;
     println!("Deleting {name}...");
 
     match prepare_identity(
@@ -1380,6 +1412,50 @@ mod tests {
             DeleteTarget::new("prod", "nest-my-oab").ecs_service_name(),
             "oab-prod-nest-my-oab"
         );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_namespace_delimiter_is_rejected_before_aws() {
+        let opts = DeleteOptions::new("cluster");
+        let accepted = [DeleteTarget::new("prod", "team-bot")];
+        let rejected = [DeleteTarget::new("prod-team", "bot")];
+        assert_eq!(
+            accepted[0].ecs_service_name(),
+            rejected[0].ecs_service_name()
+        );
+        assert!(validate_delete_request(&accepted, &opts).is_ok());
+
+        let error = delete_services(&test_sdk_config(), &rejected, &opts)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, DeleteErrorKind::Validation);
+        assert!(error.to_string().contains("must not contain '-'"));
+    }
+
+    #[test]
+    fn later_failure_preserves_the_completed_partial_report() {
+        let first = DeleteTarget::new("prod", "first");
+        let second = DeleteTarget::new("prod", "second");
+        let report = record_delete_result(DeleteReport::default(), &first, Ok(Vec::new()))
+            .expect("first target should complete");
+        let error = record_delete_result(
+            report,
+            &second,
+            Err(anyhow::anyhow!("synthetic teardown failure")),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind, DeleteErrorKind::Teardown);
+        assert_eq!(error.failed_service.as_ref(), Some(&second));
+        assert_eq!(error.completed.services.len(), 1);
+        assert_eq!(error.completed.services[0].name, "first");
+    }
+
+    #[test]
+    fn pending_apply_ingress_teardown_blocks_delete_completion() {
+        assert!(crate::apply::require_no_pending_ingress_teardown(false).is_ok());
+        let error = crate::apply::require_no_pending_ingress_teardown(true).unwrap_err();
+        assert!(error.to_string().contains("re-run the ingress-free apply"));
     }
 
     #[test]

@@ -49,11 +49,22 @@
 //! resolution chain.
 //!
 //! [`delete_services`] tears down by `namespace`+`name` ([`DeleteTarget`]).
-//! Before ECS mutation it durably records the resolved bucket, caller
-//! partition/account/region, canonical cluster/service ARNs, the ECS service
-//! `createdAt` incarnation, and exact ingress IDs in S3. Initial identity
-//! ambiguity fails closed; retries use only checkpointed IDs and remove the
-//! checkpoint last. There is no name-only orphan cleanup fallback.
+//! Delete namespaces must not contain `-`; names may contain it, making the
+//! existing `oab-{namespace}-{name}` resource identity injective for accepted
+//! targets. Before ECS mutation delete durably records the resolved bucket,
+//! caller partition/account/region, canonical cluster/service ARNs, the ECS
+//! service `createdAt` incarnation, and exact ingress IDs in S3. Initial
+//! identity ambiguity fails closed; retries use only checkpointed IDs and
+//! remove the delete checkpoint on success. If apply has a pending exact
+//! ingress-teardown checkpoint, delete fails before destructive mutation and
+//! requires the caller to finish the ingress-free apply first, preserving that
+//! cleanup identity. There is no name-only orphan cleanup fallback.
+//!
+//! Programmatic apply and delete do not provide an internal same-target lock.
+//! Callers must serialize mutations for the same AWS account, Region,
+//! control-plane bucket, ECS cluster, namespace, and name. After an accidental
+//! overlap, stop concurrent writers, inspect any retained checkpoint, and
+//! explicitly re-apply the desired state or retry delete.
 
 pub mod apply;
 mod bootstrap;

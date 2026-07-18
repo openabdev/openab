@@ -382,8 +382,22 @@ must still be registered manually in the LINE Developers console.
 > equals the ECS registry ARN. Cloud Map is deleted only by the service ID
 > parsed from a structurally and boundary-validated Cloud Map service ARN.
 > Exact-ID NotFound is idempotent; other cleanup errors retain the checkpoint.
-> There is no name-only API, Cloud Map, or S3 orphan cleanup path. If you edit
-> a manifest to remove `spec.ingress` while keeping the bot, `apply` first
+> There is no name-only API, Cloud Map, or S3 orphan cleanup path. Programmatic
+> delete namespaces must not contain `-` (names may contain it), which makes the
+> existing `oab-{namespace}-{name}` identity injective for every accepted delete
+> target. If a per-target
+> `ingress-teardown-checkpoints/<namespace>/<name>.json` record exists, delete
+> fails before destructive mutation so it cannot discard unfinished exact
+> cleanup identity. Re-run the ingress-free apply to completion, then retry
+> delete.
+>
+> Programmatic apply and delete do not provide an internal same-target lock.
+> Callers must serialize mutations for the same AWS account, Region,
+> control-plane bucket, ECS cluster, namespace, and name. After an accidental
+> overlap, stop concurrent writers, inspect retained checkpoints, then
+> explicitly re-apply the desired state or retry delete.
+>
+> If you edit a manifest to remove `spec.ingress` while keeping the bot, `apply` first
 > stores every exact ECS registry ARN only when the previously stored OAB
 > manifest owned ingress (or resumes an already-valid checkpoint); an arbitrary
 > attached registry is never enough.
