@@ -1398,6 +1398,19 @@ fn next_slow_down_interval(current: u64, server: Option<u64>) -> u64 {
     (current + 5).max(server.unwrap_or(0))
 }
 
+/// Poll-interval ceiling for transport backoff, so a still-valid device code
+/// keeps getting polled at a useful rate while the network flaps.
+const DEVICE_MAX_POLL_INTERVAL_SECS: u64 = 60;
+
+/// RFC 8628 §3.5: on a connection timeout the client MUST reduce its polling
+/// frequency before retrying, with exponential backoff recommended. Doubles
+/// the interval, clamped to `[DEVICE_DEFAULT_INTERVAL_SECS, DEVICE_MAX_POLL_INTERVAL_SECS]`.
+fn next_transport_backoff_interval(current: u64) -> u64 {
+    current
+        .saturating_mul(2)
+        .clamp(DEVICE_DEFAULT_INTERVAL_SECS, DEVICE_MAX_POLL_INTERVAL_SECS)
+}
+
 /// Shared RFC 8628 login: request a device code, show the user code +
 /// verification link (preferring the prefilled `verification_uri_complete`),
 /// poll the token endpoint until approval, persist under the vendor namespace.
@@ -1452,7 +1465,7 @@ async fn login_device_code_flow(vendor: &dyn OAuthVendor) -> Result<()> {
                 device.expires_in_secs
             ));
         }
-        let resp = client
+        let resp = match client
             .post(vendor.token_url())
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
@@ -1460,7 +1473,25 @@ async fn login_device_code_flow(vendor: &dyn OAuthVendor) -> Result<()> {
                 ("device_code", device.device_code.as_str()),
             ])
             .send()
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            // RFC 8628 §3.5: a connection timeout is transient — the device
+            // code is still valid, so back off and keep polling until the
+            // deadline instead of destroying the in-progress login (F4).
+            Err(e) if e.is_timeout() || e.is_connect() => {
+                poll_interval = next_transport_backoff_interval(poll_interval);
+                tracing::warn!(
+                    error = %e,
+                    poll_interval,
+                    "device token poll transport error; backing off and retrying"
+                );
+                continue;
+            }
+            // Non-retryable transport failures (TLS, request build, redirect
+            // policy) stay explicit and fail the flow.
+            Err(e) => return Err(e.into()),
+        };
         let status = resp.status();
         // Errors may arrive as non-JSON (proxies, HTML error pages) — treat an
         // unparseable body as an empty object so classification still runs.
@@ -1827,6 +1858,18 @@ mod tests {
         assert_eq!(next_slow_down_interval(10, Some(15)), 15);
         // A genuinely slower server interval is honored.
         assert_eq!(next_slow_down_interval(5, Some(30)), 30);
+    }
+
+    #[test]
+    fn next_transport_backoff_interval_doubles_and_clamps() {
+        // RFC 8628 §3.5 (review F4): reduce polling frequency after a
+        // connection timeout — exponential, clamped to a useful ceiling.
+        assert_eq!(next_transport_backoff_interval(5), 10);
+        assert_eq!(next_transport_backoff_interval(10), 20);
+        assert_eq!(next_transport_backoff_interval(40), 60);
+        assert_eq!(next_transport_backoff_interval(60), 60);
+        // Degenerate low values still land on the RFC default floor.
+        assert_eq!(next_transport_backoff_interval(0), 5);
     }
 
     #[test]

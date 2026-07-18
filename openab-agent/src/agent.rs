@@ -113,6 +113,13 @@ impl Agent {
         self.provider.is_oauth()
     }
 
+    /// Canonical family name of the current provider (`anthropic` / `openai` /
+    /// `xai`). Combined with `provider_is_oauth` on model switch so auth-mode
+    /// preservation is provider-specific (review F2).
+    pub fn provider_name(&self) -> String {
+        self.provider.provider_name().to_string()
+    }
+
     /// The model id the current provider will use. Authoritative source for the
     /// session's reported model (avoids a separate hardcoded default).
     pub fn provider_model(&self) -> String {

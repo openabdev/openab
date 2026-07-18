@@ -617,12 +617,20 @@ impl AcpServer {
 
         // Rebuild the current session's provider so the switch takes effect immediately
         if !session_id.is_empty() && self.sessions.contains_key(session_id) {
-            // Preserve the session's auth mode: an OAuth-forced session must not
-            // silently fall back to ANTHROPIC_API_KEY (which `auto_*` prefers).
-            let session_is_oauth = self.sessions[session_id].provider_is_oauth();
+            // Preserve the session's auth mode per provider: an Anthropic
+            // OAuth-forced session must not silently fall back to
+            // ANTHROPIC_API_KEY (which `auto_*` prefers). Only an *Anthropic*
+            // OAuth session preserves that mode — a session on another OAuth
+            // provider (xAI, Codex) switching to Anthropic must still use
+            // `auto_with_model`, or it would bypass a configured API key and
+            // fail on deployments without an Anthropic OAuth tenant (F2).
+            let session_is_anthropic_oauth = {
+                let a = &self.sessions[session_id];
+                a.provider_is_oauth() && a.provider_name() == "anthropic"
+            };
             let new_provider: Result<Box<dyn crate::llm::LlmProvider>, String> = match provider_name
             {
-                "anthropic" if session_is_oauth => {
+                "anthropic" if session_is_anthropic_oauth => {
                     AnthropicProvider::from_oauth_auto_with_model(value).map(|p| Box::new(p) as _)
                 }
                 "anthropic" => AnthropicProvider::auto_with_model(value).map(|p| Box::new(p) as _),
@@ -1009,6 +1017,70 @@ mod tests {
         assert_eq!(
             server.active_provider, None,
             "active_provider must not change on failure"
+        );
+    }
+
+    /// Minimal always-OAuth xAI-flavored provider so the F2 regression test
+    /// doesn't need a stored xai-oauth tenant on disk.
+    struct FakeXaiOauthProvider;
+    impl crate::llm::LlmProvider for FakeXaiOauthProvider {
+        fn model(&self) -> &str {
+            "grok-4.5"
+        }
+        fn is_oauth(&self) -> bool {
+            true
+        }
+        fn provider_name(&self) -> &str {
+            "xai"
+        }
+        fn chat<'a>(
+            &'a self,
+            _system: &'a str,
+            _messages: &'a [crate::llm::Message],
+            _tools: &'a [crate::llm::ToolDef],
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = anyhow::Result<Vec<crate::llm::LlmEvent>>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(vec![]) })
+        }
+    }
+
+    #[test]
+    fn test_switch_from_xai_oauth_to_anthropic_uses_api_key() {
+        // Review F2: OAuth-mode preservation must be provider-specific. A
+        // session on xAI OAuth switching to an Anthropic model must rebuild
+        // via `auto_with_model` (honoring ANTHROPIC_API_KEY) — NOT
+        // `from_oauth_auto_with_model`, which requires an Anthropic OAuth
+        // tenant and bypasses a configured API key.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let mut server = AcpServer::new();
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-key") };
+
+        let agent = Agent::new_boxed(Box::new(FakeXaiOauthProvider), "/tmp".to_string(), None);
+        server.sessions.insert("xai-session".to_string(), agent);
+        server.model_options = vec![ModelOption::new(
+            "claude-opus-4-20250514",
+            "Claude Opus 4",
+            "anthropic",
+        )];
+
+        let resp_str = server.handle_set_config_option(
+            21,
+            &json!({
+                "configId": "model",
+                "value": "claude-opus-4-20250514",
+                "sessionId": "xai-session",
+            }),
+        );
+        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
+        let resp: Value = serde_json::from_str(&resp_str).unwrap();
+        assert!(
+            resp["error"].is_null(),
+            "xAI OAuth → Anthropic switch must use the API key (F2): {resp}"
         );
     }
 

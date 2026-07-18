@@ -75,6 +75,14 @@ pub trait LlmProvider: Send + Sync {
     fn is_oauth(&self) -> bool {
         false
     }
+
+    /// Canonical provider family name (`anthropic` / `openai` / `xai`).
+    /// Combined with [`is_oauth`](Self::is_oauth) so a model switch preserves
+    /// auth mode *per provider*: an xAI OAuth session must not make a switch
+    /// to Anthropic bypass a configured `ANTHROPIC_API_KEY` (review F2).
+    fn provider_name(&self) -> &str {
+        ""
+    }
 }
 
 /// Shared, cloneable handle to an `LlmProvider`. A newtype over
@@ -510,6 +518,10 @@ impl LlmProvider for AnthropicProvider {
         matches!(self.auth, AnthropicAuth::OAuth | AnthropicAuth::OAuthEnv(_))
     }
 
+    fn provider_name(&self) -> &str {
+        "anthropic"
+    }
+
     fn chat<'a>(
         &'a self,
         system: &'a str,
@@ -686,6 +698,10 @@ impl LlmProvider for OpenAiProvider {
         &self.model
     }
 
+    fn provider_name(&self) -> &str {
+        "openai"
+    }
+
     fn chat<'a>(
         &'a self,
         system: &'a str,
@@ -852,6 +868,29 @@ pub struct XaiProvider {
     client: reqwest::Client,
 }
 
+/// Resolve the xAI model. Precedence (env-over-config, ADR §5.5):
+/// `OPENAB_AGENT_XAI_MODEL` → `OPENAB_AGENT_MODEL` → `model` in `config.json`
+/// → built-in `grok-4.5`. Each source may be `provider/`-qualified
+/// (`xai/grok-4.3`); the prefix is stripped via [`ModelRef`].
+fn xai_model() -> String {
+    if let Ok(m) = std::env::var("OPENAB_AGENT_XAI_MODEL") {
+        if !m.is_empty() {
+            return ModelRef::parse(&m).model;
+        }
+    }
+    if let Ok(m) = std::env::var("OPENAB_AGENT_MODEL") {
+        if !m.is_empty() {
+            return ModelRef::parse(&m).model;
+        }
+    }
+    if let Some(m) = crate::config::AgentConfig::load_or_default().model {
+        if !m.is_empty() {
+            return ModelRef::parse(&m).model;
+        }
+    }
+    "grok-4.5".to_string()
+}
+
 impl XaiProvider {
     /// Create provider using the stored xAI OAuth token from
     /// `~/.openab/agent/auth.json` (run `openab-agent auth xai-device` first).
@@ -862,12 +901,7 @@ impl XaiProvider {
         Ok(Self {
             base_url: std::env::var("OPENAB_AGENT_XAI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.x.ai/v1".to_string()),
-            model: ModelRef::parse(
-                &std::env::var("OPENAB_AGENT_XAI_MODEL")
-                    .or_else(|_| std::env::var("OPENAB_AGENT_MODEL"))
-                    .unwrap_or_else(|_| "grok-4.5".to_string()),
-            )
-            .model,
+            model: xai_model(),
             client: reqwest::Client::new(),
         })
     }
@@ -957,6 +991,10 @@ impl LlmProvider for XaiProvider {
         true
     }
 
+    fn provider_name(&self) -> &str {
+        "xai"
+    }
+
     fn chat<'a>(
         &'a self,
         system: &'a str,
@@ -988,6 +1026,7 @@ impl LlmProvider for XaiProvider {
             }
 
             let max_retries = 3u32;
+            let mut refreshed_after_401 = false;
             for attempt in 0..=max_retries {
                 let token = crate::auth::get_valid_token_for(crate::auth::XAI_NAMESPACE).await?;
                 let resp = self
@@ -1007,9 +1046,16 @@ impl LlmProvider for XaiProvider {
                     continue;
                 }
 
-                // 401: token may have expired mid-request, force refresh and retry
-                if status.as_u16() == 401 && attempt < max_retries {
-                    let _ = crate::auth::force_refresh_for(crate::auth::XAI_NAMESPACE).await;
+                // 401: the token may have expired mid-request. Reactive refresh
+                // at most once, and only continue on a *successful* refresh — a
+                // failed refresh (invalid_grant, storage error) must surface its
+                // actionable re-login message, not decay into a generic 401
+                // after re-sending the same stale token (review F3).
+                if status.as_u16() == 401 && !refreshed_after_401 {
+                    refreshed_after_401 = true;
+                    crate::auth::force_refresh_for(crate::auth::XAI_NAMESPACE)
+                        .await
+                        .map_err(|e| anyhow!("xAI token refresh after HTTP 401 failed: {e}"))?;
                     continue;
                 }
 
@@ -1527,5 +1573,215 @@ mod tests {
         assert_eq!(out[1]["role"], "assistant");
         assert!(out[1]["content"].is_null());
         assert_eq!(out[1]["tool_calls"][0]["function"]["name"], "read");
+    }
+
+    #[test]
+    fn xai_model_resolves_env_over_config_over_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.json");
+        std::fs::write(&cfg, r#"{"model":"xai/grok-4.3"}"#).unwrap();
+        let cfg_path = cfg.to_str().unwrap();
+
+        // Config-only (review F1): the configured model must reach the
+        // provider, not be silently replaced by the built-in default.
+        temp_env::with_vars(
+            [
+                ("OPENAB_CONFIG_PATH", Some(cfg_path)),
+                ("OPENAB_AGENT_XAI_MODEL", None),
+                ("OPENAB_AGENT_MODEL", None),
+                ("OPENAB_AGENT_PROVIDER", None),
+            ],
+            || {
+                assert_eq!(xai_model(), "grok-4.3");
+                // Same config also selects the provider — the pair that F1 broke.
+                assert_eq!(resolve_provider_choice(), "xai");
+            },
+        );
+
+        // Env still wins over config.
+        temp_env::with_vars(
+            [
+                ("OPENAB_CONFIG_PATH", Some(cfg_path)),
+                ("OPENAB_AGENT_XAI_MODEL", Some("xai/grok-4.5")),
+                ("OPENAB_AGENT_MODEL", None),
+            ],
+            || assert_eq!(xai_model(), "grok-4.5"),
+        );
+
+        // Nothing anywhere → built-in default.
+        let missing = dir.path().join("missing.json");
+        temp_env::with_vars(
+            [
+                ("OPENAB_CONFIG_PATH", Some(missing.to_str().unwrap())),
+                ("OPENAB_AGENT_XAI_MODEL", None),
+                ("OPENAB_AGENT_MODEL", None),
+            ],
+            || assert_eq!(xai_model(), "grok-4.5"),
+        );
+    }
+
+    // ── XaiProvider 401 reactive-refresh loop (review F3) ─────────────────
+    // Deterministic coverage via canned local HTTP servers: no live xAI, no
+    // real credentials. HOME is redirected to a tempdir so auth.json reads and
+    // the refresh POST stay inside the test sandbox (temp_env serialises
+    // env-mutating tests).
+
+    fn http_resp(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// Serve `responses` to sequential connections; returns the raw requests seen.
+    fn spawn_canned_http(responses: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for resp in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                let mut header_end = None;
+                let mut content_len = 0usize;
+                loop {
+                    let n = stream.read(&mut tmp).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if header_end.is_none() {
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = Some(pos + 4);
+                            let headers = String::from_utf8_lossy(&buf[..pos]);
+                            content_len = headers
+                                .lines()
+                                .find_map(|l| {
+                                    let (k, v) = l.split_once(':')?;
+                                    if k.eq_ignore_ascii_case("content-length") {
+                                        v.trim().parse().ok()
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(0);
+                        }
+                    }
+                    if let Some(he) = header_end {
+                        if buf.len() >= he + content_len {
+                            break;
+                        }
+                    }
+                }
+                seen.push(String::from_utf8_lossy(&buf).to_string());
+                stream.write_all(resp.as_bytes()).unwrap();
+            }
+            seen
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// Write a temp-HOME auth.json holding one unexpired xai-oauth tenant whose
+    /// refresh endpoint points at `refresh_url`.
+    fn write_xai_auth(home: &std::path::Path, refresh_url: &str) {
+        let far_future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 86_400;
+        let auth_dir = home.join(".openab").join("agent");
+        std::fs::create_dir_all(&auth_dir).unwrap();
+        std::fs::write(
+            auth_dir.join("auth.json"),
+            json!({
+                "xai-oauth": {
+                    "access_token": "stale-token",
+                    "refresh_token": "rt1",
+                    "expires_at": far_future,
+                    "token_endpoint": refresh_url,
+                    "provider": "xai-oauth",
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn xai_chat_401_refresh_success_retries_with_fresh_token() {
+        let home = tempfile::tempdir().unwrap();
+        // Chat endpoint: 401 first, then a successful completion.
+        let (chat_url, chat_handle) = spawn_canned_http(vec![
+            http_resp("401 Unauthorized", r#"{"error":"unauthorized"}"#),
+            http_resp(
+                "200 OK",
+                r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#,
+            ),
+        ]);
+        // Refresh endpoint: rotates the token successfully.
+        let (refresh_url, refresh_handle) = spawn_canned_http(vec![http_resp(
+            "200 OK",
+            r#"{"access_token":"fresh-token","refresh_token":"rt2","expires_in":3600}"#,
+        )]);
+        write_xai_auth(home.path(), &refresh_url);
+
+        temp_env::with_var("HOME", Some(home.path().to_str().unwrap()), || {
+            let provider = XaiProvider {
+                base_url: chat_url.clone(),
+                model: "grok-4.5".to_string(),
+                client: reqwest::Client::new(),
+            };
+            let events = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(provider.chat("sys", &[], &[]))
+                .unwrap();
+            assert!(matches!(&events[0], LlmEvent::Text(t) if t == "ok"));
+        });
+
+        let chat_reqs = chat_handle.join().unwrap();
+        assert!(chat_reqs[0].contains("Bearer stale-token"));
+        // The retry after a successful refresh must carry the rotated token.
+        assert!(chat_reqs[1].contains("Bearer fresh-token"));
+        let refresh_reqs = refresh_handle.join().unwrap();
+        assert!(refresh_reqs[0].contains("grant_type=refresh_token"));
+        assert!(refresh_reqs[0].contains("rt1"));
+    }
+
+    #[test]
+    fn xai_chat_401_refresh_failure_propagates_relogin_error() {
+        let home = tempfile::tempdir().unwrap();
+        // Chat endpoint answers 401 once; a second request must never happen.
+        let (chat_url, _chat_handle) = spawn_canned_http(vec![http_resp(
+            "401 Unauthorized",
+            r#"{"error":"unauthorized"}"#,
+        )]);
+        // Refresh endpoint rejects the grant.
+        let (refresh_url, _refresh_handle) = spawn_canned_http(vec![http_resp(
+            "400 Bad Request",
+            r#"{"error":"invalid_grant"}"#,
+        )]);
+        write_xai_auth(home.path(), &refresh_url);
+
+        temp_env::with_var("HOME", Some(home.path().to_str().unwrap()), || {
+            let provider = XaiProvider {
+                base_url: chat_url.clone(),
+                model: "grok-4.5".to_string(),
+                client: reqwest::Client::new(),
+            };
+            let err = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(provider.chat("sys", &[], &[]))
+                .unwrap_err()
+                .to_string();
+            // The actionable refresh failure surfaces (with the re-login hint
+            // from the shared refresh driver), not a generic xAI 401.
+            assert!(
+                err.contains("xAI token refresh after HTTP 401 failed"),
+                "got: {err}"
+            );
+            assert!(err.contains("openab-agent auth xai-device"), "got: {err}");
+        });
     }
 }
