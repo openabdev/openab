@@ -120,22 +120,60 @@ and rejecting forged ids.
 ## 5. Consequences & limits
 
 - **1:1 only** — reply registry is `channel_id → single reply_tx`; the delta stream
-  assumes one monotonic text. Multi-agent fan-out is Phase 4 (would corrupt this).
+  assumes one monotonic text. This matches ACP's 1:1 nature (one client ↔ one agent) and
+  is correct. Multi-agent "conversation" (Discord-style) is NOT fan-out and NOT an ACP
+  concern: it is N independent OpenAB instances, each its own `/acp` connection, relayed
+  by the client acting as the shared room (see §6, Not needed).
+- **OpenAB command parity is mostly free** — control directives (`[[ws]]`, `[[model]]`, …)
+  and slash commands (`/reset`, `/model`, …) are message-text conventions parsed
+  platform-agnostically (`openab-core`), so they already work over ACP when the client
+  includes them in a prompt — no ACP-specific work required. A typed UI for them
+  (`authenticate` / `available_commands_update`) is an optional later nicety.
 - **cwd / mcpServers** — accepted on `session/new` / `session/resume` for wire
   conformance but not yet propagated into the agent (follow-up).
 - **Emoji** — inline 顏文字 flow through as text; reaction emoji stay no-op in the base.
 - **Reconnect** — on WS disconnect the per-connection session map is dropped; the
   client reconnects with `session/resume` + its persisted `sessionId`.
 
-## 6. Roadmap (from proposal; resume pulled into the base)
+## 6. Roadmap (re-scoped; not the original proposal's numbered phases)
 
-- **Phase 2** — tool calls: `session/update` variants `tool_call` / `tool_call_update`,
-  and `session/request_permission`; reaction emoji → updates. Also enables browser
-  control (LLM operates the user's browser via MCP-over-ACP) —
-  see [Browser control via MCP-over-ACP](./acp-server-websocket-mcp-browser.md).
-- **Phase 3** — `session/load` with history replay (needs an upstream transcript store)
-- **Phase 4** — multi-agent fan-out
-- **Phase 5** — Streamable HTTP (POST + SSE) on the same `/acp`
+North star: the agent's LLM autonomously operating the user's real browser (generalized
+"computer use") — see [MCP-over-ACP browser control](./acp-server-websocket-mcp-browser.md).
+
+### Critical path (next) — everything the browser goal requires
+- **agent→client REQUEST direction** — the base does only client→agent + agent→client
+  *notifications*; browser/tool use needs the agent to send *requests* to the client and
+  await a result. The WS is already bidirectional; the dispatch loop must add this path.
+- **`session/request_permission`** — tool-use approval.
+- **MCP-over-ACP tunnel + OpenAB core as MCP proxy** — the extension exposes browser
+  tools (MCP server role over its outbound WS); core proxies them to the in-pod agent.
+- **Generated typed wire types (v1)** — decided for the base: adopt offline codegen
+  (typify → plain serde, no `schemars` dep) rather than hand-rolling the expanded
+  bidirectional surface. Currently hand-rolled; migration planned (validate round-trip
+  against real traffic first).
+
+### Optional (as-needed, off the critical path)
+- richer `session/update` variants: `tool_call` / `tool_call_update` (display),
+  `agent_thought_chunk` / `plan` / `available_commands_update` / `usage_update`
+- `fs/*`, `terminal/*` (sibling agent→client capabilities)
+- `ContentBlock` image / audio / resource (image only if screenshot-based browser tools)
+- session admin: `session/close` / `list` / `delete`, `set_mode` / `set_config_option`,
+  `session/load` (history replay — needs an upstream transcript store)
+- typed command UI: `authenticate`, `available_commands_update` advertisement
+- **Streamable HTTP** transport (POST + SSE on `/acp`) — only for environments where
+  WebSocket is not viable (serverless, aggressive proxies); not needed for local/WS use
+- multiple sessions per connection
+
+### Not needed (removed from scope)
+- **Multi-agent fan-out / ensemble** — Discord-style multi-agent is N independent OpenAB
+  instances relayed by the client (a "room"): client-side orchestration, no ACP fan-out.
+  ACP is 1:1; fan-out would only produce a single-agent "ensemble" answer, which is not a
+  goal (you want to *see* the separate agents, not merge them).
+
+### Observability (recommended first, low-risk)
+- An **ACP trace mode** (flag-gated, both directions/hops) to record real ACP traffic —
+  reveals the variant surface downstream agents actually emit, informs which of the
+  Optional variants to forward, and validates the generated-type round-trip.
 
 ## 7. References
 

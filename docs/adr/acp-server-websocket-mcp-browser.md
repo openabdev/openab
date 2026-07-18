@@ -1,11 +1,12 @@
-# ADR: Browser control via MCP-over-ACP (Phase 2, proposed)
+# ADR: Browser control via MCP-over-ACP (proposed)
 
-- **Status:** Proposed (design only — not implemented)
+- **Status:** Proposed (design only — not implemented). North-star capability the base
+  builds toward; see the base ADR §6 roadmap "Critical path".
 - **Date:** 2026-07-18
 - **Author:** @brettchien
 - **Related:** [ACP Server over WebSocket — Base (as-built)](./acp-server-websocket-base.md),
-  [ACP Server with WebSocket Transport](./acp-server-websocket.md) (Phase 2: Tool Calls &
-  Permissions), [openab-agent MCP](./openab-agent-mcp.md)
+  [ACP Server with WebSocket Transport](./acp-server-websocket.md) (original proposal),
+  [openab-agent MCP](./openab-agent-mcp.md)
 
 ---
 
