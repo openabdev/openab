@@ -514,7 +514,7 @@ fn print_next_steps(agent: &str, output_path: &Path, is_local: bool) {
                 cprintln!(C.cyan, "  1. Install Claude Code + ACP adapter:");
                 println!("       npm install -g @anthropic-ai/claude-code @agentclientprotocol/claude-agent-acp");
                 cprintln!(C.cyan, "  2. Authenticate:");
-                println!("       claude auth login --sso");
+                println!("       claude auth login");
             }
             "codex" => {
                 cprintln!(C.cyan, "  1. Install Codex CLI + ACP adapter:");
@@ -558,9 +558,7 @@ fn print_next_steps(agent: &str, output_path: &Path, is_local: bool) {
                 "       kubectl exec -it deployment/openab-kiro -- kiro-cli login --use-device-flow"
             ),
             "claude" => {
-                println!(
-                    "       kubectl exec -it deployment/openab-claude -- claude auth login --sso"
-                )
+                println!("       kubectl exec -it deployment/openab-claude -- claude auth login")
             }
             "codex" => println!(
                 "       kubectl exec -it deployment/openab-codex -- codex login --device-auth"

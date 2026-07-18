@@ -92,9 +92,13 @@ kubectl exec -it deployment/openab-claude -- sh -c "$OPENAB_AGENT_AUTH_COMMAND"
 kubectl rollout restart deployment/openab-claude
 ```
 
+> Organizations using SSO can force the SSO flow with `claude auth login --sso`
+> (e.g. override `OPENAB_AGENT_AUTH_COMMAND="claude auth login --sso"`). The
+> plain command supports Claude Pro, Max, Team, Enterprise, and Console accounts.
+
 ### Comparison
 
-| | A: `setup-token` + env var | B: `claude auth login --sso` |
+| | A: `setup-token` + env var | B: `claude auth login` |
 |---|---|---|
 | Credential lifetime | ~1 year, static | Short-lived access token (hours, observed ~8 h) + rotating refresh token |
 | Storage | Env var (secret store) | `~/.claude/.credentials.json` on disk |
