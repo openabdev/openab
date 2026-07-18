@@ -273,30 +273,59 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
             debug!(connection = %connection_id, dir = "in", frame = %trace_frame(&text), "ACP frame");
         }
 
-        let req: JsonRpcRequest = match serde_json::from_str(&text) {
-            Ok(r) => r,
+        let raw: Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
             Err(e) => {
-                let err_resp = JsonRpcResponse::error(
-                    Value::Null,
-                    -32700,
-                    format!("Parse error: {e}"),
-                );
+                let err_resp =
+                    JsonRpcResponse::error(Value::Null, -32700, format!("Parse error: {e}"));
                 let _ = out_tx.send(serde_json::to_string(&err_resp).unwrap());
                 continue;
             }
         };
 
-        // Validate JSON-RPC version (spec requires "2.0")
+        // JSON-RPC: a message WITHOUT an `id` member is a notification and MUST NOT
+        // receive any response; a message WITH an `id` (including explicit `null`) is a
+        // request. serde's `Option<Value>` collapses omitted and `null` to the same
+        // `None`, so notification detection uses raw key PRESENCE on the parsed JSON.
+        let is_notification = raw.get("id").is_none();
+
+        let req: JsonRpcRequest = match serde_json::from_value(raw) {
+            Ok(r) => r,
+            Err(e) => {
+                if !is_notification {
+                    let err_resp =
+                        JsonRpcResponse::error(Value::Null, -32600, format!("Invalid Request: {e}"));
+                    let _ = out_tx.send(serde_json::to_string(&err_resp).unwrap());
+                }
+                continue;
+            }
+        };
+
+        // Validate JSON-RPC version (spec requires "2.0"). Only answer a request.
         if req.jsonrpc != "2.0" {
-            let err_resp = JsonRpcResponse::error(
-                req.id.clone().unwrap_or(Value::Null),
-                -32600,
-                "Invalid Request: jsonrpc must be \"2.0\"",
-            );
-            let _ = out_tx.send(serde_json::to_string(&err_resp).unwrap());
+            if !is_notification {
+                let id = req.id.clone().unwrap_or(Value::Null);
+                let err_resp =
+                    JsonRpcResponse::error(id, -32600, "Invalid Request: jsonrpc must be \"2.0\"");
+                let _ = out_tx.send(serde_json::to_string(&err_resp).unwrap());
+            }
             continue;
         }
 
+        // Request-only methods sent as a notification (no id) cannot return their result,
+        // so per JSON-RPC they get no response — and we do not execute them as
+        // fire-and-forget. Only `session/cancel` is a real notification (handled below).
+        if is_notification
+            && matches!(
+                req.method.as_str(),
+                "initialize" | "session/new" | "session/resume" | "session/prompt"
+            )
+        {
+            debug!(method = %req.method, "ACP request-only method sent without id (notification) — ignored");
+            continue;
+        }
+
+        // Safe: request-only arms below are only reached when `id` is present.
         let id = req.id.clone().unwrap_or(Value::Null);
 
         match req.method.as_str() {
@@ -361,14 +390,23 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         n.notify_one();
                     }
                 }
+                // `session/cancel` is a notification: no response when sent as one. If a
+                // client sent it as a request (with an id), acknowledge with an empty result.
+                if !is_notification {
+                    let resp = JsonRpcResponse::success(id, json!({}));
+                    let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+                }
             }
             _ => {
-                let resp = JsonRpcResponse::error(
-                    id,
-                    -32601,
-                    format!("Method not found: {}", req.method),
-                );
-                let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+                // Unknown method: error a request; ignore an unknown notification.
+                if !is_notification {
+                    let resp = JsonRpcResponse::error(
+                        id,
+                        -32601,
+                        format!("Method not found: {}", req.method),
+                    );
+                    let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+                }
             }
         }
 
@@ -943,6 +981,24 @@ mod acp_conformance {
                 { "type": "text", "text": "你好 ❤️" }
             ]
         }));
+    }
+
+    // --- JSON-RPC id semantics (F8): omitted id (notification) vs explicit null (request) ---
+
+    #[test]
+    fn jsonrpc_id_presence_distinguishes_notification() {
+        // serde's `Option<Value>` collapses BOTH omitted id and explicit `id:null` to
+        // `None`, so notification detection must use raw key PRESENCE (as the dispatch
+        // does), not the deserialized field.
+        let notif: Value =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","method":"session/cancel"}"#).unwrap();
+        assert!(notif.get("id").is_none(), "no id member → notification");
+        let req_null: Value =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","method":"session/cancel","id":null}"#).unwrap();
+        assert!(req_null.get("id").is_some(), "explicit id:null → request (id member present)");
+        let req_num: Value =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","method":"initialize","id":7}"#).unwrap();
+        assert_eq!(req_num.get("id"), Some(&json!(7)));
     }
 }
 
