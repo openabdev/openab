@@ -761,3 +761,90 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
         _ => {}
     }
 }
+
+// ---------------------------------------------------------------------------
+// Conformance guard — the wire this server hand-rolls MUST validate against the
+// generated ACP v1 types (`acp_schema`). Any casing / field-name / shape drift
+// (the exact class of bug fixed during the base build: `agentMessageChunk` →
+// `agent_message_chunk`, integer `protocolVersion`, snake_case `stopReason`)
+// fails these tests. Also pins the generated types as the schema source of truth
+// while the payloads stay hand-rolled (per ADR §7: hand-roll the trivial chat
+// subset, generate the complex bidirectional surface).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod acp_conformance {
+    use crate::adapters::acp_schema as sc;
+    use serde_json::{json, Value};
+
+    /// Assert `wire` (a payload this server emits or accepts) deserializes into the
+    /// generated ACP type `T`, and that `T`'s serde is a stable fixed point
+    /// (serialize→deserialize→serialize is idempotent). No `PartialEq` needed on `T`.
+    fn conforms<T>(wire: Value)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let a: T = serde_json::from_value(wire.clone())
+            .unwrap_or_else(|e| panic!("emitted wire is not valid ACP {}: {e}\n  wire={wire}", std::any::type_name::<T>()));
+        let v1 = serde_json::to_value(&a).unwrap();
+        let b: T = serde_json::from_value(v1.clone()).expect("re-parse of generated form");
+        let v2 = serde_json::to_value(&b).unwrap();
+        assert_eq!(v1, v2, "ACP serde is not a stable fixed point for {}", std::any::type_name::<T>());
+    }
+
+    // --- outbound responses (exact shapes handle_* emit) ---
+
+    #[test]
+    fn initialize_response() {
+        // mirror of handle_initialize
+        conforms::<sc::InitializeResponse>(json!({
+            "protocolVersion": 1,
+            "agentCapabilities": {
+                "loadSession": false,
+                "sessionCapabilities": { "resume": {} },
+                "promptCapabilities": { "image": false, "audio": false, "embeddedContext": false }
+            },
+            "agentInfo": { "name": "openab", "title": "OpenAB", "version": "0.0.0" },
+            "authMethods": []
+        }));
+    }
+
+    #[test]
+    fn new_session_response() {
+        conforms::<sc::NewSessionResponse>(json!({ "sessionId": "sess_00000000-0000-0000-0000-000000000000" }));
+    }
+
+    #[test]
+    fn resume_session_response() {
+        // handle_session_resume returns {}
+        conforms::<sc::ResumeSessionResponse>(json!({}));
+    }
+
+    #[test]
+    fn prompt_response_stop_reasons() {
+        // handle_prompt emits end_turn (normal) / cancelled (session/cancel)
+        conforms::<sc::PromptResponse>(json!({ "stopReason": "end_turn" }));
+        conforms::<sc::PromptResponse>(json!({ "stopReason": "cancelled" }));
+    }
+
+    #[test]
+    fn session_update_agent_message_chunk() {
+        // the streaming notification `params` (session/update)
+        conforms::<sc::SessionNotification>(json!({
+            "sessionId": "sess_00000000-0000-0000-0000-000000000000",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "PONG 你好 (๑•̀ㅂ•́)و" }
+            }
+        }));
+    }
+
+    // --- inbound requests (params clients send) ---
+
+    #[test]
+    fn prompt_request() {
+        conforms::<sc::PromptRequest>(json!({
+            "sessionId": "sess_00000000-0000-0000-0000-000000000000",
+            "prompt": [{ "type": "text", "text": "PING" }]
+        }));
+    }
+}
