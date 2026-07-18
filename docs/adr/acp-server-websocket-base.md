@@ -127,8 +127,15 @@ and rejecting forged ids.
 - **OpenAB command parity is mostly free** — control directives (`[[ws]]`, `[[model]]`, …)
   and slash commands (`/reset`, `/model`, …) are message-text conventions parsed
   platform-agnostically (`openab-core`), so they already work over ACP when the client
-  includes them in a prompt — no ACP-specific work required. A typed UI for them
-  (`authenticate` / `available_commands_update`) is an optional later nicety.
+  includes them in a prompt — no ACP-specific work required. **Verified by construction:**
+  directives go through `directives::parse_directives` in `dispatch.rs` (no platform gating);
+  `/reset` and `/model` are intercepted in `process_gateway_event` (and the `run_gateway_adapter`
+  path), both keyed on `event.platform` generically — nothing special-cases `acp` out, and the
+  interception reads `event.content.text`, which for ACP is the prompt text the client sends.
+  The one runtime item left to confirm on a live agent is whether a slash command's
+  *confirmation* reply (`send_fire_and_forget`) renders back into the ACP client's stream —
+  folded into the deploy-gated e2e re-verify. A typed UI for them (`authenticate` /
+  `available_commands_update`) is an optional later nicety.
 - **cwd / mcpServers** — accepted on `session/new` / `session/resume` for wire
   conformance but **deliberately not propagated** into the agent working dir in the base.
   This is a security decision, not just a TODO: the downstream plumbing already exists
