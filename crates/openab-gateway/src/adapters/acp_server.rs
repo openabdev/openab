@@ -902,8 +902,16 @@ async fn handle_session_new(
     // Downgraded from info! — sessionId is a resume capability; keep it out of normal logs (F12).
     debug!(session = %session_id, "ACP session created");
 
-    // ACP session/new response is just { sessionId }.
-    JsonRpcResponse::success(id, json!({ "sessionId": session_id }))
+    // ACP session/new response is just { sessionId }. Constructed from the generated
+    // NewSessionResponse (T2.1) so the wire shape is type-checked against acp_schema; the
+    // optional fields skip-serialize, giving the same { "sessionId": ... } wire.
+    let resp = crate::adapters::acp_schema::NewSessionResponse {
+        session_id: crate::adapters::acp_schema::SessionId(session_id),
+        config_options: None,
+        meta: None,
+        modes: None,
+    };
+    JsonRpcResponse::success(id, serde_json::to_value(&resp).unwrap())
 }
 
 /// `session/resume` — re-attach to a session the client persisted, WITHOUT
@@ -977,8 +985,10 @@ async fn handle_session_resume(
 
     debug!(session = %session_id, "ACP session resumed");
 
-    // ACP session/resume response is an empty object (no history replay).
-    JsonRpcResponse::success(id, json!({}))
+    // ACP session/resume response is an empty object (no history replay) — the generated
+    // ResumeSessionResponse default serializes to {} (T2.1, type-checked against acp_schema).
+    let resp = crate::adapters::acp_schema::ResumeSessionResponse::default();
+    JsonRpcResponse::success(id, serde_json::to_value(&resp).unwrap())
 }
 
 /// Handle `session/cancel`. Per ACP it is a one-way NOTIFICATION: the notification form
@@ -1131,14 +1141,15 @@ async fn handle_session_prompt(
     // Stream replies back as ACP `session/update` notifications.
     let mut sent_len = 0usize;
     let timeout = tokio::time::Duration::from_secs(180);
-    let mut stop_reason = "end_turn";
+    // Typed StopReason (T2.1) so the final PromptResponse is constructed from acp_schema.
+    let mut stop_reason = crate::adapters::acp_schema::StopReason::EndTurn;
     let mut timed_out = false;
 
     loop {
         tokio::select! {
             // session/cancel fired — stop gracefully.
             _ = cancel.notified() => {
-                stop_reason = "cancelled";
+                stop_reason = crate::adapters::acp_schema::StopReason::Cancelled;
                 break;
             }
             recv = tokio::time::timeout(timeout, reply_rx.recv()) => {
@@ -1196,7 +1207,12 @@ async fn handle_session_prompt(
     let resp = if timed_out {
         JsonRpcResponse::error(id, -32603, "Timed out waiting for agent backend")
     } else {
-        JsonRpcResponse::success(id, json!({ "stopReason": stop_reason }))
+        // T2.1: construct the typed PromptResponse; serializes to { "stopReason": ... }.
+        let pr = crate::adapters::acp_schema::PromptResponse {
+            stop_reason,
+            meta: None,
+        };
+        JsonRpcResponse::success(id, serde_json::to_value(&pr).unwrap())
     };
     let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
 }
