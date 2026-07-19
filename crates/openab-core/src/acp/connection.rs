@@ -189,6 +189,11 @@ pub struct AcpConnection {
     pub session_reset: bool,
     _reader_handle: JoinHandle<()>,
     _stderr_handle: Option<JoinHandle<()>>,
+    /// Cancels this session's per-session MCP proxy server (D5-a) when the connection is
+    /// dropped. Held only for its `Drop` side effect (never read).
+    #[cfg(feature = "acp-mcp")]
+    #[allow(dead_code)]
+    mcp_server_guard: Option<tokio_util::sync::DropGuard>,
 }
 
 /// Build the final set of env vars for the agent subprocess.
@@ -485,7 +490,15 @@ impl AcpConnection {
             session_reset: false,
             _reader_handle: reader_handle,
             _stderr_handle: stderr_handle,
+            #[cfg(feature = "acp-mcp")]
+            mcp_server_guard: None,
         })
+    }
+
+    /// Attach the guard that stops this session's MCP proxy server when the connection drops.
+    #[cfg(feature = "acp-mcp")]
+    pub fn set_mcp_guard(&mut self, guard: Option<tokio_util::sync::DropGuard>) {
+        self.mcp_server_guard = guard;
     }
 
     fn next_id(&self) -> u64 {

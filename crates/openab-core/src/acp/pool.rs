@@ -53,6 +53,10 @@ pub struct SessionPool {
     mapping_path: PathBuf,
     meta_path: PathBuf,
     default_config_options: HashMap<String, String>,
+    /// Bridge from a session's core MCP proxy to its browser tunnel (D5-a/D6-a'); set by the
+    /// root. `None` = no browser wiring (tool calls report not-connected).
+    #[cfg(feature = "acp-mcp")]
+    browser_tunnel: Option<Arc<dyn crate::mcp_proxy::BrowserTunnel>>,
 }
 
 type CancelHandle = (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String);
@@ -197,7 +201,20 @@ impl SessionPool {
             mapping_path,
             meta_path,
             default_config_options,
+            #[cfg(feature = "acp-mcp")]
+            browser_tunnel: None,
         }
+    }
+
+    /// Wire the browser tunnel bridge (D6-a', set by the root) so per-session MCP proxies can
+    /// reach the browser. Call before sharing the pool.
+    #[cfg(feature = "acp-mcp")]
+    pub fn with_browser_tunnel(
+        mut self,
+        tunnel: Option<Arc<dyn crate::mcp_proxy::BrowserTunnel>>,
+    ) -> Self {
+        self.browser_tunnel = tunnel;
+        self
     }
 
     fn load_mapping(path: &Path) -> HashMap<String, String> {
@@ -347,6 +364,32 @@ impl SessionPool {
             self.config.working_dir.clone()
         };
 
+        // Per-session MCP proxy (D5-a): for a browser (`acp:`) session, start a loopback MCP
+        // server + write `.cursor/mcp.json` BEFORE the agent boots so it connects to it. The
+        // returned guard cancels that server when this connection is dropped (any evict path).
+        #[cfg(feature = "acp-mcp")]
+        let mcp_guard: Option<tokio_util::sync::DropGuard> =
+            if let Some(channel_id) = thread_id.strip_prefix("acp:") {
+                match crate::mcp_proxy::start_session_server(
+                    channel_id,
+                    &effective_workdir,
+                    self.browser_tunnel.clone(),
+                )
+                .await
+                {
+                    Ok((addr, ct)) => {
+                        info!(thread_id, %addr, "started per-session MCP proxy server");
+                        Some(ct.drop_guard())
+                    }
+                    Err(e) => {
+                        warn!(thread_id, error = %e, "failed to start MCP proxy; browser tools unavailable");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
         // Build the replacement connection outside the state lock so one stuck
         // initialization does not block all unrelated sessions.
         let mut new_conn = AcpConnection::spawn(
@@ -423,6 +466,8 @@ impl SessionPool {
         let activity_handle = new_conn.activity_handle();
         let child_pgid = new_conn.child_pgid();
         let cancel_session_id = new_conn.acp_session_id.clone().unwrap_or_default();
+        #[cfg(feature = "acp-mcp")]
+        new_conn.set_mcp_guard(mcp_guard);
         let new_conn = Arc::new(Mutex::new(new_conn));
 
         let mut state = self.state.write().await;
