@@ -220,9 +220,44 @@ pub async fn spawn_mcp_server(
     Ok(addr)
 }
 
+/// Start a per-session MCP proxy server (D5-a) and register it in the agent's native MCP
+/// config so the colocated agent connects to it (D2). Mints a fresh bearer, starts the
+/// loopback server, and writes/merges `<workdir>/.cursor/mcp.json` with the `openab-browser`
+/// HTTP entry (Cursor's config; other agents get their own writer later). Returns the bound
+/// address + the `CancellationToken` the caller cancels to stop the server on session evict.
+pub async fn start_session_server(
+    channel_id: &str,
+    workdir: &str,
+    tunnel: Option<Arc<dyn BrowserTunnel>>,
+) -> std::io::Result<(std::net::SocketAddr, tokio_util::sync::CancellationToken)> {
+    let bearer = uuid::Uuid::new_v4().to_string();
+    let ct = tokio_util::sync::CancellationToken::new();
+    let addr = spawn_mcp_server(channel_id.to_string(), tunnel, bearer.clone(), ct.clone()).await?;
+
+    // Merge the openab-browser entry into <workdir>/.cursor/mcp.json (don't clobber any
+    // servers the user/agent already configured).
+    let cursor_dir = std::path::Path::new(workdir).join(".cursor");
+    tokio::fs::create_dir_all(&cursor_dir).await?;
+    let cfg_path = cursor_dir.join("mcp.json");
+    let mut cfg: Value = match tokio::fs::read(&cfg_path).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({})),
+        Err(_) => json!({}),
+    };
+    if !cfg.get("mcpServers").map(Value::is_object).unwrap_or(false) {
+        cfg["mcpServers"] = json!({});
+    }
+    cfg["mcpServers"]["openab-browser"] = json!({
+        "url": format!("http://{addr}/mcp"),
+        "headers": { "Authorization": format!("Bearer {bearer}") }
+    });
+    tokio::fs::write(&cfg_path, serde_json::to_vec_pretty(&cfg)?).await?;
+
+    Ok((addr, ct))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{browser_tools, spawn_mcp_server, BrowserTunnel, ProxyHandler};
+    use super::{browser_tools, spawn_mcp_server, start_session_server, BrowserTunnel, ProxyHandler};
 
     struct MockTunnel;
     #[async_trait::async_trait]
@@ -254,6 +289,52 @@ mod tests {
             h.forward_tool_call("browser.click", None).await.is_err(),
             "a call with no attached browser must error (D4)"
         );
+    }
+
+    #[tokio::test]
+    async fn start_session_server_writes_cursor_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, ct) = start_session_server("acp_x", dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        assert!(addr.ip().is_loopback());
+
+        let cfg: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(".cursor/mcp.json")).unwrap())
+                .unwrap();
+        let entry = &cfg["mcpServers"]["openab-browser"];
+        assert_eq!(entry["url"], serde_json::json!(format!("http://{addr}/mcp")));
+        assert!(entry["headers"]["Authorization"]
+            .as_str()
+            .unwrap()
+            .starts_with("Bearer "));
+        ct.cancel();
+    }
+
+    #[tokio::test]
+    async fn start_session_server_merges_existing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let cursor = dir.path().join(".cursor");
+        std::fs::create_dir_all(&cursor).unwrap();
+        std::fs::write(
+            cursor.join("mcp.json"),
+            r#"{"mcpServers":{"other":{"url":"http://x"}}}"#,
+        )
+        .unwrap();
+        let (_addr, ct) = start_session_server("acp_x", dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        let cfg: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(cursor.join("mcp.json")).unwrap()).unwrap();
+        assert!(
+            cfg["mcpServers"]["other"].is_object(),
+            "existing server must be preserved"
+        );
+        assert!(
+            cfg["mcpServers"]["openab-browser"].is_object(),
+            "openab-browser must be added"
+        );
+        ct.cancel();
     }
 
     #[test]
