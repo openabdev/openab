@@ -255,6 +255,57 @@ async def section_edges():
                "CJK + emoji (ZWJ family) stream intact", repr(text[:40]))
 
 
+async def section_lifecycle():
+    print("\n[Lifecycle / transport] — cancel, oversized frame, header auth", flush=True)
+    from websockets.exceptions import ConnectionClosed
+
+    # valid token via the Authorization: Bearer header (non-browser path)
+    try:
+        ws = await websockets.connect(
+            BASE_URL, additional_headers={"Authorization": f"Bearer {TOKEN}"}, open_timeout=8
+        )
+        await ws.close()
+        record("life", True, "valid token via Authorization: Bearer header accepted")
+    except Exception as e:  # noqa: BLE001
+        record("life", False, "valid token via Authorization: Bearer header accepted", repr(e))
+
+    # oversized frame → the server closes the connection (no fabricated JSON-RPC response)
+    async with await try_connect(TOKEN) as ws:
+        await ws.send("x" * ((1 << 20) + 64))  # > MAX_FRAME_BYTES (1 MiB)
+        try:
+            await asyncio.wait_for(ws.recv(), timeout=8)
+            record("life", False, "oversized frame closes the connection", "got a frame back")
+        except ConnectionClosed:
+            record("life", True, "oversized frame closes the connection")
+        except asyncio.TimeoutError:
+            record("life", False, "oversized frame closes the connection", "no close within 8s")
+
+    # session/cancel → the in-flight prompt ends with stopReason:"cancelled"
+    async with await try_connect(TOKEN) as ws:
+        c = Conn(ws)
+        await c.initialize()
+        sid = await c.new_session()
+        c._id += 1
+        rid = c._id
+        await ws.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": "session/prompt",
+                                  "params": {"sessionId": sid, "prompt": [{"type": "text",
+                                  "text": "Count from 1 to 400, one number per line, slowly."}]}}))
+        # wait for streaming to start, then cancel (a notification: no id)
+        started = False
+        while not started:
+            m = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
+            if m.get("method") == "session/update":
+                started = True
+        await ws.send(json.dumps({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": sid}}))
+        stop = None
+        while True:
+            m = json.loads(await asyncio.wait_for(ws.recv(), timeout=60))
+            if m.get("id") == rid:
+                stop = m.get("result", {}).get("stopReason")
+                break
+        record("life", stop == "cancelled", "session/cancel → prompt ends stopReason:cancelled", f"got {stop!r}")
+
+
 async def main() -> int:
     if not TOKEN:
         print("ERROR: OPENAB_ACP_TOKEN is required (the /acp endpoint mandates a transport token off loopback).", file=sys.stderr)
@@ -263,6 +314,7 @@ async def main() -> int:
     await section_auth()
     await section_compliance()
     await section_edges()
+    await section_lifecycle()
 
     total = len(results)
     passed = sum(1 for _, ok, _ in results if ok)
@@ -273,7 +325,7 @@ async def main() -> int:
         if ok:
             s[0] += 1
     print("\n" + "-" * 60, flush=True)
-    labels = {"auth": "Transport / Auth", "comp": "Protocol compliance", "edge": "Protocol edge cases"}
+    labels = {"auth": "Transport / Auth", "comp": "Protocol compliance", "edge": "Protocol edge cases", "life": "Lifecycle / transport"}
     for sec, (p, t) in by_section.items():
         print(f"  {labels.get(sec, sec):22} {p}/{t}", flush=True)
     print(f"\nRESULT: {passed}/{total} checks passed", flush=True)
