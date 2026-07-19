@@ -362,8 +362,12 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
         match req.method.as_str() {
             "initialize" => {
                 let resp = handle_initialize(&req);
+                // Only mark the connection initialized when negotiation succeeded.
+                let negotiated_ok = resp.error.is_none();
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
-                initialized = true;
+                if negotiated_ok {
+                    initialized = true;
+                }
             }
             "session/new" => {
                 if !initialized {
@@ -519,14 +523,33 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
 
 fn handle_initialize(req: &JsonRpcRequest) -> JsonRpcResponse {
     let id = req.id.clone().unwrap_or(Value::Null);
-    // ACP initialize response. protocolVersion is an integer MAJOR version.
-    // We advertise `sessionCapabilities.resume` (we support session/resume) but
-    // NOT `loadSession` — the gateway cannot replay conversation history to the
-    // client (it lives inside the downstream agent CLI), so load is unsupported.
+    // Validate the official request (protocolVersion is required) before negotiating.
+    let init: crate::adapters::acp_schema::InitializeRequest =
+        match serde_json::from_value(req.params.clone().unwrap_or(Value::Null)) {
+            Ok(r) => r,
+            Err(e) => {
+                return JsonRpcResponse::error(id, -32602, format!("Invalid initialize params: {e}"));
+            }
+        };
+    // Negotiate: respond with the version we will use = the lower of the client's and
+    // ours. A higher client version negotiates down to ours (the client then decides);
+    // a version below our minimum (v1 is the first ACP version) cannot be satisfied.
+    let client_version = *init.protocol_version;
+    let negotiated = client_version.min(ACP_PROTOCOL_VERSION as u16);
+    if negotiated < 1 {
+        return JsonRpcResponse::error(
+            id,
+            -32602,
+            format!("Unsupported protocolVersion {client_version}; this agent supports {ACP_PROTOCOL_VERSION}"),
+        );
+    }
+    // ACP initialize response. We advertise `sessionCapabilities.resume` (we support
+    // session/resume) but NOT `loadSession` — the gateway cannot replay conversation
+    // history to the client (it lives inside the downstream agent CLI).
     JsonRpcResponse::success(
         id,
         json!({
-            "protocolVersion": ACP_PROTOCOL_VERSION,
+            "protocolVersion": negotiated,
             "agentCapabilities": {
                 "loadSession": false,
                 "sessionCapabilities": {
@@ -831,7 +854,7 @@ fn extract_prompt_params(params: Option<&Value>) -> Result<(String, String), Str
     // is rejected explicitly rather than silently dropped, so the client knows its
     // content was not delivered.
     let text = if let Some(arr) = prompt.as_array() {
-        let mut parts = Vec::with_capacity(arr.len());
+        let mut parts: Vec<String> = Vec::with_capacity(arr.len());
         for block in arr {
             match block.get("type").and_then(|t| t.as_str()) {
                 Some("text") => {
@@ -839,11 +862,31 @@ fn extract_prompt_params(params: Option<&Value>) -> Result<(String, String), Str
                         .get("text")
                         .and_then(|t| t.as_str())
                         .ok_or("Text content block missing 'text'")?;
-                    parts.push(t);
+                    parts.push(t.to_string());
+                }
+                Some("resource_link") => {
+                    // Baseline ACP content (every agent MUST accept text + resource_link).
+                    // We do not fetch the resource (that would be an SSRF risk); the link
+                    // reference is passed through as text so the agent can act on it.
+                    let uri = block
+                        .get("uri")
+                        .and_then(|v| v.as_str())
+                        .ok_or("resource_link content block missing 'uri'")?;
+                    let label = block
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| block.get("title").and_then(|v| v.as_str()));
+                    parts.push(match label {
+                        Some(l) => format!("[{l}]({uri})"),
+                        None => uri.to_string(),
+                    });
                 }
                 Some(other) => {
+                    // Capability-gated variants (image / audio / embedded resource) that
+                    // this agent does not advertise in promptCapabilities are rejected
+                    // explicitly rather than silently dropped.
                     return Err(format!(
-                        "Unsupported prompt content block type '{other}' — the base accepts only 'text'"
+                        "Unsupported prompt content block type '{other}' — this agent advertises no such capability (base accepts text and resource_link)"
                     ));
                 }
                 None => return Err("Prompt content block missing 'type'".into()),
@@ -1101,7 +1144,7 @@ mod acp_conformance {
     // --- prompt content blocks (F10): unsupported block types rejected, not dropped ---
 
     #[test]
-    fn prompt_rejects_non_text_blocks() {
+    fn prompt_content_blocks_baseline_accepted_gated_rejected() {
         use super::extract_prompt_params;
         // text blocks accepted and concatenated
         let (_, text) = extract_prompt_params(Some(&json!({
@@ -1110,15 +1153,31 @@ mod acp_conformance {
         })))
         .unwrap();
         assert_eq!(text, "a\nb");
-        // a non-text block (resource_link / image) is an explicit error, never dropped
-        assert!(
-            extract_prompt_params(Some(&json!({
-                "sessionId": "sess_x",
-                "prompt": [{"type": "text", "text": "hi"}, {"type": "resource_link", "uri": "file:///x"}]
-            })))
-            .is_err(),
-            "resource_link must be rejected, not silently dropped"
-        );
+        // resource_link is BASELINE — accepted, rendered as a link reference (not fetched)
+        let (_, text) = extract_prompt_params(Some(&json!({
+            "sessionId": "sess_x",
+            "prompt": [
+                {"type": "text", "text": "see"},
+                {"type": "resource_link", "uri": "file:///x", "name": "X"}
+            ]
+        })))
+        .unwrap();
+        assert_eq!(text, "see\n[X](file:///x)");
+        // resource_link without a name/title renders the bare uri
+        let (_, text) = extract_prompt_params(Some(&json!({
+            "sessionId": "sess_x",
+            "prompt": [{"type": "resource_link", "uri": "https://e/x"}]
+        })))
+        .unwrap();
+        assert_eq!(text, "https://e/x");
+        // resource_link missing its required uri → error
+        assert!(extract_prompt_params(Some(&json!({
+            "sessionId": "sess_x",
+            "prompt": [{"type": "resource_link", "name": "X"}]
+        })))
+        .is_err());
+        // capability-gated variants (image / audio / embedded resource) are rejected,
+        // never silently dropped
         assert!(extract_prompt_params(Some(&json!({
             "sessionId": "sess_x",
             "prompt": [{"type": "image", "data": "..", "mimeType": "image/png"}]
@@ -1216,21 +1275,40 @@ mod acp_handlers {
         Arc::new(tokio::sync::Mutex::new(HashMap::new()))
     }
 
-    #[test]
-    fn initialize_returns_conformant_capabilities() {
-        let req = JsonRpcRequest {
+    fn init_req(params: Option<serde_json::Value>) -> JsonRpcRequest {
+        JsonRpcRequest {
             jsonrpc: "2.0".into(),
             method: "initialize".into(),
             id: Some(json!(1)),
-            params: None,
-        };
-        let v = serde_json::to_value(handle_initialize(&req)).unwrap();
+            params,
+        }
+    }
+
+    #[test]
+    fn initialize_returns_conformant_capabilities() {
+        let v = serde_json::to_value(handle_initialize(&init_req(Some(json!({"protocolVersion": 1}))))).unwrap();
         assert_eq!(v["id"], json!(1));
         let result = &v["result"];
         assert_eq!(result["protocolVersion"], json!(1));
         assert_eq!(result["agentCapabilities"]["loadSession"], json!(false));
         assert!(result["agentCapabilities"]["sessionCapabilities"]["resume"].is_object());
         assert!(result["authMethods"].is_array());
+    }
+
+    #[test]
+    fn initialize_negotiates_version_and_rejects_bad() {
+        // a higher client version negotiates down to ours (1)
+        let v = serde_json::to_value(handle_initialize(&init_req(Some(json!({"protocolVersion": 5}))))).unwrap();
+        assert_eq!(v["result"]["protocolVersion"], json!(1));
+        // version 0 is below our minimum → -32602
+        let v = serde_json::to_value(handle_initialize(&init_req(Some(json!({"protocolVersion": 0}))))).unwrap();
+        assert_eq!(v["error"]["code"], json!(-32602));
+        // missing protocolVersion → -32602
+        let v = serde_json::to_value(handle_initialize(&init_req(Some(json!({}))))).unwrap();
+        assert_eq!(v["error"]["code"], json!(-32602));
+        // missing params → -32602
+        let v = serde_json::to_value(handle_initialize(&init_req(None))).unwrap();
+        assert_eq!(v["error"]["code"], json!(-32602));
     }
 
     #[tokio::test]
