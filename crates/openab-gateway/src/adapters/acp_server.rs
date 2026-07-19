@@ -39,6 +39,30 @@ const MAX_FRAME_BYTES: usize = 1 << 20; // 1 MiB per inbound JSON-RPC frame
 /// JSON-RPC implementation-defined server error for a hit resource cap.
 const ACP_OVERLOADED: i32 = -32000;
 
+/// WebSocket subprotocol prefix that carries the bearer token from a browser client
+/// (browsers cannot set an `Authorization` header on a WS handshake, but they CAN offer
+/// subprotocols via `new WebSocket(url, protocols)`). The client offers
+/// `Sec-WebSocket-Protocol: openab.bearer.<token>, acp.v1`; the server extracts the token
+/// and echoes the real `acp.v1` subprotocol so the handshake completes. This keeps the
+/// token OUT of the URL — the de facto browser-WS bearer pattern (as used by the
+/// Kubernetes API server). Non-browser clients should prefer `Authorization: Bearer`.
+const BEARER_SUBPROTOCOL_PREFIX: &str = "openab.bearer.";
+/// The real ACP subprotocol echoed back on a successful upgrade.
+const ACP_SUBPROTOCOL: &str = "acp.v1";
+
+/// Extract the bearer token from a `Sec-WebSocket-Protocol` offer (the
+/// `openab.bearer.<token>` entry), if present.
+fn subprotocol_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|list| {
+            list.split(',')
+                .map(str::trim)
+                .find_map(|p| p.strip_prefix(BEARER_SUBPROTOCOL_PREFIX))
+        })
+}
+
 // ---------------------------------------------------------------------------
 // ACP Configuration
 // ---------------------------------------------------------------------------
@@ -259,11 +283,16 @@ pub async fn ws_upgrade(
     headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> axum::response::Response {
-    // Auth: Bearer token from Authorization header or ?token= query param
+    // Bearer token, in priority order:
+    //   1. `Authorization: Bearer <token>` — non-browser clients (cleanest).
+    //   2. `Sec-WebSocket-Protocol: openab.bearer.<token>, acp.v1` — browsers (keeps the
+    //      token out of the URL; the de facto browser-WS bearer pattern).
+    //   3. `?token=<token>` query — legacy fallback; leaks in URLs/logs, deprecated.
     let token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
+        .or_else(|| subprotocol_token(&headers))
         .or_else(|| query.get("token").map(|s| s.as_str()));
 
     let expected = state.acp.as_ref().and_then(|c| c.auth_key.as_ref());
@@ -282,7 +311,11 @@ pub async fn ws_upgrade(
         }
     }
 
-    ws.on_upgrade(move |socket| handle_acp_connection(state, socket))
+    // Echo the `acp.v1` subprotocol so a browser that offered it (alongside its
+    // `openab.bearer.<token>` entry) completes the handshake. Clients that offer no
+    // subprotocol are unaffected.
+    ws.protocols([ACP_SUBPROTOCOL])
+        .on_upgrade(move |socket| handle_acp_connection(state, socket))
 }
 
 // ---------------------------------------------------------------------------
@@ -1246,6 +1279,20 @@ mod acp_conformance {
         // an empty key is treated as no key
         assert!(acp_auth_ok_for_bind(Some(""), "0.0.0.0:8080").is_err());
         assert!(acp_auth_ok_for_bind(Some(""), "127.0.0.1:8080").is_ok());
+    }
+
+    #[test]
+    fn subprotocol_token_extraction() {
+        use super::subprotocol_token;
+        use axum::http::HeaderMap;
+        let mut h = HeaderMap::new();
+        assert_eq!(subprotocol_token(&h), None); // no header
+        // the browser offers "openab.bearer.<token>, acp.v1" → extract the token
+        h.insert("sec-websocket-protocol", "openab.bearer.abc123, acp.v1".parse().unwrap());
+        assert_eq!(subprotocol_token(&h), Some("abc123"));
+        // only the real protocol, no bearer entry → None
+        h.insert("sec-websocket-protocol", "acp.v1".parse().unwrap());
+        assert_eq!(subprotocol_token(&h), None);
     }
 }
 

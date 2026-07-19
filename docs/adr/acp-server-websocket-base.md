@@ -38,12 +38,31 @@ ACP replies are routed back via the unified adapter's `dispatch_reply`
 **Two independent auth layers:**
 
 1. **Transport** — a shared bearer key on the WS upgrade (`OPENAB_ACP_AUTH_KEY`,
-   presented as `Authorization: Bearer <key>` or `?token=<key>`, timing-safe compare via
-   `subtle::ConstantTimeEq`). **Fail-open only on loopback:** if no key is set, `/acp` is
-   mounted only when the server binds a loopback address (`127.0.0.0/8` / `::1` /
-   `localhost`); a non-loopback bind (`0.0.0.0`, LAN, LoadBalancer) without a key refuses
-   to mount the endpoint, so an unauthenticated agent endpoint is never exposed to the
-   network. An empty key counts as unset.
+   timing-safe compare via `subtle::ConstantTimeEq`). ACP itself defines **no**
+   client→server transport auth (its reference transport is a local stdio subprocess, so
+   the OS process boundary is the trust boundary); running ACP over a network is outside
+   that model, so the transport key is an OpenAB addition. The key is presented, in
+   priority order:
+   1. **`Authorization: Bearer <key>`** — non-browser clients (cleanest).
+   2. **`Sec-WebSocket-Protocol: openab.bearer.<key>, acp.v1`** — the **browser** path:
+      browsers cannot set an `Authorization` header on a WS handshake but can offer
+      subprotocols via `new WebSocket(url, protocols)`. The server extracts the key from
+      the `openab.bearer.` entry and echoes the real `acp.v1` subprotocol. This is the de
+      facto browser-WS bearer pattern (as used by the Kubernetes API server) and keeps the
+      key **out of the URL**.
+   3. **`?token=<key>`** query — legacy fallback only; the key leaks into URLs / access
+      logs / history, so it is deprecated in favor of the subprotocol.
+
+   We deliberately do **not** repurpose ACP's `authenticate` / `authMethods` for this:
+   those are agent→provider auth (the client helping a locally-spawned agent log in to its
+   LLM, credential set out-of-band), not client→server, so a standard ACP client would
+   misread them. `authMethods` stays `[]`.
+
+   **Fail-open only on loopback:** if no key is set, `/acp` is mounted only when the server
+   binds a loopback address (`127.0.0.0/8` / `::1` / `localhost`); a non-loopback bind
+   (`0.0.0.0`, LAN, LoadBalancer) without a key refuses to mount the endpoint, so an
+   unauthenticated agent endpoint is never exposed to the network. An empty key counts as
+   unset.
 2. **Identity** — ACP events carry a fixed synthetic sender id `acp_client` and pass
    through the gateway trust registry (the `acp` platform is seeded there alongside
    telegram/line/…). Admit the sender with `GATEWAY_ALLOW_ALL_USERS=true` or

@@ -51,16 +51,17 @@ def record(section: str, ok: bool, name: str, detail: str = "") -> None:
     print(line, flush=True)
 
 
-def url_with_token(token: str | None) -> str:
-    if not token:
-        return BASE_URL
-    sep = "&" if "?" in BASE_URL else "?"
-    return f"{BASE_URL}{sep}token={token}"
+def bearer_subprotocols(token: str | None) -> list[str]:
+    # Carry the token via the Sec-WebSocket-Protocol subprotocol (keeps it out of the
+    # URL — the de facto browser-WS bearer pattern). The server echoes `acp.v1`.
+    return [f"openab.bearer.{token}", "acp.v1"] if token else ["acp.v1"]
 
 
 async def try_connect(token: str | None):
     """Return an open ws (caller closes) or raise on rejection."""
-    return await websockets.connect(url_with_token(token), open_timeout=8, max_size=None)
+    return await websockets.connect(
+        BASE_URL, subprotocols=bearer_subprotocols(token), open_timeout=8, max_size=None
+    )
 
 
 class Conn:
