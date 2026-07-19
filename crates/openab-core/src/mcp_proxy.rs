@@ -19,7 +19,9 @@ use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 use rmcp::ServerHandler;
+use axum::response::IntoResponse;
 use serde_json::json;
+use std::sync::Arc;
 
 /// The fixed set of browser tools OpenAB advertises over MCP (D4 static-advertise). DOM-
 /// semantic actions the extension executes in the user's active tab; model-agnostic.
@@ -111,11 +113,34 @@ impl ServerHandler for ProxyHandler {
     }
 }
 
+/// Loopback bearer gate for the MCP server (D3): even bound to 127.0.0.1, require the token
+/// the agent's MCP config carries, so another local process on the host can't reach the
+/// browser tools. Returns 401 when the `Authorization: Bearer <token>` header is absent or
+/// wrong.
+async fn require_bearer(
+    axum::extract::State(expected): axum::extract::State<Arc<str>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let authed = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|t| t == &*expected);
+    if authed {
+        next.run(req).await
+    } else {
+        axum::http::StatusCode::UNAUTHORIZED.into_response()
+    }
+}
+
 /// Start the in-process Streamable-HTTP MCP proxy server on an OS-assigned **loopback** port
-/// (D3). Returns the bound address; the caller hands `addr.port()` to the colocated agent's
-/// native MCP config (T5.2). Shuts down when `ct` is cancelled. A bearer gate is added in
-/// T5.2 (the token is minted alongside the config injection).
+/// (D3), gated by `bearer`. Returns the bound address; the caller hands `addr.port()` + the
+/// same `bearer` to the colocated agent's native MCP config (T5.2). Shuts down when `ct` is
+/// cancelled.
 pub async fn spawn_mcp_server(
+    bearer: String,
     ct: tokio_util::sync::CancellationToken,
 ) -> std::io::Result<std::net::SocketAddr> {
     let config = StreamableHttpServerConfig::default()
@@ -129,7 +154,12 @@ pub async fn spawn_mcp_server(
             Default::default(),
             config,
         );
-    let router = axum::Router::new().nest_service("/mcp", service);
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::<str>::from(bearer),
+            require_bearer,
+        ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     tokio::spawn(async move {
@@ -173,20 +203,23 @@ mod tests {
         }
     }
 
+    const INIT_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
+
     #[tokio::test]
-    async fn mcp_server_binds_loopback_and_initializes() {
+    async fn mcp_server_binds_loopback_and_initializes_with_bearer() {
         let ct = tokio_util::sync::CancellationToken::new();
-        let addr = spawn_mcp_server(ct.clone()).await.unwrap();
+        let addr = spawn_mcp_server("secret-token".to_string(), ct.clone())
+            .await
+            .unwrap();
         assert!(addr.ip().is_loopback(), "MCP server must bind loopback only");
 
         let url = format!("http://{addr}/mcp");
         let resp = reqwest::Client::new()
             .post(&url)
+            .header("Authorization", "Bearer secret-token")
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
-            .body(
-                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#,
-            )
+            .body(INIT_BODY)
             .send()
             .await
             .unwrap();
@@ -198,6 +231,40 @@ mod tests {
             body["result"]["capabilities"]["tools"].is_object(),
             "server must advertise the tools capability"
         );
+        ct.cancel();
+    }
+
+    #[tokio::test]
+    async fn mcp_server_rejects_missing_or_wrong_bearer() {
+        let ct = tokio_util::sync::CancellationToken::new();
+        let addr = spawn_mcp_server("secret-token".to_string(), ct.clone())
+            .await
+            .unwrap();
+        let url = format!("http://{addr}/mcp");
+        let client = reqwest::Client::new();
+
+        // no Authorization header -> 401
+        let no_auth = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(INIT_BODY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_auth.status(), 401);
+
+        // wrong token -> 401
+        let wrong = client
+            .post(&url)
+            .header("Authorization", "Bearer nope")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(INIT_BODY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), 401);
         ct.cancel();
     }
 }
