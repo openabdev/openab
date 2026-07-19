@@ -323,6 +323,16 @@ pub fn new_reply_registry() -> AcpReplyRegistry {
     Arc::new(std::sync::Mutex::new(HashMap::new()))
 }
 
+/// Registry of open MCP-over-ACP tunnels: channel_id → `TunnelHandle`. The gateway inserts a
+/// handle once it has `mcp/connect`ed to a session's browser extension server; the core MCP
+/// proxy looks one up to route a tool call to the right browser (T5.3). Same std::sync::Mutex
+/// rationale as `AcpReplyRegistry`.
+pub type AcpTunnelRegistry = Arc<std::sync::Mutex<HashMap<String, TunnelHandle>>>;
+
+pub fn new_tunnel_registry() -> AcpTunnelRegistry {
+    Arc::new(std::sync::Mutex::new(HashMap::new()))
+}
+
 // ---------------------------------------------------------------------------
 // JSON-RPC types (minimal subset for ACP)
 // ---------------------------------------------------------------------------
@@ -680,6 +690,35 @@ impl TunnelHandle {
         )
         .await
     }
+}
+
+/// Open the MCP-over-ACP tunnel to a session's declared `"type":"acp"` server and register a
+/// `TunnelHandle` under the session's `channel_id` so the core MCP proxy can reach it (T5.3).
+/// MUST run in a spawned task, never inline in the connection read loop: `mcp_connect` awaits
+/// the client's response, which only that same read loop can deliver — awaiting it inline
+/// would deadlock.
+#[allow(dead_code)]
+async fn establish_and_register_tunnel(
+    out_tx: mpsc::UnboundedSender<String>,
+    pending: Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    next_id: Arc<AtomicU64>,
+    acp_id: String,
+    channel_id: String,
+    registry: AcpTunnelRegistry,
+    timeout_secs: u64,
+) -> Result<(), String> {
+    let connection_id = mcp_connect(&out_tx, &pending, &next_id, &acp_id, timeout_secs).await?;
+    let handle = TunnelHandle {
+        out_tx,
+        pending,
+        next_id,
+        connection_id,
+    };
+    registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(channel_id, handle);
+    Ok(())
 }
 
 async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
@@ -2062,6 +2101,42 @@ mod acp_requests {
             .unwrap();
         assert_eq!(result["ok"], json!(true));
         ext.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn establish_tunnel_registers_handle_under_channel_id() {
+        let pending = new_pending();
+        let next_id = Arc::new(AtomicU64::new(1));
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        let registry = super::new_tunnel_registry();
+
+        // mock extension: answer mcp/connect with a connectionId
+        let pending2 = pending.clone();
+        let ext = tokio::spawn(async move {
+            let f: serde_json::Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
+            assert_eq!(f["method"], json!("mcp/connect"));
+            assert_eq!(f["params"]["acpId"], json!("srv-1"));
+            route_client_response(&pending2, &json!({"jsonrpc":"2.0","id":f["id"],"result":{"connectionId":"conn-9"}}))
+                .await;
+        });
+
+        super::establish_and_register_tunnel(
+            out_tx,
+            pending,
+            next_id,
+            "srv-1".into(),
+            "acp_abc".into(),
+            registry.clone(),
+            5,
+        )
+        .await
+        .unwrap();
+        ext.await.unwrap();
+
+        assert!(
+            registry.lock().unwrap().contains_key("acp_abc"),
+            "a TunnelHandle must be registered under the session channel_id"
+        );
     }
 }
 
