@@ -524,7 +524,12 @@ async fn route_client_response(
     if has_method || !looks_like_response {
         return false;
     }
-    let Some(id) = raw.get("id").and_then(Value::as_u64) else {
+    // Accept a numeric id (what we mint) or a stringified number ("1") from a spec-loose
+    // client, so its responses still correlate to the pending request instead of being dropped.
+    let Some(id) = raw
+        .get("id")
+        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+    else {
         return false;
     };
     if let Some(tx) = pending.lock().await.remove(&id) {

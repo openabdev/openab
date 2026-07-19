@@ -175,7 +175,12 @@ async fn require_bearer(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|t| t == &*expected);
+        // Constant-time compare so a wrong token can't be probed byte-by-byte via response
+        // timing (mirrors the gateway's feishu/wecom signature checks).
+        .is_some_and(|t| {
+            use subtle::ConstantTimeEq;
+            t.as_bytes().ct_eq(expected.as_bytes()).into()
+        });
     if authed {
         next.run(req).await
     } else {

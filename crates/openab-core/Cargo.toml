@@ -55,6 +55,7 @@ http = { version = "1", optional = true }
 rmcp = { version = "1.7", default-features = false, features = ["server", "transport-streamable-http-server"], optional = true }
 axum = { version = "0.8", optional = true }
 tokio-util = { version = "0.7", optional = true }
+subtle = { version = "2", optional = true } # constant-time bearer compare for the loopback MCP server
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -72,4 +73,4 @@ pre-seed = ["dep:aws-sdk-s3", "dep:aws-config", "dep:zip", "dep:hex", "dep:flate
 filestore = ["dep:aws-sdk-s3", "dep:aws-config"]
 agentcore = ["dep:aws-config", "dep:aws-sigv4", "dep:aws-credential-types", "dep:urlencoding", "dep:hex", "dep:http", "dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
 # Core-hosted MCP proxy server for MCP-over-ACP browser control (enabled by the root `acp`).
-acp-mcp = ["dep:rmcp", "dep:axum", "dep:tokio-util"]
+acp-mcp = ["dep:rmcp", "dep:axum", "dep:tokio-util", "dep:subtle"]
