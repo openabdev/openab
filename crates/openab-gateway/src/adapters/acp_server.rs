@@ -55,12 +55,52 @@ impl AcpConfig {
         if !enabled {
             return None;
         }
-        let auth_key = std::env::var("OPENAB_ACP_AUTH_KEY").ok();
+        // Treat an empty value as unset (an empty string is not a usable key).
+        let auth_key = std::env::var("OPENAB_ACP_AUTH_KEY")
+            .ok()
+            .filter(|k| !k.is_empty());
         if auth_key.is_none() {
-            warn!("OPENAB_ACP_AUTH_KEY not set — ACP endpoint is UNAUTHENTICATED");
+            warn!(
+                "OPENAB_ACP_AUTH_KEY not set — /acp is only served on a loopback bind; a \
+                 non-loopback bind will refuse to mount it (set a key to expose it)"
+            );
         }
         Some(Self { auth_key })
     }
+}
+
+/// Whether the listen address binds a loopback interface (`127.0.0.0/8`, `::1`, or
+/// `localhost`). An unknown / unparseable host is treated as non-loopback (fail safe).
+fn bind_is_loopback(listen_addr: &str) -> bool {
+    let host = listen_addr
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(listen_addr)
+        .trim_matches(|c| c == '[' || c == ']'); // strip IPv6 brackets
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// Whether `/acp` may be mounted for the given auth key and bind address. A non-empty
+/// transport key always suffices. Without a key, fail-open is permitted ONLY on a
+/// loopback bind; any non-loopback bind (`0.0.0.0`, a LAN IP, a LoadBalancer) requires
+/// `OPENAB_ACP_AUTH_KEY` so an unauthenticated agent endpoint is never exposed to the
+/// network. Returns `Err(reason)` when the endpoint must not be mounted.
+pub fn acp_auth_ok_for_bind(auth_key: Option<&str>, listen_addr: &str) -> Result<(), String> {
+    if auth_key.map(|k| !k.is_empty()).unwrap_or(false) {
+        return Ok(());
+    }
+    if bind_is_loopback(listen_addr) {
+        return Ok(());
+    }
+    Err(format!(
+        "OPENAB_ACP_AUTH_KEY is required to serve /acp on a non-loopback address \
+         ({listen_addr}); refusing to expose an unauthenticated agent endpoint"
+    ))
 }
 
 /// Incremental text to stream, given the bytes already sent (`sent_len`) and the
@@ -1186,6 +1226,26 @@ mod acp_conformance {
         // a plain-string prompt still works
         let (_, s) = extract_prompt_params(Some(&json!({"sessionId": "sess_x", "prompt": "hello"}))).unwrap();
         assert_eq!(s, "hello");
+    }
+
+    // --- transport auth gate (F1): no key allowed only on loopback ---
+
+    #[test]
+    fn acp_auth_gate_requires_key_off_loopback() {
+        use super::acp_auth_ok_for_bind;
+        // a non-empty key suffices on any bind
+        assert!(acp_auth_ok_for_bind(Some("k"), "0.0.0.0:8080").is_ok());
+        assert!(acp_auth_ok_for_bind(Some("k"), "127.0.0.1:8080").is_ok());
+        // no key: loopback binds are allowed
+        assert!(acp_auth_ok_for_bind(None, "127.0.0.1:8080").is_ok());
+        assert!(acp_auth_ok_for_bind(None, "localhost:8080").is_ok());
+        assert!(acp_auth_ok_for_bind(None, "[::1]:8080").is_ok());
+        // no key: non-loopback binds are refused
+        assert!(acp_auth_ok_for_bind(None, "0.0.0.0:8080").is_err());
+        assert!(acp_auth_ok_for_bind(None, "192.168.1.10:8080").is_err());
+        // an empty key is treated as no key
+        assert!(acp_auth_ok_for_bind(Some(""), "0.0.0.0:8080").is_err());
+        assert!(acp_auth_ok_for_bind(Some(""), "127.0.0.1:8080").is_ok());
     }
 }
 

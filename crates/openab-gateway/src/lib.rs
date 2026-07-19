@@ -520,11 +520,18 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         .route("/ws", get(ws_handler))
         .route("/health", get(health));
 
-    // ACP Server adapter
+    // ACP Server adapter. Fail-open (no transport key) is only allowed on a loopback
+    // bind; a non-loopback bind without OPENAB_ACP_AUTH_KEY refuses to mount /acp.
     #[cfg(feature = "acp")]
     if std::env::var("OPENAB_ACP_ENABLED").map(|v| v == "true" || v == "1").unwrap_or(false) {
-        info!("ACP server endpoint enabled at /acp");
-        app = app.route("/acp", get(adapters::acp_server::ws_upgrade));
+        let acp_key = std::env::var("OPENAB_ACP_AUTH_KEY").ok();
+        match adapters::acp_server::acp_auth_ok_for_bind(acp_key.as_deref(), &listen_addr) {
+            Ok(()) => {
+                info!("ACP server endpoint enabled at /acp");
+                app = app.route("/acp", get(adapters::acp_server::ws_upgrade));
+            }
+            Err(e) => tracing::error!("ACP endpoint NOT mounted: {e}"),
+        }
     }
 
     // Telegram adapter

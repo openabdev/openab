@@ -1130,11 +1130,22 @@ async fn main() -> anyhow::Result<()> {
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false)
             {
-                info!("unified: ACP server endpoint enabled at /acp");
-                app = app.route(
-                    "/acp",
-                    axum::routing::get(openab_gateway::adapters::acp_server::ws_upgrade),
-                );
+                // Fail-open (no transport key) is only allowed on a loopback bind; a
+                // non-loopback bind without OPENAB_ACP_AUTH_KEY refuses to mount /acp.
+                let acp_key = std::env::var("OPENAB_ACP_AUTH_KEY").ok();
+                match openab_gateway::adapters::acp_server::acp_auth_ok_for_bind(
+                    acp_key.as_deref(),
+                    &listen_addr,
+                ) {
+                    Ok(()) => {
+                        info!("unified: ACP server endpoint enabled at /acp");
+                        app = app.route(
+                            "/acp",
+                            axum::routing::get(openab_gateway::adapters::acp_server::ws_upgrade),
+                        );
+                    }
+                    Err(e) => error!("unified: ACP endpoint NOT mounted: {e}"),
+                }
             }
 
             let app = app.with_state(gw_state.clone());
