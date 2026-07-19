@@ -314,41 +314,65 @@ async def section_lifecycle():
         record("life", stop == "cancelled", "session/cancel → prompt ends stopReason:cancelled", f"got {stop!r}")
 
 
+async def collect_mcp_connects(c: Conn, ws, mcp_servers, window=6.0):
+    """session/new with the given mcpServers, then collect the server-initiated mcp/connect
+    requests the gateway issues within `window` seconds, answering each with a connectionId.
+    Returns (sessionId, [mcp/connect frames])."""
+    r = await c.call("session/new", {"cwd": "/home/agent", "mcpServers": mcp_servers})
+    sid = r.get("result", {}).get("sessionId", "")
+    connects = []
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + window
+    while loop.time() < deadline:
+        try:
+            m = json.loads(await asyncio.wait_for(ws.recv(), timeout=max(0.1, deadline - loop.time())))
+        except asyncio.TimeoutError:
+            break
+        if m.get("method") == "mcp/connect":
+            connects.append(m)
+            await ws.send(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": {"connectionId": f"conn-{len(connects)}"}}))
+    return sid, connects
+
+
 async def section_tunnel():
-    """MCP-over-ACP tunnel producer (T5.3): declaring a `type:acp` MCP server in
-    session/new makes the gateway open a tunnel to us (a server-initiated mcp/connect
-    request); we answer and it registers the tunnel. This exercises the live read-loop
-    spawn path end-to-end (the concurrency that unit tests can't reach)."""
+    """MCP-over-ACP tunnel producer (T5.3): a `type:acp` mcpServers entry makes the gateway
+    open a tunnel to us (a server-initiated mcp/connect). Covers the single case, fan-out over
+    multiple servers, and mixed-transport filtering. Exercises the live read-loop spawn path
+    the unit tests can't reach. (The agent→tool→browser leg needs a real extension — T6.)"""
+    # 1) single type:acp → exactly one mcp/connect carrying the declared id
     async with await try_connect(TOKEN) as ws:
         c = Conn(ws)
         await c.initialize()
-        r = await c.call(
-            "session/new",
-            {
-                "cwd": "/home/agent",
-                "mcpServers": [{"type": "acp", "id": "srv-smoke", "name": "browser"}],
-            },
-        )
-        sid = r.get("result", {}).get("sessionId", "")
+        sid, connects = await collect_mcp_connects(c, ws, [{"type": "acp", "id": "srv-solo", "name": "browser"}])
         record("tunnel", sid.startswith("sess_"), "session/new with a type:acp mcpServers entry is accepted")
+        record("tunnel", len(connects) == 1, "single type:acp server → exactly one server-initiated mcp/connect", f"got {len(connects)}")
+        if connects:
+            p = connects[0].get("params", {})
+            record("tunnel", p.get("acpId") == "srv-solo", "mcp/connect carries the declared acpId", str(p))
+            record("tunnel", connects[0].get("id") is not None, "mcp/connect is a request (has an id)")
 
-        # The gateway now issues a server-initiated mcp/connect. Wait for it.
-        connect = None
-        for _ in range(20):
-            try:
-                m = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
-            except asyncio.TimeoutError:
-                break
-            if m.get("method") == "mcp/connect":
-                connect = m
-                break
-        record("tunnel", connect is not None, "gateway sends a server-initiated mcp/connect after the type:acp declaration")
-        if connect:
-            params = connect.get("params", {})
-            record("tunnel", params.get("acpId") == "srv-smoke", "mcp/connect carries the declared acpId", str(params))
-            record("tunnel", connect.get("id") is not None, "mcp/connect is a request (has an id)")
-            await ws.send(json.dumps({"jsonrpc": "2.0", "id": connect["id"], "result": {"connectionId": "conn-smoke"}}))
-            record("tunnel", True, "answered mcp/connect with a connectionId (the tunnel registers)")
+    # 2) fan-out: two type:acp servers → one distinct mcp/connect each
+    async with await try_connect(TOKEN) as ws:
+        c = Conn(ws)
+        await c.initialize()
+        _, connects = await collect_mcp_connects(
+            c, ws, [{"type": "acp", "id": "srv-a", "name": "a"}, {"type": "acp", "id": "srv-b", "name": "b"}]
+        )
+        ids = sorted(x.get("params", {}).get("acpId") for x in connects)
+        record("tunnel", ids == ["srv-a", "srv-b"], "two type:acp servers → one mcp/connect each (fan-out)", str(ids))
+        outer = [x.get("id") for x in connects]
+        record("tunnel", len(set(outer)) == len(outer) and all(i is not None for i in outer),
+               "each mcp/connect uses a distinct request id", str(outer))
+
+    # 3) mixed transports: only the acp server is tunnelled (http is the agent's own concern)
+    async with await try_connect(TOKEN) as ws:
+        c = Conn(ws)
+        await c.initialize()
+        _, connects = await collect_mcp_connects(
+            c, ws, [{"type": "acp", "id": "srv-x", "name": "browser"}, {"type": "http", "url": "http://example/mcp"}]
+        )
+        ids = [x.get("params", {}).get("acpId") for x in connects]
+        record("tunnel", ids == ["srv-x"], "mixed acp+http mcpServers → only the acp one gets mcp/connect", str(ids))
 
 
 async def main() -> int:
