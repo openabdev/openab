@@ -633,6 +633,55 @@ async fn mcp_disconnect(
         .map(|_| ())
 }
 
+/// A cloneable handle to one `/acp` connection's MCP-over-ACP tunnel (T5.3). Bundles the
+/// per-connection outbound channel + pending-request map + id counter + the `connectionId`
+/// from `mcp/connect`, so a holder can issue `mcp/message` requests to that browser and await
+/// the result. Built by the gateway once the tunnel is open and (next) registered under the
+/// session's `channel_id` in a shared registry, so the core MCP proxy can route a tool call
+/// to the right browser. D5-agnostic: both the per-session and shared core-server designs use
+/// this same handle.
+#[derive(Clone)]
+pub struct TunnelHandle {
+    out_tx: mpsc::UnboundedSender<String>,
+    pending: Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    next_id: Arc<AtomicU64>,
+    connection_id: String,
+}
+
+impl TunnelHandle {
+    /// Tunnel an inner MCP request (`tools/list`, `tools/call`, …) to the extension over this
+    /// connection and return the inner MCP result payload.
+    pub async fn mcp_message(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        timeout_secs: u64,
+    ) -> Result<Value, String> {
+        mcp_message_request(
+            &self.out_tx,
+            &self.pending,
+            &self.next_id,
+            &self.connection_id,
+            method,
+            params,
+            timeout_secs,
+        )
+        .await
+    }
+
+    /// Close this tunnel (`mcp/disconnect`).
+    pub async fn disconnect(&self, timeout_secs: u64) -> Result<(), String> {
+        mcp_disconnect(
+            &self.out_tx,
+            &self.pending,
+            &self.next_id,
+            &self.connection_id,
+            timeout_secs,
+        )
+        .await
+    }
+}
+
 async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let connection_id = format!("acp_conn_{}", Uuid::new_v4());
@@ -1982,6 +2031,36 @@ mod acp_requests {
             .await
             .unwrap();
         assert_eq!(result["tools"][0]["name"], json!("browser.click"));
+        ext.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tunnel_handle_mcp_message_roundtrips() {
+        let pending = new_pending();
+        let next_id = Arc::new(AtomicU64::new(1));
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        let handle = super::TunnelHandle {
+            out_tx,
+            pending: pending.clone(),
+            next_id,
+            connection_id: "conn-9".into(),
+        };
+
+        let pending2 = pending.clone();
+        let ext = tokio::spawn(async move {
+            let f: serde_json::Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
+            assert_eq!(f["method"], json!("mcp/message"));
+            assert_eq!(f["params"]["connectionId"], json!("conn-9"));
+            assert_eq!(f["params"]["method"], json!("tools/call"));
+            route_client_response(&pending2, &json!({"jsonrpc":"2.0","id":f["id"],"result":{"ok":true}}))
+                .await;
+        });
+
+        let result = handle
+            .mcp_message("tools/call", Some(json!({"name": "browser.click"})), 5)
+            .await
+            .unwrap();
+        assert_eq!(result["ok"], json!(true));
         ext.await.unwrap();
     }
 }
