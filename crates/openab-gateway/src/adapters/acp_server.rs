@@ -362,15 +362,18 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
             continue;
         };
 
-        // Bound inbound frame size before parsing (deterministic overload, not OOM).
+        // Bound inbound frame size before parsing. An oversized frame can't be parsed,
+        // so we can't tell request from notification or recover its id — do NOT fabricate
+        // a JSON-RPC response (which would violate notification silence). Treat it as a
+        // transport-level violation: log and close the connection.
         if text.len() > MAX_FRAME_BYTES {
-            let resp = JsonRpcResponse::error(
-                Value::Null,
-                ACP_OVERLOADED,
-                format!("Frame too large ({} bytes; max {MAX_FRAME_BYTES})", text.len()),
+            warn!(
+                connection = %connection_id,
+                bytes = text.len(),
+                max = MAX_FRAME_BYTES,
+                "ACP frame too large; closing connection"
             );
-            let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
-            continue;
+            break;
         }
 
         if trace {
@@ -392,6 +395,20 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
         // request. serde's `Option<Value>` collapses omitted and `null` to the same
         // `None`, so notification detection uses raw key PRESENCE on the parsed JSON.
         let is_notification = raw.get("id").is_none();
+
+        // JSON-RPC: `id`, when present, MUST be a string, number, or null — never an
+        // object, array, or boolean. Reject a wrong-typed id as an Invalid Request.
+        if let Some(id) = raw.get("id") {
+            if !(id.is_string() || id.is_number() || id.is_null()) {
+                let err_resp = JsonRpcResponse::error(
+                    Value::Null,
+                    -32600,
+                    "Invalid Request: id must be a string, number, or null",
+                );
+                let _ = out_tx.send(serde_json::to_string(&err_resp).unwrap());
+                continue;
+            }
+        }
 
         let req: JsonRpcRequest = match serde_json::from_value(raw) {
             Ok(r) => r,
@@ -663,7 +680,8 @@ async fn handle_session_new(
         },
     );
 
-    info!(session = %session_id, "ACP session created");
+    // Downgraded from info! — sessionId is a resume capability; keep it out of normal logs (F12).
+    debug!(session = %session_id, "ACP session created");
 
     // ACP session/new response is just { sessionId }.
     JsonRpcResponse::success(id, json!({ "sessionId": session_id }))
@@ -714,7 +732,7 @@ async fn handle_session_resume(
         },
     );
 
-    info!(session = %session_id, "ACP session resumed");
+    debug!(session = %session_id, "ACP session resumed");
 
     // ACP session/resume response is an empty object (no history replay).
     JsonRpcResponse::success(id, json!({}))
@@ -844,7 +862,7 @@ async fn handle_session_prompt(
         }
     }
 
-    info!(session = %session_id, channel = %channel_id, "ACP: prompt dispatched");
+    debug!(session = %session_id, channel = %channel_id, "ACP: prompt dispatched");
 
     // Stream replies back as ACP `session/update` notifications.
     let mut sent_len = 0usize;

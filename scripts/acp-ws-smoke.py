@@ -206,6 +206,12 @@ async def section_edges():
         m = json.loads(await asyncio.wait_for(ws.recv(), timeout=8))
         record("edge", m.get("error", {}).get("code") == -32600, "jsonrpc != \"2.0\" rejected (-32600)")
 
+    # wrong-typed JSON-RPC id (object) → -32600
+    async with await try_connect(TOKEN) as ws:
+        await ws.send(json.dumps({"jsonrpc": "2.0", "id": {}, "method": "initialize", "params": {"protocolVersion": 1}}))
+        m = json.loads(await asyncio.wait_for(ws.recv(), timeout=8))
+        record("edge", m.get("error", {}).get("code") == -32600, "wrong-typed id (object) rejected (-32600)")
+
     # the rest run on one initialized connection
     async with await try_connect(TOKEN) as ws:
         c = Conn(ws)
