@@ -325,8 +325,9 @@ auto-replying). Fine-grained permission control is a later, separate effort.
 hand-rolled envelope (D3).
 - 4.1 `mcp/connect` (→ `connectionId`) + `mcp/message` (carries the inner MCP JSON-RPC;
   outer ACP id ↔ pending-map, inner MCP id opaque) + `mcp/disconnect`. 4.2 Gateway routes
-  these between the `/acp` client (extension) and core. 4.3 Contract doc (the spec the
-  extension implements). 4.4 Mock-MCP-over-tunnel tests.
+  these between the `/acp` client (extension) and core. 4.3 Contract doc — done:
+  [MCP-over-ACP tunnel — extension implementation contract](../mcp-over-acp-tunnel-contract.md).
+  4.4 Mock-MCP-over-tunnel tests.
 
 **T5 — OpenAB core = MCP proxy/aggregator.**
 - 5.1 A core-side **Streamable-HTTP MCP server hosted in-process** on `127.0.0.1:<port>`
