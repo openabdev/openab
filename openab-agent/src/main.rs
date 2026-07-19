@@ -94,7 +94,8 @@ enum AuthProvider {
         no_browser: bool,
     },
     /// xAI SuperGrok / X Premium via device code (RFC 8628, headless-friendly)
-    XaiDevice,
+    #[command(visible_alias = "xai-device")]
+    Xai,
     /// Show stored credentials
     Status,
 }
@@ -133,7 +134,7 @@ async fn main() {
                     std::process::exit(1);
                 }
             }
-            AuthProvider::XaiDevice => {
+            AuthProvider::Xai => {
                 if let Err(e) = auth::login_xai_device_flow().await {
                     eprintln!("❌ Authentication failed: {e}");
                     std::process::exit(1);
@@ -160,5 +161,23 @@ async fn main() {
                 }
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xai_auth_accepts_canonical_and_legacy_alias() {
+        for name in ["xai", "xai-device"] {
+            let cli = Cli::try_parse_from(["openab-agent", "auth", name]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Auth {
+                    provider: AuthProvider::Xai
+                })
+            ));
+        }
     }
 }

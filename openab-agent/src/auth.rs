@@ -536,7 +536,7 @@ fn auth_subcommand(namespace: &str) -> &'static str {
     if namespace == ANTHROPIC_NAMESPACE {
         "openab-agent auth anthropic-oauth"
     } else if namespace == XAI_NAMESPACE {
-        "openab-agent auth xai-device"
+        "openab-agent auth xai"
     } else {
         "openab-agent auth codex-oauth"
     }
@@ -1546,7 +1546,7 @@ pub fn show_status() {
 
     if tokens.is_empty() {
         println!(
-            "Not authenticated.\nRun: openab-agent auth codex-oauth  |  openab-agent auth anthropic-oauth  |  openab-agent auth xai-device"
+            "Not authenticated.\nRun: openab-agent auth codex-oauth  |  openab-agent auth anthropic-oauth  |  openab-agent auth xai"
         );
         return;
     }
@@ -1718,7 +1718,7 @@ mod tests {
     fn auth_subcommand_per_namespace() {
         assert_eq!(
             auth_subcommand(XAI_NAMESPACE),
-            "openab-agent auth xai-device"
+            "openab-agent auth xai"
         );
         assert_eq!(
             auth_subcommand(ANTHROPIC_NAMESPACE),

@@ -142,8 +142,10 @@ flow — no `XAI_API_KEY` to provision, and headless-friendly (approve on any
 device; ideal for pods via `kubectl exec`):
 
 ```bash
-openab-agent auth xai-device
+openab-agent auth xai
 ```
+
+The legacy `auth xai-device` spelling remains accepted as a compatibility alias.
 
 Prints a user code and an `https://auth.x.ai/...` verification link (prefilled
 when the server provides one). Tokens are stored under the `xai-oauth` namespace

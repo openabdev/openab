@@ -196,7 +196,7 @@ pub fn select_provider(choice: &str) -> Result<Box<dyn LlmProvider>, String> {
                     OpenAiProvider::from_auth_store()
                         .map(|p| Box::new(p) as Box<dyn LlmProvider>)
                         .map_err(|codex_err| format!(
-                            "No credentials: set ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN, or run `openab-agent auth anthropic-oauth` / `openab-agent auth codex-oauth` / `openab-agent auth xai-device`. ({codex_err})"
+                            "No credentials: set ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN, or run `openab-agent auth anthropic-oauth` / `openab-agent auth codex-oauth` / `openab-agent auth xai`. ({codex_err})"
                         ))
                 }
             }
@@ -916,7 +916,7 @@ fn validate_xai_base_url(raw: &str) -> Result<String, String> {
 
 impl XaiProvider {
     /// Create provider using the stored xAI OAuth token from
-    /// `~/.openab/agent/auth.json` (run `openab-agent auth xai-device` first).
+    /// `~/.openab/agent/auth.json` (run `openab-agent auth xai` first).
     pub fn from_auth_store() -> Result<Self, String> {
         // Just verify tokens exist; the live token is fetched (and refreshed)
         // per call, mirroring `OpenAiProvider`.
@@ -1920,7 +1920,7 @@ mod tests {
                 err.contains("xAI token refresh after HTTP 401 failed"),
                 "got: {err}"
             );
-            assert!(err.contains("openab-agent auth xai-device"), "got: {err}");
+            assert!(err.contains("openab-agent auth xai"), "got: {err}");
         });
     }
 }
