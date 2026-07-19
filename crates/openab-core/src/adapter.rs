@@ -720,6 +720,10 @@ impl AdapterRouter {
             self.table_mode
         };
         let tool_display = self.reactions_config.tool_display;
+        // ACP streams over an append-only `agent_message_chunk`; a re-rendered tool-status
+        // prefix from `compose_display` would corrupt the deltas, so ACP streams the raw
+        // append-only answer text and surfaces tools separately (review F2 / roadmap).
+        let platform_is_acp = thread_channel.platform == "acp";
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
 
@@ -947,7 +951,8 @@ impl AdapterRouter {
                                             }
                                         }
                                     } else if let Some(tx) = &buf_tx {
-                                        let _ = tx.send(compose_display(
+                                        let _ = tx.send(display_for(
+                                            platform_is_acp,
                                             &tool_lines,
                                             &text_buf,
                                             true,
@@ -996,7 +1001,8 @@ impl AdapterRouter {
                                     }
                                     // Post+edit live update (no-op under native streaming: buf_tx is None).
                                     if let Some(tx) = &buf_tx {
-                                        let _ = tx.send(compose_display(
+                                        let _ = tx.send(display_for(
+                                            platform_is_acp,
                                             &tool_lines,
                                             &text_buf,
                                             true,
@@ -1041,7 +1047,8 @@ impl AdapterRouter {
                                         });
                                     }
                                     if let Some(tx) = &buf_tx {
-                                        let _ = tx.send(compose_display(
+                                        let _ = tx.send(display_for(
+                                            platform_is_acp,
                                             &tool_lines,
                                             &text_buf,
                                             true,
@@ -1100,7 +1107,7 @@ impl AdapterRouter {
 
                     // Build final content
                     let final_content =
-                        compose_display(&tool_lines, &text_buf, false, tool_display);
+                        display_for(platform_is_acp, &tool_lines, &text_buf, false, tool_display);
                     let final_content = if final_content.is_empty() {
                         if turn_result.is_silent_failure() {
                             warn!(
@@ -1485,6 +1492,25 @@ pub(crate) fn classify_empty_turn(
         SILENT_FAILURE_MSG.to_string()
     } else {
         "_(no response)_".to_string()
+    }
+}
+
+/// Content to stream/deliver for a reply. ACP gets the raw append-only answer `text`
+/// (its `agent_message_chunk` stream is append-only, so a re-rendered `compose_display`
+/// tool-status prefix would corrupt the deltas — review F2); tool activity is surfaced
+/// separately as structured `tool_call` updates (roadmap). Every other platform gets the
+/// tool-merged display.
+fn display_for(
+    platform_is_acp: bool,
+    tool_lines: &[ToolEntry],
+    text: &str,
+    streaming: bool,
+    tool_display: ToolDisplay,
+) -> String {
+    if platform_is_acp {
+        text.to_string()
+    } else {
+        compose_display(tool_lines, text, streaming, tool_display)
     }
 }
 
