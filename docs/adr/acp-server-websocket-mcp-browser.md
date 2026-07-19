@@ -356,3 +356,35 @@ T0 spike → T1 (server→client request direction) → T2 → **T4 (adopt the R
 → then T6 in parallel against the contract → T7. The heavy items are T1 (the direction),
 T4/T5 (tunnel + proxy), and T6 (extension). Structured `tool_call` display (base ADR §6) is
 parallel and non-blocking.
+
+### As-built (2026-07-20) — OpenAB side wired end-to-end
+
+The OpenAB (server) side is implemented on `feat/acp-mcp-browser` (compiles + unit-tested;
+live path pending the extension T6 + deploy T7). Two decisions beyond D1–D4 settled during
+implementation:
+
+- **D5 = per-session MCP server.** The pool starts one loopback Streamable-HTTP MCP proxy per
+  `acp:` session (in `openab-core/src/acp/pool.rs`, at agent spawn), constructing the
+  `ProxyHandler` with that session's `channel_id` so correlation is implicit — it binds to the
+  existing `session_key`/`channel_id` map, no in-band id. Server lifetime is tied to the
+  `AcpConnection` via a `CancellationToken` `DropGuard`, so it stops on any evict path.
+- **D6 = tunnel trait in core, impl in root.** `openab-core` defines
+  `mcp_proxy::BrowserTunnel`; the **root** binary implements it (`src/browser_tunnel.rs`)
+  by looking up the gateway's `AcpTunnelRegistry` and calling `TunnelHandle::mcp_message`.
+  This keeps `openab-core` and `openab-gateway` **sibling-independent** (no cross-crate dep),
+  mirroring the existing `ChatAdapter`/`GatewayResponse` root-glue pattern.
+
+Realised call path (all in one `openab run` process):
+
+```
+agent tools/call ─http▶ core per-session ProxyHandler (mcp_proxy.rs)
+   ─▶ BrowserTunnel (core trait) ─▶ RootBrowserTunnel (root, src/browser_tunnel.rs)
+   ─▶ gateway AcpTunnelRegistry[channel_id] ─▶ TunnelHandle::mcp_message
+   ═mcp/message═▶ extension    (only this hop leaves the pod)
+```
+
+Config injection is per-agent (`.cursor/mcp.json` merged at the session workdir, loopback +
+bearer). Static-advertise + not-connected fallback (D4) hold when no browser is attached.
+**Remaining:** T5.4 `tools/list_changed` (enhancement; static-advertise already covers the
+disconnected case), T6 extension (katashiro — see the
+[tunnel contract](../mcp-over-acp-tunnel-contract.md)), and T7 live e2e + deploy.
