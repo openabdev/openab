@@ -314,6 +314,43 @@ async def section_lifecycle():
         record("life", stop == "cancelled", "session/cancel → prompt ends stopReason:cancelled", f"got {stop!r}")
 
 
+async def section_tunnel():
+    """MCP-over-ACP tunnel producer (T5.3): declaring a `type:acp` MCP server in
+    session/new makes the gateway open a tunnel to us (a server-initiated mcp/connect
+    request); we answer and it registers the tunnel. This exercises the live read-loop
+    spawn path end-to-end (the concurrency that unit tests can't reach)."""
+    async with await try_connect(TOKEN) as ws:
+        c = Conn(ws)
+        await c.initialize()
+        r = await c.call(
+            "session/new",
+            {
+                "cwd": "/home/agent",
+                "mcpServers": [{"type": "acp", "id": "srv-smoke", "name": "browser"}],
+            },
+        )
+        sid = r.get("result", {}).get("sessionId", "")
+        record("tunnel", sid.startswith("sess_"), "session/new with a type:acp mcpServers entry is accepted")
+
+        # The gateway now issues a server-initiated mcp/connect. Wait for it.
+        connect = None
+        for _ in range(20):
+            try:
+                m = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+            except asyncio.TimeoutError:
+                break
+            if m.get("method") == "mcp/connect":
+                connect = m
+                break
+        record("tunnel", connect is not None, "gateway sends a server-initiated mcp/connect after the type:acp declaration")
+        if connect:
+            params = connect.get("params", {})
+            record("tunnel", params.get("acpId") == "srv-smoke", "mcp/connect carries the declared acpId", str(params))
+            record("tunnel", connect.get("id") is not None, "mcp/connect is a request (has an id)")
+            await ws.send(json.dumps({"jsonrpc": "2.0", "id": connect["id"], "result": {"connectionId": "conn-smoke"}}))
+            record("tunnel", True, "answered mcp/connect with a connectionId (the tunnel registers)")
+
+
 async def main() -> int:
     if not TOKEN:
         print("ERROR: OPENAB_ACP_TOKEN is required (the /acp endpoint mandates a transport token off loopback).", file=sys.stderr)
@@ -323,6 +360,7 @@ async def main() -> int:
     await section_compliance()
     await section_edges()
     await section_lifecycle()
+    await section_tunnel()
 
     total = len(results)
     passed = sum(1 for _, ok, _ in results if ok)
@@ -333,7 +371,7 @@ async def main() -> int:
         if ok:
             s[0] += 1
     print("\n" + "-" * 60, flush=True)
-    labels = {"auth": "Transport / Auth", "comp": "Protocol compliance", "edge": "Protocol edge cases", "life": "Lifecycle / transport"}
+    labels = {"auth": "Transport / Auth", "comp": "Protocol compliance", "edge": "Protocol edge cases", "life": "Lifecycle / transport", "tunnel": "MCP-over-ACP tunnel"}
     for sec, (p, t) in by_section.items():
         print(f"  {labels.get(sec, sec):22} {p}/{t}", flush=True)
     print(f"\nRESULT: {passed}/{total} checks passed", flush=True)
