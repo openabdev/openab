@@ -739,6 +739,8 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
     // `route_client_response` (inbound) and `send_request` (outbound, wired in T1.4).
     let pending_requests: Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    // Monotonic id source for server-initiated requests (mcp/connect, mcp/message).
+    let next_req_id = Arc::new(AtomicU64::new(1));
     let mut initialized = false;
 
     // Track spawned prompt tasks so we can abort on disconnect
@@ -898,8 +900,32 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                     continue;
                 }
                 let acp_mcp_servers = parse_acp_mcp_servers(req.params.as_ref());
-                let resp = handle_session_new(&sessions, id.clone(), acp_mcp_servers).await;
+                let (resp, channel_id) =
+                    handle_session_new(&sessions, id.clone(), acp_mcp_servers.clone()).await;
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+
+                // If the client declared "type":"acp" MCP servers, open + register a tunnel to
+                // each so the core MCP proxy can reach this browser. SPAWNED, not awaited
+                // inline: `establish_and_register_tunnel` awaits `mcp/connect`, whose response
+                // only THIS read loop delivers — awaiting inline would deadlock.
+                if let Some(registry) = state.acp_tunnel_registry.clone() {
+                    for srv in acp_mcp_servers {
+                        let out_tx2 = out_tx.clone();
+                        let pending2 = pending_requests.clone();
+                        let next_id2 = next_req_id.clone();
+                        let channel = channel_id.clone();
+                        let reg = registry.clone();
+                        prompt_tasks.push(tokio::spawn(async move {
+                            if let Err(e) = establish_and_register_tunnel(
+                                out_tx2, pending2, next_id2, srv.id, channel, reg, 30,
+                            )
+                            .await
+                            {
+                                warn!(error = %e, "ACP: failed to open MCP-over-ACP tunnel");
+                            }
+                        }));
+                    }
+                }
             }
             "session/resume" => {
                 if !initialized {
@@ -1043,25 +1069,31 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
         handle.abort();
     }
 
-    // Remove all sessions for this connection from the reply registry
-    if let Some(ref registry) = state.acp_reply_registry {
+    // Remove all of this connection's sessions from the reply + tunnel registries.
+    let channel_ids: Vec<String> = {
         let sessions_guard = sessions.lock().await;
-        let channel_ids: Vec<String> = sessions_guard
+        sessions_guard
             .values()
             .map(|s| s.channel_id.clone())
-            .collect();
-        drop(sessions_guard);
-
+            .collect()
+    };
+    if let Some(ref registry) = state.acp_reply_registry {
         let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         for cid in &channel_ids {
             reg.remove(cid);
         }
-        debug!(
-            connection = %connection_id,
-            sessions_cleaned = channel_ids.len(),
-            "ACP connection cleanup complete"
-        );
     }
+    if let Some(ref registry) = state.acp_tunnel_registry {
+        let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        for cid in &channel_ids {
+            reg.remove(cid);
+        }
+    }
+    debug!(
+        connection = %connection_id,
+        sessions_cleaned = channel_ids.len(),
+        "ACP connection cleanup complete"
+    );
 
     send_task.abort();
     info!(connection = %connection_id, "ACP client disconnected");
@@ -1121,11 +1153,13 @@ fn handle_initialize(req: &JsonRpcRequest) -> JsonRpcResponse {
     )
 }
 
+/// Returns the response plus the minted `channel_id`, so the caller can open the
+/// MCP-over-ACP tunnel(s) for any declared `"type":"acp"` servers under that key.
 async fn handle_session_new(
     sessions: &Arc<tokio::sync::Mutex<HashMap<String, AcpSession>>>,
     id: Value,
     acp_mcp_servers: Vec<AcpMcpServer>,
-) -> JsonRpcResponse {
+) -> (JsonRpcResponse, String) {
     // sessionId and channel_id share one uuid so channel_id is always
     // re-derivable from a persisted sessionId (see session/resume).
     let uuid = Uuid::new_v4();
@@ -1135,7 +1169,7 @@ async fn handle_session_new(
     sessions.lock().await.insert(
         session_id.clone(),
         AcpSession {
-            channel_id,
+            channel_id: channel_id.clone(),
             busy: false,
             cancel: None,
             acp_mcp_servers,
@@ -1154,7 +1188,10 @@ async fn handle_session_new(
         meta: None,
         modes: None,
     };
-    JsonRpcResponse::success(id, serde_json::to_value(&resp).unwrap())
+    (
+        JsonRpcResponse::success(id, serde_json::to_value(&resp).unwrap()),
+        channel_id,
+    )
 }
 
 /// `session/resume` — re-attach to a session the client persisted, WITHOUT
@@ -2194,7 +2231,8 @@ mod acp_handlers {
     #[tokio::test]
     async fn session_new_mints_and_stores_a_session() {
         let sessions = new_sessions();
-        let v = serde_json::to_value(handle_session_new(&sessions, json!(2), vec![]).await).unwrap();
+        let v =
+            serde_json::to_value(handle_session_new(&sessions, json!(2), vec![]).await.0).unwrap();
         let sid = v["result"]["sessionId"].as_str().unwrap();
         assert!(sid.starts_with("sess_"), "sessionId must be sess_<uuid>: {sid}");
         assert!(sessions.lock().await.contains_key(sid), "session must be stored");
@@ -2227,7 +2265,7 @@ mod acp_handlers {
         let sessions = new_sessions();
         let servers = vec![AcpMcpServer { id: "srv-1".into(), name: "browser".into() }];
         let v = serde_json::to_value(
-            handle_session_new(&sessions, json!(2), servers.clone()).await,
+            handle_session_new(&sessions, json!(2), servers.clone()).await.0,
         )
         .unwrap();
         let sid = v["result"]["sessionId"].as_str().unwrap().to_string();
