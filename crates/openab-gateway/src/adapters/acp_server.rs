@@ -21,8 +21,9 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -324,6 +325,19 @@ struct JsonRpcNotification {
     params: Value,
 }
 
+/// A SERVER-INITIATED JSON-RPC request (the agent→client REQUEST direction, T1). The base
+/// only ever *received* requests, so `JsonRpcRequest` is deserialize-only; this is the
+/// outbound counterpart used by `send_request`. Wired to a caller by T1.4 (core↔gateway
+/// bridge) / the MCP-over-ACP tunnel; landed ahead of its caller as ready infrastructure.
+#[allow(dead_code)]
+#[derive(Debug, Serialize)]
+struct JsonRpcRequestOut {
+    jsonrpc: &'static str,
+    id: u64,
+    method: String,
+    params: Value,
+}
+
 impl JsonRpcResponse {
     fn success(id: Value, result: Value) -> Self {
         Self {
@@ -406,6 +420,67 @@ pub async fn ws_upgrade(
 // ACP Connection handler
 // ---------------------------------------------------------------------------
 
+/// Route an inbound client *response* (an id-bearing frame with `result`/`error` and NO
+/// `method`) to the `send_request` awaiter registered under its id. Returns `true` when the
+/// frame was a response we consumed (so the caller must stop dispatching it as a request).
+/// Mirrors the client-side correlation in `openab-core/src/acp/connection.rs`.
+async fn route_client_response(
+    pending: &Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    raw: &Value,
+) -> bool {
+    let has_method = raw.get("method").is_some();
+    let looks_like_response = raw.get("result").is_some() || raw.get("error").is_some();
+    if has_method || !looks_like_response {
+        return false;
+    }
+    let Some(id) = raw.get("id").and_then(Value::as_u64) else {
+        return false;
+    };
+    if let Some(tx) = pending.lock().await.remove(&id) {
+        let _ = tx.send(raw.clone());
+    } else {
+        warn!(id, "acp: client response with no matching pending request");
+    }
+    true
+}
+
+/// Send a server-initiated JSON-RPC request to the connected ACP client and await its
+/// response (the agent→client REQUEST direction, T1). Mints an id, registers a oneshot in
+/// `pending`, writes the frame via the outbound channel, then awaits the correlated response
+/// (resolved by `route_client_response`) with a timeout. Wired to a caller by T1.4 (the
+/// core↔gateway MCP-over-ACP bridge); landed ahead of its caller as ready infrastructure.
+#[allow(dead_code)]
+async fn send_request(
+    out_tx: &mpsc::UnboundedSender<String>,
+    pending: &Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    next_id: &AtomicU64,
+    method: impl Into<String>,
+    params: Value,
+    timeout_secs: u64,
+) -> Result<Value, String> {
+    let id = next_id.fetch_add(1, Ordering::Relaxed);
+    let (tx, rx) = oneshot::channel();
+    pending.lock().await.insert(id, tx);
+    let frame = JsonRpcRequestOut {
+        jsonrpc: "2.0",
+        id,
+        method: method.into(),
+        params,
+    };
+    if out_tx.send(serde_json::to_string(&frame).unwrap()).is_err() {
+        pending.lock().await.remove(&id);
+        return Err("connection closed".into());
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(_)) => Err("connection closed before response".into()),
+        Err(_) => {
+            pending.lock().await.remove(&id);
+            Err("request timed out".into())
+        }
+    }
+}
+
 async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let connection_id = format!("acp_conn_{}", Uuid::new_v4());
@@ -417,6 +492,12 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
 
     // Session state for this connection
     let sessions: Arc<tokio::sync::Mutex<HashMap<String, AcpSession>>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    // Pending server-initiated requests (T1): id → oneshot for the client's response. The
+    // base had only client→server requests + server→client notifications; the MCP-over-ACP
+    // tunnel adds the server→client REQUEST direction, correlated through this map by
+    // `route_client_response` (inbound) and `send_request` (outbound, wired in T1.4).
+    let pending_requests: Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let mut initialized = false;
 
@@ -492,6 +573,15 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 let _ = out_tx.send(serde_json::to_string(&err_resp).unwrap());
                 continue;
             }
+        }
+
+        // A client *response* to a server-initiated request (T1): id present, no `method`,
+        // carries `result`/`error`. Route it to the waiting `send_request` and stop — it is
+        // neither a client request nor a notification. Gated on `!is_notification` (a
+        // notification never carries an id, so it can never be a response), keeping the
+        // existing notification/request handling below untouched.
+        if !is_notification && route_client_response(&pending_requests, &raw).await {
+            continue;
         }
 
         let req: JsonRpcRequest = match serde_json::from_value(raw) {
@@ -697,6 +787,13 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
 
         // Clean up finished tasks
         prompt_tasks.retain(|h| !h.is_finished());
+    }
+
+    // Drain any in-flight server-initiated requests: dropping each oneshot sender makes the
+    // corresponding `send_request` awaiter resolve to "connection closed before response"
+    // rather than hang until timeout. Mirrors the close-drain in openab-core connection.rs.
+    for (_id, tx) in pending_requests.lock().await.drain() {
+        drop(tx);
     }
 
     // --- Disconnect cleanup ---
@@ -1585,6 +1682,96 @@ mod acp_streaming {
 // Handler-level tests — call the real handlers (not just literal round-trips) and
 // assert their actual output + side effects.
 // ---------------------------------------------------------------------------
+#[cfg(test)]
+mod acp_requests {
+    //! T1 — the agent→client REQUEST direction: server-initiated `send_request` (mints an
+    //! id, awaits the correlated response) and inbound `route_client_response`.
+    use super::{route_client_response, send_request};
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, oneshot};
+
+    fn new_pending(
+    ) -> Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>> {
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()))
+    }
+
+    #[tokio::test]
+    async fn route_client_response_resolves_pending() {
+        let pending = new_pending();
+        let (tx, rx) = oneshot::channel();
+        pending.lock().await.insert(5, tx);
+        let consumed =
+            route_client_response(&pending, &json!({"jsonrpc":"2.0","id":5,"result":{"ok":true}}))
+                .await;
+        assert!(consumed, "an id+result frame is a response we consume");
+        assert_eq!(rx.await.unwrap()["result"]["ok"], json!(true));
+        assert!(
+            pending.lock().await.is_empty(),
+            "the pending entry must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_client_response_ignores_requests_and_notifications() {
+        let pending = new_pending();
+        // has `method` → a request, not a response
+        assert!(!route_client_response(&pending, &json!({"jsonrpc":"2.0","id":1,"method":"foo"})).await);
+        // notification-shaped, no result/error → not a response
+        assert!(!route_client_response(&pending, &json!({"jsonrpc":"2.0","method":"bar"})).await);
+        // id present but neither result nor error → not a response
+        assert!(!route_client_response(&pending, &json!({"jsonrpc":"2.0","id":2})).await);
+    }
+
+    #[tokio::test]
+    async fn route_client_response_unknown_id_consumes_without_panic() {
+        let pending = new_pending();
+        let consumed = route_client_response(
+            &pending,
+            &json!({"jsonrpc":"2.0","id":99,"error":{"code":-1,"message":"x"}}),
+        )
+        .await;
+        assert!(consumed, "an unmatched response is still consumed (logged, no panic)");
+    }
+
+    #[tokio::test]
+    async fn send_request_mints_incrementing_ids_and_returns_response() {
+        let pending = new_pending();
+        let next_id = AtomicU64::new(1);
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+
+        // Driver: read the emitted request frame, assert its shape, feed a matching response.
+        let pending2 = pending.clone();
+        let driver = tokio::spawn(async move {
+            let frame = out_rx.recv().await.unwrap();
+            let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            assert_eq!(v["jsonrpc"], json!("2.0"));
+            assert_eq!(v["id"], json!(1));
+            assert_eq!(v["method"], json!("mcp/message"));
+            assert_eq!(v["params"]["connectionId"], json!("conn-1"));
+            let id = v["id"].as_u64().unwrap();
+            route_client_response(&pending2, &json!({"jsonrpc":"2.0","id":id,"result":{"pong":true}}))
+                .await;
+        });
+
+        let resp = send_request(
+            &out_tx,
+            &pending,
+            &next_id,
+            "mcp/message",
+            json!({"connectionId":"conn-1"}),
+            5,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["pong"], json!(true));
+        driver.await.unwrap();
+        assert_eq!(next_id.load(Ordering::Relaxed), 2, "the id counter advanced");
+    }
+}
+
 #[cfg(test)]
 mod acp_handlers {
     use super::{
