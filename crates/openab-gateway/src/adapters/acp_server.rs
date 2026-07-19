@@ -63,6 +63,13 @@ fn subprotocol_token(headers: &axum::http::HeaderMap) -> Option<&str> {
         })
 }
 
+/// RFC 6455 subprotocol values must be RFC 7230 `token`s. `tchar` = ALPHA / DIGIT /
+/// `!#$%&'*+-.^_`|~`. A key with any char outside this set (e.g. base64 `/` or `=`)
+/// cannot ride the `openab.bearer.<token>` subprotocol on a strict browser handshake.
+fn is_ws_subprotocol_token_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
 // ---------------------------------------------------------------------------
 // ACP Configuration
 // ---------------------------------------------------------------------------
@@ -83,11 +90,19 @@ impl AcpConfig {
         let auth_key = std::env::var("OPENAB_ACP_AUTH_KEY")
             .ok()
             .filter(|k| !k.is_empty());
-        if auth_key.is_none() {
-            warn!(
+        match auth_key {
+            None => warn!(
                 "OPENAB_ACP_AUTH_KEY not set — /acp is only served on a loopback bind; a \
                  non-loopback bind will refuse to mount it (set a key to expose it)"
-            );
+            ),
+            Some(ref key) if !key.bytes().all(is_ws_subprotocol_token_char) => warn!(
+                "OPENAB_ACP_AUTH_KEY contains characters outside the WebSocket subprotocol \
+                 token set (RFC 6455) — a browser passing it via `Sec-WebSocket-Protocol: \
+                 openab.bearer.<token>` may fail the handshake (base64 `/` and `=` padding \
+                 are the usual offenders). Prefer a key in [A-Za-z0-9._~+-]; the \
+                 `Authorization: Bearer` and `?token=` paths are unaffected"
+            ),
+            Some(_) => {}
         }
         Some(Self { auth_key })
     }
@@ -204,10 +219,21 @@ pub enum ReplyChunk {
     Done,
 }
 
-/// Registry of active ACP sessions: channel_id → reply sender.
+/// One active turn's reply sink plus the originating `GatewayEvent` id used to fence
+/// stale replies. After a prompt times out / is cancelled, the next prompt on the same
+/// session reuses the same deterministic `channel_id`; a late reply from the superseded
+/// turn carries that turn's `evt_<uuid>` in `GatewayReply.reply_to`, so matching it
+/// against `turn_id` drops it instead of mis-delivering into the new prompt's stream.
+pub struct ReplySink {
+    /// Originating `GatewayEvent.event_id` (`evt_<uuid>`), round-tripped as `reply_to`.
+    pub turn_id: String,
+    pub tx: mpsc::UnboundedSender<ReplyChunk>,
+}
+
+/// Registry of active ACP sessions: channel_id → reply sink.
 /// Uses std::sync::Mutex because all operations are fast CPU-bound
 /// (insert/remove/get) and never hold the lock across .await.
-pub type AcpReplyRegistry = Arc<std::sync::Mutex<HashMap<String, mpsc::UnboundedSender<ReplyChunk>>>>;
+pub type AcpReplyRegistry = Arc<std::sync::Mutex<HashMap<String, ReplySink>>>;
 
 pub fn new_reply_registry() -> AcpReplyRegistry {
     Arc::new(std::sync::Mutex::new(HashMap::new()))
@@ -723,7 +749,18 @@ async fn handle_session_resume(
         }
     };
 
-    sessions.lock().await.insert(
+    let mut guard = sessions.lock().await;
+    // Same per-connection cap as session/new: resume must not be an unbounded insert
+    // path (a client can mint unlimited valid `sess_<uuid>`). An already-present key is
+    // exempt so re-resuming an existing session stays idempotent.
+    if !guard.contains_key(&session_id) && guard.len() >= MAX_SESSIONS_PER_CONNECTION {
+        return JsonRpcResponse::error(
+            id,
+            ACP_OVERLOADED,
+            format!("Too many sessions on this connection (max {MAX_SESSIONS_PER_CONNECTION})"),
+        );
+    }
+    guard.insert(
         session_id.clone(),
         AcpSession {
             channel_id,
@@ -731,6 +768,7 @@ async fn handle_session_resume(
             cancel: None,
         },
     );
+    drop(guard);
 
     debug!(session = %session_id, "ACP session resumed");
 
@@ -800,16 +838,8 @@ async fn handle_session_prompt(
         }
     };
 
-    // Create reply channel for this prompt and register it
-    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<ReplyChunk>();
-    if let Some(ref registry) = state.acp_reply_registry {
-        registry
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(channel_id.clone(), reply_tx);
-    }
-
-    // Convert to GatewayEvent and dispatch
+    // Convert to GatewayEvent and dispatch. Build it first so its `event_id` can fence
+    // this turn's replies (round-tripped as `GatewayReply.reply_to`).
     let event = GatewayEvent::new(
         "acp",
         ChannelInfo {
@@ -827,6 +857,17 @@ async fn handle_session_prompt(
         &format!("acpmsg_{}", Uuid::new_v4()),
         Vec::new(),
     );
+    let turn_id = event.event_id.clone();
+
+    // Create reply channel for this prompt and register it, keyed by channel_id with the
+    // turn's event id so `handle_reply` can drop a stale reply after timeout/cancel reuse.
+    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<ReplyChunk>();
+    if let Some(ref registry) = state.acp_reply_registry {
+        registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(channel_id.clone(), ReplySink { turn_id, tx: reply_tx });
+    }
 
     // Send event through the broadcast channel
     match serde_json::to_string(&event) {
@@ -1018,7 +1059,17 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
     let tx = {
         let map = registry.lock().unwrap_or_else(|e| e.into_inner());
         match map.get(key) {
-            Some(tx) => tx.clone(),
+            // Fence stale replies: after a timeout/cancel the channel_id is reused by the
+            // next turn. A late reply carries the previous turn's `evt_<uuid>` in
+            // `reply_to`; deliver only when it matches the active turn. Empty `reply_to`
+            // (no origin id) fails open so legit traffic is never dropped.
+            Some(sink) if reply.reply_to.is_empty() || reply.reply_to == sink.turn_id => {
+                sink.tx.clone()
+            }
+            Some(_) => {
+                debug!(channel = key, "ACP dropping stale reply from a superseded turn");
+                return;
+            }
             None => return,
         }
     };
@@ -1466,5 +1517,103 @@ mod acp_handlers {
         )
         .unwrap();
         assert_eq!(v["error"]["code"], json!(-32602));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Group-review fixes (M1 resume cap / M2 stale-reply fence / subprotocol charset).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod acp_review_fixes {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    fn sessions_map() -> Arc<tokio::sync::Mutex<HashMap<String, AcpSession>>> {
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()))
+    }
+
+    // M1 — session/resume enforces the same per-connection cap as session/new, so a
+    // client cannot grow the map without bound by resuming arbitrary `sess_<uuid>`.
+    #[tokio::test]
+    async fn resume_enforces_session_cap() {
+        let sessions = sessions_map();
+        let mut ids = Vec::new();
+        for _ in 0..MAX_SESSIONS_PER_CONNECTION {
+            let sid = format!("sess_{}", Uuid::new_v4());
+            let p = json!({ "sessionId": sid });
+            let v = serde_json::to_value(handle_session_resume(&sessions, json!(1), Some(&p)).await)
+                .unwrap();
+            assert_eq!(v["result"], json!({}), "resume under cap should succeed");
+            ids.push(sid);
+        }
+        assert_eq!(sessions.lock().await.len(), MAX_SESSIONS_PER_CONNECTION);
+        // A new distinct session over the cap is refused with ACP_OVERLOADED.
+        let over = json!({ "sessionId": format!("sess_{}", Uuid::new_v4()) });
+        let v = serde_json::to_value(handle_session_resume(&sessions, json!(2), Some(&over)).await)
+            .unwrap();
+        assert_eq!(v["error"]["code"], json!(ACP_OVERLOADED), "over-cap resume must be refused");
+        // Re-resuming an already-present session is exempt (idempotent).
+        let existing = json!({ "sessionId": ids[0] });
+        let v =
+            serde_json::to_value(handle_session_resume(&sessions, json!(3), Some(&existing)).await)
+                .unwrap();
+        assert_eq!(v["result"], json!({}), "re-resume of existing session must bypass the cap");
+    }
+
+    fn reply(channel_id: &str, reply_to: &str, text: &str, command: Option<&str>) -> GatewayReply {
+        GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: reply_to.into(),
+            platform: "acp".into(),
+            channel: crate::schema::ReplyChannel { id: channel_id.into(), thread_id: None },
+            content: crate::schema::Content {
+                content_type: "text".into(),
+                text: text.into(),
+                attachments: Vec::new(),
+            },
+            command: command.map(|c| c.into()),
+            request_id: None,
+            quote_message_id: None,
+        }
+    }
+
+    // M2 — a late reply carrying a superseded turn's event id is dropped, not delivered
+    // into the current turn's stream; a reply matching the active turn is delivered.
+    #[tokio::test]
+    async fn handle_reply_fences_stale_turn() {
+        let registry = new_reply_registry();
+        let (tx, mut rx) = mpsc::unbounded_channel::<ReplyChunk>();
+        registry
+            .lock()
+            .unwrap()
+            .insert("acp_chan".into(), ReplySink { turn_id: "evt_current".into(), tx });
+
+        // Stale reply (previous turn's event id) → dropped.
+        handle_reply(&reply("acp_chan", "evt_stale", "leaked", Some("edit_message")), &registry)
+            .await;
+        assert!(rx.try_recv().is_err(), "stale reply must not reach the active turn");
+
+        // Matching reply → delivered.
+        handle_reply(&reply("acp_chan", "evt_current", "hello", Some("edit_message")), &registry)
+            .await;
+        match rx.try_recv() {
+            Ok(ReplyChunk::Text(t)) => assert_eq!(t, "hello"),
+            _ => panic!("expected the matching reply to be delivered"),
+        }
+    }
+
+    // subprotocol charset (n1) — base64 `/` and `=` are not RFC 6455 token chars; the
+    // recommended `[A-Za-z0-9._~+-]` set (plus other tchars) is.
+    #[test]
+    fn ws_subprotocol_token_charset() {
+        for &b in b"AZaz09._~+-!#$%&'*^`|" {
+            assert!(is_ws_subprotocol_token_char(b), "{} should be token-safe", b as char);
+        }
+        for &b in b"=/,; @\"" {
+            assert!(!is_ws_subprotocol_token_char(b), "{} should be rejected", b as char);
+        }
     }
 }

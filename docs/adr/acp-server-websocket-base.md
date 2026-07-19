@@ -102,6 +102,26 @@ all `false` in the base (text only). `protocolVersion` is the integer `1`.
   `cancelled`. A backend timeout has no ACP stopReason, so it returns a JSON-RPC
   error (`-32603`) instead.
 
+### Concurrency, caps & reply fencing
+
+- **Per-connection caps** — `MAX_SESSIONS_PER_CONNECTION` (128) and
+  `MAX_INFLIGHT_PROMPTS` (32) bound one connection's growth; overflow returns `-32000`
+  (`ACP_OVERLOADED`). The session cap is enforced on **both** `session/new` and
+  `session/resume` — resume is not an unbounded insert path (a client can mint unlimited
+  well-formed `sess_<uuid>`).
+- **Stale-reply fencing** — after a prompt times out or is cancelled, the next prompt on
+  the same session reuses the same deterministic `channel_id`. Each turn registers its
+  reply sink under the originating `GatewayEvent` id (`evt_<uuid>`, round-tripped as
+  `GatewayReply.reply_to`); `handle_reply` drops a reply whose `reply_to` no longer
+  matches the active turn, so a late reply from the superseded turn cannot leak into the
+  new prompt's stream.
+- **Backend work is not yet cancelled** — the inflight cap counts *gateway* stream tasks,
+  not downstream agent work. A timed-out / cancelled turn keeps running on the backend
+  until it finishes on its own; a `prompt → cancel` loop can therefore queue backend work
+  beyond the 32 cap. Bounding this needs true agent→core cancel propagation — tracked as a
+  follow-up, not addressed in the base (the fence above still prevents its late output from
+  corrupting a later turn).
+
 ### Session ↔ core mapping
 
 - `sessionId = sess_<uuid>` and `channel_id = acp_<uuid>` share one uuid, so

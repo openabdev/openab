@@ -701,7 +701,15 @@ impl AdapterRouter {
         let adapter = adapter.clone();
         let thread_channel = thread_channel.clone();
         let message_limit = reply_message_limit(&thread_channel.platform, adapter.message_limit());
-        let streaming = adapter.use_streaming(other_bot_present);
+        // ACP must not inherit the unified adapter's Telegram streaming flag (wrong
+        // coupling): it streams append-only `agent_message_chunk` deltas built from the
+        // post+edit (`edit_message` snapshot) path, i.e. streaming=false. Decide it
+        // explicitly by platform rather than by whatever Telegram happens to be set to.
+        let streaming = if thread_channel.platform == "acp" {
+            false
+        } else {
+            adapter.use_streaming(other_bot_present)
+        };
         // Keep the full turn text (incl. inter-tool narration) when streaming
         // (it was already shown live) OR when `[reactions] narration_display` is
         // set. Otherwise a send-once turn delivers only the final answer block.

@@ -137,6 +137,13 @@ fn has_unified_platform(cfg: &config::Config) -> bool {
                 .unwrap_or_default()
                 .resolve()
                 .enabled)
+        // ACP is a first-class embedded endpoint: an ACP-only deploy (no discord/slack/
+        // gateway/telegram) must not trip the "no adapter configured" preflight bail and
+        // must start the embedded HTTP server that hosts /acp.
+        || (cfg!(feature = "acp")
+            && std::env::var("OPENAB_ACP_ENABLED")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false))
 }
 
 /// Returns true when the first-class `[wecom]` section resolves all credentials
