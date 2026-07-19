@@ -1716,10 +1716,7 @@ mod tests {
 
     #[test]
     fn auth_subcommand_per_namespace() {
-        assert_eq!(
-            auth_subcommand(XAI_NAMESPACE),
-            "openab-agent auth xai"
-        );
+        assert_eq!(auth_subcommand(XAI_NAMESPACE), "openab-agent auth xai");
         assert_eq!(
             auth_subcommand(ANTHROPIC_NAMESPACE),
             "openab-agent auth anthropic-oauth"
