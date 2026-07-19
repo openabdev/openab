@@ -62,6 +62,8 @@ pub struct AppState {
     pub acp: Option<adapters::acp_server::AcpConfig>,
     #[cfg(feature = "acp")]
     pub acp_reply_registry: Option<adapters::acp_server::AcpReplyRegistry>,
+    #[cfg(feature = "acp")]
+    pub acp_tunnel_registry: Option<adapters::acp_server::AcpTunnelRegistry>,
     pub ws_token: Option<String>,
     pub event_tx: broadcast::Sender<String>,
     pub reply_token_cache: ReplyTokenCache,
@@ -105,6 +107,8 @@ impl AppState {
             acp: None,
             #[cfg(feature = "acp")]
             acp_reply_registry: None,
+            #[cfg(feature = "acp")]
+            acp_tunnel_registry: None,
             ws_token: None,
             event_tx,
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -182,6 +186,8 @@ impl AppState {
         let acp = adapters::acp_server::AcpConfig::from_env();
         #[cfg(feature = "acp")]
         let acp_reply_registry = acp.as_ref().map(|_| adapters::acp_server::new_reply_registry());
+        #[cfg(feature = "acp")]
+        let acp_tunnel_registry = acp.as_ref().map(|_| adapters::acp_server::new_tunnel_registry());
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -212,6 +218,8 @@ impl AppState {
             acp,
             #[cfg(feature = "acp")]
             acp_reply_registry,
+            #[cfg(feature = "acp")]
+            acp_tunnel_registry,
             ws_token,
             event_tx,
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -695,6 +703,10 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     let acp_reply_registry = acp
         .as_ref()
         .map(|_| adapters::acp_server::new_reply_registry());
+    #[cfg(feature = "acp")]
+    let acp_tunnel_registry = acp
+        .as_ref()
+        .map(|_| adapters::acp_server::new_tunnel_registry());
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -729,6 +741,8 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         acp,
         #[cfg(feature = "acp")]
         acp_reply_registry,
+        #[cfg(feature = "acp")]
+        acp_tunnel_registry,
         ws_token,
         event_tx,
         reply_token_cache,
