@@ -29,29 +29,47 @@ env = { OPENAB_AGENT_OPENAI_MODEL = "gpt-5.4-mini" }
 
 ### Configuration file (config.json)
 
-A small JSON file next to `auth.json` (default `<auth dir>/config.json`,
-overridable with `OPENAB_CONFIG_PATH`) declares the default model and params, so
-a deployment can set them in a file instead of only via env vars. **Secrets never
-go here** — credentials stay in the locked `auth.json` store.
+A small **valid JSON** file next to `auth.json` declares the default model and
+parameters, so a deployment can set them in a file instead of only via
+environment variables. The default path is `$HOME/.openab/agent/config.json`
+(`/home/agent/.openab/agent/config.json` for the `agent` user). Set
+`OPENAB_CONFIG_PATH` to override the whole path. **Secrets never go here** —
+credentials stay in the locked `auth.json` store.
 
-```jsonc
+For example, an xAI deployment can use:
+
+```json
 {
-  "model": "anthropic/claude-sonnet-4-6",  // single provider/model string
-  "max_tokens": 8192                         // optional
+  "model": "xai/grok-4.5",
+  "max_tokens": 8192
 }
 ```
 
-Resolution is **env-over-config**: `OPENAB_AGENT_MODEL` / `OPENAB_AGENT_MAX_TOKENS`
-override the file, so a pod's injected env stays authoritative over a baked
-config. A missing file is fine (empty config); a malformed file is logged and
-ignored (the agent then falls back to env / built-in defaults). Unknown keys are
-tolerated for forward-compatibility.
+The supported fields are `model` (a `provider/model` string) and `max_tokens`.
+A missing file is fine (empty config); malformed JSON is logged and ignored, so
+the agent falls back to environment variables and built-in defaults. Unknown
+keys are tolerated for forward compatibility.
+
+Provider selection and value precedence are separate but related:
+
+1. `OPENAB_AGENT_PROVIDER` explicitly selects `anthropic`, `openai`, `codex`,
+   `xai`, or `grok`.
+2. Otherwise, a provider prefix in `OPENAB_AGENT_MODEL` wins (for example,
+   `xai/grok-4.5`).
+3. Otherwise, a provider prefix in `config.json`'s `model` is used.
+4. With no explicit provider, auto-detection remains Anthropic → Codex;
+   xAI is **not** selected merely because an `xai-oauth` token exists.
+
+`OPENAB_AGENT_MODEL` and `OPENAB_AGENT_MAX_TOKENS` override their config-file
+values, so environment variables injected into a pod remain authoritative.
+`OPENAB_AGENT_XAI_MODEL` controls the xAI model after xAI has been selected; it
+does not by itself enable xAI auto-detection.
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OPENAB_AGENT_MODEL` | — (required for Anthropic) | Anthropic model id, optionally `provider/`-qualified (e.g. `claude-opus-4-8`, `anthropic/claude-opus-4-8`). No hardcoded default — dateless 4.6+ IDs are fixed canonical IDs that retire each generation, so the agent fails loud if unset rather than pin a model that will eventually 404. Overrides `model` in [config.json](#configuration-file-configjson). |
+| `OPENAB_AGENT_MODEL` | — (required for Anthropic) | Model to use, optionally `provider/`-qualified (for example, `anthropic/claude-opus-4-8` or `xai/grok-4.5`). Anthropic has no hardcoded default and fails loud if unset; xAI falls back to `grok-4.5`. Overrides `model` in [config.json](#configuration-file-configjson). |
 | `OPENAB_AGENT_OPENAI_MODEL` | `gpt-5.4-mini` | Model to use (must be supported by your ChatGPT plan — see [Supported Models](#supported-models-chatgpt-subscription)) |
 | `OPENAB_AGENT_OPENAI_BASE_URL` | `https://chatgpt.com/backend-api` | API base URL |
 | `OPENAB_AGENT_XAI_MODEL` | `grok-4.5` | xAI model to use (see [xAI credentials](#xai-credentials-supergrok--x-premium)) |
@@ -128,10 +146,33 @@ openab-agent auth xai-device
 ```
 
 Prints a user code and an `https://auth.x.ai/...` verification link (prefilled
-when the server provides one). Tokens are stored under the `xai-oauth` tenant in
-`auth.json` and refreshed automatically. Select the provider with
-`OPENAB_AGENT_PROVIDER=xai` or a `xai/`-prefixed model (e.g.
-`OPENAB_AGENT_MODEL=xai/grok-4.5`); xAI is not part of auto-detection.
+when the server provides one). Tokens are stored under the `xai-oauth` namespace
+in `auth.json` and refreshed automatically. The default auth file is
+`$HOME/.openab/agent/auth.json`; run `openab-agent auth status` to list each
+stored provider, a masked token, and its expiry without printing secrets.
+
+Select xAI explicitly with `OPENAB_AGENT_PROVIDER=xai` (or `grok`) or a
+`xai/`- or `grok/`-prefixed model, for example:
+
+```bash
+OPENAB_AGENT_PROVIDER=xai openab-agent
+# or use model/config selection:
+OPENAB_AGENT_MODEL=xai/grok-4.5 openab-agent
+```
+
+A config file can make that selection persistent:
+
+```json
+{
+  "model": "xai/grok-4.5",
+  "max_tokens": 8192
+}
+```
+
+xAI is not part of auto-detection: an `xai-oauth` entry by itself does not make
+the agent choose xAI. `OPENAB_AGENT_XAI_MODEL` controls the model after xAI has
+been selected; it does not enable xAI selection on its own. The OAuth token and
+refresh token stay in `auth.json`, never in `config.json`.
 
 ### Adding an OAuth vendor
 
@@ -147,13 +188,13 @@ Place an `AGENTS.md` file in the working directory (`cwd`). It will be prepended
 ```
 /home/agent/
 ├── AGENTS.md        ← read at session start
-├── .openab/
-│   └── agent/
-│       └── auth.json
-│   └── skills/      ← skill directories
-│       └── my-skill/
-│           └── SKILL.md
-└── (your project files)
+└── .openab/
+    └── agent/
+        ├── config.json  ← optional model/provider defaults
+        ├── auth.json    ← OAuth credentials; permissions should remain private
+        └── skills/      ← skill directories
+            └── my-skill/
+                └── SKILL.md
 ```
 
 ## Skills
