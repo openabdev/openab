@@ -150,16 +150,21 @@ For an ACP adapter change, use a minimal bidirectional JSON-RPC client to exerci
 
 ### WebSocket transport (`/acp`)
 
-OpenAB also serves ACP over a WebSocket (`GET /acp`, feature `acp` + `OPENAB_ACP_ENABLED`) — the upstream client↔gateway hop, distinct from the downstream stdio hop below. `scripts/acp-ws-smoke.py` is a ready-to-run client for it: it drives `initialize → session/new → session/prompt` (stream + `stopReason`) `→ session/resume`, and confirms OpenAB slash-command replies (`/model`, `/reset`) render back over ACP. It needs a live deployment (the prompt turns hit the real model).
+OpenAB also serves ACP over a WebSocket (`GET /acp`, feature `acp` + `OPENAB_ACP_ENABLED`) — the upstream client↔gateway hop, distinct from the downstream stdio hop below. `scripts/acp-ws-smoke.py` is a ready-to-run **conformance suite** for it that prints an item-by-item report (paste it into the PR as evidence), in three groups:
+
+- **Transport / Auth** — a transport token is required off loopback: no-token and wrong-token connections are rejected, the valid token is accepted.
+- **Protocol compliance** — JSON-RPC envelope + ACP wire shapes: initialize negotiation, `session/new` / `session/prompt` (streamed `session/update` `agent_message_chunk` + snake_case `stopReason`) / `session/resume`.
+- **Protocol edge cases** — version negotiation & rejects (`-32602`), required-param validation, not-initialized (`-32002`), bad JSON-RPC version (`-32600`), content-block policy (`resource_link` accepted, gated `image` rejected), notification silence, oversized-reply whole delivery, and Unicode/emoji stream integrity.
+
+It needs a live deployment (prompt turns hit the real model) and a transport token.
 
 ```bash
-# default ws://localhost:8080/acp; pass another URL as $1
-uv run scripts/acp-ws-smoke.py ws://<host>:8080/acp
-# if the endpoint sets OPENAB_ACP_AUTH_KEY:
+# WS_URL defaults to ws://localhost:8080/acp; pass another URL as $1.
+# OPENAB_ACP_TOKEN is MANDATORY — the endpoint requires a transport key off loopback.
 OPENAB_ACP_TOKEN=<key> uv run scripts/acp-ws-smoke.py ws://<host>:8080/acp
 ```
 
-Exits non-zero unless all checks pass. For the in-repo `cargo test` counterpart (offline wire-conformance of the same payloads against the generated types), see the `acp_conformance` module in `crates/openab-gateway/src/adapters/acp_server.rs`.
+Exits non-zero unless every check passes. For the in-repo `cargo test` counterpart (offline wire-conformance + handler-level + streaming tests), see the `acp_conformance`, `acp_handlers`, and `acp_streaming` modules in `crates/openab-gateway/src/adapters/acp_server.rs`.
 
 ### Transport Method
 
