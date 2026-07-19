@@ -145,8 +145,6 @@ device; ideal for pods via `kubectl exec`):
 openab-agent auth xai
 ```
 
-The legacy `auth xai-device` spelling remains accepted as a compatibility alias.
-
 Prints a user code and an `https://auth.x.ai/...` verification link (prefilled
 when the server provides one). Tokens are stored under the `xai-oauth` namespace
 in `auth.json` and refreshed automatically. The default auth file is

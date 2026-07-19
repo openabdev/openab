@@ -94,7 +94,6 @@ enum AuthProvider {
         no_browser: bool,
     },
     /// xAI SuperGrok / X Premium via device code (RFC 8628, headless-friendly)
-    #[command(visible_alias = "xai-device")]
     Xai,
     /// Show stored credentials
     Status,
@@ -169,15 +168,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn xai_auth_accepts_canonical_and_legacy_alias() {
-        for name in ["xai", "xai-device"] {
-            let cli = Cli::try_parse_from(["openab-agent", "auth", name]).unwrap();
-            assert!(matches!(
-                cli.command,
-                Some(Commands::Auth {
-                    provider: AuthProvider::Xai
-                })
-            ));
-        }
+    fn xai_auth_accepts_canonical_command() {
+        let cli = Cli::try_parse_from(["openab-agent", "auth", "xai"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Auth {
+                provider: AuthProvider::Xai
+            })
+        ));
     }
 }
