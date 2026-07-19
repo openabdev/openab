@@ -9,6 +9,8 @@ mod ctl;
     feature = "acp",
 ))]
 mod unified_adapter;
+#[cfg(feature = "acp")]
+mod browser_tunnel;
 use openab_core::acp;
 use openab_core::adapter::{self, AdapterRouter};
 use openab_core::bot_turns;
@@ -377,14 +379,24 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown_hook = cfg.hooks.pre_shutdown.clone();
 
-    let pool = Arc::new(acp::SessionPool::new(
+    // Shared MCP-over-ACP tunnel registry (D6-a'): the gateway populates it per browser
+    // session; the core MCP proxy reads it via the RootBrowserTunnel bridge below.
+    #[cfg(feature = "acp")]
+    let acp_tunnel_registry = openab_gateway::adapters::acp_server::new_tunnel_registry();
+
+    let pool_inner = acp::SessionPool::new(
         cfg.agent,
         cfg.pool.max_sessions,
         cfg.pool
             .prompt_hard_timeout_secs
             .saturating_add(cfg.pool.hung_grace_secs),
         cfg.pool.default_config_options,
-    ));
+    );
+    #[cfg(feature = "acp")]
+    let pool_inner = pool_inner.with_browser_tunnel(Some(Arc::new(
+        browser_tunnel::RootBrowserTunnel::new(acp_tunnel_registry.clone()),
+    )));
+    let pool = Arc::new(pool_inner);
     let ttl_secs = cfg.pool.session_ttl_hours * 3600;
 
     // Resolve STT config (auto-detect GROQ_API_KEY from env)
@@ -956,6 +968,12 @@ async fn main() -> anyhow::Result<()> {
 
             // Build gateway AppState from env vars (shared factory with standalone gateway)
             let mut gw_state_inner = openab_gateway::AppState::from_env(event_tx.clone(), None);
+            // Share the tunnel registry the core MCP proxy reads (D6-a'), so the gateway
+            // populates the same map the RootBrowserTunnel bridge looks up.
+            #[cfg(feature = "acp")]
+            {
+                gw_state_inner.acp_tunnel_registry = Some(acp_tunnel_registry.clone());
+            }
 
 
             // First-class `[telegram]` config overrides env-derived values
