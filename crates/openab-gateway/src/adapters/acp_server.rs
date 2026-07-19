@@ -712,6 +712,9 @@ async fn establish_and_register_tunnel(
     registry: AcpTunnelRegistry,
     timeout_secs: u64,
 ) -> Result<(), String> {
+    // Observability: reaching here means the client DID declare a "type":"acp" server, so this
+    // line in the log answers "did the browser extension advertise itself?" for a live session.
+    info!(acp_id = %acp_id, channel_id = %channel_id, "ACP: opening MCP-over-ACP browser tunnel");
     let connection_id = mcp_connect(&out_tx, &pending, &next_id, &acp_id, timeout_secs).await?;
     let handle = TunnelHandle {
         out_tx,
@@ -722,7 +725,8 @@ async fn establish_and_register_tunnel(
     registry
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(channel_id, handle);
+        .insert(channel_id.clone(), handle);
+    info!(channel_id = %channel_id, "ACP: browser tunnel registered — extension attached");
     Ok(())
 }
 
