@@ -102,3 +102,87 @@ perceive→act tool loop), but generalized: (a) targets the **user's real Chrome
 logged-in), not a sandbox; (b) action surface is **extension-defined MCP tools**
 (DOM-semantic or screenshot), not a model-specific tool; (c) **model-agnostic** — any
 MCP-capable agent can use it.
+
+## 7. Implementation blueprint (task breakdown)
+
+North-star = the agent's LLM autonomously operating the user's browser via MCP tools
+tunnelled over `/acp`. The base (PR that revives #1260) ships the 1:1 chat surface and the
+**generated v1 wire types** (`acp_schema`, already committed) — one of the four critical-
+path items is therefore done. What remains splits cleanly into an **OpenAB (server) side**
+and an **extension (client) side**, meeting at a single **MCP-over-ACP wire contract** (T4)
+so the two can proceed largely in parallel once that contract is fixed.
+
+### Findings that reshape the work
+- The **agent→client REQUEST direction already exists on the downstream hop**:
+  `openab-core/src/acp/connection.rs` receives `session/request_permission` from the agent
+  and currently **auto-replies** it (~L252). So T1 is not green-field — it is *relaying*
+  those downstream requests up to the `/acp` client (and the response back) instead of
+  auto-answering them.
+- `session/new` / `session/resume` currently send `mcpServers: []` (connection.rs L567/784).
+  Giving the agent browser tools = **injecting a core-side proxy MCP server** into that list
+  (T5) that tunnels `tools/*` to the extension.
+
+### Ownership
+- **OpenAB side** (`feat/acp-mcp-browser`): T1, T2, T4 (contract + core routing), T5.
+- **Extension side** (katashiro): T6; plus the client halves of T3 (respond to
+  `request_permission`) and T4 (serve MCP over the tunnel).
+- **Both**: T7.
+
+### Tasks
+
+**T0 — Spike (do first; de-risks everything).** PoC: give `cursor-agent` a non-empty
+`mcpServers` pointing at a mock MCP server and confirm the LLM actually discovers
+(`tools/list`) and calls (`tools/call`) a tool; confirm a downstream agent→client request
+can be relayed and answered. If this doesn't hold, the browser goal needs a different path.
+
+**T1 — agent→client REQUEST direction (relay).**
+- 1.1 Decide to relay downstream requests (`request_permission`, later MCP) to the `/acp`
+  client instead of auto-replying; enumerate the relayed methods.
+- 1.2 Gateway outbound request path: `acp_server` sends an agent-initiated REQUEST
+  (method + id) to the client and keeps a pending-response map (`id → oneshot`).
+- 1.3 Read loop distinguishes an inbound **client response** (`id` + `result`/`error`, no
+  `method`) from a client request, and routes responses to the pending map.
+- 1.4 core↔gateway bridge: relay the downstream request up + the client's response back
+  down to the agent.
+- 1.5 Round-trip tests (agent request → client → response → agent).
+
+**T2 — migrate `acp_server` to generated typed wire (bidirectional surface).**
+- 2.1 Construct response payloads from `acp_schema` types (the deferred construction
+  migration). 2.2 Type the new bidirectional messages (`request_permission`, MCP tunnel).
+  2.3 Round-trip validate against real traffic (ACP trace mode).
+
+**T3 — `session/request_permission` end-to-end.** Largely the first concrete case of T1
+(relay the request, extension consent UX, relay the response) — folds into T1, not a
+separate large task.
+
+**T4 — MCP-over-ACP tunnel framing.**
+- 4.1 Fix the **wire contract**: how MCP JSON-RPC (`tools/list` / `tools/call` / results)
+  is multiplexed over `/acp` (method namespace, e.g. `_mcp/*`; request/response
+  correlation; framing). 4.2 Gateway routes MCP-namespaced messages between the `/acp`
+  client and core. 4.3 Contract doc (the spec the extension implements). 4.4 Mock-MCP-
+  client-over-tunnel tests.
+
+**T5 — OpenAB core = MCP proxy/aggregator.**
+- 5.1 A core-side local MCP server (proxy) the agent connects to via `mcpServers`.
+- 5.2 Inject that proxy into the downstream `mcpServers` (currently `[]`).
+- 5.3 The proxy acts as an MCP *client* to the extension over the upstream tunnel.
+- 5.4 Tool-call routing (agent → proxy → tunnel → extension → result → agent).
+- 5.5 `rmcp` wiring (already used by `openab-agent`) + tests.
+
+**T6 — extension = MCP server + browser tools** (katashiro).
+- 6.1 MCP server role over the outbound `/acp` WS (`tools/list` / `tools/call`).
+- 6.2 DOM-semantic tools: `click(selector)` / `read_dom`(snapshot) / `navigate` /
+  `screenshot` / `type(selector, text)`. 6.3 Execute in the active tab
+  (`chrome.scripting` / content script + permissions). 6.4 Consent UX for
+  `request_permission`. 6.5 Tests.
+
+**T7 — integration + e2e + deploy.**
+- 7.1 Full loop: `tools/list` → LLM calls `browser.click` → extension executes → result →
+  LLM continues. 7.2 A browser-loop e2e (extend `scripts/acp-ws-smoke.py`).
+  7.3 Rebuild + redeploy Falcon. 7.4 Finalize this ADR.
+
+### Suggested order
+T0 spike → T1 (+ T3 as its first case) → T2 → **T4 (fix the wire contract)** → T5 → then
+T6 in parallel against the contract → T7. The heavy items are T1 (the direction), T4/T5
+(tunnel + proxy), and T6 (extension). Structured `tool_call` display (base ADR §6) is
+parallel and non-blocking.
