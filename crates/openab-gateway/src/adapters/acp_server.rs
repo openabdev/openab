@@ -36,7 +36,7 @@ const ACP_PROTOCOL_VERSION: u32 = 1;
 /// eviction, and global connection/worker limits are a follow-up (review F6, roadmap).
 const MAX_SESSIONS_PER_CONNECTION: usize = 128;
 const MAX_INFLIGHT_PROMPTS: usize = 32;
-const MAX_FRAME_BYTES: usize = 1 << 20; // 1 MiB per inbound JSON-RPC frame
+const MAX_FRAME_BYTES: usize = 8 << 20; // 8 MiB — browser-tool results (e.g. screenshots) exceed 1 MiB
 /// JSON-RPC implementation-defined server error for a hit resource cap.
 const ACP_OVERLOADED: i32 = -32000;
 
