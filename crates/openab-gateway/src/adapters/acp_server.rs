@@ -730,6 +730,47 @@ async fn establish_and_register_tunnel(
     Ok(())
 }
 
+/// Open + register the browser tunnel for a session's declared `type:acp` servers.
+///
+/// Exactly ONE tunnel per session is supported: the core proxy resolves a browser by
+/// `channel_id`, so registering a second server under the same `channel_id` would overwrite
+/// the first in the registry and orphan its already-opened tunnel. We therefore establish only
+/// the first declared server and warn if the client sent more. Spawned (not awaited inline)
+/// because `establish_and_register_tunnel` awaits the client's `mcp/connect` response, which
+/// only the read loop delivers — awaiting inline would deadlock.
+#[allow(clippy::too_many_arguments)]
+fn spawn_browser_tunnel(
+    servers: Vec<AcpMcpServer>,
+    channel_id: String,
+    registry: AcpTunnelRegistry,
+    out_tx: &mpsc::UnboundedSender<String>,
+    pending: &Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    next_id: &Arc<AtomicU64>,
+    prompt_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+) {
+    if servers.len() > 1 {
+        warn!(
+            channel_id = %channel_id,
+            count = servers.len(),
+            "ACP: multiple type:acp servers declared; only one browser tunnel per session is supported — using the first"
+        );
+    }
+    let Some(srv) = servers.into_iter().next() else {
+        return;
+    };
+    let out_tx = out_tx.clone();
+    let pending = pending.clone();
+    let next_id = next_id.clone();
+    prompt_tasks.push(tokio::spawn(async move {
+        if let Err(e) =
+            establish_and_register_tunnel(out_tx, pending, next_id, srv.id, channel_id, registry, 30)
+                .await
+        {
+            warn!(error = %e, "ACP: failed to open MCP-over-ACP tunnel");
+        }
+    }));
+}
+
 async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let connection_id = format!("acp_conn_{}", Uuid::new_v4());
@@ -918,22 +959,15 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 // inline: `establish_and_register_tunnel` awaits `mcp/connect`, whose response
                 // only THIS read loop delivers — awaiting inline would deadlock.
                 if let Some(registry) = state.acp_tunnel_registry.clone() {
-                    for srv in acp_mcp_servers {
-                        let out_tx2 = out_tx.clone();
-                        let pending2 = pending_requests.clone();
-                        let next_id2 = next_req_id.clone();
-                        let channel = channel_id.clone();
-                        let reg = registry.clone();
-                        prompt_tasks.push(tokio::spawn(async move {
-                            if let Err(e) = establish_and_register_tunnel(
-                                out_tx2, pending2, next_id2, srv.id, channel, reg, 30,
-                            )
-                            .await
-                            {
-                                warn!(error = %e, "ACP: failed to open MCP-over-ACP tunnel");
-                            }
-                        }));
-                    }
+                    spawn_browser_tunnel(
+                        acp_mcp_servers,
+                        channel_id.clone(),
+                        registry,
+                        &out_tx,
+                        &pending_requests,
+                        &next_req_id,
+                        &mut prompt_tasks,
+                    );
                 }
             }
             "session/resume" => {
@@ -967,22 +1001,15 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         .and_then(|v| v.as_str())
                         .and_then(derive_channel_id)
                     {
-                        for srv in parse_acp_mcp_servers(req.params.as_ref()) {
-                            let out_tx2 = out_tx.clone();
-                            let pending2 = pending_requests.clone();
-                            let next_id2 = next_req_id.clone();
-                            let channel = channel_id.clone();
-                            let reg = registry.clone();
-                            prompt_tasks.push(tokio::spawn(async move {
-                                if let Err(e) = establish_and_register_tunnel(
-                                    out_tx2, pending2, next_id2, srv.id, channel, reg, 30,
-                                )
-                                .await
-                                {
-                                    warn!(error = %e, "ACP: failed to open MCP-over-ACP tunnel on resume");
-                                }
-                            }));
-                        }
+                        spawn_browser_tunnel(
+                            parse_acp_mcp_servers(req.params.as_ref()),
+                            channel_id,
+                            registry,
+                            &out_tx,
+                            &pending_requests,
+                            &next_req_id,
+                            &mut prompt_tasks,
+                        );
                     }
                 }
             }
