@@ -259,6 +259,41 @@ struct AcpSession {
     /// "cancelled"` to the prompt's own request id (rather than hard-aborting
     /// the task and orphaning that id).
     cancel: Option<Arc<tokio::sync::Notify>>,
+    /// Client-declared MCP-over-ACP servers (the RFD `{"type":"acp"}` mcpServers entries):
+    /// the browser extension serves its MCP tools over this same /acp WS. Recorded so the
+    /// gateway can later `mcp/connect` to them (T5.3). Unused until that wiring lands.
+    #[allow(dead_code)]
+    acp_mcp_servers: Vec<AcpMcpServer>,
+}
+
+/// A client-declared MCP-over-ACP server (the RFD `"type":"acp"` `mcpServers` entry). Not in
+/// the generated schema (the RFD is a proposal), so parsed from raw params.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+struct AcpMcpServer {
+    id: String,
+    name: String,
+}
+
+/// Extract the `"type":"acp"` entries from a `session/new` / `session/resume` params
+/// `mcpServers` array. http/sse/stdio servers are ignored here — the agent connects to those
+/// itself; only the `acp`-transport ones are tunnelled over this WS.
+fn parse_acp_mcp_servers(params: Option<&Value>) -> Vec<AcpMcpServer> {
+    params
+        .and_then(|p| p.get("mcpServers"))
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|e| e.get("type").and_then(Value::as_str) == Some("acp"))
+                .filter_map(|e| {
+                    Some(AcpMcpServer {
+                        id: e.get("id").and_then(Value::as_str)?.to_string(),
+                        name: e.get("name").and_then(Value::as_str)?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub enum ReplyChunk {
@@ -774,7 +809,8 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                     let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
                     continue;
                 }
-                let resp = handle_session_new(&sessions, id.clone()).await;
+                let acp_mcp_servers = parse_acp_mcp_servers(req.params.as_ref());
+                let resp = handle_session_new(&sessions, id.clone(), acp_mcp_servers).await;
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
             }
             "session/resume" => {
@@ -1000,6 +1036,7 @@ fn handle_initialize(req: &JsonRpcRequest) -> JsonRpcResponse {
 async fn handle_session_new(
     sessions: &Arc<tokio::sync::Mutex<HashMap<String, AcpSession>>>,
     id: Value,
+    acp_mcp_servers: Vec<AcpMcpServer>,
 ) -> JsonRpcResponse {
     // sessionId and channel_id share one uuid so channel_id is always
     // re-derivable from a persisted sessionId (see session/resume).
@@ -1013,6 +1050,7 @@ async fn handle_session_new(
             channel_id,
             busy: false,
             cancel: None,
+            acp_mcp_servers,
         },
     );
 
@@ -1096,6 +1134,8 @@ async fn handle_session_resume(
             channel_id,
             busy: false,
             cancel: None,
+            // The client re-presents its mcpServers on resume; re-record the acp ones.
+            acp_mcp_servers: parse_acp_mcp_servers(params),
         },
     );
     drop(guard);
@@ -1949,7 +1989,8 @@ mod acp_requests {
 #[cfg(test)]
 mod acp_handlers {
     use super::{
-        handle_initialize, handle_session_new, handle_session_resume, AcpSession, JsonRpcRequest,
+        handle_initialize, handle_session_new, handle_session_resume, parse_acp_mcp_servers,
+        AcpMcpServer, AcpSession, JsonRpcRequest,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -1999,10 +2040,45 @@ mod acp_handlers {
     #[tokio::test]
     async fn session_new_mints_and_stores_a_session() {
         let sessions = new_sessions();
-        let v = serde_json::to_value(handle_session_new(&sessions, json!(2)).await).unwrap();
+        let v = serde_json::to_value(handle_session_new(&sessions, json!(2), vec![]).await).unwrap();
         let sid = v["result"]["sessionId"].as_str().unwrap();
         assert!(sid.starts_with("sess_"), "sessionId must be sess_<uuid>: {sid}");
         assert!(sessions.lock().await.contains_key(sid), "session must be stored");
+    }
+
+    #[test]
+    fn parse_acp_mcp_servers_keeps_only_acp_entries() {
+        let params = json!({
+            "cwd": "/w",
+            "mcpServers": [
+                {"type": "acp", "id": "srv-1", "name": "browser"},
+                {"type": "http", "url": "http://x"},
+                {"type": "acp", "id": "srv-2", "name": "other"}
+            ]
+        });
+        assert_eq!(
+            parse_acp_mcp_servers(Some(&params)),
+            vec![
+                AcpMcpServer { id: "srv-1".into(), name: "browser".into() },
+                AcpMcpServer { id: "srv-2".into(), name: "other".into() },
+            ]
+        );
+        // no mcpServers -> empty
+        assert!(parse_acp_mcp_servers(Some(&json!({"cwd": "/w"}))).is_empty());
+        assert!(parse_acp_mcp_servers(None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_new_records_declared_acp_servers() {
+        let sessions = new_sessions();
+        let servers = vec![AcpMcpServer { id: "srv-1".into(), name: "browser".into() }];
+        let v = serde_json::to_value(
+            handle_session_new(&sessions, json!(2), servers.clone()).await,
+        )
+        .unwrap();
+        let sid = v["result"]["sessionId"].as_str().unwrap().to_string();
+        let guard = sessions.lock().await;
+        assert_eq!(guard.get(&sid).unwrap().acp_mcp_servers, servers);
     }
 
     #[tokio::test]
