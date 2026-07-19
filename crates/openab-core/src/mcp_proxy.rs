@@ -251,13 +251,56 @@ pub async fn start_session_server(
     if !cfg.get("mcpServers").map(Value::is_object).unwrap_or(false) {
         cfg["mcpServers"] = json!({});
     }
+    let our_url = format!("http://{addr}/mcp");
     cfg["mcpServers"]["openab-browser"] = json!({
-        "url": format!("http://{addr}/mcp"),
+        "url": our_url,
         "headers": { "Authorization": format!("Bearer {bearer}") }
     });
-    tokio::fs::write(&cfg_path, serde_json::to_vec_pretty(&cfg)?).await?;
+    // 0600: the file carries a live bearer token — default umask would leave it world-readable.
+    write_private(&cfg_path, &serde_json::to_vec_pretty(&cfg)?).await?;
+
+    // On session evict/drop the caller cancels `ct`; strip our now-dead `openab-browser` entry
+    // (with its live bearer) so a stale credential doesn't linger. Only remove it if it still
+    // points at OUR addr — a concurrent/reconnected session may have already replaced it, and we
+    // must not clobber that live entry (the mcp.json path is shared across acp: sessions).
+    let cleanup_path = cfg_path.clone();
+    let cleanup_ct = ct.clone();
+    tokio::spawn(async move {
+        cleanup_ct.cancelled().await;
+        let Ok(bytes) = tokio::fs::read(&cleanup_path).await else {
+            return;
+        };
+        let Ok(mut cfg) = serde_json::from_slice::<Value>(&bytes) else {
+            return;
+        };
+        let still_ours = cfg
+            .pointer("/mcpServers/openab-browser/url")
+            .and_then(Value::as_str)
+            == Some(our_url.as_str());
+        if !still_ours {
+            return;
+        }
+        if let Some(servers) = cfg.get_mut("mcpServers").and_then(Value::as_object_mut) {
+            servers.remove("openab-browser");
+        }
+        if let Ok(out) = serde_json::to_vec_pretty(&cfg) {
+            let _ = write_private(&cleanup_path, &out).await;
+        }
+    });
 
     Ok((addr, ct))
+}
+
+/// Write `bytes` to `path`, then tighten it to owner-only (0600). The file holds a live bearer
+/// token for the loopback MCP server, so it must not be group/world readable.
+async fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    tokio::fs::write(path, bytes).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -313,6 +356,16 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("Bearer "));
+        // The file holds a live bearer — it must be owner-only (0600), not umask-default 0644.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join(".cursor/mcp.json"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "mcp.json (live bearer) must be 0600");
+        }
         ct.cancel();
     }
 
