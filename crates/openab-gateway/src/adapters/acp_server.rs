@@ -338,6 +338,52 @@ struct JsonRpcRequestOut {
     params: Value,
 }
 
+// --- MCP-over-ACP tunnel frames (T4) ------------------------------------------
+// The official MCP-over-ACP RFD (agentclientprotocol.com/rfds/mcp-over-acp) tunnels MCP
+// over the /acp WS with three methods: mcp/connect → connectionId, then mcp/message (the
+// inner MCP method/params FLATTENED into the params, correlated by the OUTER ACP id — the
+// inner MCP id is not carried), and mcp/disconnect. These types are NOT in the generated
+// `acp_schema` (the RFD is a proposal, not the stable v1 schema), so they are hand-rolled
+// here. The extension is the MCP server and assigns `connectionId`; the gateway (agent side
+// of the upstream hop) is the connector and issues connect/message/disconnect.
+
+/// `mcp/connect` params — `acpId` matches the `id` of the client's `session/new`
+/// `mcpServers` entry with `"type":"acp"`.
+#[allow(dead_code)]
+#[derive(Debug, Serialize)]
+struct McpConnectParams {
+    #[serde(rename = "acpId")]
+    acp_id: String,
+}
+
+/// `mcp/connect` result — the client-assigned connection handle.
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct McpConnectResult {
+    #[serde(rename = "connectionId")]
+    connection_id: String,
+}
+
+/// `mcp/message` params — the inner MCP `method`/`params` are flattened in (no inner id);
+/// `connectionId` selects the tunnelled MCP connection.
+#[allow(dead_code)]
+#[derive(Debug, Serialize)]
+struct McpMessageParams {
+    #[serde(rename = "connectionId")]
+    connection_id: String,
+    method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params: Option<Value>,
+}
+
+/// `mcp/disconnect` params.
+#[allow(dead_code)]
+#[derive(Debug, Serialize)]
+struct McpDisconnectParams {
+    #[serde(rename = "connectionId")]
+    connection_id: String,
+}
+
 impl JsonRpcResponse {
     fn success(id: Value, result: Value) -> Self {
         Self {
@@ -479,6 +525,77 @@ async fn send_request(
             Err("request timed out".into())
         }
     }
+}
+
+/// Extract the `result` from a JSON-RPC response frame, mapping an `error` member to `Err`.
+/// `send_request` yields the whole response frame; the tunnel helpers want just the payload.
+#[allow(dead_code)]
+fn frame_result(frame: Value) -> Result<Value, String> {
+    if let Some(err) = frame.get("error") {
+        return Err(format!("remote error: {err}"));
+    }
+    Ok(frame.get("result").cloned().unwrap_or(Value::Null))
+}
+
+/// `mcp/connect` (T4): open a tunnelled MCP connection to the client-provided (`"type":"acp"`)
+/// MCP server identified by `acp_id`; returns the client-assigned `connectionId`.
+#[allow(dead_code)]
+async fn mcp_connect(
+    out_tx: &mpsc::UnboundedSender<String>,
+    pending: &Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    next_id: &AtomicU64,
+    acp_id: &str,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    let params = serde_json::to_value(McpConnectParams {
+        acp_id: acp_id.to_string(),
+    })
+    .unwrap();
+    let frame = send_request(out_tx, pending, next_id, "mcp/connect", params, timeout_secs).await?;
+    let result: McpConnectResult = serde_json::from_value(frame_result(frame)?)
+        .map_err(|e| format!("mcp/connect: malformed result: {e}"))?;
+    Ok(result.connection_id)
+}
+
+/// `mcp/message` REQUEST (T4): tunnel an inner MCP request over `connection_id`; returns the
+/// inner MCP result payload (the outer ACP id does the correlation; the inner MCP id is not
+/// carried on the wire).
+#[allow(dead_code)]
+async fn mcp_message_request(
+    out_tx: &mpsc::UnboundedSender<String>,
+    pending: &Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    next_id: &AtomicU64,
+    connection_id: &str,
+    method: &str,
+    params: Option<Value>,
+    timeout_secs: u64,
+) -> Result<Value, String> {
+    let msg = serde_json::to_value(McpMessageParams {
+        connection_id: connection_id.to_string(),
+        method: method.to_string(),
+        params,
+    })
+    .unwrap();
+    let frame = send_request(out_tx, pending, next_id, "mcp/message", msg, timeout_secs).await?;
+    frame_result(frame)
+}
+
+/// `mcp/disconnect` (T4): close a tunnelled MCP connection.
+#[allow(dead_code)]
+async fn mcp_disconnect(
+    out_tx: &mpsc::UnboundedSender<String>,
+    pending: &Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    next_id: &AtomicU64,
+    connection_id: &str,
+    timeout_secs: u64,
+) -> Result<(), String> {
+    let params = serde_json::to_value(McpDisconnectParams {
+        connection_id: connection_id.to_string(),
+    })
+    .unwrap();
+    send_request(out_tx, pending, next_id, "mcp/disconnect", params, timeout_secs)
+        .await
+        .map(|_| ())
 }
 
 async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
@@ -1702,7 +1819,7 @@ mod acp_streaming {
 mod acp_requests {
     //! T1 — the agent→client REQUEST direction: server-initiated `send_request` (mints an
     //! id, awaits the correlated response) and inbound `route_client_response`.
-    use super::{route_client_response, send_request};
+    use super::{mcp_connect, mcp_message_request, route_client_response, send_request};
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1785,6 +1902,47 @@ mod acp_requests {
         assert_eq!(resp["result"]["pong"], json!(true));
         driver.await.unwrap();
         assert_eq!(next_id.load(Ordering::Relaxed), 2, "the id counter advanced");
+    }
+
+    #[tokio::test]
+    async fn mcp_tunnel_connect_and_message_roundtrip() {
+        let pending = new_pending();
+        let next_id = AtomicU64::new(1);
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+
+        // Mock extension: answer mcp/connect with a connectionId, then turn an mcp/message
+        // tools/list into an inner result, routing each reply by the frame's own outer id.
+        let pending2 = pending.clone();
+        let ext = tokio::spawn(async move {
+            let f1: serde_json::Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
+            assert_eq!(f1["method"], json!("mcp/connect"));
+            assert_eq!(f1["params"]["acpId"], json!("srv-1"));
+            route_client_response(
+                &pending2,
+                &json!({"jsonrpc":"2.0","id":f1["id"],"result":{"connectionId":"conn-9"}}),
+            )
+            .await;
+
+            let f2: serde_json::Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
+            assert_eq!(f2["method"], json!("mcp/message"));
+            assert_eq!(f2["params"]["connectionId"], json!("conn-9"));
+            assert_eq!(f2["params"]["method"], json!("tools/list"));
+            route_client_response(
+                &pending2,
+                &json!({"jsonrpc":"2.0","id":f2["id"],"result":{"tools":[{"name":"browser.click"}]}}),
+            )
+            .await;
+        });
+
+        let conn = mcp_connect(&out_tx, &pending, &next_id, "srv-1", 5)
+            .await
+            .unwrap();
+        assert_eq!(conn, "conn-9");
+        let result = mcp_message_request(&out_tx, &pending, &next_id, &conn, "tools/list", None, 5)
+            .await
+            .unwrap();
+        assert_eq!(result["tools"][0]["name"], json!("browser.click"));
+        ext.await.unwrap();
     }
 }
 
