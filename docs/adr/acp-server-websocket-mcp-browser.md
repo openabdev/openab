@@ -241,11 +241,11 @@ Precondition: session open, extension WS attached, tools/list already discovered
  ..............................................................................
  3  A --HTTP--> C   tools/call name=browser.click args={selector:"#submit"}  id=mcp#7
  4  C --(in-pod handoff)--> G   wrap upstream: mcp/message  connId=conn-1
-                                       payload=[ mcp#7 tools/call ]           id=acp#55
+                                 params={method:"tools/call", ...} FLATTENED, no inner id   id=acp#55
  5  G ==WS===>  E   server->client request (T1) = MCP-over-ACP       outer id=acp#55  <-off-pod
  6            E     chrome.scripting.executeScript -> clicks #submit, page -> /thanks
- 7  G <==WS==  E    response payload=[ mcp#7 result:{ok,url:"/thanks"} ] outer id=acp#55 <-on-pod
- 8  C <--(in-pod)-- G   gateway pending-map matches acp#55 -> extracts inner mcp#7
+ 7  G <==WS==  E    response result={ok,url:"/thanks"} (the inner MCP result)   outer id=acp#55 <-on-pod
+ 8  C <--(in-pod)-- G   gateway pending-map matches acp#55 -> core maps the result back to mcp#7
  9  A <--HTTP- C    tools/call result {content:[{text:"clicked; now /thanks"}]}  id=mcp#7
  ..............................................................................
 10  A              LLM consumes the tool result, keeps reasoning
@@ -253,9 +253,12 @@ Precondition: session open, extension WS attached, tools/list already discovered
 12  C ==WS===>  E   chat stream forwarded on /acp -> user sees narration        <-off-pod
 --------------------------------------------------------------------------------
 Two id spaces (never mixed)
-  - mcp#7  = MCP-layer id, carried verbatim agent<->core<->extension (steps 3->5->7->9)
-  - acp#55 = outer ACP-envelope id on the upstream tunnel; only the gateway pending-map
-             tracks it (steps 4<->8)
+  - mcp#7  = MCP-layer id, lives ONLY on the agent<->core HTTP hop (steps 3/9). Per the
+             MCP-over-ACP RFD, mcp/message FLATTENS the inner method/params and does NOT
+             carry an inner MCP id, so mcp#7 never travels on the tunnel.
+  - acp#55 = outer ACP-envelope id that correlates the whole upstream tunnel round-trip
+             (steps 4<->8); the response result IS the inner MCP result payload. The core
+             proxy maps its downstream mcp#7 <-> the upstream acp#55.
   - acp#1  = downstream ACP permission id; unrelated to the two above
 
 Only steps 5/7/12 leave the pod (all on the /acp WS). Permission (1-2) and tool transport
