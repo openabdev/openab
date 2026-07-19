@@ -949,6 +949,38 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 }
                 let resp = handle_session_resume(&sessions, id.clone(), req.params.as_ref()).await;
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+
+                // Re-open + register the browser tunnel(s) on resume too. katashiro persists its
+                // ACP session and RECONNECTS via session/resume (not session/new), re-declaring its
+                // "type":"acp" browser server each time. Without this, a resumed session records the
+                // server but never opens a tunnel, so the core proxy reports "no browser attached".
+                // channel_id is derived deterministically from the sessionId, matching the handler.
+                if let Some(registry) = state.acp_tunnel_registry.clone() {
+                    if let Some(channel_id) = req
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.get("sessionId"))
+                        .and_then(|v| v.as_str())
+                        .and_then(derive_channel_id)
+                    {
+                        for srv in parse_acp_mcp_servers(req.params.as_ref()) {
+                            let out_tx2 = out_tx.clone();
+                            let pending2 = pending_requests.clone();
+                            let next_id2 = next_req_id.clone();
+                            let channel = channel_id.clone();
+                            let reg = registry.clone();
+                            prompt_tasks.push(tokio::spawn(async move {
+                                if let Err(e) = establish_and_register_tunnel(
+                                    out_tx2, pending2, next_id2, srv.id, channel, reg, 30,
+                                )
+                                .await
+                                {
+                                    warn!(error = %e, "ACP: failed to open MCP-over-ACP tunnel on resume");
+                                }
+                            }));
+                        }
+                    }
+                }
             }
             "session/prompt" => {
                 if !initialized {
