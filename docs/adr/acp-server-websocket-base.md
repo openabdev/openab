@@ -195,8 +195,19 @@ North star: the agent's LLM autonomously operating the user's real browser (gene
   against real traffic first).
 
 ### Optional (as-needed, off the critical path)
-- richer `session/update` variants: `tool_call` / `tool_call_update` (display),
-  `agent_thought_chunk` / `plan` / `available_commands_update` / `usage_update`
+- **`tool_call` / `tool_call_update` display** — a client-facing tool-activity display
+  (e.g. a distinct "tool chip" per call with running/done/failed state). *State today:* the
+  downstream tool events reach the ACP client only **merged into the text** — `openab-core`
+  parses them into `AcpEvent::ToolStart` / `ToolDone`, then `compose_display` prepends
+  "🔧 …" lines onto the reply text buffer that streams as `agent_message_chunk`; there is
+  no structured separation over `/acp`. *Recommended approach:* for the `acp` platform, tap
+  the `AcpEvent::ToolStart` / `ToolDone` stream **before** the `compose_display` merge and
+  emit structured `session/update` `tool_call` / `tool_call_update` notifications (with
+  `toolCallId` / `title` / `status`) separately from the text — this is the ACP-native path
+  (standard clients like Zed render it too), avoids brittle client-side text parsing, and
+  cleanly separates tool activity from the answer. Client (extension) then renders chips.
+- other richer `session/update` variants: `agent_thought_chunk` / `plan` /
+  `available_commands_update` / `usage_update`
 - `fs/*`, `terminal/*` (sibling agent→client capabilities)
 - `ContentBlock` image / audio / resource (image only if screenshot-based browser tools)
 - session admin: `session/close` / `list` / `delete`, `set_mode` / `set_config_option`,
