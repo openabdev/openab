@@ -11,8 +11,8 @@
 //! listener (`spawn_mcp_server`) and the tunnel wiring land in the following T5 sub-ticks.
 
 use rmcp::model::{
-    object, CallToolRequestParams, CallToolResult, ErrorData as McpError, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    object, CallToolRequestParams, CallToolResult, ErrorData as McpError, JsonObject,
+    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::{
@@ -20,8 +20,25 @@ use rmcp::transport::streamable_http_server::{
 };
 use rmcp::ServerHandler;
 use axum::response::IntoResponse;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::sync::Arc;
+
+/// Core-side interface to the browser MCP-over-ACP tunnel (D6-a'). Implemented by the ROOT
+/// (which bridges to the gateway's per-connection tunnel registry) and consumed by the MCP
+/// proxy here. Keeping the trait in core with the impl in root preserves the core/gateway
+/// sibling independence, matching the existing `ChatAdapter` pattern.
+#[async_trait::async_trait]
+pub trait BrowserTunnel: Send + Sync {
+    /// Forward an inner MCP request (e.g. `tools/call`) to the browser session identified by
+    /// `channel_id` and return the inner MCP result payload. Err if no browser is currently
+    /// attached to that session.
+    async fn call(
+        &self,
+        channel_id: &str,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Value, String>;
+}
 
 /// The fixed set of browser tools OpenAB advertises over MCP (D4 static-advertise). DOM-
 /// semantic actions the extension executes in the user's active tab; model-agnostic.
@@ -77,8 +94,42 @@ pub(crate) fn browser_tools() -> Vec<Tool> {
 /// the browser tools and (once T5.3 wires the tunnel) forwards `tools/call` to the extension
 /// over MCP-over-ACP. Until then it static-advertises (D4) and returns "browser not
 /// connected" on call.
-#[derive(Clone, Default)]
-pub struct ProxyHandler {}
+#[derive(Clone)]
+pub struct ProxyHandler {
+    /// The browser session this server instance serves (D5-a: one MCP server per session).
+    channel_id: String,
+    /// Bridge to that session's browser tunnel; `None` when no browser is attached (or the
+    /// process has no tunnel wiring). A call while `None` reports "browser not connected" (D4).
+    tunnel: Option<Arc<dyn BrowserTunnel>>,
+}
+
+impl ProxyHandler {
+    pub fn new(channel_id: String, tunnel: Option<Arc<dyn BrowserTunnel>>) -> Self {
+        Self { channel_id, tunnel }
+    }
+
+    /// Forward a tool call to the browser over the tunnel (as an MCP `tools/call`), or report
+    /// not-connected (D4) when no browser is attached.
+    async fn forward_tool_call(
+        &self,
+        name: &str,
+        arguments: Option<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(tunnel) = &self.tunnel else {
+            return Err(McpError::internal_error(
+                "browser not connected: open the OpenAB side panel in your browser",
+                None,
+            ));
+        };
+        let params = json!({ "name": name, "arguments": arguments });
+        let result = tunnel
+            .call(&self.channel_id, "tools/call", Some(params))
+            .await
+            .map_err(|e| McpError::internal_error(e, None))?;
+        serde_json::from_value(result)
+            .map_err(|e| McpError::internal_error(format!("malformed tool result: {e}"), None))
+    }
+}
 
 impl ServerHandler for ProxyHandler {
     fn get_info(&self) -> ServerInfo {
@@ -102,14 +153,11 @@ impl ServerHandler for ProxyHandler {
 
     async fn call_tool(
         &self,
-        _request: CallToolRequestParams,
+        request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        // No extension wired yet (T5.3). Per D4, fail gracefully rather than hide the tool.
-        Err(McpError::internal_error(
-            "browser not connected: open the OpenAB side panel in your browser",
-            None,
-        ))
+        self.forward_tool_call(request.name.as_ref(), request.arguments)
+            .await
     }
 }
 
@@ -140,6 +188,8 @@ async fn require_bearer(
 /// same `bearer` to the colocated agent's native MCP config (T5.2). Shuts down when `ct` is
 /// cancelled.
 pub async fn spawn_mcp_server(
+    channel_id: String,
+    tunnel: Option<Arc<dyn BrowserTunnel>>,
     bearer: String,
     ct: tokio_util::sync::CancellationToken,
 ) -> std::io::Result<std::net::SocketAddr> {
@@ -150,7 +200,7 @@ pub async fn spawn_mcp_server(
         .with_cancellation_token(ct.child_token());
     let service: StreamableHttpService<ProxyHandler, LocalSessionManager> =
         StreamableHttpService::new(
-            || Ok(ProxyHandler::default()),
+            move || Ok(ProxyHandler::new(channel_id.clone(), tunnel.clone())),
             Default::default(),
             config,
         );
@@ -172,7 +222,39 @@ pub async fn spawn_mcp_server(
 
 #[cfg(test)]
 mod tests {
-    use super::{browser_tools, spawn_mcp_server};
+    use super::{browser_tools, spawn_mcp_server, BrowserTunnel, ProxyHandler};
+
+    struct MockTunnel;
+    #[async_trait::async_trait]
+    impl BrowserTunnel for MockTunnel {
+        async fn call(
+            &self,
+            channel_id: &str,
+            method: &str,
+            _params: Option<serde_json::Value>,
+        ) -> Result<serde_json::Value, String> {
+            assert_eq!(channel_id, "acp_x");
+            assert_eq!(method, "tools/call");
+            Ok(serde_json::json!({"content": [{"type": "text", "text": "clicked"}]}))
+        }
+    }
+
+    #[tokio::test]
+    async fn call_tool_forwards_to_the_tunnel() {
+        let h = ProxyHandler::new("acp_x".into(), Some(std::sync::Arc::new(MockTunnel)));
+        let result = h.forward_tool_call("browser.click", None).await.unwrap();
+        let v = serde_json::to_value(&result).unwrap();
+        assert_eq!(v["content"][0]["text"], serde_json::json!("clicked"));
+    }
+
+    #[tokio::test]
+    async fn call_tool_reports_not_connected_without_a_tunnel() {
+        let h = ProxyHandler::new("acp_x".into(), None);
+        assert!(
+            h.forward_tool_call("browser.click", None).await.is_err(),
+            "a call with no attached browser must error (D4)"
+        );
+    }
 
     #[test]
     fn browser_tools_advertises_the_fixed_set() {
@@ -208,7 +290,7 @@ mod tests {
     #[tokio::test]
     async fn mcp_server_binds_loopback_and_initializes_with_bearer() {
         let ct = tokio_util::sync::CancellationToken::new();
-        let addr = spawn_mcp_server("secret-token".to_string(), ct.clone())
+        let addr = spawn_mcp_server("acp_test".into(), None, "secret-token".to_string(), ct.clone())
             .await
             .unwrap();
         assert!(addr.ip().is_loopback(), "MCP server must bind loopback only");
@@ -237,7 +319,7 @@ mod tests {
     #[tokio::test]
     async fn mcp_server_rejects_missing_or_wrong_bearer() {
         let ct = tokio_util::sync::CancellationToken::new();
-        let addr = spawn_mcp_server("secret-token".to_string(), ct.clone())
+        let addr = spawn_mcp_server("acp_test".into(), None, "secret-token".to_string(), ct.clone())
             .await
             .unwrap();
         let url = format!("http://{addr}/mcp");
