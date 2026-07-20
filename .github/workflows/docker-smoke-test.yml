@@ -84,7 +84,7 @@ jobs:
             -copilot)
               expected=$(awk -F= '$1 == "ARG COPILOT_VERSION" {print $2; exit}' Dockerfile.copilot)
               docker run --rm --entrypoint node openab-test-copilot \
-                -e 'process.stdout.write(require("/usr/local/lib/node_modules/@github/copilot/package.json").version)' \
+                -e 'process.stdout.write(require(require.resolve("@github/copilot/package.json")).version)' \
                 | grep -Fx "$expected"
               ;;
             -devin)
