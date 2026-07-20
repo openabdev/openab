@@ -79,11 +79,17 @@ jobs:
             | grep -Fx 'OPENAB_AGENT_COMMAND=codex-acp'
 
       - name: Verify bumped runtime versions
-        if: matrix.variant.suffix == '-copilot' || matrix.variant.suffix == '-devin' || matrix.variant.suffix == '-antigravity'
+        if: matrix.variant.suffix == '' || matrix.variant.suffix == '-unified' || matrix.variant.suffix == '-copilot' || matrix.variant.suffix == '-devin' || matrix.variant.suffix == '-antigravity'
         shell: bash
         run: |
           set -euo pipefail
           case "${{ matrix.variant.suffix }}" in
+            ''|-unified)
+              expected=$(awk -F= '$1 == "ARG KIRO_CLI_VERSION" {print $2; exit}' Dockerfile)
+              test -n "$expected" || { echo "❌ Failed to extract Kiro expected version"; exit 1; }
+              docker run --rm --entrypoint kiro-cli openab-test${{ matrix.variant.suffix }} --version \
+                | grep -Fx "kiro-cli $expected"
+              ;;
             -copilot)
               expected=$(awk -F= '$1 == "ARG COPILOT_VERSION" {print $2; exit}' Dockerfile.copilot)
               test -n "$expected" || { echo "❌ Failed to extract Copilot expected version"; exit 1; }
@@ -153,6 +159,9 @@ jobs:
             done
           }
 
+          assert_line 'ARG KIRO_CLI_VERSION=2.13.0' Dockerfile Dockerfile.package Dockerfile.unified
+          assert_line 'ARG KIRO_SHA256_AMD64=d8c5277358b4a82b2d9a9ed2d52e110862536dc82b9e32c3719fc5f5a9834c94' Dockerfile Dockerfile.package Dockerfile.unified
+          assert_line 'ARG KIRO_SHA256_ARM64=95972602568c2065b7d8cc28924730304d40e612c0984ee0144d8ba452000be3' Dockerfile Dockerfile.package Dockerfile.unified
           assert_line 'ARG CODEX_ACP_VERSION=1.1.4' Dockerfile.codex Dockerfile.package Dockerfile.unified
           assert_line 'ARG CODEX_VERSION=0.144.1' Dockerfile.codex Dockerfile.package Dockerfile.unified
           assert_line 'ARG COPILOT_VERSION=1.0.71' Dockerfile.copilot Dockerfile.package Dockerfile.unified
