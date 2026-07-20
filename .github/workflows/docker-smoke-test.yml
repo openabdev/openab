@@ -79,21 +79,26 @@ jobs:
 
       - name: Verify bumped runtime versions
         if: matrix.variant.suffix == '-copilot' || matrix.variant.suffix == '-devin' || matrix.variant.suffix == '-antigravity'
+        shell: bash
         run: |
+          set -euo pipefail
           case "${{ matrix.variant.suffix }}" in
             -copilot)
               expected=$(awk -F= '$1 == "ARG COPILOT_VERSION" {print $2; exit}' Dockerfile.copilot)
-              docker run --rm --entrypoint node openab-test-copilot \
-                -e 'process.stdout.write(require(require.resolve("@github/copilot/package.json")).version)' \
+              test -n "$expected" || { echo "❌ Failed to extract Copilot expected version"; exit 1; }
+              docker run --rm --entrypoint sh openab-test-copilot \
+                -c 'NODE_PATH=$(npm root -g) node -e "process.stdout.write(require(\"@github/copilot/package.json\").version)"' \
                 | grep -Fx "$expected"
               ;;
             -devin)
               expected=$(awk -F= '$1 == "ARG DEVIN_VERSION" {print $2; exit}' Dockerfile.devin)
+              test -n "$expected" || { echo "❌ Failed to extract Devin expected version"; exit 1; }
               docker run --rm --entrypoint devin openab-test-devin --version \
                 | grep -F "$expected"
               ;;
             -antigravity)
               expected=$(awk -F= '$1 == "ENV AGY_VERSION" {print $2; exit}' Dockerfile.antigravity)
+              test -n "$expected" || { echo "❌ Failed to extract Antigravity expected version"; exit 1; }
               docker run --rm --entrypoint agy openab-test-antigravity --version \
                 | grep -F "$expected"
               ;;
@@ -148,6 +153,7 @@ jobs:
           }
 
           assert_line 'ARG CODEX_ACP_VERSION=1.1.4' Dockerfile.codex Dockerfile.package Dockerfile.unified
+          assert_line 'ARG CODEX_VERSION=0.144.1' Dockerfile.codex Dockerfile.package Dockerfile.unified
           assert_line 'ARG COPILOT_VERSION=1.0.71' Dockerfile.copilot Dockerfile.package Dockerfile.unified
           assert_line 'ARG DEVIN_VERSION=3000.2.17' Dockerfile.devin Dockerfile.package Dockerfile.unified
           assert_line 'ARG DEVIN_SHA256_AMD64=f0e1e9363afc6ee68c4ef87bab4aeb7ff5cc08a5fa838350ef3ceefdbb2a2be2' Dockerfile.devin Dockerfile.package Dockerfile.unified
