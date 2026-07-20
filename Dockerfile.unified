@@ -353,14 +353,19 @@ CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 # =============================================================================
 FROM base-debian AS antigravity
 ENV AGY_VERSION=1.1.4
+ARG AGY_SHA256_AMD64=aaab42e395cb4e3bfe5ae88994a340865d949f7a9e7f0604ffa2a3f1e8aadbfa
+ARG AGY_SHA256_ARM64=333199327cc29e21cb8fcc4e19f7c02c462bf41dd876f1328d64e9922c631700
 RUN ARCH=$(dpkg --print-architecture) && \
     case "$ARCH" in \
-      amd64) ASSET="agy_cli_linux_x64.tar.gz" ;; \
-      arm64) ASSET="agy_cli_linux_arm64.tar.gz" ;; \
+      amd64) ASSET="agy_cli_linux_x64.tar.gz"; sha="${AGY_SHA256_AMD64}" ;; \
+      arm64) ASSET="agy_cli_linux_arm64.tar.gz"; sha="${AGY_SHA256_ARM64}" ;; \
       *) echo "unsupported arch: $ARCH" && exit 1 ;; \
     esac && \
     curl -fsSL "https://github.com/google-antigravity/antigravity-cli/releases/download/${AGY_VERSION}/${ASSET}" \
-      | tar -xz -C /usr/local/bin && \
+      -o /tmp/agy.tar.gz && \
+    echo "${sha}  /tmp/agy.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/agy.tar.gz -C /usr/local/bin && \
+    rm /tmp/agy.tar.gz && \
     mv /usr/local/bin/antigravity /usr/local/bin/agy && \
     chmod +x /usr/local/bin/agy
 ENV HOME=/home/agent

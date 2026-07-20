@@ -77,6 +77,28 @@ jobs:
           docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' openab-test-codex \
             | grep -Fx 'OPENAB_AGENT_COMMAND=codex-acp'
 
+      - name: Verify bumped runtime versions
+        if: matrix.variant.suffix == '-copilot' || matrix.variant.suffix == '-devin' || matrix.variant.suffix == '-antigravity'
+        run: |
+          case "${{ matrix.variant.suffix }}" in
+            -copilot)
+              expected=$(awk -F= '$1 == "ARG COPILOT_VERSION" {print $2; exit}' Dockerfile.copilot)
+              docker run --rm --entrypoint node openab-test-copilot \
+                -e 'process.stdout.write(require("/usr/local/lib/node_modules/@github/copilot/package.json").version)' \
+                | grep -Fx "$expected"
+              ;;
+            -devin)
+              expected=$(awk -F= '$1 == "ARG DEVIN_VERSION" {print $2; exit}' Dockerfile.devin)
+              docker run --rm --entrypoint devin openab-test-devin --version \
+                | grep -F "$expected"
+              ;;
+            -antigravity)
+              expected=$(awk -F= '$1 == "ENV AGY_VERSION" {print $2; exit}' Dockerfile.antigravity)
+              docker run --rm --entrypoint agy openab-test-antigravity --version \
+                | grep -F "$expected"
+              ;;
+          esac
+
       - name: Verify agent responds
         run: |
           if [ "${{ matrix.variant.suffix }}" = "-codex" ]; then
@@ -106,3 +128,30 @@ jobs:
               openab-test${{ matrix.variant.suffix }} --help >/dev/null 2>&1
             echo "✅ Agent CLI responds (ACP skipped — likely needs auth)"
           fi
+
+  validate-packaged-pins:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Validate package and legacy pin parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          assert_line() {
+            local expected="$1"
+            shift
+            for file in "$@"; do
+              grep -Fx "$expected" "$file"
+            done
+          }
+
+          assert_line 'ARG CODEX_ACP_VERSION=1.1.4' Dockerfile.codex Dockerfile.package Dockerfile.unified
+          assert_line 'ARG COPILOT_VERSION=1.0.71' Dockerfile.copilot Dockerfile.package Dockerfile.unified
+          assert_line 'ARG DEVIN_VERSION=3000.2.17' Dockerfile.devin Dockerfile.package Dockerfile.unified
+          assert_line 'ARG DEVIN_SHA256_AMD64=f0e1e9363afc6ee68c4ef87bab4aeb7ff5cc08a5fa838350ef3ceefdbb2a2be2' Dockerfile.devin Dockerfile.package Dockerfile.unified
+          assert_line 'ARG DEVIN_SHA256_ARM64=116dc71ef085a922bc3ff0ea0377d4b26c529a431d58246e36572913e2d25624' Dockerfile.devin Dockerfile.package Dockerfile.unified
+          assert_line 'ENV AGY_VERSION=1.1.4' Dockerfile.antigravity Dockerfile.package Dockerfile.unified Dockerfile.final Dockerfile.ci
+          assert_line 'ARG AGY_SHA256_AMD64=aaab42e395cb4e3bfe5ae88994a340865d949f7a9e7f0604ffa2a3f1e8aadbfa' Dockerfile.antigravity Dockerfile.package Dockerfile.unified Dockerfile.final Dockerfile.ci
+          assert_line 'ARG AGY_SHA256_ARM64=333199327cc29e21cb8fcc4e19f7c02c462bf41dd876f1328d64e9922c631700' Dockerfile.antigravity Dockerfile.package Dockerfile.unified Dockerfile.final Dockerfile.ci
