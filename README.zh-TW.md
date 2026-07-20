@@ -25,7 +25,8 @@
 │ User         │              │        │ (unified)            │ hermes-acp              │
 ├──────────────┤              │ ┌──────┴───────────┐          │ opencode acp            │
 │ Feishu/Lark  │◄─WS/webhook─►┼►│ gateway adapters │          │ mimo acp                │
-│ User         │              │ │ standalone or    │          │ grok agent stdio        │
+│ User         │              │ │ standalone or    │          │ kimi acp                │
+│              │              │ │                  │          │ grok agent stdio        │
 ├──────────────┤              │ │ embedded unified │          │ devin acp               │
 │ Google Chat  │◄webhook/API─►┤ └──────────────────┘          │ agy-acp                 │
 │ User         │              │                               │ pi-acp                  │
