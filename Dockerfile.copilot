@@ -19,7 +19,7 @@ FROM node:22-trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini unzip && rm -rf /var/lib/apt/lists/*
 
 # Install GitHub Copilot CLI via npm (pinned version)
-ARG COPILOT_VERSION=1.0.63
+ARG COPILOT_VERSION=1.0.71
 RUN npm install -g @github/copilot@${COPILOT_VERSION} --retry 3
 
 # Install gh CLI (for auth and token management)

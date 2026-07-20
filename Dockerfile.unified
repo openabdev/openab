@@ -138,7 +138,7 @@ CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 # Target: codex
 # =============================================================================
 FROM base-node AS codex
-ARG CODEX_ACP_VERSION=1.1.2
+ARG CODEX_ACP_VERSION=1.1.4
 ARG CODEX_VERSION=0.144.1
 RUN npm install -g @agentclientprotocol/codex-acp@${CODEX_ACP_VERSION} @openai/codex@${CODEX_VERSION} --fetch-retries=3
 ENV HOME=/home/node
@@ -157,7 +157,7 @@ CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 # Target: copilot
 # =============================================================================
 FROM base-node AS copilot
-ARG COPILOT_VERSION=1.0.63
+ARG COPILOT_VERSION=1.0.71
 RUN npm install -g @github/copilot@${COPILOT_VERSION} --retry 3
 ENV HOME=/home/node
 WORKDIR /home/node
@@ -352,7 +352,7 @@ CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 # Target: antigravity
 # =============================================================================
 FROM base-debian AS antigravity
-ENV AGY_VERSION=1.1.1
+ENV AGY_VERSION=1.1.4
 RUN ARCH=$(dpkg --print-architecture) && \
     case "$ARCH" in \
       amd64) ASSET="agy_cli_linux_x64.tar.gz" ;; \
