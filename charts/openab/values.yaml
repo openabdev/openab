@@ -148,6 +148,32 @@ agents:
     #   agentsMd: ""
     #   resources: {}
     #   image: ""  # leave empty → auto-resolves to openab:<tag>-opencode
+    # kimi:
+    #   command: kimi
+    #   args:
+    #     - acp
+    #   discord:
+    #     enabled: true
+    #     allowedChannels:
+    #       - "YOUR_CHANNEL_ID"
+    #     allowedUsers: []
+    #     allowBotMessages: "off"
+    #     trustedBotIds: []
+    #   workingDir: /home/node
+    #   env: {}
+    #   envFrom: []
+    #   secretEnv: []
+    #   pool:
+    #     maxSessions: 10
+    #     sessionTtlHours: 24
+    #   reactions:
+    #     enabled: true
+    #     removeAfterReply: false
+    #   persistence:
+    #     enabled: true
+    #     storageClass: ""
+    #     size: 1Gi
+    #   image: ""  # leave empty → auto-resolves to openab:<tag>-kimi
     # pi:
     #   command: pi-acp
     #   discord:

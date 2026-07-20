@@ -62,7 +62,7 @@ jobs:
           fi
 
           # Resolve variants
-          ALLOWED="kiro,claude,codex,copilot,cursor,devin,gemini,grok,hermes,mimocode,opencode,antigravity,pi,native,agentcore"
+          ALLOWED="kiro,claude,codex,copilot,cursor,devin,gemini,grok,hermes,kimi,mimocode,opencode,antigravity,pi,native,agentcore"
           if [ "$VARIANTS_INPUT" = "all" ] || [ -z "$VARIANTS_INPUT" ]; then
             VARIANTS="$ALLOWED"
           else

@@ -57,6 +57,7 @@ jobs:
           - { name: gemini, agent: "gemini" }
           - { name: grok, agent: "grok" }
           - { name: hermes, agent: "hermes-acp" }
+          - { name: kimi, agent: "kimi" }
           - { name: mimocode, agent: "mimo" }
           - { name: opencode, agent: "opencode" }
           - { name: antigravity, agent: "agy-acp" }
@@ -122,6 +123,21 @@ jobs:
           echo "$RESPONSE" | jq -e \
             '.result.agentInfo.name == "@agentclientprotocol/codex-acp"' \
             >/dev/null
+
+      - name: Verify Kimi runtime version
+        if: matrix.target.name == 'kimi'
+        run: |
+          KIMI_CODE_VERSION=$(awk -F= '$1 == "ARG KIMI_CODE_VERSION" {print $2; exit}' Dockerfile.unified)
+          test -n "$KIMI_CODE_VERSION"
+          docker run --rm --entrypoint node openab-unified-kimi:test \
+            -e 'console.log(require("/usr/local/lib/node_modules/@moonshot-ai/kimi-code/package.json").version)' \
+            | grep -Fx "$KIMI_CODE_VERSION"
+
+      - name: Verify Kimi agent command uses native ACP
+        if: matrix.target.name == 'kimi'
+        run: |
+          docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' openab-unified-kimi:test \
+            | grep -Fx 'OPENAB_AGENT_COMMAND=kimi acp'
 
       - name: Verify Claude runtime versions
         if: matrix.target.name == 'claude'

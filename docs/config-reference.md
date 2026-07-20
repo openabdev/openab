@@ -349,6 +349,12 @@ command = "opencode"
 args = ["acp"]
 working_dir = "/home/node"
 
+# Kimi Code CLI
+[agent]
+command = "kimi"
+args = ["acp"]
+working_dir = "/home/node"
+
 # Pi Agent
 [agent]
 command = "pi-acp"

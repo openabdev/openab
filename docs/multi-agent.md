@@ -46,6 +46,7 @@ See individual agent docs for authentication steps:
 - [Kiro CLI](kiro.md)
 - [Claude Code](claude-code.md)
 - [Codex](codex.md)
+- [Kimi Code CLI](kimi.md)
 - [Gemini](gemini.md)
 
 ## Bot-to-Bot Communication
