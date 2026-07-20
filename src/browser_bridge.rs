@@ -26,10 +26,61 @@ fn wrap_frame(channel: &str, line: &str) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+/// Resolve this bridge's browser channel. The MCP client scrubs the child env (verified: cursor
+/// launches us with only HOME/PATH/USER, or the pod env — never the per-session
+/// OPENAB_BROWSER_CHANNEL openab injects into the AGENT), so we can't read it from our own env.
+/// Instead walk UP the process tree and read OPENAB_BROWSER_CHANNEL from the first ancestor that
+/// has it: the agent process openab spawned (channel injected via the pool) is always an ancestor
+/// of this stdio MCP server, for EVERY vendor. Prefer our own env first (clients that DO pass it);
+/// return "" if not found (core then reports "no browser attached").
+fn resolve_channel() -> String {
+    if let Ok(c) = std::env::var("OPENAB_BROWSER_CHANNEL") {
+        if !c.is_empty() {
+            return c;
+        }
+    }
+    let mut pid = std::process::id();
+    for _ in 0..16 {
+        if let Ok(bytes) = std::fs::read(format!("/proc/{pid}/environ")) {
+            if let Some(c) = parse_channel_from_environ(&bytes) {
+                return c;
+            }
+        }
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            break;
+        };
+        match parse_ppid_from_stat(&stat) {
+            Some(ppid) if ppid > 1 => pid = ppid, // step up (stop at init/tini = 1)
+            _ => break,
+        }
+    }
+    String::new()
+}
+
+/// Extract OPENAB_BROWSER_CHANNEL from a null-separated `/proc/<pid>/environ` blob.
+fn parse_channel_from_environ(bytes: &[u8]) -> Option<String> {
+    for kv in bytes.split(|&b| b == 0) {
+        if let Some(rest) = kv.strip_prefix(b"OPENAB_BROWSER_CHANNEL=") {
+            if !rest.is_empty() {
+                return Some(String::from_utf8_lossy(rest).into_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Parse the parent PID from a `/proc/<pid>/stat` line. Field 2 (`comm`) is parenthesized and may
+/// contain spaces or `)`, so split after the LAST `)`: the remainder is "state ppid pgrp ...".
+fn parse_ppid_from_stat(stat: &str) -> Option<u32> {
+    let after = stat.rsplit_once(')')?.1;
+    after.split_whitespace().nth(1)?.parse().ok()
+}
+
 /// Run the bridge: connect the core socket, then pump stdin→socket (channel-tagged) and
 /// socket→stdout (verbatim MCP responses) until either side closes.
 pub async fn run() -> std::io::Result<()> {
-    let channel = std::env::var("OPENAB_BROWSER_CHANNEL").unwrap_or_default();
+    let channel = resolve_channel();
+    eprintln!("[openab browser-bridge] resolved channel={channel:?}");
     let sock =
         tokio::net::UnixStream::connect(openab_core::mcp_proxy::browser_socket_path()).await?;
     let (sock_rd, sock_wr) = sock.into_split();
@@ -93,7 +144,23 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{pump, wrap_frame};
+    use super::{parse_channel_from_environ, parse_ppid_from_stat, pump, wrap_frame};
+
+    #[test]
+    fn parse_ppid_handles_comm_with_spaces_and_parens() {
+        assert_eq!(parse_ppid_from_stat("834 (sh) S 25 834 25 0 -1 ..."), Some(25));
+        assert_eq!(parse_ppid_from_stat("658 (cursor agent) R 25 658 ..."), Some(25));
+        assert_eq!(parse_ppid_from_stat("5 (weird )proc) S 3 5 ..."), Some(3)); // ')' inside comm
+        assert_eq!(parse_ppid_from_stat("nonsense"), None);
+    }
+
+    #[test]
+    fn parse_channel_from_environ_finds_the_var() {
+        let env = b"HOME=/home/agent\0OPENAB_BROWSER_CHANNEL=acp_xyz\0PATH=/bin\0";
+        assert_eq!(parse_channel_from_environ(env).as_deref(), Some("acp_xyz"));
+        assert_eq!(parse_channel_from_environ(b"HOME=/x\0PATH=/y\0"), None);
+        assert_eq!(parse_channel_from_environ(b"OPENAB_BROWSER_CHANNEL=\0"), None); // empty ignored
+    }
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     #[test]
