@@ -11,6 +11,8 @@ mod ctl;
 mod unified_adapter;
 #[cfg(feature = "acp")]
 mod browser_tunnel;
+#[cfg(feature = "acp")]
+mod browser_bridge;
 use openab_core::acp;
 use openab_core::adapter::{self, AdapterRouter};
 use openab_core::bot_turns;
@@ -101,6 +103,11 @@ enum Commands {
         #[arg(long, default_value = "kiro-cli acp --trust-all-tools")]
         command: String,
     },
+    /// Internal: stdio MCP bridge to the per-pod browser socket (Option C). Spawned per session
+    /// by the agent's MCP client; relays MCP over stdio to core's browser tunnel by inherited
+    /// OPENAB_BROWSER_CHANNEL.
+    #[cfg(feature = "acp")]
+    BrowserBridge,
     /// Set a runtime value (e.g. thread.name)
     Set {
         /// Key to set (e.g. thread.name)
@@ -270,6 +277,10 @@ async fn main() -> anyhow::Result<()> {
             command,
         } => {
             return acp::agentcore::run_bridge(&runtime_arn, &region, &command).await;
+        }
+        #[cfg(feature = "acp")]
+        Commands::BrowserBridge => {
+            return browser_bridge::run().await.map_err(Into::into);
         }
         Commands::Set { key, value, thread } => {
             let resp = ctl::send_request(&ctl::Request {
