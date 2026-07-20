@@ -22,7 +22,7 @@ ghcr.io/openabdev/openab:<version>-<agent>
 > **No `latest` tag.** Use `beta-<agent>` or `stable-<agent>` for floating tags,
 > or pin to an exact version like `0.9.0-beta.1-kiro`.
 
-Available agents: `kiro`, `claude`, `codex`, `copilot`, `cursor`, `gemini`, `grok`, `hermes`, `mimocode`, `opencode`, `antigravity`, `pi`, `native`, `agentcore`
+Available agents: `kiro`, `claude`, `codex`, `copilot`, `cursor`, `gemini`, `grok`, `hermes`, `kimi`, `mimocode`, `opencode`, `antigravity`, `pi`, `native`, `agentcore`
 
 ### Migration from per-repo images (deprecated)
 

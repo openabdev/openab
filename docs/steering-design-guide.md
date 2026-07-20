@@ -10,13 +10,13 @@ AI coding agents load persistent instructions every session, but without deliber
 
 This guide establishes a universal framework for organizing agent memory into layers, so rules are reliably followed, context budgets are respected, and teams can onboard new agents without starting from scratch.
 
-OpenAB is designed to be agent-agnostic — it supports Kiro, Claude Code, Codex, Gemini, Copilot, OpenCode, and Pi running side by side. This guide provides a shared memory architecture standard that allows all supported coding agents to maintain consistent behavior, collaborate effectively, and operate from a single source of truth regardless of their underlying platform differences.
+OpenAB is designed to be agent-agnostic — it supports Kiro, Claude Code, Codex, Gemini, Kimi Code, Copilot, OpenCode, and Pi running side by side. This guide provides a shared memory architecture standard that allows all supported coding agents to maintain consistent behavior, collaborate effectively, and operate from a single source of truth regardless of their underlying platform differences.
 
 ---
 
 How to organize AI agent memory across three tiers: hot (always loaded), warm (triggered on demand), and cold (searched when needed).
 
-Applies to: Kiro, Claude Code, Codex, Gemini, Copilot, OpenCode, Pi — any agent that supports persistent instruction files.
+Applies to: Kiro, Claude Code, Codex, Gemini, Kimi Code, Copilot, OpenCode, Pi — any agent that supports persistent instruction files.
 
 ---
 

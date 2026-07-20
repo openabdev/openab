@@ -30,7 +30,7 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   # All agent variants built from Dockerfile.unified targets.
-  AGENTS: "kiro,claude,codex,copilot,cursor,devin,gemini,grok,hermes,mimocode,opencode,antigravity,pi,native,agentcore"
+  AGENTS: "kiro,claude,codex,copilot,cursor,devin,gemini,grok,hermes,kimi,mimocode,opencode,antigravity,pi,native,agentcore"
 
 jobs:
   resolve-tag:

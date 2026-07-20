@@ -21,7 +21,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  ALL_VARIANTS: 'default,agentcore,antigravity,claude,codex,copilot,cursor,devin,gemini,grok,hermes,mimocode,native,opencode,pi'
+  ALL_VARIANTS: 'default,agentcore,antigravity,claude,codex,copilot,cursor,devin,gemini,grok,hermes,kimi,mimocode,native,opencode,pi'
 
 jobs:
   matrix:

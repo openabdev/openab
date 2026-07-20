@@ -25,8 +25,8 @@ processes refreshing the same OAuth token → refresh-token-rotation reuse → w
 is what activates the bug.**
 
 ### 1.3 The wider demand
-openab packages 14 agent variants (`kiro, claude, codex, copilot, cursor, gemini, grok, hermes, mimocode,
-opencode, antigravity, pi, native, agentcore`). Several wrap a model vendor reachable by subscription OAuth.
+openab packages 16 agent variants (`kiro, claude, codex, copilot, cursor, gemini, grok, hermes, kimi, mimocode,
+opencode, devin, antigravity, pi, native, agentcore`). Several wrap a model vendor reachable by subscription OAuth.
 A coherent extension model lets openab-agent (the `native` variant) host these directly. PR #1185 already
 shipped a Discord `/auth` slash command that relays a device-flow login — the agreed near-term auth UX.
 

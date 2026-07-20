@@ -16,7 +16,7 @@
 group "default" {
   targets = [
     "kiro", "claude", "codex", "copilot", "cursor",
-    "devin", "gemini", "grok", "hermes", "mimocode",
+    "devin", "gemini", "grok", "hermes", "kimi", "mimocode",
     "opencode", "antigravity", "pi", "gateway",
   ]
 }
@@ -86,6 +86,12 @@ target "grok" {
 target "hermes" {
   dockerfile = "Dockerfile.hermes"
   tags       = ["openab:hermes"]
+  contexts   = { builder = "target:builder" }
+}
+
+target "kimi" {
+  dockerfile = "Dockerfile.kimi"
+  tags       = ["openab:kimi"]
   contexts   = { builder = "target:builder" }
 }
 

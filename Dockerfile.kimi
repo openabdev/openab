@@ -1,0 +1,50 @@
+# --- Build stage ---
+FROM rust:1-bookworm AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/openab-core/Cargo.toml crates/openab-core/Cargo.toml
+COPY crates/openab-gateway/Cargo.toml crates/openab-gateway/Cargo.toml
+RUN mkdir -p src crates/openab-core/src crates/openab-gateway/src \
+    && echo 'fn main() {}' > src/main.rs \
+    && echo '' > crates/openab-core/src/lib.rs \
+    && echo '' > crates/openab-gateway/src/lib.rs \
+    && cargo build --release \
+    && rm -rf src crates/openab-core/src crates/openab-gateway/src
+COPY crates/ crates/
+COPY src/ src/
+RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs \
+    && cargo build --release
+
+# --- Runtime stage ---
+# Kimi Code CLI is published as @moonshot-ai/kimi-code and exposes the
+# `kimi` binary. Its native ACP adapter is started with `kimi acp`.
+# Keep the package version pinned so image rebuilds are reproducible.
+FROM node:24-trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl procps ripgrep tini bubblewrap socat unzip git \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG KIMI_CODE_VERSION=0.28.1
+RUN npm install -g @moonshot-ai/kimi-code@${KIMI_CODE_VERSION} --retry 3
+
+# Install gh CLI for agent shell workflows.
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV HOME=/home/node
+WORKDIR /home/node
+COPY --from=builder --chown=node:node /build/target/release/openab /usr/local/bin/openab
+RUN mkdir -p /home/node/.kimi-code && chown -R node:node /home/node
+
+USER node
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="kimi acp"
+ENV OPENAB_AGENT_AUTH_COMMAND="kimi login"
+
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]

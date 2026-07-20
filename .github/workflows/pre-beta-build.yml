@@ -14,7 +14,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  ALL_AGENTS: 'kiro,claude,codex,copilot,cursor,devin,gemini,grok,hermes,mimocode,opencode,antigravity,pi,native,agentcore'
+  ALL_AGENTS: 'kiro,claude,codex,copilot,cursor,devin,gemini,grok,hermes,kimi,mimocode,opencode,antigravity,pi,native,agentcore'
 
 jobs:
   gate:
