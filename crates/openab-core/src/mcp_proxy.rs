@@ -326,6 +326,10 @@ async fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<
 /// write suffers when several sessions of one agent share a single mcp.json. Merges without
 /// touching the user's other servers; idempotent (a no-op when already present + identical).
 pub async fn write_bridge_mcp_config(workdir: &str) -> std::io::Result<()> {
+    // Pure static entry — byte-identical for every session (idempotent, no cross-session clobber).
+    // The channel is deliberately NOT carried here: the MCP client scrubs the server's env and its
+    // config-var expansion is vendor-specific, so the `openab browser-bridge` shim resolves its OWN
+    // channel by walking up to the agent process (Option C b2). This entry never goes stale.
     let entry = json!({ "command": "openab", "args": ["browser-bridge"] });
     let cfg_paths = [
         std::path::Path::new(workdir).join(".cursor").join("mcp.json"),
@@ -701,6 +705,10 @@ mod tests {
             let e = &cfg["mcpServers"]["openab-browser"];
             assert_eq!(e["command"], "openab");
             assert_eq!(e["args"], serde_json::json!(["browser-bridge"]));
+            assert!(
+                e.get("env").is_none(),
+                "channel is resolved by the shim (b2), not carried in config"
+            );
             assert!(e.get("url").is_none(), "bridge entry carries no url/port");
             assert!(e.get("headers").is_none(), "bridge entry carries no bearer");
         }
