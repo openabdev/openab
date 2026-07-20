@@ -21,7 +21,7 @@ RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/li
 # Keep the package version pinned so image rebuilds are reproducible.
 FROM node:24-trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl procps ripgrep tini unzip \
+      ca-certificates curl procps ripgrep tini bubblewrap socat unzip git \
     && rm -rf /var/lib/apt/lists/*
 
 ARG KIMI_CODE_VERSION=0.28.1

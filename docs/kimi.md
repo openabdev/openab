@@ -91,7 +91,7 @@ base_url = "https://api.moonshot.ai/v1"
 KIMI_API_KEY = "sk-..."
 ```
 
-OpenAB's child-process environment is intentionally minimal. If the provider key is supplied through an environment variable, explicitly pass it using `[agent].inherit_env` or `[agent].env`; do not assume the broker's environment is forwarded automatically.
+Note that Kimi Code reads provider credentials only from `config.toml` — the provider's `api_key` field or its `[providers.<name>.env]` subtable — and does not fall back to shell environment variables. Supply the key through the agent's `configToml` (or the Kimi credential store) rather than relying on OpenAB's `[agent].inherit_env`/`[agent].env`, which control the broker's child-process environment and are not read by Kimi for provider credentials.
 
 ## ACP capabilities
 
