@@ -319,6 +319,41 @@ async fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<
     Ok(())
 }
 
+/// Write the STATIC, write-once `openab-browser` bridge entry into each colocated CLI's mcp.json
+/// (Option C, bridge mode). Unlike the per-session HTTP proxy config, this carries no port/bearer
+/// — it is the same `{command:"openab", args:["browser-bridge"]}` for every session, so it can be
+/// written once and never goes stale. That fixes the shared-config clobber the per-session dynamic
+/// write suffers when several sessions of one agent share a single mcp.json. Merges without
+/// touching the user's other servers; idempotent (a no-op when already present + identical).
+pub async fn write_bridge_mcp_config(workdir: &str) -> std::io::Result<()> {
+    let entry = json!({ "command": "openab", "args": ["browser-bridge"] });
+    let cfg_paths = [
+        std::path::Path::new(workdir).join(".cursor").join("mcp.json"),
+        std::path::Path::new(workdir)
+            .join(".kiro")
+            .join("settings")
+            .join("mcp.json"),
+    ];
+    for cfg_path in &cfg_paths {
+        if let Some(dir) = cfg_path.parent() {
+            tokio::fs::create_dir_all(dir).await?;
+        }
+        let mut cfg: Value = match tokio::fs::read(cfg_path).await {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({})),
+            Err(_) => json!({}),
+        };
+        if !cfg.get("mcpServers").map(Value::is_object).unwrap_or(false) {
+            cfg["mcpServers"] = json!({});
+        }
+        // Idempotent: only rewrite when absent or changed (no needless mtime churn each session).
+        if cfg["mcpServers"]["openab-browser"] != entry {
+            cfg["mcpServers"]["openab-browser"] = entry.clone();
+            tokio::fs::write(cfg_path, serde_json::to_vec_pretty(&cfg)?).await?;
+        }
+    }
+    Ok(())
+}
+
 // ---- Option C: per-pod stdio-bridge socket server -------------------------------------------
 // A single unix socket per pod multiplexes ALL sessions. The `openab browser-bridge` shim
 // (spawned per agent session by the CLI's MCP client) connects and forwards inner MCP requests
@@ -449,7 +484,7 @@ async fn handle_browser_conn(
 mod tests {
     use super::{
         browser_tools, dispatch_browser_mcp, serve_browser_socket, spawn_mcp_server,
-        start_session_server, BrowserTunnel, ProxyHandler,
+        start_session_server, write_bridge_mcp_config, BrowserTunnel, ProxyHandler,
     };
 
     struct MockTunnel;
@@ -592,6 +627,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r["error"]["code"], -32601);
+    }
+
+    #[tokio::test]
+    async fn write_bridge_config_writes_static_entry_to_both_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        write_bridge_mcp_config(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        for rel in [".cursor/mcp.json", ".kiro/settings/mcp.json"] {
+            let cfg: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.path().join(rel)).unwrap()).unwrap();
+            let e = &cfg["mcpServers"]["openab-browser"];
+            assert_eq!(e["command"], "openab");
+            assert_eq!(e["args"], serde_json::json!(["browser-bridge"]));
+            assert!(e.get("url").is_none(), "bridge entry carries no url/port");
+            assert!(e.get("headers").is_none(), "bridge entry carries no bearer");
+        }
+    }
+
+    #[tokio::test]
+    async fn write_bridge_config_merges_without_clobber_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let cursor = dir.path().join(".cursor");
+        std::fs::create_dir_all(&cursor).unwrap();
+        std::fs::write(
+            cursor.join("mcp.json"),
+            r#"{"mcpServers":{"other":{"url":"http://x"}}}"#,
+        )
+        .unwrap();
+        let wd = dir.path().to_str().unwrap();
+        write_bridge_mcp_config(wd).await.unwrap();
+        write_bridge_mcp_config(wd).await.unwrap(); // idempotent second call
+        let cfg: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(cursor.join("mcp.json")).unwrap()).unwrap();
+        assert_eq!(cfg["mcpServers"]["other"]["url"], "http://x"); // user's server preserved
+        assert_eq!(cfg["mcpServers"]["openab-browser"]["command"], "openab");
     }
 
     #[tokio::test]
