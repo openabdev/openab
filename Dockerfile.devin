@@ -21,9 +21,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Devin CLI (pinned version with SHA256 verification)
-ARG DEVIN_VERSION=2026.8.18
-ARG DEVIN_SHA256_AMD64=dd4bba20593086bf708474792c11ab0c9428be5b2419ff5c182ec5f1099a0661
-ARG DEVIN_SHA256_ARM64=127e7a8baf2e09cb0fd23871af989dc9e32e3bfa7f497b1f6560cc52f5bf19c6
+ARG DEVIN_VERSION=3000.2.17
+ARG DEVIN_SHA256_AMD64=f0e1e9363afc6ee68c4ef87bab4aeb7ff5cc08a5fa838350ef3ceefdbb2a2be2
+ARG DEVIN_SHA256_ARM64=116dc71ef085a922bc3ff0ea0377d4b26c529a431d58246e36572913e2d25624
 ARG TARGETPLATFORM
 RUN set -eux; \
     case "${TARGETPLATFORM:-linux/amd64}" in \
