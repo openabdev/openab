@@ -239,52 +239,68 @@ pub async fn start_session_server(
     let ct = tokio_util::sync::CancellationToken::new();
     let addr = spawn_mcp_server(channel_id.to_string(), tunnel, bearer.clone(), ct.clone()).await?;
 
-    // Merge the openab-browser entry into <workdir>/.cursor/mcp.json (don't clobber any
-    // servers the user/agent already configured).
-    let cursor_dir = std::path::Path::new(workdir).join(".cursor");
-    tokio::fs::create_dir_all(&cursor_dir).await?;
-    let cfg_path = cursor_dir.join("mcp.json");
-    let mut cfg: Value = match tokio::fs::read(&cfg_path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({})),
-        Err(_) => json!({}),
-    };
-    if !cfg.get("mcpServers").map(Value::is_object).unwrap_or(false) {
-        cfg["mcpServers"] = json!({});
-    }
     let our_url = format!("http://{addr}/mcp");
-    cfg["mcpServers"]["openab-browser"] = json!({
-        "url": our_url,
+    let entry = json!({
+        "url": our_url.clone(),
         "headers": { "Authorization": format!("Bearer {bearer}") }
     });
-    // 0600: the file carries a live bearer token — default umask would leave it world-readable.
-    write_private(&cfg_path, &serde_json::to_vec_pretty(&cfg)?).await?;
+
+    // Merge the openab-browser entry into each colocated ACP CLI's native MCP config (don't
+    // clobber servers the user/agent already configured). Cursor reads <workdir>/.cursor/mcp.json;
+    // kiro-cli reads <workdir>/.kiro/settings/mcp.json. We write both — each CLI ignores the
+    // other's file — so the browser server reaches whichever agent is colocated.
+    let cfg_paths = [
+        std::path::Path::new(workdir).join(".cursor").join("mcp.json"),
+        std::path::Path::new(workdir)
+            .join(".kiro")
+            .join("settings")
+            .join("mcp.json"),
+    ];
+    for cfg_path in &cfg_paths {
+        if let Some(dir) = cfg_path.parent() {
+            tokio::fs::create_dir_all(dir).await?;
+        }
+        let mut cfg: Value = match tokio::fs::read(cfg_path).await {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({})),
+            Err(_) => json!({}),
+        };
+        if !cfg.get("mcpServers").map(Value::is_object).unwrap_or(false) {
+            cfg["mcpServers"] = json!({});
+        }
+        cfg["mcpServers"]["openab-browser"] = entry.clone();
+        // 0600: the file carries a live bearer token — default umask would leave it world-readable.
+        write_private(cfg_path, &serde_json::to_vec_pretty(&cfg)?).await?;
+    }
 
     // On session evict/drop the caller cancels `ct`; strip our now-dead `openab-browser` entry
-    // (with its live bearer) so a stale credential doesn't linger. Only remove it if it still
-    // points at OUR addr — a concurrent/reconnected session may have already replaced it, and we
-    // must not clobber that live entry (the mcp.json path is shared across acp: sessions).
-    let cleanup_path = cfg_path.clone();
+    // (with its live bearer) from each config so a stale credential doesn't linger. Only remove it
+    // if it still points at OUR addr — a concurrent/reconnected session may have already replaced
+    // it, and we must not clobber that live entry (the mcp.json paths are shared across acp: sessions).
+    let cleanup_paths = cfg_paths.to_vec();
+    let cleanup_url = our_url;
     let cleanup_ct = ct.clone();
     tokio::spawn(async move {
         cleanup_ct.cancelled().await;
-        let Ok(bytes) = tokio::fs::read(&cleanup_path).await else {
-            return;
-        };
-        let Ok(mut cfg) = serde_json::from_slice::<Value>(&bytes) else {
-            return;
-        };
-        let still_ours = cfg
-            .pointer("/mcpServers/openab-browser/url")
-            .and_then(Value::as_str)
-            == Some(our_url.as_str());
-        if !still_ours {
-            return;
-        }
-        if let Some(servers) = cfg.get_mut("mcpServers").and_then(Value::as_object_mut) {
-            servers.remove("openab-browser");
-        }
-        if let Ok(out) = serde_json::to_vec_pretty(&cfg) {
-            let _ = write_private(&cleanup_path, &out).await;
+        for cleanup_path in &cleanup_paths {
+            let Ok(bytes) = tokio::fs::read(cleanup_path).await else {
+                continue;
+            };
+            let Ok(mut cfg) = serde_json::from_slice::<Value>(&bytes) else {
+                continue;
+            };
+            let still_ours = cfg
+                .pointer("/mcpServers/openab-browser/url")
+                .and_then(Value::as_str)
+                == Some(cleanup_url.as_str());
+            if !still_ours {
+                continue;
+            }
+            if let Some(servers) = cfg.get_mut("mcpServers").and_then(Value::as_object_mut) {
+                servers.remove("openab-browser");
+            }
+            if let Ok(out) = serde_json::to_vec_pretty(&cfg) {
+                let _ = write_private(cleanup_path, &out).await;
+            }
         }
     });
 
