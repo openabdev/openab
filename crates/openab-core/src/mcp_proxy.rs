@@ -354,6 +354,43 @@ pub async fn write_bridge_mcp_config(workdir: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Selected browser transport for the Option C rollout. `OPENAB_BROWSER_MODE=bridge` opts into
+/// the stdio bridge; anything else (including unset) keeps the per-session HTTP proxy — the safe
+/// default during rollout, so existing Cursor/Kiro browser control is unchanged until flipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserMode {
+    Proxy,
+    Bridge,
+}
+
+impl BrowserMode {
+    pub fn is_bridge(self) -> bool {
+        matches!(self, BrowserMode::Bridge)
+    }
+}
+
+fn parse_browser_mode(s: Option<&str>) -> BrowserMode {
+    match s.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("bridge") => BrowserMode::Bridge,
+        _ => BrowserMode::Proxy,
+    }
+}
+
+/// Read the browser transport mode from `OPENAB_BROWSER_MODE` (default: proxy).
+pub fn browser_mode() -> BrowserMode {
+    parse_browser_mode(std::env::var("OPENAB_BROWSER_MODE").ok().as_deref())
+}
+
+/// Per-pod browser-bridge socket path (overridable via `OPENAB_BROWSER_SOCKET`). Single source of
+/// truth shared by the core socket server and the `openab browser-bridge` shim so they agree.
+pub fn browser_socket_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("OPENAB_BROWSER_SOCKET") {
+        return p.into();
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/agent".into());
+    std::path::Path::new(&home).join(".openab").join("browser.sock")
+}
+
 // ---- Option C: per-pod stdio-bridge socket server -------------------------------------------
 // A single unix socket per pod multiplexes ALL sessions. The `openab browser-bridge` shim
 // (spawned per agent session by the CLI's MCP client) connects and forwards inner MCP requests
@@ -450,6 +487,16 @@ pub async fn serve_browser_socket(
     Ok(())
 }
 
+/// Start the browser socket for the process lifetime (no external cancellation handle) — used by
+/// the broker in bridge mode. The pod-wide server lives as long as the process, so no caller-side
+/// tokio-util dependency is needed.
+pub async fn serve_browser_socket_forever(
+    path: std::path::PathBuf,
+    tunnel: Option<Arc<dyn BrowserTunnel>>,
+) -> std::io::Result<()> {
+    serve_browser_socket(path, tunnel, tokio_util::sync::CancellationToken::new()).await
+}
+
 async fn handle_browser_conn(
     stream: tokio::net::UnixStream,
     tunnel: Option<Arc<dyn BrowserTunnel>>,
@@ -483,9 +530,22 @@ async fn handle_browser_conn(
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_tools, dispatch_browser_mcp, serve_browser_socket, spawn_mcp_server,
-        start_session_server, write_bridge_mcp_config, BrowserTunnel, ProxyHandler,
+        browser_tools, dispatch_browser_mcp, parse_browser_mode, serve_browser_socket,
+        spawn_mcp_server, start_session_server, write_bridge_mcp_config, BrowserMode, BrowserTunnel,
+        ProxyHandler,
     };
+
+    #[test]
+    fn browser_mode_defaults_to_proxy_and_opts_into_bridge() {
+        assert_eq!(parse_browser_mode(None), BrowserMode::Proxy);
+        assert_eq!(parse_browser_mode(Some("")), BrowserMode::Proxy);
+        assert_eq!(parse_browser_mode(Some("proxy")), BrowserMode::Proxy);
+        assert_eq!(parse_browser_mode(Some("junk")), BrowserMode::Proxy);
+        assert_eq!(parse_browser_mode(Some("bridge")), BrowserMode::Bridge);
+        assert_eq!(parse_browser_mode(Some("  Bridge  ")), BrowserMode::Bridge);
+        assert!(BrowserMode::Bridge.is_bridge());
+        assert!(!BrowserMode::Proxy.is_bridge());
+    }
 
     struct MockTunnel;
     #[async_trait::async_trait]

@@ -12,15 +12,6 @@
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-/// Per-pod socket path; overridable via `OPENAB_BROWSER_SOCKET`.
-fn socket_path() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("OPENAB_BROWSER_SOCKET") {
-        return p.into();
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/agent".into());
-    std::path::Path::new(&home).join(".openab").join("browser.sock")
-}
-
 /// Wrap one stdin MCP request line into a socket frame `{channel_id, request}`. Returns `None`
 /// for a blank/unparseable line (skip it) so a stray line can't break the relay.
 fn wrap_frame(channel: &str, line: &str) -> Option<Vec<u8>> {
@@ -39,7 +30,8 @@ fn wrap_frame(channel: &str, line: &str) -> Option<Vec<u8>> {
 /// socket→stdout (verbatim MCP responses) until either side closes.
 pub async fn run() -> std::io::Result<()> {
     let channel = std::env::var("OPENAB_BROWSER_CHANNEL").unwrap_or_default();
-    let sock = tokio::net::UnixStream::connect(socket_path()).await?;
+    let sock =
+        tokio::net::UnixStream::connect(openab_core::mcp_proxy::browser_socket_path()).await?;
     let (sock_rd, sock_wr) = sock.into_split();
     pump(
         channel,

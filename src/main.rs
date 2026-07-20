@@ -404,9 +404,26 @@ async fn main() -> anyhow::Result<()> {
         cfg.pool.default_config_options,
     );
     #[cfg(feature = "acp")]
-    let pool_inner = pool_inner.with_browser_tunnel(Some(Arc::new(
+    let browser_tunnel: Arc<dyn openab_core::mcp_proxy::BrowserTunnel> = Arc::new(
         browser_tunnel::RootBrowserTunnel::new(acp_tunnel_registry.clone()),
-    )));
+    );
+    #[cfg(feature = "acp")]
+    let pool_inner = pool_inner.with_browser_tunnel(Some(browser_tunnel.clone()));
+    // Option C bridge mode: start the per-pod browser socket server once; the `openab
+    // browser-bridge` shims each agent spawns dial it. Proxy mode (default) skips this.
+    #[cfg(feature = "acp")]
+    if openab_core::mcp_proxy::browser_mode().is_bridge() {
+        let sock = openab_core::mcp_proxy::browser_socket_path();
+        match openab_core::mcp_proxy::serve_browser_socket_forever(
+            sock.clone(),
+            Some(browser_tunnel.clone()),
+        )
+        .await
+        {
+            Ok(()) => info!(?sock, "browser bridge socket serving (Option C)"),
+            Err(e) => warn!(?sock, error = %e, "failed to start browser bridge socket"),
+        }
+    }
     let pool = Arc::new(pool_inner);
     let ttl_secs = cfg.pool.session_ttl_hours * 3600;
 

@@ -370,20 +370,36 @@ impl SessionPool {
         #[cfg(feature = "acp-mcp")]
         let mcp_guard: Option<tokio_util::sync::DropGuard> =
             if let Some(channel_id) = thread_id.strip_prefix("acp:") {
-                match crate::mcp_proxy::start_session_server(
-                    channel_id,
-                    &effective_workdir,
-                    self.browser_tunnel.clone(),
-                )
-                .await
-                {
-                    Ok((addr, ct)) => {
-                        info!(thread_id, %addr, "started per-session MCP proxy server");
-                        Some(ct.drop_guard())
-                    }
-                    Err(e) => {
-                        warn!(thread_id, error = %e, "failed to start MCP proxy; browser tools unavailable");
+                match crate::mcp_proxy::browser_mode() {
+                    // Bridge mode (Option C): the agent's static mcp.json points at `openab
+                    // browser-bridge`, which dials the pod-wide socket server (started at boot).
+                    // Just ensure the write-once config exists — no per-session server/guard.
+                    crate::mcp_proxy::BrowserMode::Bridge => {
+                        if let Err(e) =
+                            crate::mcp_proxy::write_bridge_mcp_config(&effective_workdir).await
+                        {
+                            warn!(thread_id, error = %e, "failed to write bridge mcp config");
+                        }
                         None
+                    }
+                    // Proxy mode (default): per-session loopback HTTP MCP server + dynamic config.
+                    crate::mcp_proxy::BrowserMode::Proxy => {
+                        match crate::mcp_proxy::start_session_server(
+                            channel_id,
+                            &effective_workdir,
+                            self.browser_tunnel.clone(),
+                        )
+                        .await
+                        {
+                            Ok((addr, ct)) => {
+                                info!(thread_id, %addr, "started per-session MCP proxy server");
+                                Some(ct.drop_guard())
+                            }
+                            Err(e) => {
+                                warn!(thread_id, error = %e, "failed to start MCP proxy; browser tools unavailable");
+                                None
+                            }
+                        }
                     }
                 }
             } else {
