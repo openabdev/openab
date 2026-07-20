@@ -319,9 +319,138 @@ async fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<
     Ok(())
 }
 
+// ---- Option C: per-pod stdio-bridge socket server -------------------------------------------
+// A single unix socket per pod multiplexes ALL sessions. The `openab browser-bridge` shim
+// (spawned per agent session by the CLI's MCP client) connects and forwards inner MCP requests
+// tagged with its own `channel_id` (from the OPENAB_BROWSER_CHANNEL env it inherits); core routes
+// `tools/call` to that session's BrowserTunnel. This is the stable, variant-agnostic replacement
+// for the per-session HTTP proxy (Option C). Wire = newline-delimited JSON, one frame per line:
+//   bridge → core : {"channel_id": "...", "request": <inner MCP JSON-RPC request>}
+//   core → bridge : <inner MCP JSON-RPC response>   (omitted for notifications)
+
+const BROWSER_MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+
+fn mcp_result(id: Value, result: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "result": result })
+}
+
+fn mcp_error(id: Value, code: i64, message: &str) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+}
+
+/// Dispatch one inner MCP request for `channel_id`, backing `tools/call` with the shared browser
+/// tunnel. Returns the MCP response, or `None` for a JSON-RPC notification (no reply). Same tool
+/// set + not-connected semantics as the HTTP `ProxyHandler` (single source of truth).
+pub(crate) async fn dispatch_browser_mcp(
+    channel_id: &str,
+    request: &Value,
+    tunnel: &Option<Arc<dyn BrowserTunnel>>,
+) -> Option<Value> {
+    // A JSON-RPC notification has no `id` → no response.
+    let id = request.get("id").cloned()?;
+    let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+    let resp = match method {
+        "initialize" => mcp_result(
+            id,
+            json!({
+                "protocolVersion": BROWSER_MCP_PROTOCOL_VERSION,
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": "openab-browser", "version": env!("CARGO_PKG_VERSION") }
+            }),
+        ),
+        "tools/list" => {
+            let tools = serde_json::to_value(browser_tools()).unwrap_or_else(|_| json!([]));
+            mcp_result(id, json!({ "tools": tools }))
+        }
+        "tools/call" => match tunnel {
+            Some(t) => match t
+                .call(channel_id, "tools/call", request.get("params").cloned())
+                .await
+            {
+                Ok(v) => mcp_result(id, v),
+                Err(e) => mcp_error(id, -32603, &e),
+            },
+            None => mcp_error(
+                id,
+                -32603,
+                "browser not connected: open the OpenAB side panel in your browser",
+            ),
+        },
+        other => mcp_error(id, -32601, &format!("method not found: {other}")),
+    };
+    Some(resp)
+}
+
+/// Serve the per-pod browser-bridge socket at `path`, routing each connection's framed requests
+/// via [`dispatch_browser_mcp`]. Binds a fresh 0600 unix socket (same-uid only), spawns the accept
+/// loop, and runs until `ct` is cancelled. Idempotent on a stale socket file from a prior run.
+pub async fn serve_browser_socket(
+    path: std::path::PathBuf,
+    tunnel: Option<Arc<dyn BrowserTunnel>>,
+    ct: tokio_util::sync::CancellationToken,
+) -> std::io::Result<()> {
+    let _ = tokio::fs::remove_file(&path).await; // clear a stale socket from a prior run
+    let listener = tokio::net::UnixListener::bind(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = ct.cancelled() => break,
+                accepted = listener.accept() => {
+                    match accepted {
+                        Ok((stream, _)) => {
+                            tokio::spawn(handle_browser_conn(stream, tunnel.clone()));
+                        }
+                        Err(_) => continue,
+                    }
+                }
+            }
+        }
+        let _ = tokio::fs::remove_file(&path).await;
+    });
+    Ok(())
+}
+
+async fn handle_browser_conn(
+    stream: tokio::net::UnixStream,
+    tunnel: Option<Arc<dyn BrowserTunnel>>,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (read_half, mut write_half) = stream.into_split();
+    let mut lines = BufReader::new(read_half).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+            continue; // skip a malformed frame rather than drop the connection
+        };
+        let channel_id = frame.get("channel_id").and_then(Value::as_str).unwrap_or("");
+        let Some(request) = frame.get("request") else {
+            continue;
+        };
+        if let Some(resp) = dispatch_browser_mcp(channel_id, request, &tunnel).await {
+            let Ok(mut buf) = serde_json::to_vec(&resp) else {
+                continue;
+            };
+            buf.push(b'\n');
+            if write_half.write_all(&buf).await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{browser_tools, spawn_mcp_server, start_session_server, BrowserTunnel, ProxyHandler};
+    use super::{
+        browser_tools, dispatch_browser_mcp, serve_browser_socket, spawn_mcp_server,
+        start_session_server, BrowserTunnel, ProxyHandler,
+    };
 
     struct MockTunnel;
     #[async_trait::async_trait]
@@ -353,6 +482,150 @@ mod tests {
             h.forward_tool_call("browser.click", None).await.is_err(),
             "a call with no attached browser must error (D4)"
         );
+    }
+
+    // --- Option C: browser-bridge socket dispatch ---
+    struct RecordTunnel {
+        result: serde_json::Value,
+    }
+    #[async_trait::async_trait]
+    impl BrowserTunnel for RecordTunnel {
+        async fn call(
+            &self,
+            channel_id: &str,
+            method: &str,
+            _params: Option<serde_json::Value>,
+        ) -> Result<serde_json::Value, String> {
+            assert_eq!(method, "tools/call");
+            assert_eq!(channel_id, "acp_win1");
+            Ok(self.result.clone())
+        }
+    }
+    struct ErrTunnel;
+    #[async_trait::async_trait]
+    impl BrowserTunnel for ErrTunnel {
+        async fn call(
+            &self,
+            _c: &str,
+            _m: &str,
+            _p: Option<serde_json::Value>,
+        ) -> Result<serde_json::Value, String> {
+            Err("no browser attached".into())
+        }
+    }
+    fn req(id: i64, method: &str, params: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+    }
+    fn arc_tunnel<T: BrowserTunnel + 'static>(t: T) -> Option<std::sync::Arc<dyn BrowserTunnel>> {
+        Some(std::sync::Arc::new(t))
+    }
+
+    #[tokio::test]
+    async fn dispatch_initialize_advertises_tools() {
+        let r = dispatch_browser_mcp("acp_x", &req(1, "initialize", serde_json::json!({})), &None)
+            .await
+            .unwrap();
+        assert_eq!(r["id"], 1);
+        assert_eq!(r["result"]["capabilities"]["tools"], serde_json::json!({}));
+        assert_eq!(r["result"]["serverInfo"]["name"], "openab-browser");
+    }
+
+    #[tokio::test]
+    async fn dispatch_tools_list_returns_five_tools() {
+        let r = dispatch_browser_mcp("acp_x", &req(2, "tools/list", serde_json::json!({})), &None)
+            .await
+            .unwrap();
+        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn dispatch_tools_call_routes_to_the_channel_tunnel() {
+        let tunnel = arc_tunnel(RecordTunnel {
+            result: serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] }),
+        });
+        let r = dispatch_browser_mcp(
+            "acp_win1",
+            &req(3, "tools/call", serde_json::json!({ "name": "browser.read_dom", "arguments": {} })),
+            &tunnel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["result"]["content"][0]["text"], "ok");
+    }
+
+    #[tokio::test]
+    async fn dispatch_tools_call_without_tunnel_is_not_connected() {
+        let r = dispatch_browser_mcp(
+            "acp_x",
+            &req(4, "tools/call", serde_json::json!({ "name": "browser.click" })),
+            &None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["error"]["code"], -32603);
+        assert!(r["error"]["message"].as_str().unwrap().contains("not connected"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_tools_call_surfaces_tunnel_error() {
+        let tunnel = arc_tunnel(ErrTunnel);
+        let r = dispatch_browser_mcp(
+            "acp_x",
+            &req(5, "tools/call", serde_json::json!({ "name": "browser.click" })),
+            &tunnel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["error"]["code"], -32603);
+        assert_eq!(r["error"]["message"], "no browser attached");
+    }
+
+    #[tokio::test]
+    async fn dispatch_notification_gets_no_response() {
+        let notif = serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+        assert!(dispatch_browser_mcp("acp_x", &notif, &None).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatch_unknown_method_is_method_not_found() {
+        let r = dispatch_browser_mcp("acp_x", &req(6, "bogus/thing", serde_json::json!({})), &None)
+            .await
+            .unwrap();
+        assert_eq!(r["error"]["code"], -32601);
+    }
+
+    #[tokio::test]
+    async fn browser_socket_round_trip() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("browser.sock");
+        let tunnel = arc_tunnel(RecordTunnel {
+            result: serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] }),
+        });
+        let ct = tokio_util::sync::CancellationToken::new();
+        serve_browser_socket(sock.clone(), tunnel, ct.clone())
+            .await
+            .unwrap();
+        let stream = loop {
+            match tokio::net::UnixStream::connect(&sock).await {
+                Ok(s) => break s,
+                Err(_) => tokio::task::yield_now().await,
+            }
+        };
+        let (rd, mut wr) = stream.into_split();
+        let frame = serde_json::json!({
+            "channel_id": "acp_win1",
+            "request": req(9, "tools/call", serde_json::json!({ "name": "browser.read_dom", "arguments": {} }))
+        });
+        let mut line = serde_json::to_vec(&frame).unwrap();
+        line.push(b'\n');
+        wr.write_all(&line).await.unwrap();
+        let mut resp = String::new();
+        BufReader::new(rd).read_line(&mut resp).await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["id"], 9);
+        assert_eq!(v["result"]["content"][0]["text"], "ok");
+        ct.cancel();
     }
 
     #[tokio::test]
