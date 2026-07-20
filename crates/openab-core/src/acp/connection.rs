@@ -336,6 +336,7 @@ impl AcpConnection {
         working_dir: &str,
         env: &std::collections::HashMap<String, String>,
         inherit_env: &[String],
+        browser_channel: Option<&str>,
     ) -> Result<Self> {
         info!(cmd = command, ?args, cwd = working_dir, "spawning agent");
 
@@ -402,6 +403,10 @@ impl AcpConnection {
                 cmd.env("SystemDrive", v);
             }
         }
+        // Option C: hand this session's browser channel to the agent so the `openab
+        // browser-bridge` stdio shim it later spawns inherits it and routes tool calls to THIS
+        // session's tunnel. env_clear() above dropped it, so (re)inject explicitly.
+        set_browser_channel(&mut cmd, browser_channel);
         for (k, v) in env {
             cmd.env(k, expand_env(v));
         }
@@ -847,10 +852,38 @@ impl Drop for AcpConnection {
     }
 }
 
+/// Inject the session's browser channel into the agent's env so the `openab browser-bridge`
+/// stdio shim the agent later spawns inherits it (Option C) and routes tool calls to THIS
+/// session's tunnel. No-op for non-browser sessions (`None`).
+fn set_browser_channel(cmd: &mut tokio::process::Command, browser_channel: Option<&str>) {
+    if let Some(channel) = browser_channel {
+        cmd.env("OPENAB_BROWSER_CHANNEL", channel);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{build_agent_env, build_permission_response, pick_best_option};
+    use super::{build_agent_env, build_permission_response, pick_best_option, set_browser_channel};
     use serde_json::json;
+
+    #[test]
+    fn set_browser_channel_injects_env_when_present() {
+        let mut cmd = tokio::process::Command::new("true");
+        set_browser_channel(&mut cmd, Some("acp_win1"));
+        assert!(cmd.as_std().get_envs().any(|(k, v)| {
+            k == "OPENAB_BROWSER_CHANNEL" && v == Some(std::ffi::OsStr::new("acp_win1"))
+        }));
+    }
+
+    #[test]
+    fn set_browser_channel_is_noop_when_absent() {
+        let mut cmd = tokio::process::Command::new("true");
+        set_browser_channel(&mut cmd, None);
+        assert!(!cmd
+            .as_std()
+            .get_envs()
+            .any(|(k, _)| k == "OPENAB_BROWSER_CHANNEL"));
+    }
 
     #[test]
     fn picks_allow_always_over_other_options() {

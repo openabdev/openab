@@ -398,6 +398,7 @@ impl SessionPool {
             &effective_workdir,
             &self.config.env,
             &self.config.inherit_env,
+            thread_id.strip_prefix("acp:"),
         )
         .await?;
 
