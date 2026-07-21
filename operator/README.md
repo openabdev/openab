@@ -137,9 +137,22 @@ record exists, delete fails before destructive mutation so it cannot discard
 unfinished exact cleanup identity. Re-run the ingress-free apply to completion,
 then retry delete.
 
-Delete namespaces must not contain `-`; names may contain it. This makes the
-existing `oab-{namespace}-{name}` physical identity injective for every target
-accepted by the programmatic delete API.
+Apply and delete share one injective logical-identity rule: namespaces must not
+contain `-`; names may contain it, so the physical `oab-{namespace}-{name}`
+identity always parses back to exactly one `namespace`/`name` pair. Manifest
+validation (CLI apply, fleet expansion, and `apply_manifests`) and
+`delete_services` all reject hyphenated namespaces before any AWS call. Before
+mutating, apply and every delete entry point additionally verify in the
+control plane that no *other* recorded logical pair (manifest, delete
+checkpoint, or ingress-teardown checkpoint) claims the same physical name, and
+fail closed with the colliding pair named in the error.
+
+Legacy policy: deployments created under a hyphenated namespace before this
+rule cannot be re-applied — apply fails with a migration message. They remain
+deletable through `oabctl delete`, which accepts a hyphenated namespace for
+teardown, prints a warning, and relies on the same control-plane ownership
+check to refuse contested physical names. Migrate by deleting the legacy
+deployment and re-creating it under a hyphen-free namespace.
 
 Programmatic apply and delete do not provide an internal same-target lock.
 Callers must serialize mutations for the same AWS account, Region, control-plane

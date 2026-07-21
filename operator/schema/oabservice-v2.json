@@ -35,7 +35,7 @@
       "required": ["name", "namespace"],
       "properties": {
         "name": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
-        "namespace": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+        "namespace": { "type": "string", "pattern": "^[a-z0-9]+$" },
         "generation": { "type": "integer", "minimum": 0 }
       },
       "additionalProperties": false
@@ -45,7 +45,7 @@
       "required": ["name", "namespace"],
       "properties": {
         "name": { "type": "string" },
-        "namespace": { "type": "string" }
+        "namespace": { "type": "string", "pattern": "^[a-z0-9]+$" }
       },
       "additionalProperties": false
     },

@@ -21,11 +21,11 @@ macro_rules! eprint {
 ///
 /// Deletion does not require the original manifest: the control-plane copy
 /// under `manifests/{namespace}/{name}.yaml` (and every other resource) is
-/// addressed by `namespace` + `name` alone. Because physical resource names
-/// use `-` as the component delimiter, [`delete_services`] accepts namespaces
-/// without `-`; names may still contain it. This keeps every accepted logical
-/// target's physical delete identity injective without renaming existing
-/// deployments.
+/// addressed by `namespace` + `name` alone. Targets are subject to the shared
+/// injective identity rule (see [`crate::identity`]): namespaces must not
+/// contain `-`, names may. Before any destructive mutation, delete also
+/// verifies in the control plane that no other recorded logical pair claims
+/// the same physical `oab-{namespace}-{name}` identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteTarget {
     pub namespace: String,
@@ -42,7 +42,7 @@ impl DeleteTarget {
 
     /// ECS service name derived from the target (`oab-{namespace}-{name}`).
     pub fn ecs_service_name(&self) -> String {
-        format!("oab-{}-{}", self.namespace, self.name)
+        crate::identity::physical_service_name(&self.namespace, &self.name)
     }
 }
 
@@ -342,7 +342,7 @@ fn classify_service_identity(
 }
 
 fn checkpoint_key(namespace: &str, name: &str) -> String {
-    format!("delete-checkpoints/{namespace}/{name}.json")
+    crate::identity::delete_checkpoint_key(namespace, name)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -386,7 +386,7 @@ fn validate_checkpoint(
     }
     validate_checkpoint_arns(
         checkpoint,
-        &format!("oab-{namespace}-{name}"),
+        &crate::identity::physical_service_name(namespace, name),
         partition,
         account,
         region,
@@ -416,19 +416,11 @@ fn validate_delete_request(
         )));
     }
     for target in targets {
-        if target.namespace.trim().is_empty() || target.name.trim().is_empty() {
-            return Err(DeleteError::validation(anyhow::anyhow!(
-                "delete target namespace and name must not be empty (got '{}'/'{}')",
-                target.namespace,
-                target.name
-            )));
-        }
-        if target.namespace.contains('-') {
-            return Err(DeleteError::validation(anyhow::anyhow!(
-                "delete target namespace must not contain '-' because it is the physical identity delimiter (got '{}')",
-                target.namespace
-            )));
-        }
+        // Shared injective identity rule (see `crate::identity`): non-empty
+        // components and a hyphen-free namespace, matching what apply-side
+        // manifest validation accepts.
+        crate::identity::validate_injective_identity(&target.namespace, &target.name)
+            .map_err(DeleteError::validation)?;
     }
     Ok(())
 }
@@ -459,10 +451,16 @@ fn record_delete_result(
 /// - the target set must be non-empty
 /// - [`DeleteOptions::cluster`] must be non-empty; its optional bucket override
 ///   follows the shared control-plane resolver
-/// - every target's `namespace`/`name` must be non-empty
-/// - target namespaces must not contain `-`; that delimiter may appear in names,
-///   so this restriction makes `oab-{namespace}-{name}` injective for every
-///   accepted target
+/// - every target must satisfy the shared injective identity rule (see
+///   [`crate::identity`]): non-empty `namespace`/`name` and a hyphen-free
+///   namespace, the same rule apply-side manifest validation enforces. Legacy
+///   deployments created under a hyphenated namespace are not accepted here;
+///   remove them with the `oabctl delete` CLI, which performs the
+///   control-plane ownership check for such targets.
+///
+/// Additionally, before any destructive mutation, delete verifies in the
+/// control plane that no other recorded logical pair claims the target's
+/// physical `oab-{namespace}-{name}` identity, and fails closed if one does.
 ///
 /// # Concurrency
 ///
@@ -740,7 +738,7 @@ async fn prepare_identity(
         return Ok(PreparedIdentity::Exact(Box::new((checkpoint, state))));
     }
 
-    let service_name = format!("oab-{namespace}-{name}");
+    let service_name = crate::identity::physical_service_name(namespace, name);
     let response = ecs.describe_services().cluster(cluster).services(&service_name)
         .send().await.context("failed to describe ECS service before delete")?;
     let service = single_described_service(&response)?;
@@ -1012,7 +1010,7 @@ async fn delete_checkpointed_ecs(
 async fn cleanup_s3(
     s3: &aws_sdk_s3::Client, bucket: &str, namespace: &str, name: &str,
 ) -> Result<()> {
-    let manifest_key = format!("manifests/{namespace}/{name}.yaml");
+    let manifest_key = crate::identity::manifest_key(namespace, name);
     s3.delete_object().bucket(bucket).key(&manifest_key).send().await
         .with_context(|| format!("failed to delete s3://{bucket}/{manifest_key}"))?;
     println!("  ✓ Manifest removed from S3");
@@ -1049,8 +1047,28 @@ async fn run_with_bucket(
     if resource != "oabservice" {
         anyhow::bail!("unknown resource type: {resource}. Use 'oabservice'");
     }
+    if namespace.trim().is_empty() || name.trim().is_empty() {
+        anyhow::bail!(
+            "delete requires a non-empty namespace and name (got '{namespace}'/'{name}')"
+        );
+    }
     let ecs = aws_sdk_ecs::Client::new(aws_config);
     let s3 = aws_sdk_s3::Client::new(aws_config);
+    if namespace.contains('-') {
+        // Legacy-deployment policy: hyphenated namespaces predate the shared
+        // injective identity rule (see `crate::identity`). Programmatic
+        // targets are rejected earlier; the CLI keeps them deletable, guarded
+        // by the exclusive-ownership check below.
+        eprintln!(
+            "  ⚠ Namespace '{namespace}' contains '-', which predates the hyphen-free \
+             namespace rule; continuing only if the control plane records no colliding \
+             deployment for '{}'",
+            crate::identity::physical_service_name(namespace, name)
+        );
+    }
+    // Shared ownership rule: refuse to touch a physical identity that another
+    // recorded logical pair (e.g. a legacy hyphenated namespace) claims.
+    crate::identity::ensure_exclusive_physical_identity(&s3, bucket, namespace, name).await?;
     crate::apply::ensure_no_pending_ingress_teardown(&s3, bucket, namespace, name)
         .await?;
     println!("Deleting {name}...");
@@ -1429,7 +1447,41 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind, DeleteErrorKind::Validation);
-        assert!(error.to_string().contains("must not contain '-'"));
+        assert!(error.to_string().contains("must not contain '-'"), "{error}");
+    }
+
+    #[test]
+    fn colliding_logical_pairs_guard_every_entry_point() {
+        // `prod/team-bot` and `prod-team/bot` share the physical identity
+        // `oab-prod-team-bot`. Cross-entry-point regression for the shared
+        // rule in `crate::identity`:
+        //
+        // 1. Apply cannot create the hyphenated-namespace side (domain rule in
+        //    manifest validation, exercised in `manifest`/`apply` tests) and
+        //    programmatic delete cannot target it
+        //    (`ambiguous_namespace_delimiter_is_rejected_before_aws` above).
+        assert!(
+            crate::identity::validate_injective_identity("prod-team", "bot").is_err(),
+            "hyphenated namespace must be outside the accepted identity domain"
+        );
+        // 2. For the accepted side, the pre-mutation ownership probe shared by
+        //    apply (`apply_ecs`) and every delete entry point
+        //    (`run_with_bucket`) checks exactly the legacy pair's manifest and
+        //    checkpoint keys, so a recorded `prod-team/bot` blocks overwrite,
+        //    checkpointing, and deletion of `oab-prod-team-bot` via
+        //    `prod/team-bot` — and vice versa.
+        assert_eq!(
+            crate::identity::collision_aliases("prod", "team-bot"),
+            vec![("prod-team".to_string(), "bot".to_string())]
+        );
+        assert!(crate::identity::collision_aliases("prod-team", "bot")
+            .contains(&("prod".to_string(), "team-bot".to_string())));
+        // 3. The probed ownership keys are derived from the same helpers the
+        //    mutation paths use, so probe and mutation cannot drift apart.
+        assert_eq!(
+            crate::identity::ownership_keys("prod-team", "bot")[1],
+            checkpoint_key("prod-team", "bot"),
+        );
     }
 
     #[test]

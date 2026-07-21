@@ -400,6 +400,14 @@ pub(crate) async fn run(
 /// Validate and reconcile in-memory manifests without writing progress to
 /// process-global stdout or stderr.
 ///
+/// Every manifest must satisfy the shared injective identity rule (see
+/// [`crate::identity`]): non-empty `metadata.namespace`/`metadata.name` and a
+/// hyphen-free namespace, so the physical `oab-{namespace}-{name}` identity
+/// maps back to exactly one logical pair. Before reconciling each service,
+/// apply also verifies in the control plane that no other recorded logical
+/// pair (for example a legacy hyphenated namespace) claims the same physical
+/// identity, and fails closed if one does.
+///
 /// # Concurrency
 ///
 /// This function is not serialized with [`crate::delete::delete_services`].
@@ -592,7 +600,7 @@ fn validate_apply_service_identity(
 }
 
 fn ingress_teardown_checkpoint_key(namespace: &str, name: &str) -> String {
-    format!("ingress-teardown-checkpoints/{namespace}/{name}.json")
+    crate::identity::ingress_teardown_checkpoint_key(namespace, name)
 }
 
 pub(crate) fn require_no_pending_ingress_teardown(checkpoint_present: bool) -> Result<()> {
@@ -818,6 +826,17 @@ async fn apply_ecs(
 ) -> Result<AppliedService> {
     let bucket = prepared.bucket.as_str();
     let bootstrap = &prepared.bootstrap;
+    // Shared ownership rule (see `crate::identity`): never reconcile a
+    // physical identity that another recorded logical pair claims — e.g. a
+    // legacy hyphenated-namespace deployment whose `oab-{namespace}-{name}`
+    // collides with this manifest's.
+    crate::identity::ensure_exclusive_physical_identity(
+        s3,
+        bucket,
+        &m.metadata.namespace,
+        &m.metadata.name,
+    )
+    .await?;
     let ecs_rt = match &m.spec.runtime {
         Runtime::Ecs(rt) => rt,
         _ => unreachable!(),
@@ -833,10 +852,7 @@ async fn apply_ecs(
     // Read the current generation from the stored desired-state manifest.
     // Ingress teardown retry state is kept separately in an exact-identity
     // checkpoint, so writing a newer manifest cannot lose pending cleanup.
-    let manifest_key = format!(
-        "manifests/{}/{}.yaml",
-        m.metadata.namespace, m.metadata.name
-    );
+    let manifest_key = crate::identity::manifest_key(&m.metadata.namespace, &m.metadata.name);
     let (current_gen, previously_had_ingress) = match s3
         .get_object()
         .bucket(bucket)
@@ -1714,6 +1730,44 @@ spec:
             .unwrap_err();
         assert_eq!(err.kind, ApplyErrorKind::Validation);
         assert!(err.to_string().contains("empty or whitespace"));
+    }
+
+    #[tokio::test]
+    async fn apply_manifests_rejects_hyphenated_namespace_locally() {
+        // Cross-entry-point injective identity regression: the pair
+        // `prod-team/bot` collides with `prod/team-bot` on the physical name
+        // `oab-prod-team-bot`, so apply must reject it before any AWS call —
+        // the same rule programmatic delete enforces on its targets.
+        let cfg = test_sdk_config();
+        let mut manifest = minimal_manifest();
+        manifest.metadata.namespace = "prod-team".to_string();
+        manifest.metadata.name = "bot".to_string();
+        let mut colliding = minimal_manifest();
+        colliding.metadata.namespace = "prod".to_string();
+        colliding.metadata.name = "team-bot".to_string();
+        assert_eq!(manifest.ecs_service_name(), colliding.ecs_service_name());
+        let err = apply_manifests(&cfg, &[manifest], &ApplyOptions::new("test-cluster"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ApplyErrorKind::Validation);
+        let chain = format!("{:#}", err.source_error());
+        assert!(chain.contains("must not contain '-'"), "{chain}");
+    }
+
+    #[tokio::test]
+    async fn apply_manifests_accepts_hyphenated_name_locally() {
+        // Names may contain '-'; only the namespace is restricted. The
+        // manifest must pass local validation and fail later at the (absent)
+        // AWS boundary instead.
+        let cfg = test_sdk_config();
+        let mut manifest = minimal_manifest();
+        manifest.metadata.namespace = "prod".to_string();
+        manifest.metadata.name = "team-bot".to_string();
+        assert!(manifest.validate().is_ok());
+        let err = apply_manifests(&cfg, &[manifest], &ApplyOptions::new("test-cluster"))
+            .await
+            .unwrap_err();
+        assert_ne!(err.kind, ApplyErrorKind::Validation, "{err}");
     }
 
     #[test]

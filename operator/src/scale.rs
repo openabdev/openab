@@ -12,7 +12,7 @@ async fn resolve_service(
         crate::config::OabConfig::load().context("failed to load ~/.oabctl/config.toml")?;
     let cluster = oab_cfg.defaults.cluster;
     let namespace = oab_cfg.defaults.namespace;
-    let service_name = format!("oab-{}-{}", namespace, name);
+    let service_name = crate::identity::physical_service_name(&namespace, name);
 
     // Verify the service exists in the oab cluster
     let ecs = aws_sdk_ecs::Client::new(aws_config);

@@ -219,6 +219,11 @@ spec:
       securityGroups: [sg-xxx]
 ```
 
+`metadata.namespace` must be hyphen-free (`[a-z0-9]+`); `metadata.name` may
+contain `-`. Physical resources are named `oab-{namespace}-{name}`, and a
+hyphen-free namespace keeps that identity unambiguous (see the teardown note
+below for the legacy-namespace policy).
+
 ### Ingress — inbound webhooks (Telegram / LINE)
 
 Discord bots are outbound-only and need no ingress. Webhook platforms (Telegram,
@@ -382,10 +387,18 @@ must still be registered manually in the LINE Developers console.
 > equals the ECS registry ARN. Cloud Map is deleted only by the service ID
 > parsed from a structurally and boundary-validated Cloud Map service ARN.
 > Exact-ID NotFound is idempotent; other cleanup errors retain the checkpoint.
-> There is no name-only API, Cloud Map, or S3 orphan cleanup path. Programmatic
-> delete namespaces must not contain `-` (names may contain it), which makes the
-> existing `oab-{namespace}-{name}` identity injective for every accepted delete
-> target. If a per-target
+> There is no name-only API, Cloud Map, or S3 orphan cleanup path. Apply and
+> delete share one injective identity rule: namespaces must not contain `-`
+> (names may contain it), so the physical `oab-{namespace}-{name}` identity
+> always maps back to exactly one `namespace`/`name` pair. Manifest validation
+> and programmatic delete reject hyphenated namespaces before any AWS call,
+> and before mutating anything both apply and delete verify in the control
+> plane that no other recorded logical pair (for example legacy `prod-team/bot`
+> versus `prod/team-bot`) claims the same physical name — contested identities
+> fail closed. Legacy deployments created under a hyphenated namespace cannot
+> be re-applied, but `oabctl delete` still accepts them (with a warning) under
+> that same ownership check; migrate by deleting and re-creating them under a
+> hyphen-free namespace. If a per-target
 > `ingress-teardown-checkpoints/<namespace>/<name>.json` record exists, delete
 > fails before destructive mutation so it cannot discard unfinished exact
 > cleanup identity. Re-run the ingress-free apply to completion, then retry

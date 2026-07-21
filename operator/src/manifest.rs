@@ -303,6 +303,14 @@ impl OABServiceManifest {
         if self.metadata.namespace.is_empty() {
             anyhow::bail!("metadata.namespace is required");
         }
+        // Shared injective identity rule: apply must not create logical pairs
+        // whose physical `oab-{namespace}-{name}` identity collides with
+        // another pair's. See `crate::identity` for the rule and the legacy
+        // hyphenated-namespace policy.
+        crate::identity::validate_injective_identity(
+            &self.metadata.namespace,
+            &self.metadata.name,
+        )?;
         if self.spec.image.is_empty() {
             anyhow::bail!("spec.image is required");
         }
@@ -352,13 +360,13 @@ impl OABServiceManifest {
     }
 
     pub fn ecs_service_name(&self) -> String {
-        format!("oab-{}-{}", self.metadata.namespace, self.metadata.name)
+        crate::identity::physical_service_name(&self.metadata.namespace, &self.metadata.name)
     }
 
     /// Cloud Map service name for this manifest (unique per namespace+name).
     /// Resolves to `<name>.<cloudMapNamespace>` in private DNS.
     pub fn cloud_map_service_name(&self) -> String {
-        format!("oab-{}-{}", self.metadata.namespace, self.metadata.name)
+        crate::identity::physical_service_name(&self.metadata.namespace, &self.metadata.name)
     }
 }
 
@@ -403,6 +411,30 @@ spec:
         assert_eq!(ing.container_port, 8080);
         assert_eq!(ing.paths, vec!["/webhook/telegram", "/webhook/line"]);
         m.validate().expect("valid");
+    }
+
+    #[test]
+    fn rejects_hyphenated_namespace_with_migration_hint() {
+        // Injective identity rule: `prod-team/bot` collides with
+        // `prod/team-bot` on `oab-prod-team-bot`, so manifest validation (the
+        // gate for CLI apply, fleet expansion, and programmatic apply) must
+        // reject hyphenated namespaces before any AWS call.
+        let mut m = parse(ECS_SERVICE_WITH_INGRESS);
+        m.metadata.namespace = "prod-team".to_string();
+        m.metadata.name = "bot".to_string();
+        let message = m.validate().unwrap_err().to_string();
+        assert!(message.contains("must not contain '-'"), "{message}");
+        assert!(message.contains("oabctl delete"), "{message}");
+    }
+
+    #[test]
+    fn accepts_hyphenated_name_with_hyphen_free_namespace() {
+        let mut m = parse(ECS_SERVICE_WITH_INGRESS);
+        m.metadata.namespace = "prod".to_string();
+        m.metadata.name = "team-bot".to_string();
+        m.validate().expect("hyphenated names remain valid");
+        assert_eq!(m.ecs_service_name(), "oab-prod-team-bot");
+        assert_eq!(m.cloud_map_service_name(), "oab-prod-team-bot");
     }
 
     #[test]

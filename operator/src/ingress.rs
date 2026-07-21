@@ -538,7 +538,7 @@ pub(crate) async fn delete_exact(
         delete_cloud_map_by_arn(
             config,
             registry_arn,
-            &format!("oab-{namespace}-{name}"),
+            &crate::identity::physical_service_name(namespace, name),
             (partition, account, region),
         )
         .await?;
