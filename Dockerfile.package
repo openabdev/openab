@@ -115,6 +115,33 @@ ENTRYPOINT ["tini", "--"]
 CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 
 # =============================================================================
+# Target: kimi
+# =============================================================================
+FROM node:24-trixie-slim AS kimi
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl procps ripgrep tini bubblewrap socat unzip git \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/*
+ARG KIMI_CODE_VERSION=0.28.1
+RUN npm install -g @moonshot-ai/kimi-code@${KIMI_CODE_VERSION} --retry 3
+ENV HOME=/home/node
+WORKDIR /home/node
+COPY --from=bins --chown=node:node /openab /usr/local/bin/openab
+RUN mkdir -p /home/node/.kimi-code && chown -R node:node /home/node
+USER node
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="kimi acp"
+ENV OPENAB_AGENT_AUTH_COMMAND="kimi"
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
+
+# =============================================================================
 # Target: copilot
 # =============================================================================
 FROM base-node AS copilot
