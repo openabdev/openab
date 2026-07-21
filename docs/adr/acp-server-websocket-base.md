@@ -16,9 +16,11 @@ the full ACP-server vision across five phases. This ADR is the **as-built record
 the base** — the concrete, **wire-conformant** primitive surface the implementation
 ships and that future work should follow.
 
-Scope: a standard-ACP **1:1 streaming chat** endpoint for real ACP clients (browser,
-desktop, IDE, CLI) over WebSocket. Not in the base: tool calls / permissions, client
-fs/terminal methods, multi-agent fan-out, Streamable HTTP.
+Scope: a standard-ACP **1:1 chat** endpoint for real ACP clients (browser,
+desktop, IDE, CLI) over WebSocket. Phase-1 returns each reply as a single terminal
+`agent_message_chunk` (backend `streaming=false`); progressive multi-chunk streaming is
+Phase-2 (§6). Not in the base: tool calls / permissions, client fs/terminal methods,
+multi-agent fan-out, Streamable HTTP.
 
 Design goal (per decision on 2026-07-17): **follow the official ACP guide** so
 third-party ACP clients (Zed, JetBrains, …) interoperate — no custom method names.
@@ -94,9 +96,12 @@ all `false` in the base (text only). `protocolVersion` is the integer `1`.
 ### Agent → Client (notification)
 
 - `session/update` with `update.sessionUpdate = "agent_message_chunk"` and
-  `update.content = { type:"text", text: <delta> }` — streamed reply text. Delta is
-  sliced char-boundary-safe (`str::get`, never byte-index) so CJK / 顏文字 / emoji
-  cannot panic the stream.
+  `update.content = { type:"text", text: <delta> }` — reply text. **Phase-1 delivers the
+  whole reply as a single terminal `agent_message_chunk` before the `session/prompt`
+  response** — the ACP `ChatAdapter` is `streaming=false`, so the backend hands the reply
+  over once rather than incrementally. Progressive multi-chunk streaming is Phase-2 (§6).
+  The delta is still sliced char-boundary-safe (`str::get`, never byte-index) so CJK /
+  顏文字 / emoji cannot panic the stream if/when multiple chunks arrive.
 - Turn completion is the `session/prompt` **response** (`{ stopReason }`, correlated
   to the request id), not a separate notification. `stopReason` ∈ `end_turn` /
   `cancelled`. A backend timeout has no ACP stopReason, so it returns a JSON-RPC
@@ -226,6 +231,11 @@ North star: the agent's LLM autonomously operating the user's real browser (gene
   `toolCallId` / `title` / `status`) separately from the text — this is the ACP-native path
   (standard clients like Zed render it too), avoids brittle client-side text parsing, and
   cleanly separates tool activity from the answer. Client (extension) then renders chips.
+- **Progressive `agent_message_chunk` streaming (Phase-2)** — Phase-1 emits the whole reply
+  as one terminal chunk because the ACP `ChatAdapter` reports `streaming=false`, so the
+  backend hands the reply over once. True incremental delivery — flip the adapter to
+  streaming and emit a chunk per delta as the backend produces text — is Phase-2; the
+  gateway's char-boundary-safe delta path already tolerates multiple chunks.
 - other richer `session/update` variants: `agent_thought_chunk` / `plan` /
   `available_commands_update` / `usage_update`
 - `fs/*`, `terminal/*` (sibling agent→client capabilities)

@@ -1750,4 +1750,65 @@ mod acp_review_fixes {
         assert!(s.busy, "busy must remain set after a rejected resume");
         assert!(s.cancel.is_some(), "the active prompt's cancel handle must survive resume");
     }
+
+    // R16-F3(A) — Phase-1 send-once: the ACP path streams the whole reply as a SINGLE terminal
+    // agent_message_chunk (backend streaming=false), which anchors the ADR/PR doc claim. A final
+    // reply (`send_message`) delivers one Text + Done, so exactly one chunk reaches the client.
+    #[tokio::test]
+    async fn phase1_emits_single_terminal_agent_message_chunk() {
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let registry = new_reply_registry();
+        let mut st = crate::AppState::test_default(event_tx);
+        st.acp_reply_registry = Some(registry.clone());
+        let state = Arc::new(st);
+
+        let sessions = sessions_map();
+        let sid = format!("sess_{}", Uuid::new_v4());
+        let channel_id = format!("acp_{}", Uuid::new_v4());
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        sessions.lock().await.insert(
+            sid.clone(),
+            AcpSession { channel_id: channel_id.clone(), busy: true, cancel: Some(cancel.clone()) },
+        );
+
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        let st2 = state.clone();
+        let sessions2 = sessions.clone();
+        let sid2 = sid.clone();
+        let handle = tokio::spawn(async move {
+            let params = json!({"sessionId": sid2, "prompt": [{"type": "text", "text": "hi"}]});
+            handle_session_prompt(&st2, &sessions2, json!(11), Some(&params), &out_tx, sid2.clone(), cancel)
+                .await;
+        });
+
+        // Wait for the handler to register its reply sink, then feed one final reply.
+        let mut turn_id = None;
+        for _ in 0..10_000 {
+            if let Some(t) = registry.lock().unwrap().get(&channel_id).map(|s| s.turn_id.clone()) {
+                turn_id = Some(t);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let turn_id = turn_id.expect("handler must register a reply sink");
+        handle_reply(&reply(&channel_id, &turn_id, "hello world", Some("send_message")), &registry).await;
+        handle.await.unwrap();
+
+        let mut chunks = Vec::new();
+        let mut final_stop = None;
+        while let Ok(s) = out_rx.try_recv() {
+            let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+            if v["method"] == json!("session/update")
+                && v["params"]["update"]["sessionUpdate"] == json!("agent_message_chunk")
+            {
+                chunks.push(v["params"]["update"]["content"]["text"].as_str().unwrap_or("").to_string());
+            }
+            if v.get("id") == Some(&json!(11)) {
+                final_stop = v["result"]["stopReason"].as_str().map(str::to_string);
+            }
+        }
+        assert_eq!(chunks.len(), 1, "Phase-1 must stream exactly one terminal chunk, got {chunks:?}");
+        assert_eq!(chunks[0], "hello world");
+        assert_eq!(final_stop.as_deref(), Some("end_turn"), "a completed turn ends end_turn");
+    }
 }
