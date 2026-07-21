@@ -547,6 +547,56 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                     let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
                     continue;
                 }
+                // Reserve this prompt's cancel state SYNCHRONOUSLY here — before spawning the
+                // async handler — so a `session/cancel` arriving on the very next frame finds
+                // `s.cancel` already installed. The read loop is sequential; installing the cancel
+                // inside the spawned task (as it was) left a window where an immediate cancel read
+                // `s.cancel == None` and was dropped, so the prompt ran uncancelled (R16-F1).
+                // Unknown-session / busy are rejected here (moved out of the handler).
+                let session_id = match req
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("sessionId"))
+                    .and_then(|v| v.as_str())
+                {
+                    Some(s) => s.to_string(),
+                    None => {
+                        let resp = JsonRpcResponse::error(id, -32602, "Missing sessionId");
+                        let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+                        continue;
+                    }
+                };
+                let cancel = Arc::new(tokio::sync::Notify::new());
+                {
+                    let mut guard = sessions.lock().await;
+                    match guard.get_mut(&session_id) {
+                        None => {
+                            drop(guard);
+                            let resp = JsonRpcResponse::error(
+                                id,
+                                -32602,
+                                format!("Unknown session: {session_id}"),
+                            );
+                            let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+                            continue;
+                        }
+                        Some(s) if s.busy => {
+                            drop(guard);
+                            let resp = JsonRpcResponse::error(
+                                id,
+                                -32001,
+                                "Session busy: a prompt is already in progress",
+                            );
+                            let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+                            continue;
+                        }
+                        Some(s) => {
+                            s.busy = true;
+                            s.cancel = Some(cancel.clone());
+                        }
+                    }
+                }
+
                 // session/prompt is async — spawn a task to handle streaming
                 let state_clone = state.clone();
                 let sessions_clone = sessions.clone();
@@ -558,6 +608,8 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         id,
                         req.params.as_ref(),
                         &out_tx_clone,
+                        session_id,
+                        cancel,
                     )
                     .await;
                 });
@@ -786,55 +838,49 @@ fn derive_channel_id(session_id: &str) -> Option<String> {
     Some(format!("acp_{uuid}"))
 }
 
+/// Release a prompt reservation: clear `busy` and drop the cancel handle. Called on every
+/// early return once the read loop has reserved the session (R16-F1).
+async fn release_prompt(
+    sessions: &Arc<tokio::sync::Mutex<HashMap<String, AcpSession>>>,
+    session_id: &str,
+) {
+    if let Some(s) = sessions.lock().await.get_mut(session_id) {
+        s.busy = false;
+        s.cancel = None;
+    }
+}
+
 async fn handle_session_prompt(
     state: &Arc<crate::AppState>,
     sessions: &Arc<tokio::sync::Mutex<HashMap<String, AcpSession>>>,
     id: Value,
     params: Option<&Value>,
     out_tx: &mpsc::UnboundedSender<String>,
+    // The caller (read loop) already reserved this session SYNCHRONOUSLY: `busy = true` and
+    // `cancel` installed under the session lock (R16-F1). This task owns releasing it on return.
+    session_id: String,
+    cancel: Arc<tokio::sync::Notify>,
 ) {
-    // Extract sessionId and prompt from params
-    let (session_id, prompt_text) = match extract_prompt_params(params) {
-        Ok(v) => v,
+    // sessionId was validated + reserved by the caller; only the prompt body can still be bad.
+    let prompt_text = match extract_prompt_params(params) {
+        Ok((_sid, text)) => text,
         Err(e) => {
             let resp = JsonRpcResponse::error(id, -32602, e);
             let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+            release_prompt(sessions, &session_id).await;
             return;
         }
     };
 
-    // Cancel signal for this prompt; `session/cancel` fires it to stop the
-    // stream gracefully.
-    let cancel = Arc::new(tokio::sync::Notify::new());
-
-    // Look up session and acquire busy lock
-    let channel_id = {
-        let mut guard = sessions.lock().await;
-        match guard.get_mut(&session_id) {
-            Some(s) => {
-                if s.busy {
-                    // Reject concurrent prompts on the same session
-                    let resp = JsonRpcResponse::error(
-                        id,
-                        -32001,
-                        "Session busy: a prompt is already in progress",
-                    );
-                    let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
-                    return;
-                }
-                s.busy = true;
-                s.cancel = Some(cancel.clone());
-                s.channel_id.clone()
-            }
-            None => {
-                let resp = JsonRpcResponse::error(
-                    id,
-                    -32602,
-                    format!("Unknown session: {session_id}"),
-                );
-                let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
-                return;
-            }
+    // The session was reserved a moment ago under the lock; just read its channel_id.
+    let channel_id = match sessions.lock().await.get(&session_id) {
+        Some(s) => s.channel_id.clone(),
+        None => {
+            let resp =
+                JsonRpcResponse::error(id, -32602, format!("Unknown session: {session_id}"));
+            let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+            release_prompt(sessions, &session_id).await;
+            return;
         }
     };
 
@@ -881,10 +927,7 @@ async fn handle_session_prompt(
                     "No agent backend connected",
                 );
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
-                // Release busy flag
-                if let Some(s) = sessions.lock().await.get_mut(&session_id) {
-                    s.busy = false;
-                }
+                release_prompt(sessions, &session_id).await;
                 // Cleanup registry
                 if let Some(ref registry) = state.acp_reply_registry {
                     registry.lock().unwrap_or_else(|e| e.into_inner()).remove(&channel_id);
@@ -896,9 +939,7 @@ async fn handle_session_prompt(
             warn!("ACP: failed to serialize event: {e}");
             let resp = JsonRpcResponse::error(id, -32603, "Internal error");
             let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
-            if let Some(s) = sessions.lock().await.get_mut(&session_id) {
-                s.busy = false;
-            }
+            release_prompt(sessions, &session_id).await;
             return;
         }
     }
@@ -1615,5 +1656,57 @@ mod acp_review_fixes {
         for &b in b"=/,; @\"" {
             assert!(!is_ws_subprotocol_token_char(b), "{} should be rejected", b as char);
         }
+    }
+
+    // R16-F1 — the read loop now reserves the prompt's cancel state SYNCHRONOUSLY (busy + a
+    // cancel Notify installed under the session lock) before spawning the handler. So a
+    // `session/cancel` arriving before the handler reaches its stream `select!` still cancels
+    // the turn: `tokio::Notify` stores one permit, so a pre-fired cancel is consumed by
+    // `cancel.notified()` (stopReason "cancelled") rather than lost. Before the fix the cancel
+    // installed inside the spawned task, so an immediate cancel read `s.cancel == None`.
+    #[tokio::test]
+    async fn prompt_cancel_race_before_first_update_cancels() {
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let mut st = crate::AppState::test_default(event_tx);
+        st.acp_reply_registry = Some(new_reply_registry());
+        let state = Arc::new(st);
+
+        let sessions = sessions_map();
+        let sid = format!("sess_{}", Uuid::new_v4());
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        sessions.lock().await.insert(
+            sid.clone(),
+            AcpSession {
+                channel_id: format!("acp_{}", Uuid::new_v4()),
+                busy: true,
+                cancel: Some(cancel.clone()),
+            },
+        );
+        // Cancel arrives before the handler's stream loop (reserved-then-immediate-cancel).
+        cancel.notify_one();
+
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        let params = json!({"sessionId": sid, "prompt": [{"type": "text", "text": "hi"}]});
+        handle_session_prompt(&state, &sessions, json!(7), Some(&params), &out_tx, sid.clone(), cancel)
+            .await;
+
+        // The final response (matching our request id) must carry stopReason "cancelled".
+        let mut final_resp = None;
+        while let Ok(s) = out_rx.try_recv() {
+            let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+            if v.get("id") == Some(&json!(7)) {
+                final_resp = Some(v);
+            }
+        }
+        let resp = final_resp.expect("prompt must produce a final response");
+        assert_eq!(
+            resp["result"]["stopReason"],
+            json!("cancelled"),
+            "an immediate cancel must cancel the turn, not be dropped"
+        );
+        // And the reservation is released.
+        let g = sessions.lock().await;
+        let s = g.get(&sid).unwrap();
+        assert!(!s.busy && s.cancel.is_none(), "cancel must release busy + cancel handle");
     }
 }
