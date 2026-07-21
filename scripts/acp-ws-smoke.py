@@ -251,8 +251,16 @@ async def section_edges():
         r = await c.call("session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text":
             "Reply with exactly this and nothing else: 你好 🎉 👨‍👩‍👧‍👦 ❤️"}]}, timeout=90)
         text = "".join(r.get("chunks", []))
-        record("edge", "🎉" in text and "👨‍👩‍👧‍👦" in text or "👨" in text,
-               "CJK + emoji (ZWJ family) stream intact", repr(text[:40]))
+        # Require EVERY marker (the old `a and b or c` parsed as `(a and b) or c`, so a lone 👨
+        # passed). Fail closed first on a timeout / JSON-RPC error so a dropped reply can't slip
+        # through the content check.
+        markers = ["你好", "🎉", "👨‍👩‍👧‍👦", "❤️"]
+        ok = (
+            not r.get("_timeout")
+            and not r.get("error")
+            and all(m in text for m in markers)
+        )
+        record("edge", ok, "CJK + emoji (ZWJ family) stream intact", repr(text[:40]))
 
 
 async def section_lifecycle():
