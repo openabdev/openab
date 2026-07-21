@@ -812,6 +812,18 @@ async fn handle_session_resume(
             format!("Too many sessions on this connection (max {MAX_SESSIONS_PER_CONNECTION})"),
         );
     }
+    // R16-F2: refuse to resume a session that currently has a prompt in flight. The insert
+    // below unconditionally rewrites AcpSession{busy:false,cancel:None}, which would drop the
+    // active turn's cancel handle — and then that turn's cleanup would clobber the resumed
+    // state / registry entry, losing its replies. A busy session is already live on this
+    // connection, so reject deterministically instead of stomping it.
+    if guard.get(&session_id).is_some_and(|s| s.busy) {
+        return JsonRpcResponse::error(
+            id,
+            -32001,
+            "Session busy: a prompt is in progress; cannot resume",
+        );
+    }
     guard.insert(
         session_id.clone(),
         AcpSession {
@@ -1708,5 +1720,34 @@ mod acp_review_fixes {
         let g = sessions.lock().await;
         let s = g.get(&sid).unwrap();
         assert!(!s.busy && s.cancel.is_none(), "cancel must release busy + cancel handle");
+    }
+
+    // R16-F2 — session/resume on a session with a prompt in flight is rejected (busy), so the
+    // active turn's cancel handle + state are NOT clobbered by resume's unconditional rewrite.
+    #[tokio::test]
+    async fn resume_while_busy_is_rejected_and_preserves_state() {
+        let sessions = sessions_map();
+        let sid = format!("sess_{}", Uuid::new_v4());
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        sessions.lock().await.insert(
+            sid.clone(),
+            AcpSession {
+                channel_id: format!("acp_{}", Uuid::new_v4()),
+                busy: true,
+                cancel: Some(cancel.clone()),
+            },
+        );
+
+        let params = json!({"sessionId": sid, "cwd": "/w", "mcpServers": []});
+        let v =
+            serde_json::to_value(handle_session_resume(&sessions, json!(9), Some(&params)).await)
+                .unwrap();
+        assert_eq!(v["error"]["code"], json!(-32001), "resume while busy must be rejected");
+
+        // The in-flight turn's state survives untouched.
+        let g = sessions.lock().await;
+        let s = g.get(&sid).unwrap();
+        assert!(s.busy, "busy must remain set after a rejected resume");
+        assert!(s.cancel.is_some(), "the active prompt's cancel handle must survive resume");
     }
 }
