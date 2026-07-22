@@ -26,7 +26,7 @@ use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, Reacti
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::LazyLock;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, error, info, warn};
@@ -64,6 +64,8 @@ fn truncate_for_discord(s: &str, max: usize) -> String {
 /// Avoid unbounded Discord history exports from very large threads.
 const THREAD_EXPORT_MESSAGE_LIMIT: usize = 5000;
 const DISCORD_MESSAGE_LIMIT: usize = 2000;
+const HANDOFF_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const MAX_HANDOFFS_PER_SOURCE: usize = 10;
 
 // --- DiscordAdapter: implements ChatAdapter for Discord via serenity ---
 
@@ -344,6 +346,8 @@ pub struct Handler {
     pub scheduled_ids: tokio::sync::Mutex<std::collections::HashSet<String>>,
     /// Recently accepted structured handoff event IDs; prevents replay within a process.
     pub handoff_events: tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>,
+    /// Per-source handoff rate window; limits trusted-bot floods within a process.
+    pub handoff_rates: tokio::sync::Mutex<HashMap<String, VecDeque<tokio::time::Instant>>>,
 }
 
 fn accept_handoff_event_in(
@@ -359,6 +363,25 @@ fn accept_handoff_event_in(
     true
 }
 
+fn accept_handoff_rate_in(
+    rates: &mut HashMap<String, VecDeque<tokio::time::Instant>>,
+    source_id: &str,
+) -> bool {
+    let now = tokio::time::Instant::now();
+    let entries = rates.entry(source_id.to_string()).or_default();
+    while entries
+        .front()
+        .is_some_and(|seen_at| seen_at.elapsed() >= HANDOFF_RATE_WINDOW)
+    {
+        entries.pop_front();
+    }
+    if entries.len() >= MAX_HANDOFFS_PER_SOURCE {
+        return false;
+    }
+    entries.push_back(now);
+    true
+}
+
 impl Handler {
     /// Accept each validated control-plane event at most once during its replay
     /// window. This is intentionally process-local; the envelope expiry and
@@ -366,6 +389,11 @@ impl Handler {
     async fn accept_handoff_event(&self, event_id: &str) -> bool {
         let mut events = self.handoff_events.lock().await;
         accept_handoff_event_in(&mut events, event_id)
+    }
+
+    async fn accept_handoff_rate(&self, source_id: &str) -> bool {
+        let mut rates = self.handoff_rates.lock().await;
+        accept_handoff_rate_in(&mut rates, source_id)
     }
 
     /// Check if the bot has participated in a Discord thread, and whether
@@ -610,6 +638,10 @@ impl EventHandler for Handler {
             let request = handoff.as_ref().expect("validated handoff must be present");
             if !self.accept_handoff_event(&request.event_id).await {
                 tracing::info!(event_id = %request.event_id, "duplicate structured handoff ignored");
+                return;
+            }
+            if !self.accept_handoff_rate(&request.source_bot_id).await {
+                tracing::warn!(source_bot_id = %request.source_bot_id, "structured handoff rate limit reached");
                 return;
             }
         }
@@ -3540,6 +3572,16 @@ mod handoff_tests {
         assert!(accept_handoff_event_in(&mut events, "event-1"));
         assert!(!accept_handoff_event_in(&mut events, "event-1"));
         assert!(accept_handoff_event_in(&mut events, "event-2"));
+    }
+
+    #[test]
+    fn handoff_rate_limit_rejects_source_floods() {
+        let mut rates = HashMap::new();
+        for _ in 0..MAX_HANDOFFS_PER_SOURCE {
+            assert!(accept_handoff_rate_in(&mut rates, "10"));
+        }
+        assert!(!accept_handoff_rate_in(&mut rates, "10"));
+        assert!(accept_handoff_rate_in(&mut rates, "11"));
     }
 
     #[test]

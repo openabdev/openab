@@ -1345,6 +1345,7 @@ async fn main() -> anyhow::Result<()> {
             reminder_store: reminder_store.clone(),
             scheduled_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
             handoff_events: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            handoff_rates: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES
