@@ -406,9 +406,12 @@ must still be registered manually in the LINE Developers console.
 >
 > Programmatic apply and delete do not provide an internal same-target lock.
 > Callers must serialize mutations for the same AWS account, Region,
-> control-plane bucket, ECS cluster, namespace, and name. After an accidental
-> overlap, stop concurrent writers, inspect retained checkpoints, then
-> explicitly re-apply the desired state or retry delete.
+> control-plane bucket, ECS cluster, and physical service identity. This
+> includes every alias-equivalent logical pair that could map to the same
+> `oab-{namespace}-{name}` value (for example `prod/team-bot` and
+> `prod-team/bot`). After an accidental overlap, stop concurrent writers,
+> inspect retained checkpoints, then explicitly re-apply the desired state or
+> retry delete.
 >
 > If you edit a manifest to remove `spec.ingress` while keeping the bot, `apply` first
 > stores every exact ECS registry ARN only when the previously stored OAB

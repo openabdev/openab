@@ -415,12 +415,21 @@ fn validate_delete_request(
             "DeleteOptions.cluster must not be empty"
         )));
     }
+
+    let mut seen = std::collections::HashSet::with_capacity(targets.len());
     for target in targets {
         // Shared injective identity rule (see `crate::identity`): non-empty
         // components and a hyphen-free namespace, matching what apply-side
         // manifest validation accepts.
         crate::identity::validate_injective_identity(&target.namespace, &target.name)
             .map_err(DeleteError::validation)?;
+        if !seen.insert((&target.namespace, &target.name)) {
+            return Err(DeleteError::validation(anyhow::anyhow!(
+                "duplicate delete target '{}/{}'",
+                target.namespace,
+                target.name
+            )));
+        }
     }
     Ok(())
 }
@@ -466,9 +475,12 @@ fn record_delete_result(
 ///
 /// This function is not serialized with [`crate::apply::apply_manifests`].
 /// Callers must serialize mutations for the same AWS account, Region,
-/// control-plane bucket, ECS cluster, namespace, and name. If that precondition
-/// is violated, stop concurrent writers, inspect the retained checkpoint, then
-/// either re-apply the intended desired state or retry delete.
+/// control-plane bucket, ECS cluster, and physical service identity. This
+/// includes every alias-equivalent logical pair that could map to the same
+/// `oab-{namespace}-{name}` value (for example `prod/team-bot` and
+/// `prod-team/bot`). If that precondition is violated, stop concurrent
+/// writers, inspect the retained checkpoint, then either re-apply the intended
+/// desired state or retry delete.
 ///
 /// Before ECS mutation, delete persists an exact-identity checkpoint containing
 /// the caller account/region, bucket, canonical cluster and service ARNs, and
@@ -1181,6 +1193,18 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.kind, DeleteErrorKind::Validation);
+    }
+
+    #[test]
+    fn delete_request_rejects_duplicate_targets_before_aws() {
+        let targets = [
+            DeleteTarget::new("prod", "bot"),
+            DeleteTarget::new("prod", "bot"),
+        ];
+        let error = validate_delete_request(&targets, &DeleteOptions::new("cluster"))
+            .expect_err("duplicate targets must fail validation");
+        assert_eq!(error.kind, DeleteErrorKind::Validation);
+        assert!(error.to_string().contains("duplicate delete target"), "{error}");
     }
 
     #[test]

@@ -412,9 +412,11 @@ pub(crate) async fn run(
 ///
 /// This function is not serialized with [`crate::delete::delete_services`].
 /// Callers must serialize mutations for the same AWS account, Region,
-/// control-plane bucket, ECS cluster, namespace, and name. If that precondition
-/// is violated, stop concurrent writers and re-apply the intended desired state
-/// before resuming other mutations.
+/// control-plane bucket, ECS cluster, and physical service identity. This
+/// includes every alias-equivalent logical pair that could map to the same
+/// `oab-{namespace}-{name}` value (for example `prod/team-bot` and
+/// `prod-team/bot`). If that precondition is violated, stop concurrent writers
+/// and re-apply the intended desired state before resuming other mutations.
 pub async fn apply_manifests(
     aws_config: &aws_config::SdkConfig,
     manifests: &[OABServiceManifest],

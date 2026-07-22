@@ -156,9 +156,13 @@ deployment and re-creating it under a hyphen-free namespace.
 
 Programmatic apply and delete do not provide an internal same-target lock.
 Callers must serialize mutations for the same AWS account, Region, control-plane
-bucket, ECS cluster, namespace, and name. If overlapping calls occur, stop
-concurrent writers, inspect the retained checkpoint, then explicitly re-apply
-the desired state or retry delete.
+bucket, ECS cluster, and physical service identity. This includes every
+alias-equivalent logical pair that could map to the same
+`oab-{namespace}-{name}` value (for example `prod/team-bot` and
+`prod-team/bot`). The complete delete target set is validated before any AWS
+request; duplicate logical targets are rejected. If overlapping calls occur,
+stop concurrent writers, inspect the retained checkpoint, then explicitly
+re-apply the desired state or retry delete.
 
 For `aws-sm://<secret-id>#<json-key>`, a non-ARN `<secret-id>` requires the
 caller to have `secretsmanager:DescribeSecret`; full-ARN shorthand does not

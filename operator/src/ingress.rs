@@ -216,7 +216,10 @@ pub async fn register_telegram_webhook(
         form.push(("secret_token".to_string(), st));
     }
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("failed to build Telegram webhook HTTP client")?;
     let resp = client
         .post(format!(
             "https://api.telegram.org/bot{bot_token}/setWebhook"
