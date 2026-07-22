@@ -192,7 +192,7 @@ async fn probe_ownership_key(
 async fn run_bounded_probes<T, F, Fut>(items: Vec<T>, probe: F) -> anyhow::Result<()>
 where
     T: Send + 'static,
-    F: Fn(T) -> Fut + Clone + Send + Sync + 'static,
+    F: Fn(T) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
 {
     let mut pending = items.into_iter();
