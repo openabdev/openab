@@ -4428,8 +4428,9 @@ mod tests {
         );
     }
 
-    // --- Per-thread streaming tests (#534) ---
-    // Streaming ON by default, OFF when another bot is detected in the thread.
+    // --- Per-thread streaming tests (#534, #1436) ---
+    // Discord presentation writes are inert, so streaming remains enabled even
+    // when another bot is present; only explicit structured handoffs route work.
 
     /// Single bot thread: streaming enabled.
     #[test]
@@ -4438,11 +4439,11 @@ mod tests {
         assert!(adapter.use_streaming(false));
     }
 
-    /// Multi-bot thread: send-once to avoid edit interference.
+    /// Multi-bot thread: sanitized presentation streaming remains enabled.
     #[test]
-    fn discord_no_stream_when_other_bot_present() {
+    fn discord_streams_when_other_bot_present() {
         let adapter = super::DiscordAdapter::new(Arc::new(super::Http::new("")));
-        assert!(!adapter.use_streaming(true));
+        assert!(adapter.use_streaming(true));
     }
 
     // --- resolve_channel tests ---

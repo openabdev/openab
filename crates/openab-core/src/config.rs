@@ -609,9 +609,10 @@ pub struct GatewayConfig {
     /// by default**. By default send-once delivers **only the final answer block** — the text after
     /// the last tool call — dropping inter-tool narration (the shared default send-once trimming in
     /// `AdapterRouter::stream_prompt_blocks`, controlled by the platform-agnostic
-    /// `[reactions] narration_display`). Discord is likewise send-once in multi-bot threads
-    /// (`use_streaming` = `!other_bot_present`) and gets the same default trimming. Set `true` to
-    /// stream live and keep the full inter-tool text.
+    /// `[reactions] narration_display`). Discord keeps sanitized presentation
+    /// streaming enabled even in multi-bot threads; this setting controls the
+    /// gateway adapter's streaming behavior. Set `true` to stream live and keep
+    /// the full inter-tool text on gateway platforms.
     #[serde(default)]
     pub streaming: bool,
     /// Show "…" placeholder at streaming start. Default: true. Set false for platforms using drafts.

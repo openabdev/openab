@@ -36,6 +36,9 @@ pub struct HandoffPayload {
 
 pub const MULTIBOT_HANDOFF_SCHEMA: &str = "openab.multibot.handoff.v1";
 
+/// Parsed directives from the beginning of an agent response.
+/// `reply_to` controls platform reply threading; `handoff_target_bot_id`
+/// requests a complete, structured control-plane handoff after the turn ends.
 #[derive(Default, Debug)]
 pub struct OutputDirectives {
     /// Message ID to reply to (Discord: message_reference)
@@ -452,11 +455,12 @@ pub trait ChatAdapter: Send + Sync + 'static {
 
     /// Whether this adapter should use streaming edit (true) or send-once (false).
     /// `other_bot_present` indicates if another bot has posted in the current thread.
-    /// Streaming should be disabled in multi-bot threads to avoid edit interference.
-    /// NOTE: Slight race window exists — the multibot cache is checked before
-    /// handle_message, so a bot arriving between the check and the response will
-    /// not be detected until the next message. This is acceptable: the first
-    /// response may stream, but subsequent ones will correctly use send-once.
+    /// Most adapters may disable streaming there when edits could interfere with
+    /// bot routing. Adapters that make presentation writes inert (for example,
+    /// Discord's sanitized output with mentions disabled) may keep streaming on
+    /// safely and reserve executable routing for an explicit control-plane path.
+    /// NOTE: There is a slight race window: a bot arriving between the multibot
+    /// cache check and `handle_message` may not be detected until the next message.
     fn use_streaming(&self, other_bot_present: bool) -> bool;
 
     /// Set the identity used as the source of control-plane handoffs.
@@ -476,7 +480,9 @@ pub trait ChatAdapter: Send + Sync + 'static {
         _channel: &ChannelRef,
         _request: &HandoffRequest,
     ) -> Result<MessageRef> {
-        Err(anyhow::anyhow!("structured handoff not supported"))
+        Err(anyhow::anyhow!(
+            "structured bot-to-bot handoff is not supported by this platform"
+        ))
     }
 
     /// Whether to send the "…" placeholder message before streaming starts.
