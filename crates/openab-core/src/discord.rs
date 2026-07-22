@@ -63,6 +63,7 @@ fn truncate_for_discord(s: &str, max: usize) -> String {
 
 /// Avoid unbounded Discord history exports from very large threads.
 const THREAD_EXPORT_MESSAGE_LIMIT: usize = 5000;
+const DISCORD_MESSAGE_LIMIT: usize = 2000;
 
 // --- DiscordAdapter: implements ChatAdapter for Discord via serenity ---
 
@@ -86,6 +87,16 @@ impl DiscordAdapter {
     }
 }
 
+fn build_handoff_content(target_id: u64, envelope: &str) -> anyhow::Result<String> {
+    let content = format!("<@{target_id}>\n{envelope}");
+    if content.encode_utf16().count() > DISCORD_MESSAGE_LIMIT {
+        anyhow::bail!(
+            "structured handoff exceeds Discord's {DISCORD_MESSAGE_LIMIT}-character message limit"
+        );
+    }
+    Ok(content)
+}
+
 #[async_trait]
 impl ChatAdapter for DiscordAdapter {
     fn platform(&self) -> &'static str {
@@ -93,7 +104,7 @@ impl ChatAdapter for DiscordAdapter {
     }
 
     fn message_limit(&self) -> usize {
-        2000
+        DISCORD_MESSAGE_LIMIT
     }
 
     async fn send_message(
@@ -205,7 +216,7 @@ impl ChatAdapter for DiscordAdapter {
         // The target mention is generated from the validated target ID exactly
         // once. The JSON envelope is the control-plane payload; no presentation
         // edit is used to route it.
-        let content = format!("<@{target_id}>\n{envelope}");
+        let content = build_handoff_content(target_id, &envelope)?;
         let msg = ChannelId::new(ch_id)
             .send_message(
                 &self.http,
@@ -576,7 +587,9 @@ impl EventHandler for Handler {
 
         // Control-plane messages are parsed before ordinary bot gating. A
         // schema-looking message that fails validation is dropped rather than
-        // falling through as an executable prompt.
+        // falling through as an executable prompt. Bot-turn accounting above
+        // already applies to every bot-authored message, including accepted
+        // handoffs, so the configured per-thread cap remains the DoS guard.
         let handoff = parse_handoff_envelope(&msg.content);
         if is_handoff_candidate(&msg.content) {
             let valid = handoff.as_ref().is_some_and(|request| {
@@ -3518,6 +3531,13 @@ mod handoff_tests {
         assert!(accept_handoff_event_in(&mut events, "event-1"));
         assert!(!accept_handoff_event_in(&mut events, "event-1"));
         assert!(accept_handoff_event_in(&mut events, "event-2"));
+    }
+
+    #[test]
+    fn handoff_content_is_bounded_by_discord_message_limit() {
+        let content = build_handoff_content(20, "payload").unwrap();
+        assert!(content.encode_utf16().count() <= DISCORD_MESSAGE_LIMIT);
+        assert!(build_handoff_content(20, &"x".repeat(DISCORD_MESSAGE_LIMIT)).is_err());
     }
 
     #[test]

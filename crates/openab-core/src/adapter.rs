@@ -26,8 +26,12 @@ pub struct HandoffRequest {
     pub origin_channel_id: String,
     /// The thread-as-channel ID when the originating message was in a thread.
     pub origin_thread_id: Option<String>,
+    /// Optional originating Discord message ID; currently omitted when the
+    /// handoff is emitted after an ACP turn rather than directly from a message event.
     pub origin_message_id: Option<String>,
     pub expires_at: u64,
+    /// Reserved for future forwarding; this protocol currently accepts only
+    /// first-hop requests (`0`) and rejects forwarded values.
     pub hop_count: u8,
     pub payload: HandoffPayload,
 }
@@ -1511,6 +1515,8 @@ fn contains_bot_mention(content: &str) -> bool {
 /// Neutralize Discord mentions in human-facing presentation text. This is applied
 /// to every cumulative streaming edit and every ordinary final send, so a partial
 /// output or an overflow chunk can never become a bot-to-bot control event.
+/// The inserted zero-width characters are intentional: Discord renders the text
+/// unchanged while raw copied content carries the inert separator.
 fn sanitize_discord_mentions(content: &str) -> String {
     content
         .replace("<@", "<\u{200b}@")
