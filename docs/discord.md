@@ -349,7 +349,7 @@ trusted_bot_ids = ["123456789012345678"]  # explicit outbound/inbound bot allowl
 
 For a structured handoff, the producing agent emits `[[handoff:<TARGET_BOT_DISCORD_ID>]]` in its output. The Discord adapter only sends that control message when the target ID is in `trusted_bot_ids` and is not the current bot. Ordinary presentation text is kept human-readable but its Discord mentions are suppressed; do not use a plain `@BotName` sentence as the handoff protocol.
 
-A handoff control message is visible in the channel because Discord does not provide a hidden bot-only message type. Its payload is accepted only after schema, source, target, channel/thread provenance, expiry, hop, replay, and rate-limit checks.
+A handoff control message is visible in the channel because Discord does not provide a hidden bot-only message type. Its payload is accepted only after schema, source, target, channel/thread provenance, expiry, hop, replay, and rate-limit checks. A bot-authored message that matches the envelope shape but fails validation is dropped rather than passed to the normal ACP prompt path; this fail-closed behavior prevents malformed control input from becoming ordinary agent input.
 
 ### Bot turn limits
 
