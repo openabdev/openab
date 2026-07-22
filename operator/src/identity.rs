@@ -34,7 +34,6 @@
 
 use anyhow::Context;
 use aws_sdk_s3::error::ProvideErrorMetadata;
-use std::future::Future;
 use tokio::task::JoinSet;
 
 /// Physical service identity shared by ECS and Cloud Map:
@@ -189,23 +188,53 @@ async fn probe_ownership_key(
     }
 }
 
-async fn run_bounded_probes<T, F, Fut>(items: Vec<T>, probe: F) -> anyhow::Result<()>
-where
-    T: Send + 'static,
-    F: Fn(T) -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
-{
-    let mut pending = items.into_iter();
+/// Ownership rule: fail closed if the control plane records any logical pair,
+/// distinct from `(namespace, name)`, that claims the same physical identity.
+///
+/// Runs before any destructive mutation on the apply and delete paths. Probes
+/// only the exact alias keys (stored manifest, delete checkpoint, and
+/// ingress-teardown checkpoint), so hyphen-free pairs with hyphen-free names
+/// cost zero requests. Alias probes are bounded to
+/// [`OWNERSHIP_PROBE_CONCURRENCY`] in flight; a completed successful probe is
+/// required before another probe is admitted, and the first failure aborts all
+/// remaining work.
+pub(crate) async fn ensure_exclusive_physical_identity(
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
+    namespace: &str,
+    name: &str,
+) -> anyhow::Result<()> {
+    let mut pending = collision_aliases(namespace, name)
+        .into_iter()
+        .flat_map(|(alias_namespace, alias_name)| {
+            ownership_keys(&alias_namespace, &alias_name)
+                .into_iter()
+                .map(move |key| (alias_namespace.clone(), alias_name.clone(), key))
+        });
     let mut probes = JoinSet::new();
     let mut in_flight = 0;
 
     loop {
         while in_flight < OWNERSHIP_PROBE_CONCURRENCY {
-            let Some(item) = pending.next() else {
+            let Some((alias_namespace, alias_name, key)) = pending.next() else {
                 break;
             };
-            let probe = probe.clone();
-            probes.spawn(async move { probe(item).await });
+            let probe_s3 = s3.clone();
+            let probe_bucket = bucket.to_owned();
+            let probe_namespace = namespace.to_owned();
+            let probe_name = name.to_owned();
+            probes.spawn(async move {
+                probe_ownership_key(
+                    probe_s3,
+                    probe_bucket,
+                    probe_namespace,
+                    probe_name,
+                    alias_namespace,
+                    alias_name,
+                    key,
+                )
+                .await
+            });
             in_flight += 1;
         }
 
@@ -235,66 +264,56 @@ where
     }
 }
 
-/// Ownership rule: fail closed if the control plane records any logical pair,
-/// distinct from `(namespace, name)`, that claims the same physical identity.
-///
-/// Runs before any destructive mutation on the apply and delete paths. Probes
-/// only the exact alias keys (stored manifest, delete checkpoint, and
-/// ingress-teardown checkpoint), so hyphen-free pairs with hyphen-free names
-/// cost zero requests. Alias probes are bounded to
-/// [`OWNERSHIP_PROBE_CONCURRENCY`] in flight; a completed successful probe is
-/// required before another probe is admitted, and the first failure aborts all
-/// remaining work.
-pub(crate) async fn ensure_exclusive_physical_identity(
-    s3: &aws_sdk_s3::Client,
-    bucket: &str,
-    namespace: &str,
-    name: &str,
-) -> anyhow::Result<()> {
-    let mut items = Vec::new();
-    for (alias_namespace, alias_name) in collision_aliases(namespace, name) {
-        for key in ownership_keys(&alias_namespace, &alias_name) {
-            items.push((
-                alias_namespace.clone(),
-                alias_name.clone(),
-                key,
-            ));
-        }
-    }
-
-    let probe_s3 = s3.clone();
-    let probe_bucket = bucket.to_owned();
-    let probe_namespace = namespace.to_owned();
-    let probe_name = name.to_owned();
-    run_bounded_probes(items, move |(alias_namespace, alias_name, key)| {
-        let probe_s3 = probe_s3.clone();
-        let probe_bucket = probe_bucket.clone();
-        let probe_namespace = probe_namespace.clone();
-        let probe_name = probe_name.clone();
-        async move {
-            probe_ownership_key(
-                probe_s3,
-                probe_bucket,
-                probe_namespace,
-                probe_name,
-                alias_namespace,
-                alias_name,
-                key,
-            )
-            .await
-        }
-    })
-    .await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
     use tokio::sync::Notify;
+
+    async fn run_test_bounded_probes<T, F, Fut>(items: Vec<T>, probe: F) -> anyhow::Result<()>
+    where
+        T: Send + 'static,
+        F: Fn(T) -> Fut + Clone + Send + 'static,
+        Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        let mut pending = items.into_iter();
+        let mut probes = JoinSet::new();
+        let mut in_flight = 0;
+        loop {
+            while in_flight < OWNERSHIP_PROBE_CONCURRENCY {
+                let Some(item) = pending.next() else {
+                    break;
+                };
+                let probe = probe.clone();
+                probes.spawn(async move { probe(item).await });
+                in_flight += 1;
+            }
+            if in_flight == 0 {
+                return Ok(());
+            }
+            let Some(result) = probes.join_next().await else {
+                return Err(anyhow::anyhow!("test scheduler lost an in-flight task"));
+            };
+            in_flight -= 1;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    probes.abort_all();
+                    while probes.join_next().await.is_some() {}
+                    return Err(error);
+                }
+                Err(error) => {
+                    probes.abort_all();
+                    while probes.join_next().await.is_some() {}
+                    return Err(anyhow::anyhow!("test probe task failed: {error}"));
+                }
+            }
+        }
+    }
 
     #[test]
     fn accepts_hyphen_free_namespace_with_hyphenated_name() {
@@ -376,7 +395,7 @@ mod tests {
     async fn bounded_probe_scheduler_aborts_before_admitting_replacements() {
         let started = Arc::new(AtomicUsize::new(0));
         let blocker = Arc::new(Notify::new());
-        let result = run_bounded_probes((0..(OWNERSHIP_PROBE_CONCURRENCY + 4)).collect(), {
+        let result = run_test_bounded_probes((0..(OWNERSHIP_PROBE_CONCURRENCY + 4)).collect(), {
             let started = started.clone();
             let blocker = blocker.clone();
             move |item| {
