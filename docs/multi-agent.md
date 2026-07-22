@@ -87,8 +87,8 @@ trusted_bot_ids = ["123456789012345678"]
 ```
 
 ```text
-Review complete: tests pass and no security issues found.
 [[handoff:123456789012345678]]
+Review complete: tests pass and no security issues found.
 ```
 
 The adapter turns the directive into a structured control message addressed to the allowlisted target. The target bot validates the envelope before placing its raw payload in the ACP prompt, while the accompanying presentation remains visible to humans with ordinary Discord mentions suppressed. If the target is not allowlisted, the directive fails closed and only the sanitized presentation is delivered.
