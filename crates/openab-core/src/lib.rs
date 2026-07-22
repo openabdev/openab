@@ -2,6 +2,7 @@ pub mod acp;
 pub mod adapter;
 pub mod bot_turns;
 pub mod config;
+pub mod delegation;
 pub mod cron;
 pub mod directives;
 pub mod dispatch;
