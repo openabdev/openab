@@ -66,6 +66,7 @@ const THREAD_EXPORT_MESSAGE_LIMIT: usize = 5000;
 const DISCORD_MESSAGE_LIMIT: usize = 2000;
 const HANDOFF_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 const MAX_HANDOFFS_PER_SOURCE: usize = 10;
+const HANDOFF_REPLAY_CACHE_MAX: usize = 4096;
 
 // --- DiscordAdapter: implements ChatAdapter for Discord via serenity ---
 
@@ -378,6 +379,9 @@ fn accept_handoff_event_in(
     if events.contains_key(event_id) {
         return false;
     }
+    if events.len() >= HANDOFF_REPLAY_CACHE_MAX {
+        return false;
+    }
     events.insert(event_id.to_string(), tokio::time::Instant::now());
     true
 }
@@ -407,7 +411,12 @@ impl Handler {
     /// event ID remain part of the wire contract for a future shared dedupe store.
     async fn accept_handoff_event(&self, event_id: &str) -> bool {
         let mut events = self.handoff_events.lock().await;
-        accept_handoff_event_in(&mut events, event_id)
+        let already_seen = events.contains_key(event_id);
+        let accepted = accept_handoff_event_in(&mut events, event_id);
+        if !accepted && !already_seen && events.len() >= HANDOFF_REPLAY_CACHE_MAX {
+            tracing::warn!("structured handoff replay cache is full; rejecting new event");
+        }
+        accepted
     }
 
     async fn accept_handoff_rate(&self, source_id: &str) -> bool {
@@ -3599,6 +3608,15 @@ mod handoff_tests {
         assert!(accept_handoff_event_in(&mut events, "event-1"));
         assert!(!accept_handoff_event_in(&mut events, "event-1"));
         assert!(accept_handoff_event_in(&mut events, "event-2"));
+    }
+
+    #[test]
+    fn handoff_replay_cache_has_a_hard_cardinality_cap() {
+        let mut events = HashMap::new();
+        for index in 0..HANDOFF_REPLAY_CACHE_MAX {
+            assert!(accept_handoff_event_in(&mut events, &format!("event-{index}")));
+        }
+        assert!(!accept_handoff_event_in(&mut events, "event-over-cap"));
     }
 
     #[test]
