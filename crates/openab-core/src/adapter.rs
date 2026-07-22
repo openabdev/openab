@@ -21,7 +21,10 @@ pub struct HandoffRequest {
     pub source_bot_id: String,
     pub target_bot_id: String,
     pub event_id: String,
+    /// Discord channel that carries the handoff envelope. For a Discord thread,
+    /// this is the thread-as-channel ID rather than its parent channel ID.
     pub origin_channel_id: String,
+    /// The thread-as-channel ID when the originating message was in a thread.
     pub origin_thread_id: Option<String>,
     pub origin_message_id: Option<String>,
     pub expires_at: u64,
@@ -80,6 +83,10 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
                                 && v.parse::<u64>().is_ok()
                             {
                                 directives.handoff_target_bot_id = Some(v.to_string());
+                            } else {
+                                tracing::debug!(
+                                    "invalid handoff directive ignored; target must be a Discord snowflake"
+                                );
                             }
                         }
                         _ => {
@@ -1203,10 +1210,13 @@ impl AdapterRouter {
                                 target_bot_id,
                                 event_id: uuid::Uuid::new_v4().to_string(),
                                 origin_channel_id: thread_channel.channel_id.clone(),
-                                origin_thread_id: thread_channel
-                                    .parent_id
-                                    .as_ref()
-                                    .map(|_| thread_channel.channel_id.clone()),
+                                // Discord threads are separate channels: when parent_id
+                                // is present, channel_id is the actual thread ID.
+                                origin_thread_id: if thread_channel.parent_id.is_some() {
+                                    Some(thread_channel.channel_id.clone())
+                                } else {
+                                    None
+                                },
                                 origin_message_id: None,
                                 expires_at: chrono::Utc::now().timestamp().max(0) as u64 + 300,
                                 hop_count: 0,
@@ -1218,8 +1228,41 @@ impl AdapterRouter {
 
                         match handoff_result {
                             Ok(_) => {
+                                // Keep the completed human-facing presentation visible
+                                // after routing the structured control message. The
+                                // control-plane handoff is not a replacement for the
+                                // presentation-plane result.
                                 if let Some(msg) = placeholder_msg {
-                                    let _ = adapter.delete_message(&msg).await;
+                                    if let Some(first) = chunks.first() {
+                                        if let Err(edit_error) =
+                                            adapter.edit_message(&msg, first).await
+                                        {
+                                            tracing::warn!(error = ?edit_error, "handoff presentation edit failed");
+                                            delivery_failed = true;
+                                            if let Err(send_error) =
+                                                adapter.send_message(&thread_channel, first).await
+                                            {
+                                                tracing::warn!(error = ?send_error, "handoff presentation first send failed");
+                                            }
+                                        }
+                                        for chunk in chunks.iter().skip(1) {
+                                            if let Err(send_error) =
+                                                adapter.send_message(&thread_channel, chunk).await
+                                            {
+                                                tracing::warn!(error = ?send_error, "handoff presentation overflow send failed");
+                                                delivery_failed = true;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    for chunk in &chunks {
+                                        if let Err(send_error) =
+                                            adapter.send_message(&thread_channel, chunk).await
+                                        {
+                                            tracing::warn!(error = ?send_error, "handoff presentation send failed");
+                                            delivery_failed = true;
+                                        }
+                                    }
                                 }
                             }
                             Err(e) => {

@@ -585,6 +585,7 @@ impl EventHandler for Handler {
                     request,
                     msg.author.id.get(),
                     bot_id.get(),
+                    msg.channel_id.get(),
                     &self.trusted_bot_ids,
                     chrono::Utc::now().timestamp().max(0) as u64,
                 )
@@ -3403,12 +3404,16 @@ fn is_handoff_candidate(content: &str) -> bool {
 }
 
 /// Validate every wire-level handoff invariant before it can bypass ordinary
-/// bot-message gating. Invalid candidates fail closed and are never sent to ACP.
+/// bot-message gating. The sender emits a five-minute expiry; the receiver
+/// also caps any accepted future expiry at one hour to bound replay exposure
+/// if a sender is buggy. Origin channel/thread metadata is bound to the live
+/// Discord channel before the payload can reach ACP.
 fn validate_handoff_envelope(
     content: &str,
     request: &HandoffRequest,
     author_id: u64,
     bot_id: u64,
+    channel_id: u64,
     trusted_bot_ids: &HashSet<u64>,
     now: u64,
 ) -> bool {
@@ -3421,6 +3426,7 @@ fn validate_handoff_envelope(
         Err(_) => return false,
     };
     let target_mention = format!("<@{target_id}>");
+    let channel_id = channel_id.to_string();
     let Some(first_line) = content.lines().next() else {
         return false;
     };
@@ -3441,6 +3447,11 @@ fn validate_handoff_envelope(
         && request.expires_at > now
         && request.expires_at <= now.saturating_add(3600)
         && request.hop_count == 0
+        && request.origin_channel_id == channel_id
+        && request
+            .origin_thread_id
+            .as_deref()
+            .map_or(true, |thread_id| thread_id == channel_id.as_str())
         && !request.origin_channel_id.is_empty()
         && !request.payload.text.is_empty()
         && request.payload.text.len() <= 100_000
@@ -3457,8 +3468,8 @@ mod handoff_tests {
             source_bot_id: "10".into(),
             target_bot_id: target.to_string(),
             event_id: uuid::Uuid::nil().to_string(),
-            origin_channel_id: "thread".into(),
-            origin_thread_id: Some("thread".into()),
+            origin_channel_id: "20".into(),
+            origin_thread_id: Some("20".into()),
             origin_message_id: None,
             expires_at: 2_000,
             hop_count: 0,
@@ -3472,11 +3483,13 @@ mod handoff_tests {
         let content = format!("<@20>\n{}", serde_json::to_string(&req).unwrap());
         let mut trusted = HashSet::new();
         trusted.insert(10);
-        assert!(validate_handoff_envelope(&content, &req, 10, 20, &trusted, 1_000));
+        assert!(validate_handoff_envelope(&content, &req, 10, 20, 20, &trusted, 1_000));
+        assert!(!validate_handoff_envelope(&content, &req, 10, 20, 21, &trusted, 1_000));
         assert!(!validate_handoff_envelope(
             &content.replace("<@20>", "<@21>"),
             &req,
             10,
+            20,
             20,
             &trusted,
             1_000
@@ -3488,15 +3501,15 @@ mod handoff_tests {
         let mut req = request(20);
         let content = format!("<@20>\n{}", serde_json::to_string(&req).unwrap());
         let mut trusted = HashSet::new();
-        assert!(!validate_handoff_envelope(&content, &req, 10, 20, &trusted, 1_000));
+        assert!(!validate_handoff_envelope(&content, &req, 10, 20, 20, &trusted, 1_000));
         trusted.insert(10);
         req.expires_at = 1_000;
         let content = format!("<@20>\n{}", serde_json::to_string(&req).unwrap());
-        assert!(!validate_handoff_envelope(&content, &req, 10, 20, &trusted, 1_000));
+        assert!(!validate_handoff_envelope(&content, &req, 10, 20, 20, &trusted, 1_000));
         req.expires_at = 2_000;
         req.hop_count = 1;
         let content = format!("<@20>\n{}", serde_json::to_string(&req).unwrap());
-        assert!(!validate_handoff_envelope(&content, &req, 10, 20, &trusted, 1_000));
+        assert!(!validate_handoff_envelope(&content, &req, 10, 20, 20, &trusted, 1_000));
     }
 
     #[test]
