@@ -492,8 +492,10 @@ fn record_delete_result(
 /// An absent ECS service or ambiguous `DescribeServices` response is rejected
 /// unless that matching durable checkpoint already exists. Cleanup uses only IDs
 /// from the checkpoint and removes the checkpoint last, making partial failures
-/// safe to retry. The legacy CLI uses best-effort warnings for dependent/S3
-/// cleanup, while this programmatic API keeps those failures fatal.
+/// safe to retry. The legacy CLI warns on a drain timeout, continues dependent/S3
+/// cleanup, retains the checkpoint for retry, and continues after individual S3
+/// object failures, while this programmatic API keeps exact-identity dependent
+/// and S3 cleanup failures fatal.
 pub async fn delete_services(
     aws_config: &aws_config::SdkConfig,
     targets: &[DeleteTarget],
@@ -899,10 +901,11 @@ async fn delete_checkpointed_ecs(
     ecs: &aws_sdk_ecs::Client,
     checkpoint: &DeleteCheckpoint,
     state: ServiceIdentityState,
-) -> Result<()> {
+    cleanup_mode: CleanupMode,
+) -> Result<bool> {
     if state == ServiceIdentityState::RetryGone {
         println!("  ✓ ECS service already absent; resuming exact dependent cleanup");
-        return Ok(());
+        return Ok(false);
     }
 
     let response = ecs
@@ -1018,44 +1021,93 @@ async fn delete_checkpointed_ecs(
             }
         };
         match drain_poll_action(complete, attempt, DRAIN_POLL_ATTEMPTS) {
-            DrainPollAction::Complete => { eprintln!(" done"); return Ok(()); }
+            DrainPollAction::Complete => {
+                eprintln!(" done");
+                return Ok(false);
+            }
             DrainPollAction::Retry => {
                 eprint!(".");
                 tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
             }
-            DrainPollAction::TimedOut => anyhow::bail!(
-                "checkpointed ECS service did not reach an unambiguous absent state; dependent cleanup was not started (safe to retry)"
-            ),
+            DrainPollAction::TimedOut => {
+                let message =
+                    "checkpointed ECS service did not reach an unambiguous absent state";
+                match cleanup_mode {
+                    CleanupMode::Strict => anyhow::bail!(
+                        "{message}; dependent cleanup was not started (safe to retry)"
+                    ),
+                    CleanupMode::BestEffort => {
+                        eprintln!(
+                            "\n  ⚠ {message}; continuing dependent cleanup and retaining checkpoint"
+                        );
+                        return Ok(true);
+                    }
+                }
+            }
         }
     }
-    unreachable!()
+    anyhow::bail!("ECS drain polling ended without a terminal result")
 }
 
 async fn cleanup_s3(
     s3: &aws_sdk_s3::Client, bucket: &str, namespace: &str, name: &str,
 ) -> Result<()> {
+    let mut failures = Vec::new();
     let manifest_key = crate::identity::manifest_key(namespace, name);
-    s3.delete_object().bucket(bucket).key(&manifest_key).send().await
-        .context("failed to delete control-plane manifest")?;
-    println!("  ✓ Manifest removed from S3");
+    match s3
+        .delete_object()
+        .bucket(bucket)
+        .key(&manifest_key)
+        .send()
+        .await
+    {
+        Ok(_) => println!("  ✓ Manifest removed from S3"),
+        Err(_) => failures.push("failed to delete control-plane manifest"),
+    }
 
     let artifact_prefix = format!("artifacts/{namespace}/{name}/");
     let mut continuation_token = None;
     loop {
-        let response = s3.list_objects_v2().bucket(bucket).prefix(&artifact_prefix)
-            .set_continuation_token(continuation_token).send().await
-            .context("failed to list control-plane config artifacts")?;
+        let response = match s3
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(&artifact_prefix)
+            .set_continuation_token(continuation_token)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                failures.push("failed to list control-plane config artifacts");
+                break;
+            }
+        };
         for object in response.contents() {
             if let Some(key) = object.key() {
-                s3.delete_object().bucket(bucket).key(key).send().await
-                    .context("failed to delete control-plane config artifact")?;
+                if s3
+                    .delete_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .send()
+                    .await
+                    .is_err()
+                {
+                    failures.push("failed to delete control-plane config artifact");
+                }
             }
         }
         continuation_token = response.next_continuation_token().map(str::to_owned);
-        if continuation_token.is_none() { break; }
+        if continuation_token.is_none() {
+            break;
+        }
     }
-    println!("  ✓ Config artifacts removed from S3");
-    Ok(())
+
+    if failures.is_empty() {
+        println!("  ✓ Config artifacts removed from S3");
+        Ok(())
+    } else {
+        anyhow::bail!("control-plane S3 cleanup incomplete: {}", failures.join("; "))
+    }
 }
 
 async fn run_with_bucket(
@@ -1114,7 +1166,14 @@ async fn run_with_bucket(
                         .to_string(),
                 );
             }
-            delete_checkpointed_ecs(&ecs, &checkpoint, state).await?;
+            let drain_incomplete =
+                delete_checkpointed_ecs(&ecs, &checkpoint, state, cleanup_mode).await?;
+            if drain_incomplete {
+                warnings.push(
+                    "ECS drain timed out; dependent cleanup continued and delete checkpoint was retained"
+                        .to_string(),
+                );
+            }
 
             match cleanup_mode {
                 CleanupMode::Strict => {
@@ -1136,7 +1195,7 @@ async fn run_with_bucket(
                     println!("  ✓ Delete checkpoint removed");
                 }
                 CleanupMode::BestEffort => {
-                    let mut cleanup_failed = false;
+                    let mut cleanup_failed = drain_incomplete;
                     if let Err(error) = crate::ingress::delete_exact(
                         aws_config,
                         namespace,

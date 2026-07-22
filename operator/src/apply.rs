@@ -794,7 +794,7 @@ async fn wait_for_registry_detach(
         }
         let service = match response.services() {
             [service] => service,
-            [] => anyhow::bail!("ECS service disappeared while verifying registry detach"),
+            [] => return Ok(()),
             services => anyhow::bail!(
                 "ECS returned {} services for one registry-detach target",
                 services.len()

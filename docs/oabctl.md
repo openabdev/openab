@@ -377,14 +377,15 @@ must still be registered manually in the LINE Developers console.
 > checkpoint is written before ECS mutation and removed only after all
 > dependent and S3 cleanup succeeds, so rerunning the same command safely
 > resumes a partial delete. ECS HTTP-200 failures, ambiguous drain responses,
-> empty service responses, and a missing service fail closed; a matching checkpoint
-> authorizes retry only when ECS explicitly reports exactly one `MISSING`
-> failure with zero services, or an `INACTIVE` response from the original
-> service incarnation. The control-plane bucket must enforce default
+> empty service responses, and a missing service fail closed for strict/programmatic
+> cleanup; a matching checkpoint authorizes retry only when ECS explicitly reports
+> exactly one `MISSING` failure with zero services, or an `INACTIVE` response from
+> the original service incarnation. The legacy CLI warns on a drain timeout,
+> continues dependent/S3 cleanup, retains the checkpoint for retry, and continues
+> after individual S3 object failures. The control-plane bucket must enforce default
 > server-side encryption and S3 versioning for durable checkpoint recovery;
 > oabctl writes application JSON but does not weaken or validate those
-> bucket-level policies per request. The legacy CLI preserves best-effort
-> dependent/S3 cleanup warnings, while the programmatic `delete_services` API
+> bucket-level policies per request. The programmatic `delete_services` API
 > keeps exact-identity and checkpoint cleanup failures fatal for safe retry.
 >
 > API cleanup never selects the first same-named API: duplicate names fail

@@ -72,9 +72,10 @@
 //! The control-plane bucket is an infrastructure prerequisite: it must enforce
 //! default server-side encryption and S3 versioning for checkpoint recovery.
 //! The library writes application JSON but does not weaken or validate those
-//! bucket-level policies on every request. The legacy CLI preserves best-effort
-//! dependent/S3 cleanup warnings, while [`delete_services`] keeps exact-identity
-//! and checkpoint cleanup failures fatal for retry safety.
+//! bucket-level policies on every request. The legacy CLI warns on a drain
+//! timeout, continues dependent/S3 cleanup, retains the checkpoint for retry,
+//! and continues after individual S3 object failures, while [`delete_services`]
+//! keeps exact-identity and checkpoint cleanup failures fatal for retry safety.
 //!
 //! Programmatic apply and delete do not provide an internal same-target lock.
 //! Callers must serialize mutations for the same AWS account, Region,

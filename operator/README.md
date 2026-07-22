@@ -141,7 +141,8 @@ then retry delete.
 The control-plane bucket must enforce default server-side encryption and S3
 versioning for durable checkpoint recovery. The library writes application JSON
 but does not weaken or validate those bucket-level policies per request. The
-legacy CLI preserves best-effort warnings for dependent/S3 cleanup, while
+legacy CLI warns on a drain timeout, continues dependent/S3 cleanup, retains the
+checkpoint for retry, and continues after individual S3 object failures, while
 `delete_services` keeps exact-identity and checkpoint cleanup failures fatal so
 callers can retry safely.
 
