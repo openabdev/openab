@@ -1207,7 +1207,12 @@ impl AdapterRouter {
                             let source_bot_id = adapter.bot_identity().ok_or_else(|| {
                                 anyhow::anyhow!("Discord bot identity unavailable for handoff")
                             })?;
-                            let payload_text = sanitize_discord_mentions(&final_content);
+                            // The control envelope is protected by explicit Discord
+                            // allowed_mentions, so preserve the raw prompt text here.
+                            // Presentation sanitization is only for human-facing output;
+                            // inserting zero-width characters into the control payload
+                            // would corrupt downstream agent context.
+                            let payload_text = final_content.clone();
                             let request = HandoffRequest {
                                 schema: MULTIBOT_HANDOFF_SCHEMA.to_string(),
                                 source_bot_id,

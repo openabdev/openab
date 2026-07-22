@@ -591,7 +591,7 @@ impl EventHandler for Handler {
         // already applies to every bot-authored message, including accepted
         // handoffs, so the configured per-thread cap remains the DoS guard.
         let handoff = parse_handoff_envelope(&msg.content);
-        if is_handoff_candidate(&msg.content) {
+        if is_handoff_candidate(&msg.content, msg.author.bot) {
             let valid = handoff.as_ref().is_some_and(|request| {
                 validate_handoff_envelope(
                     &msg.content,
@@ -3412,8 +3412,17 @@ fn parse_handoff_envelope(content: &str) -> Option<HandoffRequest> {
     serde_json::from_str(body.trim()).ok()
 }
 
-fn is_handoff_candidate(content: &str) -> bool {
-    content.contains(MULTIBOT_HANDOFF_SCHEMA)
+fn is_handoff_candidate(content: &str, author_is_bot: bool) -> bool {
+    if !author_is_bot {
+        return false;
+    }
+    let Some((mention, body)) = content.split_once('\n') else {
+        return false;
+    };
+    mention.starts_with("<@")
+        && mention.ends_with('>')
+        && body.trim_start().starts_with('{')
+        && body.contains(MULTIBOT_HANDOFF_SCHEMA)
 }
 
 /// Validate every wire-level handoff invariant before it can bypass ordinary
@@ -3443,6 +3452,8 @@ fn validate_handoff_envelope(
     let Some(first_line) = content.lines().next() else {
         return false;
     };
+    // Only the generated first line is routable. The JSON payload may contain
+    // mention-like prompt text; send_handoff explicitly allowlists only target_id.
 
     request.schema == MULTIBOT_HANDOFF_SCHEMA
         && source_id == author_id
@@ -3450,11 +3461,6 @@ fn validate_handoff_envelope(
         && trusted_bot_ids.contains(&author_id)
         && target_id == bot_id
         && first_line == target_mention
-        && content.matches(&target_mention).count() == 1
-        && !content.contains("<@!")
-        && !content.contains("<@&")
-        && !content.contains("@everyone")
-        && !content.contains("@here")
         && request.event_id.len() <= 64
         && uuid::Uuid::parse_str(&request.event_id).is_ok()
         && request.expires_at > now
@@ -3492,10 +3498,13 @@ mod handoff_tests {
 
     #[test]
     fn handoff_requires_exact_target_mention_and_validated_target() {
-        let req = request(20);
+        let mut req = request(20);
         let content = format!("<@20>\n{}", serde_json::to_string(&req).unwrap());
         let mut trusted = HashSet::new();
         trusted.insert(10);
+        assert!(validate_handoff_envelope(&content, &req, 10, 20, 20, &trusted, 1_000));
+        req.payload.text = "quoted @everyone and <@20> remain prompt text".into();
+        let content = format!("<@20>\n{}", serde_json::to_string(&req).unwrap());
         assert!(validate_handoff_envelope(&content, &req, 10, 20, 20, &trusted, 1_000));
         assert!(!validate_handoff_envelope(&content, &req, 10, 20, 21, &trusted, 1_000));
         assert!(!validate_handoff_envelope(
@@ -3543,8 +3552,19 @@ mod handoff_tests {
     #[test]
     fn handoff_parser_rejects_non_schema_content() {
         assert!(parse_handoff_envelope("<@20>\nnot json").is_none());
-        assert!(!is_handoff_candidate("<@20>\nhello"));
-        assert!(is_handoff_candidate(MULTIBOT_HANDOFF_SCHEMA));
+        assert!(!is_handoff_candidate("<@20>\nhello", true));
+        assert!(!is_handoff_candidate(
+            &format!("<@20> Please explain {MULTIBOT_HANDOFF_SCHEMA}"),
+            false
+        ));
+        assert!(!is_handoff_candidate(
+            &format!("<@20> Please explain {MULTIBOT_HANDOFF_SCHEMA}"),
+            true
+        ));
+        assert!(is_handoff_candidate(
+            &format!("<@20>\n{{\"schema\":\"{MULTIBOT_HANDOFF_SCHEMA}\"}}"),
+            true
+        ));
     }
 }
 
