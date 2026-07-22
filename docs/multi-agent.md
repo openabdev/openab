@@ -78,24 +78,20 @@ Use `"all"` only when bots need to react to each other's messages without explic
 
 ### Example: Code Review → Deploy handoff
 
-```
-┌──────────────────────────────────────────────────────────┐
-│ Discord Channel #dev                                     │
-│                                                          │
-│  👤 User: "Review this PR and deploy if it looks good"   │
-│       │                                                  │
-│       ▼                                                  │
-│  🤖 Kiro (allow_bot_messages = "off"):                   │
-│       "LGTM — tests pass, no security issues.            │
-│        @DeployBot please deploy to staging."             │
-│       │                                                  │
-│       ▼                                                  │
-│  🤖 Deploy Bot (allow_bot_messages = "mentions"):        │
-│       "Deploying to staging... ✅ Done."                  │
-└──────────────────────────────────────────────────────────┘
+The review agent can request a structured handoff by emitting the target deploy bot's Discord ID. Configure the same trusted IDs on the participating bots:
+
+```toml
+[discord]
+allow_bot_messages = "mentions"
+trusted_bot_ids = ["123456789012345678"]
 ```
 
-Note: the review bot doesn't need `allow_bot_messages` enabled — only the bot that needs to *receive* bot messages does.
+```text
+Review complete: tests pass and no security issues found.
+[[handoff:123456789012345678]]
+```
+
+The adapter turns the directive into a structured control message addressed to the allowlisted target. The target bot validates the envelope before placing its raw payload in the ACP prompt, while the accompanying presentation remains visible to humans with ordinary Discord mentions suppressed. If the target is not allowlisted, the directive fails closed and only the sanitized presentation is delivered.
 
 ### Helm values
 

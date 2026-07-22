@@ -131,7 +131,7 @@ pr      = ""
 [[openab_features]]
 feature = "streaming"
 status  = "implemented"
-note    = "Post-then-edit, not native. use_streaming returns true only when no other bot is present (!other_bot_present); the router consults it at dispatch. uses_native_streaming stays default false, so the trait's native stream methods only hit their edit-based fallbacks."
+note    = "Post-then-edit, not native. use_streaming remains enabled for single-bot and multibot threads so long-running work stays visible; each bot edits its own presentation message. Presentation mentions are sanitized, while structured handoffs use an explicit trusted_bot_ids target allowlist. uses_native_streaming stays default false, so the trait native stream methods only hit their edit-based fallbacks."
 source  = ["crates/openab-core/src/discord.rs#use_streaming", "crates/openab-core/src/adapter.rs#uses_native_streaming"]
 pr      = "#534"
 
@@ -215,7 +215,7 @@ pr      = ""
 [[openab_features]]
 feature = "multibot"
 status  = "implemented"
-note    = "Early other-bot detection cached (disk-persisted, irreversible); disables streaming, gates via MultibotMentions, enforces bot-turn limits; trusted_bot_ids + @mention admits handoff regardless of allow_bot_messages."
+note    = "Early other-bot detection is cached (disk-persisted, irreversible); multibot threads keep edit-streaming, gate user replies via MultibotMentions, and enforce bot-turn limits. Structured handoffs use [[handoff:<TARGET_BOT_ID>]] and require the target to be in trusted_bot_ids; presentation mentions are suppressed."
 source  = ["crates/openab-core/src/discord.rs#MultibotCache", "crates/openab-core/src/discord.rs#BotTurnTracker"]
 pr      = ""
 
@@ -258,7 +258,7 @@ source = "crates/openab-core/src/discord.rs#BotTurnTracker"
 date   = "2026-07-04"
 title  = "Multibot detection is irreversible & disk-cached"
 note   = """
-Once any other bot posts in a channel/thread, that thread is permanently "multibot": cached in-memory and persisted to MultibotCache on disk (survives restarts), since bot messages don't disappear. This flips streaming off (the edit-loop interferes across bots) and can require @mention under MultibotMentions.
+Once any other bot posts in a channel/thread, that thread is permanently "multibot": cached in-memory and persisted to MultibotCache on disk (survives restarts), since bot messages don't disappear. Multibot mode keeps presentation streaming enabled and can require @mention under MultibotMentions. Ordinary presentation mentions are sanitized; structured handoffs are separately validated and restricted to trusted_bot_ids.
 """
 kind   = "intrinsic"
 source = "crates/openab-core/src/discord.rs#MultibotCache"
@@ -267,7 +267,7 @@ source = "crates/openab-core/src/discord.rs#MultibotCache"
 date   = "2026-07-04"
 title  = "Streaming is post-then-edit, not native"
 note   = """
-Unlike Slack, Discord has no native streaming API; OpenAB streams by editing a placeholder message. use_streaming disables this whenever another bot is present, to avoid edit interference. uses_native_streaming stays false, so the trait's native stream methods only ever hit their edit-based fallbacks.
+Unlike Slack, Discord has no native streaming API; OpenAB streams by editing a placeholder message. use_streaming remains enabled when another bot is present, so each bot can keep its own long-running presentation visible. uses_native_streaming stays false, so the trait's native stream methods only ever hit their edit-based fallbacks.
 """
 kind   = "openab_decision"
 source = "crates/openab-core/src/discord.rs#use_streaming"

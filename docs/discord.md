@@ -263,16 +263,16 @@ No configuration is needed — video forwarding is always enabled.
 
 OpenAB uses **edit-streaming** on Discord — the bot sends a placeholder message and updates it every 1.5 seconds as tokens arrive, giving a live typing effect.
 
-Streaming is decided **per-thread**, not globally:
+Streaming remains enabled during multi-bot conversations so long-running work stays visible:
 
 | Thread state | Streaming |
 |---|---|
 | Single bot + human | ✅ ON — live edit updates |
-| 2+ bots in thread | ❌ OFF — send-once to avoid edit interference |
+| 2+ bots in thread | ✅ ON — each bot updates its own presentation message |
 
-When a second bot posts in a thread, streaming automatically switches off for that thread. This prevents multiple bots from editing placeholder messages simultaneously, which causes visual glitches on Discord.
+Presentation output is sanitized to prevent ordinary model text from notifying arbitrary Discord users, roles, or everyone. The structured handoff path is separate: an output directive such as `[[handoff:123456789012345678]]` emits a human-visible control message only when the target is in the configured `trusted_bot_ids` allowlist. The handoff target receives the raw structured payload; the human-facing presentation remains sanitized.
 
-No configuration needed — this is automatic based on multibot detection.
+No configuration is needed for streaming. Configure `trusted_bot_ids` when enabling bot-to-bot handoffs so outbound targets are explicitly authorized.
 
 ---
 
@@ -344,7 +344,12 @@ To enable bots to collaborate (e.g. code review → deploy handoff):
 # Bot that receives bot messages
 [discord]
 allow_bot_messages = "mentions"
+trusted_bot_ids = ["123456789012345678"]  # explicit outbound/inbound bot allowlist
 ```
+
+For a structured handoff, the producing agent emits `[[handoff:<TARGET_BOT_DISCORD_ID>]]` in its output. The Discord adapter only sends that control message when the target ID is in `trusted_bot_ids` and is not the current bot. Ordinary presentation text is kept human-readable but its Discord mentions are suppressed; do not use a plain `@BotName` sentence as the handoff protocol.
+
+A handoff control message is visible in the channel because Discord does not provide a hidden bot-only message type. Its payload is accepted only after schema, source, target, channel/thread provenance, expiry, hop, replay, and rate-limit checks.
 
 ### Bot turn limits
 
@@ -362,21 +367,21 @@ Warning messages are sent exactly once (on the exact threshold hit) to prevent w
 max_bot_turns = 200               # default is 100
 ```
 
-### Ice-breaking: teaching bots who's in the room
+### Ice-breaking: identifying bots in the room
 
-Since user mentions are preserved as raw `<@UID>`, bots need a UID→name mapping to know who is who. Add an ice-breaking greeting to each bot's system prompt or context entry:
+Bots can still include Discord IDs in their context to identify participants, but ordinary presentation mentions are sanitized and do not notify arbitrary users or roles. For bot-to-bot routing, use the structured directive and configure an explicit target allowlist instead of relying on a plain `@BotName` sentence:
 
 ```
 We have 3 participants in this room:
 
-MY_NICIKNAME    <@MY_NAME>
-BOT1_NICKNAME   <@BOT1>
-BOT2_NICKNAME   <@BOT2>
+MY_NICKNAME    <@MY_ID>
+BOT1_NICKNAME  <@BOT1_ID>
+BOT2_NICKNAME  <@BOT2_ID>
 
-Always use <@UID> format to mention someone in your messages.
+For a structured handoff, emit [[handoff:<TARGET_BOT_ID>]] only for a configured trusted bot.
 ```
 
-This lets each bot build the mapping in its own context from the start and correctly mention others using `<@UID>`.
+The target ID must be listed in `trusted_bot_ids` on the sending adapter. This makes the routing decision explicit and prevents model-generated numeric IDs from becoming arbitrary notification targets.
 
 See [multi-agent.md](multi-agent.md) for detailed examples.
 
