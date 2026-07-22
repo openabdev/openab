@@ -928,7 +928,7 @@ async fn delete_checkpointed_ecs(
     )
     .map_err(anyhow::Error::msg)?;
     if state == ServiceIdentityState::RetryGone {
-        return Ok(());
+        return Ok(false);
     }
     let service = service.context("checkpointed ECS service disappeared ambiguously")?;
     let delete_phase = ecs_delete_phase(service.status())?;
@@ -984,8 +984,23 @@ async fn delete_checkpointed_ecs(
             }
             Err(error) => return Err(error).context("failed to scale ECS service to zero"),
         }
+    } else if delete_phase == EcsDeletePhase::Drain {
+        match ecs
+            .delete_service()
+            .cluster(&checkpoint.cluster_arn)
+            .service(&checkpoint.service_arn)
+            .force(true)
+            .send()
+            .await
+        {
+            Ok(_) => println!("  ✓ ECS draining service deletion resumed"),
+            Err(error) if error.code() == Some("ServiceNotFoundException") => {
+                println!("  ✓ ECS draining service disappeared while resuming delete")
+            }
+            Err(error) => return Err(error).context("failed to resume ECS service deletion"),
+        }
     } else {
-        println!("  ✓ ECS service is already draining; resuming delete cleanup");
+        println!("  ✓ ECS service is already inactive; resuming delete cleanup");
     }
 
     const DRAIN_POLL_ATTEMPTS: u32 = 12;

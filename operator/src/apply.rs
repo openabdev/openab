@@ -408,6 +408,12 @@ pub(crate) async fn run(
 /// pair (for example a legacy hyphenated namespace) claims the same physical
 /// identity, and fails closed if one does.
 ///
+/// If reconciliation fails after the desired-state manifest is persisted, the
+/// manifest remains the intended state and there is no apply checkpoint to
+/// roll back. Callers should correct the underlying AWS/configuration issue and
+/// re-run `apply_manifests` (or the CLI `apply`) to reconcile the persisted
+/// desired state before resuming other mutations.
+///
 /// # Concurrency
 ///
 /// This function is not serialized with [`crate::delete::delete_services`].

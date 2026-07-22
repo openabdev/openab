@@ -138,6 +138,10 @@ record exists, delete fails before destructive mutation so it cannot discard
 unfinished exact cleanup identity. Re-run the ingress-free apply to completion,
 then retry delete.
 
+The manifest is persisted as the infrastructure desired state before ECS
+mutation. If a later AWS/configuration step fails, correct the underlying issue
+and re-run `apply`/`apply_manifests` to reconcile the persisted desired state;
+apply has no rollback checkpoint.
 The control-plane bucket must enforce default server-side encryption and S3
 versioning for durable checkpoint recovery. The library writes application JSON
 but does not weaken or validate those bucket-level policies per request. The

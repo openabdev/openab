@@ -417,9 +417,16 @@ async fn delete_cloud_map_by_arn(
     )
     .context("Cloud Map service ARN is outside the exact delete boundary")?;
     let discovery = aws_sdk_servicediscovery::Client::new(config);
+    const DELETE_ATTEMPTS: u32 = 12;
+    const BASE_RETRY_DELAY_SECS: u64 = 5;
+    const MAX_RETRY_DELAY_SECS: u64 = 30;
     let mut last_error = None;
-    for attempt in 0..6 {
-        if attempt > 0 { tokio::time::sleep(std::time::Duration::from_secs(5)).await; }
+    for attempt in 0..DELETE_ATTEMPTS {
+        if attempt > 0 {
+            let exponent = u32::min(attempt - 1, 3);
+            let delay_secs = (BASE_RETRY_DELAY_SECS << exponent).min(MAX_RETRY_DELAY_SECS);
+            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+        }
         match discovery.delete_service().id(&service_id).send().await {
             Ok(_) => {
                 eprintln!("  ✓ Deleted Cloud Map service: {service_name} ({service_id})");

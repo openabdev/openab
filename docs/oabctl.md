@@ -476,6 +476,9 @@ spec:
 ### Design Principles
 
 - **Manifest = infra desired state** — image, CPU, networking
+- **Apply failure recovery** — apply persists the manifest before ECS mutation;
+  if a later AWS/configuration step fails, correct the cause and re-run apply to
+  reconcile that persisted desired state. Apply has no rollback checkpoint.
 - **Agent config is external** — `configFrom` points to config.toml (managed via `--sync`)
 - **Secrets resolved by OpenAB** — `[secrets.refs]` in config.toml, not in manifest
 - **Runtime-agnostic spec** — same top-level fields regardless of ECS or K8S

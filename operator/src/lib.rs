@@ -61,6 +61,11 @@
 //! a legacy hyphenated namespace) claims the same physical name, and fail
 //! closed otherwise.
 //!
+//! Apply persists the manifest as desired state before ECS mutation. If a later
+//! AWS or configuration step fails, callers must correct the cause and re-run
+//! apply to reconcile that persisted desired state; apply has no rollback
+//! checkpoint.
+//!
 //! [`delete_services`] tears down by `namespace`+`name` ([`DeleteTarget`]).
 //! Before ECS mutation delete durably records the resolved bucket,
 //! caller partition/account/region, canonical cluster/service ARNs, the ECS
