@@ -483,6 +483,10 @@ pub trait ChatAdapter: Send + Sync + 'static {
         None
     }
 
+    /// Configure the outbound control-plane target allowlist. Platforms that do
+    /// not support structured handoffs may ignore this hook.
+    fn set_handoff_target_allowlist(&self, _target_bot_ids: &[String]) {}
+
     /// Send one complete, structured bot-to-bot handoff. The default is fail-closed:
     /// a platform must explicitly implement this instead of accidentally routing
     /// an incomplete presentation message as control input.

@@ -72,6 +72,7 @@ const MAX_HANDOFFS_PER_SOURCE: usize = 10;
 pub struct DiscordAdapter {
     http: Arc<Http>,
     bot_id: Arc<OnceLock<String>>,
+    handoff_targets: Arc<OnceLock<HashSet<u64>>>,
 }
 
 impl DiscordAdapter {
@@ -79,6 +80,7 @@ impl DiscordAdapter {
         Self {
             http,
             bot_id: Arc::new(OnceLock::new()),
+            handoff_targets: Arc::new(OnceLock::new()),
         }
     }
 
@@ -87,6 +89,10 @@ impl DiscordAdapter {
     fn resolve_channel(channel: &ChannelRef) -> &str {
         channel.thread_id.as_deref().unwrap_or(&channel.channel_id)
     }
+}
+
+fn handoff_target_allowed(target_id: u64, targets: Option<&HashSet<u64>>) -> bool {
+    targets.is_some_and(|allowed| allowed.contains(&target_id))
 }
 
 fn build_handoff_content(target_id: u64, envelope: &str) -> anyhow::Result<String> {
@@ -206,6 +212,14 @@ impl ChatAdapter for DiscordAdapter {
         self.bot_id.get().cloned()
     }
 
+    fn set_handoff_target_allowlist(&self, target_bot_ids: &[String]) {
+        let targets: HashSet<u64> = target_bot_ids
+            .iter()
+            .filter_map(|id| id.parse::<u64>().ok())
+            .collect();
+        let _ = self.handoff_targets.set(targets);
+    }
+
     async fn send_handoff(
         &self,
         channel: &ChannelRef,
@@ -215,6 +229,9 @@ impl ChatAdapter for DiscordAdapter {
             anyhow::bail!("unsupported handoff schema: {}", request.schema);
         }
         let target_id: u64 = request.target_bot_id.parse()?;
+        if !handoff_target_allowed(target_id, self.handoff_targets.get()) {
+            anyhow::bail!("handoff target is not in the configured trusted bot allowlist");
+        }
         let ch_id: u64 = Self::resolve_channel(channel).parse()?;
         let envelope = serde_json::to_string(request)?;
         // The target mention is generated from the validated target ID exactly
@@ -1562,6 +1579,12 @@ impl EventHandler for Handler {
             .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
             .clone();
         adapter.set_bot_identity(&ready.user.id.to_string());
+        let handoff_targets: Vec<String> = self
+            .trusted_bot_ids
+            .iter()
+            .map(u64::to_string)
+            .collect();
+        adapter.set_handoff_target_allowlist(&handoff_targets);
         info!(user = %ready.user.name, "discord bot connected");
 
         // Build the shared command list once.
@@ -3576,6 +3599,14 @@ mod handoff_tests {
         assert!(accept_handoff_event_in(&mut events, "event-1"));
         assert!(!accept_handoff_event_in(&mut events, "event-1"));
         assert!(accept_handoff_event_in(&mut events, "event-2"));
+    }
+
+    #[test]
+    fn handoff_target_requires_configured_allowlist() {
+        let allowed = HashSet::from([20_u64]);
+        assert!(handoff_target_allowed(20, Some(&allowed)));
+        assert!(!handoff_target_allowed(21, Some(&allowed)));
+        assert!(!handoff_target_allowed(20, None));
     }
 
     #[test]
