@@ -1,6 +1,9 @@
 use crate::acp::protocol::{ConfigOption, UsageReport};
 use crate::acp::ContentBlock;
-use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
+use crate::adapter::{
+    AdapterRouter, ChannelRef, ChatAdapter, HandoffRequest, MessageRef, SenderContext,
+    MULTIBOT_HANDOFF_SCHEMA,
+};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::dispatch::DispatchTarget;
@@ -10,9 +13,10 @@ use crate::remind::{self, ReminderStore};
 use crate::trust::l3_gate_applies;
 use async_trait::async_trait;
 use serenity::builder::{
-    CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateCommandOption,
-    CreateEmbed, CreateEmbedFooter, CreateInteractionResponse, CreateInteractionResponseFollowup,
-    CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind,
+    CreateActionRow, CreateAllowedMentions, CreateAttachment, CreateButton, CreateCommand,
+    CreateCommandOption, CreateEmbed, CreateEmbedFooter, CreateInteractionResponse,
+    CreateInteractionResponseFollowup, CreateInteractionResponseMessage, CreateMessage,
+    CreateSelectMenu, CreateSelectMenuKind,
     CreateSelectMenuOption, CreateThread, EditChannel, EditMessage, GetMessages,
 };
 use serenity::http::Http;
@@ -64,11 +68,15 @@ const THREAD_EXPORT_MESSAGE_LIMIT: usize = 5000;
 
 pub struct DiscordAdapter {
     http: Arc<Http>,
+    bot_id: Arc<OnceLock<String>>,
 }
 
 impl DiscordAdapter {
     pub fn new(http: Arc<Http>) -> Self {
-        Self { http }
+        Self {
+            http,
+            bot_id: Arc::new(OnceLock::new()),
+        }
     }
 
     /// Resolve the effective Discord channel ID from a ChannelRef.
@@ -94,7 +102,17 @@ impl ChatAdapter for DiscordAdapter {
         content: &str,
     ) -> anyhow::Result<MessageRef> {
         let ch_id: u64 = Self::resolve_channel(channel).parse()?;
-        let msg = ChannelId::new(ch_id).say(&self.http, content).await?;
+        let msg = ChannelId::new(ch_id)
+            .send_message(
+                &self.http,
+                CreateMessage::new()
+                    .content(content)
+                    // Presentation messages are never allowed to ping users,
+                    // roles, @everyone, or @here. Control-plane handoffs use
+                    // the explicit send_handoff path below.
+                    .allowed_mentions(CreateAllowedMentions::new().replied_user(false)),
+            )
+            .await?;
         Ok(MessageRef {
             channel: channel.clone(),
             message_id: msg.id.to_string(),
@@ -113,8 +131,9 @@ impl ChatAdapter for DiscordAdapter {
             // Invalid message ID, fall back to plain send
             return self.send_message(channel, content).await;
         }
-        let builder = serenity::builder::CreateMessage::new()
+        let builder = CreateMessage::new()
             .content(content)
+            .allowed_mentions(CreateAllowedMentions::new().replied_user(false))
             .reference_message((ChannelId::new(ch_id), MessageId::new(msg_id)));
         match ChannelId::new(ch_id)
             .send_message(&self.http, builder)
@@ -148,14 +167,61 @@ impl ChatAdapter for DiscordAdapter {
             .edit_message(
                 &self.http,
                 MessageId::new(msg_id),
-                EditMessage::new().content(content),
+                EditMessage::new()
+                    .content(content)
+                    .allowed_mentions(CreateAllowedMentions::new().replied_user(false)),
             )
             .await?;
         Ok(())
     }
 
-    fn use_streaming(&self, other_bot_present: bool) -> bool {
-        !other_bot_present
+    fn use_streaming(&self, _other_bot_present: bool) -> bool {
+        // Discord presentation writes are sanitized and explicitly disable
+        // allowed mentions, so MESSAGE_UPDATE edits cannot trigger another bot.
+        // Keep live progress visible even in a multibot thread; only the
+        // structured handoff path below can emit an executable MESSAGE_CREATE.
+        true
+    }
+
+    fn set_bot_identity(&self, bot_id: &str) {
+        let _ = self.bot_id.set(bot_id.to_string());
+    }
+
+    fn bot_identity(&self) -> Option<String> {
+        self.bot_id.get().cloned()
+    }
+
+    async fn send_handoff(
+        &self,
+        channel: &ChannelRef,
+        request: &HandoffRequest,
+    ) -> anyhow::Result<MessageRef> {
+        if request.schema != MULTIBOT_HANDOFF_SCHEMA {
+            anyhow::bail!("unsupported handoff schema: {}", request.schema);
+        }
+        let target_id: u64 = request.target_bot_id.parse()?;
+        let ch_id: u64 = Self::resolve_channel(channel).parse()?;
+        let envelope = serde_json::to_string(request)?;
+        // The target mention is generated from the validated target ID exactly
+        // once. The JSON envelope is the control-plane payload; no presentation
+        // edit is used to route it.
+        let content = format!("<@{target_id}>\n{envelope}");
+        let msg = ChannelId::new(ch_id)
+            .send_message(
+                &self.http,
+                CreateMessage::new()
+                    .content(content)
+                    .allowed_mentions(
+                        CreateAllowedMentions::new()
+                            .users([UserId::new(target_id)])
+                            .replied_user(false),
+                    ),
+            )
+            .await?;
+        Ok(MessageRef {
+            channel: channel.clone(),
+            message_id: msg.id.to_string(),
+        })
     }
 
     async fn create_thread(
@@ -265,9 +331,32 @@ pub struct Handler {
     pub reminder_store: ReminderStore,
     /// Track scheduled reminder IDs to prevent duplicate scheduling on reconnect.
     pub scheduled_ids: tokio::sync::Mutex<std::collections::HashSet<String>>,
+    /// Recently accepted structured handoff event IDs; prevents replay within a process.
+    pub handoff_events: tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>,
+}
+
+fn accept_handoff_event_in(
+    events: &mut HashMap<String, tokio::time::Instant>,
+    event_id: &str,
+) -> bool {
+    const HANDOFF_REPLAY_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+    events.retain(|_, seen_at| seen_at.elapsed() < HANDOFF_REPLAY_WINDOW);
+    if events.contains_key(event_id) {
+        return false;
+    }
+    events.insert(event_id.to_string(), tokio::time::Instant::now());
+    true
 }
 
 impl Handler {
+    /// Accept each validated control-plane event at most once during its replay
+    /// window. This is intentionally process-local; the envelope expiry and
+    /// event ID remain part of the wire contract for a future shared dedupe store.
+    async fn accept_handoff_event(&self, event_id: &str) -> bool {
+        let mut events = self.handoff_events.lock().await;
+        accept_handoff_event_in(&mut events, event_id)
+    }
+
     /// Check if the bot has participated in a Discord thread, and whether
     /// other bots have also posted in it.
     /// Returns `(involved, other_bot_present)`.
@@ -484,6 +573,32 @@ impl EventHandler for Handler {
                     .mention_roles
                     .iter()
                     .any(|r| self.allowed_role_ids.contains(&r.get())));
+
+        // Control-plane messages are parsed before ordinary bot gating. A
+        // schema-looking message that fails validation is dropped rather than
+        // falling through as an executable prompt.
+        let handoff = parse_handoff_envelope(&msg.content);
+        if is_handoff_candidate(&msg.content) {
+            let valid = handoff.as_ref().is_some_and(|request| {
+                validate_handoff_envelope(
+                    &msg.content,
+                    request,
+                    msg.author.id.get(),
+                    bot_id.get(),
+                    &self.trusted_bot_ids,
+                    chrono::Utc::now().timestamp().max(0) as u64,
+                )
+            });
+            if !valid {
+                tracing::warn!(author = %msg.author.id, channel = %msg.channel_id, "invalid structured handoff rejected");
+                return;
+            }
+            let request = handoff.as_ref().expect("validated handoff must be present");
+            if !self.accept_handoff_event(&request.event_id).await {
+                tracing::info!(event_id = %request.event_id, "duplicate structured handoff ignored");
+                return;
+            }
+        }
 
         // Early-gating optimization for bot messages to avoid unnecessary
         // async/HTTP thread detection calls when ambient mode is inactive and
@@ -836,7 +951,10 @@ impl EventHandler for Handler {
             return;
         }
 
-        let prompt = resolve_mentions(&msg.content, bot_id, &self.allowed_role_ids);
+        let prompt = handoff
+            .as_ref()
+            .map(|request| request.payload.text.clone())
+            .unwrap_or_else(|| resolve_mentions(&msg.content, bot_id, &self.allowed_role_ids));
 
         // No text and no attachments → skip
         if prompt.is_empty() && msg.attachments.is_empty() {
@@ -1389,6 +1507,11 @@ impl EventHandler for Handler {
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {
+        let adapter = self
+            .adapter
+            .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
+            .clone();
+        adapter.set_bot_identity(&ready.user.id.to_string());
         info!(user = %ready.user.name, "discord bot connected");
 
         // Build the shared command list once.
@@ -3263,6 +3386,133 @@ fn truncate_to_utf16_budget(body: &str, prefix: &str, suffix: &str, limit: usize
         truncated.push(ch);
     }
     truncated
+}
+
+/// Parse the JSON control envelope carried after the generated target mention.
+/// Presentation messages are never parsed here because they do not use this schema.
+fn parse_handoff_envelope(content: &str) -> Option<HandoffRequest> {
+    let (mention, body) = content.split_once('\n')?;
+    if !mention.starts_with("<@") || !mention.ends_with('>') {
+        return None;
+    }
+    serde_json::from_str(body.trim()).ok()
+}
+
+fn is_handoff_candidate(content: &str) -> bool {
+    content.contains(MULTIBOT_HANDOFF_SCHEMA)
+}
+
+/// Validate every wire-level handoff invariant before it can bypass ordinary
+/// bot-message gating. Invalid candidates fail closed and are never sent to ACP.
+fn validate_handoff_envelope(
+    content: &str,
+    request: &HandoffRequest,
+    author_id: u64,
+    bot_id: u64,
+    trusted_bot_ids: &HashSet<u64>,
+    now: u64,
+) -> bool {
+    let target_id = match request.target_bot_id.parse::<u64>() {
+        Ok(id) => id,
+        Err(_) => return false,
+    };
+    let source_id = match request.source_bot_id.parse::<u64>() {
+        Ok(id) => id,
+        Err(_) => return false,
+    };
+    let target_mention = format!("<@{target_id}>");
+    let Some(first_line) = content.lines().next() else {
+        return false;
+    };
+
+    request.schema == MULTIBOT_HANDOFF_SCHEMA
+        && source_id == author_id
+        && source_id != bot_id
+        && trusted_bot_ids.contains(&author_id)
+        && target_id == bot_id
+        && first_line == target_mention
+        && content.matches(&target_mention).count() == 1
+        && !content.contains("<@!")
+        && !content.contains("<@&")
+        && !content.contains("@everyone")
+        && !content.contains("@here")
+        && request.event_id.len() <= 64
+        && uuid::Uuid::parse_str(&request.event_id).is_ok()
+        && request.expires_at > now
+        && request.expires_at <= now.saturating_add(3600)
+        && request.hop_count == 0
+        && !request.origin_channel_id.is_empty()
+        && !request.payload.text.is_empty()
+        && request.payload.text.len() <= 100_000
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+    use crate::adapter::{HandoffPayload, MULTIBOT_HANDOFF_SCHEMA};
+
+    fn request(target: u64) -> HandoffRequest {
+        HandoffRequest {
+            schema: MULTIBOT_HANDOFF_SCHEMA.into(),
+            source_bot_id: "10".into(),
+            target_bot_id: target.to_string(),
+            event_id: uuid::Uuid::nil().to_string(),
+            origin_channel_id: "thread".into(),
+            origin_thread_id: Some("thread".into()),
+            origin_message_id: None,
+            expires_at: 2_000,
+            hop_count: 0,
+            payload: HandoffPayload { text: "complete".into() },
+        }
+    }
+
+    #[test]
+    fn handoff_requires_exact_target_mention_and_validated_target() {
+        let req = request(20);
+        let content = format!("<@20>\n{}", serde_json::to_string(&req).unwrap());
+        let mut trusted = HashSet::new();
+        trusted.insert(10);
+        assert!(validate_handoff_envelope(&content, &req, 10, 20, &trusted, 1_000));
+        assert!(!validate_handoff_envelope(
+            &content.replace("<@20>", "<@21>"),
+            &req,
+            10,
+            20,
+            &trusted,
+            1_000
+        ));
+    }
+
+    #[test]
+    fn handoff_rejects_untrusted_expired_or_forwarded_requests() {
+        let mut req = request(20);
+        let content = format!("<@20>\n{}", serde_json::to_string(&req).unwrap());
+        let mut trusted = HashSet::new();
+        assert!(!validate_handoff_envelope(&content, &req, 10, 20, &trusted, 1_000));
+        trusted.insert(10);
+        req.expires_at = 1_000;
+        let content = format!("<@20>\n{}", serde_json::to_string(&req).unwrap());
+        assert!(!validate_handoff_envelope(&content, &req, 10, 20, &trusted, 1_000));
+        req.expires_at = 2_000;
+        req.hop_count = 1;
+        let content = format!("<@20>\n{}", serde_json::to_string(&req).unwrap());
+        assert!(!validate_handoff_envelope(&content, &req, 10, 20, &trusted, 1_000));
+    }
+
+    #[test]
+    fn handoff_event_ids_are_replay_protected() {
+        let mut events = HashMap::new();
+        assert!(accept_handoff_event_in(&mut events, "event-1"));
+        assert!(!accept_handoff_event_in(&mut events, "event-1"));
+        assert!(accept_handoff_event_in(&mut events, "event-2"));
+    }
+
+    #[test]
+    fn handoff_parser_rejects_non_schema_content() {
+        assert!(parse_handoff_envelope("<@20>\nnot json").is_none());
+        assert!(!is_handoff_candidate("<@20>\nhello"));
+        assert!(is_handoff_candidate(MULTIBOT_HANDOFF_SCHEMA));
+    }
 }
 
 #[cfg(test)]

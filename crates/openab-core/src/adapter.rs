@@ -1,6 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, warn};
 
@@ -13,12 +13,35 @@ use crate::reactions::StatusReactionController;
 
 // --- Output directive parsing ---
 
-/// Parsed directives from agent output header block.
-/// Consecutive `[[key:value]]` lines at the start of output are directives.
+/// A validated bot-to-bot handoff request. Presentation updates must never be
+/// interpreted as this control-plane message; only a complete turn may create it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HandoffRequest {
+    pub schema: String,
+    pub source_bot_id: String,
+    pub target_bot_id: String,
+    pub event_id: String,
+    pub origin_channel_id: String,
+    pub origin_thread_id: Option<String>,
+    pub origin_message_id: Option<String>,
+    pub expires_at: u64,
+    pub hop_count: u8,
+    pub payload: HandoffPayload,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HandoffPayload {
+    pub text: String,
+}
+
+pub const MULTIBOT_HANDOFF_SCHEMA: &str = "openab.multibot.handoff.v1";
+
 #[derive(Default, Debug)]
 pub struct OutputDirectives {
     /// Message ID to reply to (Discord: message_reference)
     pub reply_to: Option<String>,
+    /// Target Discord bot ID for a complete control-plane handoff.
+    pub handoff_target_bot_id: Option<String>,
 }
 
 /// Parse `[[key:value]]` directives from the beginning of agent output.
@@ -41,6 +64,19 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
                             // Validate: non-empty, reasonable length, no whitespace/control chars
                             if !v.is_empty() && v.len() <= 64 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_') {
                                 directives.reply_to = Some(v.to_string());
+                            }
+                        }
+                        "handoff" => {
+                            let v = value.trim();
+                            // Discord snowflake IDs are decimal u64 values. Keep the
+                            // directive strict so arbitrary text can never become a
+                            // routing target.
+                            if !v.is_empty()
+                                && v.len() <= 20
+                                && v.chars().all(|c| c.is_ascii_digit())
+                                && v.parse::<u64>().is_ok()
+                            {
+                                directives.handoff_target_bot_id = Some(v.to_string());
                             }
                         }
                         _ => {
@@ -422,6 +458,26 @@ pub trait ChatAdapter: Send + Sync + 'static {
     /// not be detected until the next message. This is acceptable: the first
     /// response may stream, but subsequent ones will correctly use send-once.
     fn use_streaming(&self, other_bot_present: bool) -> bool;
+
+    /// Set the identity used as the source of control-plane handoffs.
+    /// Platforms without bot-to-bot control messages may ignore this.
+    fn set_bot_identity(&self, _bot_id: &str) {}
+
+    /// Return the configured source identity for a control-plane handoff.
+    fn bot_identity(&self) -> Option<String> {
+        None
+    }
+
+    /// Send one complete, structured bot-to-bot handoff. The default is fail-closed:
+    /// a platform must explicitly implement this instead of accidentally routing
+    /// an incomplete presentation message as control input.
+    async fn send_handoff(
+        &self,
+        _channel: &ChannelRef,
+        _request: &HandoffRequest,
+    ) -> Result<MessageRef> {
+        Err(anyhow::anyhow!("structured handoff not supported"))
+    }
 
     /// Whether to send the "…" placeholder message before streaming starts.
     /// Default: true. Platforms using drafts (e.g. Telegram Rich Messages) can
@@ -933,12 +989,13 @@ impl AdapterRouter {
                                             }
                                         }
                                     } else if let Some(tx) = &buf_tx {
-                                        let _ = tx.send(compose_display(
+                                        let display = compose_display(
                                             &tool_lines,
                                             &text_buf,
                                             true,
                                             tool_display,
-                                        ));
+                                        );
+                                        let _ = tx.send(presentation_text(adapter.platform(), &display));
                                     }
                                 }
                                 AcpEvent::Thinking => {
@@ -982,12 +1039,13 @@ impl AdapterRouter {
                                     }
                                     // Post+edit live update (no-op under native streaming: buf_tx is None).
                                     if let Some(tx) = &buf_tx {
-                                        let _ = tx.send(compose_display(
+                                        let display = compose_display(
                                             &tool_lines,
                                             &text_buf,
                                             true,
                                             tool_display,
-                                        ));
+                                        );
+                                        let _ = tx.send(presentation_text(adapter.platform(), &display));
                                     }
                                 }
                                 AcpEvent::ToolDone { id, title, status } => {
@@ -1027,12 +1085,13 @@ impl AdapterRouter {
                                         });
                                     }
                                     if let Some(tx) = &buf_tx {
-                                        let _ = tx.send(compose_display(
+                                        let display = compose_display(
                                             &tool_lines,
                                             &text_buf,
                                             true,
                                             tool_display,
-                                        ));
+                                        );
+                                        let _ = tx.send(presentation_text(adapter.platform(), &display));
                                     }
                                 }
                                 AcpEvent::ConfigUpdate { options } => {
@@ -1105,17 +1164,11 @@ impl AdapterRouter {
                     };
 
                     let final_content = markdown::convert_tables(&final_content, table_mode);
-                    let chunks = if adapter.platform() == "discord" {
-                        let mentions = extract_mentions(&final_content);
-                        let mention_reserve = mention_footer_len(&mentions);
-                        let chunks = format::split_message(
-                            &final_content,
-                            message_limit.saturating_sub(mention_reserve),
-                        );
-                        propagate_mentions_to_chunks(chunks, &mentions, message_limit)
-                    } else {
-                        format::split_message(&final_content, message_limit)
-                    };
+                    // Final presentation is always inert. A complete handoff, if
+                    // requested, uses the unsanitized payload below and is sent
+                    // through the explicit control-plane API exactly once.
+                    let presentation_content = presentation_text(adapter.platform(), &final_content);
+                    let chunks = format::split_message(&presentation_content, message_limit);
                     // Track delivery health across all final write paths. Any failure
                     // here means the user's view is incomplete; we propagate Err at the
                     // end of the closure so dispatch surfaces set_error (❌) instead of
@@ -1125,7 +1178,82 @@ impl AdapterRouter {
                     if assistant_status {
                         let _ = adapter.set_status(&thread_channel, "").await;
                     }
-                    if native {
+                    if let Some(target_bot_id) = directives.handoff_target_bot_id.clone() {
+                        // A handoff is a control-plane operation: it is emitted only
+                        // after the ACP turn is complete, never from a stream delta.
+                        let handoff_result = async {
+                            if adapter.platform() != "discord" {
+                                return Err(anyhow::anyhow!(
+                                    "structured handoff is only supported on Discord"
+                                ));
+                            }
+                            let source_bot_id = adapter.bot_identity().ok_or_else(|| {
+                                anyhow::anyhow!("Discord bot identity unavailable for handoff")
+                            })?;
+                            let payload_text = sanitize_discord_mentions(&final_content);
+                            let request = HandoffRequest {
+                                schema: MULTIBOT_HANDOFF_SCHEMA.to_string(),
+                                source_bot_id,
+                                target_bot_id,
+                                event_id: uuid::Uuid::new_v4().to_string(),
+                                origin_channel_id: thread_channel.channel_id.clone(),
+                                origin_thread_id: thread_channel
+                                    .parent_id
+                                    .as_ref()
+                                    .map(|_| thread_channel.channel_id.clone()),
+                                origin_message_id: None,
+                                expires_at: chrono::Utc::now().timestamp().max(0) as u64 + 300,
+                                hop_count: 0,
+                                payload: HandoffPayload { text: payload_text },
+                            };
+                            adapter.send_handoff(&thread_channel, &request).await
+                        }
+                        .await;
+
+                        match handoff_result {
+                            Ok(_) => {
+                                if let Some(msg) = placeholder_msg {
+                                    let _ = adapter.delete_message(&msg).await;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(error = ?e, "structured handoff failed closed");
+                                delivery_failed = true;
+                                // Keep the human-facing result visible, but it is
+                                // sanitized and therefore cannot become control input.
+                                if let Some(msg) = placeholder_msg {
+                                    if let Some(first) = chunks.first() {
+                                        if let Err(edit_error) = adapter.edit_message(&msg, first).await {
+                                            tracing::warn!(error = ?edit_error, "handoff fallback placeholder edit failed");
+                                            delivery_failed = true;
+                                            if let Err(send_error) =
+                                                adapter.send_message(&thread_channel, first).await
+                                            {
+                                                tracing::warn!(error = ?send_error, "handoff fallback first send failed");
+                                            }
+                                        }
+                                        for chunk in chunks.iter().skip(1) {
+                                            if let Err(send_error) =
+                                                adapter.send_message(&thread_channel, chunk).await
+                                            {
+                                                tracing::warn!(error = ?send_error, "handoff fallback overflow send failed");
+                                                delivery_failed = true;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    for chunk in &chunks {
+                                        if let Err(send_error) =
+                                            adapter.send_message(&thread_channel, chunk).await
+                                        {
+                                            tracing::warn!(error = ?send_error, "handoff fallback send failed");
+                                            delivery_failed = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if native {
                         if let Some(msg) = &native_msg {
                             if !native_pending.is_empty() {
                                 if let Err(e) =
@@ -1213,34 +1341,6 @@ impl AdapterRouter {
                                 if let Err(e) = adapter.delete_message(&msg).await {
                                     tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "delete placeholder failed; placeholder will remain visible");
                                 }
-                            }
-                        } else if adapter.platform() == "discord"
-                            && contains_bot_mention(&final_content)
-                        {
-                            // Discord-specific: bot mention detected. Delete placeholder
-                            // and send as new message so Discord emits MESSAGE_CREATE —
-                            // otherwise the mentioned bot won't receive the gateway
-                            // event since MESSAGE_UPDATE skips notifications (#1110).
-                            let mut send_ok = false;
-                            if let Some(first) = chunks.first() {
-                                match adapter.send_message(&thread_channel, first).await {
-                                    Ok(_) => {
-                                        send_ok = true;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "discord bot-mention first chunk send failed");
-                                        delivery_failed = true;
-                                    }
-                                }
-                            }
-                            for chunk in chunks.iter().skip(1) {
-                                if let Err(e) = adapter.send_message(&thread_channel, chunk).await {
-                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "streaming overflow chunk send failed");
-                                    delivery_failed = true;
-                                }
-                            }
-                            if send_ok {
-                                let _ = adapter.delete_message(&msg).await;
                             }
                         } else {
                             // Normal streaming: edit first chunk into placeholder, send rest.
@@ -1331,16 +1431,12 @@ impl AdapterRouter {
     }
 }
 
-/// Returns true if `content` contains a Discord user/bot mention (`<@123>`, `<@!123>`)
-/// or a role mention (`<@&123>`).
-/// Used to detect cross-bot mentions so the streaming path can switch from
-/// edit (MESSAGE_UPDATE, no mention notification) to delete+send (MESSAGE_CREATE).
+#[cfg(test)]
 fn contains_bot_mention(content: &str) -> bool {
     let mut i = 0;
     let bytes = content.as_bytes();
     while i + 2 < bytes.len() {
         if bytes[i] == b'<' && bytes[i + 1] == b'@' {
-            // Skip optional '!' (nickname mention) or '&' (role mention)
             let start = if i + 2 < bytes.len()
                 && (bytes[i + 2] == b'!' || bytes[i + 2] == b'&')
             {
@@ -1363,12 +1459,30 @@ fn contains_bot_mention(content: &str) -> bool {
     false
 }
 
+/// Neutralize Discord mentions in human-facing presentation text. This is applied
+/// to every cumulative streaming edit and every ordinary final send, so a partial
+/// output or an overflow chunk can never become a bot-to-bot control event.
+fn sanitize_discord_mentions(content: &str) -> String {
+    content
+        .replace("<@", "<\u{200b}@")
+        .replace("@everyone", "@\u{200b}everyone")
+        .replace("@here", "@\u{200b}here")
+}
+
 /// Flatten a tool-call title into a single line safe for inline-code spans.
 fn sanitize_title(title: &str) -> String {
     title
         .replace('\r', "")
         .replace('\n', " ; ")
         .replace('`', "'")
+}
+
+fn presentation_text(platform: &str, content: &str) -> String {
+    if platform == "discord" {
+        sanitize_discord_mentions(content)
+    } else {
+        content.to_string()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1588,98 +1702,6 @@ fn compose_display(
     }
     out.push_str(text.trim_end());
     out
-}
-
-fn extract_mentions(content: &str) -> Vec<String> {
-    let mut mentions = Vec::new();
-    let mut in_fence = false;
-
-    for line in content.split('\n') {
-        if line.starts_with("```") {
-            in_fence = !in_fence;
-            continue;
-        }
-        if in_fence {
-            continue;
-        }
-
-        let bytes = line.as_bytes();
-        let mut i = 0;
-        while i + 2 < bytes.len() {
-            if bytes[i] == b'<' && bytes[i + 1] == b'@' {
-                let (prefix_end, is_role) = if i + 2 < bytes.len() && bytes[i + 2] == b'&' {
-                    (i + 3, true)
-                } else if i + 2 < bytes.len() && bytes[i + 2] == b'!' {
-                    (i + 3, false)
-                } else {
-                    (i + 2, false)
-                };
-                if prefix_end < bytes.len() && bytes[prefix_end].is_ascii_digit() {
-                    if let Some(end) = line[prefix_end..].find('>') {
-                        if line[prefix_end..prefix_end + end]
-                            .chars()
-                            .all(|c| c.is_ascii_digit())
-                        {
-                            let uid = &line[prefix_end..prefix_end + end];
-                            let normalized = if is_role {
-                                format!("<@&{uid}>")
-                            } else {
-                                format!("<@{uid}>")
-                            };
-                            if !mentions.contains(&normalized) {
-                                mentions.push(normalized);
-                            }
-                            i = prefix_end + end + 1;
-                            continue;
-                        }
-                    }
-                }
-                i = prefix_end;
-            } else {
-                i += 1;
-            }
-        }
-    }
-    mentions
-}
-
-fn mention_footer_len(mentions: &[String]) -> usize {
-    if mentions.is_empty() {
-        return 0;
-    }
-    1 + mentions.iter().map(|m| m.len()).sum::<usize>() + mentions.len().saturating_sub(1)
-}
-
-fn propagate_mentions_to_chunks(
-    chunks: Vec<String>,
-    mentions: &[String],
-    limit: usize,
-) -> Vec<String> {
-    if mentions.is_empty() || chunks.len() <= 1 {
-        return chunks;
-    }
-    chunks
-        .into_iter()
-        .map(|chunk| {
-            let missing: Vec<&String> = mentions
-                .iter()
-                .filter(|m| !chunk.contains(m.as_str()))
-                .collect();
-            if missing.is_empty() {
-                chunk
-            } else {
-                let footer = format!(
-                    "\n{}",
-                    missing.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(" ")
-                );
-                if chunk.chars().count() + footer.chars().count() <= limit {
-                    format!("{chunk}{footer}")
-                } else {
-                    chunk
-                }
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -2272,7 +2294,7 @@ mod tests {
 #[cfg(test)]
 mod directive_tests {
     use super::parse_output_directives;
-    use super::{classify_empty_turn, SILENT_FAILURE_MSG};
+    use super::{classify_empty_turn, presentation_text, sanitize_discord_mentions, SILENT_FAILURE_MSG};
     use crate::acp::TurnResult;
 
     #[test]
@@ -2424,6 +2446,34 @@ mod directive_tests {
         let (directives, content) = parse_output_directives(input);
         assert_eq!(directives.reply_to, Some("456".to_string()));
         assert_eq!(content, "看看 [[這個]] 怎麼樣");
+    }
+
+    #[test]
+    fn parse_handoff_directive_extracts_valid_target() {
+        let (directives, content) = parse_output_directives(
+            "[[handoff:1490365068863606784]]\nComplete request",
+        );
+        assert_eq!(directives.handoff_target_bot_id.as_deref(), Some("1490365068863606784"));
+        assert_eq!(content, "Complete request");
+    }
+
+    #[test]
+    fn parse_handoff_directive_rejects_non_numeric_target() {
+        let (directives, content) = parse_output_directives("[[handoff:bot-b]]\nRequest");
+        assert_eq!(directives.handoff_target_bot_id, None);
+        assert_eq!(content, "Request");
+    }
+
+    #[test]
+    fn discord_presentation_neutralizes_all_mention_forms() {
+        let input = "<@123> <@!456> <@&789> @everyone @here";
+        let output = sanitize_discord_mentions(input);
+        assert!(!output.contains("<@123>"));
+        assert!(!output.contains("<@!456>"));
+        assert!(!output.contains("<@&789>"));
+        assert!(!output.contains("@everyone"));
+        assert!(!output.contains("@here"));
+        assert_eq!(presentation_text("slack", input), input);
     }
 
     // --- classify_empty_turn: adapter-level finalization tests ---
