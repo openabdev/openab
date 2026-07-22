@@ -211,7 +211,7 @@ pub(crate) async fn ensure_exclusive_physical_identity(
         }
     }
     let mut pending = items.into_iter();
-    let mut probes = JoinSet::new();
+    let mut probes: JoinSet<anyhow::Result<()>> = JoinSet::new();
     let mut in_flight = 0;
 
     loop {
@@ -281,7 +281,7 @@ mod tests {
         Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
         let mut pending = items.into_iter();
-        let mut probes = JoinSet::new();
+        let mut probes: JoinSet<anyhow::Result<()>> = JoinSet::new();
         let mut in_flight = 0;
         loop {
             while in_flight < OWNERSHIP_PROBE_CONCURRENCY {
