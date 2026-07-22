@@ -72,7 +72,13 @@ The same pattern can back multiple **named OpenAB agents** with different model 
 
 Use `terra` for an additional fixed, balanced tier or `luna` for a fixed high-throughput tier. The diagram below keeps two deployments for clarity; every added policy still requires its own OpenAB deployment.
 
-Each named OAB agent is an independent deployment with its own `config.toml`, bot identity, process, and state. OpenAB does not infer task complexity in this pattern: a human can select the target bot directly, or a coordinator bot can delegate by explicitly mentioning the target bot.
+Each named OAB agent is an independent deployment with its own `config.toml`,
+bot identity, process, and state. OpenAB does not infer task complexity in this
+pattern: a human can select the target bot directly, or an existing coordinator
+bot can route a request through an explicit mention of the target bot. That
+Discord path is message routing, not the formal delegation adapter: it has no
+stable remote task identity, replay, or signed provenance. For bounded
+inter-OAB delegation, use the [OAB Delegation Adapter ADR](../adr/oab-to-oab-delegation.md).
 
 ### Delegation architecture
 
@@ -136,7 +142,10 @@ command = "kiro-cli"
 args = ["acp", "--agent", "sol", "--trust-all-tools"]
 ```
 
-For manual routing, users mention the appropriate bot. For coordinator-to-worker delegation over Discord, allow only explicit bot mentions on the receiving worker:
+For manual routing, users mention the appropriate bot. Existing
+coordinator-to-worker message routing over Discord allows only explicit bot
+mentions on the receiving worker; it is not the formal delegation adapter
+specified by the [OAB Delegation Adapter ADR](../adr/oab-to-oab-delegation.md):
 
 ```toml
 [discord]

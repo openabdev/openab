@@ -110,7 +110,17 @@ Cloudflare APIs, pricing, or free-tier behavior part of the OAB contract.
 
 The profile is mandatory for an OAB peer; it is not optional metadata. It must
 be represented by explicitly declared, versioned, negotiable extensions that a
-peer can reject. The profile must define at least:
+peer can reject.
+
+The `DelegationRequest` and result-envelope examples in this ADR are internal
+OAB domain models, not A2A HTTP+JSON or JSON-RPC wire messages. The binding maps
+task creation to A2A `SendMessage` with a `Message` and
+`returnImmediately: true`, and carries profile data only through declared,
+negotiated extension metadata. The normative profile specification must define
+that mapping before implementation, using A2A's camelCase JSON and enum
+conventions rather than the domain model's field names.
+
+The profile must define at least:
 
 - **Authority attenuation:**
   `caller_grants intersection policy_A intersection policy_B intersection
@@ -209,7 +219,7 @@ full distributed workflow engine.
 - Negative tests for unauthorized peers, capability widening, duplicate tasks,
   timeout, cancellation, reconnect, worker failure, and credential leakage.
 
-A minimal request is conceptually:
+An internal OAB `DelegationRequest` domain model is conceptually:
 
 ```json
 {
@@ -284,7 +294,8 @@ An empty intersection is denied. OAB B executes only with its own locally
 provisioned identity. No credentials, session handles, environment maps, live
 tool objects, or arbitrary host paths cross the connection.
 
-The result envelope is signed by OAB B and binds the request to its outcome:
+OAB B creates a signed result envelope that binds the request to its outcome;
+its internal OAB domain model is:
 
 ```json
 {
