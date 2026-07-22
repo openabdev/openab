@@ -1007,6 +1007,12 @@ async fn handle_session_prompt(
     }
 
     // Cleanup: remove from registry, release busy flag, clear cancel signal.
+    // INVARIANT (R16-F1/F2): this unconditional remove/reset is safe ONLY because no newer
+    // turn can exist on this `session_id` while this one runs — both entry points that would
+    // start one are busy-gated (`session/prompt` and `session/resume` reject with -32001 when
+    // `s.busy`). If that gating is ever relaxed (e.g. multi-turn-per-session), this must become
+    // turn/owner-aware (compare the active `turn_id` before `remove`) or it will clobber the
+    // newer turn's sink. Cross-connection same-session races remain an accepted residual (F5).
     if let Some(ref registry) = state.acp_reply_registry {
         registry.lock().unwrap_or_else(|e| e.into_inner()).remove(&channel_id);
     }
