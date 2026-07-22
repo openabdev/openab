@@ -302,6 +302,72 @@ feature models OAB agent-to-remote-OAB task ownership, progress, cancellation,
 and result provenance. OAB B may use MCP internally, but it is not the
 inter-OAB delegation protocol.
 
+### Adopt the A2A protocol as the outer protocol
+
+A2A is a serious candidate for the inter-OAB wire protocol and should be
+re-evaluated before implementation hardens the custom `delegate/*` method set.
+A2A v1.0 is explicitly designed for communication between independent,
+potentially opaque agents without exposing their internal state, memory, or
+tools. Its task, message, artifact, Agent Card, authentication, cancellation,
+and asynchronous update model overlaps substantially with this ADR.
+
+The conceptual mapping is direct:
+
+| OAB delegation operation | A2A operation or object |
+| --- | --- |
+| Describe a remote peer | `AgentCard` and, when enabled, `GetExtendedAgentCard` |
+| Create a remote task | `SendMessage`, normally with `returnImmediately: true` |
+| Read task state/result | `GetTask` and the A2A `Task` object |
+| Stream progress and artifacts | `SendStreamingMessage` or `SubscribeToTask` |
+| Cancel a task | `CancelTask` |
+| Follow-up input | `Message` associated with `taskId` and `contextId` |
+| Structured outputs | `Artifact` and `Part` |
+
+A2A also supports direct configuration of an Agent Card, which is compatible
+with the MVP's configured, deny-by-default peer registry. An OAB deployment
+can publish cards privately or use a preconfigured card URL; dynamic discovery
+and federation remain out of scope.
+
+A2A is not a drop-in replacement for the complete OAB contract. The v1.0
+standard bindings are HTTP+JSON, JSON-RPC over HTTP, and gRPC, with SSE for
+streaming; WebSocket is a custom binding. A custom binding must preserve all
+A2A core operations, data-model semantics, event ordering, reconnection
+behavior, authentication integration, and Agent Card declaration. Therefore,
+the MVP should not select WebSocket merely because it is convenient if an
+A2A standard binding meets the topology requirement. If a persistent WSS
+transport remains necessary, it should be specified as an A2A custom binding,
+not as an unrelated OAB protocol.
+
+A2A also does not replace OAB-specific policy. Its authentication and
+authorization model relies on deployment and web-security practices, and its
+Agent Card signature authenticates the card rather than signing an individual
+task result. The core protocol does not define OAB's authority intersection,
+credential/session/environment isolation, depth-one rule, signed request/result
+binding, artifact ownership, or durable event cursor. A2A streaming supports
+ordered events and resubscription, but disconnected clients may miss messages;
+OAB's durable cursor and replay guarantee must remain an OAB requirement.
+A2A's extension and metadata mechanisms are appropriate places to declare
+these requirements, but credentials and live handles must never be forwarded
+through them.
+
+The preferred direction is therefore **A2A 1.0 plus an OAB Delegation Profile**,
+not raw A2A and not a second fully custom protocol:
+
+```text
+OAB DelegationAdapter / A2A Client
+  -> A2A standard binding (prefer HTTP+JSON or JSON-RPC + SSE)
+  -> OAB DelegationAdapter / A2A Server
+  -> local ACP session
+```
+
+The profile should define OAB extensions for request idempotency, authority
+attenuation, delegation depth, budgets and deadlines, principal chain,
+durable cursors, signed provenance, artifact ownership, audit records, and
+`unknown`/`expired` outcomes. Until that profile and its conformance tests are
+agreed, this ADR keeps the transport and method boundary implementation-neutral
+and treats A2A as the preferred protocol candidate rather than claiming that
+A2A alone satisfies the security and reliability acceptance criteria.
+
 ### Implement only local subagents
 
 Rejected as the MVP boundary. A local coordinator may be useful later, but it
@@ -413,6 +479,10 @@ all of the following:
 
 ## 12. References
 
+- [A2A v1.0 specification](https://a2a-protocol.org/latest/specification/)
+- [A2A streaming and asynchronous operations](https://a2a-protocol.org/latest/topics/streaming-and-async/)
+- [A2A protocol definition and schema](https://a2a-protocol.org/latest/definitions/)
+- [A2A protocol repository](https://github.com/a2aproject/A2A)
 - [OpenAB ACP connection and session pool](../../crates/openab-core/src/acp/connection.rs)
 - [OpenAB child-process environment policy](../../AGENTS.md#3-security--child-process-environment)
 - [Agent Client Protocol](https://agentclientprotocol.com/)
