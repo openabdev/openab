@@ -9,12 +9,14 @@
 //!
 //! Two rules enforce injectivity across every entry point:
 //!
-//! 1. **Domain rule** — [`validate_injective_identity`] rejects hyphenated
-//!    namespaces before any AWS call. It is enforced by
+//! 1. **Domain rule** — namespaces use `[a-z0-9]+`, names use
+//!    `[a-z0-9][a-z0-9-]*`, and [`validate_injective_identity`] additionally
+//!    rejects hyphenated namespaces before any AWS call. It is enforced by
 //!    [`crate::manifest::OABServiceManifest::validate`] (covering CLI apply,
 //!    fleet expansion, and programmatic
 //!    [`crate::apply::apply_manifests`]) and by programmatic
-//!    [`crate::delete::delete_services`].
+//!    [`crate::delete::delete_services`]. The legacy CLI delete path permits
+//!    hyphens in namespaces only through [`validate_legacy_delete_identity`].
 //! 2. **Ownership rule** — [`ensure_exclusive_physical_identity`] runs before
 //!    any destructive mutation on both the apply and delete paths. It fails
 //!    closed when the control plane records any *other* logical pair (for
@@ -32,8 +34,7 @@
 
 use anyhow::Context;
 use aws_sdk_s3::error::ProvideErrorMetadata;
-use std::sync::Arc;
-use tokio::sync::Semaphore;
+use std::future::Future;
 use tokio::task::JoinSet;
 
 /// Physical service identity shared by ECS and Cloud Map:
@@ -57,16 +58,11 @@ pub(crate) fn ingress_teardown_checkpoint_key(namespace: &str, name: &str) -> St
     format!("ingress-teardown-checkpoints/{namespace}/{name}.json")
 }
 
-/// Domain rule: `namespace` and `name` must be non-empty and `namespace` must
-/// not contain `-`, so that `oab-{namespace}-{name}` parses back to exactly
-/// one logical pair.
+/// Domain rule shared by apply and programmatic delete: namespaces use
+/// `[a-z0-9]+`, names use `[a-z0-9][a-z0-9-]*`, and neither component may
+/// contain path delimiters or other opaque characters.
 pub(crate) fn validate_injective_identity(namespace: &str, name: &str) -> anyhow::Result<()> {
-    if namespace.trim().is_empty() {
-        anyhow::bail!("namespace must not be empty (got '{namespace}'/'{name}')");
-    }
-    if name.trim().is_empty() {
-        anyhow::bail!("name must not be empty (got '{namespace}'/'{name}')");
-    }
+    validate_identity_charset(namespace, name, true)?;
     if namespace.contains('-') {
         anyhow::bail!(
             "namespace '{namespace}' must not contain '-': it is the delimiter of the physical \
@@ -76,6 +72,45 @@ pub(crate) fn validate_injective_identity(namespace: &str, name: &str) -> anyhow
              exclusive ownership in the control plane; re-create them under a hyphen-free \
              namespace",
             physical = physical_service_name(namespace, name),
+        );
+    }
+    Ok(())
+}
+
+/// Legacy CLI delete accepts hyphenated namespaces, but still enforces the
+/// same S3-safe character domain so a caller cannot create nested or ambiguous
+/// control-plane keys.
+pub(crate) fn validate_legacy_delete_identity(namespace: &str, name: &str) -> anyhow::Result<()> {
+    validate_identity_charset(namespace, name, true)
+}
+
+fn validate_identity_charset(
+    namespace: &str,
+    name: &str,
+    allow_hyphenated_namespace: bool,
+) -> anyhow::Result<()> {
+    let namespace_valid = |value: &str| {
+        !value.is_empty()
+            && value.chars().all(|ch| {
+                ch.is_ascii_lowercase()
+                    || ch.is_ascii_digit()
+                    || (allow_hyphenated_namespace && ch == '-')
+            })
+    };
+    let mut name_chars = name.chars();
+    let name_valid = matches!(
+        name_chars.next(),
+        Some(ch) if ch.is_ascii_lowercase() || ch.is_ascii_digit()
+    ) && name_chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-');
+    if !namespace_valid(namespace) {
+        anyhow::bail!(
+            "namespace must match [a-z0-9]+{} (got '{namespace}')",
+            if allow_hyphenated_namespace { " with legacy '-' support" } else { "" },
+        );
+    }
+    if !name_valid {
+        anyhow::bail!(
+            "name must match [a-z0-9][a-z0-9-]* (got '{name}')"
         );
     }
     Ok(())
@@ -154,59 +189,36 @@ async fn probe_ownership_key(
     }
 }
 
-/// Ownership rule: fail closed if the control plane records any logical pair,
-/// distinct from `(namespace, name)`, that claims the same physical identity.
-///
-/// Runs before any destructive mutation on the apply and delete paths. Probes
-/// only the exact alias keys (stored manifest, delete checkpoint, and
-/// ingress-teardown checkpoint), so hyphen-free pairs with hyphen-free names
-/// cost zero requests. Alias probes are bounded to
-/// [`OWNERSHIP_PROBE_CONCURRENCY`] in flight; probe failures other than a
-/// missing key fail closed.
-pub(crate) async fn ensure_exclusive_physical_identity(
-    s3: &aws_sdk_s3::Client,
-    bucket: &str,
-    namespace: &str,
-    name: &str,
-) -> anyhow::Result<()> {
-    let semaphore = Arc::new(Semaphore::new(OWNERSHIP_PROBE_CONCURRENCY));
+async fn run_bounded_probes<T, F, Fut>(items: Vec<T>, probe: F) -> anyhow::Result<()>
+where
+    T: Send + 'static,
+    F: Fn(T) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let mut pending = items.into_iter();
     let mut probes = JoinSet::new();
+    let mut in_flight = 0;
 
-    for (alias_namespace, alias_name) in collision_aliases(namespace, name) {
-        for key in ownership_keys(&alias_namespace, &alias_name) {
-            let permit = match semaphore.clone().acquire_owned().await {
-                Ok(permit) => permit,
-                Err(error) => {
-                    probes.abort_all();
-                    while probes.join_next().await.is_some() {}
-                    return Err(anyhow::anyhow!(
-                        "ownership probe concurrency gate closed: {error}"
-                    ));
-                }
+    loop {
+        while in_flight < OWNERSHIP_PROBE_CONCURRENCY {
+            let Some(item) = pending.next() else {
+                break;
             };
-            let probe_s3 = s3.clone();
-            let probe_bucket = bucket.to_owned();
-            let probe_namespace = namespace.to_owned();
-            let probe_name = name.to_owned();
-            let probe_alias_namespace = alias_namespace;
-            let probe_alias_name = alias_name;
-            probes.spawn(async move {
-                let _permit = permit;
-                probe_ownership_key(
-                    probe_s3,
-                    probe_bucket,
-                    probe_namespace,
-                    probe_name,
-                    probe_alias_namespace,
-                    probe_alias_name,
-                    key,
-                )
-                .await
-            });
+            let probe = probe.clone();
+            probes.spawn(async move { probe(item).await });
+            in_flight += 1;
         }
-    }
 
-    while let Some(result) = probes.join_next().await {
+        if in_flight == 0 {
+            return Ok(());
+        }
+
+        let Some(result) = probes.join_next().await else {
+            return Err(anyhow::anyhow!(
+                "ownership probe scheduler lost an in-flight task"
+            ));
+        };
+        in_flight -= 1;
         match result {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
@@ -221,12 +233,68 @@ pub(crate) async fn ensure_exclusive_physical_identity(
             }
         }
     }
-    Ok(())
+}
+
+/// Ownership rule: fail closed if the control plane records any logical pair,
+/// distinct from `(namespace, name)`, that claims the same physical identity.
+///
+/// Runs before any destructive mutation on the apply and delete paths. Probes
+/// only the exact alias keys (stored manifest, delete checkpoint, and
+/// ingress-teardown checkpoint), so hyphen-free pairs with hyphen-free names
+/// cost zero requests. Alias probes are bounded to
+/// [`OWNERSHIP_PROBE_CONCURRENCY`] in flight; a completed successful probe is
+/// required before another probe is admitted, and the first failure aborts all
+/// remaining work.
+pub(crate) async fn ensure_exclusive_physical_identity(
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
+    namespace: &str,
+    name: &str,
+) -> anyhow::Result<()> {
+    let mut items = Vec::new();
+    for (alias_namespace, alias_name) in collision_aliases(namespace, name) {
+        for key in ownership_keys(&alias_namespace, &alias_name) {
+            items.push((
+                alias_namespace.clone(),
+                alias_name.clone(),
+                key,
+            ));
+        }
+    }
+
+    let probe_s3 = s3.clone();
+    let probe_bucket = bucket.to_owned();
+    let probe_namespace = namespace.to_owned();
+    let probe_name = name.to_owned();
+    run_bounded_probes(items, move |(alias_namespace, alias_name, key)| {
+        let probe_s3 = probe_s3.clone();
+        let probe_bucket = probe_bucket.clone();
+        let probe_namespace = probe_namespace.clone();
+        let probe_name = probe_name.clone();
+        async move {
+            probe_ownership_key(
+                probe_s3,
+                probe_bucket,
+                probe_namespace,
+                probe_name,
+                alias_namespace,
+                alias_name,
+                key,
+            )
+            .await
+        }
+    })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::sync::Notify;
 
     #[test]
     fn accepts_hyphen_free_namespace_with_hyphenated_name() {
@@ -237,6 +305,26 @@ mod tests {
     fn rejects_empty_components() {
         assert!(validate_injective_identity("", "bot").is_err());
         assert!(validate_injective_identity("prod", "  ").is_err());
+    }
+
+    #[test]
+    fn rejects_non_s3_safe_identity_components() {
+        for (namespace, name) in [
+            ("prod/team", "bot"),
+            ("prod", "bot/extra"),
+            ("prod", "../bot"),
+            ("prod", " bot"),
+            ("prod", "bot_1"),
+            ("prod", "ボット"),
+            ("prod", "-bot"),
+        ] {
+            assert!(
+                validate_injective_identity(namespace, name).is_err(),
+                "identity should be rejected: {namespace}/{name}"
+            );
+        }
+        validate_legacy_delete_identity("prod-team", "bot").expect("legacy hyphenated namespace");
+        assert!(validate_legacy_delete_identity("prod/team", "bot").is_err());
     }
 
     #[test]
@@ -282,6 +370,35 @@ mod tests {
             300
         );
         assert!(OWNERSHIP_PROBE_CONCURRENCY < 300);
+    }
+
+    #[tokio::test]
+    async fn bounded_probe_scheduler_aborts_before_admitting_replacements() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let blocker = Arc::new(Notify::new());
+        let result = run_bounded_probes((0..(OWNERSHIP_PROBE_CONCURRENCY + 4)).collect(), {
+            let started = started.clone();
+            let blocker = blocker.clone();
+            move |item| {
+                let started = started.clone();
+                let blocker = blocker.clone();
+                async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    if item == 0 {
+                        anyhow::bail!("deterministic probe failure");
+                    }
+                    blocker.notified().await;
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            started.load(Ordering::SeqCst) <= OWNERSHIP_PROBE_CONCURRENCY,
+            "replacement probes were admitted after the first failure"
+        );
     }
 
     #[test]

@@ -1127,6 +1127,7 @@ async fn run_with_bucket(
             "delete requires a non-empty namespace and name (got '{namespace}'/'{name}')"
         );
     }
+    crate::identity::validate_legacy_delete_identity(namespace, name)?;
     let ecs = aws_sdk_ecs::Client::new(aws_config);
     let s3 = aws_sdk_s3::Client::new(aws_config);
     if namespace.contains('-') {

@@ -48,16 +48,18 @@
 //! otherwise both use the shared `OAB_CONTROL_PLANE_BUCKET` then caller-account
 //! resolution chain.
 //!
-//! Apply and delete share one injective logical-identity rule: namespaces
-//! must not contain `-`; names may contain it, so the physical
-//! `oab-{namespace}-{name}` identity parses back to exactly one accepted
-//! `namespace`/`name` pair. Manifest validation (all apply entry points) and
-//! [`delete_services`] both reject hyphenated namespaces before any AWS call.
-//! Before mutating, apply and delete additionally verify in the control plane
-//! that no other recorded logical pair (for example a legacy hyphenated
-//! namespace) claims the same physical name, and fail closed otherwise.
-//! Legacy hyphenated-namespace deployments cannot be re-applied but remain
-//! deletable via the `oabctl delete` CLI under that same ownership check.
+//! Apply and delete share one injective logical-identity rule: namespaces must
+//! match `[a-z0-9]+` and names must match `[a-z0-9][a-z0-9-]*`; this rejects
+//! path delimiters and opaque characters before any AWS call. Namespaces must
+//! not contain `-` on apply and programmatic delete; names may contain it, so
+//! the physical `oab-{namespace}-{name}` identity parses back to exactly one
+//! accepted `namespace`/`name` pair. Manifest validation (all apply entry
+//! points) and [`delete_services`] both reject hyphenated namespaces before any
+//! AWS call, while the legacy CLI delete path permits them only under the same
+//! S3-safe character rules. Before mutating, apply and delete additionally
+//! verify in the control plane that no other recorded logical pair (for example
+//! a legacy hyphenated namespace) claims the same physical name, and fail
+//! closed otherwise.
 //!
 //! [`delete_services`] tears down by `namespace`+`name` ([`DeleteTarget`]).
 //! Before ECS mutation delete durably records the resolved bucket,

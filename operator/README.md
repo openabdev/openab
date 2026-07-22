@@ -148,13 +148,17 @@ callers can retry safely.
 
 Apply and delete share one injective logical-identity rule: namespaces must not
 contain `-`; names may contain it, so the physical `oab-{namespace}-{name}`
-identity always parses back to exactly one `namespace`/`name` pair. Manifest
-validation (CLI apply, fleet expansion, and `apply_manifests`) and
-`delete_services` all reject hyphenated namespaces before any AWS call. Before
-mutating, apply and every delete entry point additionally verify in the
-control plane that no *other* recorded logical pair (manifest, delete
-checkpoint, or ingress-teardown checkpoint) claims the same physical name, and
-fail closed with the colliding pair named in the error.
+identity always parses back to exactly one `namespace`/`name` pair. Namespaces
+must match `[a-z0-9]+` and names must match `[a-z0-9][a-z0-9-]*`; this also
+prevents `/`, whitespace, `_`, `.`, and Unicode from becoming S3 path
+components. Manifest validation (CLI apply, fleet expansion, and
+`apply_manifests`) and `delete_services` all reject hyphenated namespaces before
+any AWS call. The legacy CLI delete path permits hyphenated namespaces only
+when the same S3-safe character rules otherwise pass. Before mutating, apply
+and every delete entry point additionally verify in the control plane that no
+*other* recorded logical pair (manifest, delete checkpoint, or
+ingress-teardown checkpoint) claims the same physical name, and fail closed
+with the colliding pair named in the error.
 
 Legacy policy: deployments created under a hyphenated namespace before this
 rule cannot be re-applied — apply fails with a migration message. They remain

@@ -394,17 +394,21 @@ must still be registered manually in the LINE Developers console.
 > parsed from a structurally and boundary-validated Cloud Map service ARN.
 > Exact-ID NotFound is idempotent; other cleanup errors retain the checkpoint.
 > There is no name-only API, Cloud Map, or S3 orphan cleanup path. Apply and
-> delete share one injective identity rule: namespaces must not contain `-`
-> (names may contain it), so the physical `oab-{namespace}-{name}` identity
-> always maps back to exactly one `namespace`/`name` pair. Manifest validation
-> and programmatic delete reject hyphenated namespaces before any AWS call,
-> and before mutating anything both apply and delete verify in the control
-> plane that no other recorded logical pair (for example legacy `prod-team/bot`
-> versus `prod/team-bot`) claims the same physical name — contested identities
-> fail closed. Legacy deployments created under a hyphenated namespace cannot
-> be re-applied, but `oabctl delete` still accepts them (with a warning) under
-> that same ownership check; migrate by deleting and re-creating them under a
-> hyphen-free namespace. If a per-target
+> delete share one injective identity rule: namespaces must match `[a-z0-9]+`
+> and names must match `[a-z0-9][a-z0-9-]*`; this rejects `/`, whitespace,
+> `_`, `.`, and Unicode before any ECS, API, or S3 request. Namespaces must not
+> contain `-` on apply and programmatic delete (names may contain it), so the
+> physical `oab-{namespace}-{name}` identity always maps back to exactly one
+> `namespace`/`name` pair. The legacy CLI delete path permits hyphenated
+> namespaces only when the remaining S3-safe character rules pass. Manifest
+> validation and programmatic delete reject hyphenated namespaces before any
+> AWS call, and before mutating anything both apply and delete verify in the
+> control plane that no other recorded logical pair (for example legacy
+> `prod-team/bot` versus `prod/team-bot`) claims the same physical name —
+> contested identities fail closed. Legacy deployments created under a
+> hyphenated namespace cannot be re-applied, but `oabctl delete` still accepts
+> them (with a warning) under that same ownership check; migrate by deleting
+> and re-creating them under a hyphen-free namespace. If a per-target
 > `ingress-teardown-checkpoints/<namespace>/<name>.json` record exists, delete
 > fails before destructive mutation so it cannot discard unfinished exact
 > cleanup identity. Re-run the ingress-free apply to completion, then retry

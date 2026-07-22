@@ -548,9 +548,14 @@ enum ApplyServicePresence {
 fn classify_apply_service_response(
     service_count: usize,
     failure_reasons: &[&str],
+    service_status: Option<&str>,
 ) -> Result<ApplyServicePresence> {
     match (service_count, failure_reasons) {
-        (1, []) => Ok(ApplyServicePresence::Present),
+        (1, []) if service_status == Some("INACTIVE") => Ok(ApplyServicePresence::Absent),
+        (1, []) if matches!(service_status, Some("ACTIVE" | "DRAINING")) => {
+            Ok(ApplyServicePresence::Present)
+        }
+        (1, []) => anyhow::bail!("ECS returned a service with an unexpected status"),
         (0, [reason]) if reason.eq_ignore_ascii_case("MISSING") => {
             Ok(ApplyServicePresence::Absent)
         }
@@ -893,6 +898,7 @@ async fn apply_ecs(
     let existing_service = match classify_apply_service_response(
         describe_resp.services().len(),
         &failure_reasons,
+        describe_resp.services().first().and_then(|service| service.status()),
     )? {
         ApplyServicePresence::Absent => None,
         ApplyServicePresence::Present => {
@@ -908,9 +914,6 @@ async fn apply_ecs(
                     .context("ECS apply response missing cluster ARN")?,
                 &service_name,
             )?;
-            if !matches!(service.status(), Some("ACTIVE" | "DRAINING")) {
-                anyhow::bail!("ECS apply response has unexpected service status");
-            }
             Some(service)
         }
     };
@@ -1911,21 +1914,31 @@ spec:
     #[test]
     fn apply_accepts_only_single_missing_failure_as_first_absence() {
         assert_eq!(
-            classify_apply_service_response(0, &["MISSING"]).unwrap(),
+            classify_apply_service_response(0, &["MISSING"], None).unwrap(),
             ApplyServicePresence::Absent
         );
-        assert!(classify_apply_service_response(0, &[]).is_err());
-        assert!(classify_apply_service_response(0, &["MISSING", "ACCESS_DENIED"]).is_err());
-        assert!(classify_apply_service_response(1, &["MISSING"]).is_err());
+        assert!(classify_apply_service_response(0, &[], None).is_err());
+        assert!(classify_apply_service_response(0, &["MISSING", "ACCESS_DENIED"], None).is_err());
+        assert!(classify_apply_service_response(1, &["MISSING"], Some("ACTIVE")).is_err());
+        assert_eq!(
+            classify_apply_service_response(1, &[], Some("INACTIVE")).unwrap(),
+            ApplyServicePresence::Absent
+        );
     }
 
     #[test]
     fn apply_requires_one_service_for_present_identity() {
         assert_eq!(
-            classify_apply_service_response(1, &[]).unwrap(),
+            classify_apply_service_response(1, &[], Some("ACTIVE")).unwrap(),
             ApplyServicePresence::Present
         );
-        assert!(classify_apply_service_response(2, &[]).is_err());
+        assert_eq!(
+            classify_apply_service_response(1, &[], Some("DRAINING")).unwrap(),
+            ApplyServicePresence::Present
+        );
+        assert!(classify_apply_service_response(1, &[], None).is_err());
+        assert!(classify_apply_service_response(1, &[], Some("UNKNOWN")).is_err());
+        assert!(classify_apply_service_response(2, &[], None).is_err());
         assert!(validate_apply_service_identity(
             "arn:aws:ecs:us-east-1:123456789012:service/cluster/oab-prod-bot",
             "arn:aws:ecs:us-east-1:123456789012:cluster/cluster",
