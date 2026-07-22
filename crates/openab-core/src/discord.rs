@@ -3525,6 +3525,7 @@ fn validate_handoff_envelope(
 
     request.schema == MULTIBOT_HANDOFF_SCHEMA
         && request.source_bot_id == source_id.to_string()
+        && request.target_bot_id == target_id.to_string()
         && source_id == author_id
         && source_id != bot_id
         && trusted_bot_ids.contains(&author_id)
@@ -3572,6 +3573,18 @@ mod handoff_tests {
         let mut trusted = HashSet::new();
         trusted.insert(10);
         assert!(validate_handoff_envelope(&content, &req, 10, 20, 20, &trusted, 1_000));
+        let mut padded_target = req.clone();
+        padded_target.target_bot_id = "020".into();
+        let padded_target_content = format!("<@20>\n{}", serde_json::to_string(&padded_target).unwrap());
+        assert!(!validate_handoff_envelope(
+            &padded_target_content,
+            &padded_target,
+            10,
+            20,
+            20,
+            &trusted,
+            1_000
+        ));
         let mut padded_source = req.clone();
         padded_source.source_bot_id = "00010".into();
         let padded_content = format!("<@20>\n{}", serde_json::to_string(&padded_source).unwrap());
