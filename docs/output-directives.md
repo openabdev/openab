@@ -39,6 +39,17 @@ Here is my reply to that specific message.
 - Invalid/non-existent message ID: silently falls back to plain send
 - Works in both streaming and send-once modes
 
+### `handoff` (Discord only)
+
+Request a structured bot-to-bot handoff after the current ACP turn completes:
+
+```
+[[handoff:123456789012345678]]
+Review complete; deploy this change to staging.
+```
+
+**Value**: a decimal Discord bot snowflake (`u64`, at most 20 digits). The directive is stripped from presentation output. On Discord, OpenAB emits a structured control message only when the target ID is present in `trusted_bot_ids` and is not the sending bot; otherwise it fails closed and delivers only the sanitized presentation. The control payload is subject to Discord's 2,000 UTF-16-code-unit message limit, including the target mention and JSON envelope, so practical payload capacity is lower than 2,000 characters. Receiving bots validate schema, trust, target, provenance, expiry, hop count, replay, rate, and payload bounds before dispatching it to ACP.
+
 **How agents get message IDs**: Every incoming message includes `message_id` in `SenderContext`:
 
 ```json

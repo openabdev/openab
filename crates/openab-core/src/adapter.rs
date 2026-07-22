@@ -1211,8 +1211,14 @@ impl AdapterRouter {
                             let source_bot_id = adapter.bot_identity().ok_or_else(|| {
                                 anyhow::anyhow!("Discord bot identity unavailable for handoff")
                             })?;
+                            if target_bot_id == source_bot_id {
+                                return Err(anyhow::anyhow!(
+                                    "structured handoff cannot target the sending bot"
+                                ));
+                            }
                             // The control envelope is protected by explicit Discord
-                            // allowed_mentions, so preserve the raw prompt text here.
+                            // allowed_mentions, so preserve the formatted final content
+                            // here (after table conversion, before mention sanitization).
                             // Presentation sanitization is only for human-facing output;
                             // inserting zero-width characters into the control payload
                             // would corrupt downstream agent context.
