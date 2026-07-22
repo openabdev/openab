@@ -146,7 +146,9 @@ impl ChatAdapter for DiscordAdapter {
         }
         let builder = CreateMessage::new()
             .content(content)
-            .allowed_mentions(CreateAllowedMentions::new().replied_user(false))
+            // Preserve the normal reply notification; presentation content
+            // itself still has no automatic user/role/everyone mentions.
+            .allowed_mentions(CreateAllowedMentions::new().replied_user(true))
             .reference_message((ChannelId::new(ch_id), MessageId::new(msg_id)));
         match ChannelId::new(ch_id)
             .send_message(&self.http, builder)
@@ -619,6 +621,7 @@ impl EventHandler for Handler {
         // already applies to every bot-authored message, including accepted
         // handoffs, so the configured per-thread cap remains the DoS guard.
         let handoff = parse_handoff_envelope(&msg.content);
+        let mut validated_handoff = None;
         if is_handoff_candidate(&msg.content, msg.author.bot) {
             let valid = handoff.as_ref().is_some_and(|request| {
                 validate_handoff_envelope(
@@ -644,6 +647,7 @@ impl EventHandler for Handler {
                 tracing::warn!(source_bot_id = %request.source_bot_id, "structured handoff rate limit reached");
                 return;
             }
+            validated_handoff = Some(request.clone());
         }
 
         // Early-gating optimization for bot messages to avoid unnecessary
@@ -997,7 +1001,7 @@ impl EventHandler for Handler {
             return;
         }
 
-        let prompt = handoff
+        let prompt = validated_handoff
             .as_ref()
             .map(|request| request.payload.text.clone())
             .unwrap_or_else(|| resolve_mentions(&msg.content, bot_id, &self.allowed_role_ids));
@@ -3454,7 +3458,7 @@ fn is_handoff_candidate(content: &str, author_is_bot: bool) -> bool {
     mention.starts_with("<@")
         && mention.ends_with('>')
         && body.trim_start().starts_with('{')
-        && body.contains(MULTIBOT_HANDOFF_SCHEMA)
+        && body.contains("\"schema\"")
 }
 
 /// Validate every wire-level handoff invariant before it can bypass ordinary
@@ -3588,7 +3592,11 @@ mod handoff_tests {
     fn handoff_content_is_bounded_by_discord_message_limit() {
         let content = build_handoff_content(20, "payload").unwrap();
         assert!(content.encode_utf16().count() <= DISCORD_MESSAGE_LIMIT);
-        assert!(build_handoff_content(20, &"x".repeat(DISCORD_MESSAGE_LIMIT)).is_err());
+
+        let mut req = request(20);
+        req.payload.text = "x".repeat(1_800);
+        let envelope = serde_json::to_string(&req).unwrap();
+        assert!(build_handoff_content(20, &envelope).is_err());
     }
 
     #[test]
@@ -3607,6 +3615,7 @@ mod handoff_tests {
             &format!("<@20>\n{{\"schema\":\"{MULTIBOT_HANDOFF_SCHEMA}\"}}"),
             true
         ));
+        assert!(is_handoff_candidate("<@20>\n{\"schema\":\"openab.multibot.handoff.v2\"}", true));
     }
 }
 
