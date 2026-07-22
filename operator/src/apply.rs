@@ -213,13 +213,13 @@ async fn load_bootstrap_state(s3: &aws_sdk_s3::Client, bucket: &str) -> Bootstra
         Ok(None) => BootstrapResolution {
             state: None,
             warning: Some(format!(
-                "no bootstrap state found in s3://{bucket}/bootstrap-state.json (run `oabctl bootstrap` first)"
+                "no bootstrap state found in the control-plane bucket (run `oabctl bootstrap` first)"
             )),
         },
         Err(error) => BootstrapResolution {
             state: None,
             warning: Some(format!(
-                "failed to read bootstrap state from s3://{bucket}: {error}"
+                "failed to read bootstrap state from the control-plane bucket: {error}"
             )),
         },
     }
@@ -631,14 +631,12 @@ async fn load_ingress_teardown_checkpoint(
                 .await
                 .context("failed to read ingress teardown checkpoint")?
                 .into_bytes();
-            Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
-                format!("invalid ingress teardown checkpoint s3://{bucket}/{key}")
-            })?))
+            Ok(Some(
+                serde_json::from_slice(&bytes).context("invalid ingress teardown checkpoint payload")?,
+            ))
         }
         Err(error) if matches!(error.code(), Some("NoSuchKey" | "NotFound")) => Ok(None),
-        Err(error) => Err(error).with_context(|| {
-            format!("failed to read ingress teardown checkpoint s3://{bucket}/{key}")
-        }),
+        Err(error) => Err(error).context("failed to read ingress teardown checkpoint"),
     }
 }
 
@@ -668,7 +666,7 @@ async fn save_ingress_teardown_checkpoint(
         .content_type("application/json")
         .send()
         .await
-        .with_context(|| format!("failed to persist s3://{bucket}/{key}"))?;
+        .context("failed to persist ingress teardown checkpoint")?;
     Ok(())
 }
 
@@ -684,7 +682,7 @@ async fn remove_ingress_teardown_checkpoint(
         .key(&key)
         .send()
         .await
-        .with_context(|| format!("failed to remove s3://{bucket}/{key}"))?;
+        .context("failed to remove ingress teardown checkpoint")?;
     Ok(())
 }
 
@@ -873,7 +871,7 @@ async fn apply_ecs(
         Err(error) if matches!(error.code(), Some("NoSuchKey" | "NotFound")) => (0, false),
         Err(error) => {
             return Err(error).with_context(|| {
-                format!("failed to read existing manifest s3://{bucket}/{manifest_key}")
+                "failed to read existing control-plane manifest"
             });
         }
     };

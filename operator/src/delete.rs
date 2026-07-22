@@ -79,9 +79,11 @@ pub struct DeletedService {
     pub namespace: String,
     pub name: String,
     pub ecs_service_name: String,
-    /// Non-fatal diagnostics retained for API compatibility. Exact-identity
-    /// dependent and S3 cleanup failures are fatal so the durable checkpoint
-    /// remains available for retry.
+    /// Non-fatal diagnostics retained for API compatibility. Examples include
+    /// resuming from an already-absent ECS service or skipping dependent ingress
+    /// cleanup when no exact ingress identity was recorded. Exact-identity
+    /// dependent and S3 cleanup failures remain fatal for programmatic calls so
+    /// the durable checkpoint remains available for retry.
     pub warnings: Vec<String>,
 }
 
@@ -484,10 +486,14 @@ fn record_delete_result(
 ///
 /// Before ECS mutation, delete persists an exact-identity checkpoint containing
 /// the caller account/region, bucket, canonical cluster and service ARNs, and
-/// any ECS registry/API IDs. An absent ECS service or ambiguous
-/// `DescribeServices` response is rejected unless that matching durable
-/// checkpoint already exists. Cleanup uses only IDs from the checkpoint and
-/// removes the checkpoint last, making partial failures safe to retry.
+/// any ECS registry/API IDs. The control-plane bucket must provide default
+/// server-side encryption and S3 versioning; this library writes application
+/// JSON but does not weaken or validate those bucket-level policies per request.
+/// An absent ECS service or ambiguous `DescribeServices` response is rejected
+/// unless that matching durable checkpoint already exists. Cleanup uses only IDs
+/// from the checkpoint and removes the checkpoint last, making partial failures
+/// safe to retry. The legacy CLI uses best-effort warnings for dependent/S3
+/// cleanup, while this programmatic API keeps those failures fatal.
 pub async fn delete_services(
     aws_config: &aws_config::SdkConfig,
     targets: &[DeleteTarget],
@@ -511,6 +517,7 @@ pub async fn delete_services(
                 &opts.cluster,
                 &target.namespace,
                 &bucket,
+                CleanupMode::Strict,
             )
             .await;
             report = record_delete_result(report, target, outcome)?;
@@ -587,6 +594,7 @@ pub(crate) async fn run_from_file(
             cluster,
             &manifest.metadata.namespace,
             &bucket,
+            CleanupMode::BestEffort,
         )
         .await
         {
@@ -625,6 +633,7 @@ pub(crate) async fn run(
         cluster,
         namespace,
         &bucket,
+        CleanupMode::BestEffort,
     )
     .await
     .map(|_warnings| ())
@@ -666,11 +675,10 @@ async fn load_checkpoint(
             let bytes = response.body.collect().await
                 .context("failed to read delete checkpoint body")?.into_bytes();
             Ok(Some(serde_json::from_slice(&bytes)
-                .with_context(|| format!("invalid delete checkpoint s3://{bucket}/{key}"))?))
+                .context("invalid delete checkpoint payload")?))
         }
         Err(error) if matches!(error.code(), Some("NoSuchKey" | "NotFound")) => Ok(None),
-        Err(error) => Err(error)
-            .with_context(|| format!("failed to read delete checkpoint s3://{bucket}/{key}")),
+        Err(error) => Err(error).context("failed to read delete checkpoint"),
     }
 }
 
@@ -679,9 +687,7 @@ async fn save_checkpoint(s3: &aws_sdk_s3::Client, checkpoint: &DeleteCheckpoint)
     let body = serde_json::to_vec_pretty(checkpoint)?;
     s3.put_object().bucket(&checkpoint.bucket).key(&key)
         .body(ByteStream::from(body)).content_type("application/json").send().await
-        .with_context(|| format!(
-            "failed to persist exact delete identity to s3://{}/{key}", checkpoint.bucket
-        ))?;
+        .context("failed to persist exact delete identity checkpoint")?;
     Ok(())
 }
 
@@ -706,6 +712,12 @@ fn single_described_service(
         ),
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupMode {
+    Strict,
+    BestEffort,
+}
+
 enum PreparedIdentity {
     Exact(Box<(DeleteCheckpoint, ServiceIdentityState)>),
 }
@@ -1024,7 +1036,7 @@ async fn cleanup_s3(
 ) -> Result<()> {
     let manifest_key = crate::identity::manifest_key(namespace, name);
     s3.delete_object().bucket(bucket).key(&manifest_key).send().await
-        .with_context(|| format!("failed to delete s3://{bucket}/{manifest_key}"))?;
+        .context("failed to delete control-plane manifest")?;
     println!("  ✓ Manifest removed from S3");
 
     let artifact_prefix = format!("artifacts/{namespace}/{name}/");
@@ -1032,13 +1044,11 @@ async fn cleanup_s3(
     loop {
         let response = s3.list_objects_v2().bucket(bucket).prefix(&artifact_prefix)
             .set_continuation_token(continuation_token).send().await
-            .with_context(|| format!(
-                "failed to list config artifacts under s3://{bucket}/{artifact_prefix}"
-            ))?;
+            .context("failed to list control-plane config artifacts")?;
         for object in response.contents() {
             if let Some(key) = object.key() {
                 s3.delete_object().bucket(bucket).key(key).send().await
-                    .with_context(|| format!("failed to delete s3://{bucket}/{key}"))?;
+                    .context("failed to delete control-plane config artifact")?;
             }
         }
         continuation_token = response.next_continuation_token().map(str::to_owned);
@@ -1055,6 +1065,7 @@ async fn run_with_bucket(
     cluster: &str,
     namespace: &str,
     bucket: &str,
+    cleanup_mode: CleanupMode,
 ) -> Result<Vec<String>> {
     if resource != "oabservice" {
         anyhow::bail!("unknown resource type: {resource}. Use 'oabservice'");
@@ -1085,35 +1096,93 @@ async fn run_with_bucket(
         .await?;
     println!("Deleting {name}...");
 
+    let mut warnings = Vec::new();
     match prepare_identity(
         aws_config, &ecs, &s3, namespace, name, cluster, bucket,
     )
     .await? {
         PreparedIdentity::Exact(boxed) => {
             let (checkpoint, state) = *boxed;
+            if state == ServiceIdentityState::RetryGone {
+                warnings.push(
+                    "ECS service was already absent; resumed exact dependent cleanup".to_string(),
+                );
+            }
+            if checkpoint.registry_arn.is_none() && checkpoint.api_id.is_none() {
+                warnings.push(
+                    "no exact ingress identity was recorded; dependent ingress cleanup was skipped"
+                        .to_string(),
+                );
+            }
             delete_checkpointed_ecs(&ecs, &checkpoint, state).await?;
-            crate::ingress::delete_exact(
-                aws_config,
-                namespace,
-                name,
-                checkpoint.api_id.as_deref(),
-                checkpoint.registry_arn.as_deref(),
-                &checkpoint.partition,
-                &checkpoint.account,
-                &checkpoint.region,
-            )
-            .await?;
-            cleanup_s3(&s3, bucket, namespace, name).await?;
-            let key = checkpoint_key(namespace, name);
-            s3.delete_object().bucket(bucket).key(&key).send().await
-                .with_context(|| format!(
-                    "cleanup completed but failed to remove s3://{bucket}/{key}"
-                ))?;
-            println!("  ✓ Delete checkpoint removed");
+
+            match cleanup_mode {
+                CleanupMode::Strict => {
+                    crate::ingress::delete_exact(
+                        aws_config,
+                        namespace,
+                        name,
+                        checkpoint.api_id.as_deref(),
+                        checkpoint.registry_arn.as_deref(),
+                        &checkpoint.partition,
+                        &checkpoint.account,
+                        &checkpoint.region,
+                    )
+                    .await?;
+                    cleanup_s3(&s3, bucket, namespace, name).await?;
+                    let key = checkpoint_key(namespace, name);
+                    s3.delete_object().bucket(bucket).key(&key).send().await
+                        .context("cleanup completed but failed to remove delete checkpoint")?;
+                    println!("  ✓ Delete checkpoint removed");
+                }
+                CleanupMode::BestEffort => {
+                    let mut cleanup_failed = false;
+                    if let Err(error) = crate::ingress::delete_exact(
+                        aws_config,
+                        namespace,
+                        name,
+                        checkpoint.api_id.as_deref(),
+                        checkpoint.registry_arn.as_deref(),
+                        &checkpoint.partition,
+                        &checkpoint.account,
+                        &checkpoint.region,
+                    )
+                    .await
+                    {
+                        let warning = format!("ingress cleanup skipped: {error}");
+                        eprintln!("  ⚠ {warning}");
+                        warnings.push(warning);
+                        cleanup_failed = true;
+                    }
+                    if let Err(error) = cleanup_s3(&s3, bucket, namespace, name).await {
+                        let warning = format!("S3 cleanup incomplete (checkpoint retained): {error}");
+                        eprintln!("  ⚠ {warning}");
+                        warnings.push(warning);
+                        cleanup_failed = true;
+                    }
+                    if !cleanup_failed {
+                        let key = checkpoint_key(namespace, name);
+                        if let Err(error) = s3.delete_object().bucket(bucket).key(&key).send().await {
+                            let warning = format!("delete checkpoint removal skipped (checkpoint retained): {error}");
+                            eprintln!("  ⚠ {warning}");
+                            warnings.push(warning);
+                            cleanup_failed = true;
+                        } else {
+                            println!("  ✓ Delete checkpoint removed");
+                        }
+                    }
+                    if cleanup_failed {
+                        let warning =
+                            "delete checkpoint retained for a later exact-identity retry".to_string();
+                        eprintln!("  ⚠ {warning}");
+                        warnings.push(warning);
+                    }
+                }
+            }
         }
     }
     println!("\n✓ {name} deleted");
-    Ok(Vec::new())
+    Ok(warnings)
 }
 #[cfg(test)]
 mod tests {
@@ -1205,6 +1274,21 @@ mod tests {
             .expect_err("duplicate targets must fail validation");
         assert_eq!(error.kind, DeleteErrorKind::Validation);
         assert!(error.to_string().contains("duplicate delete target"), "{error}");
+    }
+
+    #[test]
+    fn completed_delete_retains_non_fatal_warnings() {
+        let target = DeleteTarget::new("prod", "bot");
+        let report = record_delete_result(
+            DeleteReport::default(),
+            &target,
+            Ok(vec!["resumed from an existing checkpoint".to_string()]),
+        )
+        .expect("completed delete should produce a report");
+        assert_eq!(
+            report.services[0].warnings,
+            vec!["resumed from an existing checkpoint"]
+        );
     }
 
     #[test]

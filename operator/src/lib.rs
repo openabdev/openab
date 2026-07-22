@@ -69,6 +69,13 @@
 //! requires the caller to finish the ingress-free apply first, preserving that
 //! cleanup identity. There is no name-only orphan cleanup fallback.
 //!
+//! The control-plane bucket is an infrastructure prerequisite: it must enforce
+//! default server-side encryption and S3 versioning for checkpoint recovery.
+//! The library writes application JSON but does not weaken or validate those
+//! bucket-level policies on every request. The legacy CLI preserves best-effort
+//! dependent/S3 cleanup warnings, while [`delete_services`] keeps exact-identity
+//! and checkpoint cleanup failures fatal for retry safety.
+//!
 //! Programmatic apply and delete do not provide an internal same-target lock.
 //! Callers must serialize mutations for the same AWS account, Region,
 //! control-plane bucket, ECS cluster, and physical service identity. This

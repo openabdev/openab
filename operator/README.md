@@ -138,6 +138,13 @@ record exists, delete fails before destructive mutation so it cannot discard
 unfinished exact cleanup identity. Re-run the ingress-free apply to completion,
 then retry delete.
 
+The control-plane bucket must enforce default server-side encryption and S3
+versioning for durable checkpoint recovery. The library writes application JSON
+but does not weaken or validate those bucket-level policies per request. The
+legacy CLI preserves best-effort warnings for dependent/S3 cleanup, while
+`delete_services` keeps exact-identity and checkpoint cleanup failures fatal so
+callers can retry safely.
+
 Apply and delete share one injective logical-identity rule: namespaces must not
 contain `-`; names may contain it, so the physical `oab-{namespace}-{name}`
 identity always parses back to exactly one `namespace`/`name` pair. Manifest

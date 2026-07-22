@@ -115,15 +115,13 @@ fn contested_identity_error(
     name: &str,
     alias_namespace: &str,
     alias_name: &str,
-    bucket: &str,
-    key: &str,
 ) -> anyhow::Error {
     anyhow::anyhow!(
         "physical identity '{physical}' is contested: the control plane records \
-         '{alias_namespace}/{alias_name}' (s3://{bucket}/{key}), which maps to the same \
-         physical name as '{namespace}/{name}'. Refusing to mutate. Resolve the collision \
-         first: delete the legacy '{alias_namespace}/{alias_name}' deployment with \
-         `oabctl delete`, or pick a namespace/name pair that does not collide",
+         '{alias_namespace}/{alias_name}', which maps to the same physical name as \
+         '{namespace}/{name}'. Refusing to mutate. Resolve the collision first: delete the \
+         legacy '{alias_namespace}/{alias_name}' deployment with `oabctl delete`, or pick a \
+         namespace/name pair that does not collide",
         physical = physical_service_name(namespace, name),
     )
 }
@@ -145,13 +143,11 @@ async fn probe_ownership_key(
             &name,
             &alias_namespace,
             &alias_name,
-            &bucket,
-            &key,
         )),
         Err(error) if matches!(error.code(), Some("NoSuchKey" | "NotFound")) => Ok(()),
         Err(error) => Err(error).with_context(|| {
             format!(
-                "failed to verify exclusive ownership of '{}' via s3://{bucket}/{key}",
+                "failed to verify exclusive ownership of physical identity '{}'",
                 physical_service_name(&namespace, &name)
             )
         }),
@@ -326,15 +322,10 @@ mod tests {
             "team-bot",
             "prod-team",
             "bot",
-            "control-plane",
-            "manifests/prod-team/bot.yaml",
         );
         let message = error.to_string();
         assert!(message.contains("oab-prod-team-bot"), "{message}");
         assert!(message.contains("prod-team/bot"), "{message}");
-        assert!(
-            message.contains("s3://control-plane/manifests/prod-team/bot.yaml"),
-            "{message}"
-        );
+        assert!(!message.contains("s3://"), "{message}");
     }
 }
