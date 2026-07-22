@@ -32,6 +32,9 @@
 
 use anyhow::Context;
 use aws_sdk_s3::error::ProvideErrorMetadata;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 /// Physical service identity shared by ECS and Cloud Map:
 /// `oab-{namespace}-{name}`.
@@ -125,41 +128,100 @@ fn contested_identity_error(
     )
 }
 
+const OWNERSHIP_PROBE_CONCURRENCY: usize = 8;
+
+async fn probe_ownership_key(
+    s3: aws_sdk_s3::Client,
+    bucket: String,
+    namespace: String,
+    name: String,
+    alias_namespace: String,
+    alias_name: String,
+    key: String,
+) -> anyhow::Result<()> {
+    match s3.get_object().bucket(&bucket).key(&key).send().await {
+        Ok(_) => Err(contested_identity_error(
+            &namespace,
+            &name,
+            &alias_namespace,
+            &alias_name,
+            &bucket,
+            &key,
+        )),
+        Err(error) if matches!(error.code(), Some("NoSuchKey" | "NotFound")) => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to verify exclusive ownership of '{}' via s3://{bucket}/{key}",
+                physical_service_name(&namespace, &name)
+            )
+        }),
+    }
+}
+
 /// Ownership rule: fail closed if the control plane records any logical pair,
 /// distinct from `(namespace, name)`, that claims the same physical identity.
 ///
 /// Runs before any destructive mutation on the apply and delete paths. Probes
 /// only the exact alias keys (stored manifest, delete checkpoint, and
 /// ingress-teardown checkpoint), so hyphen-free pairs with hyphen-free names
-/// cost zero requests. Probe failures other than a missing key fail closed.
+/// cost zero requests. Alias probes are bounded to
+/// [`OWNERSHIP_PROBE_CONCURRENCY`] in flight; probe failures other than a
+/// missing key fail closed.
 pub(crate) async fn ensure_exclusive_physical_identity(
     s3: &aws_sdk_s3::Client,
     bucket: &str,
     namespace: &str,
     name: &str,
 ) -> anyhow::Result<()> {
+    let semaphore = Arc::new(Semaphore::new(OWNERSHIP_PROBE_CONCURRENCY));
+    let mut probes = JoinSet::new();
+
     for (alias_namespace, alias_name) in collision_aliases(namespace, name) {
         for key in ownership_keys(&alias_namespace, &alias_name) {
-            match s3.get_object().bucket(bucket).key(&key).send().await {
-                Ok(_) => {
-                    return Err(contested_identity_error(
-                        namespace,
-                        name,
-                        &alias_namespace,
-                        &alias_name,
-                        bucket,
-                        &key,
+            let permit = match semaphore.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(error) => {
+                    probes.abort_all();
+                    while probes.join_next().await.is_some() {}
+                    return Err(anyhow::anyhow!(
+                        "ownership probe concurrency gate closed: {error}"
                     ));
                 }
-                Err(error) if matches!(error.code(), Some("NoSuchKey" | "NotFound")) => {}
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "failed to verify exclusive ownership of '{}' via s3://{bucket}/{key}",
-                            physical_service_name(namespace, name)
-                        )
-                    });
-                }
+            };
+            let probe_s3 = s3.clone();
+            let probe_bucket = bucket.to_owned();
+            let probe_namespace = namespace.to_owned();
+            let probe_name = name.to_owned();
+            let probe_alias_namespace = alias_namespace;
+            let probe_alias_name = alias_name;
+            probes.spawn(async move {
+                let _permit = permit;
+                probe_ownership_key(
+                    probe_s3,
+                    probe_bucket,
+                    probe_namespace,
+                    probe_name,
+                    probe_alias_namespace,
+                    probe_alias_name,
+                    key,
+                )
+                .await
+            });
+        }
+    }
+
+    while let Some(result) = probes.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                probes.abort_all();
+                while probes.join_next().await.is_some() {}
+                return Err(error);
+            }
+            Err(error) => {
+                probes.abort_all();
+                while probes.join_next().await.is_some() {}
+                return Err(anyhow::anyhow!("ownership probe task failed: {error}"));
             }
         }
     }
@@ -208,6 +270,22 @@ mod tests {
                 ("a-b-c".to_string(), "d".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn long_hyphenated_names_keep_alias_probe_shape_bounded_by_scheduler() {
+        let name = (0..101).map(|_| "x").collect::<Vec<_>>().join("-");
+        assert_eq!(name.len(), 201);
+        let aliases = collision_aliases("prod", &name);
+        assert_eq!(aliases.len(), 100);
+        assert_eq!(
+            aliases
+                .iter()
+                .map(|(namespace, name)| ownership_keys(namespace, name).len())
+                .sum::<usize>(),
+            300
+        );
+        assert!(OWNERSHIP_PROBE_CONCURRENCY < 300);
     }
 
     #[test]
