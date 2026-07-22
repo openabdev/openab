@@ -416,12 +416,12 @@ must still be registered manually in the LINE Developers console.
 > If you edit a manifest to remove `spec.ingress` while keeping the bot, `apply` first
 > stores every exact ECS registry ARN only when the previously stored OAB
 > manifest owned ingress (or resumes an already-valid checkpoint); an arbitrary
-> attached registry is never enough.
-> `ingress-teardown-checkpoints/<namespace>/<name>.json`, clears only API wiring
-> bound to those ARNs, detaches all registries from ECS, waits until the detach
-> is observable, and only then deletes each exact Cloud Map service. It keeps
-> the HTTP API resource so its URL can survive re-enabling ingress and removes
-> the checkpoint only after the full apply succeeds, so retries cannot lose
+> attached registry is never enough. The resulting exact-identity record is
+> stored at `ingress-teardown-checkpoints/<namespace>/<name>.json`; it clears only
+> API wiring bound to those ARNs, detaches all registries from ECS, waits until
+> the detach is observable, and only then deletes each exact Cloud Map service.
+> It keeps the HTTP API resource so its URL can survive re-enabling ingress and
+> removes the checkpoint only after the full apply succeeds, so retries cannot lose
 > cleanup identity. The **shared** VPC Link and security-group inbound rule are
 > always left in place for other bots.
 >

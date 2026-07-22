@@ -101,8 +101,9 @@ async fn reconcile(
     delete_services(
         aws,
         &[DeleteTarget::new("prod", "bot")],
-        &DeleteOptions::new("production-cluster")
-            .with_control_plane_bucket("my-control-plane-bucket"),
+        // Omit the bucket override to use OAB_CONTROL_PLANE_BUCKET,
+        // then oab-control-plane-{account} from the caller identity.
+        &DeleteOptions::new("production-cluster"),
     )
     .await?;
     Ok(())
