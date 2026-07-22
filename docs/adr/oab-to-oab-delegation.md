@@ -1,582 +1,420 @@
-# ADR: Authenticated OAB-to-OAB Delegation with Capability Attenuation and Signed Provenance
+# ADR: OAB Delegation Adapter for Inter-OAB Remote Tasks
 
 - **Status:** Proposed
 - **Date:** 2026-07-22
 - **Author:** @chaodu-agent
 - **Discussion:** [Discord delegation discussion](https://discord.com/channels/1490282656913559673/1529261985881919529)
 
-## 1. Context
+## 1. User story
 
-OpenAB currently runs an agent behind a platform adapter or an ACP connection. A
-running OAB agent can therefore answer messages and invoke its locally configured
-agent runtime, but there is no first-class, authenticated way for one OAB agent
-to ask another trusted OAB agent to perform a bounded subtask.
+A running OAB agent should be able to delegate work instead of doing the work
+itself:
 
-Forwarding a prompt through a chat platform is not an adequate delegation
-mechanism. It loses the execution identity, makes capability boundaries
-implicit, complicates cancellation and retry, and makes it difficult to prove
-which agent produced an artifact or side effect. Reusing the caller's sessions,
-credentials, environment, or live tool handles would also turn delegation into
-authority cloning rather than authority attenuation.
+```text
+Agent A
+  -> OAB A delegation adapter
+  -> authenticated remote OAB B
+  -> Agent B performs the task
+  -> OAB A waits for the result
+  -> Agent A continues its original task
+```
 
-The desired model is a parent OAB agent delegating a narrowly scoped task to a
-worker OAB agent while preserving:
+For example, while reviewing a change, Agent A may ask a remote OAB specialized
+in security review to inspect the diff. Agent A should receive progress and a
+structured final result, then use that result in its own conversation. The
+remote worker is an OAB peer, not a Discord user, a forwarded chat message, or
+an exposed ACP process.
 
-- authenticated peer identity;
-- least-authority capability attenuation;
-- isolated execution state;
-- explicit lifecycle and failure semantics; and
-- tamper-evident provenance from the original request to the result.
-
-This ADR defines the protocol and security contract. It does not implement the
-adapter or change the behavior of existing platform adapters.
+This is an **inter-OAB operation**. The adapter must work when OAB A and OAB B
+run in different processes, hosts, or clusters. A relay may be used when both
+OAB instances can only make outbound connections, but a particular relay
+provider is not part of this protocol decision.
 
 ## 2. Decision
 
-Introduce a dedicated OAB delegation control plane with two roles:
-
-- **`DelegationClient`** — sends authenticated, bounded requests from a parent
-  OAB agent.
-- **`DelegationServer`** — authenticates the caller, authorizes the request,
-  executes it through a locally provisioned agent session, and returns a signed
-  result envelope.
-
-A transport-specific **delegation adapter** may implement the control-plane
-boundary, but it is not a `ChatAdapter` and must not route delegation through
-Discord, Slack, or another user-facing chat surface.
-
-The MVP is an inter-OAB protocol: OAB A connects to a preconfigured remote OAB B
-through authenticated HTTPS for bootstrap/health and a long-lived WebSocket
-carrying JSON-RPC messages. The WebSocket is only a transport; delegation never
-travels as a Discord, Slack, or webhook message. Remote federation and dynamic
-peer discovery are deferred, but the first implementation is already remote
-OAB-to-OAB execution rather than an in-process subagent API.
-
-Where execution is backed by an ACP agent, the server reuses OpenAB's existing
-ACP connection and session-pool lifecycle: bounded prompts, cancellation,
-process-group cleanup, and controlled child environments remain local to the
-callee.
-
-## 3. Authority and identity model
-
-A delegation request is an authority reduction, never an authority transfer.
-The callee computes the effective authority as the intersection of four
-independent constraints:
+Add a dedicated **delegation adapter** with a client side in OAB A and a server
+side in OAB B:
 
 ```text
-effective_authority =
-    caller_grants
-  ∩ callee_policy
-  ∩ request_capabilities
-  ∩ deployment_limits
+Agent A
+  |
+  | local delegate operation
+  v
+OAB A DelegationClient
+  |
+  | HTTPS bootstrap/health
+  | WebSocket + JSON-RPC 2.0
+  v
+OAB B DelegationServer
+  |
+  | local session and policy enforcement
+  v
+Agent B via ACP
 ```
 
-An empty intersection is a denial. The caller cannot grant a capability it does
-not possess, and the request cannot widen the callee's policy or deployment
-limits.
+The delegation adapter is not another `ChatAdapter`. Chat adapters translate
+human-facing platform events; the delegation adapter translates a bounded local
+agent operation into a remote OAB task and maps the remote lifecycle back to
+the caller.
 
-### 3.1 Peer identity
+OAB B keeps its ACP connection, credentials, environment, workspace policy, and
+tool approvals local. The outer delegation protocol must never expose ACP
+directly to a remote peer or forward OAB A's session and credentials.
 
-"Trusted OAB agent" means an authenticated agent identity, not a Discord UID,
-bot display name, branch name, or message origin. The server maintains an
-explicit deny-by-default peer allowlist containing an agent ID and a public-key
-identity (or a configured public-key identity bound to the remote OAB endpoint).
+### 2.1 Transport and protocol boundary
 
-The principal chain is preserved separately from peer authentication:
+The MVP uses authenticated HTTPS for bootstrap/health and a long-lived
+WebSocket carrying a versioned JSON-RPC 2.0 protocol. The transport provides
+bidirectional progress and cancellation; JSON-RPC provides method and error
+versioning without coupling the public contract to a vendor-specific ACP
+extension.
+
+The initial method set is intentionally small:
 
 ```text
-human or system principal → parent OAB agent → callee OAB agent
+delegate/describe       capability and protocol negotiation
+delegate/task.create    submit one remote task
+delegate/task.get       read current task state
+delegate/task.events    wait/replay progress and terminal events
+delegate/task.cancel    request cancellation
 ```
 
-A callee may authorize the parent peer while still recording the initiating
-principal. No agent may impersonate a human or another peer in the chain.
-
-### 3.2 Capability attenuation
-
-Capabilities are structured, namespaced values such as:
+A deployment may connect directly:
 
 ```text
-repo:read
-repo:test
-artifact:write
-network:read:approved-hosts
+OAB A -- outbound or inbound WSS --> OAB B
 ```
 
-The MVP deliberately omits `delegate` from the capability catalogue. Every
-request is evaluated against the four-way authority intersection before an
-execution session is created. Capability names, resource scopes, expiry, and
-budgets are part of the request digest.
-
-The server must reject unknown or malformed capabilities rather than silently
-ignoring them. A future capability registry may add resource-specific limits,
-but it must preserve monotonic attenuation.
-
-## 4. Wire contract
-
-The wire protocol is JSON-RPC-shaped and version-negotiated. The initial method
-set is:
+or use a relay that pairs two outbound WebSockets:
 
 ```text
-delegate/describe
-delegate/task.create
-delegate/task.get
-delegate/task.events
-delegate/task.send
-delegate/task.interrupt
+OAB A -- outbound WSS --> relay <-- outbound WSS -- OAB B
 ```
 
-`delegate/task.create` accepts a normalized request with at least:
+The relay is a deployment option, not a protocol dependency. Cloudflare Worker
+and Durable Object are possible implementations, but the ADR does not make
+Cloudflare APIs, pricing, or free-tier behavior part of the OAB contract.
+
+### 2.2 Task identity and result mapping
+
+The caller supplies an idempotent `request_id`; the callee creates an immutable
+`task_id`:
+
+```text
+request_id -> task_id -> turn_id -> event sequence/cursor
+```
+
+- `request_id` deduplicates task creation at OAB B.
+- `task_id` is the immutable storage and reconnect key generated by OAB B.
+- `task_path` is an optional human-readable route such as `/root/security`; it
+  can change without changing task ownership or event history.
+- `turn_id` identifies an execution turn if the task later supports follow-up
+  work.
+- `(task_id, turn_id, sequence)` identifies an event; a durable `cursor` allows
+  replay after reconnect.
+
+The caller waits by reading events or task state. Reconnecting with the same
+`task_id` resumes observation; it does not submit a second task. A terminal
+result includes at least `status`, `summary`, `error`, `artifacts`, and
+`executed_by`.
+
+## 3. MVP scope
+
+The MVP validates the remote delegation user story without attempting to build a
+full distributed workflow engine.
+
+### 3.1 In scope
+
+- Explicitly configured, deny-by-default OAB peers.
+- Authenticated peer connections using mTLS or signed short-lived agent tokens.
+- One parent OAB submitting a bounded task to one remote worker OAB.
+- Text task input, a deadline, output/runtime budget, and requested capabilities.
+- Read-only repository work by default.
+- A local ACP session on OAB B for actual execution.
+- `create`, `get`, event wait/replay, and cancellation lifecycle operations.
+- Durable request/task identity, idempotency, reconnect, and bounded event
+  retention.
+- Streamed progress followed by one structured terminal result.
+- Callee-owned artifact and side-effect provenance in the result envelope.
+- A maximum delegation depth of one: the remote worker cannot delegate again.
+- Per-peer and global concurrency limits with backpressure.
+- Negative tests for unauthorized peers, capability widening, duplicate tasks,
+  timeout, cancellation, reconnect, worker failure, and credential leakage.
+
+A minimal request is conceptually:
 
 ```json
 {
   "protocol_version": 1,
   "request_id": "parent-request-123",
-  "requested_by": "agent-a",
-  "principal_chain": ["principal-x", "agent-a"],
+  "target_peer": "oab-b",
   "task": "Review this diff for security issues",
-  "capabilities": ["repo:read", "repo:test"],
-  "workspace": "isolated-worktree-ref",
-  "deadline": "2026-07-22T05:00:00Z",
-  "budget": {"max_runtime_ms": 300000, "max_output_bytes": 200000},
+  "capabilities": ["repo:read"],
+  "deadline_ms": 300000,
+  "budget": {"max_output_bytes": 200000},
   "delegation_depth": 0,
   "nonce": "unique-request-nonce",
-  "idempotency_key": "parent-task-123"
+  "idempotency_key": "parent-request-123"
 }
 ```
 
-The request schema MUST NOT contain credentials, session handles, raw
-environment maps, or live tool handles. Workspace references identify a
-callee-approved resource; they are not a mechanism for passing an arbitrary
-host path.
+The schema deliberately has no credential, session, raw environment, arbitrary
+host path, or live tool-handle field.
 
-The server emits explicit lifecycle states:
+### 3.2 Explicit non-goals
+
+- In-process-only subagents: the user story is remote inter-OAB execution.
+- Delegation through Discord, Slack, webhooks, or other chat channels.
+- Recursive delegation, arbitrary DAG workflow, or unbounded fan-out.
+- Dynamic peer discovery, automatic trust enrollment, or cross-organization
+  federation.
+- Shared conversation history or implicit access to the parent's session.
+- Shared writable worktrees or parallel writers. Read-heavy exploration and
+  testing are the initial use cases.
+- Arbitrary remote tool grants, credential forwarding, or capability expansion.
+- Durable workflow scheduling that guarantees recovery after every worker crash.
+- A Cloudflare-specific relay implementation in the core OAB repository.
+
+## 4. Lessons from Codex multi-agent v2
+
+Codex multi-agent v2 is useful as an orchestration design reference, not as the
+OAB wire contract. OAB should adopt the semantics that solve the user story and
+avoid copying an experimental tool schema.
+
+| Codex v2 lesson | OAB decision |
+| --- | --- |
+| Delegation is a task tree, not just `delegate(prompt) -> text`. | Model a remote task explicitly. Use immutable `task_id` for storage and a readable `task_path` for routing and UI. MVP depth is one. |
+| Canonical task paths make routing and ancestry visible. | Accept an optional path for human-facing routing, but never use it as the permanent identity; events and reconnects use `task_id`. |
+| Spawn, message, follow-up, interrupt, wait, and discovery are distinct operations. | Keep create, state/events, and cancel distinct in the MVP. If follow-up turns are added, `message`, `followup`, and `interrupt` remain separate operations rather than one overloaded flag. |
+| Waiting is an event/mailbox wake-up, not a giant tool response containing all history. | Return a task identity immediately and stream/replay events with sequence numbers and cursors. The caller can fetch the terminal result separately. |
+| A worker owns its own context/thread. | Default context policy to `none`; do not copy Discord/private connector context or the parent's session. Future policies must be explicit (`none`, `summary`, or selected references). |
+| Concurrency is bounded globally. | Add both per-root and process-wide active-delegation limits, plus deadline, output, and budget limits. Do not consume the ordinary chat session pool without a separate delegation budget. |
+| Child agents inherit a restricted runtime, not arbitrary new authority. | Effective authority is the intersection of caller grants, OAB A delegation policy, OAB B policy, request capabilities, and deployment limits. The child cannot widen it. |
+| Progress and completion are lifecycle events. | Preserve explicit `accepted`, `running`, `completed`, `failed`, `cancelled`, `expired`, and `unknown` states and make reconnect/replay first-class. |
+| Encrypted inter-agent messages can reduce auditability. | Encrypt the transport when needed, but persist a redacted human-readable audit record containing caller, callee, task, capabilities, decision, and outcome. |
+| Experimental implementation details should not become a public contract. | Define an OAB-owned versioned delegation protocol and a backend-neutral coordinator; map Codex-like semantics to it rather than exposing Codex names or IDs. |
+
+The main lesson is that delegation is a controlled task-tree runtime with
+mailbox-style lifecycle events, not a prompt-forwarding helper. The main OAB
+addition is the remote trust, reconnect, provenance, and failure boundary that
+a local multi-agent implementation does not provide.
+
+## 5. Context, authority, and provenance
+
+Delegation must reduce authority at every boundary:
 
 ```text
-received → validated → reserved+audited → executing → terminal
+effective_authority =
+    caller_grants
+  intersection OAB A delegation policy
+  intersection OAB B callee policy
+  intersection request capabilities
+  intersection deployment limits
 ```
 
-Terminal states are `completed`, `failed`, `cancelled`, `expired`, and `unknown`.
-Requests that cannot be parsed, whose protocol version is unsupported, or whose
-signature cannot be verified are rejected immediately:
+An empty intersection is denied. OAB B executes only with its own locally
+provisioned identity. No credentials, session handles, environment maps, live
+tool objects, or arbitrary host paths cross the connection.
 
-```text
-received → rejected+audited
-```
-
-A structurally valid and authenticated request can be rejected after policy
-validation:
-
-```text
-received → validated → rejected+audited
-```
-
-A request must never reach `executing` without a committed reservation and audit
-record. OAB A may wait on the same task, reconnect, or resume event delivery
-without creating a second task.
-
-### 4.1 Canonicalization and digests
-
-Protocol v1 uses deterministic canonical serialization before hashing. The
-implementation should use RFC 8785 JSON Canonicalization Scheme (JCS), or a
-protocol-compatible deterministic encoding if the implementation cannot support
-JCS. The chosen encoding is part of protocol-version negotiation; ordinary JSON
-object key order is not sufficient.
-
-- `request_digest` covers the complete normalized request, including authority-
-  relevant fields, capabilities, workspace, deadline, budget, nonce, and
-  protocol version.
-- `authority_digest` covers the evaluated authority inputs and resulting
-  effective capability set.
-- `result_digest` covers the exact result envelope payload before its signature.
-
-## 4.2 Task and event identity
-
-The remote task is not identified by a mutable display name or routing path:
-
-- `request_id` is supplied by OAB A as the idempotency key for task creation.
-- `task_id` is generated by OAB B and is immutable and globally unique. It is
-  the storage, correlation, and crash-recovery key.
-- `task_path` is a human-readable, mutable routing/ancestry path. Rename or
-  reparent operations update path mapping only; they never rewrite event
-  ownership.
-- `turn_id` identifies each execution or follow-up turn under one task.
-- An event is identified by `(task_id, turn_id, sequence)`.
-- `cursor` is a separate durable, monotonically increasing replay position.
-
-All follow-up, wait, interrupt, and reconnect operations first resolve any
-human-readable path to `task_id`, then use the immutable ID. A duplicate
-`request_id` may return the existing `task_id` and result, but may not create a
-second remote task.
-
-## 5. Signed result and provenance envelope
-
-The callee returns a result envelope that is immutable once signed:
+The result envelope is signed by OAB B and binds the request to its outcome:
 
 ```json
 {
   "protocol_version": 1,
   "request_id": "parent-request-123",
   "task_id": "callee-task-456",
-  "turn_id": "turn-1",
-  "requested_by": "agent-a",
-  "principal_chain": ["principal-x", "agent-a", "agent-b"],
-  "executed_by": "agent-b",
+  "status": "completed",
+  "summary": "No security issues found",
+  "executed_by": "oab-b-agent",
   "effective_capabilities": ["repo:read"],
-  "authority_digest": "sha256:...",
   "request_digest": "sha256:...",
   "result_digest": "sha256:...",
-  "outcome_digest": "sha256:...",
-  "status": "completed",
+  "artifacts": [],
   "side_effects": [],
-  "artifacts": [
-    {
-      "uri": "artifact://agent-b/sha256:...",
-      "owner": "agent-b",
-      "created_by": "agent-b",
-      "digest": "sha256:...",
-      "derived_from": []
-    }
-  ],
-  "issued_at": "2026-07-22T04:50:00Z",
-  "expires_at": "2026-07-22T05:50:00Z",
-  "nonce": "unique-request-nonce",
-  "callee_key_id": "agent-b-key-1",
-  "attestation": {
-    "algorithm": "ed25519",
-    "signature": "base64url..."
-  }
+  "attestation": {"algorithm": "ed25519", "signature": "..."}
 }
 ```
 
-The callee signature binds the request to the result:
+The caller may summarize the result, but may not rewrite `executed_by`,
+effective capabilities, side effects, or artifact ownership. A callee-created
+artifact remains callee-owned; a caller-created derivative receives a new owner
+and a provenance link.
+
+The MVP rejects, fail-closed:
+
+- unknown peers or invalid authentication;
+- `delegation_depth > 0`;
+- unknown capabilities or capability widening;
+- credential/session/environment/tool-handle fields;
+- reused nonce or conflicting idempotency key;
+- expired or malformed requests;
+- invalid result signature, digest, executor identity, or artifact ownership.
+
+Nonce/idempotency reservation and the audit event must be committed before
+execution. If reservation or audit persistence fails, OAB B must not create a
+worker session, call a tool, or create an artifact.
+
+## 6. Lifecycle and failure semantics
+
+The lifecycle is:
 
 ```text
-signature = Sign_callee(
-    request_digest
-  + result_digest
-  + authority_digest
-  + principal_chain
-  + task_id
-  + turn_id
-  + issued_at
-  + expires_at
-  + nonce
-)
+received -> validated -> accepted -> running -> terminal
+                                  |             |
+                                  |             +-> completed
+                                  |             +-> failed
+                                  |             +-> cancelled
+                                  |             +-> expired
+                                  |             +-> unknown
+                                  +-> rejected
 ```
 
-The exact signed payload is the canonical serialized form, not an informal
-concatenation. A caller may summarize a result for its user or create a new
-derived artifact, but it may not rewrite `executed_by`, effective capabilities,
-side effects, artifact ownership, or the principal chain.
+`unknown` is required when OAB B cannot prove whether an external side effect
+occurred. OAB A must not silently convert `unknown`, `failed`, `cancelled`, or
+`expired` into success or blindly retry the task.
 
-An artifact created by the callee remains callee-owned. A caller-created derived
-artifact receives a new immutable owner and a `derived_from` provenance edge;
-ownership cannot be overwritten or transferred by forwarding the result.
+Cancellation is best effort: OAB B records the request, asks its local ACP
+session to stop, and emits `cancelled` only after the worker stops. A transport
+disconnect does not mean success, cancellation, or permission to create a
+second task. OAB A reconnects with `task_id` and its last cursor.
 
-Mutation records contain at least:
+Every terminal task persists its outcome digest and signed envelope. A duplicate
+request with the same normalized request returns the existing task or result;
+a conflicting request with the same idempotency key is rejected.
 
-```text
-target, action, executor_identity, timestamp, outcome, before_digest, after_digest
-```
-
-## 6. Security invariants
-
-The following are protocol invariants and must be enforced fail-closed by the
-server and result validator:
-
-1. **Recursive delegation is prohibited in the MVP.**
-   `delegation_depth > 0` is rejected with stable code
-   `recursive_delegation_forbidden`. The request capability catalogue does not
-   expose `delegate`.
-2. **Credential forwarding is prohibited.** Any credential, session, raw
-   environment, or live tool-handle field is rejected with
-   `credential_forwarding_forbidden`. The callee uses only its locally
-   provisioned identity.
-3. **Artifact ownership is immutable.** `artifact.owner != artifact.created_by`
-   for a newly created artifact is rejected with
-   `artifact_ownership_mismatch`, except where a new derived artifact and an
-   explicit `derived_from` edge are present.
-4. **Capability widening is prohibited.** The effective capability set must be
-   a subset of every input authority set and deployment limit.
-5. **No secret inheritance.** Child execution receives no parent credentials,
-   session state, environment variables, or live tool objects. The existing
-   OAB child-process environment allowlist remains the default.
-6. **No chat transport impersonation.** A chat message or bot UID is not a
-   delegation credential and cannot select the internal delegation bypass.
-7. **Signed provenance is mandatory.** A result without a valid callee signature,
-   matching request digest, matching result digest, and intact principal chain
-   is not accepted as a delegated result.
-8. **Replay is rejected before execution.** A reused nonce, expired envelope,
-   duplicate idempotency key with a conflicting request digest, or unsupported
-   protocol version is rejected and audited.
-
-## 7. Atomic reservation, audit, and replay protection
-
-Nonce/idempotency reservation and durable audit recording must commit together,
-using one database transaction or a transactional outbox. The only valid
-execution transition is:
-
-```text
-validate request
-  → atomically reserve nonce/idempotency key
-  → durably record audit event (or commit transactional outbox)
-  → commit
-  → start execution
-```
-
-If reservation, audit persistence, or the outbox commit fails, the server returns
-`reservation_failed` or `audit_unavailable` and does not create a child session,
-call a tool, or create an artifact.
-
-Audit events record at least the delegation ID, request digest, peer identity,
-principal chain, effective capabilities, decision, rejection code when present,
-and timestamp. The audit event is durable before execution begins.
-
-A retry with the same `request_id` and the same request digest returns the
-existing `task_id`, existing terminal result, or resumes the one incomplete
-execution. A conflicting digest is rejected. A terminal record persists the
-exact signed envelope and its `outcome_digest`. Repeating a request for the same
-`task_id` can therefore only return the existing outcome or recover the unfinished
-execution; it must never start a second execution.
-
-Rejection tests must assert all of the following:
-
-- stable rejection code;
-- no child session, tool call, artifact, or other execution side effect;
-- durable audit event containing the rejection reason; and
-- no second execution when the request is retried.
-
-## 8. Lifecycle, progress, and failure semantics
-
-`delegate/task.create` returns the caller's `request_id` together with the
-callee-generated immutable `task_id` and current state. OAB A may wait through
-`delegate/task.events` or query `delegate/task.get`. Progress events carry a
-monotonically increasing sequence number and durable cursor so a disconnected
-caller can reconnect without resubmitting the task. `delegate/task.send` creates
-a new `turn_id` under the same task; `delegate/task.interrupt` propagates
-cancellation.
-
-Cancellation is best effort: the server records `cancel_requested`, asks the
-local ACP session to cancel, and emits a terminal `cancelled` result only after
-local execution stops. A timeout becomes `expired`; it must not be reported as
-successful merely because the transport disconnected.
-
-The parent and worker use a lease/heartbeat on the remote connection. A
-disconnect does not automatically cancel, duplicate, or claim success for the
-task. OAB A must reattach using the immutable `task_id` and last durable cursor;
-if OAB B cannot prove the outcome, it returns `unknown` and OAB A must not blindly
-retry.
-
-The protocol must distinguish:
-
-- `failed`: execution returned a known error;
-- `cancelled`: cancellation was observed;
-- `expired`: deadline or lease expired before completion; and
-- `unknown`: the worker cannot prove whether external side effects occurred.
-
-Every terminal state persists an `outcome_digest` and the corresponding signed
-result envelope. No status other than `completed` may be presented as a successful
-delegated result. A reconnect or retry with the same immutable `task_id` returns
-that persisted outcome or resumes the single incomplete execution; it never
-re-executes a terminal task.
-
-## 9. MVP scope and non-goals
-
-### In scope
-
-- Inter-OAB remote execution over authenticated HTTPS/WebSocket transport.
-- Preconfigured remote OAB peers with authenticated identity and deny-by-default
-  allowlist.
-- One parent-to-one worker delegation request at a time, with bounded runtime,
-  output, and capability scope.
-- Text task input and streamed progress.
-- Isolated worker session using existing ACP/session-pool lifecycle.
-- Capability attenuation, signed result envelopes, artifact digests, and audit
-  records.
-- Cancellation, deadline, idempotency, replay protection, and explicit terminal
-  states.
-- Negative tests for schema, environment, authorization, result validation, and
-  replay paths.
-
-### Explicitly prohibited or deferred
-
-- Recursive delegation and nested worker trees.
-- Credential, session, environment, or live tool-handle forwarding.
-- Caller-owned attribution of callee-created artifacts.
-- Dynamic peer discovery, cross-organization federation, and automatic trust
-  enrollment.
-- Delegation through Discord, Slack, webhooks, or other public chat channels.
-- Shared conversation history or implicit parent-session access.
-- Arbitrary tool grants, unrestricted host paths, and unbounded network access.
-- Durable execution semantics that survive worker loss without a separate
-  scheduler/workflow design.
-
-Federation may later add trusted nodes and provenance edges, but it must not
-relax the three core rejection rules: recursive delegation, credential
-forwarding, and ownership mismatch.
-
-## 10. Negative-test acceptance criteria
-
-The implementation PR for this ADR must add tests that independently exercise
-all four enforcement layers:
-
-### Schema layer
-
-- Reject credential/session/environment/live-handle fields.
-- Reject unknown or malformed capabilities.
-- Reject unsupported protocol versions and malformed canonical payloads.
-
-### Execution layer
-
-- Verify the child environment contains only the deployment allowlist and
-  explicitly provisioned local values.
-- Verify no parent session or live tool handle is visible to the worker.
-- Verify an unauthorized workspace reference cannot escape the worker boundary.
-
-### Authorization layer
-
-- Reject an unknown peer identity.
-- Reject `delegation_depth > 0` with
-  `recursive_delegation_forbidden`.
-- Reject capability widening when requested capabilities exceed any authority
-  intersection input.
-- Verify the effective capability set is recorded in the authority digest.
-
-### Result and provenance layer
-
-- Reject a tampered request digest or result digest.
-- Reject a missing or invalid callee signature.
-- Reject `owner != executor` with `artifact_ownership_mismatch`.
-- Accept a valid derived artifact only when it has a new owner and a valid
-  `derived_from` edge.
-- Verify mutation side effects contain target, operation, executor, timestamp,
-  and outcome.
-
-### Wire-level replay and atomicity
-
-- Reject a reused nonce with `replay_detected`.
-- Reject an expired request with `request_expired`.
-- Reject a conflicting reuse of an idempotency key.
-- Verify reservation and audit are atomic: if either persistence step fails,
-  execution does not start.
-- Verify every rejection produces a durable audit event and no execution side
-  effect.
-- Verify a retry of an accepted request does not create a second execution or
-  second successful result.
-
-## 11. Alternatives considered
+## 7. Alternatives considered
 
 ### Forward a prompt through a chat platform
 
-Rejected. Chat transport does not provide peer authentication, capability
-attenuation, lifecycle control, replay protection, or signed provenance. It also
-creates bot-loop and attribution problems.
+Rejected for the formal path. Chat messages do not provide reliable task
+identity, cancellation, replay, peer authentication, or provenance. Discord can
+still be used to notify a human about a delegated task.
 
-### Share the caller's ACP session with the callee
+### Expose ACP directly to the remote agent
 
-Rejected. Session sharing crosses conversation state and authority boundaries,
-prevents independent cancellation and auditing, and makes it impossible to
-prove which agent performed a tool call.
+Rejected. ACP is OAB B's local runtime boundary, not a stable inter-OAB
+contract. Direct exposure would leak local process and credential assumptions.
 
-### Pass the caller's credentials or environment to the callee
+### Use MCP for the outer protocol
 
-Rejected. This is credential forwarding and authority cloning. The callee must
-use its own locally provisioned identity.
+Rejected for this user story. MCP models agent-to-tool/resource access; this
+feature models OAB agent-to-remote-OAB task ownership, progress, cancellation,
+and result provenance. OAB B may use MCP internally, but it is not the
+inter-OAB delegation protocol.
 
-### Let the callee delegate recursively
+### Implement only local subagents
 
-Rejected for the MVP. Recursive trees multiply cost and complicate provenance,
-lease ownership, replay protection, and failure recovery. A future orchestrator
-mode can be designed as a separate protocol revision with explicit depth and
-budget controls.
+Rejected as the MVP boundary. A local coordinator may be useful later, but it
+does not let any running OAB agent connect to another remote OAB as requested.
 
-### Use an unauthenticated HTTP endpoint with a shared static token
+### Stateless HTTP request/response
 
-Rejected for remote federation. A static token does not provide strong peer
-identity, rotation, request signing, or useful provenance. It may be acceptable
-as a narrowly scoped local development fixture, but not as the production wire
-contract.
+Deferred as the only transport. HTTP is appropriate for bootstrap and health,
+but a long-running delegated task needs bidirectional progress, cancellation,
+and reconnect. WebSocket is the MVP transport; another transport can map to the
+same protocol later.
 
-## 12. Prior art
+## 8. Prior art
+
+### Codex multi-agent v2
+
+Codex v2 provides the most relevant orchestration lessons: canonical task
+paths, separate lifecycle operations, mailbox/event wake-ups, explicit context
+inheritance, bounded concurrency, and structured collaboration events.
+
+- [Codex subagents](https://developers.openai.com/codex/concepts/subagents)
+- [Codex multi-agent v2 handlers](https://github.com/openai/codex/tree/main/codex-rs/core/src/tools/handlers/multi_agents_v2)
+- [Codex multi-agent specifications](https://github.com/openai/codex/blob/main/codex-rs/core/src/tools/handlers/multi_agents_spec.rs)
+- [Codex auditability issue](https://github.com/openai/codex/issues/28058)
 
 ### OpenClaw
 
-OpenClaw documents a multi-agent Gateway model in [Multi-agent
-routing](https://github.com/openclaw/openclaw/blob/main/docs/concepts/multi-agent.md).
-Each agent has separate workspace, state directory, auth profiles, and session
-store, and routing uses explicit bindings. OpenClaw also makes agent-to-agent
-messaging opt-in and allowlisted, and per-agent tool policies can only further
-restrict global policy.
+OpenClaw demonstrates explicit per-agent routing, separate state/workspace
+boundaries, and opt-in agent-to-agent messaging. OAB adopts those boundaries
+but adds a remote protocol, request/result binding, and callee-signed
+provenance.
 
-We adopt the separation of agent state, explicit routing, and monotonic
-per-agent restrictions. OpenClaw's model is primarily co-located routing inside
-one Gateway process; it does not define the cross-process OAB wire contract
-needed here, particularly the request/result digest binding and callee-signed
-artifact provenance.
+- [OpenClaw multi-agent routing](https://github.com/openclaw/openclaw/blob/main/docs/concepts/multi-agent.md)
+- [OpenClaw repository](https://github.com/openclaw/openclaw)
 
 ### Hermes Agent
 
-Hermes documents a `delegate_task` tool in [Subagent
-Delegation](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/delegation.md).
-It creates fresh child conversations and terminal sessions, limits concurrent
-children, supports cancellation and background completion, and blocks recursive
-delegation for leaf children by default. Hermes also records durable completion
-records for background results and treats an interrupted child with unknown
-side effects as `unknown` rather than claiming success.
+Hermes demonstrates fresh child conversations, bounded concurrency,
+cancellation/background completion, and explicit `unknown` handling when a
+worker may have had side effects. OAB adopts these lifecycle principles while
+keeping the inter-OAB trust and capability boundary explicit.
 
-We adopt the fresh-context boundary, bounded concurrency/lifecycle, explicit
-unknown outcome, and default-flat delegation. We diverge by making the OAB
-boundary an authenticated peer protocol with capability intersection, no
-credential forwarding, atomic replay reservation, and a callee signature that
-binds the request digest to the result digest and authority digest.
+- [Hermes subagent delegation](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/delegation.md)
+- [Hermes Agent repository](https://github.com/NousResearch/hermes-agent)
 
-## 13. Consequences
+## 9. Acceptance criteria for the implementation
+
+The implementation that follows this ADR is acceptable only when it demonstrates
+all of the following:
+
+1. Agent A can submit a bounded task to a configured remote OAB B, wait for
+   progress, and receive one structured terminal result.
+2. OAB B authenticates and authorizes the peer before creating a worker session.
+3. A duplicate request reconnects to the existing task instead of executing it
+   twice; a conflicting request is rejected.
+4. Progress and terminal events can be replayed from a durable cursor after a
+   WebSocket reconnect.
+5. Cancellation, deadline expiry, worker failure, and `unknown` outcomes are
+   distinguishable and tested.
+6. The child receives only its locally allowed environment and capabilities;
+   parent credentials, sessions, and live handles are absent.
+7. No recursive delegation, capability widening, credential forwarding, or
+   caller-owned callee artifact claim is possible through the MVP API.
+8. The signed result binds `request_digest`, `result_digest`, effective
+   capabilities, executor identity, task identity, and artifact/side-effect
+   provenance.
+9. Per-peer and global concurrency/backpressure limits prevent delegation from
+   starving ordinary OAB chat work.
+10. A human-readable audit record remains available even when the transport is
+    encrypted.
+
+## 10. Consequences
 
 ### Positive
 
-- A parent can use a running OAB worker without treating it as a chat user.
-- Authority is narrowed at every boundary and cannot be widened by the caller.
-- Credentials and session state remain local to the executing agent.
-- Results and artifacts can be independently verified and audited.
-- The protocol supports a remote OAB user story while leaving discovery and
-  cross-organization federation for later, without changing the provenance model.
+- Any running OAB agent can use another running OAB agent as a bounded remote
+  specialist without pretending it is a chat participant.
+- The user-facing operation is simple while the host retains policy,
+  authentication, retry, and audit responsibilities.
+- Codex v2's useful task-tree and mailbox semantics are available without
+  coupling OAB to an experimental vendor wire format.
+- Read-only parallel exploration, review, testing, and summarization become
+  possible before introducing write coordination.
 
 ### Costs and residual risks
 
-- Key management, canonicalization, nonce storage, and durable audit increase
-  implementation complexity compared with forwarding a prompt.
-- A worker crash during an external side effect may remain `unknown`; the client
-  must reconcile status rather than retry blindly.
-- The MVP requires preconfigured remote endpoints and key rotation remains an
-  operational responsibility until federation is designed.
-- Artifact storage and garbage collection are not defined by this ADR; the
-  implementation must provide stable content-addressed references or defer
-  artifact-producing tasks.
-- The ADR defines a contract, not a cryptographic implementation review. The
-  implementation PR must pin algorithms, key rotation behavior, and library
-  choices before enabling remote federation.
+- Remote identity, key rotation, durable cursors, and audit storage add
+  operational complexity.
+- A worker crash during an external side effect can leave the result `unknown`;
+  callers must reconcile rather than blindly retry.
+- The MVP requires preconfigured peers and does not solve global discovery or
+  federation.
+- Shared writable worktrees and multi-writer coordination remain future design
+  work; the safe default is read-only delegation.
 
-## 14. Implementation sequence
+## 11. Implementation sequence
 
-1. Add protocol types, canonical digest helpers, stable error codes, and negative
-   schema tests.
-2. Add HTTPS/WebSocket transport, remote peer authentication, and the deny-by-
-   default delegation policy.
-3. Add atomic nonce/idempotency reservation plus audit/outbox persistence.
-4. Add the worker execution bridge over the existing ACP/session-pool lifecycle,
-   with local environment and workspace restrictions.
-5. Add signed result validation, artifact provenance, progress, cancellation,
-   and crash reconciliation.
-6. Add end-to-end tests for the state machine and all negative-test acceptance
-   criteria in §10.
-7. Consider remote mTLS federation only after the local protocol is stable and
-   its signed-envelope fixtures are independently verifiable.
+1. Define versioned request/result/event types, stable errors, task identity, and
+   capability/context policies.
+2. Implement the backend-neutral delegation coordinator and local task registry.
+3. Add authenticated WebSocket JSON-RPC transport with create, state/events,
+   reconnect, and cancel.
+4. Bridge OAB B tasks to the existing ACP connection/session pool without
+   changing the child environment allowlist.
+5. Add idempotency, durable cursors, signed result validation, and audit records.
+6. Add negative and end-to-end tests covering the acceptance criteria.
+7. Evaluate relay deployment and richer follow-up/message operations only after
+   the depth-one read-only MVP is stable.
 
-## 15. References
+## 12. References
 
 - [OpenAB ACP connection and session pool](../../crates/openab-core/src/acp/connection.rs)
 - [OpenAB child-process environment policy](../../AGENTS.md#3-security--child-process-environment)
-- [OpenClaw multi-agent routing](https://github.com/openclaw/openclaw/blob/main/docs/concepts/multi-agent.md)
-- [Hermes Agent subagent delegation](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/delegation.md)
-- [RFC 8785 — JSON Canonicalization Scheme](https://www.rfc-editor.org/rfc/rfc8785)
+- [Agent Client Protocol](https://agentclientprotocol.com/)
+- [RFC 8785 - JSON Canonicalization Scheme](https://www.rfc-editor.org/rfc/rfc8785)
 - [Ed25519 signatures](https://www.rfc-editor.org/rfc/rfc8032)
