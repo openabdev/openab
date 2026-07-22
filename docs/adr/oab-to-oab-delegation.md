@@ -33,88 +33,156 @@ provider is not part of this protocol decision.
 ## 2. Decision
 
 Add a dedicated **delegation adapter** with a client side in OAB A and a server
-side in OAB B:
+side in OAB B. The decision intent is to use **A2A 1.0 as the inter-OAB wire
+candidate**, with an OAB Delegation Profile that carries the OAB-specific
+security and reliability contract:
 
 ```text
 Agent A
   |
   | local delegate operation
   v
-OAB A DelegationClient
+OAB A DelegationAdapter / A2A Client
   |
-  | HTTPS bootstrap/health
-  | WebSocket + JSON-RPC 2.0
+  | A2A standard HTTP+JSON or JSON-RPC over HTTP + SSE
+  | optional A2A custom WSS binding
   v
-OAB B DelegationServer
+OAB B DelegationAdapter / A2A Server
   |
+  | OAB Delegation Profile enforcement
   | local session and policy enforcement
   v
 Agent B via ACP
 ```
 
-The delegation adapter is not another `ChatAdapter`. Chat adapters translate
-human-facing platform events; the delegation adapter translates a bounded local
-agent operation into a remote OAB task and maps the remote lifecycle back to
-the caller.
+The adapter is not another `ChatAdapter`. Chat adapters translate human-facing
+platform events; the delegation adapter translates a bounded local agent
+operation into an A2A task and maps the remote lifecycle back to the caller.
 
 OAB B keeps its ACP connection, credentials, environment, workspace policy, and
-tool approvals local. The outer delegation protocol must never expose ACP
-directly to a remote peer or forward OAB A's session and credentials.
+tool approvals local. Neither A2A nor the OAB profile may expose ACP directly to
+a remote peer or forward OAB A's session, credentials, environment, or live
+tool handles.
+
+This decision has a gate before a binding becomes normative. Until the gate
+passes, the adapter and coordinator remain transport-neutral and no WSS,
+SSE, or `delegate/*` method names are a compatibility promise. If the gate
+fails, OAB falls back to a custom OAB protocol rather than shipping an A2A
+wrapper that changes A2A core semantics or falsely claims standard
+interoperability.
 
 ### 2.1 Transport and protocol boundary
 
-The MVP uses authenticated HTTPS for bootstrap/health and a long-lived
-WebSocket carrying a versioned JSON-RPC 2.0 protocol. The transport provides
-bidirectional progress and cancellation; JSON-RPC provides method and error
-versioning without coupling the public contract to a vendor-specific ACP
-extension.
-
-The initial method set is intentionally small:
+The preferred standard binding is authenticated HTTP+JSON or JSON-RPC over HTTP
+with SSE for server-to-client progress and artifact updates. Ordinary HTTP
+operations carry task creation, state retrieval, and cancellation. The A2A
+operation mapping is:
 
 ```text
-delegate/describe       capability and protocol negotiation
-delegate/task.create    submit one remote task
-delegate/task.get       read current task state
-delegate/task.events    wait/replay progress and terminal events
-delegate/task.cancel    request cancellation
+remote task creation  -> SendMessage(returnImmediately: true)
+task state/result     -> GetTask
+task progress/events  -> SendStreamingMessage or SubscribeToTask
+task cancellation     -> CancelTask
+peer description      -> AgentCard / GetExtendedAgentCard
 ```
 
-A deployment may connect directly:
+A persistent WSS transport remains possible only as an A2A custom binding. Such
+a binding must preserve the A2A core data model and operation semantics, declare
+itself in the Agent Card, and document event ordering, reconnect, termination,
+authentication, and error mapping. It must not silently become a second
+`delegate/*` protocol.
+
+A deployment may connect directly using the selected binding, or use a relay
+when both OAB instances are outbound-only. The spike must compare the standard
+HTTP/SSE topology with the existing outbound WSS pairing:
 
 ```text
-OAB A -- outbound or inbound WSS --> OAB B
-```
+OAB A -- outbound selected binding --> OAB B
 
-or use a relay that pairs two outbound WebSockets:
-
-```text
-OAB A -- outbound WSS --> relay <-- outbound WSS -- OAB B
+OAB A -- outbound binding --> relay <-- outbound binding -- OAB B
 ```
 
 The relay is a deployment option, not a protocol dependency. Cloudflare Worker
 and Durable Object are possible implementations, but the ADR does not make
 Cloudflare APIs, pricing, or free-tier behavior part of the OAB contract.
 
-### 2.2 Task identity and result mapping
+### 2.2 OAB Delegation Profile normative requirements
+
+The profile is mandatory for an OAB peer; it is not optional metadata. It must
+be represented by explicitly declared, versioned, negotiable extensions that a
+peer can reject. The profile must define at least:
+
+- **Authority attenuation:**
+  `caller_grants intersection policy_A intersection policy_B intersection
+  request_capabilities intersection deployment_limits`; an empty intersection
+  is denied.
+- **Isolation:** no credential, session, environment, arbitrary host path, or
+  live tool-handle forwarding.
+- **Depth and scope:** maximum delegation depth one, bounded text input,
+  deadline, runtime/output budget, requested capabilities, and read-only default.
+- **Idempotency:** normalized request identity, nonce replay protection,
+  duplicate task reuse, and rejection of conflicting reuse.
+- **Durable observation:** event sequence/cursor, retention, reconnect replay,
+  gap detection, terminal-event durability, and no duplicate side effect from
+  observation or retry.
+- **Outcome semantics:** explicit `unknown` and `expired` outcomes; neither may
+  be silently converted into success or blindly retried.
+- **Provenance:** signed request/result digest binding, executor identity,
+  effective capabilities, artifact ownership, side effects, and audit record.
+- **Conformance:** a peer that does not negotiate the required profile must be
+  rejected fail-closed; A2A core authentication or an Agent Card signature is
+  not a substitute for these requirements.
+
+The profile must not redefine A2A core task lifecycle, operation names, or
+artifact semantics. If any required guarantee can only be implemented by
+rewriting those core semantics, the A2A gate fails and the implementation must
+use the custom OAB fallback instead.
+
+### 2.3 Implementation gate and fallback
+
+Before selecting a normative binding, run a time-bounded protocol spike. The
+spike is an implementation gate, not an open-ended research phase, and must
+produce a short conformance report with pass/fail evidence for all three gates:
+
+1. **Replay gate:** run the same `create -> progress -> cancel -> disconnect ->
+   reconnect` cases over HTTP/SSE and WSS where applicable. Durable cursors must
+   replay every event, including the terminal event, without restarting the ACP
+   task or repeating a side effect.
+2. **Relay gate:** exercise direct and dual-outbound relay topologies. Measure
+   connection establishment, reconnect, backpressure, cancellation races,
+   latency, load-balancer/firewall compatibility, monitoring, and key rotation.
+   The selected A2A binding must not be materially more complex or less
+   operable than the WSS baseline without an explicit accepted trade-off.
+3. **Profile gate:** count required fields, endpoints, and extensions and verify
+   that the profile remains a thin, explicitly negotiable addition. It must not
+   replace A2A lifecycle semantics or become a second protocol.
+
+A gate failure is conclusive: the implementation falls back to the custom OAB
+protocol and records the failed criterion. There is no second indefinite debate
+round. A gate pass permits adoption of A2A 1.0 plus the OAB profile, with the
+selected binding and its conformance tests recorded before implementation is
+called interoperable.
+
+### 2.4 Task identity and result mapping
 
 The caller supplies an idempotent `request_id`; the callee creates an immutable
-`task_id`:
+task identity:
 
 ```text
-request_id -> task_id -> turn_id -> event sequence/cursor
+request_id -> A2A taskId -> turn_id -> event sequence/cursor
 ```
 
 - `request_id` deduplicates task creation at OAB B.
-- `task_id` is the immutable storage and reconnect key generated by OAB B.
+- A2A `taskId` is the immutable storage and reconnect key generated by OAB B.
 - `task_path` is an optional human-readable route such as `/root/security`; it
   can change without changing task ownership or event history.
 - `turn_id` identifies an execution turn if the task later supports follow-up
   work.
-- `(task_id, turn_id, sequence)` identifies an event; a durable `cursor` allows
-  replay after reconnect.
+- `(taskId, turn_id, sequence)` identifies an event; the OAB profile's durable
+  `cursor` allows replay after reconnect.
 
-The caller waits by reading events or task state. Reconnecting with the same
-`task_id` resumes observation; it does not submit a second task. A terminal
+The caller waits by reading A2A events or task state. Reconnecting with the same
+`taskId` resumes observation; it does not submit a second task. A terminal
 result includes at least `status`, `summary`, `error`, `artifacts`, and
 `executed_by`.
 
@@ -302,14 +370,14 @@ feature models OAB agent-to-remote-OAB task ownership, progress, cancellation,
 and result provenance. OAB B may use MCP internally, but it is not the
 inter-OAB delegation protocol.
 
-### Adopt the A2A protocol as the outer protocol
+### A2A 1.0 plus OAB Delegation Profile (selected direction; gate pending)
 
-A2A is a serious candidate for the inter-OAB wire protocol and should be
-re-evaluated before implementation hardens the custom `delegate/*` method set.
-A2A v1.0 is explicitly designed for communication between independent,
-potentially opaque agents without exposing their internal state, memory, or
-tools. Its task, message, artifact, Agent Card, authentication, cancellation,
-and asynchronous update model overlaps substantially with this ADR.
+The selected direction is A2A 1.0 as the inter-OAB wire candidate, subject to
+the implementation gate in Section 2.3. A2A is explicitly designed for
+communication between independent, potentially opaque agents without exposing
+their internal state, memory, or tools. Its task, message, artifact, Agent Card,
+authentication, cancellation, and asynchronous update model overlaps
+substantially with this ADR.
 
 The conceptual mapping is direct:
 
@@ -350,23 +418,12 @@ A2A's extension and metadata mechanisms are appropriate places to declare
 these requirements, but credentials and live handles must never be forwarded
 through them.
 
-The preferred direction is therefore **A2A 1.0 plus an OAB Delegation Profile**,
-not raw A2A and not a second fully custom protocol:
-
-```text
-OAB DelegationAdapter / A2A Client
-  -> A2A standard binding (prefer HTTP+JSON or JSON-RPC + SSE)
-  -> OAB DelegationAdapter / A2A Server
-  -> local ACP session
-```
-
-The profile should define OAB extensions for request idempotency, authority
-attenuation, delegation depth, budgets and deadlines, principal chain,
-durable cursors, signed provenance, artifact ownership, audit records, and
-`unknown`/`expired` outcomes. Until that profile and its conformance tests are
-agreed, this ADR keeps the transport and method boundary implementation-neutral
-and treats A2A as the preferred protocol candidate rather than claiming that
-A2A alone satisfies the security and reliability acceptance criteria.
+This is the normative direction for the adapter, not a claim that raw A2A
+already satisfies OAB's contract. The selected binding becomes normative only
+when the Section 2.3 gate and conformance tests pass. Until then, the transport
+and method boundary remains implementation-neutral; if the gate fails, OAB
+falls back to the custom protocol and must not claim standard A2A
+interoperability.
 
 ### Implement only local subagents
 
@@ -375,10 +432,12 @@ does not let any running OAB agent connect to another remote OAB as requested.
 
 ### Stateless HTTP request/response
 
-Deferred as the only transport. HTTP is appropriate for bootstrap and health,
-but a long-running delegated task needs bidirectional progress, cancellation,
-and reconnect. WebSocket is the MVP transport; another transport can map to the
-same protocol later.
+Rejected as the only interaction model. A2A HTTP/JSON and JSON-RPC bindings
+provide task creation, state retrieval, and cancellation over HTTP, while SSE
+provides progress and artifact updates. The gate must verify whether that
+standard binding satisfies OAB's durable replay and outbound-only relay needs.
+A persistent WSS transport remains an optional A2A custom binding or the
+fallback custom OAB protocol if the gate fails.
 
 ## 8. Prior art
 
@@ -424,7 +483,8 @@ all of the following:
 3. A duplicate request reconnects to the existing task instead of executing it
    twice; a conflicting request is rejected.
 4. Progress and terminal events can be replayed from a durable cursor after a
-   WebSocket reconnect.
+   reconnect on the selected binding; the implementation does not restart an
+   ACP task or repeat a side effect during observation recovery.
 5. Cancellation, deadline expiry, worker failure, and `unknown` outcomes are
    distinguishable and tested.
 6. The child receives only its locally allowed environment and capabilities;
@@ -438,6 +498,18 @@ all of the following:
    starving ordinary OAB chat work.
 10. A human-readable audit record remains available even when the transport is
     encrypted.
+11. The replay gate passes the same create/progress/cancel/disconnect/reconnect
+    cases for each candidate binding, including complete terminal-event replay,
+    no ACP restart, and no duplicate side effect.
+12. The relay gate records direct and dual-outbound results for connection setup,
+    reconnect, backpressure, cancellation races, latency, load-balancer and
+    firewall compatibility, monitoring, and key rotation; no material
+    operability regression is accepted without an explicit trade-off.
+13. The profile gate records required fields, endpoints, and extensions and
+    proves that the profile is thin, explicitly negotiable, rejectable, and does
+    not redefine A2A lifecycle or artifact semantics.
+14. A failed gate records the failed criterion and selects the custom OAB
+    fallback; the implementation must not claim standard A2A interoperability.
 
 ## 10. Consequences
 
@@ -465,16 +537,21 @@ all of the following:
 
 ## 11. Implementation sequence
 
-1. Define versioned request/result/event types, stable errors, task identity, and
-   capability/context policies.
+1. Define the A2A data-model mapping, version negotiation, OAB Profile
+   extension identifiers, stable errors, task identity, and context policy.
 2. Implement the backend-neutral delegation coordinator and local task registry.
-3. Add authenticated WebSocket JSON-RPC transport with create, state/events,
-   reconnect, and cancel.
-4. Bridge OAB B tasks to the existing ACP connection/session pool without
+3. Run the time-bounded spike against A2A HTTP/JSON or JSON-RPC + SSE and the
+   WSS baseline/custom binding where needed; publish replay, relay, and profile
+   gate evidence.
+4. If the gate passes, select and declare the A2A binding in the Agent Card. If
+   it fails, record the criterion and select the custom OAB fallback without
+   claiming A2A interoperability.
+5. Bridge OAB B tasks to the existing ACP connection/session pool without
    changing the child environment allowlist.
-5. Add idempotency, durable cursors, signed result validation, and audit records.
-6. Add negative and end-to-end tests covering the acceptance criteria.
-7. Evaluate relay deployment and richer follow-up/message operations only after
+6. Add idempotency, durable cursors, signed result validation, audit records,
+   and the OAB Profile conformance tests.
+7. Add negative and end-to-end tests covering the acceptance criteria, then
+   evaluate relay deployment and richer follow-up/message operations only after
    the depth-one read-only MVP is stable.
 
 ## 12. References
