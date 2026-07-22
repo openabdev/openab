@@ -204,13 +204,13 @@ pub(crate) async fn ensure_exclusive_physical_identity(
     namespace: &str,
     name: &str,
 ) -> anyhow::Result<()> {
-    let mut pending = collision_aliases(namespace, name)
-        .into_iter()
-        .flat_map(|(alias_namespace, alias_name)| {
-            ownership_keys(&alias_namespace, &alias_name)
-                .into_iter()
-                .map(move |key| (alias_namespace.clone(), alias_name.clone(), key))
-        });
+    let mut items = Vec::new();
+    for (alias_namespace, alias_name) in collision_aliases(namespace, name) {
+        for key in ownership_keys(&alias_namespace, &alias_name) {
+            items.push((alias_namespace.clone(), alias_name.clone(), key));
+        }
+    }
+    let mut pending = items.into_iter();
     let mut probes = JoinSet::new();
     let mut in_flight = 0;
 
