@@ -3524,6 +3524,7 @@ fn validate_handoff_envelope(
     // mention-like prompt text; send_handoff explicitly allowlists only target_id.
 
     request.schema == MULTIBOT_HANDOFF_SCHEMA
+        && request.source_bot_id == source_id.to_string()
         && source_id == author_id
         && source_id != bot_id
         && trusted_bot_ids.contains(&author_id)
@@ -3571,6 +3572,18 @@ mod handoff_tests {
         let mut trusted = HashSet::new();
         trusted.insert(10);
         assert!(validate_handoff_envelope(&content, &req, 10, 20, 20, &trusted, 1_000));
+        let mut padded_source = req.clone();
+        padded_source.source_bot_id = "00010".into();
+        let padded_content = format!("<@20>\n{}", serde_json::to_string(&padded_source).unwrap());
+        assert!(!validate_handoff_envelope(
+            &padded_content,
+            &padded_source,
+            10,
+            20,
+            20,
+            &trusted,
+            1_000
+        ));
         req.payload.text = "quoted @everyone and <@20> remain prompt text".into();
         let content = format!("<@20>\n{}", serde_json::to_string(&req).unwrap());
         assert!(validate_handoff_envelope(&content, &req, 10, 20, 20, &trusted, 1_000));
