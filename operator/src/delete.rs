@@ -1155,15 +1155,25 @@ async fn run_with_bucket(
                         cleanup_failed = true;
                     }
                     if let Err(error) = cleanup_s3(&s3, bucket, namespace, name).await {
-                        let warning = format!("S3 cleanup incomplete (checkpoint retained): {error}");
+                        let warning = format!(
+                            "S3 cleanup incomplete (checkpoint retained): {error}"
+                        );
                         eprintln!("  ⚠ {warning}");
                         warnings.push(warning);
                         cleanup_failed = true;
                     }
                     if !cleanup_failed {
                         let key = checkpoint_key(namespace, name);
-                        if let Err(error) = s3.delete_object().bucket(bucket).key(&key).send().await {
-                            let warning = format!("delete checkpoint removal skipped (checkpoint retained): {error}");
+                        if let Err(error) = s3
+                            .delete_object()
+                            .bucket(bucket)
+                            .key(&key)
+                            .send()
+                            .await
+                        {
+                            let warning = format!(
+                                "delete checkpoint removal skipped (checkpoint retained): {error}"
+                            );
                             eprintln!("  ⚠ {warning}");
                             warnings.push(warning);
                             cleanup_failed = true;
@@ -1287,7 +1297,7 @@ mod tests {
         .expect("completed delete should produce a report");
         assert_eq!(
             report.services[0].warnings,
-            vec!["resumed from an existing checkpoint"]
+            vec!["resumed from an existing checkpoint".to_string()]
         );
     }
 
