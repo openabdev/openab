@@ -295,7 +295,9 @@ the PR:
 2. **Preserve attribution.** Cherry-pick the contributor's commits onto a new
    branch in this repository so the original commit author is preserved. If
    commits must be rewritten or squashed, add a
-   `Co-authored-by: Name <email>` trailer.
+   `Co-authored-by: username <username@users.noreply.github.com>` trailer
+   (GitHub requires the `Name <email>` form; the noreply address avoids
+   exposing a real email).
 3. **Credit in the PR description.** The replacement PR must mention the
    original contributor with `@username` and link the original PR
    (e.g. "Supersedes #123, carrying forward @contributor's work").
