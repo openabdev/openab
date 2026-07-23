@@ -674,25 +674,11 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 prompt_tasks.push(handle);
             }
             "session/cancel" => {
-                // Per ACP, session/cancel is a one-way NOTIFICATION — no response.
-                // Fire the session's cancel signal; the in-flight prompt observes
-                // it, cleans up, and returns stopReason:"cancelled" to the prompt's
-                // own request id.
-                let sess_key = req
-                    .params
-                    .as_ref()
-                    .and_then(|p| p.get("sessionId"))
-                    .and_then(|v| v.as_str());
-                if let Some(k) = sess_key {
-                    let notify = sessions.lock().await.get(k).and_then(|s| s.cancel.clone());
-                    if let Some(n) = notify {
-                        n.notify_one();
-                    }
-                }
-                // `session/cancel` is a notification: no response when sent as one. If a
-                // client sent it as a request (with an id), acknowledge with an empty result.
-                if !is_notification {
-                    let resp = JsonRpcResponse::success(id, json!({}));
+                // Notification form fires the cancel signal (no response); a request-shaped
+                // cancel is rejected -32600 rather than acked with an empty success (R17-F3c).
+                if let Some(resp) =
+                    handle_session_cancel(&sessions, id, req.params.as_ref(), is_notification).await
+                {
                     let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
                 }
             }
@@ -896,6 +882,35 @@ async fn handle_session_resume(
 
     // ACP session/resume response is an empty object (no history replay).
     JsonRpcResponse::success(id, json!({}))
+}
+
+/// Handle `session/cancel`. Per ACP it is a one-way NOTIFICATION: the notification form
+/// (no `id`) fires the session's cancel signal — the in-flight prompt observes it, cleans
+/// up, and returns `stopReason:"cancelled"` to the prompt's own request id — and produces
+/// no response (`None`). A request-shaped cancel (with an `id`) is a protocol violation: it
+/// is rejected with -32600 invalid request and does NOT fire the signal, rather than being
+/// acknowledged with an empty success frame (R17-F3c).
+async fn handle_session_cancel(
+    sessions: &Arc<tokio::sync::Mutex<HashMap<String, AcpSession>>>,
+    id: Value,
+    params: Option<&Value>,
+    is_notification: bool,
+) -> Option<JsonRpcResponse> {
+    if !is_notification {
+        return Some(JsonRpcResponse::error(
+            id,
+            -32600,
+            "session/cancel is a notification and must not carry an id",
+        ));
+    }
+    let sess_key = params.and_then(|p| p.get("sessionId")).and_then(|v| v.as_str());
+    if let Some(k) = sess_key {
+        let notify = sessions.lock().await.get(k).and_then(|s| s.cancel.clone());
+        if let Some(n) = notify {
+            n.notify_one();
+        }
+    }
+    None
 }
 
 /// Derive the deterministic `channel_id` (`acp_<uuid>`) from a client-supplied
@@ -1934,5 +1949,51 @@ mod acp_review_fixes {
         assert_eq!(chunks.len(), 1, "Phase-1 must stream exactly one terminal chunk, got {chunks:?}");
         assert_eq!(chunks[0], "hello world");
         assert_eq!(final_stop.as_deref(), Some("end_turn"), "a completed turn ends end_turn");
+    }
+
+    // R17-F3c — a request-shaped `session/cancel` (id present) must NOT be acknowledged with
+    // an empty success frame. ACP defines cancel as notification-only, so a request form is a
+    // protocol violation → -32600 invalid request, and the cancel signal is not fired.
+    #[tokio::test]
+    async fn cancel_as_request_is_rejected_not_empty_success() {
+        let sessions = sessions_map();
+        let params = json!({"sessionId": format!("sess_{}", Uuid::new_v4())});
+        let resp = handle_session_cancel(&sessions, json!(42), Some(&params), false)
+            .await
+            .expect("a request-shaped cancel must produce a response, not silence");
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["error"]["code"], json!(-32600), "request-shaped cancel must be -32600");
+        assert_eq!(v["id"], json!(42));
+        assert!(
+            v.get("result").is_none(),
+            "must NOT carry an empty-success result: {v}"
+        );
+    }
+
+    // R17-F3c — the notification form (no id) still fires the session's cancel signal and
+    // returns no response frame, unchanged.
+    #[tokio::test]
+    async fn cancel_as_notification_fires_signal_and_returns_no_response() {
+        let sessions = sessions_map();
+        let sid = format!("sess_{}", Uuid::new_v4());
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        sessions.lock().await.insert(
+            sid.clone(),
+            AcpSession {
+                channel_id: format!("acp_{}", Uuid::new_v4()),
+                busy: true,
+                cancel: Some(cancel.clone()),
+            },
+        );
+        let params = json!({"sessionId": sid});
+        let resp = handle_session_cancel(&sessions, Value::Null, Some(&params), true).await;
+        assert!(resp.is_none(), "a notification cancel must produce no response frame");
+        // notify_one stored a permit, so notified() resolves immediately — the signal fired.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), cancel.notified())
+                .await
+                .is_ok(),
+            "notification cancel must fire the session's cancel signal"
+        );
     }
 }
