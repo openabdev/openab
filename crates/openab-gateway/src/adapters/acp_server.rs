@@ -1118,18 +1118,21 @@ fn extract_prompt_params(params: Option<&Value>) -> Result<(String, String), Str
                     // Baseline ACP content (every agent MUST accept text + resource_link).
                     // We do not fetch the resource (that would be an SSRF risk); the link
                     // reference is passed through as text so the agent can act on it.
+                    //
+                    // The generated `ResourceLink` requires BOTH `name` and `uri` (R17-F3b);
+                    // an incomplete link is rejected (-32602) rather than silently rendered.
+                    let name = block
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .ok_or("resource_link content block missing required 'name'")?;
                     let uri = block
                         .get("uri")
                         .and_then(|v| v.as_str())
-                        .ok_or("resource_link content block missing 'uri'")?;
-                    let label = block
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| block.get("title").and_then(|v| v.as_str()));
-                    parts.push(match label {
-                        Some(l) => format!("[{l}]({uri})"),
-                        None => uri.to_string(),
-                    });
+                        .ok_or("resource_link content block missing required 'uri'")?;
+                    // Render as a Markdown link reference using the required `name` (matches
+                    // the prior name-preferred labelling; the bare-uri fallback is gone since
+                    // `name` is now mandatory).
+                    parts.push(format!("[{name}]({uri})"));
                 }
                 Some(other) => {
                     // Capability-gated variants (image / audio / embedded resource) that
@@ -1423,13 +1426,16 @@ mod acp_conformance {
         })))
         .unwrap();
         assert_eq!(text, "see\n[X](file:///x)");
-        // resource_link without a name/title renders the bare uri
-        let (_, text) = extract_prompt_params(Some(&json!({
-            "sessionId": "sess_x",
-            "prompt": [{"type": "resource_link", "uri": "https://e/x"}]
-        })))
-        .unwrap();
-        assert_eq!(text, "https://e/x");
+        // R17-F3b — `ResourceLink` requires `name`; a link missing it is rejected (-32602),
+        // no longer rendered as a bare uri.
+        assert!(
+            extract_prompt_params(Some(&json!({
+                "sessionId": "sess_x",
+                "prompt": [{"type": "resource_link", "uri": "https://e/x"}]
+            })))
+            .is_err(),
+            "resource_link missing required 'name' must be rejected"
+        );
         // resource_link missing its required uri → error
         assert!(extract_prompt_params(Some(&json!({
             "sessionId": "sess_x",
