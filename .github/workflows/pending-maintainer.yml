@@ -11,7 +11,16 @@ on:
 
 jobs:
   check-pending:
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.issue.pull_request != null || github.event.pull_request != null
+    # Fork guard: pull_request_review on a fork PR gets a read-only GITHUB_TOKEN,
+    # so label writes would 403 ("Resource not accessible by integration").
+    # Skip those runs — the hourly schedule / workflow_dispatch reconciliation
+    # (full token) keeps fork PR labels correct.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      github.event.issue.pull_request != null ||
+      (github.event.pull_request != null &&
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
