@@ -3540,7 +3540,7 @@ fn validate_handoff_envelope(
         && request
             .origin_thread_id
             .as_deref()
-            .map_or(true, |thread_id| thread_id == channel_id.as_str())
+            .is_none_or(|thread_id| thread_id == channel_id.as_str())
         && !request.origin_channel_id.is_empty()
         && !request.payload.text.is_empty()
         && request.payload.text.len() <= 100_000
