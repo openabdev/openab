@@ -36,6 +36,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::{error, info, warn};
 
+#[cfg(feature = "feishu")]
 const FEISHU_IDENTITY_RESOLUTION_TIMEOUT_SECS: u64 = 15;
 
 /// Wait for SIGINT (ctrl_c) or, on unix, SIGTERM.
