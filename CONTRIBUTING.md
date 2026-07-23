@@ -279,3 +279,33 @@ Every PR follows a label-driven lifecycle that keeps the review loop moving.
 - **Author comment always resets** — any comment by the PR author removes `pending-contributor` and `closing-soon`, flipping the PR back to `pending-maintainer`.
 - **Re-check may re-apply `closing-soon`** — after the flip, automated checks still run. If blockers remain (e.g., missing Discord URL, CI failure, `needs-rebase`), `closing-soon` will be re-applied immediately, keeping the ball on the contributor.
 - **Immediate `closing-soon`** — in some cases (e.g., missing Discord Discussion URL), `closing-soon` is applied immediately without waiting for the stale period. Auto-close follows in 24 hours.
+
+### Maintainer Take-Over of Fork PRs
+
+PRs from personal forks cannot always be finished on the contributor's branch:
+maintainer bots authenticate with GitHub App installation tokens, which GitHub
+does not allow to push to fork branches (the "Allow edits by maintainers"
+mechanism only applies to user credentials). Rather than blocking a good
+contribution on back-and-forth for small fixes, a maintainer may **take over**
+the PR:
+
+1. **Agree on direction first.** Take-over happens after a maintainer review,
+   when the approach is accepted and only nits or mechanical fixes remain —
+   or when the contributor is unresponsive and the change is worth landing.
+2. **Preserve attribution.** Cherry-pick the contributor's commits onto a new
+   branch in this repository so the original commit author is preserved. If
+   commits must be rewritten or squashed, add a
+   `Co-authored-by: Name <email>` trailer.
+3. **Credit in the PR description.** The replacement PR must mention the
+   original contributor with `@username` and link the original PR
+   (e.g. "Supersedes #1440, carrying forward @SunnyYYLin's contribution").
+4. **Finish the nits and merge.** The maintainer applies the remaining review
+   feedback on the new branch and merges once checks pass.
+5. **Close the original PR** with a comment linking the replacement, thanking
+   the contributor, and noting their authorship is preserved.
+
+Example: #1443 took over #1440.
+
+Contributors who prefer to finish the work themselves can say so on the PR —
+take-over is a convenience to get accepted work merged, not a way to bypass
+the contributor.
