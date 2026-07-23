@@ -298,7 +298,7 @@ the PR:
    `Co-authored-by: Name <email>` trailer.
 3. **Credit in the PR description.** The replacement PR must mention the
    original contributor with `@username` and link the original PR
-   (e.g. "Supersedes #1440, carrying forward @SunnyYYLin's contribution").
+   (e.g. "Supersedes #123, carrying forward @contributor's work").
 4. **Finish the nits and merge.** The maintainer applies the remaining review
    feedback on the new branch and merges once checks pass.
 5. **Close the original PR** with a comment linking the replacement, thanking
