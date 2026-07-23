@@ -52,8 +52,10 @@ ACP replies are routed back via the unified adapter's `dispatch_reply`
       the `openab.bearer.` entry and echoes the real `acp.v1` subprotocol. This is the de
       facto browser-WS bearer pattern (as used by the Kubernetes API server) and keeps the
       key **out of the URL**.
-   3. **`?token=<key>`** query — legacy fallback only; the key leaks into URLs / access
-      logs / history, so it is deprecated in favor of the subprotocol.
+   The `?token=<key>` query fallback was **removed** (R17-F2): a key in the URL leaks into
+   access logs / browser history / referers, and the two header-borne sources above fully
+   cover both non-browser and browser clients. Only those two carry the bearer; a request
+   presenting a credential solely via the query string is rejected `401` in keyed mode.
 
    We deliberately do **not** repurpose ACP's `authenticate` / `authMethods` for this:
    those are agent→provider auth (the client helping a locally-spawned agent log in to its

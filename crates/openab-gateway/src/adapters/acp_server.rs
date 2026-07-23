@@ -14,7 +14,7 @@
 
 use crate::schema::*;
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{Query, State, WebSocketUpgrade};
+use axum::extract::{State, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
@@ -61,6 +61,21 @@ fn subprotocol_token(headers: &axum::http::HeaderMap) -> Option<&str> {
                 .map(str::trim)
                 .find_map(|p| p.strip_prefix(BEARER_SUBPROTOCOL_PREFIX))
         })
+}
+
+/// Extract the transport bearer key from a WS upgrade request, in priority order:
+///   1. `Authorization: Bearer <token>` — non-browser clients (cleanest).
+///   2. `Sec-WebSocket-Protocol: openab.bearer.<token>, acp.v1` — browsers (keeps the token
+///      out of the URL; the de facto browser-WS bearer pattern).
+///
+/// The legacy `?token=<token>` query fallback was removed (R17-F2): it leaks the key into
+/// URLs / access logs / history, so only these two header-borne sources carry the bearer.
+fn ws_bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .or_else(|| subprotocol_token(headers))
 }
 
 /// RFC 6455 subprotocol values must be RFC 7230 `token`s. `tchar` = ALPHA / DIGIT /
@@ -338,21 +353,12 @@ impl JsonRpcResponse {
 
 pub async fn ws_upgrade(
     State(state): State<Arc<crate::AppState>>,
-    query: Query<HashMap<String, String>>,
     headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> axum::response::Response {
-    // Bearer token, in priority order:
-    //   1. `Authorization: Bearer <token>` — non-browser clients (cleanest).
-    //   2. `Sec-WebSocket-Protocol: openab.bearer.<token>, acp.v1` — browsers (keeps the
-    //      token out of the URL; the de facto browser-WS bearer pattern).
-    //   3. `?token=<token>` query — legacy fallback; leaks in URLs/logs, deprecated.
-    let token = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .or_else(|| subprotocol_token(&headers))
-        .or_else(|| query.get("token").map(|s| s.as_str()));
+    // Bearer key from a header-borne source only (Authorization or the WS subprotocol);
+    // the legacy `?token=` query fallback was dropped in R17-F2. See `ws_bearer_token`.
+    let token = ws_bearer_token(&headers);
 
     let expected = state.acp.as_ref().and_then(|c| c.auth_key.as_ref());
     if let Some(expected) = expected {
@@ -1737,6 +1743,27 @@ mod acp_review_fixes {
         // Match is exact — no scheme/host/port fuzzing, no trailing-slash leniency.
         assert!(!acp_origin_ok(Some("https://app.example/"), &allow));
         assert!(!acp_origin_ok(Some("http://app.example"), &allow));
+    }
+
+    // R17-F2 — the legacy `?token=` query fallback is gone. The bearer is extracted ONLY
+    // from `Authorization: Bearer` or the `Sec-WebSocket-Protocol` subprotocol; `ws_upgrade`
+    // no longer reads the query string. A request whose only credential would have been
+    // `?token=<key>` now carries no header-borne token, so extraction yields None → keyed
+    // mode rejects it 401 (the query is never consulted).
+    #[test]
+    fn ws_bearer_token_ignores_query_only_request() {
+        use axum::http::HeaderMap;
+        // No Authorization, no subprotocol → what used to be a `?token=` request now has no
+        // extractable bearer (None → 401 in keyed mode).
+        assert_eq!(ws_bearer_token(&HeaderMap::new()), None);
+        // Authorization: Bearer still carries the key.
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "Bearer sekret".parse().unwrap());
+        assert_eq!(ws_bearer_token(&h), Some("sekret"));
+        // The subprotocol path still carries the key.
+        let mut h = HeaderMap::new();
+        h.insert("sec-websocket-protocol", "openab.bearer.sekret, acp.v1".parse().unwrap());
+        assert_eq!(ws_bearer_token(&h), Some("sekret"));
     }
 
     // subprotocol charset (n1) — base64 `/` and `=` are not RFC 6455 token chars; the
