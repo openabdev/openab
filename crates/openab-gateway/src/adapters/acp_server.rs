@@ -1098,10 +1098,11 @@ fn extract_prompt_params(params: Option<&Value>) -> Result<(String, String), Str
         .to_string();
     let prompt = params.get("prompt").ok_or("Missing prompt")?;
 
-    // Prompt can be an array of content blocks or a simple string. The base is
-    // text-only: an unsupported block type (image / audio / resource / resource_link)
-    // is rejected explicitly rather than silently dropped, so the client knows its
-    // content was not delivered.
+    // Per the ACP schema the generated `PromptRequest.prompt` is `[ContentBlock]`; a plain
+    // string (or any non-array) is non-conformant and rejected below (-32602), never
+    // leniently coerced. The base is text-only: an unsupported block type (image / audio /
+    // resource / resource_link) is rejected explicitly rather than silently dropped, so the
+    // client knows its content was not delivered.
     let text = if let Some(arr) = prompt.as_array() {
         let mut parts: Vec<String> = Vec::with_capacity(arr.len());
         for block in arr {
@@ -1142,10 +1143,10 @@ fn extract_prompt_params(params: Option<&Value>) -> Result<(String, String), Str
             }
         }
         parts.join("\n")
-    } else if let Some(s) = prompt.as_str() {
-        s.to_string()
     } else {
-        return Err("Invalid prompt format".into());
+        // A plain-string `prompt` (or any non-array) does not match the generated
+        // `PromptRequest.prompt: [ContentBlock]` shape → -32602 invalid params.
+        return Err("Invalid prompt: 'prompt' must be an array of content blocks".into());
     };
 
     if text.trim().is_empty() {
@@ -1442,9 +1443,18 @@ mod acp_conformance {
             "prompt": [{"type": "image", "data": "..", "mimeType": "image/png"}]
         })))
         .is_err());
-        // a plain-string prompt still works
-        let (_, s) = extract_prompt_params(Some(&json!({"sessionId": "sess_x", "prompt": "hello"}))).unwrap();
-        assert_eq!(s, "hello");
+        // R17-F3a — a plain-string prompt is non-conformant (schema requires
+        // `prompt: [ContentBlock]`) → rejected, surfaced as -32602 at the call site.
+        assert!(
+            extract_prompt_params(Some(&json!({"sessionId": "sess_x", "prompt": "hello"}))).is_err(),
+            "a bare string prompt must be rejected, not coerced"
+        );
+        // an object (non-array, non-string) prompt is likewise rejected.
+        assert!(
+            extract_prompt_params(Some(&json!({"sessionId": "sess_x", "prompt": {"type": "text"}})))
+                .is_err(),
+            "a non-array prompt must be rejected"
+        );
     }
 
     // --- transport auth gate (F1): no key allowed only on loopback ---
