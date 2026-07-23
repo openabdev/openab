@@ -1,7 +1,7 @@
 # Feishu / Lark
 
 
-> **Unified Mode (v0.9.0+):** The OAB binary now embeds the feishu adapter directly. Set `FEISHU_APP_ID` as an env var — no separate gateway container or `[gateway]` config needed. See [Telegram docs](telegram.md#unified-mode-recommended) for the pattern.
+> **Unified Mode (v0.9.0+, WebSocket support v0.10.0+):** The OAB binary now embeds the feishu adapter directly. Set `FEISHU_APP_ID` as an env var — no separate gateway container or `[gateway]` config needed. See [Telegram docs](telegram.md#unified-mode-recommended) for the pattern.
 
 ### Unified Config (Kiro + feishu)
 
@@ -313,6 +313,7 @@ Bot identification requires explicit configuration via `FEISHU_TRUSTED_BOT_IDS` 
 | Problem | Fix |
 |---|---|
 | Bot doesn't respond | Check `FEISHU_APP_ID`/`FEISHU_APP_SECRET` are correct. Check gateway logs for token errors. |
+| Unified mode receives no events | Use a release with unified WebSocket support (v0.10.0+) or use the standalone gateway as a workaround. See #1356 for the transport-mode follow-up. |
 | Bot doesn't respond in groups | Ensure bot is @mentioned, or set `requireMention: false`. Check `botUsername` matches bot's `open_id`. |
 | WebSocket keeps reconnecting | Check event subscription is set to **Long Connection** mode. Check app is published and approved. |
 | Webhook verification fails | Ensure `verificationToken` and `encryptKey` match Feishu app config. |
