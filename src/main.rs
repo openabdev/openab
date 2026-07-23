@@ -36,6 +36,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::{error, info, warn};
 
+const FEISHU_IDENTITY_RESOLUTION_TIMEOUT_SECS: u64 = 15;
+
 /// Wait for SIGINT (ctrl_c) or, on unix, SIGTERM.
 async fn shutdown_signal() {
     #[cfg(unix)]
@@ -1093,7 +1095,7 @@ async fn main() -> anyhow::Result<()> {
             if let Some(ref f) = gw_state.feishu {
                 use openab_gateway::adapters::feishu;
                 match tokio::time::timeout(
-                    std::time::Duration::from_secs(15),
+                    std::time::Duration::from_secs(FEISHU_IDENTITY_RESOLUTION_TIMEOUT_SECS),
                     f.resolve_bot_identity(),
                 )
                 .await
