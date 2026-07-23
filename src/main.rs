@@ -1092,7 +1092,17 @@ async fn main() -> anyhow::Result<()> {
             #[cfg(feature = "feishu")]
             if let Some(ref f) = gw_state.feishu {
                 use openab_gateway::adapters::feishu;
-                f.resolve_bot_identity().await;
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    f.resolve_bot_identity(),
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(_) => warn!(
+                        "unified: feishu bot identity resolution timed out; continuing without bot identity"
+                    ),
+                }
                 if f.config.streaming_mode != feishu::StreamingMode::Post {
                     let idle_ms = f.config.card_idle_finalize_ms;
                     tokio::spawn(feishu::run_idle_reaper(
