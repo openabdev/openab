@@ -65,6 +65,16 @@ ACP replies are routed back via the unified adapter's `dispatch_reply`
    (`0.0.0.0`, LAN, LoadBalancer) without a key refuses to mount the endpoint, so an
    unauthenticated agent endpoint is never exposed to the network. An empty key counts as
    unset.
+
+   **Browser `Origin` gating in keyless mode:** a WS handshake is exempt from the browser
+   same-origin policy, so a keyless `ws://127.0.0.1/acp` is otherwise reachable cross-origin
+   by any web page the user has open. In keyless (loopback) mode the upgrade handler
+   therefore inspects `Origin`: a browser-set `Origin` that is not allowlisted is rejected
+   with `403`, while a request with no `Origin` (a non-browser client) is admitted. The
+   allowlist is opt-in via `OPENAB_ACP_ALLOWED_ORIGINS` (comma-separated exact origins) and
+   defaults to empty — i.e. every browser origin is blocked until explicitly allowed. The
+   keyed (bearer) path does not consult `Origin`; the transport key is the trust boundary
+   there.
 2. **Identity** — ACP events carry a fixed synthetic sender id `acp_client` and pass
    through the gateway trust registry (the `acp` platform is seeded there alongside
    telegram/line/…). Admit the sender with `GATEWAY_ALLOW_ALL_USERS=true` or

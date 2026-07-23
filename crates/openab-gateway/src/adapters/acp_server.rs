@@ -76,6 +76,10 @@ fn is_ws_subprotocol_token_char(b: u8) -> bool {
 
 pub struct AcpConfig {
     pub auth_key: Option<String>,
+    /// Browser `Origin`s allowed to drive `/acp` in keyless loopback mode (from
+    /// `OPENAB_ACP_ALLOWED_ORIGINS`, comma-separated). Empty by default → every
+    /// browser-set `Origin` is rejected; non-browser clients (no `Origin`) are unaffected.
+    pub allowed_origins: Vec<String>,
 }
 
 impl AcpConfig {
@@ -104,7 +108,36 @@ impl AcpConfig {
             ),
             Some(_) => {}
         }
-        Some(Self { auth_key })
+        // Browser-origin allowlist for keyless loopback mode. A WS handshake bypasses the
+        // browser same-origin policy, so without this any web page could drive a keyless
+        // `ws://127.0.0.1/acp`. Comma-separated; blanks trimmed. Default empty blocks all
+        // browser origins (a non-browser client sends no `Origin` and is unaffected).
+        let allowed_origins = std::env::var("OPENAB_ACP_ALLOWED_ORIGINS")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Some(Self {
+            auth_key,
+            allowed_origins,
+        })
+    }
+}
+
+/// Whether a **keyless-mode** WS upgrade may proceed given its `Origin` header. WS
+/// handshakes are exempt from the browser same-origin policy, so on a keyless loopback
+/// bind any web page could otherwise drive `/acp`. A request with no `Origin` (a
+/// non-browser client) is allowed; a browser-set `Origin` must be explicitly allowlisted
+/// via `OPENAB_ACP_ALLOWED_ORIGINS` (default empty → every browser origin blocked). Keyed
+/// binds authenticate via the bearer key and never reach this check.
+fn acp_origin_ok(origin: Option<&str>, allowed_origins: &[String]) -> bool {
+    match origin {
+        None => true,
+        Some(o) => allowed_origins.iter().any(|a| a == o),
     }
 }
 
@@ -334,6 +367,25 @@ pub async fn ws_upgrade(
         if !valid {
             warn!("ACP WebSocket rejected: invalid or missing token");
             return StatusCode::UNAUTHORIZED.into_response();
+        }
+    } else {
+        // Keyless loopback mode: the bearer check above is skipped, so a browser could
+        // reach us cross-origin (WS handshakes bypass the same-origin policy). Reject a
+        // browser-set `Origin` that isn't allowlisted; a non-browser client (no `Origin`)
+        // is allowed.
+        let origin = headers.get("origin").and_then(|v| v.to_str().ok());
+        let allowed = state
+            .acp
+            .as_ref()
+            .map(|c| c.allowed_origins.as_slice())
+            .unwrap_or(&[]);
+        if !acp_origin_ok(origin, allowed) {
+            warn!(
+                "ACP WebSocket rejected: browser Origin {:?} not in OPENAB_ACP_ALLOWED_ORIGINS \
+                 (keyless loopback mode)",
+                origin
+            );
+            return StatusCode::FORBIDDEN.into_response();
         }
     }
 
@@ -1662,6 +1714,29 @@ mod acp_review_fixes {
             Ok(ReplyChunk::Text(t)) => assert_eq!(t, "hello"),
             _ => panic!("expected the matching reply to be delivered"),
         }
+    }
+
+    // R17-F1 — keyless-mode browser `Origin` gating. A WS handshake bypasses the browser
+    // same-origin policy, so on a keyless loopback bind an un-allowlisted browser origin
+    // must be refused (ws_upgrade turns `false` into a 403). A non-browser client sends no
+    // `Origin` and is always admitted; the keyed path never reaches this check (it lives in
+    // the `else` of the bearer branch), so a keyed bind is unaffected by the allowlist.
+    #[test]
+    fn acp_origin_ok_keyless_gating() {
+        let allow = vec!["https://app.example".to_string(), "http://localhost:5173".to_string()];
+        // Absent Origin (non-browser client) → accept, regardless of allowlist.
+        assert!(acp_origin_ok(None, &allow), "no Origin (non-browser) must be admitted");
+        assert!(acp_origin_ok(None, &[]), "no Origin must be admitted even with empty allowlist");
+        // Allowlisted browser Origin → accept (exact match, both entries).
+        assert!(acp_origin_ok(Some("https://app.example"), &allow));
+        assert!(acp_origin_ok(Some("http://localhost:5173"), &allow));
+        // Disallowed browser Origin → reject (→ 403 at the handler).
+        assert!(!acp_origin_ok(Some("https://evil.example"), &allow));
+        // Default empty allowlist blocks every browser-set Origin.
+        assert!(!acp_origin_ok(Some("https://app.example"), &[]));
+        // Match is exact — no scheme/host/port fuzzing, no trailing-slash leniency.
+        assert!(!acp_origin_ok(Some("https://app.example/"), &allow));
+        assert!(!acp_origin_ok(Some("http://app.example"), &allow));
     }
 
     // subprotocol charset (n1) — base64 `/` and `=` are not RFC 6455 token chars; the
