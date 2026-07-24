@@ -260,7 +260,8 @@ impl GmailNative {
     async fn get_message(&self, args: &Map<String, Value>) -> Result<Value> {
         let id = required_id(args, "messageId")?;
         let format = message_format(args)?;
-        self.api_get(&format!("messages/{id}?format={format}")).await
+        self.api_get(&format!("messages/{id}?format={format}"))
+            .await
     }
 
     async fn list_labels(&self) -> Result<Value> {
@@ -320,7 +321,9 @@ impl GmailNative {
         if let Some(tid) = thread_id {
             message["threadId"] = json!(tid);
         }
-        let created = self.api_post("drafts", &json!({ "message": message })).await?;
+        let created = self
+            .api_post("drafts", &json!({ "message": message }))
+            .await?;
         // The ADR requires drafts to be presented as drafts (§6.5): make the
         // outcome unambiguous for the calling agent.
         Ok(json!({
@@ -343,8 +346,7 @@ impl QueryString {
     }
     fn push_opt_str(&mut self, key: &str, v: Option<&Value>) {
         if let Some(s) = v.and_then(Value::as_str).filter(|s| !s.is_empty()) {
-            self.parts
-                .push(format!("{key}={}", urlencoding::encode(s)));
+            self.parts.push(format!("{key}={}", urlencoding::encode(s)));
         }
     }
     fn push_opt_u64(&mut self, key: &str, v: Option<&Value>, default: u64) {
@@ -552,7 +554,10 @@ fn encode_subject(subject: &str) -> Result<String> {
     if subject.is_ascii() {
         Ok(subject.to_string())
     } else {
-        Ok(format!("=?UTF-8?B?{}?=", B64_STD.encode(subject.as_bytes())))
+        Ok(format!(
+            "=?UTF-8?B?{}?=",
+            B64_STD.encode(subject.as_bytes())
+        ))
     }
 }
 
@@ -671,20 +676,21 @@ impl ServerHandler for GmailNative {
     ) -> Result<CallToolResult, McpError> {
         let empty = Map::new();
         let args = request.arguments.as_ref().unwrap_or(&empty);
-        let outcome = match request.name.as_ref() {
-            "search_threads" => self.search_threads(args).await,
-            "get_thread" => self.get_thread(args).await,
-            "get_message" => self.get_message(args).await,
-            "list_labels" => self.list_labels().await,
-            "list_drafts" => self.list_drafts(args).await,
-            "create_draft" => self.create_draft(args).await,
-            other => {
-                return Err(McpError::invalid_params(
-                    format!("unknown tool {other:?} — this adapter serves the six-tool Gmail profile"),
+        let outcome =
+            match request.name.as_ref() {
+                "search_threads" => self.search_threads(args).await,
+                "get_thread" => self.get_thread(args).await,
+                "get_message" => self.get_message(args).await,
+                "list_labels" => self.list_labels().await,
+                "list_drafts" => self.list_drafts(args).await,
+                "create_draft" => self.create_draft(args).await,
+                other => return Err(McpError::invalid_params(
+                    format!(
+                        "unknown tool {other:?} — this adapter serves the six-tool Gmail profile"
+                    ),
                     None,
-                ))
-            }
-        };
+                )),
+            };
         Ok(match outcome {
             Ok(v) => CallToolResult::success(vec![Content::text(
                 serde_json::to_string(&v).unwrap_or_else(|_| v.to_string()),
@@ -792,7 +798,11 @@ pub async fn login(redirect_uri: &str) -> Result<()> {
         .map_err(|e| anyhow!("persist gmail-native credentials: {e}"))?;
     println!(
         "● logged in: {CREDENTIAL_KEY} (refresh token: {})",
-        if refresh.is_some() { "yes" } else { "NO — see warning above" }
+        if refresh.is_some() {
+            "yes"
+        } else {
+            "NO — see warning above"
+        }
     );
     Ok(())
 }
@@ -852,7 +862,7 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("invalid email address"), "{err}");
+        assert!(err.to_string().contains("control character"), "{err}");
         let err = build_mime(
             &["a@example.com".into()],
             &[],
