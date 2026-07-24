@@ -7,9 +7,10 @@
 ## 1. Context and Problem Statement
 
 OpenAB already has a native MCP client in `openab-agent`. It supports local stdio
-servers and remote Streamable HTTP servers, OAuth, lazy connection, a single
-LLM-facing `mcp` meta-tool, and configuration-driven activation. Those decisions
-are recorded in [`openab-agent-mcp.md`](./openab-agent-mcp.md).
+servers and remote Streamable HTTP servers, OAuth, lazy connection, a
+progressive-disclosure `mcp` meta-tool for direct agent use, and
+configuration-driven activation. Those decisions are recorded in
+[`openab-agent-mcp.md`](./openab-agent-mcp.md).
 
 What is missing is a small, explicit product and integration boundary for
 first-party supported external services. Without that boundary, every service
@@ -17,118 +18,133 @@ becomes an ad-hoc `mcp.json` entry, authentication and tool-safety expectations
 are unclear, and reviewers cannot distinguish an OAB adapter from a generic
 third-party MCP server.
 
-This ADR defines **OAB MCP Adapter** as an outbound agent adapter. It connects an
-OpenAB agent to configured external MCP servers and exposes their capabilities
-through the existing native MCP client. The MVP supports:
+This ADR defines **OAB MCP Adapter** as an outbound agent capability adapter behind an OAB-hosted MCP facade. The facade gives a coding agent one stable, OpenWork-style surface:
+
+- `search_capabilities`
+- `execute_capability`
+
+OAB then discovers and invokes tools on configured external MCP servers. The MVP supports:
 
 - **Notion** via Notion's hosted MCP server.
 - **Gmail** via Google's hosted Gmail MCP server, currently a Developer Preview
   and therefore explicitly opt-in and preview-labelled.
 
-This is not a proposal to add a second MCP client, an inbound OAB MCP server, or
-native Gmail/Notion REST adapters.
+This is not a proposal to add a second outbound MCP client. It adds the
+agent-facing facade boundary while reusing the existing `openab-agent` MCP
+runtime for downstream connections. It also does not add native Gmail/Notion
+REST adapters.
 
 ## 2. Goals and Non-Goals
 
 ### Goals
 
 - Give OAB a named, documented **MCP adapter** comparable to other OAB
-  integrations, while keeping the transport implementation in `openab-agent`.
+  integrations, with a stable agent-facing MCP facade.
+- Expose exactly two facade tools to the connected agent:
+  - `search_capabilities`: discover authorized capabilities from configured
+    external MCP servers.
+  - `execute_capability`: execute an exact capability returned by discovery.
 - Provide tested configuration profiles for Notion and Gmail over Streamable
   HTTP.
-- Preserve progressive disclosure: the LLM sees one `mcp` meta-tool and
-  discovers provider tools only when needed.
+- Preserve progressive disclosure: provider tools are not flattened into the
+  agent's top-level tool list.
 - Reuse the existing MCP OAuth, PKCE, credential storage, timeout, redaction,
-  circuit-breaker, and tool-filter mechanisms.
+  circuit-breaker, and tool-filter mechanisms for downstream connections.
 - Make least-privilege and write safety explicit:
   - Notion read tools are the default MVP surface; page/database mutations are
     explicit opt-in tools.
   - Gmail search/read and draft creation are supported; direct send and delete
     are not part of the MVP surface.
-- Keep existing deployments unchanged when no MCP server is configured.
+- Keep existing deployments unchanged when the MCP facade and no MCP adapters
+  are configured.
 
 ### Non-goals
 
-- Implementing an OAB-hosted MCP server for external clients such as Codex or
-  Claude Code.
+- Exposing every provider tool directly to the agent or copying provider-specific
+  MCP schemas into a second public tool surface.
 - Replacing OBK for GitHub, AWS, Discord, or other integrations already owned by
   OBK.
 - Implementing a native Gmail or Notion REST API adapter in OAB.
 - Supporting legacy HTTP+SSE when the provider offers Streamable HTTP.
-- Providing organization-wide credential management or a control plane. OAB's
-  configured MCP credentials remain agent-local and follow the existing
-  `openab-agent` persistence model.
+- Providing organization-wide credential management or a multi-tenant control
+  plane. This MVP assumes a configured OAB instance and its existing auth
+  boundary.
 - Automatically enabling Gmail's Developer Preview endpoint in existing or new
   deployments without explicit configuration.
 
 ## 3. At a Glance
 
 ```text
-┌──────────────────────────────────────────────────────────────────────────┐
-│ OpenAB                                                                     │
-│                                                                          │
-│  Channel adapter (Discord / Slack / Gateway)                              │
-│        │                                                                    │
-│        ▼                                                                    │
-│  ACP host ── stdio JSON-RPC ──► openab-agent                              │
-│                                  │                                         │
-│                                  │ existing `mcp` meta-tool               │
-│                                  ▼                                         │
-│                         ┌─────────────────────┐                            │
-│                         │ OAB MCP Adapter     │                            │
-│                         │                    │                            │
-│                         │ config + OAuth     │                            │
-│                         │ tool discovery     │                            │
-│                         │ filtering + audit  │                            │
-│                         └─────────┬──────────┘                            │
-│                                   │ outbound MCP client                   │
-└───────────────────────────────────┼──────────────────────────────────────┘
-                                    │ Streamable HTTP + OAuth
-             ┌──────────────────────┴────────────────────────┐
-             ▼                                               ▼
-┌────────────────────────────┐                 ┌────────────────────────────┐
-│ Notion hosted MCP           │                 │ Google Gmail hosted MCP     │
-│ https://mcp.notion.com/mcp  │                 │ gmailmcp.googleapis.com/... │
-│ OAuth; provider permissions │                 │ OAuth; Developer Preview    │
-└────────────────────────────┘                 └────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────┐
+│ Coding CLI / Agent                                                         │
+│   MCP client                                                               │
+└────────────────────────────────┬───────────────────────────────────────────┘
+                                 │ Streamable HTTP MCP (local or remote)
+                                 ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│ OAB MCP Facade                                                             │
+│   search_capabilities(query)                                               │
+│   execute_capability(name, arguments)                                      │
+│                                                                            │
+│   auth + policy + capability registry                                     │
+└────────────────────────────────┬───────────────────────────────────────────┘
+                                 │ internal dispatch
+                                 ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│ OAB MCP Adapter                                                            │
+│   outbound MCP client · OAuth · tools/list · tools/call · filtering        │
+└────────────────────────────────┬───────────────────────────────────────────┘
+                                 │ Streamable HTTP MCP + provider OAuth
+                 ┌───────────────┴────────────────┐
+                 ▼                                ▼
+┌──────────────────────────────┐  ┌─────────────────────────────────────────┐
+│ Notion hosted MCP             │  │ Google Gmail hosted MCP                 │
+│ https://mcp.notion.com/mcp    │  │ https://gmailmcp.googleapis.com/mcp/v1 │
+│ user OAuth                    │  │ user OAuth · Developer Preview         │
+└──────────────────────────────┘  └─────────────────────────────────────────┘
 ```
 
-The direction is intentional: the agent connects **out** to service MCP
-servers. OAB does not expose an MCP endpoint in this MVP.
+The direction is intentional: the agent calls OAB, and OAB calls external
+MCP servers. The facade never exposes provider credentials or asks the agent to
+construct provider-specific tool calls directly.
 
 ## 4. Terminology and Positioning
 
 - **OAB MCP** is the user-facing feature name.
-- **OAB MCP Adapter** is the architecture/component name.
+- **OAB MCP Facade** is the inbound, agent-facing MCP server surface.
+- **OAB MCP Adapter** is the outbound component that connects OAB to one or
+  more external MCP servers.
 - **MCP server instance** is one configured provider connection, such as
   `notion` or `gmail`.
-- **Provider tool** is a tool advertised by that remote MCP server.
-- **`mcp` meta-tool** is the existing LLM-facing tool with actions such as
-  `list_servers`, `list_tools`, `describe_tool`, and `call`.
+- **Capability** is the OAB-facing, searchable representation of an authorized
+  provider tool.
+- **`search_capabilities`** and **`execute_capability`** are the only facade
+  methods exposed to the connected agent in the MVP.
 
 MCP is an agent capability adapter, not a channel adapter and not an Ambient
-activation mode. Ambient decides when an agent is prompted; MCP decides which
-external capabilities the agent can use after it is prompted.
+activation mode. Ambient decides when an agent is prompted; the OAB MCP facade
+and adapter decide how that agent reaches authorized external capabilities.
 
 ## 5. Prior Art and Industry Research
 
 ### 5.1 Existing OpenAB MCP client
 
-[`openab-agent-mcp.md`](./openab-agent-mcp.md) already establishes the relevant
-foundation:
+[`openab-agent-mcp.md`](./openab-agent-mcp.md) establishes the downstream
+runtime foundation:
 
-- `openab-agent` is an MCP client, not an MCP server.
+- `openab-agent` is an MCP client, not the agent-facing OAB MCP server.
 - `mcpServers` configuration is loaded from global and project
   `.openab/agent/mcp.json` files.
 - A configured server is the activation signal; an empty or missing config keeps
-  the MCP surface absent.
-- Streamable HTTP and stdio are supported; the LLM receives one progressive
-  disclosure meta-tool rather than a flat tool list.
+  the downstream MCP surface absent.
+- Streamable HTTP and stdio are supported, with lazy connection and progressive
+  disclosure rather than a flat provider tool list.
 - OAuth uses PKCE and persisted credentials, with headless paste-back/device
   flows where the provider supports them.
 
-This ADR adds service profiles and safety expectations; it does not re-specify
-that client runtime.
+The OAB MCP facade is the stable inbound boundary for a coding agent. It may use
+this existing client/runtime internally for provider discovery and execution;
+this ADR does not create a second transport or credential implementation.
 
 ### 5.2 OpenWork
 
@@ -138,11 +154,12 @@ OpenWork's Den provides useful prior art for the product boundary:
 - Its external MCP path treats Notion and similar services as MCP clients,
   discovers provider tools, and proxies calls with member-scoped credentials.
 - Its agent-facing endpoint uses progressive discovery instead of exposing every
-  provider tool directly.
+  provider tool directly, matching the two-method OAB facade proposed here.
 
-OAB adopts the external MCP path for Notion. It does not copy OpenWork's Den
-control plane or its native Gmail REST adapter; OAB remains a local/agent-side
-adapter in this MVP.
+OAB adopts the external MCP path for Notion and the agent-facing progressive
+facade pattern. It does not copy OpenWork's Den control plane or its native
+Gmail REST adapter; OAB keeps authorization and provider connectivity within
+its configured facade/adapter boundary.
 
 References: [OpenWork agent MCP](https://github.com/different-ai/openwork/blob/dev/ee/apps/den-api/src/mcp/agent.ts),
 [OpenWork external capabilities](https://github.com/different-ai/openwork/blob/dev/ee/apps/den-api/src/mcp/external-capabilities.ts),
@@ -199,17 +216,30 @@ References: [OpenClaw](https://github.com/openclaw/openclaw),
 
 ## 6. Proposed Solution
 
-### 6.1 Adapter boundary
+### 6.1 Facade and adapter boundary
 
-Add OAB MCP as a documented adapter profile on top of the existing
-`McpRuntimeManager`:
+The OAB MCP facade is the inbound MCP server exposed to the coding agent. It
+owns the stable public contract and delegates provider work to the outbound
+adapter runtime:
 
 ```text
-McpRuntimeManager
-  └── McpAdapter instance per configured server
-        ├── notion → hosted MCP + OAuth
-        └── gmail  → hosted MCP + OAuth (preview)
+Agent / Coding CLI (MCP client)
+  └── OAB MCP Facade (MCP server)
+        ├── search_capabilities(query)
+        └── execute_capability(name, arguments)
+              └── OAB MCP Adapter / McpRuntimeManager (MCP client)
+                    ├── notion → hosted MCP + OAuth
+                    └── gmail  → hosted MCP + OAuth (preview)
 ```
+
+The facade owns:
+
+- agent authentication and request authorization;
+- capability search over the configured, policy-filtered catalog;
+- stable capability names, schemas, availability, risk metadata, and provider
+  identity;
+- validation that execution uses an exact capability returned by discovery;
+- redacted results, errors, and audit records.
 
 The adapter owns connection concerns only:
 
@@ -231,8 +261,13 @@ a duplicate top-level TOML section:
 - global: `~/.openab/agent/mcp.json`;
 - project: `.openab/agent/mcp.json`;
 - project entries override global entries with the same server name;
-- no configured servers means no MCP meta-tool is injected;
+- no configured adapter servers means the facade has no provider capabilities;
 - declaring a server is the explicit opt-in activation signal.
+
+The existing file remains the source of truth for downstream provider
+connections. The facade is the agent-facing source of truth for the two-method
+contract; it does not inject provider tools into the agent's top-level tool
+list.
 
 Illustrative configuration:
 
@@ -286,27 +321,40 @@ pre-registered client, operators use the existing `oauth.client_id`,
 The profile examples are deliberately conservative. A deployment may add
 provider tools after reviewing their schemas and side effects.
 
-### 6.3 Discovery and execution
+### 6.3 Capability discovery and execution
 
-The existing meta-tool flow remains authoritative:
+The facade exposes only two stable methods. Provider-specific tools remain
+behind the adapter and are represented as searchable capabilities:
 
 ```text
-mcp(action="list_servers")
-  → notion (http, idle), gmail (http, needs login)
+search_capabilities({"query":"find recent project notes"})
+  → {
+      "capabilities": [{
+        "name": "notion-search",
+        "description": "Search authorized Notion content",
+        "input_schema": {"...": "provider-declared JSON Schema"},
+        "provider": "notion",
+        "risk": "read",
+        "availability": "ready"
+      }]
+    }
 
-mcp(action="list_tools", server="notion")
-  → provider tool names and descriptions
-
-mcp(action="describe_tool", server="notion", tool="notion-fetch")
-  → exact input schema
-
-mcp(action="call", server="notion", tool="notion-fetch", arguments={...})
-  → provider CallToolResult
+execute_capability({
+  "name": "notion-search",
+  "arguments": {"query":"project notes"}
+})
+  → provider CallToolResult (redacted and policy-checked)
 ```
 
-The LLM must use exact names and schemas returned by discovery. It must not
-invent provider tools or arguments. An MCP `tools/list_changed` notification
-invalidates the cache for that server.
+`search_capabilities` returns only configured, authorized, policy-allowed
+capabilities and their provider-declared schemas. `execute_capability` accepts
+only an exact capability name and schema returned by discovery; it validates
+arguments before dispatching the corresponding downstream `tools/call`.
+
+A downstream MCP `tools/list_changed` notification invalidates the relevant
+capability cache. The facade must then refresh discovery before accepting a
+call whose schema or availability may have changed. Provider names and raw
+provider credentials are never required in the agent-facing contract.
 
 ### 6.4 MVP capability profiles
 
@@ -335,12 +383,12 @@ invalidates the cache for that server.
 
 - HTTP MCP servers use the existing `openab-agent` OAuth manager and
   namespaced credential store (`mcp:<server-name>`).
-- Refresh tokens remain on the agent's protected persistent filesystem and are
-  never sent through chat, inserted into prompts, or written to logs.
+- Refresh tokens remain on OAB's protected persistent filesystem and are never
+  sent through chat, inserted into prompts, or written to logs.
 - The existing headless login flow is used for remote servers: device flow when
   advertised, otherwise PKCE paste-back flow.
-- A server is connected lazily on first discovery or call; one failing server
-  must not prevent the agent from starting or using another server.
+- A server is connected lazily on first discovery or execution; one failing
+  server must not prevent the facade from starting or using another server.
 - Existing per-server timeout, cancellation, idle eviction, and circuit breaker
   behavior applies without an adapter-specific retry loop.
 
@@ -360,7 +408,8 @@ The adapter treats remote content as untrusted data:
   allowlists according to the existing MCP config validation.
 - Stdio servers continue to use the existing environment scrubbing; the adapter
   must not pass OAB channel tokens or unrelated secrets to child processes.
-- Errors returned to the LLM and audit logs remain redacted.
+- Errors returned through the facade and written to audit logs remain redacted;
+  downstream provider details are not treated as agent instructions.
 
 ## 7. Why This Approach
 
@@ -373,10 +422,11 @@ existing client/runtime small:
 - Gmail's official server is available for an opt-in preview integration. The
   profile makes its preview status and limited scopes visible instead of hiding
   the risk behind a native adapter.
-- Reusing the existing MCP client avoids a second OAuth store, transport stack,
-  meta-tool, or server lifecycle implementation.
-- Tool filtering and progressive discovery prevent the model context from being
-  flooded with provider tools and create an explicit safety boundary.
+- Reusing the existing MCP client avoids a second outbound OAuth store,
+  transport stack, or server lifecycle implementation.
+- The two-method facade, tool filtering, and progressive discovery prevent the
+  model context from being flooded with provider tools and create an explicit
+  safety boundary.
 - Existing deployments are unchanged: no `mcp.json` means no MCP runtime and no
   new network calls.
 
@@ -400,17 +450,19 @@ Rejected as the OAB default. It produces different auth, tool filtering,
 credential persistence, and diagnostics for each CLI. It can remain a manual
 escape hatch for operators who intentionally configure a server outside OAB.
 
-### C. Add an inbound OAB MCP server
+### C. Add a second generic inbound MCP server
 
-Rejected as out of scope. This MVP is an outbound agent adapter. An inbound
-server would let external coding clients call OAB workflows and requires a
-separate authentication, tenancy, and authorization design.
+Rejected as unnecessary for this MVP. The OAB MCP facade is the intentionally
+scoped inbound server for the coding agent. A separate generic server for
+arbitrary OAB workflows would require another authentication, tenancy, and
+authorization design and would blur the two-method capability boundary.
 
 ### D. Flatten all provider tools into the agent's top-level tool list
 
-Rejected. The existing `mcp` meta-tool and lazy discovery preserve the agent's
-small prompt and isolate provider schema drift. This is already the accepted
-OpenAB MCP client architecture.
+Rejected. The facade exposes only `search_capabilities` and
+`execute_capability`; lazy discovery preserves the agent's small prompt and
+isolates provider schema drift. This follows the accepted progressive-disclosure
+pattern rather than flattening downstream tools.
 
 ### E. Add a new top-level `[mcp]` TOML section
 
@@ -429,7 +481,7 @@ source of truth.
 | Prompt injection in email/page content | Agent may perform unintended actions | Treat provider data as untrusted; least-privilege filters; no Gmail send/delete |
 | Token leakage | Account compromise | PKCE, protected token store, env scrubbing, redacted logs, no credentials in prompts |
 | Remote MCP outage/rate limit | Agent task failure or latency | Per-server timeout, circuit breaker, bounded retries, provider error surfaced accurately |
-| Excessive provider tool context | Poor tool selection and token cost | Single meta-tool, lazy `list_tools`/`describe_tool`, include filters |
+| Excessive provider tool context | Poor tool selection and token cost | Two-method facade, lazy capability search, and include filters |
 | Notion/Gmail account mismatch | Wrong mailbox/workspace action | Show server name and auth state; require explicit login per configured server; never infer identity from content |
 
 ## 10. Rollout Plan
@@ -488,8 +540,15 @@ provider smoke tests are acceptance criteria for the follow-up implementation PR
 
 ## 12. Decision Summary
 
-Adopt **OAB MCP Adapter** as a first-class outbound agent adapter implemented on
-top of the existing `openab-agent` MCP client.
+Adopt **OAB MCP Adapter** behind an agent-facing **OAB MCP Facade**. The
+facade exposes exactly two stable methods:
+
+- `search_capabilities` for authorized, policy-filtered provider discovery.
+- `execute_capability` for schema-validated execution of an exact discovered
+  capability.
+
+The adapter uses the existing `openab-agent` MCP client/runtime to connect to
+external providers.
 
 The MVP supports:
 
@@ -497,6 +556,5 @@ The MVP supports:
 - Gmail hosted MCP as an explicit, limited-scope Developer Preview integration
   for search/read and draft creation.
 
-Configuration presence remains the opt-in signal. The MVP does not add an OAB
-MCP server, a second MCP runtime, a native Gmail/Notion REST client, or a new
-TOML source of truth.
+Configuration presence remains the opt-in signal. The MVP does not add a second
+MCP runtime, a native Gmail/Notion REST client, or a new TOML source of truth.
