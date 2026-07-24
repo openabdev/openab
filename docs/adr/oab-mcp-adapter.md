@@ -1,4 +1,4 @@
-# ADR: OAB MCP Adapter MVP — Gmail and Notion
+# ADR: OAB MCP Adapter MVP - Gmail and Notion
 
 - **Status:** Proposed
 - **Date:** 2026-07-24
@@ -75,33 +75,33 @@ REST adapters.
 ## 3. At a Glance
 
 ```text
-┌────────────────────────────────────────────────────────────────────────────┐
-│ Coding CLI / Agent                                                         │
-│   MCP client                                                               │
-└────────────────────────────────┬───────────────────────────────────────────┘
-                                 │ Streamable HTTP MCP (local or remote)
-                                 ▼
-┌────────────────────────────────────────────────────────────────────────────┐
-│ OAB MCP Facade                                                             │
-│   search_capabilities(query)                                               │
-│   execute_capability(name, arguments)                                      │
-│                                                                            │
-│   auth + policy + capability registry                                     │
-└────────────────────────────────┬───────────────────────────────────────────┘
-                                 │ internal dispatch
-                                 ▼
-┌────────────────────────────────────────────────────────────────────────────┐
-│ OAB MCP Adapter                                                            │
-│   outbound MCP client · OAuth · tools/list · tools/call · filtering        │
-└────────────────────────────────┬───────────────────────────────────────────┘
-                                 │ Streamable HTTP MCP + provider OAuth
-                 ┌───────────────┴────────────────┐
-                 ▼                                ▼
-┌──────────────────────────────┐  ┌─────────────────────────────────────────┐
-│ Notion hosted MCP             │  │ Google Gmail hosted MCP                 │
-│ https://mcp.notion.com/mcp    │  │ https://gmailmcp.googleapis.com/mcp/v1 │
-│ user OAuth                    │  │ user OAuth · Developer Preview         │
-└──────────────────────────────┘  └─────────────────────────────────────────┘
++----------------------------------------------------------------------------+
+| Coding CLI / Agent                                                         |
+|   MCP client                                                               |
++--------------------------------+-------------------------------------------+
+                                 | Streamable HTTP MCP (local or remote)
+                                 v
++----------------------------------------------------------------------------+
+| OAB MCP Facade                                                             |
+|   search_capabilities(query)                                               |
+|   execute_capability(name, arguments)                                      |
+|                                                                            |
+|   auth + policy + capability registry                                      |
++--------------------------------+-------------------------------------------+
+                                 | internal dispatch
+                                 v
++----------------------------------------------------------------------------+
+| OAB MCP Adapter                                                            |
+|   outbound MCP client - OAuth - tools/list - tools/call - filtering        |
++--------------------------------+-------------------------------------------+
+                                 | Streamable HTTP MCP + provider OAuth
+                 +---------------+----------------+
+                 v                                v
++------------------------------+  +-----------------------------------------+
+| Notion hosted MCP            |  | Google Gmail hosted MCP                 |
+| https://mcp.notion.com/mcp   |  | https://gmailmcp.googleapis.com/mcp/v1 |
+| user OAuth                   |  | user OAuth - Developer Preview         |
++------------------------------+  +-----------------------------------------+
 ```
 
 The direction is intentional: the agent calls OAB, and OAB calls external
@@ -224,12 +224,12 @@ adapter runtime:
 
 ```text
 Agent / Coding CLI (MCP client)
-  └── OAB MCP Facade (MCP server)
-        ├── search_capabilities(query)
-        └── execute_capability(name, arguments)
-              └── OAB MCP Adapter / McpRuntimeManager (MCP client)
-                    ├── notion → hosted MCP + OAuth
-                    └── gmail  → hosted MCP + OAuth (preview)
+  +-- OAB MCP Facade (MCP server)
+        +-- search_capabilities(query)
+        +-- execute_capability(name, arguments)
+              +-- OAB MCP Adapter / McpRuntimeManager (MCP client)
+                    +-- notion -> hosted MCP + OAuth
+                    +-- gmail  -> hosted MCP + OAuth (preview)
 ```
 
 The facade owns:
@@ -328,7 +328,7 @@ behind the adapter and are represented as searchable capabilities:
 
 ```text
 search_capabilities({"query":"find recent project notes"})
-  → {
+  -> {
       "capabilities": [{
         "name": "notion-search",
         "description": "Search authorized Notion content",
@@ -343,7 +343,7 @@ execute_capability({
   "name": "notion-search",
   "arguments": {"query":"project notes"}
 })
-  → provider CallToolResult (redacted and policy-checked)
+  -> provider CallToolResult (redacted and policy-checked)
 ```
 
 `search_capabilities` returns only configured, authorized, policy-allowed
