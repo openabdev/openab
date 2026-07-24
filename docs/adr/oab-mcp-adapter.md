@@ -121,10 +121,11 @@ policy and audit controls.
 The facade exposes the same two-method contract regardless of the downstream
 path. Notion and Gmail use the hosted MCP adapter in this MVP. The dashed
 capability-plugin path is the extension point for services that do not provide
-a hosted MCP server. It is not a second agent-facing API. The coding agent
-reaches the facade through the ACP `session/new` `mcpServers` registration —
-a stdio `openab-agent mcp-facade` subprocess per session (§6.2); the native
-`openab-agent` dispatches in-process.
+a hosted MCP server. It is not a second agent-facing API. The broker serves
+the facade in-process as a loopback-only Streamable HTTP endpoint
+(`http://127.0.0.1:<port>/mcp`), enabled by the `[mcp]` section in
+`config.toml` (§6.2); any coding CLI on the host connects to that URL. The
+native `openab-agent` dispatches in-process.
 
 ## 4. Terminology and Positioning
 
@@ -355,29 +356,39 @@ must not expose provider-specific APIs directly to the agent.
 
 ### 6.2 Facade transport and registration
 
-The facade reaches the coding agent through the mechanism OAB already uses:
-the ACP `session/new` request, whose `mcpServers` parameter OAB currently sends
-as an empty list (`crates/openab-core/src/acp/connection.rs`). No coding CLI's
-own MCP configuration file is edited, and no CLI-specific registration format
-is required.
+The facade is a **loopback-only Streamable HTTP** MCP server hosted
+**in-process by the OAB broker**, activated by the presence of an `[mcp]`
+section in the broker's `config.toml`:
 
-- **External coding CLIs (Kiro, Claude Code, Codex, ...):** when the facade is
-  active, OAB advertises a **stdio** MCP server entry in the `mcpServers`
-  parameter of `session/new`: the command `openab-agent mcp-facade`. The CLI
-  spawns the facade as its own subprocess, giving each ACP session a private
-  facade instance — session isolation by construction, with no listener, no
-  port, and no session token to manage. This is dictated by a workspace
-  constraint: the MCP runtime (connections, OAuth, credential store, filters,
-  circuit breaker) lives in the `openab-agent` crate, which is excluded from
-  the broker workspace, so the broker cannot serve the facade in-process
-  without duplicating that runtime — exactly what this ADR forbids. A
-  loopback-only Streamable HTTP listener with per-session tokens remains the
-  documented follow-up if per-session subprocesses prove too heavy; it must
-  never bind a non-loopback interface.
+```toml
+[mcp]
+listen = "127.0.0.1:8848"   # loopback only; this is the default
+```
+
+- **External coding CLIs (Kiro, Claude Code, Codex, ...):** connect to
+  `http://127.0.0.1:<port>/mcp` like any remote MCP server. Because the
+  endpoint is plain Streamable HTTP, every MCP-capable CLI on the host can
+  use the facade with its normal remote-server configuration — no
+  CLI-specific registration format, no OAB-managed subprocess.
+- **Runtime sharing:** the MCP runtime (connections, OAuth, credential store,
+  tool filters, circuit breaker, schema validation) is extracted into the
+  shared `crates/openab-mcp` crate. The broker links it directly to serve the
+  facade; `openab-agent` re-exports the same crate. One implementation, two
+  hosts — no duplicated runtime, which this ADR forbids.
+- **Security posture:** the listener refuses to bind any non-loopback
+  address; the endpoint itself carries no authentication layer in the MVP,
+  so the host/pod boundary is the trust boundary. Every process on the host
+  that can reach loopback can call authorized capabilities — deployments
+  that colocate untrusted processes must not enable `[mcp]`. A token or
+  socket-permission scheme is a documented follow-up.
 - **Native `openab-agent`:** the dispatcher is invoked in-process via the
-  existing `mcp` meta-tool. No subprocess is required because the facade
+  existing `mcp` meta-tool. No HTTP hop is required because the facade
   contract and policy checks are implemented by the same dispatcher component
   (see §6.4).
+- **ACP `session/new` `mcpServers` advertisement** (OAB injecting the facade
+  URL into the agent session it spawns) is a follow-up on top of this
+  transport, not a prerequisite: the loopback URL is already reachable by any
+  CLI the operator points at it.
 
 This is the same architectural role that
 [`acp-server-websocket-mcp-browser.md`](./acp-server-websocket-mcp-browser.md)
@@ -628,12 +639,13 @@ Rejected. The facade exposes only `search_capabilities` and
 isolates provider schema drift. This follows the accepted progressive-disclosure
 pattern rather than flattening downstream tools.
 
-### E. Add a new top-level `[mcp]` TOML section
+### E. Duplicate provider configuration in a top-level `[mcp]` TOML section
 
-Rejected for the MVP because `openab-agent` already owns and documents layered
-`.openab/agent/mcp.json` configuration. A future broker-level configuration
-facade may point to or generate that file, but it should not create a second
-source of truth.
+Rejected: `openab-agent` already owns and documents layered
+`.openab/agent/mcp.json` configuration, and that file remains the only source
+of provider connections. The broker's `[mcp]` section (§6.2) is deliberately
+**not** a second provider registry — it carries only facade-listener settings
+(`listen`), and its presence is the opt-in switch for serving the facade.
 
 ## 9. Risks and Mitigations
 
