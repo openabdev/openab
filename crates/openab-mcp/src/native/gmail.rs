@@ -14,8 +14,9 @@
 //!   `list_drafts`, `create_draft`), so swapping this adapter for the hosted
 //!   entry at GA is an `mcp.json` change with no agent-facing difference.
 //!
-//! Packaging: a **stdio MCP server** (`openab-agent gmail-native serve`),
-//! registered in `mcp.json` as a normal `"type": "stdio"` entry. The
+//! Packaging: a **loopback Streamable HTTP MCP server** (`openab-agent
+//! gmail-native serve --listen 127.0.0.1:<port>`), registered in `mcp.json`
+//! as a normal `"type": "http"` entry pointing at `http://<addr>/mcp`. The
 //! outbound runtime therefore applies `tool_filter`, JSON-Schema argument
 //! validation, timeouts, the circuit breaker, and secret redaction to this
 //! adapter exactly as it does to any external server — no new integration
@@ -701,16 +702,37 @@ impl ServerHandler for GmailNative {
     }
 }
 
-/// Serve the adapter over stdio until the parent (the OAB MCP runtime, or
-/// any MCP client) closes the pipe.
-pub async fn serve_stdio() -> Result<()> {
-    use rmcp::ServiceExt as _;
+/// Serve the adapter over **loopback Streamable HTTP** at `/mcp`, mirroring
+/// the OAB MCP Facade's transport (ADR §6.2 trust model: loopback-only, no
+/// authentication layer — the host/pod boundary is the trust boundary; a
+/// non-loopback bind is refused at startup). Register in `mcp.json` as a
+/// `"type": "http"` entry pointing at `http://<addr>/mcp`.
+///
+/// One handler is constructed per MCP session, all sharing the same
+/// credential store file; a cross-session refresh race is benign (each
+/// refresh yields a valid token and the stored refresh token is preserved).
+pub async fn serve_http(addr: &str) -> Result<()> {
+    use rmcp::transport::streamable_http_server::{
+        session::local::LocalSessionManager, StreamableHttpService,
+    };
+    let sock = crate::mcp::facade::require_loopback(addr)?;
     let oauth = OauthApp::from_env()?;
-    let service = GmailNative::new(oauth)
-        .serve(rmcp::transport::stdio())
+    let service = StreamableHttpService::new(
+        move || Ok(GmailNative::new(oauth.clone())),
+        LocalSessionManager::default().into(),
+        Default::default(),
+    );
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind(sock)
         .await
-        .context("gmail-native stdio serve")?;
-    service.waiting().await.context("gmail-native run")?;
+        .with_context(|| format!("bind gmail-native listener on {sock}"))?;
+    tracing::info!(
+        addr = %sock,
+        "gmail-native adapter listening (Streamable HTTP, loopback-only, no auth — host boundary is the trust boundary)"
+    );
+    axum::serve(listener, router)
+        .await
+        .context("gmail-native HTTP server terminated")?;
     Ok(())
 }
 

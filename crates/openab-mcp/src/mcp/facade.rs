@@ -316,7 +316,7 @@ impl ServerHandler for McpFacade {
 /// Reject any bind address that is not loopback (ADR §6.2: the facade must
 /// never listen on a non-loopback interface — it has no authentication
 /// layer; the host boundary is the trust boundary).
-fn require_loopback(addr: &str) -> Result<std::net::SocketAddr> {
+pub(crate) fn require_loopback(addr: &str) -> Result<std::net::SocketAddr> {
     let sock: std::net::SocketAddr = addr
         .parse()
         .with_context(|| format!("invalid listen address {addr:?} (expected ip:port)"))?;
