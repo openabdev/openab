@@ -28,13 +28,19 @@ use std::sync::Arc;
 /// proxy here. Keeping the trait in core with the impl in root preserves the core/gateway
 /// sibling independence, matching the existing `ChatAdapter` pattern.
 #[async_trait::async_trait]
-pub trait BrowserTunnel: Send + Sync {
-    /// Forward an inner MCP request (e.g. `tools/call`) to the browser session identified by
-    /// `channel_id` and return the inner MCP result payload. Err if no browser is currently
-    /// attached to that session.
+pub trait AcpMcpTunnel: Send + Sync {
+    /// Forward an inner MCP request (e.g. `tools/call`) to the client MCP server identified by
+    /// `(channel_id, server_id)` and return the inner MCP result payload. Err if no matching
+    /// tunnel is currently attached to that session.
+    ///
+    /// `server_id` selects among multiple `type:acp` servers on one session (compound-key
+    /// registry, P1). During the single-browser transition an empty `server_id` is a sentinel
+    /// meaning "the sole tunnel on this channel" — the proxy/bridge callers don't yet know the
+    /// client-declared id at spawn time (real per-server routing lands in P2).
     async fn call(
         &self,
         channel_id: &str,
+        server_id: &str,
         method: &str,
         params: Option<Value>,
     ) -> Result<Value, String>;
@@ -100,11 +106,11 @@ pub struct ProxyHandler {
     channel_id: String,
     /// Bridge to that session's browser tunnel; `None` when no browser is attached (or the
     /// process has no tunnel wiring). A call while `None` reports "browser not connected" (D4).
-    tunnel: Option<Arc<dyn BrowserTunnel>>,
+    tunnel: Option<Arc<dyn AcpMcpTunnel>>,
 }
 
 impl ProxyHandler {
-    pub fn new(channel_id: String, tunnel: Option<Arc<dyn BrowserTunnel>>) -> Self {
+    pub fn new(channel_id: String, tunnel: Option<Arc<dyn AcpMcpTunnel>>) -> Self {
         Self { channel_id, tunnel }
     }
 
@@ -122,8 +128,10 @@ impl ProxyHandler {
             ));
         };
         let params = json!({ "name": name, "arguments": arguments });
+        // Empty server_id sentinel (Fork A): this single-browser proxy doesn't know the
+        // client-declared server id; RootBrowserTunnel resolves the sole tunnel on the channel.
         let result = tunnel
-            .call(&self.channel_id, "tools/call", Some(params))
+            .call(&self.channel_id, "", "tools/call", Some(params))
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
         serde_json::from_value(result)
@@ -194,7 +202,7 @@ async fn require_bearer(
 /// cancelled.
 pub async fn spawn_mcp_server(
     channel_id: String,
-    tunnel: Option<Arc<dyn BrowserTunnel>>,
+    tunnel: Option<Arc<dyn AcpMcpTunnel>>,
     bearer: String,
     ct: tokio_util::sync::CancellationToken,
 ) -> std::io::Result<std::net::SocketAddr> {
@@ -233,7 +241,7 @@ pub async fn spawn_mcp_server(
 pub async fn start_session_server(
     channel_id: &str,
     workdir: &str,
-    tunnel: Option<Arc<dyn BrowserTunnel>>,
+    tunnel: Option<Arc<dyn AcpMcpTunnel>>,
 ) -> std::io::Result<(std::net::SocketAddr, tokio_util::sync::CancellationToken)> {
     let bearer = uuid::Uuid::new_v4().to_string();
     let ct = tokio_util::sync::CancellationToken::new();
@@ -399,7 +407,7 @@ pub fn browser_socket_path() -> std::path::PathBuf {
 // A single unix socket per pod multiplexes ALL sessions. The `openab browser-bridge` shim
 // (spawned per agent session by the CLI's MCP client) connects and forwards inner MCP requests
 // tagged with its own `channel_id` (from the OPENAB_BROWSER_CHANNEL env it inherits); core routes
-// `tools/call` to that session's BrowserTunnel. This is the stable, variant-agnostic replacement
+// `tools/call` to that session's AcpMcpTunnel. This is the stable, variant-agnostic replacement
 // for the per-session HTTP proxy (Option C). Wire = newline-delimited JSON, one frame per line:
 //   bridge → core : {"channel_id": "...", "request": <inner MCP JSON-RPC request>}
 //   core → bridge : <inner MCP JSON-RPC response>   (omitted for notifications)
@@ -420,7 +428,7 @@ fn mcp_error(id: Value, code: i64, message: &str) -> Value {
 pub(crate) async fn dispatch_browser_mcp(
     channel_id: &str,
     request: &Value,
-    tunnel: &Option<Arc<dyn BrowserTunnel>>,
+    tunnel: &Option<Arc<dyn AcpMcpTunnel>>,
 ) -> Option<Value> {
     // A JSON-RPC notification has no `id` → no response.
     let id = request.get("id").cloned()?;
@@ -439,8 +447,11 @@ pub(crate) async fn dispatch_browser_mcp(
             mcp_result(id, json!({ "tools": tools }))
         }
         "tools/call" => match tunnel {
+            // Empty server_id sentinel (Fork A): the bridge frame carries no server id yet;
+            // RootBrowserTunnel resolves the sole tunnel on the channel. Real per-server routing
+            // (server_id in the frame) lands in P2.
             Some(t) => match t
-                .call(channel_id, "tools/call", request.get("params").cloned())
+                .call(channel_id, "", "tools/call", request.get("params").cloned())
                 .await
             {
                 Ok(v) => mcp_result(id, v),
@@ -462,7 +473,7 @@ pub(crate) async fn dispatch_browser_mcp(
 /// loop, and runs until `ct` is cancelled. Idempotent on a stale socket file from a prior run.
 pub async fn serve_browser_socket(
     path: std::path::PathBuf,
-    tunnel: Option<Arc<dyn BrowserTunnel>>,
+    tunnel: Option<Arc<dyn AcpMcpTunnel>>,
     ct: tokio_util::sync::CancellationToken,
 ) -> std::io::Result<()> {
     let _ = tokio::fs::remove_file(&path).await; // clear a stale socket from a prior run
@@ -496,14 +507,14 @@ pub async fn serve_browser_socket(
 /// tokio-util dependency is needed.
 pub async fn serve_browser_socket_forever(
     path: std::path::PathBuf,
-    tunnel: Option<Arc<dyn BrowserTunnel>>,
+    tunnel: Option<Arc<dyn AcpMcpTunnel>>,
 ) -> std::io::Result<()> {
     serve_browser_socket(path, tunnel, tokio_util::sync::CancellationToken::new()).await
 }
 
 async fn handle_browser_conn(
     stream: tokio::net::UnixStream,
-    tunnel: Option<Arc<dyn BrowserTunnel>>,
+    tunnel: Option<Arc<dyn AcpMcpTunnel>>,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let (read_half, mut write_half) = stream.into_split();
@@ -535,7 +546,7 @@ async fn handle_browser_conn(
 mod tests {
     use super::{
         browser_tools, dispatch_browser_mcp, parse_browser_mode, serve_browser_socket,
-        spawn_mcp_server, start_session_server, write_bridge_mcp_config, BrowserMode, BrowserTunnel,
+        spawn_mcp_server, start_session_server, write_bridge_mcp_config, BrowserMode, AcpMcpTunnel,
         ProxyHandler,
     };
 
@@ -553,14 +564,16 @@ mod tests {
 
     struct MockTunnel;
     #[async_trait::async_trait]
-    impl BrowserTunnel for MockTunnel {
+    impl AcpMcpTunnel for MockTunnel {
         async fn call(
             &self,
             channel_id: &str,
+            server_id: &str,
             method: &str,
             _params: Option<serde_json::Value>,
         ) -> Result<serde_json::Value, String> {
             assert_eq!(channel_id, "acp_x");
+            assert_eq!(server_id, ""); // proxy passes the empty sentinel (Fork A)
             assert_eq!(method, "tools/call");
             Ok(serde_json::json!({"content": [{"type": "text", "text": "clicked"}]}))
         }
@@ -588,10 +601,11 @@ mod tests {
         result: serde_json::Value,
     }
     #[async_trait::async_trait]
-    impl BrowserTunnel for RecordTunnel {
+    impl AcpMcpTunnel for RecordTunnel {
         async fn call(
             &self,
             channel_id: &str,
+            _server_id: &str,
             method: &str,
             _params: Option<serde_json::Value>,
         ) -> Result<serde_json::Value, String> {
@@ -602,10 +616,11 @@ mod tests {
     }
     struct ErrTunnel;
     #[async_trait::async_trait]
-    impl BrowserTunnel for ErrTunnel {
+    impl AcpMcpTunnel for ErrTunnel {
         async fn call(
             &self,
             _c: &str,
+            _s: &str,
             _m: &str,
             _p: Option<serde_json::Value>,
         ) -> Result<serde_json::Value, String> {
@@ -615,7 +630,7 @@ mod tests {
     fn req(id: i64, method: &str, params: serde_json::Value) -> serde_json::Value {
         serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
     }
-    fn arc_tunnel<T: BrowserTunnel + 'static>(t: T) -> Option<std::sync::Arc<dyn BrowserTunnel>> {
+    fn arc_tunnel<T: AcpMcpTunnel + 'static>(t: T) -> Option<std::sync::Arc<dyn AcpMcpTunnel>> {
         Some(std::sync::Arc::new(t))
     }
 

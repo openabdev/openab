@@ -323,11 +323,13 @@ pub fn new_reply_registry() -> AcpReplyRegistry {
     Arc::new(std::sync::Mutex::new(HashMap::new()))
 }
 
-/// Registry of open MCP-over-ACP tunnels: channel_id → `TunnelHandle`. The gateway inserts a
-/// handle once it has `mcp/connect`ed to a session's browser extension server; the core MCP
-/// proxy looks one up to route a tool call to the right browser (T5.3). Same std::sync::Mutex
-/// rationale as `AcpReplyRegistry`.
-pub type AcpTunnelRegistry = Arc<std::sync::Mutex<HashMap<String, TunnelHandle>>>;
+/// Registry of open MCP-over-ACP tunnels: `(channel_id, server_id)` → `TunnelHandle`. The
+/// gateway inserts a handle once it has `mcp/connect`ed to a session's declared `type:acp`
+/// server; the core MCP proxy looks one up to route a tool call to the right server (T5.3).
+/// Keyed by the compound `(channel_id, server_id)` (P1) so one session can carry several
+/// `type:acp` servers without collision; eviction drops all `(channel_id, *)` on teardown. Same
+/// std::sync::Mutex rationale as `AcpReplyRegistry`.
+pub type AcpTunnelRegistry = Arc<std::sync::Mutex<HashMap<(String, String), TunnelHandle>>>;
 
 pub fn new_tunnel_registry() -> AcpTunnelRegistry {
     Arc::new(std::sync::Mutex::new(HashMap::new()))
@@ -725,8 +727,8 @@ async fn establish_and_register_tunnel(
     registry
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(channel_id.clone(), handle);
-    info!(channel_id = %channel_id, "ACP: browser tunnel registered — extension attached");
+        .insert((channel_id.clone(), acp_id.clone()), handle);
+    info!(channel_id = %channel_id, server_id = %acp_id, "ACP: browser tunnel registered — extension attached");
     Ok(())
 }
 
@@ -1153,9 +1155,8 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
     }
     if let Some(ref registry) = state.acp_tunnel_registry {
         let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
-        for cid in &channel_ids {
-            reg.remove(cid);
-        }
+        // Compound-key registry (P1): drop every `(channel_id, *)` tunnel for the closed session.
+        reg.retain(|(cid, _), _| !channel_ids.contains(cid));
     }
     debug!(
         connection = %connection_id,
@@ -2209,7 +2210,7 @@ mod acp_requests {
     }
 
     #[tokio::test]
-    async fn establish_tunnel_registers_handle_under_channel_id() {
+    async fn establish_tunnel_registers_handle_under_channel_and_server_id() {
         let pending = new_pending();
         let next_id = Arc::new(AtomicU64::new(1));
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
@@ -2239,8 +2240,11 @@ mod acp_requests {
         ext.await.unwrap();
 
         assert!(
-            registry.lock().unwrap().contains_key("acp_abc"),
-            "a TunnelHandle must be registered under the session channel_id"
+            registry
+                .lock()
+                .unwrap()
+                .contains_key(&("acp_abc".to_string(), "srv-1".to_string())),
+            "a TunnelHandle must be registered under (channel_id, server_id)"
         );
     }
 }

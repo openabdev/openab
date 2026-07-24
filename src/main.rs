@@ -404,7 +404,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.pool.default_config_options,
     );
     #[cfg(feature = "acp")]
-    let browser_tunnel: Arc<dyn openab_core::mcp_proxy::BrowserTunnel> = Arc::new(
+    let browser_tunnel: Arc<dyn openab_core::mcp_proxy::AcpMcpTunnel> = Arc::new(
         browser_tunnel::RootBrowserTunnel::new(acp_tunnel_registry.clone()),
     );
     #[cfg(feature = "acp")]

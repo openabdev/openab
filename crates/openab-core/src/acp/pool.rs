@@ -56,7 +56,7 @@ pub struct SessionPool {
     /// Bridge from a session's core MCP proxy to its browser tunnel (D5-a/D6-a'); set by the
     /// root. `None` = no browser wiring (tool calls report not-connected).
     #[cfg(feature = "acp-mcp")]
-    browser_tunnel: Option<Arc<dyn crate::mcp_proxy::BrowserTunnel>>,
+    browser_tunnel: Option<Arc<dyn crate::mcp_proxy::AcpMcpTunnel>>,
 }
 
 type CancelHandle = (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String);
@@ -211,7 +211,7 @@ impl SessionPool {
     #[cfg(feature = "acp-mcp")]
     pub fn with_browser_tunnel(
         mut self,
-        tunnel: Option<Arc<dyn crate::mcp_proxy::BrowserTunnel>>,
+        tunnel: Option<Arc<dyn crate::mcp_proxy::AcpMcpTunnel>>,
     ) -> Self {
         self.browser_tunnel = tunnel;
         self
