@@ -12,3 +12,8 @@ pub mod googlechat;
 pub mod wecom;
 #[cfg(feature = "teams")]
 pub mod teams;
+#[cfg(feature = "acp")]
+pub mod acp_server;
+#[cfg(feature = "acp")]
+#[allow(clippy::all, dead_code, unused)]
+pub mod acp_schema;

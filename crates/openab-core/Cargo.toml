@@ -26,6 +26,7 @@ bytes = "1"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 unicode-width = "0.2"
+unicode-segmentation = "1"
 pulldown-cmark = { version = "0.13", default-features = false }
 tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.22", optional = true }

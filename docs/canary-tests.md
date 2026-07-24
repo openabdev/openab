@@ -10,6 +10,7 @@ The goal is to produce evidence that another contributor or maintainer can revie
 - [Build the Preview Image](#build-the-preview-image)
 - [Layer 1: Image Inspection](#layer-1-image-inspection)
 - [Layer 2: ACP Protocol Smoke](#layer-2-acp-protocol-smoke)
+  - [WebSocket transport (`/acp`)](#websocket-transport-acp)
   - [Transport Method](#transport-method)
 - [Layer 3: Runtime Isolation Probe](#layer-3-runtime-isolation-probe)
 - [Layer 4: Interactive Validation](#layer-4-interactive-validation)
@@ -146,6 +147,24 @@ Avoid printing the live container environment because it may include injected cr
 ## Layer 2: ACP Protocol Smoke
 
 For an ACP adapter change, use a minimal bidirectional JSON-RPC client to exercise the same stdio boundary OpenAB uses. The client may be written in any language; JavaScript is not required. A one-way shell pipeline is insufficient for multi-turn and permission tests because the adapter can send requests back to the client while a prompt is running.
+
+### WebSocket transport (`/acp`)
+
+OpenAB also serves ACP over a WebSocket (`GET /acp`, feature `acp` + `OPENAB_ACP_ENABLED`) — the upstream client↔gateway hop, distinct from the downstream stdio hop below. `scripts/acp-ws-smoke.py` is a ready-to-run **conformance suite** for it that prints an item-by-item report (paste it into the PR as evidence), in three groups:
+
+- **Transport / Auth** — a transport token is required off loopback: no-token and wrong-token connections are rejected, the valid token is accepted.
+- **Protocol compliance** — JSON-RPC envelope + ACP wire shapes: initialize negotiation, `session/new` / `session/prompt` (streamed `session/update` `agent_message_chunk` + snake_case `stopReason`) / `session/resume`.
+- **Protocol edge cases** — version negotiation & rejects (`-32602`), required-param validation, not-initialized (`-32002`), bad JSON-RPC version (`-32600`), content-block policy (`resource_link` accepted, gated `image` rejected), notification silence, oversized-reply whole delivery, and Unicode/emoji stream integrity.
+
+It needs a live deployment (prompt turns hit the real model) and a transport token.
+
+```bash
+# WS_URL defaults to ws://localhost:8080/acp; pass another URL as $1.
+# OPENAB_ACP_TOKEN is MANDATORY — the endpoint requires a transport key off loopback.
+OPENAB_ACP_TOKEN=<key> uv run scripts/acp-ws-smoke.py ws://<host>:8080/acp
+```
+
+Exits non-zero unless every check passes. For the in-repo `cargo test` counterpart (offline wire-conformance + handler-level + streaming tests), see the `acp_conformance`, `acp_handlers`, and `acp_streaming` modules in `crates/openab-gateway/src/adapters/acp_server.rs`.
 
 ### Transport Method
 

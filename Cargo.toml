@@ -28,7 +28,7 @@ serenity = { version = "0.12", default-features = false, features = ["client", "
 default = ["discord", "slack", "secrets-aws", "agentcore", "config-s3", "pre-seed", "filestore"]
 
 # Opt-in: compile all gateway adapters into a single unified binary
-unified = ["telegram", "line", "feishu", "googlechat", "wecom", "teams"]
+unified = ["telegram", "line", "feishu", "googlechat", "wecom", "teams", "acp"]
 
 # Core adapters
 discord = ["dep:serenity", "openab-core/discord"]
@@ -48,6 +48,7 @@ feishu = ["dep:openab-gateway", "dep:axum", "openab-gateway/feishu"]
 googlechat = ["dep:openab-gateway", "dep:axum", "openab-gateway/googlechat"]
 wecom = ["dep:openab-gateway", "dep:axum", "openab-gateway/wecom"]
 teams = ["dep:openab-gateway", "dep:axum", "openab-gateway/teams"]
+acp = ["dep:openab-gateway", "dep:axum", "openab-gateway/acp"]
 
 [dev-dependencies]
 tempfile = "3.27.0"

@@ -6,6 +6,7 @@ mod ctl;
     feature = "googlechat",
     feature = "wecom",
     feature = "teams",
+    feature = "acp",
 ))]
 mod unified_adapter;
 use openab_core::acp;
@@ -139,6 +140,13 @@ fn has_unified_platform(cfg: &config::Config) -> bool {
                 .unwrap_or_default()
                 .resolve()
                 .enabled)
+        // ACP is a first-class embedded endpoint: an ACP-only deploy (no discord/slack/
+        // gateway/telegram) must not trip the "no adapter configured" preflight bail and
+        // must start the embedded HTTP server that hosts /acp.
+        || (cfg!(feature = "acp")
+            && std::env::var("OPENAB_ACP_ENABLED")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false))
 }
 
 /// Returns true when the first-class `[wecom]` section resolves all credentials
@@ -363,6 +371,7 @@ async fn main() -> anyhow::Result<()> {
         feature = "googlechat",
         feature = "wecom",
         feature = "teams",
+        feature = "acp",
     ))]
     let unified_platform_enabled = has_unified_platform(&cfg);
 
@@ -422,7 +431,7 @@ async fn main() -> anyhow::Result<()> {
         let allow_all_users = env_bool("GATEWAY_ALLOW_ALL_USERS", false);
         let allowed_users = env_set("GATEWAY_ALLOWED_USERS");
         let mut reg = PlatformTrustConfigs::new();
-        for platform in ["telegram", "line", "feishu", "wecom", "googlechat", "teams"] {
+        for platform in ["telegram", "line", "feishu", "wecom", "googlechat", "teams", "acp"] {
             reg.insert(
                 platform,
                 TrustConfig::new(
@@ -914,11 +923,19 @@ async fn main() -> anyhow::Result<()> {
         feature = "googlechat",
         feature = "wecom",
         feature = "teams",
+        feature = "acp",
     ))]
     let (_unified_handle, shared_unified_adapter) = {
         use openab_core::gateway::{process_gateway_event, GatewayEventContext};
 
-        if unified_platform_enabled || cfg.telegram.is_some() {
+        // The ACP endpoint (mounted below) needs this embedded HTTP server too —
+        // start it even when only non-webhook platforms (e.g. Discord, which the
+        // core connects to directly) are configured.
+        let acp_enabled = cfg!(feature = "acp")
+            && std::env::var("OPENAB_ACP_ENABLED")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false);
+        if unified_platform_enabled || cfg.telegram.is_some() || acp_enabled {
             let listen_addr =
                 std::env::var("GATEWAY_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
 
@@ -1160,6 +1177,31 @@ async fn main() -> anyhow::Result<()> {
                     &gw_state.googlechat_webhook_path,
                     axum::routing::post(openab_gateway::adapters::googlechat::webhook),
                 );
+            }
+
+            // ACP server endpoint — mount on the embedded gateway so `openab run`
+            // (not just the standalone gateway binary) serves ACP over WebSocket.
+            #[cfg(feature = "acp")]
+            if std::env::var("OPENAB_ACP_ENABLED")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false)
+            {
+                // Fail-open (no transport key) is only allowed on a loopback bind; a
+                // non-loopback bind without OPENAB_ACP_AUTH_KEY refuses to mount /acp.
+                let acp_key = std::env::var("OPENAB_ACP_AUTH_KEY").ok();
+                match openab_gateway::adapters::acp_server::acp_auth_ok_for_bind(
+                    acp_key.as_deref(),
+                    &listen_addr,
+                ) {
+                    Ok(()) => {
+                        info!("unified: ACP server endpoint enabled at /acp");
+                        app = app.route(
+                            "/acp",
+                            axum::routing::get(openab_gateway::adapters::acp_server::ws_upgrade),
+                        );
+                    }
+                    Err(e) => error!("unified: ACP endpoint NOT mounted: {e}"),
+                }
             }
 
             let app = app.with_state(gw_state.clone());
