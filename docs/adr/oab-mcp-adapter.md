@@ -44,6 +44,9 @@ REST adapters.
   - `search_capabilities`: discover authorized capabilities from configured
     external MCP servers.
   - `execute_capability`: execute an exact capability returned by discovery.
+- Define the OAB Agent capability-access vision inspired by OpenWork: authorized
+  services such as Gmail, Calendar, Drive, Slack, Notion, and Linear should be
+  reachable through one OAB facade as their provider paths mature.
 - Provide an extension point for services without a hosted MCP server: a
   capability plugin/native adapter can use a provider API or SDK while exposing
   the same facade contract. Plugin implementations are outside this MVP.
@@ -143,24 +146,46 @@ The OAB MCP facade is the stable inbound boundary for a coding agent. It may use
 this existing client/runtime internally for provider discovery and execution;
 this ADR does not create a second transport or credential implementation.
 
-### 5.2 OpenWork
+### 5.2 OpenWork inspiration and OAB Agent capability vision
 
-OpenWork's Den provides useful prior art for the product boundary:
+OpenWork is the primary product inspiration for the agent-facing boundary. Its
+Connect and MCP model demonstrates that an agent can access authorized external
+service capabilities through one progressive-discovery surface rather than
+requiring every backing coding CLI to define its own provider integration.
 
-- Its native Gmail capabilities use a Google OAuth account and Gmail REST API.
-- Its external MCP path treats Notion and similar services as MCP clients,
-  discovers provider tools, and proxies calls with member-scoped credentials.
-- Its agent-facing endpoint uses progressive discovery instead of exposing every
-  provider tool directly, matching the two-method OAB facade proposed here.
+The OpenWork capability set provides useful direction for OAB's longer-term
+vision:
 
-OAB adopts the external MCP path for Notion and the agent-facing progressive
-facade pattern. It does not copy OpenWork's Den control plane or its native
-Gmail REST adapter; OAB keeps authorization and provider connectivity within
-its configured facade/adapter boundary.
+- Its user-facing Connect services include Gmail, Google Calendar, Google Drive,
+  Slack, Notion, and Linear.
+- Its hosted MCP connections include services such as Notion, Linear, Stripe,
+  Sentry, Exa, Context7, and Slack when the required OAuth app is configured.
+- It also supports custom compatible local or remote MCP servers.
+- Its native Gmail capability path shows the complementary case where a
+  provider is accessed through a first-party API/SDK adapter instead of a
+  hosted MCP server.
+- Its agent-facing endpoint uses progressive discovery and member-scoped
+  authorization instead of exposing every provider tool directly.
+
+OAB adopts the product principle, not a promise of immediate provider parity:
+**the OAB Agent should be able to access authorized external capabilities such
+as these through the OAB MCP Facade**, regardless of whether the implementation
+behind the facade is a hosted MCP adapter or a capability plugin/native adapter.
+The stable agent contract remains `search_capabilities` and
+`execute_capability`.
+
+The MVP deliberately starts with Notion and Gmail hosted MCP profiles. Calendar,
+Drive, Slack, Linear, Stripe, Sentry, Exa, Context7, and other services are
+roadmap candidates that can be added through the same facade and provider path
+after their auth, safety, availability, and operational requirements are
+reviewed. OAB does not copy OpenWork's Den control plane or claim those services
+are implemented by this ADR.
 
 References: [OpenWork agent MCP](https://github.com/different-ai/openwork/blob/dev/ee/apps/den-api/src/mcp/agent.ts),
 [OpenWork external capabilities](https://github.com/different-ai/openwork/blob/dev/ee/apps/den-api/src/mcp/external-capabilities.ts),
-[OpenWork Google Workspace routes](https://github.com/different-ai/openwork/blob/dev/ee/apps/den-api/src/routes/org/google-workspace.ts).
+[OpenWork Google Workspace routes](https://github.com/different-ai/openwork/blob/dev/ee/apps/den-api/src/routes/org/google-workspace.ts),
+[OpenWork Connect services](https://openworklabs.com/docs/start-here/connect-your-stack/connect-services),
+[OpenWork shared MCP connections](https://openworklabs.com/docs/cloud/share-with-your-team/shared-mcp-connections).
 
 ### 5.3 Notion hosted MCP
 
