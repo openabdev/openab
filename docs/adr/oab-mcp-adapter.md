@@ -80,7 +80,9 @@ REST adapters.
 
 ```mermaid
 flowchart TD
-    A["Coding CLI / Agent<br/>MCP client"]
+    subgraph AGENT_POD [Coding CLI Pod - agent runtime]
+        A["Coding CLI / Agent<br/>MCP client"]
+    end
 
     subgraph OAB_POD [OAB Pod - OAB-owned runtime]
         F["OAB MCP Facade<br/>search_capabilities<br/>execute_capability"]
@@ -102,16 +104,18 @@ flowchart TD
     M --> G
     P --> X
 
+    style AGENT_POD fill:#1f2937,stroke:#60a5fa,stroke-width:3px
     style OAB_POD fill:#111827,stroke:#f59e0b,stroke-width:3px
     style P stroke-dasharray: 5 5
     style X stroke-dasharray: 5 5
 ```
 
-The `OAB Pod` boundary contains the OAB-owned facade, dispatcher, hosted MCP
-adapter, and capability-plugin runtime. The Coding CLI/Agent remains outside
-the Pod and connects only to the facade. Notion, Gmail, and provider APIs also
-remain outside the Pod; the outbound adapter or plugin crosses that boundary
-under OAB policy and audit controls.
+The deployment has two runtime Pods. The **Coding CLI Pod** contains the
+Coding CLI/Agent MCP client. The **OAB Pod** contains the OAB-owned facade,
+dispatcher, hosted MCP adapter, and capability-plugin runtime. The Pods connect
+only over MCP. Notion, Gmail, and provider APIs remain outside both Pods; the
+outbound adapter or plugin crosses that boundary under OAB policy and audit
+controls.
 
 The facade exposes the same two-method contract regardless of the downstream
 path. Notion and Gmail use the hosted MCP adapter in this MVP. The dashed
@@ -259,7 +263,11 @@ owns the stable public contract and delegates provider work to a shared
 capability dispatcher:
 
 ```text
-Agent / Coding CLI (MCP client)
+Coding CLI Pod
+  +-- Agent / Coding CLI (MCP client)
+        +-- MCP connection
+
+OAB Pod
   +-- OAB MCP Facade (MCP server)
         +-- search_capabilities(query)
         +-- execute_capability(name, arguments)
