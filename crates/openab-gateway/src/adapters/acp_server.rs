@@ -2528,6 +2528,7 @@ mod acp_review_fixes {
                 channel_id: format!("acp_{}", Uuid::new_v4()),
                 busy: true,
                 cancel: Some(cancel.clone()),
+                acp_mcp_servers: Vec::new(),
             },
         );
         // Cancel arrives before the handler's stream loop (reserved-then-immediate-cancel).
@@ -2571,6 +2572,7 @@ mod acp_review_fixes {
                 channel_id: format!("acp_{}", Uuid::new_v4()),
                 busy: true,
                 cancel: Some(cancel.clone()),
+                acp_mcp_servers: Vec::new(),
             },
         );
 
@@ -2604,7 +2606,7 @@ mod acp_review_fixes {
         let cancel = Arc::new(tokio::sync::Notify::new());
         sessions.lock().await.insert(
             sid.clone(),
-            AcpSession { channel_id: channel_id.clone(), busy: true, cancel: Some(cancel.clone()) },
+            AcpSession { channel_id: channel_id.clone(), busy: true, cancel: Some(cancel.clone()), acp_mcp_servers: Vec::new() },
         );
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
@@ -2680,6 +2682,7 @@ mod acp_review_fixes {
                 channel_id: format!("acp_{}", Uuid::new_v4()),
                 busy: true,
                 cancel: Some(cancel.clone()),
+                acp_mcp_servers: Vec::new(),
             },
         );
         let params = json!({"sessionId": sid});
