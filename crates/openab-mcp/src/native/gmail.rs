@@ -676,21 +676,22 @@ impl ServerHandler for GmailNative {
     ) -> Result<CallToolResult, McpError> {
         let empty = Map::new();
         let args = request.arguments.as_ref().unwrap_or(&empty);
-        let outcome =
-            match request.name.as_ref() {
-                "search_threads" => self.search_threads(args).await,
-                "get_thread" => self.get_thread(args).await,
-                "get_message" => self.get_message(args).await,
-                "list_labels" => self.list_labels().await,
-                "list_drafts" => self.list_drafts(args).await,
-                "create_draft" => self.create_draft(args).await,
-                other => return Err(McpError::invalid_params(
+        let outcome = match request.name.as_ref() {
+            "search_threads" => self.search_threads(args).await,
+            "get_thread" => self.get_thread(args).await,
+            "get_message" => self.get_message(args).await,
+            "list_labels" => self.list_labels().await,
+            "list_drafts" => self.list_drafts(args).await,
+            "create_draft" => self.create_draft(args).await,
+            other => {
+                return Err(McpError::invalid_params(
                     format!(
                         "unknown tool {other:?} — this adapter serves the six-tool Gmail profile"
                     ),
                     None,
-                )),
-            };
+                ))
+            }
+        };
         Ok(match outcome {
             Ok(v) => CallToolResult::success(vec![Content::text(
                 serde_json::to_string(&v).unwrap_or_else(|_| v.to_string()),
