@@ -82,7 +82,7 @@ REST adapters.
 flowchart TD
     A["Coding CLI / Agent<br/>MCP client"]
 
-    subgraph OAB_POD["OAB Pod - OAB-owned runtime"]
+    subgraph OAB_POD [OAB Pod - OAB-owned runtime]
         F["OAB MCP Facade<br/>search_capabilities<br/>execute_capability"]
         D["Capability Dispatcher<br/>auth - policy - catalog - audit"]
         M["Hosted MCP Adapter<br/>outbound MCP client<br/>OAuth - tools/list - tools/call"]
@@ -102,7 +102,7 @@ flowchart TD
     M --> G
     P --> X
 
-    style OAB_POD fill:none,stroke:#9ca3af,stroke-width:2px
+    style OAB_POD fill:#111827,stroke:#f59e0b,stroke-width:3px
     style P stroke-dasharray: 5 5
     style X stroke-dasharray: 5 5
 ```
