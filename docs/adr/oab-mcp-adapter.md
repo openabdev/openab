@@ -80,42 +80,43 @@ REST adapters.
 
 ```mermaid
 flowchart TD
-    subgraph AGENT_POD [Coding CLI Pod - agent runtime]
+    subgraph OAB_POD [OAB Pod - deployment boundary]
         A["Coding CLI / Agent<br/>MCP client"]
-    end
 
-    subgraph OAB_POD [OAB Pod - OAB-owned runtime]
-        F["OAB MCP Facade<br/>search_capabilities<br/>execute_capability"]
-        D["Capability Dispatcher<br/>auth - policy - catalog - audit"]
-        M["Hosted MCP Adapter<br/>outbound MCP client<br/>OAuth - tools/list - tools/call"]
-        P["Capability Plugin / Native Adapter<br/>provider API or SDK"]
+        subgraph OAB_RUNTIME [OAB-owned runtime]
+            F["OAB MCP Facade<br/>search_capabilities<br/>execute_capability"]
+            D["Capability Dispatcher<br/>auth - policy - catalog - audit"]
+            M["Hosted MCP Adapter<br/>outbound MCP client<br/>OAuth - tools/list - tools/call"]
+            P["Capability Plugin / Native Adapter<br/>provider API or SDK"]
 
-        F --> D
-        D --> M
-        D --> P
+            F --> D
+            D --> M
+            D --> P
+        end
+
+        A -->|MCP| F
     end
 
     N["Notion hosted MCP<br/>external provider"]
     G["Gmail hosted MCP<br/>external provider - Developer Preview"]
     X["External service without hosted MCP<br/>provider API or SDK"]
 
-    A -->|MCP| F
     M --> N
     M --> G
     P --> X
 
-    style AGENT_POD fill:#1f2937,stroke:#60a5fa,stroke-width:3px
-    style OAB_POD fill:#111827,stroke:#f59e0b,stroke-width:3px
+    style OAB_POD fill:#0b1220,stroke:#60a5fa,stroke-width:3px
+    style OAB_RUNTIME fill:#111827,stroke:#f59e0b,stroke-width:3px
     style P stroke-dasharray: 5 5
     style X stroke-dasharray: 5 5
 ```
 
-The deployment has two runtime Pods. The **Coding CLI Pod** contains the
-Coding CLI/Agent MCP client. The **OAB Pod** contains the OAB-owned facade,
-dispatcher, hosted MCP adapter, and capability-plugin runtime. The Pods connect
-only over MCP. Notion, Gmail, and provider APIs remain outside both Pods; the
-outbound adapter or plugin crosses that boundary under OAB policy and audit
-controls.
+The **OAB Pod** is the outer deployment boundary. It contains both the Coding
+CLI/Agent MCP client and the inner **OAB-owned runtime** boundary. The inner
+runtime contains the OAB MCP Facade, dispatcher, hosted MCP adapter, and
+capability-plugin runtime. Notion, Gmail, and provider APIs remain outside the
+OAB Pod; only the outbound adapter or plugin crosses that boundary under OAB
+policy and audit controls.
 
 The facade exposes the same two-method contract regardless of the downstream
 path. Notion and Gmail use the hosted MCP adapter in this MVP. The dashed
@@ -263,20 +264,18 @@ owns the stable public contract and delegates provider work to a shared
 capability dispatcher:
 
 ```text
-Coding CLI Pod
-  +-- Agent / Coding CLI (MCP client)
-        +-- MCP connection
-
-OAB Pod
-  +-- OAB MCP Facade (MCP server)
-        +-- search_capabilities(query)
-        +-- execute_capability(name, arguments)
-              +-- Capability Dispatcher
-                    +-- Hosted MCP Adapter (MCP client)
-                    |     +-- notion -> hosted MCP + OAuth
-                    |     +-- gmail  -> hosted MCP + OAuth (preview)
-                    +-- Capability Plugin / Native Adapter
-                          +-- provider API or SDK
+OAB Pod (outer deployment boundary)
+  +-- Coding CLI / Agent (MCP client)
+  +-- OAB-owned runtime (inner boundary)
+        +-- OAB MCP Facade (MCP server)
+              +-- search_capabilities(query)
+              +-- execute_capability(name, arguments)
+                    +-- Capability Dispatcher
+                          +-- Hosted MCP Adapter (MCP client)
+                          |     +-- notion -> hosted MCP + OAuth
+                          |     +-- gmail  -> hosted MCP + OAuth (preview)
+                          +-- Capability Plugin / Native Adapter
+                                +-- provider API or SDK
 ```
 
 The facade owns:
