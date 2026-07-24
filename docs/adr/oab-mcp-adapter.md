@@ -148,6 +148,58 @@ MCP is an agent capability adapter, not a channel adapter and not an Ambient
 activation mode. Ambient decides when an agent is prompted; the OAB MCP facade
 and adapter decide how that agent reaches authorized external capabilities.
 
+### 4.1 Positioning relative to octobroker (OBK): a two-tier adoption ladder
+
+OpenAB develops two MCP-facing products. They are not competitors and not
+redundant; they answer different questions at different deployment scales, and
+they compose:
+
+- **OAB MCP Facade (this ADR)** is **pod-level**, for a single OAB's own use.
+  It answers *"what can the connected coding CLI discover and use?"* —
+  presentation, capability search, catalog caching, and `tool_filter`
+  least-privilege hygiene. Its credentials are **personal OAuth grants** (the
+  user authorizing access to their own Gmail, their own Notion), held in the
+  pod's `auth.json`. For a single-OAB user this is the complete, standalone
+  product: no extra deployment, the pod boundary is the trust boundary.
+- **octobroker (OBK)** is **fleet-level**, shared by many OABs with distinct
+  identities. It answers *"who is allowed to execute what?"* — per-agent
+  authentication (`X-Octobroker-Key`), default-deny tool and resource policy,
+  short-lived scoped credential minting for **organization-owned** resources,
+  and fail-closed audit. A single-OAB deployment does not need it; adopting it
+  buys governance at the cost of an extra service.
+
+| | OAB MCP Facade | octobroker (OBK) |
+|---|---|---|
+| Tier | Pod (one OAB, its own use) | Fleet (many OABs, distinct identities) |
+| Question answered | What can the CLI discover and use? | Who may execute what? |
+| Credentials | Personal OAuth (user's own resources) | Organization credentials (short-lived, scoped, minted centrally) |
+| Trust boundary | Pod / host (loopback) | Network + per-agent key + fail-closed audit |
+| When to skip | Never — it is the agent-facing entry point | Single OAB, no org-owned resources: pure added complexity |
+
+Credential ownership follows **resource ownership**, not product tier: personal
+resources (the user's Gmail or Notion) are authorized via OAuth and their
+tokens correctly live in the facade's `auth.json` — this is the end state, not
+a transitional one. Organization resources (org GitHub repositories, a company
+Notion workspace) belong behind OBK, so no organization credential ever resides
+in an agent pod.
+
+The upgrade path between tiers is a configuration change, not an agent change:
+a fleet deployment adds OBK as one more downstream entry in the facade's
+`mcp.json`. The agent-facing surface remains exactly
+`search_capabilities`/`execute_capability`; because the facade dispatches
+native `tools/call` requests to downstreams, OBK's per-tool policy and audit
+see real tool names and are never blinded by the meta-tool envelope. Two
+disciplines preserve this ladder:
+
+1. No facade feature may assume OBK exists (the single-OAB tier must remain
+   complete on its own).
+2. No OBK feature may assume the caller is the facade (directly connected MCP
+   clients are first-class in the fleet tier).
+
+Consequently, requests to add per-agent keys or fleet policy to the facade, or
+personal-OAuth stores to OBK, are out of scope by construction for the
+respective product.
+
 ## 5. Prior Art and Industry Research
 
 ### 5.1 Existing OpenAB MCP client
