@@ -44,8 +44,9 @@ REST adapters.
   - `search_capabilities`: discover authorized capabilities from configured
     external MCP servers.
   - `execute_capability`: execute an exact capability returned by discovery.
-- Provide tested configuration profiles for Notion and Gmail over Streamable
-  HTTP.
+- Provide an extension point for services without a hosted MCP server: a
+  capability plugin/native adapter can use a provider API or SDK while exposing
+  the same facade contract. Plugin implementations are outside this MVP.
 - Preserve progressive disclosure: provider tools are not flattened into the
   agent's top-level tool list.
 - Reuse the existing MCP OAuth, PKCE, credential storage, timeout, redaction,
@@ -64,7 +65,7 @@ REST adapters.
   MCP schemas into a second public tool surface.
 - Replacing OBK for GitHub, AWS, Discord, or other integrations already owned by
   OBK.
-- Implementing a native Gmail or Notion REST API adapter in OAB.
+- Implementing a native Gmail or Notion REST/API adapter as part of this MVP.
 - Supporting legacy HTTP+SSE when the provider offers Streamable HTTP.
 - Providing organization-wide credential management or a multi-tenant control
   plane. This MVP assumes a configured OAB instance and its existing auth
@@ -74,46 +75,42 @@ REST adapters.
 
 ## 3. At a Glance
 
-```text
-+----------------------------------------------------------------------------+
-| Coding CLI / Agent                                                         |
-|   MCP client                                                               |
-+--------------------------------+-------------------------------------------+
-                                 | Streamable HTTP MCP (local or remote)
-                                 v
-+----------------------------------------------------------------------------+
-| OAB MCP Facade                                                             |
-|   search_capabilities(query)                                               |
-|   execute_capability(name, arguments)                                      |
-|                                                                            |
-|   auth + policy + capability registry                                      |
-+--------------------------------+-------------------------------------------+
-                                 | internal dispatch
-                                 v
-+----------------------------------------------------------------------------+
-| OAB MCP Adapter                                                            |
-|   outbound MCP client - OAuth - tools/list - tools/call - filtering        |
-+--------------------------------+-------------------------------------------+
-                                 | Streamable HTTP MCP + provider OAuth
-                 +---------------+----------------+
-                 v                                v
-+------------------------------+  +-----------------------------------------+
-| Notion hosted MCP            |  | Google Gmail hosted MCP                 |
-| https://mcp.notion.com/mcp   |  | https://gmailmcp.googleapis.com/mcp/v1 |
-| user OAuth                   |  | user OAuth - Developer Preview         |
-+------------------------------+  +-----------------------------------------+
+```mermaid
+flowchart TD
+    A["Coding CLI / Agent<br/>MCP client"] -->|MCP| F["OAB MCP Facade<br/>search_capabilities<br/>execute_capability"]
+    F --> D["Capability Dispatcher<br/>auth - policy - catalog - audit"]
+    D --> M["Hosted MCP Adapter<br/>outbound MCP client<br/>OAuth - tools/list - tools/call"]
+    D --> P["Capability Plugin / Native Adapter<br/>provider API or SDK"]
+    M --> N["Notion hosted MCP"]
+    M --> G["Gmail hosted MCP<br/>Developer Preview"]
+    P --> X["Service without hosted MCP<br/>provider API or SDK"]
+
+    style P stroke-dasharray: 5 5
+    style X stroke-dasharray: 5 5
 ```
 
-The direction is intentional: the agent calls OAB, and OAB calls external
-MCP servers. The facade never exposes provider credentials or asks the agent to
-construct provider-specific tool calls directly.
+The facade exposes the same two-method contract regardless of the downstream
+path. Notion and Gmail use the hosted MCP adapter in this MVP. The dashed
+capability-plugin path is the extension point for services that do not provide
+a hosted MCP server: a provider API/SDK adapter can publish the same searchable
+capabilities and execute them under the same OAB authorization, policy, schema,
+and audit controls. It is not a second agent-facing API.
+
+The direction is intentional: the agent calls OAB, and OAB dispatches either to
+an external MCP server or to a provider plugin. The facade never exposes
+provider credentials or asks the agent to construct provider-specific calls
+directly.
 
 ## 4. Terminology and Positioning
 
 - **OAB MCP** is the user-facing feature name.
 - **OAB MCP Facade** is the inbound, agent-facing MCP server surface.
 - **OAB MCP Adapter** is the outbound component that connects OAB to one or
-  more external MCP servers.
+  more hosted external MCP servers.
+- **Capability Plugin / Native Adapter** is an OAB-side provider integration
+  that uses a provider API or SDK when no hosted MCP server is available. It
+  is an implementation path behind the same facade, not a new agent-facing
+  contract.
 - **MCP server instance** is one configured provider connection, such as
   `notion` or `gmail`.
 - **Capability** is the OAB-facing, searchable representation of an authorized
@@ -219,17 +216,20 @@ References: [OpenClaw](https://github.com/openclaw/openclaw),
 ### 6.1 Facade and adapter boundary
 
 The OAB MCP facade is the inbound MCP server exposed to the coding agent. It
-owns the stable public contract and delegates provider work to the outbound
-adapter runtime:
+owns the stable public contract and delegates provider work to a shared
+capability dispatcher:
 
 ```text
 Agent / Coding CLI (MCP client)
   +-- OAB MCP Facade (MCP server)
         +-- search_capabilities(query)
         +-- execute_capability(name, arguments)
-              +-- OAB MCP Adapter / McpRuntimeManager (MCP client)
-                    +-- notion -> hosted MCP + OAuth
-                    +-- gmail  -> hosted MCP + OAuth (preview)
+              +-- Capability Dispatcher
+                    +-- Hosted MCP Adapter (MCP client)
+                    |     +-- notion -> hosted MCP + OAuth
+                    |     +-- gmail  -> hosted MCP + OAuth (preview)
+                    +-- Capability Plugin / Native Adapter
+                          +-- provider API or SDK
 ```
 
 The facade owns:
@@ -241,7 +241,7 @@ The facade owns:
 - validation that execution uses an exact capability returned by discovery;
 - redacted results, errors, and audit records.
 
-The adapter owns connection concerns only:
+The hosted MCP adapter owns connection concerns only:
 
 - endpoint and transport selection;
 - OAuth discovery, PKCE, login, refresh, and credential namespace;
@@ -250,8 +250,16 @@ The adapter owns connection concerns only:
 - timeout, cancellation, circuit breaker, and redacted errors;
 - dispatch of exact provider tool names and arguments.
 
-Provider business logic remains at the provider MCP server. OAB must not
-reimplement Notion or Gmail REST operations as part of this MVP.
+A capability plugin/native adapter implements the same catalog and execution
+interface using a provider API or SDK. It is the fallback path for services
+without a hosted MCP server and must use the same OAB authorization, schema,
+policy, confirmation, redaction, and audit controls. Plugin implementations are
+not part of the Notion/Gmail hosted-MCP MVP unless separately enabled and
+reviewed.
+
+Hosted MCP provider business logic remains at the provider MCP server. A future
+plugin may contain a thin provider API/SDK translation layer, but the facade
+must not expose provider-specific APIs directly to the agent.
 
 ### 6.2 Configuration and activation
 
@@ -413,8 +421,8 @@ The adapter treats remote content as untrusted data:
 
 ## 7. Why This Approach
 
-This approach uses the provider's maintained MCP contract while keeping OAB's
-existing client/runtime small:
+This approach keeps one small, stable agent-facing contract while allowing OAB
+to support both provider-owned MCP and providers that expose only an API or SDK:
 
 - Notion already provides a production-oriented hosted MCP server and
   agent-friendly tools; duplicating its REST API would create maintenance and
@@ -422,13 +430,17 @@ existing client/runtime small:
 - Gmail's official server is available for an opt-in preview integration. The
   profile makes its preview status and limited scopes visible instead of hiding
   the risk behind a native adapter.
+- A capability plugin/native adapter provides a controlled fallback for a
+  service without hosted MCP, without changing the agent's discovery or
+  execution methods. The plugin path carries extra provider-client maintenance
+  and is explicitly not part of this MVP.
 - Reusing the existing MCP client avoids a second outbound OAuth store,
   transport stack, or server lifecycle implementation.
-- The two-method facade, tool filtering, and progressive discovery prevent the
-  model context from being flooded with provider tools and create an explicit
-  safety boundary.
-- Existing deployments are unchanged: no `mcp.json` means no MCP runtime and no
-  new network calls.
+- The two-method facade, shared dispatcher, tool filtering, and progressive
+  discovery prevent the model context from being flooded with provider tools
+  and create an explicit safety boundary.
+- Existing deployments are unchanged: no `mcp.json` means no hosted MCP runtime
+  and no new network calls.
 
 The trade-off is dependency on provider MCP availability, OAuth behavior, and
 remote tool-schema stability. Those risks are acceptable for Notion and for an
@@ -547,8 +559,10 @@ facade exposes exactly two stable methods:
 - `execute_capability` for schema-validated execution of an exact discovered
   capability.
 
-The adapter uses the existing `openab-agent` MCP client/runtime to connect to
-external providers.
+The adapter uses the existing `openab-agent` MCP client/runtime for hosted MCP
+connections. A future capability plugin/native adapter may use a provider API or
+SDK for services without hosted MCP, but it must implement the same catalog,
+policy, and execution boundary rather than adding agent-facing provider APIs.
 
 The MVP supports:
 
