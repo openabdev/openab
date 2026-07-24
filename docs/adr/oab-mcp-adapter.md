@@ -122,9 +122,9 @@ The facade exposes the same two-method contract regardless of the downstream
 path. Notion and Gmail use the hosted MCP adapter in this MVP. The dashed
 capability-plugin path is the extension point for services that do not provide
 a hosted MCP server. It is not a second agent-facing API. The coding agent
-reaches the facade through the ACP `session/new` `mcpServers` registration and
-a loopback-only listener inside the pod (§6.2); the native `openab-agent`
-dispatches in-process.
+reaches the facade through the ACP `session/new` `mcpServers` registration —
+a stdio `openab-agent mcp-facade` subprocess per session (§6.2); the native
+`openab-agent` dispatches in-process.
 
 ## 4. Terminology and Positioning
 
@@ -362,15 +362,22 @@ own MCP configuration file is edited, and no CLI-specific registration format
 is required.
 
 - **External coding CLIs (Kiro, Claude Code, Codex, ...):** when the facade is
-  active, OAB serves it as a Streamable HTTP MCP server bound to a loopback
-  interface inside the OAB pod and advertises that endpoint, with a
-  per-session authorization token, in the `mcpServers` entry of `session/new`.
-  The listener must never bind a non-loopback interface in this MVP; the token
-  scopes each ACP session to its own facade session so one thread's
-  capabilities and audit trail cannot be reused by another.
-- **Native `openab-agent`:** the dispatcher is invoked in-process. No loopback
-  hop or token exchange is required because the facade contract and policy
-  checks are implemented by the same dispatcher component (see §6.4).
+  active, OAB advertises a **stdio** MCP server entry in the `mcpServers`
+  parameter of `session/new`: the command `openab-agent mcp-facade`. The CLI
+  spawns the facade as its own subprocess, giving each ACP session a private
+  facade instance — session isolation by construction, with no listener, no
+  port, and no session token to manage. This is dictated by a workspace
+  constraint: the MCP runtime (connections, OAuth, credential store, filters,
+  circuit breaker) lives in the `openab-agent` crate, which is excluded from
+  the broker workspace, so the broker cannot serve the facade in-process
+  without duplicating that runtime — exactly what this ADR forbids. A
+  loopback-only Streamable HTTP listener with per-session tokens remains the
+  documented follow-up if per-session subprocesses prove too heavy; it must
+  never bind a non-loopback interface.
+- **Native `openab-agent`:** the dispatcher is invoked in-process via the
+  existing `mcp` meta-tool. No subprocess is required because the facade
+  contract and policy checks are implemented by the same dispatcher component
+  (see §6.4).
 
 This is the same architectural role that
 [`acp-server-websocket-mcp-browser.md`](./acp-server-websocket-mcp-browser.md)
