@@ -377,6 +377,22 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown_hook = cfg.hooks.pre_shutdown.clone();
 
+    // OAB MCP Facade (`[mcp]` in config.toml — OAB MCP Adapter ADR §6.2):
+    // serve the loopback Streamable HTTP MCP server in-process so any coding
+    // CLI on this host can reach authorized external capabilities via
+    // http://<listen>/mcp. Absent section = no listener (backward compat).
+    // A bind failure is fatal at startup (fail fast, like a bad platform
+    // token) rather than a silently missing capability surface.
+    if let Some(mcp_cfg) = cfg.mcp.clone() {
+        let listen = mcp_cfg.listen.clone();
+        tokio::spawn(async move {
+            if let Err(e) = openab_mcp::mcp::facade::serve_http(&listen).await {
+                tracing::error!(error = %format!("{e:#}"), listen, "OAB MCP facade exited");
+                std::process::exit(1);
+            }
+        });
+    }
+
     let pool = Arc::new(acp::SessionPool::new(
         cfg.agent,
         cfg.pool.max_sessions,

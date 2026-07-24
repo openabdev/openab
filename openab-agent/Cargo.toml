@@ -6,14 +6,14 @@ license = "MIT"
 description = "Native Rust coding agent with built-in ACP support"
 
 [dependencies]
+# Shared MCP runtime + auth.json layer + LLM type layer + HostBridge —
+# extracted so the broker can host the OAB MCP Facade in-process (ADR §6.2).
+# This crate re-exports them as `crate::{mcp,auth}` and from `crate::{llm,acp}`.
+openab-mcp = { path = "../crates/openab-mcp" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-# rmcp 1.7 is on reqwest 0.13; its `StreamableHttpClient`/`AuthClient` impls are
-# for the 0.13 `Client`, so the OAuth transport must hold that type. The rest of
-# the crate stays on 0.12.
-reqwest013 = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
 anyhow = "1"
 async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
@@ -21,35 +21,13 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64 = "0.22.1"
-sha2 = "0.11.0"
-getrandom = "0.4.2"
-urlencoding = "2.1.3"
-open = "5.3.5"
 url = "2.5.8"
-# Pinned to rmcp's oauth2 (5.0, default-features off) so `StoredCredentials`'
-# `OAuthTokenResponse` types unify; used to splice a rotated refresh_token back
-# into rmcp's wholesale-rebuilt credentials (OAuth 2.1 §10.4) in McpCredentialStore.
-oauth2 = { version = "5", default-features = false }
-# Multi-draft JSON Schema validator for MCP tool `inputSchema` (rows 18-21).
-# `validator_for` auto-selects the draft from the schema's `$schema` keyword
-# (draft-07 / 2020-12 / …), so one call covers every dialect a server may pin.
-# default-features off drops the http/file `$ref` resolvers — tool-arg
-# validation must never trigger an outbound fetch, and the resolvers pull a
-# blocking reqwest we don't want.
-jsonschema = { version = "0.46", default-features = false }
-rmcp = { version = "1.7", default-features = false, features = [
-    "client",
-    "transport-child-process",
-    "transport-streamable-http-client-reqwest",
-    "auth",
-    # OAB MCP Facade (`openab-agent mcp-facade`): inbound MCP server over stdio.
-    "server",
-    "transport-io",
-] }
+# rmcp model/service types still surface in the ACP layer (sampling bridge).
+rmcp = { version = "1.7", default-features = false, features = ["client"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
-temp-env = "0.3.6"
+temp-env = { version = "0.3.6", features = ["async_closure"] }

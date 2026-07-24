@@ -525,7 +525,11 @@ impl McpRuntimeManager {
             .collect();
         catalog.sort_by(|a, b| a.name.cmp(&b.name));
         let roots = Arc::new(compute_roots(std::env::current_dir().ok(), &cfg.roots));
-        let provider = crate::llm::default_provider();
+        // No default LLM provider here: this crate owns only the type layer.
+        // The agent injects its configured provider via `set_provider` (the
+        // broker-hosted facade runs with none — sampling requests are then
+        // declined, which is correct for a non-LLM host).
+        let provider = None;
         let idle_ttl = cfg.idle_ttl();
         let max_concurrent = cfg.max_concurrent();
         let handles: HashMap<_, _> = cfg
@@ -568,6 +572,15 @@ impl McpRuntimeManager {
     /// into each `OpenabClientHandler`.
     pub fn set_host_bridge(&mut self, bridge: crate::acp::HostBridge) {
         self.host_bridge = Some(bridge);
+    }
+
+    /// Inject the LLM provider used to answer MCP sampling requests
+    /// (`sampling/createMessage`). Called by the agent after construction —
+    /// `from_config` deliberately sets no provider because concrete
+    /// providers live in `openab-agent`, not this crate. Hosts without an
+    /// LLM (the broker facade) simply never call this.
+    pub fn set_provider(&mut self, provider: crate::llm::SharedLlmProvider) {
+        self.provider = Some(provider);
     }
 
     /// Cached `AuthClient` for `name`, built on first use from `server_url`.
@@ -1500,6 +1513,10 @@ impl McpRuntimeManager {
                 // Apply the operator-pinned MCP log level (row 584). Optional
                 // capability — a failure must not abort an otherwise healthy
                 // connection, so we warn and continue.
+                // rmcp deprecates set_level (SEP-2577 removes MCP logging
+                // upstream); the operator-facing `log_level` config keeps
+                // working until rmcp actually drops the method.
+                #[allow(deprecated)]
                 if let Some(level) = connect_log_level {
                     if let Err(e) = client.set_level(SetLevelRequestParams::new(level)).await {
                         tracing::warn!(

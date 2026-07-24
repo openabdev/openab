@@ -4,10 +4,13 @@ on:
   push:
     paths:
       - 'openab-agent/**'
+      # openab-agent path-depends on the shared MCP runtime crate
+      - 'crates/openab-mcp/**'
       - '.github/workflows/ci-openab-agent.yml'
   pull_request:
     paths:
       - 'openab-agent/**'
+      - 'crates/openab-mcp/**'
       - '.github/workflows/ci-openab-agent.yml'
 
 jobs:

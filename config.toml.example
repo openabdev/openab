@@ -380,3 +380,14 @@ error_hold_ms = 2500
 # [ambient.discord]
 # channels = ["1234567890"]                # channel IDs to observe
 # allow_bot_messages = false               # include other bots in buffer
+
+# --- OAB MCP Facade ---
+# In-process MCP server (Streamable HTTP, loopback-only) exposing
+# search_capabilities / execute_capability over the MCP servers configured in
+# ~/.openab/agent/mcp.json. Any coding CLI on this host (Kiro, Claude Code,
+# Codex, ...) can connect to http://127.0.0.1:8848/mcp.
+# Presence of [mcp] enables the listener; omit the section to disable.
+# NOTE: the endpoint has no authentication — it must stay on loopback
+# (non-loopback addresses are refused at startup).
+# [mcp]
+# listen = "127.0.0.1:8848"                  # loopback only

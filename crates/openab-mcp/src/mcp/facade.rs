@@ -11,11 +11,12 @@
 //! timeouts, circuit breaking, and redaction are identical regardless of
 //! frontend (ADR §6.4 "Relationship to the existing `mcp` meta-tool").
 //!
-//! Transport is stdio (`openab-agent mcp-facade`): the broker advertises this
-//! command in ACP `session/new` `mcpServers`, so each coding-CLI session gets
-//! its own facade subprocess — session isolation by construction. Logging
-//! stays on stderr (`main.rs` initializes tracing with `with_writer(stderr)`);
-//! stdout carries only MCP JSON-RPC.
+//! Transport is loopback Streamable HTTP (ADR §6.2): the broker starts the
+//! listener in-process when `[mcp]` is present in `config.toml`, and any
+//! coding CLI (Kiro, Claude Code, Codex, …) connects to
+//! `http://127.0.0.1:<port>/mcp`. Binding a non-loopback interface is
+//! refused — the endpoint carries no authentication layer, so the host
+//! boundary is the trust boundary.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -312,26 +313,50 @@ impl ServerHandler for McpFacade {
     }
 }
 
-/// Entry point for `openab-agent mcp-facade`: serve the facade over stdio
-/// until the client (the coding CLI that spawned us) closes the pipe.
+/// Reject any bind address that is not loopback (ADR §6.2: the facade must
+/// never listen on a non-loopback interface — it has no authentication
+/// layer; the host boundary is the trust boundary).
+fn require_loopback(addr: &str) -> Result<std::net::SocketAddr> {
+    let sock: std::net::SocketAddr = addr
+        .parse()
+        .with_context(|| format!("invalid listen address {addr:?} (expected ip:port)"))?;
+    if !sock.ip().is_loopback() {
+        anyhow::bail!(
+            "refusing to bind {addr}: the OAB MCP facade is loopback-only (use 127.0.0.1 or [::1])"
+        );
+    }
+    Ok(sock)
+}
+
+/// Serve the OAB MCP Facade over Streamable HTTP on a loopback address
+/// (`http://<addr>/mcp`). Runs until the process is stopped. Used by the
+/// broker when `[mcp]` is present in `config.toml`, and by
+/// `openab-agent mcp-facade --listen <addr>`.
 ///
 /// A missing/empty `mcp.json` is not an error — the facade serves an empty
 /// capability catalog (ADR §6.3: no configured servers means no provider
-/// capabilities), so the spawning CLI still gets clean MCP responses.
-pub async fn serve_stdio() -> Result<()> {
+/// capabilities), so clients still get clean MCP responses.
+pub async fn serve_http(addr: &str) -> Result<()> {
+    use rmcp::transport::streamable_http_server::{
+        session::local::LocalSessionManager, StreamableHttpService,
+    };
+    let sock = require_loopback(addr)?;
     let manager = super::load_runtime_or_warn()
         .unwrap_or_else(|| McpRuntimeManager::from_config(McpConfig::default()));
     manager.start_eviction_loop();
-    let service = rmcp::ServiceExt::serve(
-        McpFacade::new(manager),
-        (tokio::io::stdin(), tokio::io::stdout()),
-    )
-    .await
-    .context("initialize OAB MCP facade over stdio")?;
-    service
-        .waiting()
+    let service = StreamableHttpService::new(
+        move || Ok(McpFacade::new(manager.clone())),
+        LocalSessionManager::default().into(),
+        Default::default(),
+    );
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind(sock)
         .await
-        .context("OAB MCP facade terminated")?;
+        .with_context(|| format!("bind OAB MCP facade listener on {sock}"))?;
+    tracing::info!(addr = %sock, "OAB MCP facade listening (Streamable HTTP, loopback-only, no auth — host boundary is the trust boundary)");
+    axum::serve(listener, router)
+        .await
+        .context("OAB MCP facade HTTP server terminated")?;
     Ok(())
 }
 
@@ -403,6 +428,16 @@ mod tests {
         assert_ne!(ok.is_error, Some(true));
         let err = text_result(&json!({"e": true}), true);
         assert_eq!(err.is_error, Some(true));
+    }
+
+    #[test]
+    fn require_loopback_accepts_v4_and_v6_loopback_only() {
+        assert!(require_loopback("127.0.0.1:8848").is_ok());
+        assert!(require_loopback("[::1]:8848").is_ok());
+        let err = require_loopback("0.0.0.0:8848").unwrap_err().to_string();
+        assert!(err.contains("loopback-only"), "got: {err}");
+        assert!(require_loopback("192.168.1.10:8848").is_err());
+        assert!(require_loopback("not-an-addr").is_err());
     }
 
     #[tokio::test]

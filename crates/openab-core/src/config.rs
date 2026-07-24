@@ -65,9 +65,27 @@ impl<'de> Deserialize<'de> for AllowBots {
     }
 }
 
+/// `[mcp]` — enables the in-process OAB MCP Facade: a loopback Streamable
+/// HTTP MCP server exposing `search_capabilities` / `execute_capability`
+/// over the shared MCP runtime (`openab-mcp` crate). Any coding CLI on the
+/// same host connects to `http://<listen>/mcp`. Provider connections stay in
+/// `~/.openab/agent/mcp.json` (the facade has no provider config here —
+/// single source of truth, ADR §6.3 / Alternative E).
 #[derive(Debug, Clone, Deserialize)]
-pub struct AgentCoreConfig {
-    /// AgentCore Runtime ARN (required)
+pub struct McpFacadeConfig {
+    /// Loopback listen address. Non-loopback addresses are refused at
+    /// startup — the endpoint has no authentication layer, so the host
+    /// boundary is the trust boundary.
+    #[serde(default = "default_mcp_listen")]
+    pub listen: String,
+}
+
+fn default_mcp_listen() -> String {
+    "127.0.0.1:8848".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentCoreConfig {    /// AgentCore Runtime ARN (required)
     pub runtime_arn: String,
     /// ACP agent command to run in the PTY shell (default: kiro-cli acp --trust-all-tools)
     #[serde(default = "default_agentcore_shell_command")]
@@ -178,6 +196,9 @@ pub struct Config {
     pub teams: Option<TeamsConfig>,
     pub feishu: Option<FeishuConfig>,
     pub agentcore: Option<AgentCoreConfig>,
+    /// OAB MCP Facade (`[mcp]` — OAB MCP Adapter ADR §6.2/§6.3). Presence is
+    /// the opt-in signal: absent = no facade, no listener, no new behavior.
+    pub mcp: Option<McpFacadeConfig>,
     #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
@@ -2267,6 +2288,30 @@ fn default_ambient_context_flushes() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_facade_absent_by_default() {
+        // Backward compat: no [mcp] section → no facade, no listener.
+        let cfg = parse_config_str("[discord]\nbot_token = \"x\"\n", "test").unwrap();
+        assert!(cfg.mcp.is_none());
+    }
+
+    #[test]
+    fn mcp_facade_presence_enables_with_default_listen() {
+        let cfg = parse_config_str("[discord]\nbot_token = \"x\"\n[mcp]\n", "test").unwrap();
+        let mcp = cfg.mcp.expect("[mcp] presence is the opt-in signal");
+        assert_eq!(mcp.listen, "127.0.0.1:8848");
+    }
+
+    #[test]
+    fn mcp_facade_listen_override() {
+        let cfg = parse_config_str(
+            "[discord]\nbot_token = \"x\"\n[mcp]\nlisten = \"127.0.0.1:9000\"\n",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(cfg.mcp.unwrap().listen, "127.0.0.1:9000");
+    }
     use std::io::Write;
 
     #[test]
