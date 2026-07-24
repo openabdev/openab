@@ -121,7 +121,10 @@ policy and audit controls.
 The facade exposes the same two-method contract regardless of the downstream
 path. Notion and Gmail use the hosted MCP adapter in this MVP. The dashed
 capability-plugin path is the extension point for services that do not provide
-a hosted MCP server. It is not a second agent-facing API.
+a hosted MCP server. It is not a second agent-facing API. The coding agent
+reaches the facade through the ACP `session/new` `mcpServers` registration and
+a loopback-only listener inside the pod (§6.2); the native `openab-agent`
+dispatches in-process.
 
 ## 4. Terminology and Positioning
 
@@ -350,7 +353,38 @@ Hosted MCP provider business logic remains at the provider MCP server. A future
 plugin may contain a thin provider API/SDK translation layer, but the facade
 must not expose provider-specific APIs directly to the agent.
 
-### 6.2 Configuration and activation
+### 6.2 Facade transport and registration
+
+The facade reaches the coding agent through the mechanism OAB already uses:
+the ACP `session/new` request, whose `mcpServers` parameter OAB currently sends
+as an empty list (`crates/openab-core/src/acp/connection.rs`). No coding CLI's
+own MCP configuration file is edited, and no CLI-specific registration format
+is required.
+
+- **External coding CLIs (Kiro, Claude Code, Codex, ...):** when the facade is
+  active, OAB serves it as a Streamable HTTP MCP server bound to a loopback
+  interface inside the OAB pod and advertises that endpoint, with a
+  per-session authorization token, in the `mcpServers` entry of `session/new`.
+  The listener must never bind a non-loopback interface in this MVP; the token
+  scopes each ACP session to its own facade session so one thread's
+  capabilities and audit trail cannot be reused by another.
+- **Native `openab-agent`:** the dispatcher is invoked in-process. No loopback
+  hop or token exchange is required because the facade contract and policy
+  checks are implemented by the same dispatcher component (see §6.4).
+
+This is the same architectural role that
+[`acp-server-websocket-mcp-browser.md`](./acp-server-websocket-mcp-browser.md)
+assigns to OpenAB core: an MCP proxy/aggregator between the agent and upstream
+capability sources, delivered to the agent via `mcpServers`. The OAB MCP Facade
+is that inbound component for external service capabilities; browser tools and
+external capabilities share the delivery mechanism, and Alternative C's
+rejection of a "second generic inbound MCP server" means no additional
+agent-facing MCP server beyond this one aggregation point.
+
+If a backing CLI does not honor ACP `mcpServers`, the facade is unavailable for
+that CLI in the MVP rather than falling back to editing the CLI's config files.
+
+### 6.3 Configuration and activation
 
 Keep the existing `openab-agent` configuration contract rather than introducing
 a duplicate top-level TOML section:
@@ -418,7 +452,7 @@ pre-registered client, operators use the existing `oauth.client_id`,
 The profile examples are deliberately conservative. A deployment may add
 provider tools after reviewing their schemas and side effects.
 
-### 6.3 Capability discovery and execution
+### 6.4 Capability discovery and execution
 
 The facade exposes only two stable methods. Provider-specific tools remain
 behind the adapter and are represented as searchable capabilities:
@@ -453,7 +487,27 @@ capability cache. The facade must then refresh discovery before accepting a
 call whose schema or availability may have changed. Provider names and raw
 provider credentials are never required in the agent-facing contract.
 
-### 6.4 MVP capability profiles
+#### Relationship to the existing `mcp` meta-tool
+
+`openab-agent` already exposes an LLM-facing `mcp` meta-tool with six actions
+(`help`, `list_servers`, `list_tools`, `describe_tool`, `call`, `status`)
+implemented in `openab-agent/src/mcp/meta_tool.rs`. The facade does not add a
+second discovery/execution surface on top of it:
+
+- The meta-tool and the facade are two frontends over the **same capability
+  dispatcher and MCP runtime**. Catalog contents, tool filters, policy checks,
+  schema validation, and audit behavior are identical regardless of frontend.
+- No agent runtime sees both surfaces. The native `openab-agent` keeps the
+  in-process meta-tool; an external coding CLI receives only the facade via
+  ACP `mcpServers` (§6.2) and never sees the meta-tool, which is internal to
+  `openab-agent`.
+- The meta-tool's action vocabulary is unchanged by this MVP. Converging its
+  action names with `search_capabilities`/`execute_capability` is a documented
+  follow-up, not an MVP requirement, because renaming the accepted meta-tool
+  contract would be a breaking change to
+  [`openab-agent-mcp.md`](./openab-agent-mcp.md).
+
+### 6.5 MVP capability profiles
 
 #### Notion
 
@@ -476,7 +530,7 @@ provider credentials are never required in the agent-facing contract.
 - Draft results must be presented as drafts for user review; the adapter must
   not claim that a message was sent.
 
-### 6.5 Credential and session model
+### 6.6 Credential and session model
 
 - HTTP MCP servers use the existing `openab-agent` OAuth manager and
   namespaced credential store (`mcp:<server-name>`).
@@ -489,7 +543,7 @@ provider credentials are never required in the agent-facing contract.
 - Existing per-server timeout, cancellation, idle eviction, and circuit breaker
   behavior applies without an adapter-specific retry loop.
 
-### 6.6 Safety policy
+### 6.7 Safety policy
 
 The adapter treats remote content as untrusted data:
 
@@ -554,7 +608,9 @@ escape hatch for operators who intentionally configure a server outside OAB.
 ### C. Add a second generic inbound MCP server
 
 Rejected as unnecessary for this MVP. The OAB MCP facade is the intentionally
-scoped inbound server for the coding agent. A separate generic server for
+scoped inbound server for the coding agent, filling the MCP proxy/aggregator
+role that [`acp-server-websocket-mcp-browser.md`](./acp-server-websocket-mcp-browser.md)
+already assigns to OpenAB core (§6.2). A separate generic server for
 arbitrary OAB workflows would require another authentication, tenancy, and
 authorization design and would blur the two-method capability boundary.
 
