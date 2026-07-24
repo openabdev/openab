@@ -718,6 +718,16 @@ impl McpRuntimeManager {
         &self.catalog
     }
 
+    /// The configured `tool_filter` for one server, cloned out so the read
+    /// guard is not held across an await point. `None` when the server is
+    /// unknown or has no filter configured.
+    pub(crate) async fn tool_filter(&self, server: &str) -> Option<super::config::ToolFilter> {
+        let guard = self.handles.read().await;
+        guard
+            .get(server)
+            .and_then(|h| h.config.tool_filter().cloned())
+    }
+
     /// Snapshot of `(name, status)` sorted by name. Clones out so the read
     /// guard is dropped before returning — callers don't hold a lock.
     pub async fn statuses(&self) -> Vec<(String, ServerStatus)> {

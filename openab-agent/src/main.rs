@@ -29,6 +29,11 @@ enum Commands {
         #[command(subcommand)]
         action: McpAction,
     },
+    /// Serve the OAB MCP Facade over stdio: an inbound MCP server exposing
+    /// `search_capabilities` / `execute_capability` backed by the configured
+    /// downstream MCP servers (global + project mcp.json). Spawned by the OAB
+    /// broker via ACP `session/new` `mcpServers`.
+    McpFacade,
 }
 
 #[derive(Subcommand)]
@@ -160,6 +165,13 @@ async fn main() {
                 }
             }
         },
+        Some(Commands::McpFacade) => {
+            if let Err(e) = mcp::facade::serve_stdio().await {
+                // stderr only — stdout is the MCP wire.
+                eprintln!("mcp-facade: {e:#}");
+                std::process::exit(1);
+            }
+        }
     }
 }
 

@@ -42,6 +42,9 @@ rmcp = { version = "1.7", default-features = false, features = [
     "transport-child-process",
     "transport-streamable-http-client-reqwest",
     "auth",
+    # OAB MCP Facade (`openab-agent mcp-facade`): inbound MCP server over stdio.
+    "server",
+    "transport-io",
 ] }
 
 [target.'cfg(unix)'.dependencies]
