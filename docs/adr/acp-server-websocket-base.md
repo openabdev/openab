@@ -217,9 +217,12 @@ and rejecting forged ids.
 ## 6. Roadmap (re-scoped; not the original proposal's numbered phases)
 
 North star: the agent's LLM autonomously operating the user's real browser (generalized
-"computer use") — see [MCP-over-ACP browser control](./acp-server-websocket-mcp-browser.md).
+"computer use") — see [Reverse MCP-over-ACP over WebSocket](./acp-server-websocket-reverse-mcp.md).
 
 ### Critical path (next) — everything the browser goal requires
+> **Done in #1447** — all four items below shipped (agent→client request direction, the
+> MCP-over-ACP tunnel + core MCP proxy, and the generated v1 wire types). See the
+> [Reverse MCP-over-ACP ADR](./acp-server-websocket-reverse-mcp.md).
 - **agent→client REQUEST direction** — the base does only client→agent + agent→client
   *notifications*; browser/tool use needs the agent to send *requests* to the client and
   await a result. The WS is already bidirectional; the dispatch loop must add this path.
@@ -329,4 +332,4 @@ Notes:
 
 - Original proposal: [acp-server-websocket.md](./acp-server-websocket.md)
 - Official method surface + coverage: [acp-official-methods.md](../acp-official-methods.md)
-- MCP-over-ACP browser control: [acp-server-websocket-mcp-browser.md](./acp-server-websocket-mcp-browser.md)
+- Reverse MCP-over-ACP over WebSocket: [acp-server-websocket-reverse-mcp.md](./acp-server-websocket-reverse-mcp.md)

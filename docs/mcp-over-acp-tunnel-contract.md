@@ -2,7 +2,7 @@
 
 This is the wire contract the **browser extension** (the ACP client / MCP server end)
 implements so the OpenAB gateway can tunnel MCP to it over the existing `/acp` WebSocket, per
-[ADR: Browser control via MCP-over-ACP](./adr/acp-server-websocket-mcp-browser.md). It adopts
+[ADR: Reverse MCP-over-ACP over WebSocket](./adr/acp-server-websocket-reverse-mcp.md). It adopts
 the official [MCP-over-ACP RFD](https://agentclientprotocol.com/rfds/mcp-over-acp).
 
 Scope: only the **gateway ↔ extension** hop (the sole hop that leaves the pod). How OpenAB
