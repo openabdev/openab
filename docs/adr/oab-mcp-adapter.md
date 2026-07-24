@@ -206,7 +206,50 @@ References: [OpenWork agent MCP](https://github.com/different-ai/openwork/blob/d
 [OpenWork Connect services](https://openworklabs.com/docs/start-here/connect-your-stack/connect-services),
 [OpenWork shared MCP connections](https://openworklabs.com/docs/cloud/share-with-your-team/shared-mcp-connections).
 
-### 5.3 Notion hosted MCP
+### 5.3 OpenWorker native connector prior art
+
+[OpenWorker](https://github.com/andrewyng/openworker) provides complementary
+prior art for the capability-plugin path. It is a local-first desktop app with
+a local Python agent server, a connector registry, native provider tools, and
+optional remote MCP support. Its architecture shows that an agent product can
+support provider-maintained MCP and native API/SDK connectors without forcing
+every integration through MCP.
+
+The Gmail implementation is a native REST connector rather than a hosted MCP
+connection:
+
+- `gmail_search_messages` calls the Gmail REST messages endpoint with an OAuth
+  bearer token.
+- `gmail_get_message` fetches a message resource directly from Gmail.
+- `gmail_send_email` posts a base64url-encoded MIME message to Gmail and is
+  approval-gated.
+- `gmail:account:<email>` profiles support multiple mailboxes, managed token
+  refresh, a default-account pointer, and account-level privacy filters.
+- A separate generic Email connector uses IMAP/SMTP and app passwords for
+  Gmail, iCloud, Fastmail, and custom providers; it is not the native Gmail
+  API path.
+
+OAB adopts the lessons, not OpenWorker's provider-specific agent surface:
+
+- keep connector descriptors/catalog metadata separate from auth/session state;
+- enforce provider privacy filters before content reaches the agent;
+- make write/send capabilities explicitly approval-gated;
+- use a Capability Plugin / Native Adapter when a provider has no hosted MCP;
+- allow generic MCP and native connectors to coexist under one policy boundary.
+
+OAB deliberately normalizes these paths behind `search_capabilities` and
+`execute_capability` rather than exposing tools such as
+`gmail_search_messages` directly. OpenWorker's generic MCP OAuth path is also
+useful prior art, but the inspected Gmail implementation uses direct Gmail REST
+calls, not Google's hosted Gmail MCP endpoint.
+
+References: [OpenWorker README](https://github.com/andrewyng/openworker),
+[OpenWorker Gmail tools](https://github.com/andrewyng/openworker/blob/main/coworker/connectors/integration_tools.py),
+[OpenWorker Gmail accounts](https://github.com/andrewyng/openworker/blob/main/coworker/connectors/gmail_accounts.py),
+[OpenWorker generic email connector](https://github.com/andrewyng/openworker/blob/main/coworker/connectors/email_tools.py),
+[OpenWorker MCP OAuth](https://github.com/andrewyng/openworker/blob/main/coworker/mcp/oauth.py).
+
+### 5.4 Notion hosted MCP
 
 Notion provides a first-party hosted MCP server at
 `https://mcp.notion.com/mcp`, using Streamable HTTP and user OAuth. Its tools
@@ -223,7 +266,7 @@ References: [Notion connection guide](https://developers.notion.com/guides/mcp/g
 [Notion supported tools](https://developers.notion.com/guides/mcp/mcp-supported-tools),
 [Notion hosted MCP design](https://www.notion.com/blog/notions-hosted-mcp-server-an-inside-look).
 
-### 5.4 Gmail hosted MCP
+### 5.5 Gmail hosted MCP
 
 Google provides `https://gmailmcp.googleapis.com/mcp/v1` as a Gmail remote MCP
 server. The official documentation currently labels it **Developer Preview**.
@@ -238,7 +281,7 @@ not stable enough for production.
 
 Reference: [Google Gmail MCP setup](https://developers.google.com/workspace/gmail/api/guides/configure-mcp-server).
 
-### 5.5 OpenClaw and Hermes Agent
+### 5.6 OpenClaw and Hermes Agent
 
 The repository contribution guidelines require OpenClaw and Hermes Agent as
 prior art for runtime integrations.
