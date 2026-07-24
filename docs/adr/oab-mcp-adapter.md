@@ -80,29 +80,42 @@ REST adapters.
 
 ```mermaid
 flowchart TD
-    A["Coding CLI / Agent<br/>MCP client"] -->|MCP| F["OAB MCP Facade<br/>search_capabilities<br/>execute_capability"]
-    F --> D["Capability Dispatcher<br/>auth - policy - catalog - audit"]
-    D --> M["Hosted MCP Adapter<br/>outbound MCP client<br/>OAuth - tools/list - tools/call"]
-    D --> P["Capability Plugin / Native Adapter<br/>provider API or SDK"]
-    M --> N["Notion hosted MCP"]
-    M --> G["Gmail hosted MCP<br/>Developer Preview"]
-    P --> X["Service without hosted MCP<br/>provider API or SDK"]
+    A["Coding CLI / Agent<br/>MCP client"]
+
+    subgraph POD["OAB Pod"]
+        F["OAB MCP Facade<br/>search_capabilities<br/>execute_capability"]
+        D["Capability Dispatcher<br/>auth - policy - catalog - audit"]
+        M["Hosted MCP Adapter<br/>outbound MCP client<br/>OAuth - tools/list - tools/call"]
+        P["Capability Plugin / Native Adapter<br/>provider API or SDK"]
+
+        F --> D
+        D --> M
+        D --> P
+    end
+
+    N["Notion hosted MCP<br/>external provider"]
+    G["Gmail hosted MCP<br/>external provider - Developer Preview"]
+    X["External service without hosted MCP<br/>provider API or SDK"]
+
+    A -->|MCP| F
+    M --> N
+    M --> G
+    P --> X
 
     style P stroke-dasharray: 5 5
     style X stroke-dasharray: 5 5
 ```
 
+The `OAB Pod` boundary contains the OAB-owned facade, dispatcher, hosted MCP
+adapter, and capability-plugin runtime. The Coding CLI/Agent remains outside
+the Pod and connects only to the facade. Notion, Gmail, and provider APIs also
+remain outside the Pod; the outbound adapter or plugin crosses that boundary
+under OAB policy and audit controls.
+
 The facade exposes the same two-method contract regardless of the downstream
 path. Notion and Gmail use the hosted MCP adapter in this MVP. The dashed
 capability-plugin path is the extension point for services that do not provide
-a hosted MCP server: a provider API/SDK adapter can publish the same searchable
-capabilities and execute them under the same OAB authorization, policy, schema,
-and audit controls. It is not a second agent-facing API.
-
-The direction is intentional: the agent calls OAB, and OAB dispatches either to
-an external MCP server or to a provider plugin. The facade never exposes
-provider credentials or asks the agent to construct provider-specific calls
-directly.
+a hosted MCP server. It is not a second agent-facing API.
 
 ## 4. Terminology and Positioning
 
