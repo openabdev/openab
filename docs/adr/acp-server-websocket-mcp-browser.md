@@ -55,8 +55,10 @@ Five **DOM-semantic** MCP tools, served by the extension: `browser.read_dom` (sn
   `connectionId`, then `mcp/message`), not a hand-rolled envelope.
 - **D4 — lifecycle: the WS may connect *after* session start.** Core's HTTP MCP server is always-on
   and decoupled from the extension WS. As shipped, browser tools are **static-advertised** regardless
-  of WS state (a `tools/call` with no extension attached returns an MCP error "browser not connected"),
-  **plus** `notifications/tools/list_changed` on attach/detach. **Superseded as the default:** the
+  of WS state (a `tools/call` with no extension attached returns an MCP error "browser not connected").
+  `notifications/tools/list_changed` on attach/detach is **designed but not yet implemented** — no code
+  emits it today (grep `list_changed` → 0 hits in the gateway/core crates); it is tracked as P2b in
+  [reverse-MCP ADR §6.2](./acp-server-websocket-reverse-mcp.md). **Superseded as the default:** the
   generic design ([reverse-MCP ADR §6.2](./acp-server-websocket-reverse-mcp.md)) drops static-advertise
   as the default in favour of dynamic `tools/list` forwarding + `list_changed`, keeping static-advertise
   as an opt-in for the browser case.
