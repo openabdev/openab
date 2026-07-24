@@ -37,6 +37,8 @@ rmcp = { version = "1.7", default-features = false, features = [
     # OAB MCP Facade: inbound MCP server over loopback Streamable HTTP.
     "server",
     "transport-streamable-http-server",
+    # Native adapters (gmail-native): inbound MCP server over stdio.
+    "transport-io",
 ] }
 # Serves the facade's Streamable HTTP endpoint (rmcp's StreamableHttpService
 # is a tower Service; axum provides the loopback listener + router).

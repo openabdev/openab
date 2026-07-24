@@ -40,6 +40,30 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:8848")]
         listen: String,
     },
+    /// Native Gmail adapter (Capability Plugin, ADR §6.1/§6.5): the six-tool
+    /// read+drafts Gmail profile served from Gmail's GA REST API as a stdio
+    /// MCP server — no Developer Preview enrollment required. Register it in
+    /// mcp.json as a `"type": "stdio"` entry running `gmail-native serve`.
+    GmailNative {
+        #[command(subcommand)]
+        action: GmailNativeAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum GmailNativeAction {
+    /// Serve the adapter over stdio (spawned by the MCP runtime, or any MCP
+    /// client). Requires GMAIL_OAUTH_CLIENT_ID (+ optional
+    /// GMAIL_OAUTH_CLIENT_SECRET) in the environment for token refresh.
+    Serve,
+    /// Google OAuth paste-back login requesting offline access, so a refresh
+    /// token is stored and headless deployments survive token expiry.
+    /// Requires GMAIL_OAUTH_CLIENT_ID (+ optional GMAIL_OAUTH_CLIENT_SECRET).
+    Login {
+        /// Redirect URI pre-registered on the OAuth client.
+        #[arg(long, default_value = openab_mcp::native::gmail::DEFAULT_REDIRECT_URI)]
+        redirect_uri: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -177,6 +201,20 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Commands::GmailNative { action }) => match action {
+            GmailNativeAction::Serve => {
+                if let Err(e) = openab_mcp::native::gmail::serve_stdio().await {
+                    eprintln!("gmail-native: {e:#}");
+                    std::process::exit(1);
+                }
+            }
+            GmailNativeAction::Login { redirect_uri } => {
+                if let Err(e) = openab_mcp::native::gmail::login(&redirect_uri).await {
+                    eprintln!("gmail-native login: {e:#}");
+                    std::process::exit(1);
+                }
+            }
+        },
     }
 }
 
