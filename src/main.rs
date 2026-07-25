@@ -487,8 +487,9 @@ async fn main() -> anyhow::Result<()> {
     // session-aware in-process source — one listener, per-session identity
     // via broker-minted tokens; no per-session proxy servers.
     let facade_sessions = openab_mcp::mcp::sources::SessionTokens::new();
-    #[allow(unused_mut)]
-    let mut facade_serving = false;
+    // Only read under the acp feature (pool facade wiring below).
+    #[cfg(feature = "acp")]
+    let facade_serving = cfg.mcp.is_some();
     if let Some(mcp_cfg) = cfg.mcp.clone() {
         let listen = mcp_cfg.listen.clone();
         let tokens = facade_sessions.clone();
@@ -500,7 +501,6 @@ async fn main() -> anyhow::Result<()> {
                 browser_tunnel.clone(),
             )));
         }
-        facade_serving = true;
         tokio::spawn(async move {
             if let Err(e) =
                 openab_mcp::mcp::facade::serve_http_with(&listen, sources, tokens).await
