@@ -14,7 +14,7 @@
 //!   `list_drafts`, `create_draft`), so swapping this adapter for the hosted
 //!   entry at GA is an `mcp.json` change with no agent-facing difference.
 //!
-//! Packaging: a **loopback Streamable HTTP MCP server** (`openab-agent
+//! Packaging: a **loopback Streamable HTTP MCP server** (`openab
 //! gmail-native serve --listen 127.0.0.1:<port>`), registered in `mcp.json`
 //! as a normal `"type": "http"` entry pointing at `http://<addr>/mcp`. The
 //! outbound runtime therefore applies `tool_filter`, JSON-Schema argument
@@ -138,7 +138,7 @@ impl GmailNative {
                 .map_err(|e| anyhow!("read auth.json: {e}"))?
                 .ok_or_else(|| {
                     anyhow!(
-                        "no gmail-native credentials — run `openab-agent gmail-native login` first"
+                        "no gmail-native credentials — run `openab gmail-native login` first"
                     )
                 })
         };
@@ -150,7 +150,7 @@ impl GmailNative {
         if !has_refresh {
             bail!(
                 "gmail-native token expired and no refresh token is stored — \
-                 re-run `openab-agent gmail-native login` (the login flow requests \
+                 re-run `openab gmail-native login` (the login flow requests \
                  access_type=offline, so this normally does not recur)"
             );
         }
@@ -185,7 +185,7 @@ impl GmailNative {
         if !status.is_success() {
             bail!(
                 "gmail-native token refresh failed ({status}): {} — if the grant was revoked, \
-                 re-run `openab-agent gmail-native login`",
+                 re-run `openab gmail-native login`",
                 body["error"].as_str().unwrap_or("unknown error")
             );
         }
