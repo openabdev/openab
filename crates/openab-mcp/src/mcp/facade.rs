@@ -494,9 +494,6 @@ pub async fn serve_http_with(
     sources: Vec<Arc<dyn CapabilitySource>>,
     tokens: SessionTokens,
 ) -> Result<()> {
-    use rmcp::transport::streamable_http_server::{
-        session::local::LocalSessionManager, StreamableHttpService,
-    };
     let sock = require_loopback(addr)?;
     let manager = super::load_runtime_or_warn()
         .unwrap_or_else(|| McpRuntimeManager::from_config(McpConfig::default()));
