@@ -608,7 +608,9 @@ mod tests {
         let tok = tokens.mint("chan-e2e");
         let router = super::build_router(
             McpRuntimeManager::from_config(McpConfig::default()),
-            vec![std::sync::Arc::new(EchoSource { session_bound: true })],
+            vec![std::sync::Arc::new(EchoSource {
+                session_bound: true,
+            })],
             tokens,
         );
 
