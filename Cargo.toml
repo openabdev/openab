@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/openab-core", "crates/openab-gateway"]
+members = ["crates/openab-core", "crates/openab-gateway", "crates/openab-mcp"]
 exclude = ["openab-agent", "crates/platform-schema"]
 
 [package]
@@ -11,6 +11,9 @@ license = "MIT"
 [dependencies]
 openab-core = { path = "crates/openab-core", default-features = false }
 openab-gateway = { path = "crates/openab-gateway", default-features = false, optional = true }
+# OAB MCP Facade: in-process loopback Streamable HTTP MCP server, enabled by
+# `[mcp]` in config.toml (OAB MCP Adapter ADR §6.2).
+openab-mcp = { path = "crates/openab-mcp" }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }

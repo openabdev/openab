@@ -126,6 +126,46 @@ enum Commands {
         #[arg(long)]
         thread: Option<String>,
     },
+    /// MCP add-on operations (OAB MCP Adapter ADR): interactive and
+    /// operational actions for MCP components. Long-running serving is
+    /// config-driven (`[mcp]` in config.toml + `openab run`); these
+    /// subcommands cover interactive logins and standalone/dev serving.
+    Mcp {
+        #[command(subcommand)]
+        addon: McpAddon,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum McpAddon {
+    /// Native Gmail adapter (Capability Plugin, ADR §6.1/§6.5): the six-tool
+    /// read+drafts Gmail profile served from Gmail's GA REST API as a
+    /// loopback Streamable HTTP MCP server. Register it in mcp.json as a
+    /// `"type": "http"` entry pointing at http://<listen>/mcp.
+    GmailNative {
+        #[command(subcommand)]
+        action: GmailNativeAction,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum GmailNativeAction {
+    /// Serve the adapter over loopback Streamable HTTP (non-loopback
+    /// addresses are refused — same trust model as the OAB MCP Facade).
+    /// Requires GMAIL_OAUTH_CLIENT_ID (+ optional GMAIL_OAUTH_CLIENT_SECRET)
+    /// in the environment for token refresh.
+    Serve {
+        /// Loopback address to listen on.
+        #[arg(long, default_value = "127.0.0.1:8850")]
+        listen: String,
+    },
+    /// Google OAuth paste-back login requesting offline access, so a refresh
+    /// token is stored and headless deployments survive token expiry.
+    Login {
+        /// Redirect URI pre-registered on the OAuth client.
+        #[arg(long, default_value = openab_mcp::native::gmail::DEFAULT_REDIRECT_URI)]
+        redirect_uri: String,
+    },
 }
 
 /// Returns true if any unified platform is enabled and its corresponding
@@ -314,6 +354,24 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        Commands::Mcp { addon } => {
+            let McpAddon::GmailNative { action } = addon;
+            match action {
+                GmailNativeAction::Serve { listen } => {
+                    if let Err(e) = openab_mcp::native::gmail::serve_http(&listen).await {
+                        eprintln!("gmail-native: {e:#}");
+                        std::process::exit(1);
+                    }
+                }
+                GmailNativeAction::Login { redirect_uri } => {
+                    if let Err(e) = openab_mcp::native::gmail::login(&redirect_uri).await {
+                        eprintln!("gmail-native login: {e:#}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            return Ok(());
+        }
         Commands::Run { config } => config,
     };
 
@@ -339,8 +397,25 @@ async fn main() -> anyhow::Result<()> {
         && cfg.telegram.is_none()
         && !has_unified_platform(&cfg)
     {
+        // Facade-only run mode (#1451): an adapter-less config with `[mcp]`
+        // present is a valid deployment — the broker serves just the OAB MCP
+        // Facade listener. One entrypoint, config-driven: hosts that only
+        // need the capability surface (coding-CLI-only users, dev loops, CI
+        // runners, agent hosts with no chat platform) run the same
+        // `openab run` with a two-line config instead of a chat token.
+        if let Some(mcp_cfg) = cfg.mcp.clone() {
+            tracing::info!(
+                listen = %mcp_cfg.listen,
+                "no chat adapter configured — running in facade-only mode ([mcp] present)"
+            );
+            // Foreground, not spawned: the facade IS the workload. A bind
+            // failure or server exit terminates the process (fail fast).
+            return openab_mcp::mcp::facade::serve_http(&mcp_cfg.listen)
+                .await
+                .map_err(|e| anyhow::anyhow!("OAB MCP facade exited: {e:#}"));
+        }
         anyhow::bail!(
-            "no adapter configured — add [discord], [slack], [telegram], [wecom], [googlechat], or [gateway] to config, or set platform env vars (TELEGRAM_BOT_TOKEN, etc.)"
+            "no adapter configured — add [discord], [slack], [telegram], [wecom], [googlechat], or [gateway] to config (or [mcp] for facade-only mode), or set platform env vars (TELEGRAM_BOT_TOKEN, etc.)"
         );
     }
 
@@ -394,6 +469,22 @@ async fn main() -> anyhow::Result<()> {
     // session; the core MCP proxy reads it via the RootBrowserTunnel bridge below.
     #[cfg(feature = "acp")]
     let acp_tunnel_registry = openab_gateway::adapters::acp_server::new_tunnel_registry();
+
+    // OAB MCP Facade (`[mcp]` in config.toml — OAB MCP Adapter ADR §6.2):
+    // serve the loopback Streamable HTTP MCP server in-process so any coding
+    // CLI on this host can reach authorized external capabilities via
+    // http://<listen>/mcp. Absent section = no listener (backward compat).
+    // A bind failure is fatal at startup (fail fast, like a bad platform
+    // token) rather than a silently missing capability surface.
+    if let Some(mcp_cfg) = cfg.mcp.clone() {
+        let listen = mcp_cfg.listen.clone();
+        tokio::spawn(async move {
+            if let Err(e) = openab_mcp::mcp::facade::serve_http(&listen).await {
+                tracing::error!(error = %format!("{e:#}"), listen, "OAB MCP facade exited");
+                std::process::exit(1);
+            }
+        });
+    }
 
     let pool_inner = acp::SessionPool::new(
         cfg.agent,

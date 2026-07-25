@@ -118,6 +118,18 @@ impl ServerConfig {
         matches!(self, ServerConfig::Http { oauth: Some(_), .. })
     }
 
+    /// The operator-configured `tool_filter` for this server, if any.
+    /// Enforced in `meta_tool::fetch_tools` (discovery) and
+    /// `meta_tool::call_tool` (execution) so both the `mcp` meta-tool and
+    /// the OAB MCP Facade see one filtered surface.
+    pub fn tool_filter(&self) -> Option<&ToolFilter> {
+        match self {
+            ServerConfig::Stdio { tool_filter, .. } | ServerConfig::Http { tool_filter, .. } => {
+                tool_filter.as_ref()
+            }
+        }
+    }
+
     /// Per-request timeout for `tools/call` / `tools/list` against this
     /// server (ADR §5.6). Bounds a single MCP request, not the connection.
     pub fn request_timeout(&self) -> std::time::Duration {
@@ -193,6 +205,53 @@ pub struct ToolFilter {
     pub include: Vec<String>,
     #[serde(default)]
     pub exclude: Vec<String>,
+}
+
+impl ToolFilter {
+    /// Whether a provider tool may pass this filter (ADR §5.6 glob
+    /// `include`/`exclude` lists; enforcement added by the OAB MCP Facade
+    /// ADR §6.5 least-privilege profiles).
+    ///
+    /// Semantics: an empty `include` admits every tool; a non-empty
+    /// `include` admits only tools matching at least one pattern. `exclude`
+    /// is applied after `include` and always wins. Patterns support `*` as
+    /// a multi-character wildcard (e.g. `read_*`, `*_draft`, `get_*_info`).
+    pub fn allows(&self, tool: &str) -> bool {
+        let included = self.include.is_empty() || self.include.iter().any(|p| glob_match(p, tool));
+        included && !self.exclude.iter().any(|p| glob_match(p, tool))
+    }
+}
+
+/// Minimal `*`-only glob matcher (no `?`, no character classes — mirrors the
+/// patterns documented in the accepted MCP ADR §5.6). Iterative two-pointer
+/// with backtracking; O(len(pattern) × len(text)) worst case, no allocation.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    // Position of the last `*` seen and the text index it is currently
+    // matched up to — on mismatch we retry the star with one more char.
+    let (mut star, mut mark) = (None::<usize>, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// OAuth block.
@@ -499,6 +558,68 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glob_match_literal_wildcard_and_anchors() {
+        assert!(glob_match("read_file", "read_file"));
+        assert!(!glob_match("read_file", "read_files"));
+        assert!(glob_match("read_*", "read_file"));
+        assert!(!glob_match("read_*", "unread_file"));
+        assert!(glob_match("*_draft", "create_draft"));
+        assert!(glob_match("get_*_info", "get_user_info"));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("*", ""));
+        assert!(!glob_match("", "x"));
+        assert!(glob_match("", ""));
+    }
+
+    #[test]
+    fn tool_filter_empty_include_admits_all() {
+        let f = ToolFilter::default();
+        assert!(f.allows("anything"));
+    }
+
+    #[test]
+    fn tool_filter_include_admits_only_matches() {
+        let f = ToolFilter {
+            include: vec!["read_*".into(), "list_*".into()],
+            exclude: vec![],
+        };
+        assert!(f.allows("read_file"));
+        assert!(f.allows("list_dir"));
+        assert!(!f.allows("write_file"));
+    }
+
+    #[test]
+    fn tool_filter_exclude_wins_over_include() {
+        let f = ToolFilter {
+            include: vec!["*".into()],
+            exclude: vec!["delete_*".into()],
+        };
+        assert!(f.allows("read_file"));
+        assert!(!f.allows("delete_thread"));
+    }
+
+    /// ADR §11: send/delete-like Gmail tools cannot enter the default
+    /// profile — the documented profile's include list admits only
+    /// search/read/draft tools.
+    #[test]
+    fn gmail_default_profile_blocks_send_and_delete() {
+        let f = ToolFilter {
+            include: vec![
+                "search_threads".into(),
+                "get_thread".into(),
+                "get_message".into(),
+                "create_draft".into(),
+            ],
+            exclude: vec![],
+        };
+        assert!(f.allows("search_threads"));
+        assert!(f.allows("create_draft"));
+        assert!(!f.allows("send_message"));
+        assert!(!f.allows("delete_thread"));
+        assert!(!f.allows("gmail.send"));
+    }
 
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs

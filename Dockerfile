@@ -10,15 +10,17 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/openab-core/Cargo.toml crates/openab-core/Cargo.toml
 COPY crates/openab-gateway/Cargo.toml crates/openab-gateway/Cargo.toml
-RUN mkdir -p src crates/openab-core/src crates/openab-gateway/src \
+COPY crates/openab-mcp/Cargo.toml crates/openab-mcp/Cargo.toml
+RUN mkdir -p src crates/openab-core/src crates/openab-gateway/src crates/openab-mcp/src \
     && echo 'fn main() {}' > src/main.rs \
     && echo '' > crates/openab-core/src/lib.rs \
     && echo '' > crates/openab-gateway/src/lib.rs \
+    && echo '' > crates/openab-mcp/src/lib.rs \
     && cargo build --release \
-    && rm -rf src crates/openab-core/src crates/openab-gateway/src
+    && rm -rf src crates/openab-core/src crates/openab-gateway/src crates/openab-mcp/src
 COPY crates/ crates/
 COPY src/ src/
-RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs && \
+RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs crates/openab-mcp/src/lib.rs && \
     if [ "$BUILD_MODE" = "unified" ]; then \
       cargo build --release --features unified; \
     elif [ -n "$FEATURES" ]; then \

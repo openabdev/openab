@@ -5,9 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
@@ -34,107 +32,10 @@ pub struct JsonRpcNotification {
     pub params: Value,
 }
 
-/// Pending agent→host requests keyed by the outbound JSON-RPC id. Each entry
-/// is the `oneshot` half that wakes the awaiting caller once the host's
-/// response with the matching id arrives back over stdin.
-type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, Value>>>>>;
-
-/// Duplex channel from the MCP client layer back into the ACP loop.
-///
-/// The ACP transport (`AcpServer::run`) is otherwise half-duplex: it answers
-/// inbound host→agent requests and emits fire-and-forget `session/update`
-/// notifications. `HostBridge` adds the missing agent→host *request/response*
-/// direction so an MCP `ClientHandler` running on an rmcp task can ask the
-/// host a question (e.g. elicitation form) and await a structured reply.
-///
-/// All outbound bytes funnel through `writer` (a single stdout-owning drain
-/// task) to preserve the one-writer invariant; `pending` correlates each
-/// outbound id with its awaiting `oneshot`; `next_id` mints monotonic ids.
-#[derive(Clone, Debug)]
-pub struct HostBridge {
-    writer: mpsc::UnboundedSender<String>,
-    pending: PendingMap,
-    next_id: Arc<AtomicU64>,
-}
-
-impl HostBridge {
-    pub fn new(writer: mpsc::UnboundedSender<String>) -> Self {
-        Self {
-            writer,
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            next_id: Arc::new(AtomicU64::new(1)),
-        }
-    }
-
-    /// Send an outbound agent→host request and await the host's response.
-    /// Returns `Ok(result)` / `Err(error)` mirroring JSON-RPC. Returns `Err`
-    /// (rather than blocking forever) when no host is listening or the channel
-    /// is closed, so callers can degrade gracefully (e.g. auto-decline).
-    pub async fn request(&self, method: &str, params: Value) -> Result<Value, Value> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.pending
-            .lock()
-            .expect("host bridge pending map poisoned")
-            .insert(id, reply_tx);
-
-        let line = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        })
-        .to_string();
-
-        if self.writer.send(line).is_err() {
-            self.pending
-                .lock()
-                .expect("host bridge pending map poisoned")
-                .remove(&id);
-            return Err(json!({ "code": -32603, "message": "host channel closed" }));
-        }
-
-        match reply_rx.await {
-            Ok(outcome) => outcome,
-            Err(_) => Err(json!({ "code": -32603, "message": "host reply dropped" })),
-        }
-    }
-
-    /// If `line` is an inbound JSON-RPC *response* to one of our outbound
-    /// requests, resolve the matching pending `oneshot` and return `true`.
-    /// Returns `false` for anything else (inbound requests, notifications,
-    /// unknown / already-completed ids) so the caller falls through to the
-    /// normal request-dispatch path.
-    pub fn try_resolve_response(&self, line: &str) -> bool {
-        let val: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        // A response carries an id + (result | error) and NO method. A request
-        // or notification has a method — leave those for the dispatch loop.
-        if val.get("method").is_some() {
-            return false;
-        }
-        let Some(id) = val.get("id").and_then(|v| v.as_u64()) else {
-            return false;
-        };
-        let Some(reply_tx) = self
-            .pending
-            .lock()
-            .expect("host bridge pending map poisoned")
-            .remove(&id)
-        else {
-            return false;
-        };
-        let outcome = if let Some(err) = val.get("error") {
-            Err(err.clone())
-        } else {
-            Ok(val.get("result").cloned().unwrap_or(Value::Null))
-        };
-        let _ = reply_tx.send(outcome);
-        true
-    }
-}
+// `HostBridge` (the agent→host duplex request channel) moved to the shared
+// `openab-mcp` crate so the broker-hosted facade can link the MCP runtime;
+// re-exported here so `crate::acp::HostBridge` keeps resolving.
+pub use openab_mcp::acp::HostBridge;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct ModelOption {
@@ -220,6 +121,13 @@ impl AcpServer {
         let bridge = HostBridge::new(out_tx.clone());
         if let Some(manager) = self.mcp_manager.as_mut() {
             manager.set_host_bridge(bridge.clone());
+            // Provider injection moved out of `from_config` when the runtime
+            // was extracted to `openab-mcp` (that crate has no concrete
+            // providers). Set it here so MCP sampling requests keep routing
+            // to the agent's configured LLM exactly as before.
+            if let Some(provider) = crate::llm::default_provider() {
+                manager.set_provider(provider);
+            }
             manager.start_eviction_loop();
         }
 
@@ -695,9 +603,12 @@ impl AcpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Env-mutating tests use `temp_env` exclusively: it serialises on one
+    // global lock shared with the llm/agent test modules, restoring vars on
+    // exit (panic-safe). A private module lock here would be a second,
+    // uncoordinated lock domain — the parallel-scheduling race PR #1448
+    // exposed when the mcp/auth tests moved to the openab-mcp crate.
 
     #[test]
     fn test_initialize_response() {
@@ -712,19 +623,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_new() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        // Set a fake key + model so provider construction succeeds in CI
-        unsafe {
-            std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-            std::env::set_var("OPENAB_AGENT_MODEL", "claude-sonnet-4-6");
-        }
-        let mut server = AcpServer::new();
-        let resp_str = server.handle_session_new(2).await;
-        unsafe { std::env::remove_var("OPENAB_AGENT_MODEL") };
+        // Fake key + model so provider construction succeeds in CI.
+        let resp_str = temp_env::async_with_vars(
+            [
+                ("ANTHROPIC_API_KEY", Some("test-key")),
+                ("OPENAB_AGENT_MODEL", Some("claude-sonnet-4-6")),
+            ],
+            async {
+                let mut server = AcpServer::new();
+                server.handle_session_new(2).await
+            },
+        )
+        .await;
         let resp: Value = serde_json::from_str(&resp_str).unwrap();
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 2);
-        assert!(resp["result"]["sessionId"].as_str().unwrap().len() > 0);
+        assert!(!resp["result"]["sessionId"].as_str().unwrap().is_empty());
         // Verify configOptions are returned for /models support
         let config_options = resp["result"]["configOptions"].as_array().unwrap();
         assert!(!config_options.is_empty());
@@ -811,15 +725,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_new_missing_key() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        // Ensure no OAuth token exists either
-        let auth_path =
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
-                .join(".openab/agent/auth.json");
-        let _ = std::fs::remove_file(&auth_path);
-        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
-        let mut server = AcpServer::new();
-        let resp_str = server.handle_session_new(3).await;
+        // Sandbox HOME into a tempdir so "no OAuth token on disk" holds
+        // without deleting the developer's real ~/.openab/agent/auth.json.
+        let home = tempfile::tempdir().unwrap();
+        let resp_str = temp_env::async_with_vars(
+            [
+                ("ANTHROPIC_API_KEY", None),
+                ("HOME", Some(home.path().to_str().unwrap())),
+            ],
+            async {
+                let mut server = AcpServer::new();
+                server.handle_session_new(3).await
+            },
+        )
+        .await;
         let resp: Value = serde_json::from_str(&resp_str).unwrap();
         assert!(resp["error"].is_object());
         assert!(resp["error"]["message"]
@@ -832,18 +751,18 @@ mod tests {
     async fn test_session_new_requires_model() {
         // No hardcoded default: a forced anthropic provider without
         // OPENAB_AGENT_MODEL must fail loud.
-        let _guard = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::set_var("OPENAB_AGENT_PROVIDER", "anthropic");
-            std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-            std::env::remove_var("OPENAB_AGENT_MODEL");
-        }
-        let mut server = AcpServer::new();
-        let resp_str = server.handle_session_new(7).await;
-        unsafe {
-            std::env::remove_var("ANTHROPIC_API_KEY");
-            std::env::remove_var("OPENAB_AGENT_PROVIDER");
-        }
+        let resp_str = temp_env::async_with_vars(
+            [
+                ("OPENAB_AGENT_PROVIDER", Some("anthropic")),
+                ("ANTHROPIC_API_KEY", Some("test-key")),
+                ("OPENAB_AGENT_MODEL", None),
+            ],
+            async {
+                let mut server = AcpServer::new();
+                server.handle_session_new(7).await
+            },
+        )
+        .await;
         let resp: Value = serde_json::from_str(&resp_str).unwrap();
         assert!(resp["error"].is_object());
         assert!(resp["error"]["message"]
@@ -909,16 +828,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_model_switch_preserves_session_history() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-            std::env::set_var("OPENAB_AGENT_MODEL", "claude-sonnet-4-6");
-        }
+        temp_env::async_with_vars(
+            [
+                ("ANTHROPIC_API_KEY", Some("test-key")),
+                ("OPENAB_AGENT_MODEL", Some("claude-sonnet-4-6")),
+            ],
+            test_model_switch_preserves_session_history_body(),
+        )
+        .await;
+    }
+
+    async fn test_model_switch_preserves_session_history_body() {
         let mut server = AcpServer::new();
 
         // Create a session
         let resp_str = server.handle_session_new(10).await;
-        unsafe { std::env::remove_var("OPENAB_AGENT_MODEL") };
         let resp: Value = serde_json::from_str(&resp_str).unwrap();
         let session_id = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -959,7 +883,15 @@ mod tests {
 
     #[test]
     fn test_failed_switch_does_not_update_state() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        // Two env phases (key present for the seed session, absent for the
+        // failing switch) — nest with_var scopes; the outer scope pins the
+        // global temp_env lock for the whole test.
+        temp_env::with_var("ANTHROPIC_API_KEY", None::<&str>, || {
+            test_failed_switch_does_not_update_state_body()
+        });
+    }
+
+    fn test_failed_switch_does_not_update_state_body() {
         let mut server = AcpServer::new();
         server.model_options = vec![ModelOption::new("gpt-4.1-nano", "GPT-4.1 Nano", "openai")];
 
@@ -984,13 +916,13 @@ mod tests {
         server.active_provider = None;
 
         // Insert a dummy session using anthropic key
-        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-key") };
-        let provider = AnthropicProvider::auto_with_model("claude-sonnet-4-20250514").unwrap();
+        let provider = temp_env::with_var("ANTHROPIC_API_KEY", Some("test-key"), || {
+            AnthropicProvider::auto_with_model("claude-sonnet-4-20250514").unwrap()
+        });
         let agent = Agent::new_boxed(Box::new(provider), "/tmp".to_string(), None);
         server.sessions.insert("test-session".to_string(), agent);
 
-        // Remove anthropic key and try to switch to anthropic model → should fail
-        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
+        // Key is absent again here (outer scope) → switch to anthropic must fail
         server.model_options = vec![ModelOption::new(
             "claude-opus-4-20250514",
             "Claude Opus 4",
@@ -1083,9 +1015,13 @@ mod tests {
         // OAuth rebuild fails loudly — an error here proves the OAuth path was
         // taken; a silent success would mean the API key hijacked the session
         // (the regression this test pins).
-        let _guard = ENV_LOCK.lock().unwrap();
+        temp_env::with_var("ANTHROPIC_API_KEY", Some("test-key"), || {
+            test_anthropic_oauth_round_trip_body()
+        });
+    }
+
+    fn test_anthropic_oauth_round_trip_body() {
         let mut server = AcpServer::new();
-        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-key") };
 
         // Session explicitly created on Anthropic OAuth, then moved to xAI.
         let mut agent = Agent::new_boxed(
@@ -1110,7 +1046,6 @@ mod tests {
                 "sessionId": "rt-session",
             }),
         );
-        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
         let resp: Value = serde_json::from_str(&resp_str).unwrap();
         assert!(
             resp["error"].is_object(),
@@ -1126,9 +1061,13 @@ mod tests {
         // via `auto_with_model` (honoring ANTHROPIC_API_KEY) — NOT
         // `from_oauth_auto_with_model`, which requires an Anthropic OAuth
         // tenant and bypasses a configured API key.
-        let _guard = ENV_LOCK.lock().unwrap();
+        temp_env::with_var("ANTHROPIC_API_KEY", Some("test-key"), || {
+            test_switch_from_xai_oauth_body()
+        });
+    }
+
+    fn test_switch_from_xai_oauth_body() {
         let mut server = AcpServer::new();
-        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-key") };
 
         let agent = Agent::new_boxed(Box::new(FakeXaiOauthProvider), "/tmp".to_string(), None);
         server.sessions.insert("xai-session".to_string(), agent);
@@ -1146,7 +1085,6 @@ mod tests {
                 "sessionId": "xai-session",
             }),
         );
-        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
         let resp: Value = serde_json::from_str(&resp_str).unwrap();
         assert!(
             resp["error"].is_null(),
@@ -1156,16 +1094,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_load_returns_config_options() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-            std::env::set_var("OPENAB_AGENT_MODEL", "claude-sonnet-4-6");
-        }
+        temp_env::async_with_vars(
+            [
+                ("ANTHROPIC_API_KEY", Some("test-key")),
+                ("OPENAB_AGENT_MODEL", Some("claude-sonnet-4-6")),
+            ],
+            test_session_load_returns_config_options_body(),
+        )
+        .await;
+    }
+
+    async fn test_session_load_returns_config_options_body() {
         let mut server = AcpServer::new();
 
         // Create a session first
         let new_resp_str = server.handle_session_new(10).await;
-        unsafe { std::env::remove_var("OPENAB_AGENT_MODEL") };
         let new_resp: Value = serde_json::from_str(&new_resp_str).unwrap();
         let session_id = new_resp["result"]["sessionId"].as_str().unwrap();
 

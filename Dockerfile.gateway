@@ -16,16 +16,18 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/openab-core/Cargo.toml crates/openab-core/Cargo.toml
 COPY crates/openab-gateway/Cargo.toml crates/openab-gateway/Cargo.toml
-RUN mkdir -p src crates/openab-core/src crates/openab-gateway/src \
+COPY crates/openab-mcp/Cargo.toml crates/openab-mcp/Cargo.toml
+RUN mkdir -p src crates/openab-core/src crates/openab-gateway/src crates/openab-mcp/src \
     && echo 'fn main() {}' > src/main.rs \
     && echo 'fn main() {}' > crates/openab-gateway/src/main.rs \
     && echo '' > crates/openab-core/src/lib.rs \
     && echo '' > crates/openab-gateway/src/lib.rs \
+    && echo '' > crates/openab-mcp/src/lib.rs \
     && cargo build --release -p openab-gateway \
-    && rm -rf src crates/openab-core/src crates/openab-gateway/src
+    && rm -rf src crates/openab-core/src crates/openab-gateway/src crates/openab-mcp/src
 COPY crates/ crates/
 COPY src/ src/
-RUN touch crates/openab-gateway/src/main.rs crates/openab-gateway/src/lib.rs && \
+RUN touch crates/openab-gateway/src/main.rs crates/openab-gateway/src/lib.rs crates/openab-mcp/src/lib.rs && \
     if [ -n "$FEATURES" ]; then \
       cargo build --release -p openab-gateway --no-default-features --features "$FEATURES"; \
     else \

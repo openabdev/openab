@@ -148,6 +148,18 @@ async fn call_tool(
     tool: &str,
     arguments: Value,
 ) -> Result<(Value, Option<bool>)> {
+    // Least-privilege gate (OAB MCP Facade ADR §6.5/§6.7): a tool the
+    // operator filtered out must be unreachable even if the caller guesses
+    // its name — `fetch_tools` hides it from discovery, this rejects
+    // execution. Checked before connect so a blocked tool never even
+    // spawns/dials the server.
+    if let Some(filter) = manager.tool_filter(server).await {
+        if !filter.allows(tool) {
+            return Err(anyhow!(
+                "tool {tool:?} on mcp server {server:?} is blocked by the configured tool_filter"
+            ));
+        }
+    }
     // Lenient arg coercion: LLMs often send `null` or omit `arguments`
     // for no-arg tools; rejecting those would make zero-arg calls
     // fragile. Only real type errors (string, number, array, bool)
@@ -356,7 +368,10 @@ async fn call_tool(
 /// `OpenabClientHandler::on_tool_list_changed`, so a hit is current. On a miss
 /// it paginates `tools/list` and repopulates. The `Arc<RunningService>` clone
 /// lets the I/O `.await` run with no runtime lock held.
-async fn fetch_tools(manager: &McpRuntimeManager, server: &str) -> Result<Vec<rmcp::model::Tool>> {
+pub(crate) async fn fetch_tools(
+    manager: &McpRuntimeManager,
+    server: &str,
+) -> Result<Vec<rmcp::model::Tool>> {
     if let Some(cached) = manager.cached_tools(server) {
         return Ok(cached);
     }
@@ -431,6 +446,14 @@ async fn fetch_tools(manager: &McpRuntimeManager, server: &str) -> Result<Vec<rm
                     .with_context(|| format!("list_tools on {server:?}"));
             }
         }
+    }
+    // Least-privilege gate (OAB MCP Facade ADR §6.5): drop filtered-out
+    // tools *before* caching so every discovery path — meta-tool
+    // `list_tools`/`describe_tool` and facade `search_capabilities` —
+    // sees one consistent, operator-approved surface. The cache holds the
+    // filtered list; a config change is a process restart anyway.
+    if let Some(filter) = manager.tool_filter(server).await {
+        tools.retain(|t| filter.allows(t.name.as_ref()));
     }
     manager.store_tools(server, &tools);
     Ok(tools)
@@ -920,6 +943,40 @@ mod tests {
         .to_string();
         assert!(err.contains("connect mcp server"), "got: {err}");
         assert!(!err.contains("must be a JSON object"), "got: {err}");
+    }
+
+    /// Filter gate (OAB MCP Facade ADR §6.5): a filtered-out tool is
+    /// rejected *before* any connect attempt. The server command here does
+    /// not exist, so if the gate ran after connect this would fail with
+    /// "connect mcp server" instead of the block message.
+    #[tokio::test]
+    async fn call_blocked_by_tool_filter_without_connecting() {
+        let mgr = mgr_from(
+            r#"{
+                "mcpServers": {
+                    "gmail": {
+                        "type": "stdio",
+                        "command": "/nonexistent/path/openab-mcp-test-stub-zzz",
+                        "tool_filter": { "include": ["search_*", "get_*", "create_draft"] }
+                    }
+                }
+            }"#,
+        );
+        let err = dispatch(
+            &mgr,
+            Action::Call {
+                server: "gmail".into(),
+                tool: "send_message".into(),
+                arguments: Value::Null,
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("blocked by the configured tool_filter"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@
 
 pub mod breaker;
 pub mod config;
+pub mod facade;
 pub mod flow;
 pub mod meta_tool;
 pub mod oauth;
