@@ -137,7 +137,7 @@ impl GmailNative {
                 .await
                 .map_err(|e| anyhow!("read auth.json: {e}"))?
                 .ok_or_else(|| {
-                    anyhow!("no gmail-native credentials — run `openab gmail-native login` first")
+                    anyhow!("no gmail-native credentials — run `openab mcp gmail-native login` first")
                 })
         };
         let creds = load().await?;
@@ -148,7 +148,7 @@ impl GmailNative {
         if !has_refresh {
             bail!(
                 "gmail-native token expired and no refresh token is stored — \
-                 re-run `openab gmail-native login` (the login flow requests \
+                 re-run `openab mcp gmail-native login` (the login flow requests \
                  access_type=offline, so this normally does not recur)"
             );
         }
@@ -183,7 +183,7 @@ impl GmailNative {
         if !status.is_success() {
             bail!(
                 "gmail-native token refresh failed ({status}): {} — if the grant was revoked, \
-                 re-run `openab gmail-native login`",
+                 re-run `openab mcp gmail-native login`",
                 body["error"].as_str().unwrap_or("unknown error")
             );
         }

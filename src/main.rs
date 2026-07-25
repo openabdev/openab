@@ -117,9 +117,21 @@ enum Commands {
         #[arg(long)]
         thread: Option<String>,
     },
-    /// Native Gmail adapter (Capability Plugin, OAB MCP Adapter ADR §6.1/§6.5):
-    /// the six-tool read+drafts Gmail profile served from Gmail's GA REST API
-    /// as a loopback Streamable HTTP MCP server. Register it in mcp.json as a
+    /// MCP add-on operations (OAB MCP Adapter ADR): interactive and
+    /// operational actions for MCP components. Long-running serving is
+    /// config-driven (`[mcp]` in config.toml + `openab run`); these
+    /// subcommands cover interactive logins and standalone/dev serving.
+    Mcp {
+        #[command(subcommand)]
+        addon: McpAddon,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum McpAddon {
+    /// Native Gmail adapter (Capability Plugin, ADR §6.1/§6.5): the six-tool
+    /// read+drafts Gmail profile served from Gmail's GA REST API as a
+    /// loopback Streamable HTTP MCP server. Register it in mcp.json as a
     /// `"type": "http"` entry pointing at http://<listen>/mcp.
     GmailNative {
         #[command(subcommand)]
@@ -329,7 +341,8 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        Commands::GmailNative { action } => {
+        Commands::Mcp { addon } => {
+            let McpAddon::GmailNative { action } = addon;
             match action {
                 GmailNativeAction::Serve { listen } => {
                     if let Err(e) = openab_mcp::native::gmail::serve_http(&listen).await {

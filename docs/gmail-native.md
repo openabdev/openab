@@ -46,7 +46,7 @@ results state explicitly that nothing was sent.
 ```sh
 export GMAIL_OAUTH_CLIENT_ID=<client-id>
 export GMAIL_OAUTH_CLIENT_SECRET=<client-secret>   # omit for Desktop clients
-openab gmail-native login
+openab mcp gmail-native login
 ```
 
 Open the printed URL, approve, and paste the full
@@ -62,7 +62,7 @@ If the login warns that no refresh token was returned, revoke the app at
 ### 3. Serve
 
 ```sh
-openab gmail-native serve --listen 127.0.0.1:8850
+openab mcp gmail-native serve --listen 127.0.0.1:8850
 ```
 
 Loopback-only — non-loopback binds are refused at startup. The endpoint has

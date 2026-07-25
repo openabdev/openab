@@ -3,7 +3,7 @@
 //! REST API when no (usable) hosted MCP server is available.
 //!
 //! Each adapter is packaged as a **loopback Streamable HTTP MCP server**
-//! (`openab gmail-native serve --listen 127.0.0.1:<port>`) — the same
+//! (`openab mcp gmail-native serve --listen 127.0.0.1:<port>`) — the same
 //! transport and trust model as the OAB MCP Facade — rather than a new
 //! in-process integration path. The adapter is registered in `mcp.json`
 //! like any other `"type": "http"` server, so the runtime's `tool_filter`
