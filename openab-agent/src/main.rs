@@ -29,17 +29,6 @@ enum Commands {
         #[command(subcommand)]
         action: McpAction,
     },
-    /// Serve the OAB MCP Facade over loopback Streamable HTTP: an inbound
-    /// MCP server exposing `search_capabilities` / `execute_capability`
-    /// backed by the configured downstream MCP servers (global + project
-    /// mcp.json). The OAB broker hosts the same facade in-process when
-    /// `[mcp]` is set in config.toml; this subcommand is the standalone way
-    /// to run it.
-    McpFacade {
-        /// Loopback address to listen on (non-loopback addresses are refused).
-        #[arg(long, default_value = "127.0.0.1:8848")]
-        listen: String,
-    },
 }
 
 #[derive(Subcommand)]
@@ -171,12 +160,6 @@ async fn main() {
                 }
             }
         },
-        Some(Commands::McpFacade { listen }) => {
-            if let Err(e) = mcp::facade::serve_http(&listen).await {
-                eprintln!("mcp-facade: {e:#}");
-                std::process::exit(1);
-            }
-        }
     }
 }
 

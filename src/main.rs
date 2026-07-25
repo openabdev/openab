@@ -326,8 +326,25 @@ async fn main() -> anyhow::Result<()> {
         && cfg.telegram.is_none()
         && !has_unified_platform(&cfg)
     {
+        // Facade-only run mode (#1451): an adapter-less config with `[mcp]`
+        // present is a valid deployment — the broker serves just the OAB MCP
+        // Facade listener. One entrypoint, config-driven: hosts that only
+        // need the capability surface (coding-CLI-only users, dev loops, CI
+        // runners, agent hosts with no chat platform) run the same
+        // `openab run` with a two-line config instead of a chat token.
+        if let Some(mcp_cfg) = cfg.mcp.clone() {
+            tracing::info!(
+                listen = %mcp_cfg.listen,
+                "no chat adapter configured — running in facade-only mode ([mcp] present)"
+            );
+            // Foreground, not spawned: the facade IS the workload. A bind
+            // failure or server exit terminates the process (fail fast).
+            return openab_mcp::mcp::facade::serve_http(&mcp_cfg.listen)
+                .await
+                .map_err(|e| anyhow::anyhow!("OAB MCP facade exited: {e:#}"));
+        }
         anyhow::bail!(
-            "no adapter configured — add [discord], [slack], [telegram], [wecom], [googlechat], or [gateway] to config, or set platform env vars (TELEGRAM_BOT_TOKEN, etc.)"
+            "no adapter configured — add [discord], [slack], [telegram], [wecom], [googlechat], or [gateway] to config (or [mcp] for facade-only mode), or set platform env vars (TELEGRAM_BOT_TOKEN, etc.)"
         );
     }
 
