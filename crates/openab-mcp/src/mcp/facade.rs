@@ -620,7 +620,9 @@ mod tests {
                 .method("POST")
                 .uri("/mcp")
                 .header("content-type", "application/json")
-                .header("accept", "application/json, text/event-stream");
+                .header("accept", "application/json, text/event-stream")
+                // tower::oneshot bypasses hyper, which normally supplies Host.
+                .header("host", "127.0.0.1");
             if let Some(t) = bearer {
                 b = b.header("authorization", format!("Bearer {t}"));
             }
