@@ -8,6 +8,7 @@ pub mod meta_tool;
 pub mod oauth;
 pub mod runtime;
 pub mod sampling;
+pub mod sources;
 
 use serde_json::json;
 

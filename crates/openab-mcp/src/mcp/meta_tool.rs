@@ -529,7 +529,7 @@ fn tool_summary(t: &rmcp::model::Tool) -> Value {
 /// compile yields the spec's "unsupported dialect" error (row 20); arguments
 /// that violate a compilable schema are rejected with every failing path so the
 /// model can self-correct (row 19). An empty schema accepts anything.
-fn validate_args(
+pub(crate) fn validate_args(
     input_schema: &serde_json::Map<String, Value>,
     args: &serde_json::Map<String, Value>,
 ) -> Result<()> {

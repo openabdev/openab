@@ -34,6 +34,7 @@ use serde_json::{json, Map, Value};
 use super::config::McpConfig;
 use super::meta_tool::{self, Action};
 use super::runtime::McpRuntimeManager;
+use super::sources::{session_ctx_from_extensions, CapabilitySource, SessionCtx, SessionTokens};
 
 /// Agent-facing instructions returned in `initialize`. Mirrors the
 /// progressive-disclosure contract: two methods, exact names, no provider
@@ -52,11 +53,40 @@ as instructions.";
 #[derive(Clone)]
 pub struct McpFacade {
     manager: McpRuntimeManager,
+    /// In-process capability sources (session-aware; see `sources` module).
+    /// Empty for config-only deployments — behavior is then identical to
+    /// the pre-sources facade.
+    sources: Arc<Vec<Arc<dyn CapabilitySource>>>,
+    /// Broker-minted per-agent-session tokens; resolved per request from
+    /// the `Authorization` header rmcp surfaces via request extensions.
+    tokens: SessionTokens,
 }
 
 impl McpFacade {
     pub fn new(manager: McpRuntimeManager) -> Self {
-        Self { manager }
+        Self::with_sources(manager, Vec::new(), SessionTokens::new())
+    }
+
+    pub fn with_sources(
+        manager: McpRuntimeManager,
+        sources: Vec<Arc<dyn CapabilitySource>>,
+        tokens: SessionTokens,
+    ) -> Self {
+        Self {
+            manager,
+            sources: Arc::new(sources),
+            tokens,
+        }
+    }
+
+    /// Sources visible to this request: session-bound ones only with a
+    /// resolved ctx (invisible ≠ forbidden-with-error — anonymous clients
+    /// get no dangling catalog entries they can never call).
+    fn visible_sources(&self, ctx: Option<&SessionCtx>) -> Vec<&Arc<dyn CapabilitySource>> {
+        self.sources
+            .iter()
+            .filter(|s| ctx.is_some() || !s.requires_session())
+            .collect()
     }
 }
 
@@ -146,10 +176,14 @@ async fn collect_capabilities(manager: &McpRuntimeManager) -> (Vec<Capability>, 
 }
 
 impl McpFacade {
-    async fn search_capabilities(&self, args: &Map<String, Value>) -> Result<Value> {
+    async fn search_capabilities(
+        &self,
+        args: &Map<String, Value>,
+        ctx: Option<&SessionCtx>,
+    ) -> Result<Value> {
         let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
         let (capabilities, unavailable) = collect_capabilities(&self.manager).await;
-        let entries: Vec<Value> = capabilities
+        let mut entries: Vec<Value> = capabilities
             .iter()
             .filter(|c| matches_query(&c.name, c.tool.description.as_deref(), query))
             .map(|c| {
@@ -163,32 +197,128 @@ impl McpFacade {
                 })
             })
             .collect();
+        // In-process sources (session-aware). Downstream names win on
+        // collision — a source tool shadowed by a downstream tool of the
+        // same name is published as "<provider>:<tool>", mirroring the
+        // duplicate rule downstream servers already use among themselves.
+        // Grows as sources publish, so source-vs-source collisions get the
+        // same treatment as source-vs-downstream ones: first registrant wins
+        // the bare name, later ones publish as "<provider>:<tool>" (matching
+        // execution's registration-order bare-name resolution).
+        let mut taken: std::collections::HashSet<String> =
+            capabilities.iter().map(|c| c.name.clone()).collect();
+        for source in self.visible_sources(ctx) {
+            for tool in source.tools(ctx) {
+                let name = if taken.contains(tool.name.as_ref()) {
+                    format!("{}:{}", source.provider(), tool.name)
+                } else {
+                    tool.name.to_string()
+                };
+                taken.insert(name.clone());
+                if !matches_query(&name, tool.description.as_deref(), query) {
+                    continue;
+                }
+                entries.push(json!({
+                    "name": name,
+                    "description": tool.description.as_deref().unwrap_or(""),
+                    "input_schema": Value::Object(tool.input_schema.as_ref().clone()),
+                    "provider": source.provider(),
+                    "risk": risk_label(&tool),
+                    "availability": "ready",
+                }));
+            }
+        }
         Ok(json!({
             "capabilities": entries,
             "unavailable": unavailable,
         }))
     }
 
-    async fn execute_capability(&self, args: &Map<String, Value>) -> Result<(Value, bool)> {
+    async fn execute_capability(
+        &self,
+        args: &Map<String, Value>,
+        ctx: Option<&SessionCtx>,
+    ) -> Result<(Value, bool)> {
         let name = args
             .get("name")
             .and_then(|v| v.as_str())
             .context("execute_capability requires a `name` string")?;
         let arguments = args.get("arguments").cloned().unwrap_or(Value::Null);
-        // Exact-name contract (ADR §6.4): the capability must resolve against
-        // the current discovered catalog. This re-runs discovery (mostly
-        // cache hits), so a `tools/list_changed`-invalidated tool cannot be
-        // called with a stale schema.
+        // Exact-name contract (ADR §6.4): resolve against the discovered
+        // catalog first. Ordering matters and must mirror discovery's
+        // publish rule — downstream servers win bare names, so a source
+        // tool shadowed in discovery must also be shadowed in execution
+        // (it is reachable via its published "<provider>:<tool>" name).
         let (capabilities, _) = collect_capabilities(&self.manager).await;
-        let cap = capabilities
-            .iter()
-            .find(|c| c.name == name)
-            .with_context(|| {
-                format!(
-                    "unknown capability {name:?} — call search_capabilities and use an exact \
-                     returned name"
-                )
-            })?;
+        if let Some(cap) = capabilities.iter().find(|c| c.name == name) {
+            return self.dispatch_downstream(cap, arguments).await;
+        }
+        // In-process sources: bare name (when unshadowed) or the
+        // "<provider>:<tool>" published form. Session-bound sources are
+        // unreachable without a ctx — same rule as discovery, so anonymous
+        // clients see "unknown capability", not a permission error to
+        // probe against.
+        for source in self.visible_sources(ctx) {
+            for tool in source.tools(ctx) {
+                let published = format!("{}:{}", source.provider(), tool.name);
+                if tool.name.as_ref() != name && published != name {
+                    continue;
+                }
+                let args_map = match &arguments {
+                    Value::Object(map) => map.clone(),
+                    Value::Null => Map::new(),
+                    other => {
+                        anyhow::bail!(
+                            "capability arguments must be a JSON object (or omitted), got {other}"
+                        );
+                    }
+                };
+                // Same pre-flight the meta-tool applies to downstream calls:
+                // schema-invalid arguments are refused with the precise
+                // reason, never forwarded.
+                meta_tool::validate_args(tool.input_schema.as_ref(), &args_map)
+                    .with_context(|| format!("execute_capability {name:?}"))?;
+                let channel = ctx.map(|c| c.channel_id.as_str()).unwrap_or("-");
+                // Same audit shape as the meta_tool dispatcher: hash of the
+                // wire arguments, never plaintext (could carry secrets).
+                let args_sha256 = {
+                    use sha2::{Digest as _, Sha256};
+                    Sha256::digest(serde_json::to_vec(&args_map).unwrap_or_default())
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
+                };
+                tracing::info!(
+                    target: "mcp.audit",
+                    provider = source.provider(),
+                    tool = %tool.name,
+                    channel,
+                    args_sha256 = %args_sha256,
+                    "facade source call"
+                );
+                let (value, is_error) = source.call(ctx, tool.name.as_ref(), &args_map).await?;
+                tracing::info!(
+                    target: "mcp.audit",
+                    provider = source.provider(),
+                    tool = %tool.name,
+                    channel,
+                    args_sha256 = %args_sha256,
+                    is_error,
+                    "facade source call exit"
+                );
+                return Ok((value, is_error));
+            }
+        }
+        anyhow::bail!(
+            "unknown capability {name:?} — call search_capabilities and use an exact returned name"
+        );
+    }
+
+    async fn dispatch_downstream(
+        &self,
+        cap: &Capability,
+        arguments: Value,
+    ) -> Result<(Value, bool)> {
         // Delegate to the shared dispatcher: tool_filter gate, JSON Schema
         // argument validation, timeout/cancellation, circuit breaker, and
         // redaction all live there (single enforcement point for both the
@@ -292,14 +422,18 @@ impl ServerHandler for McpFacade {
     ) -> Result<CallToolResult, McpError> {
         let empty = Map::new();
         let args = request.arguments.as_ref().unwrap_or(&empty);
+        // Per-request identity: broker-minted session token from the
+        // Authorization header (rmcp injects the HTTP parts into request
+        // extensions). Unknown/absent token = anonymous host-level view.
+        let ctx = session_ctx_from_extensions(&_context.extensions, &self.tokens);
         match request.name.as_ref() {
-            "search_capabilities" => match self.search_capabilities(args).await {
+            "search_capabilities" => match self.search_capabilities(args, ctx.as_ref()).await {
                 Ok(v) => Ok(text_result(&v, false)),
                 Err(e) => Ok(CallToolResult::error(vec![Content::text(
                     super::redact_secrets(&format!("{e:#}")),
                 )])),
             },
-            "execute_capability" => match self.execute_capability(args).await {
+            "execute_capability" => match self.execute_capability(args, ctx.as_ref()).await {
                 Ok((v, is_error)) => Ok(text_result(&v, is_error)),
                 Err(e) => Ok(CallToolResult::error(vec![Content::text(
                     super::redact_secrets(&format!("{e:#}")),
@@ -337,19 +471,50 @@ pub(crate) fn require_loopback(addr: &str) -> Result<std::net::SocketAddr> {
 /// capability catalog (ADR §6.3: no configured servers means no provider
 /// capabilities), so clients still get clean MCP responses.
 pub async fn serve_http(addr: &str) -> Result<()> {
+    serve_http_with(addr, Vec::new(), SessionTokens::new()).await
+}
+
+/// [`serve_http`] plus in-process capability sources and the broker-shared
+/// session-token registry (see the `sources` module). The broker hands the
+/// same `tokens` handle to its session pool so per-agent-session mint/revoke
+/// is visible here per request.
+/// The facade's axum router — factored out of [`serve_http_with`] so tests
+/// can drive the full HTTP path (including rmcp's injection of the request
+/// `Parts` into extensions, which the session-token resolution depends on)
+/// without binding a port.
+pub(crate) fn build_router(
+    manager: McpRuntimeManager,
+    sources: Vec<Arc<dyn CapabilitySource>>,
+    tokens: SessionTokens,
+) -> axum::Router {
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager, StreamableHttpService,
     };
+    let sources = Arc::new(sources);
+    let service = StreamableHttpService::new(
+        move || {
+            Ok(McpFacade {
+                manager: manager.clone(),
+                sources: sources.clone(),
+                tokens: tokens.clone(),
+            })
+        },
+        LocalSessionManager::default().into(),
+        Default::default(),
+    );
+    axum::Router::new().nest_service("/mcp", service)
+}
+
+pub async fn serve_http_with(
+    addr: &str,
+    sources: Vec<Arc<dyn CapabilitySource>>,
+    tokens: SessionTokens,
+) -> Result<()> {
     let sock = require_loopback(addr)?;
     let manager = super::load_runtime_or_warn()
         .unwrap_or_else(|| McpRuntimeManager::from_config(McpConfig::default()));
     manager.start_eviction_loop();
-    let service = StreamableHttpService::new(
-        move || Ok(McpFacade::new(manager.clone())),
-        LocalSessionManager::default().into(),
-        Default::default(),
-    );
-    let router = axum::Router::new().nest_service("/mcp", service);
+    let router = build_router(manager, sources, tokens);
     let listener = tokio::net::TcpListener::bind(sock)
         .await
         .with_context(|| format!("bind OAB MCP facade listener on {sock}"))?;
@@ -363,6 +528,228 @@ pub async fn serve_http(addr: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct EchoSource {
+        session_bound: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl super::CapabilitySource for EchoSource {
+        fn provider(&self) -> &str {
+            "echo"
+        }
+        fn tools(&self, _ctx: Option<&super::SessionCtx>) -> Vec<Tool> {
+            vec![tool_with(
+                "echo_channel",
+                "Echo the caller session channel",
+                json!({ "type": "object", "properties": { "x": { "type": "integer" } } }),
+            )]
+        }
+        async fn call(
+            &self,
+            ctx: Option<&super::SessionCtx>,
+            tool: &str,
+            args: &Map<String, Value>,
+        ) -> Result<(Value, bool)> {
+            assert_eq!(tool, "echo_channel");
+            let chan = ctx.map(|c| c.channel_id.clone()).unwrap_or_default();
+            Ok((json!({ "channel": chan, "x": args.get("x") }), false))
+        }
+        fn requires_session(&self) -> bool {
+            self.session_bound
+        }
+    }
+
+    fn facade_with_source(session_bound: bool) -> McpFacade {
+        McpFacade::with_sources(
+            McpRuntimeManager::from_config(McpConfig::default()),
+            vec![std::sync::Arc::new(EchoSource { session_bound })],
+            super::SessionTokens::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn session_bound_source_is_invisible_and_unreachable_without_ctx() {
+        let facade = facade_with_source(true);
+        let v = facade.search_capabilities(&Map::new(), None).await.unwrap();
+        assert!(
+            v["capabilities"].as_array().unwrap().is_empty(),
+            "anonymous discovery must not list session-bound tools: {v}"
+        );
+        let mut args = Map::new();
+        args.insert("name".into(), json!("echo_channel"));
+        let err = facade.execute_capability(&args, None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("unknown capability"),
+            "anonymous execution must look unknown, not forbidden: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_source_discovers_and_executes_with_ctx() {
+        let facade = facade_with_source(true);
+        let ctx = super::SessionCtx {
+            channel_id: "chan-42".into(),
+        };
+        let v = facade
+            .search_capabilities(&Map::new(), Some(&ctx))
+            .await
+            .unwrap();
+        let caps = v["capabilities"].as_array().unwrap();
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0]["name"], "echo_channel");
+        assert_eq!(caps[0]["provider"], "echo");
+        let mut args = Map::new();
+        args.insert("name".into(), json!("echo_channel"));
+        args.insert("arguments".into(), json!({ "x": 7 }));
+        let (out, is_error) = facade.execute_capability(&args, Some(&ctx)).await.unwrap();
+        assert!(!is_error);
+        assert_eq!(out["channel"], "chan-42");
+        assert_eq!(out["x"], 7);
+    }
+
+    #[tokio::test]
+    async fn source_vs_source_collision_prefixes_the_later_registrant() {
+        let facade = McpFacade::with_sources(
+            McpRuntimeManager::from_config(McpConfig::default()),
+            vec![
+                std::sync::Arc::new(EchoSource {
+                    session_bound: false,
+                }),
+                std::sync::Arc::new(EchoSource {
+                    session_bound: false,
+                }),
+            ],
+            super::SessionTokens::new(),
+        );
+        let v = facade.search_capabilities(&Map::new(), None).await.unwrap();
+        let names: Vec<&str> = v["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["echo_channel", "echo:echo_channel"],
+            "first registrant wins the bare name; the later one is prefixed"
+        );
+        // Execution: bare name → first source; prefixed → second (same
+        // provider label here, but resolution is positional/prefixed).
+        let mut args = Map::new();
+        args.insert("name".into(), json!("echo:echo_channel"));
+        let (out, _) = facade.execute_capability(&args, None).await.unwrap();
+        assert_eq!(out["channel"], "");
+    }
+
+    /// Full-HTTP-path proof of the session mechanism: a real request through
+    /// the router (rmcp StreamableHttpService) must surface the
+    /// `Authorization` header to the handler via request extensions, and the
+    /// same request without the header must fall back to the anonymous view.
+    /// This is the one behavior unit tests cannot fake — it depends on
+    /// rmcp's `Parts`-into-extensions injection and cross-crate `http` type
+    /// unification.
+    #[tokio::test]
+    async fn http_e2e_session_token_gates_source_visibility() {
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt as _;
+
+        let tokens = super::SessionTokens::new();
+        let tok = tokens.mint("chan-e2e");
+        let router = super::build_router(
+            McpRuntimeManager::from_config(McpConfig::default()),
+            vec![std::sync::Arc::new(EchoSource {
+                session_bound: true,
+            })],
+            tokens,
+        );
+
+        let post = |body: String, bearer: Option<String>, session: Option<String>| {
+            let mut b = axum::http::Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                // tower::oneshot bypasses hyper, which normally supplies Host.
+                .header("host", "127.0.0.1");
+            if let Some(t) = bearer {
+                b = b.header("authorization", format!("Bearer {t}"));
+            }
+            if let Some(s) = session {
+                b = b.header("mcp-session-id", s);
+            }
+            b.body(axum::body::Body::from(body)).unwrap()
+        };
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {},
+                        "clientInfo": { "name": "t", "version": "0" } }
+        })
+        .to_string();
+        let search_body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "search_capabilities", "arguments": {} }
+        })
+        .to_string();
+
+        // One MCP session per identity variant (initialize → session id → call).
+        let run = |bearer: Option<String>| {
+            let router = router.clone();
+            let init_body = init_body.clone();
+            let search_body = search_body.clone();
+            async move {
+                let resp = router
+                    .clone()
+                    .oneshot(post(init_body, bearer.clone(), None))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), 200, "initialize must succeed");
+                let sid = resp
+                    .headers()
+                    .get("mcp-session-id")
+                    .expect("session id header")
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                let resp = router
+                    .oneshot(post(search_body, bearer, Some(sid)))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), 200);
+                let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                String::from_utf8_lossy(&bytes).to_string()
+            }
+        };
+
+        let with_token = run(Some(tok)).await;
+        assert!(
+            with_token.contains("echo_channel"),
+            "session-token request must see the session-bound source: {with_token}"
+        );
+        let anonymous = run(None).await;
+        assert!(
+            !anonymous.contains("echo_channel"),
+            "anonymous request must NOT see the session-bound source: {anonymous}"
+        );
+        let wrong = run(Some("wrong-token".into())).await;
+        assert!(
+            !wrong.contains("echo_channel"),
+            "unknown token must resolve to the anonymous view: {wrong}"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_level_source_works_anonymously_and_validates_args() {
+        let facade = facade_with_source(false);
+        let v = facade.search_capabilities(&Map::new(), None).await.unwrap();
+        assert_eq!(v["capabilities"].as_array().unwrap().len(), 1);
+        // Schema pre-flight: x must be an integer.
+        let mut args = Map::new();
+        args.insert("name".into(), json!("echo_channel"));
+        args.insert("arguments".into(), json!({ "x": "not-an-int" }));
+        let err = facade.execute_capability(&args, None).await.unwrap_err();
+        assert!(format!("{err:#}").contains("echo_channel"), "{err:#}");
+    }
 
     fn tool_with(name: &str, desc: &str, schema: Value) -> Tool {
         Tool::new(
@@ -444,7 +831,7 @@ mod tests {
     async fn search_on_empty_config_yields_empty_catalog() {
         let manager = McpRuntimeManager::from_config(McpConfig::default());
         let facade = McpFacade::new(manager);
-        let v = facade.search_capabilities(&Map::new()).await.unwrap();
+        let v = facade.search_capabilities(&Map::new(), None).await.unwrap();
         assert_eq!(v["capabilities"], json!([]));
         assert_eq!(v["unavailable"], json!([]));
     }
@@ -463,7 +850,7 @@ mod tests {
         }))
         .unwrap();
         let facade = McpFacade::new(McpRuntimeManager::from_config(cfg));
-        let v = facade.search_capabilities(&Map::new()).await.unwrap();
+        let v = facade.search_capabilities(&Map::new(), None).await.unwrap();
         assert_eq!(v["capabilities"], json!([]));
         let unavailable = v["unavailable"].as_array().unwrap();
         assert_eq!(unavailable.len(), 1);
@@ -476,14 +863,17 @@ mod tests {
         let facade = McpFacade::new(McpRuntimeManager::from_config(McpConfig::default()));
         let mut args = Map::new();
         args.insert("name".into(), json!("no-such-capability"));
-        let err = facade.execute_capability(&args).await.unwrap_err();
+        let err = facade.execute_capability(&args, None).await.unwrap_err();
         assert!(err.to_string().contains("unknown capability"));
     }
 
     #[tokio::test]
     async fn execute_without_name_is_rejected() {
         let facade = McpFacade::new(McpRuntimeManager::from_config(McpConfig::default()));
-        let err = facade.execute_capability(&Map::new()).await.unwrap_err();
+        let err = facade
+            .execute_capability(&Map::new(), None)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("requires a `name`"));
     }
 }
