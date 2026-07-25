@@ -201,8 +201,12 @@ impl McpFacade {
         // collision — a source tool shadowed by a downstream tool of the
         // same name is published as "<provider>:<tool>", mirroring the
         // duplicate rule downstream servers already use among themselves.
-        let taken: std::collections::HashSet<&str> =
-            capabilities.iter().map(|c| c.name.as_str()).collect();
+        // Grows as sources publish, so source-vs-source collisions get the
+        // same treatment as source-vs-downstream ones: first registrant wins
+        // the bare name, later ones publish as "<provider>:<tool>" (matching
+        // execution's registration-order bare-name resolution).
+        let mut taken: std::collections::HashSet<String> =
+            capabilities.iter().map(|c| c.name.clone()).collect();
         for source in self.visible_sources(ctx) {
             for tool in source.tools(ctx) {
                 let name = if taken.contains(tool.name.as_ref()) {
@@ -210,6 +214,7 @@ impl McpFacade {
                 } else {
                     tool.name.to_string()
                 };
+                taken.insert(name.clone());
                 if !matches_query(&name, tool.description.as_deref(), query) {
                     continue;
                 }
@@ -274,11 +279,21 @@ impl McpFacade {
                 meta_tool::validate_args(tool.input_schema.as_ref(), &args_map)
                     .with_context(|| format!("execute_capability {name:?}"))?;
                 let channel = ctx.map(|c| c.channel_id.as_str()).unwrap_or("-");
+                // Same audit shape as the meta_tool dispatcher: hash of the
+                // wire arguments, never plaintext (could carry secrets).
+                let args_sha256 = {
+                    use sha2::{Digest as _, Sha256};
+                    Sha256::digest(serde_json::to_vec(&args_map).unwrap_or_default())
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
+                };
                 tracing::info!(
                     target: "mcp.audit",
                     provider = source.provider(),
                     tool = %tool.name,
                     channel,
+                    args_sha256 = %args_sha256,
                     "facade source call"
                 );
                 let (value, is_error) = source.call(ctx, tool.name.as_ref(), &args_map).await?;
@@ -287,6 +302,7 @@ impl McpFacade {
                     provider = source.provider(),
                     tool = %tool.name,
                     channel,
+                    args_sha256 = %args_sha256,
                     is_error,
                     "facade source call exit"
                 );
@@ -590,6 +606,43 @@ mod tests {
         assert!(!is_error);
         assert_eq!(out["channel"], "chan-42");
         assert_eq!(out["x"], 7);
+    }
+
+    #[tokio::test]
+    async fn source_vs_source_collision_prefixes_the_later_registrant() {
+        let facade = McpFacade::with_sources(
+            McpRuntimeManager::from_config(McpConfig::default()),
+            vec![
+                std::sync::Arc::new(EchoSource {
+                    session_bound: false,
+                }),
+                std::sync::Arc::new(EchoSource {
+                    session_bound: false,
+                }),
+            ],
+            super::SessionTokens::new(),
+        );
+        let v = facade
+            .search_capabilities(&Map::new(), None)
+            .await
+            .unwrap();
+        let names: Vec<&str> = v["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["echo_channel", "echo:echo_channel"],
+            "first registrant wins the bare name; the later one is prefixed"
+        );
+        // Execution: bare name → first source; prefixed → second (same
+        // provider label here, but resolution is positional/prefixed).
+        let mut args = Map::new();
+        args.insert("name".into(), json!("echo:echo_channel"));
+        let (out, _) = facade.execute_capability(&args, None).await.unwrap();
+        assert_eq!(out["channel"], "");
     }
 
     /// Full-HTTP-path proof of the session mechanism: a real request through
