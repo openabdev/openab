@@ -46,5 +46,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 libc = "0.2"
 
 [dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 tempfile = "3"
 temp-env = "0.3.6"

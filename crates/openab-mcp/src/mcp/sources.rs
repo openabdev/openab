@@ -142,7 +142,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     for (x, y) in a.iter().zip(b.iter()) {
         acc |= x ^ y;
     }
-    acc == 0
+    std::hint::black_box(acc) == 0
 }
 
 /// Resolve a [`SessionCtx`] from the HTTP parts rmcp injects into request

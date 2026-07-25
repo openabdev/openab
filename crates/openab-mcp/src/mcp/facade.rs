@@ -239,10 +239,20 @@ impl McpFacade {
             .and_then(|v| v.as_str())
             .context("execute_capability requires a `name` string")?;
         let arguments = args.get("arguments").cloned().unwrap_or(Value::Null);
-        // In-process sources first (bare name, or "<provider>:<tool>" for a
-        // downstream-shadowed one). Session-bound sources are unreachable
-        // without a ctx — same rule as discovery, so anonymous clients see
-        // "unknown capability", not a permission error to probe against.
+        // Exact-name contract (ADR §6.4): resolve against the discovered
+        // catalog first. Ordering matters and must mirror discovery's
+        // publish rule — downstream servers win bare names, so a source
+        // tool shadowed in discovery must also be shadowed in execution
+        // (it is reachable via its published "<provider>:<tool>" name).
+        let (capabilities, _) = collect_capabilities(&self.manager).await;
+        if let Some(cap) = capabilities.iter().find(|c| c.name == name) {
+            return self.dispatch_downstream(cap, arguments).await;
+        }
+        // In-process sources: bare name (when unshadowed) or the
+        // "<provider>:<tool>" published form. Session-bound sources are
+        // unreachable without a ctx — same rule as discovery, so anonymous
+        // clients see "unknown capability", not a permission error to
+        // probe against.
         for source in self.visible_sources(ctx) {
             for tool in source.tools(ctx) {
                 let published = format!("{}:{}", source.provider(), tool.name);
@@ -283,20 +293,16 @@ impl McpFacade {
                 return Ok((value, is_error));
             }
         }
-        // Exact-name contract (ADR §6.4): the capability must resolve against
-        // the current discovered catalog. This re-runs discovery (mostly
-        // cache hits), so a `tools/list_changed`-invalidated tool cannot be
-        // called with a stale schema.
-        let (capabilities, _) = collect_capabilities(&self.manager).await;
-        let cap = capabilities
-            .iter()
-            .find(|c| c.name == name)
-            .with_context(|| {
-                format!(
-                    "unknown capability {name:?} — call search_capabilities and use an exact \
-                     returned name"
-                )
-            })?;
+        anyhow::bail!(
+            "unknown capability {name:?} — call search_capabilities and use an exact returned name"
+        );
+    }
+
+    async fn dispatch_downstream(
+        &self,
+        cap: &Capability,
+        arguments: Value,
+    ) -> Result<(Value, bool)> {
         // Delegate to the shared dispatcher: tool_filter gate, JSON Schema
         // argument validation, timeout/cancellation, circuit breaker, and
         // redaction all live there (single enforcement point for both the
@@ -456,18 +462,18 @@ pub async fn serve_http(addr: &str) -> Result<()> {
 /// session-token registry (see the `sources` module). The broker hands the
 /// same `tokens` handle to its session pool so per-agent-session mint/revoke
 /// is visible here per request.
-pub async fn serve_http_with(
-    addr: &str,
+/// The facade's axum router — factored out of [`serve_http_with`] so tests
+/// can drive the full HTTP path (including rmcp's injection of the request
+/// `Parts` into extensions, which the session-token resolution depends on)
+/// without binding a port.
+pub(crate) fn build_router(
+    manager: McpRuntimeManager,
     sources: Vec<Arc<dyn CapabilitySource>>,
     tokens: SessionTokens,
-) -> Result<()> {
+) -> axum::Router {
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager, StreamableHttpService,
     };
-    let sock = require_loopback(addr)?;
-    let manager = super::load_runtime_or_warn()
-        .unwrap_or_else(|| McpRuntimeManager::from_config(McpConfig::default()));
-    manager.start_eviction_loop();
     let sources = Arc::new(sources);
     let service = StreamableHttpService::new(
         move || {
@@ -480,7 +486,22 @@ pub async fn serve_http_with(
         LocalSessionManager::default().into(),
         Default::default(),
     );
-    let router = axum::Router::new().nest_service("/mcp", service);
+    axum::Router::new().nest_service("/mcp", service)
+}
+
+pub async fn serve_http_with(
+    addr: &str,
+    sources: Vec<Arc<dyn CapabilitySource>>,
+    tokens: SessionTokens,
+) -> Result<()> {
+    use rmcp::transport::streamable_http_server::{
+        session::local::LocalSessionManager, StreamableHttpService,
+    };
+    let sock = require_loopback(addr)?;
+    let manager = super::load_runtime_or_warn()
+        .unwrap_or_else(|| McpRuntimeManager::from_config(McpConfig::default()));
+    manager.start_eviction_loop();
+    let router = build_router(manager, sources, tokens);
     let listener = tokio::net::TcpListener::bind(sock)
         .await
         .with_context(|| format!("bind OAB MCP facade listener on {sock}"))?;
@@ -572,6 +593,98 @@ mod tests {
         assert!(!is_error);
         assert_eq!(out["channel"], "chan-42");
         assert_eq!(out["x"], 7);
+    }
+
+    /// Full-HTTP-path proof of the session mechanism: a real request through
+    /// the router (rmcp StreamableHttpService) must surface the
+    /// `Authorization` header to the handler via request extensions, and the
+    /// same request without the header must fall back to the anonymous view.
+    /// This is the one behavior unit tests cannot fake — it depends on
+    /// rmcp's `Parts`-into-extensions injection and cross-crate `http` type
+    /// unification.
+    #[tokio::test]
+    async fn http_e2e_session_token_gates_source_visibility() {
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt as _;
+
+        let tokens = super::SessionTokens::new();
+        let tok = tokens.mint("chan-e2e");
+        let router = super::build_router(
+            McpRuntimeManager::from_config(McpConfig::default()),
+            vec![std::sync::Arc::new(EchoSource { session_bound: true })],
+            tokens,
+        );
+
+        let post = |body: String, bearer: Option<String>, session: Option<String>| {
+            let mut b = axum::http::Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream");
+            if let Some(t) = bearer {
+                b = b.header("authorization", format!("Bearer {t}"));
+            }
+            if let Some(s) = session {
+                b = b.header("mcp-session-id", s);
+            }
+            b.body(axum::body::Body::from(body)).unwrap()
+        };
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {},
+                        "clientInfo": { "name": "t", "version": "0" } }
+        })
+        .to_string();
+        let search_body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "search_capabilities", "arguments": {} }
+        })
+        .to_string();
+
+        // One MCP session per identity variant (initialize → session id → call).
+        let run = |bearer: Option<String>| {
+            let router = router.clone();
+            let init_body = init_body.clone();
+            let search_body = search_body.clone();
+            async move {
+                let resp = router
+                    .clone()
+                    .oneshot(post(init_body, bearer.clone(), None))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), 200, "initialize must succeed");
+                let sid = resp
+                    .headers()
+                    .get("mcp-session-id")
+                    .expect("session id header")
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                let resp = router
+                    .oneshot(post(search_body, bearer, Some(sid)))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), 200);
+                let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                String::from_utf8_lossy(&bytes).to_string()
+            }
+        };
+
+        let with_token = run(Some(tok)).await;
+        assert!(
+            with_token.contains("echo_channel"),
+            "session-token request must see the session-bound source: {with_token}"
+        );
+        let anonymous = run(None).await;
+        assert!(
+            !anonymous.contains("echo_channel"),
+            "anonymous request must NOT see the session-bound source: {anonymous}"
+        );
+        let wrong = run(Some("wrong-token".into())).await;
+        assert!(
+            !wrong.contains("echo_channel"),
+            "unknown token must resolve to the anonymous view: {wrong}"
+        );
     }
 
     #[tokio::test]
