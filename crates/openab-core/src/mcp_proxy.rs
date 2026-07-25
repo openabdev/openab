@@ -280,6 +280,10 @@ pub async fn start_session_server(
         write_private(cfg_path, &serde_json::to_vec_pretty(&cfg)?).await?;
     }
 
+    // kiro `--agent <name>` deployments read the agent file, not settings/mcp.json —
+    // merge (and allowlist) there too, or the tools never reach OAB bot agents.
+    merge_kiro_agent_configs(workdir, &entry).await?;
+
     // On session evict/drop the caller cancels `ct`; strip our now-dead `openab-browser` entry
     // (with its live bearer) from each config so a stale credential doesn't linger. Only remove it
     // if it still points at OUR addr — a concurrent/reconnected session may have already replaced
@@ -287,8 +291,10 @@ pub async fn start_session_server(
     let cleanup_paths = cfg_paths.to_vec();
     let cleanup_url = our_url;
     let cleanup_ct = ct.clone();
+    let cleanup_workdir = workdir.to_string();
     tokio::spawn(async move {
         cleanup_ct.cancelled().await;
+        cleanup_kiro_agent_configs(&cleanup_workdir, &cleanup_url).await;
         for cleanup_path in &cleanup_paths {
             let Ok(bytes) = tokio::fs::read(cleanup_path).await else {
                 continue;
@@ -327,6 +333,102 @@ async fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<
     Ok(())
 }
 
+/// Merge the `openab-browser` entry into every kiro **per-agent** config
+/// (`<workdir>/.kiro/agents/*.json`). When kiro-cli runs with `--agent <name>`
+/// — as every OAB bot deployment does — it reads its MCP server list from the
+/// agent file, NOT from `.kiro/settings/mcp.json`, and gates tools through the
+/// file's `allowedTools` allowlist (verified live on the b2 fleet deployment;
+/// see docs/gmail-native.md "Kiro CLI gotcha"). Without this, browser tools
+/// are invisible to exactly the deployments this feature targets.
+///
+/// Unlike the settings-file writer, agent files carry unrelated config
+/// (model, description, allowlists), so an unparseable file is SKIPPED —
+/// never clobbered with a fresh object. macOS metadata droppings
+/// (`._*.json`) are ignored. Missing agents dir = no-op.
+async fn merge_kiro_agent_configs(workdir: &str, entry: &Value) -> std::io::Result<()> {
+    let dir = std::path::Path::new(workdir).join(".kiro").join("agents");
+    let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
+        return Ok(()); // no agents dir → nothing runs with --agent here
+    };
+    while let Ok(Some(f)) = rd.next_entry().await {
+        let path = f.path();
+        let name = f.file_name();
+        let name = name.to_string_lossy();
+        if !name.ends_with(".json") || name.starts_with("._") {
+            continue;
+        }
+        let Ok(bytes) = tokio::fs::read(&path).await else {
+            continue;
+        };
+        let Ok(mut cfg) = serde_json::from_slice::<Value>(&bytes) else {
+            continue; // agent files carry model/allowlists — never clobber
+        };
+        if !cfg.get("mcpServers").map(Value::is_object).unwrap_or(false) {
+            cfg["mcpServers"] = json!({});
+        }
+        let mut changed = false;
+        if cfg["mcpServers"]["openab-browser"] != *entry {
+            cfg["mcpServers"]["openab-browser"] = entry.clone();
+            changed = true;
+        }
+        // `allowedTools` is a default-deny allowlist: adding the server
+        // without allowlisting it leaves every browser tool blocked.
+        if let Some(allowed) = cfg.get_mut("allowedTools").and_then(Value::as_array_mut) {
+            if !allowed.iter().any(|v| v.as_str() == Some("@openab-browser")) {
+                allowed.push(json!("@openab-browser"));
+                changed = true;
+            }
+        }
+        if changed {
+            write_private(&path, &serde_json::to_vec_pretty(&cfg)?).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Session-evict counterpart of [`merge_kiro_agent_configs`]: strip the
+/// now-dead `openab-browser` entry (and its `allowedTools` grant) from every
+/// kiro agent file — but only when the entry still points at OUR `url`, so a
+/// concurrent/reconnected session's live entry is never clobbered (same rule
+/// as the settings-file cleanup). Static (url-less) bridge entries are left
+/// alone.
+async fn cleanup_kiro_agent_configs(workdir: &str, url: &str) {
+    let dir = std::path::Path::new(workdir).join(".kiro").join("agents");
+    let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
+        return;
+    };
+    while let Ok(Some(f)) = rd.next_entry().await {
+        let path = f.path();
+        let name = f.file_name();
+        let name = name.to_string_lossy();
+        if !name.ends_with(".json") || name.starts_with("._") {
+            continue;
+        }
+        let Ok(bytes) = tokio::fs::read(&path).await else {
+            continue;
+        };
+        let Ok(mut cfg) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let still_ours = cfg
+            .pointer("/mcpServers/openab-browser/url")
+            .and_then(Value::as_str)
+            == Some(url);
+        if !still_ours {
+            continue;
+        }
+        if let Some(servers) = cfg.get_mut("mcpServers").and_then(Value::as_object_mut) {
+            servers.remove("openab-browser");
+        }
+        if let Some(allowed) = cfg.get_mut("allowedTools").and_then(Value::as_array_mut) {
+            allowed.retain(|v| v.as_str() != Some("@openab-browser"));
+        }
+        if let Ok(out) = serde_json::to_vec_pretty(&cfg) {
+            let _ = write_private(&path, &out).await;
+        }
+    }
+}
+
 /// Write the STATIC, write-once `openab-browser` bridge entry into each colocated CLI's mcp.json
 /// (Option C, bridge mode). Unlike the per-session HTTP proxy config, this carries no port/bearer
 /// — it is the same `{command:"openab", args:["browser-bridge"]}` for every session, so it can be
@@ -363,6 +465,9 @@ pub async fn write_bridge_mcp_config(workdir: &str) -> std::io::Result<()> {
             tokio::fs::write(cfg_path, serde_json::to_vec_pretty(&cfg)?).await?;
         }
     }
+    // kiro `--agent` deployments read agent files, not settings/mcp.json (same
+    // gap as the proxy-mode writer). The static entry is idempotent there too.
+    merge_kiro_agent_configs(workdir, &entry).await?;
     Ok(())
 }
 
@@ -545,10 +650,152 @@ async fn handle_browser_conn(
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_tools, dispatch_browser_mcp, parse_browser_mode, serve_browser_socket,
-        spawn_mcp_server, start_session_server, write_bridge_mcp_config, BrowserMode, AcpMcpTunnel,
-        ProxyHandler,
+        browser_tools, cleanup_kiro_agent_configs, dispatch_browser_mcp,
+        merge_kiro_agent_configs, parse_browser_mode, serve_browser_socket, spawn_mcp_server,
+        start_session_server, write_bridge_mcp_config, AcpMcpTunnel, BrowserMode, ProxyHandler,
     };
+
+    /// Unique throwaway workdir with a `.kiro/agents/` tree.
+    async fn tmp_workdir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "oab-mcp-proxy-test-{tag}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(dir.join(".kiro").join("agents"))
+            .await
+            .unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn kiro_agent_merge_adds_server_and_allowlist_preserving_the_rest() {
+        let wd = tmp_workdir("merge").await;
+        let agent = wd.join(".kiro/agents/terra.json");
+        tokio::fs::write(
+            &agent,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "name": "terra",
+                "model": "gpt-5.6-terra",
+                "mcpServers": { "github": { "url": "http://ghpool:8080/mcp" } },
+                "allowedTools": ["@builtin", "@github"]
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let entry = serde_json::json!({
+            "url": "http://127.0.0.1:45678/mcp",
+            "headers": { "Authorization": "Bearer tok" }
+        });
+        merge_kiro_agent_configs(wd.to_str().unwrap(), &entry)
+            .await
+            .unwrap();
+        let cfg: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&agent).await.unwrap()).unwrap();
+        assert_eq!(cfg["mcpServers"]["openab-browser"], entry);
+        assert_eq!(
+            cfg["mcpServers"]["github"]["url"], "http://ghpool:8080/mcp",
+            "pre-existing servers must be preserved"
+        );
+        assert_eq!(cfg["model"], "gpt-5.6-terra", "unrelated fields preserved");
+        let allowed = cfg["allowedTools"].as_array().unwrap();
+        assert!(
+            allowed.iter().any(|v| v == "@openab-browser"),
+            "allowedTools is default-deny — the server must be allowlisted: {allowed:?}"
+        );
+        // Idempotent: second merge changes nothing (byte-stable allowlist).
+        merge_kiro_agent_configs(wd.to_str().unwrap(), &entry)
+            .await
+            .unwrap();
+        let cfg2: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&agent).await.unwrap()).unwrap();
+        assert_eq!(cfg, cfg2);
+        let _ = tokio::fs::remove_dir_all(&wd).await;
+    }
+
+    #[tokio::test]
+    async fn kiro_agent_merge_skips_unparseable_and_metadata_files() {
+        let wd = tmp_workdir("skip").await;
+        let junk = wd.join(".kiro/agents/broken.json");
+        tokio::fs::write(&junk, b"{not json").await.unwrap();
+        let meta = wd.join(".kiro/agents/._terra.json");
+        tokio::fs::write(&meta, b"\x00\x05\x16\x07").await.unwrap();
+        let entry = serde_json::json!({ "url": "http://127.0.0.1:1/mcp" });
+        merge_kiro_agent_configs(wd.to_str().unwrap(), &entry)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read(&junk).await.unwrap(),
+            b"{not json",
+            "unparseable agent files must be skipped, never clobbered"
+        );
+        assert_eq!(tokio::fs::read(&meta).await.unwrap(), b"\x00\x05\x16\x07");
+        let _ = tokio::fs::remove_dir_all(&wd).await;
+    }
+
+    #[tokio::test]
+    async fn kiro_agent_merge_without_agents_dir_is_noop() {
+        let wd = std::env::temp_dir().join(format!(
+            "oab-mcp-proxy-test-noop-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&wd).await.unwrap();
+        merge_kiro_agent_configs(
+            wd.to_str().unwrap(),
+            &serde_json::json!({ "url": "http://127.0.0.1:1/mcp" }),
+        )
+        .await
+        .unwrap();
+        let _ = tokio::fs::remove_dir_all(&wd).await;
+    }
+
+    #[tokio::test]
+    async fn kiro_agent_cleanup_removes_only_our_url_and_its_grant() {
+        let wd = tmp_workdir("cleanup").await;
+        let ours = wd.join(".kiro/agents/ours.json");
+        tokio::fs::write(
+            &ours,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "mcpServers": { "openab-browser": { "url": "http://127.0.0.1:1111/mcp" } },
+                "allowedTools": ["@builtin", "@openab-browser"]
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let foreign = wd.join(".kiro/agents/foreign.json");
+        tokio::fs::write(
+            &foreign,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "mcpServers": { "openab-browser": { "url": "http://127.0.0.1:2222/mcp" } },
+                "allowedTools": ["@openab-browser"]
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        cleanup_kiro_agent_configs(wd.to_str().unwrap(), "http://127.0.0.1:1111/mcp").await;
+        let ours_cfg: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&ours).await.unwrap()).unwrap();
+        assert!(ours_cfg["mcpServers"]["openab-browser"].is_null());
+        assert!(
+            !ours_cfg["allowedTools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "@openab-browser"),
+            "the stale allowlist grant must be revoked with the entry"
+        );
+        let foreign_cfg: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&foreign).await.unwrap()).unwrap();
+        assert_eq!(
+            foreign_cfg["mcpServers"]["openab-browser"]["url"], "http://127.0.0.1:2222/mcp",
+            "a concurrent session's live entry must never be clobbered"
+        );
+        let _ = tokio::fs::remove_dir_all(&wd).await;
+    }
 
     #[test]
     fn browser_mode_defaults_to_proxy_and_opts_into_bridge() {
