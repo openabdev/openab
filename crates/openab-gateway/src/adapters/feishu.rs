@@ -2869,6 +2869,7 @@ async fn handle_card_edit(
             match outcome {
                 // Success: the post→card swap stays invisible — core keeps om_post.
                 feishu_card::CardOutcome::Updated => {
+                    tracing::info!(card_id = %card_id, msg_id = %om_post, seq, "feishu card stream updated");
                     emit_response(event_tx, &reply.request_id, true, Some(om_post), None);
                 }
                 // Rate limited: skip this frame. Every update sends the FULL text,

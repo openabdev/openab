@@ -312,6 +312,22 @@ pub struct SenderContext {
 
 // --- ChatAdapter trait ---
 
+/// How the router should expose incremental output for a turn.
+///
+/// The legacy `use_streaming` and `show_streaming_placeholder` methods map to
+/// this enum through [`ChatAdapter::streaming_strategy`]. Shared adapters can
+/// override that method to choose a strategy from the concrete channel's
+/// platform without breaking existing trait implementations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamingStrategy {
+    /// Collect the turn and send it once at completion.
+    Disabled,
+    /// Edit a platform-native draft identified by the `draft` sentinel.
+    Draft,
+    /// Send a visible placeholder and edit it by its platform message ID.
+    EditablePlaceholder,
+}
+
 #[async_trait]
 pub trait ChatAdapter: Send + Sync + 'static {
     /// Platform name for logging and session key namespacing.
@@ -324,6 +340,19 @@ pub trait ChatAdapter: Send + Sync + 'static {
 
     /// Send a new message, returns a reference to the sent message.
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef>;
+
+    /// Send the initial message used by an editable-placeholder stream.
+    ///
+    /// Most adapters use the normal send lifecycle. Multiplexing adapters may
+    /// override this hook when starting a stream must return a platform-native
+    /// message ID while ordinary sends remain fire-and-forget.
+    async fn send_streaming_placeholder(
+        &self,
+        channel: &ChannelRef,
+        content: &str,
+    ) -> Result<MessageRef> {
+        self.send_message(channel, content).await
+    }
 
     /// Create a thread from a trigger message, returns the thread channel ref.
     async fn create_thread(
@@ -442,6 +471,26 @@ pub trait ChatAdapter: Send + Sync + 'static {
     /// return false to suppress the placeholder.
     fn show_streaming_placeholder(&self) -> bool {
         true
+    }
+
+    /// Select the streaming lifecycle for a concrete channel.
+    ///
+    /// The default preserves the pre-existing trait contract exactly. Unified
+    /// adapters may override it because one adapter instance can route several
+    /// platforms with different placeholder requirements.
+    fn streaming_strategy(
+        &self,
+        channel: &ChannelRef,
+        other_bot_present: bool,
+    ) -> StreamingStrategy {
+        let _ = channel;
+        if !self.use_streaming(other_bot_present) {
+            StreamingStrategy::Disabled
+        } else if self.show_streaming_placeholder() {
+            StreamingStrategy::EditablePlaceholder
+        } else {
+            StreamingStrategy::Draft
+        }
     }
 }
 
@@ -705,11 +754,12 @@ impl AdapterRouter {
         // coupling): it streams append-only `agent_message_chunk` deltas built from the
         // post+edit (`edit_message` snapshot) path, i.e. streaming=false. Decide it
         // explicitly by platform rather than by whatever Telegram happens to be set to.
-        let streaming = if thread_channel.platform == "acp" {
-            false
+        let streaming_strategy = if thread_channel.platform == "acp" {
+            StreamingStrategy::Disabled
         } else {
-            adapter.use_streaming(other_bot_present)
+            adapter.streaming_strategy(&thread_channel, other_bot_present)
         };
+        let streaming = streaming_strategy != StreamingStrategy::Disabled;
         // Keep the full turn text (incl. inter-tool narration) when streaming
         // (it was already shown live) OR when `[reactions] narration_display` is
         // set. Otherwise a send-once turn delivers only the final answer block.
@@ -780,14 +830,19 @@ impl AdapterRouter {
                         } else {
                             "…".to_string()
                         };
-                        let msg = if adapter.show_streaming_placeholder() {
-                            adapter.send_message(&thread_channel, &initial).await?
-                        } else {
-                            // Dummy ref for edit loop — gateway uses drafts, doesn't need real msg_id
-                            MessageRef {
+                        let msg = match streaming_strategy {
+                            StreamingStrategy::EditablePlaceholder => {
+                                adapter
+                                    .send_streaming_placeholder(&thread_channel, &initial)
+                                    .await?
+                            }
+                            StreamingStrategy::Draft => MessageRef {
                                 message_id: "draft".to_string(),
                                 channel: thread_channel.clone(),
-                            }
+                            },
+                            StreamingStrategy::Disabled => unreachable!(
+                                "disabled streaming cannot enter the placeholder branch"
+                            ),
                         };
                         let (tx, rx) = tokio::sync::watch::channel(initial);
                         let edit_adapter = adapter.clone();
@@ -1928,9 +1983,76 @@ mod tests {
         let adapter = TestAdapter;
         // Verify the method is callable and returns the declared value
         assert!(!adapter.use_streaming(false));
+        assert_eq!(
+            adapter.streaming_strategy(
+                &ChannelRef {
+                    platform: "test".into(),
+                    channel_id: "channel".into(),
+                    thread_id: None,
+                    parent_id: None,
+                    origin_event_id: None,
+                },
+                false,
+            ),
+            StreamingStrategy::Disabled,
+        );
         // renders_native_tables defaults to false: platforms that don't override
         // it keep the table→code/bullets conversion (e.g. Discord, Gateway).
         assert!(!adapter.renders_native_tables("discord"));
+    }
+
+    #[test]
+    fn streaming_strategy_preserves_legacy_placeholder_contract() {
+        struct StreamingAdapter(bool);
+
+        #[async_trait]
+        impl ChatAdapter for StreamingAdapter {
+            fn platform(&self) -> &'static str {
+                "test"
+            }
+            fn message_limit(&self) -> usize {
+                2000
+            }
+            async fn send_message(&self, _: &ChannelRef, _: &str) -> Result<MessageRef> {
+                unimplemented!()
+            }
+            async fn create_thread(
+                &self,
+                _: &ChannelRef,
+                _: &MessageRef,
+                _: &str,
+            ) -> Result<ChannelRef> {
+                unimplemented!()
+            }
+            async fn add_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn remove_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn use_streaming(&self, _other_bot_present: bool) -> bool {
+                true
+            }
+            fn show_streaming_placeholder(&self) -> bool {
+                self.0
+            }
+        }
+
+        let channel = ChannelRef {
+            platform: "test".into(),
+            channel_id: "channel".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: None,
+        };
+        assert_eq!(
+            StreamingAdapter(true).streaming_strategy(&channel, false),
+            StreamingStrategy::EditablePlaceholder,
+        );
+        assert_eq!(
+            StreamingAdapter(false).streaming_strategy(&channel, false),
+            StreamingStrategy::Draft,
+        );
     }
 
     #[test]

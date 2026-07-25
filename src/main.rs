@@ -907,14 +907,15 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Spawn cron scheduler (background task)
-    // Spawn embedded webhook server when gateway adapters are compiled in (unified mode).
-    // In unified mode, platform webhooks hit this axum server directly → Dispatcher.submit(),
-    // bypassing the WebSocket hop of the two-process model.
     #[cfg(feature = "feishu")]
     let mut unified_feishu_shutdown: Option<tokio::sync::watch::Sender<bool>> = None;
     #[cfg(feature = "feishu")]
     let mut unified_feishu_handle: Option<tokio::task::JoinHandle<()>> = None;
+
+    // Spawn cron scheduler (background task)
+    // Spawn embedded webhook server when gateway adapters are compiled in (unified mode).
+    // In unified mode, platform webhooks hit this axum server directly → Dispatcher.submit(),
+    // bypassing the WebSocket hop of the two-process model.
 
     #[cfg(any(
         feature = "telegram",
@@ -1248,6 +1249,16 @@ async fn main() -> anyhow::Result<()> {
                 loop {
                     match event_rx.recv().await {
                         Ok(event_json) => {
+                            // Gateway responses are consumed by unified adapter
+                            // request/response waits; they are not user events.
+                            if serde_json::from_str::<openab_gateway::schema::GatewayResponse>(
+                                &event_json,
+                            )
+                            .map(|response| response.schema == "openab.gateway.response.v1")
+                            .unwrap_or(false)
+                            {
+                                continue;
+                            }
                             let ctx = bridge_ctx.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = process_gateway_event(&event_json, &ctx).await {
