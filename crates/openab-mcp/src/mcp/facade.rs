@@ -622,10 +622,7 @@ mod tests {
             ],
             super::SessionTokens::new(),
         );
-        let v = facade
-            .search_capabilities(&Map::new(), None)
-            .await
-            .unwrap();
+        let v = facade.search_capabilities(&Map::new(), None).await.unwrap();
         let names: Vec<&str> = v["capabilities"]
             .as_array()
             .unwrap()
