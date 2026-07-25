@@ -788,3 +788,33 @@ The MVP supports:
 
 Configuration presence remains the opt-in signal. The MVP does not add a second
 MCP runtime, a native Gmail/Notion REST client, or a new TOML source of truth.
+
+## 13. Post-decision status (2026-07-25 addendum)
+
+The design above is recorded as decided; implementation and live validation
+overtook parts of §5/§10 before this ADR merged. Decisions themselves are
+unchanged — this section records outcomes so the document does not mislead:
+
+- **Facade MVP shipped** (#1448) as specified in §6.2 (broker-hosted loopback
+  Streamable HTTP + `openab-mcp` shared crate), including `tool_filter`
+  enforcement. **Facade-only run mode** followed (#1453): an adapter-less
+  config with `[mcp]` present is a valid `openab run` deployment.
+- **Gmail (§5.5/§6.5) resolved ahead of Notion, and native-first**: live
+  validation showed the hosted server rejects every `tools/call` without
+  Workspace Developer Preview Program enrollment, and the program **rejects
+  consumer accounts** — for consumer mailboxes the hosted path is unavailable
+  regardless of waiting, and program terms bar pre-GA shipping in public
+  applications. The §6.1 Capability Plugin path shipped as the **native
+  Gmail adapter** (#1449, `docs/gmail-native.md`): the six-tool §6.5 profile
+  over Gmail's GA REST API with tool names/shapes mirroring the hosted
+  server, so the §10 step-5 cut-over back to hosted (re-evaluate at GA)
+  remains a config-only change. Rollout steps 3/5 are therefore resolved;
+  step 2 (Notion) is still pending.
+- **Session-aware in-process capability sources** (#1454) extend §6: the
+  facade can host provider sources in-process, with per-agent-session
+  identity via broker-minted tokens (`Authorization` header → `SessionCtx`).
+  Session-bound capabilities (e.g. browser control, the ACP-MCP browser ADR)
+  are invisible and unreachable to anonymous clients. This supersedes the
+  assumption that all facade capabilities come from `mcp.json` servers.
+- **Positioning** (§4.1) and CLI taxonomy (`docs/cli-conventions.md`) were
+  adopted as written.
