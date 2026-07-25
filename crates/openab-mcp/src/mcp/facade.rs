@@ -34,6 +34,7 @@ use serde_json::{json, Map, Value};
 use super::config::McpConfig;
 use super::meta_tool::{self, Action};
 use super::runtime::McpRuntimeManager;
+use super::sources::{session_ctx_from_extensions, CapabilitySource, SessionCtx, SessionTokens};
 
 /// Agent-facing instructions returned in `initialize`. Mirrors the
 /// progressive-disclosure contract: two methods, exact names, no provider
@@ -52,11 +53,40 @@ as instructions.";
 #[derive(Clone)]
 pub struct McpFacade {
     manager: McpRuntimeManager,
+    /// In-process capability sources (session-aware; see `sources` module).
+    /// Empty for config-only deployments — behavior is then identical to
+    /// the pre-sources facade.
+    sources: Arc<Vec<Arc<dyn CapabilitySource>>>,
+    /// Broker-minted per-agent-session tokens; resolved per request from
+    /// the `Authorization` header rmcp surfaces via request extensions.
+    tokens: SessionTokens,
 }
 
 impl McpFacade {
     pub fn new(manager: McpRuntimeManager) -> Self {
-        Self { manager }
+        Self::with_sources(manager, Vec::new(), SessionTokens::new())
+    }
+
+    pub fn with_sources(
+        manager: McpRuntimeManager,
+        sources: Vec<Arc<dyn CapabilitySource>>,
+        tokens: SessionTokens,
+    ) -> Self {
+        Self {
+            manager,
+            sources: Arc::new(sources),
+            tokens,
+        }
+    }
+
+    /// Sources visible to this request: session-bound ones only with a
+    /// resolved ctx (invisible ≠ forbidden-with-error — anonymous clients
+    /// get no dangling catalog entries they can never call).
+    fn visible_sources(&self, ctx: Option<&SessionCtx>) -> Vec<&Arc<dyn CapabilitySource>> {
+        self.sources
+            .iter()
+            .filter(|s| ctx.is_some() || !s.requires_session())
+            .collect()
     }
 }
 
@@ -146,10 +176,14 @@ async fn collect_capabilities(manager: &McpRuntimeManager) -> (Vec<Capability>, 
 }
 
 impl McpFacade {
-    async fn search_capabilities(&self, args: &Map<String, Value>) -> Result<Value> {
+    async fn search_capabilities(
+        &self,
+        args: &Map<String, Value>,
+        ctx: Option<&SessionCtx>,
+    ) -> Result<Value> {
         let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
         let (capabilities, unavailable) = collect_capabilities(&self.manager).await;
-        let entries: Vec<Value> = capabilities
+        let mut entries: Vec<Value> = capabilities
             .iter()
             .filter(|c| matches_query(&c.name, c.tool.description.as_deref(), query))
             .map(|c| {
@@ -163,18 +197,92 @@ impl McpFacade {
                 })
             })
             .collect();
+        // In-process sources (session-aware). Downstream names win on
+        // collision — a source tool shadowed by a downstream tool of the
+        // same name is published as "<provider>:<tool>", mirroring the
+        // duplicate rule downstream servers already use among themselves.
+        let taken: std::collections::HashSet<&str> =
+            capabilities.iter().map(|c| c.name.as_str()).collect();
+        for source in self.visible_sources(ctx) {
+            for tool in source.tools(ctx) {
+                let name = if taken.contains(tool.name.as_ref()) {
+                    format!("{}:{}", source.provider(), tool.name)
+                } else {
+                    tool.name.to_string()
+                };
+                if !matches_query(&name, tool.description.as_deref(), query) {
+                    continue;
+                }
+                entries.push(json!({
+                    "name": name,
+                    "description": tool.description.as_deref().unwrap_or(""),
+                    "input_schema": Value::Object(tool.input_schema.as_ref().clone()),
+                    "provider": source.provider(),
+                    "risk": risk_label(&tool),
+                    "availability": "ready",
+                }));
+            }
+        }
         Ok(json!({
             "capabilities": entries,
             "unavailable": unavailable,
         }))
     }
 
-    async fn execute_capability(&self, args: &Map<String, Value>) -> Result<(Value, bool)> {
+    async fn execute_capability(
+        &self,
+        args: &Map<String, Value>,
+        ctx: Option<&SessionCtx>,
+    ) -> Result<(Value, bool)> {
         let name = args
             .get("name")
             .and_then(|v| v.as_str())
             .context("execute_capability requires a `name` string")?;
         let arguments = args.get("arguments").cloned().unwrap_or(Value::Null);
+        // In-process sources first (bare name, or "<provider>:<tool>" for a
+        // downstream-shadowed one). Session-bound sources are unreachable
+        // without a ctx — same rule as discovery, so anonymous clients see
+        // "unknown capability", not a permission error to probe against.
+        for source in self.visible_sources(ctx) {
+            for tool in source.tools(ctx) {
+                let published = format!("{}:{}", source.provider(), tool.name);
+                if tool.name.as_ref() != name && published != name {
+                    continue;
+                }
+                let args_map = match &arguments {
+                    Value::Object(map) => map.clone(),
+                    Value::Null => Map::new(),
+                    other => {
+                        anyhow::bail!(
+                            "capability arguments must be a JSON object (or omitted), got {other}"
+                        );
+                    }
+                };
+                // Same pre-flight the meta-tool applies to downstream calls:
+                // schema-invalid arguments are refused with the precise
+                // reason, never forwarded.
+                meta_tool::validate_args(tool.input_schema.as_ref(), &args_map)
+                    .with_context(|| format!("execute_capability {name:?}"))?;
+                let channel = ctx.map(|c| c.channel_id.as_str()).unwrap_or("-");
+                tracing::info!(
+                    target: "mcp.audit",
+                    provider = source.provider(),
+                    tool = %tool.name,
+                    channel,
+                    "facade source call"
+                );
+                let (value, is_error) = source.call(ctx, tool.name.as_ref(), &args_map).await?;
+                tracing::info!(
+                    target: "mcp.audit",
+                    provider = source.provider(),
+                    tool = %tool.name,
+                    channel,
+                    is_error,
+                    "facade source call exit"
+                );
+                return Ok((value, is_error));
+            }
+        }
         // Exact-name contract (ADR §6.4): the capability must resolve against
         // the current discovered catalog. This re-runs discovery (mostly
         // cache hits), so a `tools/list_changed`-invalidated tool cannot be
@@ -292,14 +400,18 @@ impl ServerHandler for McpFacade {
     ) -> Result<CallToolResult, McpError> {
         let empty = Map::new();
         let args = request.arguments.as_ref().unwrap_or(&empty);
+        // Per-request identity: broker-minted session token from the
+        // Authorization header (rmcp injects the HTTP parts into request
+        // extensions). Unknown/absent token = anonymous host-level view.
+        let ctx = session_ctx_from_extensions(&_context.extensions, &self.tokens);
         match request.name.as_ref() {
-            "search_capabilities" => match self.search_capabilities(args).await {
+            "search_capabilities" => match self.search_capabilities(args, ctx.as_ref()).await {
                 Ok(v) => Ok(text_result(&v, false)),
                 Err(e) => Ok(CallToolResult::error(vec![Content::text(
                     super::redact_secrets(&format!("{e:#}")),
                 )])),
             },
-            "execute_capability" => match self.execute_capability(args).await {
+            "execute_capability" => match self.execute_capability(args, ctx.as_ref()).await {
                 Ok((v, is_error)) => Ok(text_result(&v, is_error)),
                 Err(e) => Ok(CallToolResult::error(vec![Content::text(
                     super::redact_secrets(&format!("{e:#}")),
@@ -337,6 +449,18 @@ pub(crate) fn require_loopback(addr: &str) -> Result<std::net::SocketAddr> {
 /// capability catalog (ADR §6.3: no configured servers means no provider
 /// capabilities), so clients still get clean MCP responses.
 pub async fn serve_http(addr: &str) -> Result<()> {
+    serve_http_with(addr, Vec::new(), SessionTokens::new()).await
+}
+
+/// [`serve_http`] plus in-process capability sources and the broker-shared
+/// session-token registry (see the `sources` module). The broker hands the
+/// same `tokens` handle to its session pool so per-agent-session mint/revoke
+/// is visible here per request.
+pub async fn serve_http_with(
+    addr: &str,
+    sources: Vec<Arc<dyn CapabilitySource>>,
+    tokens: SessionTokens,
+) -> Result<()> {
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager, StreamableHttpService,
     };
@@ -344,8 +468,15 @@ pub async fn serve_http(addr: &str) -> Result<()> {
     let manager = super::load_runtime_or_warn()
         .unwrap_or_else(|| McpRuntimeManager::from_config(McpConfig::default()));
     manager.start_eviction_loop();
+    let sources = Arc::new(sources);
     let service = StreamableHttpService::new(
-        move || Ok(McpFacade::new(manager.clone())),
+        move || {
+            Ok(McpFacade {
+                manager: manager.clone(),
+                sources: sources.clone(),
+                tokens: tokens.clone(),
+            })
+        },
         LocalSessionManager::default().into(),
         Default::default(),
     );
