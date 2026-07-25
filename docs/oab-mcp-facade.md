@@ -9,6 +9,43 @@ the whole provider catalog instead of a flat list of every provider tool.
 
 Design: [OAB MCP Adapter ADR](adr/oab-mcp-adapter.md) (§6).
 
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph host["Host / Pod (trust boundary)"]
+        cli["Coding CLI<br/>(Kiro CLI / Claude Code / Codex / …)"]
+
+        subgraph facade["OAB MCP Facade — loopback :8848/mcp"]
+            tools["search_capabilities<br/>execute_capability"]
+        end
+
+        subgraph runtime["Shared MCP runtime (openab-mcp)"]
+            policy["tool_filter (least-privilege)<br/>JSON-Schema arg validation<br/>timeouts · circuit breaker<br/>secret redaction · audit log"]
+        end
+
+        adapter["gmail-native adapter<br/>loopback :8850/mcp"]
+    end
+
+    gmail["gmail.googleapis.com<br/>(GA REST)"]
+    obk["octobroker<br/>(fleet policy / org credentials)"]
+    hosted["hosted MCP servers<br/>(Notion, …, OAuth)"]
+
+    cli -- "MCP (Streamable HTTP)" --> tools
+    tools --> policy
+    policy -- "native tools/call" --> adapter
+    policy -- "native tools/call" --> obk
+    policy -- "native tools/call" --> hosted
+    adapter -- "bearer (auth.json,<br/>offline refresh)" --> gmail
+```
+
+The agent always sees exactly two tools; providers configured in `mcp.json`
+are discovered through `search_capabilities` and invoked through
+`execute_capability`. Because the runtime dispatches **native** `tools/call`
+requests downstream, per-tool policy at any downstream (for example
+octobroker's default-deny allowlists) sees real tool names — the meta-tool
+envelope never blinds it.
+
 ## Two ways to run it
 
 **In-process in the OAB broker** — presence of `[mcp]` in `config.toml`
