@@ -39,13 +39,15 @@ results state explicitly that nothing was sent.
    - `https://www.googleapis.com/auth/gmail.compose`
 3. Create an OAuth client (**Web application**) with redirect URI
    `http://localhost:53692/callback`. Note the client ID and secret.
-   (A secret-less **Desktop** client also works — omit the secret env var.)
+   (Google's **Desktop** client type also works with the same loopback
+   redirect, but note that Google still issues it a client secret and
+   requires it at the token endpoint — set both env vars either way.)
 
 ### 2. Log in (paste-back, once per account)
 
 ```sh
 export GMAIL_OAUTH_CLIENT_ID=<client-id>
-export GMAIL_OAUTH_CLIENT_SECRET=<client-secret>   # omit for Desktop clients
+export GMAIL_OAUTH_CLIENT_SECRET=<client-secret>
 openab mcp gmail-native login
 ```
 
