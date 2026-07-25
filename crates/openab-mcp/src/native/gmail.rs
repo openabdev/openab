@@ -137,7 +137,9 @@ impl GmailNative {
                 .await
                 .map_err(|e| anyhow!("read auth.json: {e}"))?
                 .ok_or_else(|| {
-                    anyhow!("no gmail-native credentials — run `openab mcp gmail-native login` first")
+                    anyhow!(
+                        "no gmail-native credentials — run `openab mcp gmail-native login` first"
+                    )
                 })
         };
         let creds = load().await?;
