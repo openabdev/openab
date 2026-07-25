@@ -537,10 +537,7 @@ mod tests {
     #[tokio::test]
     async fn session_bound_source_is_invisible_and_unreachable_without_ctx() {
         let facade = facade_with_source(true);
-        let v = facade
-            .search_capabilities(&Map::new(), None)
-            .await
-            .unwrap();
+        let v = facade.search_capabilities(&Map::new(), None).await.unwrap();
         assert!(
             v["capabilities"].as_array().unwrap().is_empty(),
             "anonymous discovery must not list session-bound tools: {v}"
@@ -580,10 +577,7 @@ mod tests {
     #[tokio::test]
     async fn host_level_source_works_anonymously_and_validates_args() {
         let facade = facade_with_source(false);
-        let v = facade
-            .search_capabilities(&Map::new(), None)
-            .await
-            .unwrap();
+        let v = facade.search_capabilities(&Map::new(), None).await.unwrap();
         assert_eq!(v["capabilities"].as_array().unwrap().len(), 1);
         // Schema pre-flight: x must be an integer.
         let mut args = Map::new();
@@ -712,7 +706,10 @@ mod tests {
     #[tokio::test]
     async fn execute_without_name_is_rejected() {
         let facade = McpFacade::new(McpRuntimeManager::from_config(McpConfig::default()));
-        let err = facade.execute_capability(&Map::new(), None).await.unwrap_err();
+        let err = facade
+            .execute_capability(&Map::new(), None)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("requires a `name`"));
     }
 }
