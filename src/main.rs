@@ -12,6 +12,8 @@ mod unified_adapter;
 #[cfg(feature = "acp")]
 mod browser_tunnel;
 #[cfg(feature = "acp")]
+mod browser_source;
+#[cfg(feature = "acp")]
 mod browser_bridge;
 use openab_core::acp;
 use openab_core::adapter::{self, AdapterRouter};
@@ -469,6 +471,10 @@ async fn main() -> anyhow::Result<()> {
     // session; the core MCP proxy reads it via the RootBrowserTunnel bridge below.
     #[cfg(feature = "acp")]
     let acp_tunnel_registry = openab_gateway::adapters::acp_server::new_tunnel_registry();
+    #[cfg(feature = "acp")]
+    let browser_tunnel: Arc<dyn openab_core::mcp_proxy::AcpMcpTunnel> = Arc::new(
+        browser_tunnel::RootBrowserTunnel::new(acp_tunnel_registry.clone()),
+    );
 
     // OAB MCP Facade (`[mcp]` in config.toml — OAB MCP Adapter ADR §6.2):
     // serve the loopback Streamable HTTP MCP server in-process so any coding
@@ -476,10 +482,29 @@ async fn main() -> anyhow::Result<()> {
     // http://<listen>/mcp. Absent section = no listener (backward compat).
     // A bind failure is fatal at startup (fail fast, like a bad platform
     // token) rather than a silently missing capability surface.
+    //
+    // Browser capabilities (Facade mode, default): registered as a
+    // session-aware in-process source — one listener, per-session identity
+    // via broker-minted tokens; no per-session proxy servers.
+    let facade_sessions = openab_mcp::mcp::sources::SessionTokens::new();
+    #[allow(unused_mut)]
+    let mut facade_serving = false;
     if let Some(mcp_cfg) = cfg.mcp.clone() {
         let listen = mcp_cfg.listen.clone();
+        let tokens = facade_sessions.clone();
+        #[allow(unused_mut)]
+        let mut sources: Vec<Arc<dyn openab_mcp::mcp::sources::CapabilitySource>> = Vec::new();
+        #[cfg(feature = "acp")]
+        if !openab_core::mcp_proxy::browser_mode().is_bridge() {
+            sources.push(Arc::new(browser_source::BrowserSource::new(
+                browser_tunnel.clone(),
+            )));
+        }
+        facade_serving = true;
         tokio::spawn(async move {
-            if let Err(e) = openab_mcp::mcp::facade::serve_http(&listen).await {
+            if let Err(e) =
+                openab_mcp::mcp::facade::serve_http_with(&listen, sources, tokens).await
+            {
                 tracing::error!(error = %format!("{e:#}"), listen, "OAB MCP facade exited");
                 std::process::exit(1);
             }
@@ -495,11 +520,22 @@ async fn main() -> anyhow::Result<()> {
         cfg.pool.default_config_options,
     );
     #[cfg(feature = "acp")]
-    let browser_tunnel: Arc<dyn openab_core::mcp_proxy::AcpMcpTunnel> = Arc::new(
-        browser_tunnel::RootBrowserTunnel::new(acp_tunnel_registry.clone()),
-    );
-    #[cfg(feature = "acp")]
     let pool_inner = pool_inner.with_browser_tunnel(Some(browser_tunnel.clone()));
+    // Facade mode session wiring: only when the facade is actually serving —
+    // otherwise the pool's mode fallback keeps the per-session proxy path.
+    #[cfg(feature = "acp")]
+    let pool_inner = pool_inner.with_facade_sessions(
+        facade_serving.then(|| {
+            Arc::new(browser_source::FacadeRegistrar(facade_sessions.clone()))
+                as Arc<dyn openab_core::mcp_proxy::SessionTokenRegistrar>
+        }),
+        facade_serving.then(|| {
+            format!(
+                "http://{}/mcp",
+                cfg.mcp.as_ref().map(|m| m.listen.as_str()).unwrap_or("127.0.0.1:8848")
+            )
+        }),
+    );
     // Option C bridge mode: start the per-pod browser socket server once; the `openab
     // browser-bridge` shims each agent spawns dial it. Proxy mode (default) skips this.
     #[cfg(feature = "acp")]

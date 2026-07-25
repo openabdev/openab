@@ -48,7 +48,7 @@ pub trait AcpMcpTunnel: Send + Sync {
 
 /// The fixed set of browser tools OpenAB advertises over MCP (D4 static-advertise). DOM-
 /// semantic actions the extension executes in the user's active tab; model-agnostic.
-pub(crate) fn browser_tools() -> Vec<Tool> {
+pub fn browser_tools() -> Vec<Tool> {
     vec![
         Tool::new(
             "browser.click",
@@ -471,11 +471,114 @@ pub async fn write_bridge_mcp_config(workdir: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Write the STATIC, write-once `openab` facade entry into each colocated CLI's MCP config
+/// (Facade mode). Like the Option C bridge entry it is byte-identical for every session —
+/// the per-session secret is NOT in the file: the entry references the
+/// `OPENAB_SESSION_TOKEN` environment variable, which the pool injects into each spawned
+/// agent process (config-var expansion is exactly how deployed agents already reference
+/// per-bot secrets). No cross-session clobber, nothing to clean up on evict — the token
+/// dies with the agent process and its registry entry.
+pub async fn write_facade_mcp_config(workdir: &str, facade_url: &str) -> std::io::Result<()> {
+    let entry = json!({
+        "url": facade_url,
+        "headers": { "Authorization": "Bearer ${OPENAB_SESSION_TOKEN}" }
+    });
+    let cfg_paths = [
+        std::path::Path::new(workdir).join(".cursor").join("mcp.json"),
+        std::path::Path::new(workdir)
+            .join(".kiro")
+            .join("settings")
+            .join("mcp.json"),
+    ];
+    for cfg_path in &cfg_paths {
+        if let Some(dir) = cfg_path.parent() {
+            tokio::fs::create_dir_all(dir).await?;
+        }
+        let mut cfg: Value = match tokio::fs::read(cfg_path).await {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({})),
+            Err(_) => json!({}),
+        };
+        if !cfg.get("mcpServers").map(Value::is_object).unwrap_or(false) {
+            cfg["mcpServers"] = json!({});
+        }
+        // Publish under "openab" (the facade), not "openab-browser": the agent
+        // reaches ALL facade capabilities through this one entry.
+        if cfg["mcpServers"]["openab"] != entry {
+            cfg["mcpServers"]["openab"] = entry.clone();
+            tokio::fs::write(cfg_path, serde_json::to_vec_pretty(&cfg)?).await?;
+        }
+    }
+    // kiro `--agent` deployments read agent files, not settings/mcp.json.
+    merge_kiro_agent_facade_configs(workdir, &entry).await?;
+    Ok(())
+}
+
+/// Facade-mode sibling of [`merge_kiro_agent_configs`]: merges the static
+/// `openab` facade entry + `@openab` allowlist grant into every
+/// `.kiro/agents/*.json`. Same never-clobber rules; nothing to clean up on
+/// evict (the entry is static and the token lives in the process env).
+async fn merge_kiro_agent_facade_configs(workdir: &str, entry: &Value) -> std::io::Result<()> {
+    let dir = std::path::Path::new(workdir).join(".kiro").join("agents");
+    let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
+        return Ok(());
+    };
+    while let Ok(Some(f)) = rd.next_entry().await {
+        let path = f.path();
+        let name = f.file_name();
+        let name = name.to_string_lossy();
+        if !name.ends_with(".json") || name.starts_with("._") {
+            continue;
+        }
+        let Ok(bytes) = tokio::fs::read(&path).await else {
+            continue;
+        };
+        let Ok(mut cfg) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if !cfg.get("mcpServers").map(Value::is_object).unwrap_or(false) {
+            cfg["mcpServers"] = json!({});
+        }
+        let mut changed = false;
+        if cfg["mcpServers"]["openab"] != *entry {
+            cfg["mcpServers"]["openab"] = entry.clone();
+            changed = true;
+        }
+        if let Some(allowed) = cfg.get_mut("allowedTools").and_then(Value::as_array_mut) {
+            if !allowed.iter().any(|v| v.as_str() == Some("@openab")) {
+                allowed.push(json!("@openab"));
+                changed = true;
+            }
+        }
+        if changed {
+            write_private(&path, &serde_json::to_vec_pretty(&cfg)?).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Broker-side session credential hook (Facade mode). Implemented by the root
+/// (closing over the facade's `SessionTokens` registry — core stays free of
+/// the openab-mcp dependency); the pool calls it at session spawn/evict.
+pub trait SessionTokenRegistrar: Send + Sync {
+    /// Mint (or re-mint) the token for `channel_id`; returns the value the
+    /// pool injects as `OPENAB_SESSION_TOKEN` in the agent's environment.
+    fn mint(&self, channel_id: &str) -> String;
+    /// Revoke every token for `channel_id` (session evicted/replaced).
+    fn revoke(&self, channel_id: &str);
+}
+
 /// Selected browser transport for the Option C rollout. `OPENAB_BROWSER_MODE=bridge` opts into
 /// the stdio bridge; anything else (including unset) keeps the per-session HTTP proxy — the safe
 /// default during rollout, so existing Cursor/Kiro browser control is unchanged until flipped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserMode {
+    /// Browser tools served through the OAB MCP Facade as a session-aware
+    /// in-process capability source (one listener, session identity via
+    /// broker-minted tokens). The default when the facade is running;
+    /// falls back to `Proxy` when it is not (no `[mcp]` in config).
+    Facade,
+    /// Per-session loopback HTTP MCP server + dynamic config (the original
+    /// default; explicit opt-out from facade routing).
     Proxy,
     Bridge,
 }
@@ -489,7 +592,8 @@ impl BrowserMode {
 fn parse_browser_mode(s: Option<&str>) -> BrowserMode {
     match s.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
         Some("bridge") => BrowserMode::Bridge,
-        _ => BrowserMode::Proxy,
+        Some("proxy") => BrowserMode::Proxy,
+        _ => BrowserMode::Facade,
     }
 }
 
@@ -798,15 +902,20 @@ mod tests {
     }
 
     #[test]
-    fn browser_mode_defaults_to_proxy_and_opts_into_bridge() {
-        assert_eq!(parse_browser_mode(None), BrowserMode::Proxy);
-        assert_eq!(parse_browser_mode(Some("")), BrowserMode::Proxy);
+    fn browser_mode_defaults_to_facade_with_proxy_and_bridge_opt_outs() {
+        // Facade is the default: browser tools ride the OAB MCP Facade as a
+        // session-aware source (falls back to Proxy at runtime when no
+        // facade is serving — see the pool's mode fallback).
+        assert_eq!(parse_browser_mode(None), BrowserMode::Facade);
+        assert_eq!(parse_browser_mode(Some("")), BrowserMode::Facade);
+        assert_eq!(parse_browser_mode(Some("junk")), BrowserMode::Facade);
+        // Explicit opt-outs keep their exact prior semantics.
         assert_eq!(parse_browser_mode(Some("proxy")), BrowserMode::Proxy);
-        assert_eq!(parse_browser_mode(Some("junk")), BrowserMode::Proxy);
         assert_eq!(parse_browser_mode(Some("bridge")), BrowserMode::Bridge);
         assert_eq!(parse_browser_mode(Some("  Bridge  ")), BrowserMode::Bridge);
         assert!(BrowserMode::Bridge.is_bridge());
         assert!(!BrowserMode::Proxy.is_bridge());
+        assert!(!BrowserMode::Facade.is_bridge());
     }
 
     struct MockTunnel;

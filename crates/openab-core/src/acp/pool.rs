@@ -57,6 +57,10 @@ pub struct SessionPool {
     /// root. `None` = no browser wiring (tool calls report not-connected).
     #[cfg(feature = "acp-mcp")]
     browser_tunnel: Option<Arc<dyn crate::mcp_proxy::AcpMcpTunnel>>,
+    #[cfg(feature = "acp-mcp")]
+    session_registrar: Option<Arc<dyn crate::mcp_proxy::SessionTokenRegistrar>>,
+    #[cfg(feature = "acp-mcp")]
+    facade_url: Option<String>,
 }
 
 type CancelHandle = (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String);
@@ -203,6 +207,10 @@ impl SessionPool {
             default_config_options,
             #[cfg(feature = "acp-mcp")]
             browser_tunnel: None,
+            #[cfg(feature = "acp-mcp")]
+            session_registrar: None,
+            #[cfg(feature = "acp-mcp")]
+            facade_url: None,
         }
     }
 
@@ -214,6 +222,22 @@ impl SessionPool {
         tunnel: Option<Arc<dyn crate::mcp_proxy::AcpMcpTunnel>>,
     ) -> Self {
         self.browser_tunnel = tunnel;
+        self
+    }
+
+    /// Wire the facade session-token registrar + facade URL (Facade mode,
+    /// set by the root when `[mcp]` is running). With both present, browser
+    /// capabilities route through the facade: the pool mints one token per
+    /// session, injects it as `OPENAB_SESSION_TOKEN` in the agent process
+    /// env, and writes the static facade MCP entry once per workdir.
+    #[cfg(feature = "acp-mcp")]
+    pub fn with_facade_sessions(
+        mut self,
+        registrar: Option<Arc<dyn crate::mcp_proxy::SessionTokenRegistrar>>,
+        facade_url: Option<String>,
+    ) -> Self {
+        self.session_registrar = registrar;
+        self.facade_url = facade_url;
         self
     }
 
@@ -367,10 +391,47 @@ impl SessionPool {
         // Per-session MCP proxy (D5-a): for a browser (`acp:`) session, start a loopback MCP
         // server + write `.cursor/mcp.json` BEFORE the agent boots so it connects to it. The
         // returned guard cancels that server when this connection is dropped (any evict path).
+        // Facade mode: mint the per-session token (returned env var rides the
+        // agent spawn below) and write the static facade entry once. Falls
+        // back to Proxy mode when the root wired no registrar (no [mcp]).
+        #[cfg(feature = "acp-mcp")]
+        let mut session_token: Option<String> = None;
         #[cfg(feature = "acp-mcp")]
         let mcp_guard: Option<tokio_util::sync::DropGuard> =
             if let Some(channel_id) = thread_id.strip_prefix("acp:") {
-                match crate::mcp_proxy::browser_mode() {
+                let mode = match crate::mcp_proxy::browser_mode() {
+                    crate::mcp_proxy::BrowserMode::Facade
+                        if self.session_registrar.is_none() || self.facade_url.is_none() =>
+                    {
+                        crate::mcp_proxy::BrowserMode::Proxy
+                    }
+                    m => m,
+                };
+                match mode {
+                    crate::mcp_proxy::BrowserMode::Facade => {
+                        // unwraps guarded by the fallback arm above
+                        let registrar = self.session_registrar.as_ref().unwrap();
+                        let facade_url = self.facade_url.as_ref().unwrap();
+                        if let Err(e) =
+                            crate::mcp_proxy::write_facade_mcp_config(&effective_workdir, facade_url)
+                                .await
+                        {
+                            warn!(thread_id, error = %e, "failed to write facade mcp config");
+                        }
+                        session_token = Some(registrar.mint(channel_id));
+                        info!(thread_id, "session token minted for facade browser capabilities");
+                        // Revoke on evict/replace: piggyback the same DropGuard
+                        // plumbing proxy mode uses for its server teardown.
+                        let ct = tokio_util::sync::CancellationToken::new();
+                        let child = ct.child_token();
+                        let registrar = registrar.clone();
+                        let chan = channel_id.to_string();
+                        tokio::spawn(async move {
+                            child.cancelled().await;
+                            registrar.revoke(&chan);
+                        });
+                        Some(ct.drop_guard())
+                    }
                     // Bridge mode (Option C): the agent's static mcp.json points at `openab
                     // browser-bridge`, which dials the pod-wide socket server (started at boot).
                     // Just ensure the write-once config exists — no per-session server/guard.
@@ -408,11 +469,23 @@ impl SessionPool {
 
         // Build the replacement connection outside the state lock so one stuck
         // initialization does not block all unrelated sessions.
+        #[cfg(feature = "acp-mcp")]
+        let spawn_env: std::collections::HashMap<String, String> = {
+            let mut env = self.config.env.clone();
+            if let Some(tok) = &session_token {
+                // The static facade MCP entry references ${OPENAB_SESSION_TOKEN};
+                // the value lives only in this agent process's environment.
+                env.insert("OPENAB_SESSION_TOKEN".to_string(), tok.clone());
+            }
+            env
+        };
+        #[cfg(not(feature = "acp-mcp"))]
+        let spawn_env = self.config.env.clone();
         let mut new_conn = AcpConnection::spawn(
             &self.config.command,
             &self.config.args,
             &effective_workdir,
-            &self.config.env,
+            &spawn_env,
             &self.config.inherit_env,
             thread_id.strip_prefix("acp:"),
         )

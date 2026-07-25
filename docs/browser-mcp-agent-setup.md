@@ -71,3 +71,27 @@ kiro-cli mcp list
 
 Gateway log confirms the extension side:
 `ACP: browser tunnel registered — extension attached`.
+
+## Facade mode (default when `[mcp]` is enabled)
+
+With the OAB MCP Facade running (`[mcp]` in `config.toml`), browser tools are
+served as a **session-aware in-process capability source** of the facade
+instead of per-session proxy servers:
+
+- **One listener** (the facade's, e.g. `127.0.0.1:8848/mcp`) — no per-session
+  ports, no per-session config rewrites.
+- **Identity**: the pool mints one token per chat session and injects it as
+  `OPENAB_SESSION_TOKEN` into the agent process environment; the (static,
+  write-once) MCP config entry references it as
+  `"Authorization": "Bearer ${OPENAB_SESSION_TOKEN}"`. Tokens are revoked on
+  session evict; calls route to that session's browser via the same
+  `channel_id` tunnel contract as proxy mode.
+- **Discovery**: agents find browser tools through `search_capabilities`
+  alongside every other facade capability, and execute them via
+  `execute_capability`.
+
+Mode selection (`OPENAB_BROWSER_MODE`): unset/`facade` → facade routing when
+the facade is serving, with automatic fallback to `proxy` when it is not
+(no `[mcp]` section); `proxy` → force the original per-session loopback
+servers; `bridge` → Option C stdio bridge. Proxy and bridge behavior is
+unchanged.

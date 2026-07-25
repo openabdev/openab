@@ -20,6 +20,10 @@
 //! original `openab-agent` layout so the moved code's `crate::` paths and
 //! the agent's `crate::…` re-export shims stay stable.
 
+/// Re-exported for `CapabilitySource` implementors in dependent crates
+/// (the trait surface names `rmcp::model::Tool`).
+pub use rmcp;
+
 pub mod acp;
 pub mod auth;
 pub mod llm;
