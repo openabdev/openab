@@ -495,6 +495,104 @@ pub async fn serve_http_with(
 mod tests {
     use super::*;
 
+    struct EchoSource {
+        session_bound: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl super::CapabilitySource for EchoSource {
+        fn provider(&self) -> &str {
+            "echo"
+        }
+        fn tools(&self, _ctx: Option<&super::SessionCtx>) -> Vec<Tool> {
+            vec![tool_with(
+                "echo_channel",
+                "Echo the caller session channel",
+                json!({ "type": "object", "properties": { "x": { "type": "integer" } } }),
+            )]
+        }
+        async fn call(
+            &self,
+            ctx: Option<&super::SessionCtx>,
+            tool: &str,
+            args: &Map<String, Value>,
+        ) -> Result<(Value, bool)> {
+            assert_eq!(tool, "echo_channel");
+            let chan = ctx.map(|c| c.channel_id.clone()).unwrap_or_default();
+            Ok((json!({ "channel": chan, "x": args.get("x") }), false))
+        }
+        fn requires_session(&self) -> bool {
+            self.session_bound
+        }
+    }
+
+    fn facade_with_source(session_bound: bool) -> McpFacade {
+        McpFacade::with_sources(
+            McpRuntimeManager::from_config(McpConfig::default()),
+            vec![std::sync::Arc::new(EchoSource { session_bound })],
+            super::SessionTokens::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn session_bound_source_is_invisible_and_unreachable_without_ctx() {
+        let facade = facade_with_source(true);
+        let v = facade
+            .search_capabilities(&Map::new(), None)
+            .await
+            .unwrap();
+        assert!(
+            v["capabilities"].as_array().unwrap().is_empty(),
+            "anonymous discovery must not list session-bound tools: {v}"
+        );
+        let mut args = Map::new();
+        args.insert("name".into(), json!("echo_channel"));
+        let err = facade.execute_capability(&args, None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("unknown capability"),
+            "anonymous execution must look unknown, not forbidden: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_source_discovers_and_executes_with_ctx() {
+        let facade = facade_with_source(true);
+        let ctx = super::SessionCtx {
+            channel_id: "chan-42".into(),
+        };
+        let v = facade
+            .search_capabilities(&Map::new(), Some(&ctx))
+            .await
+            .unwrap();
+        let caps = v["capabilities"].as_array().unwrap();
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0]["name"], "echo_channel");
+        assert_eq!(caps[0]["provider"], "echo");
+        let mut args = Map::new();
+        args.insert("name".into(), json!("echo_channel"));
+        args.insert("arguments".into(), json!({ "x": 7 }));
+        let (out, is_error) = facade.execute_capability(&args, Some(&ctx)).await.unwrap();
+        assert!(!is_error);
+        assert_eq!(out["channel"], "chan-42");
+        assert_eq!(out["x"], 7);
+    }
+
+    #[tokio::test]
+    async fn host_level_source_works_anonymously_and_validates_args() {
+        let facade = facade_with_source(false);
+        let v = facade
+            .search_capabilities(&Map::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(v["capabilities"].as_array().unwrap().len(), 1);
+        // Schema pre-flight: x must be an integer.
+        let mut args = Map::new();
+        args.insert("name".into(), json!("echo_channel"));
+        args.insert("arguments".into(), json!({ "x": "not-an-int" }));
+        let err = facade.execute_capability(&args, None).await.unwrap_err();
+        assert!(format!("{err:#}").contains("echo_channel"), "{err:#}");
+    }
+
     fn tool_with(name: &str, desc: &str, schema: Value) -> Tool {
         Tool::new(
             name.to_string(),
@@ -575,7 +673,7 @@ mod tests {
     async fn search_on_empty_config_yields_empty_catalog() {
         let manager = McpRuntimeManager::from_config(McpConfig::default());
         let facade = McpFacade::new(manager);
-        let v = facade.search_capabilities(&Map::new()).await.unwrap();
+        let v = facade.search_capabilities(&Map::new(), None).await.unwrap();
         assert_eq!(v["capabilities"], json!([]));
         assert_eq!(v["unavailable"], json!([]));
     }
@@ -594,7 +692,7 @@ mod tests {
         }))
         .unwrap();
         let facade = McpFacade::new(McpRuntimeManager::from_config(cfg));
-        let v = facade.search_capabilities(&Map::new()).await.unwrap();
+        let v = facade.search_capabilities(&Map::new(), None).await.unwrap();
         assert_eq!(v["capabilities"], json!([]));
         let unavailable = v["unavailable"].as_array().unwrap();
         assert_eq!(unavailable.len(), 1);
@@ -607,14 +705,14 @@ mod tests {
         let facade = McpFacade::new(McpRuntimeManager::from_config(McpConfig::default()));
         let mut args = Map::new();
         args.insert("name".into(), json!("no-such-capability"));
-        let err = facade.execute_capability(&args).await.unwrap_err();
+        let err = facade.execute_capability(&args, None).await.unwrap_err();
         assert!(err.to_string().contains("unknown capability"));
     }
 
     #[tokio::test]
     async fn execute_without_name_is_rejected() {
         let facade = McpFacade::new(McpRuntimeManager::from_config(McpConfig::default()));
-        let err = facade.execute_capability(&Map::new()).await.unwrap_err();
+        let err = facade.execute_capability(&Map::new(), None).await.unwrap_err();
         assert!(err.to_string().contains("requires a `name`"));
     }
 }
