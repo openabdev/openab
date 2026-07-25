@@ -81,8 +81,13 @@ fn get_or_insert_gate(map: &mut HashMap<String, Arc<Mutex<()>>>, key: &str) -> A
 }
 
 /// Returns true when a session should be treated as stale during idle cleanup.
-fn classify_idle(last_active: Instant, alive: bool, cutoff: Instant) -> bool {
-    last_active < cutoff || !alive
+fn classify_idle(
+    last_active: Instant,
+    alive: bool,
+    now: Instant,
+    ttl: std::time::Duration,
+) -> bool {
+    now.saturating_duration_since(last_active) > ttl || !alive
 }
 
 /// Returns true when a locked, in-flight session has exceeded the hung threshold.
@@ -654,7 +659,8 @@ impl SessionPool {
     }
 
     pub async fn cleanup_idle(&self, ttl_secs: u64) {
-        let cutoff = Instant::now() - std::time::Duration::from_secs(ttl_secs);
+        let now = Instant::now();
+        let ttl = std::time::Duration::from_secs(ttl_secs);
         let hung_threshold = std::time::Duration::from_secs(self.hung_threshold_secs);
 
         let (snapshot, activity_map, cancel_map, pgid_map) = {
@@ -736,7 +742,7 @@ impl SessionPool {
                     activity.touch();
                 }
             }
-            if classify_idle(conn.last_active, conn.alive(), cutoff) {
+            if classify_idle(conn.last_active, conn.alive(), now, ttl) {
                 stale.push((key, conn_handle, conn.acp_session_id.clone()));
             }
         }
@@ -856,23 +862,20 @@ mod tests {
     #[test]
     fn classify_idle_marks_stale_by_time() {
         let now = Instant::now();
-        let cutoff = now - std::time::Duration::from_secs(60);
         let last_active = now - std::time::Duration::from_secs(120);
-        assert!(classify_idle(last_active, true, cutoff));
+        assert!(classify_idle(last_active, true, now, std::time::Duration::from_secs(60)));
     }
 
     #[test]
     fn classify_idle_marks_stale_by_death() {
         let now = Instant::now();
-        let cutoff = now - std::time::Duration::from_secs(60);
-        assert!(classify_idle(now, false, cutoff));
+        assert!(classify_idle(now, false, now, std::time::Duration::from_secs(60)));
     }
 
     #[test]
     fn classify_idle_keeps_fresh_alive_sessions() {
         let now = Instant::now();
-        let cutoff = now - std::time::Duration::from_secs(60);
-        assert!(!classify_idle(now, true, cutoff));
+        assert!(!classify_idle(now, true, now, std::time::Duration::from_secs(60)));
     }
 
     #[test]
