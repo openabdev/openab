@@ -56,10 +56,16 @@ starts the listener:
 listen = "127.0.0.1:8848"   # loopback only; non-loopback refused at startup
 ```
 
-**Standalone**:
+**Facade-only run mode** (no chat adapter anywhere — coding-CLI-only
+hosts, dev loops, CI runners): an adapter-less config with `[mcp]` present
+is a valid deployment; `openab run` serves just the facade listener:
 
 ```sh
-openab-agent mcp-facade --listen 127.0.0.1:8848
+cat > facade-only.toml <<'TOML'
+[mcp]
+listen = "127.0.0.1:8848"
+TOML
+openab run -c facade-only.toml
 ```
 
 Both read the same layered provider config: `~/.openab/agent/mcp.json`
