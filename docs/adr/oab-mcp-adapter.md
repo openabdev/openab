@@ -443,7 +443,7 @@ listen = "127.0.0.1:8848"   # loopback only; this is the default
   CLI the operator points at it.
 
 This is the same architectural role that
-[`acp-server-websocket-mcp-browser.md`](./acp-server-websocket-mcp-browser.md)
+[`acp-server-websocket-reverse-mcp.md`](./acp-server-websocket-reverse-mcp.md)
 assigns to OpenAB core: an MCP proxy/aggregator between the agent and upstream
 capability sources, delivered to the agent via `mcpServers`. The OAB MCP Facade
 is that inbound component for external service capabilities; browser tools and
@@ -679,7 +679,7 @@ escape hatch for operators who intentionally configure a server outside OAB.
 
 Rejected as unnecessary for this MVP. The OAB MCP facade is the intentionally
 scoped inbound server for the coding agent, filling the MCP proxy/aggregator
-role that [`acp-server-websocket-mcp-browser.md`](./acp-server-websocket-mcp-browser.md)
+role that [`acp-server-websocket-reverse-mcp.md`](./acp-server-websocket-reverse-mcp.md)
 already assigns to OpenAB core (§6.2). A separate generic server for
 arbitrary OAB workflows would require another authentication, tenancy, and
 authorization design and would blur the two-method capability boundary.

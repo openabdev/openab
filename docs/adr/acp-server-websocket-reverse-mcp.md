@@ -7,8 +7,8 @@
 - **Related:** [ACP Server over WebSocket — Base (as-built)](./acp-server-websocket-base.md),
   [ACP Server with WebSocket Transport](./acp-server-websocket.md) (original proposal),
   [openab-agent MCP](./openab-agent-mcp.md).
-  **Browser-specific design + the contract the extension implements:**
-  [Browser control via MCP-over-ACP](./acp-server-websocket-mcp-browser.md).
+  The browser extension's implementation contract:
+  [MCP-over-ACP tunnel contract](../mcp-over-acp-tunnel-contract.md).
 
 ---
 
@@ -20,9 +20,8 @@ tools to a colocated agent over the outbound `/acp` WS it already holds. OpenAB 
 proxy/aggregator in the middle; the agent is a normal in-pod MCP client.
 
 The first, driving consumer is **browser control**: a browser side-panel extension serves DOM
-tools so the agent's LLM can autonomously operate the user's real, logged-in Chrome (see the
-[browser ADR](./acp-server-websocket-mcp-browser.md) for that concrete design and the extension
-contract). This ADR describes the general mechanism and its generalization to **multiple,
+tools so the agent's LLM can autonomously operate the user's real, logged-in Chrome (see **§7** for that
+concrete design and the extension contract). This ADR describes the general mechanism and its generalization to **multiple,
 arbitrary** client-side MCP servers (§6), using browser control as the running example.
 
 ## 2. Decision
@@ -61,7 +60,7 @@ The base does only client→agent (prompt) and agent→client **notifications** 
 Reverse MCP needs the **agent→client REQUEST** direction (request/response: the agent asks the
 client to do X and awaits a result). The WS is already bidirectional; `acp_server`'s dispatch loop
 adds the agent-initiated-request path. This is also where the wire types move from hand-rolled to
-**generated** (see §8).
+**generated** (see §9).
 
 ## 4. Architecture (browser control as the example)
 
@@ -129,7 +128,7 @@ sequenceDiagram
 ```
 
 The exact two-id-space bookkeeping (outer ACP-envelope id ↔ inner MCP id, flattened per the RFD) is
-detailed in the [browser ADR](./acp-server-websocket-mcp-browser.md) §4.
+detailed in **§7.3**.
 
 ## 6. Generalization — multiple client-side MCP servers
 
@@ -184,7 +183,7 @@ and the §6.4 allowlist are the **`name`**. Consequences, all confirmed by revie
 > #1453/#1454) and no facade PR remains open, so this section builds on a settled foundation.
 >
 > The adapter ADR reaches the same conclusion from the other side: its §6.2 states that the facade
-> occupies "the same architectural role that `acp-server-websocket-mcp-browser.md` assigns to OpenAB
+> occupies "the same architectural role" this ADR assigns to OpenAB
 > core… browser tools and external capabilities **share the delivery mechanism**", and its Alternative C
 > rejects "a second generic inbound MCP server", i.e. **no agent-facing MCP server beyond this one
 > aggregation point**. That makes retiring the bespoke per-session proxy (F5) a requirement of the
@@ -340,7 +339,7 @@ is via ACP `session/new` `mcpServers`, and that "if a backing CLI does not honor
 facade is unavailable for that CLI in the MVP **rather than falling back to editing the CLI's config
 files**". The as-built `write_facade_mcp_config` does write a static entry into the CLI's config —
 deliberately, because the browser path's D2 established that Cursor ignores ACP-passed `mcpServers`
-([browser ADR](./acp-server-websocket-mcp-browser.md) D2, [zed#50924](https://github.com/zed-industries/zed/issues/50924)).
+(**§7.2** D2, [zed#50924](https://github.com/zed-industries/zed/issues/50924)).
 Both positions are defensible; recording the conflict rather than silently picking a side. Owner of the
 facade contract should confirm whether config-file injection is an accepted exception for CLIs that
 ignore `mcpServers`, or whether Facade mode should be unavailable for them.
@@ -362,7 +361,129 @@ ignore `mcpServers`, or whether Facade mode should be unavailable for them.
 - **F6 e2e** — browser + a second client-declared server + a host-level `mcp.json` provider coexisting,
   and two concurrent sessions each reaching only their own browser.
 
-## 7. Alternatives considered
+## 7. Worked example — browser control
+
+The driving consumer of this mechanism, and the design the **browser extension** implements. The
+wire contract it codes against is [`mcp-over-acp-tunnel-contract.md`](../mcp-over-acp-tunnel-contract.md);
+how the agent is wired to reach the tools is [`browser-mcp-agent-setup.md`](../browser-mcp-agent-setup.md).
+
+### 7.1 Toolset
+
+Five **DOM-semantic** MCP tools, served by the extension: `katashiro.read_dom` (snapshot),
+`katashiro.screenshot`, `katashiro.navigate`, `katashiro.click(selector)`,
+`katashiro.type(selector, text)`.
+
+- **DOM-semantic, not a model-specific `computer` (pixel) tool** — `click(selector)` / `read_dom`
+  are cheaper, more reliable, and model-agnostic; screenshot + coordinates remain expressible if
+  wanted, but are not the primary surface.
+- **Screenshots are JPEG** (`captureVisibleTab {format:"jpeg", quality:70}`, ~300–500 KB); the ACP
+  frame cap is raised 1→8 MiB to carry tool results. PNG base64 (~5.5 MB) would exceed the cap.
+- The declared server name is `katashiro`; it was `browser` until 2026-07-26, when it was renamed
+  because Playwright MCP's `browser_*` tools sat beside it in the same catalog and the model could
+  not reliably tell "the user's real logged-in tab" from "a sandbox browser".
+
+### 7.2 Design decisions (D1–D6)
+
+> **Supersession notice.** D2, D3 and D5 record the **original** delivery path: a per-`acp:`-session
+> loopback MCP proxy registered in each agent's native MCP config. That path is superseded by the
+> facade integration in §6.2 — browser is now one session-aware `CapabilitySource`, and session
+> identity is the facade's broker-minted `SessionTokens` rather than a per-session port plus a
+> self-written `mcp.json` entry. They are kept because they explain *why* the shipped design looked
+> the way it did, and because `proxy`/`bridge` remain selectable. D1, D4 and D6 carry over.
+
+- **D1 — permission model.** Auto-approve **all** browser tool permissions for now: core keeps
+  auto-replying `session/request_permission` with OK. Fine-grained consent is deferred. Consequence:
+  a dedicated `request_permission`-relay task is **dropped**, but the server→client request machinery
+  is still required for the upstream MCP tunnel. (That direction was not green-field: `openab-core`'s
+  ACP connection already received `session/request_permission` from the agent and auto-replied it, so
+  the work was *relaying* those upstream rather than inventing the path.)
+- **D2 — how the agent receives the tools (injection).** The ACP `session/new` `mcpServers` parameter
+  is **not** reliable: Cursor's CLI ignores ACP-passed MCP servers and only loads MCP from its **own
+  config** (`.cursor/mcp.json`) — see [zed#50924](https://github.com/zed-industries/zed/issues/50924).
+  So the server is registered **per-agent, in that agent's native MCP config** (Cursor →
+  `.cursor/mcp.json`; Kiro → `.kiro/settings/mcp.json`). The **content** (an HTTP MCP entry: `url` +
+  `headers`) is portable across vendors. Under §6.2 this became a *static* entry referencing
+  `${OPENAB_SESSION_TOKEN}` instead of a freshly minted per-session URL.
+- **D3 — where MCP is tunnelled.** Downstream (agent ↔ core) is a **normal** in-process
+  Streamable-HTTP MCP server on `127.0.0.1:<port>` (loopback + bearer, via `rmcp`); the agent connects
+  to it like any other MCP server. Only the **upstream** (core/gateway ↔ extension) is tunnelled — an
+  MV3 extension cannot listen — adopting the official
+  [MCP-over-ACP RFD](https://agentclientprotocol.com/rfds/mcp-over-acp) framing (`mcp/connect` →
+  `connectionId`, then `mcp/message`), not a hand-rolled envelope.
+- **D4 — lifecycle: the WS may connect *after* session start.** The in-pod MCP server is always-on and
+  decoupled from the extension WS, so browser tools are **static-advertised** regardless of WS state; a
+  `tools/call` with no extension attached returns an MCP error ("browser not connected") rather than
+  the capability disappearing. `notifications/tools/list_changed` was designed but never implemented,
+  and is **dropped, not deferred** (§6.3): facade discovery is pull-based, so no cached tool list
+  exists for a notification to invalidate. The static-advertise posture is kept, implemented as
+  fetch-once-per-declared-server plus a per-`(channel_id, server_id)` cache.
+- **D5 — per-session MCP server.** The pool started one loopback Streamable-HTTP MCP proxy per `acp:`
+  session at agent spawn, constructing the `ProxyHandler` with that session's `channel_id` so
+  correlation was implicit; lifetime was tied to the `AcpConnection` via a `CancellationToken`
+  `DropGuard`. Superseded by the single facade listener (§6.2); still the behaviour of `proxy` mode.
+- **D6 — tunnel trait in core, impl in root.** `openab-core` defines the tunnel trait (`AcpMcpTunnel`,
+  §6.1); the **root** binary implements it (`src/browser_tunnel.rs`) by looking up the gateway's
+  `AcpTunnelRegistry` and calling `TunnelHandle::mcp_message`. This keeps `openab-core` and
+  `openab-gateway` sibling-independent (no cross-crate dep), mirroring the `ChatAdapter` root-glue
+  pattern, and is why the `CapabilitySource` in §6.2 also lives in the root binary.
+
+### 7.3 Runtime detail — one `katashiro.click` round-trip, and the two id spaces
+
+§5 gives the phase-level view; this is the message-level detail. Transports below are `proxy`-mode
+(agent ↔ core over loopback HTTP); under facade mode that hop is the facade listener instead, and the
+id bookkeeping is unchanged.
+
+```
+Participants  A = agent/LLM (Cursor, MCP client)   C = core (in-pod MCP server + proxy)
+              G = gateway (/acp WS srv)             E = extension (MCP server, browser)
+
+Transports    --ACP-->  downstream ACP over stdio (chat / permission)
+              --HTTP--> downstream HTTP MCP, 127.0.0.1 loopback (tools)
+              ==WS===>  upstream /acp WebSocket (official mcp/message tunnel; only hop off-pod)
+
+Precondition: session open, extension WS attached, tools already discovered
+--------------------------------------------------------------------------------
+ 1  A --ACP-->  C   session/request_permission {toolCall:"click #submit"}    id=acp#1
+ 2  A <--ACP--  C   result: allow               <- core auto-approves (D1)   id=acp#1
+ ..............................................................................
+ 3  A --HTTP--> C   tools/call name=katashiro.click args={selector:"#submit"}  id=mcp#7
+ 4  C --(in-pod handoff)--> G   wrap upstream: mcp/message  connId=conn-1
+                                 params={method:"tools/call", ...} FLATTENED, no inner id   id=acp#55
+ 5  G ==WS===>  E   server->client request = MCP-over-ACP             outer id=acp#55  <-off-pod
+ 6            E     chrome.scripting.executeScript -> clicks #submit, page -> /thanks
+ 7  G <==WS==  E    response result={ok,url:"/thanks"} (the inner MCP result)   outer id=acp#55 <-on-pod
+ 8  C <--(in-pod)-- G   gateway pending-map matches acp#55 -> core maps the result back to mcp#7
+ 9  A <--HTTP- C    tools/call result {content:[{text:"clicked; now /thanks"}]}  id=mcp#7
+ ..............................................................................
+10  A              LLM consumes the tool result, keeps reasoning
+11  A --ACP-->  C   session/update agent_message_chunk {"I clicked Submit..."}   (notif)
+12  C ==WS===>  E   chat stream forwarded on /acp -> user sees narration        <-off-pod
+--------------------------------------------------------------------------------
+Two id spaces (never mixed)
+  - mcp#7  = MCP-layer id, lives ONLY on the agent<->core hop (steps 3/9). Per the RFD,
+             mcp/message FLATTENS the inner method/params and does NOT carry an inner MCP id, so
+             mcp#7 never travels on the tunnel.
+  - acp#55 = outer ACP-envelope id correlating the whole upstream round-trip (steps 4<->8); the
+             response result IS the inner MCP result payload. The proxy maps mcp#7 <-> acp#55.
+  - acp#1  = downstream ACP permission id; unrelated to the two above
+
+Only steps 5/7/12 leave the pod (all on the /acp WS).
+```
+
+### 7.4 As-built history
+
+The OpenAB side was wired end-to-end on 2026-07-20 and live-validated on a real deployment: the full
+loop (read_dom / screenshot / navigate / click / type), the side-panel status pill, and reconnect on
+`session/resume`. At that point the realised path was
+`agent → core per-session ProxyHandler → tunnel trait → root impl → AcpTunnelRegistry → extension`,
+with per-agent config injection. `bridge` mode (stdio relay, Option C) shipped alongside.
+
+The facade integration in §6 replaced the per-session proxy as the default on 2026-07-25/26 and was
+live-validated the same way: with `[mcp]` enabled, `search_capabilities` returns provider
+`openab-browser` carrying exactly the pinned `katashiro.*` capabilities, while anonymous facade
+clients see only the two meta-tools.
+
+## 8. Alternatives considered
 
 - **Custom `ExtRequest` per action** — rejected: not surfaced to the LLM as a tool, so the model
   can't call it autonomously. Fits OpenAB-driven ops only.
@@ -375,7 +496,7 @@ ignore `mcpServers`, or whether Facade mode should be unavailable for them.
 - **Static-advertise as the default** — superseded by §6.2 (dynamic + `list_changed`); kept as an
   opt-in for browser only.
 
-## 8. Typing / dependencies
+## 9. Typing / dependencies
 
 - Bidirectional tool-call / client-method messages are where hand-rolling breaks; the expanded
   surface uses **generated** serde-only **v1** wire types (offline `typify` codegen, avoiding the
@@ -383,19 +504,17 @@ ignore `mcpServers`, or whether Facade mode should be unavailable for them.
 - The MCP machinery (handshake, tool lifecycle, tunnel framing) needs an MCP implementation
   (`rmcp`, already used by `openab-agent`) plus the ACP-tunnel transport glue.
 
-## 9. Relationship to Computer Use
+## 10. Relationship to Computer Use
 
 Same category as "computer use" (LLM autonomously drives an app via a perceive→act tool loop), but
 generalized: (a) targets the **user's real** app/session (e.g. logged-in Chrome), not a sandbox; (b)
 the action surface is **client-defined MCP tools** (DOM-semantic or screenshot), not a model-specific
 tool; (c) **model-agnostic** — any MCP-capable agent can use it.
 
-## 10. References
+## 11. References
 
 - [Base ADR](./acp-server-websocket-base.md) · [Original proposal](./acp-server-websocket.md) ·
   [openab-agent MCP](./openab-agent-mcp.md)
-- **Browser-specific design + extension contract:**
-  [Browser control via MCP-over-ACP](./acp-server-websocket-mcp-browser.md)
 - [MCP-over-ACP tunnel contract](../mcp-over-acp-tunnel-contract.md) ·
   [Browser MCP agent setup](../browser-mcp-agent-setup.md)
 - [MCP-over-ACP RFD](https://agentclientprotocol.com/rfds/mcp-over-acp) · MCP
