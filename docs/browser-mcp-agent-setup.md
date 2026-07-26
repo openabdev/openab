@@ -1,7 +1,7 @@
 # Browser MCP — how the agent gets the `openab-browser` tools
 
 The browser MCP server exposes five DOM-semantic tools —
-`browser.read_dom`, `browser.screenshot`, `browser.navigate`, `browser.click`, `browser.type` —
+`katashiro.read_dom`, `katashiro.screenshot`, `katashiro.navigate`, `katashiro.click`, `katashiro.type` —
 served by the **browser extension** over the MCP-over-ACP tunnel (see
 [tunnel contract](./mcp-over-acp-tunnel-contract.md)). This doc covers the *other* hop: how the
 colocated agent CLI actually **sees** those tools.

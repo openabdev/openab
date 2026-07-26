@@ -15,10 +15,10 @@
 //!
 //! **The prefix is a declared `name`, not a registry key** (ADR §6.1). A
 //! declaration is `{type:"acp", id, name}`; the reference client mints `id` as
-//! a fresh UUID per connection while `name` (`"browser"`) is stable. Routing
+//! a fresh UUID per connection while `name` (`"katashiro"`) is stable. Routing
 //! therefore resolves `name` → `(channel_id, id)` through the tunnel
 //! registry's enumeration, and forwards the **full** published tool name
-//! (`browser.click`) — the prefix selects the tunnel, it is not stripped,
+//! (`katashiro.click`) — the prefix selects the tunnel, it is not stripped,
 //! because the server's own `tools/call` expects its full name.
 
 use std::collections::{HashMap, HashSet};
@@ -63,12 +63,12 @@ struct ServerPolicy {
 /// source must contain no browser-specific branch").
 fn builtin_catalogs() -> HashMap<String, Vec<Tool>> {
     HashMap::from([(
-        "browser".to_string(),
+        "katashiro".to_string(),
         openab_core::mcp_proxy::browser_tools(),
     )])
 }
 
-/// The default policy when an operator has configured nothing: `browser` pinned
+/// The default policy when an operator has configured nothing: `katashiro` pinned
 /// to its five known tools, every other declared name denied.
 fn default_policy() -> HashMap<String, ServerPolicy> {
     builtin_catalogs()
@@ -496,11 +496,11 @@ mod tests {
         assert_eq!(
             names,
             [
-                "browser.click",
-                "browser.navigate",
-                "browser.read_dom",
-                "browser.screenshot",
-                "browser.type"
+                "katashiro.click",
+                "katashiro.navigate",
+                "katashiro.read_dom",
+                "katashiro.screenshot",
+                "katashiro.type"
             ],
             "the pinned browser set is advertised regardless of attach state"
         );
@@ -508,10 +508,10 @@ mod tests {
 
     #[tokio::test]
     async fn call_routes_the_name_prefix_to_the_declared_id_keeping_the_full_tool_name() {
-        let tunnel = FakeTunnel::with(&[("browser", "uuid-abc")]);
+        let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
         let src = AcpTunnelSource::with_config(tunnel.clone(), &[]);
         let (_v, is_err) = src
-            .call(Some(&ctx()), "browser.click", &Map::new())
+            .call(Some(&ctx()), "katashiro.click", &Map::new())
             .await
             .unwrap();
         assert!(!is_err);
@@ -524,7 +524,7 @@ mod tests {
             "the declared NAME must resolve to the registry id, not be used as the key"
         );
         assert_eq!(
-            params["name"], "browser.click",
+            params["name"], "katashiro.click",
             "the prefix selects the tunnel and is NOT stripped — the server published this name"
         );
     }
@@ -553,11 +553,11 @@ mod tests {
     #[tokio::test]
     async fn unpinned_tool_on_an_allowlisted_server_is_refused() {
         // The injection Falcon flagged: the client re-declares the trusted name
-        // `browser` but publishes a tool outside its pinned five.
-        let tunnel = FakeTunnel::with(&[("browser", "uuid-abc")]);
+        // `katashiro` but publishes a tool outside its pinned five.
+        let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
         let src = AcpTunnelSource::with_config(tunnel.clone(), &[]);
         let (v, is_err) = src
-            .call(Some(&ctx()), "browser.exec", &Map::new())
+            .call(Some(&ctx()), "katashiro.exec", &Map::new())
             .await
             .unwrap();
         assert!(is_err);
@@ -576,7 +576,7 @@ mod tests {
         let tunnel = FakeTunnel::with(&[]);
         let src = AcpTunnelSource::with_config(tunnel.clone(), &[]);
         let (v, is_err) = src
-            .call(Some(&ctx()), "browser.click", &Map::new())
+            .call(Some(&ctx()), "katashiro.click", &Map::new())
             .await
             .unwrap();
         assert!(is_err);
@@ -607,13 +607,13 @@ mod tests {
     #[test]
     fn operator_can_narrow_a_builtin_server_without_restating_schemas() {
         let src = AcpTunnelSource::with_config(
-            FakeTunnel::with(&[("browser", "uuid-abc")]),
-            &[cfg("browser", &["browser.read_dom"])],
+            FakeTunnel::with(&[("katashiro", "uuid-abc")]),
+            &[cfg("katashiro", &["katashiro.read_dom"])],
         );
         let names: Vec<String> = src.tools(None).iter().map(|t| t.name.to_string()).collect();
         assert_eq!(
             names,
-            ["browser.read_dom"],
+            ["katashiro.read_dom"],
             "the seed narrows to the operator's list, keeping the built-in schema"
         );
         assert!(
@@ -624,10 +624,10 @@ mod tests {
 
     #[tokio::test]
     async fn narrowing_the_policy_actually_refuses_the_dropped_tool() {
-        let tunnel = FakeTunnel::with(&[("browser", "uuid-abc")]);
-        let src = AcpTunnelSource::with_config(tunnel.clone(), &[cfg("browser", &["browser.read_dom"])]);
+        let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
+        let src = AcpTunnelSource::with_config(tunnel.clone(), &[cfg("katashiro", &["katashiro.read_dom"])]);
         let (_v, is_err) = src
-            .call(Some(&ctx()), "browser.click", &Map::new())
+            .call(Some(&ctx()), "katashiro.click", &Map::new())
             .await
             .unwrap();
         assert!(is_err, "a tool the operator removed must be refused");
@@ -656,11 +656,11 @@ mod tests {
 
     #[tokio::test]
     async fn an_entry_with_no_tools_admits_the_server_but_grants_nothing() {
-        let tunnel = FakeTunnel::with(&[("browser", "uuid-abc")]);
-        let src = AcpTunnelSource::with_config(tunnel.clone(), &[cfg("browser", &[])]);
+        let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
+        let src = AcpTunnelSource::with_config(tunnel.clone(), &[cfg("katashiro", &[])]);
         assert!(src.tools(None).is_empty(), "deny-all: no tools listed");
         let (_v, is_err) = src
-            .call(Some(&ctx()), "browser.click", &Map::new())
+            .call(Some(&ctx()), "katashiro.click", &Map::new())
             .await
             .unwrap();
         assert!(is_err);
@@ -671,10 +671,10 @@ mod tests {
     async fn configuring_other_servers_drops_the_browser_default() {
         // Writing any entry takes over the allowlist wholesale — browser is not
         // silently retained alongside the operator's list.
-        let tunnel = FakeTunnel::with(&[("browser", "uuid-abc")]);
+        let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
         let src = AcpTunnelSource::with_config(tunnel.clone(), &[cfg("notes", &["notes.list"])]);
         let (_v, is_err) = src
-            .call(Some(&ctx()), "browser.click", &Map::new())
+            .call(Some(&ctx()), "katashiro.click", &Map::new())
             .await
             .unwrap();
         assert!(is_err, "browser is no longer allowlisted once config is written");
@@ -715,10 +715,10 @@ mod tests {
     async fn caching_is_never_itself_a_grant() {
         // The server publishes a tool the operator did not permit. Caching it
         // must not make it visible OR callable.
-        let tunnel = FakeTunnel::with(&[("browser", "uuid-abc")]);
-        tunnel.set_tools_list(&["browser.read_dom", "browser.exec"]);
+        let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
+        tunnel.set_tools_list(&["katashiro.read_dom", "katashiro.exec"]);
         let src =
-            AcpTunnelSource::with_config(tunnel.clone(), &[cfg("browser", &["browser.read_dom"])]);
+            AcpTunnelSource::with_config(tunnel.clone(), &[cfg("katashiro", &["katashiro.read_dom"])]);
         let _ = src.tools(Some(&ctx()));
         settle().await;
 
@@ -727,10 +727,10 @@ mod tests {
             .iter()
             .map(|t| t.name.to_string())
             .collect();
-        assert_eq!(names, ["browser.read_dom"], "the unpermitted tool stays out");
+        assert_eq!(names, ["katashiro.read_dom"], "the unpermitted tool stays out");
 
         let (_v, is_err) = src
-            .call(Some(&ctx()), "browser.exec", &Map::new())
+            .call(Some(&ctx()), "katashiro.exec", &Map::new())
             .await
             .unwrap();
         assert!(is_err, "and it stays uncallable even though it was cached");
@@ -739,7 +739,7 @@ mod tests {
     #[tokio::test]
     async fn a_seeded_server_keeps_its_seed_until_discovery_succeeds() {
         // Fetch fails: the catalog must fall back to the seed, never to empty.
-        let tunnel = FakeTunnel::with(&[("browser", "uuid-abc")]);
+        let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
         tunnel.fail_tools_list();
         let src = AcpTunnelSource::with_config(tunnel.clone(), &[]);
         assert_eq!(src.tools(Some(&ctx())).len(), 5);
@@ -753,8 +753,8 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_is_not_repeated_while_one_is_in_flight() {
-        let tunnel = FakeTunnel::with(&[("browser", "uuid-abc")]);
-        tunnel.set_tools_list(&["browser.read_dom"]);
+        let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
+        tunnel.set_tools_list(&["katashiro.read_dom"]);
         let src = AcpTunnelSource::with_config(tunnel.clone(), &[]);
         for _ in 0..5 {
             let _ = src.tools(Some(&ctx()));
@@ -771,14 +771,14 @@ mod tests {
     async fn cached_tools_survive_a_reconnect_that_changes_the_server_id() {
         // The whole point of keying the cache by NAME: the client mints a new id
         // on reconnect, and an id-keyed entry would be orphaned by it.
-        let tunnel = FakeTunnel::with(&[("browser", "uuid-old")]);
-        tunnel.set_tools_list(&["browser.read_dom"]);
+        let tunnel = FakeTunnel::with(&[("katashiro", "uuid-old")]);
+        tunnel.set_tools_list(&["katashiro.read_dom"]);
         let src = AcpTunnelSource::with_config(tunnel.clone(), &[]);
         let _ = src.tools(Some(&ctx()));
         settle().await;
         assert_eq!(src.tools(Some(&ctx())).len(), 1);
 
-        tunnel.reattach_as("browser", "uuid-new");
+        tunnel.reattach_as("katashiro", "uuid-new");
         assert_eq!(
             src.tools(Some(&ctx())).len(),
             1,
@@ -799,7 +799,7 @@ mod tests {
         AcpTunnelSource::with_config(
             tunnel,
             &[
-                cfg("browser", &["browser.click", "browser.read_dom"]),
+                cfg("katashiro", &["katashiro.click", "katashiro.read_dom"]),
                 cfg("notes", &["notes.list"]),
             ],
         )
@@ -807,10 +807,10 @@ mod tests {
 
     #[tokio::test]
     async fn two_declared_servers_are_both_discovered_without_collision() {
-        let tunnel = FakeTunnel::with(&[("browser", "uuid-b"), ("notes", "uuid-n")]);
+        let tunnel = FakeTunnel::with(&[("katashiro", "uuid-b"), ("notes", "uuid-n")]);
         // Both servers publish a tool literally called `list` under their own
         // prefix — the case a naive un-prefixed catalog would collapse.
-        tunnel.set_tools_list(&["browser.click", "browser.read_dom", "notes.list"]);
+        tunnel.set_tools_list(&["katashiro.click", "katashiro.read_dom", "notes.list"]);
         let src = two_server_src(tunnel.clone());
 
         let _ = src.tools(Some(&ctx()));
@@ -823,7 +823,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["browser.click", "browser.read_dom", "notes.list"],
+            ["katashiro.click", "katashiro.read_dom", "notes.list"],
             "both servers contribute, each under its own prefix"
         );
         assert_eq!(
@@ -835,10 +835,10 @@ mod tests {
 
     #[tokio::test]
     async fn each_server_receives_only_its_own_calls() {
-        let tunnel = FakeTunnel::with(&[("browser", "uuid-b"), ("notes", "uuid-n")]);
+        let tunnel = FakeTunnel::with(&[("katashiro", "uuid-b"), ("notes", "uuid-n")]);
         let src = two_server_src(tunnel.clone());
 
-        for tool in ["browser.click", "notes.list"] {
+        for tool in ["katashiro.click", "notes.list"] {
             let (_v, is_err) = src.call(Some(&ctx()), tool, &Map::new()).await.unwrap();
             assert!(!is_err, "{tool} should dispatch");
         }
@@ -851,7 +851,7 @@ mod tests {
         assert_eq!(
             routed,
             [
-                ("uuid-b".to_string(), "browser.click".to_string()),
+                ("uuid-b".to_string(), "katashiro.click".to_string()),
                 ("uuid-n".to_string(), "notes.list".to_string())
             ],
             "each tool reaches the tunnel of the server that declared it"
@@ -860,13 +860,13 @@ mod tests {
 
     #[tokio::test]
     async fn one_servers_policy_does_not_leak_to_another() {
-        // `browser.click` is permitted, `notes.click` is not — a per-server gate,
+        // `katashiro.click` is permitted, `notes.click` is not — a per-server gate,
         // not a global tool-name gate.
-        let tunnel = FakeTunnel::with(&[("browser", "uuid-b"), ("notes", "uuid-n")]);
+        let tunnel = FakeTunnel::with(&[("katashiro", "uuid-b"), ("notes", "uuid-n")]);
         let src = two_server_src(tunnel.clone());
 
         let (_v, ok_err) = src
-            .call(Some(&ctx()), "browser.click", &Map::new())
+            .call(Some(&ctx()), "katashiro.click", &Map::new())
             .await
             .unwrap();
         assert!(!ok_err);
@@ -889,12 +889,12 @@ mod tests {
 
     #[tokio::test]
     async fn one_server_detaching_leaves_the_other_callable() {
-        let tunnel = FakeTunnel::with(&[("browser", "uuid-b"), ("notes", "uuid-n")]);
+        let tunnel = FakeTunnel::with(&[("katashiro", "uuid-b"), ("notes", "uuid-n")]);
         let src = two_server_src(tunnel.clone());
-        tunnel.detach("browser");
+        tunnel.detach("katashiro");
 
         let (_v, browser_err) = src
-            .call(Some(&ctx()), "browser.click", &Map::new())
+            .call(Some(&ctx()), "katashiro.click", &Map::new())
             .await
             .unwrap();
         assert!(browser_err, "the detached server reports not connected");
@@ -908,7 +908,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_tool_name_without_a_prefix_is_rejected() {
-        let src = AcpTunnelSource::with_config(FakeTunnel::with(&[("browser", "uuid-abc")]), &[]);
+        let src = AcpTunnelSource::with_config(FakeTunnel::with(&[("katashiro", "uuid-abc")]), &[]);
         let (v, is_err) = src.call(Some(&ctx()), "click", &Map::new()).await.unwrap();
         assert!(is_err);
         assert!(v["content"][0]["text"]

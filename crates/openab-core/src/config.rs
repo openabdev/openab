@@ -79,7 +79,7 @@ pub struct McpFacadeConfig {
     #[serde(default = "default_mcp_listen")]
     pub listen: String,
     /// Operator gate for **client-declared** `type:acp` MCP servers (ADR §6.4).
-    /// Absent or empty keeps the built-in default: `browser` only, pinned to
+    /// Absent or empty keeps the built-in default: `katashiro` only, pinned to
     /// its five known tools. Listing anything here replaces that default
     /// wholesale, so an operator can narrow the browser or admit another
     /// client-side service without a code change.

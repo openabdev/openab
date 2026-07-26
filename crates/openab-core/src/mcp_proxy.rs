@@ -50,7 +50,7 @@ pub trait AcpMcpTunnel: Send + Sync {
     ///
     /// Both halves are needed and they are *not* interchangeable (ADR §6.1): the registry is keyed
     /// by the client-minted `server_id`, which the reference client mints as a fresh UUID **per
-    /// connection**, while a tool name carries the stable declared **name** (`browser.click`) and
+    /// connection**, while a tool name carries the stable declared **name** (`katashiro.click`) and
     /// the §6.4 trust gate is keyed by that name too. Enumerating both is what lets a capability
     /// source resolve a tool prefix back to a tunnel; matching a prefix against the registry key
     /// alone can never work.
@@ -68,7 +68,7 @@ pub trait AcpMcpTunnel: Send + Sync {
 pub fn browser_tools() -> Vec<Tool> {
     vec![
         Tool::new(
-            "browser.click",
+            "katashiro.click",
             "Click the element matching a CSS selector in the active browser tab.",
             object(json!({
                 "type": "object",
@@ -77,7 +77,7 @@ pub fn browser_tools() -> Vec<Tool> {
             })),
         ),
         Tool::new(
-            "browser.read_dom",
+            "katashiro.read_dom",
             "Read a snapshot of the active tab's DOM (optionally scoped to a selector).",
             object(json!({
                 "type": "object",
@@ -85,7 +85,7 @@ pub fn browser_tools() -> Vec<Tool> {
             })),
         ),
         Tool::new(
-            "browser.navigate",
+            "katashiro.navigate",
             "Navigate the active browser tab to a URL.",
             object(json!({
                 "type": "object",
@@ -94,7 +94,7 @@ pub fn browser_tools() -> Vec<Tool> {
             })),
         ),
         Tool::new(
-            "browser.type",
+            "katashiro.type",
             "Type text into the element matching a CSS selector in the active tab.",
             object(json!({
                 "type": "object",
@@ -106,7 +106,7 @@ pub fn browser_tools() -> Vec<Tool> {
             })),
         ),
         Tool::new(
-            "browser.screenshot",
+            "katashiro.screenshot",
             "Capture a screenshot of the active browser tab.",
             object(json!({ "type": "object", "properties": {} })),
         ),
@@ -955,7 +955,7 @@ mod tests {
     #[tokio::test]
     async fn call_tool_forwards_to_the_tunnel() {
         let h = ProxyHandler::new("acp_x".into(), Some(std::sync::Arc::new(MockTunnel)));
-        let result = h.forward_tool_call("browser.click", None).await.unwrap();
+        let result = h.forward_tool_call("katashiro.click", None).await.unwrap();
         let v = serde_json::to_value(&result).unwrap();
         assert_eq!(v["content"][0]["text"], serde_json::json!("clicked"));
     }
@@ -964,7 +964,7 @@ mod tests {
     async fn call_tool_reports_not_connected_without_a_tunnel() {
         let h = ProxyHandler::new("acp_x".into(), None);
         assert!(
-            h.forward_tool_call("browser.click", None).await.is_err(),
+            h.forward_tool_call("katashiro.click", None).await.is_err(),
             "a call with no attached browser must error (D4)"
         );
     }
@@ -1032,7 +1032,7 @@ mod tests {
         });
         let r = dispatch_browser_mcp(
             "acp_win1",
-            &req(3, "tools/call", serde_json::json!({ "name": "browser.read_dom", "arguments": {} })),
+            &req(3, "tools/call", serde_json::json!({ "name": "katashiro.read_dom", "arguments": {} })),
             &tunnel,
         )
         .await
@@ -1044,7 +1044,7 @@ mod tests {
     async fn dispatch_tools_call_without_tunnel_is_not_connected() {
         let r = dispatch_browser_mcp(
             "acp_x",
-            &req(4, "tools/call", serde_json::json!({ "name": "browser.click" })),
+            &req(4, "tools/call", serde_json::json!({ "name": "katashiro.click" })),
             &None,
         )
         .await
@@ -1058,7 +1058,7 @@ mod tests {
         let tunnel = arc_tunnel(ErrTunnel);
         let r = dispatch_browser_mcp(
             "acp_x",
-            &req(5, "tools/call", serde_json::json!({ "name": "browser.click" })),
+            &req(5, "tools/call", serde_json::json!({ "name": "katashiro.click" })),
             &tunnel,
         )
         .await
@@ -1142,7 +1142,7 @@ mod tests {
         let (rd, mut wr) = stream.into_split();
         let frame = serde_json::json!({
             "channel_id": "acp_win1",
-            "request": req(9, "tools/call", serde_json::json!({ "name": "browser.read_dom", "arguments": {} }))
+            "request": req(9, "tools/call", serde_json::json!({ "name": "katashiro.read_dom", "arguments": {} }))
         });
         let mut line = serde_json::to_vec(&frame).unwrap();
         line.push(b'\n');
@@ -1218,11 +1218,11 @@ mod tests {
         assert_eq!(
             names,
             [
-                "browser.click",
-                "browser.read_dom",
-                "browser.navigate",
-                "browser.type",
-                "browser.screenshot"
+                "katashiro.click",
+                "katashiro.read_dom",
+                "katashiro.navigate",
+                "katashiro.type",
+                "katashiro.screenshot"
             ]
         );
     }

@@ -34,7 +34,7 @@ array with the `acp` transport type:
   "params": {
     "cwd": "...",
     "mcpServers": [
-      { "type": "acp", "id": "<uuid>", "name": "browser" }
+      { "type": "acp", "id": "<uuid>", "name": "katashiro" }
     ] } }
 ```
 
@@ -96,11 +96,11 @@ even before the extension attaches). `tools/call` executes in the **active tab**
 
 | name | arguments | behaviour |
 |---|---|---|
-| `browser.click` | `{ "selector": string }` | click the element matching the CSS selector |
-| `browser.read_dom` | `{ "selector"?: string }` | return a DOM snapshot (optionally scoped) |
-| `browser.navigate` | `{ "url": string }` | navigate the active tab to the URL |
-| `browser.type` | `{ "selector": string, "text": string }` | type text into the matched element |
-| `browser.screenshot` | `{}` | capture a screenshot of the active tab |
+| `katashiro.click` | `{ "selector": string }` | click the element matching the CSS selector |
+| `katashiro.read_dom` | `{ "selector"?: string }` | return a DOM snapshot (optionally scoped) |
+| `katashiro.navigate` | `{ "url": string }` | navigate the active tab to the URL |
+| `katashiro.type` | `{ "selector": string, "text": string }` | type text into the matched element |
+| `katashiro.screenshot` | `{}` | capture a screenshot of the active tab |
 
 `tools/call` returns an MCP `CallToolResult` (`{ "content": [ { "type":"text", "text":... } ] }`,
 or an image content block for `screenshot`). On failure return an MCP tool error result. The
