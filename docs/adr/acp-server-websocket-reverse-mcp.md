@@ -156,11 +156,20 @@ Three pieces already generalize and are reused as-is:
 > **Revised 2026-07-26.** An earlier draft of §6.2–§6.5 proposed a bespoke path: per-`(session, server)`
 > loopback MCP proxies, openab writing N entries into the agent's MCP config, dynamic `tools/list` with
 > `notifications/tools/list_changed`. That is **superseded**. The
-> [OAB MCP Facade](../oab-mcp-facade.md) (OAB MCP Adapter ADR, #1446; facade #1448/#1453) and its
-> **session-aware in-process capability sources** (#1454) already provide the multi-provider catalog,
-> discovery, policy runtime (schema validation, timeouts, circuit breaking, redaction, audit) and
-> lifecycle this section was about to reinvent. Reverse-MCP-over-ACP contributes the one thing the
-> facade lacks: a **transport for providers that cannot listen and are dialled in by the client**.
+> [OAB MCP Facade](../oab-mcp-facade.md) ([OAB MCP Adapter ADR](./oab-mcp-adapter.md), #1446; facade
+> #1448/#1453) and its **session-aware in-process capability sources** (#1454) already provide the
+> multi-provider catalog, discovery, policy runtime (schema validation, timeouts, circuit breaking,
+> redaction, audit) and lifecycle this section was about to reinvent. Reverse-MCP-over-ACP contributes
+> the one thing the facade lacks: a **transport for providers that cannot listen and are dialled in by
+> the client**. As of 2026-07-26 the whole facade series is merged upstream (#1446/#1448/#1449/#1450/
+> #1453/#1454) and no facade PR remains open, so this section builds on a settled foundation.
+>
+> The adapter ADR reaches the same conclusion from the other side: its §6.2 states that the facade
+> occupies "the same architectural role that `acp-server-websocket-mcp-browser.md` assigns to OpenAB
+> core… browser tools and external capabilities **share the delivery mechanism**", and its Alternative C
+> rejects "a second generic inbound MCP server", i.e. **no agent-facing MCP server beyond this one
+> aggregation point**. That makes retiring the bespoke per-session proxy (F5) a requirement of the
+> upstream design, not merely cleanup.
 
 ```
 Facade providers today:   stdio(command)   http(url)            ← openab dials OUT
@@ -227,7 +236,19 @@ Therefore this ADR requires, before the source is enabled by default:
 
 - an operator **allowlist** of accepted declared server names (default: `browser` only) — declarations
   outside it are ignored with a logged warning; and
-- a per-declared-server **`tool_filter`**, mirroring `mcp.json` least-privilege semantics.
+- a per-declared-server **`tool_filter`**, mirroring `mcp.json` least-privilege semantics, which is
+  **deny-all by default**.
+
+The name allowlist is **not** a trust boundary on its own: the name is chosen by the same remote
+client that declares the tools, so a client may declare a server *named* `browser` and publish any
+tool set under it. Passing the allowlist therefore grants nothing by itself — the tool set is gated
+separately:
+
+- the `browser` entry ships **pinned to its five known tools** (`browser.read_dom`,
+  `browser.screenshot`, `browser.navigate`, `browser.click`, `browser.type`); any other tool name it
+  declares is dropped with a logged warning, so a same-name declaration cannot inject new tools; and
+- every other allowlisted server starts **deny-all** and serves only the tools an operator has
+  explicitly listed.
 
 ### 6.5 Backward compatibility & what this retires
 
@@ -259,6 +280,16 @@ process environment rather than a config file — which also removes the shared-
 old per-session `mcp.json` write. Capabilities publish under the provider name `openab`. Proxy and
 Option C bridge modes remain as explicit `OPENAB_BROWSER_MODE` opt-outs. This covers §6.2's source seam
 and session identity for the **browser** case.
+
+⚠️ **Divergence to reconcile with the adapter ADR (not resolved here).** Adapter ADR §6.2 says delivery
+is via ACP `session/new` `mcpServers`, and that "if a backing CLI does not honor ACP `mcpServers`, the
+facade is unavailable for that CLI in the MVP **rather than falling back to editing the CLI's config
+files**". The as-built `write_facade_mcp_config` does write a static entry into the CLI's config —
+deliberately, because the browser path's D2 established that Cursor ignores ACP-passed `mcpServers`
+([browser ADR](./acp-server-websocket-mcp-browser.md) D2, [zed#50924](https://github.com/zed-industries/zed/issues/50924)).
+Both positions are defensible; recording the conflict rather than silently picking a side. Owner of the
+facade contract should confirm whether config-file injection is an accepted exception for CLIs that
+ignore `mcpServers`, or whether Facade mode should be unavailable for them.
 
 **Remaining to fulfil this section:**
 - **F1′ generalize the source to N client-declared servers.** Today it serves the fixed
