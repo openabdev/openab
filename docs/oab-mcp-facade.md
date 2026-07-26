@@ -92,6 +92,19 @@ mcp.audit: mcp call_tool entry server="gmail" tool="search_threads" args_sha256=
 mcp.audit: mcp call_tool exit  server="gmail" tool="search_threads" … outcome="ok"
 ```
 
+> **`mcp.audit` must be enabled in `RUST_LOG`, or these lines are silently dropped.**
+> The audit events use `mcp.audit` as a *bare* tracing target — it is not under the
+> `openab` prefix, so a filter like `RUST_LOG=openab=debug,openab_agent=debug` matches
+> nothing for them and no audit line is ever emitted. Nothing warns you that auditing
+> is effectively off. Name the target explicitly:
+>
+> ```
+> RUST_LOG=openab=debug,openab_agent=debug,mcp.audit=info
+> ```
+>
+> Any filter that raises the global default (`RUST_LOG=info`, `RUST_LOG=debug`, …) also
+> emits them.
+
 ## Client registration examples
 
 Kiro CLI (`~/.kiro/settings/mcp.json`, or the agent file — see gotcha):
