@@ -88,7 +88,7 @@ Only the client (extension) is remote; core, gateway and agent are one in-pod `o
 tree. The downstream hop has two delivery modes (§ browser ADR / §6.3): `proxy` (HTTP MCP, default)
 and `bridge` (stdio relay).
 
-## 5. MCP usage sequence (browser.click as the example)
+## 5. MCP usage sequence (katashiro.click as the example)
 
 ```mermaid
 sequenceDiagram
@@ -114,7 +114,7 @@ sequenceDiagram
     Core-->>LLM: tools/list — browser tools now in the model's tool list
 
     Note over Tab,LLM: PHASE 2 — one autonomous action (e.g. click)
-    LLM->>Core: tools/call browser.click(selector)
+    LLM->>Core: tools/call katashiro.click(selector)
     Core->>GW: tools/call  (mcp/message over the SAME /acp WS)
     GW->>Ext: mcp/message → tools/call
     Ext->>Tab: chrome.scripting / tabs API<br/>click · type · read_dom · captureVisibleTab · navigate
@@ -154,7 +154,7 @@ Three pieces already generalize and are reused as-is:
 **`id` and `name` are different things, and routing needs both.** A declaration is
 `{type:"acp", id, name}`, and the two fields have very different lifetimes — the reference client mints
 `id` as a fresh `crypto.randomUUID()` **per connection** while `name` (`"browser"`) is stable across
-reconnects. The registry key is the **`id`**; the `<server>` segment of a tool name (`browser.click`)
+reconnects. The registry key is the **`id`**; the `<server>` segment of a tool name (`katashiro.click`)
 and the §6.4 allowlist are the **`name`**. Consequences, all confirmed by review 2026-07-26:
 
 - The registry stays keyed by `(channel_id, id)` — keying by `name` would let two same-name tunnels
@@ -210,11 +210,11 @@ Reverse-MCP adds:         acp-tunnel(channel_id, server_id)     ← client diall
   *per* client-declared server is not possible — and not needed. `AcpTunnelSource` fans out internally:
   `tools(ctx)` returns the tools of **every** `type:acp` server declared by the client of that
   `channel_id`, and `call` routes on the **`<server>.<tool>`** prefix to the matching tunnel. Today's
-  names (`browser.click`, `browser.read_dom`) already carry the server segment, so this generalizes
+  names (`katashiro.click`, `katashiro.read_dom`) already carry the server segment, so this generalizes
   with no renaming — but note the segment is the declared **`name`**, not the registry key: resolving
   it to a tunnel goes `name` → `(channel_id, id)` via the recorded declaration (§6.1), never straight
   to the key. The tool name forwarded over the tunnel stays the **full** name the server published
-  (`browser.click`), since that is what the server's own `tools/call` expects; the prefix selects the
+  (`katashiro.click`), since that is what the server's own `tools/call` expects; the prefix selects the
   tunnel, it is not stripped. The facade additionally publishes a `<provider>:<tool>` form to resolve
   shadowing against `mcp.json` servers.
 - **Adding another client-side MCP service is therefore declaration + policy work, not architecture
@@ -298,8 +298,8 @@ client that declares the tools, so a client may declare a server *named* `browse
 tool set under it. Passing the allowlist therefore grants nothing by itself — the tool set is gated
 separately:
 
-- the `browser` entry ships **pinned to its five known tools** (`browser.read_dom`,
-  `browser.screenshot`, `browser.navigate`, `browser.click`, `browser.type`); any other tool name it
+- the `browser` entry ships **pinned to its five known tools** (`katashiro.read_dom`,
+  `katashiro.screenshot`, `katashiro.navigate`, `katashiro.click`, `katashiro.type`); any other tool name it
   declares is dropped with a logged warning, so a same-name declaration cannot inject new tools; and
 - every other allowlisted server starts **deny-all** and serves only the tools an operator has
   explicitly listed.
@@ -318,7 +318,7 @@ HTTP MCP server that those CLIs read directly, so bridge mode is likely redundan
 
 **Open question (not decided).** Under the facade the LLM reaches a browser action via
 `search_capabilities` → `execute_capability`, one hop more per turn than today's direct
-`browser.click`. Recommendation: ship on the meta-tool path (uniform policy, one audit surface) and
+`katashiro.click`. Recommendation: ship on the meta-tool path (uniform policy, one audit surface) and
 revisit a per-provider "expose directly" option only if interactive browser latency proves it needed.
 
 ### 6.6 Status — as-built vs remaining

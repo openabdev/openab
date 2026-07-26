@@ -26,8 +26,8 @@ and **§5 usage-sequence diagram** illustrate this exact browser flow.
 
 ## 2. Browser toolset
 
-Five **DOM-semantic** MCP tools, served by the extension: `browser.read_dom` (snapshot),
-`browser.screenshot`, `browser.navigate`, `browser.click(selector)`, `browser.type(selector, text)`.
+Five **DOM-semantic** MCP tools, served by the extension: `katashiro.read_dom` (snapshot),
+`katashiro.screenshot`, `katashiro.navigate`, `katashiro.click(selector)`, `katashiro.type(selector, text)`.
 
 - **DOM-semantic, not a model-specific `computer` (pixel) tool** — `click(selector)` / `read_dom`
   are cheaper, more reliable, and model-agnostic; screenshot + coordinates remain expressible if
@@ -82,7 +82,7 @@ Five **DOM-semantic** MCP tools, served by the extension: `browser.read_dom` (sn
   `AcpTunnelRegistry` and calling `TunnelHandle::mcp_message`. This keeps `openab-core` and
   `openab-gateway` sibling-independent (no cross-crate dep), mirroring the `ChatAdapter` root-glue pattern.
 
-## 4. Runtime sequence (detailed) — one `browser.click` round-trip
+## 4. Runtime sequence (detailed) — one `katashiro.click` round-trip
 
 The high-level phase diagram is in [reverse-MCP ADR §5](./acp-server-websocket-reverse-mcp.md); this is
 the message-level detail, including the **two id spaces**.
@@ -100,7 +100,7 @@ Precondition: session open, extension WS attached, tools/list already discovered
  1  A --ACP-->  C   session/request_permission {toolCall:"click #submit"}    id=acp#1
  2  A <--ACP--  C   result: allow               <- core auto-approves (D1)   id=acp#1
  ..............................................................................
- 3  A --HTTP--> C   tools/call name=browser.click args={selector:"#submit"}  id=mcp#7
+ 3  A --HTTP--> C   tools/call name=katashiro.click args={selector:"#submit"}  id=mcp#7
  4  C --(in-pod handoff)--> G   wrap upstream: mcp/message  connId=conn-1
                                  params={method:"tools/call", ...} FLATTENED, no inner id   id=acp#55
  5  G ==WS===>  E   server->client request = MCP-over-ACP             outer id=acp#55  <-off-pod
