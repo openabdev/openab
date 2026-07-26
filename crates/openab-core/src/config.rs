@@ -78,6 +78,34 @@ pub struct McpFacadeConfig {
     /// boundary is the trust boundary.
     #[serde(default = "default_mcp_listen")]
     pub listen: String,
+    /// Operator gate for **client-declared** `type:acp` MCP servers (ADR §6.4).
+    /// Absent or empty keeps the built-in default: `browser` only, pinned to
+    /// its five known tools. Listing anything here replaces that default
+    /// wholesale, so an operator can narrow the browser or admit another
+    /// client-side service without a code change.
+    #[serde(default)]
+    pub acp_servers: Vec<AcpServerPolicy>,
+}
+
+/// One entry of the §6.4 operator allowlist.
+///
+/// Keyed by the declared **name**, never the id: the reference client mints its
+/// `id` as a fresh UUID per connection, so an allowlist of ids could not match
+/// twice. The name is chosen by the same remote client that declares the tools,
+/// so admitting a name grants nothing by itself — `tools` is the second,
+/// independent gate that stops a client publishing extra tools under a name the
+/// operator trusts.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AcpServerPolicy {
+    /// Declared server name to accept — matches `name` in the client's
+    /// `{type:"acp", id, name}` entry and the `<server>` prefix of its tools.
+    pub name: String,
+    /// Exactly the tool names this server may publish. **Deny-all**: omitted or
+    /// empty means the server is accepted but may publish nothing. Names alone
+    /// are enough — schemas come from the built-in catalog for known servers,
+    /// or from the server's own `tools/list` once discovery caching lands.
+    #[serde(default)]
+    pub tools: Vec<String>,
 }
 
 fn default_mcp_listen() -> String {

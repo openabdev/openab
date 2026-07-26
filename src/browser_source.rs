@@ -21,7 +21,7 @@
 //! (`browser.click`) — the prefix selects the tunnel, it is not stripped,
 //! because the server's own `tools/call` expects its full name.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -41,26 +41,72 @@ use serde_json::{json, Map, Value};
 /// refused outright, and a listed name may only publish the tools pinned here.
 #[derive(Clone)]
 struct ServerPolicy {
-    /// Exactly the tools this server may publish. Anything else it declares is
-    /// dropped from the catalog and refused on call, so a client cannot inject
-    /// new tools by re-declaring a trusted name.
-    tools: Vec<Tool>,
+    /// Exactly the tool names this server may publish. Anything else it declares
+    /// is dropped from the catalog and refused on call, so a client cannot
+    /// inject new tools by re-declaring a trusted name.
+    allowed: HashSet<String>,
+    /// **Pre-attach seed** (ADR §6.3): full `Tool` values advertised from the
+    /// moment the source is registered, so a permitted server is discoverable
+    /// before its client ever attaches — the property D4 relies on. Known
+    /// servers seed from the built-in catalog; a server an operator admitted by
+    /// name alone seeds empty until discovery caching supplies real schemas.
+    /// Always a subset of `allowed`: the seed narrows with the policy, never
+    /// past it.
+    seed: Vec<Tool>,
 }
 
-/// The default operator policy: `browser` pinned to its five known tools, every
-/// other declared name denied.
+/// Built-in tool catalogs, by declared server name. The only source of full
+/// `Tool` values (schemas included) before a server has been queried.
 ///
 /// Browser-ness lives here as **policy data**, deliberately not as a branch in
 /// the routing code — that is what keeps the source generic (ADR §6.2: "the
-/// source must contain no browser-specific branch"). Admitting another
-/// client-side MCP service is an entry in this table, not a code change.
-fn default_policy() -> HashMap<String, ServerPolicy> {
+/// source must contain no browser-specific branch").
+fn builtin_catalogs() -> HashMap<String, Vec<Tool>> {
     HashMap::from([(
         "browser".to_string(),
-        ServerPolicy {
-            tools: openab_core::mcp_proxy::browser_tools(),
-        },
+        openab_core::mcp_proxy::browser_tools(),
     )])
+}
+
+/// The default policy when an operator has configured nothing: `browser` pinned
+/// to its five known tools, every other declared name denied.
+fn default_policy() -> HashMap<String, ServerPolicy> {
+    builtin_catalogs()
+        .into_iter()
+        .map(|(name, tools)| {
+            let policy = ServerPolicy {
+                allowed: tools.iter().map(|t| t.name.to_string()).collect(),
+                seed: tools,
+            };
+            (name, policy)
+        })
+        .collect()
+}
+
+/// Build the policy from the operator's `[[mcp.acp_servers]]` entries (§6.4).
+///
+/// Each entry admits one declared **name** and lists exactly the tools it may
+/// publish; deny-all means an entry with no tools admits the server but grants
+/// nothing. Names are enough — schemas are taken from the built-in catalog
+/// where one exists, narrowed to what the operator permitted, so an operator
+/// can *restrict* a known server without restating its schemas. A permitted
+/// tool with no known schema simply has no seed yet and appears once discovery
+/// caching can fetch it.
+fn policy_from_config(entries: &[openab_core::config::AcpServerPolicy]) -> HashMap<String, ServerPolicy> {
+    let mut catalogs = builtin_catalogs();
+    entries
+        .iter()
+        .map(|entry| {
+            let allowed: HashSet<String> = entry.tools.iter().cloned().collect();
+            let seed = catalogs
+                .remove(&entry.name)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|t| allowed.contains(t.name.as_ref()))
+                .collect();
+            (entry.name.clone(), ServerPolicy { allowed, seed })
+        })
+        .collect()
 }
 
 /// Facade capability source backed by MCP-over-ACP tunnels to client-declared
@@ -74,11 +120,20 @@ pub struct AcpTunnelSource {
 }
 
 impl AcpTunnelSource {
-    pub fn new(tunnel: Arc<dyn AcpMcpTunnel>) -> Self {
-        Self {
-            tunnel,
-            policy: default_policy(),
-        }
+    /// Source gated by the operator's `[[mcp.acp_servers]]` entries. An empty
+    /// list keeps the built-in default rather than denying everything, so
+    /// omitting the section leaves browser control working as before; an
+    /// operator who writes any entry takes over the allowlist wholesale.
+    pub fn with_config(
+        tunnel: Arc<dyn AcpMcpTunnel>,
+        entries: &[openab_core::config::AcpServerPolicy],
+    ) -> Self {
+        let policy = if entries.is_empty() {
+            default_policy()
+        } else {
+            policy_from_config(entries)
+        };
+        Self { tunnel, policy }
     }
 
     /// Split a published tool name into `(server_name, full_tool_name)`. The
@@ -128,7 +183,7 @@ impl CapabilitySource for AcpTunnelSource {
         let mut out: Vec<Tool> = self
             .policy
             .values()
-            .flat_map(|p| p.tools.iter().cloned())
+            .flat_map(|p| p.seed.iter().cloned())
             .collect();
         // Stable order: the catalog is user-visible and a HashMap iteration
         // order would reshuffle it between runs.
@@ -160,7 +215,7 @@ impl CapabilitySource for AcpTunnelSource {
                 "server {server_name:?} is not in the operator allowlist"
             )));
         };
-        if !policy.tools.iter().any(|t| t.name == full_tool) {
+        if !policy.allowed.contains(full_tool) {
             return Ok(Self::error_result(format!(
                 "tool {full_tool:?} is not permitted for server {server_name:?}"
             )));
@@ -275,7 +330,7 @@ mod tests {
     fn catalog_is_the_pinned_policy_set_and_survives_detachment() {
         // No tunnels attached at all: the catalog must NOT shrink (§6.3 — attachment
         // flapping stays out of discovery; unavailability is reported on call).
-        let src = AcpTunnelSource::new(FakeTunnel::with(&[]));
+        let src = AcpTunnelSource::with_config(FakeTunnel::with(&[]), &[]);
         let names: Vec<String> = src.tools(None).iter().map(|t| t.name.to_string()).collect();
         assert_eq!(
             names,
@@ -293,7 +348,7 @@ mod tests {
     #[tokio::test]
     async fn call_routes_the_name_prefix_to_the_declared_id_keeping_the_full_tool_name() {
         let tunnel = FakeTunnel::with(&[("browser", "uuid-abc")]);
-        let src = AcpTunnelSource::new(tunnel.clone());
+        let src = AcpTunnelSource::with_config(tunnel.clone(), &[]);
         let (_v, is_err) = src
             .call(Some(&ctx()), "browser.click", &Map::new())
             .await
@@ -318,7 +373,7 @@ mod tests {
         // A client declaring an un-allowlisted name must not reach the agent's catalog
         // OR its dispatch, even though its tunnel is registered.
         let tunnel = FakeTunnel::with(&[("evil", "uuid-evil")]);
-        let src = AcpTunnelSource::new(tunnel.clone());
+        let src = AcpTunnelSource::with_config(tunnel.clone(), &[]);
         let (v, is_err) = src
             .call(Some(&ctx()), "evil.exfiltrate", &Map::new())
             .await
@@ -339,7 +394,7 @@ mod tests {
         // The injection Falcon flagged: the client re-declares the trusted name
         // `browser` but publishes a tool outside its pinned five.
         let tunnel = FakeTunnel::with(&[("browser", "uuid-abc")]);
-        let src = AcpTunnelSource::new(tunnel.clone());
+        let src = AcpTunnelSource::with_config(tunnel.clone(), &[]);
         let (v, is_err) = src
             .call(Some(&ctx()), "browser.exec", &Map::new())
             .await
@@ -358,7 +413,7 @@ mod tests {
     #[tokio::test]
     async fn allowlisted_but_unattached_server_reports_not_connected() {
         let tunnel = FakeTunnel::with(&[]);
-        let src = AcpTunnelSource::new(tunnel.clone());
+        let src = AcpTunnelSource::with_config(tunnel.clone(), &[]);
         let (v, is_err) = src
             .call(Some(&ctx()), "browser.click", &Map::new())
             .await
@@ -370,9 +425,104 @@ mod tests {
             .contains("not connected"));
     }
 
+    fn cfg(name: &str, tools: &[&str]) -> openab_core::config::AcpServerPolicy {
+        // Deserialized rather than struct-literalled so the test also pins the
+        // TOML shape operators actually write.
+        serde_json::from_value(json!({
+            "name": name,
+            "tools": tools,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn absent_config_keeps_the_builtin_browser_default() {
+        // Omitting [[mcp.acp_servers]] must not deny everything — existing
+        // browser control keeps working untouched.
+        let src = AcpTunnelSource::with_config(FakeTunnel::with(&[]), &[]);
+        assert_eq!(src.tools(None).len(), 5);
+    }
+
+    #[test]
+    fn operator_can_narrow_a_builtin_server_without_restating_schemas() {
+        let src = AcpTunnelSource::with_config(
+            FakeTunnel::with(&[("browser", "uuid-abc")]),
+            &[cfg("browser", &["browser.read_dom"])],
+        );
+        let names: Vec<String> = src.tools(None).iter().map(|t| t.name.to_string()).collect();
+        assert_eq!(
+            names,
+            ["browser.read_dom"],
+            "the seed narrows to the operator's list, keeping the built-in schema"
+        );
+        assert!(
+            src.tools(None)[0].input_schema.get("type").is_some(),
+            "narrowing must not lose the built-in schema"
+        );
+    }
+
+    #[tokio::test]
+    async fn narrowing_the_policy_actually_refuses_the_dropped_tool() {
+        let tunnel = FakeTunnel::with(&[("browser", "uuid-abc")]);
+        let src = AcpTunnelSource::with_config(tunnel.clone(), &[cfg("browser", &["browser.read_dom"])]);
+        let (_v, is_err) = src
+            .call(Some(&ctx()), "browser.click", &Map::new())
+            .await
+            .unwrap();
+        assert!(is_err, "a tool the operator removed must be refused");
+        assert!(tunnel.forwarded.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn operator_may_admit_an_unknown_server_by_name_alone() {
+        // No built-in catalog for "notes": it contributes no seed yet (schemas
+        // arrive with discovery caching), but its listed tool is permitted and
+        // routes to the declared id.
+        let tunnel = FakeTunnel::with(&[("notes", "uuid-n")]);
+        let src = AcpTunnelSource::with_config(tunnel.clone(), &[cfg("notes", &["notes.list"])]);
+        assert!(
+            src.tools(None).is_empty(),
+            "a name-only server has no schemas to advertise until they are fetched"
+        );
+
+        let (_v, is_err) = src
+            .call(Some(&ctx()), "notes.list", &Map::new())
+            .await
+            .unwrap();
+        assert!(!is_err, "a permitted tool must dispatch even with no seed");
+        assert_eq!(tunnel.forwarded.lock().unwrap()[0].1, "uuid-n");
+    }
+
+    #[tokio::test]
+    async fn an_entry_with_no_tools_admits_the_server_but_grants_nothing() {
+        let tunnel = FakeTunnel::with(&[("browser", "uuid-abc")]);
+        let src = AcpTunnelSource::with_config(tunnel.clone(), &[cfg("browser", &[])]);
+        assert!(src.tools(None).is_empty(), "deny-all: no tools listed");
+        let (_v, is_err) = src
+            .call(Some(&ctx()), "browser.click", &Map::new())
+            .await
+            .unwrap();
+        assert!(is_err);
+        assert!(tunnel.forwarded.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn configuring_other_servers_drops_the_browser_default() {
+        // Writing any entry takes over the allowlist wholesale — browser is not
+        // silently retained alongside the operator's list.
+        let tunnel = FakeTunnel::with(&[("browser", "uuid-abc")]);
+        let src = AcpTunnelSource::with_config(tunnel.clone(), &[cfg("notes", &["notes.list"])]);
+        let (_v, is_err) = src
+            .call(Some(&ctx()), "browser.click", &Map::new())
+            .await
+            .unwrap();
+        assert!(is_err, "browser is no longer allowlisted once config is written");
+        assert!(tunnel.forwarded.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn malformed_tool_name_without_a_prefix_is_rejected() {
-        let src = AcpTunnelSource::new(FakeTunnel::with(&[("browser", "uuid-abc")]));
+        let src = AcpTunnelSource::with_config(FakeTunnel::with(&[("browser", "uuid-abc")]), &[]);
         let (v, is_err) = src.call(Some(&ctx()), "click", &Map::new()).await.unwrap();
         assert!(is_err);
         assert!(v["content"][0]["text"]
