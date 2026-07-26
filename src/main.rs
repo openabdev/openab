@@ -497,7 +497,7 @@ async fn main() -> anyhow::Result<()> {
         let mut sources: Vec<Arc<dyn openab_mcp::mcp::sources::CapabilitySource>> = Vec::new();
         #[cfg(feature = "acp")]
         if !openab_core::mcp_proxy::browser_mode().is_bridge() {
-            sources.push(Arc::new(browser_source::BrowserSource::new(
+            sources.push(Arc::new(browser_source::AcpTunnelSource::new(
                 browser_tunnel.clone(),
             )));
         }
