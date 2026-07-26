@@ -1,17 +1,98 @@
-# Browser MCP — how the agent gets the `openab-browser` tools
+# Browser MCP — how the agent gets the browser tools
 
 The browser MCP server exposes five DOM-semantic tools —
-`katashiro.read_dom`, `katashiro.screenshot`, `katashiro.navigate`, `katashiro.click`, `katashiro.type` —
-served by the **browser extension** over the MCP-over-ACP tunnel (see
+`katashiro.read_dom`, `katashiro.screenshot`, `katashiro.navigate`, `katashiro.click`,
+`katashiro.type` — served by the **browser extension** over the MCP-over-ACP tunnel (see
 [tunnel contract](./mcp-over-acp-tunnel-contract.md)). This doc covers the *other* hop: how the
 colocated agent CLI actually **sees** those tools.
 
-## How it reaches the agent
+There are three transports, selected by `OPENAB_BROWSER_MODE`. **Facade is the default and the one
+to use**; `proxy` and `bridge` predate it and are kept as explicit opt-outs.
 
-The gateway↔extension tunnel terminates in the pod at a **per-session loopback MCP proxy**
-(`openab-core` `mcp_proxy::start_session_server`). To expose it to the agent, openab writes an
-`openab-browser` entry into the agent CLI's **native MCP config file** — the agent connects to
-`http://127.0.0.1:<port>/mcp` and re-lists the tools. The entry looks like:
+| mode | how the agent reaches the tools | status |
+|---|---|---|
+| unset / `facade` | through the **OAB MCP Facade**, one listener, static config entry | **default** |
+| `proxy` | per-session loopback MCP server + per-session config rewrite | legacy opt-out |
+| `bridge` | per-pod unix socket + `openab browser-bridge` stdio relay (Option C) | legacy opt-out |
+
+With no `[mcp]` section in `config.toml` the facade is not serving, and facade mode falls back to
+`proxy` automatically.
+
+---
+
+## Facade mode (default)
+
+Browser tools are a **session-aware in-process capability source** of the
+[OAB MCP Facade](./oab-mcp-facade.md) — the same aggregation point that serves every other
+provider in `mcp.json`. Enable the facade and it works:
+
+```toml
+# config.toml
+[mcp]
+listen = "127.0.0.1:8848"
+
+# Operator gate for client-declared type:acp servers (reverse-MCP ADR §6.4).
+# Omit entirely to keep the built-in default: `katashiro` only, pinned to its five tools.
+[[mcp.acp_servers]]
+name  = "katashiro"
+tools = ["katashiro.read_dom","katashiro.screenshot","katashiro.navigate","katashiro.click","katashiro.type"]
+```
+
+- **One listener** — the facade's. No per-session ports and no per-session config rewrites.
+- **Identity** — the pool mints one token per chat session and injects it into the agent process as
+  `OPENAB_SESSION_TOKEN`. The MCP config entry openab writes is **static and write-once**, and
+  references the variable rather than embedding a secret:
+
+  ```json
+  {
+    "mcpServers": {
+      "openab": {
+        "url": "http://127.0.0.1:8848/mcp",
+        "headers": { "Authorization": "Bearer ${OPENAB_SESSION_TOKEN}" }
+      }
+    }
+  }
+  ```
+
+  Tokens are revoked on session evict; calls route to that session's browser over the same
+  `channel_id` tunnel. Because the secret rides the process environment, it never lands in a file
+  a shared workdir could expose.
+- **Discovery** — the agent does **not** see `katashiro.*` in its own `tools/list`. It sees the
+  facade's two meta-tools and finds browser tools through `search_capabilities`, then runs them via
+  `execute_capability`, alongside every other facade capability. A session-bound source is invisible
+  to anonymous facade clients — no token, no discovery, no execution.
+
+### Any MCP-capable CLI works
+
+Because the entry is static, **hand-configuring a variant openab does not auto-write is viable**:
+point the CLI at `http://127.0.0.1:8848/mcp` with the bearer header above. This is the practical
+difference from proxy mode, where the endpoint was per-session ephemeral and a hand-written entry
+went stale on the next session.
+
+### Verify
+
+```sh
+# facade listening?
+grep "OAB MCP facade listening" <agent logs>
+
+# the static entry openab wrote
+cat "$HOME/.cursor/mcp.json"            # Cursor
+cat "$HOME/.kiro/settings/mcp.json"     # Kiro
+
+# does the catalog contain the browser capabilities for a session-bound client?
+#   -> call search_capabilities from the agent; expect provider "openab-browser"
+#      with exactly the pinned katashiro.* tools
+```
+
+Gateway log confirms the extension side: `ACP: browser tunnel registered — extension attached`.
+
+---
+
+## Legacy: `proxy` mode
+
+`OPENAB_BROWSER_MODE=proxy` forces the original design: the gateway↔extension tunnel terminates at a
+**per-session loopback MCP proxy** (`openab-core` `mcp_proxy::start_session_server`), and openab
+writes a per-session entry into the agent CLI's native MCP config:
 
 ```json
 {
@@ -24,74 +105,28 @@ The gateway↔extension tunnel terminates in the pod at a **per-session loopback
 }
 ```
 
-Both `<port>` and `<token>` are **minted fresh per session** and the entry is stripped on session
-evict — so this is written by openab, not hand-editable to a fixed value (see *Caveat* below).
+`<port>` and `<token>` are **minted fresh per session** and the entry is stripped on evict, so it
+cannot be hand-written to a fixed value. In this mode the agent sees `katashiro.*` directly in its
+`tools/list` rather than behind the facade's meta-tools.
 
-## Per-variant MCP config location
+Config file per variant (what `start_session_server` writes):
 
-openab writes the same entry into whichever file the colocated CLI reads. Current state:
+| Variant | MCP config file (under `$workdir`, = `$HOME`) | Auto-written in proxy mode |
+|---|---|---|
+| **Cursor** (`cursor-agent`) | `.cursor/mcp.json` | ✅ |
+| **Kiro** (`kiro-cli`) | `.kiro/settings/mcp.json` | ✅ |
+| **Claude Code** | `.mcp.json` / `~/.claude.json` `mcpServers` | ⛔ |
+| **Codex** | `~/.codex/config.toml` `[mcp_servers.*]` (TOML) | ⛔ |
+| **Gemini CLI** | `~/.gemini/settings.json` `mcpServers` | ⛔ |
 
-| Variant | MCP config file (under `$workdir`, = `$HOME`) | HTTP MCP + `headers` | Auto-written by openab today |
-|---|---|---|---|
-| **Cursor** (`cursor-agent`) | `.cursor/mcp.json` | yes | ✅ yes |
-| **Kiro** (`kiro-cli`) | `.kiro/settings/mcp.json` | yes | ✅ yes |
-| **Claude Code** | `.mcp.json` / `~/.claude.json` `mcpServers` | yes | ⛔ not yet |
-| **Codex** | `~/.codex/config.toml` `[mcp_servers.*]` (TOML) | check version | ⛔ not yet |
-| **Gemini CLI** | `~/.gemini/settings.json` `mcpServers` | yes | ⛔ not yet |
+Variants marked ⛔ are unreachable in proxy mode without teaching `start_session_server` their
+config path and format — **or simply using facade mode**, where the static entry removes the problem.
 
-`start_session_server` currently writes **`.cursor/mcp.json` + `.kiro/settings/mcp.json`**. Adding
-a variant = teach that function the CLI's config path + format (same `{url, headers}` shape for
-JSON configs; Codex uses TOML and needs a small serializer).
+## Legacy: `bridge` mode (Option C)
 
-## Manual / unsupported variants
+`OPENAB_BROWSER_MODE=bridge` runs a per-pod unix-socket server plus an `openab browser-bridge`
+stdio-MCP relay; the CLI entry is the static `{"command":"openab","args":["browser-bridge"]}` and the
+relay resolves its session channel by process ancestry. Intended for stdio-only MCP clients.
 
-If a variant isn't auto-written, a user *could* add the `openab-browser` entry to that CLI's
-mcp.json by hand — **but** the current proxy endpoint is per-session ephemeral (fresh port +
-bearer each session), so a static hand-written entry goes stale on the next session and cannot
-be used as-is. Manual configuration for arbitrary variants is therefore gated on a **stable
-browser-MCP endpoint** (a fixed URL + stable auth the user configures once). That redesign is
-tracked separately (see `drafts/` browser-MCP stable-endpoint design). Until then:
-
-- **Cursor / Kiro:** work out of the box (auto-injected).
-- **Other variants:** either add the variant's writer to `start_session_server`, or wait for the
-  stable endpoint.
-
-## Verify
-
-Inside the agent pod, after the extension attaches a browser session:
-
-```sh
-# the entry openab wrote for this session
-cat "$HOME/.cursor/mcp.json"                 # Cursor
-cat "$HOME/.kiro/settings/mcp.json"          # Kiro
-
-# does the CLI see the server / tools?  (CLI-specific; e.g. Kiro:)
-kiro-cli mcp list
-```
-
-Gateway log confirms the extension side:
-`ACP: browser tunnel registered — extension attached`.
-
-## Facade mode (default when `[mcp]` is enabled)
-
-With the OAB MCP Facade running (`[mcp]` in `config.toml`), browser tools are
-served as a **session-aware in-process capability source** of the facade
-instead of per-session proxy servers:
-
-- **One listener** (the facade's, e.g. `127.0.0.1:8848/mcp`) — no per-session
-  ports, no per-session config rewrites.
-- **Identity**: the pool mints one token per chat session and injects it as
-  `OPENAB_SESSION_TOKEN` into the agent process environment; the (static,
-  write-once) MCP config entry references it as
-  `"Authorization": "Bearer ${OPENAB_SESSION_TOKEN}"`. Tokens are revoked on
-  session evict; calls route to that session's browser via the same
-  `channel_id` tunnel contract as proxy mode.
-- **Discovery**: agents find browser tools through `search_capabilities`
-  alongside every other facade capability, and execute them via
-  `execute_capability`.
-
-Mode selection (`OPENAB_BROWSER_MODE`): unset/`facade` → facade routing when
-the facade is serving, with automatic fallback to `proxy` when it is not
-(no `[mcp]` section); `proxy` → force the original per-session loopback
-servers; `bridge` → Option C stdio bridge. Proxy and bridge behavior is
-unchanged.
+> Retiring proxy and bridge once facade mode has soaked is tracked as a follow-up — the OAB MCP
+> Adapter ADR's Alternative C calls for a single agent-facing aggregation point.
