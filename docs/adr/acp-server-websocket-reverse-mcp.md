@@ -299,8 +299,10 @@ ignore `mcpServers`, or whether Facade mode should be unavailable for them.
 - **F3′ per-`(channel_id, server_id)` discovery cache** — fetch each declared server's real `tools/list`
   once on attach and serve from cache (§6.3). Required by F1′: a hardcoded tool table cannot describe
   arbitrary declared servers.
-- **F4 trust gate** — operator allowlist (default `browser` only) + per-declared-server `tool_filter`
-  (§6.4). Should land with F1′, since F1′ is what makes client-declared tool sets reachable.
+- **F4 trust gate** — operator allowlist (default `browser` only) + **deny-all-by-default**
+  per-declared-server `tool_filter`, with `browser` pinned to its five known tools so a same-name
+  declaration cannot inject others (§6.4). Should land with F1′, since F1′ is what makes
+  client-declared tool sets reachable.
 - **F5 cleanup** — retire the superseded per-session proxy path once Facade mode has soaked; bridge-mode
   removal stays an explicit operator call (§6.5).
 - **F6 e2e** — browser + a second client-declared server + a host-level `mcp.json` provider coexisting,
