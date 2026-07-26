@@ -236,8 +236,8 @@ The facade's discovery is **pull-based**: the agent sees only `search_capabiliti
   debouncing included, is removed rather than deferred.)
 - **Static-advertise is the right posture**, per the facade's source contract — but implemented as
   *dynamically sourced, then cached*, because tools for arbitrary declared servers cannot be hardcoded:
-  on declare/attach, fetch the server's real `tools/list` over its tunnel and **cache it per
-  `(channel_id, server_id)`**; serve `tools(ctx)` from that cache **regardless of current attach
+  fetch the server's real `tools/list` over its tunnel and **cache it per `(channel_id, name)`**;
+  serve `tools(ctx)` from that cache **regardless of current attach
   state**. Backend unavailability surfaces as a **call error** ("browser not connected"), never as a
   vanishing catalog entry.
 
@@ -254,9 +254,21 @@ static-advertise posture §6.4's pinned sets and D4 both depend on):
   operator has pinned advertises those tools from the moment the source is registered — it never drops
   to empty just because nothing has attached yet. This is what preserves D4's "the browser tools are
   discoverable before the extension connects".
-- The per-`(channel_id, server_id)` cache holds `fetched ∩ allowed` and **replaces the seed once a
-  fetch succeeds**, so the catalog narrows to what the server actually publishes (a server may publish
-  fewer tools than the operator permitted) without ever widening past the policy.
+- The per-`(channel_id, name)` cache holds what the server published and is read as
+  `fetched ∩ allowed`, **replacing the seed once a fetch succeeds**, so the catalog narrows to what the
+  server actually publishes (a server may publish fewer tools than the operator permitted) without ever
+  widening past the policy. Filtering on read rather than on write means tightening the policy takes
+  effect immediately instead of waiting for a cache entry to be invalidated — **caching is never itself
+  a grant**.
+- **The cache is keyed by the declared `name`, not `server_id`** (corrected 2026-07-26; earlier drafts
+  of this section said `server_id`). Ids are minted per connection, so an id-keyed entry would be
+  orphaned by exactly the reconnect the cache exists to survive — it could never outlive the attach it
+  was populated from, which is the opposite of "serve regardless of current attach state". Same-name
+  collisions are impossible by §6.1's last-attach-wins rule, so the name is a safe key.
+- Discovery is **pull-triggered**: a declared server with no cache entry has its fetch started from the
+  next `tools(ctx)` call, and its real set appears one discovery round later. The facade re-reads the
+  catalog on every call, so a single round of staleness is the entire cost, and it avoids threading an
+  attach hook from the gateway (which owns attach) into the root (which owns the source).
 - A declared server with **no** policy entry contributes nothing — not because it is un-cached, but
   because §6.4 is deny-all. Caching changes what an *allowed* server advertises; it is never itself a
   grant.
@@ -338,7 +350,7 @@ ignore `mcpServers`, or whether Facade mode should be unavailable for them.
   `browser_tools()` set for one implicit server. Extend to every `type:acp` server the session's client
   declared, routing on the `<server>.<tool>` prefix to `(channel_id, server_id)` (§6.1/§6.2), with no
   browser-specific branch left in the source.
-- **F3′ per-`(channel_id, server_id)` discovery cache** — fetch each declared server's real `tools/list`
+- **F3′ per-`(channel_id, name)` discovery cache** — fetch each declared server's real `tools/list`
   once on attach and serve from cache (§6.3). Required by F1′: a hardcoded tool table cannot describe
   arbitrary declared servers.
 - **F4 trust gate** — operator allowlist (default `browser` only) + **deny-all-by-default**

@@ -117,6 +117,34 @@ pub struct AcpTunnelSource {
     /// rather than id because ids are per-connection UUIDs — an allowlist of
     /// ids could never match twice.
     policy: HashMap<String, ServerPolicy>,
+    /// Discovered tool sets, keyed `(channel_id, declared_name)` (§6.3).
+    ///
+    /// Keyed by **name**, not by `server_id` as an earlier draft of §6.3 said:
+    /// the client mints a fresh id per connection, so an id-keyed entry would be
+    /// orphaned by the very reconnect the cache exists to paper over. Keying by
+    /// name is what lets a discovered set survive a reconnect, which is the
+    /// cache's entire purpose.
+    ///
+    /// Holds what the server published; the policy filter is applied on read, so
+    /// tightening the policy takes effect immediately without invalidating it.
+    cache: ToolsCache,
+    /// Discovery fetches currently in flight, so repeated discovery rounds do
+    /// not pile up duplicate `tools/list` requests on one tunnel.
+    inflight: InflightKeys,
+}
+
+/// Tool sets discovered from client servers, keyed `(channel_id, declared_name)`.
+type ToolsCache = Arc<std::sync::Mutex<HashMap<(String, String), Vec<Tool>>>>;
+
+/// `(channel_id, declared_name)` pairs with a discovery fetch already running.
+type InflightKeys = Arc<std::sync::Mutex<HashSet<(String, String)>>>;
+
+/// Sort a tool set by name: the catalog is user-visible and `HashMap` iteration
+/// order would otherwise reshuffle it between runs.
+fn sorted(tools: impl IntoIterator<Item = Tool>) -> Vec<Tool> {
+    let mut out: Vec<Tool> = tools.into_iter().collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
 }
 
 impl AcpTunnelSource {
@@ -133,7 +161,59 @@ impl AcpTunnelSource {
         } else {
             policy_from_config(entries)
         };
-        Self { tunnel, policy }
+        Self {
+            tunnel,
+            policy,
+            cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            inflight: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// Fetch one server's real `tools/list` in the background and cache it
+    /// (§6.3). Cheap to call on every discovery round: it is a no-op while a
+    /// fetch for the same `(channel, name)` is already in flight.
+    ///
+    /// What lands in the cache is what the server published — **unfiltered**.
+    /// The policy is applied when the catalog is read, so caching is never
+    /// itself a grant: an entry for a tool the operator did not permit stays
+    /// invisible and uncallable.
+    fn spawn_discovery(&self, channel_id: &str, name: &str, server_id: &str) {
+        // Outside a tokio runtime (unit tests calling tools() directly) there is
+        // nothing to spawn onto; discovery is best-effort, so skip quietly.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let key = (channel_id.to_string(), name.to_string());
+        {
+            let mut inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            if !inflight.insert(key.clone()) {
+                return;
+            }
+        }
+        let tunnel = self.tunnel.clone();
+        let cache = self.cache.clone();
+        let inflight = self.inflight.clone();
+        let server_id = server_id.to_string();
+        let channel = key.0.clone();
+        handle.spawn(async move {
+            let fetched = tunnel
+                .call(&channel, &server_id, "tools/list", None)
+                .await
+                .ok()
+                .and_then(|v| serde_json::from_value::<Vec<Tool>>(v.get("tools")?.clone()).ok());
+            if let Some(tools) = fetched {
+                cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key.clone(), tools);
+            }
+            // Always clear the flag: a failed fetch must be retryable on the
+            // next discovery round, not wedged as permanently "in flight".
+            inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+        });
     }
 
     /// Split a published tool name into `(server_name, full_tool_name)`. The
@@ -164,8 +244,8 @@ impl CapabilitySource for AcpTunnelSource {
         "openab-browser"
     }
 
-    /// The advertised catalog: every tool the trust policy pins, for every
-    /// allowlisted server.
+    /// The advertised catalog: for every allowlisted server, its discovered
+    /// tool set if one has been cached, else its policy seed.
     ///
     /// Deliberately **not** intersected with the tunnels currently attached.
     /// Attachment flapping must not reach the catalog (§6.3) — a tab that is
@@ -174,21 +254,54 @@ impl CapabilitySource for AcpTunnelSource {
     /// shrinking tool list. This keeps the pre-attach discovery behaviour the
     /// static-advertise design (D4) already had.
     ///
-    /// Session *scope* — restricting the catalog to the servers this client
-    /// actually declared — is a different axis and needs the per-`(channel_id,
-    /// server_id)` declaration cache that F3′ introduces; until then an
-    /// allowlisted server's pinned tools are advertised to every session, which
-    /// is exactly the status quo for the browser.
-    fn tools(&self, _ctx: Option<&SessionCtx>) -> Vec<Tool> {
-        let mut out: Vec<Tool> = self
-            .policy
-            .values()
-            .flat_map(|p| p.seed.iter().cloned())
+    /// Discovery is *pull*-triggered rather than attach-triggered: a declared
+    /// server with no cache entry yet gets a background `tools/list` fetch
+    /// kicked off here, and its real set appears on the next discovery round.
+    /// The facade re-reads the catalog on every call, so one round of staleness
+    /// is the whole cost, and it avoids threading an attach hook from the
+    /// gateway (which owns attach) into the root (which owns this source).
+    fn tools(&self, ctx: Option<&SessionCtx>) -> Vec<Tool> {
+        // Anonymous clients never reach here in practice (`requires_session`),
+        // and with no channel there is nothing to discover — serve the seeds.
+        let Some(ctx) = ctx else {
+            return sorted(self.policy.values().flat_map(|p| p.seed.iter().cloned()));
+        };
+
+        // name -> server_id for the tunnels attached to this session. Same-name
+        // duplicates cannot occur (last-attach-wins, §6.1).
+        let attached: HashMap<String, String> = self
+            .tunnel
+            .servers(&ctx.channel_id)
+            .into_iter()
             .collect();
-        // Stable order: the catalog is user-visible and a HashMap iteration
-        // order would reshuffle it between runs.
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        out
+
+        let mut out: Vec<Tool> = Vec::new();
+        for (name, policy) in &self.policy {
+            let cached = self
+                .cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(ctx.channel_id.clone(), name.clone()))
+                .cloned();
+            match cached {
+                // `fetched ∩ allowed` — the cache narrows the catalog to what the
+                // server actually publishes and can never widen it past policy.
+                Some(fetched) => out.extend(
+                    fetched
+                        .into_iter()
+                        .filter(|t| policy.allowed.contains(t.name.as_ref())),
+                ),
+                None => {
+                    // Nothing discovered yet: advertise the seed (never empty out a
+                    // seeded server) and kick off the fetch if it is attached.
+                    out.extend(policy.seed.iter().cloned());
+                    if let Some(server_id) = attached.get(name) {
+                        self.spawn_discovery(&ctx.channel_id, name, server_id);
+                    }
+                }
+            }
+        }
+        sorted(out)
     }
 
     async fn call(
@@ -280,21 +393,51 @@ mod tests {
     use serde_json::{json, Map, Value};
     use std::sync::Arc;
 
-    /// Tunnel double: reports one declared server and records what was forwarded.
+    /// Tunnel double: reports declared servers, records forwarded `tools/call`s,
+    /// and can answer or fail `tools/list`.
     struct FakeTunnel {
-        servers: Vec<(String, String)>,
+        servers: std::sync::Mutex<Vec<(String, String)>>,
         forwarded: std::sync::Mutex<Vec<(String, String, Value)>>,
+        tools_list: std::sync::Mutex<Option<Vec<String>>>,
+        tools_list_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl FakeTunnel {
         fn with(servers: &[(&str, &str)]) -> Arc<Self> {
             Arc::new(Self {
-                servers: servers
-                    .iter()
-                    .map(|(n, i)| (n.to_string(), i.to_string()))
-                    .collect(),
+                servers: std::sync::Mutex::new(
+                    servers
+                        .iter()
+                        .map(|(n, i)| (n.to_string(), i.to_string()))
+                        .collect(),
+                ),
                 forwarded: std::sync::Mutex::new(Vec::new()),
+                tools_list: std::sync::Mutex::new(None),
+                tools_list_calls: std::sync::atomic::AtomicUsize::new(0),
             })
+        }
+
+        /// Make `tools/list` answer with these tool names.
+        fn set_tools_list(&self, names: &[&str]) {
+            *self.tools_list.lock().unwrap() =
+                Some(names.iter().map(|n| n.to_string()).collect());
+        }
+
+        /// Make `tools/list` fail (no answer configured).
+        fn fail_tools_list(&self) {
+            *self.tools_list.lock().unwrap() = None;
+        }
+
+        fn tools_list_calls(&self) -> usize {
+            self.tools_list_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Simulate a reconnect: same declared name, freshly minted id.
+        fn reattach_as(&self, name: &str, new_id: &str) {
+            let mut servers = self.servers.lock().unwrap();
+            servers.retain(|(n, _)| n != name);
+            servers.push((name.to_string(), new_id.to_string()));
         }
     }
 
@@ -304,9 +447,21 @@ mod tests {
             &self,
             channel_id: &str,
             server_id: &str,
-            _method: &str,
+            method: &str,
             params: Option<Value>,
         ) -> Result<Value, String> {
+            if method == "tools/list" {
+                self.tools_list_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let Some(names) = self.tools_list.lock().unwrap().clone() else {
+                    return Err("tools/list unavailable".into());
+                };
+                let tools: Vec<Value> = names
+                    .iter()
+                    .map(|n| json!({ "name": n, "inputSchema": { "type": "object" } }))
+                    .collect();
+                return Ok(json!({ "tools": tools }));
+            }
             self.forwarded.lock().unwrap().push((
                 channel_id.to_string(),
                 server_id.to_string(),
@@ -316,7 +471,7 @@ mod tests {
         }
 
         fn servers(&self, _channel_id: &str) -> Vec<(String, String)> {
-            self.servers.clone()
+            self.servers.lock().unwrap().clone()
         }
     }
 
@@ -518,6 +673,111 @@ mod tests {
             .unwrap();
         assert!(is_err, "browser is no longer allowlisted once config is written");
         assert!(tunnel.forwarded.lock().unwrap().is_empty());
+    }
+
+    /// Let any spawned discovery task run to completion.
+    async fn settle() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_fills_the_catalog_for_a_name_only_server() {
+        // `notes` was admitted by name alone, so it starts with no seed. After a
+        // discovery round its real tools/list is cached and appears.
+        let tunnel = FakeTunnel::with(&[("notes", "uuid-n")]);
+        tunnel.set_tools_list(&["notes.list", "notes.get"]);
+        let src = AcpTunnelSource::with_config(tunnel.clone(), &[cfg("notes", &["notes.list"])]);
+
+        assert!(src.tools(Some(&ctx())).is_empty(), "nothing discovered yet");
+        settle().await;
+
+        let names: Vec<String> = src
+            .tools(Some(&ctx()))
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            ["notes.list"],
+            "fetched ∩ allowed — notes.get was published but never permitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn caching_is_never_itself_a_grant() {
+        // The server publishes a tool the operator did not permit. Caching it
+        // must not make it visible OR callable.
+        let tunnel = FakeTunnel::with(&[("browser", "uuid-abc")]);
+        tunnel.set_tools_list(&["browser.read_dom", "browser.exec"]);
+        let src =
+            AcpTunnelSource::with_config(tunnel.clone(), &[cfg("browser", &["browser.read_dom"])]);
+        let _ = src.tools(Some(&ctx()));
+        settle().await;
+
+        let names: Vec<String> = src
+            .tools(Some(&ctx()))
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert_eq!(names, ["browser.read_dom"], "the unpermitted tool stays out");
+
+        let (_v, is_err) = src
+            .call(Some(&ctx()), "browser.exec", &Map::new())
+            .await
+            .unwrap();
+        assert!(is_err, "and it stays uncallable even though it was cached");
+    }
+
+    #[tokio::test]
+    async fn a_seeded_server_keeps_its_seed_until_discovery_succeeds() {
+        // Fetch fails: the catalog must fall back to the seed, never to empty.
+        let tunnel = FakeTunnel::with(&[("browser", "uuid-abc")]);
+        tunnel.fail_tools_list();
+        let src = AcpTunnelSource::with_config(tunnel.clone(), &[]);
+        assert_eq!(src.tools(Some(&ctx())).len(), 5);
+        settle().await;
+        assert_eq!(
+            src.tools(Some(&ctx())).len(),
+            5,
+            "a failed discovery must not empty out a seeded server"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_is_not_repeated_while_one_is_in_flight() {
+        let tunnel = FakeTunnel::with(&[("browser", "uuid-abc")]);
+        tunnel.set_tools_list(&["browser.read_dom"]);
+        let src = AcpTunnelSource::with_config(tunnel.clone(), &[]);
+        for _ in 0..5 {
+            let _ = src.tools(Some(&ctx()));
+        }
+        settle().await;
+        assert_eq!(
+            tunnel.tools_list_calls(),
+            1,
+            "repeated discovery rounds must not pile up tools/list requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_tools_survive_a_reconnect_that_changes_the_server_id() {
+        // The whole point of keying the cache by NAME: the client mints a new id
+        // on reconnect, and an id-keyed entry would be orphaned by it.
+        let tunnel = FakeTunnel::with(&[("browser", "uuid-old")]);
+        tunnel.set_tools_list(&["browser.read_dom"]);
+        let src = AcpTunnelSource::with_config(tunnel.clone(), &[]);
+        let _ = src.tools(Some(&ctx()));
+        settle().await;
+        assert_eq!(src.tools(Some(&ctx())).len(), 1);
+
+        tunnel.reattach_as("browser", "uuid-new");
+        assert_eq!(
+            src.tools(Some(&ctx())).len(),
+            1,
+            "the discovered set must survive the id change"
+        );
     }
 
     #[tokio::test]
