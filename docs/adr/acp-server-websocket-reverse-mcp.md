@@ -151,6 +151,25 @@ Three pieces already generalize and are reused as-is:
 - Rename the core trait `BrowserTunnel` → **`AcpMcpTunnel`**; `call(channel_id, server_id, method, params)`.
 - Evict all `(channel_id, *)` entries on session teardown.
 
+**`id` and `name` are different things, and routing needs both.** A declaration is
+`{type:"acp", id, name}`, and the two fields have very different lifetimes — the reference client mints
+`id` as a fresh `crypto.randomUUID()` **per connection** while `name` (`"browser"`) is stable across
+reconnects. The registry key is the **`id`**; the `<server>` segment of a tool name (`browser.click`)
+and the §6.4 allowlist are the **`name`**. Consequences, all confirmed by review 2026-07-26:
+
+- The registry stays keyed by `(channel_id, id)` — keying by `name` would let two same-name tunnels
+  overwrite each other, reintroducing exactly the fan-out collapse this section fixes — but it must
+  **also record the declared `name`**, so a source can enumerate `(name, id)` for a channel and resolve
+  a tool prefix to a tunnel. Routing purely on the registry key cannot work: the key is a UUID the tool
+  name never contains.
+- Trust gating (§6.4) is keyed by **`name`**. An allowlist of `id`s is meaningless when they are
+  per-connection UUIDs.
+- **Same-name collisions resolve last-attach-wins (LWW):** a newly attached tunnel whose `name` matches
+  an existing one on the same channel **replaces and evicts** the older entry. Because the client mints
+  a new `id` on every reconnect, the stale entry would otherwise linger beside the live one; answering
+  "ambiguous, disambiguate by server_id" there would wedge the client out of its own tools on every
+  reconnect. LWW keeps reconnect self-healing; the eviction is what stops unbounded growth.
+
 ### 6.2 Downstream exposure — one `CapabilitySource` behind the OAB MCP Facade
 
 > **Revised 2026-07-26.** An earlier draft of §6.2–§6.5 proposed a bespoke path: per-`(session, server)`
@@ -190,10 +209,14 @@ Reverse-MCP adds:         acp-tunnel(channel_id, server_id)     ← client diall
   (`facade::serve_http_with(addr, sources, tokens)`; there is no runtime registration API), so a source
   *per* client-declared server is not possible — and not needed. `AcpTunnelSource` fans out internally:
   `tools(ctx)` returns the tools of **every** `type:acp` server declared by the client of that
-  `channel_id`, and `call` routes on the **`<server>.<tool>`** prefix to the matching
-  `(channel_id, server_id)` tunnel (§6.1). Today's names (`browser.click`, `browser.read_dom`) already
-  carry the server segment, so this generalizes with no renaming; the facade additionally publishes a
-  `<provider>:<tool>` form to resolve shadowing against `mcp.json` servers.
+  `channel_id`, and `call` routes on the **`<server>.<tool>`** prefix to the matching tunnel. Today's
+  names (`browser.click`, `browser.read_dom`) already carry the server segment, so this generalizes
+  with no renaming — but note the segment is the declared **`name`**, not the registry key: resolving
+  it to a tunnel goes `name` → `(channel_id, id)` via the recorded declaration (§6.1), never straight
+  to the key. The tool name forwarded over the tunnel stays the **full** name the server published
+  (`browser.click`), since that is what the server's own `tools/call` expects; the prefix selects the
+  tunnel, it is not stripped. The facade additionally publishes a `<provider>:<tool>` form to resolve
+  shadowing against `mcp.json` servers.
 - **Adding another client-side MCP service is therefore declaration + policy work, not architecture
   work.** The source must contain no browser-specific branch.
 
