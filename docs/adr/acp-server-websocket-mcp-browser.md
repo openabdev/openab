@@ -37,6 +37,15 @@ Five **DOM-semantic** MCP tools, served by the extension: `browser.read_dom` (sn
 
 ## 3. Design decisions (D1–D6)
 
+> **Supersession notice (2026-07-26).** D2, D3 and D5 describe the **as-shipped** delivery path: a
+> per-`acp:`-session loopback MCP proxy that openab registers in each agent's native MCP config. That
+> path is superseded by the OAB MCP Facade integration in
+> [reverse-MCP ADR §6.2](./acp-server-websocket-reverse-mcp.md): browser becomes one session-aware
+> `CapabilitySource` behind the facade, and session identity moves to the facade's `SessionTokens`
+> (broker-minted bearer per session) instead of a per-session port + self-written `mcp.json` entry. The
+> decisions below remain the record of why the shipped design looks the way it does; D6's trait split
+> (core defines, root implements) carries over unchanged.
+
 - **D1 — permission model.** Auto-approve **all** browser tool permissions for now: core keeps
   auto-replying `session/request_permission` with OK. Fine-grained consent is deferred. Consequence:
   a dedicated `request_permission`-relay task is **dropped**, but the server→client request machinery
@@ -56,12 +65,13 @@ Five **DOM-semantic** MCP tools, served by the extension: `browser.read_dom` (sn
 - **D4 — lifecycle: the WS may connect *after* session start.** Core's HTTP MCP server is always-on
   and decoupled from the extension WS. As shipped, browser tools are **static-advertised** regardless
   of WS state (a `tools/call` with no extension attached returns an MCP error "browser not connected").
-  `notifications/tools/list_changed` on attach/detach is **designed but not yet implemented** — no code
-  emits it today (grep `list_changed` → 0 hits in the gateway/core crates); it is tracked as P2b in
-  [reverse-MCP ADR §6.2](./acp-server-websocket-reverse-mcp.md). **Superseded as the default:** the
-  generic design ([reverse-MCP ADR §6.2](./acp-server-websocket-reverse-mcp.md)) drops static-advertise
-  as the default in favour of dynamic `tools/list` forwarding + `list_changed`, keeping static-advertise
-  as an opt-in for the browser case.
+  `notifications/tools/list_changed` on attach/detach is **designed but never implemented** — no code
+  emits it (grep `list_changed` → 0 hits in the gateway/core crates). **Resolved 2026-07-26: it is
+  dropped, not deferred.** Under the OAB MCP Facade the agent discovers capabilities by *calling*
+  `search_capabilities`, so discovery is pull-based and there is no cached tool list for a notification
+  to invalidate. The static-advertise posture is **kept** — implemented as fetch-once-per-declared-server
+  plus a per-`(channel_id, server_id)` cache, with backend unavailability reported as a call error. See
+  [reverse-MCP ADR §6.3](./acp-server-websocket-reverse-mcp.md).
 - **D5 — per-session MCP server.** The pool starts one loopback Streamable-HTTP MCP proxy per `acp:`
   session at agent spawn, constructing the `ProxyHandler` with that session's `channel_id` so
   correlation is implicit. Server lifetime is tied to the `AcpConnection` via a `CancellationToken`

@@ -151,42 +151,129 @@ Three pieces already generalize and are reused as-is:
 - Rename the core trait `BrowserTunnel` → **`AcpMcpTunnel`**; `call(channel_id, server_id, method, params)`.
 - Evict all `(channel_id, *)` entries on session teardown.
 
-### 6.2 Dynamic tool discovery (supersedes static-advertise as the default)
-- Each per-server proxy's `tools/list` forwards the client server's **real** tool list over its tunnel.
-- **Unattached / reconnecting:** return an empty list for that server — never fabricate tools.
-- **Attach → refresh:** on tunnel attach (or client re-declare on `session/resume`), push
-  `notifications/tools/list_changed` downstream so the agent re-lists. This preserves the
-  "usable before/without attach" UX that the browser's static-advertise (D4) gave, honestly.
-- Keep a per-server **cache** of the last good `tools/list` to survive brief reconnects; **debounce**
-  `list_changed` against reconnect storms.
-- The browser's static-advertise stays only as an **opt-in** fallback for the browser case; it is no
-  longer the default.
+### 6.2 Downstream exposure — one `CapabilitySource` behind the OAB MCP Facade
 
-### 6.3 Per-server downstream exposure (Option B — decided)
-Each declared client server is surfaced to the agent as its **own** MCP server entry (`openab-<name>`),
-not merged into one namespaced blob:
-- **proxy mode (HTTP):** one loopback MCP server per `(session, server)`, its own port + bearer;
-  openab writes **N entries** into the agent's native MCP config, one per server.
-- **bridge mode (stdio):** the static entry gains a selector —
-  `{"command":"openab","args":["mcp-bridge","--server","<id>"]}` — one relay per server (rename the
-  `browser-bridge` subcommand to `mcp-bridge`, keeping `browser-bridge` as a compat alias).
+> **Revised 2026-07-26.** An earlier draft of §6.2–§6.5 proposed a bespoke path: per-`(session, server)`
+> loopback MCP proxies, openab writing N entries into the agent's MCP config, dynamic `tools/list` with
+> `notifications/tools/list_changed`. That is **superseded**. The
+> [OAB MCP Facade](../oab-mcp-facade.md) (OAB MCP Adapter ADR, #1446; facade #1448/#1453) and its
+> **session-aware in-process capability sources** (#1454) already provide the multi-provider catalog,
+> discovery, policy runtime (schema validation, timeouts, circuit breaking, redaction, audit) and
+> lifecycle this section was about to reinvent. Reverse-MCP-over-ACP contributes the one thing the
+> facade lacks: a **transport for providers that cannot listen and are dialled in by the client**.
 
-Rejected — **Option A** (one aggregating proxy, `<server>__<tool>` namespacing): the prefix leaks into
-the tool names the model sees and needs reversible de-namespacing on every call. Option B is cleaner
-for the LLM and maps to MCP's native "one server = one connection" model. (A stays a possible future mode.)
+```
+Facade providers today:   stdio(command)   http(url)            ← openab dials OUT
+Reverse-MCP adds:         acp-tunnel(channel_id, server_id)     ← client dialled IN, openab tunnels
+```
 
-### 6.4 Backward compatibility
-The browser extension is unchanged: it declares `{type:acp, id, name:"openab-browser"}` and serves its
-five DOM tools via its own `tools/list` — now discovered dynamically instead of static-advertised. Both
-downstream modes are retained; single-server (browser-only) sessions behave identically.
+**Decision: expose every client-declared `type:acp` server through a single in-process
+`CapabilitySource` — `AcpTunnelSource` — registered once with the facade.**
 
-### 6.5 Generic implementation plan (folded into #1447)
-- **P1** compound-key registry + `serverId` on the tunnel trait (no behaviour change; browser stays single).
-- **P2** dynamic `tools/list` forwarding + per-server cache + `list_changed` attach/detach lifecycle.
-- **P3** per-server downstream exposure (Option B) in both proxy + bridge modes; loop config-writing.
-- **P4** generalize naming (`AcpMcpTunnel`, `openab-<name>`, `openab mcp-bridge`) + error strings.
-- **P5** e2e: a second, non-browser `type:acp` MCP server declared alongside the browser — both
-  discovered and callable in one session.
+- The seam is `openab-mcp`'s `CapabilitySource` (`provider()` / `tools(ctx)` / `call(ctx, tool, args)` /
+  `requires_session()`), with `SessionCtx { channel_id }` identifying the owning chat session. This is
+  precisely the case #1454 was built for ("browser control, where `browser.click` must reach *that
+  conversation's* browser tab").
+- `AcpTunnelSource` lives in the **root binary**, where the tunnel state (`AcpTunnelRegistry`) already
+  lives — keeping `openab-core` and `openab-gateway` sibling-independent, as with `RootBrowserTunnel`.
+- `requires_session() == true`: anonymous facade clients neither discover nor can execute these tools.
+- **One source, N servers.** Facade sources are registered **once at construction**
+  (`facade::serve_http_with(addr, sources, tokens)`; there is no runtime registration API), so a source
+  *per* client-declared server is not possible — and not needed. `AcpTunnelSource` fans out internally:
+  `tools(ctx)` returns the tools of **every** `type:acp` server declared by the client of that
+  `channel_id`, and `call` routes on the **`<server>.<tool>`** prefix to the matching
+  `(channel_id, server_id)` tunnel (§6.1). Today's names (`browser.click`, `browser.read_dom`) already
+  carry the server segment, so this generalizes with no renaming; the facade additionally publishes a
+  `<provider>:<tool>` form to resolve shadowing against `mcp.json` servers.
+- **Adding another client-side MCP service is therefore declaration + policy work, not architecture
+  work.** The source must contain no browser-specific branch.
+
+**Session identity** is the facade's `SessionTokens`: the broker mints one opaque bearer per agent
+session, writes it into that agent's MCP client config pointing at the facade, and revokes it on
+session evict; the facade resolves the header back to a `SessionCtx` per request. This **replaces** the
+bespoke per-session loopback proxy, its self-minted port/bearer, and openab's own `openab-browser`
+`mcp.json` write/strip logic.
+
+### 6.3 Tool discovery — fetch once per declared server, then serve from cache
+
+The facade's discovery is **pull-based**: the agent sees only `search_capabilities` /
+`execute_capability` and re-reads the catalog on each call. Two consequences:
+
+- **`notifications/tools/list_changed` is dropped.** There is no cached client-side tool list to
+  invalidate, so the notification has no consumer. (The earlier draft's `list_changed` lifecycle,
+  debouncing included, is removed rather than deferred.)
+- **Static-advertise is the right posture**, per the facade's source contract — but implemented as
+  *dynamically sourced, then cached*, because tools for arbitrary declared servers cannot be hardcoded:
+  on declare/attach, fetch the server's real `tools/list` over its tunnel and **cache it per
+  `(channel_id, server_id)`**; serve `tools(ctx)` from that cache **regardless of current attach
+  state**. Backend unavailability surfaces as a **call error** ("browser not connected"), never as a
+  vanishing catalog entry.
+
+Distinguish two kinds of variation: **session scope** (which servers *this* session's client declared)
+is legitimate and is exactly what `tools(ctx)` expresses; **attachment flapping** (is the tab connected
+this second) must not reach the catalog. If nothing is cached yet — declared but not attached at first
+discovery — that server contributes an empty set. An optional refinement, requiring a client wire
+change, is to carry a tool manifest in the `initialize` declaration so the catalog is known without a
+round-trip.
+
+### 6.4 Trust — client-declared tool sets need an operator gate
+
+#1454 states that source registration *is* the operator's grant, and that sources therefore carry no
+per-source `tool_filter`. That assumption holds for code-wired sources whose tool set the operator
+chose. It **does not hold** for `AcpTunnelSource`, whose tool set is declared by a **remote client**: a
+connected extension could otherwise publish arbitrary tools into the agent's capability catalog.
+
+Therefore this ADR requires, before the source is enabled by default:
+
+- an operator **allowlist** of accepted declared server names (default: `browser` only) — declarations
+  outside it are ignored with a logged warning; and
+- a per-declared-server **`tool_filter`**, mirroring `mcp.json` least-privilege semantics.
+
+### 6.5 Backward compatibility & what this retires
+
+The browser extension is **unchanged**: it declares `{type:acp, id, name}` and serves its five DOM
+tools over the tunnel. What changes is on the openab side — browser tools reach the agent through the
+facade's meta-tools rather than a dedicated per-session MCP server.
+
+Retired once this lands: the per-session `mcp_proxy` browser server, its port/bearer minting, and the
+`openab-browser` `mcp.json` injection. The **stdio bridge mode** (`OPENAB_BROWSER_MODE=bridge`,
+`openab browser-bridge`) exists because some CLIs preferred a stdio entry; the facade is a loopback
+HTTP MCP server that those CLIs read directly, so bridge mode is likely redundant — its removal is
+**not** decided here and requires an explicit operator call.
+
+**Open question (not decided).** Under the facade the LLM reaches a browser action via
+`search_capabilities` → `execute_capability`, one hop more per turn than today's direct
+`browser.click`. Recommendation: ship on the meta-tool path (uniform policy, one audit surface) and
+revisit a per-provider "expose directly" option only if interactive browser latency proves it needed.
+
+### 6.6 Status — as-built vs remaining
+
+**As-built (`bf37d25e`, `74e23f0e`): Facade mode is the default transport.** `src/browser_source.rs`
+implements `CapabilitySource` over the existing `AcpMcpTunnel` — `requires_session()`, static-advertise
+per §6.3, tunnel failures surfaced as MCP error results — and a `FacadeRegistrar` adapts the facade's
+`SessionTokens` to a `SessionTokenRegistrar` hook in core, so `openab-core` stays free of an
+`openab-mcp` dependency. `BrowserMode::Facade` is the new default (falling back to `Proxy` when no
+facade is serving); `write_facade_mcp_config` writes a **static, write-once `openab` entry** whose
+`Authorization` references `${OPENAB_SESSION_TOKEN}`, so the per-session secret rides the agent's
+process environment rather than a config file — which also removes the shared-workdir exposure of the
+old per-session `mcp.json` write. Capabilities publish under the provider name `openab`. Proxy and
+Option C bridge modes remain as explicit `OPENAB_BROWSER_MODE` opt-outs. This covers §6.2's source seam
+and session identity for the **browser** case.
+
+**Remaining to fulfil this section:**
+- **F1′ generalize the source to N client-declared servers.** Today it serves the fixed
+  `browser_tools()` set for one implicit server. Extend to every `type:acp` server the session's client
+  declared, routing on the `<server>.<tool>` prefix to `(channel_id, server_id)` (§6.1/§6.2), with no
+  browser-specific branch left in the source.
+- **F3′ per-`(channel_id, server_id)` discovery cache** — fetch each declared server's real `tools/list`
+  once on attach and serve from cache (§6.3). Required by F1′: a hardcoded tool table cannot describe
+  arbitrary declared servers.
+- **F4 trust gate** — operator allowlist (default `browser` only) + per-declared-server `tool_filter`
+  (§6.4). Should land with F1′, since F1′ is what makes client-declared tool sets reachable.
+- **F5 cleanup** — retire the superseded per-session proxy path once Facade mode has soaked; bridge-mode
+  removal stays an explicit operator call (§6.5).
+- **F6 e2e** — browser + a second client-declared server + a host-level `mcp.json` provider coexisting,
+  and two concurrent sessions each reaching only their own browser.
 
 ## 7. Alternatives considered
 
