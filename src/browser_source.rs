@@ -390,6 +390,7 @@ impl openab_core::mcp_proxy::SessionTokenRegistrar for FacadeRegistrar {
 mod tests {
     use super::{AcpTunnelSource, CapabilitySource, SessionCtx};
     use openab_core::mcp_proxy::AcpMcpTunnel;
+    use std::collections::HashSet;
     use serde_json::{json, Map, Value};
     use std::sync::Arc;
 
@@ -431,6 +432,11 @@ mod tests {
         fn tools_list_calls(&self) -> usize {
             self.tools_list_calls
                 .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Simulate a server going away (tab closed, client disconnected).
+        fn detach(&self, name: &str) {
+            self.servers.lock().unwrap().retain(|(n, _)| n != name);
         }
 
         /// Simulate a reconnect: same declared name, freshly minted id.
@@ -778,6 +784,126 @@ mod tests {
             1,
             "the discovered set must survive the id change"
         );
+    }
+
+    // --- F6: two client-declared servers in one session ---
+    //
+    // The multi-server claim §6.2 makes, exercised through the real source: one
+    // session declares `browser` and a second, non-browser server; both are
+    // discovered and callable, tool names do not collide, and each server's
+    // policy is enforced independently. The agent-side leg (facade meta-tools →
+    // this source) is not covered here — facade mode is not live anywhere yet,
+    // which is the same precondition F5 is blocked on.
+
+    fn two_server_src(tunnel: Arc<FakeTunnel>) -> AcpTunnelSource {
+        AcpTunnelSource::with_config(
+            tunnel,
+            &[
+                cfg("browser", &["browser.click", "browser.read_dom"]),
+                cfg("notes", &["notes.list"]),
+            ],
+        )
+    }
+
+    #[tokio::test]
+    async fn two_declared_servers_are_both_discovered_without_collision() {
+        let tunnel = FakeTunnel::with(&[("browser", "uuid-b"), ("notes", "uuid-n")]);
+        // Both servers publish a tool literally called `list` under their own
+        // prefix — the case a naive un-prefixed catalog would collapse.
+        tunnel.set_tools_list(&["browser.click", "browser.read_dom", "notes.list"]);
+        let src = two_server_src(tunnel.clone());
+
+        let _ = src.tools(Some(&ctx()));
+        settle().await;
+
+        let names: Vec<String> = src
+            .tools(Some(&ctx()))
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            ["browser.click", "browser.read_dom", "notes.list"],
+            "both servers contribute, each under its own prefix"
+        );
+        assert_eq!(
+            names.len(),
+            names.iter().collect::<HashSet<_>>().len(),
+            "no duplicate tool names across servers"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_server_receives_only_its_own_calls() {
+        let tunnel = FakeTunnel::with(&[("browser", "uuid-b"), ("notes", "uuid-n")]);
+        let src = two_server_src(tunnel.clone());
+
+        for tool in ["browser.click", "notes.list"] {
+            let (_v, is_err) = src.call(Some(&ctx()), tool, &Map::new()).await.unwrap();
+            assert!(!is_err, "{tool} should dispatch");
+        }
+
+        let fwd = tunnel.forwarded.lock().unwrap();
+        let routed: Vec<(String, String)> = fwd
+            .iter()
+            .map(|(_c, id, params)| (id.clone(), params["name"].as_str().unwrap().to_string()))
+            .collect();
+        assert_eq!(
+            routed,
+            [
+                ("uuid-b".to_string(), "browser.click".to_string()),
+                ("uuid-n".to_string(), "notes.list".to_string())
+            ],
+            "each tool reaches the tunnel of the server that declared it"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_servers_policy_does_not_leak_to_another() {
+        // `browser.click` is permitted, `notes.click` is not — a per-server gate,
+        // not a global tool-name gate.
+        let tunnel = FakeTunnel::with(&[("browser", "uuid-b"), ("notes", "uuid-n")]);
+        let src = two_server_src(tunnel.clone());
+
+        let (_v, ok_err) = src
+            .call(Some(&ctx()), "browser.click", &Map::new())
+            .await
+            .unwrap();
+        assert!(!ok_err);
+
+        let (v, denied) = src
+            .call(Some(&ctx()), "notes.click", &Map::new())
+            .await
+            .unwrap();
+        assert!(denied, "notes may not borrow browser's permissions");
+        assert!(v["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("is not permitted"));
+        assert_eq!(
+            tunnel.forwarded.lock().unwrap().len(),
+            1,
+            "only the permitted call reached a tunnel"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_server_detaching_leaves_the_other_callable() {
+        let tunnel = FakeTunnel::with(&[("browser", "uuid-b"), ("notes", "uuid-n")]);
+        let src = two_server_src(tunnel.clone());
+        tunnel.detach("browser");
+
+        let (_v, browser_err) = src
+            .call(Some(&ctx()), "browser.click", &Map::new())
+            .await
+            .unwrap();
+        assert!(browser_err, "the detached server reports not connected");
+
+        let (_v, notes_err) = src
+            .call(Some(&ctx()), "notes.list", &Map::new())
+            .await
+            .unwrap();
+        assert!(!notes_err, "its neighbour is unaffected");
     }
 
     #[tokio::test]
