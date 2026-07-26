@@ -18,6 +18,24 @@ to use**; `proxy` and `bridge` predate it and are kept as explicit opt-outs.
 With no `[mcp]` section in `config.toml` the facade is not serving, and facade mode falls back to
 `proxy` automatically.
 
+> ⚠️ **Switching modes does not clean up the previous mode's config entry, and a leftover entry
+> silently bypasses the facade.** Each writer only adds its own entry — facade mode writes `openab`,
+> bridge mode writes `openab-browser` — and neither removes the other's. An agent whose `mcp.json`
+> still carries a stale `openab-browser` entry loads **both** servers, so the same
+> `katashiro.*` tools are reachable twice: once through the facade (policy + audit) and once
+> directly through the old transport (**neither**). The model will happily call the direct one,
+> and every trace of that call is missing from the audit log while the tool works perfectly.
+>
+> After changing `OPENAB_BROWSER_MODE`, remove the other mode's entry from each agent's config:
+>
+> ```sh
+> # leaving facade mode's entry only
+> jq 'del(.mcpServers["openab-browser"])' "$HOME/.cursor/mcp.json"
+> jq 'del(.mcpServers["openab-browser"])' "$HOME/.kiro/settings/mcp.json"
+> ```
+>
+> Symptom to watch for: browser tools work, but no `mcp.audit` line is ever emitted for them.
+
 ---
 
 ## Facade mode (default)
