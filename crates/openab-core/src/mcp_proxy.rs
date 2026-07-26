@@ -44,6 +44,23 @@ pub trait AcpMcpTunnel: Send + Sync {
         method: &str,
         params: Option<Value>,
     ) -> Result<Value, String>;
+
+    /// The `type:acp` servers currently registered for `channel_id`, as `(declared_name,
+    /// server_id)` pairs.
+    ///
+    /// Both halves are needed and they are *not* interchangeable (ADR §6.1): the registry is keyed
+    /// by the client-minted `server_id`, which the reference client mints as a fresh UUID **per
+    /// connection**, while a tool name carries the stable declared **name** (`browser.click`) and
+    /// the §6.4 trust gate is keyed by that name too. Enumerating both is what lets a capability
+    /// source resolve a tool prefix back to a tunnel; matching a prefix against the registry key
+    /// alone can never work.
+    ///
+    /// Sync because implementations just read an in-memory registry. The default is empty, so
+    /// implementations that track no declarations (test doubles, single-target bridges) simply
+    /// advertise nothing.
+    fn servers(&self, _channel_id: &str) -> Vec<(String, String)> {
+        Vec::new()
+    }
 }
 
 /// The fixed set of browser tools OpenAB advertises over MCP (D4 static-advertise). DOM-

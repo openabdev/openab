@@ -663,9 +663,20 @@ pub struct TunnelHandle {
     pending: Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     next_id: Arc<AtomicU64>,
     connection_id: String,
+    /// The `name` the client declared for this server (e.g. `"browser"`). Stable across
+    /// reconnects, unlike the `id` the registry keys by — the reference client mints that as a
+    /// fresh UUID per connection. Tool prefixes (`browser.click`) and the §6.4 trust allowlist are
+    /// both keyed by this name, so it must survive registration to be routable (ADR §6.1).
+    server_name: String,
 }
 
 impl TunnelHandle {
+    /// The client-declared server name for this tunnel (see the field docs for why the declared
+    /// name and the registry key are deliberately different things).
+    pub fn server_name(&self) -> &str {
+        &self.server_name
+    }
+
     /// Tunnel an inner MCP request (`tools/list`, `tools/call`, …) to the extension over this
     /// connection and return the inner MCP result payload.
     pub async fn mcp_message(
@@ -705,43 +716,61 @@ impl TunnelHandle {
 /// the client's response, which only that same read loop can deliver — awaiting it inline
 /// would deadlock.
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 async fn establish_and_register_tunnel(
     out_tx: mpsc::UnboundedSender<String>,
     pending: Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     next_id: Arc<AtomicU64>,
     acp_id: String,
+    acp_name: String,
     channel_id: String,
     registry: AcpTunnelRegistry,
     timeout_secs: u64,
 ) -> Result<(), String> {
     // Observability: reaching here means the client DID declare a "type":"acp" server, so this
     // line in the log answers "did the browser extension advertise itself?" for a live session.
-    info!(acp_id = %acp_id, channel_id = %channel_id, "ACP: opening MCP-over-ACP browser tunnel");
+    info!(acp_id = %acp_id, acp_name = %acp_name, channel_id = %channel_id, "ACP: opening MCP-over-ACP tunnel");
     let connection_id = mcp_connect(&out_tx, &pending, &next_id, &acp_id, timeout_secs).await?;
     let handle = TunnelHandle {
         out_tx,
         pending,
         next_id,
         connection_id,
+        server_name: acp_name.clone(),
     };
-    registry
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert((channel_id.clone(), acp_id.clone()), handle);
-    info!(channel_id = %channel_id, server_id = %acp_id, "ACP: browser tunnel registered — extension attached");
+    let evicted = {
+        let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        // Last-attach-wins (ADR §6.1). The client mints a fresh `id` on every connection, so a
+        // reconnect would otherwise leave the dead tunnel registered beside the live one under
+        // the same declared name. Answering "ambiguous — pass a server_id" there would wedge the
+        // client out of its own tools on every reconnect, so the newest attach evicts its stale
+        // same-name predecessors instead — which is also what bounds registry growth.
+        let before = reg.len();
+        reg.retain(|(c, id), h| !(c == &channel_id && h.server_name == acp_name && id != &acp_id));
+        let evicted = before - reg.len();
+        reg.insert((channel_id.clone(), acp_id.clone()), handle);
+        evicted
+    };
+    if evicted > 0 {
+        info!(
+            channel_id = %channel_id, server_name = %acp_name, evicted,
+            "ACP: last-attach-wins — evicted stale same-name tunnel(s)"
+        );
+    }
+    info!(channel_id = %channel_id, server_id = %acp_id, server_name = %acp_name, "ACP: tunnel registered — client MCP server attached");
     Ok(())
 }
 
-/// Open + register the browser tunnel for a session's declared `type:acp` servers.
+/// Open + register a tunnel for **every** `type:acp` server the session's client declared.
 ///
-/// Exactly ONE tunnel per session is supported: the core proxy resolves a browser by
-/// `channel_id`, so registering a second server under the same `channel_id` would overwrite
-/// the first in the registry and orphan its already-opened tunnel. We therefore establish only
-/// the first declared server and warn if the client sent more. Spawned (not awaited inline)
-/// because `establish_and_register_tunnel` awaits the client's `mcp/connect` response, which
-/// only the read loop delivers — awaiting inline would deadlock.
+/// The old "first declared server only" limit came from the registry being keyed by `channel_id`
+/// alone, where a second server would overwrite the first and orphan its open tunnel. The compound
+/// `(channel_id, server_id)` key removed that collision, so all declared servers are established
+/// now; a re-declared *name* is resolved last-attach-wins inside `establish_and_register_tunnel`
+/// (ADR §6.1). Spawned (not awaited inline) because that function awaits the client's
+/// `mcp/connect` response, which only the read loop delivers — awaiting inline would deadlock.
 #[allow(clippy::too_many_arguments)]
-fn spawn_browser_tunnel(
+fn spawn_acp_tunnels(
     servers: Vec<AcpMcpServer>,
     channel_id: String,
     registry: AcpTunnelRegistry,
@@ -750,27 +779,22 @@ fn spawn_browser_tunnel(
     next_id: &Arc<AtomicU64>,
     prompt_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
-    if servers.len() > 1 {
-        warn!(
-            channel_id = %channel_id,
-            count = servers.len(),
-            "ACP: multiple type:acp servers declared; only one browser tunnel per session is supported — using the first"
-        );
+    for srv in servers {
+        let out_tx = out_tx.clone();
+        let pending = pending.clone();
+        let next_id = next_id.clone();
+        let registry = registry.clone();
+        let channel_id = channel_id.clone();
+        prompt_tasks.push(tokio::spawn(async move {
+            if let Err(e) = establish_and_register_tunnel(
+                out_tx, pending, next_id, srv.id, srv.name, channel_id, registry, 30,
+            )
+            .await
+            {
+                warn!(error = %e, "ACP: failed to open MCP-over-ACP tunnel");
+            }
+        }));
     }
-    let Some(srv) = servers.into_iter().next() else {
-        return;
-    };
-    let out_tx = out_tx.clone();
-    let pending = pending.clone();
-    let next_id = next_id.clone();
-    prompt_tasks.push(tokio::spawn(async move {
-        if let Err(e) =
-            establish_and_register_tunnel(out_tx, pending, next_id, srv.id, channel_id, registry, 30)
-                .await
-        {
-            warn!(error = %e, "ACP: failed to open MCP-over-ACP tunnel");
-        }
-    }));
 }
 
 async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
@@ -961,7 +985,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 // inline: `establish_and_register_tunnel` awaits `mcp/connect`, whose response
                 // only THIS read loop delivers — awaiting inline would deadlock.
                 if let Some(registry) = state.acp_tunnel_registry.clone() {
-                    spawn_browser_tunnel(
+                    spawn_acp_tunnels(
                         acp_mcp_servers,
                         channel_id.clone(),
                         registry,
@@ -1003,7 +1027,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         .and_then(|v| v.as_str())
                         .and_then(derive_channel_id)
                     {
-                        spawn_browser_tunnel(
+                        spawn_acp_tunnels(
                             parse_acp_mcp_servers(req.params.as_ref()),
                             channel_id,
                             registry,
@@ -2189,6 +2213,7 @@ mod acp_requests {
             pending: pending.clone(),
             next_id,
             connection_id: "conn-9".into(),
+            server_name: "browser".into(),
         };
 
         let pending2 = pending.clone();
@@ -2231,6 +2256,7 @@ mod acp_requests {
             pending,
             next_id,
             "srv-1".into(),
+            "browser".into(),
             "acp_abc".into(),
             registry.clone(),
             5,
@@ -2239,12 +2265,83 @@ mod acp_requests {
         .unwrap();
         ext.await.unwrap();
 
+        let reg = registry.lock().unwrap();
+        let handle = reg.get(&("acp_abc".to_string(), "srv-1".to_string()));
         assert!(
-            registry
-                .lock()
-                .unwrap()
-                .contains_key(&("acp_abc".to_string(), "srv-1".to_string())),
+            handle.is_some(),
             "a TunnelHandle must be registered under (channel_id, server_id)"
+        );
+        assert_eq!(
+            handle.unwrap().server_name(),
+            "browser",
+            "the declared name must survive registration — tool prefixes and the trust allowlist \
+             match on it, not on the per-connection id"
+        );
+    }
+
+    /// Drive one `establish_and_register_tunnel` against a mock client that answers `mcp/connect`.
+    async fn attach(registry: &super::AcpTunnelRegistry, server_id: &str, name: &str) {
+        let pending = new_pending();
+        let next_id = Arc::new(AtomicU64::new(1));
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        let pending2 = pending.clone();
+        let ext = tokio::spawn(async move {
+            let f: serde_json::Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
+            route_client_response(
+                &pending2,
+                &json!({"jsonrpc":"2.0","id":f["id"],"result":{"connectionId":"conn-1"}}),
+            )
+            .await;
+        });
+        super::establish_and_register_tunnel(
+            out_tx,
+            pending,
+            next_id,
+            server_id.into(),
+            name.into(),
+            "acp_abc".into(),
+            registry.clone(),
+            5,
+        )
+        .await
+        .unwrap();
+        ext.await.unwrap();
+    }
+
+    /// Last-attach-wins (ADR §6.1): the client mints a fresh `id` per connection, so a reconnect
+    /// re-declares the same `name` under a new id. The new tunnel must replace the stale one
+    /// rather than coexist with it — coexistence is what would make routing ambiguous and wedge
+    /// the client out of its own tools on every reconnect.
+    #[tokio::test]
+    async fn reattaching_same_name_evicts_the_stale_tunnel() {
+        let registry = super::new_tunnel_registry();
+        attach(&registry, "uuid-old", "browser").await;
+        attach(&registry, "uuid-new", "browser").await;
+
+        let reg = registry.lock().unwrap();
+        assert_eq!(
+            reg.len(),
+            1,
+            "the reconnect must evict the stale same-name tunnel, not accumulate beside it"
+        );
+        assert!(
+            reg.contains_key(&("acp_abc".to_string(), "uuid-new".to_string())),
+            "the most recently attached tunnel is the one that survives"
+        );
+    }
+
+    /// A different declared name on the same channel is a genuinely different server and must
+    /// coexist — that is the whole point of the compound key (§6.1/§6.2 fan-out).
+    #[tokio::test]
+    async fn different_names_on_one_channel_coexist() {
+        let registry = super::new_tunnel_registry();
+        attach(&registry, "uuid-b", "browser").await;
+        attach(&registry, "uuid-o", "other").await;
+
+        assert_eq!(
+            registry.lock().unwrap().len(),
+            2,
+            "distinct declared names are distinct servers and must both stay registered"
         );
     }
 }
