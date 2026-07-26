@@ -243,10 +243,29 @@ The facade's discovery is **pull-based**: the agent sees only `search_capabiliti
 
 Distinguish two kinds of variation: **session scope** (which servers *this* session's client declared)
 is legitimate and is exactly what `tools(ctx)` expresses; **attachment flapping** (is the tab connected
-this second) must not reach the catalog. If nothing is cached yet — declared but not attached at first
-discovery — that server contributes an empty set. An optional refinement, requiring a client wire
-change, is to carry a tool manifest in the `initialize` declaration so the catalog is known without a
-round-trip.
+this second) must not reach the catalog. An optional refinement, requiring a client wire change, is to
+carry a tool manifest in the `initialize` declaration so the catalog is known without a round-trip.
+
+**Two layers, and the policy table is the lower one** (confirmed by review 2026-07-26; an earlier draft
+of this section said an un-cached server "contributes an empty set", which contradicted the
+static-advertise posture §6.4's pinned sets and D4 both depend on):
+
+- The §6.4 policy entry for a server is its **pre-attach seed** as well as its filter. A server the
+  operator has pinned advertises those tools from the moment the source is registered — it never drops
+  to empty just because nothing has attached yet. This is what preserves D4's "the browser tools are
+  discoverable before the extension connects".
+- The per-`(channel_id, server_id)` cache holds `fetched ∩ allowed` and **replaces the seed once a
+  fetch succeeds**, so the catalog narrows to what the server actually publishes (a server may publish
+  fewer tools than the operator permitted) without ever widening past the policy.
+- A declared server with **no** policy entry contributes nothing — not because it is un-cached, but
+  because §6.4 is deny-all. Caching changes what an *allowed* server advertises; it is never itself a
+  grant.
+
+**Ordering consequence.** Because the filter is deny-all and pinned entries already carry full `Tool`
+schemas, fetching cannot surface anything an operator has not already permitted — so the discovery
+cache has no visible effect until the operator-facing configuration surface exists. The config surface
+therefore lands **first**; the cache is what supplies real schemas once operators are allowed to list
+tools by name alone.
 
 ### 6.4 Trust — client-declared tool sets need an operator gate
 
