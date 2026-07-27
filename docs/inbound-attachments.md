@@ -20,13 +20,13 @@ User sends media (photo/voice/file)
 
 | Platform | Images | Audio/Voice | Text Files | Video | Binary Files |
 |----------|--------|-------------|------------|-------|--------------|
-| **Discord** | ✅ | ✅ (file + STT) | ✅ | metadata only | skipped |
+| **Discord** | ✅ | ✅ (file + STT) | ✅ | metadata + CDN URL | skipped |
 | **Telegram** | ✅ | ✅ (file + STT) | ✅ (whitelist) | skipped | skipped |
 | **Feishu** | ✅ | ✅ (file + STT) | ✅ (whitelist) | skipped | skipped |
 | **Google Chat** | ✅ | ✅ (file + STT) | ✅ (whitelist) | skipped | Drive files skipped |
 | **WeCom** | ✅ | — | ✅ (whitelist) | skipped | skipped |
 | **LINE** | ✅ (LINE-hosted only) | ✅ (file + STT, 1:1 only, LINE-hosted only) | — | — | — |
-| **Slack** | ✅ | ✅ (file + STT) | ✅ | — | skipped |
+| **Slack** | ✅ | ✅ (file + STT) | ✅ | metadata + URL | skipped |
 
 "file + STT" means the agent always receives the audio file's metadata (and a
 fetchable URL where one exists), with the STT transcript added on top when
@@ -83,6 +83,34 @@ LINE-specific note:
 - LINE voice-message STT currently works in **1:1 chats only**.
 - LINE group/room voice messages are still blocked by mention gating because LINE does not attach mention metadata to audio messages.
 
+### Video
+
+Discord and Slack forward video as a `[Video attachment]` metadata block rather
+than inlining it. The gateway platforms have no video branch and skip it.
+
+```
+[Video attachment]
+filename: standup.mp4
+content_type: video/mp4
+size_bytes: 24117248
+url: https://<bucket>.s3.<region>.amazonaws.com/incoming/standup.mp4?X-Amz-Signature=...
+note: presigned URL, expires in 60 minutes
+```
+
+Which URL the agent gets:
+
+| Platform | Filestore configured | No filestore |
+|---|---|---|
+| Discord | presigned S3 URL | `attachment.url`, a public CDN link needing no credentials |
+| Slack | presigned S3 URL | `url_private_download`, which needs an `Authorization: Bearer <bot token>` header |
+
+The `note:` line is present only when the URL needs an explanation, so a Discord
+CDN link carries no note. On Slack the note always appears, because neither form
+is self-explanatory: the presigned URL expires, and the fallback needs a
+credential the agent does not hold. In that last case the block is effectively
+metadata plus an explanation of why the link will not resolve, which is still
+more actionable than an unannotated dead URL.
+
 ### Text Files (Documents)
 
 1. Gateway downloads file
@@ -93,7 +121,9 @@ LINE-specific note:
 
 ### Unsupported Types
 
-Binary files (zip, pdf, exe, docx), video, and stickers are **rejected with a status reason**. The agent receives a `[System: attachment "..." was not delivered — unsupported format: ...]` notification so it can inform the user.
+On the gateway platforms, binary files (zip, pdf, exe, docx), video, and stickers are **rejected with a status reason**. The agent receives a `[System: attachment "..." was not delivered — unsupported format: ...]` notification so it can inform the user.
+
+Discord and Slack do not reject these: video goes through [Video](#video), and binary files go through the filestore as a `[File: ...]` block when one is configured.
 
 ## Size Limits
 

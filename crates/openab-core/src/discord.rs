@@ -1021,11 +1021,13 @@ impl EventHandler for Handler {
                             attachment.content_type.as_deref(),
                         ) {
                             debug!(url = %attachment.url, filename = %attachment.filename, "adding video attachment link");
-                            extra_blocks.push(video_attachment_block(
+                            // Discord CDN links need no credentials, so no note is warranted.
+                            extra_blocks.push(media::video_attachment_block(
                                 &attachment.filename,
                                 attachment.content_type.as_deref(),
                                 u64::from(attachment.size),
                                 &attachment.url,
+                                None,
                             ));
                         }
                         // For all other unsupported formats (PDF, ZIP, binary, etc.):
@@ -3050,23 +3052,6 @@ fn resolve_mentions(content: &str, bot_id: UserId, allowed_role_ids: &HashSet<u6
     out.trim().to_string()
 }
 
-fn video_attachment_block(
-    filename: &str,
-    content_type: Option<&str>,
-    size: u64,
-    url: &str,
-) -> ContentBlock {
-    ContentBlock::Text {
-        text: format!(
-            "[Video attachment]\nfilename: {}\ncontent_type: {}\nsize_bytes: {}\nurl: {}",
-            filename,
-            content_type.unwrap_or("unknown"),
-            size,
-            url
-        ),
-    }
-}
-
 /// Build a `SenderContext` for Discord messages.
 ///
 /// Pure function extracted from `EventHandler::message` for testability.
@@ -3607,26 +3592,6 @@ mod tests {
         let roles: HashSet<u64> = [999].into_iter().collect();
         let result = resolve_mentions("<@&999> check <@&888>", bot_id, &roles);
         assert_eq!(result, "check @(role)");
-    }
-
-    #[test]
-    fn video_attachment_block_includes_actionable_metadata() {
-        let block = video_attachment_block(
-            "demo.mp4",
-            Some("video/mp4"),
-            12345,
-            "https://cdn.discordapp.com/attachments/demo.mp4",
-        );
-
-        let ContentBlock::Text { text } = block else {
-            panic!("video attachments must be forwarded as text metadata");
-        };
-
-        assert!(text.contains("[Video attachment]"));
-        assert!(text.contains("filename: demo.mp4"));
-        assert!(text.contains("content_type: video/mp4"));
-        assert!(text.contains("size_bytes: 12345"));
-        assert!(text.contains("url: https://cdn.discordapp.com/attachments/demo.mp4"));
     }
 
     #[test]

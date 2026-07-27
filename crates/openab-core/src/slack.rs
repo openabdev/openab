@@ -1675,12 +1675,47 @@ async fn handle_message(
                     }
                     Err(media::MediaFetchError::NotAnImage) => {
                         if media::is_video_file(filename, Some(mimetype)) {
-                            extra_blocks.push(ContentBlock::Text {
-                                text: format!(
-                                    "[Video attachment]\nfilename: {}\ncontent_type: {}\nsize_bytes: {}\nurl: {}",
-                                    filename, mimetype, size, url
+                            // url_private_download needs a bearer token the agent lacks, so a
+                            // presigned URL is the only fetchable form when a filestore exists.
+                            #[cfg(feature = "filestore")]
+                            let stored: Option<(String, String)> = match filestore {
+                                Some(fs) => media::download_and_presign_attachment(
+                                    url,
+                                    filename,
+                                    size,
+                                    Some(mimetype),
+                                    Some(bot_token),
+                                    fs,
+                                )
+                                .await
+                                .map(|presigned| {
+                                    (
+                                        presigned,
+                                        format!(
+                                            "presigned URL, expires in {} minutes",
+                                            fs.presigned_ttl_secs() / 60
+                                        ),
+                                    )
+                                }),
+                                None => None,
+                            };
+                            #[cfg(not(feature = "filestore"))]
+                            let stored: Option<(String, String)> = None;
+
+                            let (link, note) = match stored {
+                                Some((ref presigned, ref n)) => (presigned.as_str(), n.as_str()),
+                                None => (
+                                    url,
+                                    "Slack private file, requires an `Authorization: Bearer <bot token>` header to download",
                                 ),
-                            });
+                            };
+                            extra_blocks.push(media::video_attachment_block(
+                                filename,
+                                Some(mimetype),
+                                size,
+                                link,
+                                Some(note),
+                            ));
                         } else {
                             // Upload unsupported file types to filestore if available
                             #[cfg(feature = "filestore")]
