@@ -58,7 +58,7 @@ echo_transcript = true                      # default: false (opt-in)
 
 | Field | Required | Default | Description |
 |---|---|---|---|
-| `enabled` | no | `false` | Enable/disable STT. When disabled, audio attachments are silently skipped. |
+| `enabled` | no | `false` | Enable/disable transcription. Audio attachments still reach the agent as an `[Audio attachment]` metadata block either way, see [Inbound Attachments](inbound-attachments.md#audio--voice-messages). |
 | `api_key` | no* | — | API key for the STT provider. *Auto-detected from `GROQ_API_KEY` env var if not set. For local servers, use any non-empty string (e.g. `"not-needed"`). |
 | `model` | no | `whisper-large-v3-turbo` | Whisper model name. Varies by provider. |
 | `base_url` | no | `https://api.groq.com/openai/v1` | OpenAI-compatible API base URL. |
@@ -168,7 +168,10 @@ Omit the `[stt]` section entirely, or set:
 enabled = false
 ```
 
-When disabled, audio attachments are silently skipped with no impact on existing functionality.
+When disabled, no transcription runs. Audio attachments are still forwarded to the
+agent as an `[Audio attachment]` metadata block (filename, content type, size, and a
+fetchable URL where the platform provides one), so skills can process the original
+file themselves. See [Inbound Attachments](inbound-attachments.md#audio--voice-messages).
 
 ## Technical Notes
 

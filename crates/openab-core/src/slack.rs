@@ -1548,7 +1548,7 @@ async fn handle_message(
                         }
                     }
                 } else {
-                    debug!(filename, "skipping audio attachment (STT disabled)");
+                    debug!(filename, "audio attachment not transcribed (STT disabled)");
                     let msg_ref = MessageRef {
                         channel: ChannelRef {
                             platform: "slack".into(),
@@ -1561,6 +1561,46 @@ async fn handle_message(
                     };
                     let _ = adapter.add_reaction(&msg_ref, "🎤").await;
                 }
+
+                // Passthrough runs whichever way STT went: a transcript is an
+                // extra block, never a substitute for the file itself.
+                #[cfg(feature = "filestore")]
+                let stored: Option<(String, String)> = match filestore {
+                    Some(fs) => media::download_and_presign_attachment(
+                        url,
+                        filename,
+                        size,
+                        Some(mimetype),
+                        Some(bot_token),
+                        fs,
+                    )
+                    .await
+                    .map(|presigned| {
+                        (
+                            presigned,
+                            format!(
+                                "presigned URL, expires in {} minutes",
+                                fs.presigned_ttl_secs() / 60
+                            ),
+                        )
+                    }),
+                    None => None,
+                };
+                #[cfg(not(feature = "filestore"))]
+                let stored: Option<(String, String)> = None;
+
+                extra_blocks.push(match stored {
+                    Some((ref presigned, ref note)) => {
+                        media::audio_attachment_block(filename, mimetype, size, Some(presigned), Some(note))
+                    }
+                    None => media::audio_attachment_block(
+                        filename,
+                        mimetype,
+                        size,
+                        Some(url),
+                        Some("Slack private file, requires an `Authorization: Bearer <bot token>` header to download"),
+                    ),
+                });
             } else if media::is_text_file(filename, Some(mimetype)) {
                 if text_file_count >= TEXT_FILE_COUNT_CAP {
                     debug!(

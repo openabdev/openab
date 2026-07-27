@@ -12,7 +12,7 @@ User sends media (photo/voice/file)
   → Store to ~/.openab/media/inbound/<uuid>
   → WS event includes file path in attachments[].path
   → Core reads from disk (zero encoding overhead)
-  → Processes: image → LLM, audio → STT, text_file → code block
+  → Processes: image → LLM, audio → metadata block (+ STT when enabled), text_file → code block
   → File auto-evicted after 2 minutes
 ```
 
@@ -20,13 +20,17 @@ User sends media (photo/voice/file)
 
 | Platform | Images | Audio/Voice | Text Files | Video | Binary Files |
 |----------|--------|-------------|------------|-------|--------------|
-| **Discord** | ✅ | ✅ (STT) | ✅ | metadata only | skipped |
-| **Telegram** | ✅ | ✅ (STT) | ✅ (whitelist) | skipped | skipped |
-| **Feishu** | ✅ | ✅ (STT) | ✅ (whitelist) | skipped | skipped |
-| **Google Chat** | ✅ | ✅ (STT) | ✅ (whitelist) | skipped | Drive files skipped |
+| **Discord** | ✅ | ✅ (file + STT) | ✅ | metadata only | skipped |
+| **Telegram** | ✅ | ✅ (file + STT) | ✅ (whitelist) | skipped | skipped |
+| **Feishu** | ✅ | ✅ (file + STT) | ✅ (whitelist) | skipped | skipped |
+| **Google Chat** | ✅ | ✅ (file + STT) | ✅ (whitelist) | skipped | Drive files skipped |
 | **WeCom** | ✅ | — | ✅ (whitelist) | skipped | skipped |
-| **LINE** | ✅ (LINE-hosted only) | ✅ (STT, 1:1 only, LINE-hosted only) | — | — | — |
-| **Slack** | ✅ | ✅ (STT) | ✅ | — | skipped |
+| **LINE** | ✅ (LINE-hosted only) | ✅ (file + STT, 1:1 only, LINE-hosted only) | — | — | — |
+| **Slack** | ✅ | ✅ (file + STT) | ✅ | — | skipped |
+
+"file + STT" means the agent always receives the audio file's metadata (and a
+fetchable URL where one exists), with the STT transcript added on top when
+enabled. See [Audio / Voice Messages](#audio--voice-messages).
 
 ## Processing Pipeline
 
@@ -46,8 +50,34 @@ OpenAB can create the ACP image block, but downstream coding agents and selected
 
 1. Gateway downloads raw audio (ogg/m4a/mp3)
 2. Stored to filesystem (no transcoding)
-3. Core reads bytes → STT transcription (Whisper/Groq) → `[Voice message transcript]: ...`
-4. If STT disabled: silently skipped
+3. Core always emits an `[Audio attachment]` metadata block so skills can process the original file
+4. If STT is enabled, transcription (Whisper/Groq) adds `[Voice message transcript]: ...` on top
+
+The metadata block is emitted regardless of the STT setting. A transcript augments
+the file, it never replaces it:
+
+```
+[Audio attachment]
+filename: meeting.m4a
+content_type: audio/mp4
+size_bytes: 8342016
+url: https://<presigned-or-platform-url>
+note: presigned URL, expires in 60 minutes
+```
+
+Which `url` the agent gets depends on the platform and whether a
+[filestore](filestore.md) is configured:
+
+| Platform | With filestore | Without filestore |
+|----------|----------------|-------------------|
+| Discord | presigned S3 URL | `cdn.discordapp.com` URL, expires ~24h |
+| Slack | presigned S3 URL | `url_private_download`, needs an `Authorization: Bearer <bot token>` header |
+| Gateway (Telegram / Feishu / LINE / Google Chat) | presigned S3 URL | no `url` line (the gateway already consumed the platform URL during download), so the block carries metadata only |
+
+Gateway attachments reach Core as bytes (base64 or a colocate path), never as a
+platform URL, so a filestore is the only way to give the agent a fetchable link
+on those platforms. The colocate path is deliberately not exposed: it is evicted
+after 2 minutes, so it would be dead by the time most skills fetch it.
 
 LINE-specific note:
 - LINE voice-message STT currently works in **1:1 chats only**.

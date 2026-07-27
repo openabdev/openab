@@ -874,8 +874,8 @@ impl EventHandler for Handler {
         for attachment in &msg.attachments {
             let mime = attachment.content_type.as_deref().unwrap_or("");
             if media::is_audio_mime(mime) {
+                let mime_clean = mime.split(';').next().unwrap_or(mime).trim();
                 if self.stt_config.enabled {
-                    let mime_clean = mime.split(';').next().unwrap_or(mime).trim();
                     match media::download_and_transcribe(
                         &attachment.url,
                         &attachment.filename,
@@ -902,10 +902,54 @@ impl EventHandler for Handler {
                         }
                     }
                 } else {
-                    tracing::warn!(filename = %attachment.filename, "skipping audio attachment (STT disabled)");
+                    debug!(filename = %attachment.filename, "audio attachment not transcribed (STT disabled)");
                     let msg_ref = discord_msg_ref(&msg);
                     let _ = adapter.add_reaction(&msg_ref, "🎤").await;
                 }
+
+                // Passthrough runs whichever way STT went: a transcript is an
+                // extra block, never a substitute for the file itself.
+                #[cfg(feature = "filestore")]
+                let stored: Option<(String, String)> = match self.filestore {
+                    Some(ref fs) => media::download_and_presign_attachment(
+                        &attachment.url,
+                        &attachment.filename,
+                        u64::from(attachment.size),
+                        Some(mime_clean),
+                        None,
+                        fs,
+                    )
+                    .await
+                    .map(|presigned| {
+                        (
+                            presigned,
+                            format!(
+                                "presigned URL, expires in {} minutes",
+                                fs.presigned_ttl_secs() / 60
+                            ),
+                        )
+                    }),
+                    None => None,
+                };
+                #[cfg(not(feature = "filestore"))]
+                let stored: Option<(String, String)> = None;
+
+                extra_blocks.push(match stored {
+                    Some((ref presigned, ref note)) => media::audio_attachment_block(
+                        &attachment.filename,
+                        mime_clean,
+                        u64::from(attachment.size),
+                        Some(presigned),
+                        Some(note),
+                    ),
+                    None => media::audio_attachment_block(
+                        &attachment.filename,
+                        mime_clean,
+                        u64::from(attachment.size),
+                        Some(&attachment.url),
+                        Some("Discord CDN URL, expires ~24h"),
+                    ),
+                });
             } else if media::is_text_file(&attachment.filename, attachment.content_type.as_deref())
             {
                 if text_file_count >= TEXT_FILE_COUNT_CAP {
