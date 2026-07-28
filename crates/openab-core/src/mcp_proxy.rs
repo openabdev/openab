@@ -21,6 +21,7 @@ use rmcp::transport::streamable_http_server::{
 use rmcp::ServerHandler;
 use axum::response::IntoResponse;
 use serde_json::{json, Value};
+use tracing::warn;
 use std::sync::Arc;
 
 /// Core-side interface to the browser MCP-over-ACP tunnel (D6-a'). Implemented by the ROOT
@@ -762,9 +763,67 @@ pub(crate) async fn dispatch_browser_mcp(
 /// Serve the per-pod browser-bridge socket at `path`, routing each connection's framed requests
 /// via [`dispatch_browser_mcp`]. Binds a fresh 0600 unix socket (same-uid only), spawns the accept
 /// loop, and runs until `ct` is cancelled. Idempotent on a stale socket file from a prior run.
+/// Extract `OPENAB_BROWSER_CHANNEL` from a null-separated `/proc/<pid>/environ` blob.
+fn parse_channel_from_environ(bytes: &[u8]) -> Option<String> {
+    for kv in bytes.split(|b| *b == 0) {
+        if let Some(rest) = kv.strip_prefix(b"OPENAB_BROWSER_CHANNEL=") {
+            let v = String::from_utf8_lossy(rest).into_owned();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// Parse the parent PID from a `/proc/<pid>/stat` line. Field 2 (`comm`) is parenthesized and may
+/// contain spaces or `)`, so split after the LAST `)`: the remainder is "state ppid pgrp ...".
+fn parse_ppid_from_stat(stat: &str) -> Option<u32> {
+    let after = &stat[stat.rfind(')')? + 1..];
+    after.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Walk up from `start_pid` and return the first ancestor's `OPENAB_BROWSER_CHANNEL`.
+///
+/// This is the **authoritative** channel for a bridge connection: the agent process openab
+/// spawned carries the variable, and the shim it spawns is always a descendant. Deriving it from
+/// a kernel-supplied peer pid means a caller cannot choose which session it drives — unlike the
+/// `channel_id` in the frame, which is merely a claim (review R2).
+pub fn channel_from_process_ancestry(start_pid: u32) -> Option<String> {
+    let mut pid = start_pid;
+    for _ in 0..16 {
+        if let Ok(bytes) = std::fs::read(format!("/proc/{pid}/environ")) {
+            if let Some(c) = parse_channel_from_environ(&bytes) {
+                return Some(c);
+            }
+        }
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        match parse_ppid_from_stat(&stat) {
+            Some(ppid) if ppid > 1 => pid = ppid, // step up (stop at init/tini = 1)
+            _ => break,
+        }
+    }
+    None
+}
+
+/// Maps a connecting peer's pid to the channel it is allowed to drive. Injectable so the socket
+/// server can be tested without a real agent process tree above the test binary.
+pub type ChannelResolver = Arc<dyn Fn(u32) -> Option<String> + Send + Sync>;
+
 pub async fn serve_browser_socket(
     path: std::path::PathBuf,
     tunnel: Option<Arc<dyn AcpMcpTunnel>>,
+    ct: tokio_util::sync::CancellationToken,
+) -> std::io::Result<()> {
+    let resolver: ChannelResolver = Arc::new(channel_from_process_ancestry);
+    serve_browser_socket_with_resolver(path, tunnel, resolver, ct).await
+}
+
+/// [`serve_browser_socket`] with an injectable peer→channel resolver (tests).
+pub async fn serve_browser_socket_with_resolver(
+    path: std::path::PathBuf,
+    tunnel: Option<Arc<dyn AcpMcpTunnel>>,
+    resolver: ChannelResolver,
     ct: tokio_util::sync::CancellationToken,
 ) -> std::io::Result<()> {
     let _ = tokio::fs::remove_file(&path).await; // clear a stale socket from a prior run
@@ -781,7 +840,11 @@ pub async fn serve_browser_socket(
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((stream, _)) => {
-                            tokio::spawn(handle_browser_conn(stream, tunnel.clone()));
+                            tokio::spawn(handle_browser_conn(
+                                stream,
+                                tunnel.clone(),
+                                resolver.clone(),
+                            ));
                         }
                         Err(_) => continue,
                     }
@@ -806,8 +869,25 @@ pub async fn serve_browser_socket_forever(
 async fn handle_browser_conn(
     stream: tokio::net::UnixStream,
     tunnel: Option<Arc<dyn AcpMcpTunnel>>,
+    resolver: ChannelResolver,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    // Authenticate the CONNECTION, not the frame (review R2). 0600 on the socket only proves the
+    // peer shares our uid; it does not say which session the peer belongs to. The `channel_id` in
+    // a frame is a claim the sender chooses, so trusting it let any same-uid process drive another
+    // live session's browser. Derive the channel from the kernel-supplied peer pid instead, and
+    // refuse the connection outright when it cannot be established — an unauthenticated peer gets
+    // no session at all rather than a default one.
+    let peer_pid = stream.peer_cred().ok().and_then(|c| c.pid());
+    let Some(authenticated_channel) = peer_pid.and_then(|pid| resolver(pid as u32)) else {
+        warn!(
+            peer_pid = ?peer_pid,
+            "browser bridge: refusing a connection whose browser channel could not be established"
+        );
+        return;
+    };
+
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
     while let Ok(Some(line)) = lines.next_line().await {
@@ -817,11 +897,22 @@ async fn handle_browser_conn(
         let Ok(frame) = serde_json::from_str::<Value>(&line) else {
             continue; // skip a malformed frame rather than drop the connection
         };
-        let channel_id = frame.get("channel_id").and_then(Value::as_str).unwrap_or("");
+        // A frame may still carry channel_id (the shim sends it), but it is only ever checked
+        // against the authenticated value — never used to select a session.
+        if let Some(claimed) = frame.get("channel_id").and_then(Value::as_str) {
+            if !claimed.is_empty() && claimed != authenticated_channel {
+                warn!(
+                    peer_pid = ?peer_pid,
+                    claimed,
+                    "browser bridge: frame claimed a channel this peer does not own; dropping"
+                );
+                continue;
+            }
+        }
         let Some(request) = frame.get("request") else {
             continue;
         };
-        if let Some(resp) = dispatch_browser_mcp(channel_id, request, &tunnel).await {
+        if let Some(resp) = dispatch_browser_mcp(&authenticated_channel, request, &tunnel).await {
             let Ok(mut buf) = serde_json::to_vec(&resp) else {
                 continue;
             };
@@ -838,7 +929,8 @@ mod tests {
     use super::{
         browser_tools, cleanup_kiro_agent_configs, dispatch_browser_mcp,
         is_openab_direct_browser_entry, merge_kiro_agent_configs, parse_browser_mode,
-        serve_browser_socket, spawn_mcp_server, start_session_server, write_bridge_mcp_config,
+        serve_browser_socket_with_resolver, spawn_mcp_server, start_session_server,
+        write_bridge_mcp_config,
         write_facade_mcp_config, AcpMcpTunnel, BrowserMode, ProxyHandler,
     };
 
@@ -1337,9 +1429,16 @@ mod tests {
             result: serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] }),
         });
         let ct = tokio_util::sync::CancellationToken::new();
-        serve_browser_socket(sock.clone(), tunnel, ct.clone())
-            .await
-            .unwrap();
+        // The peer here is the test binary, whose ancestry carries no channel, so inject the
+        // resolver the way a real deployment's process tree would answer.
+        serve_browser_socket_with_resolver(
+            sock.clone(),
+            tunnel,
+            std::sync::Arc::new(|_pid| Some("acp_win1".to_string())),
+            ct.clone(),
+        )
+        .await
+        .unwrap();
         let stream = loop {
             match tokio::net::UnixStream::connect(&sock).await {
                 Ok(s) => break s,
@@ -1359,6 +1458,76 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["id"], 9);
         assert_eq!(v["result"]["content"][0]["text"], "ok");
+        ct.cancel();
+    }
+
+    // --- R2: the socket authenticates the connection, not the frame ---
+
+    #[test]
+    fn ancestry_parsers_read_proc_shapes() {
+        assert_eq!(super::parse_ppid_from_stat("834 (sh) S 25 834 25 0 -1 ..."), Some(25));
+        assert_eq!(super::parse_ppid_from_stat("658 (cursor agent) R 25 658 ..."), Some(25));
+        // ')' inside comm — split after the LAST ')'
+        assert_eq!(super::parse_ppid_from_stat("5 (weird )proc) S 3 5 ..."), Some(3));
+        assert_eq!(super::parse_ppid_from_stat("nonsense"), None);
+
+        let env = b"HOME=/h\0OPENAB_BROWSER_CHANNEL=acp_xyz\0PATH=/x\0";
+        assert_eq!(
+            super::parse_channel_from_environ(env).as_deref(),
+            Some("acp_xyz")
+        );
+        assert_eq!(super::parse_channel_from_environ(b"HOME=/x\0PATH=/y\0"), None);
+        assert_eq!(super::parse_channel_from_environ(b"OPENAB_BROWSER_CHANNEL=\0"), None);
+    }
+
+    /// A same-uid peer must not be able to drive a session it does not own by naming it. The
+    /// socket's 0600 mode only proves same-uid; the channel comes from the peer's process
+    /// ancestry, and a frame claiming a different one is dropped rather than honoured.
+    #[tokio::test]
+    async fn a_frame_cannot_claim_a_channel_the_peer_does_not_own() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("browser.sock");
+        let tunnel = arc_tunnel(RecordTunnel {
+            result: serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] }),
+        });
+        let ct = tokio_util::sync::CancellationToken::new();
+        // This peer owns acp_win1 (RecordTunnel asserts it only ever sees that channel).
+        serve_browser_socket_with_resolver(
+            sock.clone(),
+            tunnel,
+            std::sync::Arc::new(|_pid| Some("acp_win1".to_string())),
+            ct.clone(),
+        )
+        .await
+        .unwrap();
+        let stream = loop {
+            match tokio::net::UnixStream::connect(&sock).await {
+                Ok(s) => break s,
+                Err(_) => tokio::task::yield_now().await,
+            }
+        };
+        let (rd, mut wr) = stream.into_split();
+
+        // Claim someone else's session first, then a legitimate frame.
+        for (channel, id) in [("acp_victim", 1), ("acp_win1", 2)] {
+            let frame = serde_json::json!({
+                "channel_id": channel,
+                "request": req(id, "tools/call", serde_json::json!({ "name": "katashiro.read_dom", "arguments": {} }))
+            });
+            let mut line = serde_json::to_vec(&frame).unwrap();
+            line.push(b'\n');
+            wr.write_all(&line).await.unwrap();
+        }
+
+        // Only the legitimate frame is answered; the spoofed one produced no reply at all.
+        let mut resp = String::new();
+        BufReader::new(rd).read_line(&mut resp).await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(
+            v["id"], 2,
+            "the first response must be for the legitimate frame — the spoofed channel was dropped"
+        );
         ct.cancel();
     }
 

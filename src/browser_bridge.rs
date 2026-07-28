@@ -39,41 +39,10 @@ fn resolve_channel() -> String {
             return c;
         }
     }
-    let mut pid = std::process::id();
-    for _ in 0..16 {
-        if let Ok(bytes) = std::fs::read(format!("/proc/{pid}/environ")) {
-            if let Some(c) = parse_channel_from_environ(&bytes) {
-                return c;
-            }
-        }
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            break;
-        };
-        match parse_ppid_from_stat(&stat) {
-            Some(ppid) if ppid > 1 => pid = ppid, // step up (stop at init/tini = 1)
-            _ => break,
-        }
-    }
-    String::new()
-}
-
-/// Extract OPENAB_BROWSER_CHANNEL from a null-separated `/proc/<pid>/environ` blob.
-fn parse_channel_from_environ(bytes: &[u8]) -> Option<String> {
-    for kv in bytes.split(|&b| b == 0) {
-        if let Some(rest) = kv.strip_prefix(b"OPENAB_BROWSER_CHANNEL=") {
-            if !rest.is_empty() {
-                return Some(String::from_utf8_lossy(rest).into_owned());
-            }
-        }
-    }
-    None
-}
-
-/// Parse the parent PID from a `/proc/<pid>/stat` line. Field 2 (`comm`) is parenthesized and may
-/// contain spaces or `)`, so split after the LAST `)`: the remainder is "state ppid pgrp ...".
-fn parse_ppid_from_stat(stat: &str) -> Option<u32> {
-    let after = stat.rsplit_once(')')?.1;
-    after.split_whitespace().nth(1)?.parse().ok()
+    // Same ancestry walk the socket server now performs on our pid (review R2). Kept here only so
+    // the frame still carries a channel for logging/compatibility — the server derives its own and
+    // never trusts this one, so a wrong answer here is refused rather than honoured.
+    openab_core::mcp_proxy::channel_from_process_ancestry(std::process::id()).unwrap_or_default()
 }
 
 /// Run the bridge: connect the core socket, then pump stdin→socket (channel-tagged) and
@@ -144,23 +113,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_channel_from_environ, parse_ppid_from_stat, pump, wrap_frame};
+    use super::{pump, wrap_frame};
 
-    #[test]
-    fn parse_ppid_handles_comm_with_spaces_and_parens() {
-        assert_eq!(parse_ppid_from_stat("834 (sh) S 25 834 25 0 -1 ..."), Some(25));
-        assert_eq!(parse_ppid_from_stat("658 (cursor agent) R 25 658 ..."), Some(25));
-        assert_eq!(parse_ppid_from_stat("5 (weird )proc) S 3 5 ..."), Some(3)); // ')' inside comm
-        assert_eq!(parse_ppid_from_stat("nonsense"), None);
-    }
+    // The `/proc` parsing these covered now lives in openab-core, next to the socket server that
+    // authenticates with it, and is tested there.
 
-    #[test]
-    fn parse_channel_from_environ_finds_the_var() {
-        let env = b"HOME=/home/agent\0OPENAB_BROWSER_CHANNEL=acp_xyz\0PATH=/bin\0";
-        assert_eq!(parse_channel_from_environ(env).as_deref(), Some("acp_xyz"));
-        assert_eq!(parse_channel_from_environ(b"HOME=/x\0PATH=/y\0"), None);
-        assert_eq!(parse_channel_from_environ(b"OPENAB_BROWSER_CHANNEL=\0"), None); // empty ignored
-    }
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     #[test]
