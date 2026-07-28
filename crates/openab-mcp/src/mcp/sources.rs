@@ -96,7 +96,13 @@ impl SessionTokens {
         getrandom::fill(&mut buf).expect("os rng");
         let token = B64_URL.encode(buf);
         let mut map = self.inner.write().expect("session token lock");
-        map.retain(|_, ctx| ctx.channel_id != channel_id);
+        // Deliberately does NOT evict the channel's existing tokens. Session lifetimes overlap:
+        // two builders can race for one channel, and a pool reset can start a replacement while
+        // the predecessor is still serving. Clobbering here invalidated a token whose agent was
+        // still using it — the agent holds OPENAB_SESSION_TOKEN in its environment, so it cannot
+        // notice, and every facade call then fails auth with `requires_session` tools silently
+        // vanishing. Each mint is paired with a token-specific revoke on its own drop guard, so
+        // the map stays bounded without this.
         map.insert(
             token.clone(),
             SessionCtx {
@@ -181,6 +187,39 @@ pub fn session_ctx_from_extensions(
 mod tests {
     use super::*;
 
+    /// Two builders racing for one channel must not invalidate each other (review round 4, T1).
+    ///
+    /// R1 made revocation token-specific but left `mint` evicting by channel, so the second mint
+    /// killed the first agent's live token. That agent holds `OPENAB_SESSION_TOKEN` in its
+    /// environment and cannot observe the change: every facade call simply starts failing auth and
+    /// its `requires_session` tools vanish from discovery, with nothing pointing at the cause.
+    #[test]
+    fn a_second_mint_for_one_channel_does_not_invalidate_the_first() {
+        let tokens = SessionTokens::new();
+        let first = tokens.mint("chan-a");
+        let second = tokens.mint("chan-a");
+
+        assert_ne!(first, second, "each mint is a distinct credential");
+        assert_eq!(
+            tokens.resolve(&first).map(|c| c.channel_id),
+            Some("chan-a".to_string()),
+            "the first builder's token must survive a concurrent second mint"
+        );
+        assert_eq!(
+            tokens.resolve(&second).map(|c| c.channel_id),
+            Some("chan-a".to_string())
+        );
+
+        // Each is still independently revocable, so the map stays bounded by guard pairing
+        // rather than by eviction-on-mint.
+        tokens.revoke_token(&first);
+        assert!(tokens.resolve(&first).is_none());
+        assert!(
+            tokens.resolve(&second).is_some(),
+            "revoking one credential must not disturb the other"
+        );
+    }
+
     /// An evicted session's teardown must not cut off the session that replaced it (review R1).
     ///
     /// Session lifetimes overlap: the successor mints while the predecessor's drop guard is still
@@ -213,11 +252,13 @@ mod tests {
         let t1 = tokens.mint("chan-a");
         assert_eq!(tokens.resolve(&t1).unwrap().channel_id, "chan-a");
         assert!(tokens.resolve("nope").is_none());
-        // Re-mint for the same channel replaces the old token.
+        // A second mint for the channel coexists with the first — it used to evict it, which is
+        // the bug T1 fixes; see a_second_mint_for_one_channel_does_not_invalidate_the_first.
         let t2 = tokens.mint("chan-a");
-        assert!(tokens.resolve(&t1).is_none(), "old token must be dead");
         assert_eq!(tokens.resolve(&t2).unwrap().channel_id, "chan-a");
+        // revoke_channel is the deliberate channel-wide evict and still clears both.
         tokens.revoke_channel("chan-a");
+        assert!(tokens.resolve(&t1).is_none());
         assert!(tokens.resolve(&t2).is_none());
     }
 

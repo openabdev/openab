@@ -822,7 +822,10 @@ impl SessionPool {
         state.pgids.remove(thread_id);
         state.suspended.remove(thread_id);
         state.persisted.remove(thread_id);
-        state.creating.remove(thread_id);
+        // Do NOT remove the creating gate — same reason `purge_session_entries` documents. It is
+        // concurrency control, not session state: dropping it while a builder still holds the old
+        // gate Arc lets a concurrent get_or_create mint a fresh gate and run a second creation for
+        // the same key, so two builders spawn agents and mint tokens for one channel.
         state.session_workdirs.remove(thread_id);
         self.save_mapping(&state.persisted);
         self.save_meta(&state.session_workdirs);
