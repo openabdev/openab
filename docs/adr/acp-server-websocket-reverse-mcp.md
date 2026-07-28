@@ -1,7 +1,7 @@
 # ADR: Reverse MCP-over-ACP over WebSocket
 
-- **Status:** Accepted — the mechanism is **as-built in #1447**; the generic multi-server
-  generalization (§6) is accepted and implementing in the same PR.
+- **Status:** Accepted — the mechanism and the generic multi-server generalization (§6) are both
+  **as-built in #1447** (F1′, F3′, F4 and F5 landed; F6 e2e coverage remains).
 - **Date:** 2026-07-18 (updated 2026-07-24)
 - **Author:** @brettchien
 - **Related:** [ACP Server over WebSocket — Base (as-built)](./acp-server-websocket-base.md),
@@ -97,7 +97,7 @@ sequenceDiagram
     participant Core as openab-core<br/>OAB MCP Facade
     participant LLM as agent LLM<br/>MCP client
 
-    Note over Ext,LLM: PHASE 1 — connect & tool discovery
+    Note over Ext,LLM: PHASE 1 — connect & agent wiring (no tool discovery yet)
     Ext->>GW: WS GET /acp — initialize<br/>mcpServers = [ type:acp, "openab-browser" ]
     GW-->>Ext: initialize result (agentCapabilities)
     Ext->>GW: session/new  (or session/resume on reconnect)
@@ -105,14 +105,18 @@ sequenceDiagram
     GW->>Core: spawn agent (mint facade session token)
     Core->>Core: write static "openab" facade entry into agent's mcp.json<br/>{url, Authorization: Bearer ${OPENAB_SESSION_TOKEN}}
     LLM->>Core: MCP initialize + tools/list
-    Core->>GW: tools/list  (MCP-over-ACP: mcp/message frame)
+    Core-->>LLM: the facade's TWO meta-tools ONLY<br/>(search_capabilities · execute_capability) — returns at once,<br/>no upstream call; katashiro.* are NOT in the model's tool list
+
+    Note over Tab,LLM: PHASE 2 — discovery is PULL-triggered by the model
+    LLM->>Core: search_capabilities("browser")
+    Core->>GW: tools/list  (MCP-over-ACP: mcp/message frame)<br/>spawned on first pull per (channel_id, declared_name), then cached
     GW->>Ext: mcp/message → tools/list
     Ext-->>GW: 5 tools: read_dom · screenshot · navigate · click · type
     GW-->>Core: tools result
-    Core-->>LLM: tools/list — the facade's TWO meta-tools<br/>(search_capabilities · execute_capability); katashiro.* are NOT in the model's tool list
+    Core-->>LLM: capabilities: openab-browser:katashiro.*
 
-    Note over Tab,LLM: PHASE 2 — one autonomous action (e.g. click)
-    LLM->>Core: search_capabilities → execute_capability("openab-browser:katashiro.click", {selector})
+    Note over Tab,LLM: PHASE 3 — one autonomous action (e.g. click)
+    LLM->>Core: execute_capability("openab-browser:katashiro.click", {selector})
     Core->>GW: tools/call  (mcp/message over the SAME /acp WS)
     GW->>Ext: mcp/message → tools/call
     Ext->>Tab: chrome.scripting / tabs API<br/>click · type · read_dom · captureVisibleTab · navigate
@@ -131,8 +135,8 @@ detailed in **§7.3**.
 
 ## 6. Generalization — multiple client-side MCP servers
 
-The browser path wires **one** MCP server. This section is the accepted direction (implementing in
-#1447) to make reverse MCP-over-ACP **generic**: any ACP WS client may declare **one or more**
+The browser path wires **one** MCP server. This section is the accepted direction, **as-built in
+#1447**, making reverse MCP-over-ACP **generic**: any ACP WS client may declare **one or more**
 `type:acp` MCP servers on `initialize`, and the agent's LLM discovers and calls each server's real
 tools. The browser extension becomes *one instance* of the mechanism, not a special case.
 
@@ -154,8 +158,8 @@ Three pieces already generalize and are reused as-is:
 
 **`id` and `name` are different things, and routing needs both.** A declaration is
 `{type:"acp", id, name}`, and the two fields have very different lifetimes — the reference client mints
-`id` as a fresh `crypto.randomUUID()` **per connection** while `name` (`"browser"`) is stable across
-reconnects. The registry key is the **`id`**; the `<server>` segment of a tool name (`katashiro.click`)
+`id` as a fresh `crypto.randomUUID()` **per connection** while `name` (`"katashiro"`) is stable
+across reconnects. The registry key is the **`id`**; the `<server>` segment of a tool name (`katashiro.click`)
 and the §6.4 allowlist are the **`name`**. Consequences, all confirmed by review 2026-07-26:
 
 - The registry stays keyed by `(channel_id, id)` — keying by `name` would let two same-name tunnels
