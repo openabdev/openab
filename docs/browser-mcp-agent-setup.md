@@ -6,33 +6,27 @@ The browser MCP server exposes five DOM-semantic tools —
 [tunnel contract](./mcp-over-acp-tunnel-contract.md)). This doc covers the *other* hop: how the
 colocated agent CLI actually **sees** those tools.
 
-There are two transports, selected by `OPENAB_BROWSER_MODE`. **Facade is the default and the one
-to use**; `proxy` predates it and is kept as an explicit opt-out.
+There is **one** transport: the OAB MCP Facade. The per-session `proxy` and the `openab
+browser-bridge` stdio relay both existed before it and have been removed, along with the
+`OPENAB_BROWSER_MODE` variable that selected between them. See [Removed
+transports](#removed-transports) if you are upgrading from either.
 
-| mode | how the agent reaches the tools | status |
-|---|---|---|
-| unset / `facade` | through the **OAB MCP Facade**, one listener, static config entry | **default** |
-| `proxy` | per-session loopback MCP server + per-session config rewrite | legacy opt-out |
+**Browser control now requires `[mcp]` in `config.toml`.** This is a breaking change. Without that
+section there is no browser control — openab does **not** start a listener you did not configure,
+and says so once at startup rather than leaving you to infer it from missing tools.
 
-With no `[mcp]` section in `config.toml` the facade is not serving, and facade mode falls back to
-`proxy` automatically.
-
-> ⚠️ **`bridge` mode has been removed.** The per-pod unix socket, the `openab browser-bridge`
-> subcommand and the stdio relay are gone. `OPENAB_BROWSER_MODE=bridge` is now simply an
-> unrecognised value and resolves to `facade`, so a deployment still carrying it upgrades into
-> working browser control instead of refusing to start — but it no longer does what it says, and
-> should be removed from your environment.
+> ⚠️ **A leftover `openab-browser` entry from either old transport can still sit in your agent's
+> `mcp.json`,** and the two are handled differently.
 >
-> Facade setup **deletes a leftover `openab-browser` bridge entry for you** on the next session, in
-> `.cursor/mcp.json`, `.kiro/settings/mcp.json` and the kiro agent files (including its
-> `@openab-browser` grant). Left in place, that entry names a subcommand that no longer exists, so
-> the agent's MCP client would try and fail to start it every session. It is removed only when it
-> is byte-identical to the entry we wrote — `{"command":"openab","args":["browser-bridge"]}` —
-> because that exact shape is the only proof we have that it is ours rather than a server you
-> configured under the same key.
+> The **bridge** entry is deleted for you on the next session — in `.cursor/mcp.json`,
+> `.kiro/settings/mcp.json` and the kiro agent files, including its `@openab-browser` grant. Left
+> in place it names a subcommand that no longer exists, so the agent's MCP client would try and
+> fail to start it every session. It is removed only when byte-identical to the entry we wrote
+> (`{"command":"openab","args":["browser-bridge"]}`), because that exact shape is the only proof we
+> have that it is ours rather than a server you configured under the same key.
 >
-> A stale **proxy** entry is deliberately *not* removed: its url and bearer were minted per session
-> and never recorded anywhere, so under that key we cannot tell your server from ours. It is dead
+> The **proxy** entry is deliberately *not* removed: its url and bearer were minted per session and
+> never recorded anywhere, so under that key we cannot tell your server from ours. It is dead
 > configuration — the port died with its session — but if you want it gone, remove it yourself:
 >
 > ```sh
@@ -41,8 +35,6 @@ With no `[mcp]` section in `config.toml` the facade is not serving, and facade m
 >   [ -f "$f" ] && jq 'del(.mcpServers["openab-browser"])' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
 > done
 > ```
->
-> Symptom to watch for: browser tools work, but no `mcp.audit` line is ever emitted for them.
 
 ---
 
@@ -114,45 +106,28 @@ Gateway log confirms the extension side: `ACP: browser tunnel registered — ext
 
 ---
 
-## Legacy: `proxy` mode
+## Removed transports
 
-`OPENAB_BROWSER_MODE=proxy` forces the original design: the gateway↔extension tunnel terminates at a
-**per-session loopback MCP proxy** (`openab-core` `mcp_proxy::start_session_server`), and openab
-writes a per-session entry into the agent CLI's native MCP config:
+Both legacy transports are gone. This section is kept as a migration note, not as documentation of
+anything you can still turn on.
 
-```json
-{
-  "mcpServers": {
-    "openab-browser": {
-      "url": "http://127.0.0.1:<port>/mcp",
-      "headers": { "Authorization": "Bearer <token>" }
-    }
-  }
-}
-```
+**`proxy` mode** terminated the gateway↔extension tunnel at a per-session loopback MCP server and
+rewrote the agent CLI's MCP config with a freshly minted url and bearer on every session. It is
+removed: the per-session server, its bearer, and the per-session config write and cleanup.
 
-`<port>` and `<token>` are **minted fresh per session** and the entry is stripped on evict, so it
-cannot be hand-written to a fixed value. In this mode the agent sees `katashiro.*` directly in its
-`tools/list` rather than behind the facade's meta-tools.
+**`bridge` mode (Option C)** ran a per-pod unix-socket server plus an `openab browser-bridge`
+stdio-MCP relay that resolved its session channel by walking `/proc`. It is removed: the
+subcommand, the socket server, the ancestry resolver and the static config entry.
 
-Config file per variant (what `start_session_server` writes):
+`OPENAB_BROWSER_MODE` no longer selects anything and can be unset. If it is still set to any value,
+openab logs one warning at startup naming the value and reporting what is actually in force —
+`facade` when `[mcp]` is configured, `disabled` when it is not.
 
-| Variant | MCP config file (under `$workdir`, = `$HOME`) | Auto-written in proxy mode |
-|---|---|---|
-| **Cursor** (`cursor-agent`) | `.cursor/mcp.json` | ✅ |
-| **Kiro** (`kiro-cli`) | `.kiro/settings/mcp.json` | ✅ |
-| **Claude Code** | `.mcp.json` / `~/.claude.json` `mcpServers` | ⛔ |
-| **Codex** | `~/.codex/config.toml` `[mcp_servers.*]` (TOML) | ⛔ |
-| **Gemini CLI** | `~/.gemini/settings.json` `mcpServers` | ⛔ |
+**What to do when upgrading:** configure `[mcp]` in `config.toml`. Without it there is no browser
+control at all — nothing is auto-started, because starting a listener you did not ask for is the
+coupling this design deliberately avoids. A leftover `openab-browser` bridge entry is deleted for
+you on the next session; a leftover proxy entry is not, for the ownership reason given above.
 
-Variants marked ⛔ are unreachable in proxy mode without teaching `start_session_server` their
-config path and format — **or simply using facade mode**, where the static entry removes the problem.
-
-## Legacy: `bridge` mode (Option C)
-
-`OPENAB_BROWSER_MODE=bridge` runs a per-pod unix-socket server plus an `openab browser-bridge`
-stdio-MCP relay; the CLI entry is the static `{"command":"openab","args":["browser-bridge"]}` and the
-relay resolves its session channel by process ancestry. Intended for stdio-only MCP clients.
-
-> Retiring proxy and bridge once facade mode has soaked is tracked as a follow-up — the OAB MCP
-> Adapter ADR's Alternative C calls for a single agent-facing aggregation point.
+Proxy mode also only ever auto-wrote two of the five CLI variants (Cursor and Kiro); the other
+three had to be configured by hand. The facade's static entry removes that gap rather than
+extending it.

@@ -479,6 +479,12 @@ async fn main() -> anyhow::Result<()> {
     // Only read under the acp feature (pool facade wiring below).
     #[cfg(feature = "acp")]
     let facade_serving = cfg.mcp.is_some();
+    // Startup, not per-session: OPENAB_BROWSER_MODE selects nothing any more, and an operator
+    // still setting it needs to be told that here rather than discovering it as missing tools.
+    // Gated on `acp` (the root feature that pulls in core's `acp-mcp`), not on `acp-mcp` itself —
+    // that is a core feature and naming it here is an unknown-cfg error.
+    #[cfg(feature = "acp")]
+    openab_core::mcp_proxy::warn_if_browser_mode_set(cfg.mcp.is_some());
     if let Some(mcp_cfg) = cfg.mcp.clone() {
         let listen = mcp_cfg.listen.clone();
         let tokens = facade_sessions.clone();

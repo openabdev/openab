@@ -417,87 +417,50 @@ impl SessionPool {
             self.config.working_dir.clone()
         };
 
-        // Per-session MCP proxy (D5-a): for a browser (`acp:`) session, start a loopback MCP
-        // server + write `.cursor/mcp.json` BEFORE the agent boots so it connects to it. The
-        // returned guard cancels that server when this connection is dropped (any evict path).
-        // Facade mode: mint the per-session token (returned env var rides the
-        // agent spawn below) and write the static facade entry once. Falls
-        // back to Proxy mode when the root wired no registrar (no [mcp]).
+        // Browser capabilities for an `acp:` session come from the OAB MCP Facade and nowhere
+        // else: mint a per-session token (it rides the agent spawn below as OPENAB_SESSION_TOKEN)
+        // and write the static facade entry before the agent boots. The returned guard revokes
+        // that token when this connection is dropped, on any evict path.
+        //
+        // There is no transport fallback. Without `[mcp]` the root wires no registrar, and the
+        // session simply starts without browser capabilities — which is the honest outcome and is
+        // reported once at startup rather than being silently substituted per session.
         #[cfg(feature = "acp-mcp")]
         let mut session_token: Option<String> = None;
         #[cfg(feature = "acp-mcp")]
-        let mcp_guard: Option<tokio_util::sync::DropGuard> =
-            if let Some(channel_id) = thread_id.strip_prefix("acp:") {
-                // The Facade -> Proxy fallback lives inside `browser_mode_effective` so that the
-                // one place resolving the transport is also the place that can warn about it.
-                let facade_available =
-                    self.session_registrar.is_some() && self.facade_url.is_some();
-                let mode = crate::mcp_proxy::browser_mode_effective(facade_available);
-                match mode {
-                    crate::mcp_proxy::BrowserMode::Facade => {
-                        // unwraps guarded by the fallback arm above
-                        let registrar = self.session_registrar.as_ref().unwrap();
-                        let facade_url = self.facade_url.as_ref().unwrap();
-                        match setup_facade_session(
-                            &effective_workdir,
-                            facade_url,
-                            channel_id,
-                            registrar,
-                        )
-                        .await
-                        {
-                            Some(token) => {
-                                session_token = Some(token);
-                                info!(
-                                    thread_id,
-                                    "session token minted for facade browser capabilities"
-                                );
-                                // Revoke on evict/replace: piggyback the same DropGuard
-                                // plumbing proxy mode uses for its server teardown.
-                                //
-                                // The guard carries the TOKEN it minted, not the channel. A
-                                // replaced session's teardown runs after its successor has already
-                                // re-minted for the same channel, so revoking by channel would
-                                // strip the live token and silently cut the new agent off from the
-                                // facade; revoking this exact token is a no-op by then (R1).
-                                let ct = tokio_util::sync::CancellationToken::new();
-                                let child = ct.child_token();
-                                let registrar = registrar.clone();
-                                let minted = session_token.clone().unwrap_or_default();
-                                tokio::spawn(async move {
-                                    child.cancelled().await;
-                                    registrar.revoke(&minted);
-                                });
-                                Some(ct.drop_guard())
-                            }
-                            // No config, so no token and no revoke guard to arm. The session
-                            // still starts — it simply has no browser capabilities.
-                            None => None,
-                        }
+        let mcp_guard: Option<tokio_util::sync::DropGuard> = match (
+            thread_id.strip_prefix("acp:"),
+            self.session_registrar.as_ref(),
+            self.facade_url.as_ref(),
+        ) {
+            (Some(channel_id), Some(registrar), Some(facade_url)) => {
+                match setup_facade_session(&effective_workdir, facade_url, channel_id, registrar)
+                    .await
+                {
+                    Some(token) => {
+                        session_token = Some(token.clone());
+                        info!(thread_id, "session token minted for facade browser capabilities");
+                        // The guard carries the TOKEN it minted, not the channel. A replaced
+                        // session's teardown runs after its successor has already re-minted for
+                        // the same channel, so revoking by channel would strip the live token and
+                        // silently cut the new agent off from the facade; revoking this exact
+                        // token is a no-op by then (R1).
+                        let ct = tokio_util::sync::CancellationToken::new();
+                        let child = ct.child_token();
+                        let registrar = registrar.clone();
+                        tokio::spawn(async move {
+                            child.cancelled().await;
+                            registrar.revoke(&token);
+                        });
+                        Some(ct.drop_guard())
                     }
-                    // Proxy mode (default): per-session loopback HTTP MCP server + dynamic config.
-                    crate::mcp_proxy::BrowserMode::Proxy => {
-                        match crate::mcp_proxy::start_session_server(
-                            channel_id,
-                            &effective_workdir,
-                            self.browser_tunnel.clone(),
-                        )
-                        .await
-                        {
-                            Ok((addr, ct)) => {
-                                info!(thread_id, %addr, "started per-session MCP proxy server");
-                                Some(ct.drop_guard())
-                            }
-                            Err(e) => {
-                                warn!(thread_id, error = %e, "failed to start MCP proxy; browser tools unavailable");
-                                None
-                            }
-                        }
-                    }
+                    // No config, so no token and no revoke guard to arm. The session still
+                    // starts — it simply has no browser capabilities.
+                    None => None,
                 }
-            } else {
-                None
-            };
+            }
+            _ => None,
+        };
 
         // Build the replacement connection outside the state lock so one stuck
         // initialization does not block all unrelated sessions.

@@ -1,27 +1,22 @@
-//! Core-hosted MCP proxy server for MCP-over-ACP browser control (feature `acp-mcp`).
+//! Agent-facing wiring for MCP-over-ACP browser control (feature `acp-mcp`).
 //!
-//! Per ADR §7 (D3), OpenAB **core** hosts an in-process Streamable-HTTP MCP server on
-//! loopback that the colocated agent CLI connects to as a normal MCP client. The server is a
-//! proxy: its tool list + tool execution are backed by the remote browser extension over the
-//! `/acp` MCP-over-ACP tunnel (wired in T5.3). Per D4 the browser tool set is
-//! **static-advertised** regardless of whether an extension is currently attached — a call
-//! while disconnected returns a "browser not connected" error rather than hiding the tools.
+//! The module name is historical. It no longer hosts a proxy: the per-session loopback MCP
+//! server, its bearer and its per-session config rewrite were removed along with the stdio
+//! bridge, leaving the OAB MCP Facade as the only way an agent reaches browser tools.
 //!
-//! This module currently provides the static tool set; the `ServerHandler` + loopback
-//! listener (`spawn_mcp_server`) and the tunnel wiring land in the following T5 sub-ticks.
+//! What remains is the seam between core and the colocated agent CLI:
+//!
+//! - [`browser_tools`] — the static tool set (D4 static-advertise), now consumed by the facade's
+//!   capability source rather than served here. It is advertised whether or not an extension is
+//!   attached; a call while disconnected reports "browser not connected" instead of the tools
+//!   silently disappearing.
+//! - [`AcpMcpTunnel`] — the trait core calls to reach a session's tunnel, implemented in the root.
+//! - [`write_facade_mcp_config`] — writes the one static facade entry into each colocated CLI's
+//!   config, and retires the bridge entry it replaces.
+//! - [`warn_if_browser_mode_set`] — startup migration notice for the removed `OPENAB_BROWSER_MODE`.
 
-use rmcp::model::{
-    object, CallToolRequestParams, CallToolResult, ErrorData as McpError, JsonObject,
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
-};
-use rmcp::service::{RequestContext, RoleServer};
-use rmcp::transport::streamable_http_server::{
-    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
-};
-use rmcp::ServerHandler;
-use axum::response::IntoResponse;
+use rmcp::model::{object, Tool};
 use serde_json::{json, Value};
-use std::sync::Arc;
 
 /// Core-side interface to the browser MCP-over-ACP tunnel (D6-a'). Implemented by the ROOT
 /// (which bridges to the gateway's per-connection tunnel registry) and consumed by the MCP
@@ -113,230 +108,6 @@ pub fn browser_tools() -> Vec<Tool> {
     ]
 }
 
-/// The core-hosted MCP server the colocated agent connects to (D3). A proxy: it advertises
-/// the browser tools and (once T5.3 wires the tunnel) forwards `tools/call` to the extension
-/// over MCP-over-ACP. Until then it static-advertises (D4) and returns "browser not
-/// connected" on call.
-#[derive(Clone)]
-pub struct ProxyHandler {
-    /// The browser session this server instance serves (D5-a: one MCP server per session).
-    channel_id: String,
-    /// Bridge to that session's browser tunnel; `None` when no browser is attached (or the
-    /// process has no tunnel wiring). A call while `None` reports "browser not connected" (D4).
-    tunnel: Option<Arc<dyn AcpMcpTunnel>>,
-}
-
-impl ProxyHandler {
-    pub fn new(channel_id: String, tunnel: Option<Arc<dyn AcpMcpTunnel>>) -> Self {
-        Self { channel_id, tunnel }
-    }
-
-    /// Forward a tool call to the browser over the tunnel (as an MCP `tools/call`), or report
-    /// not-connected (D4) when no browser is attached.
-    async fn forward_tool_call(
-        &self,
-        name: &str,
-        arguments: Option<JsonObject>,
-    ) -> Result<CallToolResult, McpError> {
-        let Some(tunnel) = &self.tunnel else {
-            return Err(McpError::internal_error(
-                "browser not connected: open the OpenAB side panel in your browser",
-                None,
-            ));
-        };
-        let params = json!({ "name": name, "arguments": arguments });
-        // Empty server_id sentinel (Fork A): this single-browser proxy doesn't know the
-        // client-declared server id; RootBrowserTunnel resolves the sole tunnel on the channel.
-        let result = tunnel
-            .call(&self.channel_id, "", "tools/call", Some(params))
-            .await
-            .map_err(|e| McpError::internal_error(e, None))?;
-        serde_json::from_value(result)
-            .map_err(|e| McpError::internal_error(format!("malformed tool result: {e}"), None))
-    }
-}
-
-impl ServerHandler for ProxyHandler {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "OpenAB browser-control proxy: DOM-semantic tools executed in the user's browser \
-             via MCP-over-ACP.",
-        )
-    }
-
-    async fn list_tools(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListToolsResult, McpError> {
-        // D4 static-advertise: expose the browser tools regardless of extension state.
-        Ok(ListToolsResult {
-            tools: browser_tools(),
-            ..Default::default()
-        })
-    }
-
-    async fn call_tool(
-        &self,
-        request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        self.forward_tool_call(request.name.as_ref(), request.arguments)
-            .await
-    }
-}
-
-/// Loopback bearer gate for the MCP server (D3): even bound to 127.0.0.1, require the token
-/// the agent's MCP config carries, so another local process on the host can't reach the
-/// browser tools. Returns 401 when the `Authorization: Bearer <token>` header is absent or
-/// wrong.
-async fn require_bearer(
-    axum::extract::State(expected): axum::extract::State<Arc<str>>,
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    let authed = req
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        // Constant-time compare so a wrong token can't be probed byte-by-byte via response
-        // timing (mirrors the gateway's feishu/wecom signature checks).
-        .is_some_and(|t| {
-            use subtle::ConstantTimeEq;
-            t.as_bytes().ct_eq(expected.as_bytes()).into()
-        });
-    if authed {
-        next.run(req).await
-    } else {
-        axum::http::StatusCode::UNAUTHORIZED.into_response()
-    }
-}
-
-/// Start the in-process Streamable-HTTP MCP proxy server on an OS-assigned **loopback** port
-/// (D3), gated by `bearer`. Returns the bound address; the caller hands `addr.port()` + the
-/// same `bearer` to the colocated agent's native MCP config (T5.2). Shuts down when `ct` is
-/// cancelled.
-pub async fn spawn_mcp_server(
-    channel_id: String,
-    tunnel: Option<Arc<dyn AcpMcpTunnel>>,
-    bearer: String,
-    ct: tokio_util::sync::CancellationToken,
-) -> std::io::Result<std::net::SocketAddr> {
-    let config = StreamableHttpServerConfig::default()
-        .with_stateful_mode(false)
-        .with_json_response(true)
-        .with_sse_keep_alive(None)
-        .with_cancellation_token(ct.child_token());
-    let service: StreamableHttpService<ProxyHandler, LocalSessionManager> =
-        StreamableHttpService::new(
-            move || Ok(ProxyHandler::new(channel_id.clone(), tunnel.clone())),
-            Default::default(),
-            config,
-        );
-    let router = axum::Router::new()
-        .nest_service("/mcp", service)
-        .layer(axum::middleware::from_fn_with_state(
-            Arc::<str>::from(bearer),
-            require_bearer,
-        ));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, router)
-            .with_graceful_shutdown(async move { ct.cancelled_owned().await })
-            .await;
-    });
-    Ok(addr)
-}
-
-/// Start a per-session MCP proxy server (D5-a) and register it in the agent's native MCP
-/// config so the colocated agent connects to it (D2). Mints a fresh bearer, starts the
-/// loopback server, and writes/merges `<workdir>/.cursor/mcp.json` with the `openab-browser`
-/// HTTP entry (Cursor's config; other agents get their own writer later). Returns the bound
-/// address + the `CancellationToken` the caller cancels to stop the server on session evict.
-pub async fn start_session_server(
-    channel_id: &str,
-    workdir: &str,
-    tunnel: Option<Arc<dyn AcpMcpTunnel>>,
-) -> std::io::Result<(std::net::SocketAddr, tokio_util::sync::CancellationToken)> {
-    let bearer = uuid::Uuid::new_v4().to_string();
-    let ct = tokio_util::sync::CancellationToken::new();
-    let addr = spawn_mcp_server(channel_id.to_string(), tunnel, bearer.clone(), ct.clone()).await?;
-
-    let our_url = format!("http://{addr}/mcp");
-    let entry = json!({
-        "url": our_url.clone(),
-        "headers": { "Authorization": format!("Bearer {bearer}") }
-    });
-
-    // Merge the openab-browser entry into each colocated ACP CLI's native MCP config (don't
-    // clobber servers the user/agent already configured). Cursor reads <workdir>/.cursor/mcp.json;
-    // kiro-cli reads <workdir>/.kiro/settings/mcp.json. We write both — each CLI ignores the
-    // other's file — so the browser server reaches whichever agent is colocated.
-    let cfg_paths = [
-        std::path::Path::new(workdir).join(".cursor").join("mcp.json"),
-        std::path::Path::new(workdir)
-            .join(".kiro")
-            .join("settings")
-            .join("mcp.json"),
-    ];
-    for cfg_path in &cfg_paths {
-        if let Some(dir) = cfg_path.parent() {
-            tokio::fs::create_dir_all(dir).await?;
-        }
-        let mut cfg: Value = match tokio::fs::read(cfg_path).await {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({})),
-            Err(_) => json!({}),
-        };
-        if !cfg.get("mcpServers").map(Value::is_object).unwrap_or(false) {
-            cfg["mcpServers"] = json!({});
-        }
-        cfg["mcpServers"]["openab-browser"] = entry.clone();
-        // 0600: the file carries a live bearer token — default umask would leave it world-readable.
-        write_private(cfg_path, &serde_json::to_vec_pretty(&cfg)?).await?;
-    }
-
-    // kiro `--agent <name>` deployments read the agent file, not settings/mcp.json —
-    // merge (and allowlist) there too, or the tools never reach OAB bot agents.
-    merge_kiro_agent_configs(workdir, &entry).await?;
-
-    // On session evict/drop the caller cancels `ct`; strip our now-dead `openab-browser` entry
-    // (with its live bearer) from each config so a stale credential doesn't linger. Only remove it
-    // if it still points at OUR addr — a concurrent/reconnected session may have already replaced
-    // it, and we must not clobber that live entry (the mcp.json paths are shared across acp: sessions).
-    let cleanup_paths = cfg_paths.to_vec();
-    let cleanup_url = our_url;
-    let cleanup_ct = ct.clone();
-    let cleanup_workdir = workdir.to_string();
-    tokio::spawn(async move {
-        cleanup_ct.cancelled().await;
-        cleanup_kiro_agent_configs(&cleanup_workdir, &cleanup_url).await;
-        for cleanup_path in &cleanup_paths {
-            let Ok(bytes) = tokio::fs::read(cleanup_path).await else {
-                continue;
-            };
-            let Ok(mut cfg) = serde_json::from_slice::<Value>(&bytes) else {
-                continue;
-            };
-            let still_ours = cfg
-                .pointer("/mcpServers/openab-browser/url")
-                .and_then(Value::as_str)
-                == Some(cleanup_url.as_str());
-            if !still_ours {
-                continue;
-            }
-            if let Some(servers) = cfg.get_mut("mcpServers").and_then(Value::as_object_mut) {
-                servers.remove("openab-browser");
-            }
-            if let Ok(out) = serde_json::to_vec_pretty(&cfg) {
-                let _ = write_private(cleanup_path, &out).await;
-            }
-        }
-    });
-
-    Ok((addr, ct))
-}
 
 /// Write `bytes` to `path`, then tighten it to owner-only (0600). The file holds a live bearer
 /// token for the loopback MCP server, so it must not be group/world readable.
@@ -350,120 +121,20 @@ async fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<
     Ok(())
 }
 
-/// Merge the `openab-browser` entry into every kiro **per-agent** config
-/// (`<workdir>/.kiro/agents/*.json`). When kiro-cli runs with `--agent <name>`
-/// — as every OAB bot deployment does — it reads its MCP server list from the
-/// agent file, NOT from `.kiro/settings/mcp.json`, and gates tools through the
-/// file's `allowedTools` allowlist (verified live on the b2 fleet deployment;
-/// see docs/gmail-native.md "Kiro CLI gotcha"). Without this, browser tools
-/// are invisible to exactly the deployments this feature targets.
+/// True when an `openab-browser` entry is one we can **prove** we wrote, and so may be removed.
 ///
-/// Unlike the settings-file writer, agent files carry unrelated config
-/// (model, description, allowlists), so an unparseable file is SKIPPED —
-/// never clobbered with a fresh object. macOS metadata droppings
-/// (`._*.json`) are ignored. Missing agents dir = no-op.
-async fn merge_kiro_agent_configs(workdir: &str, entry: &Value) -> std::io::Result<()> {
-    let dir = std::path::Path::new(workdir).join(".kiro").join("agents");
-    let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
-        return Ok(()); // no agents dir → nothing runs with --agent here
-    };
-    while let Ok(Some(f)) = rd.next_entry().await {
-        let path = f.path();
-        let name = f.file_name();
-        let name = name.to_string_lossy();
-        if !name.ends_with(".json") || name.starts_with("._") {
-            continue;
-        }
-        let Ok(bytes) = tokio::fs::read(&path).await else {
-            continue;
-        };
-        let Ok(mut cfg) = serde_json::from_slice::<Value>(&bytes) else {
-            continue; // agent files carry model/allowlists — never clobber
-        };
-        if !cfg.get("mcpServers").map(Value::is_object).unwrap_or(false) {
-            cfg["mcpServers"] = json!({});
-        }
-        let mut changed = false;
-        if cfg["mcpServers"]["openab-browser"] != *entry {
-            cfg["mcpServers"]["openab-browser"] = entry.clone();
-            changed = true;
-        }
-        // `allowedTools` is a default-deny allowlist: adding the server
-        // without allowlisting it leaves every browser tool blocked.
-        if let Some(allowed) = cfg.get_mut("allowedTools").and_then(Value::as_array_mut) {
-            if !allowed.iter().any(|v| v.as_str() == Some("@openab-browser")) {
-                allowed.push(json!("@openab-browser"));
-                changed = true;
-            }
-        }
-        if changed {
-            write_private(&path, &serde_json::to_vec_pretty(&cfg)?).await?;
-        }
-    }
-    Ok(())
-}
-
-/// Session-evict counterpart of [`merge_kiro_agent_configs`]: strip the
-/// now-dead `openab-browser` entry (and its `allowedTools` grant) from every
-/// kiro agent file — but only when the entry still points at OUR `url`, so a
-/// concurrent/reconnected session's live entry is never clobbered (same rule
-/// as the settings-file cleanup). Static (url-less) bridge entries are left
-/// alone.
-async fn cleanup_kiro_agent_configs(workdir: &str, url: &str) {
-    let dir = std::path::Path::new(workdir).join(".kiro").join("agents");
-    let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
-        return;
-    };
-    while let Ok(Some(f)) = rd.next_entry().await {
-        let path = f.path();
-        let name = f.file_name();
-        let name = name.to_string_lossy();
-        if !name.ends_with(".json") || name.starts_with("._") {
-            continue;
-        }
-        let Ok(bytes) = tokio::fs::read(&path).await else {
-            continue;
-        };
-        let Ok(mut cfg) = serde_json::from_slice::<Value>(&bytes) else {
-            continue;
-        };
-        let still_ours = cfg
-            .pointer("/mcpServers/openab-browser/url")
-            .and_then(Value::as_str)
-            == Some(url);
-        if !still_ours {
-            continue;
-        }
-        if let Some(servers) = cfg.get_mut("mcpServers").and_then(Value::as_object_mut) {
-            servers.remove("openab-browser");
-        }
-        if let Some(allowed) = cfg.get_mut("allowedTools").and_then(Value::as_array_mut) {
-            allowed.retain(|v| v.as_str() != Some("@openab-browser"));
-        }
-        if let Ok(out) = serde_json::to_vec_pretty(&cfg) {
-            let _ = write_private(&path, &out).await;
-        }
-    }
-}
-
-/// True when an `openab-browser` entry is one we can **prove** we wrote, and so may be dropped
-/// when facade mode takes over.
+/// Only the removed bridge entry qualifies. It was byte-identical every session
+/// (`{"command":"openab","args":["browser-bridge"]}`) and names our own binary and a subcommand
+/// that no longer exists, so matching that exact shape is itself the proof — and leaving it would
+/// have the agent's MCP client fail to start it on every session.
 ///
-/// Only the bridge entry qualifies. It is byte-identical every session
-/// (`{"command":"openab","args":["browser-bridge"]}`) and names our own binary and subcommand, so
-/// matching it is itself the proof.
-///
-/// The per-session proxy entry deliberately does **not** qualify, correcting an earlier version of
-/// this function. Its url and bearer are minted per session and never recorded anywhere, so
-/// "loopback url plus some `Bearer` header" is a description, not an identity — it matches any
-/// local MCP server an operator happened to configure under this key. That check claimed to
-/// recognise "a bearer we minted" while comparing against nothing we had kept. With no way to
-/// prove ownership we fail closed and preserve.
-///
-/// Preserving costs little. A leftover proxy entry names an ephemeral port belonging to a session
-/// that is gone — `start_session_server` binds `127.0.0.1:0` and drops the listener with the
-/// session — so it is dead configuration rather than a live bypass. The bridge entry is the one
-/// that would still resolve and run, and that is the one removed.
+/// The per-session proxy entry deliberately does **not** qualify. Its url and bearer were minted
+/// per session and never recorded anywhere, so "loopback url plus some `Bearer` header" is a
+/// description rather than an identity: it matches any local MCP server an operator configured
+/// under this key. An earlier version of this function claimed to recognise "a bearer we minted"
+/// while comparing against nothing we had kept. With no way to prove ownership we fail closed and
+/// preserve — deleting an operator's configuration is worse than leaving a dead entry, and with
+/// the proxy gone the entry it names is dead configuration rather than a live bypass.
 fn is_openab_direct_browser_entry(entry: &Value) -> bool {
     entry.get("command").and_then(Value::as_str) == Some("openab")
         && entry.get("args") == Some(&json!(["browser-bridge"]))
@@ -590,106 +261,116 @@ async fn merge_kiro_agent_facade_configs(workdir: &str, entry: &Value) -> std::i
 /// (closing over the facade's `SessionTokens` registry — core stays free of
 /// the openab-mcp dependency); the pool calls it at session spawn/evict.
 pub trait SessionTokenRegistrar: Send + Sync {
-    /// Mint (or re-mint) the token for `channel_id`; returns the value the
-    /// pool injects as `OPENAB_SESSION_TOKEN` in the agent's environment.
+    /// Mint a fresh token for `channel_id`; returns the value the pool injects as
+    /// `OPENAB_SESSION_TOKEN` in the agent's environment.
+    ///
+    /// Does **not** replace a token the channel already has — tokens for a channel coexist, so a
+    /// respawned or racing session gets its own credential without invalidating one a running
+    /// agent is still presenting.
     fn mint(&self, channel_id: &str) -> String;
     /// Revoke one specific token (the session that held it was evicted).
     ///
-    /// Deliberately keyed by token, not by channel. `mint` replaces whatever token a channel had,
-    /// so a replaced session's teardown runs *after* its successor has already minted a new one;
-    /// revoking by channel would strip that live token and silently cut the new agent off from the
-    /// facade. Revoking the exact token makes a late teardown a no-op instead (review R1).
+    /// Deliberately keyed by token, not by channel. Because tokens coexist and session lifetimes
+    /// overlap, a replaced session's teardown runs *after* its successor has already minted its
+    /// own token for the same channel. Revoking by channel would take the successor's live
+    /// credential with it and silently cut the new agent off from the facade; revoking this exact
+    /// token is a no-op by then instead (review R1).
     fn revoke(&self, token: &str);
 }
 
-/// Selected browser transport. `OPENAB_BROWSER_MODE=proxy` opts out of facade routing; anything
-/// else, including unset, uses the facade.
+/// Report, once at startup, that `OPENAB_BROWSER_MODE` no longer selects anything.
 ///
-/// The stdio bridge was the third variant and is gone. `bridge` is now simply an unrecognised
-/// value and falls through to `Facade` like any other — deliberately, so a deployment still
-/// carrying `OPENAB_BROWSER_MODE=bridge` from the previous release comes up with working browser
-/// control rather than refusing to start on a value that used to be valid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BrowserMode {
-    /// Browser tools served through the OAB MCP Facade as a session-aware
-    /// in-process capability source (one listener, session identity via
-    /// broker-minted tokens). The default when the facade is running;
-    /// falls back to `Proxy` when it is not (no `[mcp]` in config).
-    Facade,
-    /// Per-session loopback HTTP MCP server + dynamic config (explicit opt-out
-    /// from facade routing).
-    Proxy,
-}
-
-fn parse_browser_mode(s: Option<&str>) -> BrowserMode {
-    match s.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
-        Some("proxy") => BrowserMode::Proxy,
-        _ => BrowserMode::Facade,
+/// Call this from configuration/startup, **not** from a session path: nothing per-session is
+/// decided by it any more, and a warning on that path would repeat for every spawn.
+///
+/// The variable used to choose between three transports. Two are gone and the third is no longer
+/// optional, so any value it holds is inert. Ignoring it silently would leave an operator
+/// believing they had configured something — the same failure the removed-bridge warning existed
+/// to prevent, one level up. So the message says the value is ignored *and* reports what is
+/// actually in force, since "ignored" alone does not tell them whether they still have browser
+/// control at all.
+pub fn warn_if_browser_mode_set(mcp_configured: bool) {
+    let raw = std::env::var("OPENAB_BROWSER_MODE").ok();
+    if let Some((requested, browser_control)) =
+        browser_mode_migration_notice(raw.as_deref(), mcp_configured)
+    {
+        tracing::warn!(
+            requested,
+            browser_control,
+            "OPENAB_BROWSER_MODE is ignored — it no longer selects a transport and can be unset. \
+             Browser control is configured by the [mcp] section of config.toml; `browser_control` \
+             reports what is actually in force for this process."
+        );
     }
 }
 
-/// True when `OPENAB_BROWSER_MODE` is set to something that is not a transport we still have.
+/// Decide whether to warn and what to say: `(requested, browser_control)`, or `None` to stay quiet.
 ///
-/// Empty and unset are not "unrecognised" — they mean "no preference expressed". Only a value the
-/// operator deliberately wrote and that no longer selects anything counts, which today is `bridge`
-/// and any typo.
-fn is_unrecognised_mode(raw: Option<&str>) -> Option<&str> {
-    let v = raw?.trim();
-    if v.is_empty() || v.eq_ignore_ascii_case("proxy") || v.eq_ignore_ascii_case("facade") {
+/// Split out from the logging so the decision is testable without a subscriber or process env.
+///
+/// **Every** non-empty value warns, `proxy` and `facade` included. `proxy` no longer selects
+/// anything either, so staying quiet for it would be the same silence this notice exists to
+/// remove; `facade` is merely redundant, but reporting it costs one line at startup and saying
+/// "this variable is read" of some values and not others would be false.
+fn browser_mode_migration_notice(
+    raw: Option<&str>,
+    mcp_configured: bool,
+) -> Option<(&str, &'static str)> {
+    let requested = raw?.trim();
+    if requested.is_empty() {
         return None;
     }
-    Some(v)
+    Some((
+        requested,
+        if mcp_configured { "facade" } else { "disabled" },
+    ))
 }
 
-/// Resolve the transport actually in use from the configured value and whether the facade is
-/// really serving. Pure, so the resolution is testable without touching process env.
-///
-/// Two separate demotions land here and both are silent to the operator on their own: an
-/// unrecognised value falls through to `Facade`, and `Facade` falls back to `Proxy` when no
-/// `[mcp]` wired a registrar. Composing them is how `OPENAB_BROWSER_MODE=bridge` ends up running
-/// **proxy** — which is why the caller warns with the resolved value rather than the requested one.
-fn resolve_browser_mode(raw: Option<&str>, facade_available: bool) -> BrowserMode {
-    match parse_browser_mode(raw) {
-        BrowserMode::Facade if !facade_available => BrowserMode::Proxy,
-        m => m,
-    }
-}
-
-/// The transport to use for this process, resolved against whether the facade is serving.
-///
-/// `facade_available` is false when no `[mcp]` section wired a session registrar or facade url.
-///
-/// Warns once per process when `OPENAB_BROWSER_MODE` names a transport that no longer exists.
-/// Accepting the stale value keeps an upgraded deployment running; accepting it *silently* would
-/// leave the operator believing they are on a transport that was deleted, so the warning names the
-/// transport actually in use — not the one they asked for, and not merely the one that parsing
-/// picked, since the `[mcp]` fallback can demote that again.
-pub fn browser_mode_effective(facade_available: bool) -> BrowserMode {
-    let raw = std::env::var("OPENAB_BROWSER_MODE").ok();
-    let mode = resolve_browser_mode(raw.as_deref(), facade_available);
-    if let Some(requested) = is_unrecognised_mode(raw.as_deref()) {
-        static WARNED: std::sync::Once = std::sync::Once::new();
-        WARNED.call_once(|| {
-            tracing::warn!(
-                requested,
-                effective = ?mode,
-                "OPENAB_BROWSER_MODE names a transport that no longer exists (the stdio bridge was \
-                 removed); continuing on the transport shown as `effective`. Unset the variable, \
-                 or set it to `proxy`, to make the configuration say what is actually running."
-            );
-        });
-    }
-    mode
-}
 
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_tools, cleanup_kiro_agent_configs, is_openab_direct_browser_entry,
-        is_unrecognised_mode, merge_kiro_agent_configs, parse_browser_mode, resolve_browser_mode,
-        spawn_mcp_server, start_session_server,
-        write_facade_mcp_config, AcpMcpTunnel, BrowserMode, ProxyHandler,
+        browser_mode_migration_notice, browser_tools, is_openab_direct_browser_entry,
+        write_facade_mcp_config,
     };
+
+    /// The variable is inert now, so the notice must fire for every value an operator could have
+    /// set — including `proxy`, which used to be a real selection. Staying quiet for it would
+    /// reproduce the silence this notice exists to remove.
+    #[test]
+    fn every_set_browser_mode_value_is_reported_as_ignored() {
+        for v in ["bridge", "proxy", "facade", "  Bridge  ", "typo"] {
+            assert!(
+                browser_mode_migration_notice(Some(v), true).is_some(),
+                "{v:?} is a value someone deliberately set; it must not be ignored silently"
+            );
+        }
+        // Unset and blank express no preference — warning on them would fire for every default
+        // deployment and train operators to skip the line.
+        assert_eq!(browser_mode_migration_notice(None, true), None);
+        assert_eq!(browser_mode_migration_notice(Some(""), true), None);
+        assert_eq!(browser_mode_migration_notice(Some("   "), true), None);
+    }
+
+    /// The second field is the one an operator actually needs: not which mode they are in (there
+    /// are none left) but whether they still have browser control at all. Without `[mcp]` they do
+    /// not, and the removed Facade->Proxy fallback no longer hides that.
+    #[test]
+    fn the_notice_reports_whether_browser_control_survives_not_which_mode() {
+        assert_eq!(
+            browser_mode_migration_notice(Some("bridge"), true),
+            Some(("bridge", "facade"))
+        );
+        assert_eq!(
+            browser_mode_migration_notice(Some("bridge"), false),
+            Some(("bridge", "disabled"))
+        );
+        // Trimmed, so the log shows what was set rather than the surrounding whitespace.
+        assert_eq!(
+            browser_mode_migration_notice(Some("  proxy  "), false),
+            Some(("proxy", "disabled"))
+        );
+    }
 
     // --- F4: facade setup retires the direct transport it replaces ---
 
@@ -908,309 +589,18 @@ mod tests {
         dir
     }
 
-    #[tokio::test]
-    async fn kiro_agent_merge_adds_server_and_allowlist_preserving_the_rest() {
-        let wd = tmp_workdir("merge").await;
-        let agent = wd.join(".kiro/agents/terra.json");
-        tokio::fs::write(
-            &agent,
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "name": "terra",
-                "model": "gpt-5.6-terra",
-                "mcpServers": { "github": { "url": "http://ghpool:8080/mcp" } },
-                "allowedTools": ["@builtin", "@github"]
-            }))
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-        let entry = serde_json::json!({
-            "url": "http://127.0.0.1:45678/mcp",
-            "headers": { "Authorization": "Bearer tok" }
-        });
-        merge_kiro_agent_configs(wd.to_str().unwrap(), &entry)
-            .await
-            .unwrap();
-        let cfg: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(&agent).await.unwrap()).unwrap();
-        assert_eq!(cfg["mcpServers"]["openab-browser"], entry);
-        assert_eq!(
-            cfg["mcpServers"]["github"]["url"], "http://ghpool:8080/mcp",
-            "pre-existing servers must be preserved"
-        );
-        assert_eq!(cfg["model"], "gpt-5.6-terra", "unrelated fields preserved");
-        let allowed = cfg["allowedTools"].as_array().unwrap();
-        assert!(
-            allowed.iter().any(|v| v == "@openab-browser"),
-            "allowedTools is default-deny — the server must be allowlisted: {allowed:?}"
-        );
-        // Idempotent: second merge changes nothing (byte-stable allowlist).
-        merge_kiro_agent_configs(wd.to_str().unwrap(), &entry)
-            .await
-            .unwrap();
-        let cfg2: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(&agent).await.unwrap()).unwrap();
-        assert_eq!(cfg, cfg2);
-        let _ = tokio::fs::remove_dir_all(&wd).await;
-    }
 
-    #[tokio::test]
-    async fn kiro_agent_merge_skips_unparseable_and_metadata_files() {
-        let wd = tmp_workdir("skip").await;
-        let junk = wd.join(".kiro/agents/broken.json");
-        tokio::fs::write(&junk, b"{not json").await.unwrap();
-        let meta = wd.join(".kiro/agents/._terra.json");
-        tokio::fs::write(&meta, b"\x00\x05\x16\x07").await.unwrap();
-        let entry = serde_json::json!({ "url": "http://127.0.0.1:1/mcp" });
-        merge_kiro_agent_configs(wd.to_str().unwrap(), &entry)
-            .await
-            .unwrap();
-        assert_eq!(
-            tokio::fs::read(&junk).await.unwrap(),
-            b"{not json",
-            "unparseable agent files must be skipped, never clobbered"
-        );
-        assert_eq!(tokio::fs::read(&meta).await.unwrap(), b"\x00\x05\x16\x07");
-        let _ = tokio::fs::remove_dir_all(&wd).await;
-    }
 
-    #[tokio::test]
-    async fn kiro_agent_merge_without_agents_dir_is_noop() {
-        let wd = std::env::temp_dir().join(format!(
-            "oab-mcp-proxy-test-noop-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        tokio::fs::create_dir_all(&wd).await.unwrap();
-        merge_kiro_agent_configs(
-            wd.to_str().unwrap(),
-            &serde_json::json!({ "url": "http://127.0.0.1:1/mcp" }),
-        )
-        .await
-        .unwrap();
-        let _ = tokio::fs::remove_dir_all(&wd).await;
-    }
 
-    #[tokio::test]
-    async fn kiro_agent_cleanup_removes_only_our_url_and_its_grant() {
-        let wd = tmp_workdir("cleanup").await;
-        let ours = wd.join(".kiro/agents/ours.json");
-        tokio::fs::write(
-            &ours,
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "mcpServers": { "openab-browser": { "url": "http://127.0.0.1:1111/mcp" } },
-                "allowedTools": ["@builtin", "@openab-browser"]
-            }))
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-        let foreign = wd.join(".kiro/agents/foreign.json");
-        tokio::fs::write(
-            &foreign,
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "mcpServers": { "openab-browser": { "url": "http://127.0.0.1:2222/mcp" } },
-                "allowedTools": ["@openab-browser"]
-            }))
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-        cleanup_kiro_agent_configs(wd.to_str().unwrap(), "http://127.0.0.1:1111/mcp").await;
-        let ours_cfg: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(&ours).await.unwrap()).unwrap();
-        assert!(ours_cfg["mcpServers"]["openab-browser"].is_null());
-        assert!(
-            !ours_cfg["allowedTools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|v| v == "@openab-browser"),
-            "the stale allowlist grant must be revoked with the entry"
-        );
-        let foreign_cfg: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(&foreign).await.unwrap()).unwrap();
-        assert_eq!(
-            foreign_cfg["mcpServers"]["openab-browser"]["url"], "http://127.0.0.1:2222/mcp",
-            "a concurrent session's live entry must never be clobbered"
-        );
-        let _ = tokio::fs::remove_dir_all(&wd).await;
-    }
 
-    #[test]
-    fn browser_mode_defaults_to_facade_with_proxy_and_bridge_opt_outs() {
-        // Facade is the default: browser tools ride the OAB MCP Facade as a
-        // session-aware source (falls back to Proxy at runtime when no
-        // facade is serving — see the pool's mode fallback).
-        assert_eq!(parse_browser_mode(None), BrowserMode::Facade);
-        assert_eq!(parse_browser_mode(Some("")), BrowserMode::Facade);
-        assert_eq!(parse_browser_mode(Some("junk")), BrowserMode::Facade);
-        // The one remaining explicit opt-out keeps its exact prior semantics.
-        assert_eq!(parse_browser_mode(Some("proxy")), BrowserMode::Proxy);
-        assert_eq!(parse_browser_mode(Some("  Proxy  ")), BrowserMode::Proxy);
-        // `bridge` was a third mode and is gone. It must degrade to the default like any other
-        // unknown value rather than being special-cased into an error: a deployment still carrying
-        // OPENAB_BROWSER_MODE=bridge from the previous release has to come up with working browser
-        // control, not refuse to start on a value that used to be valid.
-        assert_eq!(parse_browser_mode(Some("bridge")), BrowserMode::Facade);
-        assert_eq!(parse_browser_mode(Some("  Bridge  ")), BrowserMode::Facade);
-    }
 
-    /// The two demotions compose, and the second one is the reason the warning cannot just echo
-    /// what parsing returned: `bridge` degrades to Facade, and Facade degrades again to Proxy when
-    /// no `[mcp]` is configured. An operator who set `bridge` and has no facade is running
-    /// **proxy** — the transport furthest from what they wrote.
-    #[test]
-    fn a_removed_mode_resolves_through_both_demotions_to_the_transport_actually_running() {
-        assert_eq!(
-            resolve_browser_mode(Some("bridge"), false),
-            BrowserMode::Proxy,
-            "bridge + no [mcp] must resolve to proxy, which is what the operator is really running"
-        );
-        assert_eq!(resolve_browser_mode(Some("bridge"), true), BrowserMode::Facade);
-        // An explicit opt-out is not a fallback and is never re-resolved.
-        assert_eq!(resolve_browser_mode(Some("proxy"), true), BrowserMode::Proxy);
-        assert_eq!(resolve_browser_mode(Some("proxy"), false), BrowserMode::Proxy);
-        // Unset behaves like any other non-preference.
-        assert_eq!(resolve_browser_mode(None, true), BrowserMode::Facade);
-        assert_eq!(resolve_browser_mode(None, false), BrowserMode::Proxy);
-    }
 
-    /// Only a value the operator actually wrote and that no longer selects anything is worth
-    /// warning about. Warning on unset would fire for every default deployment, and warning on a
-    /// live value would train operators to ignore it.
-    #[test]
-    fn only_a_deliberately_set_dead_value_is_reported_as_unrecognised() {
-        assert_eq!(is_unrecognised_mode(Some("bridge")), Some("bridge"));
-        assert_eq!(is_unrecognised_mode(Some("  Bridge  ")), Some("Bridge"));
-        assert_eq!(is_unrecognised_mode(Some("typo")), Some("typo"));
-        assert_eq!(is_unrecognised_mode(None), None);
-        assert_eq!(is_unrecognised_mode(Some("")), None);
-        assert_eq!(is_unrecognised_mode(Some("   ")), None);
-        assert_eq!(is_unrecognised_mode(Some("proxy")), None);
-        assert_eq!(is_unrecognised_mode(Some("FACADE")), None);
-    }
 
-    struct MockTunnel;
-    #[async_trait::async_trait]
-    impl AcpMcpTunnel for MockTunnel {
-        async fn call(
-            &self,
-            channel_id: &str,
-            server_id: &str,
-            method: &str,
-            _params: Option<serde_json::Value>,
-        ) -> Result<serde_json::Value, String> {
-            assert_eq!(channel_id, "acp_x");
-            assert_eq!(server_id, ""); // proxy passes the empty sentinel (Fork A)
-            assert_eq!(method, "tools/call");
-            Ok(serde_json::json!({"content": [{"type": "text", "text": "clicked"}]}))
-        }
-    }
 
-    #[tokio::test]
-    async fn call_tool_forwards_to_the_tunnel() {
-        let h = ProxyHandler::new("acp_x".into(), Some(std::sync::Arc::new(MockTunnel)));
-        let result = h.forward_tool_call("katashiro.click", None).await.unwrap();
-        let v = serde_json::to_value(&result).unwrap();
-        assert_eq!(v["content"][0]["text"], serde_json::json!("clicked"));
-    }
 
-    #[tokio::test]
-    async fn call_tool_reports_not_connected_without_a_tunnel() {
-        let h = ProxyHandler::new("acp_x".into(), None);
-        assert!(
-            h.forward_tool_call("katashiro.click", None).await.is_err(),
-            "a call with no attached browser must error (D4)"
-        );
-    }
 
     // --- Option C: browser-bridge socket dispatch ---
-    struct RecordTunnel {
-        result: serde_json::Value,
-    }
-    #[async_trait::async_trait]
-    impl AcpMcpTunnel for RecordTunnel {
-        async fn call(
-            &self,
-            channel_id: &str,
-            _server_id: &str,
-            method: &str,
-            _params: Option<serde_json::Value>,
-        ) -> Result<serde_json::Value, String> {
-            assert_eq!(method, "tools/call");
-            assert_eq!(channel_id, "acp_win1");
-            Ok(self.result.clone())
-        }
-    }
-    struct ErrTunnel;
-    #[async_trait::async_trait]
-    impl AcpMcpTunnel for ErrTunnel {
-        async fn call(
-            &self,
-            _c: &str,
-            _s: &str,
-            _m: &str,
-            _p: Option<serde_json::Value>,
-        ) -> Result<serde_json::Value, String> {
-            Err("no browser attached".into())
-        }
-    }
-    #[tokio::test]
-    async fn start_session_server_writes_cursor_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let (addr, ct) = start_session_server("acp_x", dir.path().to_str().unwrap(), None)
-            .await
-            .unwrap();
-        assert!(addr.ip().is_loopback());
 
-        let cfg: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(dir.path().join(".cursor/mcp.json")).unwrap())
-                .unwrap();
-        let entry = &cfg["mcpServers"]["openab-browser"];
-        assert_eq!(entry["url"], serde_json::json!(format!("http://{addr}/mcp")));
-        assert!(entry["headers"]["Authorization"]
-            .as_str()
-            .unwrap()
-            .starts_with("Bearer "));
-        // The file holds a live bearer — it must be owner-only (0600), not umask-default 0644.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.path().join(".cursor/mcp.json"))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o600, "mcp.json (live bearer) must be 0600");
-        }
-        ct.cancel();
-    }
-
-    #[tokio::test]
-    async fn start_session_server_merges_existing_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let cursor = dir.path().join(".cursor");
-        std::fs::create_dir_all(&cursor).unwrap();
-        std::fs::write(
-            cursor.join("mcp.json"),
-            r#"{"mcpServers":{"other":{"url":"http://x"}}}"#,
-        )
-        .unwrap();
-        let (_addr, ct) = start_session_server("acp_x", dir.path().to_str().unwrap(), None)
-            .await
-            .unwrap();
-        let cfg: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(cursor.join("mcp.json")).unwrap()).unwrap();
-        assert!(
-            cfg["mcpServers"]["other"].is_object(),
-            "existing server must be preserved"
-        );
-        assert!(
-            cfg["mcpServers"]["openab-browser"].is_object(),
-            "openab-browser must be added"
-        );
-        ct.cancel();
-    }
 
     #[test]
     fn browser_tools_advertises_the_fixed_set() {
@@ -1243,66 +633,5 @@ mod tests {
 
     const INIT_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
 
-    #[tokio::test]
-    async fn mcp_server_binds_loopback_and_initializes_with_bearer() {
-        let ct = tokio_util::sync::CancellationToken::new();
-        let addr = spawn_mcp_server("acp_test".into(), None, "secret-token".to_string(), ct.clone())
-            .await
-            .unwrap();
-        assert!(addr.ip().is_loopback(), "MCP server must bind loopback only");
 
-        let url = format!("http://{addr}/mcp");
-        let resp = reqwest::Client::new()
-            .post(&url)
-            .header("Authorization", "Bearer secret-token")
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json, text/event-stream")
-            .body(INIT_BODY)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["jsonrpc"], "2.0");
-        assert!(body["result"].is_object(), "initialize must return a result");
-        assert!(
-            body["result"]["capabilities"]["tools"].is_object(),
-            "server must advertise the tools capability"
-        );
-        ct.cancel();
-    }
-
-    #[tokio::test]
-    async fn mcp_server_rejects_missing_or_wrong_bearer() {
-        let ct = tokio_util::sync::CancellationToken::new();
-        let addr = spawn_mcp_server("acp_test".into(), None, "secret-token".to_string(), ct.clone())
-            .await
-            .unwrap();
-        let url = format!("http://{addr}/mcp");
-        let client = reqwest::Client::new();
-
-        // no Authorization header -> 401
-        let no_auth = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json, text/event-stream")
-            .body(INIT_BODY)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(no_auth.status(), 401);
-
-        // wrong token -> 401
-        let wrong = client
-            .post(&url)
-            .header("Authorization", "Bearer nope")
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json, text/event-stream")
-            .body(INIT_BODY)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(wrong.status(), 401);
-        ct.cancel();
-    }
 }
