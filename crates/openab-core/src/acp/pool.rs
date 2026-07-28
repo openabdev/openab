@@ -110,6 +110,35 @@ fn better_candidate(current_oldest: Option<Instant>, candidate_last_active: Inst
     }
 }
 
+/// Prepare facade browser capabilities for one session: write the agent's facade MCP entry, and
+/// mint its session token **only if that write succeeded**.
+///
+/// The token is useless without the config. The entry is what points the agent at the facade and
+/// carries `Authorization: Bearer ${OPENAB_SESSION_TOKEN}`; with no entry the agent never reaches
+/// the facade and never presents the token. Minting regardless would register a live credential
+/// for a session that cannot use it and leave it valid until eviction, while the failure showed up
+/// only as a warning. Returning `None` keeps the session running without browser capabilities,
+/// which is the honest description of what actually happened.
+#[cfg(feature = "acp-mcp")]
+async fn setup_facade_session(
+    workdir: &str,
+    facade_url: &str,
+    channel_id: &str,
+    registrar: &Arc<dyn crate::mcp_proxy::SessionTokenRegistrar>,
+) -> Option<String> {
+    match crate::mcp_proxy::write_facade_mcp_config(workdir, facade_url).await {
+        Ok(()) => Some(registrar.mint(channel_id)),
+        Err(e) => {
+            tracing::error!(
+                workdir, error = %e,
+                "facade mcp config write failed — starting this session WITHOUT browser \
+                 capabilities and not minting a session token that could never be presented"
+            );
+            None
+        }
+    }
+}
+
 /// Remove every non-`active` pool entry for `key`, reset-style.
 ///
 /// Hung eviction must NOT leave the session resumable: the old streaming task
@@ -412,25 +441,36 @@ impl SessionPool {
                         // unwraps guarded by the fallback arm above
                         let registrar = self.session_registrar.as_ref().unwrap();
                         let facade_url = self.facade_url.as_ref().unwrap();
-                        if let Err(e) =
-                            crate::mcp_proxy::write_facade_mcp_config(&effective_workdir, facade_url)
-                                .await
+                        match setup_facade_session(
+                            &effective_workdir,
+                            facade_url,
+                            channel_id,
+                            registrar,
+                        )
+                        .await
                         {
-                            warn!(thread_id, error = %e, "failed to write facade mcp config");
+                            Some(token) => {
+                                session_token = Some(token);
+                                info!(
+                                    thread_id,
+                                    "session token minted for facade browser capabilities"
+                                );
+                                // Revoke on evict/replace: piggyback the same DropGuard
+                                // plumbing proxy mode uses for its server teardown.
+                                let ct = tokio_util::sync::CancellationToken::new();
+                                let child = ct.child_token();
+                                let registrar = registrar.clone();
+                                let chan = channel_id.to_string();
+                                tokio::spawn(async move {
+                                    child.cancelled().await;
+                                    registrar.revoke(&chan);
+                                });
+                                Some(ct.drop_guard())
+                            }
+                            // No config, so no token and no revoke guard to arm. The session
+                            // still starts — it simply has no browser capabilities.
+                            None => None,
                         }
-                        session_token = Some(registrar.mint(channel_id));
-                        info!(thread_id, "session token minted for facade browser capabilities");
-                        // Revoke on evict/replace: piggyback the same DropGuard
-                        // plumbing proxy mode uses for its server teardown.
-                        let ct = tokio_util::sync::CancellationToken::new();
-                        let child = ct.child_token();
-                        let registrar = registrar.clone();
-                        let chan = channel_id.to_string();
-                        tokio::spawn(async move {
-                            child.cancelled().await;
-                            registrar.revoke(&chan);
-                        });
-                        Some(ct.drop_guard())
                     }
                     // Bridge mode (Option C): the agent's static mcp.json points at `openab
                     // browser-bridge`, which dials the pod-wide socket server (started at boot).
@@ -952,6 +992,68 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Mutex;
     use tokio::time::Instant;
+
+    /// Registrar double that records every mint, so a test can assert one never happened.
+    #[cfg(feature = "acp-mcp")]
+    #[derive(Default)]
+    struct CountingRegistrar {
+        minted: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[cfg(feature = "acp-mcp")]
+    impl crate::mcp_proxy::SessionTokenRegistrar for CountingRegistrar {
+        fn mint(&self, channel_id: &str) -> String {
+            self.minted.lock().unwrap().push(channel_id.to_string());
+            "token-xyz".to_string()
+        }
+        fn revoke(&self, _channel_id: &str) {}
+    }
+
+    /// A failed facade config write must not mint a token. The agent has no `openab` entry, so it
+    /// can never present one; minting anyway would leave a live credential registered for a
+    /// session that cannot use it until eviction.
+    #[cfg(feature = "acp-mcp")]
+    #[tokio::test]
+    async fn no_token_is_minted_when_the_facade_config_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        // Make `<workdir>/.cursor` a FILE, so create_dir_all inside the writer fails.
+        std::fs::write(dir.path().join(".cursor"), b"not a directory").unwrap();
+
+        let counting = Arc::new(CountingRegistrar::default());
+        let registrar: Arc<dyn crate::mcp_proxy::SessionTokenRegistrar> = counting.clone();
+        let token = super::setup_facade_session(
+            dir.path().to_str().unwrap(),
+            "http://127.0.0.1:8848/mcp",
+            "acp_x",
+            &registrar,
+        )
+        .await;
+
+        assert!(token.is_none(), "a failed config write must yield no token");
+        assert!(
+            counting.minted.lock().unwrap().is_empty(),
+            "the registrar must never be asked to mint when the config could not be written"
+        );
+    }
+
+    /// The happy path still mints exactly once, for the right channel.
+    #[cfg(feature = "acp-mcp")]
+    #[tokio::test]
+    async fn a_successful_facade_config_write_mints_one_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let counting = Arc::new(CountingRegistrar::default());
+        let registrar: Arc<dyn crate::mcp_proxy::SessionTokenRegistrar> = counting.clone();
+        let token = super::setup_facade_session(
+            dir.path().to_str().unwrap(),
+            "http://127.0.0.1:8848/mcp",
+            "acp_x",
+            &registrar,
+        )
+        .await;
+
+        assert_eq!(token.as_deref(), Some("token-xyz"));
+        assert_eq!(counting.minted.lock().unwrap().as_slice(), ["acp_x"]);
+    }
 
     #[test]
     fn remove_if_same_handle_removes_matching_entry() {
