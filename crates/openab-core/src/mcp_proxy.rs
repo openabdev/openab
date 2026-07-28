@@ -815,6 +815,50 @@ pub fn channel_from_process_ancestry(start_pid: u32) -> Option<String> {
 /// server can be tested without a real agent process tree above the test binary.
 pub type ChannelResolver = Arc<dyn Fn(u32) -> Option<String> + Send + Sync>;
 
+/// Hard ceiling for one bridge frame (review R4).
+///
+/// Matches the ACP tunnel's own frame ceiling so the bridge is never the tighter bottleneck for
+/// legitimate MCP traffic, while still bounding what a single frame can make us allocate.
+const MAX_BRIDGE_FRAME_BYTES: usize = 8 << 20; // 8 MiB
+
+/// Read one newline-terminated frame, refusing to buffer more than `max` bytes.
+///
+/// `BufReader::lines()` grows until it sees a newline, so a peer that never sends one pins an
+/// arbitrarily large allocation — no malice required, a wedged writer does it too. Returns
+/// `Ok(None)` at EOF, and `InvalidData` once the pending frame would exceed `max`; the caller
+/// drops the connection rather than trying to resynchronise mid-frame.
+async fn read_frame_bounded<R>(reader: &mut R, max: usize) -> std::io::Result<Option<Vec<u8>>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        // Copy out of the fill buffer before consuming: `available` borrows the reader.
+        let (chunk, terminated) = {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                return Ok((!out.is_empty()).then_some(out)); // EOF
+            }
+            match available.iter().position(|b| *b == b'\n') {
+                Some(pos) => (available[..pos].to_vec(), true),
+                None => (available.to_vec(), false),
+            }
+        };
+        if out.len() + chunk.len() > max {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("bridge frame exceeds {max} bytes"),
+            ));
+        }
+        out.extend_from_slice(&chunk);
+        reader.consume(chunk.len() + usize::from(terminated));
+        if terminated {
+            return Ok(Some(out));
+        }
+    }
+}
+
 pub async fn serve_browser_socket(
     path: std::path::PathBuf,
     tunnel: Option<Arc<dyn AcpMcpTunnel>>,
@@ -876,7 +920,7 @@ async fn handle_browser_conn(
     tunnel: Option<Arc<dyn AcpMcpTunnel>>,
     resolver: ChannelResolver,
 ) {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncWriteExt, BufReader};
 
     // Authenticate the CONNECTION, not the frame (review R2). 0600 on the socket only proves the
     // peer shares our uid; it does not say which session the peer belongs to. The `channel_id` in
@@ -894,8 +938,21 @@ async fn handle_browser_conn(
     };
 
     let (read_half, mut write_half) = stream.into_split();
-    let mut lines = BufReader::new(read_half).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    let mut reader = BufReader::new(read_half);
+    loop {
+        let line = match read_frame_bounded(&mut reader, MAX_BRIDGE_FRAME_BYTES).await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => break, // EOF
+            Err(e) => {
+                // Oversized or unreadable: the stream cannot be resynchronised mid-frame, so the
+                // connection goes rather than leaving a partial frame buffered (R4).
+                warn!(peer_pid = ?peer_pid, error = %e, "browser bridge: dropping connection");
+                break;
+            }
+        };
+        let Ok(line) = String::from_utf8(line) else {
+            continue; // skip a non-UTF8 frame rather than drop the connection
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -1464,6 +1521,45 @@ mod tests {
         assert_eq!(v["id"], 9);
         assert_eq!(v["result"]["content"][0]["text"], "ok");
         ct.cancel();
+    }
+
+    // --- R4: one frame cannot pin an unbounded allocation ---
+
+    /// `BufReader::lines()` grows until it sees a newline, so a peer that never sends one — a
+    /// wedged writer just as much as a hostile one — pins an arbitrarily large buffer. Tested at a
+    /// small cap so the assertion is about the bound, not about allocating megabytes.
+    #[tokio::test]
+    async fn an_unterminated_frame_is_refused_once_it_passes_the_cap() {
+        // Terminated frames under the cap read normally, newline consumed.
+        let mut r = std::io::Cursor::new(b"hello\nworld\n".to_vec());
+        assert_eq!(
+            super::read_frame_bounded(&mut r, 16).await.unwrap(),
+            Some(b"hello".to_vec())
+        );
+        assert_eq!(
+            super::read_frame_bounded(&mut r, 16).await.unwrap(),
+            Some(b"world".to_vec())
+        );
+        // EOF is None, not an error.
+        assert_eq!(super::read_frame_bounded(&mut r, 16).await.unwrap(), None);
+
+        // Exactly at the cap is still allowed — the bound is inclusive.
+        let mut at_cap = std::io::Cursor::new(b"0123456789abcdef\n".to_vec());
+        assert_eq!(
+            super::read_frame_bounded(&mut at_cap, 16).await.unwrap(),
+            Some(b"0123456789abcdef".to_vec())
+        );
+
+        // Unterminated and over the cap: refused rather than buffered.
+        let mut flood = std::io::Cursor::new(vec![b'x'; 64]);
+        let err = super::read_frame_bounded(&mut flood, 16)
+            .await
+            .expect_err("an unterminated frame past the cap must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        // A terminated frame that is merely too long is refused too.
+        let mut long = std::io::Cursor::new([vec![b'y'; 64], vec![b'\n']].concat());
+        assert!(super::read_frame_bounded(&mut long, 16).await.is_err());
     }
 
     // --- R2: the socket authenticates the connection, not the frame ---
