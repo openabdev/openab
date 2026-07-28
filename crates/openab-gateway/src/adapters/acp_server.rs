@@ -1011,32 +1011,32 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                     let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
                     continue;
                 }
-                let resp = handle_session_resume(&sessions, id.clone(), req.params.as_ref()).await;
+                let (resp, resumed_channel) =
+                    handle_session_resume(&sessions, id.clone(), req.params.as_ref()).await;
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
 
                 // Re-open + register the browser tunnel(s) on resume too. katashiro persists its
                 // ACP session and RECONNECTS via session/resume (not session/new), re-declaring its
                 // "type":"acp" browser server each time. Without this, a resumed session records the
                 // server but never opens a tunnel, so the core proxy reports "no browser attached".
-                // channel_id is derived deterministically from the sessionId, matching the handler.
-                if let Some(registry) = state.acp_tunnel_registry.clone() {
-                    if let Some(channel_id) = req
-                        .params
-                        .as_ref()
-                        .and_then(|p| p.get("sessionId"))
-                        .and_then(|v| v.as_str())
-                        .and_then(derive_channel_id)
-                    {
-                        spawn_acp_tunnels(
-                            parse_acp_mcp_servers(req.params.as_ref()),
-                            channel_id,
-                            registry,
-                            &out_tx,
-                            &pending_requests,
-                            &next_req_id,
-                            &mut prompt_tasks,
-                        );
-                    }
+                // ONLY on a resume the handler accepted — `resumed_channel` is that signal. A
+                // rejected resume must not touch tunnels: same-name re-attach is last-write-wins,
+                // so spawning here would let a refused request (busy, over-cap, unknown session)
+                // evict the very tunnel it was refused in favour of. Deriving the channel from the
+                // requested sessionId is NOT a sufficient guard — a well-formed id derives fine on
+                // every one of those rejection paths.
+                if let (Some(registry), Some(channel_id)) =
+                    (state.acp_tunnel_registry.clone(), resumed_channel)
+                {
+                    spawn_acp_tunnels(
+                        parse_acp_mcp_servers(req.params.as_ref()),
+                        channel_id,
+                        registry,
+                        &out_tx,
+                        &pending_requests,
+                        &next_req_id,
+                        &mut prompt_tasks,
+                    );
                 }
             }
             "session/prompt" => {
@@ -1302,23 +1302,30 @@ async fn handle_session_new(
 /// Security: `sessionId` is a server-minted, high-entropy capability;
 /// `derive_channel_id` requires a well-formed `sess_<uuid>`, keeping the channel
 /// inside the `acp_` namespace and rejecting forged ids.
+/// Returns the response and, **only when the resume actually succeeded**, the channel it resumed.
+/// The caller uses that `Some` as its permission to open tunnels: deriving a channel id from the
+/// requested `sessionId` is not sufficient, because a well-formed id derives fine even on the
+/// paths that reject the resume (unknown session, per-connection cap, busy).
 async fn handle_session_resume(
     sessions: &Arc<tokio::sync::Mutex<HashMap<String, AcpSession>>>,
     id: Value,
     params: Option<&Value>,
-) -> JsonRpcResponse {
+) -> (JsonRpcResponse, Option<String>) {
     let session_id = match params.and_then(|p| p.get("sessionId")).and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
-        None => return JsonRpcResponse::error(id, -32602, "Missing sessionId"),
+        None => return (JsonRpcResponse::error(id, -32602, "Missing sessionId"), None),
     };
 
     let channel_id = match derive_channel_id(&session_id) {
         Some(cid) => cid,
         None => {
-            return JsonRpcResponse::error(
-                id,
-                -32602,
-                "Invalid sessionId: expected the form sess_<uuid>",
+            return (
+                JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    "Invalid sessionId: expected the form sess_<uuid>",
+                ),
+                None,
             );
         }
     };
@@ -1328,10 +1335,13 @@ async fn handle_session_resume(
     // path (a client can mint unlimited valid `sess_<uuid>`). An already-present key is
     // exempt so re-resuming an existing session stays idempotent.
     if !guard.contains_key(&session_id) && guard.len() >= MAX_SESSIONS_PER_CONNECTION {
-        return JsonRpcResponse::error(
-            id,
-            ACP_OVERLOADED,
-            format!("Too many sessions on this connection (max {MAX_SESSIONS_PER_CONNECTION})"),
+        return (
+            JsonRpcResponse::error(
+                id,
+                ACP_OVERLOADED,
+                format!("Too many sessions on this connection (max {MAX_SESSIONS_PER_CONNECTION})"),
+            ),
+            None,
         );
     }
     // R16-F2: refuse to resume a session that currently has a prompt in flight. The insert
@@ -1340,16 +1350,19 @@ async fn handle_session_resume(
     // state / registry entry, losing its replies. A busy session is already live on this
     // connection, so reject deterministically instead of stomping it.
     if guard.get(&session_id).is_some_and(|s| s.busy) {
-        return JsonRpcResponse::error(
-            id,
-            -32001,
-            "Session busy: a prompt is in progress; cannot resume",
+        return (
+            JsonRpcResponse::error(
+                id,
+                -32001,
+                "Session busy: a prompt is in progress; cannot resume",
+            ),
+            None,
         );
     }
     guard.insert(
         session_id.clone(),
         AcpSession {
-            channel_id,
+            channel_id: channel_id.clone(),
             busy: false,
             cancel: None,
             // The client re-presents its mcpServers on resume; re-record the acp ones.
@@ -1363,7 +1376,10 @@ async fn handle_session_resume(
     // ACP session/resume response is an empty object (no history replay) — the generated
     // ResumeSessionResponse default serializes to {} (T2.1, type-checked against acp_schema).
     let resp = crate::adapters::acp_schema::ResumeSessionResponse::default();
-    JsonRpcResponse::success(id, serde_json::to_value(&resp).unwrap())
+    (
+        JsonRpcResponse::success(id, serde_json::to_value(&resp).unwrap()),
+        Some(channel_id),
+    )
 }
 
 /// Handle `session/cancel`. Per ACP it is a one-way NOTIFICATION: the notification form
@@ -2448,18 +2464,18 @@ mod acp_handlers {
         // valid sess_<uuid> → {} and the session is (re)stored
         let sid = format!("sess_{}", Uuid::new_v4());
         let params = json!({"sessionId": sid, "cwd": "/w", "mcpServers": []});
-        let v = serde_json::to_value(handle_session_resume(&sessions, json!(3), Some(&params)).await)
+        let v = serde_json::to_value(handle_session_resume(&sessions, json!(3), Some(&params)).await.0)
             .unwrap();
         assert_eq!(v["result"], json!({}));
         assert!(sessions.lock().await.contains_key(&sid));
         // malformed sessionId shape → -32602
         let bad = json!({"sessionId": "not-a-session", "cwd": "/w", "mcpServers": []});
-        let v = serde_json::to_value(handle_session_resume(&sessions, json!(4), Some(&bad)).await)
+        let v = serde_json::to_value(handle_session_resume(&sessions, json!(4), Some(&bad)).await.0)
             .unwrap();
         assert_eq!(v["error"]["code"], json!(-32602));
         // missing sessionId → -32602
         let v = serde_json::to_value(
-            handle_session_resume(&sessions, json!(5), Some(&json!({"cwd": "/w"}))).await,
+            handle_session_resume(&sessions, json!(5), Some(&json!({"cwd": "/w"}))).await.0,
         )
         .unwrap();
         assert_eq!(v["error"]["code"], json!(-32602));
@@ -2490,7 +2506,7 @@ mod acp_review_fixes {
         for _ in 0..MAX_SESSIONS_PER_CONNECTION {
             let sid = format!("sess_{}", Uuid::new_v4());
             let p = json!({ "sessionId": sid });
-            let v = serde_json::to_value(handle_session_resume(&sessions, json!(1), Some(&p)).await)
+            let v = serde_json::to_value(handle_session_resume(&sessions, json!(1), Some(&p)).await.0)
                 .unwrap();
             assert_eq!(v["result"], json!({}), "resume under cap should succeed");
             ids.push(sid);
@@ -2498,15 +2514,70 @@ mod acp_review_fixes {
         assert_eq!(sessions.lock().await.len(), MAX_SESSIONS_PER_CONNECTION);
         // A new distinct session over the cap is refused with ACP_OVERLOADED.
         let over = json!({ "sessionId": format!("sess_{}", Uuid::new_v4()) });
-        let v = serde_json::to_value(handle_session_resume(&sessions, json!(2), Some(&over)).await)
+        let v = serde_json::to_value(handle_session_resume(&sessions, json!(2), Some(&over)).await.0)
             .unwrap();
         assert_eq!(v["error"]["code"], json!(ACP_OVERLOADED), "over-cap resume must be refused");
         // Re-resuming an already-present session is exempt (idempotent).
         let existing = json!({ "sessionId": ids[0] });
         let v =
-            serde_json::to_value(handle_session_resume(&sessions, json!(3), Some(&existing)).await)
+            serde_json::to_value(handle_session_resume(&sessions, json!(3), Some(&existing)).await.0)
                 .unwrap();
         assert_eq!(v["result"], json!({}), "re-resume of existing session must bypass the cap");
+    }
+
+    /// A rejected `session/resume` must not become permission to open tunnels.
+    ///
+    /// The read loop spawns tunnels only when the handler hands back a channel. Deriving one from
+    /// the requested `sessionId` — which is what the loop used to do — is not a sufficient guard,
+    /// because a perfectly well-formed `sess_<uuid>` derives fine on every rejection path. Combined
+    /// with last-write-wins same-name re-attach, that let a refused resume evict the live tunnel it
+    /// was refused in favour of, so each rejection is checked for a `None` channel here.
+    #[tokio::test]
+    async fn a_rejected_resume_yields_no_channel_to_open_tunnels_with() {
+        let sessions = sessions_map();
+
+        // 1. missing sessionId
+        let (resp, chan) =
+            handle_session_resume(&sessions, json!(1), Some(&json!({"cwd": "/w"}))).await;
+        assert_eq!(serde_json::to_value(resp).unwrap()["error"]["code"], json!(-32602));
+        assert!(chan.is_none(), "missing sessionId must not yield a channel");
+
+        // 2. malformed sessionId
+        let bad = json!({"sessionId": "not-a-session", "cwd": "/w"});
+        let (resp, chan) = handle_session_resume(&sessions, json!(2), Some(&bad)).await;
+        assert_eq!(serde_json::to_value(resp).unwrap()["error"]["code"], json!(-32602));
+        assert!(chan.is_none(), "malformed sessionId must not yield a channel");
+
+        // 3. over the per-connection cap — note the id IS well formed, so the old
+        //    derive-from-params guard would have happily produced a channel here.
+        for _ in 0..MAX_SESSIONS_PER_CONNECTION {
+            let p = json!({ "sessionId": format!("sess_{}", Uuid::new_v4()) });
+            let (_r, chan) = handle_session_resume(&sessions, json!(3), Some(&p)).await;
+            assert!(chan.is_some(), "resume under the cap should succeed");
+        }
+        let over = json!({ "sessionId": format!("sess_{}", Uuid::new_v4()) });
+        let (resp, chan) = handle_session_resume(&sessions, json!(4), Some(&over)).await;
+        assert_eq!(
+            serde_json::to_value(resp).unwrap()["error"]["code"],
+            json!(ACP_OVERLOADED)
+        );
+        assert!(chan.is_none(), "an over-cap resume must not yield a channel");
+
+        // 4. busy — likewise a well-formed id on a session that really exists.
+        let busy_sid = format!("sess_{}", Uuid::new_v4());
+        sessions.lock().await.insert(
+            busy_sid.clone(),
+            AcpSession {
+                channel_id: derive_channel_id(&busy_sid).unwrap(),
+                busy: true,
+                cancel: Some(Arc::new(tokio::sync::Notify::new())),
+                acp_mcp_servers: Vec::new(),
+            },
+        );
+        let (resp, chan) =
+            handle_session_resume(&sessions, json!(5), Some(&json!({"sessionId": busy_sid}))).await;
+        assert_eq!(serde_json::to_value(resp).unwrap()["error"]["code"], json!(-32001));
+        assert!(chan.is_none(), "a busy-rejected resume must not yield a channel");
     }
 
     fn reply(channel_id: &str, reply_to: &str, text: &str, command: Option<&str>) -> GatewayReply {
@@ -2678,10 +2749,14 @@ mod acp_review_fixes {
         );
 
         let params = json!({"sessionId": sid, "cwd": "/w", "mcpServers": []});
-        let v =
-            serde_json::to_value(handle_session_resume(&sessions, json!(9), Some(&params)).await)
-                .unwrap();
+        let (resp, resumed) = handle_session_resume(&sessions, json!(9), Some(&params)).await;
+        let v = serde_json::to_value(resp).unwrap();
         assert_eq!(v["error"]["code"], json!(-32001), "resume while busy must be rejected");
+        assert!(
+            resumed.is_none(),
+            "a rejected resume must not hand back a channel — that value is the caller's \
+             permission to open tunnels, and same-name re-attach would evict the live one"
+        );
 
         // The in-flight turn's state survives untouched.
         let g = sessions.lock().await;
