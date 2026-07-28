@@ -495,6 +495,55 @@ pub async fn write_bridge_mcp_config(workdir: &str) -> std::io::Result<()> {
 /// agent process (config-var expansion is exactly how deployed agents already reference
 /// per-bot secrets). No cross-session clobber, nothing to clean up on evict — the token
 /// dies with the agent process and its registry entry.
+/// True when an `openab-browser` entry is demonstrably one **we** wrote for a direct transport,
+/// and so is safe to drop when facade mode takes over.
+///
+/// Matching is by exact known shape, never by name alone: the key is not proof of ownership, and
+/// an operator may have configured their own server under it. Only two shapes were ever written:
+///
+/// - the bridge entry, byte-identical every session: `{"command":"openab","args":["browser-bridge"]}`;
+/// - the per-session proxy entry: a loopback `http://127.0.0.1:<port>/mcp` url with a bearer header.
+///
+/// Anything else — a remote url, a different command, no bearer — is left alone. Leaving a stale
+/// entry only preserves the bypass; deleting someone's config destroys work, so this errs at the
+/// former.
+fn is_openab_direct_browser_entry(entry: &Value) -> bool {
+    // Bridge shape.
+    if entry.get("command").and_then(Value::as_str) == Some("openab")
+        && entry.get("args") == Some(&json!(["browser-bridge"]))
+    {
+        return true;
+    }
+    // Per-session proxy shape: loopback url + a bearer we minted.
+    let is_loopback_mcp = entry
+        .get("url")
+        .and_then(Value::as_str)
+        .and_then(|u| u.strip_prefix("http://127.0.0.1:"))
+        .and_then(|rest| rest.strip_suffix("/mcp"))
+        .is_some_and(|port| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()));
+    let has_bearer = entry
+        .pointer("/headers/Authorization")
+        .and_then(Value::as_str)
+        .is_some_and(|a| a.starts_with("Bearer "));
+    is_loopback_mcp && has_bearer
+}
+
+/// Drop a stale direct-transport `openab-browser` entry from an `mcpServers` map, returning
+/// whether anything was removed. Both entries otherwise load side by side and the model may pick
+/// the direct one, bypassing the facade's policy and audit.
+fn strip_direct_browser_entry(cfg: &mut Value) -> bool {
+    let Some(servers) = cfg.get_mut("mcpServers").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    match servers.get("openab-browser") {
+        Some(entry) if is_openab_direct_browser_entry(entry) => {
+            servers.remove("openab-browser");
+            true
+        }
+        _ => false,
+    }
+}
+
 pub async fn write_facade_mcp_config(workdir: &str, facade_url: &str) -> std::io::Result<()> {
     let entry = json!({
         "url": facade_url,
@@ -520,8 +569,15 @@ pub async fn write_facade_mcp_config(workdir: &str, facade_url: &str) -> std::io
         }
         // Publish under "openab" (the facade), not "openab-browser": the agent
         // reaches ALL facade capabilities through this one entry.
+        let mut changed = false;
         if cfg["mcpServers"]["openab"] != entry {
             cfg["mcpServers"]["openab"] = entry.clone();
+            changed = true;
+        }
+        // Retire the direct transport we previously wrote here. Leaving it means both entries
+        // load and the model can reach the browser without passing through facade policy/audit.
+        changed |= strip_direct_browser_entry(&mut cfg);
+        if changed {
             tokio::fs::write(cfg_path, serde_json::to_vec_pretty(&cfg)?).await?;
         }
     }
@@ -559,6 +615,15 @@ async fn merge_kiro_agent_facade_configs(workdir: &str, entry: &Value) -> std::i
         if cfg["mcpServers"]["openab"] != *entry {
             cfg["mcpServers"]["openab"] = entry.clone();
             changed = true;
+        }
+        // Same retirement as the settings files, plus the agent-file allowlist grant that made
+        // the direct server callable — `allowedTools` is default-deny, so a leftover
+        // `@openab-browser` is what keeps the bypass reachable here.
+        if strip_direct_browser_entry(&mut cfg) {
+            changed = true;
+            if let Some(allowed) = cfg.get_mut("allowedTools").and_then(Value::as_array_mut) {
+                allowed.retain(|v| v.as_str() != Some("@openab-browser"));
+            }
         }
         if let Some(allowed) = cfg.get_mut("allowedTools").and_then(Value::as_array_mut) {
             if !allowed.iter().any(|v| v.as_str() == Some("@openab")) {
@@ -772,9 +837,151 @@ async fn handle_browser_conn(
 mod tests {
     use super::{
         browser_tools, cleanup_kiro_agent_configs, dispatch_browser_mcp,
-        merge_kiro_agent_configs, parse_browser_mode, serve_browser_socket, spawn_mcp_server,
-        start_session_server, write_bridge_mcp_config, AcpMcpTunnel, BrowserMode, ProxyHandler,
+        is_openab_direct_browser_entry, merge_kiro_agent_configs, parse_browser_mode,
+        serve_browser_socket, spawn_mcp_server, start_session_server, write_bridge_mcp_config,
+        write_facade_mcp_config, AcpMcpTunnel, BrowserMode, ProxyHandler,
     };
+
+    // --- F4: facade setup retires the direct transport it replaces ---
+
+    /// The bridge and per-session-proxy entries we wrote are recognised; anything else under the
+    /// same key is not ours to delete.
+    #[test]
+    fn only_our_own_direct_browser_shapes_are_recognised() {
+        let bridge = serde_json::json!({ "command": "openab", "args": ["browser-bridge"] });
+        let proxy = serde_json::json!({
+            "url": "http://127.0.0.1:45678/mcp",
+            "headers": { "Authorization": "Bearer abc" }
+        });
+        assert!(is_openab_direct_browser_entry(&bridge));
+        assert!(is_openab_direct_browser_entry(&proxy));
+
+        // Not ours: a remote url, a bearer-less loopback, a different command, an empty port.
+        for foreign in [
+            serde_json::json!({ "url": "https://example.com/mcp", "headers": { "Authorization": "Bearer x" } }),
+            serde_json::json!({ "url": "http://127.0.0.1:45678/mcp" }),
+            serde_json::json!({ "command": "openab", "args": ["something-else"] }),
+            serde_json::json!({ "command": "my-browser-tool", "args": ["browser-bridge"] }),
+            serde_json::json!({ "url": "http://127.0.0.1:/mcp", "headers": { "Authorization": "Bearer x" } }),
+        ] {
+            assert!(
+                !is_openab_direct_browser_entry(&foreign),
+                "must not claim ownership of {foreign}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn facade_setup_removes_the_stale_direct_entry_but_keeps_user_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let cursor = dir.path().join(".cursor");
+        std::fs::create_dir_all(&cursor).unwrap();
+        std::fs::write(
+            cursor.join("mcp.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "mcpServers": {
+                    // ours, the bridge transport facade mode replaces
+                    "openab-browser": { "command": "openab", "args": ["browser-bridge"] },
+                    // the operator's own servers must survive untouched
+                    "github": { "url": "http://ghpool:8080/mcp" },
+                    "notes": { "command": "notes-mcp", "args": ["--stdio"] }
+                },
+                "someUnrelatedKey": 42
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        write_facade_mcp_config(dir.path().to_str().unwrap(), "http://127.0.0.1:8848/mcp")
+            .await
+            .unwrap();
+
+        let cfg: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(cursor.join("mcp.json")).unwrap()).unwrap();
+        let servers = cfg["mcpServers"].as_object().unwrap();
+        assert!(
+            !servers.contains_key("openab-browser"),
+            "the direct transport must not load alongside the facade — that is the bypass"
+        );
+        assert_eq!(servers["openab"]["url"], "http://127.0.0.1:8848/mcp");
+        assert_eq!(servers["github"]["url"], "http://ghpool:8080/mcp");
+        assert_eq!(servers["notes"]["command"], "notes-mcp");
+        assert_eq!(cfg["someUnrelatedKey"], 42, "unrelated config must survive");
+    }
+
+    #[tokio::test]
+    async fn facade_setup_leaves_a_foreign_openab_browser_entry_alone() {
+        // Same key, but a shape we never wrote: it belongs to the operator, so removing it would
+        // destroy their configuration to fix a bypass that entry does not create.
+        let dir = tempfile::tempdir().unwrap();
+        let cursor = dir.path().join(".cursor");
+        std::fs::create_dir_all(&cursor).unwrap();
+        let foreign = serde_json::json!({ "url": "https://my-own-browser.example/mcp" });
+        std::fs::write(
+            cursor.join("mcp.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "mcpServers": { "openab-browser": foreign }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        write_facade_mcp_config(dir.path().to_str().unwrap(), "http://127.0.0.1:8848/mcp")
+            .await
+            .unwrap();
+
+        let cfg: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(cursor.join("mcp.json")).unwrap()).unwrap();
+        assert_eq!(
+            cfg["mcpServers"]["openab-browser"], foreign,
+            "an entry we did not write must be preserved verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn facade_setup_retires_the_direct_entry_and_its_grant_in_kiro_agent_files() {
+        let wd = tmp_workdir("f4-agent").await;
+        let agent = wd.join(".kiro/agents/terra.json");
+        tokio::fs::write(
+            &agent,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "name": "terra",
+                "mcpServers": {
+                    "openab-browser": {
+                        "url": "http://127.0.0.1:45678/mcp",
+                        "headers": { "Authorization": "Bearer tok" }
+                    },
+                    "github": { "url": "http://ghpool:8080/mcp" }
+                },
+                "allowedTools": ["@builtin", "@openab-browser", "@github"]
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        write_facade_mcp_config(wd.to_str().unwrap(), "http://127.0.0.1:8848/mcp")
+            .await
+            .unwrap();
+
+        let cfg: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&agent).await.unwrap()).unwrap();
+        assert!(!cfg["mcpServers"].as_object().unwrap().contains_key("openab-browser"));
+        assert_eq!(cfg["mcpServers"]["github"]["url"], "http://ghpool:8080/mcp");
+        let allowed: Vec<&str> = cfg["allowedTools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            !allowed.contains(&"@openab-browser"),
+            "allowedTools is default-deny — a leftover grant is what keeps the bypass reachable"
+        );
+        assert!(allowed.contains(&"@openab"), "the facade must be granted");
+        assert!(allowed.contains(&"@github"), "unrelated grants must survive");
+        let _ = tokio::fs::remove_dir_all(&wd).await;
+    }
 
     /// Unique throwaway workdir with a `.kiro/agents/` tree.
     async fn tmp_workdir(tag: &str) -> std::path::PathBuf {
