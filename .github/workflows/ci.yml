@@ -61,7 +61,9 @@ jobs:
       # Filtered to `mcp_proxy::` for the same reason the gateway step is scoped to one package —
       # it keeps the flaky hooks::tests out of this job.
       - name: cargo test (acp-mcp core)
-        run: cargo test -p openab-core --features acp-mcp mcp_proxy::
+        # Quoted: the trailing `::` of the filter would otherwise read as a YAML mapping
+        # indicator and make the whole workflow file unparseable.
+        run: "cargo test -p openab-core --features acp-mcp mcp_proxy::"
       # And the root package's own tests — the ACP-tunnel capability source (browser_source.rs) and
       # the stdio bridge shim (browser_bridge.rs) — are `acp`-gated, so `--workspace` above skips
       # them too. This is where the source's routing and trust-gate coverage lives.
