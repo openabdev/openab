@@ -37,6 +37,23 @@ const ACP_PROTOCOL_VERSION: u32 = 1;
 const MAX_SESSIONS_PER_CONNECTION: usize = 128;
 const MAX_INFLIGHT_PROMPTS: usize = 32;
 const MAX_FRAME_BYTES: usize = 8 << 20; // 8 MiB — browser-tool results (e.g. screenshots) exceed 1 MiB
+/// The method of a parsed inbound frame when it exceeds the limit for its kind, else `None`.
+///
+/// Only client **responses** — `id` present, no `method` — carry tunnel results and may use the
+/// full [`MAX_FRAME_BYTES`]. Everything method-bearing is a client request or notification and is
+/// held to [`MAX_NON_TUNNEL_FRAME_BYTES`].
+fn oversized_for_its_kind(len: usize, raw: &Value) -> Option<&str> {
+    let method = raw.get("method").and_then(Value::as_str)?;
+    (len > MAX_NON_TUNNEL_FRAME_BYTES).then_some(method)
+}
+
+/// Ceiling for every inbound frame that is **not** a tunnel result (review F2).
+///
+/// The 8 MiB allowance above exists for browser tool results, and those arrive as client
+/// *responses* to our server-initiated `mcp/message` requests — `id` present, no `method`.
+/// Nothing else needs it: capping method-bearing frames back at the pre-existing 1 MiB stops the
+/// raise from being usable to hold `MAX_INFLIGHT_PROMPTS` × 8 MiB of prompt text per connection.
+const MAX_NON_TUNNEL_FRAME_BYTES: usize = 1 << 20; // 1 MiB
 /// JSON-RPC implementation-defined server error for a hit resource cap.
 const ACP_OVERLOADED: i32 = -32000;
 
@@ -889,6 +906,37 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                     "Invalid Request: id must be a string, number, or null",
                 );
                 let _ = out_tx.send(serde_json::to_string(&err_resp).unwrap());
+                continue;
+            }
+        }
+
+        // Per-kind size cap (review F2). The 8 MiB check above is the transport ceiling, and only
+        // tunnel results legitimately reach it — those are client RESPONSES (no `method`), handled
+        // just below. Anything carrying a `method` is a client request or notification, so hold it
+        // to the pre-existing 1 MiB: otherwise the browser-result allowance doubles as a way to
+        // park MAX_INFLIGHT_PROMPTS × 8 MiB of prompt text on one connection.
+        if let Some(method) = oversized_for_its_kind(text.len(), &raw) {
+            {
+                warn!(
+                    connection = %connection_id,
+                    method,
+                    bytes = text.len(),
+                    max = MAX_NON_TUNNEL_FRAME_BYTES,
+                    "ACP frame too large for its method; rejecting"
+                );
+                // A notification MUST NOT be answered; drop it and keep the connection.
+                if !is_notification {
+                    let id = raw.get("id").cloned().unwrap_or(Value::Null);
+                    let err_resp = JsonRpcResponse::error(
+                        id,
+                        ACP_OVERLOADED,
+                        format!(
+                            "Frame too large: {} exceeds the {MAX_NON_TUNNEL_FRAME_BYTES}-byte limit for `{method}`",
+                            text.len()
+                        ),
+                    );
+                    let _ = out_tx.send(serde_json::to_string(&err_resp).unwrap());
+                }
                 continue;
             }
         }
@@ -2523,6 +2571,45 @@ mod acp_review_fixes {
             serde_json::to_value(handle_session_resume(&sessions, json!(3), Some(&existing)).await.0)
                 .unwrap();
         assert_eq!(v["result"], json!({}), "re-resume of existing session must bypass the cap");
+    }
+
+    // --- F2: the 8 MiB allowance is for tunnel results only ---
+
+    /// The raise to 8 MiB was for browser tool results, which arrive as client RESPONSES
+    /// (`id`, no `method`). Frames carrying a method — `session/prompt` above all — stay at the
+    /// pre-existing 1 MiB, so the allowance cannot be used to park
+    /// MAX_INFLIGHT_PROMPTS × 8 MiB of prompt text on one connection.
+    #[test]
+    fn only_tunnel_results_may_use_the_larger_frame_allowance() {
+        let over_1mib = super::MAX_NON_TUNNEL_FRAME_BYTES + 1;
+        let big_result = 8 * 1024 * 1024; // within MAX_FRAME_BYTES
+
+        // A client response (no `method`) may be large — this is the screenshot path.
+        let response = json!({ "jsonrpc": "2.0", "id": 7, "result": { "content": [] } });
+        assert!(
+            super::oversized_for_its_kind(big_result, &response).is_none(),
+            "an 8 MiB tunnel result must still be accepted — that is what the raise is for"
+        );
+
+        // A prompt of the same size must not be.
+        let prompt = json!({ "jsonrpc": "2.0", "id": 1, "method": "session/prompt" });
+        assert_eq!(
+            super::oversized_for_its_kind(over_1mib, &prompt),
+            Some("session/prompt"),
+            "a >1 MiB prompt must be rejected"
+        );
+        assert!(
+            super::oversized_for_its_kind(super::MAX_NON_TUNNEL_FRAME_BYTES, &prompt).is_none(),
+            "exactly 1 MiB is still allowed — the bound is inclusive"
+        );
+
+        // Notifications are method-bearing too, so they are bounded as well (the caller must
+        // drop them silently rather than answer).
+        let notification = json!({ "jsonrpc": "2.0", "method": "session/cancel" });
+        assert_eq!(
+            super::oversized_for_its_kind(over_1mib, &notification),
+            Some("session/cancel")
+        );
     }
 
     /// A rejected `session/resume` must not become permission to open tunnels.
