@@ -496,37 +496,27 @@ pub async fn write_bridge_mcp_config(workdir: &str) -> std::io::Result<()> {
 /// agent process (config-var expansion is exactly how deployed agents already reference
 /// per-bot secrets). No cross-session clobber, nothing to clean up on evict — the token
 /// dies with the agent process and its registry entry.
-/// True when an `openab-browser` entry is demonstrably one **we** wrote for a direct transport,
-/// and so is safe to drop when facade mode takes over.
+/// True when an `openab-browser` entry is one we can **prove** we wrote, and so may be dropped
+/// when facade mode takes over.
 ///
-/// Matching is by exact known shape, never by name alone: the key is not proof of ownership, and
-/// an operator may have configured their own server under it. Only two shapes were ever written:
+/// Only the bridge entry qualifies. It is byte-identical every session
+/// (`{"command":"openab","args":["browser-bridge"]}`) and names our own binary and subcommand, so
+/// matching it is itself the proof.
 ///
-/// - the bridge entry, byte-identical every session: `{"command":"openab","args":["browser-bridge"]}`;
-/// - the per-session proxy entry: a loopback `http://127.0.0.1:<port>/mcp` url with a bearer header.
+/// The per-session proxy entry deliberately does **not** qualify, correcting an earlier version of
+/// this function. Its url and bearer are minted per session and never recorded anywhere, so
+/// "loopback url plus some `Bearer` header" is a description, not an identity — it matches any
+/// local MCP server an operator happened to configure under this key. That check claimed to
+/// recognise "a bearer we minted" while comparing against nothing we had kept. With no way to
+/// prove ownership we fail closed and preserve.
 ///
-/// Anything else — a remote url, a different command, no bearer — is left alone. Leaving a stale
-/// entry only preserves the bypass; deleting someone's config destroys work, so this errs at the
-/// former.
+/// Preserving costs little. A leftover proxy entry names an ephemeral port belonging to a session
+/// that is gone — `start_session_server` binds `127.0.0.1:0` and drops the listener with the
+/// session — so it is dead configuration rather than a live bypass. The bridge entry is the one
+/// that would still resolve and run, and that is the one removed.
 fn is_openab_direct_browser_entry(entry: &Value) -> bool {
-    // Bridge shape.
-    if entry.get("command").and_then(Value::as_str) == Some("openab")
+    entry.get("command").and_then(Value::as_str) == Some("openab")
         && entry.get("args") == Some(&json!(["browser-bridge"]))
-    {
-        return true;
-    }
-    // Per-session proxy shape: loopback url + a bearer we minted.
-    let is_loopback_mcp = entry
-        .get("url")
-        .and_then(Value::as_str)
-        .and_then(|u| u.strip_prefix("http://127.0.0.1:"))
-        .and_then(|rest| rest.strip_suffix("/mcp"))
-        .is_some_and(|port| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()));
-    let has_bearer = entry
-        .pointer("/headers/Authorization")
-        .and_then(Value::as_str)
-        .is_some_and(|a| a.starts_with("Bearer "));
-    is_loopback_mcp && has_bearer
 }
 
 /// Drop a stale direct-transport `openab-browser` entry from an `mcpServers` map, returning
@@ -1003,15 +993,13 @@ mod tests {
     #[test]
     fn only_our_own_direct_browser_shapes_are_recognised() {
         let bridge = serde_json::json!({ "command": "openab", "args": ["browser-bridge"] });
-        let proxy = serde_json::json!({
-            "url": "http://127.0.0.1:45678/mcp",
-            "headers": { "Authorization": "Bearer abc" }
-        });
         assert!(is_openab_direct_browser_entry(&bridge));
-        assert!(is_openab_direct_browser_entry(&proxy));
 
-        // Not ours: a remote url, a bearer-less loopback, a different command, an empty port.
+        // Not provably ours. The loopback+bearer shapes are the important ones: they describe our
+        // old proxy entry, but they equally describe an operator's own local MCP server, and the
+        // per-session url/bearer were never recorded, so ownership cannot be established.
         for foreign in [
+            serde_json::json!({ "url": "http://127.0.0.1:45678/mcp", "headers": { "Authorization": "Bearer abc" } }),
             serde_json::json!({ "url": "https://example.com/mcp", "headers": { "Authorization": "Bearer x" } }),
             serde_json::json!({ "url": "http://127.0.0.1:45678/mcp" }),
             serde_json::json!({ "command": "openab", "args": ["something-else"] }),
@@ -1063,6 +1051,74 @@ mod tests {
         assert_eq!(cfg["someUnrelatedKey"], 42, "unrelated config must survive");
     }
 
+    /// An operator's own local MCP server under this key survives facade setup — the entry **and**
+    /// its allowlist grant (review R3-F2).
+    ///
+    /// The previous matcher treated any loopback url carrying any `Bearer` header as ours, which
+    /// is precisely the shape a locally-run MCP server takes, so that configuration was deleted.
+    /// Ownership of that shape cannot be proven — the per-session url and bearer were never
+    /// recorded — so it is preserved now.
+    #[tokio::test]
+    async fn a_local_mcp_server_under_our_key_is_not_deleted() {
+        let wd = tmp_workdir("r3f2").await;
+        let cursor = wd.join(".cursor");
+        tokio::fs::create_dir_all(&cursor).await.unwrap();
+        // Indistinguishable from our retired proxy entry by shape alone.
+        let theirs = serde_json::json!({
+            "url": "http://127.0.0.1:45678/mcp",
+            "headers": { "Authorization": "Bearer their-own-token" }
+        });
+        tokio::fs::write(
+            cursor.join("mcp.json"),
+            serde_json::to_vec_pretty(
+                &serde_json::json!({ "mcpServers": { "openab-browser": theirs } }),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let agent = wd.join(".kiro/agents/terra.json");
+        tokio::fs::write(
+            &agent,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "name": "terra",
+                "mcpServers": { "openab-browser": theirs },
+                "allowedTools": ["@builtin", "@openab-browser"]
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        write_facade_mcp_config(wd.to_str().unwrap(), "http://127.0.0.1:8848/mcp")
+            .await
+            .unwrap();
+
+        let cfg: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(cursor.join("mcp.json")).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            cfg["mcpServers"]["openab-browser"], theirs,
+            "an entry we cannot prove we wrote must be preserved verbatim"
+        );
+
+        let agent_cfg: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&agent).await.unwrap()).unwrap();
+        assert_eq!(agent_cfg["mcpServers"]["openab-browser"], theirs);
+        let allowed: Vec<&str> = agent_cfg["allowedTools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            allowed.contains(&"@openab-browser"),
+            "the grant must survive too — revoking it silently disables the operator's own server"
+        );
+        let _ = tokio::fs::remove_dir_all(&wd).await;
+    }
+
     #[tokio::test]
     async fn facade_setup_leaves_a_foreign_openab_browser_entry_alone() {
         // Same key, but a shape we never wrote: it belongs to the operator, so removing it would
@@ -1101,10 +1157,7 @@ mod tests {
             serde_json::to_vec_pretty(&serde_json::json!({
                 "name": "terra",
                 "mcpServers": {
-                    "openab-browser": {
-                        "url": "http://127.0.0.1:45678/mcp",
-                        "headers": { "Authorization": "Bearer tok" }
-                    },
+                    "openab-browser": { "command": "openab", "args": ["browser-bridge"] },
                     "github": { "url": "http://ghpool:8080/mcp" }
                 },
                 "allowedTools": ["@builtin", "@openab-browser", "@github"]
