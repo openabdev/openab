@@ -6,8 +6,9 @@ implements so the OpenAB gateway can tunnel MCP to it over the existing `/acp` W
 the official [MCP-over-ACP RFD](https://agentclientprotocol.com/rfds/mcp-over-acp).
 
 Scope: only the **gateway ↔ extension** hop (the sole hop that leaves the pod). How OpenAB
-routes tool calls internally (core-hosted MCP proxy, agent subprocess) is out of scope for
-the extension and may change without affecting this contract.
+routes tool calls internally (today: the OAB MCP Facade and the agent subprocess) is out of scope
+for the extension and may change without affecting this contract — as it already has: the
+per-session MCP proxy and the stdio bridge that this line used to name are both gone.
 
 ## Roles
 

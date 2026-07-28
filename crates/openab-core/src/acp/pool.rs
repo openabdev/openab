@@ -411,7 +411,7 @@ impl SessionPool {
         #[cfg(feature = "acp-mcp")]
         let mut session_token: Option<String> = None;
         #[cfg(feature = "acp-mcp")]
-        let mcp_guard: Option<tokio_util::sync::DropGuard> = match (
+        let facade_token_guard: Option<tokio_util::sync::DropGuard> = match (
             thread_id.strip_prefix("acp:"),
             self.session_registrar.as_ref(),
             self.facade_url.as_ref(),
@@ -534,7 +534,7 @@ impl SessionPool {
         let child_pgid = new_conn.child_pgid();
         let cancel_session_id = new_conn.acp_session_id.clone().unwrap_or_default();
         #[cfg(feature = "acp-mcp")]
-        new_conn.set_mcp_guard(mcp_guard);
+        new_conn.set_facade_token_guard(facade_token_guard);
         let new_conn = Arc::new(Mutex::new(new_conn));
 
         let mut state = self.state.write().await;

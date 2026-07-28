@@ -110,8 +110,12 @@ pub fn browser_tools() -> Vec<Tool> {
 }
 
 
-/// Write `bytes` to `path`, then tighten it to owner-only (0600). The file holds a live bearer
-/// token for the loopback MCP server, so it must not be group/world readable.
+/// Write `bytes` to `path`, then tighten it to owner-only (0600).
+///
+/// The file no longer holds a secret — the facade entry references `${OPENAB_SESSION_TOKEN}` and
+/// the value lives only in the agent process's environment. `0600` is kept anyway: it is an
+/// agent's MCP configuration, a shared workdir is the normal deployment, and nothing needs it to
+/// be readable by other users.
 async fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     tokio::fs::write(path, bytes).await?;
     #[cfg(unix)]
@@ -611,9 +615,6 @@ mod tests {
 
 
 
-
-
-    // --- Option C: browser-bridge socket dispatch ---
 
 
     #[test]

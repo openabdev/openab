@@ -517,9 +517,9 @@ async fn main() -> anyhow::Result<()> {
             .saturating_add(cfg.pool.hung_grace_secs),
         cfg.pool.default_config_options,
     );
-    #[cfg(feature = "acp")]
-    // Facade mode session wiring: only when the facade is actually serving —
-    // otherwise the pool's mode fallback keeps the per-session proxy path.
+    // Facade session wiring: only when the facade is actually serving. With no `[mcp]` there is
+    // no registrar and no facade url, and the pool simply starts sessions without browser
+    // capabilities — there is no longer a proxy path for it to fall back to.
     #[cfg(feature = "acp")]
     let pool_inner = pool_inner.with_facade_sessions(
         facade_serving.then(|| {
