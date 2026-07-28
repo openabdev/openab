@@ -755,24 +755,41 @@ async fn establish_and_register_tunnel(
         connection_id,
         server_name: acp_name.clone(),
     };
-    let evicted = {
+    let replaced = {
         let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         // Last-attach-wins (ADR §6.1). The client mints a fresh `id` on every connection, so a
         // reconnect would otherwise leave the dead tunnel registered beside the live one under
         // the same declared name. Answering "ambiguous — pass a server_id" there would wedge the
         // client out of its own tools on every reconnect, so the newest attach evicts its stale
         // same-name predecessors instead — which is also what bounds registry growth.
-        let before = reg.len();
-        reg.retain(|(c, id), h| !(c == &channel_id && h.server_name == acp_name && id != &acp_id));
-        let evicted = before - reg.len();
+        //
+        // Take the stale handles OUT rather than dropping them: the client still believes those
+        // connections are open, so each one is owed an `mcp/disconnect` (review R7). They are
+        // collected here and disconnected after the lock is released — `disconnect` is async and
+        // this is a std mutex, so awaiting under it is not an option.
+        let stale: Vec<(String, String)> = reg
+            .iter()
+            .filter(|((c, id), h)| c == &channel_id && h.server_name == acp_name && id != &acp_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let replaced: Vec<TunnelHandle> = stale.iter().filter_map(|k| reg.remove(k)).collect();
         reg.insert((channel_id.clone(), acp_id.clone()), handle);
-        evicted
+        replaced
     };
-    if evicted > 0 {
+    if !replaced.is_empty() {
         info!(
-            channel_id = %channel_id, server_name = %acp_name, evicted,
+            channel_id = %channel_id, server_name = %acp_name, evicted = replaced.len(),
             "ACP: last-attach-wins — evicted stale same-name tunnel(s)"
         );
+        // Best-effort and off the attach path: a replaced connection may already be dead, and
+        // waiting on its response would stall the tunnel that just came up for no benefit.
+        tokio::spawn(async move {
+            for handle in replaced {
+                if let Err(e) = handle.disconnect(5).await {
+                    debug!(error = %e, "ACP: mcp/disconnect for a replaced tunnel did not complete");
+                }
+            }
+        });
     }
     info!(channel_id = %channel_id, server_id = %acp_id, server_name = %acp_name, "ACP: tunnel registered — client MCP server attached");
     Ok(())
@@ -2391,6 +2408,62 @@ mod acp_requests {
         assert!(
             reg.contains_key(&("acp_abc".to_string(), "uuid-new".to_string())),
             "the most recently attached tunnel is the one that survives"
+        );
+    }
+
+    /// A replaced tunnel is owed an `mcp/disconnect` (review R7).
+    ///
+    /// Last-attach-wins used to simply drop the stale handle, so the only `mcp_disconnect` impl
+    /// was never called and the client kept believing that connection was open — stale state that
+    /// accumulates across every reconnect.
+    #[tokio::test]
+    async fn a_replaced_tunnel_is_told_to_disconnect() {
+        let registry = super::new_tunnel_registry();
+
+        // First attach. Keep this connection's out_rx alive so the disconnect can be observed on
+        // it once the handle has been replaced.
+        let pending = new_pending();
+        let next_id = Arc::new(AtomicU64::new(1));
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        let pending2 = pending.clone();
+        let ext = tokio::spawn(async move {
+            let f: serde_json::Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
+            assert_eq!(f["method"], json!("mcp/connect"));
+            route_client_response(
+                &pending2,
+                &json!({"jsonrpc":"2.0","id":f["id"],"result":{"connectionId":"conn-old"}}),
+            )
+            .await;
+            out_rx // hand the receiver back so the test can keep reading it
+        });
+        super::establish_and_register_tunnel(
+            out_tx,
+            pending,
+            next_id,
+            "uuid-old".into(),
+            "browser".into(),
+            "acp_abc".into(),
+            registry.clone(),
+            5,
+        )
+        .await
+        .unwrap();
+        let mut out_rx = ext.await.unwrap();
+
+        // Same declared name, fresh id — this replaces the handle above.
+        attach(&registry, "uuid-new", "browser").await;
+
+        // The replaced connection must be told to close, naming ITS connectionId.
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("a replaced tunnel must be sent mcp/disconnect")
+            .expect("channel closed before the disconnect arrived");
+        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["method"], json!("mcp/disconnect"));
+        assert_eq!(
+            v["params"]["connectionId"],
+            json!("conn-old"),
+            "the disconnect must name the replaced connection, not the live one"
         );
     }
 
