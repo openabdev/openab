@@ -56,6 +56,17 @@ jobs:
       # `-p openab-gateway` to avoid the workspace hooks::tests parallel flake.
       - name: cargo test (acp gateway)
         run: cargo test -p openab-gateway --features acp
+      # Same default-features gap on the core side: `mcp_proxy` is the only `acp-mcp`-gated module,
+      # so its tunnel-trait, tools-cache and bridge-dispatch tests never compile above either.
+      # Filtered to `mcp_proxy::` for the same reason the gateway step is scoped to one package —
+      # it keeps the flaky hooks::tests out of this job.
+      - name: cargo test (acp-mcp core)
+        run: cargo test -p openab-core --features acp-mcp mcp_proxy::
+      # And the root package's own tests — the ACP-tunnel capability source (browser_source.rs) and
+      # the stdio bridge shim (browser_bridge.rs) — are `acp`-gated, so `--workspace` above skips
+      # them too. This is where the source's routing and trust-gate coverage lives.
+      - name: cargo test (acp root)
+        run: cargo test --features acp
       - name: cargo build (unified)
         run: cargo build --features unified
 
