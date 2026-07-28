@@ -41,8 +41,9 @@ fits OpenAB-driven (non-LLM) operations. MCP is the standard way agents receive 
   connection — so it serves MCP over the **outbound `/acp` WS it already opened**. This is the only
   way a can't-listen client can be a full MCP server.
 - **OpenAB core = MCP proxy/aggregator.** A middlebox between two connections: it consumes the
-  client's tools from the upstream tunnel and re-exposes them to the agent downstream so the LLM's
-  `tools/list` sees them.
+  client's tools from the upstream tunnel and re-exposes them to the agent downstream. Note the LLM's
+  own `tools/list` does **not** show them: it sees the facade's two meta-tools, and reaches the
+  client's tools through `search_capabilities` / `execute_capability` (§6.3).
 - **Agent = MCP client.** The agent (Claude / Codex / Cursor / Kiro …) is a subprocess colocated in
   the OpenAB pod; it calls the tools over its in-pod MCP link.
 
@@ -137,7 +138,8 @@ detailed in **§7.3**.
 
 The browser path wires **one** MCP server. This section is the accepted direction, **as-built in
 #1447**, making reverse MCP-over-ACP **generic**: any ACP WS client may declare **one or more**
-`type:acp` MCP servers on `initialize`, and the agent's LLM discovers and calls each server's real
+`type:acp` MCP servers on `session/new` (and re-declare them on `session/resume`) — **not** on
+`initialize`, which never reads `mcpServers` — and the agent's LLM discovers and calls each server's real
 tools. The browser extension becomes *one instance* of the mechanism, not a special case.
 
 Three pieces already generalize and are reused as-is:
@@ -247,10 +249,12 @@ The facade's discovery is **pull-based**: the agent sees only `search_capabiliti
   state**. Backend unavailability surfaces as a **call error** ("browser not connected"), never as a
   vanishing catalog entry.
 
-Distinguish two kinds of variation: **session scope** (which servers *this* session's client declared)
-is legitimate and is exactly what `tools(ctx)` expresses; **attachment flapping** (is the tab connected
-this second) must not reach the catalog. An optional refinement, requiring a client wire change, is to
-carry a tool manifest in the `initialize` declaration so the catalog is known without a round-trip.
+Distinguish two kinds of variation: **session scope** is legitimate; **attachment flapping** (is the
+tab connected this second) must not reach the catalog. Note what `tools(ctx)` actually varies by
+session is the **discovery cache**, not the declaration set — it iterates the *operator policy* map,
+so a pinned server is advertised even when the client declared nothing, and a client-declared server
+with no policy entry contributes nothing. An optional refinement, requiring a client wire change, is to
+carry a tool manifest in the `session/new` declaration so the catalog is known without a round-trip.
 
 **Two layers, and the policy table is the lower one** (confirmed by review 2026-07-26; an earlier draft
 of this section said an un-cached server "contributes an empty set", which contradicted the
@@ -294,19 +298,37 @@ connected extension could otherwise publish arbitrary tools into the agent's cap
 
 Therefore this ADR requires, before the source is enabled by default:
 
-- an operator **allowlist** of accepted declared server names (default: `katashiro` only) — declarations
-  outside it are ignored with a logged warning; and
+- an operator **allowlist** of accepted declared server names (default: `katashiro` only) — a
+  declaration outside it is refused by the capability source: it contributes no tools and its calls
+  return an error result. **Note it is not refused at declaration time** — the gateway still opens
+  and registers the tunnel — **and nothing is logged today** (see the gap noted below); and
 - a per-declared-server **`tool_filter`**, mirroring `mcp.json` least-privilege semantics, which is
   **deny-all by default**.
 
+> ⚠️ **Two gaps between this section and the code, recorded rather than quietly reworded.**
+>
+> **No logging.** This section said twice that a refused declaration and a dropped tool are "logged".
+> `src/browser_source.rs` contains no logging call at all — both refusals are silent. An operator
+> who mis-types a server name in `[[mcp.acp_servers]]` gets missing tools and no signal, which is
+> the shape of failure this ADR spends §6.4 preventing. **Fixing this is a code change, so it is
+> filed as follow-up F7 rather than made here.**
+>
+> **The policy runtime does not wrap in-process sources.** §6 claims the facade already provides
+> "schema validation, timeouts, circuit breaking, redaction, audit" to capability sources. Only
+> argument validation and audit apply on the source path (`facade.rs` `execute_capability`);
+> timeout/cancellation, the circuit breaker and redaction live in `meta_tool::dispatch`, which only
+> downstream `mcp.json` servers traverse. A hung browser tunnel is bounded by the tunnel's own
+> timeout, not by the facade's. **Also F7.**
+
 The name allowlist is **not** a trust boundary on its own: the name is chosen by the same remote
-client that declares the tools, so a client may declare a server *named* `browser` and publish any
-tool set under it. Passing the allowlist therefore grants nothing by itself — the tool set is gated
+client that declares the tools, so a client may declare a server under an allowlisted name — say
+`katashiro` — and publish any tool set under it. Passing the allowlist therefore grants nothing by itself — the tool set is gated
 separately:
 
 - the `katashiro` entry ships **pinned to its five known tools** (`katashiro.read_dom`,
   `katashiro.screenshot`, `katashiro.navigate`, `katashiro.click`, `katashiro.type`); any other tool name it
-  declares is dropped with a logged warning, so a same-name declaration cannot inject new tools; and
+  declares is dropped, so a same-name declaration cannot inject new tools (dropped silently today —
+  see the gap below); and
 - every other allowlisted server starts **deny-all** and serves only the tools an operator has
   explicitly listed.
 
@@ -376,6 +398,11 @@ through; **F6 genuinely remains**:
   bridge-mode removal stays an explicit operator call (§6.5).~~ **Done 2026-07-28**: the operator
   call was made and both transports were removed in this PR, so there is no soak period and no
   remaining opt-out.
+- **F7 close the two §6.4 gaps** — (a) log a warning when a declared server is refused by the
+  allowlist and when a fetched tool is dropped by the pin, since both are silent today and an
+  operator's only symptom is missing tools; (b) decide whether in-process capability sources should
+  traverse the same timeout / circuit-breaker / redaction path as downstream servers, or whether the
+  ADR should stop claiming they do. Both are code changes, deliberately not made in #1447.
 - **F6 e2e** — browser + a second client-declared server + a host-level `mcp.json` provider coexisting,
   and two concurrent sessions each reaching only their own browser.
 
@@ -395,7 +422,8 @@ Five **DOM-semantic** MCP tools, served by the extension: `katashiro.read_dom` (
   are cheaper, more reliable, and model-agnostic; screenshot + coordinates remain expressible if
   wanted, but are not the primary surface.
 - **Screenshots are JPEG** (`captureVisibleTab {format:"jpeg", quality:70}`, ~300–500 KB); the ACP
-  frame cap is raised 1→8 MiB to carry tool results. PNG base64 (~5.5 MB) would exceed the cap.
+  frame cap is raised 1→8 MiB to carry tool results. PNG base64 (~5.5 MB) exceeded the **old** 1 MiB
+  cap, which is why JPEG was chosen; it fits within the 8 MiB cap that replaced it.
 - The declared server name is `katashiro`; it was `browser` until 2026-07-26, when it was renamed
   because Playwright MCP's `browser_*` tools sat beside it in the same catalog and the model could
   not reliably tell "the user's real logged-in tab" from "a sandbox browser".
