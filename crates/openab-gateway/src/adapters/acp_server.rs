@@ -36,6 +36,13 @@ const ACP_PROTOCOL_VERSION: u32 = 1;
 /// eviction, and global connection/worker limits are a follow-up (review F6, roadmap).
 const MAX_SESSIONS_PER_CONNECTION: usize = 128;
 const MAX_INFLIGHT_PROMPTS: usize = 32;
+/// Cap on `type:acp` servers a single session may declare (review R3-F1).
+///
+/// Every declaration costs a spawned task, a pending `mcp/connect` holding a 30s timeout, and an
+/// outbound frame. Declarations are tiny, so thousands fit inside the 1 MiB limit that applies to
+/// a `session/new` frame — without a cap, one accepted request bursts all of that at once. Eight
+/// is far above any real client (the reference client declares one) and far below what hurts.
+const MAX_ACP_SERVERS_PER_SESSION: usize = 8;
 const MAX_FRAME_BYTES: usize = 8 << 20; // 8 MiB — browser-tool results (e.g. screenshots) exceed 1 MiB
 /// The method of a parsed inbound frame when it exceeds the limit for its kind, else `None`.
 ///
@@ -311,6 +318,31 @@ fn parse_acp_mcp_servers(params: Option<&Value>) -> Vec<AcpMcpServer> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Validate a session's declared `type:acp` servers before any of them costs anything.
+///
+/// Returns the list to act on, or an error message to reject the whole `session/new` /
+/// `session/resume` with. Callers must run this **before** inserting the session or spawning
+/// tunnels: the point is that an over-declaring request never reaches the work.
+///
+/// Duplicate ids collapse to the first occurrence. A repeated id would otherwise spawn two tunnels
+/// racing for one registry key, where the loser is a task and a pending `mcp/connect` that exist
+/// only to be overwritten. Entries missing `id` or `name` were already dropped by
+/// `parse_acp_mcp_servers`, so after this the list is unique and complete.
+fn accept_acp_servers(servers: Vec<AcpMcpServer>) -> Result<Vec<AcpMcpServer>, String> {
+    let mut seen = std::collections::HashSet::new();
+    let deduped: Vec<AcpMcpServer> = servers
+        .into_iter()
+        .filter(|s| seen.insert(s.id.clone()))
+        .collect();
+    if deduped.len() > MAX_ACP_SERVERS_PER_SESSION {
+        return Err(format!(
+            "Too many type:acp servers declared ({}, max {MAX_ACP_SERVERS_PER_SESSION})",
+            deduped.len()
+        ));
+    }
+    Ok(deduped)
 }
 
 pub enum ReplyChunk {
@@ -1040,7 +1072,18 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                     let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
                     continue;
                 }
-                let acp_mcp_servers = parse_acp_mcp_servers(req.params.as_ref());
+                // Bound the declaration fan-out BEFORE the session exists or any task is
+                // spawned (R3-F1): an over-declaring request must cost nothing.
+                let acp_mcp_servers = match accept_acp_servers(parse_acp_mcp_servers(
+                    req.params.as_ref(),
+                )) {
+                    Ok(list) => list,
+                    Err(msg) => {
+                        let resp = JsonRpcResponse::error(id, ACP_OVERLOADED, msg);
+                        let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+                        continue;
+                    }
+                };
                 let (resp, channel_id) =
                     handle_session_new(&sessions, id.clone(), acp_mcp_servers.clone()).await;
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
@@ -1076,6 +1119,17 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                     let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
                     continue;
                 }
+                // Same bound on resume: the client re-presents its declarations each time, so
+                // resume is an equally good burst vector (R3-F1).
+                let resumed_servers =
+                    match accept_acp_servers(parse_acp_mcp_servers(req.params.as_ref())) {
+                        Ok(list) => list,
+                        Err(msg) => {
+                            let resp = JsonRpcResponse::error(id, ACP_OVERLOADED, msg);
+                            let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+                            continue;
+                        }
+                    };
                 let (resp, resumed_channel) =
                     handle_session_resume(&sessions, id.clone(), req.params.as_ref()).await;
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
@@ -1094,7 +1148,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                     (state.acp_tunnel_registry.clone(), resumed_channel)
                 {
                     spawn_acp_tunnels(
-                        parse_acp_mcp_servers(req.params.as_ref()),
+                        resumed_servers,
                         channel_id,
                         registry,
                         &out_tx,
@@ -2644,6 +2698,101 @@ mod acp_review_fixes {
             serde_json::to_value(handle_session_resume(&sessions, json!(3), Some(&existing)).await.0)
                 .unwrap();
         assert_eq!(v["result"], json!({}), "re-resume of existing session must bypass the cap");
+    }
+
+    // --- R3-F1: declaration fan-out is bounded before it costs anything ---
+
+    fn decl(id: &str, name: &str) -> super::AcpMcpServer {
+        super::AcpMcpServer {
+            id: id.into(),
+            name: name.into(),
+        }
+    }
+
+    /// Each declaration buys a task, a pending `mcp/connect` holding a 30s timeout, and an
+    /// outbound frame. Declarations are small enough that thousands fit inside one accepted frame,
+    /// so the count is capped before the session exists or any task is spawned.
+    #[test]
+    fn declaration_fan_out_is_capped_and_deduplicated() {
+        let cap = super::MAX_ACP_SERVERS_PER_SESSION;
+
+        // At the cap is fine; one past it refuses the whole request.
+        let at_cap: Vec<_> = (0..cap).map(|i| decl(&format!("id{i}"), "s")).collect();
+        assert_eq!(super::accept_acp_servers(at_cap).unwrap().len(), cap);
+
+        let over: Vec<_> = (0..cap + 1).map(|i| decl(&format!("id{i}"), "s")).collect();
+        let err = super::accept_acp_servers(over)
+            .expect_err("declaring past the cap must be refused outright");
+        assert!(err.contains("Too many type:acp servers"), "{err}");
+
+        // A burst of thousands — the shape the finding describes — is refused rather than
+        // truncated: truncating would silently honour part of a request the client cannot know
+        // was clipped.
+        let flood: Vec<_> = (0..5000).map(|i| decl(&format!("id{i}"), "s")).collect();
+        assert!(super::accept_acp_servers(flood).is_err());
+
+        // Duplicate ids collapse to the first, so a repeated id cannot spawn two tunnels racing
+        // for one registry key. Dedup runs before the cap, so repeats are not a way to trip it.
+        let dupes = vec![
+            decl("same", "browser"),
+            decl("same", "browser"),
+            decl("other", "notes"),
+        ];
+        let kept = super::accept_acp_servers(dupes).unwrap();
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].id, "same");
+        assert_eq!(kept[1].id, "other");
+
+        let many_dupes: Vec<_> = (0..5000).map(|_| decl("same", "browser")).collect();
+        assert_eq!(
+            super::accept_acp_servers(many_dupes).unwrap().len(),
+            1,
+            "repeats of one id are one server, not a cap violation"
+        );
+    }
+
+    /// The accepted list is exactly what gets spawned: one task per unique declaration, no more.
+    #[tokio::test]
+    async fn only_accepted_declarations_spawn_tunnels() {
+        let registry = super::new_tunnel_registry();
+        // Built inline: this module has its own helpers and does not share acp_requests'.
+        let pending: Arc<
+            tokio::sync::Mutex<HashMap<u64, tokio::sync::oneshot::Sender<serde_json::Value>>>,
+        > = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let next_id = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+        let accepted = super::accept_acp_servers(vec![
+            decl("a", "browser"),
+            decl("a", "browser"), // duplicate — must not spawn twice
+            decl("b", "notes"),
+        ])
+        .unwrap();
+        super::spawn_acp_tunnels(
+            accepted,
+            "acp_abc".into(),
+            registry,
+            &out_tx,
+            &pending,
+            &next_id,
+            &mut tasks,
+        );
+
+        assert_eq!(tasks.len(), 2, "one task per unique declaration");
+        // Exactly two mcp/connect frames go out, for the two distinct ids.
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let f: serde_json::Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
+            assert_eq!(f["method"], json!("mcp/connect"));
+            ids.push(f["params"]["acpId"].as_str().unwrap().to_string());
+        }
+        ids.sort();
+        assert_eq!(ids, ["a", "b"]);
+        assert!(out_rx.try_recv().is_err(), "no excess mcp/connect was sent");
+        for t in tasks {
+            t.abort();
+        }
     }
 
     // --- F2: the 8 MiB allowance is for tunnel results only ---
