@@ -88,9 +88,13 @@ impl SessionTokens {
         Self::default()
     }
 
-    /// Mint a fresh opaque token bound to `channel_id`. A prior token for
-    /// the same channel (e.g. a respawned session) is replaced — exactly one
-    /// live token per channel.
+    /// Mint a fresh opaque token bound to `channel_id`.
+    ///
+    /// Tokens for a channel **coexist**: a respawned or racing session gets its own credential and
+    /// any already-issued token keeps resolving. There is deliberately no "one live token per
+    /// channel" invariant — enforcing it here invalidated credentials that a running agent was
+    /// still presenting. Each token is retired individually through [`Self::revoke_token`], which
+    /// is what keeps the map bounded.
     pub fn mint(&self, channel_id: &str) -> String {
         let mut buf = [0u8; 32];
         getrandom::fill(&mut buf).expect("os rng");
@@ -112,11 +116,11 @@ impl SessionTokens {
         token
     }
 
-    /// Revoke every token for `channel_id` (session evict / respawn).
+    /// Revoke **every** token for `channel_id` — a deliberate channel-wide eviction.
     ///
-    /// Prefer [`Self::revoke_token`] when tearing down a *specific* session: `mint` replaces a
-    /// channel's token, so a late teardown revoking by channel removes its successor's live token
-    /// rather than its own.
+    /// Prefer [`Self::revoke_token`] when tearing down one specific session. Because tokens for a
+    /// channel coexist, revoking by channel here also destroys credentials belonging to any other
+    /// live session on it, which is only correct when the intent really is "end this channel".
     pub fn revoke_channel(&self, channel_id: &str) {
         self.inner
             .write()
@@ -124,8 +128,11 @@ impl SessionTokens {
             .retain(|_, ctx| ctx.channel_id != channel_id);
     }
 
-    /// Revoke exactly one token. A no-op once that token has already been replaced, which is what
-    /// stops an evicted session's teardown from cutting off the session that succeeded it.
+    /// Revoke exactly one token, leaving every other token for that channel intact.
+    ///
+    /// This is the teardown a session's drop guard should use: it retires the credential that
+    /// session minted and nothing else, so a late teardown cannot cut off a session that started
+    /// alongside or after it. A no-op if the token was already revoked.
     pub fn revoke_token(&self, token: &str) {
         self.inner
             .write()
