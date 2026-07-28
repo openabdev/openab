@@ -70,10 +70,10 @@ flowchart LR
   subgraph POD["OPENAB POD — 'openab run', one process tree"]
     direction LR
     GW["<b>openab-gateway</b><br/>/acp WS server<br/>AcpTunnelRegistry"]
-    CORE["<b>openab-core</b><br/>MCP proxy /<br/>aggregator"]
+    CORE["<b>openab-core</b><br/>OAB MCP Facade"]
     AGENT["<b>agent CLI</b><br/>Cursor · Kiro · Claude · Codex<br/>LLM = MCP CLIENT"]
     GW <--> CORE
-    CORE -.->|"<b>proxy</b> mode (legacy opt-out)<br/>per-session loopback HTTP MCP<br/>{url,headers} → .cursor / .kiro mcp.json<br/>bearer-gated · 0600 · stripped on evict"| AGENT
+    CORE ==>|"<b>OAB MCP Facade</b> (only path)<br/>one listener, requires [mcp]<br/>static {url, Bearer ${OPENAB_SESSION_TOKEN}} → .cursor / .kiro mcp.json<br/>token in agent env, revoked on evict"| AGENT
   end
   EXT <==>|"UPSTREAM — only remote hop<br/>MCP-over-ACP · mcp/message framing<br/>multiplexed with ACP chat on ONE /acp WSS<br/>8 MiB frame cap · JPEG screenshots"| GW
   classDef remote fill:#fde68a,stroke:#b45309,color:#111;
@@ -94,7 +94,7 @@ sequenceDiagram
     participant Tab as Chrome tab<br/>(user's real, logged-in)
     participant Ext as browser ext.<br/>MCP SERVER
     participant GW as openab-gateway<br/>/acp WS
-    participant Core as openab-core<br/>MCP proxy
+    participant Core as openab-core<br/>OAB MCP Facade
     participant LLM as agent LLM<br/>MCP client
 
     Note over Ext,LLM: PHASE 1 — connect & tool discovery
@@ -109,10 +109,10 @@ sequenceDiagram
     GW->>Ext: mcp/message → tools/list
     Ext-->>GW: 5 tools: read_dom · screenshot · navigate · click · type
     GW-->>Core: tools result
-    Core-->>LLM: tools/list — browser tools now in the model's tool list
+    Core-->>LLM: tools/list — the facade's TWO meta-tools<br/>(search_capabilities · execute_capability); katashiro.* are NOT in the model's tool list
 
     Note over Tab,LLM: PHASE 2 — one autonomous action (e.g. click)
-    LLM->>Core: tools/call katashiro.click(selector)
+    LLM->>Core: search_capabilities → execute_capability("openab-browser:katashiro.click", {selector})
     Core->>GW: tools/call  (mcp/message over the SAME /acp WS)
     GW->>Ext: mcp/message → tools/call
     Ext->>Tab: chrome.scripting / tabs API<br/>click · type · read_dom · captureVisibleTab · navigate
@@ -222,8 +222,9 @@ Reverse-MCP adds:         acp-tunnel(channel_id, server_id)     ← client diall
   work.** The source must contain no browser-specific branch.
 
 **Session identity** is the facade's `SessionTokens`: the broker mints one opaque bearer per agent
-session, writes it into that agent's MCP client config pointing at the facade, and revokes it on
-session evict; the facade resolves the header back to a `SessionCtx` per request. This **replaces** the
+session, injects it into that agent's process environment as `OPENAB_SESSION_TOKEN`, and revokes it
+on session evict. The config file gets only the literal `${OPENAB_SESSION_TOKEN}` reference, never the
+value — that is what keeps the secret out of a shared workdir; the facade resolves the header back to a `SessionCtx` per request. This **replaces** the
 bespoke per-session loopback proxy, its self-minted port/bearer, and openab's own `openab-browser`
 `mcp.json` write/strip logic.
 
@@ -289,7 +290,7 @@ connected extension could otherwise publish arbitrary tools into the agent's cap
 
 Therefore this ADR requires, before the source is enabled by default:
 
-- an operator **allowlist** of accepted declared server names (default: `browser` only) — declarations
+- an operator **allowlist** of accepted declared server names (default: `katashiro` only) — declarations
   outside it are ignored with a logged warning; and
 - a per-declared-server **`tool_filter`**, mirroring `mcp.json` least-privilege semantics, which is
   **deny-all by default**.
@@ -299,7 +300,7 @@ client that declares the tools, so a client may declare a server *named* `browse
 tool set under it. Passing the allowlist therefore grants nothing by itself — the tool set is gated
 separately:
 
-- the `browser` entry ships **pinned to its five known tools** (`katashiro.read_dom`,
+- the `katashiro` entry ships **pinned to its five known tools** (`katashiro.read_dom`,
   `katashiro.screenshot`, `katashiro.navigate`, `katashiro.click`, `katashiro.type`); any other tool name it
   declares is dropped with a logged warning, so a same-name declaration cannot inject new tools; and
 - every other allowlisted server starts **deny-all** and serves only the tools an operator has
@@ -331,14 +332,15 @@ revisit a per-provider "expose directly" option only if interactive browser late
 
 ### 6.6 Status — as-built vs remaining
 
-**As-built (`bf37d25e`, `74e23f0e`): Facade mode is the default transport.** `src/browser_source.rs`
+**As-built (`bf37d25e`, `74e23f0e`): the facade is the only transport.** `src/browser_source.rs`
 implements `CapabilitySource` over the existing `AcpMcpTunnel` — `requires_session()`, static-advertise
 per §6.3, tunnel failures surfaced as MCP error results — and a `FacadeRegistrar` adapts the facade's
 `SessionTokens` to a `SessionTokenRegistrar` hook in core, so `openab-core` stays free of an
 `openab-mcp` dependency. `write_facade_mcp_config` writes a **static, write-once `openab` entry** whose
 `Authorization` references `${OPENAB_SESSION_TOKEN}`, so the per-session secret rides the agent's
 process environment rather than a config file — which also removes the shared-workdir exposure of the
-old per-session `mcp.json` write. Capabilities publish under the provider name `openab`. Both
+old per-session `mcp.json` write. Capabilities publish under the provider name `openab-browser` (`openab` is the mcp.json entry key,
+a different thing). Both
 legacy transports were removed on 2026-07-28 — bridge first, then the per-session proxy — and
 `OPENAB_BROWSER_MODE` no longer selects anything; `[mcp]` is now required for browser control.
 This covers §6.2's source seam and session identity for the **browser** case.
@@ -353,18 +355,18 @@ Both positions are defensible; recording the conflict rather than silently picki
 facade contract should confirm whether config-file injection is an accepted exception for CLIs that
 ignore `mcpServers`, or whether Facade mode should be unavailable for them.
 
-**Remaining to fulfil this section:**
-- **F1′ generalize the source to N client-declared servers.** Today it serves the fixed
-  `browser_tools()` set for one implicit server. Extend to every `type:acp` server the session's client
-  declared, routing on the `<server>.<tool>` prefix to `(channel_id, server_id)` (§6.1/§6.2), with no
-  browser-specific branch left in the source.
-- **F3′ per-`(channel_id, name)` discovery cache** — fetch each declared server's real `tools/list`
-  once on attach and serve from cache (§6.3). Required by F1′: a hardcoded tool table cannot describe
-  arbitrary declared servers.
-- **F4 trust gate** — operator allowlist (default `browser` only) + **deny-all-by-default**
-  per-declared-server `tool_filter`, with `browser` pinned to its five known tools so a same-name
-  declaration cannot inject others (§6.4). Should land with F1′, since F1′ is what makes
-  client-declared tool sets reachable.
+**Remaining to fulfil this section** — F1′, F3′, F4 and F5 all landed in #1447 and are struck
+through; **F6 genuinely remains**:
+- ~~**F1′ generalize the source to N client-declared servers.**~~ **Done in #1447**: the source
+  holds an N-entry policy map, enumerates `tunnel.servers(channel_id)` and routes on the
+  `<server>.<tool>` prefix to `(channel_id, server_id)`. Browser-ness is data in `builtin_catalogs`,
+  not a branch.
+- ~~**F3′ per-`(channel_id, name)` discovery cache**~~ **Done in #1447**: `ToolsCache` keyed
+  `(channel_id, declared_name)` with in-flight dedupe and pull-triggered discovery (§6.3).
+- ~~**F4 trust gate** — operator allowlist + **deny-all-by-default** per-declared-server
+  `tool_filter` (§6.4).~~ **Done in #1447**: `ServerPolicy` / `policy_from_config` over
+  `[[mcp.acp_servers]]`, enforced in both `tools()` and `call()` before the tunnel is resolved;
+  default allowlist is `katashiro` pinned to its five tools.
 - ~~**F5 cleanup** — retire the superseded per-session proxy path once Facade mode has soaked;
   bridge-mode removal stays an explicit operator call (§6.5).~~ **Done 2026-07-28**: the operator
   call was made and both transports were removed in this PR, so there is no soak period and no
@@ -428,7 +430,8 @@ Five **DOM-semantic** MCP tools, served by the extension: `katashiro.read_dom` (
   the capability disappearing. `notifications/tools/list_changed` was designed but never implemented,
   and is **dropped, not deferred** (§6.3): facade discovery is pull-based, so no cached tool list
   exists for a notification to invalidate. The static-advertise posture is kept, implemented as
-  fetch-once-per-declared-server plus a per-`(channel_id, server_id)` cache.
+  fetch-once-per-declared-server plus a per-`(channel_id, declared_name)` cache — keyed by NAME, not
+  `server_id`, so a reconnect that mints a fresh id does not lose the cache (§6.3).
 - **D5 — per-session MCP server.** The pool started one loopback Streamable-HTTP MCP proxy per `acp:`
   session at agent spawn, constructing the `ProxyHandler` with that session's `channel_id` so
   correlation was implicit; lifetime was tied to the `AcpConnection` via a `CancellationToken`
@@ -507,8 +510,10 @@ clients see only the two meta-tools.
   servers well; a special on-stream MCP type is invasive
   ([ACP discussion #58](https://github.com/orgs/agentclientprotocol/discussions/58)). Only the
   can't-listen *client* leg is tunnelled; downstream stays a normal in-process MCP server.
-- **Static-advertise as the default** — superseded by §6.2 (dynamic + `list_changed`); kept as an
-  opt-in for browser only.
+- ~~**Static-advertise as the default** — superseded by §6.2 (dynamic + `list_changed`); kept as an
+  opt-in for browser only.~~ **Reversed:** static-advertise IS the implemented posture,
+  `list_changed` was dropped with no consumer (§6.3), and there is no opt-in — the source is
+  registered unconditionally whenever `[mcp]` is present.
 
 ## 9. Typing / dependencies
 
