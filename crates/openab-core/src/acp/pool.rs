@@ -53,10 +53,6 @@ pub struct SessionPool {
     mapping_path: PathBuf,
     meta_path: PathBuf,
     default_config_options: HashMap<String, String>,
-    /// Bridge from a session's core MCP proxy to its browser tunnel (D5-a/D6-a'); set by the
-    /// root. `None` = no browser wiring (tool calls report not-connected).
-    #[cfg(feature = "acp-mcp")]
-    browser_tunnel: Option<Arc<dyn crate::mcp_proxy::AcpMcpTunnel>>,
     #[cfg(feature = "acp-mcp")]
     session_registrar: Option<Arc<dyn crate::mcp_proxy::SessionTokenRegistrar>>,
     #[cfg(feature = "acp-mcp")]
@@ -235,23 +231,10 @@ impl SessionPool {
             meta_path,
             default_config_options,
             #[cfg(feature = "acp-mcp")]
-            browser_tunnel: None,
-            #[cfg(feature = "acp-mcp")]
             session_registrar: None,
             #[cfg(feature = "acp-mcp")]
             facade_url: None,
         }
-    }
-
-    /// Wire the browser tunnel bridge (D6-a', set by the root) so per-session MCP proxies can
-    /// reach the browser. Call before sharing the pool.
-    #[cfg(feature = "acp-mcp")]
-    pub fn with_browser_tunnel(
-        mut self,
-        tunnel: Option<Arc<dyn crate::mcp_proxy::AcpMcpTunnel>>,
-    ) -> Self {
-        self.browser_tunnel = tunnel;
-        self
     }
 
     /// Wire the facade session-token registrar + facade URL (Facade mode,

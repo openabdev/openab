@@ -484,7 +484,7 @@ async fn main() -> anyhow::Result<()> {
     // Gated on `acp` (the root feature that pulls in core's `acp-mcp`), not on `acp-mcp` itself —
     // that is a core feature and naming it here is an unknown-cfg error.
     #[cfg(feature = "acp")]
-    openab_core::mcp_proxy::warn_if_browser_mode_set(cfg.mcp.is_some());
+    openab_core::mcp_proxy::report_browser_control(cfg.mcp.is_some());
     if let Some(mcp_cfg) = cfg.mcp.clone() {
         let listen = mcp_cfg.listen.clone();
         let tokens = facade_sessions.clone();
@@ -518,7 +518,6 @@ async fn main() -> anyhow::Result<()> {
         cfg.pool.default_config_options,
     );
     #[cfg(feature = "acp")]
-    let pool_inner = pool_inner.with_browser_tunnel(Some(browser_tunnel.clone()));
     // Facade mode session wiring: only when the facade is actually serving —
     // otherwise the pool's mode fallback keeps the per-session proxy path.
     #[cfg(feature = "acp")]

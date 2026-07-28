@@ -12,8 +12,16 @@ browser-bridge` stdio relay both existed before it and have been removed, along 
 transports](#removed-transports) if you are upgrading from either.
 
 **Browser control now requires `[mcp]` in `config.toml`.** This is a breaking change. Without that
-section there is no browser control — openab does **not** start a listener you did not configure,
-and says so once at startup rather than leaving you to infer it from missing tools.
+section there is no browser control — openab does **not** start a listener you did not configure.
+
+openab reports which of the two you are in once at startup, so it is never something you have to
+infer from tools that do not appear:
+
+```
+INFO browser control: enabled via the OAB MCP Facade ([mcp] configured)
+INFO browser control: unconfigured — no [mcp] section in config.toml, so browser tools are
+     unavailable and nothing was started. Add [mcp] to enable them.
+```
 
 > ⚠️ **A leftover `openab-browser` entry from either old transport can still sit in your agent's
 > `mcp.json`,** and the two are handled differently.

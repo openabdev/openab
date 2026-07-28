@@ -13,7 +13,8 @@
 //! - [`AcpMcpTunnel`] — the trait core calls to reach a session's tunnel, implemented in the root.
 //! - [`write_facade_mcp_config`] — writes the one static facade entry into each colocated CLI's
 //!   config, and retires the bridge entry it replaces.
-//! - [`warn_if_browser_mode_set`] — startup migration notice for the removed `OPENAB_BROWSER_MODE`.
+//! - [`report_browser_control`] — startup report of whether browser control is on, plus the
+//!   migration notice for the removed `OPENAB_BROWSER_MODE`.
 
 use rmcp::model::{object, Tool};
 use serde_json::{json, Value};
@@ -278,7 +279,8 @@ pub trait SessionTokenRegistrar: Send + Sync {
     fn revoke(&self, token: &str);
 }
 
-/// Report, once at startup, that `OPENAB_BROWSER_MODE` no longer selects anything.
+/// Report, once at startup, whether browser control is enabled — and that
+/// `OPENAB_BROWSER_MODE` no longer selects anything.
 ///
 /// Call this from configuration/startup, **not** from a session path: nothing per-session is
 /// decided by it any more, and a warning on that path would repeat for every spawn.
@@ -289,7 +291,19 @@ pub trait SessionTokenRegistrar: Send + Sync {
 /// to prevent, one level up. So the message says the value is ignored *and* reports what is
 /// actually in force, since "ignored" alone does not tell them whether they still have browser
 /// control at all.
-pub fn warn_if_browser_mode_set(mcp_configured: bool) {
+pub fn report_browser_control(mcp_configured: bool) {
+    if mcp_configured {
+        tracing::info!("browser control: enabled via the OAB MCP Facade ([mcp] configured)");
+    } else {
+        // Unconditional, and the whole point of the change: with the proxy fallback gone, an
+        // unconfigured deployment has NO browser control. Saying nothing would leave that to be
+        // inferred from tools that never appear — which is the failure this replaced, not a
+        // quieter version of it.
+        tracing::info!(
+            "browser control: unconfigured — no [mcp] section in config.toml, so browser tools \
+             are unavailable and nothing was started. Add [mcp] to enable them."
+        );
+    }
     let raw = std::env::var("OPENAB_BROWSER_MODE").ok();
     if let Some((requested, browser_control)) =
         browser_mode_migration_notice(raw.as_deref(), mcp_configured)
