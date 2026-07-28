@@ -83,8 +83,8 @@ flowchart LR
 ```
 
 Only the client (extension) is remote; core, gateway and agent are one in-pod `openab run` process
-tree. The downstream hop has two delivery modes (§ browser ADR / §6.3): `proxy` (HTTP MCP, default)
-and `bridge` (stdio relay).
+tree. The downstream hop has **one** delivery path: the OAB MCP Facade. It had two others — `proxy`
+(HTTP MCP, once the default) and `bridge` (stdio relay) — and both were removed on 2026-07-28.
 
 ## 5. MCP usage sequence (katashiro.click as the example)
 
@@ -317,9 +317,12 @@ Retired once this lands: the per-session `mcp_proxy` browser server, its port/be
 **Update — the operator call was made on 2026-07-28: bridge mode is removed.** The stdio bridge
 (`OPENAB_BROWSER_MODE=bridge`, `openab browser-bridge`, the per-pod unix socket and its
 process-ancestry channel resolver) existed because some CLIs preferred a stdio entry. The facade is
-a loopback HTTP MCP server those CLIs read directly, so the premise no longer held. `bridge` is now
-an unrecognised mode value and degrades to `facade`; facade setup deletes the leftover static entry,
-which is the only one whose exact shape proves we wrote it.
+a loopback HTTP MCP server those CLIs read directly, so the premise no longer held. Facade setup
+deletes the leftover static entry, which is the only one whose exact shape proves we wrote it.
+
+This paragraph said `bridge` "degrades to `facade`", which was true for one commit. The per-session
+proxy was removed hours later, taking `BrowserMode` and the whole `OPENAB_BROWSER_MODE` mechanism
+with it: the variable now selects nothing at all and is merely reported at startup.
 
 **Open question (not decided).** Under the facade the LLM reaches a browser action via
 `search_capabilities` → `execute_capability`, one hop more per turn than today's direct
@@ -332,8 +335,7 @@ revisit a per-provider "expose directly" option only if interactive browser late
 implements `CapabilitySource` over the existing `AcpMcpTunnel` — `requires_session()`, static-advertise
 per §6.3, tunnel failures surfaced as MCP error results — and a `FacadeRegistrar` adapts the facade's
 `SessionTokens` to a `SessionTokenRegistrar` hook in core, so `openab-core` stays free of an
-`openab-mcp` dependency. `BrowserMode::Facade` is the new default (falling back to `Proxy` when no
-facade is serving); `write_facade_mcp_config` writes a **static, write-once `openab` entry** whose
+`openab-mcp` dependency. `write_facade_mcp_config` writes a **static, write-once `openab` entry** whose
 `Authorization` references `${OPENAB_SESSION_TOKEN}`, so the per-session secret rides the agent's
 process environment rather than a config file — which also removes the shared-workdir exposure of the
 old per-session `mcp.json` write. Capabilities publish under the provider name `openab`. Both
@@ -398,7 +400,8 @@ Five **DOM-semantic** MCP tools, served by the extension: `katashiro.read_dom` (
 > facade integration in §6.2 — browser is now one session-aware `CapabilitySource`, and session
 > identity is the facade's broker-minted `SessionTokens` rather than a per-session port plus a
 > self-written `mcp.json` entry. They are kept because they explain *why* the shipped design looked
-> the way it did, and because `proxy`/`bridge` remain selectable. D1, D4 and D6 carry over.
+> the way it did. Neither `proxy` nor `bridge` is selectable any more — both were removed on
+> 2026-07-28. D1, D4 and D6 carry over.
 
 - **D1 — permission model.** Auto-approve **all** browser tool permissions for now: core keeps
   auto-replying `session/request_permission` with OK. Fine-grained consent is deferred. Consequence:
