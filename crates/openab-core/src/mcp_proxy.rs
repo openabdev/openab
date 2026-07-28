@@ -646,8 +646,13 @@ pub trait SessionTokenRegistrar: Send + Sync {
     /// Mint (or re-mint) the token for `channel_id`; returns the value the
     /// pool injects as `OPENAB_SESSION_TOKEN` in the agent's environment.
     fn mint(&self, channel_id: &str) -> String;
-    /// Revoke every token for `channel_id` (session evicted/replaced).
-    fn revoke(&self, channel_id: &str);
+    /// Revoke one specific token (the session that held it was evicted).
+    ///
+    /// Deliberately keyed by token, not by channel. `mint` replaces whatever token a channel had,
+    /// so a replaced session's teardown runs *after* its successor has already minted a new one;
+    /// revoking by channel would strip that live token and silently cut the new agent off from the
+    /// facade. Revoking the exact token makes a late teardown a no-op instead (review R1).
+    fn revoke(&self, token: &str);
 }
 
 /// Selected browser transport for the Option C rollout. `OPENAB_BROWSER_MODE=bridge` opts into

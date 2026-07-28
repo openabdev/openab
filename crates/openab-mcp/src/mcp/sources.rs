@@ -107,11 +107,24 @@ impl SessionTokens {
     }
 
     /// Revoke every token for `channel_id` (session evict / respawn).
+    ///
+    /// Prefer [`Self::revoke_token`] when tearing down a *specific* session: `mint` replaces a
+    /// channel's token, so a late teardown revoking by channel removes its successor's live token
+    /// rather than its own.
     pub fn revoke_channel(&self, channel_id: &str) {
         self.inner
             .write()
             .expect("session token lock")
             .retain(|_, ctx| ctx.channel_id != channel_id);
+    }
+
+    /// Revoke exactly one token. A no-op once that token has already been replaced, which is what
+    /// stops an evicted session's teardown from cutting off the session that succeeded it.
+    pub fn revoke_token(&self, token: &str) {
+        self.inner
+            .write()
+            .expect("session token lock")
+            .remove(token);
     }
 
     /// Resolve a presented token. Constant-time comparison over stored
@@ -167,6 +180,32 @@ pub fn session_ctx_from_extensions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An evicted session's teardown must not cut off the session that replaced it (review R1).
+    ///
+    /// Session lifetimes overlap: the successor mints while the predecessor's drop guard is still
+    /// pending. Revoking by channel at that point removes the *live* token, and the new agent
+    /// loses facade access with nothing pointing at the cause. Revoking the specific token makes
+    /// the late teardown a no-op.
+    #[test]
+    fn a_replaced_sessions_teardown_cannot_revoke_its_successors_token() {
+        let tokens = SessionTokens::new();
+        let old = tokens.mint("chan-a");
+        let new = tokens.mint("chan-a"); // successor takes over the channel
+
+        // The predecessor's guard fires late, carrying the token IT minted.
+        tokens.revoke_token(&old);
+
+        assert_eq!(
+            tokens.resolve(&new).map(|c| c.channel_id),
+            Some("chan-a".to_string()),
+            "the successor's token must survive a late teardown of the session it replaced"
+        );
+
+        // And revoking the current token still works.
+        tokens.revoke_token(&new);
+        assert!(tokens.resolve(&new).is_none());
+    }
 
     #[test]
     fn mint_resolve_revoke_lifecycle() {

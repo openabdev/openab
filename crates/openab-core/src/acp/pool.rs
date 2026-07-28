@@ -457,13 +457,19 @@ impl SessionPool {
                                 );
                                 // Revoke on evict/replace: piggyback the same DropGuard
                                 // plumbing proxy mode uses for its server teardown.
+                                //
+                                // The guard carries the TOKEN it minted, not the channel. A
+                                // replaced session's teardown runs after its successor has already
+                                // re-minted for the same channel, so revoking by channel would
+                                // strip the live token and silently cut the new agent off from the
+                                // facade; revoking this exact token is a no-op by then (R1).
                                 let ct = tokio_util::sync::CancellationToken::new();
                                 let child = ct.child_token();
                                 let registrar = registrar.clone();
-                                let chan = channel_id.to_string();
+                                let minted = session_token.clone().unwrap_or_default();
                                 tokio::spawn(async move {
                                     child.cancelled().await;
-                                    registrar.revoke(&chan);
+                                    registrar.revoke(&minted);
                                 });
                                 Some(ct.drop_guard())
                             }
@@ -1006,7 +1012,7 @@ mod tests {
             self.minted.lock().unwrap().push(channel_id.to_string());
             "token-xyz".to_string()
         }
-        fn revoke(&self, _channel_id: &str) {}
+        fn revoke(&self, _token: &str) {}
     }
 
     /// A failed facade config write must not mint a token. The agent has no `openab` entry, so it
