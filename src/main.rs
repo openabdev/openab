@@ -13,8 +13,6 @@ mod unified_adapter;
 mod browser_tunnel;
 #[cfg(feature = "acp")]
 mod browser_source;
-#[cfg(feature = "acp")]
-mod browser_bridge;
 use openab_core::acp;
 use openab_core::adapter::{self, AdapterRouter};
 use openab_core::bot_turns;
@@ -105,11 +103,6 @@ enum Commands {
         #[arg(long, default_value = "kiro-cli acp --trust-all-tools")]
         command: String,
     },
-    /// Internal: stdio MCP bridge to the per-pod browser socket (Option C). Spawned per session
-    /// by the agent's MCP client; relays MCP over stdio to core's browser tunnel by inherited
-    /// OPENAB_BROWSER_CHANNEL.
-    #[cfg(feature = "acp")]
-    BrowserBridge,
     /// Set a runtime value (e.g. thread.name)
     Set {
         /// Key to set (e.g. thread.name)
@@ -320,10 +313,6 @@ async fn main() -> anyhow::Result<()> {
         } => {
             return acp::agentcore::run_bridge(&runtime_arn, &region, &command).await;
         }
-        #[cfg(feature = "acp")]
-        Commands::BrowserBridge => {
-            return browser_bridge::run().await.map_err(Into::into);
-        }
         Commands::Set { key, value, thread } => {
             let resp = ctl::send_request(&ctl::Request {
                 action: ctl::Action::Set,
@@ -493,15 +482,17 @@ async fn main() -> anyhow::Result<()> {
     if let Some(mcp_cfg) = cfg.mcp.clone() {
         let listen = mcp_cfg.listen.clone();
         let tokens = facade_sessions.clone();
-        #[allow(unused_mut)]
-        let mut sources: Vec<Arc<dyn openab_mcp::mcp::sources::CapabilitySource>> = Vec::new();
+        // The ACP tunnel source is registered unconditionally under the `acp` feature. It used to
+        // be skipped in bridge mode; with the bridge gone there is no mode in which the facade
+        // runs without it.
         #[cfg(feature = "acp")]
-        if !openab_core::mcp_proxy::browser_mode().is_bridge() {
-            sources.push(Arc::new(browser_source::AcpTunnelSource::with_config(
+        let sources: Vec<Arc<dyn openab_mcp::mcp::sources::CapabilitySource>> =
+            vec![Arc::new(browser_source::AcpTunnelSource::with_config(
                 browser_tunnel.clone(),
                 &mcp_cfg.acp_servers,
-            )));
-        }
+            ))];
+        #[cfg(not(feature = "acp"))]
+        let sources: Vec<Arc<dyn openab_mcp::mcp::sources::CapabilitySource>> = Vec::new();
         tokio::spawn(async move {
             if let Err(e) =
                 openab_mcp::mcp::facade::serve_http_with(&listen, sources, tokens).await
@@ -537,21 +528,6 @@ async fn main() -> anyhow::Result<()> {
             )
         }),
     );
-    // Option C bridge mode: start the per-pod browser socket server once; the `openab
-    // browser-bridge` shims each agent spawns dial it. Proxy mode (default) skips this.
-    #[cfg(feature = "acp")]
-    if openab_core::mcp_proxy::browser_mode().is_bridge() {
-        let sock = openab_core::mcp_proxy::browser_socket_path();
-        match openab_core::mcp_proxy::serve_browser_socket_forever(
-            sock.clone(),
-            Some(browser_tunnel.clone()),
-        )
-        .await
-        {
-            Ok(()) => info!(?sock, "browser bridge socket serving (Option C)"),
-            Err(e) => warn!(?sock, error = %e, "failed to start browser bridge socket"),
-        }
-    }
     let pool = Arc::new(pool_inner);
     let ttl_secs = cfg.pool.session_ttl_hours * 3600;
 

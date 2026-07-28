@@ -73,8 +73,7 @@ flowchart LR
     CORE["<b>openab-core</b><br/>MCP proxy /<br/>aggregator"]
     AGENT["<b>agent CLI</b><br/>Cursor · Kiro · Claude · Codex<br/>LLM = MCP CLIENT"]
     GW <--> CORE
-    CORE ==>|"<b>proxy</b> mode (default)<br/>per-session loopback HTTP MCP<br/>{url,headers} → .cursor / .kiro mcp.json<br/>bearer-gated · 0600 · stripped on evict"| AGENT
-    CORE -.->|"<b>bridge</b> mode (Option C)<br/>per-pod unix socket + stdio relay<br/>'openab browser-bridge' · static {command,args}<br/>channel via process-ancestry (multi-window)"| AGENT
+    CORE -.->|"<b>proxy</b> mode (legacy opt-out)<br/>per-session loopback HTTP MCP<br/>{url,headers} → .cursor / .kiro mcp.json<br/>bearer-gated · 0600 · stripped on evict"| AGENT
   end
   EXT <==>|"UPSTREAM — only remote hop<br/>MCP-over-ACP · mcp/message framing<br/>multiplexed with ACP chat on ONE /acp WSS<br/>8 MiB frame cap · JPEG screenshots"| GW
   classDef remote fill:#fde68a,stroke:#b45309,color:#111;
@@ -310,10 +309,14 @@ tools over the tunnel. What changes is on the openab side — browser tools reac
 facade's meta-tools rather than a dedicated per-session MCP server.
 
 Retired once this lands: the per-session `mcp_proxy` browser server, its port/bearer minting, and the
-`openab-browser` `mcp.json` injection. The **stdio bridge mode** (`OPENAB_BROWSER_MODE=bridge`,
-`openab browser-bridge`) exists because some CLIs preferred a stdio entry; the facade is a loopback
-HTTP MCP server that those CLIs read directly, so bridge mode is likely redundant — its removal is
-**not** decided here and requires an explicit operator call.
+`openab-browser` `mcp.json` injection.
+
+**Update — the operator call was made on 2026-07-28: bridge mode is removed.** The stdio bridge
+(`OPENAB_BROWSER_MODE=bridge`, `openab browser-bridge`, the per-pod unix socket and its
+process-ancestry channel resolver) existed because some CLIs preferred a stdio entry. The facade is
+a loopback HTTP MCP server those CLIs read directly, so the premise no longer held. `bridge` is now
+an unrecognised mode value and degrades to `facade`; facade setup deletes the leftover static entry,
+which is the only one whose exact shape proves we wrote it.
 
 **Open question (not decided).** Under the facade the LLM reaches a browser action via
 `search_capabilities` → `execute_capability`, one hop more per turn than today's direct
@@ -330,9 +333,9 @@ per §6.3, tunnel failures surfaced as MCP error results — and a `FacadeRegist
 facade is serving); `write_facade_mcp_config` writes a **static, write-once `openab` entry** whose
 `Authorization` references `${OPENAB_SESSION_TOKEN}`, so the per-session secret rides the agent's
 process environment rather than a config file — which also removes the shared-workdir exposure of the
-old per-session `mcp.json` write. Capabilities publish under the provider name `openab`. Proxy and
-Option C bridge modes remain as explicit `OPENAB_BROWSER_MODE` opt-outs. This covers §6.2's source seam
-and session identity for the **browser** case.
+old per-session `mcp.json` write. Capabilities publish under the provider name `openab`. Proxy mode
+remains as the one explicit `OPENAB_BROWSER_MODE` opt-out; bridge mode was removed on 2026-07-28.
+This covers §6.2's source seam and session identity for the **browser** case.
 
 ⚠️ **Divergence to reconcile with the adapter ADR (not resolved here).** Adapter ADR §6.2 says delivery
 is via ACP `session/new` `mcpServers`, and that "if a backing CLI does not honor ACP `mcpServers`, the
@@ -476,7 +479,8 @@ The OpenAB side was wired end-to-end on 2026-07-20 and live-validated on a real 
 loop (read_dom / screenshot / navigate / click / type), the side-panel status pill, and reconnect on
 `session/resume`. At that point the realised path was
 `agent → core per-session ProxyHandler → tunnel trait → root impl → AcpTunnelRegistry → extension`,
-with per-agent config injection. `bridge` mode (stdio relay, Option C) shipped alongside.
+with per-agent config injection. `bridge` mode (stdio relay, Option C) shipped alongside and was
+removed on 2026-07-28.
 
 The facade integration in §6 replaced the per-session proxy as the default on 2026-07-25/26 and was
 live-validated the same way: with `[mcp]` enabled, `search_capabilities` returns provider

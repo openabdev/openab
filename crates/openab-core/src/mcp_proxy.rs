@@ -21,7 +21,6 @@ use rmcp::transport::streamable_http_server::{
 use rmcp::ServerHandler;
 use axum::response::IntoResponse;
 use serde_json::{json, Value};
-use tracing::warn;
 use std::sync::Arc;
 
 /// Core-side interface to the browser MCP-over-ACP tunnel (D6-a'). Implemented by the ROOT
@@ -447,55 +446,6 @@ async fn cleanup_kiro_agent_configs(workdir: &str, url: &str) {
     }
 }
 
-/// Write the STATIC, write-once `openab-browser` bridge entry into each colocated CLI's mcp.json
-/// (Option C, bridge mode). Unlike the per-session HTTP proxy config, this carries no port/bearer
-/// — it is the same `{command:"openab", args:["browser-bridge"]}` for every session, so it can be
-/// written once and never goes stale. That fixes the shared-config clobber the per-session dynamic
-/// write suffers when several sessions of one agent share a single mcp.json. Merges without
-/// touching the user's other servers; idempotent (a no-op when already present + identical).
-pub async fn write_bridge_mcp_config(workdir: &str) -> std::io::Result<()> {
-    // Pure static entry — byte-identical for every session (idempotent, no cross-session clobber).
-    // The channel is deliberately NOT carried here: the MCP client scrubs the server's env and its
-    // config-var expansion is vendor-specific, so the `openab browser-bridge` shim resolves its OWN
-    // channel by walking up to the agent process (Option C b2). This entry never goes stale.
-    let entry = json!({ "command": "openab", "args": ["browser-bridge"] });
-    let cfg_paths = [
-        std::path::Path::new(workdir).join(".cursor").join("mcp.json"),
-        std::path::Path::new(workdir)
-            .join(".kiro")
-            .join("settings")
-            .join("mcp.json"),
-    ];
-    for cfg_path in &cfg_paths {
-        if let Some(dir) = cfg_path.parent() {
-            tokio::fs::create_dir_all(dir).await?;
-        }
-        let mut cfg: Value = match tokio::fs::read(cfg_path).await {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({})),
-            Err(_) => json!({}),
-        };
-        if !cfg.get("mcpServers").map(Value::is_object).unwrap_or(false) {
-            cfg["mcpServers"] = json!({});
-        }
-        // Idempotent: only rewrite when absent or changed (no needless mtime churn each session).
-        if cfg["mcpServers"]["openab-browser"] != entry {
-            cfg["mcpServers"]["openab-browser"] = entry.clone();
-            tokio::fs::write(cfg_path, serde_json::to_vec_pretty(&cfg)?).await?;
-        }
-    }
-    // kiro `--agent` deployments read agent files, not settings/mcp.json (same
-    // gap as the proxy-mode writer). The static entry is idempotent there too.
-    merge_kiro_agent_configs(workdir, &entry).await?;
-    Ok(())
-}
-
-/// Write the STATIC, write-once `openab` facade entry into each colocated CLI's MCP config
-/// (Facade mode). Like the Option C bridge entry it is byte-identical for every session —
-/// the per-session secret is NOT in the file: the entry references the
-/// `OPENAB_SESSION_TOKEN` environment variable, which the pool injects into each spawned
-/// agent process (config-var expansion is exactly how deployed agents already reference
-/// per-bot secrets). No cross-session clobber, nothing to clean up on evict — the token
-/// dies with the agent process and its registry entry.
 /// True when an `openab-browser` entry is one we can **prove** we wrote, and so may be dropped
 /// when facade mode takes over.
 ///
@@ -535,6 +485,13 @@ fn strip_direct_browser_entry(cfg: &mut Value) -> bool {
     }
 }
 
+/// Write the STATIC, write-once `openab` facade entry into each colocated CLI's MCP config
+/// (Facade mode). Like the Option C bridge entry it is byte-identical for every session —
+/// the per-session secret is NOT in the file: the entry references the
+/// `OPENAB_SESSION_TOKEN` environment variable, which the pool injects into each spawned
+/// agent process (config-var expansion is exactly how deployed agents already reference
+/// per-bot secrets). No cross-session clobber, nothing to clean up on evict — the token
+/// dies with the agent process and its registry entry.
 pub async fn write_facade_mcp_config(workdir: &str, facade_url: &str) -> std::io::Result<()> {
     let entry = json!({
         "url": facade_url,
@@ -645,9 +602,13 @@ pub trait SessionTokenRegistrar: Send + Sync {
     fn revoke(&self, token: &str);
 }
 
-/// Selected browser transport for the Option C rollout. `OPENAB_BROWSER_MODE=bridge` opts into
-/// the stdio bridge; anything else (including unset) keeps the per-session HTTP proxy — the safe
-/// default during rollout, so existing Cursor/Kiro browser control is unchanged until flipped.
+/// Selected browser transport. `OPENAB_BROWSER_MODE=proxy` opts out of facade routing; anything
+/// else, including unset, uses the facade.
+///
+/// The stdio bridge was the third variant and is gone. `bridge` is now simply an unrecognised
+/// value and falls through to `Facade` like any other — deliberately, so a deployment still
+/// carrying `OPENAB_BROWSER_MODE=bridge` from the previous release comes up with working browser
+/// control rather than refusing to start on a value that used to be valid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserMode {
     /// Browser tools served through the OAB MCP Facade as a session-aware
@@ -655,21 +616,13 @@ pub enum BrowserMode {
     /// broker-minted tokens). The default when the facade is running;
     /// falls back to `Proxy` when it is not (no `[mcp]` in config).
     Facade,
-    /// Per-session loopback HTTP MCP server + dynamic config (the original
-    /// default; explicit opt-out from facade routing).
+    /// Per-session loopback HTTP MCP server + dynamic config (explicit opt-out
+    /// from facade routing).
     Proxy,
-    Bridge,
-}
-
-impl BrowserMode {
-    pub fn is_bridge(self) -> bool {
-        matches!(self, BrowserMode::Bridge)
-    }
 }
 
 fn parse_browser_mode(s: Option<&str>) -> BrowserMode {
     match s.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
-        Some("bridge") => BrowserMode::Bridge,
         Some("proxy") => BrowserMode::Proxy,
         _ => BrowserMode::Facade,
     }
@@ -680,309 +633,11 @@ pub fn browser_mode() -> BrowserMode {
     parse_browser_mode(std::env::var("OPENAB_BROWSER_MODE").ok().as_deref())
 }
 
-/// Per-pod browser-bridge socket path (overridable via `OPENAB_BROWSER_SOCKET`). Single source of
-/// truth shared by the core socket server and the `openab browser-bridge` shim so they agree.
-pub fn browser_socket_path() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("OPENAB_BROWSER_SOCKET") {
-        return p.into();
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/agent".into());
-    std::path::Path::new(&home).join(".openab").join("browser.sock")
-}
-
-// ---- Option C: per-pod stdio-bridge socket server -------------------------------------------
-// A single unix socket per pod multiplexes ALL sessions. The `openab browser-bridge` shim
-// (spawned per agent session by the CLI's MCP client) connects and forwards inner MCP requests
-// tagged with its own `channel_id` (from the OPENAB_BROWSER_CHANNEL env it inherits); core routes
-// `tools/call` to that session's AcpMcpTunnel. This is the stable, variant-agnostic replacement
-// for the per-session HTTP proxy (Option C). Wire = newline-delimited JSON, one frame per line:
-//   bridge → core : {"channel_id": "...", "request": <inner MCP JSON-RPC request>}
-//   core → bridge : <inner MCP JSON-RPC response>   (omitted for notifications)
-
-const BROWSER_MCP_PROTOCOL_VERSION: &str = "2025-06-18";
-
-fn mcp_result(id: Value, result: Value) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "result": result })
-}
-
-fn mcp_error(id: Value, code: i64, message: &str) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
-}
-
-/// Dispatch one inner MCP request for `channel_id`, backing `tools/call` with the shared browser
-/// tunnel. Returns the MCP response, or `None` for a JSON-RPC notification (no reply). Same tool
-/// set + not-connected semantics as the HTTP `ProxyHandler` (single source of truth).
-pub(crate) async fn dispatch_browser_mcp(
-    channel_id: &str,
-    request: &Value,
-    tunnel: &Option<Arc<dyn AcpMcpTunnel>>,
-) -> Option<Value> {
-    // A JSON-RPC notification has no `id` → no response.
-    let id = request.get("id").cloned()?;
-    let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-    let resp = match method {
-        "initialize" => mcp_result(
-            id,
-            json!({
-                "protocolVersion": BROWSER_MCP_PROTOCOL_VERSION,
-                "capabilities": { "tools": {} },
-                "serverInfo": { "name": "openab-browser", "version": env!("CARGO_PKG_VERSION") }
-            }),
-        ),
-        "tools/list" => {
-            let tools = serde_json::to_value(browser_tools()).unwrap_or_else(|_| json!([]));
-            mcp_result(id, json!({ "tools": tools }))
-        }
-        "tools/call" => match tunnel {
-            // Empty server_id sentinel (Fork A): the bridge frame carries no server id yet;
-            // RootBrowserTunnel resolves the sole tunnel on the channel. Real per-server routing
-            // (server_id in the frame) lands in P2.
-            Some(t) => match t
-                .call(channel_id, "", "tools/call", request.get("params").cloned())
-                .await
-            {
-                Ok(v) => mcp_result(id, v),
-                Err(e) => mcp_error(id, -32603, &e),
-            },
-            None => mcp_error(
-                id,
-                -32603,
-                "browser not connected: open the OpenAB side panel in your browser",
-            ),
-        },
-        other => mcp_error(id, -32601, &format!("method not found: {other}")),
-    };
-    Some(resp)
-}
-
-/// Serve the per-pod browser-bridge socket at `path`, routing each connection's framed requests
-/// via [`dispatch_browser_mcp`]. Binds a fresh 0600 unix socket (same-uid only), spawns the accept
-/// loop, and runs until `ct` is cancelled. Idempotent on a stale socket file from a prior run.
-/// Extract `OPENAB_BROWSER_CHANNEL` from a null-separated `/proc/<pid>/environ` blob.
-fn parse_channel_from_environ(bytes: &[u8]) -> Option<String> {
-    for kv in bytes.split(|b| *b == 0) {
-        if let Some(rest) = kv.strip_prefix(b"OPENAB_BROWSER_CHANNEL=") {
-            let v = String::from_utf8_lossy(rest).into_owned();
-            if !v.is_empty() {
-                return Some(v);
-            }
-        }
-    }
-    None
-}
-
-/// Parse the parent PID from a `/proc/<pid>/stat` line. Field 2 (`comm`) is parenthesized and may
-/// contain spaces or `)`, so split after the LAST `)`: the remainder is "state ppid pgrp ...".
-fn parse_ppid_from_stat(stat: &str) -> Option<u32> {
-    let after = &stat[stat.rfind(')')? + 1..];
-    after.split_whitespace().nth(1)?.parse().ok()
-}
-
-/// Walk up from `start_pid` and return the first ancestor's `OPENAB_BROWSER_CHANNEL`.
-///
-/// This is the **authoritative** channel for a bridge connection: the agent process openab
-/// spawned carries the variable, and the shim it spawns is always a descendant. Deriving it from
-/// a kernel-supplied peer pid means a caller cannot choose which session it drives — unlike the
-/// `channel_id` in the frame, which is merely a claim (review R2).
-pub fn channel_from_process_ancestry(start_pid: u32) -> Option<String> {
-    let mut pid = start_pid;
-    for _ in 0..16 {
-        if let Ok(bytes) = std::fs::read(format!("/proc/{pid}/environ")) {
-            if let Some(c) = parse_channel_from_environ(&bytes) {
-                return Some(c);
-            }
-        }
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        match parse_ppid_from_stat(&stat) {
-            Some(ppid) if ppid > 1 => pid = ppid, // step up (stop at init/tini = 1)
-            _ => break,
-        }
-    }
-    None
-}
-
-/// Maps a connecting peer's pid to the channel it is allowed to drive. Injectable so the socket
-/// server can be tested without a real agent process tree above the test binary.
-pub type ChannelResolver = Arc<dyn Fn(u32) -> Option<String> + Send + Sync>;
-
-/// Hard ceiling for one bridge frame (review R4).
-///
-/// Matches the ACP tunnel's own frame ceiling so the bridge is never the tighter bottleneck for
-/// legitimate MCP traffic, while still bounding what a single frame can make us allocate.
-const MAX_BRIDGE_FRAME_BYTES: usize = 8 << 20; // 8 MiB
-
-/// Read one newline-terminated frame, refusing to buffer more than `max` bytes.
-///
-/// `BufReader::lines()` grows until it sees a newline, so a peer that never sends one pins an
-/// arbitrarily large allocation — no malice required, a wedged writer does it too. Returns
-/// `Ok(None)` at EOF, and `InvalidData` once the pending frame would exceed `max`; the caller
-/// drops the connection rather than trying to resynchronise mid-frame.
-async fn read_frame_bounded<R>(reader: &mut R, max: usize) -> std::io::Result<Option<Vec<u8>>>
-where
-    R: tokio::io::AsyncBufRead + Unpin,
-{
-    use tokio::io::AsyncBufReadExt;
-    let mut out: Vec<u8> = Vec::new();
-    loop {
-        // Copy out of the fill buffer before consuming: `available` borrows the reader.
-        let (chunk, terminated) = {
-            let available = reader.fill_buf().await?;
-            if available.is_empty() {
-                return Ok((!out.is_empty()).then_some(out)); // EOF
-            }
-            match available.iter().position(|b| *b == b'\n') {
-                Some(pos) => (available[..pos].to_vec(), true),
-                None => (available.to_vec(), false),
-            }
-        };
-        if out.len() + chunk.len() > max {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("bridge frame exceeds {max} bytes"),
-            ));
-        }
-        out.extend_from_slice(&chunk);
-        reader.consume(chunk.len() + usize::from(terminated));
-        if terminated {
-            return Ok(Some(out));
-        }
-    }
-}
-
-pub async fn serve_browser_socket(
-    path: std::path::PathBuf,
-    tunnel: Option<Arc<dyn AcpMcpTunnel>>,
-    ct: tokio_util::sync::CancellationToken,
-) -> std::io::Result<()> {
-    let resolver: ChannelResolver = Arc::new(channel_from_process_ancestry);
-    serve_browser_socket_with_resolver(path, tunnel, resolver, ct).await
-}
-
-/// [`serve_browser_socket`] with an injectable peer→channel resolver (tests).
-pub async fn serve_browser_socket_with_resolver(
-    path: std::path::PathBuf,
-    tunnel: Option<Arc<dyn AcpMcpTunnel>>,
-    resolver: ChannelResolver,
-    ct: tokio_util::sync::CancellationToken,
-) -> std::io::Result<()> {
-    let _ = tokio::fs::remove_file(&path).await; // clear a stale socket from a prior run
-    let listener = tokio::net::UnixListener::bind(&path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = ct.cancelled() => break,
-                accepted = listener.accept() => {
-                    match accepted {
-                        Ok((stream, _)) => {
-                            tokio::spawn(handle_browser_conn(
-                                stream,
-                                tunnel.clone(),
-                                resolver.clone(),
-                            ));
-                        }
-                        Err(_) => continue,
-                    }
-                }
-            }
-        }
-        let _ = tokio::fs::remove_file(&path).await;
-    });
-    Ok(())
-}
-
-/// Start the browser socket for the process lifetime (no external cancellation handle) — used by
-/// the broker in bridge mode. The pod-wide server lives as long as the process, so no caller-side
-/// tokio-util dependency is needed.
-pub async fn serve_browser_socket_forever(
-    path: std::path::PathBuf,
-    tunnel: Option<Arc<dyn AcpMcpTunnel>>,
-) -> std::io::Result<()> {
-    serve_browser_socket(path, tunnel, tokio_util::sync::CancellationToken::new()).await
-}
-
-async fn handle_browser_conn(
-    stream: tokio::net::UnixStream,
-    tunnel: Option<Arc<dyn AcpMcpTunnel>>,
-    resolver: ChannelResolver,
-) {
-    use tokio::io::{AsyncWriteExt, BufReader};
-
-    // Authenticate the CONNECTION, not the frame (review R2). 0600 on the socket only proves the
-    // peer shares our uid; it does not say which session the peer belongs to. The `channel_id` in
-    // a frame is a claim the sender chooses, so trusting it let any same-uid process drive another
-    // live session's browser. Derive the channel from the kernel-supplied peer pid instead, and
-    // refuse the connection outright when it cannot be established — an unauthenticated peer gets
-    // no session at all rather than a default one.
-    let peer_pid = stream.peer_cred().ok().and_then(|c| c.pid());
-    let Some(authenticated_channel) = peer_pid.and_then(|pid| resolver(pid as u32)) else {
-        warn!(
-            peer_pid = ?peer_pid,
-            "browser bridge: refusing a connection whose browser channel could not be established"
-        );
-        return;
-    };
-
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-    loop {
-        let line = match read_frame_bounded(&mut reader, MAX_BRIDGE_FRAME_BYTES).await {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => break, // EOF
-            Err(e) => {
-                // Oversized or unreadable: the stream cannot be resynchronised mid-frame, so the
-                // connection goes rather than leaving a partial frame buffered (R4).
-                warn!(peer_pid = ?peer_pid, error = %e, "browser bridge: dropping connection");
-                break;
-            }
-        };
-        let Ok(line) = String::from_utf8(line) else {
-            continue; // skip a non-UTF8 frame rather than drop the connection
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(frame) = serde_json::from_str::<Value>(&line) else {
-            continue; // skip a malformed frame rather than drop the connection
-        };
-        // A frame may still carry channel_id (the shim sends it), but it is only ever checked
-        // against the authenticated value — never used to select a session.
-        if let Some(claimed) = frame.get("channel_id").and_then(Value::as_str) {
-            if !claimed.is_empty() && claimed != authenticated_channel {
-                warn!(
-                    peer_pid = ?peer_pid,
-                    claimed,
-                    "browser bridge: frame claimed a channel this peer does not own; dropping"
-                );
-                continue;
-            }
-        }
-        let Some(request) = frame.get("request") else {
-            continue;
-        };
-        if let Some(resp) = dispatch_browser_mcp(&authenticated_channel, request, &tunnel).await {
-            let Ok(mut buf) = serde_json::to_vec(&resp) else {
-                continue;
-            };
-            buf.push(b'\n');
-            if write_half.write_all(&buf).await.is_err() {
-                break;
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_tools, cleanup_kiro_agent_configs, dispatch_browser_mcp,
-        is_openab_direct_browser_entry, merge_kiro_agent_configs, parse_browser_mode,
-        serve_browser_socket_with_resolver, spawn_mcp_server, start_session_server,
-        write_bridge_mcp_config,
+        browser_tools, cleanup_kiro_agent_configs, is_openab_direct_browser_entry,
+        merge_kiro_agent_configs, parse_browser_mode, spawn_mcp_server, start_session_server,
         write_facade_mcp_config, AcpMcpTunnel, BrowserMode, ProxyHandler,
     };
 
@@ -1340,13 +995,15 @@ mod tests {
         assert_eq!(parse_browser_mode(None), BrowserMode::Facade);
         assert_eq!(parse_browser_mode(Some("")), BrowserMode::Facade);
         assert_eq!(parse_browser_mode(Some("junk")), BrowserMode::Facade);
-        // Explicit opt-outs keep their exact prior semantics.
+        // The one remaining explicit opt-out keeps its exact prior semantics.
         assert_eq!(parse_browser_mode(Some("proxy")), BrowserMode::Proxy);
-        assert_eq!(parse_browser_mode(Some("bridge")), BrowserMode::Bridge);
-        assert_eq!(parse_browser_mode(Some("  Bridge  ")), BrowserMode::Bridge);
-        assert!(BrowserMode::Bridge.is_bridge());
-        assert!(!BrowserMode::Proxy.is_bridge());
-        assert!(!BrowserMode::Facade.is_bridge());
+        assert_eq!(parse_browser_mode(Some("  Proxy  ")), BrowserMode::Proxy);
+        // `bridge` was a third mode and is gone. It must degrade to the default like any other
+        // unknown value rather than being special-cased into an error: a deployment still carrying
+        // OPENAB_BROWSER_MODE=bridge from the previous release has to come up with working browser
+        // control, not refuse to start on a value that used to be valid.
+        assert_eq!(parse_browser_mode(Some("bridge")), BrowserMode::Facade);
+        assert_eq!(parse_browser_mode(Some("  Bridge  ")), BrowserMode::Facade);
     }
 
     struct MockTunnel;
@@ -1414,277 +1071,6 @@ mod tests {
             Err("no browser attached".into())
         }
     }
-    fn req(id: i64, method: &str, params: serde_json::Value) -> serde_json::Value {
-        serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
-    }
-    fn arc_tunnel<T: AcpMcpTunnel + 'static>(t: T) -> Option<std::sync::Arc<dyn AcpMcpTunnel>> {
-        Some(std::sync::Arc::new(t))
-    }
-
-    #[tokio::test]
-    async fn dispatch_initialize_advertises_tools() {
-        let r = dispatch_browser_mcp("acp_x", &req(1, "initialize", serde_json::json!({})), &None)
-            .await
-            .unwrap();
-        assert_eq!(r["id"], 1);
-        assert_eq!(r["result"]["capabilities"]["tools"], serde_json::json!({}));
-        assert_eq!(r["result"]["serverInfo"]["name"], "openab-browser");
-    }
-
-    #[tokio::test]
-    async fn dispatch_tools_list_returns_five_tools() {
-        let r = dispatch_browser_mcp("acp_x", &req(2, "tools/list", serde_json::json!({})), &None)
-            .await
-            .unwrap();
-        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 5);
-    }
-
-    #[tokio::test]
-    async fn dispatch_tools_call_routes_to_the_channel_tunnel() {
-        let tunnel = arc_tunnel(RecordTunnel {
-            result: serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] }),
-        });
-        let r = dispatch_browser_mcp(
-            "acp_win1",
-            &req(3, "tools/call", serde_json::json!({ "name": "katashiro.read_dom", "arguments": {} })),
-            &tunnel,
-        )
-        .await
-        .unwrap();
-        assert_eq!(r["result"]["content"][0]["text"], "ok");
-    }
-
-    #[tokio::test]
-    async fn dispatch_tools_call_without_tunnel_is_not_connected() {
-        let r = dispatch_browser_mcp(
-            "acp_x",
-            &req(4, "tools/call", serde_json::json!({ "name": "katashiro.click" })),
-            &None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(r["error"]["code"], -32603);
-        assert!(r["error"]["message"].as_str().unwrap().contains("not connected"));
-    }
-
-    #[tokio::test]
-    async fn dispatch_tools_call_surfaces_tunnel_error() {
-        let tunnel = arc_tunnel(ErrTunnel);
-        let r = dispatch_browser_mcp(
-            "acp_x",
-            &req(5, "tools/call", serde_json::json!({ "name": "katashiro.click" })),
-            &tunnel,
-        )
-        .await
-        .unwrap();
-        assert_eq!(r["error"]["code"], -32603);
-        assert_eq!(r["error"]["message"], "no browser attached");
-    }
-
-    #[tokio::test]
-    async fn dispatch_notification_gets_no_response() {
-        let notif = serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
-        assert!(dispatch_browser_mcp("acp_x", &notif, &None).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn dispatch_unknown_method_is_method_not_found() {
-        let r = dispatch_browser_mcp("acp_x", &req(6, "bogus/thing", serde_json::json!({})), &None)
-            .await
-            .unwrap();
-        assert_eq!(r["error"]["code"], -32601);
-    }
-
-    #[tokio::test]
-    async fn write_bridge_config_writes_static_entry_to_both_variants() {
-        let dir = tempfile::tempdir().unwrap();
-        write_bridge_mcp_config(dir.path().to_str().unwrap())
-            .await
-            .unwrap();
-        for rel in [".cursor/mcp.json", ".kiro/settings/mcp.json"] {
-            let cfg: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(dir.path().join(rel)).unwrap()).unwrap();
-            let e = &cfg["mcpServers"]["openab-browser"];
-            assert_eq!(e["command"], "openab");
-            assert_eq!(e["args"], serde_json::json!(["browser-bridge"]));
-            assert!(
-                e.get("env").is_none(),
-                "channel is resolved by the shim (b2), not carried in config"
-            );
-            assert!(e.get("url").is_none(), "bridge entry carries no url/port");
-            assert!(e.get("headers").is_none(), "bridge entry carries no bearer");
-        }
-    }
-
-    #[tokio::test]
-    async fn write_bridge_config_merges_without_clobber_and_is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        let cursor = dir.path().join(".cursor");
-        std::fs::create_dir_all(&cursor).unwrap();
-        std::fs::write(
-            cursor.join("mcp.json"),
-            r#"{"mcpServers":{"other":{"url":"http://x"}}}"#,
-        )
-        .unwrap();
-        let wd = dir.path().to_str().unwrap();
-        write_bridge_mcp_config(wd).await.unwrap();
-        write_bridge_mcp_config(wd).await.unwrap(); // idempotent second call
-        let cfg: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(cursor.join("mcp.json")).unwrap()).unwrap();
-        assert_eq!(cfg["mcpServers"]["other"]["url"], "http://x"); // user's server preserved
-        assert_eq!(cfg["mcpServers"]["openab-browser"]["command"], "openab");
-    }
-
-    #[tokio::test]
-    async fn browser_socket_round_trip() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("browser.sock");
-        let tunnel = arc_tunnel(RecordTunnel {
-            result: serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] }),
-        });
-        let ct = tokio_util::sync::CancellationToken::new();
-        // The peer here is the test binary, whose ancestry carries no channel, so inject the
-        // resolver the way a real deployment's process tree would answer.
-        serve_browser_socket_with_resolver(
-            sock.clone(),
-            tunnel,
-            std::sync::Arc::new(|_pid| Some("acp_win1".to_string())),
-            ct.clone(),
-        )
-        .await
-        .unwrap();
-        let stream = loop {
-            match tokio::net::UnixStream::connect(&sock).await {
-                Ok(s) => break s,
-                Err(_) => tokio::task::yield_now().await,
-            }
-        };
-        let (rd, mut wr) = stream.into_split();
-        let frame = serde_json::json!({
-            "channel_id": "acp_win1",
-            "request": req(9, "tools/call", serde_json::json!({ "name": "katashiro.read_dom", "arguments": {} }))
-        });
-        let mut line = serde_json::to_vec(&frame).unwrap();
-        line.push(b'\n');
-        wr.write_all(&line).await.unwrap();
-        let mut resp = String::new();
-        BufReader::new(rd).read_line(&mut resp).await.unwrap();
-        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
-        assert_eq!(v["id"], 9);
-        assert_eq!(v["result"]["content"][0]["text"], "ok");
-        ct.cancel();
-    }
-
-    // --- R4: one frame cannot pin an unbounded allocation ---
-
-    /// `BufReader::lines()` grows until it sees a newline, so a peer that never sends one — a
-    /// wedged writer just as much as a hostile one — pins an arbitrarily large buffer. Tested at a
-    /// small cap so the assertion is about the bound, not about allocating megabytes.
-    #[tokio::test]
-    async fn an_unterminated_frame_is_refused_once_it_passes_the_cap() {
-        // Terminated frames under the cap read normally, newline consumed.
-        let mut r = std::io::Cursor::new(b"hello\nworld\n".to_vec());
-        assert_eq!(
-            super::read_frame_bounded(&mut r, 16).await.unwrap(),
-            Some(b"hello".to_vec())
-        );
-        assert_eq!(
-            super::read_frame_bounded(&mut r, 16).await.unwrap(),
-            Some(b"world".to_vec())
-        );
-        // EOF is None, not an error.
-        assert_eq!(super::read_frame_bounded(&mut r, 16).await.unwrap(), None);
-
-        // Exactly at the cap is still allowed — the bound is inclusive.
-        let mut at_cap = std::io::Cursor::new(b"0123456789abcdef\n".to_vec());
-        assert_eq!(
-            super::read_frame_bounded(&mut at_cap, 16).await.unwrap(),
-            Some(b"0123456789abcdef".to_vec())
-        );
-
-        // Unterminated and over the cap: refused rather than buffered.
-        let mut flood = std::io::Cursor::new(vec![b'x'; 64]);
-        let err = super::read_frame_bounded(&mut flood, 16)
-            .await
-            .expect_err("an unterminated frame past the cap must be refused");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-
-        // A terminated frame that is merely too long is refused too.
-        let mut long = std::io::Cursor::new([vec![b'y'; 64], vec![b'\n']].concat());
-        assert!(super::read_frame_bounded(&mut long, 16).await.is_err());
-    }
-
-    // --- R2: the socket authenticates the connection, not the frame ---
-
-    #[test]
-    fn ancestry_parsers_read_proc_shapes() {
-        assert_eq!(super::parse_ppid_from_stat("834 (sh) S 25 834 25 0 -1 ..."), Some(25));
-        assert_eq!(super::parse_ppid_from_stat("658 (cursor agent) R 25 658 ..."), Some(25));
-        // ')' inside comm — split after the LAST ')'
-        assert_eq!(super::parse_ppid_from_stat("5 (weird )proc) S 3 5 ..."), Some(3));
-        assert_eq!(super::parse_ppid_from_stat("nonsense"), None);
-
-        let env = b"HOME=/h\0OPENAB_BROWSER_CHANNEL=acp_xyz\0PATH=/x\0";
-        assert_eq!(
-            super::parse_channel_from_environ(env).as_deref(),
-            Some("acp_xyz")
-        );
-        assert_eq!(super::parse_channel_from_environ(b"HOME=/x\0PATH=/y\0"), None);
-        assert_eq!(super::parse_channel_from_environ(b"OPENAB_BROWSER_CHANNEL=\0"), None);
-    }
-
-    /// A same-uid peer must not be able to drive a session it does not own by naming it. The
-    /// socket's 0600 mode only proves same-uid; the channel comes from the peer's process
-    /// ancestry, and a frame claiming a different one is dropped rather than honoured.
-    #[tokio::test]
-    async fn a_frame_cannot_claim_a_channel_the_peer_does_not_own() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("browser.sock");
-        let tunnel = arc_tunnel(RecordTunnel {
-            result: serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] }),
-        });
-        let ct = tokio_util::sync::CancellationToken::new();
-        // This peer owns acp_win1 (RecordTunnel asserts it only ever sees that channel).
-        serve_browser_socket_with_resolver(
-            sock.clone(),
-            tunnel,
-            std::sync::Arc::new(|_pid| Some("acp_win1".to_string())),
-            ct.clone(),
-        )
-        .await
-        .unwrap();
-        let stream = loop {
-            match tokio::net::UnixStream::connect(&sock).await {
-                Ok(s) => break s,
-                Err(_) => tokio::task::yield_now().await,
-            }
-        };
-        let (rd, mut wr) = stream.into_split();
-
-        // Claim someone else's session first, then a legitimate frame.
-        for (channel, id) in [("acp_victim", 1), ("acp_win1", 2)] {
-            let frame = serde_json::json!({
-                "channel_id": channel,
-                "request": req(id, "tools/call", serde_json::json!({ "name": "katashiro.read_dom", "arguments": {} }))
-            });
-            let mut line = serde_json::to_vec(&frame).unwrap();
-            line.push(b'\n');
-            wr.write_all(&line).await.unwrap();
-        }
-
-        // Only the legitimate frame is answered; the spoofed one produced no reply at all.
-        let mut resp = String::new();
-        BufReader::new(rd).read_line(&mut resp).await.unwrap();
-        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
-        assert_eq!(
-            v["id"], 2,
-            "the first response must be for the legitimate frame — the spoofed channel was dropped"
-        );
-        ct.cancel();
-    }
-
     #[tokio::test]
     async fn start_session_server_writes_cursor_config() {
         let dir = tempfile::tempdir().unwrap();
