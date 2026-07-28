@@ -628,16 +628,66 @@ fn parse_browser_mode(s: Option<&str>) -> BrowserMode {
     }
 }
 
-/// Read the browser transport mode from `OPENAB_BROWSER_MODE` (default: proxy).
-pub fn browser_mode() -> BrowserMode {
-    parse_browser_mode(std::env::var("OPENAB_BROWSER_MODE").ok().as_deref())
+/// True when `OPENAB_BROWSER_MODE` is set to something that is not a transport we still have.
+///
+/// Empty and unset are not "unrecognised" — they mean "no preference expressed". Only a value the
+/// operator deliberately wrote and that no longer selects anything counts, which today is `bridge`
+/// and any typo.
+fn is_unrecognised_mode(raw: Option<&str>) -> Option<&str> {
+    let v = raw?.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("proxy") || v.eq_ignore_ascii_case("facade") {
+        return None;
+    }
+    Some(v)
+}
+
+/// Resolve the transport actually in use from the configured value and whether the facade is
+/// really serving. Pure, so the resolution is testable without touching process env.
+///
+/// Two separate demotions land here and both are silent to the operator on their own: an
+/// unrecognised value falls through to `Facade`, and `Facade` falls back to `Proxy` when no
+/// `[mcp]` wired a registrar. Composing them is how `OPENAB_BROWSER_MODE=bridge` ends up running
+/// **proxy** — which is why the caller warns with the resolved value rather than the requested one.
+fn resolve_browser_mode(raw: Option<&str>, facade_available: bool) -> BrowserMode {
+    match parse_browser_mode(raw) {
+        BrowserMode::Facade if !facade_available => BrowserMode::Proxy,
+        m => m,
+    }
+}
+
+/// The transport to use for this process, resolved against whether the facade is serving.
+///
+/// `facade_available` is false when no `[mcp]` section wired a session registrar or facade url.
+///
+/// Warns once per process when `OPENAB_BROWSER_MODE` names a transport that no longer exists.
+/// Accepting the stale value keeps an upgraded deployment running; accepting it *silently* would
+/// leave the operator believing they are on a transport that was deleted, so the warning names the
+/// transport actually in use — not the one they asked for, and not merely the one that parsing
+/// picked, since the `[mcp]` fallback can demote that again.
+pub fn browser_mode_effective(facade_available: bool) -> BrowserMode {
+    let raw = std::env::var("OPENAB_BROWSER_MODE").ok();
+    let mode = resolve_browser_mode(raw.as_deref(), facade_available);
+    if let Some(requested) = is_unrecognised_mode(raw.as_deref()) {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                requested,
+                effective = ?mode,
+                "OPENAB_BROWSER_MODE names a transport that no longer exists (the stdio bridge was \
+                 removed); continuing on the transport shown as `effective`. Unset the variable, \
+                 or set it to `proxy`, to make the configuration say what is actually running."
+            );
+        });
+    }
+    mode
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         browser_tools, cleanup_kiro_agent_configs, is_openab_direct_browser_entry,
-        merge_kiro_agent_configs, parse_browser_mode, spawn_mcp_server, start_session_server,
+        is_unrecognised_mode, merge_kiro_agent_configs, parse_browser_mode, resolve_browser_mode,
+        spawn_mcp_server, start_session_server,
         write_facade_mcp_config, AcpMcpTunnel, BrowserMode, ProxyHandler,
     };
 
@@ -1004,6 +1054,41 @@ mod tests {
         // control, not refuse to start on a value that used to be valid.
         assert_eq!(parse_browser_mode(Some("bridge")), BrowserMode::Facade);
         assert_eq!(parse_browser_mode(Some("  Bridge  ")), BrowserMode::Facade);
+    }
+
+    /// The two demotions compose, and the second one is the reason the warning cannot just echo
+    /// what parsing returned: `bridge` degrades to Facade, and Facade degrades again to Proxy when
+    /// no `[mcp]` is configured. An operator who set `bridge` and has no facade is running
+    /// **proxy** — the transport furthest from what they wrote.
+    #[test]
+    fn a_removed_mode_resolves_through_both_demotions_to_the_transport_actually_running() {
+        assert_eq!(
+            resolve_browser_mode(Some("bridge"), false),
+            BrowserMode::Proxy,
+            "bridge + no [mcp] must resolve to proxy, which is what the operator is really running"
+        );
+        assert_eq!(resolve_browser_mode(Some("bridge"), true), BrowserMode::Facade);
+        // An explicit opt-out is not a fallback and is never re-resolved.
+        assert_eq!(resolve_browser_mode(Some("proxy"), true), BrowserMode::Proxy);
+        assert_eq!(resolve_browser_mode(Some("proxy"), false), BrowserMode::Proxy);
+        // Unset behaves like any other non-preference.
+        assert_eq!(resolve_browser_mode(None, true), BrowserMode::Facade);
+        assert_eq!(resolve_browser_mode(None, false), BrowserMode::Proxy);
+    }
+
+    /// Only a value the operator actually wrote and that no longer selects anything is worth
+    /// warning about. Warning on unset would fire for every default deployment, and warning on a
+    /// live value would train operators to ignore it.
+    #[test]
+    fn only_a_deliberately_set_dead_value_is_reported_as_unrecognised() {
+        assert_eq!(is_unrecognised_mode(Some("bridge")), Some("bridge"));
+        assert_eq!(is_unrecognised_mode(Some("  Bridge  ")), Some("Bridge"));
+        assert_eq!(is_unrecognised_mode(Some("typo")), Some("typo"));
+        assert_eq!(is_unrecognised_mode(None), None);
+        assert_eq!(is_unrecognised_mode(Some("")), None);
+        assert_eq!(is_unrecognised_mode(Some("   ")), None);
+        assert_eq!(is_unrecognised_mode(Some("proxy")), None);
+        assert_eq!(is_unrecognised_mode(Some("FACADE")), None);
     }
 
     struct MockTunnel;

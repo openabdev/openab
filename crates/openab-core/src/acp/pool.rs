@@ -428,14 +428,11 @@ impl SessionPool {
         #[cfg(feature = "acp-mcp")]
         let mcp_guard: Option<tokio_util::sync::DropGuard> =
             if let Some(channel_id) = thread_id.strip_prefix("acp:") {
-                let mode = match crate::mcp_proxy::browser_mode() {
-                    crate::mcp_proxy::BrowserMode::Facade
-                        if self.session_registrar.is_none() || self.facade_url.is_none() =>
-                    {
-                        crate::mcp_proxy::BrowserMode::Proxy
-                    }
-                    m => m,
-                };
+                // The Facade -> Proxy fallback lives inside `browser_mode_effective` so that the
+                // one place resolving the transport is also the place that can warn about it.
+                let facade_available =
+                    self.session_registrar.is_some() && self.facade_url.is_some();
+                let mode = crate::mcp_proxy::browser_mode_effective(facade_available);
                 match mode {
                     crate::mcp_proxy::BrowserMode::Facade => {
                         // unwraps guarded by the fallback arm above
