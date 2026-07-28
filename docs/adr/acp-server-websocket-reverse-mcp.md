@@ -312,8 +312,9 @@ The browser extension is **unchanged**: it declares `{type:acp, id, name}` and s
 tools over the tunnel. What changes is on the openab side — browser tools reach the agent through the
 facade's meta-tools rather than a dedicated per-session MCP server.
 
-Retired once this lands: the per-session `mcp_proxy` browser server, its port/bearer minting, and the
-`openab-browser` `mcp.json` injection.
+**Retired in this PR (2026-07-28):** the per-session `mcp_proxy` browser server, its port/bearer
+minting, and the `openab-browser` `mcp.json` injection — along with the stdio bridge described
+below. Both legacy transports are gone; the facade is the only downstream path.
 
 **Update — the operator call was made on 2026-07-28: bridge mode is removed.** The stdio bridge
 (`OPENAB_BROWSER_MODE=bridge`, `openab browser-bridge`, the per-pod unix socket and its
@@ -424,8 +425,10 @@ Five **DOM-semantic** MCP tools, served by the extension: `katashiro.read_dom` (
   MV3 extension cannot listen — adopting the official
   [MCP-over-ACP RFD](https://agentclientprotocol.com/rfds/mcp-over-acp) framing (`mcp/connect` →
   `connectionId`, then `mcp/message`), not a hand-rolled envelope.
-- **D4 — lifecycle: the WS may connect *after* session start.** The in-pod MCP server is always-on and
-  decoupled from the extension WS, so browser tools are **static-advertised** regardless of WS state; a
+- **D4 — lifecycle: the WS may connect *after* session start.** When `[mcp]` is configured the
+  facade listener is process-lifetime and decoupled from the extension WS — it is not
+  unconditionally always-on, since without `[mcp]` no listener starts at all and there is no browser
+  control. Given a listener, browser tools are **static-advertised** regardless of WS state; a
   `tools/call` with no extension attached returns an MCP error ("browser not connected") rather than
   the capability disappearing. `notifications/tools/list_changed` was designed but never implemented,
   and is **dropped, not deferred** (§6.3): facade discovery is pull-based, so no cached tool list
