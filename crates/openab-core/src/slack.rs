@@ -1574,16 +1574,7 @@ async fn handle_message(
                         Some(bot_token),
                         fs,
                     )
-                    .await
-                    .map(|presigned| {
-                        (
-                            presigned,
-                            format!(
-                                "presigned URL, expires in {} minutes",
-                                fs.presigned_ttl_secs() / 60
-                            ),
-                        )
-                    }),
+                    .await,
                     None => None,
                 };
                 #[cfg(not(feature = "filestore"))]
@@ -1687,16 +1678,7 @@ async fn handle_message(
                                     Some(bot_token),
                                     fs,
                                 )
-                                .await
-                                .map(|presigned| {
-                                    (
-                                        presigned,
-                                        format!(
-                                            "presigned URL, expires in {} minutes",
-                                            fs.presigned_ttl_secs() / 60
-                                        ),
-                                    )
-                                }),
+                                .await,
                                 None => None,
                             };
                             #[cfg(not(feature = "filestore"))]

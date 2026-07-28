@@ -1085,16 +1085,7 @@ pub async fn run_gateway_adapter(
                                                                 &bytes,
                                                                 fs,
                                                             )
-                                                            .await
-                                                            .map(|presigned| {
-                                                                (
-                                                                    presigned,
-                                                                    format!(
-                                                                        "presigned URL, expires in {} minutes",
-                                                                        fs.presigned_ttl_secs() / 60
-                                                                    ),
-                                                                )
-                                                            }),
+                                                            .await,
                                                             None => None,
                                                         };
                                                         #[cfg(not(feature = "filestore"))]
@@ -1591,15 +1582,6 @@ pub async fn process_gateway_event(
                             Some(ref fs) => {
                                 crate::media::upload_bytes_and_presign(&att.filename, &bytes, fs)
                                     .await
-                                    .map(|presigned| {
-                                        (
-                                            presigned,
-                                            format!(
-                                                "presigned URL, expires in {} minutes",
-                                                fs.presigned_ttl_secs() / 60
-                                            ),
-                                        )
-                                    })
                             }
                             None => None,
                         };

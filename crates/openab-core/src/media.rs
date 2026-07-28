@@ -903,13 +903,24 @@ pub async fn upload_bytes_to_filestore_public(
     upload_bytes_to_filestore(filename, bytes, filestore).await
 }
 
-/// Presigned URL only, for callers that build their own block (audio passthrough).
+/// One wording for the presigned URL's lifetime, so the five call sites that
+/// surface it to the agent cannot drift apart.
+#[cfg(feature = "filestore")]
+fn presigned_note(filestore: &crate::filestore::Filestore) -> String {
+    format!(
+        "presigned URL, expires in {} minutes",
+        filestore.presigned_ttl_secs() / 60
+    )
+}
+
+/// Presigned URL plus the note describing its lifetime, for callers that hold
+/// the bytes already (the gateway, which never has a platform URL).
 #[cfg(feature = "filestore")]
 pub async fn upload_bytes_and_presign(
     filename: &str,
     bytes: &[u8],
     filestore: &crate::filestore::Filestore,
-) -> Option<String> {
+) -> Option<(String, String)> {
     let actual_size = bytes.len() as u64;
     let max_size = filestore.max_file_size();
     if actual_size > max_size {
@@ -925,7 +936,7 @@ pub async fn upload_bytes_and_presign(
     match filestore.upload_and_presign(filename, bytes).await {
         Ok(presigned_url) => {
             tracing::info!(filename, size = actual_size, "audio uploaded to filestore");
-            Some(presigned_url)
+            Some((presigned_url, presigned_note(filestore)))
         }
         Err(e) => {
             tracing::error!(filename, error = %e, "filestore upload failed (audio passthrough)");
@@ -1077,7 +1088,8 @@ async fn download_and_presign_any_file(
     }
 }
 
-/// Presigned URL only, for callers that build their own block (audio passthrough).
+/// Presigned URL plus the note describing its lifetime, for callers that build
+/// their own block. Paired so every caller labels the URL identically.
 #[cfg(feature = "filestore")]
 pub async fn download_and_presign_attachment(
     url: &str,
@@ -1086,11 +1098,11 @@ pub async fn download_and_presign_attachment(
     content_type: Option<&str>,
     auth_token: Option<&str>,
     filestore: &crate::filestore::Filestore,
-) -> Option<String> {
+) -> Option<(String, String)> {
     download_and_presign_any_file(url, filename, size, content_type, auth_token, filestore)
         .await
         .ok()
-        .map(|(presigned_url, _)| presigned_url)
+        .map(|(presigned_url, _)| (presigned_url, presigned_note(filestore)))
 }
 
 /// Upload already-downloaded bytes to the filestore and return the hint block.

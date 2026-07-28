@@ -919,16 +919,7 @@ impl EventHandler for Handler {
                         None,
                         fs,
                     )
-                    .await
-                    .map(|presigned| {
-                        (
-                            presigned,
-                            format!(
-                                "presigned URL, expires in {} minutes",
-                                fs.presigned_ttl_secs() / 60
-                            ),
-                        )
-                    }),
+                    .await,
                     None => None,
                 };
                 #[cfg(not(feature = "filestore"))]
