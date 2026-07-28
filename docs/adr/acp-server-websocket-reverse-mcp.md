@@ -102,8 +102,8 @@ sequenceDiagram
     GW-->>Ext: initialize result (agentCapabilities)
     Ext->>GW: session/new  (or session/resume on reconnect)
     GW->>GW: register per-session TunnelHandle<br/>(AcpTunnelRegistry)
-    GW->>Core: spawn agent + start per-session MCP proxy
-    Core->>Core: write "openab-browser" into agent's mcp.json<br/>proxy: {url,headers} · bridge: static {command,args}
+    GW->>Core: spawn agent (mint facade session token)
+    Core->>Core: write static "openab" facade entry into agent's mcp.json<br/>{url, Authorization: Bearer ${OPENAB_SESSION_TOKEN}}
     LLM->>Core: MCP initialize + tools/list
     Core->>GW: tools/list  (MCP-over-ACP: mcp/message frame)
     GW->>Ext: mcp/message → tools/list
@@ -140,8 +140,11 @@ Three pieces already generalize and are reused as-is:
 - `parse_acp_mcp_servers` already parses **N** `type:acp` entries with arbitrary `{id, name}`.
 - `establish_and_register_tunnel(…, srv.id, …)` already threads the declared `srv.id` into
   `mcp/connect` — the wire already carries a per-server discriminator.
-- `ProxyHandler::forward_tool_call` forwards **any** tool name+args down the tunnel — no
-  browser-specific validation.
+- ~~`ProxyHandler::forward_tool_call` forwards **any** tool name+args down the tunnel — no
+  browser-specific validation.~~ `ProxyHandler` was removed with the per-session proxy on
+  2026-07-28. Forwarding is now `AcpTunnelSource::call` in the facade capability source, and it is
+  **not** unvalidated: the §6.4 trust gate refuses a tool whose server name is not allowlisted or
+  whose name is not pinned, before anything reaches the tunnel.
 
 ### 6.1 Address every hop by `(channel_id, serverId)`
 - `AcpTunnelRegistry` becomes keyed by `(channel_id, serverId)` instead of `channel_id` alone — the
@@ -333,8 +336,9 @@ per §6.3, tunnel failures surfaced as MCP error results — and a `FacadeRegist
 facade is serving); `write_facade_mcp_config` writes a **static, write-once `openab` entry** whose
 `Authorization` references `${OPENAB_SESSION_TOKEN}`, so the per-session secret rides the agent's
 process environment rather than a config file — which also removes the shared-workdir exposure of the
-old per-session `mcp.json` write. Capabilities publish under the provider name `openab`. Proxy mode
-remains as the one explicit `OPENAB_BROWSER_MODE` opt-out; bridge mode was removed on 2026-07-28.
+old per-session `mcp.json` write. Capabilities publish under the provider name `openab`. Both
+legacy transports were removed on 2026-07-28 — bridge first, then the per-session proxy — and
+`OPENAB_BROWSER_MODE` no longer selects anything; `[mcp]` is now required for browser control.
 This covers §6.2's source seam and session identity for the **browser** case.
 
 ⚠️ **Divergence to reconcile with the adapter ADR (not resolved here).** Adapter ADR §6.2 says delivery
@@ -359,8 +363,10 @@ ignore `mcpServers`, or whether Facade mode should be unavailable for them.
   per-declared-server `tool_filter`, with `browser` pinned to its five known tools so a same-name
   declaration cannot inject others (§6.4). Should land with F1′, since F1′ is what makes
   client-declared tool sets reachable.
-- **F5 cleanup** — retire the superseded per-session proxy path once Facade mode has soaked; bridge-mode
-  removal stays an explicit operator call (§6.5).
+- ~~**F5 cleanup** — retire the superseded per-session proxy path once Facade mode has soaked;
+  bridge-mode removal stays an explicit operator call (§6.5).~~ **Done 2026-07-28**: the operator
+  call was made and both transports were removed in this PR, so there is no soak period and no
+  remaining opt-out.
 - **F6 e2e** — browser + a second client-declared server + a host-level `mcp.json` provider coexisting,
   and two concurrent sessions each reaching only their own browser.
 
@@ -423,7 +429,8 @@ Five **DOM-semantic** MCP tools, served by the extension: `katashiro.read_dom` (
 - **D5 — per-session MCP server.** The pool started one loopback Streamable-HTTP MCP proxy per `acp:`
   session at agent spawn, constructing the `ProxyHandler` with that session's `channel_id` so
   correlation was implicit; lifetime was tied to the `AcpConnection` via a `CancellationToken`
-  `DropGuard`. Superseded by the single facade listener (§6.2); still the behaviour of `proxy` mode.
+  `DropGuard`. Superseded by the single facade listener (§6.2). `proxy` mode kept this behaviour
+  until it too was removed on 2026-07-28, so this section is now purely historical.
 - **D6 — tunnel trait in core, impl in root.** `openab-core` defines the tunnel trait (`AcpMcpTunnel`,
   §6.1); the **root** binary implements it (`src/browser_tunnel.rs`) by looking up the gateway's
   `AcpTunnelRegistry` and calling `TunnelHandle::mcp_message`. This keeps `openab-core` and
