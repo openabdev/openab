@@ -397,7 +397,10 @@ pub fn is_audio_mime(mime: &str) -> bool {
 /// Extension fallback like `is_video_file`, returning a MIME rather than a bool
 /// because `stt::transcribe` drops any request whose `mime_str` fails to parse.
 pub fn audio_mime(filename: &str, content_type: Option<&str>) -> Option<String> {
-    let mime = strip_mime_params(content_type.unwrap_or(""));
+    // Normalised once, because a half-normalised comparison reads `Audio/OGG`
+    // as an explicit non-audio type and suppresses the fallback below.
+    let mime = strip_mime_params(content_type.unwrap_or("")).to_ascii_lowercase();
+    let mime = mime.as_str();
     if is_audio_mime(mime) {
         return Some(mime.to_string());
     }
@@ -411,9 +414,10 @@ pub fn audio_mime(filename: &str, content_type: Option<&str>) -> Option<String> 
 }
 
 /// Types that carry no information about the payload, so the extension may speak.
+/// Expects the already-lowercased value `audio_mime` normalises.
 fn is_generic_mime(mime: &str) -> bool {
     matches!(
-        mime.to_ascii_lowercase().as_str(),
+        mime,
         "application/octet-stream" | "binary/octet-stream" | "application/unknown" | "*/*"
     )
 }
@@ -1753,6 +1757,29 @@ mod tests {
             assert_eq!(audio_mime(filename, Some("")), None, "{filename}");
         }
         assert_eq!(audio_mime("noextension", None), None);
+    }
+
+    #[test]
+    fn mime_casing_does_not_decide_the_audio_path() {
+        // RFC 2045 makes these case-insensitive, and an audio type read as a
+        // non-audio one takes the file out of STT entirely.
+        for mime in ["Audio/OGG", "AUDIO/OGG", "audio/OGG; codecs=opus"] {
+            assert_eq!(
+                audio_mime("voice.ogg", Some(mime)).as_deref(),
+                Some("audio/ogg"),
+                "{mime}"
+            );
+        }
+        assert_eq!(
+            audio_mime("voice.opus", Some("Application/Octet-Stream")).as_deref(),
+            Some("audio/opus"),
+            "a generic type must defer to the extension whatever its casing"
+        );
+        assert_eq!(
+            audio_mime("report.mp3", Some("Application/PDF")),
+            None,
+            "casing must not smuggle a non-audio type into the audio path"
+        );
     }
 
     #[test]
