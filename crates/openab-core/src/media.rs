@@ -394,6 +394,32 @@ pub fn is_audio_mime(mime: &str) -> bool {
     mime.starts_with("audio/")
 }
 
+/// Extension fallback like `is_video_file`, returning a MIME rather than a bool
+/// because `stt::transcribe` drops any request whose `mime_str` fails to parse.
+pub fn audio_mime(filename: &str, content_type: Option<&str>) -> Option<String> {
+    let mime = strip_mime_params(content_type.unwrap_or(""));
+    if is_audio_mime(mime) {
+        return Some(mime.to_string());
+    }
+    audio_mime_from_extension(filename).map(str::to_string)
+}
+
+/// Deliberately excludes the containers that carry either stream (`webm`, `mp4`,
+/// `ogv`), so this never claims an attachment `is_video_file` should handle.
+fn audio_mime_from_extension(filename: &str) -> Option<&'static str> {
+    match filename.rsplit('.').next()?.to_lowercase().as_str() {
+        "ogg" | "oga" => Some("audio/ogg"),
+        "opus" => Some("audio/opus"),
+        "m4a" => Some("audio/mp4"),
+        "mp3" => Some("audio/mpeg"),
+        "wav" => Some("audio/wav"),
+        "flac" => Some("audio/flac"),
+        "aac" => Some("audio/aac"),
+        "amr" => Some("audio/amr"),
+        _ => None,
+    }
+}
+
 // Attachment names and MIME types are user-controlled and land verbatim in the prompt.
 fn sanitize_attachment_meta(filename: &str, content_type: &str) -> (String, String) {
     let safe_filename: String = filename
@@ -1569,6 +1595,63 @@ mod tests {
         assert!(texts[1].contains("filename: first.ogg"));
         assert!(texts[2].contains("goodbye"));
         assert!(texts[3].contains("filename: second.ogg"));
+    }
+
+    #[test]
+    fn audio_mime_prefers_the_platform_type() {
+        assert_eq!(
+            audio_mime("meeting.m4a", Some("audio/mp4")).as_deref(),
+            Some("audio/mp4")
+        );
+        assert_eq!(
+            audio_mime("voice.ogg", Some("audio/ogg; codecs=opus")).as_deref(),
+            Some("audio/ogg")
+        );
+    }
+
+    #[test]
+    fn audio_mime_falls_back_when_the_platform_omits_the_type() {
+        // Discord and Slack both hand over "" when the field is absent, and a CDN
+        // commonly labels an upload application/octet-stream.
+        for supplied in [None, Some(""), Some("application/octet-stream")] {
+            assert_eq!(
+                audio_mime("clip.ogg", supplied).as_deref(),
+                Some("audio/ogg"),
+                "supplied={supplied:?}"
+            );
+            assert_eq!(
+                audio_mime("meeting.m4a", supplied).as_deref(),
+                Some("audio/mp4"),
+                "supplied={supplied:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn audio_mime_never_claims_a_video_container() {
+        // is_video_file owns these; claiming one here would route video into STT.
+        for filename in ["standup.mp4", "clip.webm", "demo.mov", "reel.mkv"] {
+            assert_eq!(audio_mime(filename, Some("")), None, "{filename}");
+        }
+        assert_eq!(audio_mime("notes.txt", Some("text/plain")), None);
+        assert_eq!(audio_mime("noextension", None), None);
+    }
+
+    #[test]
+    fn audio_mime_output_is_accepted_by_the_stt_multipart_encoder() {
+        // stt::transcribe drops the request when Part::mime_str rejects the value,
+        // so a fallback that parses is the whole point of returning a MIME here.
+        for filename in [
+            "a.ogg", "a.oga", "a.opus", "a.m4a", "a.mp3", "a.wav", "a.flac", "a.aac", "a.amr",
+        ] {
+            let mime = audio_mime(filename, None).expect(filename);
+            assert!(
+                reqwest::multipart::Part::bytes(Vec::new())
+                    .mime_str(&mime)
+                    .is_ok(),
+                "{filename} produced {mime}, which stt::transcribe would drop"
+            );
+        }
     }
 
     #[test]

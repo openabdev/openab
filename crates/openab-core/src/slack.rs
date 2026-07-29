@@ -1515,7 +1515,8 @@ async fn handle_message(
                 continue;
             }
 
-            if media::is_audio_mime(mimetype) {
+            if let Some(audio_mime) = media::audio_mime(filename, Some(mimetype_raw)) {
+                let mimetype = audio_mime.as_str();
                 let mut stt_line: Option<String> = None;
                 if stt_config.enabled {
                     match media::download_and_transcribe(

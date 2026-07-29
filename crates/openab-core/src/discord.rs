@@ -872,9 +872,10 @@ impl EventHandler for Handler {
         const TEXT_FILE_COUNT_CAP: u32 = 5;
 
         for attachment in &msg.attachments {
-            let mime = attachment.content_type.as_deref().unwrap_or("");
-            if media::is_audio_mime(mime) {
-                let mime_clean = mime.split(';').next().unwrap_or(mime).trim();
+            if let Some(mime_clean) =
+                media::audio_mime(&attachment.filename, attachment.content_type.as_deref())
+            {
+                let mime_clean = mime_clean.as_str();
                 let mut stt_line: Option<String> = None;
                 if self.stt_config.enabled {
                     match media::download_and_transcribe(
