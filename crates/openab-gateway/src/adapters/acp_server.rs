@@ -856,7 +856,34 @@ async fn establish_and_register_tunnel(
     info!(acp_id = %acp_id, acp_name = %acp_name, channel = %redact_id(&channel_id), "ACP: opening MCP-over-ACP tunnel");
     let connection_id = mcp_connect(&out_tx, &pending, &next_id, &acp_id, timeout_secs).await?;
     // MCP lifecycle before the tunnel is usable — see `inner_mcp_handshake`.
-    inner_mcp_handshake(&out_tx, &pending, &next_id, &connection_id, timeout_secs).await?;
+    //
+    // On failure the client is still holding an open connection it opened for us, and we are about
+    // to return without registering a handle for it. Every other cleanup path in this file goes
+    // through the registry (`reg.remove(..)` then `handle.disconnect(..)`), so a connection that
+    // never got registered has none at all — it would leak for the life of the process, once per
+    // attach, and a handshake timeout against a slow server is enough to trigger it. Same
+    // obligation the eviction path documents: the client believes the connection is open, so it is
+    // owed an `mcp/disconnect`.
+    //
+    // Best-effort and off the failure path, matching the eviction disconnect: a client that just
+    // failed a handshake may be in no state to answer, and waiting on it would delay the error the
+    // caller needs to log.
+    if let Err(e) =
+        inner_mcp_handshake(&out_tx, &pending, &next_id, &connection_id, timeout_secs).await
+    {
+        let (tx, pend, nid, cid) = (
+            out_tx.clone(),
+            pending.clone(),
+            next_id.clone(),
+            connection_id.clone(),
+        );
+        tokio::spawn(async move {
+            if let Err(e) = mcp_disconnect(&tx, &pend, &nid, &cid, 5).await {
+                debug!(error = %e, "ACP: mcp/disconnect after a failed handshake did not complete");
+            }
+        });
+        return Err(e);
+    }
     let handle = TunnelHandle {
         out_tx,
         pending,
@@ -3730,9 +3757,43 @@ mod acp_ws_integration {
             }
         }
 
-        // The establish must fail. Poll rather than sleep: we are proving something stays absent,
-        // so give it real time to appear wrongly instead of checking once and declaring victory.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        // The client opened a connection for us and we are not going to use it, so it is owed an
+        // `mcp/disconnect` naming that connection. Asserting only "not registered" is what let the
+        // leak through: the connection is leaked *inside* the not-registered state, so a test that
+        // checks the registry alone asserts the broken state as correct.
+        // Bounded with its own message: without it, a regression here waits out the generic
+        // `recv` timeout and reports "timed out waiting for a server frame" — which names the
+        // harness, not the leak, and reads like a flake.
+        let wait_disconnect = async {
+            loop {
+                let f = recv(&mut ws).await;
+                if f.get("method").and_then(Value::as_str) == Some("mcp/disconnect") {
+                    return f["params"]["connectionId"].as_str().unwrap().to_string();
+                }
+            }
+        };
+        let disconnected = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            wait_disconnect,
+        )
+        .await
+        .map(Some)
+        .expect(
+            "no `mcp/disconnect` after a refused handshake: the connection the client opened for \
+             us is leaked — it never entered the registry, and every cleanup path goes through the \
+             registry",
+        );
+        assert_eq!(
+            disconnected.as_deref(),
+            Some("conn-1"),
+            "the connection opened for a server that then refused the handshake must be closed, \
+             naming that connection — nothing else can close it, since every other cleanup path \
+             goes through the registry it never entered"
+        );
+
+        // And it must still not be registered. Poll rather than check once: we are proving
+        // something stays absent, so give it real time to appear wrongly.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
             assert!(
                 registry.lock().unwrap().is_empty(),
