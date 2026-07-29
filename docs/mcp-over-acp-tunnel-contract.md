@@ -157,7 +157,7 @@ notification is simply never delivered, so do not treat its absence as "keep goi
 | In-flight establishes | 64 (`MAX_INFLIGHT_ESTABLISHES`) | concurrent tunnel setups per connection |
 | Any inbound frame | 8 MiB (`MAX_FRAME_BYTES`) | checked **before** parsing. Exceeding it **closes the connection**, whatever the frame is — an unparseable frame has no recoverable `id` to answer |
 | A `method` frame that is a **request** | 1 MiB (`MAX_NON_TUNNEL_FRAME_BYTES`) | checked **after** parsing. Answered with an error, **connection kept** |
-| A `method` frame that is a **notification** | 1 MiB (same check) | **silently dropped** — a notification has no `id`, so there is nothing to answer, and inventing a reply would break the rule that notifications get none |
+| A `method` frame that is a **notification** | 1 MiB (same check) | **silently dropped.** Not a limitation — the gateway could answer with a null id and deliberately does not, because replying to a notification violates JSON-RPC. The refusal is required, and the cost is that you get no signal |
 
 Three failure modes, and the line is drawn by **which limit you crossed**, not by whether the frame
 was a request or a response. The 8 MiB allowance exists for tool results, which arrive as responses

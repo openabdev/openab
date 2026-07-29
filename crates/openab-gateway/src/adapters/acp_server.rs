@@ -54,6 +54,26 @@ const MAX_INFLIGHT_ESTABLISHES: usize = 64;
 /// Not operator-configurable today. Anything set above it is silently capped here, which is why the
 /// config path warns rather than letting a larger value look effective.
 pub const ACP_PROMPT_IDLE_TIMEOUT_SECS: u64 = 180;
+
+/// Warn when a configured tunnel timeout cannot take effect because the idle timeout above overtakes
+/// it.
+///
+/// Lives here, next to the number it is about, rather than in the binary that reads the config. The
+/// edge is unchanged — the binary already depends on this crate — but the caller no longer has to
+/// know what the ceiling is or which direction to compare, so when that constant changes or becomes
+/// configurable there is one place to edit instead of two. This is a relocation of the invariant, not
+/// a removal of coupling: the value still has to be handed in, because this crate never sees the
+/// config.
+pub fn warn_if_tunnel_timeout_is_ineffective(configured_secs: u64) {
+    if configured_secs >= ACP_PROMPT_IDLE_TIMEOUT_SECS {
+        warn!(
+            configured = configured_secs,
+            effective_ceiling = ACP_PROMPT_IDLE_TIMEOUT_SECS,
+            "[mcp] tunnel_timeout_seconds is at or above the ACP prompt idle timeout, which is not \
+             configurable — the turn ends there first, so this value cannot take effect"
+        );
+    }
+}
 /// Cap on `type:acp` servers a single session may declare (review R3-F1).
 ///
 /// Every declaration costs a spawned task, a pending `mcp/connect` holding a 30s timeout, and an
@@ -1033,11 +1053,23 @@ async fn establish_and_register_tunnel(
         if superseded {
             Registered::Superseded(handle)
         } else {
+            // No rank comparison here, deliberately. Everything ranking ABOVE this establish has
+            // already returned through `superseded`, and ranks are unique, so every surviving
+            // same-name entry necessarily ranks below — the comparison would be true every time.
+            //
+            // It was written out rather than left in place because a condition that looks like a
+            // check, is in fact always true, and becomes WRONG if it ever stops matching the
+            // comparison above is worse than no condition at all. Held as lexicographic it was
+            // redundant; changed on its own to attach-order it silently stopped evicting an incumbent
+            // that was older by connection but later by attach, leaving two tunnels under one
+            // declared name. Both readings of it misled me inside two hours.
+            //
+            // INVARIANT: the eviction set is "same declared name, not me". Anything that should have
+            // won is filtered out earlier by `superseded`; if that check is ever weakened, this is
+            // where the damage shows up, so change the two together.
             let stale: Vec<(String, String)> = reg
                 .iter()
-                .filter(|((c, id), h)| {
-                    same_name(c, id, h) && (h.connection_generation, h.generation) < rank
-                })
+                .filter(|((c, id), h)| same_name(c, id, h))
                 .map(|(k, _)| k.clone())
                 .collect();
             let mut replaced: Vec<TunnelHandle> =
@@ -4062,6 +4094,220 @@ mod acp_ws_integration {
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+    }
+
+    /// When connection age and attach order DISAGREE, connection age decides who keeps the name.
+    ///
+    /// The construction is what matters: an incumbent that is older by connection but LATER by
+    /// attach, which happens when the newer connection's establish starts first and then stalls
+    /// while the older connection's starts later and completes. Every other same-name test has the
+    /// two dimensions agreeing — same-connection ones have equal ages, and the cross-connection one
+    /// has the older side also attaching earlier — so none of them can tell the orderings apart.
+    ///
+    /// Ordering on attach alone gets this backwards: it reads the arriving establish as the older
+    /// one, lets it stand down, and leaves the wrong connection holding the name.
+    ///
+    /// History worth keeping, because it cost two wrong turns. I first mutated the eviction filter,
+    /// saw the suite stay green, and wrote into the source that the comparison was "provably inert"
+    /// — reading green as "nothing can distinguish this" when it only meant "my tests do not". The
+    /// filter has since been simplified away entirely, since everything that should win is already
+    /// filtered by the supersede check above, so what this test now pins is that comparison.
+    #[tokio::test]
+    async fn eviction_follows_connection_age_when_it_disagrees_with_attach_order() {
+        let (url, registry) = serve().await;
+
+        // B opens FIRST — older connection — and declares nothing yet.
+        let (mut b, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        send(&mut b, json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}}
+        })).await;
+        let _ = recv(&mut b).await;
+        send(&mut b, json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": {"cwd": "/w", "mcpServers": []}
+        })).await;
+        let session_id = loop {
+            let f = recv(&mut b).await;
+            if f.get("id") == Some(&json!(2)) {
+                break f["result"]["sessionId"].as_str().unwrap().to_string();
+            }
+        };
+
+        // C opens SECOND — newer connection — and starts its establish FIRST, then stalls: its
+        // `mcp/connect` is captured and deliberately left unanswered, so it takes the LOWER attach
+        // number while making no progress.
+        let (mut c, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        send(&mut c, json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}}
+        })).await;
+        let _ = recv(&mut c).await;
+        send(&mut c, json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/resume",
+            "params": {"sessionId": session_id.clone(), "cwd": "/w",
+                       "mcpServers": [{"type": "acp", "id": "srv-c", "name": "katashiro"}]}
+        })).await;
+        let c_connect_id = loop {
+            let f = recv(&mut c).await;
+            if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
+                break f["id"].clone();
+            }
+        };
+
+        // Now the OLDER connection declares the same name under a different id and completes, so it
+        // registers with the HIGHER attach number.
+        send(&mut b, json!({
+            "jsonrpc": "2.0", "id": 9, "method": "session/resume",
+            "params": {"sessionId": session_id, "cwd": "/w",
+                       "mcpServers": [{"type": "acp", "id": "srv-b", "name": "katashiro"}]}
+        })).await;
+        let mut done = false;
+        while !done {
+            let f = recv(&mut b).await;
+            if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
+                send(&mut b, json!({
+                    "jsonrpc": "2.0", "id": f["id"].clone(),
+                    "result": {"connectionId": "conn-b"}
+                })).await;
+            } else if handled_inner_lifecycle(&mut b, &f).await == Some("initialize") {
+                done = true;
+            }
+        }
+        wait_for_tunnels(&registry, 1).await;
+
+        // Finally let the stalled, newer-connection establish finish.
+        send(&mut c, json!({
+            "jsonrpc": "2.0", "id": c_connect_id,
+            "result": {"connectionId": "conn-c"}
+        })).await;
+        loop {
+            let f = recv(&mut c).await;
+            if handled_inner_lifecycle(&mut c, &f).await == Some("initialize") {
+                break;
+            }
+        }
+
+        // Exactly one tunnel, and it must be the newer connection's.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let ids: Vec<String> = {
+                let reg = registry.lock().unwrap();
+                reg.keys().map(|(_, id)| id.clone()).collect()
+            };
+            if ids == vec!["srv-c".to_string()] {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expected only the newer connection's tunnel, got {ids:?} — the incumbent was older \
+                 by connection but later by attach, and attach order alone reads that as 'not older' \
+                 and refuses to evict it"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Same declared name, DIFFERENT id, incumbent on the newer connection: the arriving establish
+    /// must stand down rather than sit beside it.
+    ///
+    /// This is the same-name comparison, which the take-over test cannot reach: there the late
+    /// resume re-declares the SAME id, so it goes through the own-key check and `same_name` never
+    /// sees the incumbent (`id != &acp_id` excludes it). Here the ids differ, so this is the only
+    /// site that can refuse it.
+    ///
+    /// The failure is not a take-over — it is TWO tunnels under one declared name, which is exactly
+    /// the ambiguity last-attach-wins exists to remove (ADR §6.1). Ordering on attach alone permits
+    /// it: the older connection's late resume carries the higher attach number, so it is neither
+    /// superseded nor able to evict, and simply lands alongside.
+    #[tokio::test]
+    async fn a_same_name_establish_from_an_older_connection_stands_down() {
+        let (url, registry) = serve().await;
+
+        // B opens first, so its connection is the OLDER one. It declares nothing yet.
+        let (mut b, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        send(&mut b, json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}}
+        })).await;
+        let _ = recv(&mut b).await;
+        send(&mut b, json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": {"cwd": "/w", "mcpServers": []}
+        })).await;
+        let session_id = loop {
+            let f = recv(&mut b).await;
+            if f.get("id") == Some(&json!(2)) {
+                break f["result"]["sessionId"].as_str().unwrap().to_string();
+            }
+        };
+
+        // C opens second (NEWER connection) and establishes srv-3 under the shared name.
+        let (mut c, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        send(&mut c, json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}}
+        })).await;
+        let _ = recv(&mut c).await;
+        send(&mut c, json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/resume",
+            "params": {"sessionId": session_id.clone(), "cwd": "/w",
+                       "mcpServers": [{"type": "acp", "id": "srv-3", "name": "katashiro"}]}
+        })).await;
+        loop {
+            let f = recv(&mut c).await;
+            if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
+                send(&mut c, json!({
+                    "jsonrpc": "2.0", "id": f["id"].clone(),
+                    "result": {"connectionId": "conn-c"}
+                })).await;
+            } else if handled_inner_lifecycle(&mut c, &f).await == Some("initialize") {
+                break;
+            }
+        }
+        wait_for_tunnels(&registry, 1).await;
+
+        // The OLDER connection now declares the same NAME under a different id, and completes.
+        send(&mut b, json!({
+            "jsonrpc": "2.0", "id": 9, "method": "session/resume",
+            "params": {"sessionId": session_id, "cwd": "/w",
+                       "mcpServers": [{"type": "acp", "id": "srv-4", "name": "katashiro"}]}
+        })).await;
+        let mut done = false;
+        while !done {
+            let f = recv(&mut b).await;
+            if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
+                send(&mut b, json!({
+                    "jsonrpc": "2.0", "id": f["id"].clone(),
+                    "result": {"connectionId": "conn-b"}
+                })).await;
+            } else if handled_inner_lifecycle(&mut b, &f).await == Some("initialize") {
+                done = true;
+            }
+        }
+
+        // Poll: the wrong outcome is an EXTRA entry appearing, so give it time to appear.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let names: Vec<String> = {
+                let reg = registry.lock().unwrap();
+                reg.values().map(|h| h.server_name().to_string()).collect()
+            };
+            assert_eq!(
+                names.len(),
+                1,
+                "two tunnels are registered under one declared name ({names:?}) — an establish from \
+                 an OLDER connection neither stood down nor evicted, because attach order alone \
+                 ranks it above the incumbent it arrived after"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        // And it must be the newer connection's tunnel that survived.
+        let ids: Vec<String> = {
+            let reg = registry.lock().unwrap();
+            reg.keys().map(|(_, id)| id.clone()).collect()
+        };
+        assert_eq!(ids, vec!["srv-3".to_string()], "the newer connection's tunnel must hold the name");
     }
 
     /// An older connection's late resume must not TAKE OVER a newer connection's tunnel either.
