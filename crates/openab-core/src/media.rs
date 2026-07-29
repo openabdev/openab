@@ -494,6 +494,16 @@ pub fn audio_attachment_blocks(
 pub const AUDIO_NO_URL_NOTE: &str =
     "no fetchable URL for this attachment; configure a filestore to give the agent a downloadable link";
 
+/// Why a configured filestore produced no URL. Collapsing these into the
+/// no-filestore case told the operator to configure one they already had.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioStoreError {
+    /// Larger than the configured `max_file_size`, so no upload was attempted.
+    TooLarge,
+    /// The upload or the presign did not complete.
+    UploadFailed,
+}
+
 /// What the gateway managed to do with an audio attachment's bytes.
 #[derive(Clone, Copy)]
 pub enum AudioOutcome<'a> {
@@ -501,8 +511,22 @@ pub enum AudioOutcome<'a> {
     Stored { url: &'a str, note: &'a str },
     /// Bytes arrived but no filestore is configured, so there is nothing to fetch.
     NoStore,
+    /// A filestore is configured and refused or failed the upload.
+    StoreFailed(AudioStoreError),
     /// The bytes never arrived, so there is no size and nothing to fetch.
     ReadFailed,
+}
+
+/// Kept pure so the configured-but-failed cases are testable without an S3
+/// client; `None` means no filestore, which is not the same as one that failed.
+pub fn audio_outcome<'a>(
+    stored: Option<&'a Result<(String, String), AudioStoreError>>,
+) -> AudioOutcome<'a> {
+    match stored {
+        None => AudioOutcome::NoStore,
+        Some(Ok((url, note))) => AudioOutcome::Stored { url, note },
+        Some(Err(e)) => AudioOutcome::StoreFailed(*e),
+    }
 }
 
 /// The gateway's two entry points both route here, so a fallback fixed on one
@@ -517,6 +541,14 @@ pub fn audio_blocks_for(
     let (url, note) = match outcome {
         AudioOutcome::Stored { url, note } => (Some(url), Some(note)),
         AudioOutcome::NoStore => (None, Some(AUDIO_NO_URL_NOTE)),
+        AudioOutcome::StoreFailed(AudioStoreError::TooLarge) => (
+            None,
+            Some("exceeds the configured upload limit and could not be stored, so there is no fetchable URL"),
+        ),
+        AudioOutcome::StoreFailed(AudioStoreError::UploadFailed) => (
+            None,
+            Some("the configured filestore could not store this attachment, so there is no fetchable URL"),
+        ),
         AudioOutcome::ReadFailed => (None, Some("attachment bytes unavailable (read failed)")),
     };
     audio_attachment_blocks(filename, content_type, size, url, note, stt_line)
@@ -1006,7 +1038,7 @@ pub async fn upload_bytes_and_presign(
     bytes: &[u8],
     content_type: Option<&str>,
     filestore: &crate::filestore::Filestore,
-) -> Option<(String, String)> {
+) -> Result<(String, String), AudioStoreError> {
     let actual_size = bytes.len() as u64;
     let max_size = filestore.max_file_size();
     if actual_size > max_size {
@@ -1016,7 +1048,7 @@ pub async fn upload_bytes_and_presign(
             max = max_size,
             "file exceeds filestore size limit, skipping upload"
         );
-        return None;
+        return Err(AudioStoreError::TooLarge);
     }
 
     match filestore
@@ -1025,11 +1057,11 @@ pub async fn upload_bytes_and_presign(
     {
         Ok(presigned_url) => {
             tracing::info!(filename, size = actual_size, "audio uploaded to filestore");
-            Some((presigned_url, presigned_note(filestore)))
+            Ok((presigned_url, presigned_note(filestore)))
         }
         Err(e) => {
             tracing::error!(filename, error = %e, "filestore upload failed (audio passthrough)");
-            None
+            Err(AudioStoreError::UploadFailed)
         }
     }
 }
@@ -1720,6 +1752,66 @@ mod tests {
             let text = block_text(without_stt.into_iter().next().unwrap());
             assert!(text.contains(expected), "got {text}");
         }
+    }
+
+    #[test]
+    fn a_configured_filestore_that_fails_is_not_reported_as_missing() {
+        // The bug this pins: every None collapsed to NoStore, so an outage told
+        // the operator to configure the filestore they already had.
+        let too_large = Err(AudioStoreError::TooLarge);
+        let failed = Err(AudioStoreError::UploadFailed);
+
+        let none_text = block_text(
+            audio_blocks_for("v.ogg", "audio/ogg", 512, audio_outcome(None), None)
+                .into_iter()
+                .next()
+                .unwrap(),
+        );
+        let large_text = block_text(
+            audio_blocks_for("v.ogg", "audio/ogg", 512, audio_outcome(Some(&too_large)), None)
+                .into_iter()
+                .next()
+                .unwrap(),
+        );
+        let failed_text = block_text(
+            audio_blocks_for("v.ogg", "audio/ogg", 512, audio_outcome(Some(&failed)), None)
+                .into_iter()
+                .next()
+                .unwrap(),
+        );
+
+        assert!(none_text.contains("configure a filestore"));
+        assert!(
+            !large_text.contains("configure a filestore"),
+            "a size rejection is not a missing configuration: {large_text}"
+        );
+        assert!(
+            !failed_text.contains("configure a filestore"),
+            "an upload failure is not a missing configuration: {failed_text}"
+        );
+        assert!(large_text.contains("exceeds the configured upload limit"));
+        assert!(failed_text.contains("could not store this attachment"));
+
+        // Whatever the reason, none of the three may offer a URL.
+        for text in [&none_text, &large_text, &failed_text] {
+            assert!(!text.contains("url:"), "got {text}");
+        }
+    }
+
+    #[test]
+    fn audio_outcome_keeps_the_success_url_and_note() {
+        let ok = Ok((
+            "https://s3/x?sig=1".to_string(),
+            "presigned URL, expires in 60 minutes".to_string(),
+        ));
+        let text = block_text(
+            audio_blocks_for("v.ogg", "audio/ogg", 512, audio_outcome(Some(&ok)), None)
+                .into_iter()
+                .next()
+                .unwrap(),
+        );
+        assert!(text.contains("url: https://s3/x?sig=1"));
+        assert!(text.contains("note: presigned URL, expires in 60 minutes"));
     }
 
     #[test]

@@ -95,15 +95,17 @@ pub(crate) async fn gateway_audio_blocks(
     // Passthrough runs whichever way STT went: a transcript augments the file,
     // never replaces it.
     let size = bytes.len() as u64;
+    // `None` means no filestore at all. A configured one that refuses or fails
+    // reports why, so the agent is not told to configure what it already has.
     #[cfg(feature = "filestore")]
-    let stored: Option<(String, String)> = match filestore {
+    let stored = match filestore {
         Some(fs) => {
-            crate::media::upload_bytes_and_presign(filename, &bytes, Some(mime_type), fs).await
+            Some(crate::media::upload_bytes_and_presign(filename, &bytes, Some(mime_type), fs).await)
         }
         None => None,
     };
     #[cfg(not(feature = "filestore"))]
-    let stored: Option<(String, String)> = None;
+    let stored: Option<Result<(String, String), crate::media::AudioStoreError>> = None;
 
     let stt_line: Option<String> = if stt_config.enabled {
         match crate::stt::transcribe(
@@ -127,13 +129,7 @@ pub(crate) async fn gateway_audio_blocks(
         None
     };
 
-    let outcome = match stored {
-        Some((ref presigned, ref note)) => crate::media::AudioOutcome::Stored {
-            url: presigned,
-            note,
-        },
-        None => crate::media::AudioOutcome::NoStore,
-    };
+    let outcome = crate::media::audio_outcome(stored.as_ref());
     crate::media::audio_blocks_for(filename, mime_type, size, outcome, stt_line.as_deref())
 }
 
