@@ -435,10 +435,23 @@ fn audio_mime_from_extension(filename: &str) -> Option<&'static str> {
 }
 
 // Attachment names and MIME types are user-controlled and land verbatim in the prompt.
+/// `char::is_control` covers only C0/C1, so the separators and bidi formatters
+/// that can restructure a rendered prompt line survive it.
+fn splits_a_prompt_line(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{2028}' | '\u{2029}'                  // line / paragraph separator
+            | '\u{200E}' | '\u{200F}' | '\u{061C}'   // directional marks
+            | '\u{202A}'..='\u{202E}'                // bidi embedding and override
+            | '\u{2066}'..='\u{2069}'                // bidi isolates
+            | '\u{FEFF}'                             // zero-width no-break space
+        )
+}
+
 fn sanitize_attachment_meta(filename: &str, content_type: &str) -> (String, String) {
     let safe_filename: String = filename
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !splits_a_prompt_line(*c))
         .take(200)
         .collect();
     let safe_mime: String = content_type
@@ -1751,6 +1764,21 @@ mod tests {
                 "{mime}"
             );
         }
+    }
+
+    #[test]
+    fn sanitizer_strips_unicode_separators_and_bidi_controls() {
+        // char::is_control covers only C0/C1, so these survived it and could
+        // restructure the rendered block or reorder it visually.
+        let hostile = "a\u{2028}b\u{2029}c\u{202E}d\u{2066}e\u{200F}f\u{FEFF}g.ogg";
+        let text = block_text(audio_attachment_block(hostile, "audio/ogg", 1, None, None));
+
+        for bad in ['\u{2028}', '\u{2029}', '\u{202E}', '\u{2066}', '\u{200F}', '\u{FEFF}'] {
+            assert!(!text.contains(bad), "{bad:?} survived sanitisation");
+        }
+        assert!(text.contains("filename: abcdefg.ogg"));
+        // Exactly the four declared lines, so nothing forged an extra one.
+        assert_eq!(text.lines().count(), 4, "got {text}");
     }
 
     #[test]
