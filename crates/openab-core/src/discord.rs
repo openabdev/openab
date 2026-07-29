@@ -875,6 +875,7 @@ impl EventHandler for Handler {
             let mime = attachment.content_type.as_deref().unwrap_or("");
             if media::is_audio_mime(mime) {
                 let mime_clean = mime.split(';').next().unwrap_or(mime).trim();
+                let mut stt_line: Option<String> = None;
                 if self.stt_config.enabled {
                     match media::download_and_transcribe(
                         &attachment.url,
@@ -888,12 +889,7 @@ impl EventHandler for Handler {
                     {
                         Some(transcript) => {
                             debug!(filename = %attachment.filename, chars = transcript.len(), "voice transcript injected");
-                            extra_blocks.insert(
-                                0,
-                                ContentBlock::Text {
-                                    text: format!("[Voice message transcript]: {transcript}"),
-                                },
-                            );
+                            stt_line = Some(format!("[Voice message transcript]: {transcript}"));
                             echo_entries.push(crate::stt::EchoEntry::Success(transcript));
                         }
                         None => {
@@ -925,22 +921,18 @@ impl EventHandler for Handler {
                 #[cfg(not(feature = "filestore"))]
                 let stored: Option<(String, String)> = None;
 
-                extra_blocks.push(match stored {
-                    Some((ref presigned, ref note)) => media::audio_attachment_block(
-                        &attachment.filename,
-                        mime_clean,
-                        u64::from(attachment.size),
-                        Some(presigned),
-                        Some(note),
-                    ),
-                    None => media::audio_attachment_block(
-                        &attachment.filename,
-                        mime_clean,
-                        u64::from(attachment.size),
-                        Some(&attachment.url),
-                        Some("Discord CDN URL, expires ~24h"),
-                    ),
-                });
+                let (url, note) = match stored {
+                    Some((ref presigned, ref note)) => (presigned.as_str(), note.as_str()),
+                    None => (attachment.url.as_str(), "Discord CDN URL, expires ~24h"),
+                };
+                extra_blocks.extend(media::audio_attachment_blocks(
+                    &attachment.filename,
+                    mime_clean,
+                    u64::from(attachment.size),
+                    Some(url),
+                    Some(note),
+                    stt_line.as_deref(),
+                ));
             } else if media::is_text_file(&attachment.filename, attachment.content_type.as_deref())
             {
                 if text_file_count >= TEXT_FILE_COUNT_CAP {

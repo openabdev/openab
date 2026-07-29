@@ -437,6 +437,32 @@ pub fn audio_attachment_block(
     ContentBlock::Text { text }
 }
 
+/// STT line then the file it describes, kept together because assembling them
+/// separately across a loop pairs one file's transcript with another's metadata.
+pub fn audio_attachment_blocks(
+    filename: &str,
+    content_type: &str,
+    size: u64,
+    url: Option<&str>,
+    note: Option<&str>,
+    stt_line: Option<&str>,
+) -> Vec<ContentBlock> {
+    let mut blocks = Vec::with_capacity(2);
+    if let Some(stt_line) = stt_line {
+        blocks.push(ContentBlock::Text {
+            text: stt_line.to_string(),
+        });
+    }
+    blocks.push(audio_attachment_block(
+        filename,
+        content_type,
+        size,
+        url,
+        note,
+    ));
+    blocks
+}
+
 /// `note` names what the URL needs to be fetched; `None` when it needs nothing,
 /// as with a public CDN link.
 pub fn video_attachment_block(
@@ -1519,6 +1545,38 @@ mod tests {
         assert!(text.contains("size_bytes: 1024"));
         assert!(!text.contains("url:"));
         assert!(text.contains("note: no fetchable URL for this attachment"));
+    }
+
+    #[test]
+    fn audio_blocks_keep_each_transcript_next_to_its_own_file() {
+        // Pins the defect: a front-inserted transcript landed ahead of an
+        // earlier note's metadata, so the agent could not tell which was which.
+        let mut blocks = Vec::new();
+        for (filename, transcript) in [("first.ogg", "hello"), ("second.ogg", "goodbye")] {
+            blocks.extend(audio_attachment_blocks(
+                filename,
+                "audio/ogg",
+                1024,
+                None,
+                None,
+                Some(&format!("[Voice message transcript]: {transcript}")),
+            ));
+        }
+
+        let texts: Vec<String> = blocks.into_iter().map(block_text).collect();
+        assert_eq!(texts.len(), 4);
+        assert!(texts[0].contains("hello"));
+        assert!(texts[1].contains("filename: first.ogg"));
+        assert!(texts[2].contains("goodbye"));
+        assert!(texts[3].contains("filename: second.ogg"));
+    }
+
+    #[test]
+    fn audio_blocks_emit_only_the_file_when_stt_produced_nothing() {
+        let blocks = audio_attachment_blocks("voice.ogg", "audio/ogg", 1024, None, None, None);
+
+        assert_eq!(blocks.len(), 1);
+        assert!(block_text(blocks.into_iter().next().unwrap()).contains("[Audio attachment]"));
     }
 
     #[test]

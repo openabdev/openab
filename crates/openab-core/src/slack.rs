@@ -1,4 +1,3 @@
-use crate::acp::ContentBlock;
 use crate::adapter::{ChannelRef, ChatAdapter, MessageRef, SenderContext};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
@@ -1517,6 +1516,7 @@ async fn handle_message(
             }
 
             if media::is_audio_mime(mimetype) {
+                let mut stt_line: Option<String> = None;
                 if stt_config.enabled {
                     match media::download_and_transcribe(
                         url,
@@ -1534,12 +1534,7 @@ async fn handle_message(
                                 chars = transcript.len(),
                                 "voice transcript injected"
                             );
-                            extra_blocks.insert(
-                                0,
-                                ContentBlock::Text {
-                                    text: format!("[Voice message transcript]: {transcript}"),
-                                },
-                            );
+                            stt_line = Some(format!("[Voice message transcript]: {transcript}"));
                             echo_entries.push(crate::stt::EchoEntry::Success(transcript));
                         }
                         None => {
@@ -1580,18 +1575,21 @@ async fn handle_message(
                 #[cfg(not(feature = "filestore"))]
                 let stored: Option<(String, String)> = None;
 
-                extra_blocks.push(match stored {
-                    Some((ref presigned, ref note)) => {
-                        media::audio_attachment_block(filename, mimetype, size, Some(presigned), Some(note))
-                    }
-                    None => media::audio_attachment_block(
-                        filename,
-                        mimetype,
-                        size,
-                        Some(url),
-                        Some("Slack private file, requires an `Authorization: Bearer <bot token>` header to download"),
+                let (audio_url, audio_note) = match stored {
+                    Some((ref presigned, ref note)) => (presigned.as_str(), note.as_str()),
+                    None => (
+                        url,
+                        "Slack private file, requires an `Authorization: Bearer <bot token>` header to download",
                     ),
-                });
+                };
+                extra_blocks.extend(media::audio_attachment_blocks(
+                    filename,
+                    mimetype,
+                    size,
+                    Some(audio_url),
+                    Some(audio_note),
+                    stt_line.as_deref(),
+                ));
             } else if media::is_text_file(filename, Some(mimetype)) {
                 if text_file_count >= TEXT_FILE_COUNT_CAP {
                     debug!(
