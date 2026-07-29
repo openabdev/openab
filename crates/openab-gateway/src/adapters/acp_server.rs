@@ -293,14 +293,13 @@ struct AcpSession {
     cancel: Option<Arc<tokio::sync::Notify>>,
     /// Client-declared MCP-over-ACP servers (the RFD `{"type":"acp"}` mcpServers entries):
     /// the browser extension serves its MCP tools over this same /acp WS. Recorded so the
-    /// gateway can later `mcp/connect` to them (T5.3). Unused until that wiring lands.
-    #[allow(dead_code)]
+    /// gateway can later `mcp/connect` to them (T5.3). Read on resume to work out which
+    /// declarations the client withdrew.
     acp_mcp_servers: Vec<AcpMcpServer>,
 }
 
 /// A client-declared MCP-over-ACP server (the RFD `"type":"acp"` `mcpServers` entry). Not in
 /// the generated schema (the RFD is a proposal), so parsed from raw params.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 struct AcpMcpServer {
     id: String,
@@ -437,9 +436,8 @@ struct JsonRpcNotification {
 
 /// A SERVER-INITIATED JSON-RPC request (the agent→client REQUEST direction, T1). The base
 /// only ever *received* requests, so `JsonRpcRequest` is deserialize-only; this is the
-/// outbound counterpart used by `send_request`. Wired to a caller by T1.4 (core↔gateway
-/// bridge) / the MCP-over-ACP tunnel; landed ahead of its caller as ready infrastructure.
-#[allow(dead_code)]
+/// outbound counterpart used by `send_request`, which the MCP-over-ACP tunnel drives for
+/// `mcp/connect`, `mcp/message` and `mcp/disconnect`.
 #[derive(Debug, Serialize)]
 struct JsonRpcRequestOut {
     jsonrpc: &'static str,
@@ -459,7 +457,6 @@ struct JsonRpcRequestOut {
 
 /// `mcp/connect` params — `acpId` matches the `id` of the client's `session/new`
 /// `mcpServers` entry with `"type":"acp"`.
-#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 struct McpConnectParams {
     #[serde(rename = "acpId")]
@@ -467,7 +464,6 @@ struct McpConnectParams {
 }
 
 /// `mcp/connect` result — the client-assigned connection handle.
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct McpConnectResult {
     #[serde(rename = "connectionId")]
@@ -476,7 +472,6 @@ struct McpConnectResult {
 
 /// `mcp/message` params — the inner MCP `method`/`params` are flattened in (no inner id);
 /// `connectionId` selects the tunnelled MCP connection.
-#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 struct McpMessageParams {
     #[serde(rename = "connectionId")]
