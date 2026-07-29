@@ -391,7 +391,9 @@ cargo build --no-default-features --features "discord,slack,..."
 ```
 
 When built without it, the `[filestore]` config section is ignored and all
-behavior is unchanged from before.
+filestore behaviour is unchanged from before. Inbound audio still produces an
+`[Audio attachment]` block either way, carrying the platform URL where one exists
+and a note explaining the absence where one does not.
 
 ## Cost Considerations
 

@@ -174,7 +174,7 @@ pr      = ""
 [[openab_features]]
 feature = "media_inbound"
 status  = "implemented"
-note    = "Async download via Media API after the 200 response: images (resize longest side ≤1200px, JPEG q75, ≤10 MB; GIF passthrough); text-like files (extension whitelist, ≤512 KB each, ≤5 files / ≤1 MB aggregate); audio (≤25 MB, stored raw). Drive-sourced & video skipped."
+note    = "Async download via Media API after the 200 response: images (resize longest side ≤1200px, JPEG q75, ≤10 MB; GIF passthrough); text-like files (extension whitelist, ≤512 KB each, ≤5 files / ≤1 MB aggregate); audio (≤20 MB, the gateway store cap, stored raw). Drive-sourced & video skipped."
 source  = ["crates/openab-gateway/src/adapters/googlechat.rs#parse_attachments", "crates/openab-gateway/src/adapters/googlechat.rs#download_googlechat_image"]
 pr      = ""
 
