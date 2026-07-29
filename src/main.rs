@@ -465,11 +465,11 @@ async fn main() -> anyhow::Result<()> {
         browser_tunnel::RootBrowserTunnel::new(
             acp_tunnel_registry.clone(),
             // Browser control requires `[mcp]`, so the absent case is unreachable in practice;
-            // fall back to the same default rather than to the old 30s, which was the defect.
+            // fall back through the SAME function serde uses rather than repeating the literal.
             cfg.mcp
                 .as_ref()
                 .map(|m| m.tunnel_timeout_seconds)
-                .unwrap_or(180),
+                .unwrap_or_else(openab_core::config::default_tunnel_timeout_seconds),
         ),
     );
 

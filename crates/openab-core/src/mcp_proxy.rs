@@ -213,8 +213,20 @@ async fn write_json_atomic(path: &std::path::Path, value: &Value) -> std::io::Re
             // directory operation and is not covered by it. Without this a crash can leave the
             // directory entry unwritten while the data it points at is safely on disk — "fsynced,
             // then renamed" is not the same as "the rename survived".
-            if let Ok(d) = tokio::fs::File::open(dir).await {
-                let _ = d.sync_all().await;
+            // Report rather than swallow: this function's whole purpose is durability, so a
+            // silent failure of the step that provides it is the worst shape available. Not fatal
+            // — the data is written and visible, only the rename's survival across a crash is
+            // unproven. On Windows a directory cannot be opened as a file at all, so this is
+            // expected to fail there and is logged at debug rather than warn for that reason.
+            match tokio::fs::File::open(dir).await {
+                Ok(d) => {
+                    if let Err(e) = d.sync_all().await {
+                        tracing::debug!(dir = %dir.display(), error = %e,
+                            "MCP config: directory fsync failed — the rename may not survive a crash");
+                    }
+                }
+                Err(e) => tracing::debug!(dir = %dir.display(), error = %e,
+                    "MCP config: could not open the directory to fsync it (expected on Windows)"),
             }
             Ok(())
         }

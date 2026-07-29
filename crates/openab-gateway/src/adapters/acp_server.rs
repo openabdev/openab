@@ -589,7 +589,10 @@ async fn route_client_response(
     if let Some(tx) = pending.lock().await.remove(&id) {
         let _ = tx.send(raw.clone());
     } else {
-        warn!(id, "acp: client response with no matching pending request");
+        // `debug!`, not `warn!`: since the tunnel cancels on expiry, a reply arriving after we
+        // gave up is EXPECTED traffic from a well-behaved peer, not a client defect. Logging it at
+        // warn made a correct peer look broken.
+        debug!(id, "acp: client response arrived after its request was abandoned; discarding");
     }
     true
 }

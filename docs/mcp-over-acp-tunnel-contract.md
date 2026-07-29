@@ -155,8 +155,11 @@ notification is simply never delivered, so do not treat its absence as "keep goi
 | Connect / handshake timeout | 30s | `mcp/connect` and the `initialize` that follows it |
 | Servers per session | 8 (`MAX_ACP_SERVERS_PER_SESSION`) | `type:acp` entries accepted per `session/new` |
 | In-flight establishes | 64 (`MAX_INFLIGHT_ESTABLISHES`) | concurrent tunnel setups per connection |
-| Inbound response frame | 8 MiB (`MAX_FRAME_BYTES`) | a reply to `mcp/message` — `id`, no `method`; sized for screenshots |
-| Inbound method-bearing frame | 1 MiB (`MAX_NON_TUNNEL_FRAME_BYTES`) | anything carrying a `method`; the 8 MiB allowance is deliberately not reusable for these |
+| Any inbound frame | 8 MiB (`MAX_FRAME_BYTES`) | checked before parsing. **Exceeding it closes the connection** — an unparseable frame has no recoverable `id` to answer |
+| Inbound frame carrying a `method` | 1 MiB (`MAX_NON_TUNNEL_FRAME_BYTES`) | checked after parsing. **Answered with an error, connection kept.** The 8 MiB allowance exists for tool results, which arrive as responses (`id`, no `method`); capping method-bearing frames lower stops that allowance being reused to hold prompt text |
+
+The two differ in failure mode, which matters more than the numbers: oversize a response and the
+socket closes under you, oversize a request and you get an error back and may continue.
 
 The request timeout is operator-configurable because openab is the requester here and the peer is
 an extension it neither ships nor controls. It sits beneath the ACP idle timeout, so raising it

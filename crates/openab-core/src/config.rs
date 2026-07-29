@@ -90,16 +90,22 @@ pub struct McpFacadeConfig {
     ///
     /// Enforced server-side because on this tunnel OPENAB is the requester and the peer is a
     /// browser extension we neither ship nor control, so there is nobody else to bound it.
-    /// The default matches the ACP idle timeout it sits beneath: raising only this one would
-    /// move the wall rather than remove it, since a turn that outlives the idle timeout is cut
-    /// short there instead. A heavy page can run silent for minutes, which is why the old
-    /// hard-coded 30s was too low to be a policy.
+    /// The default sits STRICTLY beneath the ACP per-chunk idle timeout (180s, hard-coded at
+    /// `acp_server.rs`), and the margin is the point. Setting the two equal makes which one fires
+    /// first undecidable at the boundary, and they do different things: only when this one wins
+    /// does the peer receive `mcp/cancel` and the caller see a timeout error. If the idle timeout
+    /// wins the turn simply ends, which leaves exactly the stranded work on the extension that
+    /// cancellation exists to prevent. Raising this past the idle timeout moves the wall rather
+    /// than removing it — raise both, in that order.
     #[serde(default = "default_tunnel_timeout_seconds")]
     pub tunnel_timeout_seconds: u64,
 }
 
-fn default_tunnel_timeout_seconds() -> u64 {
-    180
+/// Public so the binary can use the same value instead of repeating the literal. A private
+/// default plus an `unwrap_or(180)` at the call site is two records of one fact, and the one in
+/// the binary would silently keep the old number the day this changes.
+pub fn default_tunnel_timeout_seconds() -> u64 {
+    170
 }
 
 /// One entry of the §6.4 operator allowlist.
