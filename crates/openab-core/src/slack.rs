@@ -1495,6 +1495,8 @@ async fn handle_message(
     // adapters apply the same limits: 5 files or 1 MB of text per message.
     const TEXT_TOTAL_CAP: u64 = 1024 * 1024;
     const TEXT_FILE_COUNT_CAP: u32 = 5;
+    const SLACK_URL_REQUIREMENT: &str =
+        "Slack private file, requires an `Authorization: Bearer <bot token>` header to download";
 
     let mut extra_blocks = Vec::new();
     let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
@@ -1561,26 +1563,34 @@ async fn handle_message(
                 // Passthrough runs whichever way STT went: a transcript is an
                 // extra block, never a substitute for the file itself.
                 #[cfg(feature = "filestore")]
-                let stored: Option<(String, String)> = match filestore {
-                    Some(fs) => media::download_and_presign_attachment(
-                        url,
-                        filename,
-                        size,
-                        Some(mimetype),
-                        Some(bot_token),
-                        fs,
-                    )
-                    .await,
+                let stored = match filestore {
+                    Some(fs) => Some(
+                        media::download_and_presign_attachment(
+                            url,
+                            filename,
+                            size,
+                            Some(mimetype),
+                            Some(bot_token),
+                            fs,
+                        )
+                        .await,
+                    ),
                     None => None,
                 };
                 #[cfg(not(feature = "filestore"))]
-                let stored: Option<(String, String)> = None;
+                let stored: Option<Result<(String, String), media::AudioStoreError>> = None;
 
+                // A configured store that failed must not read as no store at all:
+                // the fallback URL is identical either way, so only the note can say so.
+                let failure_note = stored
+                    .as_ref()
+                    .and_then(|r| r.as_ref().err())
+                    .map(|e| media::store_failure_note(*e, SLACK_URL_REQUIREMENT));
                 let (audio_url, audio_note) = match stored {
-                    Some((ref presigned, ref note)) => (presigned.as_str(), note.as_str()),
-                    None => (
+                    Some(Ok((ref presigned, ref note))) => (presigned.as_str(), note.as_str()),
+                    _ => (
                         url,
-                        "Slack private file, requires an `Authorization: Bearer <bot token>` header to download",
+                        failure_note.as_deref().unwrap_or(SLACK_URL_REQUIREMENT),
                     ),
                 };
                 extra_blocks.extend(media::audio_attachment_blocks(
@@ -1668,26 +1678,33 @@ async fn handle_message(
                             // url_private_download needs a bearer token the agent lacks, so a
                             // presigned URL is the only fetchable form when a filestore exists.
                             #[cfg(feature = "filestore")]
-                            let stored: Option<(String, String)> = match filestore {
-                                Some(fs) => media::download_and_presign_attachment(
-                                    url,
-                                    filename,
-                                    size,
-                                    Some(mimetype),
-                                    Some(bot_token),
-                                    fs,
-                                )
-                                .await,
+                            let stored = match filestore {
+                                Some(fs) => Some(
+                                    media::download_and_presign_attachment(
+                                        url,
+                                        filename,
+                                        size,
+                                        Some(mimetype),
+                                        Some(bot_token),
+                                        fs,
+                                    )
+                                    .await,
+                                ),
                                 None => None,
                             };
                             #[cfg(not(feature = "filestore"))]
-                            let stored: Option<(String, String)> = None;
+                            let stored: Option<Result<(String, String), media::AudioStoreError>> =
+                                None;
 
+                            let failure_note = stored
+                                .as_ref()
+                                .and_then(|r| r.as_ref().err())
+                                .map(|e| media::store_failure_note(*e, SLACK_URL_REQUIREMENT));
                             let (link, note) = match stored {
-                                Some((ref presigned, ref n)) => (presigned.as_str(), n.as_str()),
-                                None => (
+                                Some(Ok((ref presigned, ref n))) => (presigned.as_str(), n.as_str()),
+                                _ => (
                                     url,
-                                    "Slack private file, requires an `Authorization: Bearer <bot token>` header to download",
+                                    failure_note.as_deref().unwrap_or(SLACK_URL_REQUIREMENT),
                                 ),
                             };
                             extra_blocks.push(media::video_attachment_block(

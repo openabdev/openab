@@ -1246,11 +1246,26 @@ pub async fn download_and_presign_attachment(
     content_type: Option<&str>,
     auth_token: Option<&str>,
     filestore: &crate::filestore::Filestore,
-) -> Option<(String, String)> {
+) -> Result<(String, String), AudioStoreError> {
     download_and_presign_any_file(url, filename, size, content_type, auth_token, filestore)
         .await
-        .ok()
         .map(|(presigned_url, _)| (presigned_url, presigned_note(filestore)))
+        .map_err(|e| match e {
+            PresignError::Unavailable => AudioStoreError::TooLarge,
+            PresignError::UploadFailed | PresignError::UploadTimedOut => {
+                AudioStoreError::UploadFailed
+            }
+        })
+}
+
+/// The note for a platform URL the agent cannot fetch, naming the configured
+/// store's failure so an operator is not left reading it as "no store here".
+pub fn store_failure_note(err: AudioStoreError, platform_requirement: &str) -> String {
+    let reason = match err {
+        AudioStoreError::TooLarge => "exceeds the configured upload limit",
+        AudioStoreError::UploadFailed => "could not be stored by the configured filestore",
+    };
+    format!("this attachment {reason}, so the URL below is the platform's own: {platform_requirement}")
 }
 
 /// Upload already-downloaded bytes to the filestore and return the hint block.

@@ -906,6 +906,8 @@ impl EventHandler for Handler {
 
                 // Passthrough runs whichever way STT went: a transcript is an
                 // extra block, never a substitute for the file itself.
+                // Discord's fallback is a public CDN link the agent can fetch, so a
+                // store failure is not a degradation here and needs no separate note.
                 #[cfg(feature = "filestore")]
                 let stored: Option<(String, String)> = match self.filestore {
                     Some(ref fs) => media::download_and_presign_attachment(
@@ -916,7 +918,8 @@ impl EventHandler for Handler {
                         None,
                         fs,
                     )
-                    .await,
+                    .await
+                    .ok(),
                     None => None,
                 };
                 #[cfg(not(feature = "filestore"))]
