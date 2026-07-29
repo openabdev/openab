@@ -181,7 +181,7 @@ pr      = ""
 [[openab_features]]
 feature = "voice_stt"
 status  = "partial"
-note    = "Adapter downloads audio and emits it as an audio attachment with real MIME; STT happens in core only if stt_config.enabled, else forwarded as a \"transcription failed\" note."
+note    = "Adapter downloads audio and emits it as an audio attachment with real MIME; core always emits the [Audio attachment] block, and adds a transcript when stt_config.enabled succeeds or a \"transcription failed\" line when it is enabled and fails. With STT disabled the block stands alone."
 source  = ["crates/openab-gateway/src/adapters/googlechat.rs#download_googlechat_audio", "crates/openab-core/src/gateway.rs#process_gateway_event"]
 pr      = ""
 

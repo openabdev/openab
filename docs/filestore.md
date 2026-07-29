@@ -370,10 +370,16 @@ mc ilm rule add myminio/oab-uploads \
 | File exceeds max_file_size_mb (gateway) | Agent receives degraded hint: "exceeds the configured upload limit and could not be stored" |
 | Presigned URL generation fails | Agent receives degraded hint |
 | Filestore not configured | Legacy behavior (>512KB files silently dropped) |
+| Gateway audio, configured store rejects on size | `[Audio attachment]` block with `note: exceeds the configured upload limit and could not be stored, so there is no fetchable URL` |
+| Gateway audio, configured store fails to upload or presign | `[Audio attachment]` block with `note: the configured filestore could not store this attachment, so there is no fetchable URL` |
+| Gateway audio, no filestore configured | `[Audio attachment]` block with `note: no fetchable URL for this attachment; configure a filestore ...` |
 
 When filestore is configured but upload fails, the agent always receives a
 hint indicating the file exists but content is unavailable. This ensures
-the agent can inform the user, even if it cannot retrieve the content.
+the agent can inform the user, even if it cannot retrieve the content. The
+audio rows above are stated separately because a configured store that fails
+must not be reported as an absent one: that would send the operator to
+configure something they already have.
 
 ## Build Requirement
 

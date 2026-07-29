@@ -218,7 +218,7 @@ The gateway downloads and forwards image and text file attachments to the AI age
 | `text` | Text extracted, forwarded as prompt |
 | `image` | Image downloaded, resized (max 1200px), JPEG compressed, stored to `~/.openab/media/inbound/<uuid>` → `ContentBlock::Image` |
 | `file` | Text files only (`.txt`, `.py`, `.rs`, `.md`, `.json`, etc., max 512KB). Non-text files (`.pdf`, `.zip`, etc.) are silently ignored. |
-| `audio` | Voice message downloaded (opus/ogg, max 25MB), stored to filesystem, forwarded to core. If `[stt]` is enabled, core transcribes via Whisper API and injects `[Voice message transcript]: ...` into the prompt. If STT is disabled or fails, the message is silently skipped. |
+| `audio` | Voice message downloaded (opus/ogg, max 25MB), stored to filesystem, forwarded to core. Core always emits an `[Audio attachment]` metadata block so the agent can act on the file itself. If `[stt]` is enabled, transcription via the Whisper API adds `[Voice message transcript]: ...` on top; if it is disabled the block is emitted alone, and if it fails a transcription-failed line accompanies the block. The message is never skipped for STT reasons. |
 | `post` | Rich text: text nodes extracted as prompt, `img` nodes downloaded as image attachments. This is the format Feishu uses when @mention + paste image in a group. |
 
 **Group chat limitation:** Feishu does not allow @mention and image upload in the same message. However, @mention + paste (Ctrl+V) an image works — Feishu sends this as a `post` message containing both the mention and the image. Direct image upload (via the attachment button) cannot include @mention, so the bot will not respond in groups.

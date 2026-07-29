@@ -706,7 +706,7 @@ presigned_ttl = 3600       # URL expiry in seconds (default: 3600 = 1 hour)
 - MinIO
 - Any S3-compatible object store
 
-**Build requirement:** The filestore feature is enabled by default in standard builds. When built without it (e.g. `--no-default-features`), the `[filestore]` config section is ignored and all behavior is unchanged.
+**Build requirement:** The filestore feature is enabled by default in standard builds. When built without it (e.g. `--no-default-features`), the `[filestore]` config section is ignored and every path behaves as if no filestore were configured. That is not the same as "nothing changes": inbound audio still produces an `[Audio attachment]` block, carrying the platform URL where one exists and a note explaining the absence where one does not.
 
 **Minimum IAM policy:**
 
