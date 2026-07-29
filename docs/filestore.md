@@ -134,9 +134,9 @@ The streaming approach means a 500 MB file uses the same ~16 MB of memory as a 1
 
 | Platform | Download Method | Upload Method | File Types |
 |----------|----------------|---------------|------------|
-| Discord | Streaming download | Streaming multipart (~16 MB chunks) | Text > 512KB + PDF/ZIP/binary (videos excluded — see Behavior) |
-| Slack | Streaming download | Streaming multipart (~16 MB chunks) | Text > 512KB + PDF/ZIP/binary (videos excluded — see Behavior) |
-| Gateway (Telegram, Feishu, Google Chat, WeCom, LINE) | File on local disk | Single PUT | Text files delivered by adapter pipeline; binary limited by adapter validation |
+| Discord | Streaming download | Streaming multipart (~16 MB chunks) | Text > 512KB + PDF/ZIP/binary + audio; video excluded, its CDN link already needs no credentials |
+| Slack | Streaming download | Streaming multipart (~16 MB chunks) | Text > 512KB + PDF/ZIP/binary + audio + video, since neither Slack URL form is fetchable by the agent |
+| Gateway (Telegram, Feishu, Google Chat, WeCom, LINE) | File on local disk | Single PUT | Text files delivered by adapter pipeline, plus audio bytes the adapter already holds; binary limited by adapter validation |
 
 Gateway adapters use their existing text-file pipeline (extension whitelist).
 When filestore is configured, large text files (>512 KB) that pass through
@@ -189,7 +189,9 @@ after 24 hours (no configuration needed).
 >   and any unsupported format are uploaded to filestore via streaming multipart.
 > - **Gateway (Telegram, Feishu, Google Chat, WeCom, LINE):** Filestore is wired for
 >   files delivered by existing adapter pipelines. Large text files (>512KB) that pass
->   through the adapter are uploaded. Binary/generic-file support remains limited by
+>   through the adapter are uploaded, as is audio, whose bytes the adapter already holds
+>   and which therefore uses the buffered single PUT rather than the streaming path.
+>   Binary/generic-file support remains limited by
 >   current gateway adapter validation (UTF-8 checks, platform-specific size limits).
 >   Full binary support requires a gateway schema change tracked in follow-up #1349.
 
@@ -198,7 +200,11 @@ after 24 hours (no configuration needed).
 | Text ≤ 512 KB | any | Inlined into prompt (unchanged) |
 | Text > 512 KB | ✅ yes | Uploaded → presigned URL returned |
 | PDF, ZIP, DOCX, binary (Discord/Slack only) | ✅ yes | Uploaded → presigned URL returned |
-| Video (`video/*` MIME or `.mp4/.mov/.m4v/.webm/.mkv/.avi`) | any | **Never uploaded** — agent receives a `[Video attachment]` metadata block (filename, type, size, platform URL) |
+| Audio (`audio/*` MIME, or `.ogg/.oga/.opus/.m4a/.mp3/.wav/.flac/.aac/.amr`) | ✅ yes | Uploaded, and the `[Audio attachment]` block's `url:` is the presigned URL |
+| Audio | ❌ no | Not uploaded; the block still appears, carrying the platform URL where one exists |
+| Video on Discord (`video/*` MIME or `.mp4/.mov/.m4v/.webm/.mkv/.avi`) | any | **Never uploaded.** The agent receives a `[Video attachment]` block whose `url:` is the CDN link, which already needs no credentials |
+| Video on Slack | ✅ yes | Uploaded, because neither `url_private_download` nor `url_private` is fetchable by the agent |
+| Video on Slack | ❌ no | Not uploaded; the block carries `url_private_download` plus a `note:` naming the bearer-token requirement |
 | Text > 512 KB | ❌ no | Silently dropped (legacy behavior) |
 | PDF, ZIP, DOCX, binary | ❌ no | Silently dropped (legacy behavior) |
 | > max_file_size_mb (default 250 MB, max 500 MB) | ✅ yes | Dropped on Discord/Slack; degraded hint on gateway (see Error Handling) |

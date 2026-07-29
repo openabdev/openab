@@ -114,8 +114,12 @@ Which URL the agent gets:
 
 | Platform | Filestore configured | No filestore |
 |---|---|---|
-| Discord | presigned S3 URL | `attachment.url`, a public CDN link needing no credentials |
+| Discord | `attachment.url`, a public CDN link needing no credentials | same |
 | Slack | presigned S3 URL | `url_private_download`, which needs an `Authorization: Bearer <bot token>` header |
+
+Discord video deliberately never reaches the filestore: the CDN link already
+resolves without credentials, so uploading a copy would buy nothing. The
+filestore branch in `discord.rs` excludes video for that reason.
 
 The `note:` line is present only when the URL needs an explanation, so a Discord
 CDN link carries no note. On Slack the note always appears, because neither form
