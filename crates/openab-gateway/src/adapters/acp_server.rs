@@ -482,7 +482,6 @@ struct McpMessageParams {
 }
 
 /// `mcp/disconnect` params.
-#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 struct McpDisconnectParams {
     #[serde(rename = "connectionId")]
