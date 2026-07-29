@@ -65,11 +65,6 @@ fn platform_supports_streaming(platform: &str) -> bool {
     !NON_EDITABLE_PLATFORMS.contains(&platform)
 }
 
-/// Gateway attachments arrive as bytes, so a filestore is the only way to hand
-/// the agent a location it can fetch.
-const AUDIO_NO_URL_NOTE: &str =
-    "no fetchable URL for this attachment; configure a filestore to give the agent a downloadable link";
-
 /// Shared filter parameters for gateway event gating.
 /// Used by both `run_gateway_adapter` (WebSocket) and `process_gateway_event` (unified).
 struct EventFilterParams<'a> {
@@ -1113,29 +1108,28 @@ pub async fn run_gateway_adapter(
                                                             None
                                                         };
 
-                                                        let (url, note) = match stored {
-                                                            Some((ref presigned, ref note)) => (Some(presigned.as_str()), Some(note.as_str())),
-                                                            None => (None, Some(AUDIO_NO_URL_NOTE)),
+                                                        let outcome = match stored {
+                                                            Some((ref presigned, ref note)) => crate::media::AudioOutcome::Stored { url: presigned, note },
+                                                            None => crate::media::AudioOutcome::NoStore,
                                                         };
-                                                        extra_blocks.extend(crate::media::audio_attachment_blocks(
+                                                        extra_blocks.extend(crate::media::audio_blocks_for(
                                                             &att.filename,
                                                             &att.mime_type,
                                                             size,
-                                                            url,
-                                                            note,
+                                                            outcome,
                                                             stt_line.as_deref(),
                                                         ));
                                                     }
                                                     Err(e) => {
                                                         tracing::warn!(filename = %att.filename, error = %e, "gateway audio read failed");
-                                                        // No STT block here: the file never arrived, so the
+                                                        // No STT line here: the file never arrived, so the
                                                         // metadata block alone is the whole failure signal.
-                                                        extra_blocks.push(crate::media::audio_attachment_block(
+                                                        extra_blocks.extend(crate::media::audio_blocks_for(
                                                             &att.filename,
                                                             &att.mime_type,
                                                             att.size,
+                                                            crate::media::AudioOutcome::ReadFailed,
                                                             None,
-                                                            Some("attachment bytes unavailable (read failed)"),
                                                         ));
                                                     }
                                                 }
@@ -1605,31 +1599,33 @@ pub async fn process_gateway_event(
                             None
                         };
 
-                        let (url, note) = match stored {
+                        let outcome = match stored {
                             Some((ref presigned, ref note)) => {
-                                (Some(presigned.as_str()), Some(note.as_str()))
+                                crate::media::AudioOutcome::Stored {
+                                    url: presigned,
+                                    note,
+                                }
                             }
-                            None => (None, Some(AUDIO_NO_URL_NOTE)),
+                            None => crate::media::AudioOutcome::NoStore,
                         };
-                        extra_blocks.extend(crate::media::audio_attachment_blocks(
+                        extra_blocks.extend(crate::media::audio_blocks_for(
                             &att.filename,
                             &att.mime_type,
                             size,
-                            url,
-                            note,
+                            outcome,
                             stt_line.as_deref(),
                         ));
                     }
                     Err(e) => {
                         tracing::warn!(filename = %att.filename, error = %e, "gateway audio read failed");
-                        // No STT block here: the file never arrived, so the
+                        // No STT line here: the file never arrived, so the
                         // metadata block alone is the whole failure signal.
-                        extra_blocks.push(crate::media::audio_attachment_block(
+                        extra_blocks.extend(crate::media::audio_blocks_for(
                             &att.filename,
                             &att.mime_type,
                             att.size,
+                            crate::media::AudioOutcome::ReadFailed,
                             None,
-                            Some("attachment bytes unavailable (read failed)"),
                         ));
                     }
                 }

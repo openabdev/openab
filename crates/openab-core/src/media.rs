@@ -489,6 +489,39 @@ pub fn audio_attachment_blocks(
     blocks
 }
 
+/// Gateway attachments arrive as bytes, so a filestore is the only way to hand
+/// the agent a location it can fetch.
+pub const AUDIO_NO_URL_NOTE: &str =
+    "no fetchable URL for this attachment; configure a filestore to give the agent a downloadable link";
+
+/// What the gateway managed to do with an audio attachment's bytes.
+#[derive(Clone, Copy)]
+pub enum AudioOutcome<'a> {
+    /// Uploaded; the agent can fetch it at `url`.
+    Stored { url: &'a str, note: &'a str },
+    /// Bytes arrived but no filestore is configured, so there is nothing to fetch.
+    NoStore,
+    /// The bytes never arrived, so there is no size and nothing to fetch.
+    ReadFailed,
+}
+
+/// The gateway's two entry points both route here, so a fallback fixed on one
+/// cannot silently stay wrong on the other.
+pub fn audio_blocks_for(
+    filename: &str,
+    content_type: &str,
+    size: u64,
+    outcome: AudioOutcome<'_>,
+    stt_line: Option<&str>,
+) -> Vec<ContentBlock> {
+    let (url, note) = match outcome {
+        AudioOutcome::Stored { url, note } => (Some(url), Some(note)),
+        AudioOutcome::NoStore => (None, Some(AUDIO_NO_URL_NOTE)),
+        AudioOutcome::ReadFailed => (None, Some("attachment bytes unavailable (read failed)")),
+    };
+    audio_attachment_blocks(filename, content_type, size, url, note, stt_line)
+}
+
 /// `note` names what the URL needs to be fetched; `None` when it needs nothing,
 /// as with a public CDN link.
 pub fn video_attachment_block(
@@ -1651,6 +1684,54 @@ mod tests {
                     .is_ok(),
                 "{filename} produced {mime}, which stt::transcribe would drop"
             );
+        }
+    }
+
+    #[test]
+    fn audio_blocks_for_covers_every_gateway_outcome() {
+        // The gateway's two entry points share this decision, so each row is the
+        // wiring both of them get, rather than the wiring one of them was given.
+        let cases = [
+            (
+                AudioOutcome::Stored {
+                    url: "https://s3/x?sig=1",
+                    note: "presigned URL, expires in 60 minutes",
+                },
+                "url: https://s3/x?sig=1",
+            ),
+            (AudioOutcome::NoStore, "note: no fetchable URL"),
+            (
+                AudioOutcome::ReadFailed,
+                "note: attachment bytes unavailable (read failed)",
+            ),
+        ];
+
+        for (outcome, expected) in cases {
+            let with_stt = audio_blocks_for("v.ogg", "audio/ogg", 512, outcome, Some("[t]: hi"));
+            assert_eq!(with_stt.len(), 2);
+            let texts: Vec<String> = with_stt.into_iter().map(block_text).collect();
+            assert_eq!(texts[0], "[t]: hi", "the STT line must lead");
+            assert!(texts[1].contains(expected), "got {}", texts[1]);
+        }
+
+        for (outcome, expected) in cases {
+            let without_stt = audio_blocks_for("v.ogg", "audio/ogg", 512, outcome, None);
+            assert_eq!(without_stt.len(), 1);
+            let text = block_text(without_stt.into_iter().next().unwrap());
+            assert!(text.contains(expected), "got {text}");
+        }
+    }
+
+    #[test]
+    fn audio_blocks_for_never_offers_a_url_it_cannot_back() {
+        for outcome in [AudioOutcome::NoStore, AudioOutcome::ReadFailed] {
+            let text = block_text(
+                audio_blocks_for("v.ogg", "audio/ogg", 512, outcome, None)
+                    .into_iter()
+                    .next()
+                    .unwrap(),
+            );
+            assert!(!text.contains("url:"), "got {text}");
         }
     }
 
