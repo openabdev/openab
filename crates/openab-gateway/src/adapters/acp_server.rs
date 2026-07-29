@@ -702,6 +702,19 @@ async fn mcp_disconnect(
         .map(|_| ())
 }
 
+/// Monotonic attach ordering for last-attach-wins (ADR §6.1).
+///
+/// Stamped at the START of an establish, before the first round trip, because "which declaration
+/// is newer" is decided by when the client asked — not by which handshake happened to finish
+/// first. Those differ whenever handshake durations differ, which over a real socket is the
+/// normal case: a slow older establish would otherwise complete last, evict the successor that
+/// beat it, and leave the STALE tunnel installed. Registration order is not attach order.
+///
+/// Process-wide rather than per-connection on purpose: the racing establishes belong to
+/// *different* connections (a reconnect mints a fresh `server_id` on a new socket), so a
+/// per-connection sequence cannot order them, and cross-connection is precisely the failing case.
+static TUNNEL_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 /// A cloneable handle to one `/acp` connection's MCP-over-ACP tunnel (T5.3). Bundles the
 /// per-connection outbound channel + pending-request map + id counter + the `connectionId`
 /// from `mcp/connect`, so a holder can issue `mcp/message` requests to that browser and await
@@ -727,6 +740,11 @@ pub struct TunnelHandle {
     /// connections by `session/resume`. Teardown therefore matches on this owner rather than on
     /// the key, so a late cleanup cannot remove a handle installed by a different connection.
     owner: String,
+    /// Attach ordering from [`TUNNEL_GENERATION`], stamped when this establish STARTED.
+    ///
+    /// Eviction compares generations instead of trusting arrival order, so a slow establish that
+    /// finishes after a newer one cannot evict its own successor.
+    generation: u64,
 }
 
 impl TunnelHandle {
@@ -866,6 +884,9 @@ async fn establish_and_register_tunnel(
     // Observability: reaching here means the client DID declare a "type":"acp" server, so this
     // line in the log answers "did the browser extension advertise itself?" for a live session.
     info!(acp_id = %acp_id, acp_name = %acp_name, channel = %redact_id(&channel_id), "ACP: opening MCP-over-ACP tunnel");
+    // Stamp BEFORE the first round trip: this establish's place in attach order is fixed by when
+    // the client declared the server, not by how long its handshake takes. See `TUNNEL_GENERATION`.
+    let generation = TUNNEL_GENERATION.fetch_add(1, Ordering::Relaxed);
     let connection_id = mcp_connect(&out_tx, &pending, &next_id, &acp_id, timeout_secs).await?;
     // MCP lifecycle before the tunnel is usable — see `inner_mcp_handshake`.
     //
@@ -911,8 +932,15 @@ async fn establish_and_register_tunnel(
         connection_id,
         server_name: acp_name.clone(),
         owner: owner.clone(),
+        generation,
     };
-    let replaced = {
+    // `Superseded` carries the handle back out of the lock: a losing establish still owes its
+    // client an `mcp/disconnect`, and `disconnect` is async while this is a std mutex.
+    enum Registered {
+        Done(Vec<TunnelHandle>),
+        Superseded(TunnelHandle),
+    }
+    let outcome = {
         let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         // Last-attach-wins (ADR §6.1). The client mints a fresh `id` on every connection, so a
         // reconnect would otherwise leave the dead tunnel registered beside the live one under
@@ -924,22 +952,52 @@ async fn establish_and_register_tunnel(
         // connections are open, so each one is owed an `mcp/disconnect` (review R7). They are
         // collected here and disconnected after the lock is released — `disconnect` is async and
         // this is a std mutex, so awaiting under it is not an option.
-        let stale: Vec<(String, String)> = reg
+        //
+        // Deliberately NOT scoped to the attaching connection. A reconnecting client arrives on a
+        // NEW socket with a fresh `server_id`, so its predecessor's handle is owned by the old
+        // connection — restricting eviction to one owner would leave that dead tunnel registered
+        // beside the live one under the same declared name, which is the ambiguity
+        // last-attach-wins exists to prevent (ADR §6.1). Teardown is owner-scoped; eviction is
+        // not, and they are different questions.
+        let same_name = |c: &String, id: &String, h: &TunnelHandle| {
+            c == &channel_id && h.server_name == acp_name && id != &acp_id
+        };
+        // Ordering is by generation, not by who reached this lock first. A slow establish that
+        // started EARLIER but finished later must not evict the newer tunnel that beat it here:
+        // it lost the race the client actually cares about, so it stands down and closes its own
+        // connection instead of installing a stale handle over a live one.
+        if reg
             .iter()
-            .filter(|((c, id), h)| {
-                // Deliberately NOT scoped to the attaching connection. A reconnecting client
-                // arrives on a NEW socket with a fresh `server_id`, so its predecessor's handle is
-                // owned by the old connection — restricting eviction to one owner would leave that
-                // dead tunnel registered beside the live one under the same declared name, which
-                // is the ambiguity last-attach-wins exists to prevent (ADR §6.1). Teardown is
-                // owner-scoped; eviction is not, and they are different questions.
-                c == &channel_id && h.server_name == acp_name && id != &acp_id
-            })
-            .map(|(k, _)| k.clone())
-            .collect();
-        let replaced: Vec<TunnelHandle> = stale.iter().filter_map(|k| reg.remove(k)).collect();
-        reg.insert((channel_id.clone(), acp_id.clone()), handle);
-        replaced
+            .any(|((c, id), h)| same_name(c, id, h) && h.generation > generation)
+        {
+            Registered::Superseded(handle)
+        } else {
+            let stale: Vec<(String, String)> = reg
+                .iter()
+                .filter(|((c, id), h)| same_name(c, id, h) && h.generation < generation)
+                .map(|(k, _)| k.clone())
+                .collect();
+            let replaced: Vec<TunnelHandle> = stale.iter().filter_map(|k| reg.remove(k)).collect();
+            reg.insert((channel_id.clone(), acp_id.clone()), handle);
+            Registered::Done(replaced)
+        }
+    };
+    let replaced = match outcome {
+        Registered::Done(replaced) => replaced,
+        Registered::Superseded(handle) => {
+            info!(
+                channel = %redact_id(&channel_id), server_name = %acp_name, generation,
+                "ACP: a newer attach already holds this name — standing down without registering"
+            );
+            // Same obligation as eviction: the client opened this connection for us and we are not
+            // going to use it, so it is owed an `mcp/disconnect`. Best-effort, off the attach path.
+            tokio::spawn(async move {
+                if let Err(e) = handle.disconnect(5).await {
+                    debug!(error = %e, "ACP: mcp/disconnect for a superseded establish did not complete");
+                }
+            });
+            return Ok(());
+        }
     };
     if !replaced.is_empty() {
         info!(
@@ -2631,6 +2689,7 @@ mod acp_requests {
             next_id,
             connection_id: "conn-9".into(),
             server_name: "browser".into(),
+            generation: 0,
         };
 
         let pending2 = pending.clone();
@@ -3824,6 +3883,106 @@ mod acp_ws_integration {
         }
     }
 
+    /// A slow establish that STARTED first must not evict the newer tunnel that beat it to the
+    /// registry.
+    ///
+    /// The failing case is cross-connection by construction, which is why a per-connection
+    /// sequence number could not have fixed it: a reconnecting client arrives on a NEW socket and
+    /// mints a fresh `server_id`, so the two establishes racing for one declared name belong to
+    /// different connections. Here socket A declares `katashiro` and then stalls — its
+    /// `mcp/connect` is deliberately left unanswered — while socket B resumes the same session,
+    /// declares the same name, and completes. When A finally finishes it is the OLDER attach, and
+    /// before the generation stamp it would have evicted B and installed the stale tunnel over the
+    /// live one.
+    ///
+    /// Ordering is stamped at establish start rather than at registration for exactly this reason:
+    /// registration order is finish order, and finish order inverts whenever handshake durations
+    /// differ.
+    #[tokio::test]
+    async fn a_late_finishing_older_establish_does_not_evict_its_successor() {
+        let (url, registry) = serve().await;
+
+        // Socket A: declare `katashiro` as srv-1, then STALL — do not answer its `mcp/connect`.
+        let (mut a, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        send(&mut a, json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}}
+        })).await;
+        let _ = recv(&mut a).await;
+        send(&mut a, json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": {"cwd": "/w", "mcpServers": [{"type": "acp", "id": "srv-1", "name": "katashiro"}]}
+        })).await;
+
+        let mut session_id = None;
+        let mut a_connect_id = None;
+        while session_id.is_none() || a_connect_id.is_none() {
+            let f = recv(&mut a).await;
+            if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
+                assert_eq!(f["params"]["acpId"], json!("srv-1"));
+                a_connect_id = Some(f["id"].clone());
+            } else if f.get("id") == Some(&json!(2)) {
+                session_id = Some(f["result"]["sessionId"].as_str().unwrap().to_string());
+            }
+        }
+        let session_id = session_id.unwrap();
+
+        // Socket B: resume the SAME session — same channel — declaring the same name as srv-2, and
+        // carry it all the way to registered. This is the newer attach.
+        let (mut b, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        send(&mut b, json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}}
+        })).await;
+        let _ = recv(&mut b).await;
+        send(&mut b, json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/resume",
+            "params": {"sessionId": session_id, "cwd": "/w",
+                       "mcpServers": [{"type": "acp", "id": "srv-2", "name": "katashiro"}]}
+        })).await;
+        loop {
+            let f = recv(&mut b).await;
+            if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
+                send(&mut b, json!({
+                    "jsonrpc": "2.0", "id": f["id"].clone(),
+                    "result": {"connectionId": "conn-new"}
+                })).await;
+            } else if handled_inner_lifecycle(&mut b, &f).await == Some("initialize") {
+                break;
+            }
+        }
+        wait_for_tunnels(&registry, 1).await;
+
+        // Now let the OLDER establish finish.
+        send(&mut a, json!({
+            "jsonrpc": "2.0", "id": a_connect_id.unwrap(),
+            "result": {"connectionId": "conn-old"}
+        })).await;
+        loop {
+            let f = recv(&mut a).await;
+            if handled_inner_lifecycle(&mut a, &f).await == Some("initialize") {
+                break;
+            }
+        }
+
+        // The newer tunnel must still be the registered one. Poll: we are proving the late arrival
+        // never displaces it, and it would do so asynchronously.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let ids: Vec<String> = {
+                let reg = registry.lock().unwrap();
+                reg.keys().map(|(_, id)| id.clone()).collect()
+            };
+            assert_eq!(
+                ids,
+                vec!["srv-2".to_string()],
+                "the older establish finished last and displaced its successor — attach order was \
+                 taken from registration order instead of the generation stamp"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
     /// A server that *succeeds* at `initialize` but answers a protocol version we do not speak
     /// must not be registered either.
     ///
@@ -4355,6 +4514,7 @@ mod acp_teardown_ownership {
             connection_id: connection_id.into(),
             server_name: "katashiro".into(),
             owner: owner.into(),
+            generation: 0,
         }
     }
 
