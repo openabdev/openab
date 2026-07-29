@@ -36,6 +36,14 @@ const ACP_PROTOCOL_VERSION: u32 = 1;
 /// eviction, and global connection/worker limits are a follow-up (review F6, roadmap).
 const MAX_SESSIONS_PER_CONNECTION: usize = 128;
 const MAX_INFLIGHT_PROMPTS: usize = 32;
+/// Cap on concurrently-establishing tunnels per connection.
+///
+/// Separate from [`MAX_INFLIGHT_PROMPTS`] on purpose. These tasks used to share one budget, so a
+/// client with several slow `mcp/connect`s outstanding could exhaust it and make ordinary
+/// `session/prompt` calls fail with "Too many in-flight prompts" — an error naming a limit the
+/// client had not reached, for work it had not asked for. `MAX_ACP_SERVERS_PER_SESSION` bounds one
+/// session's declarations; this bounds every session's establishes on a connection at once.
+const MAX_INFLIGHT_ESTABLISHES: usize = 64;
 /// Cap on `type:acp` servers a single session may declare (review R3-F1).
 ///
 /// Every declaration costs a spawned task, a pending `mcp/connect` holding a 30s timeout, and an
@@ -866,9 +874,13 @@ fn spawn_acp_tunnels(
     out_tx: &mpsc::UnboundedSender<String>,
     pending: &Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     next_id: &Arc<AtomicU64>,
-    prompt_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+    establish_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
     owner: &str,
 ) {
+    // Drop finished handles first so a long-lived connection does not accumulate them, then bound
+    // what is still running. Over the cap the declaration is dropped with a warning rather than
+    // refusing the whole request: the session itself is valid and its other servers still attach.
+    establish_tasks.retain(|h| !h.is_finished());
     for srv in servers {
         let out_tx = out_tx.clone();
         let pending = pending.clone();
@@ -876,7 +888,14 @@ fn spawn_acp_tunnels(
         let registry = registry.clone();
         let channel_id = channel_id.clone();
         let owner = owner.to_string();
-        prompt_tasks.push(tokio::spawn(async move {
+        if establish_tasks.len() >= MAX_INFLIGHT_ESTABLISHES {
+            warn!(
+                max = MAX_INFLIGHT_ESTABLISHES,
+                "ACP: too many tunnels establishing on this connection — dropping a declaration"
+            );
+            break;
+        }
+        establish_tasks.push(tokio::spawn(async move {
             if let Err(e) = establish_and_register_tunnel(
                 out_tx, pending, next_id, srv.id, srv.name, channel_id, registry, 30, owner,
             )
@@ -912,6 +931,9 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
 
     // Track spawned prompt tasks so we can abort on disconnect
     let mut prompt_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    // Tunnel establishes get their own set. Sharing one with prompts meant a pending `mcp/connect`
+    // consumed prompt budget, and the client saw an overload error for work it never requested.
+    let mut establish_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     // Channel for sending messages back to the client
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
@@ -1125,7 +1147,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         &out_tx,
                         &pending_requests,
                         &next_req_id,
-                        &mut prompt_tasks,
+                        &mut establish_tasks,
                         &connection_id,
                     );
                 }
@@ -1220,7 +1242,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         &out_tx,
                         &pending_requests,
                         &next_req_id,
-                        &mut prompt_tasks,
+                        &mut establish_tasks,
                         &connection_id,
                     );
                 }
@@ -1334,8 +1356,9 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
             }
         }
 
-        // Clean up finished tasks
+        // Clean up finished tasks (both sets)
         prompt_tasks.retain(|h| !h.is_finished());
+        establish_tasks.retain(|h| !h.is_finished());
     }
 
     // Drain any in-flight server-initiated requests: dropping each oneshot sender makes the
@@ -1346,8 +1369,10 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
     }
 
     // --- Disconnect cleanup ---
-    // Abort any in-flight prompt tasks to prevent registry leaks
-    for handle in prompt_tasks {
+    // Abort any in-flight tasks to prevent registry leaks. Establishes are aborted too: a task
+    // still waiting on `mcp/connect` would otherwise insert a handle into the registry AFTER the
+    // teardown below has run, leaving a dead tunnel registered for a closed connection.
+    for handle in prompt_tasks.into_iter().chain(establish_tasks) {
         handle.abort();
     }
 
@@ -3487,6 +3512,94 @@ mod acp_ws_integration {
             err.contains("no active tab"),
             "the client's message must reach the caller, got: {err}"
         );
+    }
+
+    /// A prompt must not be refused because tunnels are still establishing.
+    ///
+    /// The two used to share `prompt_tasks` and `MAX_INFLIGHT_PROMPTS`, so a client with enough
+    /// slow `mcp/connect`s outstanding got "Too many in-flight prompts" — a limit it had not
+    /// reached, for work it had not asked for.
+    ///
+    /// It takes **more than `MAX_INFLIGHT_PROMPTS` parked establishes** to reach the old bug, and
+    /// one session cannot supply them: `MAX_ACP_SERVERS_PER_SESSION` is 8 against a prompt cap of
+    /// 32. A first version of this test used a single session, so it passed against the shared
+    /// budget too and proved nothing. Hence several sessions.
+    #[tokio::test]
+    async fn pending_tunnel_establishes_do_not_consume_the_prompt_budget() {
+        let (url, _registry) = serve().await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        send(&mut ws, json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}}
+        })).await;
+        let _ = recv(&mut ws).await;
+
+        // Enough sessions to park strictly more than MAX_INFLIGHT_PROMPTS establishes.
+        let sessions_needed = MAX_INFLIGHT_PROMPTS / MAX_ACP_SERVERS_PER_SESSION + 1;
+        let want_connects = sessions_needed * MAX_ACP_SERVERS_PER_SESSION;
+        assert!(
+            want_connects > MAX_INFLIGHT_PROMPTS,
+            "the test must exceed the prompt cap or it cannot observe the old behaviour"
+        );
+
+        let mut last_session = None;
+        let mut connects = 0;
+        let mut answered_new = 0;
+        for n in 0..sessions_needed {
+            let req_id = 100 + n as i64;
+            let servers: Vec<Value> = (0..MAX_ACP_SERVERS_PER_SESSION)
+                .map(|i| json!({"type": "acp", "id": format!("s{n}-{i}"), "name": format!("n{n}-{i}")}))
+                .collect();
+            send(&mut ws, json!({
+                "jsonrpc": "2.0", "id": req_id, "method": "session/new",
+                "params": {"cwd": "/w", "mcpServers": servers}
+            })).await;
+            // Collect this session's response; mcp/connect frames are observed and NEVER answered,
+            // which is what keeps each establish task in flight.
+            let mut got_resp = false;
+            while !got_resp {
+                let f = recv(&mut ws).await;
+                if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
+                    connects += 1;
+                } else if f.get("id") == Some(&json!(req_id)) {
+                    last_session = Some(f["result"]["sessionId"].as_str().unwrap().to_string());
+                    answered_new += 1;
+                    got_resp = true;
+                }
+            }
+        }
+        assert_eq!(answered_new, sessions_needed);
+
+        // Drain any remaining mcp/connect frames so the parked count is what we think it is.
+        while connects < want_connects {
+            let f = recv(&mut ws).await;
+            if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
+                connects += 1;
+            }
+        }
+
+        // With >32 establishes parked, a prompt must still be accepted.
+        send(&mut ws, json!({
+            "jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": {"sessionId": last_session.unwrap(), "prompt": [{"type": "text", "text": "hi"}]}
+        })).await;
+
+        let mut saw = None;
+        for _ in 0..40 {
+            let f = recv(&mut ws).await;
+            if f.get("id") == Some(&json!(3)) {
+                saw = Some(f);
+                break;
+            }
+        }
+        let f = saw.expect("no response to the prompt");
+        if let Some(err) = f.get("error") {
+            let msg = err["message"].as_str().unwrap_or("");
+            assert!(
+                !msg.contains("in-flight prompts"),
+                "{connects} parked mcp/connects must not spend the prompt budget, got: {msg}"
+            );
+        }
     }
 
     /// A resume that stops declaring a server must retire its tunnel.
