@@ -221,7 +221,11 @@ async fn write_json_atomic(path: &std::path::Path, value: &Value) -> std::io::Re
             match tokio::fs::File::open(dir).await {
                 Ok(d) => {
                     if let Err(e) = d.sync_all().await {
-                        tracing::debug!(dir = %dir.display(), error = %e,
+                        // `warn!`, not `debug!`: opening a directory can legitimately fail (Windows),
+                        // but an fsync that runs and FAILS is an unexpected durability failure, and
+                        // reporting it more quietly than the thing it protects would hide the worse
+                        // of the two — the same reasoning as the failed-handshake disconnect.
+                        tracing::warn!(dir = %dir.display(), error = %e,
                             "MCP config: directory fsync failed — the rename may not survive a crash");
                     }
                 }

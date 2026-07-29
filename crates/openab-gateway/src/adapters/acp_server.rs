@@ -44,6 +44,16 @@ const MAX_INFLIGHT_PROMPTS: usize = 32;
 /// client had not reached, for work it had not asked for. `MAX_ACP_SERVERS_PER_SESSION` bounds one
 /// session's declarations; this bounds every session's establishes on a connection at once.
 const MAX_INFLIGHT_ESTABLISHES: usize = 64;
+/// Per-chunk idle timeout for a prompt turn, in `handle_session_prompt`.
+///
+/// Named rather than left inline because it is the effective ceiling on anything a turn waits for:
+/// the tunnel's own timeout has to stay strictly beneath it, and `[mcp] tunnel_timeout_seconds`
+/// documents itself against this value. As a bare literal in the middle of a loop it was invisible
+/// to exactly the person who needed it — the operator raising the tunnel timeout into it.
+///
+/// Not operator-configurable today. Anything set above it is silently capped here, which is why the
+/// config path warns rather than letting a larger value look effective.
+pub const ACP_PROMPT_IDLE_TIMEOUT_SECS: u64 = 180;
 /// Cap on `type:acp` servers a single session may declare (review R3-F1).
 ///
 /// Every declaration costs a spawned task, a pending `mcp/connect` holding a 30s timeout, and an
@@ -899,6 +909,7 @@ async fn establish_and_register_tunnel(
     timeout_secs: u64,
     owner: String,
     connection_generation: u64,
+    connection_closed: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), String> {
     // Observability: reaching here means the client DID declare a "type":"acp" server, so this
     // line in the log answers "did the browser extension advertise itself?" for a live session.
@@ -994,18 +1005,39 @@ async fn establish_and_register_tunnel(
         // peer. When it does, both establishes land on this one key, `same_name` never sees the
         // newer entry, and the older arrival would `insert` straight over a live handle. Ordering
         // has to hold per key, not just per declared name.
-        let superseded = reg
-            .get(&own_key)
-            .is_some_and(|h| h.generation > generation)
+        // The closed flag is read HERE, under the registry lock, because that is the only place it
+        // can be decisive. `abort()` cannot close this race: it takes effect at an await point and
+        // there is none between the handshake completing and the insert below, so on a
+        // multi-thread runtime this section runs concurrently with teardown's `retain`. The flag is
+        // set BEFORE that retain, so whichever takes the lock first the outcome is right — insert
+        // first and the retain removes it; retain first and we never insert at all. Without it a
+        // late establish drops a handle owned by a dead connection into an empty slot, where
+        // nothing will ever remove it.
+        // Ordering is LEXICOGRAPHIC on (connection age, attach order), and it has to be both.
+        //
+        // Attach order alone repeats the mistake the sweep already had to fix: it is stamped when an
+        // establish starts, so an older connection's LATE resume spawns an establish with a HIGHER
+        // number — precisely because it ran later — and then outranks the newer connection whose
+        // tunnel it must not take. Connection age is what says which declaration set is current.
+        //
+        // Attach order is still needed as the tiebreak: within ONE connection the ages are equal, and
+        // there last-attach-wins is exactly right.
+        let rank = (connection_generation, generation);
+        let superseded = connection_closed.load(std::sync::atomic::Ordering::Acquire)
             || reg
-                .iter()
-                .any(|((c, id), h)| same_name(c, id, h) && h.generation > generation);
+                .get(&own_key)
+                .is_some_and(|h| (h.connection_generation, h.generation) > rank)
+            || reg.iter().any(|((c, id), h)| {
+                same_name(c, id, h) && (h.connection_generation, h.generation) > rank
+            });
         if superseded {
             Registered::Superseded(handle)
         } else {
             let stale: Vec<(String, String)> = reg
                 .iter()
-                .filter(|((c, id), h)| same_name(c, id, h) && h.generation < generation)
+                .filter(|((c, id), h)| {
+                    same_name(c, id, h) && (h.connection_generation, h.generation) < rank
+                })
                 .map(|(k, _)| k.clone())
                 .collect();
             let mut replaced: Vec<TunnelHandle> =
@@ -1072,6 +1104,7 @@ fn spawn_acp_tunnels(
     establish_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
     owner: &str,
     connection_generation: u64,
+    connection_closed: &Arc<std::sync::atomic::AtomicBool>,
 ) {
     // Drop finished handles first so a long-lived connection does not accumulate them, then bound
     // what is still running. Over the cap the declaration is dropped with a warning rather than
@@ -1084,6 +1117,7 @@ fn spawn_acp_tunnels(
         let registry = registry.clone();
         let channel_id = channel_id.clone();
         let owner = owner.to_string();
+        let connection_closed = connection_closed.clone();
         if establish_tasks.len() >= MAX_INFLIGHT_ESTABLISHES {
             warn!(
                 max = MAX_INFLIGHT_ESTABLISHES,
@@ -1094,7 +1128,7 @@ fn spawn_acp_tunnels(
         establish_tasks.push(tokio::spawn(async move {
             if let Err(e) = establish_and_register_tunnel(
                 out_tx, pending, next_id, srv.id, srv.name, channel_id, registry, 30, owner,
-                connection_generation,
+                connection_generation, connection_closed,
             )
             .await
             {
@@ -1111,6 +1145,9 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
     // retire someone else's tunnel is decided by which CONNECTION is newer, so it has to be stamped
     // here — once, at accept — rather than per request.
     let connection_generation = TUNNEL_GENERATION.fetch_add(1, Ordering::Relaxed);
+    // Set once, at teardown, and read by in-flight establishes under the registry lock. See the
+    // check in `establish_and_register_tunnel` for why `abort()` cannot do this job.
+    let connection_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     info!(connection = %connection_id, "ACP client connected");
 
@@ -1351,6 +1388,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         &mut establish_tasks,
                         &connection_id,
                         connection_generation,
+                        &connection_closed,
                     );
                 }
             }
@@ -1412,11 +1450,25 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 // `session/new` has the same reading of absence, and D-06 treats a missing
                 // `protocolVersion` as fail-closed; absence should not be the most damaging
                 // interpretation here while it is the safest one there.
-                let declared_servers = req
-                    .params
-                    .as_ref()
-                    .and_then(|p| p.get("mcpServers"))
-                    .is_some();
+                // Only a real ARRAY withdraws. `is_some()` was wrong in the case this guard exists
+                // for: `null` is a third state, semantically next to absent, and it is the shape a
+                // serde `Option<Vec<_>>` without `skip_serializing_if` produces for a field the
+                // client left unset — so the most likely real wire form of "omitted" landed on the
+                // destructive side. `{}` and `"x"` were swept too, silently, because
+                // `parse_acp_mcp_servers` reads through `as_array()` and yields an empty list for
+                // anything that is not one. A malformed declaration must not be the most damaging
+                // reading available.
+                // One reachable way to arrive with an empty `keep` and a present key: the client
+                // declared only NON-`type:acp` servers. `parse_acp_mcp_servers` filters by type, so
+                // the list empties while the field itself is a perfectly good array. That withdraws
+                // every acp tunnel on the channel and is the CORRECT reading — the client
+                // re-presented its whole set and there is no acp server in it. Noted because it
+                // looks identical to a defect that was reported here and turned out to be
+                // unreachable.
+                let declared_servers = matches!(
+                    req.params.as_ref().and_then(|p| p.get("mcpServers")),
+                    Some(Value::Array(_))
+                );
                 if let (Some(registry), Some(channel_id)) =
                     (state.acp_tunnel_registry.clone(), resumed_channel.as_ref())
                 {
@@ -1480,6 +1532,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         &mut establish_tasks,
                         &connection_id,
                         connection_generation,
+                        &connection_closed,
                     );
                 }
             }
@@ -1605,6 +1658,10 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
     }
 
     // --- Disconnect cleanup ---
+    // Announce the close BEFORE anything is torn down. An establish that is past its last await
+    // point cannot be aborted, so the flag — not `abort()` — is what stops it installing a handle
+    // for a connection that no longer exists.
+    connection_closed.store(true, std::sync::atomic::Ordering::Release);
     // Abort any in-flight tasks to prevent registry leaks. Establishes are aborted too: a task
     // still waiting on `mcp/connect` would otherwise insert a handle into the registry AFTER the
     // teardown below has run, leaving a dead tunnel registered for a closed connection.
@@ -2015,7 +2072,7 @@ async fn handle_session_prompt(
 
     // Stream replies back as ACP `session/update` notifications.
     let mut sent_len = 0usize;
-    let timeout = tokio::time::Duration::from_secs(180);
+    let timeout = tokio::time::Duration::from_secs(ACP_PROMPT_IDLE_TIMEOUT_SECS);
     // Typed StopReason (T2.1) so the final PromptResponse is constructed from acp_schema.
     let mut stop_reason = crate::adapters::acp_schema::StopReason::EndTurn;
     let mut timed_out = false;
@@ -2763,6 +2820,85 @@ mod acp_requests {
         ext.await.unwrap();
     }
 
+    /// An establish that finishes after its connection closed must not register.
+    ///
+    /// The connection's tasks are aborted at teardown, but `abort()` only takes effect at an await
+    /// point and there is none between the inner handshake completing and the registry insert. On
+    /// a multi-thread runtime that section runs concurrently with teardown's `retain`, so a late
+    /// establish could drop a handle owned by a dead connection into a slot the retain had already
+    /// emptied — where nothing would ever remove it, because every cleanup path is scoped to a
+    /// connection that no longer exists.
+    ///
+    /// The generation stamp does NOT cover this: it can only lose to a handle that is still there,
+    /// and after teardown the slot is empty. Both Mira and I claimed otherwise; Orca showed the
+    /// empty-slot case, and this is the guard that closes it.
+    #[tokio::test]
+    async fn an_establish_that_finishes_after_teardown_does_not_register() {
+        let pending = new_pending();
+        let next_id = Arc::new(AtomicU64::new(1));
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        let registry = super::new_tunnel_registry();
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let pending2 = pending.clone();
+        let closed2 = closed.clone();
+        let ext = tokio::spawn(async move {
+            let f: serde_json::Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
+            route_client_response(
+                &pending2,
+                &json!({"jsonrpc":"2.0","id":f["id"],"result":{"connectionId":"conn-9"}}),
+            )
+            .await;
+            // Close BEFORE answering the handshake, not after. The establish cannot get past its
+            // handshake until this reply lands, so the flag is ordered by the reply channel itself
+            // rather than by timing. Setting it afterwards is a real race that the establish
+            // usually WINS — it goes straight from the handshake to the lock without waiting for
+            // this task, registers, sends no disconnect, and the `recv` below then blocks forever.
+            // The first version of this test did that and hung the whole suite.
+            closed2.store(true, std::sync::atomic::Ordering::Release);
+            answer_inner_handshake(&mut out_rx, &pending2).await;
+            // Bounded: a regression must fail, not hang. An unbounded `recv` turns "no disconnect
+            // was sent" into a stuck suite, which is strictly worse than a red test.
+            tokio::time::timeout(std::time::Duration::from_secs(10), out_rx.recv())
+                .await
+                .expect("timed out waiting for the mcp/disconnect a stood-down establish owes")
+        });
+
+        super::establish_and_register_tunnel(
+            out_tx,
+            pending,
+            next_id,
+            "srv-1".into(),
+            "browser".into(),
+            "acp_abc".into(),
+            registry.clone(),
+            5,
+            "conn-test".into(),
+            0,
+            closed,
+        )
+        .await
+        .unwrap();
+
+        // Registry first. With the guard removed the establish does NOT stand down — it registers —
+        // so awaiting the mock here would fail on "no disconnect from a stood-down establish",
+        // naming a thing that did not happen and costing a 10s timeout to say it. This ordering
+        // rule has now been needed three times in this file: run the assertion whose truth differs
+        // between fixed and broken FIRST, and it is not the same assertion in every test.
+        assert!(
+            registry.lock().unwrap().is_empty(),
+            "an establish registered a tunnel for a connection that had already closed — nothing \
+             else can remove it, because every cleanup path is scoped to that dead connection"
+        );
+        let disconnect = ext.await.unwrap();
+        let frame: serde_json::Value = serde_json::from_str(&disconnect.expect(
+            "the stood-down establish still owes its client an mcp/disconnect for the connection \
+             it opened",
+        ))
+        .unwrap();
+        assert_eq!(frame["method"], json!("mcp/disconnect"));
+    }
+
     #[tokio::test]
     async fn establish_tunnel_registers_handle_under_channel_and_server_id() {
         let pending = new_pending();
@@ -2792,6 +2928,7 @@ mod acp_requests {
             5,
             "conn-test".into(),
             0,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await
         .unwrap();
@@ -2837,6 +2974,7 @@ mod acp_requests {
             5,
             "conn-test".into(),
             0,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await
         .unwrap();
@@ -2902,6 +3040,7 @@ mod acp_requests {
             5,
             "conn-test".into(),
             0,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await
         .unwrap();
@@ -3170,6 +3309,7 @@ mod acp_review_fixes {
             &mut tasks,
             "conn-test",
             0,
+            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
 
         assert_eq!(tasks.len(), 2, "one task per unique declaration");
@@ -3924,6 +4064,107 @@ mod acp_ws_integration {
         }
     }
 
+    /// An older connection's late resume must not TAKE OVER a newer connection's tunnel either.
+    ///
+    /// The sibling test covers the sweep path, where the older resume withdraws what it never knew
+    /// about. This covers the establish path, which needed the same fix and did not get it: resume
+    /// re-spawns an establish for every declared server without checking whether that
+    /// `(channel, id)` is already live, and that establish is stamped when it STARTS — so the older
+    /// connection's late one carries the HIGHER attach number, for the same reason its resume ran
+    /// later. Ordering on attach alone therefore lets it replace the incumbent and disconnect a
+    /// connection that is newer than itself.
+    ///
+    /// The difference from the sibling is only which id the late resume names: there it declared
+    /// something the newer connection did not hold, so nothing collided. Here it declares exactly
+    /// what the newer connection holds, which is the case a stable-id client produces on every
+    /// reconnect.
+    #[tokio::test]
+    async fn an_older_connections_late_resume_does_not_take_over_a_newer_connections_tunnel() {
+        let (url, registry) = serve().await;
+
+        // Connection B (older) opens the session but establishes nothing yet.
+        let (mut b, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        send(&mut b, json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}}
+        })).await;
+        let _ = recv(&mut b).await;
+        send(&mut b, json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": {"cwd": "/w", "mcpServers": []}
+        })).await;
+        let session_id = loop {
+            let f = recv(&mut b).await;
+            if f.get("id") == Some(&json!(2)) {
+                break f["result"]["sessionId"].as_str().unwrap().to_string();
+            }
+        };
+
+        // Connection C (newer) resumes and establishes srv-1.
+        let (mut c, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        send(&mut c, json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}}
+        })).await;
+        let _ = recv(&mut c).await;
+        send(&mut c, json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/resume",
+            "params": {"sessionId": session_id.clone(), "cwd": "/w",
+                       "mcpServers": [{"type": "acp", "id": "srv-1", "name": "katashiro"}]}
+        })).await;
+        loop {
+            let f = recv(&mut c).await;
+            if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
+                send(&mut c, json!({
+                    "jsonrpc": "2.0", "id": f["id"].clone(),
+                    "result": {"connectionId": "conn-c"}
+                })).await;
+            } else if handled_inner_lifecycle(&mut c, &f).await == Some("initialize") {
+                break;
+            }
+        }
+        wait_for_tunnels(&registry, 1).await;
+
+        // The OLDER connection now resumes declaring THE SAME id, and answers its handshake fully.
+        send(&mut b, json!({
+            "jsonrpc": "2.0", "id": 9, "method": "session/resume",
+            "params": {"sessionId": session_id, "cwd": "/w",
+                       "mcpServers": [{"type": "acp", "id": "srv-1", "name": "katashiro"}]}
+        })).await;
+        let mut answered = false;
+        while !answered {
+            let f = recv(&mut b).await;
+            if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
+                send(&mut b, json!({
+                    "jsonrpc": "2.0", "id": f["id"].clone(),
+                    "result": {"connectionId": "conn-b"}
+                })).await;
+            } else if handled_inner_lifecycle(&mut b, &f).await == Some("initialize") {
+                answered = true;
+            }
+        }
+
+        // C must keep the slot: it is the newer connection. Before the fix B took it over and C was
+        // disconnected, so the discriminating check is that C — not B — is never told to disconnect.
+        let stolen = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let f = recv(&mut c).await;
+                if f.get("method").and_then(Value::as_str) == Some("mcp/disconnect") {
+                    return f["params"]["connectionId"].as_str().unwrap_or("?").to_string();
+                }
+            }
+        })
+        .await;
+        assert!(
+            stolen.is_err(),
+            "an older connection's late resume replaced a NEWER connection's live tunnel and \
+             disconnected it ({:?}) — the establish path orders by attach number alone, which the \
+             late resume wins precisely because it ran late",
+            stolen.ok()
+        );
+        assert_eq!(registry.lock().unwrap().len(), 1, "exactly one tunnel must hold the slot");
+    }
+
     /// An older connection's late resume must not retire a NEWER connection's tunnel.
     ///
     /// The withdrawn set is "registered under this channel, minus what the client just declared".
@@ -4026,6 +4267,22 @@ mod acp_ws_integration {
         let resumed = recv(&mut b).await;
         assert!(resumed.get("result").is_some(), "resume failed: {resumed}");
 
+        // The other shapes an "omitted" field takes on the wire, pinned as REJECTIONS rather than
+        // as sweeps. A serde `Option<Vec<_>>` without `skip_serializing_if` emits `null`, and a
+        // guard written as `is_some()` would accept that as a declaration with an empty list — but
+        // schema validation runs first and refuses anything that is not a sequence, so the
+        // destructive path is unreachable from the wire. This records that, because the guard below
+        // reads as if it were the only thing standing between `null` and a full sweep, and the next
+        // person to relax the schema needs the two facts in one place.
+        for shape in [json!(null), json!({}), json!("nonsense")] {
+            send(&mut b, json!({
+                "jsonrpc": "2.0", "id": 3, "method": "session/resume",
+                "params": {"sessionId": session_id, "cwd": "/w", "mcpServers": shape}
+            })).await;
+            let r = recv(&mut b).await;
+            assert!(r.get("result").is_some() || r.get("error").is_some(), "no reply: {r}");
+        }
+
         // The tunnel must stay. Poll, because a wrongful teardown is asynchronous.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
@@ -4039,7 +4296,18 @@ mod acp_ws_integration {
         }
     }
 
-    /// A resume that RE-DECLARES an already-registered id must leave that tunnel completely alone.
+    /// A resume that RE-DECLARES an already-registered id must not have that tunnel SWEPT.
+    ///
+    /// Scope deliberately narrow, because the system does not leave the tunnel alone: resume then
+    /// spawns an establish for every declared server without checking whether that
+    /// `(channel, id)` is already registered, so the re-declared one is replaced through the
+    /// own-key path and its predecessor is disconnected. The churn is real and is tracked
+    /// separately; what this test pins is only that the SWEEP does not take it.
+    ///
+    /// It is green for that reason and not because the tunnel survives end to end — the second
+    /// `mcp/connect` is never answered here, so the replacement cannot complete inside the window.
+    /// Worth stating plainly: withholding a trigger is exactly why the two tests this one was
+    /// written to supplement looked like they had coverage.
     ///
     /// This is what pins the withdrawn set to "registered MINUS declared". Both neighbouring
     /// withdrawal tests survive a mutation that simply sweeps the whole channel on every resume:

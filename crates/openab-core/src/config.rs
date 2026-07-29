@@ -90,13 +90,20 @@ pub struct McpFacadeConfig {
     ///
     /// Enforced server-side because on this tunnel OPENAB is the requester and the peer is a
     /// browser extension we neither ship nor control, so there is nobody else to bound it.
-    /// The default sits STRICTLY beneath the ACP per-chunk idle timeout (180s, hard-coded at
-    /// `acp_server.rs`), and the margin is the point. Setting the two equal makes which one fires
+    /// The default sits STRICTLY beneath the ACP per-chunk idle timeout in `handle_session_prompt`
+    /// (`ACP_PROMPT_IDLE_TIMEOUT_SECS`, 180s), and the margin is the point. Referenced by name, not
+    /// by line: the same claim was written as a line number twice and was wrong both times, because
+    /// every edit above it moves the target. Setting the two equal makes which one fires
     /// first undecidable at the boundary, and they do different things: only when this one wins
     /// does the peer receive `mcp/cancel` and the caller see a timeout error. If the idle timeout
     /// wins the turn simply ends, which leaves exactly the stranded work on the extension that
-    /// cancellation exists to prevent. Raising this past the idle timeout moves the wall rather
-    /// than removing it — raise both, in that order.
+    /// cancellation exists to prevent.
+    ///
+    /// **180s is therefore the effective ceiling.** A larger value here is not an error and is not
+    /// clamped, but it cannot take effect: the idle timeout is not operator-configurable, so the turn
+    /// ends there first and this setting stops mattering. Startup warns when it is set that high
+    /// rather than letting the number look effective. Earlier wording said to "raise both, in that
+    /// order" — there is no second knob to raise, so that instruction could not be followed.
     #[serde(default = "default_tunnel_timeout_seconds")]
     pub tunnel_timeout_seconds: u64,
 }

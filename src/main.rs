@@ -466,10 +466,27 @@ async fn main() -> anyhow::Result<()> {
             acp_tunnel_registry.clone(),
             // Browser control requires `[mcp]`, so the absent case is unreachable in practice;
             // fall back through the SAME function serde uses rather than repeating the literal.
-            cfg.mcp
-                .as_ref()
-                .map(|m| m.tunnel_timeout_seconds)
-                .unwrap_or_else(openab_core::config::default_tunnel_timeout_seconds),
+            {
+                let t = cfg
+                    .mcp
+                    .as_ref()
+                    .map(|m| m.tunnel_timeout_seconds)
+                    .unwrap_or_else(openab_core::config::default_tunnel_timeout_seconds);
+                // Say so rather than let a larger number look effective. The prompt turn's idle
+                // timeout is not operator-configurable, so anything at or above it is overtaken
+                // there and this setting stops deciding the outcome — silence would leave the
+                // operator believing a value that cannot apply.
+                let ceiling = openab_gateway::adapters::acp_server::ACP_PROMPT_IDLE_TIMEOUT_SECS;
+                if t >= ceiling {
+                    tracing::warn!(
+                        configured = t, effective_ceiling = ceiling,
+                        "[mcp] tunnel_timeout_seconds is at or above the ACP prompt idle timeout, \
+                         which is not configurable — the turn ends there first, so this value \
+                         cannot take effect"
+                    );
+                }
+                t
+            },
         ),
     );
 
