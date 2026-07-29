@@ -3182,3 +3182,256 @@ mod acp_review_fixes {
         );
     }
 }
+
+/// End-to-end tests over the **real** `/acp` WebSocket route.
+///
+/// Every other test in this file calls the handlers directly with hand-built structures, so
+/// nothing had ever exercised the axum route, the upgrade, the frame codec, or the request/reply
+/// correlation across an actual socket. A reviewer raised exactly that: the tunnel was asserted
+/// by construction rather than observed working. These bind a real listener and drive it with a
+/// scripted `tokio-tungstenite` client — no browser, no model.
+#[cfg(test)]
+mod acp_ws_integration {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    /// Serve `/acp` on an ephemeral loopback port. Returns the URL and the tunnel registry, so a
+    /// test can drive the server side the way core does.
+    async fn serve() -> (String, AcpTunnelRegistry) {
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        let mut state = crate::AppState::test_default(tx);
+        state.acp = Some(AcpConfig {
+            // Keyless loopback: no bearer. A client sending no `Origin` is accepted, which is
+            // what a non-browser client (this test, and the real extension's native host) is.
+            auth_key: None,
+            allowed_origins: vec![],
+        });
+        state.acp_reply_registry = Some(new_reply_registry());
+        let registry = new_tunnel_registry();
+        state.acp_tunnel_registry = Some(registry.clone());
+
+        let app = axum::Router::new()
+            .route("/acp", axum::routing::get(ws_upgrade))
+            .with_state(std::sync::Arc::new(state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("ws://{addr}/acp"), registry)
+    }
+
+    type Ws = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn send(ws: &mut Ws, v: Value) {
+        ws.send(WsMessage::Text(v.to_string())).await.unwrap();
+    }
+
+    /// Next JSON frame from the server, skipping anything that is not text (pings etc).
+    async fn recv(ws: &mut Ws) -> Value {
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+                .await
+                .expect("timed out waiting for a server frame")
+                .expect("socket closed")
+                .unwrap()
+            {
+                WsMessage::Text(t) => return serde_json::from_str(&t).unwrap(),
+                WsMessage::Close(_) => panic!("server closed the socket"),
+                _ => continue,
+            }
+        }
+    }
+
+    /// Drive `initialize` + `session/new` declaring one `type:acp` server, then answer the
+    /// `mcp/connect` the gateway sends back. Returns the session id.
+    async fn handshake(ws: &mut Ws, acp_id: &str, name: &str, connection_id: &str) -> String {
+        send(ws, json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}}
+        })).await;
+        let init = recv(ws).await;
+        assert!(init.get("result").is_some(), "initialize failed: {init}");
+
+        send(ws, json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": {
+                "cwd": "/w",
+                "mcpServers": [{"type": "acp", "id": acp_id, "name": name}]
+            }
+        })).await;
+
+        // The gateway now does two things concurrently: answer session/new, and open the tunnel
+        // by sending mcp/connect. Order is not guaranteed, so accept either first.
+        let mut session_id = None;
+        let mut connected = false;
+        while session_id.is_none() || !connected {
+            let frame = recv(ws).await;
+            if frame.get("method").and_then(Value::as_str) == Some("mcp/connect") {
+                assert_eq!(
+                    frame["params"]["acpId"], json!(acp_id),
+                    "mcp/connect must name the declared id"
+                );
+                send(ws, json!({
+                    "jsonrpc": "2.0", "id": frame["id"].clone(),
+                    "result": {"connectionId": connection_id}
+                })).await;
+                connected = true;
+            } else if frame.get("id") == Some(&json!(2)) {
+                session_id = Some(
+                    frame["result"]["sessionId"].as_str().expect("sessionId").to_string(),
+                );
+            }
+        }
+        session_id.unwrap()
+    }
+
+    /// Wait until `n` tunnels are registered.
+    ///
+    /// Registration happens *after* the client answers `mcp/connect` — the establishing task still
+    /// has to build the handle and take the registry lock — so reading the registry straight after
+    /// replying is a race. Polling the real condition is honest; sleeping a fixed interval and
+    /// hoping would make this test flaky on a loaded machine.
+    async fn wait_for_tunnels(registry: &AcpTunnelRegistry, n: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let len = registry.lock().unwrap().len();
+            if len == n {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expected {n} tunnel(s) registered, still {len} after 5s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A real `mcp/message` crosses the socket and its result comes back to the caller.
+    #[tokio::test]
+    async fn a_tool_call_crosses_the_real_socket_and_returns_its_result() {
+        let (url, registry) = serve().await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        handshake(&mut ws, "uuid-1", "katashiro", "conn-1").await;
+        wait_for_tunnels(&registry, 1).await;
+
+        // Server side, exactly as core reaches a session's tunnel.
+        let handle = {
+            let reg = registry.lock().unwrap();
+            reg.values().next().expect("a tunnel must be registered").clone()
+        };
+        let call = tokio::spawn(async move {
+            handle.mcp_message("tools/call", Some(json!({"name": "katashiro.click"})), 5).await
+        });
+
+        let framed = recv(&mut ws).await;
+        assert_eq!(framed["method"], json!("mcp/message"));
+        assert_eq!(framed["params"]["connectionId"], json!("conn-1"));
+        assert_eq!(framed["params"]["method"], json!("tools/call"));
+        assert_eq!(framed["params"]["params"]["name"], json!("katashiro.click"));
+
+        send(&mut ws, json!({
+            "jsonrpc": "2.0", "id": framed["id"].clone(),
+            "result": {"content": [{"type": "text", "text": "clicked"}]}
+        })).await;
+
+        let got = call.await.unwrap().expect("the call must succeed");
+        assert_eq!(got["content"][0]["text"], json!("clicked"));
+    }
+
+    /// The error half: a JSON-RPC error from the client surfaces as `Err`, not as a null result.
+    /// Asserting only the happy path would let a handler that swallows errors pass.
+    #[tokio::test]
+    async fn an_error_from_the_client_surfaces_as_an_error_not_an_empty_result() {
+        let (url, registry) = serve().await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        handshake(&mut ws, "uuid-2", "katashiro", "conn-2").await;
+        wait_for_tunnels(&registry, 1).await;
+
+        let handle = {
+            let reg = registry.lock().unwrap();
+            reg.values().next().unwrap().clone()
+        };
+        let call = tokio::spawn(async move { handle.mcp_message("tools/call", None, 5).await });
+
+        let framed = recv(&mut ws).await;
+        send(&mut ws, json!({
+            "jsonrpc": "2.0", "id": framed["id"].clone(),
+            "error": {"code": -32603, "message": "no active tab"}
+        })).await;
+
+        let err = call.await.unwrap().expect_err("a remote error must not read as success");
+        assert!(
+            err.contains("no active tab"),
+            "the client's message must reach the caller, got: {err}"
+        );
+    }
+
+    /// A reconnect that **resumes** the same session re-declares the same NAME with a fresh id.
+    /// That evicts the stale tunnel, and the client is owed an `mcp/disconnect` for the connection
+    /// it still believes is open (review R7).
+    ///
+    /// It has to be a resume, not a second `session/new`: eviction is scoped to one `channel_id`
+    /// (`c == &channel_id` in `establish_and_register_tunnel`), and a new session is a new channel,
+    /// so two independent sessions declaring the same name do not collide and must not evict each
+    /// other. Writing this as two `session/new` calls asserts nothing.
+    #[tokio::test]
+    async fn a_resume_replacing_a_same_name_tunnel_disconnects_the_one_it_replaced() {
+        let (url, registry) = serve().await;
+        let (mut first, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let session_id = handshake(&mut first, "uuid-old", "katashiro", "conn-old").await;
+        wait_for_tunnels(&registry, 1).await;
+
+        // The client comes back on a fresh socket and resumes, re-declaring under the same name
+        // with the fresh id its runtime mints per connection.
+        let (mut second, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        send(&mut second, json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}}
+        })).await;
+        let _ = recv(&mut second).await;
+        send(&mut second, json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/resume",
+            "params": {
+                "sessionId": session_id,
+                "cwd": "/w",
+                "mcpServers": [{"type": "acp", "id": "uuid-new", "name": "katashiro"}]
+            }
+        })).await;
+        loop {
+            let frame = recv(&mut second).await;
+            if frame.get("method").and_then(Value::as_str) == Some("mcp/connect") {
+                send(&mut second, json!({
+                    "jsonrpc": "2.0", "id": frame["id"].clone(),
+                    "result": {"connectionId": "conn-new"}
+                })).await;
+                break;
+            }
+            if frame.get("id") == Some(&json!(2)) {
+                assert!(
+                    frame.get("result").is_some(),
+                    "session/resume was refused, so no tunnel is opened: {frame}"
+                );
+            }
+        }
+
+        // The disconnect must name the REPLACED connection. Without this assertion an
+        // implementation that disconnected the newly registered tunnel would pass too.
+        let framed = recv(&mut first).await;
+        assert_eq!(framed["method"], json!("mcp/disconnect"));
+        assert_eq!(
+            framed["params"]["connectionId"], json!("conn-old"),
+            "the evicted connection is the one owed a disconnect, not its replacement"
+        );
+
+        // And the survivor is the new one.
+        let names: Vec<String> = {
+            let reg = registry.lock().unwrap();
+            reg.values().map(|h| h.connection_id.clone()).collect()
+        };
+        assert_eq!(names, vec!["conn-new".to_string()], "only the newest tunnel may remain");
+    }
+}
