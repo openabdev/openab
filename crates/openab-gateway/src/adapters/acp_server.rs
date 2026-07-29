@@ -64,8 +64,18 @@ pub const ACP_PROMPT_IDLE_TIMEOUT_SECS: u64 = 180;
 /// configurable there is one place to edit instead of two. This is a relocation of the invariant, not
 /// a removal of coupling: the value still has to be handed in, because this crate never sees the
 /// config.
+/// Whether a configured tunnel timeout is overtaken by the idle timeout, and so cannot decide the
+/// outcome.
+///
+/// Split out from the warning so the boundary is testable without capturing log output: the
+/// interesting part is one comparison, and an inverted `>=` would be silent in exactly the case it
+/// exists to report.
+pub fn tunnel_timeout_is_ineffective(configured_secs: u64) -> bool {
+    configured_secs >= ACP_PROMPT_IDLE_TIMEOUT_SECS
+}
+
 pub fn warn_if_tunnel_timeout_is_ineffective(configured_secs: u64) {
-    if configured_secs >= ACP_PROMPT_IDLE_TIMEOUT_SECS {
+    if tunnel_timeout_is_ineffective(configured_secs) {
         warn!(
             configured = configured_secs,
             effective_ceiling = ACP_PROMPT_IDLE_TIMEOUT_SECS,
@@ -2852,6 +2862,28 @@ mod acp_requests {
         ext.await.unwrap();
     }
 
+    /// The ineffective-timeout boundary is inclusive on the ceiling.
+    ///
+    /// Equal is the case that matters and the one an inverted comparison would drop: at exactly the
+    /// idle timeout the two clocks start together and which fires first is undecided, so the value
+    /// cannot be relied on to decide anything — that is the whole reason the margin exists.
+    #[test]
+    fn a_tunnel_timeout_at_or_above_the_idle_timeout_is_ineffective() {
+        let ceiling = super::ACP_PROMPT_IDLE_TIMEOUT_SECS;
+        assert!(
+            super::tunnel_timeout_is_ineffective(ceiling),
+            "equal to the ceiling must count as ineffective: the two clocks start together, so \
+             neither reliably wins"
+        );
+        assert!(super::tunnel_timeout_is_ineffective(ceiling + 1));
+        assert!(
+            !super::tunnel_timeout_is_ineffective(ceiling - 1),
+            "one second beneath the ceiling is the intended configuration, not a warning"
+        );
+        // The shipped default cannot be checked here: this crate does not depend on the one that
+        // owns it. That pairing is asserted in the binary, which is the only place both are visible.
+    }
+
     /// An establish that finishes after its connection closed must not register.
     ///
     /// The connection's tasks are aborted at teardown, but `abort()` only takes effect at an await
@@ -4203,6 +4235,104 @@ mod acp_ws_integration {
                 "expected only the newer connection's tunnel, got {ids:?} — the incumbent was older \
                  by connection but later by attach, and attach order alone reads that as 'not older' \
                  and refuses to evict it"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Within ONE connection, the later establish still wins — the attach tiebreak is load-bearing.
+    ///
+    /// Every other ordering test here is cross-connection, so all of them survive dropping the second
+    /// half of `(connection age, attach order)` and comparing only age: their connection ages already
+    /// give the right answer. What no other test reaches is two establishes on the SAME connection,
+    /// where the ages are equal and attach order is the only thing left to decide with. Compare age
+    /// alone and a late-finishing older establish is neither superseded nor blocked, so it evicts the
+    /// successor that already registered and installs the stale tunnel over it.
+    ///
+    /// Deterministic without racing two spawns: the first establish is parked by withholding its
+    /// `mcp/connect` answer, the second is driven to completion, and only then is the first released.
+    /// Which one started earlier is fixed by the order the resumes were sent.
+    #[tokio::test]
+    async fn within_one_connection_a_late_finishing_older_establish_loses_to_its_successor() {
+        let (url, registry) = serve().await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        send(&mut ws, json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}}
+        })).await;
+        let _ = recv(&mut ws).await;
+        send(&mut ws, json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": {"cwd": "/w", "mcpServers": []}
+        })).await;
+        let session_id = loop {
+            let f = recv(&mut ws).await;
+            if f.get("id") == Some(&json!(2)) {
+                break f["result"]["sessionId"].as_str().unwrap().to_string();
+            }
+        };
+
+        // First resume: declare srv-1 and PARK it — its `mcp/connect` is captured, not answered, so
+        // it holds the lower attach number while making no progress.
+        send(&mut ws, json!({
+            "jsonrpc": "2.0", "id": 3, "method": "session/resume",
+            "params": {"sessionId": session_id.clone(), "cwd": "/w",
+                       "mcpServers": [{"type": "acp", "id": "srv-1", "name": "katashiro"}]}
+        })).await;
+        let parked_connect_id = loop {
+            let f = recv(&mut ws).await;
+            if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
+                assert_eq!(f["params"]["acpId"], json!("srv-1"));
+                break f["id"].clone();
+            }
+        };
+
+        // Second resume on the SAME connection: same name, new id, driven to completion.
+        send(&mut ws, json!({
+            "jsonrpc": "2.0", "id": 4, "method": "session/resume",
+            "params": {"sessionId": session_id, "cwd": "/w",
+                       "mcpServers": [{"type": "acp", "id": "srv-2", "name": "katashiro"}]}
+        })).await;
+        let mut registered = false;
+        while !registered {
+            let f = recv(&mut ws).await;
+            if f.get("method").and_then(Value::as_str) == Some("mcp/connect")
+                && f["params"]["acpId"] == json!("srv-2")
+            {
+                send(&mut ws, json!({
+                    "jsonrpc": "2.0", "id": f["id"].clone(),
+                    "result": {"connectionId": "conn-2"}
+                })).await;
+            } else if handled_inner_lifecycle(&mut ws, &f).await == Some("initialize") {
+                registered = true;
+            }
+        }
+        wait_for_tunnels(&registry, 1).await;
+
+        // Now release the parked, EARLIER establish.
+        send(&mut ws, json!({
+            "jsonrpc": "2.0", "id": parked_connect_id,
+            "result": {"connectionId": "conn-1"}
+        })).await;
+        loop {
+            let f = recv(&mut ws).await;
+            if handled_inner_lifecycle(&mut ws, &f).await == Some("initialize") {
+                break;
+            }
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let ids: Vec<String> = {
+                let reg = registry.lock().unwrap();
+                reg.keys().map(|(_, id)| id.clone()).collect()
+            };
+            assert_eq!(
+                ids,
+                vec!["srv-2".to_string()],
+                "the earlier establish finished last and took the name back ({ids:?}) — within one \
+                 connection the ages are equal, so attach order is the only thing that can decide, \
+                 and dropping it lets a stale tunnel replace its own successor"
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
