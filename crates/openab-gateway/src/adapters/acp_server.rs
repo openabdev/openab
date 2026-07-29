@@ -786,6 +786,59 @@ impl TunnelHandle {
 /// the client's response, which only that same read loop can deliver — awaiting it inline
 /// would deadlock.
 #[allow(dead_code)]
+/// MCP protocol version the gateway speaks to a tunnelled client MCP server.
+const INNER_MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// Perform the inner MCP handshake on a freshly connected tunnel.
+///
+/// MCP requires `initialize` → response → `notifications/initialized` before any other request. We
+/// were sending `tools/list` and `tools/call` straight after `mcp/connect`, which happens to work
+/// against today's single extension because it is lenient. That is not a defence: the deliverable
+/// is *generic* client-declared MCP servers, and a standards-compliant server is entitled to
+/// reject — or simply not answer — anything that arrives before it has been initialized.
+///
+/// Failure here fails the establish, so a server that cannot complete the handshake never reaches
+/// the registry: better no tunnel than one whose first real call is rejected for a reason the
+/// operator cannot see.
+async fn inner_mcp_handshake(
+    out_tx: &mpsc::UnboundedSender<String>,
+    pending: &Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    next_id: &AtomicU64,
+    connection_id: &str,
+    timeout_secs: u64,
+) -> Result<(), String> {
+    let init = serde_json::to_value(McpMessageParams {
+        connection_id: connection_id.to_string(),
+        method: "initialize".to_string(),
+        params: Some(json!({
+            "protocolVersion": INNER_MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": { "name": "openab-gateway", "version": env!("CARGO_PKG_VERSION") }
+        })),
+    })
+    .map_err(|e| e.to_string())?;
+    let frame = send_request(out_tx, pending, next_id, "mcp/message", init, timeout_secs).await?;
+    frame_result(frame)?;
+
+    // `notifications/initialized` is a notification in both directions: an inner MCP notification,
+    // carried by an outer frame with no `id`, so nothing is awaited and no reply is owed.
+    let initialized = serde_json::to_value(McpMessageParams {
+        connection_id: connection_id.to_string(),
+        method: "notifications/initialized".to_string(),
+        params: None,
+    })
+    .map_err(|e| e.to_string())?;
+    let notification = json!({
+        "jsonrpc": "2.0",
+        "method": "mcp/message",
+        "params": initialized,
+    });
+    out_tx
+        .send(notification.to_string())
+        .map_err(|_| "connection closed before notifications/initialized".to_string())?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn establish_and_register_tunnel(
     out_tx: mpsc::UnboundedSender<String>,
@@ -802,6 +855,8 @@ async fn establish_and_register_tunnel(
     // line in the log answers "did the browser extension advertise itself?" for a live session.
     info!(acp_id = %acp_id, acp_name = %acp_name, channel = %redact_id(&channel_id), "ACP: opening MCP-over-ACP tunnel");
     let connection_id = mcp_connect(&out_tx, &pending, &next_id, &acp_id, timeout_secs).await?;
+    // MCP lifecycle before the tunnel is usable — see `inner_mcp_handshake`.
+    inner_mcp_handshake(&out_tx, &pending, &next_id, &connection_id, timeout_secs).await?;
     let handle = TunnelHandle {
         out_tx,
         pending,
@@ -2372,6 +2427,32 @@ mod acp_requests {
     use std::sync::Arc;
     use tokio::sync::{mpsc, oneshot};
 
+    /// Answer the inner MCP `initialize` that `establish_and_register_tunnel` now sends after
+    /// `mcp/connect`, and swallow the `notifications/initialized` that follows.
+    ///
+    /// A mock extension that answers only `mcp/connect` leaves the establish waiting on the
+    /// handshake, so it never registers — surfacing as "no handle in the registry", which says
+    /// nothing about the handshake. Every mock driving a real establish needs this.
+    async fn answer_inner_handshake(
+        out_rx: &mut mpsc::UnboundedReceiver<String>,
+        pending: &Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>,
+    ) {
+        let f: serde_json::Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(f["params"]["method"], json!("initialize"), "expected the inner MCP initialize");
+        route_client_response(
+            pending,
+            &json!({"jsonrpc":"2.0","id":f["id"],"result":{
+                "protocolVersion":"2025-06-18","capabilities":{"tools":{}},
+                "serverInfo":{"name":"test-ext","version":"0"}
+            }}),
+        )
+        .await;
+        // The notification owes no reply, but it must come off the channel so a later
+        // `out_rx.recv()` does not mistake it for the frame the test is waiting for.
+        let n: serde_json::Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(n["params"]["method"], json!("notifications/initialized"));
+    }
+
     fn new_pending(
     ) -> Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>> {
         Arc::new(tokio::sync::Mutex::new(HashMap::new()))
@@ -2538,6 +2619,7 @@ mod acp_requests {
             assert_eq!(f["params"]["acpId"], json!("srv-1"));
             route_client_response(&pending2, &json!({"jsonrpc":"2.0","id":f["id"],"result":{"connectionId":"conn-9"}}))
                 .await;
+            answer_inner_handshake(&mut out_rx, &pending2).await;
         });
 
         super::establish_and_register_tunnel(
@@ -2582,6 +2664,7 @@ mod acp_requests {
                 &json!({"jsonrpc":"2.0","id":f["id"],"result":{"connectionId":"conn-1"}}),
             )
             .await;
+            answer_inner_handshake(&mut out_rx, &pending2).await;
         });
         super::establish_and_register_tunnel(
             out_tx,
@@ -2644,6 +2727,7 @@ mod acp_requests {
                 &json!({"jsonrpc":"2.0","id":f["id"],"result":{"connectionId":"conn-old"}}),
             )
             .await;
+            answer_inner_handshake(&mut out_rx, &pending2).await;
             out_rx // hand the receiver back so the test can keep reading it
         });
         super::establish_and_register_tunnel(
@@ -3392,9 +3476,15 @@ mod acp_ws_integration {
     }
 
     /// Next JSON frame from the server, skipping anything that is not text (pings etc).
+    ///
+    /// The timeout guards against a hang, so it should be generous rather than tight: it is not
+    /// measuring anything. At 5s it produced two transient failures when these WebSocket tests ran
+    /// alongside the rest of the suite — a budget that depends on machine load is a flaky test, and
+    /// a flaky test in a security-adjacent area is worse than none, because the next person learns
+    /// to re-run it.
     async fn recv(ws: &mut Ws) -> Value {
         loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+            match tokio::time::timeout(std::time::Duration::from_secs(30), ws.next())
                 .await
                 .expect("timed out waiting for a server frame")
                 .expect("socket closed")
@@ -3404,6 +3494,39 @@ mod acp_ws_integration {
                 WsMessage::Close(_) => panic!("server closed the socket"),
                 _ => continue,
             }
+        }
+    }
+
+    /// Handle a frame belonging to the inner MCP lifecycle, if it is one.
+    ///
+    /// Returns `Some("initialize")` after answering the request, `Some("initialized")` after
+    /// consuming the notification that follows it, `None` for anything else.
+    ///
+    /// Deliberately a classifier, not a loop. The first version looped on `recv` until it saw the
+    /// initialize and dropped everything else on the way — including the `session/new` response
+    /// its caller was still waiting for, which hung. A helper that eats frames its caller needs is
+    /// worse than no helper: every call site is already a dispatch loop, so this handles one frame
+    /// and hands the rest back.
+    async fn handled_inner_lifecycle(ws: &mut Ws, frame: &Value) -> Option<&'static str> {
+        if frame.get("method").and_then(Value::as_str) != Some("mcp/message") {
+            return None;
+        }
+        match frame["params"]["method"].as_str() {
+            Some("initialize") => {
+                send(ws, json!({
+                    "jsonrpc": "2.0", "id": frame["id"].clone(),
+                    "result": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": { "tools": {} },
+                        "serverInfo": { "name": "test-ext", "version": "0" }
+                    }
+                })).await;
+                Some("initialize")
+            }
+            // A notification: no reply is owed, but it must still be taken off the socket or the
+            // next `recv` in a test mistakes it for the frame it was waiting for.
+            Some("notifications/initialized") => Some("initialized"),
+            _ => None,
         }
     }
 
@@ -3427,10 +3550,20 @@ mod acp_ws_integration {
 
         // The gateway now does two things concurrently: answer session/new, and open the tunnel
         // by sending mcp/connect. Order is not guaranteed, so accept either first.
+        // Three things must land before this returns, and the third is easy to forget: the
+        // gateway registers the tunnel only after the inner MCP handshake completes, so returning
+        // once `mcp/connect` is answered leaves the `initialize` unread in the socket. Nobody is
+        // polling the socket after that, the gateway times out, and the establish fails — which
+        // shows up as "no tunnel registered" rather than anything about initialize.
         let mut session_id = None;
         let mut connected = false;
-        while session_id.is_none() || !connected {
+        let mut lifecycle = 0;
+        while session_id.is_none() || !connected || lifecycle < 2 {
             let frame = recv(ws).await;
+            if handled_inner_lifecycle(ws, &frame).await.is_some() {
+                lifecycle += 1;
+                continue;
+            }
             if frame.get("method").and_then(Value::as_str) == Some("mcp/connect") {
                 assert_eq!(
                     frame["params"]["acpId"], json!(acp_id),
@@ -3469,6 +3602,87 @@ mod acp_ws_integration {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// The tunnel is not usable until the inner MCP lifecycle has completed.
+    ///
+    /// MCP requires `initialize` → response → `notifications/initialized` before any other
+    /// request. Driven over the socket because the ordering is the whole assertion: a unit test of
+    /// the handshake function could confirm it sends the right frames while saying nothing about
+    /// whether `tools/list` can still arrive first.
+    #[tokio::test]
+    async fn the_inner_mcp_lifecycle_completes_before_the_tunnel_is_registered() {
+        let (url, registry) = serve().await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        send(&mut ws, json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}}
+        })).await;
+        let _ = recv(&mut ws).await;
+        send(&mut ws, json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": {"cwd": "/w", "mcpServers": [{"type": "acp", "id": "srv-1", "name": "katashiro"}]}
+        })).await;
+
+        // Bounded explicitly, with its own message. Letting the generic `recv` timeout catch a
+        // missing lifecycle works, but it costs 30s and reports "timed out waiting for a server
+        // frame" — which names the harness rather than the regression. A test that catches a bug
+        // should also say which bug.
+        let collect = async {
+            let mut order: Vec<String> = Vec::new();
+        let mut connected = false;
+        let mut lifecycle = 0;
+        while !connected || lifecycle < 2 {
+            let f = recv(&mut ws).await;
+            if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
+                order.push("mcp/connect".into());
+                send(&mut ws, json!({
+                    "jsonrpc": "2.0", "id": f["id"].clone(),
+                    "result": {"connectionId": "conn-1"}
+                })).await;
+                connected = true;
+            } else if f.get("method").and_then(Value::as_str) == Some("mcp/message") {
+                let inner = f["params"]["method"].as_str().unwrap_or("").to_string();
+                order.push(inner.clone());
+                if inner == "initialize" {
+                    // The registry must still be empty: a server that has not answered
+                    // `initialize` has not agreed to serve anything yet.
+                    assert!(
+                        registry.lock().unwrap().is_empty(),
+                        "the tunnel was registered before the MCP handshake completed"
+                    );
+                    send(&mut ws, json!({
+                        "jsonrpc": "2.0", "id": f["id"].clone(),
+                        "result": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": { "tools": {} },
+                            "serverInfo": { "name": "test-ext", "version": "0" }
+                        }
+                    })).await;
+                }
+                lifecycle += 1;
+            }
+        }
+        order
+        };
+        let order = tokio::time::timeout(std::time::Duration::from_secs(10), collect)
+            .await
+            .expect(
+                "no inner MCP lifecycle on the tunnel: the gateway connected but never sent \
+                 `initialize`, so a standards-compliant client MCP server would be asked for tools \
+                 before it had been initialized",
+            );
+
+        assert_eq!(
+            order,
+            vec![
+                "mcp/connect".to_string(),
+                "initialize".to_string(),
+                "notifications/initialized".to_string()
+            ],
+            "the gateway must connect, then initialize, then notify — in that order"
+        );
+        wait_for_tunnels(&registry, 1).await;
     }
 
     /// A real `mcp/message` crosses the socket and its result comes back to the caller.
@@ -3643,10 +3857,17 @@ mod acp_ws_integration {
                 {"type": "acp", "id": "drop-1", "name": "other"}
             ]}
         })).await;
+        // Two servers: two `mcp/connect`s AND two lifecycle pairs (initialize + notification).
+        // Exiting on the connects alone leaves the handshakes unread and both establishes fail.
         let mut session_id = None;
         let mut connects = 0;
-        while session_id.is_none() || connects < 2 {
+        let mut lifecycle = 0;
+        while session_id.is_none() || connects < 2 || lifecycle < 4 {
             let f = recv(&mut ws).await;
+            if handled_inner_lifecycle(&mut ws, &f).await.is_some() {
+                lifecycle += 1;
+                continue;
+            }
             if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
                 let acp_id = f["params"]["acpId"].as_str().unwrap().to_string();
                 send(&mut ws, json!({
@@ -3677,8 +3898,13 @@ mod acp_ws_integration {
         // Asserting on whichever arrives first tests the scheduler, not the behaviour.
         let mut disconnected: Vec<String> = Vec::new();
         let mut reconnected = false;
-        while disconnected.len() < 2 || !reconnected {
+        let mut relifecycle = 0;
+        while disconnected.len() < 2 || !reconnected || relifecycle < 2 {
             let f = recv(&mut ws).await;
+            if handled_inner_lifecycle(&mut ws, &f).await.is_some() {
+                relifecycle += 1;
+                continue;
+            }
             match f.get("method").and_then(Value::as_str) {
                 Some("mcp/disconnect") => {
                     disconnected.push(f["params"]["connectionId"].as_str().unwrap().to_string());
@@ -3745,14 +3971,20 @@ mod acp_ws_integration {
                 "mcpServers": [{"type": "acp", "id": "uuid-new", "name": "katashiro"}]
             }
         })).await;
-        loop {
+        let mut connected_new = false;
+        let mut new_lifecycle = 0;
+        while !connected_new || new_lifecycle < 2 {
             let frame = recv(&mut second).await;
+            if handled_inner_lifecycle(&mut second, &frame).await.is_some() {
+                new_lifecycle += 1;
+                continue;
+            }
             if frame.get("method").and_then(Value::as_str) == Some("mcp/connect") {
                 send(&mut second, json!({
                     "jsonrpc": "2.0", "id": frame["id"].clone(),
                     "result": {"connectionId": "conn-new"}
                 })).await;
-                break;
+                connected_new = true;
             }
             if frame.get("id") == Some(&json!(2)) {
                 assert!(
