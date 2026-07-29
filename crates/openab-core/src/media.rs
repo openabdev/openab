@@ -527,6 +527,8 @@ pub const AUDIO_NO_URL_NOTE: &str =
 pub enum AudioStoreError {
     /// Larger than the configured `max_file_size`, so no upload was attempted.
     TooLarge,
+    /// The platform did not hand over the bytes, so there was nothing to upload.
+    DownloadFailed,
     /// The upload or the presign did not complete.
     UploadFailed,
 }
@@ -571,6 +573,10 @@ pub fn audio_blocks_for(
         AudioOutcome::StoreFailed(AudioStoreError::TooLarge) => (
             None,
             Some("exceeds the configured upload limit and could not be stored, so there is no fetchable URL"),
+        ),
+        AudioOutcome::StoreFailed(AudioStoreError::DownloadFailed) => (
+            None,
+            Some("the platform did not return this attachment's bytes, so there is no fetchable URL"),
         ),
         AudioOutcome::StoreFailed(AudioStoreError::UploadFailed) => (
             None,
@@ -1140,7 +1146,7 @@ pub async fn download_and_upload_any_file(
             tracing::info!(filename, mime, size = actual_bytes, "file uploaded to filestore (any-file path)");
             Some((ContentBlock::Text { text: hint }, 0))
         }
-        Err(PresignError::Unavailable) => None,
+        Err(PresignError::TooLarge | PresignError::DownloadFailed) => None,
         Err(PresignError::UploadFailed) => {
             let size_kb = size / 1024;
             let hint = format!(
@@ -1166,8 +1172,10 @@ pub async fn download_and_upload_any_file(
 /// messages while URL-only callers can collapse every failure to a fallback.
 #[cfg(feature = "filestore")]
 enum PresignError {
-    /// Nothing was uploaded (size cap or download failure).
-    Unavailable,
+    /// Refused before any request, because the reported size exceeds the cap.
+    TooLarge,
+    /// The platform did not hand over the bytes, so there was nothing to upload.
+    DownloadFailed,
     UploadFailed,
     UploadTimedOut,
 }
@@ -1184,7 +1192,7 @@ async fn download_and_presign_any_file(
     let max_size = filestore.max_file_size();
     if size > max_size {
         tracing::warn!(filename, size, max = max_size, "file exceeds filestore size limit, skipping");
-        return Err(PresignError::Unavailable);
+        return Err(PresignError::TooLarge);
     }
 
     const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
@@ -1197,19 +1205,19 @@ async fn download_and_presign_any_file(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(url, error = %e, "file download failed (filestore any-file path)");
-            return Err(PresignError::Unavailable);
+            return Err(PresignError::DownloadFailed);
         }
     };
     if !resp.status().is_success() {
         tracing::warn!(url, status = %resp.status(), "file download failed (filestore any-file path)");
-        return Err(PresignError::Unavailable);
+        return Err(PresignError::DownloadFailed);
     }
 
     // Content-Length pre-check
     if let Some(content_length) = resp.content_length() {
         if content_length > max_size {
             tracing::warn!(filename, content_length, max = max_size, "Content-Length exceeds filestore limit");
-            return Err(PresignError::Unavailable);
+            return Err(PresignError::TooLarge);
         }
     }
 
@@ -1251,7 +1259,8 @@ pub async fn download_and_presign_attachment(
         .await
         .map(|(presigned_url, _)| (presigned_url, presigned_note(filestore)))
         .map_err(|e| match e {
-            PresignError::Unavailable => AudioStoreError::TooLarge,
+            PresignError::TooLarge => AudioStoreError::TooLarge,
+            PresignError::DownloadFailed => AudioStoreError::DownloadFailed,
             PresignError::UploadFailed | PresignError::UploadTimedOut => {
                 AudioStoreError::UploadFailed
             }
@@ -1262,10 +1271,13 @@ pub async fn download_and_presign_attachment(
 /// store's failure so an operator is not left reading it as "no store here".
 pub fn store_failure_note(err: AudioStoreError, platform_requirement: &str) -> String {
     let reason = match err {
-        AudioStoreError::TooLarge => "exceeds the configured upload limit",
-        AudioStoreError::UploadFailed => "could not be stored by the configured filestore",
+        AudioStoreError::TooLarge => "it exceeds the configured upload limit",
+        AudioStoreError::DownloadFailed => "the platform did not return the bytes",
+        AudioStoreError::UploadFailed => "the upload did not complete",
     };
-    format!("this attachment {reason}, so the URL below is the platform's own: {platform_requirement}")
+    // Not "above"/"below": the block writes `url:` before `note:`, and a
+    // positional claim would go stale the moment that order changes.
+    format!("the configured filestore has no copy of this attachment ({reason}), so this url is the platform's own: {platform_requirement}")
 }
 
 /// Upload already-downloaded bytes to the filestore and return the hint block.
@@ -1846,6 +1858,63 @@ mod tests {
             let text = block_text(without_stt.into_iter().next().unwrap());
             assert!(text.contains(expected), "got {text}");
         }
+    }
+
+    #[test]
+    fn each_store_failure_states_its_own_reason() {
+        // PresignError::Unavailable used to cover both a size rejection and a
+        // failed download, so mapping it to one reason mislabelled the other.
+        let notes: Vec<String> = [
+            AudioStoreError::TooLarge,
+            AudioStoreError::DownloadFailed,
+            AudioStoreError::UploadFailed,
+        ]
+        .iter()
+        .map(|e| store_failure_note(*e, "needs a bearer token"))
+        .collect();
+
+        assert!(notes[0].contains("exceeds the configured upload limit"));
+        assert!(notes[1].contains("did not return the bytes"));
+        assert!(notes[2].contains("upload did not complete"));
+        assert!(notes.iter().all(|n| n.contains("needs a bearer token")));
+
+        // Distinct reasons, or the split bought nothing.
+        assert_ne!(notes[0], notes[1]);
+        assert_ne!(notes[1], notes[2]);
+
+        for n in &notes {
+            assert!(!n.contains('\n'), "a newline would forge a block line: {n}");
+            // The block writes `url:` before `note:`, so no note may claim otherwise.
+            assert!(!n.contains("below"), "positional claim in {n}");
+        }
+    }
+
+    #[test]
+    fn gateway_store_failures_are_distinguishable_too() {
+        let seen: Vec<String> = [
+            AudioStoreError::TooLarge,
+            AudioStoreError::DownloadFailed,
+            AudioStoreError::UploadFailed,
+        ]
+        .iter()
+        .map(|e| {
+            let err = Err(*e);
+            block_text(
+                audio_blocks_for("v.ogg", "audio/ogg", 512, audio_outcome(Some(&err)), None)
+                    .into_iter()
+                    .next()
+                    .unwrap(),
+            )
+        })
+        .collect();
+
+        assert_eq!(seen.len(), 3);
+        for (i, text) in seen.iter().enumerate() {
+            assert!(!text.contains("configure a filestore"), "case {i}: {text}");
+            assert!(!text.contains("url:"), "case {i}: {text}");
+        }
+        assert_ne!(seen[0], seen[1]);
+        assert_ne!(seen[1], seen[2]);
     }
 
     #[test]
