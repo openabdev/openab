@@ -1022,8 +1022,8 @@ async fn establish_and_register_tunnel(
     };
     if !replaced.is_empty() {
         info!(
-            channel = %redact_id(&channel_id), server_name = %acp_name, evicted = replaced.len(),
-            "ACP: last-attach-wins — evicted stale same-name tunnel(s)"
+            channel = %redact_id(&channel_id), server_name = %acp_name, replaced = replaced.len(),
+            "ACP: last-attach-wins — replaced stale tunnel(s)"
         );
         // Best-effort and off the attach path: a replaced connection may already be dead, and
         // waiting on its response would stall the tunnel that just came up for no benefit.
@@ -1381,10 +1381,25 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 // (`disconnect` is async, this is a std mutex). Each is owed that disconnect
                 // because the client still believes the connection is open — same obligation as a
                 // same-name replacement (R7).
+                //
+                // ABSENT and EMPTY are not the same thing. `mcpServers` omitted entirely means the
+                // client said nothing about its servers, so nothing is withdrawn; an explicit `[]`
+                // is a client saying it now offers none, which withdraws everything. Treating the
+                // two alike was harmless while the withdrawn set was always empty — deriving it
+                // from the registry made it destructive, so a compliant client that simply left
+                // the optional field out would have every tunnel on its channel torn down.
+                // `session/new` has the same reading of absence, and D-06 treats a missing
+                // `protocolVersion` as fail-closed; absence should not be the most damaging
+                // interpretation here while it is the safest one there.
+                let declared_servers = req
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("mcpServers"))
+                    .is_some();
                 if let (Some(registry), Some(channel_id)) =
                     (state.acp_tunnel_registry.clone(), resumed_channel.as_ref())
                 {
-                    {
+                    if declared_servers {
                         let keep: std::collections::HashSet<&str> =
                             resumed_servers.iter().map(|s| s.id.as_str()).collect();
                         let dropped: Vec<TunnelHandle> = {
@@ -3871,6 +3886,93 @@ mod acp_ws_integration {
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+    }
+
+    /// A resume that OMITS `mcpServers` withdraws nothing.
+    ///
+    /// Absent and empty are different statements. Omitting the optional field says nothing about
+    /// the client's servers; an explicit `[]` says it now offers none. Conflating them was
+    /// harmless while the withdrawn set was always empty, but deriving that set from the registry
+    /// made absence the most destructive reading available — a compliant client that simply left
+    /// the field out would have every tunnel on its channel torn down. Elsewhere absence is read
+    /// fail-closed (a missing `protocolVersion` refuses the establish); it should not be the most
+    /// damaging reading here.
+    #[tokio::test]
+    async fn a_resume_that_omits_mcp_servers_withdraws_nothing() {
+        let (url, registry) = serve().await;
+        let (mut a, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let session_id = handshake(&mut a, "srv-1", "katashiro", "conn-1").await;
+        wait_for_tunnels(&registry, 1).await;
+
+        let (mut b, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        send(&mut b, json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}}
+        })).await;
+        let _ = recv(&mut b).await;
+        // No `mcpServers` key at all.
+        send(&mut b, json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/resume",
+            "params": {"sessionId": session_id, "cwd": "/w"}
+        })).await;
+        let resumed = recv(&mut b).await;
+        assert!(resumed.get("result").is_some(), "resume failed: {resumed}");
+
+        // The tunnel must stay. Poll, because a wrongful teardown is asynchronous.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            assert_eq!(
+                registry.lock().unwrap().len(),
+                1,
+                "a resume that never mentioned mcpServers tore down the session's tunnels — \
+                 absence was read as 'the client withdrew everything'"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// A resume that RE-DECLARES an already-registered id must leave that tunnel completely alone.
+    ///
+    /// This is what pins the withdrawn set to "registered MINUS declared". Both neighbouring
+    /// withdrawal tests survive a mutation that simply sweeps the whole channel on every resume:
+    /// one declares `[]` so its `keep` is empty either way, and the other re-declares under a NEW
+    /// id, so the tunnel a sweep would wrongly remove was going to be evicted by last-attach-wins
+    /// anyway and the end state matches. Only re-declaring the SAME id makes the difference
+    /// observable — the tunnel must not be disconnected and rebuilt, which for a client with
+    /// stable ids would mean a spurious `mcp/disconnect` and a gap on every single resume.
+    #[tokio::test]
+    async fn a_resume_redeclaring_the_same_id_leaves_its_tunnel_untouched() {
+        let (url, registry) = serve().await;
+        let (mut a, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let session_id = handshake(&mut a, "srv-1", "katashiro", "conn-1").await;
+        wait_for_tunnels(&registry, 1).await;
+
+        // Same connection, same id, re-declared.
+        send(&mut a, json!({
+            "jsonrpc": "2.0", "id": 3, "method": "session/resume",
+            "params": {"sessionId": session_id, "cwd": "/w",
+                       "mcpServers": [{"type": "acp", "id": "srv-1", "name": "katashiro"}]}
+        })).await;
+
+        // Nothing may be disconnected. A sweep-everything implementation retires conn-1 here and
+        // then re-establishes it, which this catches; the correct implementation sends no
+        // `mcp/disconnect` at all, so a short quiet window is the assertion.
+        let quiet = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let f = recv(&mut a).await;
+                if f.get("method").and_then(Value::as_str) == Some("mcp/disconnect") {
+                    return f["params"]["connectionId"].as_str().unwrap_or("?").to_string();
+                }
+            }
+        })
+        .await;
+        assert!(
+            quiet.is_err(),
+            "a resume that re-declared the SAME id disconnected its tunnel ({:?}) — the withdrawn \
+             set is not 'registered minus declared', it is 'everything'",
+            quiet.ok()
+        );
+        assert_eq!(registry.lock().unwrap().len(), 1, "the tunnel must still be registered");
     }
 
     /// A resume on a NEW connection that stops declaring a server retires its tunnel.
