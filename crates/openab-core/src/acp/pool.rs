@@ -135,13 +135,17 @@ async fn setup_facade_session(
     }
 }
 
-/// Remove every non-`active` pool entry for `key`, reset-style.
+/// Remove every non-`active` pool entry for `key`.
 ///
-/// Hung eviction must NOT leave the session resumable: the old streaming task
-/// still holds an Arc clone of the connection, so the agent process may be
-/// alive and mid-turn. If the session id stayed in `suspended`/`persisted`,
-/// the next message would `session/load` the same session while the old
-/// process still owns an in-flight turn. Mirror `reset_session` instead.
+/// The single implementation for both hung eviction and [`SessionPool::reset_session`]; the latter
+/// removes `active` itself and then calls this. It used to be a second copy of the same list, which
+/// is how the two could drift — and the line most likely to be lost from a copy is the one below
+/// about the creating gate, because it says *not* to remove something.
+///
+/// Hung eviction must NOT leave the session resumable: the old streaming task still holds an Arc
+/// clone of the connection, so the agent process may be alive and mid-turn. If the session id
+/// stayed in `suspended`/`persisted`, the next message would `session/load` the same session while
+/// the old process still owns an in-flight turn.
 fn purge_session_entries(state: &mut PoolState, key: &str) {
     state.cancel_handles.remove(key);
     state.activity.remove(key);
@@ -748,16 +752,11 @@ impl SessionPool {
 
         let mut state = self.state.write().await;
         let had_active = state.active.remove(thread_id).is_some();
-        state.cancel_handles.remove(thread_id);
-        state.activity.remove(thread_id);
-        state.pgids.remove(thread_id);
-        state.suspended.remove(thread_id);
-        state.persisted.remove(thread_id);
-        // Do NOT remove the creating gate — same reason `purge_session_entries` documents. It is
-        // concurrency control, not session state: dropping it while a builder still holds the old
-        // gate Arc lets a concurrent get_or_create mint a fresh gate and run a second creation for
-        // the same key, so two builders spawn agents and mint tokens for one channel.
-        state.session_workdirs.remove(thread_id);
+        // Everything else a reset clears is exactly what hung eviction clears, including the rule
+        // that the creating gate survives. Call the one implementation rather than keeping a second
+        // copy of the list: the copies are what let the two drift, and the gate rule is precisely
+        // the kind of line that gets dropped from a duplicate without anyone noticing.
+        purge_session_entries(&mut state, thread_id);
         self.save_mapping(&state.persisted);
         self.save_meta(&state.session_workdirs);
         if had_active {
