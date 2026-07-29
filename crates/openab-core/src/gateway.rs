@@ -65,6 +65,78 @@ fn platform_supports_streaming(platform: &str) -> bool {
     !NON_EDITABLE_PLATFORMS.contains(&platform)
 }
 
+/// The gateway's only audio arm. Both entry points call it, because when the
+/// arm existed twice the copies drifted: a duplicated read-failure block and a
+/// missing STT warn each landed on one side only.
+pub(crate) async fn gateway_audio_blocks(
+    filename: &str,
+    mime_type: &str,
+    reported_size: u64,
+    bytes_result: Result<Vec<u8>, String>,
+    stt_config: &crate::config::SttConfig,
+    #[cfg(feature = "filestore")] filestore: Option<&crate::filestore::Filestore>,
+) -> Vec<ContentBlock> {
+    let bytes = match bytes_result {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(filename, error = %e, "gateway audio read failed");
+            // No STT line: the file never arrived, so the metadata block alone
+            // is the whole failure signal.
+            return crate::media::audio_blocks_for(
+                filename,
+                mime_type,
+                reported_size,
+                crate::media::AudioOutcome::ReadFailed,
+                None,
+            );
+        }
+    };
+
+    // Passthrough runs whichever way STT went: a transcript augments the file,
+    // never replaces it.
+    let size = bytes.len() as u64;
+    #[cfg(feature = "filestore")]
+    let stored: Option<(String, String)> = match filestore {
+        Some(fs) => {
+            crate::media::upload_bytes_and_presign(filename, &bytes, Some(mime_type), fs).await
+        }
+        None => None,
+    };
+    #[cfg(not(feature = "filestore"))]
+    let stored: Option<(String, String)> = None;
+
+    let stt_line: Option<String> = if stt_config.enabled {
+        match crate::stt::transcribe(
+            &crate::media::HTTP_CLIENT,
+            stt_config,
+            bytes,
+            filename.to_string(),
+            mime_type,
+        )
+        .await
+        {
+            Some(transcript) => Some(format!("[Voice message transcript]: {transcript}")),
+            None => {
+                tracing::warn!(filename, "gateway audio STT failed");
+                // The adjacent metadata block already names the file, so this
+                // line carries no filename.
+                Some("[Voice message - transcription failed]".to_string())
+            }
+        }
+    } else {
+        None
+    };
+
+    let outcome = match stored {
+        Some((ref presigned, ref note)) => crate::media::AudioOutcome::Stored {
+            url: presigned,
+            note,
+        },
+        None => crate::media::AudioOutcome::NoStore,
+    };
+    crate::media::audio_blocks_for(filename, mime_type, size, outcome, stt_line.as_deref())
+}
+
 /// Shared filter parameters for gateway event gating.
 /// Used by both `run_gateway_adapter` (WebSocket) and `process_gateway_event` (unified).
 struct EventFilterParams<'a> {
@@ -1069,70 +1141,26 @@ pub async fn run_gateway_adapter(
                                                 }
                                             }
                                             "audio" => {
-                                                match bytes_result {
-                                                    Ok(bytes) => {
-                                                        // Passthrough runs whichever way STT went: a
-                                                        // transcript augments the file, never replaces it.
-                                                        let size = bytes.len() as u64;
-                                                        #[cfg(feature = "filestore")]
-                                                        let stored: Option<(String, String)> = match filestore {
-                                                            Some(ref fs) => crate::media::upload_bytes_and_presign(
-                                                                &att.filename,
-                                                                &bytes,
-                                                                Some(att.mime_type.as_str()),
-                                                                fs,
-                                                            )
-                                                            .await,
-                                                            None => None,
-                                                        };
-                                                        #[cfg(not(feature = "filestore"))]
-                                                        let stored: Option<(String, String)> = None;
-
-                                                        let stt_line: Option<String> = if stt_config.enabled {
-                                                            match crate::stt::transcribe(
-                                                                &crate::media::HTTP_CLIENT,
-                                                                &stt_config,
-                                                                bytes,
-                                                                att.filename.clone(),
-                                                                &att.mime_type,
-                                                            ).await {
-                                                                Some(transcript) => Some(format!("[Voice message transcript]: {transcript}")),
-                                                                None => {
-                                                                    tracing::warn!(filename = %att.filename, "gateway audio STT failed");
-                                                                    // The adjacent metadata block already names the
-                                                                    // file, so this line carries no filename.
-                                                                    Some("[Voice message - transcription failed]".to_string())
-                                                                }
-                                                            }
-                                                        } else {
-                                                            None
-                                                        };
-
-                                                        let outcome = match stored {
-                                                            Some((ref presigned, ref note)) => crate::media::AudioOutcome::Stored { url: presigned, note },
-                                                            None => crate::media::AudioOutcome::NoStore,
-                                                        };
-                                                        extra_blocks.extend(crate::media::audio_blocks_for(
-                                                            &att.filename,
-                                                            &att.mime_type,
-                                                            size,
-                                                            outcome,
-                                                            stt_line.as_deref(),
-                                                        ));
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::warn!(filename = %att.filename, error = %e, "gateway audio read failed");
-                                                        // No STT line here: the file never arrived, so the
-                                                        // metadata block alone is the whole failure signal.
-                                                        extra_blocks.extend(crate::media::audio_blocks_for(
-                                                            &att.filename,
-                                                            &att.mime_type,
-                                                            att.size,
-                                                            crate::media::AudioOutcome::ReadFailed,
-                                                            None,
-                                                        ));
-                                                    }
-                                                }
+                                                #[cfg(feature = "filestore")]
+                                                let blocks = gateway_audio_blocks(
+                                                    &att.filename,
+                                                    &att.mime_type,
+                                                    att.size,
+                                                    bytes_result,
+                                                    &stt_config,
+                                                    filestore.as_deref(),
+                                                )
+                                                .await;
+                                                #[cfg(not(feature = "filestore"))]
+                                                let blocks = gateway_audio_blocks(
+                                                    &att.filename,
+                                                    &att.mime_type,
+                                                    att.size,
+                                                    bytes_result,
+                                                    &stt_config,
+                                                )
+                                                .await;
+                                                extra_blocks.extend(blocks);
                                             }
                                             _ => {}
                                         }
@@ -1554,81 +1582,26 @@ pub async fn process_gateway_event(
                 }
             }
             "audio" => {
-                match bytes_result {
-                    Ok(bytes) => {
-                        // Passthrough runs whichever way STT went: a transcript
-                        // augments the file, never replaces it.
-                        let size = bytes.len() as u64;
-                        #[cfg(feature = "filestore")]
-                        let stored: Option<(String, String)> = match ctx.filestore {
-                            Some(ref fs) => {
-                                crate::media::upload_bytes_and_presign(
-                                    &att.filename,
-                                    &bytes,
-                                    Some(att.mime_type.as_str()),
-                                    fs,
-                                )
-                                .await
-                            }
-                            None => None,
-                        };
-                        #[cfg(not(feature = "filestore"))]
-                        let stored: Option<(String, String)> = None;
-
-                        let stt_line: Option<String> = if ctx.stt_config.enabled {
-                            match crate::stt::transcribe(
-                                &crate::media::HTTP_CLIENT,
-                                &ctx.stt_config,
-                                bytes,
-                                att.filename.clone(),
-                                &att.mime_type,
-                            )
-                            .await
-                            {
-                                Some(transcript) => {
-                                    Some(format!("[Voice message transcript]: {transcript}"))
-                                }
-                                None => {
-                                    tracing::warn!(filename = %att.filename, "gateway audio STT failed");
-                                    // The adjacent metadata block already names the
-                                    // file, so this line carries no filename.
-                                    Some("[Voice message - transcription failed]".to_string())
-                                }
-                            }
-                        } else {
-                            None
-                        };
-
-                        let outcome = match stored {
-                            Some((ref presigned, ref note)) => {
-                                crate::media::AudioOutcome::Stored {
-                                    url: presigned,
-                                    note,
-                                }
-                            }
-                            None => crate::media::AudioOutcome::NoStore,
-                        };
-                        extra_blocks.extend(crate::media::audio_blocks_for(
-                            &att.filename,
-                            &att.mime_type,
-                            size,
-                            outcome,
-                            stt_line.as_deref(),
-                        ));
-                    }
-                    Err(e) => {
-                        tracing::warn!(filename = %att.filename, error = %e, "gateway audio read failed");
-                        // No STT line here: the file never arrived, so the
-                        // metadata block alone is the whole failure signal.
-                        extra_blocks.extend(crate::media::audio_blocks_for(
-                            &att.filename,
-                            &att.mime_type,
-                            att.size,
-                            crate::media::AudioOutcome::ReadFailed,
-                            None,
-                        ));
-                    }
-                }
+                #[cfg(feature = "filestore")]
+                let blocks = gateway_audio_blocks(
+                    &att.filename,
+                    &att.mime_type,
+                    att.size,
+                    bytes_result,
+                    &ctx.stt_config,
+                    ctx.filestore.as_deref(),
+                )
+                .await;
+                #[cfg(not(feature = "filestore"))]
+                let blocks = gateway_audio_blocks(
+                    &att.filename,
+                    &att.mime_type,
+                    att.size,
+                    bytes_result,
+                    &ctx.stt_config,
+                )
+                .await;
+                extra_blocks.extend(blocks);
             }
             _ => {}
         }
@@ -1736,6 +1709,70 @@ fn format_size(n: u64) -> String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    fn stt_off() -> crate::config::SttConfig {
+        crate::config::SttConfig {
+            enabled: false,
+            api_key: String::new(),
+            model: "whisper-1".into(),
+            base_url: "http://127.0.0.1:1".into(),
+            echo_transcript: false,
+        }
+    }
+
+    fn block_text(block: ContentBlock) -> String {
+        let ContentBlock::Text { text } = block else {
+            panic!("audio arm must emit text blocks");
+        };
+        text
+    }
+
+    /// Exercises the real arm both entry points call. STT off plus no filestore
+    /// means no network and no AWS, so this runs in CI rather than under
+    /// `#[ignore]`.
+    #[tokio::test]
+    async fn gateway_audio_arm_reports_a_read_failure_without_offering_a_url() {
+        let blocks = gateway_audio_blocks(
+            "voice.ogg",
+            "audio/ogg",
+            4096,
+            Err("no such file".into()),
+            &stt_off(),
+            #[cfg(feature = "filestore")]
+            None,
+        )
+        .await;
+
+        assert_eq!(blocks.len(), 1);
+        let text = block_text(blocks.into_iter().next().unwrap());
+        assert!(text.contains("[Audio attachment]"));
+        assert!(text.contains("filename: voice.ogg"));
+        // The reported size survives, because the bytes never arrived to measure.
+        assert!(text.contains("size_bytes: 4096"));
+        assert!(text.contains("note: attachment bytes unavailable (read failed)"));
+        assert!(!text.contains("url:"), "nothing was stored, so nothing to fetch");
+    }
+
+    #[tokio::test]
+    async fn gateway_audio_arm_passes_the_file_through_with_stt_off_and_no_filestore() {
+        let blocks = gateway_audio_blocks(
+            "voice.ogg",
+            "audio/ogg",
+            999,
+            Ok(vec![0u8; 128]),
+            &stt_off(),
+            #[cfg(feature = "filestore")]
+            None,
+        )
+        .await;
+
+        assert_eq!(blocks.len(), 1, "STT is off, so there is no transcript line");
+        let text = block_text(blocks.into_iter().next().unwrap());
+        // The measured length wins over the reported one once the bytes arrive.
+        assert!(text.contains("size_bytes: 128"), "got {text}");
+        assert!(text.contains("no fetchable URL"));
+        assert!(!text.contains("url:"));
+    }
 
     #[test]
     fn line_cannot_stream_and_is_forced_send_once() {
