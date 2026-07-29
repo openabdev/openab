@@ -110,21 +110,99 @@ pub fn browser_tools() -> Vec<Tool> {
 }
 
 
-/// Write `bytes` to `path`, then tighten it to owner-only (0600).
+/// Serialise writers per path.
 ///
-/// The file no longer holds a secret — the facade entry references `${OPENAB_SESSION_TOKEN}` and
-/// the value lives only in the agent process's environment. `0600` is kept anyway: it is an
-/// agent's MCP configuration, a shared workdir is the normal deployment, and nothing needs it to
-/// be readable by other users.
-async fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    tokio::fs::write(path, bytes).await?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
-    }
-    Ok(())
+/// Two sessions starting at once write the same `mcp.json`. Read-modify-write without this lets
+/// the later read see the earlier state and drop the other's entry — and with `rename` below the
+/// loser's whole file wins, so the interleaving is silent rather than merely partial.
+fn config_write_lock(path: &std::path::Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static LOCKS: OnceLock<
+        Mutex<HashMap<std::path::PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    > =
+        OnceLock::new();
+    let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .entry(path.to_path_buf())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
+
+/// Read a JSON config we intend to merge into, or `None` when it must be left alone.
+///
+/// `None` means **skip this file**, never "start from empty". Returning `{}` on a parse failure and
+/// then writing is how a config with a comment in it, or any file this parser does not accept, gets
+/// replaced by ours — destroying configuration we did not write and cannot reconstruct. A missing
+/// file is different and returns `Some({})`: there is nothing to lose.
+///
+/// A non-object root is also `None`. It cannot be merged into, and indexing a `Value::Array` with a
+/// string key **panics** rather than failing, so this guard is what stops a `[]`-rooted file from
+/// taking the process down.
+async fn load_mergeable_config(path: &std::path::Path) -> Option<Value> {
+    match tokio::fs::read(path).await {
+        Err(_) => Some(json!({})),
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(v) if v.is_object() => Some(v),
+            Ok(_) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "MCP config root is not a JSON object — leaving it untouched; browser tools \
+                     will not be configured here"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(), error = %e,
+                    "MCP config is not parseable JSON — leaving it untouched rather than replacing \
+                     it; browser tools will not be configured here"
+                );
+                None
+            }
+        },
+    }
+}
+
+/// Write `value` to `path` atomically, owner-only.
+///
+/// Same-directory temp file created `0600` *before* any bytes reach it, then `rename`. Writing in
+/// place leaves a window where a reader sees a half-written config, and chmod-after-write leaves
+/// one where the file is world-readable. `rename` within a directory is atomic, so a concurrent
+/// reader sees either the old file or the new one.
+async fn write_json_atomic(path: &std::path::Path, value: &Value) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)?;
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let tmp = dir.join(format!(
+        ".{}.openab-tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("mcp.json")
+    ));
+    {
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            // tokio's OpenOptions carries `mode` itself; no std extension trait needed.
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp).await?;
+        use tokio::io::AsyncWriteExt;
+        f.write_all(&bytes).await?;
+        f.flush().await?;
+        // Durability before the rename: a crash must not leave the new name pointing at a file
+        // whose contents never reached disk.
+        f.sync_all().await?;
+    }
+    match tokio::fs::rename(&tmp, path).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            Err(e)
+        }
+    }
+}
+
 
 /// True when an `openab-browser` entry is one we can **prove** we wrote, and so may be removed.
 ///
@@ -184,9 +262,15 @@ pub async fn write_facade_mcp_config(workdir: &str, facade_url: &str) -> std::io
         if let Some(dir) = cfg_path.parent() {
             tokio::fs::create_dir_all(dir).await?;
         }
-        let mut cfg: Value = match tokio::fs::read(cfg_path).await {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({})),
-            Err(_) => json!({}),
+        // Held across the read-modify-write so a concurrent session cannot read pre-write state
+        // and then rename its copy over ours.
+        let lock = config_write_lock(cfg_path);
+        let _guard = lock.lock().await;
+
+        let Some(mut cfg) = load_mergeable_config(cfg_path).await else {
+            // Unparseable or non-object root: already logged. Skip rather than replace — this is
+            // the user's file and we cannot merge into it safely.
+            continue;
         };
         if !cfg.get("mcpServers").map(Value::is_object).unwrap_or(false) {
             cfg["mcpServers"] = json!({});
@@ -202,7 +286,7 @@ pub async fn write_facade_mcp_config(workdir: &str, facade_url: &str) -> std::io
         // load and the model can reach the browser without passing through facade policy/audit.
         changed |= strip_direct_browser_entry(&mut cfg);
         if changed {
-            tokio::fs::write(cfg_path, serde_json::to_vec_pretty(&cfg)?).await?;
+            write_json_atomic(cfg_path, &cfg).await?;
         }
     }
     // kiro `--agent` deployments read agent files, not settings/mcp.json.
@@ -226,10 +310,12 @@ async fn merge_kiro_agent_facade_configs(workdir: &str, entry: &Value) -> std::i
         if !name.ends_with(".json") || name.starts_with("._") {
             continue;
         }
-        let Ok(bytes) = tokio::fs::read(&path).await else {
-            continue;
-        };
-        let Ok(mut cfg) = serde_json::from_slice::<Value>(&bytes) else {
+        let lock = config_write_lock(&path);
+        let _guard = lock.lock().await;
+        // Same fail-closed rule as the settings files: unparseable, or a root we cannot merge
+        // into, means leave the agent file alone. These carry model, description and allowlists
+        // that are none of our business to rewrite.
+        let Some(mut cfg) = load_mergeable_config(&path).await else {
             continue;
         };
         if !cfg.get("mcpServers").map(Value::is_object).unwrap_or(false) {
@@ -256,7 +342,7 @@ async fn merge_kiro_agent_facade_configs(workdir: &str, entry: &Value) -> std::i
             }
         }
         if changed {
-            write_private(&path, &serde_json::to_vec_pretty(&cfg)?).await?;
+            write_json_atomic(&path, &cfg).await?;
         }
     }
     Ok(())
@@ -344,6 +430,136 @@ fn browser_mode_migration_notice(
     ))
 }
 
+
+/// The destructive cases for the only code that touches a user's `mcp.json`.
+///
+/// Each of these previously either destroyed a file or panicked the process, and none of them is
+/// exotic: a comment in a JSON config is common, `[]` is what an empty array-shaped config looks
+/// like, and two sessions starting together is the normal case on a busy pod.
+#[cfg(test)]
+mod facade_config_writer {
+    use super::*;
+
+    async fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("openab-cfg-{tag}-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&d).await;
+        tokio::fs::create_dir_all(d.join(".cursor")).await.unwrap();
+        d
+    }
+
+    /// A config this parser cannot read must be left EXACTLY as it was.
+    ///
+    /// The old code parsed with `unwrap_or_else(|_| json!({}))` and then wrote, so a file with a
+    /// `//` comment — which plenty of editors and humans put in `mcp.json` — came back containing
+    /// only our entry. Everything the user had configured was gone, unrecoverably.
+    #[tokio::test]
+    async fn an_unparseable_config_is_left_untouched() {
+        let wd = tmp_dir("unparseable").await;
+        let path = wd.join(".cursor").join("mcp.json");
+        let original = "{\n  // my servers\n  \"mcpServers\": { \"mine\": { \"command\": \"x\" } }\n}";
+        tokio::fs::write(&path, original).await.unwrap();
+
+        write_facade_mcp_config(wd.to_str().unwrap(), "http://127.0.0.1:8848/mcp")
+            .await
+            .unwrap();
+
+        let after = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(
+            after, original,
+            "an unparseable config must survive byte-for-byte — replacing it destroys work we \
+             cannot reconstruct"
+        );
+        let _ = tokio::fs::remove_dir_all(&wd).await;
+    }
+
+    /// A non-object root must not panic.
+    ///
+    /// `cfg["mcpServers"] = ...` on a `Value::Array` does not return an error — `IndexMut` panics,
+    /// taking the process down. The guard has to run before any indexing.
+    #[tokio::test]
+    async fn an_array_root_does_not_panic_and_is_left_untouched() {
+        let wd = tmp_dir("arrayroot").await;
+        let path = wd.join(".cursor").join("mcp.json");
+        tokio::fs::write(&path, "[]").await.unwrap();
+
+        let r = write_facade_mcp_config(wd.to_str().unwrap(), "http://127.0.0.1:8848/mcp").await;
+        assert!(r.is_ok(), "a `[]` root must be skipped, not fatal: {r:?}");
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            "[]",
+            "we cannot merge into an array root, so it is left alone"
+        );
+        let _ = tokio::fs::remove_dir_all(&wd).await;
+    }
+
+    /// A user's own servers survive, and ours is added beside them.
+    #[tokio::test]
+    async fn a_valid_config_keeps_the_users_servers() {
+        let wd = tmp_dir("merge").await;
+        let path = wd.join(".cursor").join("mcp.json");
+        tokio::fs::write(&path, r#"{"mcpServers":{"mine":{"command":"x"}},"other":42}"#)
+            .await
+            .unwrap();
+
+        write_facade_mcp_config(wd.to_str().unwrap(), "http://127.0.0.1:8848/mcp")
+            .await
+            .unwrap();
+
+        let v: Value =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["mine"]["command"], json!("x"), "user server preserved");
+        assert_eq!(v["other"], json!(42), "unrelated top-level keys preserved");
+        assert_eq!(
+            v["mcpServers"]["openab"]["headers"]["Authorization"],
+            json!("Bearer ${OPENAB_SESSION_TOKEN}"),
+            "and ours is added by reference, never with the token value"
+        );
+        let _ = tokio::fs::remove_dir_all(&wd).await;
+    }
+
+    /// Concurrent writers must not lose each other's work.
+    ///
+    /// With an atomic rename and no lock this is *worse* than a torn write: the loser's entire
+    /// file replaces the winner's, silently. Both calls write the same entry, so what this pins is
+    /// that the user's pre-existing server survives both — a lost update would drop it.
+    #[tokio::test]
+    async fn concurrent_writers_do_not_lose_the_users_config() {
+        let wd = tmp_dir("concurrent").await;
+        let path = wd.join(".cursor").join("mcp.json");
+        tokio::fs::write(&path, r#"{"mcpServers":{"mine":{"command":"x"}}}"#)
+            .await
+            .unwrap();
+
+        let w = wd.to_str().unwrap().to_string();
+        let (a, b) = tokio::join!(
+            write_facade_mcp_config(&w, "http://127.0.0.1:8848/mcp"),
+            write_facade_mcp_config(&w, "http://127.0.0.1:8848/mcp"),
+        );
+        a.unwrap();
+        b.unwrap();
+
+        let v: Value =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["mine"]["command"], json!("x"), "user server survived both");
+        assert!(v["mcpServers"]["openab"].is_object(), "ours is present");
+        let _ = tokio::fs::remove_dir_all(&wd).await;
+    }
+
+    /// The file we write is owner-only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_written_config_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let wd = tmp_dir("perms").await;
+        write_facade_mcp_config(wd.to_str().unwrap(), "http://127.0.0.1:8848/mcp")
+            .await
+            .unwrap();
+        let path = wd.join(".cursor").join("mcp.json");
+        let mode = tokio::fs::metadata(&path).await.unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "0600 must be set at creation, not chmod'd after");
+        let _ = tokio::fs::remove_dir_all(&wd).await;
+    }
+}
 
 #[cfg(test)]
 mod tests {
