@@ -174,9 +174,22 @@ async fn load_mergeable_config(path: &std::path::Path) -> Option<Value> {
 async fn write_json_atomic(path: &std::path::Path, value: &Value) -> std::io::Result<()> {
     let bytes = serde_json::to_vec_pretty(value)?;
     let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    // Unique per WRITE, not per process. A fixed name made concurrent writers share one temp file:
+    // both opened it with `truncate`, both wrote, and whichever renamed first left the other
+    // renaming a path that no longer existed. A pid alone does not fix that — the racing writers
+    // are usually two tasks in the SAME process — so the counter is what makes each attempt
+    // distinct, and the pid keeps a respawn that overlaps its predecessor off the same paths.
+    //
+    // This separates two concerns that were tangled: the lock orders read-modify-write so a writer
+    // cannot publish over a state it never read, and the unique temp name stops writers colliding
+    // on the intermediate file. Previously the lock was doing both, which is why removing it
+    // failed with ENOENT — a filename collision reported as if it were a lost update.
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp = dir.join(format!(
-        ".{}.openab-tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("mcp.json")
+        ".{}.openab-tmp.{}.{}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("mcp.json"),
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     {
         let mut opts = tokio::fs::OpenOptions::new();
@@ -195,7 +208,16 @@ async fn write_json_atomic(path: &std::path::Path, value: &Value) -> std::io::Re
         f.sync_all().await?;
     }
     match tokio::fs::rename(&tmp, path).await {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // `sync_all` above made the CONTENTS durable; the rename that publishes them is a
+            // directory operation and is not covered by it. Without this a crash can leave the
+            // directory entry unwritten while the data it points at is safely on disk — "fsynced,
+            // then renamed" is not the same as "the rename survived".
+            if let Ok(d) = tokio::fs::File::open(dir).await {
+                let _ = d.sync_all().await;
+            }
+            Ok(())
+        }
         Err(e) => {
             let _ = tokio::fs::remove_file(&tmp).await;
             Err(e)
@@ -523,25 +545,45 @@ mod facade_config_writer {
     /// file replaces the winner's, silently. Both calls write the same entry, so what this pins is
     /// that the user's pre-existing server survives both — a lost update would drop it.
     #[tokio::test]
-    async fn concurrent_writers_do_not_lose_the_users_config() {
+    async fn concurrent_writers_never_publish_a_damaged_config() {
         let wd = tmp_dir("concurrent").await;
         let path = wd.join(".cursor").join("mcp.json");
         tokio::fs::write(&path, r#"{"mcpServers":{"mine":{"command":"x"}}}"#)
             .await
             .unwrap();
 
+        // DIFFERENT urls on purpose. The previous version passed the same url to both writers, so
+        // their outputs were byte-identical and a lost update was unobservable by construction —
+        // and because both merge from the same base, even a real lost update left `mine` and
+        // `openab` both present. The assertions could not fail. Removing the lock made it red for
+        // an unrelated reason: the two writers shared one fixed temp filename, so one renamed it
+        // away and the other hit ENOENT. It was reporting a filename collision as a lost update.
+        //
+        // With distinct urls the winner is identifiable, so this pins the guarantee that is really
+        // on offer: whichever writer lands last, the published file is complete and valid — never
+        // a merge of the two, never half-written, and never missing the user's own server.
         let w = wd.to_str().unwrap().to_string();
         let (a, b) = tokio::join!(
             write_facade_mcp_config(&w, "http://127.0.0.1:8848/mcp"),
-            write_facade_mcp_config(&w, "http://127.0.0.1:8848/mcp"),
+            write_facade_mcp_config(&w, "http://127.0.0.1:9999/mcp"),
         );
         a.unwrap();
         b.unwrap();
 
-        let v: Value =
-            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
-        assert_eq!(v["mcpServers"]["mine"]["command"], json!("x"), "user server survived both");
-        assert!(v["mcpServers"]["openab"].is_object(), "ours is present");
+        let v: Value = serde_json::from_slice(&tokio::fs::read(&path).await.unwrap())
+            .expect("a concurrent write published a file that is not valid JSON");
+        assert_eq!(
+            v["mcpServers"]["mine"]["command"],
+            json!("x"),
+            "the user's own server must survive both writers"
+        );
+        let url = v["mcpServers"]["openab"]["url"]
+            .as_str()
+            .expect("our entry must be present and complete");
+        assert!(
+            url == "http://127.0.0.1:8848/mcp" || url == "http://127.0.0.1:9999/mcp",
+            "the published entry must be exactly one writer's, not a blend of both: {url}"
+        );
         let _ = tokio::fs::remove_dir_all(&wd).await;
     }
 
