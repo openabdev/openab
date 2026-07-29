@@ -749,6 +749,15 @@ pub struct TunnelHandle {
     /// connections by `session/resume`. Teardown therefore matches on this owner rather than on
     /// the key, so a late cleanup cannot remove a handle installed by a different connection.
     owner: String,
+    /// Age of the CONNECTION that installed this tunnel, from [`TUNNEL_GENERATION`], stamped
+    /// when that connection was accepted.
+    ///
+    /// A resume sweep is authorised by connection age, not by when the resume happened to be
+    /// processed: an older connection's late resume must not retire a tunnel installed by a newer
+    /// connection, and "which resume ran first" cannot express that. Stamping the resume itself
+    /// measures the wrong thing — the late resume takes the HIGHER number precisely because it ran
+    /// last, so it would still outrank the newer connection it must not touch.
+    connection_generation: u64,
     /// Attach ordering from [`TUNNEL_GENERATION`], stamped when this establish STARTED.
     ///
     /// Eviction compares generations instead of trusting arrival order, so a slow establish that
@@ -889,6 +898,7 @@ async fn establish_and_register_tunnel(
     registry: AcpTunnelRegistry,
     timeout_secs: u64,
     owner: String,
+    connection_generation: u64,
 ) -> Result<(), String> {
     // Observability: reaching here means the client DID declare a "type":"acp" server, so this
     // line in the log answers "did the browser extension advertise itself?" for a live session.
@@ -942,6 +952,7 @@ async fn establish_and_register_tunnel(
         server_name: acp_name.clone(),
         owner: owner.clone(),
         generation,
+        connection_generation,
     };
     // `Superseded` carries the handle back out of the lock: a losing establish still owes its
     // client an `mcp/disconnect`, and `disconnect` is async while this is a std mutex.
@@ -1060,6 +1071,7 @@ fn spawn_acp_tunnels(
     next_id: &Arc<AtomicU64>,
     establish_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
     owner: &str,
+    connection_generation: u64,
 ) {
     // Drop finished handles first so a long-lived connection does not accumulate them, then bound
     // what is still running. Over the cap the declaration is dropped with a warning rather than
@@ -1082,6 +1094,7 @@ fn spawn_acp_tunnels(
         establish_tasks.push(tokio::spawn(async move {
             if let Err(e) = establish_and_register_tunnel(
                 out_tx, pending, next_id, srv.id, srv.name, channel_id, registry, 30, owner,
+                connection_generation,
             )
             .await
             {
@@ -1094,6 +1107,10 @@ fn spawn_acp_tunnels(
 async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let connection_id = format!("acp_conn_{}", Uuid::new_v4());
+    // Age of this connection, from the same counter that orders attaches. A resume's authority to
+    // retire someone else's tunnel is decided by which CONNECTION is newer, so it has to be stamped
+    // here — once, at accept — rather than per request.
+    let connection_generation = TUNNEL_GENERATION.fetch_add(1, Ordering::Relaxed);
 
     info!(connection = %connection_id, "ACP client connected");
 
@@ -1333,6 +1350,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         &next_req_id,
                         &mut establish_tasks,
                         &connection_id,
+                        connection_generation,
                     );
                 }
             }
@@ -1408,9 +1426,18 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         let dropped: Vec<TunnelHandle> = {
                             let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
                             let stale: Vec<(String, String)> = reg
-                                .keys()
-                                .filter(|(c, id)| c == channel_id && !keep.contains(id.as_str()))
-                                .cloned()
+                                .iter()
+                                .filter(|((c, id), h)| {
+                                    c == channel_id
+                                        && !keep.contains(id.as_str())
+                                        // Never retire a tunnel a NEWER connection installed. An
+                                        // older connection's late resume carries an out-of-date
+                                        // declaration set, so its silence about a newer
+                                        // connection's server is not a withdrawal — it simply
+                                        // never knew about it.
+                                        && h.connection_generation <= connection_generation
+                                })
+                                .map(|(k, _)| k.clone())
                                 .collect();
                             stale.iter().filter_map(|k| reg.remove(k)).collect()
                         };
@@ -1452,6 +1479,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         &next_req_id,
                         &mut establish_tasks,
                         &connection_id,
+                        connection_generation,
                     );
                 }
             }
@@ -2714,6 +2742,7 @@ mod acp_requests {
             connection_id: "conn-9".into(),
             server_name: "browser".into(),
             generation: 0,
+            connection_generation: 0,
         };
 
         let pending2 = pending.clone();
@@ -2762,6 +2791,7 @@ mod acp_requests {
             registry.clone(),
             5,
             "conn-test".into(),
+            0,
         )
         .await
         .unwrap();
@@ -2806,6 +2836,7 @@ mod acp_requests {
             registry.clone(),
             5,
             "conn-test".into(),
+            0,
         )
         .await
         .unwrap();
@@ -2870,6 +2901,7 @@ mod acp_requests {
             registry.clone(),
             5,
             "conn-test".into(),
+            0,
         )
         .await
         .unwrap();
@@ -3137,6 +3169,7 @@ mod acp_review_fixes {
             &next_id,
             &mut tasks,
             "conn-test",
+            0,
         );
 
         assert_eq!(tasks.len(), 2, "one task per unique declaration");
@@ -3886,6 +3919,78 @@ mod acp_ws_integration {
                 registry.lock().unwrap().is_empty(),
                 "a server that refused `initialize` was registered anyway — the handshake failure \
                  did not fail the establish"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// An older connection's late resume must not retire a NEWER connection's tunnel.
+    ///
+    /// The withdrawn set is "registered under this channel, minus what the client just declared".
+    /// That is only sound if the declaration is current. An older connection whose resume is
+    /// processed late carries an out-of-date view: its silence about a server a newer connection
+    /// established is not a withdrawal, it simply never knew about it.
+    ///
+    /// Authorising the sweep by connection age is what expresses that. Stamping the RESUME instead
+    /// measures the wrong thing and cannot fix this case — the late resume takes the higher number
+    /// precisely because it ran last, so it would still outrank the newer connection it must not
+    /// touch. Both reviewers and I initially proposed exactly that, and it fails here.
+    #[tokio::test]
+    async fn an_older_connections_late_resume_does_not_retire_a_newer_connections_tunnel() {
+        let (url, registry) = serve().await;
+
+        // Connection B (older) establishes srv-2 and stays open.
+        let (mut b, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let session_id = handshake(&mut b, "srv-2", "katashiro", "conn-b").await;
+        wait_for_tunnels(&registry, 1).await;
+
+        // Connection C (newer) resumes the same session and adds srv-3 under a different name.
+        let (mut c, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        send(&mut c, json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}}
+        })).await;
+        let _ = recv(&mut c).await;
+        send(&mut c, json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/resume",
+            "params": {"sessionId": session_id.clone(), "cwd": "/w",
+                       "mcpServers": [{"type": "acp", "id": "srv-2", "name": "katashiro"},
+                                      {"type": "acp", "id": "srv-3", "name": "notes"}]}
+        })).await;
+        loop {
+            let f = recv(&mut c).await;
+            if f.get("method").and_then(Value::as_str) == Some("mcp/connect")
+                && f["params"]["acpId"] == json!("srv-3")
+            {
+                send(&mut c, json!({
+                    "jsonrpc": "2.0", "id": f["id"].clone(),
+                    "result": {"connectionId": "conn-c"}
+                })).await;
+            } else if handled_inner_lifecycle(&mut c, &f).await == Some("initialize") {
+                break;
+            }
+        }
+        wait_for_tunnels(&registry, 2).await;
+
+        // Now the OLDER connection resumes, still declaring only what it knew about.
+        send(&mut b, json!({
+            "jsonrpc": "2.0", "id": 9, "method": "session/resume",
+            "params": {"sessionId": session_id, "cwd": "/w",
+                       "mcpServers": [{"type": "acp", "id": "srv-2", "name": "katashiro"}]}
+        })).await;
+
+        // srv-3 belongs to a newer connection and must survive. Poll: a wrongful retire is async.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let ids: std::collections::HashSet<String> = {
+                let reg = registry.lock().unwrap();
+                reg.keys().map(|(_, id)| id.clone()).collect()
+            };
+            assert!(
+                ids.contains("srv-3"),
+                "an older connection's late resume retired a tunnel a NEWER connection had \
+                 established — the sweep was authorised by resume order instead of connection age, \
+                 leaving: {ids:?}"
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
@@ -4842,6 +4947,7 @@ mod acp_teardown_ownership {
             server_name: "katashiro".into(),
             owner: owner.into(),
             generation: 0,
+            connection_generation: 0,
         }
     }
 
