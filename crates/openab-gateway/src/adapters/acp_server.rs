@@ -791,9 +791,9 @@ async fn inner_mcp_handshake(
     timeout_secs: u64,
 ) -> Result<(), String> {
     // Reuse `mcp_message_request` rather than re-assembling the frame: sending an inner MCP
-    // request and unwrapping its result should have exactly one implementation, or the
-    // `protocolVersion` check this handshake still lacks would have to be added in two places.
-    mcp_message_request(
+    // request and unwrapping its result has exactly one implementation, so the `protocolVersion`
+    // check below only has to exist in one place.
+    let init = mcp_message_request(
         out_tx,
         pending,
         next_id,
@@ -807,6 +807,25 @@ async fn inner_mcp_handshake(
         timeout_secs,
     )
     .await?;
+
+    // A reply proves the server answered, not that it agreed. A server answering a version we do
+    // not speak would be registered here and then fail on its first real `tools/call`, for a
+    // reason nothing in the log explains — the exact opaque failure this handshake exists to
+    // prevent. Refuse the establish instead, and name both versions so the mismatch is readable.
+    match init.get("protocolVersion").and_then(Value::as_str) {
+        Some(INNER_MCP_PROTOCOL_VERSION) => {}
+        Some(other) => {
+            return Err(format!(
+                "inner MCP server answered protocolVersion {other}, but this gateway speaks \
+                 {INNER_MCP_PROTOCOL_VERSION}"
+            ));
+        }
+        None => {
+            return Err(
+                "inner MCP `initialize` result carried no `protocolVersion` string".to_string(),
+            );
+        }
+    }
 
     // `notifications/initialized` is a notification in both directions: an inner MCP notification,
     // carried by an outer frame with no `id`, so nothing is awaited and no reply is owed.
@@ -3803,6 +3822,99 @@ mod acp_ws_integration {
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+    }
+
+    /// A server that *succeeds* at `initialize` but answers a protocol version we do not speak
+    /// must not be registered either.
+    ///
+    /// Distinct from the refusal test in the one way that matters: there is no JSON-RPC `error`
+    /// here. The handshake completes, so every check that only asks "did a reply arrive" passes —
+    /// which is exactly why the version went unchecked. The gateway used to discard this result
+    /// entirely, register the tunnel, and fail on the first real `tools/call` with nothing in the
+    /// log to explain it.
+    ///
+    /// The mock answered the supported version everywhere, so the happy path was the only path the
+    /// suite could reach and an absent check passed.
+    #[tokio::test]
+    async fn a_server_answering_an_unsupported_protocol_version_is_not_registered() {
+        let (url, registry) = serve().await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        send(&mut ws, json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}}
+        })).await;
+        let _ = recv(&mut ws).await;
+        send(&mut ws, json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": {"cwd": "/w", "mcpServers": [{"type": "acp", "id": "srv-1", "name": "katashiro"}]}
+        })).await;
+
+        // Answer `mcp/connect`, then answer `initialize` SUCCESSFULLY with an older spec version.
+        // 2024-11-05 is a real MCP revision, so this is a plausible peer rather than a nonsense one.
+        let mut answered = false;
+        while !answered {
+            let f = recv(&mut ws).await;
+            match f.get("method").and_then(Value::as_str) {
+                Some("mcp/connect") => {
+                    send(&mut ws, json!({
+                        "jsonrpc": "2.0", "id": f["id"].clone(),
+                        "result": {"connectionId": "conn-1"}
+                    })).await;
+                }
+                Some("mcp/message") if f["params"]["method"] == json!("initialize") => {
+                    send(&mut ws, json!({
+                        "jsonrpc": "2.0", "id": f["id"].clone(),
+                        "result": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": { "tools": {} },
+                            "serverInfo": { "name": "old-ext", "version": "0" }
+                        }
+                    })).await;
+                    answered = true;
+                }
+                _ => {}
+            }
+        }
+
+        // Registry first, deliberately. Both obligations below fail when the version check is
+        // missing, but only this one NAMES that: delete the check and the tunnel is registered and
+        // genuinely in use, so leading with the disconnect assertion reports a leaked connection —
+        // a different defect, which is not actually present. A failing test that names the wrong
+        // cause costs more than one that names none.
+        // Poll rather than check once: we are proving something stays absent.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            assert!(
+                registry.lock().unwrap().is_empty(),
+                "a server answering an unsupported protocolVersion was registered anyway — the \
+                 version check did not fail the establish"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // The connection the client opened for us is still owed an `mcp/disconnect`: it never
+        // entered the registry, and every cleanup path goes through the registry. Bounded with its
+        // own message so a regression names the defect rather than the harness.
+        let wait_disconnect = async {
+            loop {
+                let f = recv(&mut ws).await;
+                if f.get("method").and_then(Value::as_str) == Some("mcp/disconnect") {
+                    return f["params"]["connectionId"].as_str().unwrap().to_string();
+                }
+            }
+        };
+        let disconnected =
+            tokio::time::timeout(std::time::Duration::from_secs(10), wait_disconnect)
+                .await
+                .expect(
+                    "no `mcp/disconnect` after a version mismatch: the connection opened for a \
+                     server we then rejected is leaked",
+                );
+        assert_eq!(
+            disconnected, "conn-1",
+            "the connection opened for a server whose protocol version we rejected must be closed, \
+             naming that connection"
+        );
     }
 
     /// A real `mcp/message` crosses the socket and its result comes back to the caller.
