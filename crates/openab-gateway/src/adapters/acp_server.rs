@@ -610,7 +610,6 @@ async fn route_client_response(
 /// `pending`, writes the frame via the outbound channel, then awaits the correlated response
 /// (resolved by `route_client_response`) with a timeout. Wired to a caller by T1.4 (the
 /// core↔gateway MCP-over-ACP bridge); landed ahead of its caller as ready infrastructure.
-#[allow(dead_code)]
 async fn send_request(
     out_tx: &mpsc::UnboundedSender<String>,
     pending: &Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
@@ -644,7 +643,6 @@ async fn send_request(
 
 /// Extract the `result` from a JSON-RPC response frame, mapping an `error` member to `Err`.
 /// `send_request` yields the whole response frame; the tunnel helpers want just the payload.
-#[allow(dead_code)]
 fn frame_result(frame: Value) -> Result<Value, String> {
     if let Some(err) = frame.get("error") {
         return Err(format!("remote error: {err}"));
@@ -654,7 +652,6 @@ fn frame_result(frame: Value) -> Result<Value, String> {
 
 /// `mcp/connect` (T4): open a tunnelled MCP connection to the client-provided (`"type":"acp"`)
 /// MCP server identified by `acp_id`; returns the client-assigned `connectionId`.
-#[allow(dead_code)]
 async fn mcp_connect(
     out_tx: &mpsc::UnboundedSender<String>,
     pending: &Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
@@ -675,7 +672,6 @@ async fn mcp_connect(
 /// `mcp/message` REQUEST (T4): tunnel an inner MCP request over `connection_id`; returns the
 /// inner MCP result payload (the outer ACP id does the correlation; the inner MCP id is not
 /// carried on the wire).
-#[allow(dead_code)]
 async fn mcp_message_request(
     out_tx: &mpsc::UnboundedSender<String>,
     pending: &Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
@@ -696,7 +692,6 @@ async fn mcp_message_request(
 }
 
 /// `mcp/disconnect` (T4): close a tunnelled MCP connection.
-#[allow(dead_code)]
 async fn mcp_disconnect(
     out_tx: &mpsc::UnboundedSender<String>,
     pending: &Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
@@ -843,7 +838,6 @@ async fn inner_mcp_handshake(
 /// MUST run in a spawned task, never inline in the connection read loop: `mcp_connect` awaits
 /// the client's response, which only that same read loop can deliver — awaiting it inline
 /// would deadlock.
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 async fn establish_and_register_tunnel(
     out_tx: mpsc::UnboundedSender<String>,
