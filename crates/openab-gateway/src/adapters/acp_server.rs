@@ -954,6 +954,7 @@ async fn establish_and_register_tunnel(
         // beside the live one under the same declared name, which is the ambiguity
         // last-attach-wins exists to prevent (ADR §6.1). Teardown is owner-scoped; eviction is
         // not, and they are different questions.
+        let own_key = (channel_id.clone(), acp_id.clone());
         let same_name = |c: &String, id: &String, h: &TunnelHandle| {
             c == &channel_id && h.server_name == acp_name && id != &acp_id
         };
@@ -961,10 +962,20 @@ async fn establish_and_register_tunnel(
         // started EARLIER but finished later must not evict the newer tunnel that beat it here:
         // it lost the race the client actually cares about, so it stands down and closes its own
         // connection instead of installing a stale handle over a live one.
-        if reg
-            .iter()
-            .any(|((c, id), h)| same_name(c, id, h) && h.generation > generation)
-        {
+        //
+        // OUR OWN KEY is checked separately and must be, because `same_name` excludes it: a client
+        // is free to reuse the same `server_id` across a reconnect — nothing in the protocol
+        // requires a fresh one, and a stable id is the more natural implementation for a generic
+        // peer. When it does, both establishes land on this one key, `same_name` never sees the
+        // newer entry, and the older arrival would `insert` straight over a live handle. Ordering
+        // has to hold per key, not just per declared name.
+        let superseded = reg
+            .get(&own_key)
+            .is_some_and(|h| h.generation > generation)
+            || reg
+                .iter()
+                .any(|((c, id), h)| same_name(c, id, h) && h.generation > generation);
+        if superseded {
             Registered::Superseded(handle)
         } else {
             let stale: Vec<(String, String)> = reg
@@ -972,8 +983,12 @@ async fn establish_and_register_tunnel(
                 .filter(|((c, id), h)| same_name(c, id, h) && h.generation < generation)
                 .map(|(k, _)| k.clone())
                 .collect();
-            let replaced: Vec<TunnelHandle> = stale.iter().filter_map(|k| reg.remove(k)).collect();
-            reg.insert((channel_id.clone(), acp_id.clone()), handle);
+            let mut replaced: Vec<TunnelHandle> =
+                stale.iter().filter_map(|k| reg.remove(k)).collect();
+            // Whatever this insert displaces is owed a disconnect too. Discarding the return value
+            // leaked the previous holder of this exact key: it left the registry, so no cleanup
+            // path could reach it, while its client still believed the connection was open.
+            replaced.extend(reg.insert(own_key, handle));
             Registered::Done(replaced)
         }
     };
@@ -4013,6 +4028,125 @@ mod acp_ws_integration {
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+
+        // And the establish that stood down owes ITS client a disconnect. Asserting only "the
+        // right tunnel is registered" is what let the equivalent leak through on the refusal path:
+        // the losing connection never enters the registry, so no cleanup path can ever reach it.
+        // Without this, deleting the whole `tokio::spawn(disconnect)` in the `Superseded` arm
+        // leaves this test green.
+        let wait_disconnect = async {
+            loop {
+                let f = recv(&mut a).await;
+                if f.get("method").and_then(Value::as_str) == Some("mcp/disconnect") {
+                    return f["params"]["connectionId"].as_str().unwrap().to_string();
+                }
+            }
+        };
+        let disconnected =
+            tokio::time::timeout(std::time::Duration::from_secs(10), wait_disconnect)
+                .await
+                .expect(
+                    "the superseded establish never disconnected the connection it opened — it is \
+                     not in the registry, so nothing else can close it",
+                );
+        assert_eq!(disconnected, "conn-old");
+    }
+
+    /// A client that REUSES its `server_id` across a reconnect must still be ordered.
+    ///
+    /// The same-name predicate deliberately excludes the attaching key (`id != &acp_id`), so when
+    /// both establishes carry the same `server_id` they land on one registry key and that
+    /// predicate never sees the newer entry. The older arrival would then `insert` straight over a
+    /// live handle — and because the old `insert` return value was discarded, the displaced
+    /// connection left the registry with no cleanup path while its client still believed it was
+    /// open. Ordering has to hold per key, not just per declared name.
+    ///
+    /// Reusing a stable id is not a client bug. Nothing in the protocol requires a fresh one; the
+    /// "mints a new id per connection" assumption holds for our own extension, and the deliverable
+    /// here is a GENERIC compliant peer.
+    #[tokio::test]
+    async fn a_reconnect_reusing_the_same_server_id_is_still_ordered() {
+        let (url, registry) = serve().await;
+
+        // Socket A declares srv-1 and stalls with its `mcp/connect` unanswered.
+        let (mut a, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        send(&mut a, json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}}
+        })).await;
+        let _ = recv(&mut a).await;
+        send(&mut a, json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": {"cwd": "/w", "mcpServers": [{"type": "acp", "id": "srv-1", "name": "katashiro"}]}
+        })).await;
+        let mut session_id = None;
+        let mut a_connect_id = None;
+        while session_id.is_none() || a_connect_id.is_none() {
+            let f = recv(&mut a).await;
+            if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
+                a_connect_id = Some(f["id"].clone());
+            } else if f.get("id") == Some(&json!(2)) {
+                session_id = Some(f["result"]["sessionId"].as_str().unwrap().to_string());
+            }
+        }
+
+        // Socket B reconnects and re-declares THE SAME id, completing fully.
+        let (mut b, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        send(&mut b, json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}}
+        })).await;
+        let _ = recv(&mut b).await;
+        send(&mut b, json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/resume",
+            "params": {"sessionId": session_id.unwrap(), "cwd": "/w",
+                       "mcpServers": [{"type": "acp", "id": "srv-1", "name": "katashiro"}]}
+        })).await;
+        loop {
+            let f = recv(&mut b).await;
+            if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
+                send(&mut b, json!({
+                    "jsonrpc": "2.0", "id": f["id"].clone(),
+                    "result": {"connectionId": "conn-new"}
+                })).await;
+            } else if handled_inner_lifecycle(&mut b, &f).await == Some("initialize") {
+                break;
+            }
+        }
+        wait_for_tunnels(&registry, 1).await;
+
+        // Now let the OLDER establish finish, on the same key.
+        send(&mut a, json!({
+            "jsonrpc": "2.0", "id": a_connect_id.unwrap(),
+            "result": {"connectionId": "conn-old"}
+        })).await;
+        loop {
+            let f = recv(&mut a).await;
+            if handled_inner_lifecycle(&mut a, &f).await == Some("initialize") {
+                break;
+            }
+        }
+
+        // It must stand down and close its own connection. Before the fix it silently overwrote
+        // the live handle instead, and `conn-old` was never disconnected because it believed it
+        // had won — so this wait is what distinguishes the two.
+        let wait_disconnect = async {
+            loop {
+                let f = recv(&mut a).await;
+                if f.get("method").and_then(Value::as_str) == Some("mcp/disconnect") {
+                    return f["params"]["connectionId"].as_str().unwrap().to_string();
+                }
+            }
+        };
+        let disconnected =
+            tokio::time::timeout(std::time::Duration::from_secs(10), wait_disconnect)
+                .await
+                .expect(
+                    "an older establish reusing the same server_id overwrote the newer live handle \
+                     instead of standing down — same-key ordering is not enforced",
+                );
+        assert_eq!(disconnected, "conn-old");
+        assert_eq!(registry.lock().unwrap().len(), 1, "exactly one tunnel must remain");
     }
 
     /// A server that *succeeds* at `initialize` but answers a protocol version we do not speak
