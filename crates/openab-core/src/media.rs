@@ -401,7 +401,21 @@ pub fn audio_mime(filename: &str, content_type: Option<&str>) -> Option<String> 
     if is_audio_mime(mime) {
         return Some(mime.to_string());
     }
+    // An explicit non-audio type is the platform stating what the file is, and
+    // overriding it would hand a PDF to STT. Only a missing or deliberately
+    // generic type leaves the extension as the best signal available.
+    if !mime.is_empty() && !is_generic_mime(mime) {
+        return None;
+    }
     audio_mime_from_extension(filename).map(str::to_string)
+}
+
+/// Types that carry no information about the payload, so the extension may speak.
+fn is_generic_mime(mime: &str) -> bool {
+    matches!(
+        mime.to_ascii_lowercase().as_str(),
+        "application/octet-stream" | "binary/octet-stream" | "application/unknown" | "*/*"
+    )
 }
 
 /// Deliberately excludes the containers that carry either stream (`webm`, `mp4`,
@@ -1698,8 +1712,45 @@ mod tests {
         for filename in ["standup.mp4", "clip.webm", "demo.mov", "reel.mkv"] {
             assert_eq!(audio_mime(filename, Some("")), None, "{filename}");
         }
-        assert_eq!(audio_mime("notes.txt", Some("text/plain")), None);
         assert_eq!(audio_mime("noextension", None), None);
+    }
+
+    #[test]
+    fn an_explicit_non_audio_mime_wins_over_an_audio_extension() {
+        // The earlier `notes.txt` + `text/plain` case passed for the wrong reason:
+        // `.txt` is not in the extension list, so it never exercised the MIME at
+        // all. These names all ARE in the list, which isolates the conflict.
+        for (filename, mime) in [
+            ("report.mp3", "application/pdf"),
+            ("clip.m4a", "video/mp4"),
+            ("notes.wav", "text/plain"),
+            ("archive.ogg", "application/zip"),
+            ("sheet.flac", "image/png"),
+        ] {
+            assert_eq!(
+                audio_mime(filename, Some(mime)),
+                None,
+                "{mime} on {filename} must stay out of the audio path"
+            );
+        }
+    }
+
+    #[test]
+    fn a_generic_mime_still_defers_to_the_extension() {
+        // Slack labels an uploaded .opus this way, which is the case the fallback
+        // exists for, so tightening it must not close that door.
+        for mime in [
+            "application/octet-stream",
+            "binary/octet-stream",
+            "application/unknown",
+            "*/*",
+        ] {
+            assert_eq!(
+                audio_mime("voice.opus", Some(mime)).as_deref(),
+                Some("audio/opus"),
+                "{mime}"
+            );
+        }
     }
 
     #[test]
