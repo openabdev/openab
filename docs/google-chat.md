@@ -203,7 +203,7 @@ Each field falls back to its `GOOGLE_CHAT_ALLOW_ALL_USERS` / `GOOGLE_CHAT_ALLOWE
 - **Inbound attachments** — image, text file, and audio attachments are downloaded via Google Chat Media API and stored to `~/.openab/media/inbound/<uuid>` (colocate filesystem store):
   - Images: resized to ≤1200px JPEG (q75); GIFs preserved. Max 10 MB.
   - Text files: only known text extensions (`.txt`, `.md`, `.json`, `.py`, `.rs`, etc.). Max 512 KB.
-  - Audio: forwarded as-is for STT processing by core. Max 25 MB.
+  - Audio: forwarded as-is to core, which always emits an `[Audio attachment]` block and transcribes on top when `[stt]` is enabled. Downloaded up to 25 MB, but the gateway store caps it at 20 MB, so 20 MB is the effective limit.
   - Drive-sourced attachments are skipped (require separate Drive API integration).
 
 ### Not Supported

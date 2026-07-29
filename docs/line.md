@@ -135,7 +135,7 @@ In the LINE Developers Console → **Messaging API** tab → scan the QR code wi
 ### Supported
 
 - **1:1 chat** — send a message to the bot, get an AI agent response
-- **Inbound voice messages in 1:1 chat** — LINE-hosted audio messages are downloaded through the LINE Content API and forwarded to OpenAB as `audio` attachments, so the existing STT flow can transcribe them. This requires `[stt] enabled = true` in OpenAB core. See [STT (Speech-to-Text)](stt.md).
+- **Inbound voice messages in 1:1 chat** — LINE-hosted audio messages are downloaded through the LINE Content API and forwarded to OpenAB as `audio` attachments. Core always emits an `[Audio attachment]` block for them; `[stt] enabled = true` is required only for the transcript on top, not for delivery. See [STT (Speech-to-Text)](stt.md).
 - **Group chat** — add the bot to a group; it responds only when @-mentioned (see @mention gating below)
 - **Inbound images** — user-sent LINE images are downloaded through the LINE Content API and forwarded to OpenAB as image attachments
 - **Webhook signature validation** — HMAC-SHA256 via `LINE_CHANNEL_SECRET`

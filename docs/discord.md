@@ -235,12 +235,12 @@ for the agent. Supported types (checked in order):
 
 | Type | Detection | Agent receives |
 |------|-----------|----------------|
-| Audio | MIME `audio/*` | Transcribed text via STT (if enabled) |
+| Audio | MIME `audio/*`, or an audio extension when Discord omits or generalises the MIME | Text block with filename, content type, size, and a URL (presigned when a filestore is configured, else the Discord CDN link), plus transcribed text via STT when enabled |
 | Text files | Extension list (`.txt`, `.md`, `.json`, etc.) | File content inlined (up to 5 files, 1 MB total) |
 | Images | MIME `image/*` or image extensions | Base64-encoded image block |
 | Video | MIME `video/*` or extensions (`.mp4`, `.mov`, `.webm`, `.mkv`, `.m4v`, `.avi`) | Text block with filename, content type, size, and Discord CDN URL |
 
-Unsupported attachment types are silently ignored.
+Other types go through the filestore as a `[File: ...]` block when one is configured, and are silently ignored otherwise.
 
 ### Video attachments
 

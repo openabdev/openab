@@ -20,13 +20,13 @@ User sends media (photo/voice/file)
 
 | Platform | Images | Audio/Voice | Text Files | Video | Binary Files |
 |----------|--------|-------------|------------|-------|--------------|
-| **Discord** | ✅ | ✅ (file + STT) | ✅ | metadata + CDN URL | skipped |
+| **Discord** | ✅ | ✅ (file + STT) | ✅ | metadata + CDN URL | `[File: ...]` via filestore, else skipped |
 | **Telegram** | ✅ | ✅ (file + STT) | ✅ (whitelist) | skipped | skipped |
 | **Feishu** | ✅ | ✅ (file + STT) | ✅ (whitelist) | skipped | skipped |
 | **Google Chat** | ✅ | ✅ (file + STT) | ✅ (whitelist) | skipped | Drive files skipped |
 | **WeCom** | ✅ | — | ✅ (whitelist) | skipped | skipped |
 | **LINE** | ✅ (LINE-hosted only) | ✅ (file + STT, 1:1 only, LINE-hosted only) | — | — | — |
-| **Slack** | ✅ | ✅ (file + STT) | ✅ | metadata + URL | skipped |
+| **Slack** | ✅ | ✅ (file + STT) | ✅ | metadata + URL | `[File: ...]` via filestore, else skipped |
 
 "file + STT" means the agent always receives the audio file's metadata (and a
 fetchable URL where one exists), with the STT transcript added on top when
@@ -147,7 +147,8 @@ Discord and Slack do not reject these: video goes through [Video](#video), and b
 | Type | Max Size | Enforced By |
 |------|----------|-------------|
 | Images | 10 MB | Gateway (pre-download Content-Length + post-download bytes) |
-| Audio | 20 MB | Gateway |
+| Audio (gateway platforms) | 20 MB | Gateway |
+| Audio and video (Discord, Slack) | `max_file_size_mb` (default 250 MB) | Filestore; over the cap the block is still delivered with the platform URL |
 | Text files | 20 MB | Gateway (same as store cap) |
 | GIF passthrough | 5 MB | `resize_and_compress()` |
 | Store (defense-in-depth) | 20 MB | `store_media()` |

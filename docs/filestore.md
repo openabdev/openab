@@ -136,7 +136,7 @@ The streaming approach means a 500 MB file uses the same ~16 MB of memory as a 1
 |----------|----------------|---------------|------------|
 | Discord | Streaming download | Streaming multipart (~16 MB chunks) | Text > 512KB + PDF/ZIP/binary + audio; video excluded, its CDN link already needs no credentials |
 | Slack | Streaming download | Streaming multipart (~16 MB chunks) | Text > 512KB + PDF/ZIP/binary + audio + video, since neither Slack URL form is fetchable by the agent |
-| Gateway (Telegram, Feishu, Google Chat, WeCom, LINE) | File on local disk | Single PUT | Text files delivered by adapter pipeline, plus audio bytes the adapter already holds; binary limited by adapter validation |
+| Gateway (Telegram, Feishu, Google Chat, WeCom, LINE) | File on local disk | Single PUT | Text files delivered by adapter pipeline, plus audio bytes on the adapters that emit them (Telegram, Feishu, Google Chat, LINE; WeCom drops `voice` outright); binary limited by adapter validation |
 
 Gateway adapters use their existing text-file pipeline (extension whitelist).
 When filestore is configured, large text files (>512 KB) that pass through
@@ -207,7 +207,7 @@ after 24 hours (no configuration needed).
 | Video on Slack | ❌ no | Not uploaded; the block carries `url_private_download` plus a `note:` naming the bearer-token requirement |
 | Text > 512 KB | ❌ no | Silently dropped (legacy behavior) |
 | PDF, ZIP, DOCX, binary | ❌ no | Silently dropped (legacy behavior) |
-| > max_file_size_mb (default 250 MB, max 500 MB) | ✅ yes | Dropped on Discord/Slack; degraded hint on gateway (see Error Handling) |
+| > max_file_size_mb (default 250 MB, max 500 MB) | ✅ yes | Text and binary dropped on Discord/Slack; audio and Slack video still delivered with the platform URL and a `note:` naming the size refusal; degraded hint on gateway (see Error Handling) |
 
 ## What the Agent Sees
 
@@ -366,7 +366,8 @@ mc ilm rule add myminio/oab-uploads \
 | S3 upload times out (>10 min) | Same as upload failure — degraded hint returned |
 | Download from platform fails | File is dropped (warn log), agent not notified |
 | Download times out (>10 min) | Same as download failure — file dropped |
-| File exceeds max_file_size_mb (Discord/Slack) | File is dropped (warn log), agent not notified |
+| File exceeds max_file_size_mb (Discord/Slack, text or binary) | File is dropped (warn log), agent not notified |
+| File exceeds max_file_size_mb (Discord/Slack, audio or Slack video) | Block still emitted with the platform URL; on Slack a `note:` names the size refusal, on Discord the CDN link needs no note |
 | File exceeds max_file_size_mb (gateway) | Agent receives degraded hint: "exceeds the configured upload limit and could not be stored" |
 | Presigned URL generation fails | Agent receives degraded hint |
 | Filestore not configured | Legacy behavior (>512KB files silently dropped) |

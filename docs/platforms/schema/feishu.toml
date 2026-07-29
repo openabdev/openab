@@ -172,14 +172,14 @@ pr      = ""
 [[openab_features]]
 feature = "media_inbound"
 status  = "implemented"
-note    = "Images (resized to <=1200 px, JPEG q75, <=10 MB; GIF passthrough), text files (extension-allowlisted, <=512 KB), audio (<=25 MB, Whisper cap), and post-embedded images. Oversized/unsupported -> Attachment::rejected."
+note    = "Images (resized to <=1200 px, JPEG q75, <=10 MB; GIF passthrough), text files (extension-allowlisted, <=512 KB), audio (<=25 MB downloaded but <=20 MB stored, so 20 MB effective), and post-embedded images. Oversized/unsupported -> Attachment::rejected."
 source  = ["crates/openab-gateway/src/adapters/feishu.rs#download_feishu_image", "crates/openab-gateway/src/adapters/feishu.rs#download_feishu_file", "crates/openab-gateway/src/adapters/feishu.rs#download_feishu_audio"]
 pr      = ""
 
 [[openab_features]]
 feature = "voice_stt"
 status  = "partial"
-note    = "Adapter only downloads audio into an audio attachment (<=25 MB); actual speech-to-text is done downstream (Whisper) by core, not in the adapter."
+note    = "Adapter only downloads audio into an audio attachment (<=25 MB, of which the gateway store keeps <=20 MB); core always emits an `[Audio attachment]` block for it, and speech-to-text is done downstream (Whisper) by core when enabled, not in the adapter."
 source  = ["crates/openab-gateway/src/adapters/feishu.rs#download_feishu_audio"]
 pr      = ""
 

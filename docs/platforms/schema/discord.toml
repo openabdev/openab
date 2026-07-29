@@ -173,14 +173,14 @@ pr      = ""
 [[openab_features]]
 feature = "media_inbound"
 status  = "implemented"
-note    = "Attachments processed inline in the per-attachment loop: images encoded (download_and_encode_image), text files (≤1 MB total, ≤5 files), video passed as a URL block; non-image files warned to the user."
+note    = "Attachments processed inline in the per-attachment loop: images encoded (download_and_encode_image), text files (≤1 MB total, ≤5 files), audio passed as an `[Audio attachment]` block (classified by `media::audio_mime`, uploaded to the filestore when configured, else the CDN link), video passed as a URL block; non-image files warned to the user."
 source  = ["crates/openab-core/src/discord.rs#download_and_encode_image"]
 pr      = ""
 
 [[openab_features]]
 feature = "voice_stt"
 status  = "implemented"
-note    = "Audio attachments transcribed via media::download_and_transcribe when stt_config.enabled; transcript injected + echoed; 🎤 reaction when STT disabled."
+note    = "Audio attachments transcribed via media::download_and_transcribe when stt_config.enabled; the transcript is emitted immediately before the `[Audio attachment]` block it describes, not hoisted to the front, so multiple voice notes stay paired with their own file. Echoed best-effort; 🎤 reaction when STT disabled, alongside the block, which is emitted either way."
 source  = ["crates/openab-core/src/discord.rs"]
 pr      = ""
 

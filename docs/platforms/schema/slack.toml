@@ -171,14 +171,14 @@ pr      = ""
 [[openab_features]]
 feature = "media_inbound"
 status  = "implemented"
-note    = "Images (download+encode), text files (5-file / 1 MB total cap, TEXT_FILE_COUNT_CAP/TEXT_TOTAL_CAP, mirroring Discord #291), audio → STT. Private files fetched with the bot token; failed images trigger a files:read/format hint message."
+note    = "Images (download+encode), text files (5-file / 1 MB total cap, TEXT_FILE_COUNT_CAP/TEXT_TOTAL_CAP, mirroring Discord #291), audio → `[Audio attachment]` block (classified by `media::audio_mime`, which falls back to the extension when Slack omits or generalises the type), video → `[Video attachment]` block. Both upload to the filestore when configured, since neither Slack URL form is fetchable by the agent; without one the block carries the URL plus a `note:` naming the bearer-token requirement. Private files fetched with the bot token; failed images trigger a files:read/format hint message."
 source  = ["crates/openab-core/src/slack.rs#TEXT_FILE_COUNT_CAP", "crates/openab-core/src/slack.rs#TEXT_TOTAL_CAP"]
 pr      = ""
 
 [[openab_features]]
 feature = "voice_stt"
 status  = "implemented"
-note    = "Audio attachments transcribed via media::download_and_transcribe when stt.enabled; transcript injected as a leading text block + best-effort echo (stt::post_echo). STT disabled → 🎤 reaction ack."
+note    = "Audio attachments transcribed via media::download_and_transcribe when stt.enabled; the transcript is emitted immediately before the `[Audio attachment]` block it describes, not hoisted to the front, so multiple voice notes stay paired with their own file. Best-effort echo (stt::post_echo). STT disabled → 🎤 reaction ack plus the block, which is emitted either way."
 source  = ["crates/openab-core/src/media.rs#download_and_transcribe", "crates/openab-core/src/stt.rs#post_echo"]
 pr      = ""
 

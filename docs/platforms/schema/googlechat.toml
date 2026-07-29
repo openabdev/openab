@@ -320,7 +320,7 @@ refs   = []
 [[quirks]]
 date   = "2026-07-04"
 title  = "Attachment upload limit is 200 MB"
-note   = "Attachment upload limit is 200 MB; some file types are blocked (an attachment message can't also carry accessory widgets). OpenAB downloads far below this (image 10 MB / file 512 KB / audio 25 MB) and skips Drive-sourced & video attachments."
+note   = "Attachment upload limit is 200 MB; some file types are blocked (an attachment message can't also carry accessory widgets). OpenAB downloads far below this (image 10 MB / file 512 KB / audio 25 MB downloaded but 20 MB stored, so 20 MB effective) and skips Drive-sourced & video attachments."
 kind   = "intrinsic"
 source = "https://developers.google.com/workspace/chat/upload-media-attachments"
 refs   = []
