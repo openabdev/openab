@@ -625,6 +625,17 @@ async fn send_request(
         Ok(Err(_)) => Err("connection closed before response".into()),
         Err(_) => {
             pending.lock().await.remove(&id);
+            // Tell the peer we gave up. Dropping the pending entry only ends OUR wait: the
+            // extension is still running the request and still holding whatever it holds — a tab,
+            // a navigation, a script — with no way to learn that nobody is listening any more.
+            // Best-effort by construction: this is a notification, so there is no reply to await,
+            // and a peer that has already gone away simply never reads it.
+            let cancel = JsonRpcNotification {
+                jsonrpc: "2.0",
+                method: "mcp/cancel".to_string(),
+                params: json!({ "requestId": id }),
+            };
+            let _ = out_tx.send(serde_json::to_string(&cancel).unwrap());
             Err("request timed out".into())
         }
     }
@@ -4300,6 +4311,51 @@ mod acp_ws_integration {
             err.contains("no active tab"),
             "the client's message must reach the caller, got: {err}"
         );
+    }
+
+    /// A tunnelled request that times out tells the peer, instead of just giving up quietly.
+    ///
+    /// Dropping the pending entry ends only OUR wait. The extension is still running the request
+    /// and still holding whatever it holds — a tab, a navigation, a script — and without a
+    /// cancellation it has no way to learn that nobody is listening. That is work and state
+    /// stranded on the peer for every timeout.
+    #[tokio::test]
+    async fn a_timed_out_tunnel_request_cancels_itself_on_the_peer() {
+        let (url, registry) = serve().await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        handshake(&mut ws, "srv-1", "katashiro", "conn-1").await;
+        wait_for_tunnels(&registry, 1).await;
+
+        let handle = {
+            let reg = registry.lock().unwrap();
+            reg.values().next().unwrap().clone()
+        };
+        // One second, and deliberately never answered.
+        let call = tokio::spawn(async move { handle.mcp_message("tools/call", None, 1).await });
+
+        let request = recv(&mut ws).await;
+        let request_id = request["id"].clone();
+        assert_eq!(request["method"], json!("mcp/message"));
+
+        let cancel = tokio::time::timeout(std::time::Duration::from_secs(10), recv(&mut ws))
+            .await
+            .expect(
+                "no `mcp/cancel` after the request timed out — the peer is still working on a \
+                 request nobody is waiting for",
+            );
+        assert_eq!(cancel["method"], json!("mcp/cancel"));
+        assert_eq!(
+            cancel["params"]["requestId"], request_id,
+            "the cancellation must name the request it cancels, or the peer cannot tell which of \
+             several in-flight requests to abandon"
+        );
+        assert!(
+            cancel.get("id").is_none(),
+            "a cancellation is a notification: giving it an `id` would oblige a reply nobody reads"
+        );
+
+        let err = call.await.unwrap().expect_err("a timed-out call must not read as success");
+        assert!(err.contains("timed out"), "got: {err}");
     }
 
     /// A prompt must not be refused because tunnels are still establishing.

@@ -127,7 +127,49 @@ or an image content block for `screenshot`). On failure return an MCP tool error
 extension MAY expose additional tools beyond this baseline; they surface to the agent via
 `tools/list` + a `tools/list_changed` notification.
 
-## 7. Permissions
+## 7. Cancellation and limits
+
+The gateway bounds how long it will wait for any tunnelled request. When that bound is reached it
+stops waiting **and tells you**, so the extension is never left working on a request nobody reads.
+
+### `mcp/cancel` (gateway → extension, notification)
+
+```json
+{ "jsonrpc": "2.0", "method": "mcp/cancel", "params": { "requestId": 42 } }
+```
+
+`requestId` is the **outer ACP frame `id`** of the request being abandoned — the same id you would
+have replied to. There is no `id` on this frame: it is a notification, so no reply is owed and none
+is read.
+
+On receipt, stop the work and release whatever it holds (the tab, the navigation, the script). A
+late reply to a cancelled `requestId` is discarded, so answering costs the gateway nothing and buys
+you nothing. Cancellation is best-effort in one direction only: if the socket is already gone the
+notification is simply never delivered, so do not treat its absence as "keep going".
+
+### Limits
+
+| Limit | Value | Meaning |
+|---|---|---|
+| Tunnel request timeout | `[mcp] tunnel_timeout_seconds`, default **180s** | one `mcp/message` request |
+| Connect / handshake timeout | 30s | `mcp/connect` and the `initialize` that follows it |
+| Servers per session | 8 (`MAX_ACP_SERVERS_PER_SESSION`) | `type:acp` entries accepted per `session/new` |
+| In-flight establishes | 64 (`MAX_INFLIGHT_ESTABLISHES`) | concurrent tunnel setups per connection |
+| Inbound response frame | 8 MiB (`MAX_FRAME_BYTES`) | a reply to `mcp/message` — `id`, no `method`; sized for screenshots |
+| Inbound method-bearing frame | 1 MiB (`MAX_NON_TUNNEL_FRAME_BYTES`) | anything carrying a `method`; the 8 MiB allowance is deliberately not reusable for these |
+
+The request timeout is operator-configurable because openab is the requester here and the peer is
+an extension it neither ships nor controls. It sits beneath the ACP idle timeout, so raising it
+past that bound moves the wall rather than removing it.
+
+### `session/resume` withdraws what it does not re-declare
+
+A resume re-presents the client's **whole** declaration set. Any `type:acp` server registered for
+that session and absent from the new set is treated as withdrawn: its tunnel is retired and its
+connection receives an `mcp/disconnect`. Re-declare every server you still want, on every resume —
+including across a reconnect.
+
+## 8. Permissions
 
 OpenAB core auto-approves tool permissions today (ADR D1); the extension does **not** need a
 per-call consent UX yet. Fine-grained consent is a later addition to this contract.

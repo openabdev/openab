@@ -21,7 +21,7 @@ flowchart LR
         end
 
         subgraph runtime["Shared MCP runtime (openab-mcp)"]
-            policy["tool_filter (least-privilege)<br/>JSON-Schema arg validation<br/>timeouts · circuit breaker<br/>secret redaction · audit log"]
+            policy["tool_filter (least-privilege)<br/>JSON-Schema arg validation<br/>timeouts<br/>secret redaction · audit log"]
         end
 
         adapter["gmail-native adapter<br/>loopback :8850/mcp"]
@@ -81,8 +81,8 @@ connections stay in `mcp.json` — `[mcp]` carries listener settings only
    by each server's `tool_filter` **before** anything reaches the agent.
 2. `execute_capability` (`name` + `arguments`) — execute an exact capability
    returned by discovery. Arguments are validated against the capability's
-   JSON Schema before dispatch; timeouts, circuit breaking, and secret
-   redaction apply on the same path the native agent uses.
+   JSON Schema before dispatch; timeouts and secret redaction apply on the
+   same path the native agent uses.
 
 An audit line is logged for every dispatch (tool name + args SHA-256 — never
 plaintext arguments):

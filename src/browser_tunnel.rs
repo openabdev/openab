@@ -11,11 +11,18 @@ use serde_json::Value;
 
 pub struct RootBrowserTunnel {
     registry: AcpTunnelRegistry,
+    /// Operator-configurable ceiling for one tunnelled request (`[mcp] tunnel_timeout_seconds`).
+    /// Carried here rather than read per call so the value a session runs under is fixed when the
+    /// tunnel is wired, not re-resolved mid-flight.
+    timeout_secs: u64,
 }
 
 impl RootBrowserTunnel {
-    pub fn new(registry: AcpTunnelRegistry) -> Self {
-        Self { registry }
+    pub fn new(registry: AcpTunnelRegistry, timeout_secs: u64) -> Self {
+        Self {
+            registry,
+            timeout_secs,
+        }
     }
 }
 
@@ -51,7 +58,7 @@ impl AcpMcpTunnel for RootBrowserTunnel {
             }
         };
         match handle {
-            Some(h) => h.mcp_message(method, params, 30).await,
+            Some(h) => h.mcp_message(method, params, self.timeout_secs).await,
             None => Err(format!("no browser attached to session {channel_id}")),
         }
     }

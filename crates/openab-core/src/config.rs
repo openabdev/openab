@@ -85,6 +85,21 @@ pub struct McpFacadeConfig {
     /// client-side service without a code change.
     #[serde(default)]
     pub acp_servers: Vec<AcpServerPolicy>,
+    /// How long a single request tunnelled to a client-declared `type:acp` server may run
+    /// before openab gives up on it, in seconds.
+    ///
+    /// Enforced server-side because on this tunnel OPENAB is the requester and the peer is a
+    /// browser extension we neither ship nor control, so there is nobody else to bound it.
+    /// The default matches the ACP idle timeout it sits beneath: raising only this one would
+    /// move the wall rather than remove it, since a turn that outlives the idle timeout is cut
+    /// short there instead. A heavy page can run silent for minutes, which is why the old
+    /// hard-coded 30s was too low to be a policy.
+    #[serde(default = "default_tunnel_timeout_seconds")]
+    pub tunnel_timeout_seconds: u64,
+}
+
+fn default_tunnel_timeout_seconds() -> u64 {
+    180
 }
 
 /// One entry of the §6.4 operator allowlist.

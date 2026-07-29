@@ -462,7 +462,15 @@ async fn main() -> anyhow::Result<()> {
     let acp_tunnel_registry = openab_gateway::adapters::acp_server::new_tunnel_registry();
     #[cfg(feature = "acp")]
     let browser_tunnel: Arc<dyn openab_core::mcp_proxy::AcpMcpTunnel> = Arc::new(
-        browser_tunnel::RootBrowserTunnel::new(acp_tunnel_registry.clone()),
+        browser_tunnel::RootBrowserTunnel::new(
+            acp_tunnel_registry.clone(),
+            // Browser control requires `[mcp]`, so the absent case is unreachable in practice;
+            // fall back to the same default rather than to the old 30s, which was the defect.
+            cfg.mcp
+                .as_ref()
+                .map(|m| m.tunnel_timeout_seconds)
+                .unwrap_or(180),
+        ),
     );
 
     // OAB MCP Facade (`[mcp]` in config.toml — OAB MCP Adapter ADR §6.2):
