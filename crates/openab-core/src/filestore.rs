@@ -15,6 +15,28 @@ pub struct Filestore {
     max_file_size: u64,
 }
 
+/// Below a minute the URL tends to expire before the agent fetches it, and every
+/// hint that renders `ttl / 60` reports "0 minutes"; a week is the upper bound.
+const MIN_PRESIGNED_TTL: u64 = 60;
+const MAX_PRESIGNED_TTL: u64 = 7 * 24 * 60 * 60;
+
+fn clamp_presigned_ttl(configured: u64) -> u64 {
+    if configured > MAX_PRESIGNED_TTL {
+        tracing::warn!(
+            configured,
+            capped = MAX_PRESIGNED_TTL,
+            "presigned_ttl exceeds 7-day maximum, capping"
+        );
+    } else if configured < MIN_PRESIGNED_TTL {
+        tracing::warn!(
+            configured,
+            raised = MIN_PRESIGNED_TTL,
+            "presigned_ttl below 60-second minimum, raising"
+        );
+    }
+    configured.clamp(MIN_PRESIGNED_TTL, MAX_PRESIGNED_TTL)
+}
+
 impl Filestore {
     /// Initialize a new Filestore from the given configuration.
     ///
@@ -57,16 +79,7 @@ impl Filestore {
 
         let client = aws_sdk_s3::Client::from_conf(s3_config_builder.build());
 
-        // Cap presigned TTL at 7 days to prevent excessively long-lived URLs.
-        const MAX_PRESIGNED_TTL: u64 = 7 * 24 * 60 * 60; // 7 days
-        let ttl_secs = config.presigned_ttl.min(MAX_PRESIGNED_TTL);
-        if config.presigned_ttl > MAX_PRESIGNED_TTL {
-            tracing::warn!(
-                configured = config.presigned_ttl,
-                capped = MAX_PRESIGNED_TTL,
-                "presigned_ttl exceeds 7-day maximum, capping"
-            );
-        }
+        let ttl_secs = clamp_presigned_ttl(config.presigned_ttl);
 
         // Cap max_file_size_mb at 500 MB absolute maximum.
         const ABSOLUTE_MAX_FILE_SIZE_MB: u64 = 500;
@@ -499,6 +512,28 @@ pub fn format_filestore_hint(filename: &str, size_bytes: u64, presigned_url: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presigned_ttl_clamps_to_both_bounds() {
+        assert_eq!(clamp_presigned_ttl(3600), 3600);
+        assert_eq!(clamp_presigned_ttl(MIN_PRESIGNED_TTL), MIN_PRESIGNED_TTL);
+        assert_eq!(clamp_presigned_ttl(MAX_PRESIGNED_TTL), MAX_PRESIGNED_TTL);
+        assert_eq!(clamp_presigned_ttl(0), MIN_PRESIGNED_TTL);
+        assert_eq!(clamp_presigned_ttl(59), MIN_PRESIGNED_TTL);
+        assert_eq!(
+            clamp_presigned_ttl(MAX_PRESIGNED_TTL + 1),
+            MAX_PRESIGNED_TTL
+        );
+    }
+
+    #[test]
+    fn presigned_ttl_never_renders_zero_minutes() {
+        // The three hint sites all render `ttl / 60`, so the floor is what keeps
+        // "expires in 0 minutes" unreachable.
+        for configured in [0, 1, 59] {
+            assert!(clamp_presigned_ttl(configured) / 60 >= 1);
+        }
+    }
 
     #[test]
     fn filestore_config_deserializes_with_defaults() {
