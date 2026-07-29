@@ -1057,8 +1057,8 @@ pub async fn upload_bytes_to_filestore_public(
     upload_bytes_to_filestore(filename, bytes, filestore).await
 }
 
-/// One wording for the presigned URL's lifetime, so the five call sites that
-/// surface it to the agent cannot drift apart.
+/// One wording for the presigned URL's lifetime, so the call sites that surface
+/// it to the agent cannot drift apart.
 #[cfg(feature = "filestore")]
 fn presigned_note(filestore: &crate::filestore::Filestore) -> String {
     format!(
@@ -1824,15 +1824,21 @@ mod tests {
     fn sanitizer_strips_unicode_separators_and_bidi_controls() {
         // char::is_control covers only C0/C1, so these survived it and could
         // restructure the rendered block or reorder it visually.
-        let hostile = "a\u{2028}b\u{2029}c\u{202E}d\u{2066}e\u{200F}f\u{FEFF}g.ogg";
+        let hostile = "a\u{2028}b\u{2029}c\u{202E}d\u{2066}e\u{200F}f\u{FEFF}g\u{061C}h.ogg";
         let text = block_text(audio_attachment_block(hostile, "audio/ogg", 1, None, None));
 
-        for bad in ['\u{2028}', '\u{2029}', '\u{202E}', '\u{2066}', '\u{200F}', '\u{FEFF}'] {
+        for bad in [
+            '\u{2028}', '\u{2029}', '\u{202E}', '\u{2066}', '\u{200F}', '\u{FEFF}', '\u{061C}',
+        ] {
             assert!(!text.contains(bad), "{bad:?} survived sanitisation");
         }
-        assert!(text.contains("filename: abcdefg.ogg"));
-        // Exactly the four declared lines, so nothing forged an extra one.
-        assert_eq!(text.lines().count(), 4, "got {text}");
+        assert!(text.contains("filename: abcdefgh.ogg"));
+        // Counted over every separator a renderer may break on, since str::lines
+        // sees only \n and would read four whether or not U+2028 survived.
+        let rendered_lines = text
+            .split(|c| c == '\n' || c == '\u{2028}' || c == '\u{2029}')
+            .count();
+        assert_eq!(rendered_lines, 4, "got {text}");
     }
 
     #[test]
@@ -1911,8 +1917,11 @@ mod tests {
 
         for n in &notes {
             assert!(!n.contains('\n'), "a newline would forge a block line: {n}");
-            // The block writes `url:` before `note:`, so no note may claim otherwise.
-            assert!(!n.contains("below"), "positional claim in {n}");
+            // Field order is the block's to change, so neither direction may be claimed.
+            assert!(
+                !n.contains("below") && !n.contains("above"),
+                "positional claim in {n}"
+            );
         }
     }
 
@@ -2079,6 +2088,30 @@ mod tests {
             text,
             "[Video attachment]\nfilename: demo.mp4\ncontent_type: video/mp4\nsize_bytes: 12345\nurl: https://cdn.discordapp.com/attachments/demo.mp4"
         );
+    }
+
+    #[test]
+    fn the_video_block_diverges_from_main_only_on_a_mime_main_passed_through_raw() {
+        // main used `content_type.unwrap_or("unknown")` and passed the value through
+        // raw, so the acceptance criterion has to name this divergence too.
+        let empty = block_text(video_attachment_block("a.mp4", Some(""), 1, "u", None));
+        assert!(empty.contains("content_type: unknown"), "{empty}");
+
+        let quoted = block_text(video_attachment_block(
+            "a.mp4",
+            Some("video/mp4; codecs=\"avc1.42E01E\""),
+            1,
+            "u",
+            None,
+        ));
+        assert!(
+            quoted.contains("content_type: video/mp4; codecs=avc1.42E01E"),
+            "{quoted}"
+        );
+
+        // None was already "unknown" on main, so that case is untouched.
+        let absent = block_text(video_attachment_block("a.mp4", None, 1, "u", None));
+        assert!(absent.contains("content_type: unknown"), "{absent}");
     }
 
     #[test]

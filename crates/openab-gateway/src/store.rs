@@ -111,8 +111,7 @@ mod tests {
     use super::*;
 
     /// The Google Chat adapter downloads audio up to 25 MB while this store caps
-    /// at 20, so the effective inbound limit is the smaller of the two. Rejection
-    /// returns before any filesystem call, which is why this runs in CI.
+    /// at 20, so the effective inbound limit is the smaller of the two.
     #[tokio::test]
     async fn store_rejects_above_the_cap_and_accepts_at_it() {
         assert!(
