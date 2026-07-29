@@ -361,6 +361,12 @@ pub struct ReplySink {
     /// Originating `GatewayEvent.event_id` (`evt_<uuid>`), round-tripped as `reply_to`.
     pub turn_id: String,
     pub tx: mpsc::UnboundedSender<ReplyChunk>,
+    /// The `acp_conn_*` id of the WebSocket connection that installed this sink.
+    ///
+    /// Teardown removes only what it owns. "Remove the keys for my sessions" is not enough: a
+    /// client that reconnects and resumes takes over the same `channel_id`, so a slow cleanup from
+    /// the old connection would delete the *successor's* live sink and silently stop its replies.
+    pub owner: String,
 }
 
 /// Registry of active ACP sessions: channel_id → reply sink.
@@ -717,6 +723,13 @@ pub struct TunnelHandle {
     /// fresh UUID per connection. Tool prefixes (`browser.click`) and the §6.4 trust allowlist are
     /// both keyed by this name, so it must survive registration to be routable (ADR §6.1).
     server_name: String,
+    /// The `acp_conn_*` id of the WebSocket connection this tunnel belongs to.
+    ///
+    /// The registry key is `(channel_id, server_id)` and a reconnecting client mints a fresh
+    /// `server_id`, so a key is not a stable identity — and even the channel is reused across
+    /// connections by `session/resume`. Teardown therefore matches on this owner rather than on
+    /// the key, so a late cleanup cannot remove a handle installed by a different connection.
+    owner: String,
 }
 
 impl TunnelHandle {
@@ -775,6 +788,7 @@ async fn establish_and_register_tunnel(
     channel_id: String,
     registry: AcpTunnelRegistry,
     timeout_secs: u64,
+    owner: String,
 ) -> Result<(), String> {
     // Observability: reaching here means the client DID declare a "type":"acp" server, so this
     // line in the log answers "did the browser extension advertise itself?" for a live session.
@@ -786,6 +800,7 @@ async fn establish_and_register_tunnel(
         next_id,
         connection_id,
         server_name: acp_name.clone(),
+        owner: owner.clone(),
     };
     let replaced = {
         let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
@@ -801,7 +816,15 @@ async fn establish_and_register_tunnel(
         // this is a std mutex, so awaiting under it is not an option.
         let stale: Vec<(String, String)> = reg
             .iter()
-            .filter(|((c, id), h)| c == &channel_id && h.server_name == acp_name && id != &acp_id)
+            .filter(|((c, id), h)| {
+                // Deliberately NOT scoped to the attaching connection. A reconnecting client
+                // arrives on a NEW socket with a fresh `server_id`, so its predecessor's handle is
+                // owned by the old connection — restricting eviction to one owner would leave that
+                // dead tunnel registered beside the live one under the same declared name, which
+                // is the ambiguity last-attach-wins exists to prevent (ADR §6.1). Teardown is
+                // owner-scoped; eviction is not, and they are different questions.
+                c == &channel_id && h.server_name == acp_name && id != &acp_id
+            })
             .map(|(k, _)| k.clone())
             .collect();
         let replaced: Vec<TunnelHandle> = stale.iter().filter_map(|k| reg.remove(k)).collect();
@@ -844,6 +867,7 @@ fn spawn_acp_tunnels(
     pending: &Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     next_id: &Arc<AtomicU64>,
     prompt_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+    owner: &str,
 ) {
     for srv in servers {
         let out_tx = out_tx.clone();
@@ -851,9 +875,10 @@ fn spawn_acp_tunnels(
         let next_id = next_id.clone();
         let registry = registry.clone();
         let channel_id = channel_id.clone();
+        let owner = owner.to_string();
         prompt_tasks.push(tokio::spawn(async move {
             if let Err(e) = establish_and_register_tunnel(
-                out_tx, pending, next_id, srv.id, srv.name, channel_id, registry, 30,
+                out_tx, pending, next_id, srv.id, srv.name, channel_id, registry, 30, owner,
             )
             .await
             {
@@ -1101,6 +1126,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         &pending_requests,
                         &next_req_id,
                         &mut prompt_tasks,
+                        &connection_id,
                     );
                 }
             }
@@ -1155,6 +1181,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         &pending_requests,
                         &next_req_id,
                         &mut prompt_tasks,
+                        &connection_id,
                     );
                 }
             }
@@ -1229,6 +1256,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 let state_clone = state.clone();
                 let sessions_clone = sessions.clone();
                 let out_tx_clone = out_tx.clone();
+                let conn_for_prompt = connection_id.clone();
                 let handle = tokio::spawn(async move {
                     handle_session_prompt(
                         &state_clone,
@@ -1238,6 +1266,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         &out_tx_clone,
                         session_id,
                         cancel,
+                        &conn_for_prompt,
                     )
                     .await;
                 });
@@ -1290,16 +1319,18 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
             .map(|s| s.channel_id.clone())
             .collect()
     };
+    // Teardown removes only what THIS connection owns. Matching on the key alone is wrong for
+    // both registries: a client that reconnects and resumes takes over the same `channel_id`, so a
+    // late cleanup from the closing connection would delete the successor's live entry — the
+    // reply sink stops delivering, or the tunnel disappears from under a working session.
     if let Some(ref registry) = state.acp_reply_registry {
         let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
-        for cid in &channel_ids {
-            reg.remove(cid);
-        }
+        reg.retain(|cid, sink| !(channel_ids.contains(cid) && sink.owner == connection_id));
     }
     if let Some(ref registry) = state.acp_tunnel_registry {
         let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
-        // Compound-key registry (P1): drop every `(channel_id, *)` tunnel for the closed session.
-        reg.retain(|(cid, _), _| !channel_ids.contains(cid));
+        // Compound-key registry (P1): drop this connection's `(channel_id, *)` tunnels only.
+        reg.retain(|(cid, _), h| !(channel_ids.contains(cid) && h.owner == connection_id));
     }
     debug!(
         connection = %connection_id,
@@ -1552,6 +1583,9 @@ async fn release_prompt(
     }
 }
 
+// 8 args: the connection id is threaded in so the reply sink records which connection installed
+// it. Bundling these into a struct would hide that relationship at the call site.
+#[allow(clippy::too_many_arguments)]
 async fn handle_session_prompt(
     state: &Arc<crate::AppState>,
     sessions: &Arc<tokio::sync::Mutex<HashMap<String, AcpSession>>>,
@@ -1562,6 +1596,9 @@ async fn handle_session_prompt(
     // `cancel` installed under the session lock (R16-F1). This task owns releasing it on return.
     session_id: String,
     cancel: Arc<tokio::sync::Notify>,
+    // `acp_conn_*` id of the connection running this prompt, stamped on the reply sink so
+    // teardown removes only the sinks this connection installed.
+    connection_id: &str,
 ) {
     // sessionId was validated + reserved by the caller; only the prompt body can still be bad.
     let prompt_text = match extract_prompt_params(params) {
@@ -1614,7 +1651,10 @@ async fn handle_session_prompt(
         registry
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(channel_id.clone(), ReplySink { turn_id, tx: reply_tx });
+            .insert(
+                channel_id.clone(),
+                ReplySink { turn_id, tx: reply_tx, owner: connection_id.to_string() },
+            );
     }
 
     // Send event through the broadcast channel
@@ -2344,6 +2384,7 @@ mod acp_requests {
         let next_id = Arc::new(AtomicU64::new(1));
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
         let handle = super::TunnelHandle {
+            owner: "conn-test".into(),
             out_tx,
             pending: pending.clone(),
             next_id,
@@ -2395,6 +2436,7 @@ mod acp_requests {
             "acp_abc".into(),
             registry.clone(),
             5,
+            "conn-test".into(),
         )
         .await
         .unwrap();
@@ -2437,6 +2479,7 @@ mod acp_requests {
             "acp_abc".into(),
             registry.clone(),
             5,
+            "conn-test".into(),
         )
         .await
         .unwrap();
@@ -2499,6 +2542,7 @@ mod acp_requests {
             "acp_abc".into(),
             registry.clone(),
             5,
+            "conn-test".into(),
         )
         .await
         .unwrap();
@@ -2777,6 +2821,7 @@ mod acp_review_fixes {
             &pending,
             &next_id,
             &mut tasks,
+            "conn-test",
         );
 
         assert_eq!(tasks.len(), 2, "one task per unique declaration");
@@ -2915,7 +2960,10 @@ mod acp_review_fixes {
         registry
             .lock()
             .unwrap()
-            .insert("acp_chan".into(), ReplySink { turn_id: "evt_current".into(), tx });
+            .insert(
+                "acp_chan".into(),
+                ReplySink { turn_id: "evt_current".into(), tx, owner: "conn-test".into() },
+            );
 
         // Stale reply (previous turn's event id) → dropped.
         handle_reply(&reply("acp_chan", "evt_stale", "leaked", Some("edit_message")), &registry)
@@ -3017,7 +3065,7 @@ mod acp_review_fixes {
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
         let params = json!({"sessionId": sid, "prompt": [{"type": "text", "text": "hi"}]});
-        handle_session_prompt(&state, &sessions, json!(7), Some(&params), &out_tx, sid.clone(), cancel)
+        handle_session_prompt(&state, &sessions, json!(7), Some(&params), &out_tx, sid.clone(), cancel, "conn-test")
             .await;
 
         // The final response (matching our request id) must carry stopReason "cancelled".
@@ -3100,7 +3148,7 @@ mod acp_review_fixes {
         let sid2 = sid.clone();
         let handle = tokio::spawn(async move {
             let params = json!({"sessionId": sid2, "prompt": [{"type": "text", "text": "hi"}]});
-            handle_session_prompt(&st2, &sessions2, json!(11), Some(&params), &out_tx, sid2.clone(), cancel)
+            handle_session_prompt(&st2, &sessions2, json!(11), Some(&params), &out_tx, sid2.clone(), cancel, "conn-test")
                 .await;
         });
 
@@ -3434,4 +3482,104 @@ mod acp_ws_integration {
         };
         assert_eq!(names, vec!["conn-new".to_string()], "only the newest tunnel may remain");
     }
+}
+
+/// Teardown ownership (canonical item 2).
+///
+/// Both registries are keyed by things that outlive a connection — the reply registry by
+/// `channel_id`, the tunnel registry by `(channel_id, server_id)` — and `session/resume` hands the
+/// same channel to a *new* connection. So "remove the keys for my sessions" deletes a successor's
+/// live entry. "Only remove keys I inserted" is no better: the key is reused, so it cannot tell the
+/// two apart. The owner can.
+///
+/// All three cases below fail against key-only teardown.
+#[cfg(test)]
+mod acp_teardown_ownership {
+    use super::*;
+
+    fn tunnel(owner: &str, connection_id: &str) -> TunnelHandle {
+        let (out_tx, _rx) = mpsc::unbounded_channel::<String>();
+        TunnelHandle {
+            out_tx,
+            pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+            connection_id: connection_id.into(),
+            server_name: "katashiro".into(),
+            owner: owner.into(),
+        }
+    }
+
+    /// Model the teardown predicate exactly as `cleanup` applies it, so the test exercises the
+    /// rule rather than a paraphrase of it.
+    fn teardown(reg: &AcpTunnelRegistry, channel_ids: &[&str], closing: &str) {
+        let mut reg = reg.lock().unwrap();
+        reg.retain(|(cid, _), h| !(channel_ids.contains(&cid.as_str()) && h.owner == closing));
+    }
+
+    /// A connection that closes must not take its successor's tunnel with it.
+    ///
+    /// The old connection's cleanup runs late — after the client reconnected, resumed the same
+    /// channel and registered a fresh tunnel. Under key-only teardown the successor's handle is
+    /// removed and a working session loses its browser with no error anywhere.
+    #[test]
+    fn a_late_cleanup_does_not_remove_the_successors_tunnel() {
+        let reg = new_tunnel_registry();
+        {
+            let mut r = reg.lock().unwrap();
+            // The successor: same channel, fresh server id, different connection.
+            r.insert(("acp_x".into(), "srv-new".into()), tunnel("conn-B", "cid-new"));
+        }
+        teardown(&reg, &["acp_x"], "conn-A");
+
+        let r = reg.lock().unwrap();
+        assert!(
+            r.contains_key(&("acp_x".to_string(), "srv-new".to_string())),
+            "conn-A's cleanup must not remove a tunnel owned by conn-B on the same channel"
+        );
+    }
+
+    /// Its own entries still go.
+    #[test]
+    fn a_cleanup_still_removes_the_tunnels_it_owns() {
+        let reg = new_tunnel_registry();
+        {
+            let mut r = reg.lock().unwrap();
+            r.insert(("acp_x".into(), "srv-a".into()), tunnel("conn-A", "cid-a"));
+            r.insert(("acp_x".into(), "srv-b".into()), tunnel("conn-B", "cid-b"));
+        }
+        teardown(&reg, &["acp_x"], "conn-A");
+
+        let r = reg.lock().unwrap();
+        assert!(!r.contains_key(&("acp_x".to_string(), "srv-a".to_string())), "conn-A's own tunnel must go");
+        assert!(r.contains_key(&("acp_x".to_string(), "srv-b".to_string())), "conn-B's must stay");
+        assert_eq!(r.len(), 1);
+    }
+
+    /// A reply sink installed by a successor survives the predecessor's cleanup.
+    ///
+    /// Same defect, quieter symptom: the sink is how a prompt's output reaches the client, so
+    /// deleting the wrong one produces a session that accepts prompts and answers none.
+    #[test]
+    fn a_late_cleanup_does_not_remove_the_successors_reply_sink() {
+        let reg = new_reply_registry();
+        {
+            let (tx, _rx) = mpsc::unbounded_channel::<ReplyChunk>();
+            reg.lock().unwrap().insert(
+                "acp_x".into(),
+                ReplySink { turn_id: "evt_new".into(), tx, owner: "conn-B".into() },
+            );
+        }
+        {
+            let mut r = reg.lock().unwrap();
+            let channel_ids = ["acp_x"];
+            r.retain(|cid, s| !(channel_ids.contains(&cid.as_str()) && s.owner == "conn-A"));
+        }
+        let r = reg.lock().unwrap();
+        assert_eq!(
+            r.get("acp_x").map(|s| s.turn_id.as_str()),
+            Some("evt_new"),
+            "conn-A's cleanup must leave conn-B's sink in place, or the live session goes mute"
+        );
+    }
+
 }
