@@ -800,7 +800,7 @@ async fn establish_and_register_tunnel(
 ) -> Result<(), String> {
     // Observability: reaching here means the client DID declare a "type":"acp" server, so this
     // line in the log answers "did the browser extension advertise itself?" for a live session.
-    info!(acp_id = %acp_id, acp_name = %acp_name, channel_id = %channel_id, "ACP: opening MCP-over-ACP tunnel");
+    info!(acp_id = %acp_id, acp_name = %acp_name, channel = %redact_id(&channel_id), "ACP: opening MCP-over-ACP tunnel");
     let connection_id = mcp_connect(&out_tx, &pending, &next_id, &acp_id, timeout_secs).await?;
     let handle = TunnelHandle {
         out_tx,
@@ -841,7 +841,7 @@ async fn establish_and_register_tunnel(
     };
     if !replaced.is_empty() {
         info!(
-            channel_id = %channel_id, server_name = %acp_name, evicted = replaced.len(),
+            channel = %redact_id(&channel_id), server_name = %acp_name, evicted = replaced.len(),
             "ACP: last-attach-wins — evicted stale same-name tunnel(s)"
         );
         // Best-effort and off the attach path: a replaced connection may already be dead, and
@@ -854,7 +854,7 @@ async fn establish_and_register_tunnel(
             }
         });
     }
-    info!(channel_id = %channel_id, server_id = %acp_id, server_name = %acp_name, "ACP: tunnel registered — client MCP server attached");
+    info!(channel = %redact_id(&channel_id), server_id = %acp_id, server_name = %acp_name, "ACP: tunnel registered — client MCP server attached");
     Ok(())
 }
 
@@ -1208,7 +1208,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         };
                         if !dropped.is_empty() {
                             info!(
-                                channel_id = %channel_id, retired = dropped.len(),
+                                channel = %redact_id(channel_id), retired = dropped.len(),
                                 "ACP: resume withdrew declarations — retiring their tunnels"
                             );
                             tokio::spawn(async move {
@@ -1661,6 +1661,23 @@ async fn handle_session_cancel(
 /// `sessionId` (`sess_<uuid>`). Returns `None` if malformed — the uuid must
 /// parse, which keeps a resumed channel inside the `acp_` namespace and rejects
 /// forged ids.
+/// A stable, non-reversible tag for an ACP channel or session id, for logs.
+///
+/// `channel_id` is `acp_<uuid>` and `session_id` is `sess_<same uuid>` — see
+/// [`derive_channel_id`] — so either one in a log line is a working `session/resume` credential.
+/// Anyone who can read operator logs could take over a live session, and logs travel further than
+/// the sessions they describe.
+///
+/// Dropping the lines to `debug!` would hide them from the operators who need them ("did the
+/// extension attach?"), so the id is hashed instead: the same session tags identically on every
+/// line, which is what makes a log readable, but the tag cannot be turned back into the id.
+fn redact_id(id: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(id.as_bytes());
+    let short: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    format!("#{short}")
+}
+
 fn derive_channel_id(session_id: &str) -> Option<String> {
     let uuid = session_id.strip_prefix("sess_")?;
     Uuid::parse_str(uuid).ok()?;
@@ -1824,7 +1841,7 @@ async fn handle_session_prompt(
                     }
                     Ok(Some(ReplyChunk::Done)) | Ok(None) => break,
                     Err(_) => {
-                        warn!(session = %session_id, "ACP: prompt timed out waiting for reply");
+                        warn!(session = %redact_id(&session_id), "ACP: prompt timed out waiting for reply");
                         timed_out = true;
                         break;
                     }
@@ -3772,6 +3789,95 @@ mod acp_ws_integration {
 /// two apart. The owner can.
 ///
 /// All three cases below fail against key-only teardown.
+/// Operator logs must not hand out a resume credential.
+#[cfg(test)]
+mod acp_log_redaction {
+    use super::*;
+
+    /// The two ids are the same uuid under different prefixes, so either one in a log line is a
+    /// working `session/resume` credential. This is the property that makes redaction necessary —
+    /// if it ever stops holding, the redaction is solving a problem that moved.
+    #[test]
+    fn a_channel_id_yields_its_session_id() {
+        let uuid = Uuid::new_v4();
+        let session_id = format!("sess_{uuid}");
+        let channel_id = derive_channel_id(&session_id).unwrap();
+        assert_eq!(channel_id, format!("acp_{uuid}"));
+        assert_eq!(
+            channel_id.strip_prefix("acp_"),
+            session_id.strip_prefix("sess_"),
+            "one is trivially derivable from the other — that is why neither may be logged raw"
+        );
+    }
+
+    #[test]
+    fn a_redacted_id_is_stable_but_does_not_contain_the_original() {
+        let uuid = Uuid::new_v4();
+        let channel_id = format!("acp_{uuid}");
+        let tag = redact_id(&channel_id);
+
+        assert_eq!(tag, redact_id(&channel_id), "same id must tag identically, or logs stop \
+                                                 being correlatable across lines");
+        assert!(!tag.contains(&uuid.to_string()), "the uuid must not survive into the tag");
+        assert!(
+            !tag.contains(&channel_id) && !channel_id.contains(&tag[1..]),
+            "the tag must not be a substring of the id or vice versa"
+        );
+        assert_ne!(tag, redact_id(&format!("acp_{}", Uuid::new_v4())), "different ids differ");
+    }
+
+    /// No `info!`/`warn!`/`error!` in this file may carry a raw channel or session id.
+    ///
+    /// Written as a source scan because the defect is a *class*, not a line: the item named two
+    /// sites, and a multi-line-aware sweep found four — the two extra ones added by later items in
+    /// this same round, and missed by a line-oriented grep because the macro and the field sat on
+    /// different lines. Pinning the four known sites would pass while the next wrapped `info!`
+    /// reintroduced the leak.
+    #[test]
+    fn no_operator_log_line_carries_a_raw_acp_id() {
+        let src = include_str!("acp_server.rs");
+        let mut offenders: Vec<String> = Vec::new();
+        for macro_open in ["info!(", "warn!(", "error!("] {
+            let mut from = 0;
+            while let Some(rel) = src[from..].find(macro_open) {
+                let start = from + rel;
+                // Balance from the macro's own opening paren, so a mention of `info!` in prose
+                // cannot send this scanning for a close paren that was never opened.
+                let open = start + macro_open.len() - 1;
+                from = open + 1;
+                let mut depth = 0usize;
+                let mut end = open;
+                for (i, c) in src[open..].char_indices() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = open + i;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let body = &src[start..=end];
+                // `%channel_id` / `%session_id` interpolate the raw value; `redact_id(..)` does not.
+                if body.contains("%channel_id") || body.contains("%session_id") {
+                    let line = src[..start].matches('\n').count() + 1;
+                    offenders.push(format!(
+                        "{line}: {}",
+                        body.split_whitespace().take(8).collect::<Vec<_>>().join(" ")
+                    ));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these operator-visible log lines carry a raw resume credential: {offenders:#?}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod acp_teardown_ownership {
     use super::*;
