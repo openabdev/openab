@@ -74,12 +74,31 @@ inner MCP `id`; correlation is by the outer ACP JSON-RPC id):
   { "jsonrpc":"2.0", "id":<n>, "result": { ...inner MCP result... } }
   ```
   An inner MCP-level error is returned as the outer JSON-RPC `error`.
-- **Notification** (outer frame has no `id`): fire-and-forget inner MCP notification; no
-  reply. The **extension** sends these upward for server-originated MCP notifications (e.g.
-  `notifications/tools/list_changed` when its tool set changes).
+- **Notification** (outer frame has no `id`): fire-and-forget inner MCP notification; no reply.
+  These travel in **both** directions. The extension sends them upward for server-originated MCP
+  notifications; the gateway sends them downward, and the extension must forward them to its inner
+  MCP server exactly as it forwards requests — see `notifications/initialized` below.
+
+### Lifecycle: the gateway initializes before it asks for anything
+
+Immediately after `mcp/connect` the gateway performs the MCP handshake on the new connection:
+
+1. `mcp/message` **request** carrying inner `initialize` — the extension forwards it to its MCP
+   server and returns the server's `InitializeResult`.
+2. `mcp/message` **notification** (no outer `id`) carrying inner `notifications/initialized` — the
+   extension forwards it to the server and replies with nothing.
+
+Only then does the gateway send `tools/list` or `tools/call`.
+
+**A server that fails `initialize` is not registered**, so its tools never become reachable and no
+later call is attempted against it. Forwarding the notification matters as much as answering the
+request: MCP servers are entitled to reject work until they have received `initialized`, and an
+extension that swallows it leaves its own server permanently un-initialized while the gateway
+believes the handshake completed.
 
 Inner MCP methods the extension must handle as a server:
-- `initialize` → advertise `capabilities.tools`.
+- `initialize` → forward to the server; return its `InitializeResult`.
+- `notifications/initialized` → forward to the server; no reply.
 - `tools/list` → return the browser tools (§6).
 - `tools/call` → execute the named tool in the active tab; return an MCP `CallToolResult`.
 

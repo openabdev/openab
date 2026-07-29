@@ -3685,6 +3685,64 @@ mod acp_ws_integration {
         wait_for_tunnels(&registry, 1).await;
     }
 
+    /// A server that refuses the handshake must not be registered.
+    ///
+    /// `inner_mcp_handshake`'s doc promises "failure here fails the establish, so a server that
+    /// cannot complete the handshake never reaches the registry" — and nothing tested it. The
+    /// ordering test cannot: change the call to `let _ = inner_mcp_handshake(...)` and the frame
+    /// order is unchanged, the registry is still empty when `initialize` arrives, and it stays
+    /// green while refusing servers get registered anyway.
+    #[tokio::test]
+    async fn a_server_that_refuses_initialize_is_not_registered() {
+        let (url, registry) = serve().await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        send(&mut ws, json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}}
+        })).await;
+        let _ = recv(&mut ws).await;
+        send(&mut ws, json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": {"cwd": "/w", "mcpServers": [{"type": "acp", "id": "srv-1", "name": "katashiro"}]}
+        })).await;
+
+        // Answer `mcp/connect`, then REFUSE `initialize` the way a server that will not serve us
+        // does: a JSON-RPC error, per the contract's "an inner MCP-level error is returned as the
+        // outer JSON-RPC `error`".
+        let mut refused = false;
+        while !refused {
+            let f = recv(&mut ws).await;
+            match f.get("method").and_then(Value::as_str) {
+                Some("mcp/connect") => {
+                    send(&mut ws, json!({
+                        "jsonrpc": "2.0", "id": f["id"].clone(),
+                        "result": {"connectionId": "conn-1"}
+                    })).await;
+                }
+                Some("mcp/message") if f["params"]["method"] == json!("initialize") => {
+                    send(&mut ws, json!({
+                        "jsonrpc": "2.0", "id": f["id"].clone(),
+                        "error": {"code": -32603, "message": "not accepting connections"}
+                    })).await;
+                    refused = true;
+                }
+                _ => {}
+            }
+        }
+
+        // The establish must fail. Poll rather than sleep: we are proving something stays absent,
+        // so give it real time to appear wrongly instead of checking once and declaring victory.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            assert!(
+                registry.lock().unwrap().is_empty(),
+                "a server that refused `initialize` was registered anyway — the handshake failure \
+                 did not fail the establish"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
     /// A real `mcp/message` crosses the socket and its result comes back to the caller.
     #[tokio::test]
     async fn a_tool_call_crosses_the_real_socket_and_returns_its_result() {
