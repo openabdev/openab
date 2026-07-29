@@ -780,12 +780,6 @@ impl TunnelHandle {
     }
 }
 
-/// Open the MCP-over-ACP tunnel to a session's declared `"type":"acp"` server and register a
-/// `TunnelHandle` under the session's `channel_id` so the core MCP proxy can reach it (T5.3).
-/// MUST run in a spawned task, never inline in the connection read loop: `mcp_connect` awaits
-/// the client's response, which only that same read loop can deliver — awaiting it inline
-/// would deadlock.
-#[allow(dead_code)]
 /// MCP protocol version the gateway speaks to a tunnelled client MCP server.
 const INNER_MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -839,6 +833,12 @@ async fn inner_mcp_handshake(
     Ok(())
 }
 
+/// Open the MCP-over-ACP tunnel to a session's declared `"type":"acp"` server and register a
+/// `TunnelHandle` under the session's `channel_id` so the core MCP proxy can reach it (T5.3).
+/// MUST run in a spawned task, never inline in the connection read loop: `mcp_connect` awaits
+/// the client's response, which only that same read loop can deliver — awaiting it inline
+/// would deadlock.
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 async fn establish_and_register_tunnel(
     out_tx: mpsc::UnboundedSender<String>,
