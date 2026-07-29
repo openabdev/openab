@@ -1083,6 +1083,7 @@ pub async fn run_gateway_adapter(
                                                             Some(ref fs) => crate::media::upload_bytes_and_presign(
                                                                 &att.filename,
                                                                 &bytes,
+                                                                Some(att.mime_type.as_str()),
                                                                 fs,
                                                             )
                                                             .await,
@@ -1580,8 +1581,13 @@ pub async fn process_gateway_event(
                         #[cfg(feature = "filestore")]
                         let stored: Option<(String, String)> = match ctx.filestore {
                             Some(ref fs) => {
-                                crate::media::upload_bytes_and_presign(&att.filename, &bytes, fs)
-                                    .await
+                                crate::media::upload_bytes_and_presign(
+                                    &att.filename,
+                                    &bytes,
+                                    Some(att.mime_type.as_str()),
+                                    fs,
+                                )
+                                .await
                             }
                             None => None,
                         };

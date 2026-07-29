@@ -96,6 +96,7 @@ impl Filestore {
         &self,
         filename: &str,
         data: &[u8],
+        content_type: Option<&str>,
     ) -> anyhow::Result<String> {
         // Sanitize filename: strip path separators, traversal sequences,
         // double quotes (breaks Content-Disposition header parsing), and
@@ -122,7 +123,7 @@ impl Filestore {
             .put_object()
             .bucket(&self.bucket)
             .key(&key)
-            .content_type("text/plain; charset=utf-8")
+            .content_type(content_type.unwrap_or("application/octet-stream"))
             .content_disposition(format!("attachment; filename=\"{safe_name}\""))
             .body(aws_sdk_s3::primitives::ByteStream::from(data.to_vec()))
             .send();

@@ -919,6 +919,7 @@ fn presigned_note(filestore: &crate::filestore::Filestore) -> String {
 pub async fn upload_bytes_and_presign(
     filename: &str,
     bytes: &[u8],
+    content_type: Option<&str>,
     filestore: &crate::filestore::Filestore,
 ) -> Option<(String, String)> {
     let actual_size = bytes.len() as u64;
@@ -933,7 +934,10 @@ pub async fn upload_bytes_and_presign(
         return None;
     }
 
-    match filestore.upload_and_presign(filename, bytes).await {
+    match filestore
+        .upload_and_presign(filename, bytes, content_type)
+        .await
+    {
         Ok(presigned_url) => {
             tracing::info!(filename, size = actual_size, "audio uploaded to filestore");
             Some((presigned_url, presigned_note(filestore)))
@@ -1133,7 +1137,10 @@ async fn upload_bytes_to_filestore(
         return None;
     }
 
-    match filestore.upload_and_presign(filename, bytes).await {
+    match filestore
+        .upload_and_presign(filename, bytes, Some("text/plain; charset=utf-8"))
+        .await
+    {
         Ok(presigned_url) => {
             let hint = crate::filestore::format_filestore_hint(
                 filename,
