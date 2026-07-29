@@ -74,10 +74,23 @@ Which `url` the agent gets depends on the platform and whether a
 | Slack | presigned S3 URL | `url_private_download`, needs an `Authorization: Bearer <bot token>` header |
 | Gateway (Telegram / Feishu / LINE / Google Chat) | presigned S3 URL | no `url` line (the gateway already consumed the platform URL during download), so the block carries metadata only |
 
+**Slack caveat.** Slack forwards an attachment only when its file JSON carries
+`url_private_download` or `url_private`. When both are absent the whole
+attachment is skipped before its type is examined, audio included, so the
+guarantee on Slack reads "always emitted, provided Slack returned a private
+URL."
+
 Gateway attachments reach Core as bytes (base64 or a colocate path), never as a
 platform URL, so a filestore is the only way to give the agent a fetchable link
 on those platforms. The colocate path is deliberately not exposed: it is evicted
 after 2 minutes, so it would be dead by the time most skills fetch it.
+
+**Count bound.** Audio has no per-message count cap of its own, unlike text
+files (`TEXT_FILE_COUNT_CAP = 5`). The text cap exists to protect the prompt
+from inlined content and is bypassed as soon as a filestore takes over the
+upload; audio bytes are never inlined, so that reason does not apply. The bound
+is the platform's own per-message file limit, 10 on both Slack and Discord,
+combined with the per-file `max_file_size`.
 
 LINE-specific note:
 - LINE voice-message STT currently works in **1:1 chats only**.
