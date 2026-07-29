@@ -801,18 +801,23 @@ async fn inner_mcp_handshake(
     connection_id: &str,
     timeout_secs: u64,
 ) -> Result<(), String> {
-    let init = serde_json::to_value(McpMessageParams {
-        connection_id: connection_id.to_string(),
-        method: "initialize".to_string(),
-        params: Some(json!({
+    // Reuse `mcp_message_request` rather than re-assembling the frame: sending an inner MCP
+    // request and unwrapping its result should have exactly one implementation, or the
+    // `protocolVersion` check this handshake still lacks would have to be added in two places.
+    mcp_message_request(
+        out_tx,
+        pending,
+        next_id,
+        connection_id,
+        "initialize",
+        Some(json!({
             "protocolVersion": INNER_MCP_PROTOCOL_VERSION,
             "capabilities": {},
             "clientInfo": { "name": "openab-gateway", "version": env!("CARGO_PKG_VERSION") }
         })),
-    })
-    .map_err(|e| e.to_string())?;
-    let frame = send_request(out_tx, pending, next_id, "mcp/message", init, timeout_secs).await?;
-    frame_result(frame)?;
+        timeout_secs,
+    )
+    .await?;
 
     // `notifications/initialized` is a notification in both directions: an inner MCP notification,
     // carried by an outer frame with no `id`, so nothing is awaited and no reply is owed.
@@ -879,7 +884,15 @@ async fn establish_and_register_tunnel(
         );
         tokio::spawn(async move {
             if let Err(e) = mcp_disconnect(&tx, &pend, &nid, &cid, 5).await {
-                debug!(error = %e, "ACP: mcp/disconnect after a failed handshake did not complete");
+                // `warn!`, not `debug!`: reaching here means the connection we opened is now
+                // leaked for the life of the process — it never entered the registry, so nothing
+                // else will ever close it. Logging the cleanup failure more quietly than the
+                // handshake failure it cleans up after would hide the worse of the two.
+                warn!(
+                    error = %e, connection = %redact_id(&cid),
+                    "ACP: mcp/disconnect after a failed handshake did not complete — that \
+                     connection is now unreclaimable"
+                );
             }
         });
         return Err(e);
