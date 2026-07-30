@@ -165,9 +165,17 @@ has a load problem to report rather than a value to raise.
 
 | Limit | Value | Effect when reached |
 |-------|-------|---------------------|
-| Concurrent attachment fetches | 4 | Further events queue for a slot; nothing is dropped |
-| Pending pre-dispatch events | 32 | The next event's attachment bytes are **not** fetched. The agent still receives the message, carrying the same `[System: attachment ... was not delivered ...]` line a platform-side rejection produces, with the pending-attachment limit named as the reason |
+| Concurrent attachment fetches | 4 | Further events queue for a slot. Their sources are already read by then (see below), so queueing costs latency, not content |
+| Pending pre-dispatch events | 32 | The next event's attachment bytes are **not** fetched. The agent still receives the message, carrying the same `[System: attachment ... was not delivered ...]` line a platform-side rejection produces, with the limit named as the reason |
+| Admitted source bytes | 256 MiB | Same effect as the pending-event limit: the event is admitted without its attachment bytes rather than queued. Measured against the platform's declared sizes, which are advisory |
 | Tracked thread keys | 256 | Idle threads are forgotten; keys with work in flight are kept |
+
+**Sources are read before an event queues.** A colocated attachment is read out of
+the store as soon as its event is admitted, ahead of waiting for a fetch slot,
+because the store evicts media 120 seconds after it lands and sweeps every 30.
+A task that queued first could find the file already swept and hand the agent a
+read failure for an attachment that was present when the event arrived. Holding
+those bytes is what the admitted-source budget bounds.
 
 Two ordering properties survive the move:
 
@@ -176,16 +184,22 @@ Two ordering properties survive the move:
   that takes 30 seconds to upload cannot be overtaken by the text sent after it.
   Different threads never wait on each other.
 - **`/reset` beats work in flight.** A reset invalidates every event admitted
-  before it, so a message still being prepared is dropped instead of landing in
-  the new session. The fence covers the dispatcher handoff itself, not just the
-  moment before it: a reset arriving while the handoff waits on a full thread
-  queue abandons the message rather than letting the dispatcher's retry place it
-  on a consumer belonging to the new session. A reset also detaches the events
-  that follow it from the ones it discarded, so the first message of the new
-  session never waits out an upload from the old one. The
-  `Dropped n buffered message(s)` count in the reset reply covers buffered
-  messages only; anything still being prepared is dropped with an `info!` log and
-  is not counted.
+  before it, and cancels the whole of their remaining preparation, not just the
+  moment of handing over to the dispatcher. Discarded work therefore stops
+  waiting for a fetch slot, stops uploading, and cannot go on to create a forum
+  topic; the slot and the source budget it held are returned immediately, so the
+  first event of the new session does not queue behind it. Cancelling the handoff
+  matters on its own account: a reset landing while it waits on a full thread
+  queue would otherwise let the dispatcher's retry place that message on a
+  consumer belonging to the new session. A reset also detaches the events that
+  follow it from the ones it discarded. The `Dropped n buffered message(s)` count
+  in the reset reply covers buffered messages only; anything still being prepared
+  is dropped with an `info!` log and is not counted.
+
+  One edge stays: a remote call already in flight when the reset lands (a forum
+  topic creation whose request has left the process) may still take effect on the
+  platform. Cancellation stops the broker from acting on the result, not the
+  platform from having received the request.
 
 ## Storage (Colocate Mode)
 

@@ -133,6 +133,62 @@ pub(crate) async fn gateway_audio_blocks(
     crate::media::audio_blocks_for(filename, mime_type, size, outcome, stt_line.as_deref())
 }
 
+/// Read every attachment's bytes, in arrival order, one entry per attachment.
+///
+/// Runs before the task queues for a fetch slot: the gateway store evicts
+/// colocated media 120s after it lands, so a task that waited for a slot first
+/// could find the file already swept and hand the agent a read failure for an
+/// attachment that was present when the event arrived.
+async fn read_attachment_sources(attachments: &[GwAttachment]) -> Vec<Result<Vec<u8>, String>> {
+    let mut sources = Vec::with_capacity(attachments.len());
+    for att in attachments {
+        // Prefer the colocated file path, fall back to inline base64.
+        sources.push(if att.status.is_some() {
+            // Rejected upstream, so there is nothing to read and no warning to log.
+            Err("rejected by the platform".into())
+        } else if let Some(ref path) = att.path {
+            tokio::fs::read(path).await.map_err(|e| e.to_string())
+        } else if !att.data.is_empty() {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(&att.data)
+                .map_err(|e| e.to_string())
+        } else {
+            tracing::warn!(
+                filename = %att.filename,
+                mime = %att.mime_type,
+                "gateway: attachment has no path or data, skipping"
+            );
+            Err("no path or data".into())
+        });
+    }
+    sources
+}
+
+/// Bytes an attachment source may occupy while its event waits for a fetch slot.
+/// Reading before queueing is what keeps a colocated file from being swept, and
+/// this is the memory that costs.
+const MAX_ADMITTED_SOURCE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Whether this event's sources fit in the admitted-bytes budget.
+fn fits_source_budget(admitted_bytes: u64, event_bytes: u64) -> bool {
+    admitted_bytes.saturating_add(event_bytes) <= MAX_ADMITTED_SOURCE_BYTES
+}
+
+/// Holds this event's share of the admitted-source budget, and returns it when
+/// the task ends however it ends, `/reset` cancellation included.
+struct SourceBudgetGuard {
+    admitted: Arc<std::sync::atomic::AtomicU64>,
+    bytes: u64,
+}
+
+impl Drop for SourceBudgetGuard {
+    fn drop(&mut self) {
+        self.admitted
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// The blocks one gateway event's attachments render as.
 ///
 /// Awaited from inside the spawned per-event work, never on the receive path:
@@ -143,11 +199,12 @@ pub(crate) async fn gateway_audio_blocks(
 /// file, and neither logged both.
 async fn assemble_attachment_blocks(
     attachments: &[GwAttachment],
+    sources: &[Result<Vec<u8>, String>],
     stt_config: &crate::config::SttConfig,
     #[cfg(feature = "filestore")] filestore: Option<&crate::filestore::Filestore>,
 ) -> Vec<ContentBlock> {
     let mut extra_blocks = Vec::new();
-    for att in attachments {
+    for (index, att) in attachments.iter().enumerate() {
         // Rejected or truncated: the reason goes to the agent, the file does not.
         if let Some(ref reason) = att.status {
             tracing::info!(
@@ -164,22 +221,10 @@ async fn assemble_attachment_blocks(
             continue;
         }
 
-        // Prefer the colocated file path, fall back to inline base64.
-        let bytes_result = if let Some(ref path) = att.path {
-            tokio::fs::read(path).await.map_err(|e| e.to_string())
-        } else if !att.data.is_empty() {
-            use base64::Engine;
-            base64::engine::general_purpose::STANDARD
-                .decode(&att.data)
-                .map_err(|e| e.to_string())
-        } else {
-            tracing::warn!(
-                filename = %att.filename,
-                mime = %att.mime_type,
-                "gateway: attachment has no path or data, skipping"
-            );
-            Err("no path or data".into())
-        };
+        let bytes_result = sources
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| Err("no source read".into()));
 
         match att.attachment_type.as_str() {
             "image" => match bytes_result {
@@ -361,10 +406,35 @@ impl Default for ThreadOrder {
     }
 }
 
-/// One event's place in its thread's order, taken on the receive path.
-struct OrderTicket {
+/// The reset half of a ticket, separate so the work it cancels can still hold
+/// the ordering half.
+#[derive(Clone)]
+struct ResetGuard {
     generation: u64,
     reset: tokio::sync::watch::Receiver<u64>,
+}
+
+impl ResetGuard {
+    /// Whether the session this ticket was admitted into is still the live one.
+    fn is_current(&self) -> bool {
+        *self.reset.borrow() == self.generation
+    }
+
+    /// Resolves when `/reset` invalidates this ticket, including a reset that
+    /// landed before this was first awaited.
+    async fn fired(&mut self) {
+        while *self.reset.borrow_and_update() == self.generation {
+            if self.reset.changed().await.is_err() {
+                // The thread was forgotten, so no further reset can reach it.
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
+/// One event's place in its thread's order, taken on the receive path.
+struct OrderTicket {
+    guard: ResetGuard,
     predecessor: Option<tokio::sync::oneshot::Receiver<()>>,
     /// Dropped once the event is done with the dispatcher, releasing the next
     /// one. A cancelled or panicking task drops it too, so the chain cannot wedge.
@@ -381,47 +451,36 @@ impl OrderTicket {
         }
     }
 
-    /// Whether the session this ticket was admitted into is still the live one.
-    fn is_current(&self) -> bool {
-        *self.reset.borrow() == self.generation
-    }
-
-    /// Resolves when `/reset` invalidates this ticket, including a reset that
-    /// landed before this was first awaited.
-    async fn reset_fired(&mut self) {
-        while *self.reset.borrow_and_update() == self.generation {
-            if self.reset.changed().await.is_err() {
-                // The thread was forgotten, so no further reset can reach it.
-                std::future::pending::<()>().await;
-            }
-        }
+    fn guard(&self) -> ResetGuard {
+        self.guard.clone()
     }
 }
 
-/// Whether the message reached the dispatcher or was dropped by a `/reset`.
+/// Whether the work ran to completion or was dropped by a `/reset`.
 #[derive(Debug, PartialEq, Eq)]
-enum HandoffOutcome {
-    Submitted,
+enum PreDispatchOutcome {
+    Completed,
     AbandonedByReset,
 }
 
-/// Hand the message to the dispatcher unless `/reset` beats it there. Checking
-/// the generation once beforehand is not enough: a reset landing while `submit`
-/// is parked on a full queue drops the consumer, and `submit` transparently
-/// retries that `SendError` onto a consumer belonging to the new session.
-/// Abandoning the future instead is safe, since a parked `mpsc` send has
-/// enqueued nothing.
-async fn handoff_unless_reset(
-    ticket: &mut OrderTicket,
-    submit: impl std::future::Future<Output = ()>,
-) -> HandoffOutcome {
-    if !ticket.is_current() {
-        return HandoffOutcome::AbandonedByReset;
+/// Run this event's pre-dispatch work, abandoning all of it the moment `/reset`
+/// invalidates the ticket. It wraps the whole body, not just the dispatcher
+/// handoff, because every earlier step is side-effecting: discarded work that
+/// keeps running holds a fetch slot the new session needs, uploads bytes nobody
+/// will read, and can create a forum topic. Abandoning the handoff is safe too,
+/// since a parked `mpsc` send has enqueued nothing, and leaving it parked would
+/// let `submit` retry it onto a consumer belonging to the new session.
+async fn run_unless_reset(
+    guard: &mut ResetGuard,
+    work: impl std::future::Future<Output = ()>,
+) -> PreDispatchOutcome {
+    if !guard.is_current() {
+        return PreDispatchOutcome::AbandonedByReset;
     }
     tokio::select! {
         biased;
-        () = ticket.reset_fired() => HandoffOutcome::AbandonedByReset,
-        () = submit => HandoffOutcome::Submitted,
+        () = guard.fired() => PreDispatchOutcome::AbandonedByReset,
+        () = work => PreDispatchOutcome::Completed,
     }
 }
 
@@ -433,8 +492,10 @@ impl PreDispatchOrder {
         let entry = self.threads.entry(key.to_string()).or_default();
         let (done, tail) = tokio::sync::oneshot::channel();
         OrderTicket {
-            generation: *entry.generation.borrow(),
-            reset: entry.generation.subscribe(),
+            guard: ResetGuard {
+                generation: *entry.generation.borrow(),
+                reset: entry.generation.subscribe(),
+            },
             predecessor: entry.tail.replace(tail),
             _done: done,
         }
@@ -1214,6 +1275,7 @@ pub async fn run_gateway_adapter(
     let fetch_slots = Arc::new(tokio::sync::Semaphore::new(
         MAX_CONCURRENT_ATTACHMENT_FETCHES,
     ));
+    let admitted_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     loop {
         // Check shutdown before connecting
@@ -1414,28 +1476,52 @@ pub async fn run_gateway_adapter(
                                     // gating attachment fetches means what it says.
                                     while tasks.try_join_next().is_some() {}
                                     let has_attachments = !event.content.attachments.is_empty();
-                                    let shed = sheds_attachment_work(tasks.len(), has_attachments);
+                                    let event_bytes: u64 =
+                                        event.content.attachments.iter().map(|a| a.size).sum();
+                                    // Only this loop admits, so load-then-add needs no CAS.
+                                    let admitted_now =
+                                        admitted_bytes.load(std::sync::atomic::Ordering::Relaxed);
+                                    let shed = sheds_attachment_work(tasks.len(), has_attachments)
+                                        || (has_attachments
+                                            && !fits_source_budget(admitted_now, event_bytes));
                                     if shed {
                                         warn!(
                                             pending = tasks.len(),
+                                            admitted_bytes = admitted_now,
                                             channel = %event.channel.id,
-                                            "gateway: pending-attachment limit reached, describing attachments instead of fetching them"
+                                            "gateway: pre-dispatch limit reached, describing attachments instead of fetching them"
                                         );
                                     }
+                                    let budget = (!shed && has_attachments).then(|| {
+                                        admitted_bytes
+                                            .fetch_add(event_bytes, std::sync::atomic::Ordering::Relaxed);
+                                        SourceBudgetGuard {
+                                            admitted: admitted_bytes.clone(),
+                                            bytes: event_bytes,
+                                        }
+                                    });
                                     // Taken on the receive path, so the order is arrival order.
                                     let mut ticket = order.lock().unwrap().admit(&gateway_order_key(&event));
+                                    let mut guard = ticket.guard();
                                     let fetch_slots = fetch_slots.clone();
 
                                     tasks.spawn(async move {
+                                      let outcome = run_unless_reset(&mut guard, async move {
+                                        let _budget = budget;
                                         // Attachment assembly can await object storage, so it
                                         // belongs here rather than in the `ws_rx.next()` arm.
                                         let extra_blocks = if shed {
                                             shed_attachment_blocks(&event.content.attachments)
                                         } else if has_attachments {
+                                            // Read before queueing, so a colocated file cannot be
+                                            // swept out from under a task waiting for a slot.
+                                            let sources =
+                                                read_attachment_sources(&event.content.attachments).await;
                                             // Err only if the semaphore is closed, which it never is.
                                             let _permit = fetch_slots.acquire().await.ok();
                                             assemble_attachment_blocks(
                                                 &event.content.attachments,
+                                                &sources,
                                                 &stt_config,
                                                 #[cfg(feature = "filestore")]
                                                 filestore.as_deref(),
@@ -1484,24 +1570,23 @@ pub async fn run_gateway_adapter(
                                             other_bot_present: false,
                                             recipient: None, // Slack-only (assistant mode); N/A for gateway
                                         };
-                                        // Gates the handoff, not the fetch: the fetch is the part
-                                        // that is meant to run concurrently.
+                                        // Ordered here, not around the fetch: the fetch is the
+                                        // part that is meant to run concurrently.
                                         ticket.wait_for_turn().await;
-                                        let outcome = handoff_unless_reset(&mut ticket, async {
-                                            if let Err(e) = dispatcher
-                                                .submit(thread_key, thread_channel, adapter, buf_msg)
-                                                .await
-                                            {
-                                                error!("gateway dispatcher submit error: {e}");
-                                            }
-                                        })
-                                        .await;
-                                        if outcome == HandoffOutcome::AbandonedByReset {
-                                            info!(
-                                                platform,
-                                                "gateway: session reset while this message was being prepared, dropping it"
-                                            );
+                                        if let Err(e) = dispatcher
+                                            .submit(thread_key, thread_channel, adapter, buf_msg)
+                                            .await
+                                        {
+                                            error!("gateway dispatcher submit error: {e}");
                                         }
+                                      })
+                                      .await;
+                                      if outcome == PreDispatchOutcome::AbandonedByReset {
+                                          info!(
+                                              platform,
+                                              "gateway: session reset while this message was being prepared, dropping it"
+                                          );
+                                      }
                                     });
                                 }
                                 Err(e) => warn!("invalid gateway event: {e}"),
@@ -1739,8 +1824,10 @@ pub async fn process_gateway_event(
     };
 
     // Convert gateway attachments to ContentBlocks
+    let sources = read_attachment_sources(&event.content.attachments).await;
     let extra_blocks = assemble_attachment_blocks(
         &event.content.attachments,
+        &sources,
         &ctx.stt_config,
         #[cfg(feature = "filestore")]
         ctx.filestore.as_deref(),
@@ -1889,8 +1976,10 @@ mod tests {
             gw_attachment("sticker", "wave.tgs", "application/gzip", "YWJj"),
         ];
 
+        let sources = read_attachment_sources(&attachments).await;
         let blocks = assemble_attachment_blocks(
             &attachments,
+            &sources,
             &stt_off(),
             #[cfg(feature = "filestore")]
             None,
@@ -1912,8 +2001,11 @@ mod tests {
         let mut rejected = gw_attachment("audio", "voice.ogg", "audio/ogg", "");
         rejected.status = Some("download failed upstream".into());
 
+        let attachments = [rejected];
+        let sources = read_attachment_sources(&attachments).await;
         let blocks = assemble_attachment_blocks(
-            &[rejected],
+            &attachments,
+            &sources,
             &stt_off(),
             #[cfg(feature = "filestore")]
             None,
@@ -1994,15 +2086,15 @@ mod tests {
     fn a_message_being_prepared_when_reset_arrives_is_dropped() {
         let mut order = PreDispatchOrder::default();
         let in_flight = order.admit("telegram:42");
-        assert!(in_flight.is_current());
+        assert!(in_flight.guard().is_current());
 
         order.reset("telegram:42");
-        assert!(!in_flight.is_current());
+        assert!(!in_flight.guard().is_current());
 
         let after_reset = order.admit("telegram:42");
         order.reset("telegram:99");
         assert!(
-            after_reset.is_current(),
+            after_reset.guard().is_current(),
             "another thread's reset is not this thread's business"
         );
     }
@@ -2013,7 +2105,8 @@ mod tests {
     #[tokio::test]
     async fn a_reset_during_a_parked_handoff_abandons_the_message() {
         let order = Arc::new(std::sync::Mutex::new(PreDispatchOrder::default()));
-        let mut ticket = order.lock().unwrap().admit("telegram:42");
+        let ticket = order.lock().unwrap().admit("telegram:42");
+        let mut guard = ticket.guard();
 
         let reset_order = order.clone();
         let resetter = tokio::spawn(async move {
@@ -2028,32 +2121,152 @@ mod tests {
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             // Stands in for a submit parked on a full queue: it never resolves.
-            handoff_unless_reset(&mut ticket, std::future::pending::<()>()),
+            run_unless_reset(&mut guard, std::future::pending::<()>()),
         )
         .await
         .expect("a reset must release a parked handoff");
 
-        assert_eq!(outcome, HandoffOutcome::AbandonedByReset);
+        assert_eq!(outcome, PreDispatchOutcome::AbandonedByReset);
         resetter.await.unwrap();
     }
 
+    /// The fence covers preparation, not just the handoff, so a reset that lands
+    /// first must stop the body before it can take a fetch slot, upload bytes, or
+    /// create a forum topic.
     #[tokio::test]
-    async fn a_reset_before_the_handoff_abandons_the_message() {
+    async fn a_reset_stops_the_work_before_any_of_it_runs() {
         let mut order = PreDispatchOrder::default();
-        let mut ticket = order.admit("telegram:42");
+        let ticket = order.admit("telegram:42");
+        let mut guard = ticket.guard();
         order.reset("telegram:42");
 
-        let outcome = handoff_unless_reset(&mut ticket, std::future::pending::<()>()).await;
-        assert_eq!(outcome, HandoffOutcome::AbandonedByReset);
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = started.clone();
+        let outcome = run_unless_reset(&mut guard, async move {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        })
+        .await;
+
+        assert_eq!(outcome, PreDispatchOutcome::AbandonedByReset);
+        assert!(
+            !started.load(std::sync::atomic::Ordering::Relaxed),
+            "a reset must stop the work before it creates a forum topic or takes a slot"
+        );
     }
 
     #[tokio::test]
-    async fn a_handoff_that_lands_first_counts_as_submitted() {
+    async fn work_that_finishes_first_counts_as_completed() {
         let mut order = PreDispatchOrder::default();
-        let mut ticket = order.admit("telegram:42");
+        let ticket = order.admit("telegram:42");
+        let mut guard = ticket.guard();
 
-        let outcome = handoff_unless_reset(&mut ticket, std::future::ready(())).await;
-        assert_eq!(outcome, HandoffOutcome::Submitted);
+        let outcome = run_unless_reset(&mut guard, std::future::ready(())).await;
+        assert_eq!(outcome, PreDispatchOutcome::Completed);
+    }
+
+    /// The reviewer's reproduction: stale tasks holding every fetch slot must not
+    /// keep the first event of the new session waiting.
+    #[tokio::test]
+    async fn a_reset_releases_the_fetch_slot_the_new_session_needs() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut order = PreDispatchOrder::default();
+        let stale = order.admit("telegram:42");
+        let mut stale_guard = stale.guard();
+
+        let held = slots.clone();
+        let work = tokio::spawn(async move {
+            run_unless_reset(&mut stale_guard, async move {
+                let _permit = held.acquire().await.ok();
+                std::future::pending::<()>().await;
+            })
+            .await
+        });
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            slots.available_permits(),
+            0,
+            "the stale task should hold it"
+        );
+
+        order.reset("telegram:42");
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), work)
+            .await
+            .expect("a reset must cancel work parked on a fetch slot")
+            .unwrap();
+
+        assert_eq!(outcome, PreDispatchOutcome::AbandonedByReset);
+        assert_eq!(
+            slots.available_permits(),
+            1,
+            "cancelled work must return the slot the new session needs"
+        );
+    }
+
+    /// Reading the source before queueing is what makes this pass: the gateway
+    /// store sweeps colocated media 120s after it lands, and a task that waited
+    /// for a fetch slot first would find the file gone.
+    #[tokio::test]
+    async fn an_admitted_attachment_survives_a_source_that_expires_while_it_queues() {
+        let path = std::env::temp_dir().join(format!(
+            "openab-gateway-source-{}-{}.ogg",
+            std::process::id(),
+            line!()
+        ));
+        tokio::fs::write(&path, b"voice bytes").await.unwrap();
+
+        let mut att = gw_attachment("audio", "note.ogg", "audio/ogg", "");
+        att.path = Some(path.to_string_lossy().into_owned());
+        let attachments = [att];
+
+        // Admission: read now, queue later.
+        let sources = read_attachment_sources(&attachments).await;
+
+        // The store's eviction loop runs while the task waits for a slot.
+        tokio::fs::remove_file(&path).await.unwrap();
+        assert!(
+            read_attachment_sources(&attachments).await[0].is_err(),
+            "the source must really be gone, or this test proves nothing"
+        );
+
+        let blocks = assemble_attachment_blocks(
+            &attachments,
+            &sources,
+            &stt_off(),
+            #[cfg(feature = "filestore")]
+            None,
+        )
+        .await;
+
+        let text = block_text(blocks.into_iter().next().unwrap());
+        assert!(text.contains("[Audio attachment]"), "{text}");
+        assert!(text.contains("note.ogg"), "{text}");
+        // The marker that separates "we still had the bytes" from "we went back
+        // for them and they were gone".
+        assert!(!text.contains("read failed"), "{text}");
+    }
+
+    #[test]
+    fn the_source_budget_bounds_what_admitted_events_may_hold() {
+        assert!(fits_source_budget(0, MAX_ADMITTED_SOURCE_BYTES));
+        assert!(!fits_source_budget(1, MAX_ADMITTED_SOURCE_BYTES));
+        assert!(!fits_source_budget(MAX_ADMITTED_SOURCE_BYTES, 1));
+        assert!(!fits_source_budget(u64::MAX, 1), "must not wrap");
+    }
+
+    #[test]
+    fn an_abandoned_task_returns_its_source_budget() {
+        let admitted = Arc::new(std::sync::atomic::AtomicU64::new(100));
+        {
+            let _guard = SourceBudgetGuard {
+                admitted: admitted.clone(),
+                bytes: 100,
+            };
+            assert_eq!(admitted.load(std::sync::atomic::Ordering::Relaxed), 100);
+        }
+        assert_eq!(admitted.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     /// A reset detaches the tail as well as bumping the generation, so the first
