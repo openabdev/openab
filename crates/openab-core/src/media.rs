@@ -465,19 +465,26 @@ fn splits_a_prompt_line(c: char) -> bool {
         )
 }
 
-pub(crate) fn sanitize_attachment_meta(filename: &str, content_type: &str) -> (String, String) {
-    let safe_filename: String = filename
+/// One prompt-safe fragment: nothing that could start a line or reorder what
+/// follows it, bounded, and never empty. Any untrusted text interpolated into a
+/// prompt line goes through here, not just the filename it was written for.
+pub(crate) fn sanitize_prompt_fragment(text: &str, max_chars: usize, if_empty: &str) -> String {
+    let safe: String = text
         .chars()
         .filter(|c| !splits_a_prompt_line(*c))
-        .take(200)
+        .take(max_chars)
         .collect();
-    // A name made entirely of stripped characters would leave a bare `filename:`
-    // line; `filestore.rs` already models this fallback for the same reason.
-    let safe_filename = if safe_filename.is_empty() {
-        "unnamed".to_string()
+    // A value made entirely of stripped characters would leave a bare label;
+    // `filestore.rs` already models this fallback for the same reason.
+    if safe.is_empty() {
+        if_empty.to_string()
     } else {
-        safe_filename
-    };
+        safe
+    }
+}
+
+pub(crate) fn sanitize_attachment_meta(filename: &str, content_type: &str) -> (String, String) {
+    let safe_filename = sanitize_prompt_fragment(filename, 200, "unnamed");
     let safe_mime: String = content_type
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || "/-+.;= ".contains(*c))

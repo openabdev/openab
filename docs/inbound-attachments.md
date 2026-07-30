@@ -158,7 +158,7 @@ Discord and Slack do not reject these: video goes through [Video](#video), and b
 
 Attachment bytes are fetched inside the per-event task rather than on the
 WebSocket receive path, so a slow object-storage transfer cannot stop the socket
-from reading the next event (a `/cancel` included). Three limits bound what that
+from reading the next event (a `/cancel` included). Four limits bound what that
 concurrency can cost, all compile-time constants in `gateway.rs` with no config
 key: they are safety valves, not tuning knobs, and an operator who reaches them
 has a load problem to report rather than a value to raise.
@@ -167,7 +167,7 @@ has a load problem to report rather than a value to raise.
 |-------|-------|---------------------|
 | Concurrent attachment fetches | 4 | Further events queue for a slot. Their sources are already read by then (see below), so queueing costs latency, not content |
 | Pending pre-dispatch events | 32 | The next event's attachment bytes are **not** fetched. The agent still receives the message, carrying the same `[System: attachment ... was not delivered ...]` line a platform-side rejection produces, with the limit named as the reason |
-| Admitted source bytes | 256 MiB | Same effect as the pending-event limit: the event is admitted without its attachment bytes rather than queued. Measured against the platform's declared sizes, which are advisory |
+| Retained source bytes | 256 MiB | Same effect as the pending-event limit, per attachment rather than per event: that attachment is delivered as a `not delivered` line and the rest of the message goes through. Charged against bytes actually held, never against the platform's declared size, and the read is capped at what was reserved so an under-reported size cannot overshoot |
 | Tracked thread keys | 256 | Idle threads are forgotten; keys with work in flight are kept |
 
 **Sources are read before an event queues.** A colocated attachment is read out of
@@ -175,7 +175,7 @@ the store as soon as its event is admitted, ahead of waiting for a fetch slot,
 because the store evicts media 120 seconds after it lands and sweeps every 30.
 A task that queued first could find the file already swept and hand the agent a
 read failure for an attachment that was present when the event arrived. Holding
-those bytes is what the admitted-source budget bounds.
+those bytes is what the retained-source budget bounds.
 
 Two ordering properties survive the move:
 
