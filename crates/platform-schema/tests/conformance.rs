@@ -207,6 +207,18 @@ fn check_code_ref_rejects_path_traversal() {
     );
 }
 
+#[test]
+fn check_code_ref_rejects_absolute_path() {
+    // Path::join replaces the base entirely when the joined path is absolute,
+    // so this exercises a different code path than the "../" traversal above.
+    let root = repo_root();
+    let err = check_code_ref(&root, "/etc/passwd").expect_err("absolute path must be rejected");
+    assert!(
+        err.contains("does not exist") || err.contains("escapes repo root"),
+        "unexpected error: {err}"
+    );
+}
+
 /// The template must keep enumerating every capability section + feature key, so
 /// a struct change can't silently leave the human-facing template behind.
 #[test]
