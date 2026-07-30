@@ -278,6 +278,142 @@ async fn assemble_attachment_blocks(
     extra_blocks
 }
 
+/// Attachment fetches allowed to run at once, now that they no longer run one at
+/// a time on the receive path: a burst of voice notes would otherwise open one
+/// object-storage transfer each.
+const MAX_CONCURRENT_ATTACHMENT_FETCHES: usize = 4;
+
+/// Pending pre-dispatch events past which attachment bytes are not fetched at
+/// all. The text still reaches the agent, carrying the same undelivered line a
+/// platform-side rejection produces, because shedding a user's message is worse
+/// than shedding the file attached to it.
+const MAX_PENDING_ATTACHMENT_EVENTS: usize = 32;
+
+/// Thread keys tracked for ordering past which idle ones are swept. A broker that
+/// runs for weeks otherwise keeps an entry per channel it has ever seen.
+const MAX_TRACKED_ORDER_KEYS: usize = 256;
+
+/// Whether this event's attachments must be described rather than fetched.
+fn sheds_attachment_work(pending_events: usize, has_attachments: bool) -> bool {
+    has_attachments && pending_events >= MAX_PENDING_ATTACHMENT_EVENTS
+}
+
+/// What the agent is told about attachments the broker refused to fetch under
+/// load. Named the same way a platform-side rejection is, because from the
+/// agent's side the two are the same event: metadata arrived, bytes did not.
+fn shed_attachment_blocks(attachments: &[GwAttachment]) -> Vec<ContentBlock> {
+    attachments
+        .iter()
+        .map(|att| ContentBlock::Text {
+            text: undelivered_attachment_line(
+                &att.filename,
+                &att.mime_type,
+                &format_size(att.size),
+                "the broker was over its pending-attachment limit and did not fetch it",
+            ),
+        })
+        .collect()
+}
+
+/// The key `/reset` and the ordering gate agree on.
+///
+/// Not `Dispatcher::key`: that one needs the thread a supergroup event has yet to
+/// create, so it is only knowable after the spawned work runs, and it also folds
+/// in the sender, which `/reset` does not scope by.
+fn gateway_order_key(event: &GatewayEvent) -> String {
+    format!(
+        "{}:{}",
+        event.platform,
+        event
+            .channel
+            .thread_id
+            .as_deref()
+            .unwrap_or(&event.channel.id)
+    )
+}
+
+/// Restores what assembling attachments in the `ws_rx.next()` arm used to give
+/// for free: same-thread events reach the dispatcher in arrival order, and
+/// `/reset` only has to cancel buffered messages because nothing else is in
+/// flight. A ticket is taken on the receive path, in arrival order, and carries
+/// the session generation it was taken in.
+#[derive(Default)]
+struct PreDispatchOrder {
+    threads: HashMap<String, ThreadOrder>,
+}
+
+#[derive(Default)]
+struct ThreadOrder {
+    /// Completion of the most recently admitted event. The next one holds it so
+    /// it cannot reach the dispatcher first.
+    tail: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Bumped by `/reset`, so a ticket taken before it can tell.
+    generation: u64,
+}
+
+/// One event's place in its thread's order, taken on the receive path.
+struct OrderTicket {
+    key: String,
+    generation: u64,
+    predecessor: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Dropped once the event is done with the dispatcher, releasing the next
+    /// one. A cancelled or panicking task drops it too, so the chain cannot wedge.
+    _done: tokio::sync::oneshot::Sender<()>,
+}
+
+impl OrderTicket {
+    /// Wait until every same-thread event admitted earlier is done.
+    async fn wait_for_turn(&mut self) {
+        if let Some(predecessor) = self.predecessor.take() {
+            // Err means that event was dropped without submitting, which still
+            // means its turn is over.
+            let _ = predecessor.await;
+        }
+    }
+}
+
+impl PreDispatchOrder {
+    /// Take this event's place in line. Called from the receive arm, so it moves
+    /// two `Option`s and never awaits.
+    fn admit(&mut self, key: &str) -> OrderTicket {
+        self.sweep_idle();
+        let entry = self.threads.entry(key.to_string()).or_default();
+        let (done, tail) = tokio::sync::oneshot::channel();
+        OrderTicket {
+            key: key.to_string(),
+            generation: entry.generation,
+            predecessor: entry.tail.replace(tail),
+            _done: done,
+        }
+    }
+
+    /// Invalidate every ticket taken on this thread so far.
+    fn reset(&mut self, key: &str) {
+        self.threads.entry(key.to_string()).or_default().generation += 1;
+    }
+
+    /// Whether the session the ticket was admitted into is still the live one.
+    fn is_current(&self, ticket: &OrderTicket) -> bool {
+        self.threads.get(&ticket.key).map(|t| t.generation) == Some(ticket.generation)
+    }
+
+    /// Forget threads with nothing in flight. A resolved or absent tail proves
+    /// there is nothing: every ticket waits for its predecessor before dropping
+    /// its own `_done`, so the tail cannot resolve while an earlier ticket works.
+    fn sweep_idle(&mut self) {
+        if self.threads.len() <= MAX_TRACKED_ORDER_KEYS {
+            return;
+        }
+        self.threads.retain(|_, t| match t.tail.as_mut() {
+            Some(tail) => matches!(
+                tail.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            None => false,
+        });
+    }
+}
+
 /// Shared filter parameters for gateway event gating.
 /// Used by both `run_gateway_adapter` (WebSocket) and `process_gateway_event` (unified).
 struct EventFilterParams<'a> {
@@ -1019,6 +1155,14 @@ pub async fn run_gateway_adapter(
     let mut backoff_secs = 1u64;
     const MAX_BACKOFF: u64 = 30;
 
+    // Outlive the reconnect loop: a ticket taken before a reconnect is still held
+    // by a task draining after it.
+    // std::sync::Mutex - the critical sections have no .await.
+    let order = Arc::new(std::sync::Mutex::new(PreDispatchOrder::default()));
+    let fetch_slots = Arc::new(tokio::sync::Semaphore::new(
+        MAX_CONCURRENT_ATTACHMENT_FETCHES,
+    ));
+
     loop {
         // Check shutdown before connecting
         if *shutdown_rx.borrow() {
@@ -1179,7 +1323,10 @@ pub async fn run_gateway_adapter(
                                     let trimmed = prompt.trim();
                                     if trimmed == "/reset" {
                                         let thread_id_str = event.channel.thread_id.as_deref().unwrap_or(&event.channel.id);
-                                        let thread_key = format!("{}:{}", event.platform, thread_id_str);
+                                        let thread_key = gateway_order_key(&event);
+                                        // Before cancelling the buffer, so an event still
+                                        // assembling cannot submit into the new session.
+                                        order.lock().unwrap().reset(&thread_key);
                                         let dropped = dispatcher.cancel_buffered_thread(event.platform.as_str(), thread_id_str);
                                         let msg = match (router.pool().reset_session(&thread_key).await, dropped) {
                                             (Ok(()), 0) => "🔄 Session reset. Start a new conversation!".to_string(),
@@ -1211,16 +1358,41 @@ pub async fn run_gateway_adapter(
                                     #[cfg(feature = "filestore")]
                                     let filestore = filestore.clone();
 
+                                    // Reaped here rather than at shutdown so the pending count
+                                    // gating attachment fetches means what it says.
+                                    while tasks.try_join_next().is_some() {}
+                                    let has_attachments = !event.content.attachments.is_empty();
+                                    let shed = sheds_attachment_work(tasks.len(), has_attachments);
+                                    if shed {
+                                        warn!(
+                                            pending = tasks.len(),
+                                            channel = %event.channel.id,
+                                            "gateway: pending-attachment limit reached, describing attachments instead of fetching them"
+                                        );
+                                    }
+                                    // Taken on the receive path, so the order is arrival order.
+                                    let mut ticket = order.lock().unwrap().admit(&gateway_order_key(&event));
+                                    let order_for_event = order.clone();
+                                    let fetch_slots = fetch_slots.clone();
+
                                     tasks.spawn(async move {
                                         // Attachment assembly can await object storage, so it
                                         // belongs here rather than in the `ws_rx.next()` arm.
-                                        let extra_blocks = assemble_attachment_blocks(
-                                            &event.content.attachments,
-                                            &stt_config,
-                                            #[cfg(feature = "filestore")]
-                                            filestore.as_deref(),
-                                        )
-                                        .await;
+                                        let extra_blocks = if shed {
+                                            shed_attachment_blocks(&event.content.attachments)
+                                        } else if has_attachments {
+                                            // Err only if the semaphore is closed, which it never is.
+                                            let _permit = fetch_slots.acquire().await.ok();
+                                            assemble_attachment_blocks(
+                                                &event.content.attachments,
+                                                &stt_config,
+                                                #[cfg(feature = "filestore")]
+                                                filestore.as_deref(),
+                                            )
+                                            .await
+                                        } else {
+                                            Vec::new()
+                                        };
 
                                         // If supergroup with no thread_id, create a forum topic
                                         let thread_channel = if event.channel.channel_type == "supergroup"
@@ -1261,6 +1433,16 @@ pub async fn run_gateway_adapter(
                                             other_bot_present: false,
                                             recipient: None, // Slack-only (assistant mode); N/A for gateway
                                         };
+                                        // Gates the handoff, not the fetch: the fetch is the part
+                                        // that is meant to run concurrently.
+                                        ticket.wait_for_turn().await;
+                                        if !order_for_event.lock().unwrap().is_current(&ticket) {
+                                            info!(
+                                                platform = %thread_channel.platform,
+                                                "gateway: session reset while this message was being prepared, dropping it"
+                                            );
+                                            return;
+                                        }
                                         if let Err(e) = dispatcher
                                             .submit(thread_key, thread_channel, adapter, buf_msg)
                                             .await
@@ -1707,6 +1889,135 @@ mod tests {
         );
         assert!(line.contains("audio/mp4x"), "{line}");
     }
+
+    /// Drives the real failure the delayed assembly introduced: without
+    /// `wait_for_turn` the second event reaches the dispatcher while the first is
+    /// still fetching, and the dispatcher's per-thread queue takes them that way.
+    #[tokio::test]
+    async fn same_thread_events_reach_the_dispatcher_in_arrival_order() {
+        let order = Arc::new(std::sync::Mutex::new(PreDispatchOrder::default()));
+        let mut first = order.lock().unwrap().admit("telegram:42");
+        let mut second = order.lock().unwrap().admit("telegram:42");
+
+        let submitted = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let (release_fetch, fetch) = tokio::sync::oneshot::channel::<()>();
+
+        let log = submitted.clone();
+        let slow = tokio::spawn(async move {
+            let _ = fetch.await; // stands in for the attachment fetch
+            first.wait_for_turn().await;
+            log.lock().unwrap().push("first");
+        });
+        let log = submitted.clone();
+        let quick = tokio::spawn(async move {
+            second.wait_for_turn().await;
+            log.lock().unwrap().push("second");
+        });
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            submitted.lock().unwrap().is_empty(),
+            "the second event must not overtake the one still fetching"
+        );
+
+        let _ = release_fetch.send(());
+        slow.await.unwrap();
+        quick.await.unwrap();
+        assert_eq!(*submitted.lock().unwrap(), vec!["first", "second"]);
+    }
+
+    #[test]
+    fn a_second_thread_is_not_held_behind_the_first() {
+        let mut order = PreDispatchOrder::default();
+        let first = order.admit("telegram:42");
+        assert!(first.predecessor.is_none());
+        assert!(order.admit("telegram:43").predecessor.is_none());
+        assert!(order.admit("telegram:42").predecessor.is_some());
+    }
+
+    #[test]
+    fn a_message_being_prepared_when_reset_arrives_is_dropped() {
+        let mut order = PreDispatchOrder::default();
+        let in_flight = order.admit("telegram:42");
+        assert!(order.is_current(&in_flight));
+
+        order.reset("telegram:42");
+        assert!(!order.is_current(&in_flight));
+
+        let after_reset = order.admit("telegram:42");
+        order.reset("telegram:99");
+        assert!(
+            order.is_current(&after_reset),
+            "another thread's reset is not this thread's business"
+        );
+    }
+
+    /// A ticket dropped without submitting (reset, panic, shutdown) must not wedge
+    /// the events queued behind it.
+    #[tokio::test]
+    async fn a_dropped_event_releases_the_next_one() {
+        let mut order = PreDispatchOrder::default();
+        let first = order.admit("line:7");
+        let mut second = order.admit("line:7");
+
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_secs(1), second.wait_for_turn())
+            .await
+            .expect("dropping the predecessor must release its successor");
+    }
+
+    #[test]
+    fn an_idle_thread_stops_being_tracked() {
+        let mut order = PreDispatchOrder::default();
+        for i in 0..=MAX_TRACKED_ORDER_KEYS {
+            drop(order.admit(&format!("telegram:{i}")));
+        }
+        assert_eq!(order.threads.len(), MAX_TRACKED_ORDER_KEYS + 1);
+
+        drop(order.admit("telegram:fresh"));
+        assert_eq!(order.threads.len(), 1);
+    }
+
+    #[test]
+    fn attachment_work_is_shed_only_once_the_queue_is_full() {
+        assert!(!sheds_attachment_work(
+            MAX_PENDING_ATTACHMENT_EVENTS - 1,
+            true
+        ));
+        assert!(sheds_attachment_work(MAX_PENDING_ATTACHMENT_EVENTS, true));
+        assert!(!sheds_attachment_work(
+            MAX_PENDING_ATTACHMENT_EVENTS * 2,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_shed_attachment_still_tells_the_agent_what_arrived() {
+        let blocks =
+            shed_attachment_blocks(&[gw_attachment("audio", "note.ogg", "audio/ogg", "YWJj")]);
+
+        assert_eq!(blocks.len(), 1);
+        let text = block_text(blocks.into_iter().next().unwrap());
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.contains("note.ogg"), "{text}");
+        assert!(text.contains("audio/ogg"), "{text}");
+        assert!(text.contains("did not fetch it"), "{text}");
+    }
+
+    /// `/reset` and the ordering gate must scope to the same string, or a reset
+    /// would bump a generation no ticket carries.
+    #[test]
+    fn the_order_key_matches_the_one_reset_scopes_to() {
+        let mut event = make_event(false, "u1", "chan-1", "private", None, vec![]);
+        event.platform = "telegram".into();
+        assert_eq!(gateway_order_key(&event), "telegram:chan-1");
+
+        event.channel.thread_id = Some("topic-9".into());
+        assert_eq!(gateway_order_key(&event), "telegram:topic-9");
+    }
+
     use std::collections::HashSet;
 
     fn stt_off() -> crate::config::SttConfig {

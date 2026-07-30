@@ -153,6 +153,33 @@ Discord and Slack do not reject these: video goes through [Video](#video), and b
 | GIF passthrough | 5 MB | `resize_and_compress()` |
 | Store (defense-in-depth) | 20 MB | `store_media()` |
 
+## Pre-Dispatch Limits (Gateway WebSocket Path)
+
+Attachment bytes are fetched inside the per-event task rather than on the
+WebSocket receive path, so a slow object-storage transfer cannot stop the socket
+from reading the next event (a `/cancel` included). Three limits bound what that
+concurrency can cost, all compile-time constants in `gateway.rs` with no config
+key: they are safety valves, not tuning knobs, and an operator who reaches them
+has a load problem to report rather than a value to raise.
+
+| Limit | Value | Effect when reached |
+|-------|-------|---------------------|
+| Concurrent attachment fetches | 4 | Further events queue for a slot; nothing is dropped |
+| Pending pre-dispatch events | 32 | The next event's attachment bytes are **not** fetched. The agent still receives the message, carrying the same `[System: attachment ... was not delivered ...]` line a platform-side rejection produces, with the pending-attachment limit named as the reason |
+| Tracked thread keys | 256 | Idle threads are forgotten; keys with work in flight are kept |
+
+Two ordering properties survive the move:
+
+- **Arrival order per thread.** Each event takes a ticket at receipt and waits for
+  the previous same-thread event before reaching the dispatcher, so a voice note
+  that takes 30 seconds to upload cannot be overtaken by the text sent after it.
+  Different threads never wait on each other.
+- **`/reset` beats work in flight.** A reset invalidates every event admitted
+  before it, so a message still being prepared is dropped instead of landing in
+  the new session. The `Dropped n buffered message(s)` count in the reset reply
+  covers buffered messages only; anything still being prepared is dropped with an
+  `info!` log and is not counted.
+
 ## Storage (Colocate Mode)
 
 Media is stored at `~/.openab/media/inbound/<uuid>`:

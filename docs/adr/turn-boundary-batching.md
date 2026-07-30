@@ -826,7 +826,7 @@ The following classes of transformation are categorically forbidden because they
 - **No intent merge.** Broker must not coalesce two adjacent same-sender messages into a single event even when they appear to express one logical thought ("see this" + "[image]"). Each arrival keeps its own `<sender_context>`.
 - **No sender collapse.** Broker must not merge multiple distinct `sender_id`s into a single header even when display names or roles match (e.g. two human users with the same name, or two bots with the same role). Each unique sender event gets its own `<sender_context>`.
 - **No silent drop.** Broker must not omit an arrival event from a batch on the grounds that it appears redundant, off-topic, or empty. The agent decides what to do with it.
-- **No ordering inversion.** Broker must not reorder events within a batch based on perceived priority, sender role, or content type. Arrival order from the platform adapter is preserved.
+- **No ordering inversion.** Broker must not reorder events within a batch based on perceived priority, sender role, or content type. Arrival order from the platform adapter is preserved. On the gateway WebSocket path this is no longer implied by serial execution: attachment fetches run inside the spawned per-event work, so arrival order is held explicitly by a per-thread ticket taken at receipt (`PreDispatchOrder` in `gateway.rs`), and `/reset` invalidates every ticket taken before it rather than letting already-prepared work land in the new session.
 
 If a future feature genuinely requires one of these transformations, it belongs in the ACP agent (which has the semantic context to make the call), not in the broker. The broker's job ends at faithful structural transport.
 
@@ -1053,8 +1053,9 @@ async fn consumer_loop(
 
 ## Notes
 
-- **Version:** 0.7
+- **Version:** 0.8
 - **Changelog:**
+  - 0.8 (2026-07-30): §6.5 "No ordering inversion" now names its gateway mechanism ([#1460](https://github.com/openabdev/openab/pull/1460)). Moving attachment fetches off the WebSocket receive path removed the serial execution that used to imply arrival order, so the clause states the per-thread receipt ticket that replaces it and the `/reset` generation check that keeps work prepared before a reset out of the session after it.
   - 0.7 (2026-07-30): Voice-only arrivals re-stated for audio passthrough ([#1460](https://github.com/openabdev/openab/pull/1460)). An audio attachment now always contributes an `[Audio attachment]` metadata Text block, so §3.1's minimum block count and the Scenario D worked example cover both STT states, and the §3.6 rollback hatch (cited again from §5.2 and §6.9) selects the transcript block explicitly instead of inferring it from `extra_blocks.len() == 1`, which the metadata block made ambiguous.
   - 0.6 (2026-05-05): Round-4 corrections, two threads.
     - **Design contract change (matches `feature/turn-boundary-batching-v2` @ `e119abf`).** §2.5 SendError handling rewritten to match the post-`afd6fff` design — proactive `consumer.is_finished()` check at submit head + transparent retry once on `SendError`; ❌ + ⚠️ + `Err(ConsumerDead)` only if the retry also fails. Motivated by the first-message-after-idle race; one-attempt bound preserves the no-spin-loop property. §6.11 staging smoke matrix split into Path A (transparent retry happy path, `PANIC_ONCE`) and Path B (failing-retry surfaces error, `PANIC_ALWAYS`). §4.4 Phase 1 plan + test list updated to the new contract.
