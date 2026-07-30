@@ -24,6 +24,8 @@ Each `schema/<platform>.toml` has three schema-driven parts:
 
 - **Current schema version: `2026-07-08`** — the top-line `schema_version` in each file. Bump it when the schema changes; the conformance test then flags every file that hasn't been re-verified.
 
+**Known limitation:** conformance only checks that a code-ref's file/symbol still *exists* — it can't detect a symbol whose behavior changed without being renamed or removed, or a `note`/`status` that has quietly gone stale while the code-ref it cites remains technically valid. That kind of semantic drift is caught only by PR review (see `CONTRIBUTING.md`), not by CI. No dedicated per-platform owner is assigned to periodically audit for it; revisit if this proves insufficient in practice.
+
 ## Platforms
 
 | Platform | Schema file |

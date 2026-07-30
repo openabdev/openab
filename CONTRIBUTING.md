@@ -201,6 +201,8 @@ gh run view <run_id> --repo openabdev/openab --json conclusion -q .conclusion
 
 When modifying a platform adapter (`crates/openab-gateway/src/adapters/*.rs`), check whether the change affects the platform's documented capabilities or feature status. If it does, update the corresponding `docs/platforms/schema/<platform>.toml`.
 
+If you notice a platform's official API has changed (a new webhook event type, a deprecated field, etc.) or spot a platform-specific quirk while working on something else, feel free to update the corresponding `docs/platforms/schema/<platform>.toml` (`[capability.*]` or `[[quirks]]`) directly in your PR — no need to wait for a dedicated owner to notice.
+
 See [`docs/platforms/README.md`](docs/platforms/README.md) for:
 - The three-schema structure (capability, feature-support, quirks)
 - How to add a new feature to the closed set
