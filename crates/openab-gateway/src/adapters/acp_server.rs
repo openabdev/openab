@@ -430,20 +430,33 @@ pub fn resolve_by_name(
     channel_id: &str,
     server_name: &str,
 ) -> Option<String> {
+    // One pass, no allocation, and `rank > best` says which direction wins out loud. The first
+    // version collected into a `Vec`, sorted it, and took the last element — the cost of that was
+    // never the problem at one or two entries, but it asked the reader to re-derive whether the
+    // direction was right, and direction is what this file has got wrong repeatedly: the rank
+    // polarity, `<=` against `<`, which of the two numbers is compared first. A shape that already
+    // holds a `Vec` under the lock also invites the next person to do more work in here.
     let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
-    let mut matches: Vec<(&(String, String), &TunnelHandle)> = reg
-        .iter()
-        .filter(|((c, _), h)| c == channel_id && h.server_name == server_name)
-        .collect();
-    if matches.len() > 1 {
+    let mut count = 0usize;
+    let mut best: Option<(&String, (u64, u64))> = None;
+    for ((c, id), h) in reg.iter() {
+        if c != channel_id || h.server_name != server_name {
+            continue;
+        }
+        count += 1;
+        let rank = (h.connection_generation, h.generation);
+        if best.is_none_or(|(_, current)| rank > current) {
+            best = Some((id, rank));
+        }
+    }
+    if count > 1 {
         warn!(
-            channel = %redact_id(channel_id), server_name, count = matches.len(),
+            channel = %redact_id(channel_id), server_name, count,
             "ACP: more than one tunnel is registered under one declared name — registry uniqueness \
              was broken upstream; routing to the newest attach"
         );
     }
-    matches.sort_by_key(|(_, h)| (h.connection_generation, h.generation));
-    matches.last().map(|((_, id), _)| id.clone())
+    best.map(|(id, _)| id.clone())
 }
 
 /// Registry of active ACP sessions: channel_id → reply sink.

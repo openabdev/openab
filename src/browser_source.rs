@@ -267,13 +267,6 @@ impl CapabilitySource for AcpTunnelSource {
             return sorted(self.policy.values().flat_map(|p| p.seed.iter().cloned()));
         };
 
-        // name -> server_id for the tunnels attached to this session. Same-name
-        // duplicates cannot occur (last-attach-wins, §6.1).
-        let attached: HashMap<String, String> = self
-            .tunnel
-            .servers(&ctx.channel_id)
-            .into_iter()
-            .collect();
 
         let mut out: Vec<Tool> = Vec::new();
         for (name, policy) in &self.policy {
@@ -295,8 +288,15 @@ impl CapabilitySource for AcpTunnelSource {
                     // Nothing discovered yet: advertise the seed (never empty out a
                     // seeded server) and kick off the fetch if it is attached.
                     out.extend(policy.seed.iter().cloned());
-                    if let Some(server_id) = attached.get(name) {
-                        self.spawn_discovery(&ctx.channel_id, name, server_id);
+                    // Resolved through the same call routing uses, not through a snapshot of
+                    // `servers()`. Collecting that into a map keeps whichever entry the iterator
+                    // yields LAST, and registry iteration is not ordered by generation — so in a
+                    // duplicate-name state discovery could fetch its catalog from one tunnel while
+                    // calls went to another, advertising tools the serving tunnel does not have.
+                    // Uniqueness makes that unreachable today; using one resolution makes it
+                    // unreachable by construction.
+                    if let Some(server_id) = self.tunnel.resolve_by_name(&ctx.channel_id, name) {
+                        self.spawn_discovery(&ctx.channel_id, name, &server_id);
                     }
                 }
             }
