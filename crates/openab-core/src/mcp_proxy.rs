@@ -6,10 +6,14 @@
 //!
 //! What remains is the seam between core and the colocated agent CLI:
 //!
-//! - [`browser_tools`] — the static tool set (D4 static-advertise), now consumed by the facade's
-//!   capability source rather than served here. It is advertised whether or not an extension is
-//!   attached; a call while disconnected reports "browser not connected" instead of the tools
-//!   silently disappearing.
+//! - [`browser_tools`] — the static `katashiro` tool set (D4 static-advertise). **It no longer has
+//!   any caller in this workspace.** It was consumed by the facade's capability source as a schema
+//!   seed until 2026-07-30, when D-20 deleted the built-in catalog: `katashiro` is an example
+//!   implementation of the client side, not a component of openab, so product code must not carry
+//!   its schemas. Schemas now come only from discovery over the tunnel.
+//!
+//!   Left in place deliberately rather than deleted — it is `pub`, so removing it is a public API
+//!   change and that is not this loop's call to make.
 //! - [`AcpMcpTunnel`] — the trait core calls to reach a session's tunnel, implemented in the root.
 //! - [`write_facade_mcp_config`] — authors `.openab/mcp-facade.json`, the ONE file openab owns.
 //!   It does not write, merge into, or read any vendor's MCP config, and it does not invoke a
