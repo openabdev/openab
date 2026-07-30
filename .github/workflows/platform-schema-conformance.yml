@@ -2,19 +2,32 @@ name: platform-schema conformance
 
 # Verify docs/platforms/schema/*.toml stays in sync with the code: structural
 # schema validation + that every `source` code-ref still exists in the tree.
-# Runs on any change to the schema files, the template, or the checker itself.
+# Runs on any change to the schema files, the checker itself, or the adapter/core
+# source trees that schema code-refs point into (so a rename/delete there is
+# caught immediately, not by the next unrelated schema PR).
 on:
   pull_request:
     paths:
       - "docs/platforms/schema/**"
       - "docs/platforms/_template.toml"
       - "crates/platform-schema/**"
+      - "crates/openab-gateway/src/**"
+      - "crates/openab-core/src/**"
+      - "src/main.rs"
   push:
     branches: [main]
     paths:
       - "docs/platforms/schema/**"
       - "docs/platforms/_template.toml"
       - "crates/platform-schema/**"
+      - "crates/openab-gateway/src/**"
+      - "crates/openab-core/src/**"
+      - "src/main.rs"
+  schedule:
+    # Safety net: catch drift from renames/deletes even if a PR touching the
+    # source tree somehow bypassed the path triggers above (e.g. merged via
+    # a workflow that skipped this check).
+    - cron: "0 6 * * 1"
 
 concurrency:
   group: platform-schema-${{ github.ref }}
