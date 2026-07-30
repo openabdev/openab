@@ -2914,6 +2914,12 @@ mod acp_requests {
     ///
     /// The establish path cannot produce two tunnels under one name, so a state that only
     /// `resolve_by_name` has to cope with has to be built by hand.
+    ///
+    /// **Give every handle a distinct rank.** `resolve_by_name` compares with a strict `>`, so on a
+    /// tie the first one the registry iterator happens to yield wins — and that order is not stable.
+    /// Real handles cannot tie, because `fetch_add` makes the attach number unique; only handmade
+    /// ones can. A test built on two equal ranks would be intermittently wrong for a reason with no
+    /// visible connection to what it was testing.
     fn tunnel_ranked(owner: &str, conn_gen: u64, gen: u64) -> super::TunnelHandle {
         let (out_tx, _rx) = mpsc::unbounded_channel::<String>();
         super::TunnelHandle {

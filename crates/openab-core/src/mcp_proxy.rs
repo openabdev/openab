@@ -41,30 +41,15 @@ pub trait AcpMcpTunnel: Send + Sync {
         params: Option<Value>,
     ) -> Result<Value, String>;
 
-    /// The `type:acp` servers currently registered for `channel_id`, as `(declared_name,
-    /// server_id)` pairs.
-    ///
-    /// Both halves are needed and they are *not* interchangeable (ADR §6.1): the registry is keyed
-    /// by the client-minted `server_id`, which the reference client mints as a fresh UUID **per
-    /// connection**, while a tool name carries the stable declared **name** (`katashiro.click`) and
-    /// the §6.4 trust gate is keyed by that name too. Enumerating both is what lets a capability
-    /// source resolve a tool prefix back to a tunnel; matching a prefix against the registry key
-    /// alone can never work.
-    ///
-    /// Sync because implementations just read an in-memory registry. The default is empty, so
-    /// implementations that track no declarations (test doubles, single-target bridges) simply
-    /// advertise nothing.
-    fn servers(&self, _channel_id: &str) -> Vec<(String, String)> {
-        Vec::new()
-    }
 
     /// Resolve a declared server NAME to the `server_id` the registry keys that tunnel by, for one
     /// channel.
     ///
-    /// Separate from [`Self::servers`] on purpose. Enumerating and picking the first name match is
-    /// only correct while same-name entries cannot coexist, and that uniqueness is maintained far
-    /// from any caller — so the choice belongs with the code that maintains it, not with each
-    /// consumer. `servers` stays for enumeration and discovery, where seeing everything is the point.
+    /// The only way to reach a tunnel by name. There was also an enumerating `servers()`, and both
+    /// its callers collapsed `name -> id` themselves: routing took the first match, discovery took
+    /// whichever a `HashMap` kept last. Two collapse rules for one fact, neither beside the eviction
+    /// that makes the fact true. Both now call this, and the enumerator is gone rather than left as a
+    /// second route someone would reasonably mistake for the supported one.
     ///
     /// Required, with no default. A default returning `None` compiles for every existing implementor
     /// and then silently answers "not connected" for all routing — the failure surfaces at run time,

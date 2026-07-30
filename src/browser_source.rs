@@ -451,11 +451,13 @@ mod tests {
         /// The double holds a controlled list, so matching it directly is honest here — the
         /// reason the real implementation delegates to the gateway is that IT cannot rank two
         /// same-name tunnels, not that matching is wrong in principle.
-        fn resolve_by_name(&self, channel_id: &str, server_name: &str) -> Option<String> {
-            self.servers(channel_id)
-                .into_iter()
+        fn resolve_by_name(&self, _channel_id: &str, server_name: &str) -> Option<String> {
+            self.servers
+                .lock()
+                .unwrap()
+                .iter()
                 .find(|(name, _)| name == server_name)
-                .map(|(_, id)| id)
+                .map(|(_, id)| id.clone())
         }
 
         async fn call(
@@ -483,10 +485,6 @@ mod tests {
                 params.unwrap_or(Value::Null),
             ));
             Ok(json!({ "content": [{ "type": "text", "text": "ok" }] }))
-        }
-
-        fn servers(&self, _channel_id: &str) -> Vec<(String, String)> {
-            self.servers.lock().unwrap().clone()
         }
     }
 

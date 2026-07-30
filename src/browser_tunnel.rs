@@ -76,15 +76,4 @@ impl AcpMcpTunnel for RootBrowserTunnel {
         )
     }
 
-    /// Enumerate this channel's registered tunnels as `(declared_name, server_id)` (ADR §6.1).
-    /// The name is what a tool prefix and the §6.4 allowlist match on; the id is what the registry
-    /// is keyed by. Same-name duplicates cannot appear here — `establish_and_register_tunnel`
-    /// evicts the stale entry on attach (last-attach-wins).
-    fn servers(&self, channel_id: &str) -> Vec<(String, String)> {
-        let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
-        reg.iter()
-            .filter(|((c, _), _)| c == channel_id)
-            .map(|((_, id), h)| (h.server_name().to_string(), id.clone()))
-            .collect()
-    }
 }
