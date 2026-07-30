@@ -927,10 +927,18 @@ const INNER_MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 ///   - `tools/list` — `src/browser_source.rs:200`;
 ///   - `tools/call` — `src/browser_source.rs:351`.
 ///
-/// Verified against the tree: those are the only methods reaching an inner server. A fifth would
-/// have to be re-checked across the set, because compatibility is a property of the methods we
-/// actually send, not of the revisions in the abstract. A bare list of version strings with no
-/// stated reason is how this becomes silently wrong later.
+/// Verified against the tree: those are the only methods reaching an inner server.
+///
+/// RE-CHECK THIS SET when any of three things changes, not just the first:
+///
+///   - a fifth inner method is added;
+///   - the transport changes;
+///   - the framing changes.
+///
+/// Compatibility is a property of what we actually send and how we send it, not of the revisions
+/// in the abstract, so a transport or framing change can invalidate the set while the method list
+/// stays identical. A bare list of version strings with no stated reason is how this becomes
+/// silently wrong later.
 const SUPPORTED_INNER_MCP_PROTOCOL_VERSIONS: [&str; 3] =
     ["2025-06-18", "2025-03-26", "2024-11-05"];
 
