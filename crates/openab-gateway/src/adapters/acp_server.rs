@@ -5644,8 +5644,27 @@ mod acp_ws_integration {
             }
         }
 
-        // The disconnect must name the REPLACED connection. Without this assertion an
-        // implementation that disconnected the newly registered tunnel would pass too.
+        // WHAT THIS TEST ACTUALLY COVERS — measured, not assumed.
+        //
+        // The name says last-attach-wins eviction (R7). It does not exercise it. Instrumenting
+        // every `mcp/disconnect` emitter and running this test against unmodified code shows one
+        // line: the WITHDRAWAL-RETIREMENT path (`resume withdrew declarations`). The eviction
+        // branch never runs, because the resume drops `uuid-old` from the accepted set, so
+        // retirement removes that registry entry BEFORE the establish for `uuid-new` looks for
+        // same-name predecessors — `replaced` is empty and `if !replaced.is_empty()` is false.
+        //
+        // A mutation confirms it: redirecting the eviction disconnect from the stale handles to
+        // the newly registered one (preserving "empty unless something was replaced") leaves this
+        // test GREEN. So the assertions below cannot distinguish disconnecting the right tunnel
+        // from disconnecting the wrong one — they are satisfied by a different mechanism.
+        //
+        // The previous comment here claimed the opposite ("an implementation that disconnected the
+        // newly registered tunnel would pass too"), and the commit that added it reported the
+        // assertion as mutation-checked by flipping the expected `connectionId`. That mutates the
+        // TEST, not the code; negating a tautology also goes red. Both claims were wrong.
+        //
+        // Whether `same_name` eviction is reachable through a resume AT ALL is an open question
+        // filed for review, not something this test should paper over.
         let framed = recv(&mut first).await;
         assert_eq!(framed["method"], json!("mcp/disconnect"));
         assert_eq!(
@@ -5659,6 +5678,36 @@ mod acp_ws_integration {
             reg.values().map(|h| h.connection_id.clone()).collect()
         };
         assert_eq!(names, vec!["conn-new".to_string()], "only the newest tunnel may remain");
+
+        // The survivor must WORK, not merely be present in the registry: a replacement that
+        // registers a handle whose socket is gone satisfies every assertion above. This is the
+        // `mcp/message` round trip the review request for this trio announced and this test never
+        // performed.
+        //
+        // It also pins frame ORDER on the surviving socket. Frames on one socket are ordered, so
+        // any implementation that wrote a disconnect to the replacement would have to write it
+        // before this response — asserting the next frame is the tool call fails fast and names
+        // the reason, where a missing-frame check could only time out.
+        let handle = {
+            let reg = registry.lock().unwrap();
+            reg.values().next().expect("the survivor must be registered").clone()
+        };
+        let call = tokio::spawn(async move {
+            handle.mcp_message("tools/call", Some(json!({"name": "katashiro.click"})), 5).await
+        });
+
+        let request = recv(&mut second).await;
+        assert_eq!(
+            request["method"], json!("mcp/message"),
+            "the next frame owed to the surviving connection is the tool call, not a disconnect"
+        );
+        assert_eq!(request["params"]["connectionId"], json!("conn-new"));
+        send(&mut second, json!({
+            "jsonrpc": "2.0", "id": request["id"].clone(),
+            "result": {"content": [{"type": "text", "text": "clicked"}]}
+        })).await;
+        let got = call.await.unwrap().expect("the surviving tunnel must carry a call");
+        assert_eq!(got["content"][0]["text"], json!("clicked"));
     }
 }
 
