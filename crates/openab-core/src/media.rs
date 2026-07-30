@@ -396,7 +396,10 @@ pub fn is_audio_mime(mime: &str) -> bool {
 
 /// Extension fallback like `is_video_file`, returning a MIME rather than a bool
 /// because `stt::transcribe` drops any request whose `mime_str` fails to parse.
-pub fn audio_mime(filename: &str, content_type: Option<&str>) -> Option<String> {
+// Reached only from the Discord and Slack adapters, so a build with neither
+// has no caller for these by design.
+#[cfg_attr(not(any(feature = "slack", feature = "discord")), allow(dead_code))]
+pub(crate) fn audio_mime(filename: &str, content_type: Option<&str>) -> Option<String> {
     // Normalised once, because a half-normalised comparison reads `Audio/OGG`
     // as an explicit non-audio type and suppresses the fallback below.
     let mime = strip_mime_params(content_type.unwrap_or("")).to_ascii_lowercase();
@@ -415,6 +418,7 @@ pub fn audio_mime(filename: &str, content_type: Option<&str>) -> Option<String> 
 
 /// Types that carry no information about the payload, so the extension may speak.
 /// Expects the already-lowercased value `audio_mime` normalises.
+#[cfg_attr(not(any(feature = "slack", feature = "discord")), allow(dead_code))]
 fn is_generic_mime(mime: &str) -> bool {
     matches!(
         mime,
@@ -424,6 +428,7 @@ fn is_generic_mime(mime: &str) -> bool {
 
 /// Deliberately excludes the containers that carry either stream (`webm`, `mp4`,
 /// `ogv`), so this never claims an attachment `is_video_file` should handle.
+#[cfg_attr(not(any(feature = "slack", feature = "discord")), allow(dead_code))]
 fn audio_mime_from_extension(filename: &str) -> Option<&'static str> {
     match filename.rsplit('.').next()?.to_lowercase().as_str() {
         "ogg" | "oga" => Some("audio/ogg"),
@@ -473,7 +478,7 @@ fn sanitize_attachment_meta(filename: &str, content_type: &str) -> (String, Stri
 
 /// Emitted regardless of STT so a transcript augments the file, never replaces
 /// it; `url` is `None` on gateway, which holds bytes and no fetchable location.
-pub fn audio_attachment_block(
+pub(crate) fn audio_attachment_block(
     filename: &str,
     content_type: &str,
     size: u64,
@@ -496,7 +501,7 @@ pub fn audio_attachment_block(
 
 /// STT line then the file it describes, kept together because assembling them
 /// separately across a loop pairs one file's transcript with another's metadata.
-pub fn audio_attachment_blocks(
+pub(crate) fn audio_attachment_blocks(
     filename: &str,
     content_type: &str,
     size: u64,
@@ -522,13 +527,16 @@ pub fn audio_attachment_blocks(
 
 /// Gateway attachments arrive as bytes, so a filestore is the only way to hand
 /// the agent a location it can fetch.
-pub const AUDIO_NO_URL_NOTE: &str =
+pub(crate) const AUDIO_NO_URL_NOTE: &str =
     "no fetchable URL for this attachment; configure a filestore to give the agent a downloadable link";
 
 /// Why a configured filestore produced no URL. Collapsing these into the
 /// no-filestore case told the operator to configure one they already had.
+// Only filestore code constructs these, while `audio_outcome` needs the type in
+// its signature either way, so without the feature they are unreachable by design.
+#[cfg_attr(not(feature = "filestore"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AudioStoreError {
+pub(crate) enum AudioStoreError {
     /// Larger than the configured `max_file_size`, so no upload was attempted.
     TooLarge,
     /// The platform did not hand over the bytes, so there was nothing to upload.
@@ -539,7 +547,7 @@ pub enum AudioStoreError {
 
 /// What the gateway managed to do with an audio attachment's bytes.
 #[derive(Clone, Copy)]
-pub enum AudioOutcome<'a> {
+pub(crate) enum AudioOutcome<'a> {
     /// Uploaded; the agent can fetch it at `url`.
     Stored { url: &'a str, note: &'a str },
     /// Bytes arrived but no filestore is configured, so there is nothing to fetch.
@@ -552,7 +560,7 @@ pub enum AudioOutcome<'a> {
 
 /// Kept pure so the configured-but-failed cases are testable without an S3
 /// client; `None` means no filestore, which is not the same as one that failed.
-pub fn audio_outcome<'a>(
+pub(crate) fn audio_outcome<'a>(
     stored: Option<&'a Result<(String, String), AudioStoreError>>,
 ) -> AudioOutcome<'a> {
     match stored {
@@ -564,7 +572,7 @@ pub fn audio_outcome<'a>(
 
 /// The gateway's two entry points both route here, so a fallback fixed on one
 /// cannot silently stay wrong on the other.
-pub fn audio_blocks_for(
+pub(crate) fn audio_blocks_for(
     filename: &str,
     content_type: &str,
     size: u64,
@@ -593,7 +601,8 @@ pub fn audio_blocks_for(
 
 /// `note` names what the URL needs to be fetched; `None` when it needs nothing,
 /// as with a public CDN link.
-pub fn video_attachment_block(
+#[cfg_attr(not(any(feature = "slack", feature = "discord")), allow(dead_code))]
+pub(crate) fn video_attachment_block(
     filename: &str,
     content_type: Option<&str>,
     size: u64,
@@ -1070,7 +1079,7 @@ fn presigned_note(filestore: &crate::filestore::Filestore) -> String {
 /// Presigned URL plus the note describing its lifetime, for callers that hold
 /// the bytes already (the gateway, which never has a platform URL).
 #[cfg(feature = "filestore")]
-pub async fn upload_bytes_and_presign(
+pub(crate) async fn upload_bytes_and_presign(
     filename: &str,
     bytes: &[u8],
     content_type: Option<&str>,
@@ -1089,7 +1098,7 @@ pub async fn upload_bytes_and_presign(
     }
 
     match filestore
-        .upload_and_presign(filename, bytes, content_type)
+        .upload_and_presign_with_content_type(filename, bytes, content_type)
         .await
     {
         Ok(presigned_url) => {
@@ -1251,7 +1260,7 @@ async fn download_and_presign_any_file(
 /// Presigned URL plus the note describing its lifetime, for callers that build
 /// their own block. Paired so every caller labels the URL identically.
 #[cfg(feature = "filestore")]
-pub async fn download_and_presign_attachment(
+pub(crate) async fn download_and_presign_attachment(
     url: &str,
     filename: &str,
     size: u64,
@@ -1273,7 +1282,8 @@ pub async fn download_and_presign_attachment(
 
 /// The note for a platform URL the agent cannot fetch, naming the configured
 /// store's failure so an operator is not left reading it as "no store here".
-pub fn store_failure_note(err: AudioStoreError, platform_requirement: &str) -> String {
+#[cfg_attr(not(any(feature = "slack", feature = "discord")), allow(dead_code))]
+pub(crate) fn store_failure_note(err: AudioStoreError, platform_requirement: &str) -> String {
     let reason = match err {
         AudioStoreError::TooLarge => "it exceeds the configured upload limit",
         AudioStoreError::DownloadFailed => "the platform did not return the bytes",
@@ -1312,10 +1322,7 @@ async fn upload_bytes_to_filestore(
         return None;
     }
 
-    match filestore
-        .upload_and_presign(filename, bytes, Some("text/plain; charset=utf-8"))
-        .await
-    {
+    match filestore.upload_and_presign(filename, bytes).await {
         Ok(presigned_url) => {
             let hint = crate::filestore::format_filestore_hint(
                 filename,
@@ -1835,9 +1842,7 @@ mod tests {
         assert!(text.contains("filename: abcdefgh.ogg"));
         // Counted over every separator a renderer may break on, since str::lines
         // sees only \n and would read four whether or not U+2028 survived.
-        let rendered_lines = text
-            .split(|c| c == '\n' || c == '\u{2028}' || c == '\u{2029}')
-            .count();
+        let rendered_lines = text.split(['\n', '\u{2028}', '\u{2029}']).count();
         assert_eq!(rendered_lines, 4, "got {text}");
     }
 

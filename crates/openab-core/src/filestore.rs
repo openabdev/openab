@@ -15,6 +15,10 @@ pub struct Filestore {
     max_file_size: u64,
 }
 
+/// What `upload_and_presign` has always stored, kept named so the compatibility
+/// wrapper and its doc comment cannot drift apart.
+const TEXT_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
+
 const MAX_PRESIGNED_TTL: u64 = 7 * 24 * 60 * 60;
 
 fn cap_presigned_ttl(configured: u64) -> u64 {
@@ -104,11 +108,18 @@ impl Filestore {
         }
     }
 
+    /// Uploads as `text/plain; charset=utf-8`. Kept at its original signature and
+    /// content type for external callers; new code wants the typed method below.
+    pub async fn upload_and_presign(&self, filename: &str, data: &[u8]) -> anyhow::Result<String> {
+        self.upload_and_presign_with_content_type(filename, data, Some(TEXT_CONTENT_TYPE))
+            .await
+    }
+
     /// Upload a file to S3 and return a presigned GET URL.
     ///
     /// The object key is `{prefix}{uuid}_{filename}`. On success returns the
     /// presigned URL as a String. On failure logs the error and returns Err.
-    pub async fn upload_and_presign(
+    pub async fn upload_and_presign_with_content_type(
         &self,
         filename: &str,
         data: &[u8],
@@ -515,6 +526,13 @@ pub fn format_filestore_hint(filename: &str, size_bytes: u64, presigned_url: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_compatibility_wrapper_still_stores_what_it_always_did() {
+        // External callers of the two-argument `upload_and_presign` get this value,
+        // so it is the API contract, not an implementation detail.
+        assert_eq!(TEXT_CONTENT_TYPE, "text/plain; charset=utf-8");
+    }
 
     #[test]
     fn presigned_ttl_is_capped_but_never_raised() {
