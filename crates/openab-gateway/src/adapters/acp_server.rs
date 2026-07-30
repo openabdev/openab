@@ -468,13 +468,16 @@ pub fn new_reply_registry() -> AcpReplyRegistry {
     Arc::new(std::sync::Mutex::new(HashMap::new()))
 }
 
-/// Registry of open MCP-over-ACP tunnels: `(channel_id, server_id)` → `TunnelHandle`. The
-/// gateway inserts a handle once it has `mcp/connect`ed to a session's declared `type:acp`
-/// server; the core MCP proxy looks one up to route a tool call to the right server (T5.3).
-/// Keyed by the compound `(channel_id, server_id)` (P1) so one session can carry several
-/// `type:acp` servers without collision; eviction drops all `(channel_id, *)` on teardown. Same
-/// std::sync::Mutex rationale as `AcpReplyRegistry`.
-/// Shared map of live MCP-over-ACP tunnels, keyed `(channel_id, server_id)`.
+/// Registry of open MCP-over-ACP tunnels: `(channel_id, server_id)` → `TunnelHandle`.
+///
+/// The gateway inserts a handle once it has `mcp/connect`ed to a session's declared `type:acp`
+/// server; the core MCP proxy looks one up to route a tool call to the right server (T5.3). Keyed
+/// by the compound `(channel_id, server_id)` (P1) so one session can carry several `type:acp`
+/// servers without collision. Same `std::sync::Mutex` rationale as `AcpReplyRegistry`.
+///
+/// Teardown removes only the entries THIS connection owns — it matches on `owner`, not on the
+/// channel. Removing every `(channel_id, *)` would delete a successor's live entry, because a
+/// client that reconnects and resumes takes over the same `channel_id`.
 ///
 /// **To reach a tunnel by its declared NAME, call [`resolve_by_name`].** Holding this map and
 /// matching `server_name()` yourself is possible and is the wrong thing: which entry wins when a
