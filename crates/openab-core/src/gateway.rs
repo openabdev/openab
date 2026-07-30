@@ -162,7 +162,7 @@ async fn read_attachment_sources(
             sources.push(Err(SourceFailure::Unreadable("no path or data".into())));
             continue;
         };
-        let Some(guard) = budget.reserve(bound) else {
+        let Some(guard) = budget.reserve(retained_upper_bound(&att.attachment_type, bound)) else {
             tracing::warn!(
                 filename = %att.filename,
                 bytes = bound,
@@ -193,14 +193,45 @@ async fn read_attachment_sources(
     (sources, guards)
 }
 
-/// Bytes an attachment source may occupy while its event waits for a fetch slot.
-/// Reading before queueing is what keeps a colocated file from being swept, and
-/// this is the memory that costs.
+/// Bytes an attachment may occupy while its event waits for a fetch slot, source
+/// and assembled block together. Reading before queueing is what keeps a
+/// colocated file from being swept, and this is the memory that costs.
 const MAX_ADMITTED_SOURCE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Bytes one message may inline. The dispatcher queue these blocks outlive the
+/// source budget in is bounded by message count, so nothing else bounds its size.
+const MAX_INLINE_BLOCK_BYTES: u64 = 24 * 1024 * 1024;
 
 /// The reason an attachment the broker refused to hold reports to the agent.
 const SOURCE_BUDGET_REASON: &str =
     "the broker was over its attachment memory budget and did not fetch it";
+
+/// The reason an attachment dropped for exceeding the per-message payload cap
+/// reports to the agent.
+const INLINE_BUDGET_REASON: &str =
+    "the message was over its attachment payload limit and it was not included";
+
+/// Bytes an assembled block keeps on top of its source. Only the types that
+/// inline bytes retain anything; audio and video carry a URL and metadata.
+fn inline_payload_bytes(attachment_type: &str, source_bytes: u64) -> u64 {
+    match attachment_type {
+        // base64 spends four characters on every three bytes.
+        "image" => source_bytes.div_ceil(3).saturating_mul(4),
+        "text_file" => source_bytes,
+        _ => 0,
+    }
+}
+
+/// Peak bytes holding this attachment through assembly can cost: the source, plus
+/// whatever the block built from it retains while the source is still alive.
+fn retained_upper_bound(attachment_type: &str, source_bytes: u64) -> u64 {
+    source_bytes.saturating_add(inline_payload_bytes(attachment_type, source_bytes))
+}
+
+/// Whether one more block of `payload` bytes still fits what a message may inline.
+fn fits_inline_budget(inlined: u64, payload: u64, limit: u64) -> bool {
+    inlined.saturating_add(payload) <= limit
+}
 
 /// Bytes currently retained by attachment sources.
 ///
@@ -302,12 +333,17 @@ async fn read_at_most(path: &str, limit: u64) -> Result<Vec<u8>, String> {
 /// file, and neither logged both.
 async fn assemble_attachment_blocks(
     attachments: &[GwAttachment],
-    sources: &[Result<Vec<u8>, SourceFailure>],
+    sources: Vec<Result<Vec<u8>, SourceFailure>>,
+    inline_limit: u64,
     stt_config: &crate::config::SttConfig,
     #[cfg(feature = "filestore")] filestore: Option<&crate::filestore::Filestore>,
 ) -> Vec<ContentBlock> {
+    // Taken by value so each source moves into its block: cloning here would put a
+    // second copy of every attachment outside what the budget reserved.
+    debug_assert_eq!(attachments.len(), sources.len());
     let mut extra_blocks = Vec::new();
-    for (index, att) in attachments.iter().enumerate() {
+    let mut inlined = 0u64;
+    for (att, source) in attachments.iter().zip(sources) {
         // Rejected or truncated: the reason goes to the agent, the file does not.
         if let Some(ref reason) = att.status {
             tracing::info!(
@@ -324,10 +360,10 @@ async fn assemble_attachment_blocks(
             continue;
         }
 
-        let bytes_result = match sources.get(index) {
-            Some(Ok(bytes)) => Ok(bytes.clone()),
-            Some(Err(SourceFailure::Unreadable(e))) => Err(e.clone()),
-            Some(Err(SourceFailure::Undeliverable(reason))) => {
+        let bytes_result = match source {
+            Ok(bytes) => Ok(bytes),
+            Err(SourceFailure::Unreadable(e)) => Err(e),
+            Err(SourceFailure::Undeliverable(reason)) => {
                 extra_blocks.push(ContentBlock::Text {
                     text: undelivered_attachment_line(
                         &att.filename,
@@ -338,8 +374,31 @@ async fn assemble_attachment_blocks(
                 });
                 continue;
             }
-            None => Err("no source read".to_string()),
         };
+
+        // Charged before the payload is built, so the cap bounds the peak and not
+        // just what survives it.
+        if let Ok(ref bytes) = bytes_result {
+            let payload = inline_payload_bytes(&att.attachment_type, bytes.len() as u64);
+            if !fits_inline_budget(inlined, payload, inline_limit) {
+                tracing::warn!(
+                    filename = %att.filename,
+                    bytes = payload,
+                    inlined,
+                    "gateway: per-message inline payload cap reached, describing attachment instead"
+                );
+                extra_blocks.push(ContentBlock::Text {
+                    text: undelivered_attachment_line(
+                        &att.filename,
+                        &att.mime_type,
+                        &format_size(att.size),
+                        INLINE_BUDGET_REASON,
+                    ),
+                });
+                continue;
+            }
+            inlined += payload;
+        }
 
         match att.attachment_type.as_str() {
             "image" => match bytes_result {
@@ -1609,30 +1668,32 @@ pub async fn run_gateway_adapter(
                                       let outcome = run_unless_reset(&mut guard, async move {
                                         // Attachment assembly can await object storage, so it
                                         // belongs here rather than in the `ws_rx.next()` arm.
-                                        let extra_blocks = if shed {
-                                            shed_attachment_blocks(&event.content.attachments)
+                                        // Held for the whole task: the blocks built from these bytes
+                                        // outlive assembly, so releasing here would stop bounding them.
+                                        let (extra_blocks, _source_guards) = if shed {
+                                            (shed_attachment_blocks(&event.content.attachments), Vec::new())
                                         } else if has_attachments {
                                             // Read before queueing, so a colocated file cannot be
-                                            // swept out from under a task waiting for a slot. The
-                                            // guards hold the memory budget for as long as the
-                                            // bytes are alive.
-                                            let (sources, _guards) = read_attachment_sources(
+                                            // swept out from under a task waiting for a slot.
+                                            let (sources, guards) = read_attachment_sources(
                                                 &event.content.attachments,
                                                 &budget,
                                             )
                                             .await;
                                             // Err only if the semaphore is closed, which it never is.
                                             let _permit = fetch_slots.acquire().await.ok();
-                                            assemble_attachment_blocks(
+                                            let blocks = assemble_attachment_blocks(
                                                 &event.content.attachments,
-                                                &sources,
+                                                sources,
+                                                MAX_INLINE_BLOCK_BYTES,
                                                 &stt_config,
                                                 #[cfg(feature = "filestore")]
                                                 filestore.as_deref(),
                                             )
-                                            .await
+                                            .await;
+                                            (blocks, guards)
                                         } else {
-                                            Vec::new()
+                                            (Vec::new(), Vec::new())
                                         };
 
                                         // If supergroup with no thread_id, create a forum topic
@@ -1932,7 +1993,8 @@ pub async fn process_gateway_event(
     let (sources, _guards) = read_attachment_sources(&event.content.attachments, &budget).await;
     let extra_blocks = assemble_attachment_blocks(
         &event.content.attachments,
-        &sources,
+        sources,
+        MAX_INLINE_BLOCK_BYTES,
         &ctx.stt_config,
         #[cfg(feature = "filestore")]
         ctx.filestore.as_deref(),
@@ -2089,7 +2151,8 @@ mod tests {
                 .await;
         let blocks = assemble_attachment_blocks(
             &attachments,
-            &sources,
+            sources,
+            MAX_INLINE_BLOCK_BYTES,
             &stt_off(),
             #[cfg(feature = "filestore")]
             None,
@@ -2117,7 +2180,8 @@ mod tests {
                 .await;
         let blocks = assemble_attachment_blocks(
             &attachments,
-            &sources,
+            sources,
+            MAX_INLINE_BLOCK_BYTES,
             &stt_off(),
             #[cfg(feature = "filestore")]
             None,
@@ -2350,7 +2414,8 @@ mod tests {
 
         let blocks = assemble_attachment_blocks(
             &attachments,
-            &sources,
+            sources,
+            MAX_INLINE_BLOCK_BYTES,
             &stt_off(),
             #[cfg(feature = "filestore")]
             None,
@@ -2363,6 +2428,87 @@ mod tests {
         // The marker that separates "we still had the bytes" from "we went back
         // for them and they were gone".
         assert!(!text.contains("read failed"), "{text}");
+    }
+
+    #[test]
+    fn the_inline_budget_admits_exactly_the_limit() {
+        assert!(fits_inline_budget(0, 10, 10));
+        assert!(!fits_inline_budget(1, 10, 10));
+        assert!(
+            !fits_inline_budget(u64::MAX, 1, 10),
+            "saturating, not wrapping"
+        );
+
+        assert_eq!(
+            inline_payload_bytes("image", 3),
+            4,
+            "base64 spends four characters on three bytes"
+        );
+        assert_eq!(inline_payload_bytes("text_file", 3), 3);
+        for carries_a_url in ["audio", "video"] {
+            assert_eq!(inline_payload_bytes(carries_a_url, 1_000_000), 0);
+        }
+        assert_eq!(
+            retained_upper_bound("image", 3),
+            7,
+            "the source is alive while its encoded copy is built"
+        );
+    }
+
+    /// The source is charged for the block it will become, not just for itself:
+    /// the encoded copy is alive at the same time as the bytes it came from.
+    #[tokio::test]
+    async fn an_image_reserves_what_its_encoded_block_will_hold() {
+        let image = gw_attachment("image", "a.png", "image/png", "dm9pY2UgYnl0ZXM=");
+        let source = source_upper_bound(&image).await.unwrap();
+        let attachments = [image];
+
+        let tight = SourceBudget::new(source);
+        let (refused, _) = read_attachment_sources(&attachments, &tight).await;
+        assert!(
+            matches!(refused[0], Err(SourceFailure::Undeliverable(_))),
+            "room for the source alone must not admit the copy built from it"
+        );
+
+        let enough = SourceBudget::new(retained_upper_bound("image", source));
+        let (admitted, guards) = read_attachment_sources(&attachments, &enough).await;
+        assert!(admitted[0].is_ok(), "room for both must admit it");
+        assert_eq!(guards.len(), 1);
+    }
+
+    /// What the dispatcher queue holds is capped per message, because the source
+    /// reservation is gone by the time the blocks are sitting in it.
+    #[tokio::test]
+    async fn a_near_limit_image_is_described_rather_than_inlined() {
+        let attachments = [
+            gw_attachment("image", "a.png", "image/png", "dm9pY2UgYnl0ZXM="),
+            gw_attachment("image", "b.png", "image/png", "dm9pY2UgYnl0ZXM="),
+        ];
+        let budget = SourceBudget::new(MAX_ADMITTED_SOURCE_BYTES);
+        let (sources, _guards) = read_attachment_sources(&attachments, &budget).await;
+        // Eleven decoded bytes encode to sixteen, so exactly one of them fits.
+        let limit = inline_payload_bytes("image", 11);
+
+        let blocks = assemble_attachment_blocks(
+            &attachments,
+            sources,
+            limit,
+            &stt_off(),
+            #[cfg(feature = "filestore")]
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(blocks[0], ContentBlock::Image { .. }),
+            "the first fits and is inlined"
+        );
+        let text = block_text(blocks.into_iter().nth(1).unwrap());
+        assert!(text.contains("payload limit"), "{text}");
+        assert!(
+            !text.contains("read failed"),
+            "nothing failed to read: {text}"
+        );
     }
 
     #[test]
@@ -2425,7 +2571,8 @@ mod tests {
 
         let blocks = assemble_attachment_blocks(
             &attachments,
-            &sources,
+            sources,
+            MAX_INLINE_BLOCK_BYTES,
             &stt_off(),
             #[cfg(feature = "filestore")]
             None,
