@@ -431,7 +431,13 @@ fn is_generic_mime(mime: &str) -> bool {
 /// `ogv`), so this never claims an attachment `is_video_file` should handle.
 #[cfg_attr(not(any(feature = "slack", feature = "discord")), allow(dead_code))]
 fn audio_mime_from_extension(filename: &str) -> Option<&'static str> {
-    match filename.rsplit('.').next()?.to_lowercase().as_str() {
+    // `rsplit('.').next()` yields the whole string when there is no dot, so a file
+    // named `mp3` classified as audio and was handed to STT on its name alone.
+    let (stem, ext) = filename.rsplit_once('.')?;
+    if stem.is_empty() {
+        return None;
+    }
+    match ext.to_lowercase().as_str() {
         "ogg" | "oga" => Some("audio/ogg"),
         "opus" => Some("audio/opus"),
         "m4a" => Some("audio/mp4"),
@@ -1438,6 +1444,20 @@ async fn upload_bytes_to_filestore(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_without_a_real_extension_is_not_audio() {
+        // The platform sending no type is what reaches the extension fallback, so
+        // these are exactly the inputs that used to be classified on a bare name.
+        for bare in ["mp3", "wav", "ogg", ".mp3", "."] {
+            assert_eq!(audio_mime(bare, None), None, "{bare}");
+        }
+        assert_eq!(audio_mime("a.mp3", None).as_deref(), Some("audio/mpeg"));
+        assert_eq!(
+            audio_mime("clip.name.wav", None).as_deref(),
+            Some("audio/wav")
+        );
+    }
 
     // The classification only exists under `filestore`, and so does the enum it
     // reads, so the test that pins it has to follow the same gate.
