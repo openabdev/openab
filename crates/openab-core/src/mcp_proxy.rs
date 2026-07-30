@@ -13,8 +13,10 @@
 //! - [`AcpMcpTunnel`] — the trait core calls to reach a session's tunnel, implemented in the root.
 //! - [`write_facade_mcp_config`] — authors `.openab/mcp-facade.json`, the ONE file openab owns.
 //!   It does not write, merge into, or read any vendor's MCP config, and it does not invoke a
-//!   vendor CLI (D-2026-07-30-15). Putting the entry in place is the operator's step, except for
-//!   Claude Code, which is pointed at the file with `--mcp-config` at spawn.
+//!   vendor CLI (D-2026-07-30-15). Putting the entry in place is the operator's step for EVERY
+//!   vendor today. Pointing Claude Code at it with `--mcp-config` at spawn is decided but NOT
+//!   implemented — it needs a way to identify the vendor at spawn time, which this codebase has
+//!   deliberately never had.
 //! - [`report_browser_control`] — startup report of whether browser control is on, plus the
 //!   migration notice for the removed `OPENAB_BROWSER_MODE`.
 
@@ -226,8 +228,9 @@ pub async fn write_facade_mcp_config(workdir: &str, facade_url: &str) -> std::io
 
 /// The one file openab authors: `<workdir>/.openab/mcp-facade.json`.
 ///
-/// Source for Claude Code's `--mcp-config` at spawn time and for the operator's
-/// `kiro-cli mcp import --file … workspace`. openab never puts it in place itself (D-15).
+/// Source for the operator's `kiro-cli mcp import --file … workspace`, and the intended source for
+/// Claude Code's `--mcp-config` once spawn-time vendor identification is decided. openab never puts
+/// it in place itself (D-15).
 pub fn facade_config_path(workdir: &str) -> std::path::PathBuf {
     std::path::Path::new(workdir).join(".openab").join("mcp-facade.json")
 }
