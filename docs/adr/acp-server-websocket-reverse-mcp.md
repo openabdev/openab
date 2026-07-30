@@ -350,8 +350,14 @@ below. Both legacy transports are gone; the facade is the only downstream path.
 **Update — the operator call was made on 2026-07-28: bridge mode is removed.** The stdio bridge
 (`OPENAB_BROWSER_MODE=bridge`, `openab browser-bridge`, the per-pod unix socket and its
 process-ancestry channel resolver) existed because some CLIs preferred a stdio entry. The facade is
-a loopback HTTP MCP server those CLIs read directly, so the premise no longer held. Facade setup
-deletes the leftover static entry, which is the only one whose exact shape proves we wrote it.
+a loopback HTTP MCP server those CLIs read directly, so the premise no longer held. ~~Facade setup
+deletes the leftover static entry, which is the only one whose exact shape proves we wrote it.~~
+That deletion was performed by editing the operator's file, and openab stopped doing that on
+2026-07-30 (D-15): it authors `.openab/mcp-facade.json` and touches nothing else. **Removing a
+leftover bridge entry is now the operator's step, and it is a policy question rather than tidiness
+— while it is present there is a route to the browser that bypasses facade policy and audit.** The
+`jq` snippet in `docs/browser-mcp-agent-setup.md` covers it, including the kiro agent-file
+`@openab-browser` grant.
 
 This paragraph said `bridge` "degrades to `facade`", which was true for one commit. The per-session
 proxy was removed hours later, taking `BrowserMode` and the whole `OPENAB_BROWSER_MODE` mechanism
@@ -368,7 +374,8 @@ revisit a per-provider "expose directly" option only if interactive browser late
 implements `CapabilitySource` over the existing `AcpMcpTunnel` — `requires_session()`, static-advertise
 per §6.3, tunnel failures surfaced as MCP error results — and a `FacadeRegistrar` adapts the facade's
 `SessionTokens` to a `SessionTokenRegistrar` hook in core, so `openab-core` stays free of an
-`openab-mcp` dependency. `write_facade_mcp_config` writes a **static, write-once `openab` entry** whose
+`openab-mcp` dependency. `write_facade_mcp_config` authors `.openab/mcp-facade.json` — the one file openab owns — containing
+a **static `openab` entry** whose
 `Authorization` references `${OPENAB_SESSION_TOKEN}`, so the per-session secret rides the agent's
 process environment rather than a config file — which also removes the shared-workdir exposure of the
 old per-session `mcp.json` write. Capabilities publish under the provider name `openab-browser` (`openab` is the mcp.json entry key,
@@ -383,9 +390,18 @@ facade is unavailable for that CLI in the MVP **rather than falling back to edit
 files**". The as-built `write_facade_mcp_config` does write a static entry into the CLI's config —
 deliberately, because the browser path's D2 established that Cursor ignores ACP-passed `mcpServers`
 (**§7.2** D2, [zed#50924](https://github.com/zed-industries/zed/issues/50924)).
-Both positions are defensible; recording the conflict rather than silently picking a side. Owner of the
+~~Both positions are defensible; recording the conflict rather than silently picking a side. Owner of the
 facade contract should confirm whether config-file injection is an accepted exception for CLIs that
-ignore `mcpServers`, or whether Facade mode should be unavailable for them.
+ignore `mcpServers`, or whether Facade mode should be unavailable for them.~~
+
+**RESOLVED 2026-07-30 (D-15), in favour of the adapter ADR.** openab does not edit a CLI's config
+files, and does not invoke a vendor CLI to do it either. It authors `.openab/mcp-facade.json`; the
+operator puts that entry in place (`kiro-cli mcp import --file … workspace` for kiro, by hand for
+cursor, which has no include/extends and no launch flag). The cost is stated rather than hidden:
+kiro and cursor both lose zero-config onboarding, which is wider than the cursor-only regression
+first recorded. Whether Claude Code is pointed at the file with `--mcp-config` at spawn is a
+separate open question — it needs spawn-time vendor identification, which this codebase has
+deliberately never had.
 
 **Remaining to fulfil this section** — F1′, F3′, F4 and F5 all landed in #1447 and are struck
 through; **F6 genuinely remains**:

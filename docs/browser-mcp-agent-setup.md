@@ -26,21 +26,31 @@ INFO browser control: unconfigured — no [mcp] section in config.toml, so brows
 > ⚠️ **A leftover `openab-browser` entry from either old transport can still sit in your agent's
 > `mcp.json`,** and the two are handled differently.
 >
-> The **bridge** entry is deleted for you on the next session — in `.cursor/mcp.json`,
-> `.kiro/settings/mcp.json` and the kiro agent files, including its `@openab-browser` grant. Left
-> in place it names a subcommand that no longer exists, so the agent's MCP client would try and
-> fail to start it every session. It is removed only when byte-identical to the entry we wrote
-> (`{"command":"openab","args":["browser-bridge"]}`), because that exact shape is the only proof we
-> have that it is ours rather than a server you configured under the same key.
+> **You have to remove it yourself. openab no longer edits your MCP config at all**, so neither
+> entry is cleaned up for you.
 >
-> The **proxy** entry is deliberately *not* removed: its url and bearer were minted per session and
-> never recorded anywhere, so under that key we cannot tell your server from ours. It is dead
-> configuration — the port died with its session — but if you want it gone, remove it yourself:
+> Earlier versions deleted the **bridge** entry on the next session. That cleanup worked by
+> editing your file, and openab no longer does that — it authors `.openab/mcp-facade.json` and
+> nothing else. **This is worth acting on rather than ignoring:** a leftover `openab-browser`
+> entry is a *working* path to the browser that does not pass through facade policy or the audit
+> trail, so until you remove it the allowlist in `[[mcp.acp_servers]]` is not the only way in. The
+> bridge entry also names a subcommand that no longer exists, so the agent's MCP client will fail
+> to start it every session.
+>
+> The **proxy** entry was never removed automatically either: its url and bearer were minted per
+> session and never recorded, so under that key openab cannot tell your server from its own.
+>
+> Remove both, and the kiro agent-file grant that made the bridge entry callable:
 >
 > ```sh
 > # edits in place; check the diff before trusting it
 > for f in "$HOME/.cursor/mcp.json" "$HOME/.kiro/settings/mcp.json"; do
 >   [ -f "$f" ] && jq 'del(.mcpServers["openab-browser"])' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+> done
+> # kiro agent files carry a separate default-deny grant; the entry stays reachable while it is listed
+> for f in "$HOME"/.kiro/agents/*.json; do
+>   [ -f "$f" ] && jq 'del(.mcpServers["openab-browser"]) | .allowedTools = ((.allowedTools // []) - ["@openab-browser"])' \
+>     "$f" > "$f.tmp" && mv "$f.tmp" "$f"
 > done
 > ```
 
@@ -65,9 +75,13 @@ tools = ["katashiro.read_dom","katashiro.screenshot","katashiro.navigate","katas
 ```
 
 - **One listener** — the facade's. No per-session ports and no per-session config rewrites.
+- **openab writes ONE file, and it is not yours.** It authors `<workdir>/.openab/mcp-facade.json`
+  and never reads, merges into, or writes `.cursor/mcp.json`, `.kiro/settings/mcp.json` or a kiro
+  agent file. Putting that entry in front of your agent is your step — see
+  [Wiring it up](#wiring-it-up) below.
 - **Identity** — the pool mints one token per chat session and injects it into the agent process as
-  `OPENAB_SESSION_TOKEN`. The MCP config entry openab writes is **static and write-once**, and
-  references the variable rather than embedding a secret:
+  `OPENAB_SESSION_TOKEN`. The entry is **static**, and references the variable rather than
+  embedding a secret:
 
   ```json
   {
@@ -88,12 +102,19 @@ tools = ["katashiro.read_dom","katashiro.screenshot","katashiro.navigate","katas
   `execute_capability`, alongside every other facade capability. A session-bound source is invisible
   to anonymous facade clients — no token, no discovery, no execution.
 
-### Any MCP-capable CLI works
+### Wiring it up
 
-Because the entry is static, **hand-configuring a variant openab does not auto-write is viable**:
-point the CLI at `http://127.0.0.1:8848/mcp` with the bearer header above. This is the practical
-difference from proxy mode, where the endpoint was per-session ephemeral and a hand-written entry
-went stale on the next session.
+openab authors `<workdir>/.openab/mcp-facade.json` and stops there. It does not run your agent's
+CLI for you either — configuring your own agent stays your decision.
+
+| Agent | What you do |
+|---|---|
+| **kiro** | `kiro-cli mcp import --file <workdir>/.openab/mcp-facade.json workspace` — the vendor performs the merge with its own semantics. Do **not** pass `--force`: it would overwrite a same-named server of yours. |
+| **cursor** | No import mechanism exists — there is no include/extends and no launch flag. Paste the `mcpServers` object below into `.cursor/mcp.json` yourself. |
+| **any other MCP-capable CLI** | Point it at `http://127.0.0.1:8848/mcp` with the bearer header above. Because the entry is static, a hand-written one keeps working — the practical difference from proxy mode, where the endpoint was per-session ephemeral and a hand-written entry went stale on the next session. |
+
+The startup log prints the resolved path and these commands, so the value is not guessed from this
+page.
 
 ### Verify
 
@@ -101,9 +122,12 @@ went stale on the next session.
 # facade listening?
 grep "OAB MCP facade listening" <agent logs>
 
-# the static entry openab wrote
-cat "$HOME/.cursor/mcp.json"            # Cursor
-cat "$HOME/.kiro/settings/mcp.json"     # Kiro
+# the file openab authored (the only one it writes)
+cat "$HOME/.openab/mcp-facade.json"
+
+# and whether YOU have put it in front of the agent yet
+cat "$HOME/.cursor/mcp.json"            # Cursor — you paste it here
+cat "$HOME/.kiro/settings/mcp.json"     # Kiro — written by `kiro-cli mcp import`
 
 # does the catalog contain the browser capabilities for a session-bound client?
 #   -> call search_capabilities from the agent; expect provider "openab-browser"
