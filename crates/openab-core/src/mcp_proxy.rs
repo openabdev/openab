@@ -11,8 +11,10 @@
 //!   attached; a call while disconnected reports "browser not connected" instead of the tools
 //!   silently disappearing.
 //! - [`AcpMcpTunnel`] — the trait core calls to reach a session's tunnel, implemented in the root.
-//! - [`write_facade_mcp_config`] — writes the one static facade entry into each colocated CLI's
-//!   config, and retires the bridge entry it replaces.
+//! - [`write_facade_mcp_config`] — authors `.openab/mcp-facade.json`, the ONE file openab owns.
+//!   It does not write, merge into, or read any vendor's MCP config, and it does not invoke a
+//!   vendor CLI (D-2026-07-30-15). Putting the entry in place is the operator's step, except for
+//!   Claude Code, which is pointed at the file with `--mcp-config` at spawn.
 //! - [`report_browser_control`] — startup report of whether browser control is on, plus the
 //!   migration notice for the removed `OPENAB_BROWSER_MODE`.
 
@@ -110,60 +112,7 @@ pub fn browser_tools() -> Vec<Tool> {
 }
 
 
-/// Serialise writers per path.
-///
-/// Two sessions starting at once write the same `mcp.json`. Read-modify-write without this lets
-/// the later read see the earlier state and drop the other's entry — and with `rename` below the
-/// loser's whole file wins, so the interleaving is silent rather than merely partial.
-fn config_write_lock(path: &std::path::Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    static LOCKS: OnceLock<
-        Mutex<HashMap<std::path::PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>>,
-    > =
-        OnceLock::new();
-    let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
-    guard
-        .entry(path.to_path_buf())
-        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
-}
 
-/// Read a JSON config we intend to merge into, or `None` when it must be left alone.
-///
-/// `None` means **skip this file**, never "start from empty". Returning `{}` on a parse failure and
-/// then writing is how a config with a comment in it, or any file this parser does not accept, gets
-/// replaced by ours — destroying configuration we did not write and cannot reconstruct. A missing
-/// file is different and returns `Some({})`: there is nothing to lose.
-///
-/// A non-object root is also `None`. It cannot be merged into, and indexing a `Value::Array` with a
-/// string key **panics** rather than failing, so this guard is what stops a `[]`-rooted file from
-/// taking the process down.
-async fn load_mergeable_config(path: &std::path::Path) -> Option<Value> {
-    match tokio::fs::read(path).await {
-        Err(_) => Some(json!({})),
-        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
-            Ok(v) if v.is_object() => Some(v),
-            Ok(_) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    "MCP config root is not a JSON object — leaving it untouched; browser tools \
-                     will not be configured here"
-                );
-                None
-            }
-            Err(e) => {
-                tracing::warn!(
-                    path = %path.display(), error = %e,
-                    "MCP config is not parseable JSON — leaving it untouched rather than replacing \
-                     it; browser tools will not be configured here"
-                );
-                None
-            }
-        },
-    }
-}
 
 /// Write `value` to `path` atomically, owner-only.
 ///
@@ -242,149 +191,47 @@ async fn write_json_atomic(path: &std::path::Path, value: &Value) -> std::io::Re
 }
 
 
-/// True when an `openab-browser` entry is one we can **prove** we wrote, and so may be removed.
-///
-/// Only the removed bridge entry qualifies. It was byte-identical every session
-/// (`{"command":"openab","args":["browser-bridge"]}`) and names our own binary and a subcommand
-/// that no longer exists, so matching that exact shape is itself the proof — and leaving it would
-/// have the agent's MCP client fail to start it on every session.
-///
-/// The per-session proxy entry deliberately does **not** qualify. Its url and bearer were minted
-/// per session and never recorded anywhere, so "loopback url plus some `Bearer` header" is a
-/// description rather than an identity: it matches any local MCP server an operator configured
-/// under this key. An earlier version of this function claimed to recognise "a bearer we minted"
-/// while comparing against nothing we had kept. With no way to prove ownership we fail closed and
-/// preserve — deleting an operator's configuration is worse than leaving a dead entry, and with
-/// the proxy gone the entry it names is dead configuration rather than a live bypass.
-fn is_openab_direct_browser_entry(entry: &Value) -> bool {
-    entry.get("command").and_then(Value::as_str) == Some("openab")
-        && entry.get("args") == Some(&json!(["browser-bridge"]))
-}
 
-/// Drop a stale direct-transport `openab-browser` entry from an `mcpServers` map, returning
-/// whether anything was removed. Both entries otherwise load side by side and the model may pick
-/// the direct one, bypassing the facade's policy and audit.
-fn strip_direct_browser_entry(cfg: &mut Value) -> bool {
-    let Some(servers) = cfg.get_mut("mcpServers").and_then(Value::as_object_mut) else {
-        return false;
-    };
-    match servers.get("openab-browser") {
-        Some(entry) if is_openab_direct_browser_entry(entry) => {
-            servers.remove("openab-browser");
-            true
-        }
-        _ => false,
-    }
-}
 
-/// Write the STATIC, write-once `openab` facade entry into each colocated CLI's MCP config
-/// (Facade mode). Like the Option C bridge entry it is byte-identical for every session —
-/// the per-session secret is NOT in the file: the entry references the
+/// Author the static `openab` facade entry into the one file openab owns
+/// (Facade mode). The entry is byte-identical for every session — the bridge it used to be
+/// compared against here was removed with the rest of Option C, so the comparison is gone
+/// rather than left pointing at code that no longer exists.
+///
+/// The per-session secret is NOT in the file: the entry references the
 /// `OPENAB_SESSION_TOKEN` environment variable, which the pool injects into each spawned
 /// agent process (config-var expansion is exactly how deployed agents already reference
 /// per-bot secrets). No cross-session clobber, nothing to clean up on evict — the token
 /// dies with the agent process and its registry entry.
 pub async fn write_facade_mcp_config(workdir: &str, facade_url: &str) -> std::io::Result<()> {
-    let entry = json!({
-        "url": facade_url,
-        "headers": { "Authorization": "Bearer ${OPENAB_SESSION_TOKEN}" }
+    let cfg = json!({
+        "mcpServers": {
+            // Published as "openab" (the facade), not "openab-browser": the agent reaches ALL
+            // facade capabilities through this one entry.
+            "openab": {
+                "url": facade_url,
+                "headers": { "Authorization": "Bearer ${OPENAB_SESSION_TOKEN}" }
+            }
+        }
     });
-    let cfg_paths = [
-        std::path::Path::new(workdir).join(".cursor").join("mcp.json"),
-        std::path::Path::new(workdir)
-            .join(".kiro")
-            .join("settings")
-            .join("mcp.json"),
-    ];
-    for cfg_path in &cfg_paths {
-        if let Some(dir) = cfg_path.parent() {
-            tokio::fs::create_dir_all(dir).await?;
-        }
-        // Held across the read-modify-write so a concurrent session cannot read pre-write state
-        // and then rename its copy over ours.
-        let lock = config_write_lock(cfg_path);
-        let _guard = lock.lock().await;
-
-        let Some(mut cfg) = load_mergeable_config(cfg_path).await else {
-            // Unparseable or non-object root: already logged. Skip rather than replace — this is
-            // the user's file and we cannot merge into it safely.
-            continue;
-        };
-        if !cfg.get("mcpServers").map(Value::is_object).unwrap_or(false) {
-            cfg["mcpServers"] = json!({});
-        }
-        // Publish under "openab" (the facade), not "openab-browser": the agent
-        // reaches ALL facade capabilities through this one entry.
-        let mut changed = false;
-        if cfg["mcpServers"]["openab"] != entry {
-            cfg["mcpServers"]["openab"] = entry.clone();
-            changed = true;
-        }
-        // Retire the direct transport we previously wrote here. Leaving it means both entries
-        // load and the model can reach the browser without passing through facade policy/audit.
-        changed |= strip_direct_browser_entry(&mut cfg);
-        if changed {
-            write_json_atomic(cfg_path, &cfg).await?;
-        }
+    let path = facade_config_path(workdir);
+    if let Some(dir) = path.parent() {
+        tokio::fs::create_dir_all(dir).await?;
     }
-    // kiro `--agent` deployments read agent files, not settings/mcp.json.
-    merge_kiro_agent_facade_configs(workdir, &entry).await?;
-    Ok(())
+    // No read-modify-write and no per-path lock. The content is a pure function of `facade_url`,
+    // so concurrent sessions write identical bytes and the rename in `write_json_atomic` makes
+    // last-one-wins harmless: there is no prior state to lose, because we own the file.
+    write_json_atomic(&path, &cfg).await
 }
 
-/// Facade-mode sibling of [`merge_kiro_agent_configs`]: merges the static
-/// `openab` facade entry + `@openab` allowlist grant into every
-/// `.kiro/agents/*.json`. Same never-clobber rules; nothing to clean up on
-/// evict (the entry is static and the token lives in the process env).
-async fn merge_kiro_agent_facade_configs(workdir: &str, entry: &Value) -> std::io::Result<()> {
-    let dir = std::path::Path::new(workdir).join(".kiro").join("agents");
-    let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
-        return Ok(());
-    };
-    while let Ok(Some(f)) = rd.next_entry().await {
-        let path = f.path();
-        let name = f.file_name();
-        let name = name.to_string_lossy();
-        if !name.ends_with(".json") || name.starts_with("._") {
-            continue;
-        }
-        let lock = config_write_lock(&path);
-        let _guard = lock.lock().await;
-        // Same fail-closed rule as the settings files: unparseable, or a root we cannot merge
-        // into, means leave the agent file alone. These carry model, description and allowlists
-        // that are none of our business to rewrite.
-        let Some(mut cfg) = load_mergeable_config(&path).await else {
-            continue;
-        };
-        if !cfg.get("mcpServers").map(Value::is_object).unwrap_or(false) {
-            cfg["mcpServers"] = json!({});
-        }
-        let mut changed = false;
-        if cfg["mcpServers"]["openab"] != *entry {
-            cfg["mcpServers"]["openab"] = entry.clone();
-            changed = true;
-        }
-        // Same retirement as the settings files, plus the agent-file allowlist grant that made
-        // the direct server callable — `allowedTools` is default-deny, so a leftover
-        // `@openab-browser` is what keeps the bypass reachable here.
-        if strip_direct_browser_entry(&mut cfg) {
-            changed = true;
-            if let Some(allowed) = cfg.get_mut("allowedTools").and_then(Value::as_array_mut) {
-                allowed.retain(|v| v.as_str() != Some("@openab-browser"));
-            }
-        }
-        if let Some(allowed) = cfg.get_mut("allowedTools").and_then(Value::as_array_mut) {
-            if !allowed.iter().any(|v| v.as_str() == Some("@openab")) {
-                allowed.push(json!("@openab"));
-                changed = true;
-            }
-        }
-        if changed {
-            write_json_atomic(&path, &cfg).await?;
-        }
-    }
-    Ok(())
+/// The one file openab authors: `<workdir>/.openab/mcp-facade.json`.
+///
+/// Source for Claude Code's `--mcp-config` at spawn time and for the operator's
+/// `kiro-cli mcp import --file … workspace`. openab never puts it in place itself (D-15).
+pub fn facade_config_path(workdir: &str) -> std::path::PathBuf {
+    std::path::Path::new(workdir).join(".openab").join("mcp-facade.json")
 }
+
 
 /// Broker-side session credential hook (Facade mode). Implemented by the root
 /// (closing over the facade's `SessionTokens` registry — core stays free of
@@ -481,125 +328,107 @@ mod facade_config_writer {
     async fn tmp_dir(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("openab-cfg-{tag}-{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&d).await;
-        tokio::fs::create_dir_all(d.join(".cursor")).await.unwrap();
+        tokio::fs::create_dir_all(&d).await.unwrap();
         d
     }
 
-    /// A config this parser cannot read must be left EXACTLY as it was.
-    ///
-    /// The old code parsed with `unwrap_or_else(|_| json!({}))` and then wrote, so a file with a
-    /// `//` comment — which plenty of editors and humans put in `mcp.json` — came back containing
-    /// only our entry. Everything the user had configured was gone, unrecoverably.
+    /// We author exactly one file, in our own directory, with the facade entry.
     #[tokio::test]
-    async fn an_unparseable_config_is_left_untouched() {
-        let wd = tmp_dir("unparseable").await;
-        let path = wd.join(".cursor").join("mcp.json");
-        let original = "{\n  // my servers\n  \"mcpServers\": { \"mine\": { \"command\": \"x\" } }\n}";
-        tokio::fs::write(&path, original).await.unwrap();
-
+    async fn the_facade_entry_is_written_to_the_file_we_own() {
+        let wd = tmp_dir("authored").await;
         write_facade_mcp_config(wd.to_str().unwrap(), "http://127.0.0.1:8848/mcp")
             .await
             .unwrap();
 
-        let after = tokio::fs::read_to_string(&path).await.unwrap();
-        assert_eq!(
-            after, original,
-            "an unparseable config must survive byte-for-byte — replacing it destroys work we \
-             cannot reconstruct"
-        );
-        let _ = tokio::fs::remove_dir_all(&wd).await;
-    }
-
-    /// A non-object root must not panic.
-    ///
-    /// `cfg["mcpServers"] = ...` on a `Value::Array` does not return an error — `IndexMut` panics,
-    /// taking the process down. The guard has to run before any indexing.
-    #[tokio::test]
-    async fn an_array_root_does_not_panic_and_is_left_untouched() {
-        let wd = tmp_dir("arrayroot").await;
-        let path = wd.join(".cursor").join("mcp.json");
-        tokio::fs::write(&path, "[]").await.unwrap();
-
-        let r = write_facade_mcp_config(wd.to_str().unwrap(), "http://127.0.0.1:8848/mcp").await;
-        assert!(r.is_ok(), "a `[]` root must be skipped, not fatal: {r:?}");
-        assert_eq!(
-            tokio::fs::read_to_string(&path).await.unwrap(),
-            "[]",
-            "we cannot merge into an array root, so it is left alone"
-        );
-        let _ = tokio::fs::remove_dir_all(&wd).await;
-    }
-
-    /// A user's own servers survive, and ours is added beside them.
-    #[tokio::test]
-    async fn a_valid_config_keeps_the_users_servers() {
-        let wd = tmp_dir("merge").await;
-        let path = wd.join(".cursor").join("mcp.json");
-        tokio::fs::write(&path, r#"{"mcpServers":{"mine":{"command":"x"}},"other":42}"#)
-            .await
-            .unwrap();
-
-        write_facade_mcp_config(wd.to_str().unwrap(), "http://127.0.0.1:8848/mcp")
-            .await
-            .unwrap();
-
+        let path = facade_config_path(wd.to_str().unwrap());
+        assert_eq!(path, wd.join(".openab").join("mcp-facade.json"));
         let v: Value =
             serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
-        assert_eq!(v["mcpServers"]["mine"]["command"], json!("x"), "user server preserved");
-        assert_eq!(v["other"], json!(42), "unrelated top-level keys preserved");
+        assert_eq!(v["mcpServers"]["openab"]["url"], json!("http://127.0.0.1:8848/mcp"));
+        // The token is never in the file — the literal is, and the agent's env supplies the value.
         assert_eq!(
             v["mcpServers"]["openab"]["headers"]["Authorization"],
-            json!("Bearer ${OPENAB_SESSION_TOKEN}"),
-            "and ours is added by reference, never with the token value"
+            json!("Bearer ${OPENAB_SESSION_TOKEN}")
         );
         let _ = tokio::fs::remove_dir_all(&wd).await;
     }
 
-    /// Concurrent writers must not lose each other's work.
+    /// THE BOUNDARY (D-2026-07-30-03, D-2026-07-30-15): openab never modifies a file it did not
+    /// create, and never creates one in someone else's directory.
     ///
-    /// With an atomic rename and no lock this is *worse* than a torn write: the loser's entire
-    /// file replaces the winner's, silently. Both calls write the same entry, so what this pins is
-    /// that the user's pre-existing server survives both — a lost update would drop it.
+    /// Every defect in canonical item 9 — EACCES read as "file absent" then overwritten, no
+    /// directory fsync, rename dropping mode/owner and replacing symlinks, a concurrency test that
+    /// passed for the wrong reason — was a consequence of editing the operator's `mcp.json`.
+    /// Deleting that path deleted all four, and this test is what stops it coming back: a
+    /// reintroduced merge would have to modify one of these files to be useful, and that fails
+    /// here rather than in someone's deployment.
     #[tokio::test]
-    async fn concurrent_writers_never_publish_a_damaged_config() {
-        let wd = tmp_dir("concurrent").await;
-        let path = wd.join(".cursor").join("mcp.json");
-        tokio::fs::write(&path, r#"{"mcpServers":{"mine":{"command":"x"}}}"#)
+    async fn an_operators_own_mcp_config_is_never_touched() {
+        let wd = tmp_dir("boundary").await;
+        let cursor = wd.join(".cursor").join("mcp.json");
+        let kiro = wd.join(".kiro").join("settings").join("mcp.json");
+        let agent = wd.join(".kiro").join("agents").join("terra.json");
+        for f in [&cursor, &kiro, &agent] {
+            tokio::fs::create_dir_all(f.parent().unwrap()).await.unwrap();
+        }
+        // Deliberately including a `//` comment: the shape that the old merge path destroyed.
+        let cursor_body = "{\n  // mine\n  \"mcpServers\": {\"mine\": {\"command\": \"x\"}}\n}";
+        let kiro_body = "{\"mcpServers\":{\"openab-browser\":{\"command\":\"openab\",\"args\":[\"browser-bridge\"]}}}";
+        let agent_body = "{\"allowedTools\":[\"@openab-browser\",\"@github\"]}";
+        tokio::fs::write(&cursor, cursor_body).await.unwrap();
+        tokio::fs::write(&kiro, kiro_body).await.unwrap();
+        tokio::fs::write(&agent, agent_body).await.unwrap();
+
+        write_facade_mcp_config(wd.to_str().unwrap(), "http://127.0.0.1:8848/mcp")
             .await
             .unwrap();
 
-        // DIFFERENT urls on purpose. The previous version passed the same url to both writers, so
-        // their outputs were byte-identical and a lost update was unobservable by construction —
-        // and because both merge from the same base, even a real lost update left `mine` and
-        // `openab` both present. The assertions could not fail. Removing the lock made it red for
-        // an unrelated reason: the two writers shared one fixed temp filename, so one renamed it
-        // away and the other hit ENOENT. It was reporting a filename collision as a lost update.
-        //
-        // With distinct urls the winner is identifiable, so this pins the guarantee that is really
-        // on offer: whichever writer lands last, the published file is complete and valid — never
-        // a merge of the two, never half-written, and never missing the user's own server.
+        // Byte-for-byte, including the stale `openab-browser` entry and its grant. openab no
+        // longer retires those — see the PR body: that cleanup became operator-performed, and it
+        // is a policy bypass rather than a convenience, so it is stated rather than silently
+        // dropped.
+        assert_eq!(tokio::fs::read_to_string(&cursor).await.unwrap(), cursor_body);
+        assert_eq!(tokio::fs::read_to_string(&kiro).await.unwrap(), kiro_body);
+        assert_eq!(tokio::fs::read_to_string(&agent).await.unwrap(), agent_body);
+        let _ = tokio::fs::remove_dir_all(&wd).await;
+    }
+
+    /// A vendor directory that does not exist must not be created either — absence of a file is
+    /// not permission to author one.
+    #[tokio::test]
+    async fn no_vendor_directory_is_created() {
+        let wd = tmp_dir("novendor").await;
+        write_facade_mcp_config(wd.to_str().unwrap(), "http://127.0.0.1:8848/mcp")
+            .await
+            .unwrap();
+        for d in [".cursor", ".kiro"] {
+            assert!(
+                !wd.join(d).exists(),
+                "{d} was created — openab may only author inside .openab/"
+            );
+        }
+        let _ = tokio::fs::remove_dir_all(&wd).await;
+    }
+
+    /// Concurrent sessions must still publish a readable file.
+    ///
+    /// Weaker than the merge-path version by design: with no read-modify-write there is no lost
+    /// update to prevent, because both writers produce identical bytes from the same `facade_url`.
+    /// What remains worth pinning is that the rename never exposes a partial file.
+    #[tokio::test]
+    async fn concurrent_writers_publish_a_readable_config() {
+        let wd = tmp_dir("concurrent").await;
         let w = wd.to_str().unwrap().to_string();
         let (a, b) = tokio::join!(
             write_facade_mcp_config(&w, "http://127.0.0.1:8848/mcp"),
-            write_facade_mcp_config(&w, "http://127.0.0.1:9999/mcp"),
+            write_facade_mcp_config(&w, "http://127.0.0.1:8848/mcp"),
         );
         a.unwrap();
         b.unwrap();
-
-        let v: Value = serde_json::from_slice(&tokio::fs::read(&path).await.unwrap())
-            .expect("a concurrent write published a file that is not valid JSON");
-        assert_eq!(
-            v["mcpServers"]["mine"]["command"],
-            json!("x"),
-            "the user's own server must survive both writers"
-        );
-        let url = v["mcpServers"]["openab"]["url"]
-            .as_str()
-            .expect("our entry must be present and complete");
-        assert!(
-            url == "http://127.0.0.1:8848/mcp" || url == "http://127.0.0.1:9999/mcp",
-            "the published entry must be exactly one writer's, not a blend of both: {url}"
-        );
+        let v: Value =
+            serde_json::from_slice(&tokio::fs::read(facade_config_path(&w)).await.unwrap())
+                .unwrap();
+        assert_eq!(v["mcpServers"]["openab"]["url"], json!("http://127.0.0.1:8848/mcp"));
         let _ = tokio::fs::remove_dir_all(&wd).await;
     }
 
@@ -612,7 +441,7 @@ mod facade_config_writer {
         write_facade_mcp_config(wd.to_str().unwrap(), "http://127.0.0.1:8848/mcp")
             .await
             .unwrap();
-        let path = wd.join(".cursor").join("mcp.json");
+        let path = facade_config_path(wd.to_str().unwrap());
         let mode = tokio::fs::metadata(&path).await.unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "0600 must be set at creation, not chmod'd after");
         let _ = tokio::fs::remove_dir_all(&wd).await;
@@ -622,8 +451,7 @@ mod facade_config_writer {
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_mode_migration_notice, browser_tools, is_openab_direct_browser_entry,
-        write_facade_mcp_config,
+        browser_mode_migration_notice, browser_tools,
     };
 
     /// The variable is inert now, so the notice must fire for every value an operator could have
@@ -666,207 +494,10 @@ mod tests {
 
     // --- F4: facade setup retires the direct transport it replaces ---
 
-    /// The bridge and per-session-proxy entries we wrote are recognised; anything else under the
-    /// same key is not ours to delete.
-    #[test]
-    fn only_our_own_direct_browser_shapes_are_recognised() {
-        let bridge = serde_json::json!({ "command": "openab", "args": ["browser-bridge"] });
-        assert!(is_openab_direct_browser_entry(&bridge));
 
-        // Not provably ours. The loopback+bearer shapes are the important ones: they describe our
-        // old proxy entry, but they equally describe an operator's own local MCP server, and the
-        // per-session url/bearer were never recorded, so ownership cannot be established.
-        for foreign in [
-            serde_json::json!({ "url": "http://127.0.0.1:45678/mcp", "headers": { "Authorization": "Bearer abc" } }),
-            serde_json::json!({ "url": "https://example.com/mcp", "headers": { "Authorization": "Bearer x" } }),
-            serde_json::json!({ "url": "http://127.0.0.1:45678/mcp" }),
-            serde_json::json!({ "command": "openab", "args": ["something-else"] }),
-            serde_json::json!({ "command": "my-browser-tool", "args": ["browser-bridge"] }),
-            serde_json::json!({ "url": "http://127.0.0.1:/mcp", "headers": { "Authorization": "Bearer x" } }),
-        ] {
-            assert!(
-                !is_openab_direct_browser_entry(&foreign),
-                "must not claim ownership of {foreign}"
-            );
-        }
-    }
 
-    #[tokio::test]
-    async fn facade_setup_removes_the_stale_direct_entry_but_keeps_user_servers() {
-        let dir = tempfile::tempdir().unwrap();
-        let cursor = dir.path().join(".cursor");
-        std::fs::create_dir_all(&cursor).unwrap();
-        std::fs::write(
-            cursor.join("mcp.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "mcpServers": {
-                    // ours, the bridge transport facade mode replaces
-                    "openab-browser": { "command": "openab", "args": ["browser-bridge"] },
-                    // the operator's own servers must survive untouched
-                    "github": { "url": "http://ghpool:8080/mcp" },
-                    "notes": { "command": "notes-mcp", "args": ["--stdio"] }
-                },
-                "someUnrelatedKey": 42
-            }))
-            .unwrap(),
-        )
-        .unwrap();
 
-        write_facade_mcp_config(dir.path().to_str().unwrap(), "http://127.0.0.1:8848/mcp")
-            .await
-            .unwrap();
 
-        let cfg: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(cursor.join("mcp.json")).unwrap()).unwrap();
-        let servers = cfg["mcpServers"].as_object().unwrap();
-        assert!(
-            !servers.contains_key("openab-browser"),
-            "the direct transport must not load alongside the facade — that is the bypass"
-        );
-        assert_eq!(servers["openab"]["url"], "http://127.0.0.1:8848/mcp");
-        assert_eq!(servers["github"]["url"], "http://ghpool:8080/mcp");
-        assert_eq!(servers["notes"]["command"], "notes-mcp");
-        assert_eq!(cfg["someUnrelatedKey"], 42, "unrelated config must survive");
-    }
-
-    /// An operator's own local MCP server under this key survives facade setup — the entry **and**
-    /// its allowlist grant (review R3-F2).
-    ///
-    /// The previous matcher treated any loopback url carrying any `Bearer` header as ours, which
-    /// is precisely the shape a locally-run MCP server takes, so that configuration was deleted.
-    /// Ownership of that shape cannot be proven — the per-session url and bearer were never
-    /// recorded — so it is preserved now.
-    #[tokio::test]
-    async fn a_local_mcp_server_under_our_key_is_not_deleted() {
-        let wd = tmp_workdir("r3f2").await;
-        let cursor = wd.join(".cursor");
-        tokio::fs::create_dir_all(&cursor).await.unwrap();
-        // Indistinguishable from our retired proxy entry by shape alone.
-        let theirs = serde_json::json!({
-            "url": "http://127.0.0.1:45678/mcp",
-            "headers": { "Authorization": "Bearer their-own-token" }
-        });
-        tokio::fs::write(
-            cursor.join("mcp.json"),
-            serde_json::to_vec_pretty(
-                &serde_json::json!({ "mcpServers": { "openab-browser": theirs } }),
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-
-        let agent = wd.join(".kiro/agents/terra.json");
-        tokio::fs::write(
-            &agent,
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "name": "terra",
-                "mcpServers": { "openab-browser": theirs },
-                "allowedTools": ["@builtin", "@openab-browser"]
-            }))
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-
-        write_facade_mcp_config(wd.to_str().unwrap(), "http://127.0.0.1:8848/mcp")
-            .await
-            .unwrap();
-
-        let cfg: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(cursor.join("mcp.json")).await.unwrap())
-                .unwrap();
-        assert_eq!(
-            cfg["mcpServers"]["openab-browser"], theirs,
-            "an entry we cannot prove we wrote must be preserved verbatim"
-        );
-
-        let agent_cfg: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(&agent).await.unwrap()).unwrap();
-        assert_eq!(agent_cfg["mcpServers"]["openab-browser"], theirs);
-        let allowed: Vec<&str> = agent_cfg["allowedTools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
-        assert!(
-            allowed.contains(&"@openab-browser"),
-            "the grant must survive too — revoking it silently disables the operator's own server"
-        );
-        let _ = tokio::fs::remove_dir_all(&wd).await;
-    }
-
-    #[tokio::test]
-    async fn facade_setup_leaves_a_foreign_openab_browser_entry_alone() {
-        // Same key, but a shape we never wrote: it belongs to the operator, so removing it would
-        // destroy their configuration to fix a bypass that entry does not create.
-        let dir = tempfile::tempdir().unwrap();
-        let cursor = dir.path().join(".cursor");
-        std::fs::create_dir_all(&cursor).unwrap();
-        let foreign = serde_json::json!({ "url": "https://my-own-browser.example/mcp" });
-        std::fs::write(
-            cursor.join("mcp.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "mcpServers": { "openab-browser": foreign }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        write_facade_mcp_config(dir.path().to_str().unwrap(), "http://127.0.0.1:8848/mcp")
-            .await
-            .unwrap();
-
-        let cfg: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(cursor.join("mcp.json")).unwrap()).unwrap();
-        assert_eq!(
-            cfg["mcpServers"]["openab-browser"], foreign,
-            "an entry we did not write must be preserved verbatim"
-        );
-    }
-
-    #[tokio::test]
-    async fn facade_setup_retires_the_direct_entry_and_its_grant_in_kiro_agent_files() {
-        let wd = tmp_workdir("f4-agent").await;
-        let agent = wd.join(".kiro/agents/terra.json");
-        tokio::fs::write(
-            &agent,
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "name": "terra",
-                "mcpServers": {
-                    "openab-browser": { "command": "openab", "args": ["browser-bridge"] },
-                    "github": { "url": "http://ghpool:8080/mcp" }
-                },
-                "allowedTools": ["@builtin", "@openab-browser", "@github"]
-            }))
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-
-        write_facade_mcp_config(wd.to_str().unwrap(), "http://127.0.0.1:8848/mcp")
-            .await
-            .unwrap();
-
-        let cfg: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(&agent).await.unwrap()).unwrap();
-        assert!(!cfg["mcpServers"].as_object().unwrap().contains_key("openab-browser"));
-        assert_eq!(cfg["mcpServers"]["github"]["url"], "http://ghpool:8080/mcp");
-        let allowed: Vec<&str> = cfg["allowedTools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
-        assert!(
-            !allowed.contains(&"@openab-browser"),
-            "allowedTools is default-deny — a leftover grant is what keeps the bypass reachable"
-        );
-        assert!(allowed.contains(&"@openab"), "the facade must be granted");
-        assert!(allowed.contains(&"@github"), "unrelated grants must survive");
-        let _ = tokio::fs::remove_dir_all(&wd).await;
-    }
 
     /// Unique throwaway workdir with a `.kiro/agents/` tree.
     async fn tmp_workdir(tag: &str) -> std::path::PathBuf {

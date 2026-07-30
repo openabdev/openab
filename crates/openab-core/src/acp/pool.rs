@@ -955,8 +955,14 @@ mod tests {
     #[tokio::test]
     async fn no_token_is_minted_when_the_facade_config_write_fails() {
         let dir = tempfile::tempdir().unwrap();
-        // Make `<workdir>/.cursor` a FILE, so create_dir_all inside the writer fails.
-        std::fs::write(dir.path().join(".cursor"), b"not a directory").unwrap();
+        // Make `<workdir>/.openab` a FILE, so `create_dir_all` inside the writer fails.
+        //
+        // This used to block on `.cursor`, which openab no longer creates: since D-15 it authors
+        // only `.openab/mcp-facade.json` and never touches a vendor directory. Left pointing at
+        // `.cursor` the write would SUCCEED, the test would fail, and — worse if it had been
+        // written the other way round — a test asserting "no mint on failure" would have been
+        // passing against a call that never failed.
+        std::fs::write(dir.path().join(".openab"), b"not a directory").unwrap();
 
         let counting = Arc::new(CountingRegistrar::default());
         let registrar: Arc<dyn crate::mcp_proxy::SessionTokenRegistrar> = counting.clone();
