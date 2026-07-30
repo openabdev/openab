@@ -207,7 +207,10 @@ after 24 hours (no configuration needed).
 | Video on Slack | ❌ no | Not uploaded; the block carries `url_private_download` plus a `note:` naming the bearer-token requirement |
 | Text > 512 KB | ❌ no | Silently dropped (legacy behavior) |
 | PDF, ZIP, DOCX, binary | ❌ no | Silently dropped (legacy behavior) |
-| > max_file_size_mb (default 250 MB, max 500 MB) | ✅ yes | Text and binary dropped on Discord/Slack; audio and Slack video still delivered with the platform URL and a `note:` naming the size refusal; degraded hint on gateway (see Error Handling) |
+| > max_file_size_mb (default 250 MB, max 500 MB), text or binary | ✅ yes | Dropped on Discord/Slack (warn log, agent not notified) |
+| > max_file_size_mb, Discord audio | ✅ yes | Block still delivered, carrying the CDN link and its usual note; the CDN link needs no credentials, so the refusal costs the agent nothing |
+| > max_file_size_mb, Slack audio or Slack video | ✅ yes | Block still delivered, carrying `url_private_download` and a `note:` naming both the size refusal and the bearer-token requirement |
+| > max_file_size_mb, gateway | ✅ yes | Degraded hint (see Error Handling) |
 
 ## What the Agent Sees
 
@@ -421,5 +424,5 @@ For typical usage (a few large files per day, auto-expired after 24h):
 
 - **Structured `ContentBlock::File`** in ACP for richer metadata (mime, size, TTL)
 - **Metrics** — upload success rate, latency, file size distribution
-- **URL hint fallback** — when filestore is not configured, fall back to platform URL hint (PR #1346 pattern)
-- **Multi-modal** — extend filestore to images/audio when inline is too large
+- **URL hint fallback** for text and binary attachments, which are still dropped when no filestore is configured (PR #1346 pattern); audio and Slack video already fall back to the platform URL
+- **Multi-modal** — extend filestore to images when inline is too large

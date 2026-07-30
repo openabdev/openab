@@ -181,9 +181,9 @@ pr      = ""
 
 [[openab_features]]
 feature = "voice_stt"
-status  = "not_implemented"
-note    = "Audio is downloaded and stored as an attachment only; no speech-to-text is performed in the LINE path."
-source  = ["crates/openab-gateway/src/adapters/line.rs"]
+status  = "partial"
+note    = "The adapter only downloads audio into an audio attachment and does no transcription. Core always emits an `[Audio attachment]` block for it, and adds a `[Voice message transcript]:` line on top when `stt_config.enabled` and transcription succeeds. With STT disabled the block stands alone."
+source  = ["crates/openab-gateway/src/adapters/line.rs", "crates/openab-core/src/gateway.rs#gateway_audio_blocks"]
 pr      = ""
 
 [[openab_features]]

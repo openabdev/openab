@@ -173,7 +173,7 @@ pr      = ""
 [[openab_features]]
 feature = "media_inbound"
 status  = "implemented"
-note    = "Attachments processed inline in the per-attachment loop: images encoded (download_and_encode_image), text files (≤1 MB total, ≤5 files), audio passed as an `[Audio attachment]` block (classified by `media::audio_mime`, uploaded to the filestore when configured, else the CDN link), video passed as a URL block; non-image files warned to the user."
+note    = "Attachments processed inline in the per-attachment loop: images encoded (download_and_encode_image), text files (≤1 MB total, ≤5 files), audio passed as an `[Audio attachment]` block (classified by `media::audio_mime`, uploaded to the filestore when configured, else the CDN link), video passed as a URL block. The user-facing warning covers images that failed to download, not every non-image type."
 source  = ["crates/openab-core/src/discord.rs#download_and_encode_image"]
 pr      = ""
 

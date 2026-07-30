@@ -336,7 +336,7 @@ ContentBlock::Text { "{prompt}" }                                       ← omit
 
 `<sender_context>` is its own block so that, in batched dispatch, agents can scan the `Vec<ContentBlock>` for `<sender_context>` openers to find arrival boundaries without parsing inside any single Text block. Within an arrival, transcripts precede `{prompt}` (so voice content reads first, matching pre-batching adapter UX); images trail `{prompt}` (matching pre-batching adapter UX).
 
-For a single-message dispatch (`batch.len() == 1`) the minimum is two blocks: delimiter + prompt. Each transcript adds one Text block; each image adds one non-Text block. An empty-prompt arrival (e.g. voice-only) skips the prompt block — minimum becomes one delimiter + one transcript.
+For a single-message dispatch (`batch.len() == 1`) the minimum is two blocks: delimiter + prompt. Each transcript adds one Text block; each image adds one non-Text block. An empty-prompt arrival (e.g. voice-only) skips the prompt block, so the minimum is one delimiter plus whatever the attachment itself contributes. Since audio passthrough ([#1460](https://github.com/openabdev/openab/pull/1460)) an audio attachment always contributes an `[Audio attachment]` metadata Text block, with the transcript block ahead of it when STT is enabled and succeeds: a voice-only arrival is three blocks with STT, two without, and never one.
 
 `{json}` is the existing `SenderContext` record:
 
@@ -494,8 +494,10 @@ The broker does not "skip" bob's message or re-link alice's M1 ↔ M3 — those 
 **Scenario D — voice-only message in a batch (existing STT path)**
 
 - M1 (alice): "look at this" + screenshot
-- M2 (alice): voice-only — `msg.content` empty; `discord.rs:524` produces a `[Voice message transcript]: …` Text block in `extra_blocks`
+- M2 (alice): voice-only, `msg.content` empty. At the pinned base `discord.rs:524` produces a `[Voice message transcript]: …` Text block in `extra_blocks`; since [#1460](https://github.com/openabdev/openab/pull/1460) the same branch also always produces an `[Audio attachment]` metadata Text block, so a transcript is an addition to the file rather than a replacement for it.
 - M3 (bob): "what?"
+
+With STT enabled and transcription succeeding, M2 contributes two Text blocks:
 
 ```
 <sender_context>{alice, ts=T1}</sender_context>
@@ -503,15 +505,21 @@ look at this
 [ImageBlock]
 <sender_context>{alice, ts=T2}</sender_context>
 [Voice message transcript]: hey can we sync about the deploy
+[Audio attachment]
+filename: voice-message.ogg
+content_type: audio/ogg
+size_bytes: 20480
+url: https://cdn.discordapp.com/…
+note: Discord CDN URL, expires ~24h
 <sender_context>{bob, ts=T3}</sender_context>
 what?
 ```
 
-M2 has empty `{prompt}` (so the prompt block is omitted, §3.1) and one transcript block. The transcript lands immediately after the delimiter — within M2's arrival, before any `{prompt}` block would appear.
+M2 has empty `{prompt}`, so the prompt block is omitted (§3.1). Both of M2's blocks are Text extras, so they land immediately after the delimiter, transcript first, before any `{prompt}` block would appear. With STT disabled, or enabled but failing, M2 contributes the `[Audio attachment]` block alone and the agent fetches the file instead of reading its text.
 
 **Behavior change vs. v0.8.2-beta.1:** in the per-message path (`adapter.rs:158-162`) the transcript is *prepended* before `<sender_context>` so it reads as if it were the user's typed text. Under this ADR the transcript moves to *inside the arrival event*, after the `<sender_context>` delimiter and before `{prompt}`, owned by M2 like any other attachment. The agent still sees the transcript content — just one block down, with the sender envelope explicitly framing it.
 
-**Rollback path if cross-agent smoke fails.** If a Phase 1 cross-agent smoke fixture (Scenario D against Claude Code, Cursor, and Copilot) shows any target regressing on voice-only handling, the response is a code change, not a runtime toggle. The hotfix restores the v0.8.2-beta.1 single-message voice layout in two steps inside `pack_arrival_event`: (1) re-introduce the `extra_blocks.len() == 1 && prompt.is_empty()` special case that treats the transcript as a `{prompt}` substitute; (2) for that case, fold `<sender_context>` back into the same Text block as the substituted prompt (the combined-block layout). Both steps are needed — the standalone-delimiter split (§3 change 2) and the transcript-position move (§3 change 3) are independent and either alone could surface the regression. **No always-on feature flag.** The cross-agent smoke fixture is the gate; a hotfix PR is the rollback mechanism.
+**Rollback path if cross-agent smoke fails.** If a Phase 1 cross-agent smoke fixture (Scenario D against Claude Code, Cursor, and Copilot) shows any target regressing on voice-only handling, the response is a code change, not a runtime toggle. The hotfix restores the v0.8.2-beta.1 single-message voice layout in two steps inside `pack_arrival_event`: (1) re-introduce the special case that treats the transcript as a `{prompt}` substitute. Its v0.8.2-beta.1 formulation, `extra_blocks.len() == 1 && prompt.is_empty()`, no longer selects that case: a voice-only arrival now carries the `[Audio attachment]` block as well, so the count is 2 when STT succeeds (the hatch never fires) and 1 when it does not (the single block is the metadata, which the hatch would promote into the prompt slot). The hatch has to test for the transcript block itself, i.e. `prompt.is_empty()` and a leading Text extra beginning with `[Voice message transcript]:`, substitute that block, and leave the remaining extras where they are; (2) for that case, fold `<sender_context>` back into the same Text block as the substituted prompt (the combined-block layout). Both steps are needed — the standalone-delimiter split (§3 change 2) and the transcript-position move (§3 change 3) are independent and either alone could surface the regression. **No always-on feature flag.** The cross-agent smoke fixture is the gate; a hotfix PR is the rollback mechanism.
 
 The principle (instance of I3): **structural truth is non-negotiable, semantic interpretation is deferred.**
 
@@ -713,7 +721,7 @@ LINE-style atomic cut-over is not required. In Phase 1 `message_processing_mode`
 
 **RFC MVP wrapper, `extra_blocks` placed inside the `<message>` tag.** A patch on the above: place each sub-message's `extra_blocks` immediately after its `<message index=N>` tag (JARVIS's suggested fix). **Rejected** because the same fix is achievable using `<sender_context>` itself as the boundary marker — no need to introduce a parallel `<message>` schema. §3's design is the same fix expressed without the new wrapper tag.
 
-**Keep current asymmetric ordering as a special case.** Preserve `adapter.rs:158-169` ordering via an `extra_blocks.len() == 1 && prompt.is_empty()` branch on every single-message dispatch. **Rejected.** Single uniform code path beats a fast-path branch for a marginal Scenario D readability difference. Scenario D's behavior change is reversible if cross-agent smoke shows real disruption (§3.6 rollback).
+**Keep current asymmetric ordering as a special case.** Preserve `adapter.rs:158-169` ordering via a voice-only branch on every single-message dispatch (§3.6 carries the predicate; a bare block count stopped identifying voice-only once audio passthrough added a metadata block). **Rejected.** Single uniform code path beats a fast-path branch for a marginal Scenario D readability difference. Scenario D's behavior change is reversible if cross-agent smoke shows real disruption (§3.6 rollback).
 
 **Inject a leading `[Batched: N messages…]` banner string.** **Rejected — violates I3.** Broker injecting framing is a semantic directive ("treat these as one logical unit") that the agent can no longer un-see. Whether to treat the messages as one logical unit is the kind of judgment the agent should make from the structural facts (same `sender_id`, close `timestamp` deltas), not from a broker hint.
 
@@ -909,7 +917,7 @@ Cross-agent smoke verifies that agents correctly read transcript content after t
 | Cursor | Voice-only message in a thread → agent responds | Same as Claude Code voice-only |
 | Copilot | Voice-only message in a thread → agent responds | Same as Claude Code voice-only |
 
-**Decision gate:** if any agent fails to reference transcript content, do not merge Phase 1. Apply the `extra_blocks.len() == 1 && prompt.is_empty()` escape hatch (§3.6 rollback), re-run the matrix. If still failing: hold Phase 1, file follow-up.
+**Decision gate:** if any agent fails to reference transcript content, do not merge Phase 1. Apply the transcript-substitution escape hatch (§3.6 rollback), re-run the matrix. If still failing: hold Phase 1, file follow-up.
 
 ### 6.10 Per-mode consumer idle timeout
 
@@ -1045,8 +1053,9 @@ async fn consumer_loop(
 
 ## Notes
 
-- **Version:** 0.6
+- **Version:** 0.7
 - **Changelog:**
+  - 0.7 (2026-07-30): Voice-only arrivals re-stated for audio passthrough ([#1460](https://github.com/openabdev/openab/pull/1460)). An audio attachment now always contributes an `[Audio attachment]` metadata Text block, so §3.1's minimum block count and the Scenario D worked example cover both STT states, and the §3.6 rollback hatch (cited again from §5.2 and §6.9) selects the transcript block explicitly instead of inferring it from `extra_blocks.len() == 1`, which the metadata block made ambiguous.
   - 0.6 (2026-05-05): Round-4 corrections, two threads.
     - **Design contract change (matches `feature/turn-boundary-batching-v2` @ `e119abf`).** §2.5 SendError handling rewritten to match the post-`afd6fff` design — proactive `consumer.is_finished()` check at submit head + transparent retry once on `SendError`; ❌ + ⚠️ + `Err(ConsumerDead)` only if the retry also fails. Motivated by the first-message-after-idle race; one-attempt bound preserves the no-spin-loop property. §6.11 staging smoke matrix split into Path A (transparent retry happy path, `PANIC_ONCE`) and Path B (failing-retry surfaces error, `PANIC_ALWAYS`). §4.4 Phase 1 plan + test list updated to the new contract.
     - **Anchor audit (relative to declared base v0.8.2-beta.1 / `52052b8`).** Pre-existing drift fixed in `adapter.rs` references that had been wrong since the SHA pin was set in v0.2: `:131-152` → `:156-172` (content_blocks build), `:138-143` → `:158-162` (transcript prepend, 7 sites), `:148-152` → `:165-169` (image append), `:154-161` → `:173-180` (per-thread keying), `:181` → `:254` (`pool.with_connection` call site — was pointing at the wrong call), `:240` → `:260` (`session_prompt` invocation). All `acp/connection.rs` / `acp/pool.rs` / `discord.rs` / `slack.rs` anchors verified correct vs `52052b8`. Anchor-pinning preamble (line 9) expanded to also pin the implementation cross-check SHA so readers can distinguish "released-base anchor" from "design-validated-against" SHAs.

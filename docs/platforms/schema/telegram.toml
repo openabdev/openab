@@ -177,8 +177,8 @@ pr      = ""
 [[openab_features]]
 feature = "voice_stt"
 status  = "partial"
-note    = "The adapter only downloads voice/audio as an `audio` attachment (`MediaKind::Audio`, `download_telegram_media`); it does no transcription. STT happens downstream in core: batched / per-message paths call `download_and_transcribe` when `stt_config.enabled`, injecting a `[Voice message transcript]:` block."
-source  = ["crates/openab-gateway/src/adapters/telegram.rs#download_telegram_media", "crates/openab-core/src/media.rs#download_and_transcribe"]
+note    = "The adapter only downloads voice/audio as an `audio` attachment (`MediaKind::Audio`, `download_telegram_media`); it does no transcription. Core always emits an `[Audio attachment]` block for it, and adds a `[Voice message transcript]:` line on top when `stt_config.enabled` and transcription succeeds. With STT disabled the block stands alone."
+source  = ["crates/openab-gateway/src/adapters/telegram.rs#download_telegram_media", "crates/openab-core/src/gateway.rs#gateway_audio_blocks"]
 pr      = ""
 
 [[openab_features]]
@@ -355,6 +355,6 @@ source = "crates/openab-gateway/src/media.rs#FILE_MAX_DOWNLOAD"
 [[quirks]]
 date   = "2026-07-04"
 title  = "Findings-log: STT done in core, not the adapter"
-note   = "Voice/audio STT is not done in the adapter; core transcribes `audio` attachments via `download_and_transcribe` when `stt_config.enabled`."
+note   = "Voice/audio STT is not done in the adapter; core handles `audio` attachments in `gateway_audio_blocks`, which always emits an `[Audio attachment]` block and transcribes on top of it when `stt_config.enabled`."
 kind   = "openab_decision"
-source = "crates/openab-core/src/media.rs#download_and_transcribe"
+source = "crates/openab-core/src/gateway.rs#gateway_audio_blocks"

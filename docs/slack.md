@@ -45,7 +45,7 @@ Socket Mode uses a persistent WebSocket connection — no public URL or ingress 
 | `channels:read` | List public channels |
 | `groups:read` | List private channels |
 | `reactions:write` | Add/remove emoji reactions |
-| `files:read` | Download file attachments (images, audio) |
+| `files:read` | Download file attachments (images, audio, video, and other binaries), all fetched with the bot token |
 | `users:read` | Resolve user display names |
 | `assistant:write` | Native streaming + assistant status line (required when `assistant_mode = true`) |
 
