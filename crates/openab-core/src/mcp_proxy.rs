@@ -269,9 +269,32 @@ pub trait SessionTokenRegistrar: Send + Sync {
 /// to prevent, one level up. So the message says the value is ignored *and* reports what is
 /// actually in force, since "ignored" alone does not tell them whether they still have browser
 /// control at all.
-pub fn report_browser_control(mcp_configured: bool) {
+pub fn report_browser_control(mcp_configured: bool, workdir: &str) {
     if mcp_configured {
-        tracing::info!("browser control: enabled via the OAB MCP Facade ([mcp] configured)");
+        // "enabled" alone became false when openab stopped wiring vendor configs (D-15). The
+        // facade IS running, but no agent can reach it until the entry is placed, and an operator
+        // reading "enabled" would go looking for a bug instead of doing the remaining step. So the
+        // line reports the facade AND names the step, with the exact commands.
+        //
+        // `workdir` here is the CONFIGURED default. A session may resolve a different one
+        // (`effective_workdir`: a stored per-session value, or an explicit override), and the file
+        // is written under whichever that session used. Startup cannot know those, so the path
+        // below is the default rather than a promise about every session — which is also why the
+        // deployed default matters: with `working_dir == $HOME` the two coincide.
+        let path = facade_config_path(workdir);
+        tracing::info!(
+            facade_config = %path.display(),
+            "browser control: the OAB MCP Facade is running ([mcp] configured), and openab has \
+             written its entry to the file above. openab does NOT modify your agent's MCP config, \
+             so browser tools stay unavailable until that entry is in place."
+        );
+        tracing::info!(
+            "browser control — to finish wiring, run ONE of these for your agent:  \
+             kiro:  kiro-cli mcp import --file {path} workspace   (do not pass --force)  |  \
+             cursor: no import mechanism exists — paste the contents of {path} into the \
+             \"mcpServers\" object of .cursor/mcp.json yourself",
+            path = path.display()
+        );
     } else {
         // Unconditional, and the whole point of the change: with the proxy fallback gone, an
         // unconfigured deployment has NO browser control. Saying nothing would leave that to be
