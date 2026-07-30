@@ -1720,6 +1720,9 @@ fn parse_id_set(raw: &[String], label: &str) -> anyhow::Result<HashSet<u64>> {
 #[cfg(test)]
 mod tests {
 
+    use super::*;
+    use clap::Parser;
+
     /// The shipped tunnel-timeout default must stay strictly beneath the ceiling that overtakes it.
     ///
     /// This pairing can only be asserted here. The gateway owns the ceiling and cannot see the
@@ -1745,8 +1748,6 @@ mod tests {
             "the shipped default must not be a value the startup warning fires on"
         );
     }
-    use super::*;
-    use clap::Parser;
 
     #[test]
     fn cli_no_args_defaults_to_run() {

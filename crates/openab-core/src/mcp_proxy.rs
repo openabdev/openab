@@ -57,6 +57,21 @@ pub trait AcpMcpTunnel: Send + Sync {
     fn servers(&self, _channel_id: &str) -> Vec<(String, String)> {
         Vec::new()
     }
+
+    /// Resolve a declared server NAME to the `server_id` the registry keys that tunnel by, for one
+    /// channel.
+    ///
+    /// Separate from [`Self::servers`] on purpose. Enumerating and picking the first name match is
+    /// only correct while same-name entries cannot coexist, and that uniqueness is maintained far
+    /// from any caller — so the choice belongs with the code that maintains it, not with each
+    /// consumer. `servers` stays for enumeration and discovery, where seeing everything is the point.
+    ///
+    /// Required, with no default. A default returning `None` compiles for every existing implementor
+    /// and then silently answers "not connected" for all routing — the failure surfaces at run time,
+    /// in tests belonging to whoever did NOT add the method. A missing implementation should be a
+    /// compile error, not a behaviour change. This was not hypothetical: adding it with a `None`
+    /// default broke five routing tests that had nothing to do with the change.
+    fn resolve_by_name(&self, channel_id: &str, server_name: &str) -> Option<String>;
 }
 
 /// The fixed set of browser tools OpenAB advertises over MCP (D4 static-advertise). DOM-

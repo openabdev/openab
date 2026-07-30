@@ -63,6 +63,19 @@ impl AcpMcpTunnel for RootBrowserTunnel {
         }
     }
 
+    /// Delegates to the gateway, which resolves under the registry lock and beside the eviction
+    /// that keeps declared names unique. Deliberately not implemented here by enumerating and
+    /// matching: this crate cannot rank two tunnels — the ordering fields are private to the gateway
+    /// — so a local implementation could only take an arbitrary match or refuse, and refusing is the
+    /// behaviour ADR §6.1 rejects.
+    fn resolve_by_name(&self, channel_id: &str, server_name: &str) -> Option<String> {
+        openab_gateway::adapters::acp_server::resolve_by_name(
+            &self.registry,
+            channel_id,
+            server_name,
+        )
+    }
+
     /// Enumerate this channel's registered tunnels as `(declared_name, server_id)` (ADR §6.1).
     /// The name is what a tool prefix and the §6.4 allowlist match on; the id is what the registry
     /// is keyed by. Same-name duplicates cannot appear here — `establish_and_register_tunnel`

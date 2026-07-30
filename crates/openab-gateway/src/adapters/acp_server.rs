@@ -55,15 +55,6 @@ const MAX_INFLIGHT_ESTABLISHES: usize = 64;
 /// config path warns rather than letting a larger value look effective.
 pub const ACP_PROMPT_IDLE_TIMEOUT_SECS: u64 = 180;
 
-/// Warn when a configured tunnel timeout cannot take effect because the idle timeout above overtakes
-/// it.
-///
-/// Lives here, next to the number it is about, rather than in the binary that reads the config. The
-/// edge is unchanged — the binary already depends on this crate — but the caller no longer has to
-/// know what the ceiling is or which direction to compare, so when that constant changes or becomes
-/// configurable there is one place to edit instead of two. This is a relocation of the invariant, not
-/// a removal of coupling: the value still has to be handed in, because this crate never sees the
-/// config.
 /// Whether a configured tunnel timeout is overtaken by the idle timeout, and so cannot decide the
 /// outcome.
 ///
@@ -74,6 +65,15 @@ pub fn tunnel_timeout_is_ineffective(configured_secs: u64) -> bool {
     configured_secs >= ACP_PROMPT_IDLE_TIMEOUT_SECS
 }
 
+/// Warn when a configured tunnel timeout cannot take effect because the idle timeout above overtakes
+/// it.
+///
+/// Lives here, next to the number it is about, rather than in the binary that reads the config. The
+/// edge is unchanged — the binary already depends on this crate — but the caller no longer has to
+/// know what the ceiling is or which direction to compare, so when that constant changes or becomes
+/// configurable there is one place to edit instead of two. This is a relocation of the invariant, not
+/// a removal of coupling: the value still has to be handed in, because this crate never sees the
+/// config.
 pub fn warn_if_tunnel_timeout_is_ineffective(configured_secs: u64) {
     if tunnel_timeout_is_ineffective(configured_secs) {
         warn!(
@@ -409,6 +409,41 @@ pub struct ReplySink {
     /// client that reconnects and resumes takes over the same `channel_id`, so a slow cleanup from
     /// the old connection would delete the *successor's* live sink and silently stop its replies.
     pub owner: String,
+}
+
+/// Resolve a client-declared server NAME to the registry key of its tunnel, for one channel.
+///
+/// Lives here, beside the code that maintains the uniqueness it relies on, and that is the whole
+/// point. The caller used to enumerate the channel's tunnels and take the first name match, which
+/// was correct only because same-name entries cannot coexist — an invariant established by the
+/// single insert site below, in another crate's line of sight, with nothing binding the two. Weaken
+/// that eviction and a "take the first" caller does not fail, it silently picks an arbitrary tunnel.
+///
+/// Moving the resolution next to the invariant removes the distance rather than documenting it.
+///
+/// If two ever do coexist, this picks the newest by the SAME ordering that produced the invariant
+/// and warns. It deliberately does not error: answering "ambiguous, pass a server_id" is the
+/// behaviour ADR §6.1 exists to avoid, because it locks a client out of its own tools on every
+/// reconnect. A hard stop is the wrong response to a soft inconsistency.
+pub fn resolve_by_name(
+    registry: &AcpTunnelRegistry,
+    channel_id: &str,
+    server_name: &str,
+) -> Option<String> {
+    let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+    let mut matches: Vec<(&(String, String), &TunnelHandle)> = reg
+        .iter()
+        .filter(|((c, _), h)| c == channel_id && h.server_name == server_name)
+        .collect();
+    if matches.len() > 1 {
+        warn!(
+            channel = %redact_id(channel_id), server_name, count = matches.len(),
+            "ACP: more than one tunnel is registered under one declared name — registry uniqueness \
+             was broken upstream; routing to the newest attach"
+        );
+    }
+    matches.sort_by_key(|(_, h)| (h.connection_generation, h.generation));
+    matches.last().map(|((_, id), _)| id.clone())
 }
 
 /// Registry of active ACP sessions: channel_id → reply sink.
@@ -2862,6 +2897,74 @@ mod acp_requests {
         ext.await.unwrap();
     }
 
+    /// A handle with chosen ordering numbers, for asserting on resolution directly.
+    ///
+    /// The establish path cannot produce two tunnels under one name, so a state that only
+    /// `resolve_by_name` has to cope with has to be built by hand.
+    fn tunnel_ranked(owner: &str, conn_gen: u64, gen: u64) -> super::TunnelHandle {
+        let (out_tx, _rx) = mpsc::unbounded_channel::<String>();
+        super::TunnelHandle {
+            out_tx,
+            pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+            connection_id: format!("{owner}-conn"),
+            server_name: "katashiro".into(),
+            owner: owner.into(),
+            connection_generation: conn_gen,
+            generation: gen,
+        }
+    }
+
+    /// `resolve_by_name` picks the newest attach when a name somehow has two tunnels.
+    ///
+    /// The registry keeps declared names unique, so this state should not arise — which is exactly
+    /// why the behaviour needs pinning. The caller this replaced enumerated and took the FIRST match,
+    /// and a first match is whatever the map iterator happened to yield: correct only while the
+    /// invariant holds, and silently arbitrary the moment it does not. Constructed directly here
+    /// because the establish path will not produce it.
+    ///
+    /// Newest-wins rather than an error, deliberately: refusing with "ambiguous, pass a server_id" is
+    /// the behaviour ADR §6.1 exists to avoid, since it locks a client out of its own tools on every
+    /// reconnect. A soft inconsistency should not become a hard stop.
+    #[test]
+    fn resolve_by_name_routes_to_the_newest_attach_if_a_name_is_ever_duplicated() {
+        let registry = super::new_tunnel_registry();
+        {
+            let mut reg = registry.lock().unwrap();
+            // Deliberately out of insertion order relative to rank, so a "first match" answer and a
+            // "newest" answer differ.
+            reg.insert(("acp_1".into(), "srv-new".into()), tunnel_ranked("conn-b", 7, 2));
+            reg.insert(("acp_1".into(), "srv-old".into()), tunnel_ranked("conn-a", 3, 9));
+            reg.insert(("acp_1".into(), "other".into()), {
+                let mut h = tunnel_ranked("conn-c", 9, 9);
+                h.server_name = "notes".into();
+                h
+            });
+            reg.insert(("acp_2".into(), "elsewhere".into()), tunnel_ranked("conn-d", 99, 99));
+        }
+        assert_eq!(
+            super::resolve_by_name(&registry, "acp_1", "katashiro").as_deref(),
+            Some("srv-new"),
+            "must pick the higher (connection_generation, generation), not whichever the map yields \
+             first — note srv-old has the larger attach number, so attach order alone answers wrong"
+        );
+        assert_eq!(
+            super::resolve_by_name(&registry, "acp_1", "notes").as_deref(),
+            Some("other"),
+            "a different declared name on the same channel resolves independently"
+        );
+        assert_eq!(
+            super::resolve_by_name(&registry, "acp_1", "absent"),
+            None,
+            "an unknown name resolves to nothing rather than to an arbitrary tunnel"
+        );
+        assert_eq!(
+            super::resolve_by_name(&registry, "acp_other", "katashiro"),
+            None,
+            "resolution is scoped to the channel — another channel's tunnel must not be reachable"
+        );
+    }
+
     /// The ineffective-timeout boundary is inclusive on the ceiling.
     ///
     /// Equal is the case that matters and the one an inverted comparison would drop: at exactly the
@@ -4242,12 +4345,17 @@ mod acp_ws_integration {
 
     /// Within ONE connection, the later establish still wins — the attach tiebreak is load-bearing.
     ///
-    /// Every other ordering test here is cross-connection, so all of them survive dropping the second
-    /// half of `(connection age, attach order)` and comparing only age: their connection ages already
-    /// give the right answer. What no other test reaches is two establishes on the SAME connection,
-    /// where the ages are equal and attach order is the only thing left to decide with. Compare age
-    /// alone and a late-finishing older establish is neither superseded nor blocked, so it evicts the
-    /// successor that already registered and installs the stale tunnel over it.
+    /// Same-connection ordering tests DO exist — `mod acp_requests` builds handles with a
+    /// `connection_generation` of 0 throughout — but every one of them exercises the same direction:
+    /// the later establish also finishes later, and there dropping the tiebreak still answers
+    /// correctly (equal ages mean nothing supersedes, the same-name eviction is unconditional, and
+    /// the later arrival wins anyway). What nothing reaches is the REVERSE direction: started
+    /// earlier, finished later. Compare age alone there and the stale establish is neither superseded
+    /// nor blocked, so it evicts the successor that already registered and installs itself over it.
+    ///
+    /// Stated this way on purpose. An earlier draft claimed "every other ordering test is
+    /// cross-connection", which is a universal that one same-connection test disproves — and the case
+    /// for this test would have appeared to fall with it, though the gap is real either way.
     ///
     /// Deterministic without racing two spawns: the first establish is parked by withholding its
     /// `mcp/connect` answer, the second is driven to completion, and only then is the first released.

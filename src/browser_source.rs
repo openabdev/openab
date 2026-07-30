@@ -334,14 +334,12 @@ impl CapabilitySource for AcpTunnelSource {
             )));
         }
 
-        // Resolve the declared name to the tunnel's registry key (§6.1). Same-name
-        // duplicates cannot occur — attach evicts the stale entry (last-attach-wins).
-        let Some((_, server_id)) = self
-            .tunnel
-            .servers(&ctx.channel_id)
-            .into_iter()
-            .find(|(name, _)| name == server_name)
-        else {
+        // Resolve the declared name to the tunnel's registry key (§6.1). Delegated rather than
+        // done here: enumerating and taking the first name match is only correct while same-name
+        // entries cannot coexist, and that uniqueness is maintained in the gateway, out of this
+        // file's sight. A "take the first" caller does not fail when it breaks — it silently routes
+        // to an arbitrary tunnel. The resolution now lives beside the eviction that guarantees it.
+        let Some(server_id) = self.tunnel.resolve_by_name(&ctx.channel_id, server_name) else {
             return Ok(Self::error_result(format!(
                 "{server_name} not connected: open the OpenAB side panel in your browser"
             )));
@@ -450,6 +448,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AcpMcpTunnel for FakeTunnel {
+        /// The double holds a controlled list, so matching it directly is honest here — the
+        /// reason the real implementation delegates to the gateway is that IT cannot rank two
+        /// same-name tunnels, not that matching is wrong in principle.
+        fn resolve_by_name(&self, channel_id: &str, server_name: &str) -> Option<String> {
+            self.servers(channel_id)
+                .into_iter()
+                .find(|(name, _)| name == server_name)
+                .map(|(_, id)| id)
+        }
+
         async fn call(
             &self,
             channel_id: &str,
