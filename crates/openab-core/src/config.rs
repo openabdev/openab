@@ -191,6 +191,7 @@ pub struct Config {
     pub gateway: Option<GatewayConfig>,
     pub telegram: Option<TelegramConfig>,
     pub line: Option<LineConfig>,
+    pub lineworks: Option<LineWorksConfig>,
     pub wecom: Option<WecomConfig>,
     pub googlechat: Option<GoogleChatConfig>,
     pub teams: Option<TeamsConfig>,
@@ -884,6 +885,151 @@ impl LineConfig {
     /// uniform `GATEWAY_*` seed (and to warn when it does).
     pub fn env_trust_present() -> bool {
         std::env::var("LINE_ALLOW_ALL_USERS").is_ok() || std::env::var("LINE_ALLOWED_USERS").is_ok()
+    }
+}
+
+/// First-class `[lineworks]` section — credentials for the LINE WORKS bot
+/// adapter. Config-first invariant (#1375): each field resolves
+/// `[lineworks].field` (with `${}` expansion) → `LINEWORKS_*` env var →
+/// default. The adapter is enabled only when bot id, bot secret, and the
+/// full service-account auth material all resolve to non-empty values.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct LineWorksConfig {
+    /// Bot ID (also cross-checked against the `X-WORKS-BotId` callback
+    /// header). Env fallback: `LINEWORKS_BOT_ID`.
+    pub bot_id: Option<String>,
+    /// Bot Secret for webhook HMAC-SHA256 signature verification (L1).
+    /// Env fallback: `LINEWORKS_BOT_SECRET`.
+    pub bot_secret: Option<String>,
+    /// App Client ID (JWT `iss`). Env fallback: `LINEWORKS_CLIENT_ID`.
+    pub client_id: Option<String>,
+    /// App Client Secret (token request). Env fallback:
+    /// `LINEWORKS_CLIENT_SECRET`.
+    pub client_secret: Option<String>,
+    /// Service account email (JWT `sub`). Env fallback:
+    /// `LINEWORKS_SERVICE_ACCOUNT`.
+    pub service_account: Option<String>,
+    /// RS256 private key PEM (inline). Env fallback: `LINEWORKS_PRIVATE_KEY`.
+    /// Takes precedence over `private_key_file`.
+    pub private_key: Option<String>,
+    /// Path to the RS256 private key PEM downloaded from the Developer
+    /// Console. Env fallback: `LINEWORKS_PRIVATE_KEY_FILE`.
+    pub private_key_file: Option<String>,
+    /// Webhook mount path. Env fallback: `LINEWORKS_WEBHOOK_PATH`
+    /// (default `/webhook/lineworks`).
+    pub webhook_path: Option<String>,
+    /// Require an @-mention of the bot in channel (group) messages; 1:1
+    /// always passes. Env fallback: `LINEWORKS_REQUIRE_MENTION`
+    /// (default `true`).
+    pub require_mention: Option<bool>,
+    /// Bot display name for mention matching. When unset, fetched from
+    /// `GET /bots/{botId}`. Env fallback: `LINEWORKS_BOT_NAME`.
+    pub bot_name: Option<String>,
+    /// Render markdown replies as flexible-template messages (plain-text
+    /// fallback on any failure). Env fallback: `LINEWORKS_RICH_MESSAGES`
+    /// (default `true`).
+    pub rich_messages: Option<bool>,
+    /// Receipt acknowledgement message sent when a user message is accepted
+    /// (LINE WORKS has no reaction/typing APIs). Unset/empty = disabled.
+    /// Env fallback: `LINEWORKS_ACK_MESSAGE`.
+    pub ack_message: Option<String>,
+    /// Explicit flag: true = allow all users, false = check `allowed_users`.
+    /// When not set, defaults to `false` (deny-all, per identity-trust-none
+    /// ADR). Env fallback: `LINEWORKS_ALLOW_ALL_USERS` (empty string = unset).
+    pub allow_all_users: Option<bool>,
+    /// LINE WORKS userIds (UUIDs, as carried in callback events) allowed to
+    /// interact. Only checked when `allow_all_users` resolves to `false`.
+    /// Env fallback: `LINEWORKS_ALLOWED_USERS` (comma-separated).
+    pub allowed_users: Option<Vec<String>>,
+}
+
+/// Fully resolved LINE WORKS settings (config → env → default applied).
+#[derive(Debug, Clone)]
+pub struct ResolvedLineWorks {
+    pub bot_id: Option<String>,
+    pub bot_secret: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub service_account: Option<String>,
+    pub private_key: Option<String>,
+    pub private_key_file: Option<String>,
+    pub webhook_path: String,
+    pub require_mention: bool,
+    pub bot_name: Option<String>,
+    pub rich_messages: bool,
+    pub ack_message: Option<String>,
+}
+
+impl ResolvedLineWorks {
+    /// The single activation validator: true only when every credential the
+    /// adapter constructor requires is present and non-empty (bot id/secret,
+    /// OAuth client pair, service account, and a private key — inline or
+    /// file path). Startup preflight, cron platform registration, and
+    /// adapter construction must all agree on this definition.
+    pub fn is_complete(&self) -> bool {
+        self.bot_id.is_some()
+            && self.bot_secret.is_some()
+            && self.client_id.is_some()
+            && self.client_secret.is_some()
+            && self.service_account.is_some()
+            && (self.private_key.is_some()
+                || self
+                    .private_key_file
+                    .as_deref()
+                    .is_some_and(|p| std::fs::read(p).is_ok()))
+    }
+}
+
+impl LineWorksConfig {
+    /// Resolve every field: config value (if set) → `LINEWORKS_*` env →
+    /// default. Same shape as [`LineConfig::resolve`]; empty strings — from
+    /// `${}` expansion of unset vars OR from empty env values — are treated
+    /// as unset on both layers, so activation checks and adapter
+    /// construction agree on what "configured" means.
+    pub fn resolve(&self) -> ResolvedLineWorks {
+        let field = |v: &Option<String>, env: &str| {
+            v.as_ref()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .or_else(|| std::env::var(env).ok().filter(|s| !s.is_empty()))
+        };
+        ResolvedLineWorks {
+            bot_id: field(&self.bot_id, "LINEWORKS_BOT_ID"),
+            bot_secret: field(&self.bot_secret, "LINEWORKS_BOT_SECRET"),
+            client_id: field(&self.client_id, "LINEWORKS_CLIENT_ID"),
+            client_secret: field(&self.client_secret, "LINEWORKS_CLIENT_SECRET"),
+            service_account: field(&self.service_account, "LINEWORKS_SERVICE_ACCOUNT"),
+            private_key: field(&self.private_key, "LINEWORKS_PRIVATE_KEY"),
+            private_key_file: field(&self.private_key_file, "LINEWORKS_PRIVATE_KEY_FILE"),
+            webhook_path: field(&self.webhook_path, "LINEWORKS_WEBHOOK_PATH")
+                .unwrap_or_else(|| "/webhook/lineworks".into()),
+            require_mention: self.require_mention.unwrap_or_else(|| {
+                std::env::var("LINEWORKS_REQUIRE_MENTION")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(true)
+            }),
+            bot_name: field(&self.bot_name, "LINEWORKS_BOT_NAME"),
+            rich_messages: self.rich_messages.unwrap_or_else(|| {
+                std::env::var("LINEWORKS_RICH_MESSAGES")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(true)
+            }),
+            ack_message: field(&self.ack_message, "LINEWORKS_ACK_MESSAGE"),
+        }
+    }
+
+    /// Trust-fields view for the shared registry override path, preserving
+    /// the semantics the section had as a [`PlatformTrustConfig`].
+    pub fn trust_config(&self) -> PlatformTrustConfig {
+        PlatformTrustConfig {
+            allow_all_users: self.allow_all_users,
+            allowed_users: self.allowed_users.clone(),
+        }
     }
 }
 
@@ -2974,6 +3120,10 @@ allowed_users = ["users/123456789"]
 [teams]
 app_id = "app-1"
 allow_all_users = true
+
+[lineworks]
+bot_id = "123"
+allowed_users = ["uuid-a", "uuid-b"]
 "#;
         let cfg = parse_config_str(toml_str, "test").unwrap();
         let wecom = cfg.wecom.expect("wecom section");
@@ -2993,12 +3143,28 @@ allow_all_users = true
         let teams = cfg.teams.expect("teams section");
         assert_eq!(teams.app_id.as_deref(), Some("app-1"));
         assert_eq!(teams.allow_all_users, Some(true));
+        let lw = cfg.lineworks.expect("lineworks section");
+        assert_eq!(lw.bot_id.as_deref(), Some("123"));
+        assert_eq!(lw.allow_all_users, None);
+        assert_eq!(
+            lw.allowed_users.as_deref(),
+            Some(&["uuid-a".to_string(), "uuid-b".to_string()][..])
+        );
+        // trust_config() preserves the section's fields for the shared
+        // registry override path (platform_trust_override, prefix LINEWORKS).
+        let tc = lw.trust_config();
+        assert_eq!(tc.allow_all_users, None);
+        assert_eq!(
+            tc.allowed_users.as_deref(),
+            Some(&["uuid-a".to_string(), "uuid-b".to_string()][..])
+        );
 
         // Absent sections → None (trust falls back to legacy GATEWAY_* seed).
         let cfg = parse_config_str("[discord]\nbot_token = \"x\"\n", "test").unwrap();
         assert!(cfg.wecom.is_none());
         assert!(cfg.googlechat.is_none());
         assert!(cfg.teams.is_none());
+        assert!(cfg.lineworks.is_none());
     }
 
     /// All `WECOM_*` env scenarios in ONE test — std::env is process-global and
@@ -3674,5 +3840,73 @@ cancel_strategy = "noop"
         let cfg = parse_config(toml, "test").unwrap();
         let ac = cfg.agentcore.unwrap();
         assert_eq!(ac.cancel_strategy, AgentCoreCancelStrategy::Noop);
+    }
+
+    #[test]
+    fn lineworks_activation_validator() {
+        // Serialized via env hygiene: clear all LINEWORKS_* first (tests in
+        // this binary do not otherwise touch these vars).
+        for var in [
+            "LINEWORKS_BOT_ID",
+            "LINEWORKS_BOT_SECRET",
+            "LINEWORKS_CLIENT_ID",
+            "LINEWORKS_CLIENT_SECRET",
+            "LINEWORKS_SERVICE_ACCOUNT",
+            "LINEWORKS_PRIVATE_KEY",
+            "LINEWORKS_PRIVATE_KEY_FILE",
+        ] {
+            std::env::remove_var(var);
+        }
+
+        let full = LineWorksConfig {
+            bot_id: Some("1".into()),
+            bot_secret: Some("s".into()),
+            client_id: Some("c".into()),
+            client_secret: Some("cs".into()),
+            service_account: Some("sa@x".into()),
+            private_key: Some("pem".into()),
+            ..Default::default()
+        };
+        assert!(full.resolve().is_complete());
+
+        // Empty environment → not activated.
+        assert!(!LineWorksConfig::default().resolve().is_complete());
+
+        // Any missing credential → incomplete (bot id alone must NOT activate).
+        let only_bot_id = LineWorksConfig {
+            bot_id: Some("1".into()),
+            ..Default::default()
+        };
+        assert!(!only_bot_id.resolve().is_complete());
+        let mut partial = full.clone();
+        partial.client_secret = None;
+        assert!(!partial.resolve().is_complete());
+
+        // Empty-string config values are treated as unset.
+        let mut empty_val = full.clone();
+        empty_val.bot_secret = Some(String::new());
+        assert!(!empty_val.resolve().is_complete());
+
+        // Empty-string ENV values are also treated as unset...
+        let mut needs_env = full.clone();
+        needs_env.bot_id = None;
+        std::env::set_var("LINEWORKS_BOT_ID", "");
+        assert!(!needs_env.resolve().is_complete());
+        // ...while a real env value completes the set.
+        std::env::set_var("LINEWORKS_BOT_ID", "99");
+        assert!(needs_env.resolve().is_complete());
+        std::env::remove_var("LINEWORKS_BOT_ID");
+
+        // private_key_file counts as key material only when READABLE —
+        // activation must match adapter construction, which reads the file.
+        let mut file_key = full.clone();
+        file_key.private_key = None;
+        file_key.private_key_file = Some("/nonexistent/lineworks_key.pem".into());
+        assert!(!file_key.resolve().is_complete());
+        let tmp = std::env::temp_dir().join("lineworks_test_key_validator.pem");
+        std::fs::write(&tmp, "-----BEGIN PRIVATE KEY-----").unwrap();
+        file_key.private_key_file = Some(tmp.to_string_lossy().into_owned());
+        assert!(file_key.resolve().is_complete());
+        let _ = std::fs::remove_file(&tmp);
     }
 }

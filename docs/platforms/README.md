@@ -36,6 +36,7 @@ Each `schema/<platform>.toml` has three schema-driven parts:
 | wecom | [schema/wecom.toml](./schema/wecom.toml) |
 | googlechat | [schema/googlechat.toml](./schema/googlechat.toml) |
 | teams | [schema/teams.toml](./schema/teams.toml) |
+| lineworks | [schema/lineworks.toml](./schema/lineworks.toml) |
 
 ---
 

@@ -26,6 +26,7 @@ User sends media (photo/voice/file)
 | **Google Chat** | ✅ | ✅ (file + STT) | ✅ (whitelist) | skipped | Drive files skipped |
 | **WeCom** | ✅ | — | ✅ (whitelist) | skipped | skipped |
 | **LINE** | ✅ (LINE-hosted only) | ✅ (file + STT, 1:1 only, LINE-hosted only) | — | — | — |
+| **LINE WORKS** | ✅ | ✅ (file + STT) | ✅ (whitelist) | skipped | skipped |
 | **Slack** | ✅ | ✅ (file + STT) | ✅ | metadata + URL | `[File: ...]` via filestore, else skipped |
 
 "file + STT" means the agent always receives the audio file's metadata (and a
@@ -72,7 +73,7 @@ Which `url` the agent gets depends on the platform and whether a
 |----------|----------------|-------------------|
 | Discord | presigned S3 URL | `cdn.discordapp.com` URL, expires ~24h |
 | Slack | presigned S3 URL | `url_private_download`, needs an `Authorization: Bearer <bot token>` header |
-| Gateway (Telegram / Feishu / LINE / Google Chat) | presigned S3 URL | no `url` line (the gateway already consumed the platform URL during download), so the block carries metadata only |
+| Gateway (Telegram / Feishu / LINE / LINE WORKS / Google Chat) | presigned S3 URL | no `url` line (the gateway already consumed the platform URL during download), so the block carries metadata only |
 
 **Slack caveat.** Slack forwards an attachment only when its file JSON carries
 `url_private_download` or `url_private`. When both are absent the whole

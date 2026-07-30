@@ -7,6 +7,7 @@ mod ctl;
     feature = "wecom",
     feature = "teams",
     feature = "acp",
+    feature = "lineworks",
 ))]
 mod unified_adapter;
 use openab_core::acp;
@@ -187,6 +188,37 @@ fn has_unified_platform(cfg: &config::Config) -> bool {
             && std::env::var("OPENAB_ACP_ENABLED")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false))
+        || (cfg!(feature = "lineworks") && lineworks_activated(cfg.lineworks.as_ref()))
+}
+
+/// Single LINE WORKS activation validator: the resolved (config → env →
+/// default) credentials must be complete and non-empty — the same rule the
+/// adapter constructor applies. Used by startup preflight AND cron platform
+/// registration so a partial/empty environment can never register a
+/// platform whose adapter will not construct.
+/// Feature-off stub: `has_unified_platform` calls this through a runtime
+/// `cfg!` check, so the symbol must exist (and answer "not activated") even
+/// when the lineworks feature is compiled out.
+#[cfg(not(feature = "lineworks"))]
+fn lineworks_activated(_lineworks: Option<&config::LineWorksConfig>) -> bool {
+    false
+}
+
+#[cfg(feature = "lineworks")]
+fn lineworks_activated(lineworks: Option<&config::LineWorksConfig>) -> bool {
+    let r = lineworks.cloned().unwrap_or_default().resolve();
+    if !r.is_complete() {
+        return false;
+    }
+    // Same key-material rule as adapter construction: the PEM must parse,
+    // not merely exist — an invalid key must not report a healthy startup.
+    let pem = r.private_key.or_else(|| {
+        r.private_key_file
+            .as_deref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+    });
+    pem.as_deref()
+        .is_some_and(openab_gateway::adapters::lineworks::valid_private_key)
 }
 
 /// Returns true when the first-class `[wecom]` section resolves all credentials
@@ -230,8 +262,9 @@ fn gateway_section_trust(gw: &config::GatewayConfig) -> openab_core::trust::Trus
 /// Apply a platform's first-class trust section to the registry, or — when the
 /// platform is active but still trust-driven by the deprecated uniform
 /// `GATEWAY_ALLOW_ALL_USERS`/`GATEWAY_ALLOWED_USERS` env — log the Phase 1
-/// deprecation warning (#1356). Shared by the `[wecom]`/`[googlechat]`/`[teams]`
-/// overrides; same override shape as the bespoke `[telegram]`/`[line]` blocks.
+/// deprecation warning (#1356). Shared by the `[wecom]`/`[googlechat]`/`[teams]`/
+/// `[feishu]`/`[lineworks]` overrides; same override shape as the bespoke
+/// `[telegram]`/`[line]` blocks.
 ///
 /// L2 (channels) stays on the shared gateway values passed in; L3 mirrors the
 /// resolved section (config → `{env_prefix}_*` env → deny-all).
@@ -447,6 +480,7 @@ async fn main() -> anyhow::Result<()> {
         feature = "wecom",
         feature = "teams",
         feature = "acp",
+        feature = "lineworks",
     ))]
     let unified_platform_enabled = has_unified_platform(&cfg);
 
@@ -522,7 +556,16 @@ async fn main() -> anyhow::Result<()> {
         let allow_all_users = env_bool("GATEWAY_ALLOW_ALL_USERS", false);
         let allowed_users = env_set("GATEWAY_ALLOWED_USERS");
         let mut reg = PlatformTrustConfigs::new();
-        for platform in ["telegram", "line", "feishu", "wecom", "googlechat", "teams", "acp"] {
+        for platform in [
+            "telegram",
+            "line",
+            "feishu",
+            "wecom",
+            "googlechat",
+            "teams",
+            "acp",
+            "lineworks",
+        ] {
             reg.insert(
                 platform,
                 TrustConfig::new(
@@ -726,6 +769,15 @@ async fn main() -> anyhow::Result<()> {
             allow_all_channels,
             &allowed_channels,
         );
+        platform_trust_override(
+            &mut reg,
+            "lineworks",
+            &cfg.lineworks.as_ref().map(|lw| lw.trust_config()),
+            "LINEWORKS",
+            lineworks_activated(cfg.lineworks.as_ref()),
+            allow_all_channels,
+            &allowed_channels,
+        );
         reg
     };
 
@@ -873,6 +925,10 @@ async fn main() -> anyhow::Result<()> {
     {
         configured_platforms.push("googlechat");
     }
+    #[cfg(feature = "lineworks")]
+    if lineworks_activated(cfg.lineworks.as_ref()) {
+        configured_platforms.push("lineworks");
+    }
     cron::validate_cronjobs(&cfg.cron.jobs, &configured_platforms)?;
 
     // Spawn Slack adapter (background task)
@@ -1015,6 +1071,7 @@ async fn main() -> anyhow::Result<()> {
         feature = "wecom",
         feature = "teams",
         feature = "acp",
+        feature = "lineworks",
     ))]
     let (_unified_handle, shared_unified_adapter) = {
         use openab_core::gateway::{process_gateway_event, GatewayEventContext};
@@ -1048,6 +1105,20 @@ async fn main() -> anyhow::Result<()> {
             // Build gateway AppState from env vars (shared factory with standalone gateway)
             let mut gw_state_inner = openab_gateway::AppState::from_env(event_tx.clone(), None);
 
+            // Pre-download identity probe: lets adapters consult the shared
+            // L3 identity gate BEFORE spending resources on attachment
+            // download. Mirrors gate_gateway_event (is_dm = false, Phase 1).
+            {
+                let probe_router = router.clone();
+                gw_state_inner.trust_probe = Some(std::sync::Arc::new(
+                    move |platform: &str, channel_id: &str, sender_id: &str| {
+                        probe_router
+                            .gate_incoming(platform, channel_id, false, sender_id)
+                            .is_allowed()
+                    },
+                ));
+            }
+
 
             // First-class `[telegram]` config overrides env-derived values
             // (config-authoritative + ${} expansion + TELEGRAM_* env fallback).
@@ -1077,6 +1148,29 @@ async fn main() -> anyhow::Result<()> {
                     channel_secret: r.channel_secret,
                     channel_access_token: r.channel_access_token,
                     webhook_path: r.webhook_path,
+                });
+            }
+
+            // First-class `[lineworks]` config overrides env-derived values
+            // (config-authoritative + ${} expansion + LINEWORKS_* env
+            // fallback). The apply rebuilds the adapter through the same
+            // validation as env-only construction.
+            #[cfg(feature = "lineworks")]
+            if let Some(ref lw) = cfg.lineworks {
+                let r = lw.resolve();
+                gw_state_inner.apply_lineworks_config(openab_gateway::GatewayLineWorksConfig {
+                    bot_id: r.bot_id,
+                    bot_secret: r.bot_secret,
+                    client_id: r.client_id,
+                    client_secret: r.client_secret,
+                    service_account: r.service_account,
+                    private_key: r.private_key,
+                    private_key_file: r.private_key_file,
+                    webhook_path: r.webhook_path,
+                    require_mention: r.require_mention,
+                    bot_name: r.bot_name,
+                    rich_messages: r.rich_messages,
+                    ack_message: r.ack_message,
                 });
             }
 
@@ -1295,6 +1389,15 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
+            #[cfg(feature = "lineworks")]
+            if let Some(ref lw) = gw_state.lineworks {
+                info!(path = %lw.config.webhook_path, "unified: lineworks adapter enabled");
+                app = app.route(
+                    &lw.config.webhook_path,
+                    axum::routing::post(openab_gateway::adapters::lineworks::webhook),
+                );
+            }
+
             let app = app.with_state(gw_state.clone());
 
             // Bridge task: receive events from adapters via event_tx, dispatch to core
@@ -1411,6 +1514,10 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "googlechat")]
         if let Some(ref a) = shared_unified_adapter {
             cron_adapters.insert("googlechat".into(), a.clone());
+        }
+        #[cfg(feature = "lineworks")]
+        if let Some(ref a) = shared_unified_adapter {
+            cron_adapters.insert("lineworks".into(), a.clone());
         }
         let cron_platforms: Vec<String> =
             configured_platforms.iter().map(|s| s.to_string()).collect();
