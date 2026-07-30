@@ -5644,7 +5644,31 @@ mod acp_ws_integration {
     /// path has to exist and has to behave.
     ///
     /// Which of the two wins is a genuine race, so this asserts the RELATION rather than a
-    /// winner: exactly one tunnel survives, and the disconnect names the one that did not.
+    /// winner: exactly one tunnel survives, and the disconnect names the one that did not. That
+    /// holds under either interleaving, so the test itself is stable.
+    ///
+    /// WHAT IT DOES NOT GUARANTEE — read before relying on this as eviction coverage.
+    ///
+    /// `generation` is stamped inside `establish_and_register_tunnel`, i.e. within the spawned
+    /// task, so declaration order does NOT determine generation order. Both establishes share a
+    /// `connection_generation`, so ordering falls to `generation`, and which arm runs depends on
+    /// the scheduler:
+    ///
+    ///   - lower-generation task registers first → the later one evicts it → EVICTION arm;
+    ///   - higher-generation task registers first → the earlier one is superseded and stands down,
+    ///     closing its own connection → SUPERSEDED arm, and eviction never runs.
+    ///
+    /// Both produce "one survivor, loser gets the disconnect", which is why the assertions cannot
+    /// tell them apart. Measured on this machine: 20 of 20 runs took the EVICTION arm, so the
+    /// coverage is real in practice — but it is not guaranteed by construction, and a change that
+    /// broke eviction could pass on an unlucky-for-us schedule.
+    ///
+    /// The fix is to stamp `generation` in the declaration loop of `spawn_acp_tunnels` rather than
+    /// inside the task. Declaration order within one request is the only order the client ever
+    /// expressed, so that is arguably more faithful than task-scheduling order, and it would make
+    /// this test cover the eviction arm deterministically. Filed as a follow-up rather than done
+    /// here: it changes the ordering semantics the whole last-attach-wins design rests on, and
+    /// that deserves its own review rather than riding along with a test.
     #[tokio::test]
     async fn two_same_name_servers_in_one_session_evict_down_to_one() {
         let (url, registry) = serve().await;
@@ -5679,7 +5703,16 @@ mod acp_ws_integration {
             if disconnected.is_some() && session_seen && connected.len() == 2 {
                 break;
             }
-            let frame = recv(&mut ws).await;
+            // The 40 bounds the frame COUNT; this bounds the WAIT, and only together do they do
+            // what the comment claims. `recv` blocks, so a regression that never sends the
+            // disconnect would not run out the loop and fail with the state below — it would sit
+            // on frame 9 until `recv`'s own 30s guard fired, reporting a harness timeout instead
+            // of the missing disconnect. Breaking out here keeps the failure attributable.
+            let Ok(frame) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), recv(&mut ws)).await
+            else {
+                break;
+            };
             if handled_inner_lifecycle(&mut ws, &frame).await.is_some() {
                 continue;
             }
