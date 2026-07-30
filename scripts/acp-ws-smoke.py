@@ -277,16 +277,63 @@ async def section_lifecycle():
     except Exception as e:  # noqa: BLE001
         record("life", False, "valid token via Authorization: Bearer header accepted", repr(e))
 
-    # oversized frame → the server closes the connection (no fabricated JSON-RPC response)
+    # There are TWO ceilings with DIFFERENT outcomes, and this used to cover neither.
+    #
+    # It sent 1 MiB + 64 bytes against a comment reading "> MAX_FRAME_BYTES (1 MiB)". The transport
+    # ceiling is 8 MiB, so that payload stopped reaching it — and being a bare "x" string rather
+    # than JSON, the close it still saw came from the parse path. Green, wrong mechanism.
+    #
+    # Both cases are also covered by Rust WS integration tests, which the gate runs; these are the
+    # end-to-end versions against a real deployment.
+
+    # 1. Over the TRANSPORT ceiling (8 MiB) → connection closes, no JSON-RPC response. The frame
+    #    cannot be parsed, so the server cannot tell request from notification or recover an id,
+    #    and answering could mean answering a notification.
     async with await try_connect(TOKEN) as ws:
-        await ws.send("x" * ((1 << 20) + 64))  # > MAX_FRAME_BYTES (1 MiB)
+        oversized = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                "pad": "x" * ((8 << 20) + 64)})
+        await ws.send(oversized)
         try:
             await asyncio.wait_for(ws.recv(), timeout=8)
-            record("life", False, "oversized frame closes the connection", "got a frame back")
+            record("life", False, "frame over the transport ceiling closes the connection",
+                   "got a frame back")
         except ConnectionClosed:
-            record("life", True, "oversized frame closes the connection")
+            record("life", True, "frame over the transport ceiling closes the connection")
         except asyncio.TimeoutError:
-            record("life", False, "oversized frame closes the connection", "no close within 8s")
+            record("life", False, "frame over the transport ceiling closes the connection",
+                   "no close within 8s")
+
+    # 2. Over the PER-KIND ceiling (1 MiB for anything carrying a `method`) but under the transport
+    #    ceiling → answered with an error, and the connection SURVIVES. The 8 MiB allowance is for
+    #    tunnel results, which are responses; letting method frames use it would turn the allowance
+    #    into a way to park MAX_INFLIGHT_PROMPTS x 8 MiB of prompt text per connection.
+    async with await try_connect(TOKEN) as ws:
+        big_method = json.dumps({"jsonrpc": "2.0", "id": 7, "method": "initialize",
+                                 "params": {"protocolVersion": 1, "clientCapabilities": {},
+                                            "pad": "y" * ((1 << 20) + 4096)}})
+        await ws.send(big_method)
+        try:
+            resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=8))
+            if resp.get("error") is None:
+                record("life", False, "oversized method frame is refused with an error",
+                       f"no error in {resp}")
+            else:
+                record("life", True, "oversized method frame is refused with an error")
+                # The discriminating half: a server that closed instead would pass the check above
+                # only by never getting here.
+                await ws.send(json.dumps({"jsonrpc": "2.0", "id": 8, "method": "initialize",
+                                          "params": {"protocolVersion": 1,
+                                                     "clientCapabilities": {}}}))
+                after = json.loads(await asyncio.wait_for(ws.recv(), timeout=8))
+                record("life", after.get("result") is not None,
+                       "connection survives a per-kind refusal",
+                       "" if after.get("result") is not None else f"got {after}")
+        except ConnectionClosed:
+            record("life", False, "oversized method frame is refused with an error",
+                   "connection closed — that is the transport-ceiling behaviour, not this one")
+        except asyncio.TimeoutError:
+            record("life", False, "oversized method frame is refused with an error",
+                   "no response within 8s")
 
     # session/cancel → the in-flight prompt ends with stopReason:"cancelled"
     async with await try_connect(TOKEN) as ws:

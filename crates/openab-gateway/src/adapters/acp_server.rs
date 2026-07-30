@@ -5752,6 +5752,82 @@ mod acp_ws_integration {
         );
     }
 
+    /// The transport ceiling: a frame over `MAX_FRAME_BYTES` closes the connection.
+    ///
+    /// Deliberately paired with the test below, because the two ceilings have DIFFERENT outcomes
+    /// and a single test cannot show that. Over 8 MiB the frame cannot be parsed at all, so the
+    /// gateway cannot tell a request from a notification or recover an id — fabricating a response
+    /// would risk answering a notification, so it closes instead.
+    ///
+    /// `scripts/acp-ws-smoke.py` asserted this with a 1 MiB + 64 byte payload and a comment
+    /// reading `> MAX_FRAME_BYTES (1 MiB)`. The ceiling moved to 8 MiB, so that payload stopped
+    /// reaching it — and because the payload was a bare `x` string rather than JSON, the close it
+    /// still observed came from the parse path. The assertion kept passing while covering a
+    /// different mechanism, which is why this now lives here where the gate runs it.
+    #[tokio::test]
+    async fn a_frame_over_the_transport_ceiling_closes_the_connection() {
+        let (url, _registry) = serve().await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let oversized = "x".repeat(super::MAX_FRAME_BYTES + 64);
+        send(&mut ws, json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "pad": oversized}))
+            .await;
+
+        // The connection must go away rather than answer. Bounded so a regression that keeps it
+        // open fails here instead of hanging.
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match ws.next().await {
+                    None => return true,
+                    Some(Err(_)) => return true,
+                    Some(Ok(_)) => return false,
+                }
+            }
+        })
+        .await;
+        assert_eq!(
+            closed,
+            Ok(true),
+            "a frame over the transport ceiling must close the connection, not answer it"
+        );
+    }
+
+    /// The per-kind ceiling: a METHOD-bearing frame over `MAX_NON_TUNNEL_FRAME_BYTES` is refused
+    /// with an error and the connection SURVIVES.
+    ///
+    /// This is the half the smoke script never covered. The 8 MiB allowance exists for tunnel
+    /// results, which arrive as client responses; letting a method-bearing frame use it would make
+    /// the allowance a way to park `MAX_INFLIGHT_PROMPTS` × 8 MiB of prompt text per connection.
+    #[tokio::test]
+    async fn a_method_frame_over_its_ceiling_is_refused_but_keeps_the_connection() {
+        let (url, _registry) = serve().await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        // Over 1 MiB, comfortably under 8 MiB — so it reaches the per-kind check, not the
+        // transport one. Asserting the gap between the two ceilings is the point.
+        let pad = "y".repeat(super::MAX_NON_TUNNEL_FRAME_BYTES + 4096);
+        assert!(pad.len() < super::MAX_FRAME_BYTES, "must not trip the transport ceiling");
+        send(&mut ws, json!({
+            "jsonrpc": "2.0", "id": 7, "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}, "pad": pad}
+        })).await;
+
+        let resp = recv(&mut ws).await;
+        assert_eq!(resp["id"], json!(7));
+        assert!(resp.get("error").is_some(), "an oversized request must be answered with an error: {resp}");
+
+        // And the connection still works — the discriminating half. A regression that closed here
+        // would satisfy every assertion above.
+        send(&mut ws, json!({
+            "jsonrpc": "2.0", "id": 8, "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}}
+        })).await;
+        let after = recv(&mut ws).await;
+        assert_eq!(after["id"], json!(8));
+        assert!(
+            after.get("result").is_some(),
+            "the connection must survive a per-kind refusal: {after}"
+        );
+    }
+
     /// The eviction branch's ONLY coverage — and the scenario that proves it is not dead code.
     ///
     /// `a_resume_replacing_a_same_name_tunnel_disconnects_the_one_it_replaced` is named for
