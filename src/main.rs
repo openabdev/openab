@@ -1733,6 +1733,13 @@ mod tests {
     /// Raising the default to or above the ceiling would silently restore the condition several
     /// commits were spent removing: two clocks starting together, with the wrong one able to fire
     /// first, and no cancellation reaching the peer when it does.
+    ///
+    /// Feature-gated because it names `openab_gateway`, which is an OPTIONAL dependency: the crate
+    /// is absent under default features, so without this gate the whole `openab` test binary fails
+    /// to compile for anyone building without `acp` — including CI, whose `check` job runs a plain
+    /// `cargo test --workspace`. The surrounding `mod tests` is `#[cfg(test)]` only, so the gate has
+    /// to be here.
+    #[cfg(feature = "acp")]
     #[test]
     fn the_default_tunnel_timeout_stays_beneath_the_idle_timeout() {
         let default = openab_core::config::default_tunnel_timeout_seconds();
