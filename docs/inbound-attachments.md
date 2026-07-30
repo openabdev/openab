@@ -177,9 +177,15 @@ Two ordering properties survive the move:
   Different threads never wait on each other.
 - **`/reset` beats work in flight.** A reset invalidates every event admitted
   before it, so a message still being prepared is dropped instead of landing in
-  the new session. The `Dropped n buffered message(s)` count in the reset reply
-  covers buffered messages only; anything still being prepared is dropped with an
-  `info!` log and is not counted.
+  the new session. The fence covers the dispatcher handoff itself, not just the
+  moment before it: a reset arriving while the handoff waits on a full thread
+  queue abandons the message rather than letting the dispatcher's retry place it
+  on a consumer belonging to the new session. A reset also detaches the events
+  that follow it from the ones it discarded, so the first message of the new
+  session never waits out an upload from the old one. The
+  `Dropped n buffered message(s)` count in the reset reply covers buffered
+  messages only; anything still being prepared is dropped with an `info!` log and
+  is not counted.
 
 ## Storage (Colocate Mode)
 

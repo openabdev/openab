@@ -342,19 +342,29 @@ struct PreDispatchOrder {
     threads: HashMap<String, ThreadOrder>,
 }
 
-#[derive(Default)]
 struct ThreadOrder {
     /// Completion of the most recently admitted event. The next one holds it so
     /// it cannot reach the dispatcher first.
     tail: Option<tokio::sync::oneshot::Receiver<()>>,
-    /// Bumped by `/reset`, so a ticket taken before it can tell.
-    generation: u64,
+    /// Bumped by `/reset`. A watch rather than a plain counter so a ticket parked
+    /// in the dispatcher handoff is told about the reset, instead of only being
+    /// able to check for one before it starts waiting.
+    generation: tokio::sync::watch::Sender<u64>,
+}
+
+impl Default for ThreadOrder {
+    fn default() -> Self {
+        Self {
+            tail: None,
+            generation: tokio::sync::watch::channel(0).0,
+        }
+    }
 }
 
 /// One event's place in its thread's order, taken on the receive path.
 struct OrderTicket {
-    key: String,
     generation: u64,
+    reset: tokio::sync::watch::Receiver<u64>,
     predecessor: Option<tokio::sync::oneshot::Receiver<()>>,
     /// Dropped once the event is done with the dispatcher, releasing the next
     /// one. A cancelled or panicking task drops it too, so the chain cannot wedge.
@@ -370,6 +380,49 @@ impl OrderTicket {
             let _ = predecessor.await;
         }
     }
+
+    /// Whether the session this ticket was admitted into is still the live one.
+    fn is_current(&self) -> bool {
+        *self.reset.borrow() == self.generation
+    }
+
+    /// Resolves when `/reset` invalidates this ticket, including a reset that
+    /// landed before this was first awaited.
+    async fn reset_fired(&mut self) {
+        while *self.reset.borrow_and_update() == self.generation {
+            if self.reset.changed().await.is_err() {
+                // The thread was forgotten, so no further reset can reach it.
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
+/// Whether the message reached the dispatcher or was dropped by a `/reset`.
+#[derive(Debug, PartialEq, Eq)]
+enum HandoffOutcome {
+    Submitted,
+    AbandonedByReset,
+}
+
+/// Hand the message to the dispatcher unless `/reset` beats it there. Checking
+/// the generation once beforehand is not enough: a reset landing while `submit`
+/// is parked on a full queue drops the consumer, and `submit` transparently
+/// retries that `SendError` onto a consumer belonging to the new session.
+/// Abandoning the future instead is safe, since a parked `mpsc` send has
+/// enqueued nothing.
+async fn handoff_unless_reset(
+    ticket: &mut OrderTicket,
+    submit: impl std::future::Future<Output = ()>,
+) -> HandoffOutcome {
+    if !ticket.is_current() {
+        return HandoffOutcome::AbandonedByReset;
+    }
+    tokio::select! {
+        biased;
+        () = ticket.reset_fired() => HandoffOutcome::AbandonedByReset,
+        () = submit => HandoffOutcome::Submitted,
+    }
 }
 
 impl PreDispatchOrder {
@@ -380,21 +433,20 @@ impl PreDispatchOrder {
         let entry = self.threads.entry(key.to_string()).or_default();
         let (done, tail) = tokio::sync::oneshot::channel();
         OrderTicket {
-            key: key.to_string(),
-            generation: entry.generation,
+            generation: *entry.generation.borrow(),
+            reset: entry.generation.subscribe(),
             predecessor: entry.tail.replace(tail),
             _done: done,
         }
     }
 
-    /// Invalidate every ticket taken on this thread so far.
+    /// Invalidate every ticket taken on this thread so far, and detach the ones
+    /// that follow from them: an event arriving after a reset must not wait out
+    /// an upload belonging to the session that reset just discarded.
     fn reset(&mut self, key: &str) {
-        self.threads.entry(key.to_string()).or_default().generation += 1;
-    }
-
-    /// Whether the session the ticket was admitted into is still the live one.
-    fn is_current(&self, ticket: &OrderTicket) -> bool {
-        self.threads.get(&ticket.key).map(|t| t.generation) == Some(ticket.generation)
+        let entry = self.threads.entry(key.to_string()).or_default();
+        entry.generation.send_modify(|g| *g += 1);
+        entry.tail = None;
     }
 
     /// Forget threads with nothing in flight. A resolved or absent tail proves
@@ -1372,7 +1424,6 @@ pub async fn run_gateway_adapter(
                                     }
                                     // Taken on the receive path, so the order is arrival order.
                                     let mut ticket = order.lock().unwrap().admit(&gateway_order_key(&event));
-                                    let order_for_event = order.clone();
                                     let fetch_slots = fetch_slots.clone();
 
                                     tasks.spawn(async move {
@@ -1436,18 +1487,20 @@ pub async fn run_gateway_adapter(
                                         // Gates the handoff, not the fetch: the fetch is the part
                                         // that is meant to run concurrently.
                                         ticket.wait_for_turn().await;
-                                        if !order_for_event.lock().unwrap().is_current(&ticket) {
+                                        let outcome = handoff_unless_reset(&mut ticket, async {
+                                            if let Err(e) = dispatcher
+                                                .submit(thread_key, thread_channel, adapter, buf_msg)
+                                                .await
+                                            {
+                                                error!("gateway dispatcher submit error: {e}");
+                                            }
+                                        })
+                                        .await;
+                                        if outcome == HandoffOutcome::AbandonedByReset {
                                             info!(
-                                                platform = %thread_channel.platform,
+                                                platform,
                                                 "gateway: session reset while this message was being prepared, dropping it"
                                             );
-                                            return;
-                                        }
-                                        if let Err(e) = dispatcher
-                                            .submit(thread_key, thread_channel, adapter, buf_msg)
-                                            .await
-                                        {
-                                            error!("gateway dispatcher submit error: {e}");
                                         }
                                     });
                                 }
@@ -1941,17 +1994,86 @@ mod tests {
     fn a_message_being_prepared_when_reset_arrives_is_dropped() {
         let mut order = PreDispatchOrder::default();
         let in_flight = order.admit("telegram:42");
-        assert!(order.is_current(&in_flight));
+        assert!(in_flight.is_current());
 
         order.reset("telegram:42");
-        assert!(!order.is_current(&in_flight));
+        assert!(!in_flight.is_current());
 
         let after_reset = order.admit("telegram:42");
         order.reset("telegram:99");
         assert!(
-            order.is_current(&after_reset),
+            after_reset.is_current(),
             "another thread's reset is not this thread's business"
         );
+    }
+
+    /// The race the generation check alone does not cover: `Dispatcher::submit`
+    /// parks on a full queue, and its `SendError` retry would put this message on
+    /// a consumer belonging to the session created after the reset.
+    #[tokio::test]
+    async fn a_reset_during_a_parked_handoff_abandons_the_message() {
+        let order = Arc::new(std::sync::Mutex::new(PreDispatchOrder::default()));
+        let mut ticket = order.lock().unwrap().admit("telegram:42");
+
+        let reset_order = order.clone();
+        let resetter = tokio::spawn(async move {
+            // Let the handoff park first, so this is the "during" case rather
+            // than the pre-check case the test below covers.
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            reset_order.lock().unwrap().reset("telegram:42");
+        });
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            // Stands in for a submit parked on a full queue: it never resolves.
+            handoff_unless_reset(&mut ticket, std::future::pending::<()>()),
+        )
+        .await
+        .expect("a reset must release a parked handoff");
+
+        assert_eq!(outcome, HandoffOutcome::AbandonedByReset);
+        resetter.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reset_before_the_handoff_abandons_the_message() {
+        let mut order = PreDispatchOrder::default();
+        let mut ticket = order.admit("telegram:42");
+        order.reset("telegram:42");
+
+        let outcome = handoff_unless_reset(&mut ticket, std::future::pending::<()>()).await;
+        assert_eq!(outcome, HandoffOutcome::AbandonedByReset);
+    }
+
+    #[tokio::test]
+    async fn a_handoff_that_lands_first_counts_as_submitted() {
+        let mut order = PreDispatchOrder::default();
+        let mut ticket = order.admit("telegram:42");
+
+        let outcome = handoff_unless_reset(&mut ticket, std::future::ready(())).await;
+        assert_eq!(outcome, HandoffOutcome::Submitted);
+    }
+
+    /// A reset detaches the tail as well as bumping the generation, so the first
+    /// message of the new session does not wait out an upload from the old one.
+    #[tokio::test]
+    async fn a_post_reset_event_does_not_wait_for_pre_reset_work() {
+        let mut order = PreDispatchOrder::default();
+        // Held for the whole test: this stands in for an event still uploading.
+        let _still_uploading = order.admit("telegram:42");
+
+        order.reset("telegram:42");
+        let mut after_reset = order.admit("telegram:42");
+
+        assert!(after_reset.predecessor.is_none());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            after_reset.wait_for_turn(),
+        )
+        .await
+        .expect("a post-reset event must not queue behind discarded work");
     }
 
     /// A ticket dropped without submitting (reset, panic, shutdown) must not wedge
