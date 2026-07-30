@@ -47,8 +47,14 @@ impl AcpMcpTunnel for RootBrowserTunnel {
                     (Some((_, h)), None) => Some(h.clone()),
                     (None, _) => None,
                     (Some(_), Some(_)) => {
+                        // Redacted at construction, same as the `None` arm below and for the same
+                        // reason. This one was MISSED when that one was fixed: the fix landed on
+                        // the site a reviewer cited instead of on every site in the file, twelve
+                        // lines away.
                         return Err(format!(
-                            "multiple MCP servers attached to session {channel_id}; a server_id is required to disambiguate"
+                            "multiple MCP servers attached to session {}; a server_id is \
+                             required to disambiguate",
+                            openab_core::redact::redact_session_ids(channel_id)
                         ));
                     }
                 }

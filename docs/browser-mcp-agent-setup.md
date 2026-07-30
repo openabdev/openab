@@ -42,17 +42,32 @@ INFO browser control: unconfigured — no [mcp] section in config.toml, so brows
 >
 > Remove both, and the kiro agent-file grant that made the bridge entry callable:
 >
+> These delete the entry only when it is **byte-identical to the bridge entry openab wrote**
+> (`{"command":"openab","args":["browser-bridge"]}`). That exact shape is the only proof it is ours
+> rather than a server you configured under the same key — the automation this replaces used the
+> same test, and a manual step should not be more destructive than the automation it stands in for.
+>
 > ```sh
 > # edits in place; check the diff before trusting it
+> BRIDGE='{"command":"openab","args":["browser-bridge"]}'
 > for f in "$HOME/.cursor/mcp.json" "$HOME/.kiro/settings/mcp.json"; do
->   [ -f "$f" ] && jq 'del(.mcpServers["openab-browser"])' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+>   [ -f "$f" ] && jq --argjson bridge "$BRIDGE" \
+>     'if .mcpServers["openab-browser"] == $bridge then del(.mcpServers["openab-browser"]) else . end' \
+>     "$f" > "$f.tmp" && mv "$f.tmp" "$f"
 > done
 > # kiro agent files carry a separate default-deny grant; the entry stays reachable while it is listed
 > for f in "$HOME"/.kiro/agents/*.json; do
->   [ -f "$f" ] && jq 'del(.mcpServers["openab-browser"]) | .allowedTools = ((.allowedTools // []) - ["@openab-browser"])' \
+>   [ -f "$f" ] && jq --argjson bridge "$BRIDGE" \
+>     'if .mcpServers["openab-browser"] == $bridge
+>      then del(.mcpServers["openab-browser"])
+>           | .allowedTools = ((.allowedTools // []) - ["@openab-browser"])
+>      else . end' \
 >     "$f" > "$f.tmp" && mv "$f.tmp" "$f"
 > done
 > ```
+>
+> If your entry under that key is a *different* shape, these leave it alone — openab cannot tell it
+> from a server of yours, which is why the proxy entry was never removed automatically either.
 
 ---
 

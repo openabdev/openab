@@ -646,7 +646,7 @@ impl SessionPool {
                 .active
                 .get(thread_id)
                 .cloned()
-                .ok_or_else(|| anyhow!("no connection for thread {thread_id}"))?
+                .ok_or_else(|| anyhow!("no connection for thread {}", crate::redact::redact_session_ids(thread_id)))?
         };
 
         let mut conn = conn.lock().await;
@@ -678,7 +678,7 @@ impl SessionPool {
                 .active
                 .get(thread_id)
                 .cloned()
-                .ok_or_else(|| anyhow!("no connection for thread {thread_id}"))?
+                .ok_or_else(|| anyhow!("no connection for thread {}", crate::redact::redact_session_ids(thread_id)))?
         };
         let mut conn = conn.lock().await;
         conn.set_config_option(config_id, value).await
@@ -694,7 +694,7 @@ impl SessionPool {
                 .active
                 .get(thread_id)
                 .cloned()
-                .ok_or_else(|| anyhow!("no connection for thread {thread_id}"))?
+                .ok_or_else(|| anyhow!("no connection for thread {}", crate::redact::redact_session_ids(thread_id)))?
         };
         let mut conn = conn.lock().await;
         conn.get_usage().await
@@ -709,7 +709,7 @@ impl SessionPool {
                 .cancel_handles
                 .get(thread_id)
                 .cloned()
-                .ok_or_else(|| anyhow!("no session for thread {thread_id}"))?
+                .ok_or_else(|| anyhow!("no session for thread {}", crate::redact::redact_session_ids(thread_id)))?
         };
         let data = serde_json::to_string(&serde_json::json!({
             "jsonrpc": "2.0",
@@ -763,7 +763,7 @@ impl SessionPool {
             info!(thread_id = %crate::redact::redact_session_ids(thread_id), "session reset");
             Ok(())
         } else {
-            Err(anyhow!("no session for thread {thread_id}"))
+            Err(anyhow!("no session for thread {}", crate::redact::redact_session_ids(thread_id)))
         }
     }
 
