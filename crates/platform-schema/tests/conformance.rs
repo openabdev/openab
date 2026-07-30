@@ -171,13 +171,40 @@ fn check_code_ref(root: &Path, src: &str) -> Result<(), String> {
     if !path.is_file() {
         return Err(format!("source file {:?} does not exist", r.file));
     }
+    let canonical_root = root.canonicalize().map_err(|e| e.to_string())?;
+    let canonical_path = path.canonicalize().map_err(|e| e.to_string())?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(format!("source path {:?} escapes repo root", r.file));
+    }
     if let Some(sym) = r.symbol {
+        if sym.is_empty() {
+            return Err(format!("empty symbol after '#' in {:?}", r.file));
+        }
         let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
         if !text.contains(sym) {
             return Err(format!("symbol {sym:?} not found in {:?} (renamed/deleted?)", r.file));
         }
     }
     Ok(())
+}
+
+#[test]
+fn check_code_ref_rejects_empty_symbol() {
+    let root = repo_root();
+    let err = check_code_ref(&root, "docs/platforms/README.md#")
+        .expect_err("empty symbol must be rejected");
+    assert!(err.contains("empty symbol"), "unexpected error: {err}");
+}
+
+#[test]
+fn check_code_ref_rejects_path_traversal() {
+    let root = repo_root();
+    let err = check_code_ref(&root, "../../../../../../../../../../etc/passwd")
+        .expect_err("path escaping repo root must be rejected");
+    assert!(
+        err.contains("does not exist") || err.contains("escapes repo root"),
+        "unexpected error: {err}"
+    );
 }
 
 /// The template must keep enumerating every capability section + feature key, so

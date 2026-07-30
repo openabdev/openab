@@ -14,6 +14,8 @@ Each `schema/<platform>.toml` has three schema-driven parts:
 
 **Sourcing rule:** attach the source that answers *"why should I trust or keep this?"* — intrinsic `(A)` facts link the **official platform doc** (a `source` URL); OpenAB `(B)` decisions/findings point at the **code** (`file.rs#symbol`) and, where relevant, the **PR** (`pr` / `refs`). Code refs use a grep-stable `#symbol` (no line numbers), so conformance can confirm they still exist without breaking on unrelated edits above the target.
 
+> **Decision:** unlike `[[quirks]]`, every `[[openab_features]]` source must currently be a code-ref — `feature_sources_exist_in_tree` rejects URL sources rather than skipping them. This is intentional, not an oversight: no feature currently needs to cite an official-doc URL, and relaxing the check preemptively would let feature sources silently drift to unverifiable doc links instead of code. Revisit if/when a feature genuinely needs a URL source (see #1340).
+
 ## Conformance
 
 `crates/platform-schema` deserializes every `schema/*.toml` into typed structs and, in CI, enforces:
