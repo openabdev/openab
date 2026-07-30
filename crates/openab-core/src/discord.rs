@@ -27,12 +27,12 @@ use std::sync::LazyLock;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, error, info, warn};
 
-/// Hard cap on consecutive bot messages in a channel or thread.
-/// Prevents runaway loops between multiple bots in "all" mode.
 /// Named so a test can pin it: the agent fetches this link unaided, which is
 /// what makes a size or upload failure safe to report without a store note.
 pub(crate) const DISCORD_CDN_NOTE: &str = "Discord CDN URL, expires ~24h";
 
+/// Hard cap on consecutive bot messages in a channel or thread.
+/// Prevents runaway loops between multiple bots in "all" mode.
 const MAX_CONSECUTIVE_BOT_TURNS: u32 = 1000;
 
 /// Maximum entries in the participation cache before eviction.
