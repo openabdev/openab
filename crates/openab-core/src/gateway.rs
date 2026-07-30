@@ -142,6 +142,7 @@ pub(crate) async fn gateway_audio_blocks(
 async fn read_attachment_sources(
     attachments: &[GwAttachment],
     budget: &SourceBudget,
+    has_filestore: bool,
 ) -> (Vec<Result<Vec<u8>, SourceFailure>>, Vec<SourceBudgetGuard>) {
     let mut sources = Vec::with_capacity(attachments.len());
     let mut guards = Vec::new();
@@ -162,7 +163,8 @@ async fn read_attachment_sources(
             sources.push(Err(SourceFailure::Unreadable("no path or data".into())));
             continue;
         };
-        let Some(guard) = budget.reserve(retained_upper_bound(&att.attachment_type, bound)) else {
+        let reservation = retained_upper_bound(&att.attachment_type, bound, has_filestore);
+        let Some(guard) = budget.reserve(reservation) else {
             tracing::warn!(
                 filename = %att.filename,
                 bytes = bound,
@@ -211,9 +213,23 @@ const SOURCE_BUDGET_REASON: &str =
 const INLINE_BUDGET_REASON: &str =
     "the message was over its attachment payload limit and it was not included";
 
-/// Bytes an assembled block keeps on top of its source. Only the types that
-/// inline bytes retain anything; audio and video carry a URL and metadata.
-fn inline_payload_bytes(attachment_type: &str, source_bytes: u64) -> u64 {
+/// Whether a filestore takes this attachment's bytes instead of the prompt. Text
+/// only crosses over above the inline limit; audio always does.
+fn goes_to_filestore(attachment_type: &str, source_bytes: u64, has_filestore: bool) -> bool {
+    has_filestore
+        && match attachment_type {
+            "audio" => true,
+            "text_file" => source_bytes > crate::media::TEXT_INLINE_LIMIT,
+            _ => false,
+        }
+}
+
+/// Bytes an assembled block keeps on top of its source. Only bytes that reach the
+/// prompt count: an externalized attachment carries a URL, whatever it weighs.
+fn inline_payload_bytes(attachment_type: &str, source_bytes: u64, has_filestore: bool) -> u64 {
+    if goes_to_filestore(attachment_type, source_bytes, has_filestore) {
+        return 0;
+    }
     match attachment_type {
         // base64 spends four characters on every three bytes.
         "image" => source_bytes.div_ceil(3).saturating_mul(4),
@@ -222,10 +238,30 @@ fn inline_payload_bytes(attachment_type: &str, source_bytes: u64) -> u64 {
     }
 }
 
+/// Bytes an upload transiently copies: the request body owns its own buffer while
+/// the original is still alive, for STT or for the inline fallback.
+fn upload_copy_bytes(attachment_type: &str, source_bytes: u64, has_filestore: bool) -> u64 {
+    if goes_to_filestore(attachment_type, source_bytes, has_filestore) {
+        source_bytes
+    } else {
+        0
+    }
+}
+
 /// Peak bytes holding this attachment through assembly can cost: the source, plus
-/// whatever the block built from it retains while the source is still alive.
-fn retained_upper_bound(attachment_type: &str, source_bytes: u64) -> u64 {
-    source_bytes.saturating_add(inline_payload_bytes(attachment_type, source_bytes))
+/// whatever is alive alongside it, whether that is the block or an upload body.
+fn retained_upper_bound(attachment_type: &str, source_bytes: u64, has_filestore: bool) -> u64 {
+    source_bytes
+        .saturating_add(inline_payload_bytes(
+            attachment_type,
+            source_bytes,
+            has_filestore,
+        ))
+        .saturating_add(upload_copy_bytes(
+            attachment_type,
+            source_bytes,
+            has_filestore,
+        ))
 }
 
 /// Whether one more block of `payload` bytes still fits what a message may inline.
@@ -341,6 +377,10 @@ async fn assemble_attachment_blocks(
     // Taken by value so each source moves into its block: cloning here would put a
     // second copy of every attachment outside what the budget reserved.
     debug_assert_eq!(attachments.len(), sources.len());
+    #[cfg(feature = "filestore")]
+    let has_filestore = filestore.is_some();
+    #[cfg(not(feature = "filestore"))]
+    let has_filestore = false;
     let mut extra_blocks = Vec::new();
     let mut inlined = 0u64;
     for (att, source) in attachments.iter().zip(sources) {
@@ -379,7 +419,8 @@ async fn assemble_attachment_blocks(
         // Charged before the payload is built, so the cap bounds the peak and not
         // just what survives it.
         if let Ok(ref bytes) = bytes_result {
-            let payload = inline_payload_bytes(&att.attachment_type, bytes.len() as u64);
+            let payload =
+                inline_payload_bytes(&att.attachment_type, bytes.len() as u64, has_filestore);
             if !fits_inline_budget(inlined, payload, inline_limit) {
                 tracing::warn!(
                     filename = %att.filename,
@@ -520,6 +561,15 @@ fn sheds_attachment_work(pending_events: usize, has_attachments: bool) -> bool {
 /// What the agent is told about attachments the broker refused to fetch under
 /// load. Named the same way a platform-side rejection is, because from the
 /// agent's side the two are the same event: metadata arrived, bytes did not.
+/// Describe the attachments from metadata and drop their bytes. A shed attachment
+/// is never read, so carrying its payload through the wait for a turn bounds
+/// nothing and is what let the pending-event limit miss the memory it names.
+fn shed_attachment_payload(content: &mut GwContent) -> Vec<ContentBlock> {
+    let blocks = shed_attachment_blocks(&content.attachments);
+    content.attachments = Vec::new();
+    blocks
+}
+
 fn shed_attachment_blocks(attachments: &[GwAttachment]) -> Vec<ContentBlock> {
     attachments
         .iter()
@@ -1525,7 +1575,7 @@ pub async fn run_gateway_adapter(
                             }
 
                             match serde_json::from_str::<GatewayEvent>(text_str) {
-                                Ok(event) => {
+                                Ok(mut event) => {
                                     if should_skip_event(&event, &filter) {
                                         continue;
                                     }
@@ -1645,19 +1695,27 @@ pub async fn run_gateway_adapter(
                                     let stt_config = stt_config.clone();
                                     #[cfg(feature = "filestore")]
                                     let filestore = filestore.clone();
+                                    #[cfg(feature = "filestore")]
+                                    let has_filestore = filestore.is_some();
+                                    #[cfg(not(feature = "filestore"))]
+                                    let has_filestore = false;
 
                                     // Reaped here rather than at shutdown so the pending count
                                     // gating attachment fetches means what it says.
                                     while tasks.try_join_next().is_some() {}
                                     let has_attachments = !event.content.attachments.is_empty();
                                     let shed = sheds_attachment_work(tasks.len(), has_attachments);
-                                    if shed {
+                                    // Dropped before the task can capture it, see the helper.
+                                    let shed_blocks = if shed {
                                         warn!(
                                             pending = tasks.len(),
                                             channel = %event.channel.id,
                                             "gateway: pending-attachment limit reached, describing attachments instead of fetching them"
                                         );
-                                    }
+                                        shed_attachment_payload(&mut event.content)
+                                    } else {
+                                        Vec::new()
+                                    };
                                     let budget = source_budget.clone();
                                     // Taken on the receive path, so the order is arrival order.
                                     let mut ticket = order.lock().unwrap().admit(&gateway_order_key(&event));
@@ -1671,13 +1729,14 @@ pub async fn run_gateway_adapter(
                                         // Held for the whole task: the blocks built from these bytes
                                         // outlive assembly, so releasing here would stop bounding them.
                                         let (extra_blocks, _source_guards) = if shed {
-                                            (shed_attachment_blocks(&event.content.attachments), Vec::new())
+                                            (shed_blocks, Vec::new())
                                         } else if has_attachments {
                                             // Read before queueing, so a colocated file cannot be
                                             // swept out from under a task waiting for a slot.
                                             let (sources, guards) = read_attachment_sources(
                                                 &event.content.attachments,
                                                 &budget,
+                                                has_filestore,
                                             )
                                             .await;
                                             // Err only if the semaphore is closed, which it never is.
@@ -1990,7 +2049,12 @@ pub async fn process_gateway_event(
 
     // Convert gateway attachments to ContentBlocks
     let budget = SourceBudget::new(MAX_ADMITTED_SOURCE_BYTES);
-    let (sources, _guards) = read_attachment_sources(&event.content.attachments, &budget).await;
+    #[cfg(feature = "filestore")]
+    let has_filestore = ctx.filestore.is_some();
+    #[cfg(not(feature = "filestore"))]
+    let has_filestore = false;
+    let (sources, _guards) =
+        read_attachment_sources(&event.content.attachments, &budget, has_filestore).await;
     let extra_blocks = assemble_attachment_blocks(
         &event.content.attachments,
         sources,
@@ -2146,9 +2210,12 @@ mod tests {
             gw_attachment("sticker", "wave.tgs", "application/gzip", "YWJj"),
         ];
 
-        let (sources, _guards) =
-            read_attachment_sources(&attachments, &SourceBudget::new(MAX_ADMITTED_SOURCE_BYTES))
-                .await;
+        let (sources, _guards) = read_attachment_sources(
+            &attachments,
+            &SourceBudget::new(MAX_ADMITTED_SOURCE_BYTES),
+            false,
+        )
+        .await;
         let blocks = assemble_attachment_blocks(
             &attachments,
             sources,
@@ -2175,9 +2242,12 @@ mod tests {
         rejected.status = Some("download failed upstream".into());
 
         let attachments = [rejected];
-        let (sources, _guards) =
-            read_attachment_sources(&attachments, &SourceBudget::new(MAX_ADMITTED_SOURCE_BYTES))
-                .await;
+        let (sources, _guards) = read_attachment_sources(
+            &attachments,
+            &SourceBudget::new(MAX_ADMITTED_SOURCE_BYTES),
+            false,
+        )
+        .await;
         let blocks = assemble_attachment_blocks(
             &attachments,
             sources,
@@ -2398,16 +2468,23 @@ mod tests {
         let attachments = [att];
 
         // Admission: read now, queue later.
-        let (sources, _guards) =
-            read_attachment_sources(&attachments, &SourceBudget::new(MAX_ADMITTED_SOURCE_BYTES))
-                .await;
+        let (sources, _guards) = read_attachment_sources(
+            &attachments,
+            &SourceBudget::new(MAX_ADMITTED_SOURCE_BYTES),
+            false,
+        )
+        .await;
 
         // The store's eviction loop runs while the task waits for a slot.
         tokio::fs::remove_file(&path).await.unwrap();
         assert!(
-            read_attachment_sources(&attachments, &SourceBudget::new(MAX_ADMITTED_SOURCE_BYTES))
-                .await
-                .0[0]
+            read_attachment_sources(
+                &attachments,
+                &SourceBudget::new(MAX_ADMITTED_SOURCE_BYTES),
+                false
+            )
+            .await
+            .0[0]
                 .is_err(),
             "the source must really be gone, or this test proves nothing"
         );
@@ -2440,18 +2517,83 @@ mod tests {
         );
 
         assert_eq!(
-            inline_payload_bytes("image", 3),
+            inline_payload_bytes("image", 3, false),
             4,
             "base64 spends four characters on three bytes"
         );
-        assert_eq!(inline_payload_bytes("text_file", 3), 3);
+        assert_eq!(inline_payload_bytes("text_file", 3, false), 3);
         for carries_a_url in ["audio", "video"] {
-            assert_eq!(inline_payload_bytes(carries_a_url, 1_000_000), 0);
+            assert_eq!(inline_payload_bytes(carries_a_url, 1_000_000, false), 0);
         }
         assert_eq!(
-            retained_upper_bound("image", 3),
+            retained_upper_bound("image", 3, false),
             7,
             "the source is alive while its encoded copy is built"
+        );
+    }
+
+    /// Shedding is a memory decision, so it has to release the memory: the bytes go
+    /// before a task that may wait a long time for its turn captures the event.
+    #[test]
+    fn a_shed_event_carries_no_attachment_bytes() {
+        let mut content = GwContent {
+            content_type: "text".into(),
+            text: "look at this".into(),
+            attachments: vec![
+                gw_attachment("image", "a.png", "image/png", "dm9pY2UgYnl0ZXM="),
+                gw_attachment("audio", "b.ogg", "audio/ogg", "dm9pY2UgYnl0ZXM="),
+            ],
+        };
+
+        let blocks = shed_attachment_payload(&mut content);
+
+        assert_eq!(blocks.len(), 2, "both are still described to the agent");
+        assert!(
+            block_text(blocks.into_iter().next().unwrap()).contains("pending-attachment limit"),
+            "the reason names the limit that shed it"
+        );
+        assert!(
+            content.attachments.is_empty(),
+            "the payload must not survive into the wait for a turn"
+        );
+    }
+
+    /// What a filestore takes never reaches the prompt, so charging it against the
+    /// inline cap would spend the allowance on bytes the message does not carry.
+    #[test]
+    fn a_filestore_moves_the_charge_from_the_prompt_to_the_upload() {
+        let big = crate::media::TEXT_INLINE_LIMIT + 1;
+
+        assert_eq!(
+            inline_payload_bytes("text_file", big, true),
+            0,
+            "an externalized text file is delivered as a URL"
+        );
+        assert_eq!(
+            inline_payload_bytes("text_file", big, false),
+            big,
+            "with no store to take it, the same file is inlined whole"
+        );
+        assert_eq!(
+            inline_payload_bytes("text_file", crate::media::TEXT_INLINE_LIMIT, true),
+            crate::media::TEXT_INLINE_LIMIT,
+            "under the limit it is inlined even when a store exists"
+        );
+
+        assert_eq!(
+            retained_upper_bound("audio", 100, true),
+            200,
+            "the upload body is a second buffer alive with the source"
+        );
+        assert_eq!(
+            retained_upper_bound("audio", 100, false),
+            100,
+            "with no store there is no upload to copy for"
+        );
+        assert_eq!(
+            retained_upper_bound("image", 3, true),
+            7,
+            "images are never externalized on this path"
         );
     }
 
@@ -2464,14 +2606,14 @@ mod tests {
         let attachments = [image];
 
         let tight = SourceBudget::new(source);
-        let (refused, _) = read_attachment_sources(&attachments, &tight).await;
+        let (refused, _) = read_attachment_sources(&attachments, &tight, false).await;
         assert!(
             matches!(refused[0], Err(SourceFailure::Undeliverable(_))),
             "room for the source alone must not admit the copy built from it"
         );
 
-        let enough = SourceBudget::new(retained_upper_bound("image", source));
-        let (admitted, guards) = read_attachment_sources(&attachments, &enough).await;
+        let enough = SourceBudget::new(retained_upper_bound("image", source, false));
+        let (admitted, guards) = read_attachment_sources(&attachments, &enough, false).await;
         assert!(admitted[0].is_ok(), "room for both must admit it");
         assert_eq!(guards.len(), 1);
     }
@@ -2485,9 +2627,9 @@ mod tests {
             gw_attachment("image", "b.png", "image/png", "dm9pY2UgYnl0ZXM="),
         ];
         let budget = SourceBudget::new(MAX_ADMITTED_SOURCE_BYTES);
-        let (sources, _guards) = read_attachment_sources(&attachments, &budget).await;
+        let (sources, _guards) = read_attachment_sources(&attachments, &budget, false).await;
         // Eleven decoded bytes encode to sixteen, so exactly one of them fits.
-        let limit = inline_payload_bytes("image", 11);
+        let limit = inline_payload_bytes("image", 11, false);
 
         let blocks = assemble_attachment_blocks(
             &attachments,
@@ -2551,7 +2693,7 @@ mod tests {
         // Room for one of them, and only because the charge is the real size.
         let budget = SourceBudget::new(source_upper_bound(&first).await.unwrap());
         let attachments = [first, second];
-        let (sources, guards) = read_attachment_sources(&attachments, &budget).await;
+        let (sources, guards) = read_attachment_sources(&attachments, &budget, false).await;
 
         assert!(sources[0].is_ok(), "the first still fits");
         assert!(
@@ -2567,7 +2709,7 @@ mod tests {
         let attachments = [att];
         // No room at all.
         let budget = SourceBudget::new(0);
-        let (sources, _guards) = read_attachment_sources(&attachments, &budget).await;
+        let (sources, _guards) = read_attachment_sources(&attachments, &budget, false).await;
 
         let blocks = assemble_attachment_blocks(
             &attachments,

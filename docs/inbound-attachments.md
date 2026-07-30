@@ -166,7 +166,7 @@ has a load problem to report rather than a value to raise.
 | Limit | Value | Effect when reached |
 |-------|-------|---------------------|
 | Concurrent attachment fetches | 4 | Further events queue for a slot. Their sources are already read by then (see below), so queueing costs latency, not content |
-| Pending pre-dispatch events | 32 | The next event's attachment bytes are **not** fetched. The agent still receives the message, carrying the same `[System: attachment ... was not delivered ...]` line a platform-side rejection produces, with the limit named as the reason |
+| Pending pre-dispatch events | 32 | The next event's attachment bytes are **not** fetched, and the bytes it arrived with are released before it queues. The agent still receives the message, carrying the same `[System: attachment ... was not delivered ...]` line a platform-side rejection produces, with the limit named as the reason |
 | Retained attachment bytes | 256 MiB | Same effect as the pending-event limit, per attachment rather than per event: that attachment is delivered as a `not delivered` line and the rest of the message goes through. Charged against bytes actually held, never against the platform's declared size, and the read is capped at what was reserved so an under-reported size cannot overshoot |
 | Inlined bytes per message | 24 MiB | The attachment that would cross it is described rather than inlined, again as a `not delivered` line |
 | Tracked thread keys | 256 | Idle threads are forgotten; keys with work in flight are kept |
@@ -183,9 +183,16 @@ before a source is read and covers the source together with the block built from
 it, since both are alive at once; it is returned when the event reaches the
 dispatcher. The blocks themselves live on in the dispatcher's queue, which is
 bounded by message count (`max_buffered_messages`, 10 per thread) and not by
-size, so the per-message inline cap is what bounds it in bytes. Only the types
-that inline bytes are charged against that cap: audio and video carry a URL and
-metadata whatever their source weighs.
+size, so the per-message inline cap is what bounds it in bytes.
+
+Only bytes that reach the prompt are charged against that cap. Images and text
+files under `TEXT_INLINE_LIMIT` are inlined and pay for it; audio, and text above
+that limit when a filestore is configured, are delivered as a URL and pay
+nothing, whatever their source weighs. Gateway video is not a case here at all:
+it is rejected before Core sees it, per [Unsupported Types](#unsupported-types).
+An attachment a filestore takes is charged against the 256 MiB budget instead,
+and for twice its size, because the upload body is a second buffer alive with the
+source it was copied from.
 
 Two ordering properties survive the move:
 
