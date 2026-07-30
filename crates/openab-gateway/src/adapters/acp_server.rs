@@ -910,6 +910,30 @@ impl TunnelHandle {
 /// MCP protocol version the gateway speaks to a tunnelled client MCP server.
 const INNER_MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// Revisions this gateway ACCEPTS in an inner `initialize` result (R5, D-2026-07-30-10).
+///
+/// Negotiation, not equality. MCP says a server that does not support the requested revision
+/// answers with one it does support, so strict equality against
+/// [`INNER_MCP_PROTOCOL_VERSION`] rejected a peer for behaving exactly as specified. That matters
+/// here because the point of client-declared `type:acp` servers is to work with peers we did not
+/// write.
+///
+/// WHY THIS SET IS SAFE — re-check this before adding a fifth inner method.
+///
+/// The whole inner surface this gateway drives is four methods, and their shapes are compatible
+/// across all three revisions:
+///
+///   - `initialize` and `notifications/initialized` — `inner_mcp_handshake`, below;
+///   - `tools/list` — `src/browser_source.rs:200`;
+///   - `tools/call` — `src/browser_source.rs:351`.
+///
+/// Verified against the tree: those are the only methods reaching an inner server. A fifth would
+/// have to be re-checked across the set, because compatibility is a property of the methods we
+/// actually send, not of the revisions in the abstract. A bare list of version strings with no
+/// stated reason is how this becomes silently wrong later.
+const SUPPORTED_INNER_MCP_PROTOCOL_VERSIONS: [&str; 3] =
+    ["2025-06-18", "2025-03-26", "2024-11-05"];
+
 /// Perform the inner MCP handshake on a freshly connected tunnel.
 ///
 /// MCP requires `initialize` → response → `notifications/initialized` before any other request. We
@@ -951,11 +975,12 @@ async fn inner_mcp_handshake(
     // reason nothing in the log explains — the exact opaque failure this handshake exists to
     // prevent. Refuse the establish instead, and name both versions so the mismatch is readable.
     match init.get("protocolVersion").and_then(Value::as_str) {
-        Some(INNER_MCP_PROTOCOL_VERSION) => {}
+        Some(v) if SUPPORTED_INNER_MCP_PROTOCOL_VERSIONS.contains(&v) => {}
         Some(other) => {
             return Err(format!(
-                "inner MCP server answered protocolVersion {other}, but this gateway speaks \
-                 {INNER_MCP_PROTOCOL_VERSION}"
+                "inner MCP server answered protocolVersion {other}, which this gateway does not \
+                 speak (requested {INNER_MCP_PROTOCOL_VERSION}, accepts {})",
+                SUPPORTED_INNER_MCP_PROTOCOL_VERSIONS.join(", ")
             ));
         }
         None => {
@@ -2816,6 +2841,84 @@ mod acp_requests {
     fn new_pending(
     ) -> Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>> {
         Arc::new(tokio::sync::Mutex::new(HashMap::new()))
+    }
+
+    /// Drive `inner_mcp_handshake` against a peer answering `version`, and report the outcome.
+    ///
+    /// The handshake awaits a reply, so the answer has to be routed from a second task; doing it
+    /// inline deadlocks on the `pending` entry that has not been created yet.
+    async fn handshake_answering(version: Option<&str>) -> Result<(), String> {
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        let pending = new_pending();
+        let next_id = AtomicU64::new(1);
+        let p2 = pending.clone();
+        let version = version.map(str::to_string);
+        let responder = tokio::spawn(async move {
+            let f: serde_json::Value =
+                serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
+            let result = match version {
+                Some(v) => json!({
+                    "protocolVersion": v, "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "test-ext", "version": "0"}
+                }),
+                // A result with no `protocolVersion` at all — the branch that was never in
+                // dispute and must keep rejecting.
+                None => json!({
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "test-ext", "version": "0"}
+                }),
+            };
+            route_client_response(&p2, &json!({"jsonrpc":"2.0","id":f["id"],"result":result}))
+                .await;
+            // Drain `notifications/initialized` if the handshake got far enough to send it.
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(200), out_rx.recv()).await;
+        });
+        let r = super::inner_mcp_handshake(&out_tx, &pending, &next_id, "conn-1", 5).await;
+        let _ = responder.await;
+        r
+    }
+
+    /// Every revision in the accepted set must be accepted (R5, D-2026-07-30-10).
+    ///
+    /// Asserted per-revision rather than "the set is non-empty": a membership test that only ever
+    /// exercises the requested version would pass for the strict-equality code this replaced.
+    #[tokio::test]
+    async fn every_supported_inner_revision_is_accepted() {
+        for v in super::SUPPORTED_INNER_MCP_PROTOCOL_VERSIONS {
+            assert!(
+                handshake_answering(Some(v)).await.is_ok(),
+                "{v} is in the supported set, so a peer answering it must be accepted"
+            );
+        }
+    }
+
+    /// A peer answering with a revision outside the set is still refused, and the error names both
+    /// what we asked for and what we accept — otherwise the operator cannot tell a version
+    /// mismatch from an unreachable peer.
+    #[tokio::test]
+    async fn a_revision_outside_the_set_is_still_refused() {
+        let err = handshake_answering(Some("1999-01-01"))
+            .await
+            .expect_err("an unknown revision must not be negotiated into");
+        assert!(err.contains("1999-01-01"), "the error must name what the peer answered: {err}");
+        assert!(
+            err.contains(super::INNER_MCP_PROTOCOL_VERSION),
+            "the error must name what we requested: {err}"
+        );
+        assert!(
+            err.contains("2024-11-05"),
+            "the error must name what we accept, or the operator cannot tell what to change: {err}"
+        );
+    }
+
+    /// The `None` branch was never in dispute: a result carrying no `protocolVersion` string is
+    /// not a compliant answer, and widening acceptance must not have widened this.
+    #[tokio::test]
+    async fn a_result_with_no_protocol_version_is_refused() {
+        let err = handshake_answering(None)
+            .await
+            .expect_err("no protocolVersion is not a compliant initialize result");
+        assert!(err.contains("no `protocolVersion`"), "unexpected error: {err}");
     }
 
     #[tokio::test]
@@ -5208,6 +5311,9 @@ mod acp_ws_integration {
     ///
     /// The mock answered the supported version everywhere, so the happy path was the only path the
     /// suite could reach and an absent check passed.
+    ///
+    /// "Unsupported" means outside `SUPPORTED_INNER_MCP_PROTOCOL_VERSIONS`, which since R5 holds
+    /// three revisions rather than one — being older than what we request is no longer sufficient.
     #[tokio::test]
     async fn a_server_answering_an_unsupported_protocol_version_is_not_registered() {
         let (url, registry) = serve().await;
@@ -5222,8 +5328,18 @@ mod acp_ws_integration {
             "params": {"cwd": "/w", "mcpServers": [{"type": "acp", "id": "srv-1", "name": "katashiro"}]}
         })).await;
 
-        // Answer `mcp/connect`, then answer `initialize` SUCCESSFULLY with an older spec version.
-        // 2024-11-05 is a real MCP revision, so this is a plausible peer rather than a nonsense one.
+        // Answer `mcp/connect`, then answer `initialize` SUCCESSFULLY with a revision outside the
+        // accepted set.
+        //
+        // This used to be `2024-11-05`, chosen because a real MCP revision makes a more plausible
+        // peer than a nonsense string. R5 then ADDED that revision to
+        // `SUPPORTED_INNER_MCP_PROTOCOL_VERSIONS`, so the literal quietly became a SUPPORTED
+        // version and this test began asserting the opposite of the decided behaviour. Picking a
+        // realistic example coupled the test to the policy it was meant to be independent of.
+        //
+        // `2019-01-01` is well-formed and deliberately not a real revision, so extending the set
+        // cannot silently invert this test again. If it is ever added, that is a decision someone
+        // has to make explicitly.
         let mut answered = false;
         while !answered {
             let f = recv(&mut ws).await;
@@ -5238,7 +5354,7 @@ mod acp_ws_integration {
                     send(&mut ws, json!({
                         "jsonrpc": "2.0", "id": f["id"].clone(),
                         "result": {
-                            "protocolVersion": "2024-11-05",
+                            "protocolVersion": "2019-01-01",
                             "capabilities": { "tools": {} },
                             "serverInfo": { "name": "old-ext", "version": "0" }
                         }
