@@ -426,7 +426,7 @@ impl SessionPool {
                 {
                     Some(token) => {
                         session_token = Some(token.clone());
-                        info!(thread_id, "session token minted for facade browser capabilities");
+                        info!(thread_id = %crate::redact::redact_session_ids(thread_id), "session token minted for facade browser capabilities");
                         // The guard carries the TOKEN it minted, not the channel. A replaced
                         // session's teardown runs after its successor has already re-minted for
                         // the same channel, so revoking by channel would strip the live token and
@@ -480,7 +480,7 @@ impl SessionPool {
             if new_conn.supports_load_session {
                 match new_conn.session_load(sid, &effective_workdir).await {
                     Ok(()) => {
-                        info!(thread_id, session_id = %sid, "session resumed via session/load");
+                        info!(thread_id = %crate::redact::redact_session_ids(thread_id), session_id = %crate::redact::redact_session_ids(sid), "session resumed via session/load");
                         resumed = true;
                     }
                     Err(e) => {
@@ -488,7 +488,7 @@ impl SessionPool {
                         let is_transient =
                             TRANSIENT_LOAD_ERRORS.iter().any(|s| err_str.contains(s));
                         if is_transient {
-                            warn!(thread_id, session_id = %sid, error = %e,
+                            warn!(thread_id = %crate::redact::redact_session_ids(thread_id), session_id = %crate::redact::redact_session_ids(sid), error = %e,
                                 "session/load failed transiently, preserving session ID for retry");
                             load_failed = Some(if err_str.contains("timeout waiting for") {
                                 "timeout"
@@ -496,7 +496,7 @@ impl SessionPool {
                                 "connection lost"
                             });
                         } else {
-                            warn!(thread_id, session_id = %sid, error = %e,
+                            warn!(thread_id = %crate::redact::redact_session_ids(thread_id), session_id = %crate::redact::redact_session_ids(sid), error = %e,
                                 "session/load failed, creating new session");
                         }
                     }
@@ -552,7 +552,7 @@ impl SessionPool {
             if existing.alive() {
                 return Ok(false);
             }
-            warn!(thread_id, "stale connection, rebuilding");
+            warn!(thread_id = %crate::redact::redact_session_ids(thread_id), "stale connection, rebuilding");
             drop(existing);
             state.active.remove(thread_id);
             state.cancel_handles.remove(thread_id);
@@ -566,7 +566,7 @@ impl SessionPool {
                     state.cancel_handles.remove(&key);
                     state.activity.remove(&key);
                     state.pgids.remove(&key);
-                    info!(evicted = %key, "pool full, suspending oldest idle session");
+                    info!(evicted = %crate::redact::redact_session_ids(&key), "pool full, suspending oldest idle session");
                     if let Some(sid) = sid {
                         state.persisted.insert(key.clone(), sid.clone());
                         state.suspended.insert(key, sid);
@@ -574,7 +574,7 @@ impl SessionPool {
                         state.persisted.remove(&key);
                     }
                 } else {
-                    warn!(evicted = %key, "pool full but eviction candidate changed before removal");
+                    warn!(evicted = %crate::redact::redact_session_ids(&key), "pool full but eviction candidate changed before removal");
                 }
             } else if skipped_locked_candidates > 0 {
                 warn!(
@@ -716,7 +716,7 @@ impl SessionPool {
             "method": "session/cancel",
             "params": {"sessionId": session_id}
         }))?;
-        tracing::info!(session_id, "sending session/cancel");
+        tracing::info!(session_id = %crate::redact::redact_session_ids(&session_id), "sending session/cancel");
         use tokio::io::AsyncWriteExt;
         let mut w = stdin.lock().await;
         w.write_all(data.as_bytes()).await?;
@@ -742,7 +742,7 @@ impl SessionPool {
                 "method": "session/cancel",
                 "params": {"sessionId": session_id}
             }))?;
-            tracing::info!(session_id, "reset: sending session/cancel");
+            tracing::info!(session_id = %crate::redact::redact_session_ids(&session_id), "reset: sending session/cancel");
             use tokio::io::AsyncWriteExt;
             let mut w = stdin.lock().await;
             let _ = w.write_all(data.as_bytes()).await;
@@ -760,7 +760,7 @@ impl SessionPool {
         self.save_mapping(&state.persisted);
         self.save_meta(&state.session_workdirs);
         if had_active {
-            info!(thread_id, "session reset");
+            info!(thread_id = %crate::redact::redact_session_ids(thread_id), "session reset");
             Ok(())
         } else {
             Err(anyhow!("no session for thread {thread_id}"))
@@ -862,7 +862,7 @@ impl SessionPool {
         let mut state = self.state.write().await;
         for (key, expected_conn, sid) in stale {
             if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
-                info!(thread_id = %key, "cleaning up idle session");
+                info!(thread_id = %crate::redact::redact_session_ids(&key), "cleaning up idle session");
                 state.cancel_handles.remove(&key);
                 state.activity.remove(&key);
                 state.pgids.remove(&key);
@@ -877,7 +877,7 @@ impl SessionPool {
         }
         for (key, expected_conn) in hung {
             if !apply_hung_eviction(&mut state, &key, &expected_conn) {
-                warn!(thread_id = %key, "hung session was replaced before eviction; maps untouched");
+                warn!(thread_id = %crate::redact::redact_session_ids(&key), "hung session was replaced before eviction; maps untouched");
             }
         }
         self.save_mapping(&state.persisted);

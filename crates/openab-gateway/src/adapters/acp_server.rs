@@ -1880,7 +1880,7 @@ async fn handle_session_new(
     );
 
     // Downgraded from info! — sessionId is a resume capability; keep it out of normal logs (F12).
-    debug!(session = %session_id, "ACP session created");
+    debug!(session = %redact_id(&session_id), "ACP session created");
 
     // ACP session/new response is just { sessionId }. Constructed from the generated
     // NewSessionResponse (T2.1) so the wire shape is type-checked against acp_schema; the
@@ -1990,7 +1990,7 @@ async fn handle_session_resume(
     );
     drop(guard);
 
-    debug!(session = %session_id, "ACP session resumed");
+    debug!(session = %redact_id(&session_id), "ACP session resumed");
 
     // ACP session/resume response is an empty object (no history replay) — the generated
     // ResumeSessionResponse default serializes to {} (T2.1, type-checked against acp_schema).
@@ -2172,7 +2172,7 @@ async fn handle_session_prompt(
         }
     }
 
-    debug!(session = %session_id, channel = %channel_id, "ACP: prompt dispatched");
+    debug!(session = %redact_id(&session_id), channel = %redact_id(&channel_id), "ACP: prompt dispatched");
 
     // Stream replies back as ACP `session/update` notifications.
     let mut sent_len = 0usize;
