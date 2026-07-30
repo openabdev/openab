@@ -10,9 +10,17 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The 8 platforms that must have a schema file.
+/// The 9 platforms that must have a schema file.
 const EXPECTED_PLATFORMS: &[&str] = &[
-    "line", "slack", "telegram", "discord", "feishu", "wecom", "googlechat", "teams",
+    "line",
+    "slack",
+    "telegram",
+    "discord",
+    "feishu",
+    "wecom",
+    "googlechat",
+    "teams",
+    "lineworks",
 ];
 
 fn repo_root() -> PathBuf {

@@ -22,7 +22,24 @@ pub const REPLY_TOKEN_CACHE_MAX: usize = 10_000;
 /// Maximum number of post-ack LINE webhook payloads processed concurrently.
 pub const LINE_WEBHOOK_CONCURRENCY_MAX: usize = 8;
 
+/// Maximum number of post-ack LINE WORKS webhook events processed concurrently.
+pub const LINEWORKS_WEBHOOK_CONCURRENCY_MAX: usize = 8;
+
+/// Maximum number of accepted LINE WORKS callbacks allowed to wait for a
+/// worker permit. Bursts up to this depth are acknowledged and queued instead
+/// of rejected (LINE WORKS does not resend callbacks); beyond it the webhook
+/// answers 503 — a loud, bounded overflow.
+pub const LINEWORKS_INGRESS_QUEUE_MAX: usize = 64;
+
 // --- App state (shared across all adapters) ---
+
+/// Pre-download identity probe installed by the unified binary: maps
+/// `(platform, channel_id, sender_id)` to "may this sender consume adapter
+/// resources?". Lets adapters apply the core L3 identity gate BEFORE
+/// expensive work (attachment download) without a crate dependency on
+/// openab-core. `None` = probe unavailable (standalone gateway) — adapters
+/// proceed and the core-side ingress gate still applies after broadcast.
+pub type IngressTrustProbe = Arc<dyn Fn(&str, &str, &str) -> bool + Send + Sync>;
 
 /// Whether a webhook platform's L1 (transport authentication) is unenforceable:
 /// the platform is active (configured to receive traffic) but its verification
@@ -64,10 +81,19 @@ pub struct AppState {
     pub acp_reply_registry: Option<adapters::acp_server::AcpReplyRegistry>,
     #[cfg(feature = "acp")]
     pub acp_tunnel_registry: Option<adapters::acp_server::AcpTunnelRegistry>,
+    #[cfg(feature = "lineworks")]
+    pub lineworks: Option<Arc<adapters::lineworks::LineWorksAdapter>>,
     pub ws_token: Option<String>,
     pub event_tx: broadcast::Sender<String>,
     pub reply_token_cache: ReplyTokenCache,
     pub line_webhook_semaphore: Arc<Semaphore>,
+    /// Bounds post-ack LINE WORKS webhook processing (mention gate + attachment download).
+    pub lineworks_webhook_semaphore: Arc<Semaphore>,
+    /// Bounds LINE WORKS callbacks accepted but still waiting for a worker
+    /// permit — burst absorption (see [`LINEWORKS_INGRESS_QUEUE_MAX`]).
+    pub lineworks_ingress_queue: Arc<Semaphore>,
+    /// Optional pre-download identity probe (see [`IngressTrustProbe`]).
+    pub trust_probe: Option<IngressTrustProbe>,
     pub client: reqwest::Client,
 }
 
@@ -109,10 +135,15 @@ impl AppState {
             acp_reply_registry: None,
             #[cfg(feature = "acp")]
             acp_tunnel_registry: None,
+            #[cfg(feature = "lineworks")]
+            lineworks: None,
             ws_token: None,
             event_tx,
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
+        lineworks_webhook_semaphore: Arc::new(Semaphore::new(LINEWORKS_WEBHOOK_CONCURRENCY_MAX)),
+        lineworks_ingress_queue: Arc::new(Semaphore::new(LINEWORKS_INGRESS_QUEUE_MAX)),
+        trust_probe: None,
             client: reqwest::Client::new(),
         }
     }
@@ -188,6 +219,12 @@ impl AppState {
         let acp_reply_registry = acp.as_ref().map(|_| adapters::acp_server::new_reply_registry());
         #[cfg(feature = "acp")]
         let acp_tunnel_registry = acp.as_ref().map(|_| adapters::acp_server::new_tunnel_registry());
+        // LINE WORKS
+        #[cfg(feature = "lineworks")]
+        let lineworks = adapters::lineworks::LineWorksConfig::from_env().map(|config| {
+            info!("lineworks adapter configured");
+            Arc::new(adapters::lineworks::LineWorksAdapter::new(config))
+        });
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -220,10 +257,15 @@ impl AppState {
             acp_reply_registry,
             #[cfg(feature = "acp")]
             acp_tunnel_registry,
+            #[cfg(feature = "lineworks")]
+            lineworks,
             ws_token,
             event_tx,
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
+        lineworks_webhook_semaphore: Arc::new(Semaphore::new(LINEWORKS_WEBHOOK_CONCURRENCY_MAX)),
+        lineworks_ingress_queue: Arc::new(Semaphore::new(LINEWORKS_INGRESS_QUEUE_MAX)),
+        trust_probe: None,
             client,
         }
     }
@@ -351,6 +393,31 @@ impl AppState {
         self.line_webhook_path = cfg.webhook_path;
     }
 
+    /// Apply resolved `[lineworks]` config values, rebuilding the adapter
+    /// through the same `from_reader` validation as env-only construction —
+    /// an incomplete section resolves to no adapter, matching env-only
+    /// semantics. Same crate-boundary pattern as
+    /// [`AppState::apply_wecom_config`].
+    #[cfg(feature = "lineworks")]
+    pub fn apply_lineworks_config(&mut self, cfg: GatewayLineWorksConfig) {
+        self.lineworks = adapters::lineworks::LineWorksConfig::from_reader(|k| match k {
+            "LINEWORKS_BOT_ID" => cfg.bot_id.clone(),
+            "LINEWORKS_BOT_SECRET" => cfg.bot_secret.clone(),
+            "LINEWORKS_CLIENT_ID" => cfg.client_id.clone(),
+            "LINEWORKS_CLIENT_SECRET" => cfg.client_secret.clone(),
+            "LINEWORKS_SERVICE_ACCOUNT" => cfg.service_account.clone(),
+            "LINEWORKS_PRIVATE_KEY" => cfg.private_key.clone(),
+            "LINEWORKS_PRIVATE_KEY_FILE" => cfg.private_key_file.clone(),
+            "LINEWORKS_WEBHOOK_PATH" => Some(cfg.webhook_path.clone()),
+            "LINEWORKS_REQUIRE_MENTION" => Some(cfg.require_mention.to_string()),
+            "LINEWORKS_BOT_NAME" => cfg.bot_name.clone(),
+            "LINEWORKS_RICH_MESSAGES" => Some(cfg.rich_messages.to_string()),
+            "LINEWORKS_ACK_MESSAGE" => cfg.ack_message.clone(),
+            _ => None,
+        })
+        .map(|config| Arc::new(adapters::lineworks::LineWorksAdapter::new(config)));
+    }
+
     /// Apply resolved `[wecom]` config values (#1378), rebuilding the WeCom
     /// adapter from them. Reuses the adapter's `from_reader` construction so
     /// the exact same validation applies (all five credentials mandatory,
@@ -442,6 +509,25 @@ pub struct GatewayLineConfig {
     pub channel_secret: Option<String>,
     pub channel_access_token: Option<String>,
     pub webhook_path: String,
+}
+
+/// Parameter object for passing resolved LINE WORKS config across the crate
+/// boundary without introducing a dependency on `openab-core`.
+/// Fields are the fully resolved (config → env → default) values.
+#[derive(Debug, Clone)]
+pub struct GatewayLineWorksConfig {
+    pub bot_id: Option<String>,
+    pub bot_secret: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub service_account: Option<String>,
+    pub private_key: Option<String>,
+    pub private_key_file: Option<String>,
+    pub webhook_path: String,
+    pub require_mention: bool,
+    pub bot_name: Option<String>,
+    pub rich_messages: bool,
+    pub ack_message: Option<String>,
 }
 
 /// Parameter object for passing resolved WeCom config across the crate
@@ -707,6 +793,16 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     let acp_tunnel_registry = acp
         .as_ref()
         .map(|_| adapters::acp_server::new_tunnel_registry());
+    // LINE WORKS adapter
+    #[cfg(feature = "lineworks")]
+    let lineworks = adapters::lineworks::LineWorksConfig::from_env()
+        .map(|config| Arc::new(adapters::lineworks::LineWorksAdapter::new(config)));
+    #[cfg(feature = "lineworks")]
+    if let Some(ref lw) = lineworks {
+        let path = lw.config.webhook_path.clone();
+        info!(path = %path, "lineworks adapter enabled");
+        app = app.route(&path, post(adapters::lineworks::webhook));
+    }
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -743,10 +839,15 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         acp_reply_registry,
         #[cfg(feature = "acp")]
         acp_tunnel_registry,
+        #[cfg(feature = "lineworks")]
+        lineworks,
         ws_token,
         event_tx,
         reply_token_cache,
         line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
+        lineworks_webhook_semaphore: Arc::new(Semaphore::new(LINEWORKS_WEBHOOK_CONCURRENCY_MAX)),
+        lineworks_ingress_queue: Arc::new(Semaphore::new(LINEWORKS_INGRESS_QUEUE_MAX)),
+        trust_probe: None,
         client,
     });
 
@@ -968,6 +1069,26 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                             "acp" => {
                                 if let Some(ref registry) = state_for_recv.acp_reply_registry {
                                     adapters::acp_server::handle_reply(&reply, registry).await;
+                                }
+                            }
+                            #[cfg(feature = "lineworks")]
+                            "lineworks" => {
+                                if let Some(ref lineworks) = state_for_recv.lineworks {
+                                    let ok = adapters::lineworks::dispatch_lineworks_reply(
+                                        &client,
+                                        lineworks,
+                                        &reply,
+                                    )
+                                    .await;
+                                    if !ok {
+                                        tracing::error!(
+                                            channel = %reply.channel.id,
+                                            command = ?reply.command.as_deref(),
+                                            "lineworks reply delivery failed — reply lost"
+                                        );
+                                    }
+                                } else {
+                                    warn!("reply for lineworks but adapter not configured");
                                 }
                             }
                             other => warn!(platform = other, "unknown reply platform"),

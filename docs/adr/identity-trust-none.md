@@ -688,6 +688,7 @@ Handler. The Trust Gate only evaluates human sender identity.
 | WeCom | `trusted_bot_ids.contains(userid)` | WeCom has no reliable native bot flag; match against known bot IDs. Note: `enter_agent` (member-enter event) is user-initiated — do NOT treat as bot. **Today the Receiver hardcodes `is_bot = false`** (`wecom.rs`), so the L3 bot-bypass is a no-op for WeCom until bot detection is implemented — the bypass is *available* uniformly but *effective* only where the Receiver can derive `is_bot` |
 | Google Chat | `message.sender.type == "BOT"` | Native field from Chat API event payload |
 | MS Teams | `activity.from.role == "bot"` or `trusted_bot_ids.contains(activity.from.id)` | Bot Framework marks bot senders with role field; verify against known bot IDs for reliability |
+| LINE WORKS | Always `false` | Message callbacks deliver user messages only (no bot-to-bot delivery, same as LINE); bot-bypass is a no-op |
 
 **`trusted_bot_ids` is shared config (NOT Handler-only):**
 
@@ -818,6 +819,7 @@ calls platform APIs directly.
 | WeCom | Reply in-chat via `message.send` API | Uses the application's send-message endpoint; targets the source conversation |
 | Google Chat | Reply in-space via `spaces.messages.create` | Replies in the same space; for DMs uses the DM space with the user |
 | MS Teams | Reply in-conversation via Bot Framework `sendToConversation` | Uses the Bot Framework connector to reply in the originating conversation |
+| LINE WORKS | Ordinary push send to the originating user/channel | No reply-token mechanism exists (all sends are pushes); per-sender echo throttle bounds amplification. Per-message push quota is unpublished (`?`-flagged in the platform schema) |
 
 **Echo content by scope (leak-safe):**
 - **DM / 1:1 context:** echo includes sender UID (self-serve — user forwards to admin to request access)

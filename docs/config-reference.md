@@ -159,6 +159,43 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
 
 ---
 
+## `[lineworks]`
+
+First-class LINE WORKS section — bot credentials and service-account auth (config-first parity, #1375). Each field resolves: config → `LINEWORKS_*` env → default. The adapter is enabled only when `bot_id`, `bot_secret`, `client_id`, `client_secret`, `service_account`, and a private key (inline or file) all resolve to non-empty values; an incomplete section disables the adapter, matching env-only semantics.
+
+LINE WORKS is webhook-only: register the callback URL (`https://<host><webhook_path>`) in the Developer Console — a CA-signed HTTPS certificate is required (no self-signed). Outbound messages authenticate via the OAuth 2.0 service-account JWT flow (RS256 key from the Console).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `bot_id` | string | — | Bot ID, cross-checked against the `X-WORKS-BotId` callback header. Env: `LINEWORKS_BOT_ID`. |
+| `bot_secret` | string | — | Bot Secret for webhook HMAC-SHA256 signature verification (L1). Env: `LINEWORKS_BOT_SECRET`. |
+| `client_id` | string | — | App Client ID (JWT `iss`). Env: `LINEWORKS_CLIENT_ID`. |
+| `client_secret` | string | — | App Client Secret. Env: `LINEWORKS_CLIENT_SECRET`. |
+| `service_account` | string | — | Service account email (JWT `sub`). Env: `LINEWORKS_SERVICE_ACCOUNT`. |
+| `private_key` | string | — | RS256 private key PEM (inline; takes precedence over `private_key_file`). Env: `LINEWORKS_PRIVATE_KEY`. |
+| `private_key_file` | string | — | Path to the RS256 private key PEM. Env: `LINEWORKS_PRIVATE_KEY_FILE`. |
+| `webhook_path` | string | `/webhook/lineworks` | Webhook mount path. Env: `LINEWORKS_WEBHOOK_PATH`. |
+| `require_mention` | bool | `true` | Channel (group) messages must @-mention the bot; 1:1 always passes. Set `false` for ambient listening. Env: `LINEWORKS_REQUIRE_MENTION`. |
+| `bot_name` | string | — | Bot display name for mention matching (plain-text match; the callback has no structured mention data). When unset, fetched from `GET /bots/{botId}` and cached. Env: `LINEWORKS_BOT_NAME`. |
+| `rich_messages` | bool | `true` | Render markdown replies as flexible-template (flex) messages — headings, lists, inline bold/code, and shaded code blocks. Falls back to plain text when the reply has no markdown, exceeds flex size limits, or the API rejects the payload. Env: `LINEWORKS_RICH_MESSAGES`. |
+| `ack_message` | string | — (disabled) | Short receipt message sent once a user message passes the mention/trust gates (e.g. `"🤔 處理中…"`). LINE WORKS has no reaction or typing-indicator API, so this is the only "working on it" signal. The webhook callback is acknowledged first; the ack send is then awaited inside the bounded post-ack worker — before attachment download and agent dispatch — so bursts cannot fan out unbounded outbound sends. Env: `LINEWORKS_ACK_MESSAGE`. |
+| `allow_all_users` | bool \| omit | `false` (deny-all) | L3 identity trust: `true` = allow all senders. Overrides the uniform `GATEWAY_ALLOW_ALL_USERS` seed for this platform. Env: `LINEWORKS_ALLOW_ALL_USERS`. |
+| `allowed_users` | string[] | `[]` | LINE WORKS userIds (UUIDs, as carried in callback events — a denied sender's request-access echo shows their ID). Only checked when `allow_all_users` is `false`. Env: `LINEWORKS_ALLOWED_USERS` (comma-separated). |
+
+Platform limits: no message edit/delete (no streaming), no reactions, no threads, plain-text messages up to 10,000 chars (longer replies are split). Inbound attachments are downloaded and processed: images feed the LLM (vision), audio is stored for STT, text files pass an extension whitelist; binaries/video/location/sticker are rejected or ignored with a reason the agent can see.
+
+```toml
+[lineworks]
+bot_id           = "${LINEWORKS_BOT_ID}"
+bot_secret       = "${LINEWORKS_BOT_SECRET}"
+client_id        = "${LINEWORKS_CLIENT_ID}"
+client_secret    = "${LINEWORKS_CLIENT_SECRET}"
+service_account  = "bot@example.serviceaccount"
+private_key_file = "/etc/openab/lineworks_private_key.pem"
+```
+
+---
+
 ## `[wecom]`
 
 Full first-class WeCom section (config-first parity, #1378) — credentials, connection, and L3 identity trust. Each field resolves: config → `WECOM_*` env → default. The adapter requires all five credentials (`corp_id`, `secret`, `token`, `encoding_aes_key`, `agent_id`); an incomplete section (after env fallback) disables the adapter, matching env-only semantics.

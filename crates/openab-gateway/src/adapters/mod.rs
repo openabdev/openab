@@ -17,3 +17,7 @@ pub mod acp_server;
 #[cfg(feature = "acp")]
 #[allow(clippy::all, dead_code, unused)]
 pub mod acp_schema;
+#[cfg(feature = "lineworks")]
+pub mod lineworks;
+#[cfg(feature = "lineworks")]
+pub mod lineworks_flex;

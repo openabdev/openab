@@ -1,0 +1,288 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  LINE WORKS — machine-readable platform schema
+#  Converted from the adapter source + official docs. Structure follows _template.toml.
+# ═══════════════════════════════════════════════════════════════════════════
+
+schema_version = "2026-07-08"
+
+[platform]
+name          = "lineworks"
+official_docs = "https://developers.worksmobile.com/en/docs/api"
+description   = "LINE WORKS Bot API — workplace messaging bots receiving events via signed webhook and sending via a REST API authenticated with an OAuth 2.0 service-account JWT."
+
+
+# ═══ Schema 1 — platform-capability ══════════════════════════════════════════
+
+[capability.transport]
+kind   = "webhook"
+note   = "HTTPS POST to the Console-registered callback URL; one event object per request (no batching). Callback URL must present a CA-signed certificate (self-signed rejected)."
+source = "https://developers.worksmobile.com/en/docs/bot-callback"
+
+[capability.inbound_auth]
+scheme = "hmac_sha256"
+note   = "HMAC-SHA256 over the raw request body keyed by the Bot Secret, Base64-encoded, compared to the X-WORKS-Signature header. X-WORKS-BotId carries the target bot id."
+source = "https://developers.worksmobile.com/en/docs/bot-callback"
+
+[capability.threads]
+model  = "none"
+note   = "No thread/topic primitive. Flat 1:1 talks and (multi-member) channels only."
+source = "https://developers.worksmobile.com/en/docs/bot"
+
+[capability.slash_commands]
+supported = false
+note      = "No command registration/delivery API; any /cmd arrives as plain message text."
+source    = "https://developers.worksmobile.com/en/docs/bot-callback"
+
+[capability.mentions]
+method = "username"
+note   = "Callback content is {type, text} only — no structured mention/mentionees data and no self-flag. A mention appears solely as literal \"@BotDisplayName\" text, so detection is plain-text matching against the bot name (fetched from GET /bots/{botId})."
+source = "https://developers.worksmobile.com/jp/reference/bot-callback-message?lang=ja"
+
+[capability.emoji_reactions]
+bot_can_add        = false
+bot_can_remove     = false
+bot_receives_events = false
+note               = "No reaction add/remove API and no reaction webhooks."
+source             = "https://developers.worksmobile.com/en/docs/bot"
+
+[capability.edit_message]
+supported = false
+note      = "No message-edit endpoint; a sent message is immutable."
+source    = "https://developers.worksmobile.com/en/docs/bot-user-message-send"
+
+[capability.delete_message]
+supported = false
+scope     = "none"
+note      = "No message-delete endpoint."
+source    = "https://developers.worksmobile.com/en/docs/bot-user-message-send"
+
+[capability.rich_content]
+markdown = false
+cards    = true
+buttons  = true
+note     = "Plain text only for text objects (markdown renders literally). Rich types: image, file, link, sticker, button template, list template, carousel, image carousel, flexible template (LINE Flex JSON spec), plus quick replies."
+source   = "https://developers.worksmobile.com/en/docs/bot-send-content"
+
+[capability.attachments]
+inbound     = ["image", "audio", "video", "file"]
+outbound    = ["image", "audio", "video", "file"]
+# outbound_delivery: both models exist — messages may carry a public URL or a
+# fileId obtained from the upload API.
+note        = "Inbound media events carry a fileId; content is fetched via GET /bots/{botId}/attachments/{fileId}, which 302-redirects to the storage host (the redirect target also requires the Authorization header). Outbound media is sent by URL or by fileId from the file-upload API. Official per-type size caps are not published on the message pages (? unverified)."
+source      = "https://developers.worksmobile.com/en/docs/bot-attachment"
+
+[capability.message_length_limit]
+max_chars = 10000
+note      = "Text object body cap (characters). OpenAB splits longer replies client-side."
+source    = "https://developers.worksmobile.com/en/docs/bot-send-content"
+
+[capability.dm_support]
+supported = true
+note      = "1:1 talks via POST /bots/{botId}/users/{userId}/messages; the userId path parameter also accepts the account loginId (email form) — verified live."
+source    = "https://developers.worksmobile.com/en/docs/bot-user-message-send"
+
+[capability.group_model]
+kinds  = ["channel", "user"]
+note   = "Group talk rooms are \"channels\" (source.channelId present); 1:1 events carry only source.userId. Bots must be added to a channel to see it."
+source = "https://developers.worksmobile.com/en/docs/bot-callback"
+
+[capability.group_sender_identity]
+stable_id = "yes"
+note      = "Channel message events always carry source.userId (stable per-tenant UUID)."
+source    = "https://developers.worksmobile.com/en/docs/bot-callback"
+
+[capability.send_model]
+model               = "any_time"
+note                = "Push-style only: the same users/{userId} / channels/{channelId} message endpoints serve solicited and unsolicited sends alike. No reply-token mechanism (unlike consumer LINE) and no send window."
+source              = "https://developers.worksmobile.com/en/docs/bot-user-message-send"
+
+[capability.proactive_push]
+supported   = true
+quota_model = "unlimited"
+note        = "? No published per-message quota for bot sends; general API rate limits apply. Recipients must be within the bot's Admin-assigned usage scope."
+source      = "https://developers.worksmobile.com/en/docs/bot"
+
+[capability.bot_to_bot]
+delivered = false
+note      = "Bot messages are not delivered to other bots' callbacks; bots only receive user events."
+source    = "https://developers.worksmobile.com/en/docs/bot-callback"
+
+[capability.typing_indicator]
+supported = false
+note      = "No typing/status indicator API."
+source    = "https://developers.worksmobile.com/en/docs/bot"
+
+
+# ═══ Schema 2 — openab-feature-support ═══════════════════════════════════════
+
+[[openab_features]]
+feature = "send_message"
+status  = "implemented"
+note    = "Outbound via POST users/{userId}|channels/{channelId}/messages (201 = success). 1:1 vs channel endpoint selected by the adapter's user: channel-id prefix. Markdown replies go out as flexible-template messages with plain-text fallback; 401 triggers one token-refresh retry."
+source  = ["crates/openab-gateway/src/adapters/lineworks.rs#dispatch_lineworks_reply", "crates/openab-gateway/src/adapters/lineworks.rs#send_endpoint"]
+pr      = ""
+
+[[openab_features]]
+feature = "message_split"
+status  = "implemented"
+note    = "Adapter-side char-boundary splitting at the 10,000-char text cap; chunks sent sequentially, aborting on first failure."
+source  = ["crates/openab-gateway/src/adapters/lineworks.rs#split_text", "crates/openab-gateway/src/adapters/lineworks.rs#LINEWORKS_TEXT_LIMIT"]
+pr      = ""
+
+[[openab_features]]
+feature = "streaming"
+status  = "n_a"
+note    = "No edit API to drive post+edit streaming. The platform is listed in NON_EDITABLE_PLATFORMS so the core forces streaming off and the cosmetic edit/delete commands are dropped by the dispatcher."
+source  = ["crates/openab-core/src/gateway.rs#NON_EDITABLE_PLATFORMS", "crates/openab-gateway/src/adapters/lineworks.rs#dispatch_lineworks_reply"]
+pr      = ""
+
+[[openab_features]]
+feature = "reply_quote"
+status  = "n_a"
+note    = "No quote/reply-rendering parameter on the send API; quote_message_id is ignored and replies are plain sends."
+source  = ["crates/openab-gateway/src/adapters/lineworks.rs#dispatch_lineworks_reply"]
+pr      = ""
+
+[[openab_features]]
+feature = "edit_message"
+status  = "n_a"
+note    = "No platform edit endpoint. edit_message commands are explicitly ignored (streaming placeholders would otherwise repost as new messages)."
+source  = ["crates/openab-gateway/src/adapters/lineworks.rs#dispatch_lineworks_reply"]
+pr      = ""
+
+[[openab_features]]
+feature = "delete_message"
+status  = "n_a"
+note    = "No platform delete endpoint; delete_message commands are explicitly ignored."
+source  = ["crates/openab-gateway/src/adapters/lineworks.rs#dispatch_lineworks_reply"]
+pr      = ""
+
+[[openab_features]]
+feature = "emoji_reactions"
+status  = "n_a"
+note    = "No reaction API. add_reaction/remove_reaction commands are ignored with a log line; the reactions ack-flow degrades to nothing (operators can use ack_message instead)."
+source  = ["crates/openab-gateway/src/adapters/lineworks.rs#dispatch_lineworks_reply"]
+pr      = ""
+
+[[openab_features]]
+feature = "threads_topics"
+status  = "n_a"
+note    = "No thread primitive; create_topic is ignored alongside the reaction commands."
+source  = ["crates/openab-gateway/src/adapters/lineworks.rs#dispatch_lineworks_reply"]
+pr      = ""
+
+[[openab_features]]
+feature = "media_inbound"
+status  = "partial"
+note    = "image/audio/file events download via the attachments endpoint with a manual 302-follow (auth header must survive the cross-host hop), size caps enforced mid-stream. Images resize/compress for vision, audio stored raw, files gated by the text-extension whitelist; binaries are rejected as status-only attachments. video/location/sticker are not ingested."
+source  = ["crates/openab-gateway/src/adapters/lineworks.rs#fetch_attachment_bytes", "crates/openab-gateway/src/adapters/lineworks.rs#download_attachment"]
+pr      = ""
+
+[[openab_features]]
+feature = "voice_stt"
+status  = "partial"
+note    = "Audio attachments are downloaded and stored; transcription itself happens in the shared core attachment path when [stt] is configured — no lineworks-specific STT code."
+source  = ["crates/openab-gateway/src/adapters/lineworks.rs#download_attachment", "crates/openab-core/src/gateway.rs#process_gateway_event"]
+pr      = ""
+
+[[openab_features]]
+feature = "trust_gate"
+status  = "implemented"
+note    = "L1 signature (constant-time HMAC compare + bot-id cross-check) at the webhook; shared L2 scope / L3 identity gate applies in the gateway ingress path keyed by platform. L3 is first-class on [lineworks] (allow_all_users/allowed_users, LINEWORKS_* env fallback; deprecated uniform GATEWAY_* seed as last resort)."
+source  = ["crates/openab-gateway/src/adapters/lineworks.rs#verify_signature", "crates/openab-core/src/gateway.rs#process_gateway_event"]
+pr      = ""
+
+[[openab_features]]
+feature = "deny_echo"
+status  = "implemented"
+note    = "L3 identity-deny echoes the sender their ID via the normal push send (throttled per platform:sender). No reply-token constraints — the echo is an ordinary send to the originating user/channel."
+source  = ["crates/openab-core/src/gateway.rs#process_gateway_event", "crates/openab-gateway/src/adapters/lineworks.rs#dispatch_lineworks_reply"]
+pr      = ""
+
+[[openab_features]]
+feature = "mention_gating"
+status  = "implemented"
+note    = "Channel messages require literal \"@BotDisplayName\" text (no structured mention data exists); the mention is stripped from the prompt on a hit. Bot name resolves from GET /bots/{botId} (cached) or the bot_name config override; require_mention=false disables the gate. 1:1 always passes. Fail-open when the name cannot be resolved."
+source  = ["crates/openab-gateway/src/adapters/lineworks.rs#passes_mention_gate"]
+pr      = ""
+
+[[openab_features]]
+feature = "slash_commands"
+status  = "partial"
+note    = "No platform command surface; the shared gateway text-command path handles /models and /agents typed as plain text (verified live). No slash-command UI or registration."
+source  = ["crates/openab-core/src/gateway.rs"]
+pr      = ""
+
+[[openab_features]]
+feature = "multibot"
+status  = "n_a"
+note    = "The platform does not deliver bot messages to other bots' callbacks, so multi-bot coordination cannot trigger."
+source  = ["crates/openab-gateway/src/adapters/lineworks.rs#classify_event"]
+pr      = ""
+
+[[openab_features]]
+feature = "group_routing"
+status  = "implemented"
+note    = "Channel keyed by channelId for group talks; 1:1 talks use a user:{userId} synthetic channel id so reply dispatch can pick the users vs channels endpoint from the otherwise-opaque id."
+source  = ["crates/openab-gateway/src/adapters/lineworks.rs#classify_event", "crates/openab-gateway/src/adapters/lineworks.rs#send_endpoint"]
+pr      = ""
+
+[[openab_features]]
+feature = "cron_dispatch"
+status  = "implemented"
+note    = "Registered in cron VALID_PLATFORMS and the unified cron_adapters map; verified live for both channel targets and user:{loginId} 1:1 targets (the send API accepts loginId in place of the UUID, so no directory lookup is needed)."
+source  = ["crates/openab-core/src/cron.rs#VALID_PLATFORMS"]
+pr      = ""
+
+
+# ═══ Schema 3 — platform-quirks ══════════════════════════════════════════════
+
+[[quirks]]
+date  = "2026-07-25"
+title = "Push-only send model — no reply token, split user/channel endpoints"
+note  = """
+Unlike consumer LINE there is no reply-token mechanism and no reply-vs-push economics: every outbound message is an ordinary authenticated POST, usable at any time. The cost of this simplicity is that the send endpoint differs by conversation kind (users/{userId} vs channels/{channelId}) while GatewayReply only carries an opaque channel id. OpenAB encodes the distinction in the id itself: 1:1 events produce a synthetic "user:{userId}" channel id and dispatch strips the prefix to pick the endpoint. Cron jobs and any other core feature that targets a channel string inherit this convention for free.
+"""
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/lineworks.rs#send_endpoint"
+refs   = []
+
+[[quirks]]
+date  = "2026-07-25"
+title = "userId path parameter accepts loginId (email form)"
+note  = """
+POST /bots/{botId}/users/{userId}/messages returns 201 when {userId} is the account loginId (e.g. can@tenant) instead of the UUID — verified against the live API. This removes the need for the Directory/Users API (and its extra scope) for 1:1 targeting: operators can write cron targets as channel = "user:<loginId>" directly. The UUID remains what inbound events carry in source.userId.
+"""
+kind   = "intrinsic"
+source = "https://developers.worksmobile.com/en/docs/bot-user-message-send"
+refs   = []
+
+[[quirks]]
+date  = "2026-07-25"
+title = "No structured mention data — gating is plain-text bot-name matching"
+note  = """
+Text message callbacks carry only {type, text}; a mention is literally "@BotDisplayName" inside the text (no mentionees array, no isSelf flag — contrast with consumer LINE). Mention gating therefore matches and strips the literal string, with the display name auto-resolved from GET /bots/{botId} and cacheable/overridable via config. Consequences: a user typing the name manually triggers the bot (accepted), and a Console rename needs a restart or bot_name override to take effect. The gate fails open if the name cannot be resolved so an API hiccup never bricks the bot.
+"""
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/lineworks.rs#passes_mention_gate"
+refs   = []
+
+[[quirks]]
+date  = "2026-07-25"
+title = "Attachment download 302-redirects to a host that still wants the Authorization header"
+note  = """
+GET /bots/{botId}/attachments/{fileId} answers 302 with a storage-host Location that itself requires the same bearer token. reqwest (like most HTTP clients) strips the Authorization header on cross-host redirects, so automatic redirect following yields 401s. The adapter follows redirects manually (bounded at 4 hops) re-attaching the token each hop, with size caps enforced during body streaming.
+"""
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/lineworks.rs#fetch_attachment_bytes"
+refs   = []
+
+[[quirks]]
+date  = "2026-07-25"
+title = "Flex-first rendering with unconditional plain-text fallback"
+note  = """
+Text objects render markdown literally, but the flexible template (LINE Flex JSON spec) is expressive enough to approximate it: headings → bold sized text, fenced code → shaded boxes, lists → bulleted lines, inline bold/italic/code → spans. The adapter renders markdown replies as flex bubbles and falls back to the plain-text path whenever the reply has no markdown, the bubble exceeds conservative size ceilings (20KB / 120 components), or the API rejects the payload — content is never lost to a renderer bug. altText carries the first 400 chars for notification previews.
+"""
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/lineworks_flex.rs#markdown_to_flex"
+refs   = []

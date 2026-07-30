@@ -238,10 +238,16 @@ pub fn should_fire(schedule: &Schedule, tz: Tz) -> bool {
 }
 
 /// Known platforms that have adapter support.
-const VALID_PLATFORMS: &[&str] = &["discord", "slack", "telegram", "googlechat"];
+const VALID_PLATFORMS: &[&str] = &["discord", "slack", "telegram", "googlechat", "lineworks"];
+
+/// Cron platforms that must NOT get a synthetic thread: Google Chat cron
+/// messages stay top-level by design, and LINE WORKS has no thread/topic API
+/// (its reply dispatch ignores topic creation), so a synthetic thread would
+/// silently deliver to the flat channel instead.
+const CRON_THREADLESS_PLATFORMS: &[&str] = &["googlechat", "lineworks"];
 
 fn should_create_cron_thread(job: &CronJobConfig) -> bool {
-    job.thread_id.is_none() && job.platform != "googlechat"
+    job.thread_id.is_none() && !CRON_THREADLESS_PLATFORMS.contains(&job.platform.as_str())
 }
 
 fn cron_sender_thread_id(channel: &ChannelRef) -> Option<String> {
@@ -1562,6 +1568,19 @@ message = "a"
         assert!(!should_create_cron_thread(&job));
 
         job.thread_id = Some("spaces/TEST/threads/THREAD".into());
+        assert!(!should_create_cron_thread(&job));
+    }
+
+    #[test]
+    fn lineworks_cron_never_requests_synthetic_thread() {
+        // LINE WORKS has no thread API — a synthetic cron thread would be
+        // silently ignored by reply dispatch (flat-channel delivery).
+        let mut job = test_cron_job();
+        job.platform = "lineworks".into();
+
+        assert!(!should_create_cron_thread(&job));
+
+        job.thread_id = Some("explicit-thread".into());
         assert!(!should_create_cron_thread(&job));
     }
 

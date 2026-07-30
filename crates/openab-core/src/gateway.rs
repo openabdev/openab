@@ -57,7 +57,7 @@ fn platform_acks_writes(platform: &str) -> bool {
 /// for a *capability*. The right long-term model is a capability handshake at
 /// gateway-connect time ("can this adapter edit messages?"); until that exists,
 /// any new gateway platform that lacks a message-edit API MUST be added here.
-const NON_EDITABLE_PLATFORMS: &[&str] = &["line"];
+const NON_EDITABLE_PLATFORMS: &[&str] = &["line", "lineworks"];
 
 /// Whether cosmetic streaming (placeholder + in-place edits) is possible on
 /// `platform`. See `NON_EDITABLE_PLATFORMS`.

@@ -44,9 +44,9 @@ thread_id = ""                               # optional: post to existing thread
 |-------|----------|---------|-------------|
 | `enabled` | | `true` | Set `false` to disable without removing the entry |
 | `schedule` | ✅ | — | 5-field POSIX cron expression |
-| `channel` | ✅ | — | Discord channel/thread ID, Slack channel ID, Telegram chat ID, or Google Chat space name |
+| `channel` | ✅ | — | Discord channel/thread ID, Slack channel ID, Telegram chat ID, Google Chat space name, or LINE WORKS channel ID / `user:<userId>` |
 | `message` | ✅ | — | Message sent to the agent as a prompt |
-| `platform` | | `"discord"` | `"discord"`, `"slack"`, `"telegram"`, or `"googlechat"` (non-default platforms require their feature) |
+| `platform` | | `"discord"` | `"discord"`, `"slack"`, `"telegram"`, `"googlechat"`, or `"lineworks"` (non-default platforms require their feature) |
 | `sender_name` | | `"openab-cron"` | Attribution shown in prompt context |
 | `timezone` | | `"UTC"` | IANA timezone (e.g. `"America/New_York"`, `"Europe/Berlin"`) |
 | `thread_id` | | — | Post into an existing thread instead of the channel |
@@ -347,10 +347,13 @@ Use `sender_name` to distinguish different scheduled tasks in logs and thread ti
 | `slack` | `--features slack` | `[slack]` section in config.toml |
 | `telegram` | `--features telegram` | `[telegram]` section in config.toml **or** `TELEGRAM_BOT_TOKEN` env var |
 | `googlechat` | `--features googlechat` | `[googlechat] enabled = true` in config.toml **or** `GOOGLE_CHAT_ENABLED=true` env var, plus credentials (`sa_key_json`/`sa_key_file`/`access_token` fields or their `GOOGLE_CHAT_*` env equivalents) |
+| `lineworks` | `--features lineworks` | `[lineworks]` section in config.toml (or the `LINEWORKS_*` env equivalents) |
 
 > **Note:** The `channel` field for Telegram should be the numeric chat ID (e.g. `"176096071"`). Use [@userinfobot](https://t.me/userinfobot) or the Telegram Bot API `getUpdates` to find your chat ID.
 
 For Google Chat, use the space resource name (for example, `"spaces/AAAA1234567"`). Jobs without `thread_id` stay at the top level of the space because Google Chat does not implement OpenAB's `create_topic` command. To post into an existing thread, set `thread_id` to its full Google Chat thread resource name.
+
+For LINE WORKS, use a channel ID for group talks or `user:<userId>` (or `user:<loginId>`) for 1:1 delivery. LINE WORKS has no thread API, so cron messages always deliver to the flat channel; no synthetic thread is created and `thread_id` has no effect.
 
 ## When to Use External Schedulers Instead
 

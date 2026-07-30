@@ -29,6 +29,7 @@ use std::path::Path;
 /// - `[googlechat]` → `GoogleChatConfig` (#1383)
 /// - `[teams]`    → `TeamsConfig` (#1384)
 /// - `[feishu]`   → `FeishuConfig` (#1385)
+/// - `[lineworks]` → `LineWorksConfig`
 ///
 /// When you add a platform env var to this crate:
 /// 1. add the matching field to the platform's section struct in
@@ -104,11 +105,27 @@ const COVERED: &[&str] = &[
     "TEAMS_WEBHOOK_PATH",
     "TEAMS_ALLOW_ALL_USERS",
     "TEAMS_ALLOWED_USERS",
+    // lineworks
+    "LINEWORKS_BOT_ID",
+    "LINEWORKS_BOT_SECRET",
+    "LINEWORKS_CLIENT_ID",
+    "LINEWORKS_CLIENT_SECRET",
+    "LINEWORKS_SERVICE_ACCOUNT",
+    "LINEWORKS_PRIVATE_KEY",
+    "LINEWORKS_PRIVATE_KEY_FILE",
+    "LINEWORKS_WEBHOOK_PATH",
+    "LINEWORKS_REQUIRE_MENTION",
+    "LINEWORKS_BOT_NAME",
+    "LINEWORKS_RICH_MESSAGES",
+    "LINEWORKS_ACK_MESSAGE",
+    "LINEWORKS_ALLOW_ALL_USERS",
+    "LINEWORKS_ALLOWED_USERS",
 ];
 
 const PLATFORM_PREFIXES: &[&str] = &[
     "TELEGRAM_",
     "LINE_",
+    "LINEWORKS_",
     "FEISHU_",
     "WECOM_",
     "GOOGLE_CHAT_",

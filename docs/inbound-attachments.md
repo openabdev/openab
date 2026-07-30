@@ -26,6 +26,7 @@ User sends media (photo/voice/file)
 | **Google Chat** | ✅ | ✅ (STT) | ✅ (whitelist) | skipped | Drive files skipped |
 | **WeCom** | ✅ | — | ✅ (whitelist) | skipped | skipped |
 | **LINE** | ✅ (LINE-hosted only) | ✅ (STT, 1:1 only, LINE-hosted only) | — | — | — |
+| **LINE WORKS** | ✅ | ✅ (STT) | ✅ (whitelist) | skipped | skipped |
 | **Slack** | ✅ | ✅ (STT) | ✅ | — | skipped |
 
 ## Processing Pipeline

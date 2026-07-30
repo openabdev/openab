@@ -88,6 +88,18 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # allowed_users = ["U1234567890abcdef0123456789abcdef"]  # LINE user IDs (U…, 33 chars)
 #                                       # env fallback: LINE_ALLOWED_USERS (comma-separated)
 
+# [lineworks]
+# bot_id           = "${LINEWORKS_BOT_ID}"          # env fallback: LINEWORKS_BOT_ID
+# bot_secret       = "${LINEWORKS_BOT_SECRET}"      # L1 webhook HMAC key; env fallback: LINEWORKS_BOT_SECRET
+# client_id        = "${LINEWORKS_CLIENT_ID}"       # JWT iss; env fallback: LINEWORKS_CLIENT_ID
+# client_secret    = "${LINEWORKS_CLIENT_SECRET}"   # env fallback: LINEWORKS_CLIENT_SECRET
+# service_account  = "bot@example.serviceaccount"   # JWT sub; env fallback: LINEWORKS_SERVICE_ACCOUNT
+# private_key_file = "/etc/openab/lineworks_key.pem" # RS256 key from Developer Console
+#                                       # env fallback: LINEWORKS_PRIVATE_KEY_FILE (inline: LINEWORKS_PRIVATE_KEY)
+# webhook_path = "/webhook/lineworks"   # env fallback: LINEWORKS_WEBHOOK_PATH (default /webhook/lineworks)
+# allow_all_users = false               # L3 identity trust; default deny-all. env fallback: LINEWORKS_ALLOW_ALL_USERS
+# allowed_users = ["userId-uuid"]       # userIds admitted when allow_all_users=false. env fallback: LINEWORKS_ALLOWED_USERS
+
 # --- WeCom / Google Chat / MS Teams (first-class trust sections) ---
 # Same shape as [line]: L3 identity trust per platform, replacing the uniform
 # GATEWAY_ALLOW_ALL_USERS / GATEWAY_ALLOWED_USERS env for that platform
