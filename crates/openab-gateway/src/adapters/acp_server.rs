@@ -5416,12 +5416,16 @@ mod acp_ws_integration {
         let _ = recv(&mut ws).await;
 
         // Enough sessions to park strictly more than MAX_INFLIGHT_PROMPTS establishes.
+        //
+        // There used to be an `assert!(want_connects > MAX_INFLIGHT_PROMPTS)` here. `want_connects`
+        // is DERIVED from the cap two lines above, so that assertion restated the integer-division
+        // identity `(P/S + 1) * S = P - (P % S) + S > P`, which holds for every positive P and S.
+        // It could not fire for any value of either constant — it looked like a guard on the
+        // test's premise and guarded nothing. What can actually go wrong is the server not parking
+        // the establishes we asked for, so the premise is checked below against the count the
+        // socket really delivered.
         let sessions_needed = MAX_INFLIGHT_PROMPTS / MAX_ACP_SERVERS_PER_SESSION + 1;
         let want_connects = sessions_needed * MAX_ACP_SERVERS_PER_SESSION;
-        assert!(
-            want_connects > MAX_INFLIGHT_PROMPTS,
-            "the test must exceed the prompt cap or it cannot observe the old behaviour"
-        );
 
         let mut last_session = None;
         let mut connects = 0;
@@ -5452,12 +5456,22 @@ mod acp_ws_integration {
         assert_eq!(answered_new, sessions_needed);
 
         // Drain any remaining mcp/connect frames so the parked count is what we think it is.
-        while connects < want_connects {
+        // Bounded: if the server parks fewer than we declared, this must fail naming the count,
+        // not sit in `recv` until its 30s guard panics. A failure named after the harness reads
+        // as a flake and gets dismissed; one naming the count points at the defect.
+        let mut frames = 0;
+        while connects < want_connects && frames < want_connects * 4 {
             let f = recv(&mut ws).await;
+            frames += 1;
             if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
                 connects += 1;
             }
         }
+        assert!(
+            connects > MAX_INFLIGHT_PROMPTS,
+            "the budget defect is only observable with more than MAX_INFLIGHT_PROMPTS \
+             ({MAX_INFLIGHT_PROMPTS}) establishes parked, but only {connects} were"
+        );
 
         // With >32 establishes parked, a prompt must still be accepted.
         send(&mut ws, json!({
@@ -5474,13 +5488,23 @@ mod acp_ws_integration {
             }
         }
         let f = saw.expect("no response to the prompt");
-        if let Some(err) = f.get("error") {
-            let msg = err["message"].as_str().unwrap_or("");
-            assert!(
-                !msg.contains("in-flight prompts"),
-                "{connects} parked mcp/connects must not spend the prompt budget, got: {msg}"
-            );
-        }
+
+        // The prompt is expected to pass the in-flight budget gate and then fail at the backend,
+        // because this harness attaches none. That specific error IS the evidence: the budget gate
+        // rejects earlier and with a different message.
+        //
+        // Pinned exactly, not asserted as `!msg.contains("in-flight prompts")`. A negative
+        // substring check is satisfied by every OTHER error too — a session-not-found, a params
+        // error, or the budget message itself once someone rewords it — so it could only ever fail
+        // for one spelling of one regression, and would pass silently through the rest.
+        let err = f
+            .get("error")
+            .unwrap_or_else(|| panic!("the prompt must reach the backend and fail there, got: {f}"));
+        assert_eq!(
+            err["message"], json!("No agent backend connected"),
+            "{connects} parked mcp/connects must not spend the prompt budget; the prompt must \
+             reach the backend and fail only for the missing backend, got: {f}"
+        );
     }
 
     /// A resume that stops declaring a server must retire its tunnel.
