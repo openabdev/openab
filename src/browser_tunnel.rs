@@ -59,7 +59,14 @@ impl AcpMcpTunnel for RootBrowserTunnel {
         };
         match handle {
             Some(h) => h.mcp_message(method, params, self.timeout_secs).await,
-            None => Err(format!("no browser attached to session {channel_id}")),
+            // Redacted here, at construction. This string is RETURNED, not logged — it reaches a
+            // caller that may log it, surface it to a model, or put it in an error response, so no
+            // logging-side redaction point can ever catch it. An id embedded mid-sentence also
+            // escapes every field-name scan: the pattern that found the other sites cannot see it.
+            None => Err(format!(
+                "no browser attached to session {}",
+                openab_core::redact::redact_session_ids(channel_id)
+            )),
         }
     }
 

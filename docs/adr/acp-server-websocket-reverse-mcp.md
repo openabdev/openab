@@ -156,7 +156,12 @@ Three pieces already generalize and are reused as-is:
 - `AcpTunnelRegistry` becomes keyed by `(channel_id, serverId)` instead of `channel_id` alone — the
   "one tunnel per session" collapse was a fan-out fix; the correct fix is a **compound key**.
 - Rename the core trait `BrowserTunnel` → **`AcpMcpTunnel`**; `call(channel_id, server_id, method, params)`.
-- Evict all `(channel_id, *)` entries on session teardown.
+- On session teardown, evict only the `(channel_id, *)` entries **this connection owns** —
+  matched on `owner`, not on the channel. Evicting every entry for the channel would delete a
+  successor's live tunnel, because a client that reconnects and resumes takes over the same
+  `channel_id`. (The unqualified form was this document's original wording and describes a
+  defect that was fixed in the implementation; left uncorrected it is the copy that could get
+  the code "restored" back into the bug.)
 
 **`id` and `name` are different things, and routing needs both.** A declaration is
 `{type:"acp", id, name}`, and the two fields have very different lifetimes — the reference client mints

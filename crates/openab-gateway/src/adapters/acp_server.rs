@@ -1685,7 +1685,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                             let resp = JsonRpcResponse::error(
                                 id,
                                 -32602,
-                                format!("Unknown session: {session_id}"),
+                                format!("Unknown session: {}", redact_id(&session_id)),
                             );
                             let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
                             continue;
@@ -2045,10 +2045,48 @@ async fn handle_session_cancel(
 /// extension attach?"), so the id is hashed instead: the same session tags identically on every
 /// line, which is what makes a log readable, but the tag cannot be turned back into the id.
 fn redact_id(id: &str) -> String {
+    // Hash the UUID, not the prefixed string. One session is addressed as `sess_<uuid>` and as
+    // `acp_<uuid>`; hashing the whole string gives those two a different tag each, and a third
+    // different from `openab-core`, which strips the prefix. That is three tags for one session —
+    // and `prompt dispatched` prints two of them on a single line. Correlating a session across
+    // logs is the entire reason the tag exists, so producing several defeats the purpose more
+    // completely than not redacting would.
+    let uuid = id.strip_prefix("acp_").or_else(|| id.strip_prefix("sess_")).unwrap_or(id);
     use sha2::{Digest as _, Sha256};
-    let digest = Sha256::digest(id.as_bytes());
+    let digest = Sha256::digest(uuid.as_bytes());
     let short: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
     format!("#{short}")
+}
+
+#[cfg(test)]
+mod redact_id_cross_encoding {
+    /// Both encodings of one session must tag identically, and identically to `openab-core`.
+    ///
+    /// This assertion existed in `openab-core` and not here, so the gateway diverged silently while
+    /// core's own test asserted the property core alone upheld. An invariant that spans two crates
+    /// has to be asserted in both — checking it where it happens to hold proves nothing about the
+    /// side that breaks it.
+    #[test]
+    fn both_encodings_of_one_session_produce_one_tag() {
+        let u = "00000000-0000-0000-0000-000000000000";
+        let a = super::redact_id(&format!("acp_{u}"));
+        let s = super::redact_id(&format!("sess_{u}"));
+        assert_eq!(a, s, "one session must not read as two");
+        assert_eq!(
+            a,
+            openab_core_tag(u),
+            "the gateway's tag must equal openab-core's for the same session, or an operator \
+             following one log to the other finds nothing"
+        );
+    }
+
+    /// Recomputed rather than imported: the crates do not depend on one another, so the shared
+    /// value has to be pinned on both sides independently.
+    fn openab_core_tag(uuid: &str) -> String {
+        use sha2::{Digest as _, Sha256};
+        let d = Sha256::digest(uuid.as_bytes());
+        format!("#{}", d.iter().take(4).map(|b| format!("{b:02x}")).collect::<String>())
+    }
 }
 
 fn derive_channel_id(session_id: &str) -> Option<String> {
@@ -2102,7 +2140,11 @@ async fn handle_session_prompt(
         Some(s) => s.channel_id.clone(),
         None => {
             let resp =
-                JsonRpcResponse::error(id, -32602, format!("Unknown session: {session_id}"));
+                JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    format!("Unknown session: {}", redact_id(&session_id)),
+                );
             let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
             release_prompt(sessions, &session_id).await;
             return;
