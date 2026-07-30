@@ -29,6 +29,10 @@ use tracing::{debug, error, info, warn};
 
 /// Hard cap on consecutive bot messages in a channel or thread.
 /// Prevents runaway loops between multiple bots in "all" mode.
+/// Named so a test can pin it: the agent fetches this link unaided, which is
+/// what makes a size or upload failure safe to report without a store note.
+pub(crate) const DISCORD_CDN_NOTE: &str = "Discord CDN URL, expires ~24h";
+
 const MAX_CONSECUTIVE_BOT_TURNS: u32 = 1000;
 
 /// Maximum entries in the participation cache before eviction.
@@ -906,35 +910,38 @@ impl EventHandler for Handler {
 
                 // Passthrough runs whichever way STT went: a transcript is an
                 // extra block, never a substitute for the file itself.
-                // Discord's fallback is a public CDN link the agent can fetch, so a
-                // store failure is not a degradation here and needs no separate note.
                 #[cfg(feature = "filestore")]
-                let stored: Option<(String, String)> = match self.filestore {
-                    Some(ref fs) => media::download_and_presign_attachment(
-                        &attachment.url,
-                        &attachment.filename,
-                        u64::from(attachment.size),
-                        Some(mime_clean),
-                        None,
-                        fs,
-                    )
-                    .await
-                    .ok(),
+                let stored = match self.filestore {
+                    Some(ref fs) => Some(
+                        media::download_and_presign_attachment(
+                            &attachment.url,
+                            &attachment.filename,
+                            u64::from(attachment.size),
+                            Some(mime_clean),
+                            None,
+                            fs,
+                        )
+                        .await,
+                    ),
                     None => None,
                 };
                 #[cfg(not(feature = "filestore"))]
-                let stored: Option<(String, String)> = None;
+                let stored: Option<media::StoredAttachmentResult> = None;
 
-                let (url, note) = match stored {
-                    Some((ref presigned, ref note)) => (presigned.as_str(), note.as_str()),
-                    None => (attachment.url.as_str(), "Discord CDN URL, expires ~24h"),
-                };
+                let (url, note, size) = media::attachment_url_note_size(
+                    stored.as_ref(),
+                    attachment.url.as_str(),
+                    u64::from(attachment.size),
+                    media::PlatformUrl::Fetchable {
+                        note: DISCORD_CDN_NOTE,
+                    },
+                );
                 extra_blocks.extend(media::audio_attachment_blocks(
                     &attachment.filename,
                     mime_clean,
-                    u64::from(attachment.size),
+                    size,
                     Some(url),
-                    Some(note),
+                    Some(&note),
                     stt_line.as_deref(),
                 ));
             } else if media::is_text_file(&attachment.filename, attachment.content_type.as_deref())
@@ -992,11 +999,15 @@ impl EventHandler for Handler {
                     Ok(block) => {
                         debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
                         extra_blocks.push(block);
+                        let (safe_filename, safe_mime) = media::sanitize_attachment_meta(
+                            &attachment.filename,
+                            attachment.content_type.as_deref().unwrap_or("unknown"),
+                        );
                         extra_blocks.push(ContentBlock::Text {
                             text: format!(
                                 "[Image attachment]\nfilename: {}\ncontent_type: {}\nsize_bytes: {}\nurl: {} (expires ~24h)",
-                                attachment.filename,
-                                attachment.content_type.as_deref().unwrap_or("unknown"),
+                                safe_filename,
+                                safe_mime,
                                 attachment.size,
                                 attachment.url,
                             ),
@@ -3283,6 +3294,65 @@ fn truncate_to_utf16_budget(body: &str, prefix: &str, suffix: &str, limit: usize
 
 #[cfg(test)]
 mod tests {
+
+    /// The four store outcomes this adapter can hand the agent. Pins the note
+    /// constant too: an Accepted Residual Risk rests on its exact wording.
+    #[test]
+    fn discord_renders_every_store_outcome_and_only_hides_a_safe_failure() {
+        use crate::media::{AudioStoreError, PlatformUrl, StoredAttachment};
+        // Pinned literally: the rows below compare against the constant, so an
+        // emptied or repurposed value would satisfy them tautologically.
+        assert_eq!(super::DISCORD_CDN_NOTE, "Discord CDN URL, expires ~24h");
+        let platform = PlatformUrl::Fetchable {
+            note: super::DISCORD_CDN_NOTE,
+        };
+        let call = |stored: Option<&Result<StoredAttachment, AudioStoreError>>| {
+            let (u, n, sz) = crate::media::attachment_url_note_size(
+                stored,
+                "https://platform.example/file",
+                1_024,
+                platform,
+            );
+            (u.to_string(), n, sz)
+        };
+
+        // Stored: the presigned url wins, and so does the count measured while
+        // streaming, because Discord's reported size is advisory.
+        let ok = Ok(StoredAttachment {
+            url: "https://s3.example/presigned".into(),
+            note: "presigned URL, expires in 60 minutes".into(),
+            measured_bytes: 5_242_880,
+        });
+        let (u, n, sz) = call(Some(&ok));
+        assert_eq!(u, "https://s3.example/presigned");
+        assert_eq!(n, "presigned URL, expires in 60 minutes");
+        assert_eq!(sz, 5_242_880, "the measured count must win over 1_024");
+
+        // No filestore configured at all.
+        let (u, n, sz) = call(None);
+        assert_eq!(u, "https://platform.example/file");
+        assert_eq!(n, super::DISCORD_CDN_NOTE);
+        assert_eq!(sz, 1_024);
+
+        for err in [AudioStoreError::TooLarge, AudioStoreError::UploadFailed] {
+            let (u, n, _) = call(Some(&Err(err)));
+            assert_eq!(u, "https://platform.example/file", "{err:?}");
+            assert_eq!(
+                n,
+                super::DISCORD_CDN_NOTE,
+                "the CDN link still works, so no store note: {err:?}"
+            );
+        }
+
+        // DownloadFailed is the one outcome produced only after the bot fetched
+        // this very url and failed, so it may never read as a working url.
+        let (u, n, _) = call(Some(&Err(AudioStoreError::DownloadFailed)));
+        assert_eq!(u, "https://platform.example/file");
+        assert!(
+            n.contains("did not return the bytes"),
+            "DownloadFailed must say the platform withheld the bytes: {n}"
+        );
+    }
     use super::*;
     use crate::bot_turns::{TurnResult, HARD_BOT_TURN_LIMIT, BOT_TURN_LIMIT_WARNING_PREFIX};
 

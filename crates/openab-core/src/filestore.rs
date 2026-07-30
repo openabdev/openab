@@ -20,8 +20,18 @@ pub struct Filestore {
 const TEXT_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 
 const MAX_PRESIGNED_TTL: u64 = 7 * 24 * 60 * 60;
+/// Not a display floor: S3 rejects `X-Amz-Expires=0` outright, so zero is a
+/// URL that cannot work at all rather than one that expires quickly.
+const MIN_PRESIGNED_TTL: u64 = 1;
 
 fn cap_presigned_ttl(configured: u64) -> u64 {
+    if configured < MIN_PRESIGNED_TTL {
+        tracing::warn!(
+            configured,
+            raised = MIN_PRESIGNED_TTL,
+            "presigned_ttl of 0 yields an X-Amz-Expires S3 refuses, raising to 1s"
+        );
+    }
     if configured > MAX_PRESIGNED_TTL {
         tracing::warn!(
             configured,
@@ -29,7 +39,7 @@ fn cap_presigned_ttl(configured: u64) -> u64 {
             "presigned_ttl exceeds 7-day maximum, capping"
         );
     }
-    configured.min(MAX_PRESIGNED_TTL)
+    configured.clamp(MIN_PRESIGNED_TTL, MAX_PRESIGNED_TTL)
 }
 
 /// The lifetime as the agent reads it. `presigned_ttl` governs how long an
@@ -38,8 +48,8 @@ pub(crate) fn format_presigned_lifetime(ttl_secs: u64) -> String {
     match ttl_secs {
         1 => "1 second".to_string(),
         s if s < 60 => format!("{s} seconds"),
-        // Unchanged from before the sub-minute branch existed, so the #738 hint
-        // stays byte-identical at every TTL that path could already render.
+        // Byte-identical to main at 60s and above; below that main rendered
+        // "0 minutes", which this deliberately replaces rather than reproduces.
         s => format!("{} minutes", s / 60),
     }
 }
@@ -535,12 +545,14 @@ mod tests {
     }
 
     #[test]
-    fn presigned_ttl_is_capped_but_never_raised() {
-        // The value is an authorization lifetime, so only the upper bound may move it.
-        for configured in [0, 1, 59, 60, 3600, MAX_PRESIGNED_TTL] {
+    fn presigned_ttl_is_capped_and_only_an_unusable_zero_is_raised() {
+        // It is an authorization lifetime, so no usable value may be lengthened.
+        for configured in [1, 30, 59, 60, 3600, MAX_PRESIGNED_TTL] {
             assert_eq!(cap_presigned_ttl(configured), configured, "{configured}");
         }
         assert_eq!(cap_presigned_ttl(MAX_PRESIGNED_TTL + 1), MAX_PRESIGNED_TTL);
+        // Zero is the one value raised, because S3 refuses X-Amz-Expires=0.
+        assert_eq!(cap_presigned_ttl(0), MIN_PRESIGNED_TTL);
     }
 
     #[test]

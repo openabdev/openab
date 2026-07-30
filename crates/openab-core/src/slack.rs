@@ -690,6 +690,11 @@ impl ChatAdapter for SlackAdapter {
 /// Hard cap on consecutive bot messages in a thread. Prevents runaway loops.
 const MAX_CONSECUTIVE_BOT_TURNS: usize = 1000;
 
+/// Hoisted to module scope so a test can pin it: an Accepted Residual Risk rests
+/// on this line naming the header verbatim, and an inner const is unassertable.
+pub(crate) const SLACK_URL_REQUIREMENT: &str =
+    "Slack private file, requires an `Authorization: Bearer <bot token>` header to download";
+
 /// Socket Mode keepalive. Slack's inbound WebSocket can go half-open (e.g. a NAT
 /// idle-timeout silently drops inbound frames with no Close/FIN), which leaves
 /// `read.next()` blocked forever, so the reconnect loop never fires and the bot
@@ -1495,9 +1500,6 @@ async fn handle_message(
     // adapters apply the same limits: 5 files or 1 MB of text per message.
     const TEXT_TOTAL_CAP: u64 = 1024 * 1024;
     const TEXT_FILE_COUNT_CAP: u32 = 5;
-    const SLACK_URL_REQUIREMENT: &str =
-        "Slack private file, requires an `Authorization: Bearer <bot token>` header to download";
-
     let mut extra_blocks = Vec::new();
     let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
     let mut text_file_bytes: u64 = 0;
@@ -1514,6 +1516,7 @@ async fn handle_message(
             let url = slack_file_download_url(file);
 
             if url.is_empty() {
+                debug!(filename, "slack file has no private URL, skipping");
                 continue;
             }
 
@@ -1578,27 +1581,22 @@ async fn handle_message(
                     None => None,
                 };
                 #[cfg(not(feature = "filestore"))]
-                let stored: Option<Result<(String, String), media::AudioStoreError>> = None;
+                let stored: Option<media::StoredAttachmentResult> = None;
 
-                // A configured store that failed must not read as no store at all:
-                // the fallback URL is identical either way, so only the note can say so.
-                let failure_note = stored
-                    .as_ref()
-                    .and_then(|r| r.as_ref().err())
-                    .map(|e| media::store_failure_note(*e, SLACK_URL_REQUIREMENT));
-                let (audio_url, audio_note) = match stored {
-                    Some(Ok((ref presigned, ref note))) => (presigned.as_str(), note.as_str()),
-                    _ => (
-                        url,
-                        failure_note.as_deref().unwrap_or(SLACK_URL_REQUIREMENT),
-                    ),
-                };
+                let (audio_url, audio_note, audio_size) = media::attachment_url_note_size(
+                    stored.as_ref(),
+                    url,
+                    size,
+                    media::PlatformUrl::NeedsCredentials {
+                        requirement: SLACK_URL_REQUIREMENT,
+                    },
+                );
                 extra_blocks.extend(media::audio_attachment_blocks(
                     filename,
                     mimetype,
-                    size,
+                    audio_size,
                     Some(audio_url),
-                    Some(audio_note),
+                    Some(&audio_note),
                     stt_line.as_deref(),
                 ));
             } else if media::is_text_file(filename, Some(mimetype)) {
@@ -1693,26 +1691,24 @@ async fn handle_message(
                                 None => None,
                             };
                             #[cfg(not(feature = "filestore"))]
-                            let stored: Option<Result<(String, String), media::AudioStoreError>> =
-                                None;
+                            let stored: Option<
+                                Result<media::StoredAttachment, media::AudioStoreError>,
+                            > = None;
 
-                            let failure_note = stored
-                                .as_ref()
-                                .and_then(|r| r.as_ref().err())
-                                .map(|e| media::store_failure_note(*e, SLACK_URL_REQUIREMENT));
-                            let (link, note) = match stored {
-                                Some(Ok((ref presigned, ref n))) => (presigned.as_str(), n.as_str()),
-                                _ => (
-                                    url,
-                                    failure_note.as_deref().unwrap_or(SLACK_URL_REQUIREMENT),
-                                ),
-                            };
+                            let (link, note, video_size) = media::attachment_url_note_size(
+                                stored.as_ref(),
+                                url,
+                                size,
+                                media::PlatformUrl::NeedsCredentials {
+                                    requirement: SLACK_URL_REQUIREMENT,
+                                },
+                            );
                             extra_blocks.push(media::video_attachment_block(
                                 filename,
                                 Some(mimetype),
-                                size,
+                                video_size,
                                 link,
-                                Some(note),
+                                Some(&note),
                             ));
                         } else {
                             // Upload unsupported file types to filestore if available
@@ -2161,6 +2157,67 @@ fn build_set_status_body(channel_id: &str, thread_ts: &str, status: &str) -> ser
 
 #[cfg(test)]
 mod tests {
+
+    /// The four store outcomes this adapter can hand the agent. Pins the note
+    /// constant too: an Accepted Residual Risk rests on its exact wording.
+    #[test]
+    fn slack_renders_every_store_outcome_and_never_hides_a_failure() {
+        use crate::media::{AudioStoreError, PlatformUrl, StoredAttachment};
+        // Pinned literally: the rows below compare against the constant, so an
+        // emptied or repurposed value would satisfy them tautologically.
+        assert_eq!(
+            super::SLACK_URL_REQUIREMENT,
+            "Slack private file, requires an `Authorization: Bearer <bot token>` header to download"
+        );
+        let platform = PlatformUrl::NeedsCredentials {
+            requirement: super::SLACK_URL_REQUIREMENT,
+        };
+        let call = |stored: Option<&Result<StoredAttachment, AudioStoreError>>| {
+            let (u, n, sz) = crate::media::attachment_url_note_size(
+                stored,
+                "https://platform.example/file",
+                0,
+                platform,
+            );
+            (u.to_string(), n, sz)
+        };
+
+        // Stored: the presigned url wins, and so does the count measured while
+        // streaming, because Slack reports size == 0 for externally-backed files.
+        let ok = Ok(StoredAttachment {
+            url: "https://s3.example/presigned".into(),
+            note: "presigned URL, expires in 60 minutes".into(),
+            measured_bytes: 5_242_880,
+        });
+        let (u, n, sz) = call(Some(&ok));
+        assert_eq!(u, "https://s3.example/presigned");
+        assert_eq!(n, "presigned URL, expires in 60 minutes");
+        assert_eq!(sz, 5_242_880, "the measured count must win over 0");
+
+        // No filestore configured at all.
+        let (u, n, sz) = call(None);
+        assert_eq!(u, "https://platform.example/file");
+        assert_eq!(n, super::SLACK_URL_REQUIREMENT);
+        assert_eq!(sz, 0);
+
+        for err in [AudioStoreError::TooLarge, AudioStoreError::UploadFailed] {
+            let (u, n, _) = call(Some(&Err(err)));
+            assert_eq!(u, "https://platform.example/file", "{err:?}");
+            assert!(
+                n.contains("Authorization: Bearer"),
+                "every Slack note names the header: {err:?}"
+            );
+        }
+
+        // DownloadFailed is the one outcome produced only after the bot fetched
+        // this very url and failed, so it may never read as a working url.
+        let (u, n, _) = call(Some(&Err(AudioStoreError::DownloadFailed)));
+        assert_eq!(u, "https://platform.example/file");
+        assert!(
+            n.contains("did not return the bytes"),
+            "DownloadFailed must say the platform withheld the bytes: {n}"
+        );
+    }
     use super::*;
 
     // --- trust gate tests ---
