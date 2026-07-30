@@ -158,18 +158,26 @@ Discord and Slack do not reject these: video goes through [Video](#video), and b
 
 Attachment bytes are fetched inside the per-event task rather than on the
 WebSocket receive path, so a slow object-storage transfer cannot stop the socket
-from reading the next event (a `/cancel` included). Five limits bound what that
+from reading the next event (a `/cancel` included). Six limits bound what that
 concurrency can cost, all compile-time constants in `gateway.rs` with no config
 key: they are safety valves, not tuning knobs, and an operator who reaches them
 has a load problem to report rather than a value to raise.
 
 | Limit | Value | Effect when reached |
 |-------|-------|---------------------|
+| Events in preparation | 256 | The event is **refused**: it is not queued, and the sender is told to send it again. This is the one limit a user can see, and the only alternative to it was letting preparation grow until the process died |
 | Concurrent attachment fetches | 4 | Further events queue for a slot. Their sources are already read by then (see below), so queueing costs latency, not content |
 | Pending pre-dispatch events | 32 | The next event's attachment bytes are **not** fetched, and the bytes it arrived with are released before it queues. The agent still receives the message, carrying the same `[System: attachment ... was not delivered ...]` line a platform-side rejection produces, with the limit named as the reason |
-| Retained attachment bytes | 256 MiB | Same effect as the pending-event limit, per attachment rather than per event: that attachment is delivered as a `not delivered` line and the rest of the message goes through. Charged against bytes actually held, never against the platform's declared size, and the read is capped at what was reserved so an under-reported size cannot overshoot |
+| Retained attachment bytes | 256 MiB | Same effect as the pending-event limit, per attachment rather than per event: that attachment is delivered as a `not delivered` line and the rest of the message goes through. Charged against bytes actually held (the encoded input, the buffer decoded from it, and whatever the block or upload adds), never against the platform's declared size, and the read is capped at what was reserved so an under-reported size cannot overshoot |
 | Inlined bytes per message | 24 MiB | The attachment that would cross it is described rather than inlined, again as a `not delivered` line |
 | Tracked thread keys | 256 | Idle threads are forgotten; keys with work in flight are kept |
+
+**Inline input is released as soon as it is decoded.** An attachment can arrive as
+base64 on the event itself rather than as a colocated path, and that string is
+allocated when the event is parsed. It is taken off the event before decoding, so
+it is freed at that point rather than riding along through assembly and dispatch,
+and it is taken on the refusal paths too: an attachment refused for being over
+budget must not go on holding the very bytes the refusal existed to avoid.
 
 **Sources are read before an event queues.** A colocated attachment is read out of
 the store as soon as its event is admitted, ahead of waiting for a fetch slot,

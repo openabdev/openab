@@ -140,13 +140,19 @@ pub(crate) async fn gateway_audio_blocks(
 /// could find the file already swept and hand the agent a read failure for an
 /// attachment that was present when the event arrived.
 async fn read_attachment_sources(
-    attachments: &[GwAttachment],
+    attachments: &mut [GwAttachment],
     budget: &SourceBudget,
     has_filestore: bool,
 ) -> (Vec<Result<Vec<u8>, SourceFailure>>, Vec<SourceBudgetGuard>) {
     let mut sources = Vec::with_capacity(attachments.len());
     let mut guards = Vec::new();
     for att in attachments {
+        // The encoded input was allocated when the event was parsed and lives on
+        // the event, so it outlives this function unless it is dropped here. Taken
+        // on every path, refusals included, or a refused attachment keeps the very
+        // bytes the refusal was meant to avoid holding.
+        let encoded = std::mem::take(&mut att.data);
+
         if att.status.is_some() {
             // Rejected upstream, so there is nothing to read and no warning to log.
             sources.push(Err(SourceFailure::Unreadable(
@@ -154,7 +160,7 @@ async fn read_attachment_sources(
             )));
             continue;
         }
-        let Some(bound) = source_upper_bound(att).await else {
+        let Some(bound) = source_upper_bound(att, &encoded).await else {
             tracing::warn!(
                 filename = %att.filename,
                 mime = %att.mime_type,
@@ -163,7 +169,12 @@ async fn read_attachment_sources(
             sources.push(Err(SourceFailure::Unreadable("no path or data".into())));
             continue;
         };
-        let reservation = retained_upper_bound(&att.attachment_type, bound, has_filestore);
+        let reservation = retained_upper_bound(
+            &att.attachment_type,
+            bound,
+            encoded.len() as u64,
+            has_filestore,
+        );
         let Some(guard) = budget.reserve(reservation) else {
             tracing::warn!(
                 filename = %att.filename,
@@ -180,9 +191,10 @@ async fn read_attachment_sources(
         } else {
             use base64::Engine;
             base64::engine::general_purpose::STANDARD
-                .decode(&att.data)
+                .decode(&encoded)
                 .map_err(|e| e.to_string())
         };
+        drop(encoded);
         match read {
             Ok(bytes) => {
                 guards.push(guard);
@@ -250,8 +262,15 @@ fn upload_copy_bytes(attachment_type: &str, source_bytes: u64, has_filestore: bo
 
 /// Peak bytes holding this attachment through assembly can cost: the source, plus
 /// whatever is alive alongside it, whether that is the block or an upload body.
-fn retained_upper_bound(attachment_type: &str, source_bytes: u64, has_filestore: bool) -> u64 {
-    source_bytes
+fn retained_upper_bound(
+    attachment_type: &str,
+    source_bytes: u64,
+    encoded_bytes: u64,
+    has_filestore: bool,
+) -> u64 {
+    // The encoded input is alive alongside the buffer decoded from it.
+    encoded_bytes
+        .saturating_add(source_bytes)
         .saturating_add(inline_payload_bytes(
             attachment_type,
             source_bytes,
@@ -333,12 +352,12 @@ enum SourceFailure {
 
 /// An upper bound on what reading this attachment would retain, computed without
 /// reading it so the budget can be charged first.
-async fn source_upper_bound(att: &GwAttachment) -> Option<u64> {
+async fn source_upper_bound(att: &GwAttachment, encoded: &str) -> Option<u64> {
     if let Some(ref path) = att.path {
         tokio::fs::metadata(path).await.ok().map(|m| m.len())
-    } else if !att.data.is_empty() {
+    } else if !encoded.is_empty() {
         // base64 yields at most three bytes per four characters.
-        Some(att.data.len() as u64 / 4 * 3 + 3)
+        Some(encoded.len() as u64 / 4 * 3 + 3)
     } else {
         None
     }
@@ -554,6 +573,20 @@ const MAX_PENDING_ATTACHMENT_EVENTS: usize = 32;
 const MAX_TRACKED_ORDER_KEYS: usize = 256;
 
 /// Whether this event's attachments must be described rather than fetched.
+/// Events that may be in preparation at once. Past this the broker refuses rather
+/// than admitting work it has no way to bound, and says so to the sender: a
+/// refusal a user can act on beats a queue that grows until the process dies.
+const MAX_PENDING_DISPATCH_EVENTS: usize = 256;
+
+/// What the sender is told when an event is refused for capacity.
+const OVERLOADED_REPLY: &str =
+    "\u{26a0}\u{fe0f} The broker is at capacity and did not accept this message. Please send it again in a moment.";
+
+/// Whether one more event can be admitted for preparation.
+fn admits_event(pending_events: usize, limit: usize) -> bool {
+    pending_events < limit
+}
+
 fn sheds_attachment_work(pending_events: usize, has_attachments: bool) -> bool {
     has_attachments && pending_events >= MAX_PENDING_ATTACHMENT_EVENTS
 }
@@ -1703,6 +1736,15 @@ pub async fn run_gateway_adapter(
                                     // Reaped here rather than at shutdown so the pending count
                                     // gating attachment fetches means what it says.
                                     while tasks.try_join_next().is_some() {}
+                                    if !admits_event(tasks.len(), MAX_PENDING_DISPATCH_EVENTS) {
+                                        warn!(
+                                            pending = tasks.len(),
+                                            channel = %event.channel.id,
+                                            "gateway: pending-event limit reached, refusing the event"
+                                        );
+                                        let _ = send_fire_and_forget(&slash_ws_tx, &channel, OVERLOADED_REPLY).await;
+                                        continue;
+                                    }
                                     let has_attachments = !event.content.attachments.is_empty();
                                     let shed = sheds_attachment_work(tasks.len(), has_attachments);
                                     // Dropped before the task can capture it, see the helper.
@@ -1734,7 +1776,7 @@ pub async fn run_gateway_adapter(
                                             // Read before queueing, so a colocated file cannot be
                                             // swept out from under a task waiting for a slot.
                                             let (sources, guards) = read_attachment_sources(
-                                                &event.content.attachments,
+                                                &mut event.content.attachments,
                                                 &budget,
                                                 has_filestore,
                                             )
@@ -1974,7 +2016,7 @@ pub async fn process_gateway_event(
     event_json: &str,
     ctx: &GatewayEventContext,
 ) -> anyhow::Result<bool> {
-    let event: GatewayEvent = serde_json::from_str(event_json)
+    let mut event: GatewayEvent = serde_json::from_str(event_json)
         .map_err(|e| anyhow::anyhow!("invalid gateway event JSON: {e}"))?;
 
     // Structural gating (bot filter + @mention) stays in should_skip_event.
@@ -2054,7 +2096,7 @@ pub async fn process_gateway_event(
     #[cfg(not(feature = "filestore"))]
     let has_filestore = false;
     let (sources, _guards) =
-        read_attachment_sources(&event.content.attachments, &budget, has_filestore).await;
+        read_attachment_sources(&mut event.content.attachments, &budget, has_filestore).await;
     let extra_blocks = assemble_attachment_blocks(
         &event.content.attachments,
         sources,
@@ -2204,14 +2246,14 @@ mod tests {
         let mut rejected = gw_attachment("image", "huge.png", "image/png", "");
         rejected.status = Some("too large for the gateway store".into());
 
-        let attachments = vec![
+        let mut attachments = vec![
             rejected,
             gw_attachment("audio", "note.m4a", "audio/mp4", "YWJj"),
             gw_attachment("sticker", "wave.tgs", "application/gzip", "YWJj"),
         ];
 
         let (sources, _guards) = read_attachment_sources(
-            &attachments,
+            &mut attachments,
             &SourceBudget::new(MAX_ADMITTED_SOURCE_BYTES),
             false,
         )
@@ -2241,9 +2283,9 @@ mod tests {
         let mut rejected = gw_attachment("audio", "voice.ogg", "audio/ogg", "");
         rejected.status = Some("download failed upstream".into());
 
-        let attachments = [rejected];
+        let mut attachments = [rejected];
         let (sources, _guards) = read_attachment_sources(
-            &attachments,
+            &mut attachments,
             &SourceBudget::new(MAX_ADMITTED_SOURCE_BYTES),
             false,
         )
@@ -2465,11 +2507,11 @@ mod tests {
 
         let mut att = gw_attachment("audio", "note.ogg", "audio/ogg", "");
         att.path = Some(path.to_string_lossy().into_owned());
-        let attachments = [att];
+        let mut attachments = [att];
 
         // Admission: read now, queue later.
         let (sources, _guards) = read_attachment_sources(
-            &attachments,
+            &mut attachments,
             &SourceBudget::new(MAX_ADMITTED_SOURCE_BYTES),
             false,
         )
@@ -2479,7 +2521,7 @@ mod tests {
         tokio::fs::remove_file(&path).await.unwrap();
         assert!(
             read_attachment_sources(
-                &attachments,
+                &mut attachments,
                 &SourceBudget::new(MAX_ADMITTED_SOURCE_BYTES),
                 false
             )
@@ -2526,7 +2568,7 @@ mod tests {
             assert_eq!(inline_payload_bytes(carries_a_url, 1_000_000, false), 0);
         }
         assert_eq!(
-            retained_upper_bound("image", 3, false),
+            retained_upper_bound("image", 3, 0, false),
             7,
             "the source is alive while its encoded copy is built"
         );
@@ -2581,17 +2623,17 @@ mod tests {
         );
 
         assert_eq!(
-            retained_upper_bound("audio", 100, true),
+            retained_upper_bound("audio", 100, 0, true),
             200,
             "the upload body is a second buffer alive with the source"
         );
         assert_eq!(
-            retained_upper_bound("audio", 100, false),
+            retained_upper_bound("audio", 100, 0, false),
             100,
             "with no store there is no upload to copy for"
         );
         assert_eq!(
-            retained_upper_bound("image", 3, true),
+            retained_upper_bound("image", 3, 0, true),
             7,
             "images are never externalized on this path"
         );
@@ -2601,33 +2643,85 @@ mod tests {
     /// the encoded copy is alive at the same time as the bytes it came from.
     #[tokio::test]
     async fn an_image_reserves_what_its_encoded_block_will_hold() {
-        let image = gw_attachment("image", "a.png", "image/png", "dm9pY2UgYnl0ZXM=");
-        let source = source_upper_bound(&image).await.unwrap();
-        let attachments = [image];
+        let encoded = "dm9pY2UgYnl0ZXM=";
+        let probe = gw_attachment("image", "a.png", "image/png", encoded);
+        let source = source_upper_bound(&probe, &probe.data).await.unwrap();
+        let encoded_len = encoded.len() as u64;
 
-        let tight = SourceBudget::new(source);
-        let (refused, _) = read_attachment_sources(&attachments, &tight, false).await;
+        // Room for the input and the buffer decoded from it, but not for the block.
+        let tight = SourceBudget::new(encoded_len + source);
+        let mut attachments = [gw_attachment("image", "a.png", "image/png", encoded)];
+        let (refused, _) = read_attachment_sources(&mut attachments, &tight, false).await;
         assert!(
             matches!(refused[0], Err(SourceFailure::Undeliverable(_))),
             "room for the source alone must not admit the copy built from it"
         );
 
-        let enough = SourceBudget::new(retained_upper_bound("image", source, false));
-        let (admitted, guards) = read_attachment_sources(&attachments, &enough, false).await;
-        assert!(admitted[0].is_ok(), "room for both must admit it");
+        let enough = SourceBudget::new(retained_upper_bound("image", source, encoded_len, false));
+        let mut attachments = [gw_attachment("image", "a.png", "image/png", encoded)];
+        let (admitted, guards) = read_attachment_sources(&mut attachments, &enough, false).await;
+        assert!(admitted[0].is_ok(), "room for all of it must admit it");
         assert_eq!(guards.len(), 1);
+    }
+
+    /// The encoded input is charged, and then released rather than riding along on
+    /// the event: a refused attachment must not keep the bytes the refusal existed
+    /// to avoid holding.
+    #[tokio::test]
+    async fn the_reservation_covers_the_encoded_input_and_then_frees_it() {
+        let encoded = "dm9pY2UgYnl0ZXM=";
+        let probe = gw_attachment("audio", "a.ogg", "audio/ogg", encoded);
+        let source = source_upper_bound(&probe, &probe.data).await.unwrap();
+
+        // Enough for the decoded buffer, but not for the input it was decoded from.
+        let tight = SourceBudget::new(source);
+        let mut attachments = [gw_attachment("audio", "a.ogg", "audio/ogg", encoded)];
+        let (refused, _) = read_attachment_sources(&mut attachments, &tight, false).await;
+        assert!(
+            matches!(refused[0], Err(SourceFailure::Undeliverable(_))),
+            "the input has to be charged too, or the bound is short by its size"
+        );
+        assert!(
+            attachments[0].data.is_empty(),
+            "a refused attachment must not go on holding its input"
+        );
+
+        let enough = SourceBudget::new(retained_upper_bound(
+            "audio",
+            source,
+            encoded.len() as u64,
+            false,
+        ));
+        let mut attachments = [gw_attachment("audio", "a.ogg", "audio/ogg", encoded)];
+        let (admitted, _) = read_attachment_sources(&mut attachments, &enough, false).await;
+        assert!(admitted[0].is_ok(), "charging both must still admit it");
+        assert!(
+            attachments[0].data.is_empty(),
+            "the input is released once it has been decoded"
+        );
+    }
+
+    #[test]
+    fn admission_stops_at_the_limit() {
+        assert!(admits_event(0, 2));
+        assert!(admits_event(1, 2));
+        assert!(
+            !admits_event(2, 2),
+            "at the limit the next event is refused"
+        );
+        assert!(!admits_event(9, 2));
     }
 
     /// What the dispatcher queue holds is capped per message, because the source
     /// reservation is gone by the time the blocks are sitting in it.
     #[tokio::test]
     async fn a_near_limit_image_is_described_rather_than_inlined() {
-        let attachments = [
+        let mut attachments = [
             gw_attachment("image", "a.png", "image/png", "dm9pY2UgYnl0ZXM="),
             gw_attachment("image", "b.png", "image/png", "dm9pY2UgYnl0ZXM="),
         ];
         let budget = SourceBudget::new(MAX_ADMITTED_SOURCE_BYTES);
-        let (sources, _guards) = read_attachment_sources(&attachments, &budget, false).await;
+        let (sources, _guards) = read_attachment_sources(&mut attachments, &budget, false).await;
         // Eleven decoded bytes encode to sixteen, so exactly one of them fits.
         let limit = inline_payload_bytes("image", 11, false);
 
@@ -2691,9 +2785,11 @@ mod tests {
         second.size = 0;
 
         // Room for one of them, and only because the charge is the real size.
-        let budget = SourceBudget::new(source_upper_bound(&first).await.unwrap());
-        let attachments = [first, second];
-        let (sources, guards) = read_attachment_sources(&attachments, &budget, false).await;
+        let encoded_len = first.data.len() as u64;
+        let source = source_upper_bound(&first, &first.data).await.unwrap();
+        let budget = SourceBudget::new(retained_upper_bound("audio", source, encoded_len, false));
+        let mut attachments = [first, second];
+        let (sources, guards) = read_attachment_sources(&mut attachments, &budget, false).await;
 
         assert!(sources[0].is_ok(), "the first still fits");
         assert!(
@@ -2706,10 +2802,10 @@ mod tests {
     #[tokio::test]
     async fn a_refused_source_tells_the_agent_rather_than_claiming_a_read_failure() {
         let att = gw_attachment("audio", "note.ogg", "audio/ogg", "dm9pY2UgYnl0ZXM=");
-        let attachments = [att];
+        let mut attachments = [att];
         // No room at all.
         let budget = SourceBudget::new(0);
-        let (sources, _guards) = read_attachment_sources(&attachments, &budget, false).await;
+        let (sources, _guards) = read_attachment_sources(&mut attachments, &budget, false).await;
 
         let blocks = assemble_attachment_blocks(
             &attachments,
