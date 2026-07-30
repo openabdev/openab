@@ -71,7 +71,16 @@ impl<'de> Deserialize<'de> for AllowBots {
 /// same host connects to `http://<listen>/mcp`. Provider connections stay in
 /// `~/.openab/agent/mcp.json` (the facade has no provider config here —
 /// single source of truth, ADR §6.3 / Alternative E).
+/// **Strict.** An unknown key here is a hard startup failure, not a warning.
+///
+/// This section is a permissions control, and the failure mode of a silently-ignored key runs the
+/// wrong way: `[[mcp.acp_server]]` (singular) leaves `acp_servers` empty, and an empty list keeps
+/// the built-in default of five browser tools. So an operator writing a one-tool allowlist and
+/// mistyping the section gets five tools — tightening the config actually widens it. Every other
+/// misconfiguration in this section fails closed; only the typo fails open, which is why the parser
+/// has to catch it rather than the policy layer.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpFacadeConfig {
     /// Loopback listen address. Non-loopback addresses are refused at
     /// startup — the endpoint has no authentication layer, so the host
@@ -131,7 +140,13 @@ pub fn default_tunnel_timeout_seconds() -> u64 {
 /// so admitting a name grants nothing by itself — `tools` is the second,
 /// independent gate that stops a client publishing extra tools under a name the
 /// operator trusts.
+/// **Strict**, for the same reason as [`McpFacadeConfig`]: a mistyped `tools` key would leave the
+/// list empty, and an entry with no tools is accepted-but-publishes-nothing. That direction fails
+/// closed, so it is the milder case — but an operator who cannot tell a typo from an intentional
+/// deny-all has no way to debug a server that went quiet, and the same keystroke in the parent
+/// section fails open.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AcpServerPolicy {
     /// Declared server name to accept — matches `name` in the client's
     /// `{type:"acp", id, name}` entry and the `<server>` prefix of its tools.
@@ -2365,6 +2380,53 @@ mod tests {
         let cfg = parse_config_str("[discord]\nbot_token = \"x\"\n[mcp]\n", "test").unwrap();
         let mcp = cfg.mcp.expect("[mcp] presence is the opt-in signal");
         assert_eq!(mcp.listen, "127.0.0.1:8848");
+    }
+
+    /// The typo that motivated `deny_unknown_fields`, asserted as a REJECTION.
+    ///
+    /// `[[mcp.acp_server]]` is one character from `[[mcp.acp_servers]]`. Before this, it parsed
+    /// clean, left `acp_servers` empty, and `browser_source.rs` read an empty list as "keep the
+    /// built-in default" — five tools, from a config asking for one.
+    #[test]
+    fn a_mistyped_acp_servers_section_is_refused_not_ignored() {
+        let err = parse_config_str(
+            "[discord]\nbot_token = \"x\"\n[mcp]\n[[mcp.acp_server]]\nname = \"katashiro\"\n\
+             tools = [\"katashiro.read_dom\"]\n",
+            "test",
+        )
+        .expect_err("a mistyped section must fail the parse, not widen the tool set");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("acp_server"),
+            "the error must name the offending key so the operator can find it, got: {msg}"
+        );
+    }
+
+    /// The correctly spelled section still parses — otherwise the test above would pass for a
+    /// parser that rejects everything.
+    #[test]
+    fn the_correctly_spelled_acp_servers_section_still_parses() {
+        let cfg = parse_config_str(
+            "[discord]\nbot_token = \"x\"\n[mcp]\n[[mcp.acp_servers]]\nname = \"katashiro\"\n\
+             tools = [\"katashiro.read_dom\"]\n",
+            "test",
+        )
+        .expect("the documented spelling must keep working");
+        let mcp = cfg.mcp.expect("[mcp] present");
+        assert_eq!(mcp.acp_servers.len(), 1);
+        assert_eq!(mcp.acp_servers[0].name, "katashiro");
+        assert_eq!(mcp.acp_servers[0].tools, vec!["katashiro.read_dom".to_string()]);
+    }
+
+    #[test]
+    fn a_mistyped_key_inside_an_acp_server_entry_is_refused() {
+        let err = parse_config_str(
+            "[discord]\nbot_token = \"x\"\n[mcp]\n[[mcp.acp_servers]]\nname = \"katashiro\"\n\
+             tool = [\"katashiro.read_dom\"]\n",
+            "test",
+        )
+        .expect_err("`tool` is not `tools`; silently dropping it makes the entry deny-all");
+        assert!(err.to_string().contains("tool"));
     }
 
     #[test]
