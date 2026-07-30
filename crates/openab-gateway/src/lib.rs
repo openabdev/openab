@@ -886,7 +886,7 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                     Ok(reply) => {
                         info!(
                             platform = %reply.platform,
-                            channel = %reply.channel.id,
+                            channel = %redact_channel(&reply.channel.id),
                             command = ?reply.command.as_deref(),
                             "OAB → gateway reply"
                         );
@@ -1176,5 +1176,61 @@ mod l1_audit_tests {
         assert_eq!(s.line_webhook_path, "/hook/line");
         // Config-supplied secret satisfies the L1 startup check.
         assert!(flagged(&s).is_empty());
+    }
+}
+
+/// Render a channel id for logs, hashing it when it is an ACP channel.
+///
+/// An ACP `channel_id` is `acp_<uuid>` and the session id is `sess_<same uuid>`, so the two are
+/// mutually derivable: the channel id printed here IS a resume credential. Anyone reading operator
+/// logs could resume the session, and logs travel further than the sessions they describe.
+///
+/// Only ACP ids are hashed. A Discord or Slack channel id is a public identifier that operators
+/// legitimately grep for, and redacting it would cost real debuggability to protect nothing.
+///
+/// Hashed rather than dropped so the same session still tags identically on every line — that
+/// correlation is the whole reason the id is in the log. **The tag must match the one produced in
+/// the other crates that log channel ids**, or a session cannot be followed across them; each copy
+/// is pinned to the same vector by its own test. The copies exist because these crates deliberately
+/// do not depend on one another, and adding an edge to share five lines would trade a documented
+/// architectural boundary for a duplicate.
+fn redact_channel(id: &str) -> String {
+    if !id.starts_with("acp_") {
+        return id.to_string();
+    }
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(id.as_bytes());
+    let short: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    format!("#{short}")
+}
+
+#[cfg(test)]
+mod redact_channel_tests {
+    /// The tag for a given session must be IDENTICAL in every crate that logs a channel id.
+    ///
+    /// This exact vector and expectation are repeated in `openab-gateway`, `openab-core` and
+    /// `openab-mcp`. The three copies of `redact_channel` exist because those crates deliberately
+    /// do not depend on one another; pinning the same vector in each is what makes a divergence
+    /// fail a build instead of quietly splitting one session into three untraceable tags.
+    ///
+    /// If this assertion is ever changed, change it in all three or the redaction stops doing the
+    /// one job that justifies keeping an identifier in the log at all.
+    #[test]
+    fn an_acp_channel_hashes_to_the_shared_vector_and_others_pass_through() {
+        assert_eq!(
+            super::redact_channel("acp_00000000-0000-0000-0000-000000000000"),
+            "#850414fa",
+            "ACP channel ids must hash to the tag the other crates produce for the same session"
+        );
+        assert_eq!(
+            super::redact_channel("1234567890"),
+            "1234567890",
+            "a non-ACP channel id is a public identifier and must stay greppable"
+        );
+        assert_eq!(
+            super::redact_channel("-"),
+            "-",
+            "the no-session sentinel must not be hashed into something that looks like a session"
+        );
     }
 }
