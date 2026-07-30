@@ -73,12 +73,20 @@ impl<'de> Deserialize<'de> for AllowBots {
 /// single source of truth, ADR §6.3 / Alternative E).
 /// **Strict.** An unknown key here is a hard startup failure, not a warning.
 ///
-/// This section is a permissions control, and the failure mode of a silently-ignored key runs the
-/// wrong way: `[[mcp.acp_server]]` (singular) leaves `acp_servers` empty, and an empty list keeps
-/// the built-in default of five browser tools. So an operator writing a one-tool allowlist and
-/// mistyping the section gets five tools — tightening the config actually widens it. Every other
-/// misconfiguration in this section fails closed; only the typo fails open, which is why the parser
-/// has to catch it rather than the policy layer.
+/// This section is a permissions control and a silently-ignored key is not survivable in one:
+/// `[[mcp.acp_server]]` (singular) leaves `acp_servers` empty, so the operator's allowlist is
+/// simply not there.
+///
+/// **The direction of that failure inverted on 2026-07-30 (D-20), and the reason for this
+/// attribute changed with it.** It used to fail OPEN: an empty list kept a built-in default of
+/// five browser tools, so mistyping the section while writing a one-tool allowlist got you five —
+/// tightening the config actually widened it. That default is gone; empty now admits nothing. The
+/// same typo therefore fails CLOSED: browser control silently does not work.
+///
+/// The attribute stays, because "silently" is the objectionable part in both directions — an
+/// operator who mistyped deserves an error either way. But do not repeat the old justification:
+/// this no longer guards against a permissions widening, it guards against a permissions control
+/// that was never applied.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpFacadeConfig {
@@ -88,10 +96,16 @@ pub struct McpFacadeConfig {
     #[serde(default = "default_mcp_listen")]
     pub listen: String,
     /// Operator gate for **client-declared** `type:acp` MCP servers (ADR §6.4).
-    /// Absent or empty keeps the built-in default: `katashiro` only, pinned to
-    /// its five known tools. Listing anything here replaces that default
-    /// wholesale, so an operator can narrow the browser or admit another
-    /// client-side service without a code change.
+    ///
+    /// **Empty means none.** Absent and explicitly `[]` are the same thing and
+    /// both admit NO servers (D-20). There is no built-in default — this used to
+    /// keep `katashiro` pinned to five tools when nothing was configured, which
+    /// made an example client implementation openab's default in all but name.
+    ///
+    /// Each entry admits one declared name and lists exactly the tools it may
+    /// publish. Schemas are not built in either: they come from discovery over
+    /// the tunnel, so a freshly configured server publishes nothing until its
+    /// first `tools/list` has been fetched.
     #[serde(default)]
     pub acp_servers: Vec<AcpServerPolicy>,
     /// How long a single request tunnelled to a client-declared `type:acp` server may run
@@ -2530,9 +2544,18 @@ mod tests {
 
     /// The typo that motivated `deny_unknown_fields`, asserted as a REJECTION.
     ///
-    /// `[[mcp.acp_server]]` is one character from `[[mcp.acp_servers]]`. Before this, it parsed
-    /// clean, left `acp_servers` empty, and `browser_source.rs` read an empty list as "keep the
-    /// built-in default" — five tools, from a config asking for one.
+    /// `[[mcp.acp_server]]` is one character from `[[mcp.acp_servers]]`, and before this attribute
+    /// it parsed clean and left `acp_servers` empty.
+    ///
+    /// The CONSEQUENCE of that has since inverted (D-20) and the test outlived it, which is worth
+    /// stating so nobody reads the old reason as current. It used to be a permissions WIDENING:
+    /// `browser_source.rs` read an empty list as "keep the built-in default", so a config asking
+    /// for one tool got five. That default is gone; empty now admits nothing, so the same typo
+    /// silently disables browser control instead.
+    ///
+    /// The assertion is unchanged and still right — a mistyped permissions control must be an
+    /// error, not a guess — but it now protects against a control that was never applied rather
+    /// than against one that was widened.
     #[test]
     fn a_mistyped_acp_servers_section_is_refused_not_ignored() {
         let err = parse_config_str(

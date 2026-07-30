@@ -303,7 +303,8 @@ connected extension could otherwise publish arbitrary tools into the agent's cap
 
 Therefore this ADR requires, before the source is enabled by default:
 
-- an operator **allowlist** of accepted declared server names (default: `katashiro` only) — a
+- an operator **allowlist** of accepted declared server names (~~default: `katashiro` only~~ — as of
+  2026-07-30 there is NO default; empty admits nothing, D-20) — a
   declaration outside it is refused by the capability source: it contributes no tools and its calls
   return an error result. **Note it is not refused at declaration time** — the gateway still opens
   and registers the tunnel — **and nothing is logged today** (see the gap noted below); and
@@ -330,7 +331,10 @@ client that declares the tools, so a client may declare a server under an allowl
 `katashiro` — and publish any tool set under it. Passing the allowlist therefore grants nothing by itself — the tool set is gated
 separately:
 
-- the `katashiro` entry ships **pinned to its five known tools** (`katashiro.read_dom`,
+- ~~the `katashiro` entry ships **pinned to its five known tools**~~ — the built-in catalog was
+  deleted on 2026-07-30 (D-20): schemas now come only from discovery over the tunnel, so a
+  configured server publishes nothing until its first `tools/list` returns. Historically it was
+  (`katashiro.read_dom`,
   `katashiro.screenshot`, `katashiro.navigate`, `katashiro.click`, `katashiro.type`); any other tool name it
   declares is dropped, so a same-name declaration cannot inject new tools (dropped silently today —
   see the gap below); and
@@ -414,7 +418,8 @@ through; **F6 genuinely remains**:
 - ~~**F4 trust gate** — operator allowlist + **deny-all-by-default** per-declared-server
   `tool_filter` (§6.4).~~ **Done in #1447**: `ServerPolicy` / `policy_from_config` over
   `[[mcp.acp_servers]]`, enforced in both `tools()` and `call()` before the tunnel is resolved;
-  default allowlist is `katashiro` pinned to its five tools.
+  ~~default allowlist is `katashiro` pinned to its five tools~~ — there is no default allowlist as
+  of 2026-07-30 (D-20).
 - ~~**F5 cleanup** — retire the superseded per-session proxy path once Facade mode has soaked;
   bridge-mode removal stays an explicit operator call (§6.5).~~ **Done 2026-07-28**: the operator
   call was made and both transports were removed in this PR, so there is no soak period and no

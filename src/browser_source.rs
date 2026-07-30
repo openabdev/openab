@@ -54,57 +54,31 @@ struct ServerPolicy {
     /// past it.
     seed: Vec<Tool>,
 }
-
-/// Built-in tool catalogs, by declared server name. The only source of full
-/// `Tool` values (schemas included) before a server has been queried.
-///
-/// Browser-ness lives here as **policy data**, deliberately not as a branch in
-/// the routing code — that is what keeps the source generic (ADR §6.2: "the
-/// source must contain no browser-specific branch").
-fn builtin_catalogs() -> HashMap<String, Vec<Tool>> {
-    HashMap::from([(
-        "katashiro".to_string(),
-        openab_core::mcp_proxy::browser_tools(),
-    )])
-}
-
-/// The default policy when an operator has configured nothing: `katashiro` pinned
-/// to its five known tools, every other declared name denied.
-fn default_policy() -> HashMap<String, ServerPolicy> {
-    builtin_catalogs()
-        .into_iter()
-        .map(|(name, tools)| {
-            let policy = ServerPolicy {
-                allowed: tools.iter().map(|t| t.name.to_string()).collect(),
-                seed: tools,
-            };
-            (name, policy)
-        })
-        .collect()
-}
-
 /// Build the policy from the operator's `[[mcp.acp_servers]]` entries (§6.4).
 ///
 /// Each entry admits one declared **name** and lists exactly the tools it may
 /// publish; deny-all means an entry with no tools admits the server but grants
-/// nothing. Names are enough — schemas are taken from the built-in catalog
-/// where one exists, narrowed to what the operator permitted, so an operator
-/// can *restrict* a known server without restating its schemas. A permitted
-/// tool with no known schema simply has no seed yet and appears once discovery
-/// caching can fetch it.
+/// nothing.
+///
+/// **No seed.** Schemas come only from discovery over the tunnel
+/// (`spawn_discovery` → `tools/list` → cache). There used to be a built-in
+/// catalog that seeded `katashiro`'s five schemas so an operator could restrict
+/// a known server without restating them; it was deleted on 2026-07-30 (D-20)
+/// because katashiro is an **example implementation of the client side, not a
+/// component of openab**, and hardcoding its schemas made it a default in fact
+/// even where it was not one in name.
+///
+/// The security gate is unchanged: `allowed` still filters
+/// `fetched INTERSECT allowed`, so the operator's `tools = [...]` remains the
+/// only thing deciding what may be published. What changed is that a permitted
+/// tool has no schema until discovery fetches one — see the cold-start note on
+/// [`AcpTunnelSource::tools`].
 fn policy_from_config(entries: &[openab_core::config::AcpServerPolicy]) -> HashMap<String, ServerPolicy> {
-    let mut catalogs = builtin_catalogs();
     entries
         .iter()
         .map(|entry| {
             let allowed: HashSet<String> = entry.tools.iter().cloned().collect();
-            let seed = catalogs
-                .remove(&entry.name)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|t| allowed.contains(t.name.as_ref()))
-                .collect();
-            (entry.name.clone(), ServerPolicy { allowed, seed })
+            (entry.name.clone(), ServerPolicy { allowed, seed: Vec::new() })
         })
         .collect()
 }
@@ -148,19 +122,18 @@ fn sorted(tools: impl IntoIterator<Item = Tool>) -> Vec<Tool> {
 }
 
 impl AcpTunnelSource {
-    /// Source gated by the operator's `[[mcp.acp_servers]]` entries. An empty
-    /// list keeps the built-in default rather than denying everything, so
-    /// omitting the section leaves browser control working as before; an
-    /// operator who writes any entry takes over the allowlist wholesale.
+    /// Source gated by the operator's `[[mcp.acp_servers]]` entries.
+    ///
+    /// **Empty means none.** An absent section and an explicit `[]` are the same
+    /// thing and both admit NO servers (D-20). There is no built-in default: the
+    /// previous behaviour kept `katashiro` pinned to five tools when nothing was
+    /// configured, which made an example client implementation into openab's
+    /// default in all but name. An operator who wants browser control now says so.
     pub fn with_config(
         tunnel: Arc<dyn AcpMcpTunnel>,
         entries: &[openab_core::config::AcpServerPolicy],
     ) -> Self {
-        let policy = if entries.is_empty() {
-            default_policy()
-        } else {
-            policy_from_config(entries)
-        };
+        let policy = policy_from_config(entries);
         Self {
             tunnel,
             policy,
@@ -494,29 +467,35 @@ mod tests {
         }
     }
 
-    #[test]
-    fn catalog_is_the_pinned_policy_set_and_survives_detachment() {
-        // No tunnels attached at all: the catalog must NOT shrink (§6.3 — attachment
-        // flapping stays out of discovery; unavailability is reported on call).
-        let src = AcpTunnelSource::with_config(FakeTunnel::with(&[]), &[]);
-        let names: Vec<String> = src.tools(None).iter().map(|t| t.name.to_string()).collect();
-        assert_eq!(
-            names,
-            [
-                "katashiro.click",
-                "katashiro.navigate",
-                "katashiro.read_dom",
-                "katashiro.screenshot",
-                "katashiro.type"
-            ],
-            "the pinned browser set is advertised regardless of attach state"
-        );
+    #[tokio::test]
+    async fn a_discovered_catalog_survives_detachment() {
+        // §6.3: attachment flapping stays out of discovery; unavailability is
+        // reported on call, not by shrinking the catalog.
+        //
+        // Before D-20 this asserted the five PINNED names with no tunnel ever
+        // attached, because the built-in seed advertised them regardless. With no
+        // seed the catalog starts empty, so the property has to be asserted the
+        // way it actually matters: discover first, then detach, then check the
+        // catalog held.
+        let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
+        tunnel.set_tools_list(&["katashiro.click", "katashiro.navigate", "katashiro.read_dom", "katashiro.screenshot", "katashiro.type"]);
+        let src = AcpTunnelSource::with_config(tunnel.clone(), &[katashiro_all()]);
+        let _ = src.tools(Some(&ctx()));
+        settle().await;
+        let before: Vec<String> =
+            src.tools(Some(&ctx())).iter().map(|t| t.name.to_string()).collect();
+        assert!(!before.is_empty(), "precondition: discovery must have populated the catalog");
+
+        tunnel.detach("katashiro");
+        let after: Vec<String> =
+            src.tools(Some(&ctx())).iter().map(|t| t.name.to_string()).collect();
+        assert_eq!(after, before, "a detached tunnel must not shrink the catalog");
     }
 
     #[tokio::test]
     async fn call_routes_the_name_prefix_to_the_declared_id_keeping_the_full_tool_name() {
         let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
-        let src = AcpTunnelSource::with_config(tunnel.clone(), &[]);
+        let src = AcpTunnelSource::with_config(tunnel.clone(), &[katashiro_all()]);
         let (_v, is_err) = src
             .call(Some(&ctx()), "katashiro.click", &Map::new())
             .await
@@ -541,7 +520,7 @@ mod tests {
         // A client declaring an un-allowlisted name must not reach the agent's catalog
         // OR its dispatch, even though its tunnel is registered.
         let tunnel = FakeTunnel::with(&[("evil", "uuid-evil")]);
-        let src = AcpTunnelSource::with_config(tunnel.clone(), &[]);
+        let src = AcpTunnelSource::with_config(tunnel.clone(), &[katashiro_all()]);
         let (v, is_err) = src
             .call(Some(&ctx()), "evil.exfiltrate", &Map::new())
             .await
@@ -562,7 +541,7 @@ mod tests {
         // The injection Falcon flagged: the client re-declares the trusted name
         // `katashiro` but publishes a tool outside its pinned five.
         let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
-        let src = AcpTunnelSource::with_config(tunnel.clone(), &[]);
+        let src = AcpTunnelSource::with_config(tunnel.clone(), &[katashiro_all()]);
         let (v, is_err) = src
             .call(Some(&ctx()), "katashiro.exec", &Map::new())
             .await
@@ -581,7 +560,7 @@ mod tests {
     #[tokio::test]
     async fn allowlisted_but_unattached_server_reports_not_connected() {
         let tunnel = FakeTunnel::with(&[]);
-        let src = AcpTunnelSource::with_config(tunnel.clone(), &[]);
+        let src = AcpTunnelSource::with_config(tunnel.clone(), &[katashiro_all()]);
         let (v, is_err) = src
             .call(Some(&ctx()), "katashiro.click", &Map::new())
             .await
@@ -591,6 +570,25 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("not connected"));
+    }
+
+    /// The example client's five tools, as an operator would allowlist them.
+    ///
+    /// Tests may name katashiro; product code may not (D-20). Before that ruling
+    /// these tests passed `&[]` and inherited a built-in default, so the example
+    /// client's identity was baked into the PRODUCT and the tests never had to
+    /// state it. Now the test states it, which is where it belongs.
+    fn katashiro_all() -> openab_core::config::AcpServerPolicy {
+        cfg(
+            "katashiro",
+            &[
+                "katashiro.click",
+                "katashiro.navigate",
+                "katashiro.read_dom",
+                "katashiro.screenshot",
+                "katashiro.type",
+            ],
+        )
     }
 
     fn cfg(name: &str, tools: &[&str]) -> openab_core::config::AcpServerPolicy {
@@ -604,28 +602,46 @@ mod tests {
     }
 
     #[test]
-    fn absent_config_keeps_the_builtin_browser_default() {
-        // Omitting [[mcp.acp_servers]] must not deny everything — existing
-        // browser control keeps working untouched.
-        let src = AcpTunnelSource::with_config(FakeTunnel::with(&[]), &[]);
-        assert_eq!(src.tools(None).len(), 5);
+    fn an_absent_or_empty_config_admits_nothing() {
+        // Inverted on 2026-07-30 (D-20). This asserted 5 tools — the built-in
+        // `katashiro` default that applied when an operator configured nothing.
+        // That default is gone: katashiro is an example client implementation,
+        // not a component of openab, and shipping its catalog made it the
+        // default in fact even where it was not one in name.
+        //
+        // Absent and explicitly-empty are now the SAME thing, which is why both
+        // are asserted here rather than only the absent case.
+        let absent = AcpTunnelSource::with_config(FakeTunnel::with(&[]), &[]);
+        assert!(absent.tools(None).is_empty(), "an absent section admits no servers");
+
+        let explicitly_empty = AcpTunnelSource::with_config(FakeTunnel::with(&[]), &[]);
+        assert!(
+            explicitly_empty.tools(None).is_empty(),
+            "an explicit [] admits no servers either — the distinction the old default created is gone"
+        );
     }
 
     #[test]
-    fn operator_can_narrow_a_builtin_server_without_restating_schemas() {
+    fn an_allowlisted_tool_has_no_schema_until_discovery_supplies_one() {
+        // This test used to be `operator_can_narrow_a_builtin_server_without_
+        // restating_schemas`, and it asserted the property D-20 deleted: that a
+        // known server's schemas came from a built-in catalog, so an operator
+        // could restrict it by name alone and still publish full schemas.
+        //
+        // Kept rather than deleted, because the SCENARIO still happens every
+        // day — an operator allowlists one tool and looks at the catalog. What
+        // changed is the answer, and that is worth pinning: the name is
+        // admitted, and nothing is published until discovery has run. This is
+        // the cold-start window, asserted rather than left to be rediscovered
+        // as a regression.
         let src = AcpTunnelSource::with_config(
             FakeTunnel::with(&[("katashiro", "uuid-abc")]),
             &[cfg("katashiro", &["katashiro.read_dom"])],
         );
-        let names: Vec<String> = src.tools(None).iter().map(|t| t.name.to_string()).collect();
-        assert_eq!(
-            names,
-            ["katashiro.read_dom"],
-            "the seed narrows to the operator's list, keeping the built-in schema"
-        );
         assert!(
-            src.tools(None)[0].input_schema.get("type").is_some(),
-            "narrowing must not lose the built-in schema"
+            src.tools(None).is_empty(),
+            "no seed exists any more, so a freshly configured server publishes nothing \
+             until tools/list has been fetched over the tunnel"
         );
     }
 
@@ -744,17 +760,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_seeded_server_keeps_its_seed_until_discovery_succeeds() {
-        // Fetch fails: the catalog must fall back to the seed, never to empty.
+    async fn a_failed_discovery_does_not_empty_an_already_populated_catalog() {
+        // Renamed from `a_seeded_server_keeps_its_seed_until_discovery_succeeds`.
+        // Seeds are gone (D-20), so "falls back to the seed" is not a property any
+        // more — but the invariant underneath it survives and is the one that
+        // actually protects a running deployment: once a catalog has been
+        // discovered, a LATER failed fetch must not empty it.
         let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
+        tunnel.set_tools_list(&["katashiro.click", "katashiro.navigate", "katashiro.read_dom", "katashiro.screenshot", "katashiro.type"]);
+        let src = AcpTunnelSource::with_config(tunnel.clone(), &[katashiro_all()]);
+
+        // Populate the cache with a successful discovery first.
+        let _ = src.tools(Some(&ctx()));
+        settle().await;
+        let discovered = src.tools(Some(&ctx())).len();
+        assert!(discovered > 0, "precondition: discovery must have populated the catalog");
+
+        // Now make discovery fail and confirm the catalog is not emptied.
         tunnel.fail_tools_list();
-        let src = AcpTunnelSource::with_config(tunnel.clone(), &[]);
-        assert_eq!(src.tools(Some(&ctx())).len(), 5);
+        let _ = src.tools(Some(&ctx()));
         settle().await;
         assert_eq!(
             src.tools(Some(&ctx())).len(),
-            5,
-            "a failed discovery must not empty out a seeded server"
+            discovered,
+            "a failed discovery must not empty a catalog that was already populated"
         );
     }
 
@@ -762,7 +791,7 @@ mod tests {
     async fn discovery_is_not_repeated_while_one_is_in_flight() {
         let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
         tunnel.set_tools_list(&["katashiro.read_dom"]);
-        let src = AcpTunnelSource::with_config(tunnel.clone(), &[]);
+        let src = AcpTunnelSource::with_config(tunnel.clone(), &[katashiro_all()]);
         for _ in 0..5 {
             let _ = src.tools(Some(&ctx()));
         }
@@ -780,7 +809,7 @@ mod tests {
         // on reconnect, and an id-keyed entry would be orphaned by it.
         let tunnel = FakeTunnel::with(&[("katashiro", "uuid-old")]);
         tunnel.set_tools_list(&["katashiro.read_dom"]);
-        let src = AcpTunnelSource::with_config(tunnel.clone(), &[]);
+        let src = AcpTunnelSource::with_config(tunnel.clone(), &[katashiro_all()]);
         let _ = src.tools(Some(&ctx()));
         settle().await;
         assert_eq!(src.tools(Some(&ctx())).len(), 1);

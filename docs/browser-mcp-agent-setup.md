@@ -83,7 +83,9 @@ provider in `mcp.json`. Enable the facade and it works:
 listen = "127.0.0.1:8848"
 
 # Operator gate for client-declared type:acp servers (reverse-MCP ADR §6.4).
-# Omit entirely to keep the built-in default: `katashiro` only, pinned to its five tools.
+# REQUIRED for browser control. Omitting this section — or writing an empty list — admits NO
+# servers (D-20). There is no built-in default: `katashiro` is an example client implementation,
+# not a component of openab. Name the server and list exactly the tools it may publish.
 [[mcp.acp_servers]]
 name  = "katashiro"
 tools = ["katashiro.read_dom","katashiro.screenshot","katashiro.navigate","katashiro.click","katashiro.type"]
