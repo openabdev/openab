@@ -112,7 +112,7 @@ presigned_ttl = 7200
 | `region` | ✅ | — | AWS region (`"auto"` for R2) |
 | `endpoint` | ❌ | AWS default | Custom S3-compatible endpoint URL |
 | `prefix` | ❌ | `"incoming/"` | Object key prefix |
-| `presigned_ttl` | ❌ | `3600` | Presigned URL lifetime in seconds (capped at 604800, i.e. 7 days; the configured value is never raised, and a sub-minute lifetime is reported to the agent in seconds) |
+| `presigned_ttl` | ❌ | `3600` | Presigned URL lifetime in seconds (capped at 604800, i.e. 7 days; the configured value is never raised, with one exception: `0` becomes `1`, because S3 rejects `X-Amz-Expires=0` outright and a URL that cannot work at all is worse than one that expires immediately. A sub-minute lifetime is reported to the agent in seconds) |
 | `max_file_size_mb` | ❌ | `250` | Maximum file size for upload in MB (max 500) |
 | `access_key_id` | ❌ | provider chain | Explicit access key |
 | `secret_access_key` | ❌ | provider chain | Explicit secret key |
