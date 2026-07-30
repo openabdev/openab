@@ -474,6 +474,13 @@ pub fn new_reply_registry() -> AcpReplyRegistry {
 /// Keyed by the compound `(channel_id, server_id)` (P1) so one session can carry several
 /// `type:acp` servers without collision; eviction drops all `(channel_id, *)` on teardown. Same
 /// std::sync::Mutex rationale as `AcpReplyRegistry`.
+/// Shared map of live MCP-over-ACP tunnels, keyed `(channel_id, server_id)`.
+///
+/// **To reach a tunnel by its declared NAME, call [`resolve_by_name`].** Holding this map and
+/// matching `server_name()` yourself is possible and is the wrong thing: which entry wins when a
+/// name appears twice is decided by rank, that rank is private, and the eviction keeping names
+/// unique lives beside `resolve_by_name` rather than beside you. Two callers previously did their
+/// own matching, by two different rules, and neither noticed.
 pub type AcpTunnelRegistry = Arc<std::sync::Mutex<HashMap<(String, String), TunnelHandle>>>;
 
 pub fn new_tunnel_registry() -> AcpTunnelRegistry {
@@ -856,6 +863,10 @@ pub struct TunnelHandle {
 impl TunnelHandle {
     /// The client-declared server name for this tunnel (see the field docs for why the declared
     /// name and the registry key are deliberately different things).
+    ///
+    /// Exposed for reporting, not for routing. Selecting a tunnel by comparing this against a
+    /// wanted name is what [`resolve_by_name`] exists to do — it also knows which entry wins if a
+    /// name ever appears twice, which this accessor cannot tell you.
     pub fn server_name(&self) -> &str {
         &self.server_name
     }
