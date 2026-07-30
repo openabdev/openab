@@ -389,10 +389,9 @@ pub fn resize_and_compress(raw: &[u8]) -> Result<(Vec<u8>, String), image::Image
     Ok((buf.into_inner(), "image/jpeg".to_string()))
 }
 
-/// Check if a MIME type is audio. Crate-internal on purpose: the only caller is
-/// `audio_mime`, and a public entry point here invites a caller to reproduce the
-/// extension-blind classification `audio_mime` exists to replace.
-pub(crate) fn is_audio_mime(mime: &str) -> bool {
+/// Check if a MIME type is audio. Kept public at its original signature for
+/// external callers; adapters want `audio_mime`, which also reads the extension.
+pub fn is_audio_mime(mime: &str) -> bool {
     mime.starts_with("audio/")
 }
 
@@ -1194,13 +1193,26 @@ pub async fn download_and_upload_any_file(
 /// Distinguished so the hint-block wrapper keeps its three distinct degraded
 /// messages while URL-only callers can collapse every failure to a fallback.
 #[cfg(feature = "filestore")]
+#[derive(Debug, PartialEq, Eq)]
 enum PresignError {
-    /// Refused before any request, because the reported size exceeds the cap.
+    /// Over the cap, either by the advisory prechecks or by the count measured
+    /// while streaming, which is the only authoritative one.
     TooLarge,
     /// The platform did not hand over the bytes, so there was nothing to upload.
     DownloadFailed,
     UploadFailed,
     UploadTimedOut,
+}
+
+/// The failure the agent is told about. Extracted because flattening every
+/// post-response failure into one variant named the wrong component to inspect.
+#[cfg(feature = "filestore")]
+fn presign_error_for_upload(err: &anyhow::Error) -> PresignError {
+    match err.downcast_ref::<crate::filestore::StreamUploadCause>() {
+        Some(crate::filestore::StreamUploadCause::SourceRead) => PresignError::DownloadFailed,
+        Some(crate::filestore::StreamUploadCause::TooLarge) => PresignError::TooLarge,
+        None => PresignError::UploadFailed,
+    }
 }
 
 #[cfg(feature = "filestore")]
@@ -1258,7 +1270,7 @@ async fn download_and_presign_any_file(
         Ok(Ok(uploaded)) => Ok(uploaded),
         Ok(Err(e)) => {
             tracing::error!(filename, error = %e, "filestore upload failed (any-file path)");
-            Err(PresignError::UploadFailed)
+            Err(presign_error_for_upload(&e))
         }
         Err(_) => {
             tracing::error!(filename, "filestore upload timed out (any-file path)");
@@ -1426,6 +1438,51 @@ async fn upload_bytes_to_filestore(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The classification only exists under `filestore`, and so does the enum it
+    // reads, so the test that pins it has to follow the same gate.
+    #[cfg(feature = "filestore")]
+    #[test]
+    fn a_post_response_failure_names_the_component_actually_at_fault() {
+        use crate::filestore::StreamUploadCause;
+
+        let cases = [
+            (
+                anyhow::Error::new(StreamUploadCause::SourceRead)
+                    .context("stream read error: connection reset"),
+                PresignError::DownloadFailed,
+                "did not return the bytes",
+            ),
+            (
+                anyhow::Error::new(StreamUploadCause::TooLarge)
+                    .context("file exceeds max size (300000000 > 262144000)"),
+                PresignError::TooLarge,
+                "exceeds the configured upload limit",
+            ),
+            (
+                anyhow::anyhow!("upload_part 3 failed: connection closed"),
+                PresignError::UploadFailed,
+                "the upload did not complete",
+            ),
+        ];
+
+        for (err, expected, expected_reason) in cases {
+            // The message the operator reads in the log must survive the tagging.
+            let displayed = err.to_string();
+            let classified = presign_error_for_upload(&err);
+            assert_eq!(classified, expected, "{displayed}");
+
+            let store_err = match classified {
+                PresignError::TooLarge => AudioStoreError::TooLarge,
+                PresignError::DownloadFailed => AudioStoreError::DownloadFailed,
+                PresignError::UploadFailed | PresignError::UploadTimedOut => {
+                    AudioStoreError::UploadFailed
+                }
+            };
+            let note = store_failure_note(store_err, "fetch it with a bearer token");
+            assert!(note.contains(expected_reason), "{note}");
+        }
+    }
 
     fn make_png(width: u32, height: u32) -> Vec<u8> {
         let img = image::RgbImage::new(width, height);

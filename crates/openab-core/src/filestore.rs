@@ -15,6 +15,28 @@ pub struct Filestore {
     max_file_size: u64,
 }
 
+/// Why a streaming upload stopped, carried in the error chain so a caller can
+/// name the component at fault. Everything else is an S3 failure, which is what
+/// an untagged error already means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamUploadCause {
+    /// The platform's body stream failed or ended empty after a 2xx response.
+    SourceRead,
+    /// The bytes actually read overran the cap that the advisory prechecks passed.
+    TooLarge,
+}
+
+impl std::fmt::Display for StreamUploadCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SourceRead => f.write_str("the platform's body stream failed"),
+            Self::TooLarge => f.write_str("the measured bytes exceeded the configured limit"),
+        }
+    }
+}
+
+impl std::error::Error for StreamUploadCause {}
+
 /// What `upload_and_presign` has always stored, kept named so the compatibility
 /// wrapper and its doc comment cannot drift apart.
 const TEXT_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
@@ -230,10 +252,12 @@ impl Filestore {
 
         // Pre-check reported size
         if reported_size > self.max_file_size {
-            return Err(anyhow::anyhow!(
-                "reported file size ({reported_size}) exceeds max ({})",
-                self.max_file_size
-            ));
+            return Err(
+                anyhow::Error::new(StreamUploadCause::TooLarge).context(format!(
+                    "reported file size ({reported_size}) exceeds max ({})",
+                    self.max_file_size
+                )),
+            );
         }
 
         // Initiate multipart upload
@@ -268,17 +292,21 @@ impl Filestore {
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(e) => {
-                    upload_error = Some(anyhow::anyhow!("stream read error: {e}"));
+                    upload_error = Some(
+                        anyhow::Error::new(StreamUploadCause::SourceRead)
+                            .context(format!("stream read error: {e}")),
+                    );
                     break;
                 }
             };
             total_bytes += chunk.len() as u64;
 
             if total_bytes > self.max_file_size {
-                upload_error = Some(anyhow::anyhow!(
-                    "file exceeds max size ({} > {})",
-                    total_bytes,
-                    self.max_file_size
+                upload_error = Some(anyhow::Error::new(StreamUploadCause::TooLarge).context(
+                    format!(
+                        "file exceeds max size ({} > {})",
+                        total_bytes, self.max_file_size
+                    ),
                 ));
                 break;
             }
@@ -399,7 +427,8 @@ impl Filestore {
                 .upload_id(&upload_id)
                 .send()
                 .await;
-            return Err(anyhow::anyhow!("stream produced no data — file may be empty or download failed"));
+            return Err(anyhow::Error::new(StreamUploadCause::SourceRead)
+                .context("stream produced no data, so the file is empty or the download failed"));
         }
 
         // If buffer has remaining data but no parts yet (file < 16 MB), upload as single part
