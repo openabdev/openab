@@ -15,26 +15,29 @@ pub struct Filestore {
     max_file_size: u64,
 }
 
-/// Below a minute the URL tends to expire before the agent fetches it, and every
-/// hint that renders `ttl / 60` reports "0 minutes"; a week is the upper bound.
-const MIN_PRESIGNED_TTL: u64 = 60;
 const MAX_PRESIGNED_TTL: u64 = 7 * 24 * 60 * 60;
 
-fn clamp_presigned_ttl(configured: u64) -> u64 {
+fn cap_presigned_ttl(configured: u64) -> u64 {
     if configured > MAX_PRESIGNED_TTL {
         tracing::warn!(
             configured,
             capped = MAX_PRESIGNED_TTL,
             "presigned_ttl exceeds 7-day maximum, capping"
         );
-    } else if configured < MIN_PRESIGNED_TTL {
-        tracing::warn!(
-            configured,
-            raised = MIN_PRESIGNED_TTL,
-            "presigned_ttl below 60-second minimum, raising"
-        );
     }
-    configured.clamp(MIN_PRESIGNED_TTL, MAX_PRESIGNED_TTL)
+    configured.min(MAX_PRESIGNED_TTL)
+}
+
+/// The lifetime as the agent reads it. `presigned_ttl` governs how long an
+/// authorization lives, so a sub-minute value is rendered, never raised.
+pub(crate) fn format_presigned_lifetime(ttl_secs: u64) -> String {
+    match ttl_secs {
+        1 => "1 second".to_string(),
+        s if s < 60 => format!("{s} seconds"),
+        // Unchanged from before the sub-minute branch existed, so the #738 hint
+        // stays byte-identical at every TTL that path could already render.
+        s => format!("{} minutes", s / 60),
+    }
 }
 
 impl Filestore {
@@ -79,7 +82,7 @@ impl Filestore {
 
         let client = aws_sdk_s3::Client::from_conf(s3_config_builder.build());
 
-        let ttl_secs = clamp_presigned_ttl(config.presigned_ttl);
+        let ttl_secs = cap_presigned_ttl(config.presigned_ttl);
 
         // Cap max_file_size_mb at 500 MB absolute maximum.
         const ABSOLUTE_MAX_FILE_SIZE_MB: u64 = 500;
@@ -496,7 +499,7 @@ impl Filestore {
 /// to the filestore instead of being inlined.
 pub fn format_filestore_hint(filename: &str, size_bytes: u64, presigned_url: &str, ttl_secs: u64) -> String {
     let size_kb = size_bytes / 1024;
-    let ttl_minutes = ttl_secs / 60;
+    let lifetime = format_presigned_lifetime(ttl_secs);
     // Sanitize filename for prompt safety — strip control characters
     let safe_filename: String = filename.chars().filter(|c| !c.is_control()).take(200).collect();
     format!(
@@ -505,7 +508,7 @@ pub fn format_filestore_hint(filename: &str, size_bytes: u64, presigned_url: &st
          It has been uploaded to temporary storage. \
          Fetch the contents using the URL below:\n\
          {presigned_url}\n\
-         Note: this URL expires in {ttl_minutes} minutes."
+         Note: this URL expires in {lifetime}."
     )
 }
 
@@ -514,24 +517,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn presigned_ttl_clamps_to_both_bounds() {
-        assert_eq!(clamp_presigned_ttl(3600), 3600);
-        assert_eq!(clamp_presigned_ttl(MIN_PRESIGNED_TTL), MIN_PRESIGNED_TTL);
-        assert_eq!(clamp_presigned_ttl(MAX_PRESIGNED_TTL), MAX_PRESIGNED_TTL);
-        assert_eq!(clamp_presigned_ttl(0), MIN_PRESIGNED_TTL);
-        assert_eq!(clamp_presigned_ttl(59), MIN_PRESIGNED_TTL);
-        assert_eq!(
-            clamp_presigned_ttl(MAX_PRESIGNED_TTL + 1),
-            MAX_PRESIGNED_TTL
-        );
+    fn presigned_ttl_is_capped_but_never_raised() {
+        // The value is an authorization lifetime, so only the upper bound may move it.
+        for configured in [0, 1, 59, 60, 3600, MAX_PRESIGNED_TTL] {
+            assert_eq!(cap_presigned_ttl(configured), configured, "{configured}");
+        }
+        assert_eq!(cap_presigned_ttl(MAX_PRESIGNED_TTL + 1), MAX_PRESIGNED_TTL);
     }
 
     #[test]
-    fn presigned_ttl_never_renders_zero_minutes() {
-        // The three hint sites all render `ttl / 60`, so the floor is what keeps
-        // "expires in 0 minutes" unreachable.
-        for configured in [0, 1, 59] {
-            assert!(clamp_presigned_ttl(configured) / 60 >= 1);
+    fn a_sub_minute_lifetime_renders_in_seconds_not_as_zero_minutes() {
+        for (secs, expected) in [
+            (0, "0 seconds"),
+            (1, "1 second"),
+            (30, "30 seconds"),
+            (59, "59 seconds"),
+        ] {
+            assert_eq!(format_presigned_lifetime(secs), expected);
+        }
+    }
+
+    #[test]
+    fn a_minute_or_more_renders_exactly_as_it_did_before() {
+        // Pins the #738 hint: these are the `ttl / 60` values main produced.
+        for (secs, expected) in [
+            (60, "1 minutes"),
+            (900, "15 minutes"),
+            (3600, "60 minutes"),
+            (MAX_PRESIGNED_TTL, "10080 minutes"),
+        ] {
+            assert_eq!(format_presigned_lifetime(secs), expected);
         }
     }
 

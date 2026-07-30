@@ -1062,8 +1062,8 @@ pub async fn upload_bytes_to_filestore_public(
 #[cfg(feature = "filestore")]
 fn presigned_note(filestore: &crate::filestore::Filestore) -> String {
     format!(
-        "presigned URL, expires in {} minutes",
-        filestore.presigned_ttl_secs() / 60
+        "presigned URL, expires in {}",
+        crate::filestore::format_presigned_lifetime(filestore.presigned_ttl_secs())
     )
 }
 
@@ -1144,8 +1144,8 @@ pub async fn download_and_upload_any_file(
                  This file has been uploaded to temporary storage. \
                  Fetch the contents using the URL below:\n\
                  {presigned_url}\n\
-                 Note: this URL expires in {} minutes.",
-                filestore.presigned_ttl_secs() / 60
+                 Note: this URL expires in {}.",
+                crate::filestore::format_presigned_lifetime(filestore.presigned_ttl_secs())
             );
             tracing::info!(filename, mime, size = actual_bytes, "file uploaded to filestore (any-file path)");
             Some((ContentBlock::Text { text: hint }, 0))

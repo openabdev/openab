@@ -681,7 +681,7 @@ presigned_ttl = 3600       # URL expiry in seconds (default: 3600 = 1 hour)
 | `region` | ✅ | — | AWS region (use `"auto"` for Cloudflare R2) |
 | `endpoint` | ❌ | AWS default | Custom S3-compatible endpoint URL (R2, MinIO, etc.) |
 | `prefix` | ❌ | `"incoming/"` | Object key prefix for uploaded files |
-| `presigned_ttl` | ❌ | `3600` | Presigned URL expiry in seconds, clamped to 60 … 604800 |
+| `presigned_ttl` | ❌ | `3600` | Presigned URL expiry in seconds, capped at 604800 (7 days) and never raised |
 | `max_file_size_mb` | ❌ | `250` | Maximum file size for upload in MB (hard cap: 500) |
 | `access_key_id` | ❌ | provider chain | Explicit access key (falls back to IRSA/env/config) |
 | `secret_access_key` | ❌ | provider chain | Explicit secret key |
