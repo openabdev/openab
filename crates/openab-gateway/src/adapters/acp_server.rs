@@ -5493,6 +5493,20 @@ mod acp_ws_integration {
         // because this harness attaches none. That specific error IS the evidence: the budget gate
         // rejects earlier and with a different message.
         //
+        // READ THIS BEFORE LOOSENING THE ASSERTION. The pinned string carries two different
+        // things, and only one of them is a contract:
+        //
+        //   (a) `No agent backend connected` is INCIDENTAL — an artifact of this harness having no
+        //       backend. It is not what the test protects.
+        //   (b) That the prompt got far enough to fail there AT ALL is the property: establish
+        //       tasks and prompt tasks hold separate budgets.
+        //
+        // So if a harness change makes this red, the fix is to RE-DERIVE what "reached the
+        // backend" now looks like and pin that — not to relax the check back toward
+        // `!msg.contains("in-flight prompts")`. That substring form is what this replaced, and it
+        // would pass for every other error and for any rewording of the budget message: it could
+        // only ever fail for one spelling of one regression.
+        //
         // Pinned exactly, not asserted as `!msg.contains("in-flight prompts")`. A negative
         // substring check is satisfied by every OTHER error too — a session-not-found, a params
         // error, or the budget message itself once someone rewords it — so it could only ever fail
@@ -5611,6 +5625,106 @@ mod acp_ws_integration {
             keys,
             vec!["keep-2".to_string()],
             "the withdrawn declaration must not stay reachable, got {keys:?}"
+        );
+    }
+
+    /// The eviction branch's ONLY coverage — and the scenario that proves it is not dead code.
+    ///
+    /// `a_resume_replacing_a_same_name_tunnel_disconnects_the_one_it_replaced` is named for
+    /// last-attach-wins but never reaches it: on the resume path the sweep runs before
+    /// `spawn_acp_tunnels`, so the same-name predecessor is already retired and `replaced` is
+    /// empty. That left `if !replaced.is_empty()` with no test at all.
+    ///
+    /// It IS reachable through a single `session/new`. `accept_acp_servers` dedups on `id` alone
+    /// (`seen.insert(s.id.clone())`), so one declaration may legally carry two servers sharing a
+    /// NAME with different ids, and `session/new` runs no sweep — the channel is a freshly minted
+    /// uuid that cannot collide. The two establishes race; whichever takes the registry lock
+    /// second sees its same-name predecessor, `same_name` matches, and the eviction disconnect
+    /// fires. Two same-name declarations are a client error, but the gateway accepts them, so the
+    /// path has to exist and has to behave.
+    ///
+    /// Which of the two wins is a genuine race, so this asserts the RELATION rather than a
+    /// winner: exactly one tunnel survives, and the disconnect names the one that did not.
+    #[tokio::test]
+    async fn two_same_name_servers_in_one_session_evict_down_to_one() {
+        let (url, registry) = serve().await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        send(&mut ws, json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}}
+        })).await;
+        let init = recv(&mut ws).await;
+        assert!(init.get("result").is_some(), "initialize failed: {init}");
+
+        // Same name, different ids — accepted, because the dedup key is the id.
+        send(&mut ws, json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": {
+                "cwd": "/w",
+                "mcpServers": [
+                    {"type": "acp", "id": "uuid-a", "name": "katashiro"},
+                    {"type": "acp", "id": "uuid-b", "name": "katashiro"}
+                ]
+            }
+        })).await;
+
+        // Answer both connects, absorb both inner lifecycles, and wait for the disconnect the
+        // loser is owed. Bounded so a regression fails naming what was missing rather than
+        // sitting in `recv` until its 30s guard trips — a failure named after the harness reads
+        // as a flake.
+        let mut connected = std::collections::HashMap::new();
+        let mut disconnected: Option<String> = None;
+        let mut session_seen = false;
+        for _ in 0..40 {
+            if disconnected.is_some() && session_seen && connected.len() == 2 {
+                break;
+            }
+            let frame = recv(&mut ws).await;
+            if handled_inner_lifecycle(&mut ws, &frame).await.is_some() {
+                continue;
+            }
+            match frame.get("method").and_then(Value::as_str) {
+                Some("mcp/connect") => {
+                    let acp_id = frame["params"]["acpId"].as_str().expect("acpId").to_string();
+                    let conn = format!("conn-{}", acp_id.trim_start_matches("uuid-"));
+                    connected.insert(acp_id, conn.clone());
+                    send(&mut ws, json!({
+                        "jsonrpc": "2.0", "id": frame["id"].clone(),
+                        "result": {"connectionId": conn}
+                    })).await;
+                }
+                Some("mcp/disconnect") => {
+                    disconnected = Some(
+                        frame["params"]["connectionId"].as_str().expect("connectionId").to_string(),
+                    );
+                }
+                _ => {
+                    if frame.get("id") == Some(&json!(2)) {
+                        assert!(frame.get("result").is_some(), "session/new refused: {frame}");
+                        session_seen = true;
+                    }
+                }
+            }
+        }
+        assert_eq!(connected.len(), 2, "both declared servers must be asked to connect");
+        let evicted = disconnected.expect(
+            "the evicted tunnel is owed an mcp/disconnect — if this is missing, the eviction \
+             branch did not run and this scenario no longer covers it",
+        );
+
+        wait_for_tunnels(&registry, 1).await;
+        let survivors: Vec<String> = {
+            let reg = registry.lock().unwrap();
+            reg.values().map(|h| h.connection_id.clone()).collect()
+        };
+        assert_eq!(survivors.len(), 1, "last-attach-wins must collapse the name to one tunnel");
+        assert_ne!(
+            survivors[0], evicted,
+            "the disconnect must name the tunnel that LOST, not the one still registered"
+        );
+        assert!(
+            connected.values().any(|c| c == &evicted),
+            "the disconnected connection must be one of the two we opened, got {evicted}"
         );
     }
 
