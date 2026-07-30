@@ -133,6 +133,151 @@ pub(crate) async fn gateway_audio_blocks(
     crate::media::audio_blocks_for(filename, mime_type, size, outcome, stt_line.as_deref())
 }
 
+/// The blocks one gateway event's attachments render as.
+///
+/// Awaited from inside the spawned per-event work, never on the receive path:
+/// `run_gateway_adapter` used to build these in its `ws_rx.next()` arm, so a slow
+/// filestore upload stopped the socket from reading anything else, slash commands
+/// included. Shared by both entry points because the two inline copies had already
+/// drifted: one logged a rejected attachment, the other logged an unreadable text
+/// file, and neither logged both.
+async fn assemble_attachment_blocks(
+    attachments: &[GwAttachment],
+    stt_config: &crate::config::SttConfig,
+    #[cfg(feature = "filestore")] filestore: Option<&crate::filestore::Filestore>,
+) -> Vec<ContentBlock> {
+    let mut extra_blocks = Vec::new();
+    for att in attachments {
+        // Rejected or truncated: the reason goes to the agent, the file does not.
+        if let Some(ref reason) = att.status {
+            tracing::info!(
+                filename = %att.filename,
+                mime_type = %att.mime_type,
+                size = att.size,
+                reason = %reason,
+                "gateway attachment rejected, forwarding reason to agent"
+            );
+            let size_str = format_size(att.size);
+            extra_blocks.push(ContentBlock::Text {
+                text: undelivered_attachment_line(&att.filename, &att.mime_type, &size_str, reason),
+            });
+            continue;
+        }
+
+        // Prefer the colocated file path, fall back to inline base64.
+        let bytes_result = if let Some(ref path) = att.path {
+            tokio::fs::read(path).await.map_err(|e| e.to_string())
+        } else if !att.data.is_empty() {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(&att.data)
+                .map_err(|e| e.to_string())
+        } else {
+            tracing::warn!(
+                filename = %att.filename,
+                mime = %att.mime_type,
+                "gateway: attachment has no path or data, skipping"
+            );
+            Err("no path or data".into())
+        };
+
+        match att.attachment_type.as_str() {
+            "image" => match bytes_result {
+                Ok(bytes) => {
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    extra_blocks.push(ContentBlock::Image {
+                        media_type: att.mime_type.clone(),
+                        data: b64,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(filename = %att.filename, error = %e, "gateway image read failed");
+                }
+            },
+            "text_file" => match bytes_result {
+                Ok(bytes) => {
+                    let safe_filename: String = att
+                        .filename
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .take(200)
+                        .collect();
+                    let size = bytes.len() as u64;
+                    if size <= crate::media::TEXT_INLINE_LIMIT {
+                        let text = String::from_utf8_lossy(&bytes);
+                        extra_blocks.push(ContentBlock::Text {
+                            text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
+                        });
+                    } else {
+                        #[cfg(feature = "filestore")]
+                        if let Some(fs) = filestore {
+                            if let Some((block, _)) =
+                                crate::media::upload_bytes_to_filestore_public(
+                                    &att.filename,
+                                    &bytes,
+                                    fs,
+                                )
+                                .await
+                            {
+                                extra_blocks.push(block);
+                            } else {
+                                // Refused on size: a degraded hint, never the oversized body.
+                                let size_kb = bytes.len() / 1024;
+                                tracing::warn!(filename = %att.filename, size = bytes.len(), "filestore upload refused; emitting degraded hint");
+                                extra_blocks.push(ContentBlock::Text {
+                                    text: format!(
+                                        "[File: {safe_filename}]\nThis file ({size_kb} KB) exceeds the configured upload limit and could not be stored."
+                                    ),
+                                });
+                            }
+                        } else {
+                            let text = String::from_utf8_lossy(&bytes);
+                            extra_blocks.push(ContentBlock::Text {
+                                text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
+                            });
+                        }
+                        #[cfg(not(feature = "filestore"))]
+                        {
+                            let text = String::from_utf8_lossy(&bytes);
+                            extra_blocks.push(ContentBlock::Text {
+                                text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(filename = %att.filename, error = %e, "gateway text_file read failed");
+                }
+            },
+            "audio" => {
+                #[cfg(feature = "filestore")]
+                let blocks = gateway_audio_blocks(
+                    &att.filename,
+                    &att.mime_type,
+                    att.size,
+                    bytes_result,
+                    stt_config,
+                    filestore,
+                )
+                .await;
+                #[cfg(not(feature = "filestore"))]
+                let blocks = gateway_audio_blocks(
+                    &att.filename,
+                    &att.mime_type,
+                    att.size,
+                    bytes_result,
+                    stt_config,
+                )
+                .await;
+                extra_blocks.extend(blocks);
+            }
+            _ => {}
+        }
+    }
+    extra_blocks
+}
+
 /// Shared filter parameters for gateway event gating.
 /// Used by both `run_gateway_adapter` (WebSocket) and `process_gateway_event` (unified).
 struct EventFilterParams<'a> {
@@ -1026,143 +1171,6 @@ pub async fn run_gateway_adapter(
                                     let dispatcher = dispatcher.clone();
 
                                     // Convert gateway attachments to ContentBlocks
-                                    let mut extra_blocks = Vec::new();
-                                    for att in &event.content.attachments {
-                                        // Rejected/truncated attachment: surface reason to the agent and skip.
-                                        if let Some(ref reason) = att.status {
-                                            tracing::info!(
-                                                filename = %att.filename,
-                                                mime_type = %att.mime_type,
-                                                size = att.size,
-                                                reason = %reason,
-                                                "gateway attachment rejected, forwarding reason to agent"
-                                            );
-                                            let size_str = {
-                                                let n = att.size;
-                                                if n >= 1024 * 1024 {
-                                                    format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
-                                                } else if n >= 1024 {
-                                                    format!("{:.1} KB", n as f64 / 1024.0)
-                                                } else {
-                                                    format!("{} B", n)
-                                                }
-                                            };
-                                            extra_blocks.push(ContentBlock::Text {
-                                                text: undelivered_attachment_line(
-                                                    &att.filename,
-                                                    &att.mime_type,
-                                                    &size_str,
-                                                    reason,
-                                                ),
-                                            });
-                                            continue;
-                                        }
-
-                                        // Read bytes: prefer file path (colocate), fallback to base64
-                                        let bytes_result = if let Some(ref path) = att.path {
-                                            tokio::fs::read(path).await.map_err(|e| e.to_string())
-                                        } else if !att.data.is_empty() {
-                                            use base64::Engine;
-                                            base64::engine::general_purpose::STANDARD
-                                                .decode(&att.data)
-                                                .map_err(|e| e.to_string())
-                                        } else {
-                                            tracing::warn!(
-                                                filename = %att.filename,
-                                                mime = %att.mime_type,
-                                                "gateway: attachment has no path or data, skipping"
-                                            );
-                                            Err("no path or data".into())
-                                        };
-
-                                        match att.attachment_type.as_str() {
-                                            "image" => {
-                                                match bytes_result {
-                                                    Ok(bytes) => {
-                                                        use base64::Engine;
-                                                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                                                        extra_blocks.push(ContentBlock::Image {
-                                                            media_type: att.mime_type.clone(),
-                                                            data: b64,
-                                                        });
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::warn!(filename = %att.filename, error = %e, "gateway image read failed");
-                                                    }
-                                                }
-                                            }
-                                            "text_file" => {
-                                                if let Ok(bytes) = bytes_result {
-                                                    let safe_filename: String = att.filename
-                                                        .chars()
-                                                        .filter(|c| !c.is_control())
-                                                        .take(200)
-                                                        .collect();
-                                                    let size = bytes.len() as u64;
-                                                    if size <= crate::media::TEXT_INLINE_LIMIT {
-                                                        let text = String::from_utf8_lossy(&bytes);
-                                                        extra_blocks.push(ContentBlock::Text {
-                                                            text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
-                                                        });
-                                                    } else {
-                                                        // Large file — upload to filestore if available
-                                                        #[cfg(feature = "filestore")]
-                                                        if let Some(ref fs) = filestore {
-                                                            if let Some((block, _)) = crate::media::upload_bytes_to_filestore_public(&att.filename, &bytes, fs).await {
-                                                                extra_blocks.push(block);
-                                                            } else {
-                                                                // Upload refused (size cap) — emit degraded hint, don't inline oversized body
-                                                                let size_kb = bytes.len() / 1024;
-                                                                tracing::warn!(filename = %att.filename, size = bytes.len(), "filestore upload refused; emitting degraded hint");
-                                                                extra_blocks.push(ContentBlock::Text {
-                                                                    text: format!(
-                                                                        "[File: {safe_filename}]\nThis file ({size_kb} KB) exceeds the configured upload limit and could not be stored."
-                                                                    ),
-                                                                });
-                                                            }
-                                                        } else {
-                                                            // No filestore configured — fall back to inline (original behavior)
-                                                            let text = String::from_utf8_lossy(&bytes);
-                                                            extra_blocks.push(ContentBlock::Text {
-                                                                text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
-                                                            });
-                                                        }
-                                                        #[cfg(not(feature = "filestore"))]
-                                                        {
-                                                            // Feature not compiled — inline as before
-                                                            let text = String::from_utf8_lossy(&bytes);
-                                                            extra_blocks.push(ContentBlock::Text {
-                                                                text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
-                                                            });
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            "audio" => {
-                                                #[cfg(feature = "filestore")]
-                                                let blocks = gateway_audio_blocks(
-                                                    &att.filename,
-                                                    &att.mime_type,
-                                                    att.size,
-                                                    bytes_result,
-                                                    &stt_config,
-                                                    filestore.as_deref(),
-                                                )
-                                                .await;
-                                                #[cfg(not(feature = "filestore"))]
-                                                let blocks = gateway_audio_blocks(
-                                                    &att.filename,
-                                                    &att.mime_type,
-                                                    att.size,
-                                                    bytes_result,
-                                                    &stt_config,
-                                                )
-                                                .await;
-                                                extra_blocks.extend(blocks);
-                                            }
-                                            _ => {}
-                                        }
-                                    }
 
                                     // Slash command interception for gateway platforms
                                     // (Feishu/LINE/Telegram don't have native slash commands)
@@ -1199,7 +1207,21 @@ pub async fn run_gateway_adapter(
                                         }
                                     }
 
+                                    let stt_config = stt_config.clone();
+                                    #[cfg(feature = "filestore")]
+                                    let filestore = filestore.clone();
+
                                     tasks.spawn(async move {
+                                        // Attachment assembly can await object storage, so it
+                                        // belongs here rather than in the `ws_rx.next()` arm.
+                                        let extra_blocks = assemble_attachment_blocks(
+                                            &event.content.attachments,
+                                            &stt_config,
+                                            #[cfg(feature = "filestore")]
+                                            filestore.as_deref(),
+                                        )
+                                        .await;
+
                                         // If supergroup with no thread_id, create a forum topic
                                         let thread_channel = if event.channel.channel_type == "supergroup"
                                             && channel.thread_id.is_none()
@@ -1482,125 +1504,13 @@ pub async fn process_gateway_event(
     };
 
     // Convert gateway attachments to ContentBlocks
-    let mut extra_blocks = Vec::new();
-    for att in &event.content.attachments {
-        if let Some(ref reason) = att.status {
-            let size_str = format_size(att.size);
-            extra_blocks.push(ContentBlock::Text {
-                text: undelivered_attachment_line(&att.filename, &att.mime_type, &size_str, reason),
-            });
-            continue;
-        }
-
-        let bytes_result = if let Some(ref path) = att.path {
-            tokio::fs::read(path).await.map_err(|e| e.to_string())
-        } else if !att.data.is_empty() {
-            use base64::Engine;
-            base64::engine::general_purpose::STANDARD
-                .decode(&att.data)
-                .map_err(|e| e.to_string())
-        } else {
-            tracing::warn!(
-                filename = %att.filename,
-                mime = %att.mime_type,
-                "gateway: attachment has no path or data, skipping"
-            );
-            Err("no path or data".into())
-        };
-
-        match att.attachment_type.as_str() {
-            "image" => {
-                match bytes_result {
-                    Ok(bytes) => {
-                        use base64::Engine;
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                        extra_blocks.push(ContentBlock::Image {
-                            media_type: att.mime_type.clone(),
-                            data: b64,
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!(filename = %att.filename, error = %e, "gateway image read failed");
-                    }
-                }
-            }
-            "text_file" => {
-                match bytes_result {
-                    Ok(bytes) => {
-                        let safe_filename: String = att.filename
-                            .chars()
-                            .filter(|c| !c.is_control())
-                            .take(200)
-                            .collect();
-                        let size = bytes.len() as u64;
-                        if size <= crate::media::TEXT_INLINE_LIMIT {
-                            let text = String::from_utf8_lossy(&bytes);
-                            extra_blocks.push(ContentBlock::Text {
-                                text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
-                            });
-                        } else {
-                            // Large file — upload to filestore if available
-                            #[cfg(feature = "filestore")]
-                            if let Some(ref fs) = ctx.filestore {
-                                if let Some((block, _)) = crate::media::upload_bytes_to_filestore_public(&att.filename, &bytes, fs).await {
-                                    extra_blocks.push(block);
-                                } else {
-                                    // Upload refused (size cap) — emit degraded hint, don't inline oversized body
-                                    let size_kb = bytes.len() / 1024;
-                                    tracing::warn!(filename = %att.filename, size = bytes.len(), "filestore upload refused; emitting degraded hint");
-                                    extra_blocks.push(ContentBlock::Text {
-                                        text: format!(
-                                            "[File: {safe_filename}]\nThis file ({size_kb} KB) exceeds the configured upload limit and could not be stored."
-                                        ),
-                                    });
-                                }
-                            } else {
-                                // No filestore configured — fall back to inline (original behavior)
-                                let text = String::from_utf8_lossy(&bytes);
-                                extra_blocks.push(ContentBlock::Text {
-                                    text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
-                                });
-                            }
-                            #[cfg(not(feature = "filestore"))]
-                            {
-                                // Feature not compiled — inline as before
-                                let text = String::from_utf8_lossy(&bytes);
-                                extra_blocks.push(ContentBlock::Text {
-                                    text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
-                                });
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(filename = %att.filename, error = %e, "gateway text_file read failed");
-                    }
-                }
-            }
-            "audio" => {
-                #[cfg(feature = "filestore")]
-                let blocks = gateway_audio_blocks(
-                    &att.filename,
-                    &att.mime_type,
-                    att.size,
-                    bytes_result,
-                    &ctx.stt_config,
-                    ctx.filestore.as_deref(),
-                )
-                .await;
-                #[cfg(not(feature = "filestore"))]
-                let blocks = gateway_audio_blocks(
-                    &att.filename,
-                    &att.mime_type,
-                    att.size,
-                    bytes_result,
-                    &ctx.stt_config,
-                )
-                .await;
-                extra_blocks.extend(blocks);
-            }
-            _ => {}
-        }
-    }
+    let extra_blocks = assemble_attachment_blocks(
+        &event.content.attachments,
+        &ctx.stt_config,
+        #[cfg(feature = "filestore")]
+        ctx.filestore.as_deref(),
+    )
+    .await;
 
     // Slash command interception
     let prompt = event.content.text.clone();
@@ -1718,6 +1628,68 @@ fn format_size(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gw_attachment(kind: &str, filename: &str, mime: &str, data: &str) -> GwAttachment {
+        GwAttachment {
+            attachment_type: kind.into(),
+            filename: filename.into(),
+            mime_type: mime.into(),
+            data: data.into(),
+            size: data.len() as u64,
+            path: None,
+            status: None,
+        }
+    }
+
+    /// The loop this covers was inline in two entry points and had no test at all;
+    /// extracting it to get it off the receive path is what made one possible.
+    #[tokio::test]
+    async fn attachment_assembly_keeps_arrival_order_and_skips_what_it_cannot_render() {
+        let mut rejected = gw_attachment("image", "huge.png", "image/png", "");
+        rejected.status = Some("too large for the gateway store".into());
+
+        let attachments = vec![
+            rejected,
+            gw_attachment("audio", "note.m4a", "audio/mp4", "YWJj"),
+            gw_attachment("sticker", "wave.tgs", "application/gzip", "YWJj"),
+        ];
+
+        let blocks = assemble_attachment_blocks(
+            &attachments,
+            &stt_off(),
+            #[cfg(feature = "filestore")]
+            None,
+        )
+        .await;
+
+        // Rejected reason then the audio block. The sticker has no branch, so it
+        // contributes nothing rather than an empty block.
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        let first = block_text(blocks.into_iter().next().unwrap());
+        assert!(first.starts_with("[System: attachment"), "{first}");
+        assert!(first.contains("too large for the gateway store"), "{first}");
+    }
+
+    /// A rejected attachment is the one row that never touches the filestore, so it
+    /// is also the cheapest proof that assembly no longer needs the receive path.
+    #[tokio::test]
+    async fn attachment_assembly_needs_no_filestore_to_report_a_rejection() {
+        let mut rejected = gw_attachment("audio", "voice.ogg", "audio/ogg", "");
+        rejected.status = Some("download failed upstream".into());
+
+        let blocks = assemble_attachment_blocks(
+            &[rejected],
+            &stt_off(),
+            #[cfg(feature = "filestore")]
+            None,
+        )
+        .await;
+
+        assert_eq!(blocks.len(), 1);
+        let text = block_text(blocks.into_iter().next().unwrap());
+        assert!(text.contains("voice.ogg"), "{text}");
+        assert!(text.contains("download failed upstream"), "{text}");
+    }
 
     #[test]
     fn an_undelivered_attachment_cannot_forge_its_own_system_line() {
