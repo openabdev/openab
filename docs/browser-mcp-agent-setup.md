@@ -33,8 +33,8 @@ INFO browser control: unconfigured — no [mcp] section in config.toml, so brows
 > Earlier versions deleted the **bridge** entry on the next session. That cleanup worked by
 > editing your file, and openab no longer does that — it authors `.openab/mcp-facade.json` and
 > nothing else. **This is worth acting on rather than ignoring:** a leftover `openab-browser`
-> entry is a *working* path to the browser that does not pass through facade policy or the audit
-> trail, so until you remove it the allowlist in `[[mcp.acp_servers]]` is not the only way in. The
+> entry is a *working* path to the browser that does not pass through the facade or its audit
+> trail, so until you remove it the transport-authed facade is not the only way to the browser. The
 > bridge entry also names a subcommand that no longer exists, so the agent's MCP client will fail
 > to start it every session.
 >
@@ -82,15 +82,14 @@ provider in `mcp.json`. Enable the facade and it works:
 # config.toml
 [mcp]
 listen = "127.0.0.1:8848"
-
-# Operator gate for client-declared type:acp servers (reverse-MCP ADR §6.4).
-# REQUIRED for browser control. Omitting this section — or writing an empty list — admits NO
-# servers (D-20). There is no built-in default: `katashiro` is an example client implementation,
-# not a component of openab. Name the server and list exactly the tools it may publish.
-[[mcp.acp_servers]]
-name  = "katashiro"
-tools = ["katashiro.read_dom","katashiro.screenshot","katashiro.navigate","katashiro.click","katashiro.type"]
 ```
+
+That is the whole `[mcp]` section. **There is no operator allowlist** — the `[[mcp.acp_servers]]`
+block was removed in D-29 (reversing D-20's fail-closed default), so a config still carrying it now
+fails to parse rather than being silently ignored. Any `type:acp` server that authenticates to
+`/acp` and attaches may publish the tools it declares; admission is the transport auth
+(`OPENAB_ACP_AUTH_KEY`, or loopback + `OPENAB_ACP_ALLOWED_ORIGINS`), because the extension already
+authenticates to reach the tunnel and a second config allowlist duplicated that intent.
 
 - **One listener** — the facade's. No per-session ports and no per-session config rewrites.
 - **openab writes ONE file, and it is not yours.** It authors `<workdir>/.openab/mcp-facade.json`
@@ -159,8 +158,7 @@ flag; both are your step, and openab touches neither.
 
 The second row is the one to act on rather than skim. openab no longer removes that stale entry
 (it stopped editing your config), so if this deployment ever ran bridge mode, clear it with the
-`jq` snippet above before relying on the allowlist in `[[mcp.acp_servers]]` — until then, the
-allowlist is not the only way in.
+`jq` snippet above — until then, the facade and its audit trail are not the only way to the browser.
 
 The startup log prints the resolved path and these commands, so the value is not guessed from this
 page.
@@ -180,7 +178,7 @@ cat "$HOME/.kiro/settings/mcp.json"     # Kiro — written by `kiro-cli mcp impo
 
 # does the catalog contain the browser capabilities for a session-bound client?
 #   -> call search_capabilities from the agent; expect provider "openab-browser"
-#      with exactly the tools you allowlisted in [[mcp.acp_servers]], once discovery has run
+#      with the tools the connected server declares, once discovery has run
 ```
 
 Gateway log confirms the extension side: `ACP: browser tunnel registered — extension attached`.
@@ -208,7 +206,7 @@ coupling this design deliberately avoids.
 one is cleaned up for you.** openab stopped editing files it does not own, and that cleanup went
 with it. This is worth doing rather than deferring: a surviving bridge entry is a *working* route
 to the browser that does not pass through facade policy or the audit trail, so until it is gone the
-allowlist in `[[mcp.acp_servers]]` is not the only way in. The shape-matched `jq` snippet earlier in
+facade and its audit trail are not the only way to the browser. The shape-matched `jq` snippet earlier in
 this document removes it without touching a same-named server of your own.
 
 Proxy mode also only ever auto-wrote two of the five CLI variants (Cursor and Kiro); the other

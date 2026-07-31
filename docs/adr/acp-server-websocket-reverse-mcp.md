@@ -148,9 +148,9 @@ Three pieces already generalize and are reused as-is:
   `mcp/connect` — the wire already carries a per-server discriminator.
 - ~~`ProxyHandler::forward_tool_call` forwards **any** tool name+args down the tunnel — no
   browser-specific validation.~~ `ProxyHandler` was removed with the per-session proxy on
-  2026-07-28. Forwarding is now `AcpTunnelSource::call` in the facade capability source, and it is
-  **not** unvalidated: the §6.4 trust gate refuses a tool whose server name is not allowlisted or
-  whose name is not pinned, before anything reaches the tunnel.
+  2026-07-28. Forwarding is now `AcpTunnelSource::call` in the facade capability source. Since D-29
+  it applies no allowlist or tool-pin gate — admission is the `/acp` transport auth (§6.4) — so it
+  forwards any tool a connected server declares; the only refusal is not-connected.
 
 ### 6.1 Address every hop by `(channel_id, serverId)`
 - `AcpTunnelRegistry` becomes keyed by `(channel_id, serverId)` instead of `channel_id` alone — the
@@ -167,15 +167,17 @@ Three pieces already generalize and are reused as-is:
 `{type:"acp", id, name}`, and the two fields have very different lifetimes — the reference client mints
 `id` as a fresh `crypto.randomUUID()` **per connection** while `name` (`"katashiro"`) is stable
 across reconnects. The registry key is the **`id`**; the `<server>` segment of a tool name (`katashiro.click`)
-and the §6.4 allowlist are the **`name`**. Consequences, all confirmed by review 2026-07-26:
+resolves by the **`name`**. Consequences, all confirmed by review 2026-07-26:
 
 - The registry stays keyed by `(channel_id, id)` — keying by `name` would let two same-name tunnels
   overwrite each other, reintroducing exactly the fan-out collapse this section fixes — but it must
   **also record the declared `name`**, so a source can enumerate `(name, id)` for a channel and resolve
   a tool prefix to a tunnel. Routing purely on the registry key cannot work: the key is a UUID the tool
   name never contains.
-- Trust gating (§6.4) is keyed by **`name`**. An allowlist of `id`s is meaningless when they are
-  per-connection UUIDs.
+- Routing and discovery are keyed by **`name`**: `resolve_by_name` and `attached_server_names` both
+  work in declared names, since an `id` scheme would be meaningless when ids are per-connection UUIDs.
+  (This bullet once said "trust gating (§6.4) is keyed by name"; D-29 removed the allowlist, but the
+  name-keying it motivated survives in the routing path.)
 - **Same-name collisions resolve by rank, `(connection_generation, generation)`:** a newly attached
   tunnel whose `name` matches an existing one on the same channel **replaces and evicts** the older
   entry only if it outranks it. Because the client mints a new `id` on every reconnect, the stale
@@ -268,46 +270,43 @@ The facade's discovery is **pull-based**: the agent sees only `search_capabiliti
   vanishing catalog entry.
 
 Distinguish two kinds of variation: **session scope** is legitimate; **attachment flapping** (is the
-tab connected this second) must not reach the catalog. Note what `tools(ctx)` actually varies by
-session is the **discovery cache**, not the declaration set — it iterates the *operator policy* map,
-so an allowlisted server appears in the catalog independently of what the client declared, and a
-client-declared server with no policy entry contributes nothing. ~~A pinned server is advertised even
-when the client declared nothing~~ — that no longer follows: with the seed deleted (D-20) an
-allowlisted server contributes nothing until its own `tools/list` has been fetched. An optional refinement, requiring a client wire change, is to
-carry a tool manifest in the `session/new` declaration so the catalog is known without a round-trip.
+tab connected this second) must not reach the catalog. What `tools(ctx)` varies by session is the
+**discovery cache** keyed by channel. Since D-29 it iterates the servers **attached** to the channel
+(union the names already discovered for it), not an operator policy map — so what appears is what the
+client actually connected and declared, and a name that is neither attached nor cached contributes
+nothing. ~~A pinned server is advertised even when the client declared nothing~~ — that stopped
+holding when D-20 deleted the seed, and D-29 makes it moot: there is no pin and no policy, only what
+an attached server publishes. An optional refinement, requiring a client wire change, is to carry a
+tool manifest in the `session/new` declaration so the catalog is known without a round-trip.
 
-**Two layers, and the policy table is the lower one** (confirmed by review 2026-07-26; an earlier draft
-of this section said an un-cached server "contributes an empty set", which contradicted the
-static-advertise posture §6.4's pinned sets and D4 both depended on — and which, after D-20 deleted
-the seed, is now exactly what happens):
+**One layer now — the discovery cache** (an earlier draft described a lower *policy* layer as well;
+D-29 removed the allowlist, so there is no filter table beneath the cache):
 
 - ~~The §6.4 policy entry for a server is its **pre-attach seed** as well as its filter. A server the
   operator has pinned advertises those tools from the moment the source is registered — it never drops
   to empty just because nothing has attached yet. This is what preserves D4's "the browser tools are
   discoverable before the extension connects".~~ **The seed mechanism was removed on 2026-07-30
-  (D-20)**: `policy_from_config` now sets `seed: Vec::new()` for every entry, so a policy entry is a
-  filter and nothing else. D4's "discoverable before the extension connects" no longer holds — there
-  is a cold-start window in which a configured server advertises nothing until its first `tools/list`
-  returns. The strikethroughs at `:334` and `:421` retire the *katashiro five tools* claim; this one
-  retires the *mechanism*, which outlived it.
-- The per-`(channel_id, name)` cache holds what the server published and is read as
-  `fetched ∩ allowed`, **replacing the seed once a fetch succeeds**, so the catalog narrows to what the
-  server actually publishes (a server may publish fewer tools than the operator permitted) without ever
-  widening past the policy. Filtering on read rather than on write means tightening the policy takes
-  effect immediately instead of waiting for a cache entry to be invalidated — **caching is never itself
-  a grant**.
+  (D-20), and the policy entry itself on 2026-07-31 (D-29).** There is no seed and no filter: a server
+  advertises nothing until its first `tools/list` returns (the cold-start window), and then advertises
+  exactly what it published. D4's "discoverable before the extension connects" no longer holds.
+- The per-`(channel_id, name)` cache holds what the server published, and since D-29 that is exactly
+  what is advertised — there is no allowlist to intersect against, so no narrowing on read. Caching is
+  not itself the admission: the `/acp` transport auth (§6.4) already admitted the server; the cache
+  only decides **when** its tools become visible, one discovery round after it attaches.
 - **The cache is keyed by the declared `name`, not `server_id`** (corrected 2026-07-26; earlier drafts
   of this section said `server_id`). Ids are minted per connection, so an id-keyed entry would be
   orphaned by exactly the reconnect the cache exists to survive — it could never outlive the attach it
   was populated from, which is the opposite of "serve regardless of current attach state". Same-name
   collisions are impossible by §6.1's rank rule, so the name is a safe key.
-- Discovery is **pull-triggered**: a declared server with no cache entry has its fetch started from the
-  next `tools(ctx)` call, and its real set appears one discovery round later. The facade re-reads the
-  catalog on every call, so a single round of staleness is the entire cost, and it avoids threading an
-  attach hook from the gateway (which owns attach) into the root (which owns the source).
-- A declared server with **no** policy entry contributes nothing — not because it is un-cached, but
-  because §6.4 is deny-all. Caching changes what an *allowed* server advertises; it is never itself a
-  grant.
+- Discovery is **pull-triggered**: an attached server with no cache entry has its fetch started from the
+  next `tools(ctx)` call, and its real set appears one discovery round later. `tools()` drives this from
+  `attached_server_names` (the per-channel enumeration re-introduced by D-29), resolving each name to a
+  tunnel through the single `resolve_by_name`. The facade re-reads the catalog on every call, so a
+  single round of staleness is the entire cost, and it avoids threading an attach hook from the gateway
+  (which owns attach) into the root (which owns the source).
+- A name contributes nothing only when it is neither attached now nor already in the cache — because
+  there is nothing to show, not because a policy denied it. A momentary detach does not drop a name
+  that is still cached (the union above), which is what keeps flapping out of the catalog.
 
 **Ordering consequence (as reasoned at the time).** ~~Because the filter is deny-all and pinned
 entries already carry full `Tool` schemas, fetching cannot surface anything an operator has not
@@ -321,52 +320,41 @@ invisible but **load-bearing**, because it is the only source of schemas. This i
 retracted in the status comment: "discovery is unnecessary because the schemas are hardcoded" rested
 on the seed that was deleted.
 
-### 6.4 Trust — client-declared tool sets need an operator gate
+### 6.4 Trust — the `/acp` transport is the gate (D-29, reversing D-20)
 
 #1454 states that source registration *is* the operator's grant, and that sources therefore carry no
-per-source `tool_filter`. That assumption holds for code-wired sources whose tool set the operator
-chose. It **does not hold** for `AcpTunnelSource`, whose tool set is declared by a **remote client**: a
-connected extension could otherwise publish arbitrary tools into the agent's capability catalog.
+per-source `tool_filter`. `AcpTunnelSource` was originally treated as the exception, because its tool
+set is declared by a **remote client** rather than chosen by the operator: an earlier design added an
+operator allowlist of accepted declared server names plus a per-server deny-all `tool_filter`, so a
+connected extension could not publish arbitrary tools into the agent's catalog.
 
-Therefore this ADR requires, before the source is enabled by default:
+**That allowlist was removed on 2026-07-31 (D-29), reversing the D-20 fail-closed default.** The
+trust boundary is the `/acp` transport: a `type:acp` server reaches the tunnel only by
+authenticating to `/acp` (`OPENAB_ACP_AUTH_KEY`, or the loopback + `OPENAB_ACP_ALLOWED_ORIGINS`
+gate), and that authentication already carries the admission intent — the extension a deployment
+trusts to reach `/acp` is the same one whose tools a `[[mcp.acp_servers]]` allowlist would re-approve
+by name. So admission is now transport-auth alone: a connected server publishes every tool it
+declares, and the capability source applies no name or tool filter. The one refusal left in the
+source is **not-connected**, a liveness answer rather than a permission one.
 
-- an operator **allowlist** of accepted declared server names (~~default: `katashiro` only~~ — as of
-  2026-07-30 there is NO default; empty admits nothing, D-20) — a
-  declaration outside it is refused by the capability source: it contributes no tools and its calls
-  return an error result. **Note it is not refused at declaration time** — the gateway still opens
-  and registers the tunnel — **and nothing is logged today** (see the gap noted below); and
-- a per-declared-server **`tool_filter`**, mirroring `mcp.json` least-privilege semantics, which is
-  **deny-all by default**.
+History, so the reversal is not read as drift: the gate began (D-20 and before) as **fail-closed
+deny-all** — an absent or empty `[[mcp.acp_servers]]` admitted nothing, and each listed server was
+pinned to an explicit tool set (the `katashiro` entry to its five known tools; every other server
+deny-all until an operator listed tools). D-29 removed the section entirely, and
+`#[serde(deny_unknown_fields)]` now makes a config still carrying it fail to parse, so a stale
+allowlist announces itself rather than looking effective.
 
-> ⚠️ **Two gaps between this section and the code, recorded rather than quietly reworded.**
+> ⚠️ **One gap between this section and the code remains, recorded rather than quietly reworded.**
 >
-> **No logging.** This section said twice that a refused declaration and a dropped tool are "logged".
-> `src/acp_tunnel_source.rs` contains no logging call at all — both refusals are silent. An operator
-> who mis-types a server name in `[[mcp.acp_servers]]` gets missing tools and no signal, which is
-> the shape of failure this ADR spends §6.4 preventing. **Fixing this is a code change, so it is
-> filed as follow-up F7 rather than made here.**
+> The allowlist-refusal logging gap is **gone with D-29**: there is no allowlist refusal or pinned-tool
+> drop to log any more, only the visible not-connected error result the agent already receives.
 >
-> **The policy runtime does not wrap in-process sources.** §6 claims the facade already provides
+> **The policy runtime still does not wrap in-process sources.** §6 claims the facade already provides
 > "schema validation, timeouts, circuit breaking, redaction, audit" to capability sources. Only
 > argument validation and audit apply on the source path (`facade.rs` `execute_capability`);
 > timeout/cancellation, the circuit breaker and redaction live in `meta_tool::dispatch`, which only
 > downstream `mcp.json` servers traverse. A hung browser tunnel is bounded by the tunnel's own
-> timeout, not by the facade's. **Also F7.**
-
-The name allowlist is **not** a trust boundary on its own: the name is chosen by the same remote
-client that declares the tools, so a client may declare a server under an allowlisted name — say
-`katashiro` — and publish any tool set under it. Passing the allowlist therefore grants nothing by itself — the tool set is gated
-separately:
-
-- ~~the `katashiro` entry ships **pinned to its five known tools**~~ — the built-in catalog was
-  deleted on 2026-07-30 (D-20): schemas now come only from discovery over the tunnel, so a
-  configured server publishes nothing until its first `tools/list` returns. Historically it was
-  (`katashiro.read_dom`,
-  `katashiro.screenshot`, `katashiro.navigate`, `katashiro.click`, `katashiro.type`); any other tool name it
-  declares is dropped, so a same-name declaration cannot inject new tools (dropped silently today —
-  see the gap below); and
-- every other allowlisted server starts **deny-all** and serves only the tools an operator has
-  explicitly listed.
+> timeout (`[mcp] tunnel_timeout_seconds`), not by the facade's. **Filed as follow-up F7.**
 
 ### 6.5 Backward compatibility & what this retires
 
@@ -454,19 +442,21 @@ through; **F6 genuinely remains**:
 - ~~**F3′ per-`(channel_id, name)` discovery cache**~~ **Done in #1447**: `ToolsCache` keyed
   `(channel_id, declared_name)` with in-flight dedupe and pull-triggered discovery (§6.3).
 - ~~**F4 trust gate** — operator allowlist + **deny-all-by-default** per-declared-server
-  `tool_filter` (§6.4).~~ **Done in #1447**: `ServerPolicy` / `policy_from_config` over
-  `[[mcp.acp_servers]]`, enforced in both `tools()` and `call()` before the tunnel is resolved;
-  ~~default allowlist is `katashiro` pinned to its five tools~~ — there is no default allowlist as
-  of 2026-07-30 (D-20).
+  `tool_filter` (§6.4).~~ **Implemented in #1447, then REMOVED (D-29, 2026-07-31).** It landed as
+  `ServerPolicy` / `policy_from_config` over `[[mcp.acp_servers]]`, enforced in both `tools()` and
+  `call()`; D-29 reversed the whole approach — the `/acp` transport auth is the gate, so the
+  allowlist and per-server `tool_filter` are gone and a connected server publishes every tool it
+  declares (§6.4).
 - ~~**F5 cleanup** — retire the superseded per-session proxy path once Facade mode has soaked;
   bridge-mode removal stays an explicit operator call (§6.5).~~ **Done 2026-07-28**: the operator
   call was made and both transports were removed in this PR, so there is no soak period and no
   remaining opt-out.
-- **F7 close the two §6.4 gaps** — (a) log a warning when a declared server is refused by the
-  allowlist and when a fetched tool is dropped by the pin, since both are silent today and an
-  operator's only symptom is missing tools; (b) decide whether in-process capability sources should
-  traverse the same timeout / circuit-breaker / redaction path as downstream servers, or whether the
-  ADR should stop claiming they do. Both are code changes, deliberately not made in #1447.
+- **F7 close the remaining §6.4 gap** — (a) ~~log a warning when a declared server is refused by the
+  allowlist and when a fetched tool is dropped by the pin~~ **dissolved by D-29**: there is no
+  allowlist refusal or pinned-tool drop any more, only the visible not-connected error result; (b)
+  decide whether in-process capability sources should traverse the same timeout / circuit-breaker /
+  redaction path as downstream servers, or whether the ADR should stop claiming they do — a code
+  change, deliberately not made in #1447.
 - **F6 e2e** — browser + a second client-declared server + a host-level `mcp.json` provider coexisting,
   and two concurrent sessions each reaching only their own browser.
 
@@ -524,7 +514,7 @@ Five **DOM-semantic** MCP tools, served by the extension: `katashiro.read_dom` (
 - **D4 — lifecycle: the WS may connect *after* session start.** When `[mcp]` is configured the
   facade listener is process-lifetime and decoupled from the extension WS — it is not
   unconditionally always-on, since without `[mcp]` no listener starts at all and there is no browser
-  control. Given a listener, an allowlisted server's tools stay in the catalog regardless of WS
+  control. Given a listener, an attached server's tools stay in the catalog regardless of WS
   state once discovered; a `tools/call` with no extension attached returns an MCP error ("browser
   not connected") rather than the capability disappearing. ~~Tools are **static-advertised**
   regardless of WS state~~ — before discovery has run there is nothing to advertise (D-20). `notifications/tools/list_changed` was designed but never implemented,
@@ -605,7 +595,7 @@ removed on 2026-07-28.
 
 The facade integration in §6 replaced the per-session proxy as the default on 2026-07-25/26 and was
 live-validated the same way: with `[mcp]` enabled, `search_capabilities` returns provider
-`openab-browser` carrying exactly the pinned `katashiro.*` capabilities, while anonymous facade
+`openab-browser` carrying the `katashiro.*` capabilities the connected extension declares, while anonymous facade
 clients see only the two meta-tools.
 
 ## 8. Alternatives considered

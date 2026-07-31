@@ -112,8 +112,9 @@ Extension releases the connection and replies `{ "result": {} }`.
 ## 6. Browser tools (the MCP tools the extension serves)
 
 Baseline DOM-semantic set (model-agnostic), as served by the example `katashiro` extension. OpenAB
-ships no catalog of its own: what appears is what the operator allowlisted in
-`[[mcp.acp_servers]]`, intersected with what the extension published — and nothing appears until the
+ships no catalog of its own: what appears is what the connected extension publishes — there is no
+operator allowlist to intersect against since D-29 removed `[[mcp.acp_servers]]`, so admission is
+the `/acp` transport auth and every declared tool is served — and nothing appears until the
 extension's first `tools/list` returns. `tools/call` executes in the **active tab**.
 
 | name | arguments | behaviour |
