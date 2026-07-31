@@ -109,12 +109,15 @@ fn better_candidate(current_oldest: Option<Instant>, candidate_last_active: Inst
 /// Prepare facade browser capabilities for one session: write the agent's facade MCP entry, and
 /// mint its session token **only if that write succeeded**.
 ///
-/// The token is useless without the config. The entry is what points the agent at the facade and
-/// carries `Authorization: Bearer ${OPENAB_SESSION_TOKEN}`; with no entry the agent never reaches
-/// the facade and never presents the token. Minting regardless would register a live credential
-/// for a session that cannot use it and leave it valid until eviction, while the failure showed up
-/// only as a warning. Returning `None` keeps the session running without browser capabilities,
-/// which is the honest description of what actually happened.
+/// The token is useless without the config. The file carries
+/// `Authorization: Bearer ${OPENAB_SESSION_TOKEN}`, and it is the artifact the OPERATOR wires in
+/// — since D-15 openab writes only `.openab/mcp-facade.json`, which no agent reads on its own, so
+/// the import or `--mcp-config` flag is what actually points the agent at the facade. The ordering
+/// still holds for a narrower reason: if openab cannot even author that file, the session has no
+/// path to the facade it could be wired to, and minting regardless would register a live
+/// credential for a session that cannot use it and leave it valid until eviction, while the
+/// failure showed up only as a warning. Returning `None` keeps the session running without
+/// browser capabilities, which is the honest description of what actually happened.
 #[cfg(feature = "acp-mcp")]
 async fn setup_facade_session(
     workdir: &str,
@@ -241,11 +244,16 @@ impl SessionPool {
         }
     }
 
-    /// Wire the facade session-token registrar + facade URL (Facade mode,
-    /// set by the root when `[mcp]` is running). With both present, browser
-    /// capabilities route through the facade: the pool mints one token per
-    /// session, injects it as `OPENAB_SESSION_TOKEN` in the agent process
-    /// env, and writes the static facade MCP entry once per workdir.
+    /// Wire the facade session-token registrar + facade URL, set by the root
+    /// when `[mcp]` is running. With both present the pool does its half: mints
+    /// one token per session, injects it as `OPENAB_SESSION_TOKEN` in the agent
+    /// process env, and writes the static facade MCP entry once per workdir.
+    ///
+    /// That is necessary but NOT sufficient for browser capabilities to route
+    /// through the facade. Two things outside this crate are also required: the
+    /// operator must put the written entry in front of the agent, and
+    /// `[[mcp.acp_servers]]` must be non-empty — an absent or empty list admits
+    /// no servers at all (D-20).
     #[cfg(feature = "acp-mcp")]
     pub fn with_facade_sessions(
         mut self,
