@@ -329,13 +329,24 @@ operator allowlist of accepted declared server names plus a per-server deny-all 
 connected extension could not publish arbitrary tools into the agent's catalog.
 
 **That allowlist was removed on 2026-07-31 (D-29), reversing the D-20 fail-closed default.** The
-trust boundary is the `/acp` transport: a `type:acp` server reaches the tunnel only by
-authenticating to `/acp` (`OPENAB_ACP_AUTH_KEY`, or the loopback + `OPENAB_ACP_ALLOWED_ORIGINS`
-gate), and that authentication already carries the admission intent — the extension a deployment
-trusts to reach `/acp` is the same one whose tools a `[[mcp.acp_servers]]` allowlist would re-approve
-by name. So admission is now transport-auth alone: a connected server publishes every tool it
-declares, and the capability source applies no name or tool filter. The one refusal left in the
-source is **not-connected**, a liveness answer rather than a permission one.
+trust boundary is now the `/acp` transport alone, so it is worth stating plainly what that boundary
+is **in the default configuration** rather than leaving it implicit in the base ADR. `/acp` has two
+auth layers (base ADR §2): a shared bearer key (`OPENAB_ACP_AUTH_KEY`) and, in keyless mode, a
+browser `Origin` allowlist (`OPENAB_ACP_ALLOWED_ORIGINS`). **By default both are unset.** In that
+default keyless-loopback mode `/acp` binds loopback only, the `Origin` check rejects **browsers**
+whose origin is not allowlisted — but a request with **no `Origin`, i.e. a non-browser local client,
+is admitted with no credential at all** (base ADR §2; the endpoint is "unauthenticated by default").
+So in the shipped default the effective admission gate is **loopback reachability**: any non-browser
+process on the host can attach a `type:acp` server and publish callable tools. Setting
+`OPENAB_ACP_AUTH_KEY` is what turns that into actual authentication.
+
+Since D-29 removed the operator allowlist, this transport admission is the **only** gate — there is
+no second `[[mcp.acp_servers]]` check behind it — which is exactly why the default posture is
+load-bearing and named here. A connected server publishes every tool it declares, and the capability
+source applies no name or tool filter; the one refusal left in the source is **not-connected**, a
+liveness answer rather than a permission one. Where the transport IS keyed, the reasoning that
+retired the allowlist still holds: the client a deployment trusts with the bearer is the same one
+whose tools a `[[mcp.acp_servers]]` allowlist would have re-approved by name.
 
 History, so the reversal is not read as drift: the gate began (D-20 and before) as **fail-closed
 deny-all** — an absent or empty `[[mcp.acp_servers]]` admitted nothing, and each listed server was
