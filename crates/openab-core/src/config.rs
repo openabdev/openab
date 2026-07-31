@@ -71,22 +71,17 @@ impl<'de> Deserialize<'de> for AllowBots {
 /// same host connects to `http://<listen>/mcp`. Provider connections stay in
 /// `~/.openab/agent/mcp.json` (the facade has no provider config here —
 /// single source of truth, ADR §6.3 / Alternative E).
-/// **Strict.** An unknown key here is a hard startup failure, not a warning.
+/// **Strict.** An unknown key here is a hard startup failure, not a warning — a mistyped `listen`
+/// or `tunnel_timeout_seconds` should stop startup, not be silently ignored into its default.
 ///
-/// This section is a permissions control and a silently-ignored key is not survivable in one:
-/// `[[mcp.acp_server]]` (singular) leaves `acp_servers` empty, so the operator's allowlist is
-/// simply not there.
-///
-/// **The direction of that failure inverted on 2026-07-30 (D-20), and the reason for this
-/// attribute changed with it.** It used to fail OPEN: an empty list kept a built-in default of
-/// five browser tools, so mistyping the section while writing a one-tool allowlist got you five —
-/// tightening the config actually widened it. That default is gone; empty now admits nothing. The
-/// same typo therefore fails CLOSED: browser control silently does not work.
-///
-/// The attribute stays, because "silently" is the objectionable part in both directions — an
-/// operator who mistyped deserves an error either way. But do not repeat the old justification:
-/// this no longer guards against a permissions widening, it guards against a permissions control
-/// that was never applied.
+/// **The operator allowlist this attribute used to guard was removed on 2026-07-31 (D-29),
+/// reversing D-20's fail-closed default.** `[[mcp.acp_servers]]` is gone: admission for
+/// client-declared `type:acp` servers is now the `/acp` transport auth alone
+/// (`OPENAB_ACP_AUTH_KEY`, or loopback + `OPENAB_ACP_ALLOWED_ORIGINS`), because the extension
+/// already authenticates to reach the tunnel and a second operator allowlist duplicated that
+/// intent. `deny_unknown_fields` keeps a sharper edge for it: a config still carrying an
+/// `[[mcp.acp_servers]]` block HARD-FAILS to parse rather than ignoring it — intended, so a stale
+/// allowlist announces itself instead of looking effective.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpFacadeConfig {
@@ -95,19 +90,6 @@ pub struct McpFacadeConfig {
     /// boundary is the trust boundary.
     #[serde(default = "default_mcp_listen")]
     pub listen: String,
-    /// Operator gate for **client-declared** `type:acp` MCP servers (ADR §6.4).
-    ///
-    /// **Empty means none.** Absent and explicitly `[]` are the same thing and
-    /// both admit NO servers (D-20). There is no built-in default — this used to
-    /// keep `katashiro` pinned to five tools when nothing was configured, which
-    /// made an example client implementation openab's default in all but name.
-    ///
-    /// Each entry admits one declared name and lists exactly the tools it may
-    /// publish. Schemas are not built in either: they come from discovery over
-    /// the tunnel, so a freshly configured server publishes nothing until its
-    /// first `tools/list` has been fetched.
-    #[serde(default)]
-    pub acp_servers: Vec<AcpServerPolicy>,
     /// How long a single request tunnelled to a client-declared `type:acp` server may run
     /// before openab gives up on it, in seconds.
     ///
@@ -144,40 +126,6 @@ pub struct McpFacadeConfig {
 /// the binary would silently keep the old number the day this changes.
 pub fn default_tunnel_timeout_seconds() -> u64 {
     170
-}
-
-/// One entry of the §6.4 operator allowlist.
-///
-/// Keyed by the declared **name**, never the id: the reference client mints its
-/// `id` as a fresh UUID per connection, so an allowlist of ids could not match
-/// twice. The name is chosen by the same remote client that declares the tools,
-/// so admitting a name grants nothing by itself — `tools` is the second,
-/// independent gate that stops a client publishing extra tools under a name the
-/// operator trusts.
-/// **Strict**, for the same reason as [`McpFacadeConfig`]: a mistyped `tools` key would leave the
-/// list empty, and an entry with no tools is accepted-but-publishes-nothing. That direction fails
-/// closed, so it is the milder case — but an operator who cannot tell a typo from an intentional
-/// deny-all has no way to debug a server that went quiet, and the same keystroke in the parent
-/// section fails open.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AcpServerPolicy {
-    /// Declared server name to accept — matches `name` in the client's
-    /// `{type:"acp", id, name}` entry and the `<server>` prefix of its tools.
-    pub name: String,
-    /// Exactly the tool names this server may publish. **Deny-all**: omitted or
-    /// empty means the server is accepted but may publish nothing. Names alone
-    /// are enough — schemas come from the server's own `tools/list`, fetched over
-    /// the tunnel and cached.
-    ///
-    /// This said schemas come "from the built-in catalog for known servers, or
-    /// from the server's own `tools/list` once discovery caching lands". Both
-    /// halves are now wrong: D-20 deleted the catalog, and discovery caching has
-    /// shipped. The struct doc above was corrected at the time and this field doc
-    /// was not — it justified itself by the parent's old behaviour, which is how
-    /// it survived a sweep.
-    #[serde(default)]
-    pub tools: Vec<String>,
 }
 
 fn default_mcp_listen() -> String {
@@ -2549,60 +2497,39 @@ mod tests {
         assert_eq!(mcp.listen, "127.0.0.1:8848");
     }
 
-    /// The typo that motivated `deny_unknown_fields`, asserted as a REJECTION.
-    ///
-    /// `[[mcp.acp_server]]` is one character from `[[mcp.acp_servers]]`, and before this attribute
-    /// it parsed clean and left `acp_servers` empty.
-    ///
-    /// The CONSEQUENCE of that has since inverted (D-20) and the test outlived it, which is worth
-    /// stating so nobody reads the old reason as current. It used to be a permissions WIDENING:
-    /// `browser_source.rs` read an empty list as "keep the built-in default", so a config asking
-    /// for one tool got five. That default is gone; empty now admits nothing, so the same typo
-    /// silently disables browser control instead.
-    ///
-    /// The assertion is unchanged and still right — a mistyped permissions control must be an
-    /// error, not a guess — but it now protects against a control that was never applied rather
-    /// than against one that was widened.
+    /// The operator allowlist was removed on 2026-07-31 (D-29), reversing D-20. `[[mcp.acp_servers]]`
+    /// is no longer a field on `McpFacadeConfig`, and `deny_unknown_fields` turns a leftover block
+    /// from a silent no-op into a hard parse failure — a stale allowlist must announce itself rather
+    /// than look effective. This replaces the pair of tests that pinned the allowlist's
+    /// mistyped-vs-correct spellings: there is no correct spelling any more, and the entry-key test
+    /// went with the `AcpServerPolicy` struct it exercised.
     #[test]
-    fn a_mistyped_acp_servers_section_is_refused_not_ignored() {
+    fn an_acp_servers_block_is_now_refused_because_the_allowlist_was_removed() {
         let err = parse_config_str(
-            "[discord]\nbot_token = \"x\"\n[mcp]\n[[mcp.acp_server]]\nname = \"katashiro\"\n\
+            "[discord]\nbot_token = \"x\"\n[mcp]\n[[mcp.acp_servers]]\nname = \"katashiro\"\n\
              tools = [\"katashiro.read_dom\"]\n",
             "test",
         )
-        .expect_err("a mistyped section must fail the parse, not widen the tool set");
+        .expect_err("a leftover allowlist block must fail the parse, not be silently ignored");
         let msg = err.to_string();
         assert!(
-            msg.contains("acp_server"),
+            msg.contains("acp_servers"),
             "the error must name the offending key so the operator can find it, got: {msg}"
         );
     }
 
-    /// The correctly spelled section still parses — otherwise the test above would pass for a
-    /// parser that rejects everything.
+    /// Positive control for the test above: the `[mcp]` shape that SURVIVES D-29 — `listen` and
+    /// `tunnel_timeout_seconds` only — still parses, so the rejection above is about the removed
+    /// key and not a parser that refuses everything.
     #[test]
-    fn the_correctly_spelled_acp_servers_section_still_parses() {
+    fn a_bare_mcp_section_still_parses() {
         let cfg = parse_config_str(
-            "[discord]\nbot_token = \"x\"\n[mcp]\n[[mcp.acp_servers]]\nname = \"katashiro\"\n\
-             tools = [\"katashiro.read_dom\"]\n",
+            "[discord]\nbot_token = \"x\"\n[mcp]\nlisten = \"127.0.0.1:9000\"\n",
             "test",
         )
-        .expect("the documented spelling must keep working");
+        .expect("the surviving [mcp] shape must keep working");
         let mcp = cfg.mcp.expect("[mcp] present");
-        assert_eq!(mcp.acp_servers.len(), 1);
-        assert_eq!(mcp.acp_servers[0].name, "katashiro");
-        assert_eq!(mcp.acp_servers[0].tools, vec!["katashiro.read_dom".to_string()]);
-    }
-
-    #[test]
-    fn a_mistyped_key_inside_an_acp_server_entry_is_refused() {
-        let err = parse_config_str(
-            "[discord]\nbot_token = \"x\"\n[mcp]\n[[mcp.acp_servers]]\nname = \"katashiro\"\n\
-             tool = [\"katashiro.read_dom\"]\n",
-            "test",
-        )
-        .expect_err("`tool` is not `tools`; silently dropping it makes the entry deny-all");
-        assert!(err.to_string().contains("tool"));
+        assert_eq!(mcp.listen, "127.0.0.1:9000");
     }
 
     #[test]

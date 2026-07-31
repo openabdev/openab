@@ -21,10 +21,18 @@
 //! (`katashiro.click`) — the prefix selects the tunnel, it is not stripped,
 //! because the server's own `tools/call` expects its full name.
 //!
-//! Not through enumeration: `tunnel.servers(channel_id)` was deleted in
-//! `74315a60` precisely because enumerate-and-match was the wrong route — it
-//! collapsed same-name entries in registry order rather than by generation, so
-//! it could resolve to a stale tunnel.
+//! **Admission is the transport, not an allowlist** (D-29, reversing D-20).
+//! There is no operator `[[mcp.acp_servers]]` gate: any server that authenticates
+//! to `/acp` and declares itself may publish every tool it lists, because the
+//! extension already authenticates to reach the tunnel and a second allowlist
+//! duplicated that intent. Discovery is therefore driven by what is *attached*,
+//! not by a configured list — `tools()` enumerates `attached_server_names` and
+//! resolves each to an id through `resolve_by_name`. Names only, one collapse
+//! rule: the enumerating `tunnel.servers(channel_id)` deleted in `74315a60`
+//! (which collapsed same-name entries in registry order rather than by
+//! generation, resolving to a stale tunnel) is *not* revived — the new
+//! enumerator returns names, and the single `resolve_by_name` still does every
+//! name → id resolution beside the eviction that makes it unique.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -35,70 +43,10 @@ use openab_mcp::mcp::sources::{CapabilitySource, SessionCtx};
 use openab_mcp::rmcp::model::Tool;
 use serde_json::{json, Map, Value};
 
-/// Trust policy for one declared server name (ADR §6.4).
-///
-/// #1454 treats source registration as the operator's grant, so facade sources
-/// carry no `tool_filter`. That holds for code-wired sources whose tool set the
-/// operator chose; it does **not** hold here, where the tool set is declared by
-/// a remote client. The declared *name* is chosen by that same client, so
-/// passing the allowlist grants nothing by itself — the tool set is gated
-/// separately, and **deny-all is the default**: a name with no policy entry is
-/// refused outright, and a listed name may only publish the tools pinned here.
-#[derive(Clone)]
-struct ServerPolicy {
-    /// Exactly the tool names this server may publish. Anything else it declares
-    /// is dropped from the catalog and refused on call, so a client cannot
-    /// inject new tools by re-declaring a trusted name.
-    allowed: HashSet<String>,
-    /// **Always empty.** Kept as a field because the read path still asks for it,
-    /// but `policy_from_config` constructs every entry with `Vec::new()`.
-    ///
-    /// It used to be a pre-attach seed (ADR §6.3): full `Tool` values advertised
-    /// from the moment the source was registered, so a permitted server was
-    /// discoverable before its client attached — the property D4 relied on.
-    /// Known servers seeded from a built-in catalog. D-20 deleted that catalog
-    /// because `katashiro` is an example client, not a component of openab, so
-    /// there is nothing left to seed FROM and no server is discoverable before
-    /// its first `tools/list`.
-    seed: Vec<Tool>,
-}
-/// Build the policy from the operator's `[[mcp.acp_servers]]` entries (§6.4).
-///
-/// Each entry admits one declared **name** and lists exactly the tools it may
-/// publish; deny-all means an entry with no tools admits the server but grants
-/// nothing.
-///
-/// **No seed.** Schemas come only from discovery over the tunnel
-/// (`spawn_discovery` → `tools/list` → cache). There used to be a built-in
-/// catalog that seeded `katashiro`'s five schemas so an operator could restrict
-/// a known server without restating them; it was deleted on 2026-07-30 (D-20)
-/// because katashiro is an **example implementation of the client side, not a
-/// component of openab**, and hardcoding its schemas made it a default in fact
-/// even where it was not one in name.
-///
-/// The security gate is unchanged: `allowed` still filters
-/// `fetched INTERSECT allowed`, so the operator's `tools = [...]` remains the
-/// only thing deciding what may be published. What changed is that a permitted
-/// tool has no schema until discovery fetches one — see the cold-start note on
-/// [`AcpTunnelSource::tools`].
-fn policy_from_config(entries: &[openab_core::config::AcpServerPolicy]) -> HashMap<String, ServerPolicy> {
-    entries
-        .iter()
-        .map(|entry| {
-            let allowed: HashSet<String> = entry.tools.iter().cloned().collect();
-            (entry.name.clone(), ServerPolicy { allowed, seed: Vec::new() })
-        })
-        .collect()
-}
-
 /// Facade capability source backed by MCP-over-ACP tunnels to client-declared
 /// MCP servers.
 pub struct AcpTunnelSource {
     tunnel: Arc<dyn AcpMcpTunnel>,
-    /// Trust policy keyed by declared server **name** (§6.4). Keyed by name
-    /// rather than id because ids are per-connection UUIDs — an allowlist of
-    /// ids could never match twice.
-    policy: HashMap<String, ServerPolicy>,
     /// Discovered tool sets, keyed `(channel_id, declared_name)` (§6.3).
     ///
     /// Keyed by **name**, not by `server_id` as an earlier draft of §6.3 said:
@@ -107,8 +55,8 @@ pub struct AcpTunnelSource {
     /// name is what lets a discovered set survive a reconnect, which is the
     /// cache's entire purpose.
     ///
-    /// Holds what the server published; the policy filter is applied on read, so
-    /// tightening the policy takes effect immediately without invalidating it.
+    /// Holds what the server published, and that is what is advertised — with the
+    /// allowlist gone (D-29) there is no read-time filter to narrow it.
     cache: ToolsCache,
     /// Discovery fetches currently in flight, so repeated discovery rounds do
     /// not pile up duplicate `tools/list` requests on one tunnel.
@@ -130,21 +78,14 @@ fn sorted(tools: impl IntoIterator<Item = Tool>) -> Vec<Tool> {
 }
 
 impl AcpTunnelSource {
-    /// Source gated by the operator's `[[mcp.acp_servers]]` entries.
-    ///
-    /// **Empty means none.** An absent section and an explicit `[]` are the same
-    /// thing and both admit NO servers (D-20). There is no built-in default: the
-    /// previous behaviour kept `katashiro` pinned to five tools when nothing was
-    /// configured, which made an example client implementation into openab's
-    /// default in all but name. An operator who wants browser control now says so.
-    pub fn with_config(
-        tunnel: Arc<dyn AcpMcpTunnel>,
-        entries: &[openab_core::config::AcpServerPolicy],
-    ) -> Self {
-        let policy = policy_from_config(entries);
+    /// Source over the MCP-over-ACP tunnel. No operator allowlist (D-29): every
+    /// server that authenticates to `/acp` and declares itself may publish the
+    /// tools it lists, so what is admitted is decided by the transport, not by
+    /// config. The catalog is driven by what is actually attached (see
+    /// [`AcpTunnelSource::tools`]).
+    pub fn new(tunnel: Arc<dyn AcpMcpTunnel>) -> Self {
         Self {
             tunnel,
-            policy,
             cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             inflight: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
@@ -154,10 +95,10 @@ impl AcpTunnelSource {
     /// (§6.3). Cheap to call on every discovery round: it is a no-op while a
     /// fetch for the same `(channel, name)` is already in flight.
     ///
-    /// What lands in the cache is what the server published — **unfiltered**.
-    /// The policy is applied when the catalog is read, so caching is never
-    /// itself a grant: an entry for a tool the operator did not permit stays
-    /// invisible and uncallable.
+    /// What lands in the cache is what the server published, and since D-29 that
+    /// is also what is advertised — there is no allowlist to intersect against on
+    /// read. A tool appears in the catalog once discovery has fetched it and the
+    /// server is (or was) attached; see [`AcpTunnelSource::tools`].
     fn spawn_discovery(&self, channel_id: &str, name: &str, server_id: &str) {
         // Outside a tokio runtime (unit tests calling tools() directly) there is
         // nothing to spawn onto; discovery is best-effort, so skip quietly.
@@ -225,65 +166,57 @@ impl CapabilitySource for AcpTunnelSource {
         "openab-browser"
     }
 
-    /// The advertised catalog: for every allowlisted server, its discovered tool
-    /// set if one has been cached, else nothing.
+    /// The advertised catalog: every tool discovered from the servers connected
+    /// to this session, unfiltered (D-29 removed the allowlist — a connected
+    /// server publishes every tool it declares).
     ///
-    /// Deliberately **not** intersected with the tunnels currently attached.
-    /// Attachment flapping must not reach the catalog (§6.3) — a tab that is
-    /// closed for a second must not make the tools vanish and reappear — so
-    /// availability is reported by `call` ("not connected"), never by a shrinking
-    /// tool list.
+    /// Which servers to advertise is driven by what is **attached**, since there
+    /// is no configured list any more: the set of names is
+    /// `attached_server_names` UNION the names already discovered for this
+    /// channel. The union is what preserves §6.3 — attachment flapping must not
+    /// reach the catalog, so a tab closed for a second stays in the catalog via
+    /// its cache entry even while it is momentarily not in `attached_server_names`.
+    /// A newly attached server, conversely, is what introduces a new name.
     ///
-    /// It no longer preserves D4's pre-attach discovery, though: with the seed
-    /// gone there is a COLD START in which an allowlisted server publishes
-    /// nothing until its first `tools/list` returns. What survives of §6.3 is
-    /// the narrower guarantee that an already-populated catalog does not shrink.
-    ///
-    /// Discovery is *pull*-triggered rather than attach-triggered: a declared
-    /// server with no cache entry yet gets a background `tools/list` fetch
-    /// kicked off here, and its real set appears on the next discovery round.
-    /// The facade re-reads the catalog on every call, so one round of staleness
-    /// is the whole cost, and it avoids threading an attach hook from the
-    /// gateway (which owns attach) into the root (which owns this source).
+    /// COLD START (§6.3, unchanged by D-29): with no seed, an attached server
+    /// publishes nothing until its first `tools/list` returns. Discovery is
+    /// *pull*-triggered — an attached server with no cache entry gets a
+    /// background `tools/list` fetch kicked off here, and its real set appears on
+    /// the next discovery round. The facade re-reads the catalog on every call,
+    /// so one round of staleness is the whole cost, and it avoids threading an
+    /// attach hook from the gateway (which owns attach) into the root.
     fn tools(&self, ctx: Option<&SessionCtx>) -> Vec<Tool> {
         // Anonymous clients never reach here in practice (`requires_session`), and
-        // with no channel there is nothing to discover. This returns the seeds,
-        // which are now always empty — kept as the same expression rather than a
-        // bare `vec![]` so the read path stays uniform if a seed ever returns.
+        // with no channel there is nothing attached and nothing to discover.
         let Some(ctx) = ctx else {
-            return sorted(self.policy.values().flat_map(|p| p.seed.iter().cloned()));
+            return Vec::new();
         };
 
+        // Snapshot this channel's discovered catalog once, rather than re-locking per name.
+        let cached: HashMap<String, Vec<Tool>> = {
+            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache
+                .iter()
+                .filter(|((c, _), _)| *c == ctx.channel_id)
+                .map(|((_, name), tools)| (name.clone(), tools.clone()))
+                .collect()
+        };
+
+        // Names to advertise: attached now, UNION already-discovered (§6.3 no-shrink).
+        let mut names: HashSet<String> =
+            self.tunnel.attached_server_names(&ctx.channel_id).into_iter().collect();
+        names.extend(cached.keys().cloned());
 
         let mut out: Vec<Tool> = Vec::new();
-        for (name, policy) in &self.policy {
-            let cached = self
-                .cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&(ctx.channel_id.clone(), name.clone()))
-                .cloned();
-            match cached {
-                // `fetched ∩ allowed` — the cache narrows the catalog to what the
-                // server actually publishes and can never widen it past policy.
-                Some(fetched) => out.extend(
-                    fetched
-                        .into_iter()
-                        .filter(|t| policy.allowed.contains(t.name.as_ref())),
-                ),
+        for name in &names {
+            match cached.get(name) {
+                // Unfiltered: with the allowlist gone, every tool the server published is admitted.
+                Some(fetched) => out.extend(fetched.iter().cloned()),
                 None => {
-                    // Nothing discovered yet. This extends by the seed, which is always
-                    // empty since D-20 — so in practice it contributes nothing and the
-                    // server stays absent from the catalog until the fetch below lands.
-                    // That is the cold-start window, not an oversight.
-                    out.extend(policy.seed.iter().cloned());
-                    // Resolved through the same call routing uses, not through a snapshot of
-                    // `servers()`. Collecting that into a map keeps whichever entry the iterator
-                    // yields LAST, and registry iteration is not ordered by generation — so in a
-                    // duplicate-name state discovery could fetch its catalog from one tunnel while
-                    // calls went to another, advertising tools the serving tunnel does not have.
-                    // Uniqueness makes that unreachable today; using one resolution makes it
-                    // unreachable by construction.
+                    // Attached but not discovered yet — the cold-start window. Resolve through the
+                    // same route calls use (one resolution rule, §6.1); a name that appears only
+                    // because it is still cached but detached resolves to None here and simply is
+                    // not re-fetched, while its cached tools above keep it in the catalog.
                     if let Some(server_id) = self.tunnel.resolve_by_name(&ctx.channel_id, name) {
                         self.spawn_discovery(&ctx.channel_id, name, &server_id);
                     }
@@ -308,20 +241,9 @@ impl CapabilitySource for AcpTunnelSource {
             )));
         };
 
-        // §6.4 gate, in two independent steps: the name must be allowlisted,
-        // and the tool must be one this server is pinned to. The second check
-        // is what stops a client injecting tools by re-declaring a trusted
-        // name, so it is not redundant with the first.
-        let Some(policy) = self.policy.get(server_name) else {
-            return Ok(Self::error_result(format!(
-                "server {server_name:?} is not in the operator allowlist"
-            )));
-        };
-        if !policy.allowed.contains(full_tool) {
-            return Ok(Self::error_result(format!(
-                "tool {full_tool:?} is not permitted for server {server_name:?}"
-            )));
-        }
+        // No allowlist gate (D-29): admission is the `/acp` transport auth, so a connected server's
+        // declared tools are all callable. `resolve_by_name` returning `None` — the server is not
+        // attached — is the only refusal left, and it is a liveness answer, not a permission one.
 
         // Resolve the declared name to the tunnel's registry key (§6.1). Delegated rather than
         // done here: enumerating and taking the first name match is only correct while same-name
@@ -449,6 +371,19 @@ mod tests {
                 .map(|(_, id)| id.clone())
         }
 
+        fn attached_server_names(&self, _channel_id: &str) -> Vec<String> {
+            let mut names: Vec<String> = self
+                .servers
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect();
+            names.sort();
+            names.dedup();
+            names
+        }
+
         async fn call(
             &self,
             channel_id: &str,
@@ -462,8 +397,25 @@ mod tests {
                 let Some(names) = self.tools_list.lock().unwrap().clone() else {
                     return Err("tools/list unavailable".into());
                 };
+                // A real server returns only ITS OWN tools. The double holds one shared list, so
+                // partition it by the queried server's declared name — otherwise, now that the
+                // source no longer filters by an allowlist, one server's tunnel would appear to
+                // publish another's tools. The name for this `server_id` comes from the registry.
+                let server_name = self
+                    .servers
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(_, id)| id == server_id)
+                    .map(|(n, _)| n.clone());
                 let tools: Vec<Value> = names
                     .iter()
+                    .filter(|n| match &server_name {
+                        Some(name) => n
+                            .split_once('.')
+                            .is_some_and(|(prefix, _)| prefix == name),
+                        None => true,
+                    })
                     .map(|n| json!({ "name": n, "inputSchema": { "type": "object" } }))
                     .collect();
                 return Ok(json!({ "tools": tools }));
@@ -483,35 +435,19 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_discovered_catalog_survives_detachment() {
-        // §6.3: attachment flapping stays out of discovery; unavailability is
-        // reported on call, not by shrinking the catalog.
-        //
-        // Before D-20 this asserted the five PINNED names with no tunnel ever
-        // attached, because the built-in seed advertised them regardless. With no
-        // seed the catalog starts empty, so the property has to be asserted the
-        // way it actually matters: discover first, then detach, then check the
-        // catalog held.
-        let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
-        tunnel.set_tools_list(&["katashiro.click", "katashiro.navigate", "katashiro.read_dom", "katashiro.screenshot", "katashiro.type"]);
-        let src = AcpTunnelSource::with_config(tunnel.clone(), &[katashiro_all()]);
-        let _ = src.tools(Some(&ctx()));
-        settle().await;
-        let before: Vec<String> =
-            src.tools(Some(&ctx())).iter().map(|t| t.name.to_string()).collect();
-        assert!(!before.is_empty(), "precondition: discovery must have populated the catalog");
-
-        tunnel.detach("katashiro");
-        let after: Vec<String> =
-            src.tools(Some(&ctx())).iter().map(|t| t.name.to_string()).collect();
-        assert_eq!(after, before, "a detached tunnel must not shrink the catalog");
+    /// Let any spawned discovery task run to completion.
+    async fn settle() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
     }
+
+    // --- Routing (unchanged by D-29): the prefix selects the tunnel by NAME ---
 
     #[tokio::test]
     async fn call_routes_the_name_prefix_to_the_declared_id_keeping_the_full_tool_name() {
         let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
-        let src = AcpTunnelSource::with_config(tunnel.clone(), &[katashiro_all()]);
+        let src = AcpTunnelSource::new(tunnel.clone());
         let (_v, is_err) = src
             .call(Some(&ctx()), "katashiro.click", &Map::new())
             .await
@@ -532,51 +468,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unlisted_server_name_is_refused_even_when_a_tunnel_is_attached() {
-        // A client declaring an un-allowlisted name must not reach the agent's catalog
-        // OR its dispatch, even though its tunnel is registered.
-        let tunnel = FakeTunnel::with(&[("evil", "uuid-evil")]);
-        let src = AcpTunnelSource::with_config(tunnel.clone(), &[katashiro_all()]);
-        let (v, is_err) = src
-            .call(Some(&ctx()), "evil.exfiltrate", &Map::new())
-            .await
-            .unwrap();
+    async fn malformed_tool_name_without_a_prefix_is_rejected() {
+        let src = AcpTunnelSource::new(FakeTunnel::with(&[("katashiro", "uuid-abc")]));
+        let (v, is_err) = src.call(Some(&ctx()), "click", &Map::new()).await.unwrap();
         assert!(is_err);
         assert!(v["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("not in the operator allowlist"));
-        assert!(
-            tunnel.forwarded.lock().unwrap().is_empty(),
-            "a denied call must never reach the tunnel"
-        );
+            .contains("expected <server>.<tool>"));
+    }
+
+    // --- Admission is the transport, not an allowlist (D-29, reversing D-20) ---
+
+    #[tokio::test]
+    async fn any_attached_server_is_callable_without_an_allowlist() {
+        // Inverted from `unlisted_server_name_is_refused_even_when_a_tunnel_is_attached`. With the
+        // operator allowlist gone (D-29), a server that authenticated to `/acp` and attached is
+        // admitted by the transport: its declared tool routes to its tunnel, not refused as
+        // "not in the allowlist".
+        let tunnel = FakeTunnel::with(&[("notes", "uuid-n")]);
+        let src = AcpTunnelSource::new(tunnel.clone());
+        let (_v, is_err) = src
+            .call(Some(&ctx()), "notes.anything", &Map::new())
+            .await
+            .unwrap();
+        assert!(!is_err, "no allowlist gate: a connected server's declared tool dispatches");
+        let fwd = tunnel.forwarded.lock().unwrap();
+        assert_eq!(fwd[0].1, "uuid-n");
+        assert_eq!(fwd[0].2["name"], "notes.anything");
     }
 
     #[tokio::test]
-    async fn unpinned_tool_on_an_allowlisted_server_is_refused() {
-        // The injection Falcon flagged: the client re-declares the trusted name
-        // `katashiro` but publishes a tool outside its pinned five.
+    async fn every_tool_a_server_publishes_is_advertised_unfiltered() {
+        // Inverted from `caching_is_never_itself_a_grant`, which asserted that a published-but-
+        // unpermitted tool stayed OUT of the catalog and uncallable. There is no permit step any
+        // more: whatever a connected server publishes is advertised and callable. (Also supersedes
+        // `unpinned_tool_on_an_allowlisted_server_is_refused` — the "pinning" it guarded is gone.)
         let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
-        let src = AcpTunnelSource::with_config(tunnel.clone(), &[katashiro_all()]);
-        let (v, is_err) = src
+        tunnel.set_tools_list(&["katashiro.read_dom", "katashiro.exec"]);
+        let src = AcpTunnelSource::new(tunnel.clone());
+        let _ = src.tools(Some(&ctx()));
+        settle().await;
+
+        let names: Vec<String> = src
+            .tools(Some(&ctx()))
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            ["katashiro.exec", "katashiro.read_dom"],
+            "both published tools appear — nothing is filtered out"
+        );
+
+        let (_v, is_err) = src
             .call(Some(&ctx()), "katashiro.exec", &Map::new())
             .await
             .unwrap();
-        assert!(is_err);
-        assert!(v["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("is not permitted"));
-        assert!(
-            tunnel.forwarded.lock().unwrap().is_empty(),
-            "an unpinned tool must never reach the tunnel"
-        );
+        assert!(!is_err, "and the once-unpermitted tool is now callable");
     }
 
+    // --- Liveness: not-connected is the only refusal left, and it is a liveness answer ---
+
     #[tokio::test]
-    async fn allowlisted_but_unattached_server_reports_not_connected() {
+    async fn an_unattached_server_reports_not_connected() {
+        // Renamed from `allowlisted_but_unattached_server_reports_not_connected`. The refusal that
+        // survives D-29 is liveness, not permission: a name with no attached tunnel resolves to
+        // nothing.
         let tunnel = FakeTunnel::with(&[]);
-        let src = AcpTunnelSource::with_config(tunnel.clone(), &[katashiro_all()]);
+        let src = AcpTunnelSource::new(tunnel.clone());
         let (v, is_err) = src
             .call(Some(&ctx()), "katashiro.click", &Map::new())
             .await
@@ -588,154 +548,30 @@ mod tests {
             .contains("not connected"));
     }
 
-    /// The example client's five tools, as an operator would allowlist them.
-    ///
-    /// Tests may name katashiro; product code may not (D-20). Before that ruling
-    /// these tests passed `&[]` and inherited a built-in default, so the example
-    /// client's identity was baked into the PRODUCT and the tests never had to
-    /// state it. Now the test states it, which is where it belongs.
-    fn katashiro_all() -> openab_core::config::AcpServerPolicy {
-        cfg(
-            "katashiro",
-            &[
-                "katashiro.click",
-                "katashiro.navigate",
-                "katashiro.read_dom",
-                "katashiro.screenshot",
-                "katashiro.type",
-            ],
-        )
-    }
-
-    fn cfg(name: &str, tools: &[&str]) -> openab_core::config::AcpServerPolicy {
-        // Deserialized rather than struct-literalled so the test also pins the
-        // TOML shape operators actually write.
-        serde_json::from_value(json!({
-            "name": name,
-            "tools": tools,
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn an_absent_or_empty_config_admits_nothing() {
-        // Inverted on 2026-07-30 (D-20). This asserted 5 tools — the built-in
-        // `katashiro` default that applied when an operator configured nothing.
-        // That default is gone: katashiro is an example client implementation,
-        // not a component of openab, and shipping its catalog made it the
-        // default in fact even where it was not one in name.
-        //
-        // Absent and explicitly-empty are now the SAME thing, which is why both
-        // are asserted here rather than only the absent case.
-        let absent = AcpTunnelSource::with_config(FakeTunnel::with(&[]), &[]);
-        assert!(absent.tools(None).is_empty(), "an absent section admits no servers");
-
-        let explicitly_empty = AcpTunnelSource::with_config(FakeTunnel::with(&[]), &[]);
-        assert!(
-            explicitly_empty.tools(None).is_empty(),
-            "an explicit [] admits no servers either — the distinction the old default created is gone"
-        );
-    }
-
-    #[test]
-    fn an_allowlisted_tool_has_no_schema_until_discovery_supplies_one() {
-        // This test used to be `operator_can_narrow_a_builtin_server_without_
-        // restating_schemas`, and it asserted the property D-20 deleted: that a
-        // known server's schemas came from a built-in catalog, so an operator
-        // could restrict it by name alone and still publish full schemas.
-        //
-        // Kept rather than deleted, because the SCENARIO still happens every
-        // day — an operator allowlists one tool and looks at the catalog. What
-        // changed is the answer, and that is worth pinning: the name is
-        // admitted, and nothing is published until discovery has run. This is
-        // the cold-start window, asserted rather than left to be rediscovered
-        // as a regression.
-        let src = AcpTunnelSource::with_config(
-            FakeTunnel::with(&[("katashiro", "uuid-abc")]),
-            &[cfg("katashiro", &["katashiro.read_dom"])],
-        );
-        assert!(
-            src.tools(None).is_empty(),
-            "no seed exists any more, so a freshly configured server publishes nothing \
-             until tools/list has been fetched over the tunnel"
-        );
-    }
+    // --- Discovery drives the catalog from what is ATTACHED (§6.3, cold start) ---
 
     #[tokio::test]
-    async fn narrowing_the_policy_actually_refuses_the_dropped_tool() {
-        let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
-        let src = AcpTunnelSource::with_config(tunnel.clone(), &[cfg("katashiro", &["katashiro.read_dom"])]);
-        let (_v, is_err) = src
-            .call(Some(&ctx()), "katashiro.click", &Map::new())
-            .await
-            .unwrap();
-        assert!(is_err, "a tool the operator removed must be refused");
-        assert!(tunnel.forwarded.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn operator_may_admit_an_unknown_server_by_name_alone() {
-        // No server has a seed any more (D-20 deleted the catalog), so "notes"
-        // contributes nothing to the catalog until discovery runs — but its listed
-        // tool is permitted and routes to the declared id.
+    async fn an_attached_server_has_no_schema_until_discovery_supplies_one() {
+        // Renamed from `an_allowlisted_tool_has_no_schema_until_discovery_supplies_one`. The
+        // cold-start window survives D-29; what admits the server is now attachment, not config, so
+        // the catalog is empty until the first `tools/list` returns over the tunnel.
         let tunnel = FakeTunnel::with(&[("notes", "uuid-n")]);
-        let src = AcpTunnelSource::with_config(tunnel.clone(), &[cfg("notes", &["notes.list"])]);
+        let src = AcpTunnelSource::new(tunnel.clone());
         assert!(
-            src.tools(None).is_empty(),
-            "a name-only server has no schemas to advertise until they are fetched"
+            src.tools(Some(&ctx())).is_empty(),
+            "attached but not yet discovered: nothing to advertise until tools/list is fetched"
         );
-
-        let (_v, is_err) = src
-            .call(Some(&ctx()), "notes.list", &Map::new())
-            .await
-            .unwrap();
-        assert!(!is_err, "a permitted tool must dispatch even with no seed");
-        assert_eq!(tunnel.forwarded.lock().unwrap()[0].1, "uuid-n");
     }
 
     #[tokio::test]
-    async fn an_entry_with_no_tools_admits_the_server_but_grants_nothing() {
-        let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
-        let src = AcpTunnelSource::with_config(tunnel.clone(), &[cfg("katashiro", &[])]);
-        assert!(src.tools(None).is_empty(), "deny-all: no tools listed");
-        let (_v, is_err) = src
-            .call(Some(&ctx()), "katashiro.click", &Map::new())
-            .await
-            .unwrap();
-        assert!(is_err);
-        assert!(tunnel.forwarded.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn configuring_one_server_does_not_admit_another() {
-        // Renamed: this was `configuring_other_servers_drops_the_browser_default`, which named a
-        // built-in default that D-20 deleted — there is no default left to drop. What the test
-        // actually pins is unchanged and still worth pinning: the allowlist is exhaustive, so a
-        // server the operator did not list is refused even though a tunnel for it is attached.
-        let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
-        let src = AcpTunnelSource::with_config(tunnel.clone(), &[cfg("notes", &["notes.list"])]);
-        let (_v, is_err) = src
-            .call(Some(&ctx()), "katashiro.click", &Map::new())
-            .await
-            .unwrap();
-        assert!(is_err, "an unlisted server is refused even with a live tunnel attached");
-        assert!(tunnel.forwarded.lock().unwrap().is_empty());
-    }
-
-    /// Let any spawned discovery task run to completion.
-    async fn settle() {
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-    }
-
-    #[tokio::test]
-    async fn discovery_fills_the_catalog_for_a_name_only_server() {
-        // `notes` was admitted by name alone, so it starts with no seed. After a
-        // discovery round its real tools/list is cached and appears.
+    async fn discovery_fills_the_catalog_for_an_attached_server() {
+        // Renamed from `discovery_fills_the_catalog_for_a_name_only_server`, and the assertion
+        // inverted: BOTH published tools now appear. The old test expected `["notes.list"]` because
+        // `notes.get` was "published but never permitted"; with no allowlist there is nothing to
+        // intersect against.
         let tunnel = FakeTunnel::with(&[("notes", "uuid-n")]);
         tunnel.set_tools_list(&["notes.list", "notes.get"]);
-        let src = AcpTunnelSource::with_config(tunnel.clone(), &[cfg("notes", &["notes.list"])]);
+        let src = AcpTunnelSource::new(tunnel.clone());
 
         assert!(src.tools(Some(&ctx())).is_empty(), "nothing discovered yet");
         settle().await;
@@ -747,54 +583,44 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["notes.list"],
-            "fetched ∩ allowed — notes.get was published but never permitted"
+            ["notes.get", "notes.list"],
+            "every published tool appears — no allowlist to intersect against"
         );
     }
 
     #[tokio::test]
-    async fn caching_is_never_itself_a_grant() {
-        // The server publishes a tool the operator did not permit. Caching it
-        // must not make it visible OR callable.
+    async fn a_discovered_catalog_survives_detachment() {
+        // §6.3: attachment flapping stays out of the catalog. Discovery is driven by
+        // `attached_server_names`, but a name already in the cache keeps its tools even while it is
+        // momentarily not attached — the UNION in `tools()` is what preserves this.
         let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
-        tunnel.set_tools_list(&["katashiro.read_dom", "katashiro.exec"]);
-        let src =
-            AcpTunnelSource::with_config(tunnel.clone(), &[cfg("katashiro", &["katashiro.read_dom"])]);
+        tunnel.set_tools_list(&["katashiro.click", "katashiro.navigate", "katashiro.read_dom", "katashiro.screenshot", "katashiro.type"]);
+        let src = AcpTunnelSource::new(tunnel.clone());
         let _ = src.tools(Some(&ctx()));
         settle().await;
+        let before: Vec<String> =
+            src.tools(Some(&ctx())).iter().map(|t| t.name.to_string()).collect();
+        assert!(!before.is_empty(), "precondition: discovery must have populated the catalog");
 
-        let names: Vec<String> = src
-            .tools(Some(&ctx()))
-            .iter()
-            .map(|t| t.name.to_string())
-            .collect();
-        assert_eq!(names, ["katashiro.read_dom"], "the unpermitted tool stays out");
-
-        let (_v, is_err) = src
-            .call(Some(&ctx()), "katashiro.exec", &Map::new())
-            .await
-            .unwrap();
-        assert!(is_err, "and it stays uncallable even though it was cached");
+        tunnel.detach("katashiro");
+        let after: Vec<String> =
+            src.tools(Some(&ctx())).iter().map(|t| t.name.to_string()).collect();
+        assert_eq!(after, before, "a detached tunnel must not shrink the catalog");
     }
 
     #[tokio::test]
     async fn a_failed_discovery_does_not_empty_an_already_populated_catalog() {
-        // Renamed from `a_seeded_server_keeps_its_seed_until_discovery_succeeds`.
-        // Seeds are gone (D-20), so "falls back to the seed" is not a property any
-        // more — but the invariant underneath it survives and is the one that
-        // actually protects a running deployment: once a catalog has been
-        // discovered, a LATER failed fetch must not empty it.
+        // Once a catalog has been discovered, a LATER failed fetch must not empty it — the
+        // invariant that protects a running deployment through a flap.
         let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
         tunnel.set_tools_list(&["katashiro.click", "katashiro.navigate", "katashiro.read_dom", "katashiro.screenshot", "katashiro.type"]);
-        let src = AcpTunnelSource::with_config(tunnel.clone(), &[katashiro_all()]);
+        let src = AcpTunnelSource::new(tunnel.clone());
 
-        // Populate the cache with a successful discovery first.
         let _ = src.tools(Some(&ctx()));
         settle().await;
         let discovered = src.tools(Some(&ctx())).len();
         assert!(discovered > 0, "precondition: discovery must have populated the catalog");
 
-        // Now make discovery fail and confirm the catalog is not emptied.
         tunnel.fail_tools_list();
         let _ = src.tools(Some(&ctx()));
         settle().await;
@@ -809,7 +635,7 @@ mod tests {
     async fn discovery_is_not_repeated_while_one_is_in_flight() {
         let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
         tunnel.set_tools_list(&["katashiro.read_dom"]);
-        let src = AcpTunnelSource::with_config(tunnel.clone(), &[katashiro_all()]);
+        let src = AcpTunnelSource::new(tunnel.clone());
         for _ in 0..5 {
             let _ = src.tools(Some(&ctx()));
         }
@@ -823,11 +649,11 @@ mod tests {
 
     #[tokio::test]
     async fn cached_tools_survive_a_reconnect_that_changes_the_server_id() {
-        // The whole point of keying the cache by NAME: the client mints a new id
-        // on reconnect, and an id-keyed entry would be orphaned by it.
+        // The whole point of keying the cache by NAME: the client mints a new id on reconnect, and
+        // an id-keyed entry would be orphaned by it.
         let tunnel = FakeTunnel::with(&[("katashiro", "uuid-old")]);
         tunnel.set_tools_list(&["katashiro.read_dom"]);
-        let src = AcpTunnelSource::with_config(tunnel.clone(), &[katashiro_all()]);
+        let src = AcpTunnelSource::new(tunnel.clone());
         let _ = src.tools(Some(&ctx()));
         settle().await;
         assert_eq!(src.tools(Some(&ctx())).len(), 1);
@@ -842,28 +668,19 @@ mod tests {
 
     // --- F6: two client-declared servers in one session ---
     //
-    // The multi-server claim §6.2 makes, exercised through the real source: one
-    // session declares `browser` and a second, non-browser server; both are
-    // discovered and callable, tool names do not collide, and each server's
-    // policy is enforced independently. The agent-side leg (facade meta-tools →
-    // this source) is not covered here — facade mode is not live anywhere yet,
-    // which is the same precondition F5 is blocked on.
+    // The multi-server claim §6.2 makes, exercised through the real source: one session declares
+    // `katashiro` and a second, non-browser server; both are discovered and callable, tool names do
+    // not collide, and each tool routes to the tunnel of the server that declared it. The agent-side
+    // leg (facade meta-tools → this source) is not covered here — facade mode is not live anywhere
+    // yet.
 
     fn two_server_src(tunnel: Arc<FakeTunnel>) -> AcpTunnelSource {
-        AcpTunnelSource::with_config(
-            tunnel,
-            &[
-                cfg("katashiro", &["katashiro.click", "katashiro.read_dom"]),
-                cfg("notes", &["notes.list"]),
-            ],
-        )
+        AcpTunnelSource::new(tunnel)
     }
 
     #[tokio::test]
     async fn two_declared_servers_are_both_discovered_without_collision() {
         let tunnel = FakeTunnel::with(&[("katashiro", "uuid-b"), ("notes", "uuid-n")]);
-        // Both servers publish a tool literally called `list` under their own
-        // prefix — the case a naive un-prefixed catalog would collapse.
         tunnel.set_tools_list(&["katashiro.click", "katashiro.read_dom", "notes.list"]);
         let src = two_server_src(tunnel.clone());
 
@@ -913,32 +730,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_servers_policy_does_not_leak_to_another() {
-        // `katashiro.click` is permitted, `notes.click` is not — a per-server gate,
-        // not a global tool-name gate.
+    async fn a_tool_routes_by_its_prefix_to_the_named_server() {
+        // Inverted from `one_servers_policy_does_not_leak_to_another`. There is no per-server policy
+        // gate to leak any more; what remains, and is worth pinning, is that the PREFIX selects the
+        // tunnel: `notes.click` reaches `notes`'s tunnel (whether `notes` implements `click` is the
+        // server's concern, not openab's), never `katashiro`'s.
         let tunnel = FakeTunnel::with(&[("katashiro", "uuid-b"), ("notes", "uuid-n")]);
         let src = two_server_src(tunnel.clone());
 
-        let (_v, ok_err) = src
-            .call(Some(&ctx()), "katashiro.click", &Map::new())
-            .await
-            .unwrap();
-        assert!(!ok_err);
-
-        let (v, denied) = src
+        let (_v, err) = src
             .call(Some(&ctx()), "notes.click", &Map::new())
             .await
             .unwrap();
-        assert!(denied, "notes may not borrow browser's permissions");
-        assert!(v["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("is not permitted"));
-        assert_eq!(
-            tunnel.forwarded.lock().unwrap().len(),
-            1,
-            "only the permitted call reached a tunnel"
-        );
+        assert!(!err, "prefix selects the tunnel; the server decides what it implements");
+        let fwd = tunnel.forwarded.lock().unwrap();
+        assert_eq!(fwd.len(), 1);
+        assert_eq!(fwd[0].1, "uuid-n", "routed to notes' tunnel, not katashiro's");
+        assert_eq!(fwd[0].2["name"], "notes.click");
     }
 
     #[tokio::test]
@@ -958,16 +766,5 @@ mod tests {
             .await
             .unwrap();
         assert!(!notes_err, "its neighbour is unaffected");
-    }
-
-    #[tokio::test]
-    async fn malformed_tool_name_without_a_prefix_is_rejected() {
-        let src = AcpTunnelSource::with_config(FakeTunnel::with(&[("katashiro", "uuid-abc")]), &[]);
-        let (v, is_err) = src.call(Some(&ctx()), "click", &Map::new()).await.unwrap();
-        assert!(is_err);
-        assert!(v["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("expected <server>.<tool>"));
     }
 }

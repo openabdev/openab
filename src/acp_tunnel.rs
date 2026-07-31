@@ -89,4 +89,10 @@ impl AcpMcpTunnel for RootAcpTunnel {
         )
     }
 
+    /// Delegates to the gateway, which owns the registry. Names only; the caller resolves each via
+    /// `resolve_by_name`, so this crate never collapses name→id itself (it cannot rank two tunnels —
+    /// the ordering fields are private to the gateway).
+    fn attached_server_names(&self, channel_id: &str) -> Vec<String> {
+        openab_gateway::adapters::acp_server::attached_server_names(&self.registry, channel_id)
+    }
 }

@@ -544,9 +544,8 @@ async fn main() -> anyhow::Result<()> {
         // runs without it.
         #[cfg(feature = "acp")]
         let sources: Vec<Arc<dyn openab_mcp::mcp::sources::CapabilitySource>> =
-            vec![Arc::new(acp_tunnel_source::AcpTunnelSource::with_config(
+            vec![Arc::new(acp_tunnel_source::AcpTunnelSource::new(
                 acp_tunnel.clone(),
-                &mcp_cfg.acp_servers,
             ))];
         #[cfg(not(feature = "acp"))]
         let sources: Vec<Arc<dyn openab_mcp::mcp::sources::CapabilitySource>> = Vec::new();

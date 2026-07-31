@@ -250,10 +250,10 @@ impl SessionPool {
     /// process env, and writes the static facade MCP entry once per workdir.
     ///
     /// That is necessary but NOT sufficient for browser capabilities to route
-    /// through the facade. Two things outside this crate are also required: the
-    /// operator must put the written entry in front of the agent, and
-    /// `[[mcp.acp_servers]]` must be non-empty — an absent or empty list admits
-    /// no servers at all (D-20).
+    /// through the facade. The operator must still put the written entry in front
+    /// of the agent, and a `type:acp` server must actually attach over `/acp` —
+    /// admission is that transport auth, not a config allowlist (D-29 removed
+    /// `[[mcp.acp_servers]]`, reversing D-20).
     #[cfg(feature = "acp-mcp")]
     pub fn with_facade_sessions(
         mut self,

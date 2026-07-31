@@ -465,6 +465,26 @@ pub fn resolve_by_name(
     best.map(|(id, _)| id.clone())
 }
 
+/// The distinct declared **names** of tunnels currently attached to `channel_id`.
+///
+/// Drives the facade's discovery now that there is no operator allowlist to enumerate (D-29). It
+/// returns names, never `(name, id)`: the caller resolves each through [`resolve_by_name`], so the
+/// name→id collapse stays in the one place `74315a60` consolidated it — this is not a second route
+/// back to the enumerate-and-match hazard that commit removed. Deduplicated because a same-name
+/// collision (two tunnels mid-eviction) is one server to discover; `resolve_by_name` selects the
+/// ranked winner when discovery resolves it.
+pub fn attached_server_names(registry: &AcpTunnelRegistry, channel_id: &str) -> Vec<String> {
+    let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+    let mut names: Vec<String> = reg
+        .iter()
+        .filter(|((c, _), _)| c == channel_id)
+        .map(|(_, h)| h.server_name.clone())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Registry of active ACP sessions: channel_id → reply sink.
 /// Uses std::sync::Mutex because all operations are fast CPU-bound
 /// (insert/remove/get) and never hold the lock across .await.

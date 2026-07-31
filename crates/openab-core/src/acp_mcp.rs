@@ -51,6 +51,23 @@ pub trait AcpMcpTunnel: Send + Sync {
     /// compile error, not a behaviour change. This was not hypothetical: adding it with a `None`
     /// default broke five routing tests that had nothing to do with the change.
     fn resolve_by_name(&self, channel_id: &str, server_name: &str) -> Option<String>;
+
+    /// The declared **names** of the servers currently attached to this channel — the set the
+    /// facade's discovery iterates now that the operator allowlist is gone (D-29 removed
+    /// `[[mcp.acp_servers]]`; without it `tools()` had no source of names, because the allowlist
+    /// was doing double duty as the security gate AND the discovery list).
+    ///
+    /// **Names only, deduplicated — never `(name, id)`.** This is deliberately not the enumerating
+    /// `servers()` that `74315a60` removed: that returned a name→id mapping and its two callers
+    /// collapsed it by different rules. Here the caller resolves each name to an id through
+    /// [`AcpMcpTunnel::resolve_by_name`], so the name→id collapse stays in one place, beside the
+    /// eviction that makes the answer unique. Discovery is the only caller; routing never uses this.
+    /// A same-name collision (two tunnels mid-eviction) is one server to discover — hence dedup, and
+    /// `resolve_by_name` picks the ranked winner.
+    ///
+    /// Required, with no default — same reason as [`AcpMcpTunnel::resolve_by_name`]: a defaulted
+    /// empty answer would compile everywhere and then silently advertise nothing.
+    fn attached_server_names(&self, channel_id: &str) -> Vec<String>;
 }
 
 
