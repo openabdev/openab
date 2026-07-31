@@ -17,7 +17,9 @@ openab reports at startup whether the facade is running, so that much is never s
 infer:
 
 ```
-INFO browser control: enabled via the OAB MCP Facade ([mcp] configured)
+INFO browser control: the OAB MCP Facade is running ([mcp] configured), and openab has written
+     its entry to <workdir>/.openab/mcp-facade.json. openab does NOT modify your agent's MCP
+     config, so browser tools stay unavailable until that entry is in place.
 INFO browser control: unconfigured — no [mcp] section in config.toml, so browser tools are
      unavailable and nothing was started. Add [mcp] to enable them.
 ```
