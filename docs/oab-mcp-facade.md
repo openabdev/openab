@@ -128,8 +128,10 @@ claude mcp add --transport http oab http://127.0.0.1:8848/mcp
 ## Trust model
 
 Loopback-only, **no authentication layer** — the host/pod boundary is the
-trust boundary. Any process on the host can invoke every authorized
-capability while the facade runs. Do not enable it on hosts that colocate
+trust boundary. Any process on the host can invoke every capability that does **not** require a session.
+Session-bound sources are different: since the per-session bearer shipped, the facade filters
+them out unless the request resolves to a session, so a host process without that token can
+neither discover nor call them. Do not enable it on hosts that colocate
 untrusted processes. Least-privilege is enforced per provider with
 `tool_filter` include/exclude lists in `mcp.json`; excluded tools are
 invisible to discovery and rejected at execution.

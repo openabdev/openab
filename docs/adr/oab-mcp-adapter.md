@@ -428,11 +428,13 @@ listen = "127.0.0.1:8848"   # loopback only; this is the default
   facade; `openab-agent` re-exports the same crate. One implementation, two
   hosts — no duplicated runtime, which this ADR forbids.
 - **Security posture:** the listener refuses to bind any non-loopback
-  address; the endpoint itself carries no authentication layer in the MVP,
-  so the host/pod boundary is the trust boundary. Every process on the host
-  that can reach loopback can call authorized capabilities — deployments
-  that colocate untrusted processes must not enable `[mcp]`. A token or
-  socket-permission scheme is a documented follow-up.
+  address; the endpoint itself carries no authentication layer,
+  so the host/pod boundary is the trust boundary for every capability that
+  does not require a session. Deployments that colocate untrusted processes
+  must not enable `[mcp]`. Session-bound sources are the exception: the
+  per-session bearer shipped in #1447, so the facade hides and refuses them
+  unless the request resolves to a session. A socket-permission scheme for
+  the remaining session-free capabilities is still a documented follow-up.
 - **Native `openab-agent`:** the dispatcher is invoked in-process via the
   existing `mcp` meta-tool. No HTTP hop is required because the facade
   contract and policy checks are implemented by the same dispatcher component
