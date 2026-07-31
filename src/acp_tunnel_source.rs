@@ -13,13 +13,15 @@
 //! construction, so there is no source-per-declared-server; this one fans out
 //! internally, routing the `<server>.<tool>` prefix to the right tunnel.
 //!
-//! **The prefix is a declared `name`, not a registry key** (ADR §6.1). A
-//! declaration is `{type:"acp", id, name}`; the reference client mints `id` as
-//! a fresh UUID per connection while `name` (`"katashiro"`) is stable. Routing
-//! therefore resolves `name` → `(channel_id, id)` through the registry's
-//! `resolve_by_name`, and forwards the **full** published tool name
-//! (`katashiro.click`) — the prefix selects the tunnel, it is not stripped,
-//! because the server's own `tools/call` expects its full name.
+//! **Routing is by what the server published, not by the tool name's shape**
+//! (F5). A tool is routed to the server whose discovered `tools/list` contained
+//! it — a generic server may publish a bare `build`, or a name whose first
+//! segment is not its own, and both stay callable. The declared server `name`
+//! (from `{type:"acp", id, name}`; the client mints a fresh `id` per connection
+//! while `name` is stable) then resolves to `(channel_id, id)` through the
+//! registry's `resolve_by_name`, and the **full** published tool name is
+//! forwarded unchanged because the server's own `tools/call` expects it. The
+//! `<server>.` prefix is only a pre-discovery fallback for routing.
 //!
 //! **Admission is the transport, not an allowlist** (D-29, reversing D-20).
 //! There is no operator `[[mcp.acp_servers]]` gate: any server that authenticates
@@ -138,15 +140,35 @@ impl AcpTunnelSource {
         });
     }
 
-    /// Split a published tool name into `(server_name, full_tool_name)`. The
-    /// full name is returned deliberately: the prefix picks the tunnel, and the
-    /// server's own `tools/call` expects the name it published.
-    fn split_prefix(tool: &str) -> Option<(&str, &str)> {
+    /// The declared name of the connected server that published `tool` on `channel_id`, from the
+    /// discovery cache.
+    ///
+    /// This is how a tool is routed since F5 dropped the `<server>.<tool>` name-prefix assumption: a
+    /// generic server may publish a bare `build`, or a name whose first segment is not its own, so
+    /// the publisher is looked up by what was actually discovered rather than parsed out of the tool
+    /// string. Deterministic on the (already-ambiguous) case of two servers publishing the same bare
+    /// name — the lexicographically-first server name wins — so routing never depends on `HashMap`
+    /// iteration order.
+    fn server_publishing(&self, channel_id: &str, tool: &str) -> Option<String> {
+        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache
+            .iter()
+            .filter(|((c, _), tools)| c == channel_id && tools.iter().any(|t| t.name.as_ref() == tool))
+            .map(|((_, name), _)| name.clone())
+            .min()
+    }
+
+    /// The `<server>` segment of a `<server>.<tool>` name, as a **pre-discovery fallback** for
+    /// routing. Once discovery has run, [`server_publishing`] is authoritative and this is not
+    /// consulted; before it, a prefixed name still yields a candidate server so a cold call reports
+    /// "not connected" (and the common browser case works) rather than "not available". A bare or
+    /// mismatched-prefix name has no candidate here and waits for discovery.
+    fn split_prefix(tool: &str) -> Option<&str> {
         let (server, _rest) = tool.split_once('.')?;
         if server.is_empty() {
             return None;
         }
-        Some((server, tool))
+        Some(server)
     }
 
     /// An error *result* (not a dispatch fault): the agent gets an actionable
@@ -235,28 +257,33 @@ impl CapabilitySource for AcpTunnelSource {
         // requires_session() guarantees ctx in practice; defend anyway.
         let ctx = ctx.ok_or_else(|| anyhow!("ACP tunnel capabilities require a session token"))?;
 
-        let Some((server_name, full_tool)) = Self::split_prefix(tool) else {
+        // Route by what was DISCOVERED, not by parsing the tool name (F5). A generic server may
+        // publish a bare `build` or a name whose first segment is not the server's own; both are
+        // callable because the publisher is looked up from the cache. The `<server>.` prefix is only
+        // a pre-discovery fallback (see `split_prefix`). No allowlist gate (D-29): the only refusal
+        // left is not-connected, a liveness answer.
+        let Some(server_name) = self
+            .server_publishing(&ctx.channel_id, tool)
+            .or_else(|| Self::split_prefix(tool).map(str::to_string))
+        else {
             return Ok(Self::error_result(format!(
-                "malformed tool name {tool:?}: expected <server>.<tool>"
+                "tool {tool:?} is not available: no connected server has published it, and it \
+                 carries no <server>.<tool> prefix to route by before discovery"
             )));
         };
-
-        // No allowlist gate (D-29): admission is the `/acp` transport auth, so a connected server's
-        // declared tools are all callable. `resolve_by_name` returning `None` — the server is not
-        // attached — is the only refusal left, and it is a liveness answer, not a permission one.
 
         // Resolve the declared name to the tunnel's registry key (§6.1). Delegated rather than
         // done here: enumerating and taking the first name match is only correct while same-name
         // entries cannot coexist, and that uniqueness is maintained in the gateway, out of this
         // file's sight. A "take the first" caller does not fail when it breaks — it silently routes
         // to an arbitrary tunnel. The resolution now lives beside the eviction that guarantees it.
-        let Some(server_id) = self.tunnel.resolve_by_name(&ctx.channel_id, server_name) else {
+        let Some(server_id) = self.tunnel.resolve_by_name(&ctx.channel_id, &server_name) else {
             return Ok(Self::error_result(format!(
                 "{server_name} not connected: open the OpenAB side panel in your browser"
             )));
         };
 
-        let params = json!({ "name": full_tool, "arguments": args });
+        let params = json!({ "name": tool, "arguments": args });
         match self
             .tunnel
             .call(&ctx.channel_id, &server_id, "tools/call", Some(params))
@@ -310,6 +337,9 @@ mod tests {
         servers: std::sync::Mutex<Vec<(String, String)>>,
         forwarded: std::sync::Mutex<Vec<(String, String, Value)>>,
         tools_list: std::sync::Mutex<Option<Vec<String>>>,
+        /// Per-declared-name tool lists returned verbatim (no prefix partition), so a test can give
+        /// a server an unprefixed tool (`build`) or a name whose first segment is not the server's.
+        server_tools: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
         tools_list_calls: std::sync::atomic::AtomicUsize,
     }
 
@@ -324,6 +354,7 @@ mod tests {
                 ),
                 forwarded: std::sync::Mutex::new(Vec::new()),
                 tools_list: std::sync::Mutex::new(None),
+                server_tools: std::sync::Mutex::new(std::collections::HashMap::new()),
                 tools_list_calls: std::sync::atomic::AtomicUsize::new(0),
             })
         }
@@ -332,6 +363,15 @@ mod tests {
         fn set_tools_list(&self, names: &[&str]) {
             *self.tools_list.lock().unwrap() =
                 Some(names.iter().map(|n| n.to_string()).collect());
+        }
+
+        /// Make a specific server's `tools/list` return exactly `names`, verbatim — the tool names
+        /// need not be prefixed with the server's name.
+        fn set_server_tools(&self, server_name: &str, names: &[&str]) {
+            self.server_tools
+                .lock()
+                .unwrap()
+                .insert(server_name.to_string(), names.iter().map(|n| n.to_string()).collect());
         }
 
         /// Make `tools/list` fail (no answer configured).
@@ -394,13 +434,7 @@ mod tests {
             if method == "tools/list" {
                 self.tools_list_calls
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let Some(names) = self.tools_list.lock().unwrap().clone() else {
-                    return Err("tools/list unavailable".into());
-                };
-                // A real server returns only ITS OWN tools. The double holds one shared list, so
-                // partition it by the queried server's declared name — otherwise, now that the
-                // source no longer filters by an allowlist, one server's tunnel would appear to
-                // publish another's tools. The name for this `server_id` comes from the registry.
+                // The name for this `server_id` comes from the registry.
                 let server_name = self
                     .servers
                     .lock()
@@ -408,14 +442,32 @@ mod tests {
                     .iter()
                     .find(|(_, id)| id == server_id)
                     .map(|(n, _)| n.clone());
+                // Prefer an explicit per-server list (returned verbatim, so it may be unprefixed);
+                // otherwise fall back to the shared list partitioned by the server's declared name.
+                // A real server returns only ITS OWN tools; the partition keeps one server's tunnel
+                // from appearing to publish another's now that the source applies no allowlist.
+                let explicit = server_name
+                    .as_ref()
+                    .and_then(|n| self.server_tools.lock().unwrap().get(n).cloned());
+                let names = match explicit {
+                    Some(list) => list,
+                    None => {
+                        let Some(shared) = self.tools_list.lock().unwrap().clone() else {
+                            return Err("tools/list unavailable".into());
+                        };
+                        shared
+                            .into_iter()
+                            .filter(|n| match &server_name {
+                                Some(name) => n
+                                    .split_once('.')
+                                    .is_some_and(|(prefix, _)| prefix == name),
+                                None => true,
+                            })
+                            .collect()
+                    }
+                };
                 let tools: Vec<Value> = names
                     .iter()
-                    .filter(|n| match &server_name {
-                        Some(name) => n
-                            .split_once('.')
-                            .is_some_and(|(prefix, _)| prefix == name),
-                        None => true,
-                    })
                     .map(|n| json!({ "name": n, "inputSchema": { "type": "object" } }))
                     .collect();
                 return Ok(json!({ "tools": tools }));
@@ -467,15 +519,19 @@ mod tests {
         );
     }
 
+    // Inverted by F5: a bare name is no longer "malformed" — bare tools are legitimate and routed by
+    // discovery. What a bare name that NO connected server published earns is "not available", not a
+    // format complaint. (The tool here is never discovered — katashiro's tools/list is not fetched —
+    // and "click" has no prefix to fall back on, so both routing paths miss.)
     #[tokio::test]
-    async fn malformed_tool_name_without_a_prefix_is_rejected() {
+    async fn an_undiscovered_bare_tool_is_reported_unavailable() {
         let src = AcpTunnelSource::new(FakeTunnel::with(&[("katashiro", "uuid-abc")]));
         let (v, is_err) = src.call(Some(&ctx()), "click", &Map::new()).await.unwrap();
         assert!(is_err);
         assert!(v["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("expected <server>.<tool>"));
+            .contains("is not available"));
     }
 
     // --- Admission is the transport, not an allowlist (D-29, reversing D-20) ---
@@ -766,5 +822,48 @@ mod tests {
             .await
             .unwrap();
         assert!(!notes_err, "its neighbour is unaffected");
+    }
+
+    // --- F5: routing by what was discovered, not by the tool name's shape ---
+
+    #[tokio::test]
+    async fn an_unprefixed_tool_from_a_generic_server_is_callable() {
+        // A generic server "project-tools" publishing a bare "build" (no <server>. prefix) is both
+        // discoverable and callable. The old `split_prefix` rejected it as malformed; discovery
+        // routing looks the publisher up from the cache.
+        let tunnel = FakeTunnel::with(&[("project-tools", "uuid-p")]);
+        tunnel.set_server_tools("project-tools", &["build"]);
+        let src = AcpTunnelSource::new(tunnel.clone());
+
+        let _ = src.tools(Some(&ctx()));
+        settle().await;
+        let names: Vec<String> =
+            src.tools(Some(&ctx())).iter().map(|t| t.name.to_string()).collect();
+        assert_eq!(names, ["build"], "the bare tool is advertised");
+
+        let (_v, is_err) = src.call(Some(&ctx()), "build", &Map::new()).await.unwrap();
+        assert!(!is_err, "a bare tool must dispatch, not be rejected as malformed");
+        let fwd = tunnel.forwarded.lock().unwrap();
+        assert_eq!(fwd[0].1, "uuid-p", "routed to the publishing server's tunnel");
+        assert_eq!(fwd[0].2["name"], "build", "the original tool name is forwarded unchanged");
+    }
+
+    #[tokio::test]
+    async fn a_tool_whose_prefix_differs_from_its_server_name_is_callable() {
+        // Server "katashiro" publishing "browser.click": the first segment ("browser") is not the
+        // server's name. `split_prefix` would route to a phantom "browser" server; discovery routing
+        // sends it to katashiro, its actual publisher.
+        let tunnel = FakeTunnel::with(&[("katashiro", "uuid-k")]);
+        tunnel.set_server_tools("katashiro", &["browser.click"]);
+        let src = AcpTunnelSource::new(tunnel.clone());
+
+        let _ = src.tools(Some(&ctx()));
+        settle().await;
+
+        let (_v, is_err) = src.call(Some(&ctx()), "browser.click", &Map::new()).await.unwrap();
+        assert!(!is_err, "a mismatched-prefix tool must route to its publisher, not a phantom server");
+        let fwd = tunnel.forwarded.lock().unwrap();
+        assert_eq!(fwd[0].1, "uuid-k", "routed to katashiro, not the 'browser' prefix");
+        assert_eq!(fwd[0].2["name"], "browser.click", "the original tool name is forwarded unchanged");
     }
 }
