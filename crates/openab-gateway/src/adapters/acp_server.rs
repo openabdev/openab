@@ -415,6 +415,16 @@ pub struct ReplySink {
     /// client that reconnects and resumes takes over the same `channel_id`, so a slow cleanup from
     /// the old connection would delete the *successor's* live sink and silently stop its replies.
     pub owner: String,
+    /// Age of the CONNECTION that installed this sink (`connection_generation`, from
+    /// [`TUNNEL_GENERATION`], stamped when that connection was accepted).
+    ///
+    /// The reply registry is process-wide and keyed by `channel_id`, but session busy-state is
+    /// per-connection — so two connections resuming the same session can both start a turn and race
+    /// on this one key. Generation is what orders them: a NEWER connection (a reconnecting client
+    /// taking over the channel) may install over an older one, but an older connection arriving late
+    /// must not clobber the newer's sink. Paired with turn-scoped removal, this stops either turn
+    /// from deleting or overwriting the other's live sink (F4, was the F5-of-round-3 residual).
+    pub generation: u64,
 }
 
 /// Resolve a client-declared server NAME to the registry key of its tunnel, for one channel.
@@ -492,6 +502,37 @@ pub type AcpReplyRegistry = Arc<std::sync::Mutex<HashMap<String, ReplySink>>>;
 
 pub fn new_reply_registry() -> AcpReplyRegistry {
     Arc::new(std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Install `sink` as the reply sink for `channel_id`, unless a strictly NEWER connection already
+/// owns it. Returns true if installed.
+///
+/// A reconnecting client takes over the same `channel_id`, so a newer connection (higher
+/// `generation`) is allowed to install over an older one — but an older connection whose prompt is
+/// processed late must not clobber the newer connection's live sink. Same generation (the same
+/// connection starting its next turn) installs, replacing its own prior sink.
+fn install_reply_sink(registry: &AcpReplyRegistry, channel_id: &str, sink: ReplySink) -> bool {
+    let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+    match reg.get(channel_id) {
+        Some(existing) if existing.generation > sink.generation => false,
+        _ => {
+            reg.insert(channel_id.to_string(), sink);
+            true
+        }
+    }
+}
+
+/// Remove the reply sink for `channel_id` only if `turn_id` still owns it.
+///
+/// A turn's completion must not remove a sink a successor turn (a reconnect, or a concurrent
+/// same-session connection) has since installed — `turn_id` is a per-turn `evt_<uuid>`, so matching
+/// it identifies *this* turn's own sink and nothing else. The unconditional `remove` this replaces
+/// was the F5-of-round-3 residual: either completion dropped whichever sink was there.
+fn remove_reply_sink_if_owner(registry: &AcpReplyRegistry, channel_id: &str, turn_id: &str) {
+    let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+    if reg.get(channel_id).is_some_and(|s| s.turn_id == turn_id) {
+        reg.remove(channel_id);
+    }
 }
 
 /// Registry of open MCP-over-ACP tunnels: `(channel_id, server_id)` → `TunnelHandle`.
@@ -1783,6 +1824,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         session_id,
                         cancel,
                         &conn_for_prompt,
+                        connection_generation,
                     )
                     .await;
                 });
@@ -2202,6 +2244,10 @@ async fn handle_session_prompt(
     // `acp_conn_*` id of the connection running this prompt, stamped on the reply sink so
     // teardown removes only the sinks this connection installed.
     connection_id: &str,
+    // Age of this connection (`connection_generation`), stamped on the reply sink so a newer
+    // connection resuming the same session takes over the channel and an older one cannot clobber
+    // it (F4).
+    connection_generation: u64,
 ) {
     // sessionId was validated + reserved by the caller; only the prompt body can still be bad.
     let prompt_text = match extract_prompt_params(params) {
@@ -2255,13 +2301,16 @@ async fn handle_session_prompt(
     // turn's event id so `handle_reply` can drop a stale reply after timeout/cancel reuse.
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<ReplyChunk>();
     if let Some(ref registry) = state.acp_reply_registry {
-        registry
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                channel_id.clone(),
-                ReplySink { turn_id, tx: reply_tx, owner: connection_id.to_string() },
-            );
+        install_reply_sink(
+            registry,
+            &channel_id,
+            ReplySink {
+                turn_id: turn_id.clone(),
+                tx: reply_tx,
+                owner: connection_id.to_string(),
+                generation: connection_generation,
+            },
+        );
     }
 
     // Send event through the broadcast channel
@@ -2277,9 +2326,9 @@ async fn handle_session_prompt(
                 );
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
                 release_prompt(sessions, &session_id).await;
-                // Cleanup registry
+                // Cleanup registry — only this turn's own sink (F4).
                 if let Some(ref registry) = state.acp_reply_registry {
-                    registry.lock().unwrap_or_else(|e| e.into_inner()).remove(&channel_id);
+                    remove_reply_sink_if_owner(registry, &channel_id, &turn_id);
                 }
                 return;
             }
@@ -2345,14 +2394,13 @@ async fn handle_session_prompt(
     }
 
     // Cleanup: remove from registry, release busy flag, clear cancel signal.
-    // INVARIANT (R16-F1/F2): this unconditional remove/reset is safe ONLY because no newer
-    // turn can exist on this `session_id` while this one runs — both entry points that would
-    // start one are busy-gated (`session/prompt` and `session/resume` reject with -32001 when
-    // `s.busy`). If that gating is ever relaxed (e.g. multi-turn-per-session), this must become
-    // turn/owner-aware (compare the active `turn_id` before `remove`) or it will clobber the
-    // newer turn's sink. Cross-connection same-session races remain an accepted residual (F5).
+    // Turn-scoped removal (F4): only remove the sink if THIS turn still owns it. A newer connection
+    // resuming the same session (or a reconnect) can have taken over the channel key between this
+    // turn's start and its end; `remove_reply_sink_if_owner` matches on `turn_id` so this
+    // completion cannot delete the successor's live sink. This was the F5-of-round-3 residual —
+    // the per-connection busy gate does not serialize turns across two connections on one session.
     if let Some(ref registry) = state.acp_reply_registry {
-        registry.lock().unwrap_or_else(|e| e.into_inner()).remove(&channel_id);
+        remove_reply_sink_if_owner(registry, &channel_id, &turn_id);
     }
     if let Some(s) = sessions.lock().await.get_mut(&session_id) {
         s.busy = false;
@@ -3864,7 +3912,7 @@ mod acp_review_fixes {
             .unwrap()
             .insert(
                 "acp_chan".into(),
-                ReplySink { turn_id: "evt_current".into(), tx, owner: "conn-test".into() },
+                ReplySink { turn_id: "evt_current".into(), tx, owner: "conn-test".into(), generation: 0 },
             );
 
         // Stale reply (previous turn's event id) → dropped.
@@ -3879,6 +3927,60 @@ mod acp_review_fixes {
             Ok(ReplyChunk::Text(t)) => assert_eq!(t, "hello"),
             _ => panic!("expected the matching reply to be delivered"),
         }
+    }
+
+    // F4 — two connections on one session race on the process-wide reply registry (session busy is
+    // per-connection). Generation orders them: a newer connection takes over, an older one arriving
+    // late cannot clobber it, and neither turn's completion removes the other's live sink.
+    #[test]
+    fn neither_connection_clobbers_the_others_reply_sink() {
+        let registry = new_reply_registry();
+        let sink = |turn: &str, owner: &str, generation: u64| {
+            let (tx, _rx) = mpsc::unbounded_channel::<ReplyChunk>();
+            super::ReplySink { turn_id: turn.into(), tx, owner: owner.into(), generation }
+        };
+        let current_turn = || registry.lock().unwrap().get("acp_x").map(|s| s.turn_id.clone());
+
+        // Connection A (gen 1) installs its sink.
+        assert!(super::install_reply_sink(&registry, "acp_x", sink("evt_a", "conn-A", 1)));
+        // Newer connection B (gen 2) resumes the same session and takes over (reconnect semantics).
+        assert!(super::install_reply_sink(&registry, "acp_x", sink("evt_b", "conn-B", 2)));
+        assert_eq!(current_turn().as_deref(), Some("evt_b"), "the newer connection owns the sink");
+
+        // The older connection A, its prompt processed late, must NOT clobber B's live sink.
+        assert!(
+            !super::install_reply_sink(&registry, "acp_x", sink("evt_a2", "conn-A", 1)),
+            "an older connection cannot install over a newer one"
+        );
+        assert_eq!(current_turn().as_deref(), Some("evt_b"), "B's sink survives A's late install");
+
+        // A's turn completing must not remove B's sink (turn-scoped removal).
+        super::remove_reply_sink_if_owner(&registry, "acp_x", "evt_a");
+        assert_eq!(current_turn().as_deref(), Some("evt_b"), "A's completion must not remove B's sink");
+
+        // B's own completion removes B's sink.
+        super::remove_reply_sink_if_owner(&registry, "acp_x", "evt_b");
+        assert!(current_turn().is_none(), "the owner's completion removes its own sink");
+    }
+
+    // F4 — the SAME connection starting its next turn replaces its own sink; the stale prior turn's
+    // completion must not then remove the live new one.
+    #[test]
+    fn a_connections_new_turn_replaces_its_own_sink_without_the_old_turn_removing_it() {
+        let registry = new_reply_registry();
+        let sink = |turn: &str| {
+            let (tx, _rx) = mpsc::unbounded_channel::<ReplyChunk>();
+            super::ReplySink { turn_id: turn.into(), tx, owner: "conn-A".into(), generation: 5 }
+        };
+        assert!(super::install_reply_sink(&registry, "acp_x", sink("evt_1")));
+        assert!(super::install_reply_sink(&registry, "acp_x", sink("evt_2")));
+        // Stale turn 1's completion must not remove turn 2's sink.
+        super::remove_reply_sink_if_owner(&registry, "acp_x", "evt_1");
+        assert_eq!(
+            registry.lock().unwrap().get("acp_x").map(|s| s.turn_id.clone()).as_deref(),
+            Some("evt_2"),
+            "the stale turn must not remove the same connection's newer sink"
+        );
     }
 
     // R17-F1 — keyless-mode browser `Origin` gating. A WS handshake bypasses the browser
@@ -3966,7 +4068,7 @@ mod acp_review_fixes {
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
         let params = json!({"sessionId": sid, "prompt": [{"type": "text", "text": "hi"}]});
-        handle_session_prompt(&state, &sessions, json!(7), Some(&params), &out_tx, sid.clone(), cancel, "conn-test")
+        handle_session_prompt(&state, &sessions, json!(7), Some(&params), &out_tx, sid.clone(), cancel, "conn-test", 0)
             .await;
 
         // The final response (matching our request id) must carry stopReason "cancelled".
@@ -4048,7 +4150,7 @@ mod acp_review_fixes {
         let sid2 = sid.clone();
         let handle = tokio::spawn(async move {
             let params = json!({"sessionId": sid2, "prompt": [{"type": "text", "text": "hi"}]});
-            handle_session_prompt(&st2, &sessions2, json!(11), Some(&params), &out_tx, sid2.clone(), cancel, "conn-test")
+            handle_session_prompt(&st2, &sessions2, json!(11), Some(&params), &out_tx, sid2.clone(), cancel, "conn-test", 0)
                 .await;
         });
 
@@ -6317,7 +6419,7 @@ mod acp_teardown_ownership {
             let (tx, _rx) = mpsc::unbounded_channel::<ReplyChunk>();
             reg.lock().unwrap().insert(
                 "acp_x".into(),
-                ReplySink { turn_id: "evt_new".into(), tx, owner: "conn-B".into() },
+                ReplySink { turn_id: "evt_new".into(), tx, owner: "conn-B".into(), generation: 0 },
             );
         }
         {
