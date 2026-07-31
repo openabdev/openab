@@ -111,8 +111,10 @@ Extension releases the connection and replies `{ "result": {} }`.
 
 ## 6. Browser tools (the MCP tools the extension serves)
 
-Baseline DOM-semantic set (model-agnostic; OpenAB also static-advertises these so they appear
-even before the extension attaches). `tools/call` executes in the **active tab**.
+Baseline DOM-semantic set (model-agnostic), as served by the example `katashiro` extension. OpenAB
+ships no catalog of its own: what appears is what the operator allowlisted in
+`[[mcp.acp_servers]]`, intersected with what the extension published — and nothing appears until the
+extension's first `tools/list` returns. `tools/call` executes in the **active tab**.
 
 | name | arguments | behaviour |
 |---|---|---|

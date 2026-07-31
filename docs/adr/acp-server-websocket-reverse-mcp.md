@@ -247,8 +247,11 @@ The facade's discovery is **pull-based**: the agent sees only `search_capabiliti
 - **`notifications/tools/list_changed` is dropped.** There is no cached client-side tool list to
   invalidate, so the notification has no consumer. (The earlier draft's `list_changed` lifecycle,
   debouncing included, is removed rather than deferred.)
-- **Static-advertise is the right posture**, per the facade's source contract — but implemented as
-  *dynamically sourced, then cached*, because tools for arbitrary declared servers cannot be hardcoded:
+- **A catalog that does not flap is the right posture**, per the facade's source contract —
+  implemented as *dynamically sourced, then cached*, because tools for arbitrary declared servers
+  cannot be hardcoded. (This bullet said "static-advertise is the right posture" until D-20 deleted
+  the built-in catalog; advertising before a server has spoken is no longer possible, so the posture
+  is discover-then-hold.):
   fetch the server's real `tools/list` over its tunnel and **cache it per `(channel_id, name)`**;
   serve `tools(ctx)` from that cache **regardless of current attach
   state**. Backend unavailability surfaces as a **call error** ("browser not connected"), never as a
@@ -257,13 +260,16 @@ The facade's discovery is **pull-based**: the agent sees only `search_capabiliti
 Distinguish two kinds of variation: **session scope** is legitimate; **attachment flapping** (is the
 tab connected this second) must not reach the catalog. Note what `tools(ctx)` actually varies by
 session is the **discovery cache**, not the declaration set — it iterates the *operator policy* map,
-so a pinned server is advertised even when the client declared nothing, and a client-declared server
-with no policy entry contributes nothing. An optional refinement, requiring a client wire change, is to
+so an allowlisted server appears in the catalog independently of what the client declared, and a
+client-declared server with no policy entry contributes nothing. ~~A pinned server is advertised even
+when the client declared nothing~~ — that no longer follows: with the seed deleted (D-20) an
+allowlisted server contributes nothing until its own `tools/list` has been fetched. An optional refinement, requiring a client wire change, is to
 carry a tool manifest in the `session/new` declaration so the catalog is known without a round-trip.
 
 **Two layers, and the policy table is the lower one** (confirmed by review 2026-07-26; an earlier draft
 of this section said an un-cached server "contributes an empty set", which contradicted the
-static-advertise posture §6.4's pinned sets and D4 both depend on):
+static-advertise posture §6.4's pinned sets and D4 both depended on — and which, after D-20 deleted
+the seed, is now exactly what happens):
 
 - ~~The §6.4 policy entry for a server is its **pre-attach seed** as well as its filter. A server the
   operator has pinned advertises those tools from the moment the source is registered — it never drops
@@ -293,11 +299,17 @@ static-advertise posture §6.4's pinned sets and D4 both depend on):
   because §6.4 is deny-all. Caching changes what an *allowed* server advertises; it is never itself a
   grant.
 
-**Ordering consequence.** Because the filter is deny-all and pinned entries already carry full `Tool`
-schemas, fetching cannot surface anything an operator has not already permitted — so the discovery
-cache has no visible effect until the operator-facing configuration surface exists. The config surface
-therefore lands **first**; the cache is what supplies real schemas once operators are allowed to list
-tools by name alone.
+**Ordering consequence (as reasoned at the time).** ~~Because the filter is deny-all and pinned
+entries already carry full `Tool` schemas, fetching cannot surface anything an operator has not
+already permitted — so the discovery cache has no visible effect until the operator-facing
+configuration surface exists.~~ The config surface landed **first**, which was the decision this
+paragraph drove.
+
+Both halves of the premise are now false: entries carry no schemas (D-20 deleted the catalog) and the
+configuration surface has shipped. The conclusion inverted with them — the discovery cache is not
+invisible but **load-bearing**, because it is the only source of schemas. This is also the argument
+retracted in the status comment: "discovery is unnecessary because the schemas are hardcoded" rested
+on the seed that was deleted.
 
 ### 6.4 Trust — client-declared tool sets need an operator gate
 
@@ -379,9 +391,10 @@ revisit a per-provider "expose directly" option only if interactive browser late
 
 ### 6.6 Status — as-built vs remaining
 
-**As-built (`bf37d25e`, `74e23f0e`): the facade is the only transport.** `src/browser_source.rs`
-implements `CapabilitySource` over the existing `AcpMcpTunnel` — `requires_session()`, static-advertise
-per §6.3, tunnel failures surfaced as MCP error results — and a `FacadeRegistrar` adapts the facade's
+**As-built (`bf37d25e`, `74e23f0e`): the facade is the only transport.** `src/acp_tunnel_source.rs`
+(renamed from `browser_source.rs`) implements `CapabilitySource` over the existing `AcpMcpTunnel` —
+`requires_session()`, a catalog that does not shrink on detach per §6.3, tunnel failures surfaced as
+MCP error results — and a `FacadeRegistrar` adapts the facade's
 `SessionTokens` to a `SessionTokenRegistrar` hook in core, so `openab-core` stays free of an
 `openab-mcp` dependency. `write_facade_mcp_config` authors `.openab/mcp-facade.json` — the one file openab owns — containing
 a **static `openab` entry** whose
@@ -497,11 +510,13 @@ Five **DOM-semantic** MCP tools, served by the extension: `katashiro.read_dom` (
 - **D4 — lifecycle: the WS may connect *after* session start.** When `[mcp]` is configured the
   facade listener is process-lifetime and decoupled from the extension WS — it is not
   unconditionally always-on, since without `[mcp]` no listener starts at all and there is no browser
-  control. Given a listener, browser tools are **static-advertised** regardless of WS state; a
-  `tools/call` with no extension attached returns an MCP error ("browser not connected") rather than
-  the capability disappearing. `notifications/tools/list_changed` was designed but never implemented,
+  control. Given a listener, an allowlisted server's tools stay in the catalog regardless of WS
+  state once discovered; a `tools/call` with no extension attached returns an MCP error ("browser
+  not connected") rather than the capability disappearing. ~~Tools are **static-advertised**
+  regardless of WS state~~ — before discovery has run there is nothing to advertise (D-20). `notifications/tools/list_changed` was designed but never implemented,
   and is **dropped, not deferred** (§6.3): facade discovery is pull-based, so no cached tool list
-  exists for a notification to invalidate. The static-advertise posture is kept, implemented as
+  exists for a notification to invalidate. ~~The static-advertise posture is kept~~ — it is not; what
+  is kept is that a discovered catalog does not shrink, implemented as
   fetch-once-per-declared-server plus a per-`(channel_id, declared_name)` cache — keyed by NAME, not
   `server_id`, so a reconnect that mints a fresh id does not lose the cache (§6.3).
 - **D5 — per-session MCP server.** The pool started one loopback Streamable-HTTP MCP proxy per `acp:`
@@ -590,9 +605,12 @@ clients see only the two meta-tools.
   ([ACP discussion #58](https://github.com/orgs/agentclientprotocol/discussions/58)). Only the
   can't-listen *client* leg is tunnelled; downstream stays a normal in-process MCP server.
 - ~~**Static-advertise as the default** — superseded by §6.2 (dynamic + `list_changed`); kept as an
-  opt-in for browser only.~~ **Reversed:** static-advertise IS the implemented posture,
+  opt-in for browser only.~~ **Reversed (2026-07-26):** static-advertise IS the implemented posture,
   `list_changed` was dropped with no consumer (§6.3), and there is no opt-in — the source is
-  registered unconditionally whenever `[mcp]` is present.
+  registered unconditionally whenever `[mcp]` is present. **Reversed again (2026-07-30, D-20):** the
+  built-in catalog that made static-advertise possible was deleted, so the posture is now
+  discover-then-hold — nothing is advertised before a server's first `tools/list`. The `list_changed`
+  and no-opt-in halves still stand.
 
 ## 9. Typing / dependencies
 

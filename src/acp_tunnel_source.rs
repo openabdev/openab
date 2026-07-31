@@ -45,13 +45,16 @@ struct ServerPolicy {
     /// is dropped from the catalog and refused on call, so a client cannot
     /// inject new tools by re-declaring a trusted name.
     allowed: HashSet<String>,
-    /// **Pre-attach seed** (ADR §6.3): full `Tool` values advertised from the
-    /// moment the source is registered, so a permitted server is discoverable
-    /// before its client ever attaches — the property D4 relies on. Known
-    /// servers seed from the built-in catalog; a server an operator admitted by
-    /// name alone seeds empty until discovery caching supplies real schemas.
-    /// Always a subset of `allowed`: the seed narrows with the policy, never
-    /// past it.
+    /// **Always empty.** Kept as a field because the read path still asks for it,
+    /// but `policy_from_config` constructs every entry with `Vec::new()`.
+    ///
+    /// It used to be a pre-attach seed (ADR §6.3): full `Tool` values advertised
+    /// from the moment the source was registered, so a permitted server was
+    /// discoverable before its client attached — the property D4 relied on.
+    /// Known servers seeded from a built-in catalog. D-20 deleted that catalog
+    /// because `katashiro` is an example client, not a component of openab, so
+    /// there is nothing left to seed FROM and no server is discoverable before
+    /// its first `tools/list`.
     seed: Vec<Tool>,
 }
 /// Build the policy from the operator's `[[mcp.acp_servers]]` entries (§6.4).
@@ -217,15 +220,19 @@ impl CapabilitySource for AcpTunnelSource {
         "openab-browser"
     }
 
-    /// The advertised catalog: for every allowlisted server, its discovered
-    /// tool set if one has been cached, else its policy seed.
+    /// The advertised catalog: for every allowlisted server, its discovered tool
+    /// set if one has been cached, else nothing.
     ///
     /// Deliberately **not** intersected with the tunnels currently attached.
     /// Attachment flapping must not reach the catalog (§6.3) — a tab that is
     /// closed for a second must not make the tools vanish and reappear — so
-    /// availability is reported by `call` ("browser not connected"), never by a
-    /// shrinking tool list. This keeps the pre-attach discovery behaviour the
-    /// static-advertise design (D4) already had.
+    /// availability is reported by `call` ("not connected"), never by a shrinking
+    /// tool list.
+    ///
+    /// It no longer preserves D4's pre-attach discovery, though: with the seed
+    /// gone there is a COLD START in which an allowlisted server publishes
+    /// nothing until its first `tools/list` returns. What survives of §6.3 is
+    /// the narrower guarantee that an already-populated catalog does not shrink.
     ///
     /// Discovery is *pull*-triggered rather than attach-triggered: a declared
     /// server with no cache entry yet gets a background `tools/list` fetch
@@ -234,8 +241,10 @@ impl CapabilitySource for AcpTunnelSource {
     /// is the whole cost, and it avoids threading an attach hook from the
     /// gateway (which owns attach) into the root (which owns this source).
     fn tools(&self, ctx: Option<&SessionCtx>) -> Vec<Tool> {
-        // Anonymous clients never reach here in practice (`requires_session`),
-        // and with no channel there is nothing to discover — serve the seeds.
+        // Anonymous clients never reach here in practice (`requires_session`), and
+        // with no channel there is nothing to discover. This returns the seeds,
+        // which are now always empty — kept as the same expression rather than a
+        // bare `vec![]` so the read path stays uniform if a seed ever returns.
         let Some(ctx) = ctx else {
             return sorted(self.policy.values().flat_map(|p| p.seed.iter().cloned()));
         };
@@ -258,8 +267,10 @@ impl CapabilitySource for AcpTunnelSource {
                         .filter(|t| policy.allowed.contains(t.name.as_ref())),
                 ),
                 None => {
-                    // Nothing discovered yet: advertise the seed (never empty out a
-                    // seeded server) and kick off the fetch if it is attached.
+                    // Nothing discovered yet. This extends by the seed, which is always
+                    // empty since D-20 — so in practice it contributes nothing and the
+                    // server stays absent from the catalog until the fetch below lands.
+                    // That is the cold-start window, not an oversight.
                     out.extend(policy.seed.iter().cloned());
                     // Resolved through the same call routing uses, not through a snapshot of
                     // `servers()`. Collecting that into a map keeps whichever entry the iterator

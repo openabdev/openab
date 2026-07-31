@@ -53,10 +53,17 @@ pub trait CapabilitySource: Send + Sync {
     fn provider(&self) -> &str;
 
     /// The advertised tool set. `ctx` is `None` for anonymous clients.
-    /// Sources may vary the set by session, but static-advertising
-    /// regardless of backend attachment (D4, #1447) is the recommended
-    /// default — availability problems belong in call errors, not in
-    /// catalog flapping.
+    ///
+    /// Sources may vary the set by session. Availability problems belong in call
+    /// errors, not in catalog flapping — a backend that detaches for a moment
+    /// must not make its tools vanish and reappear.
+    ///
+    /// This used to recommend *static-advertising regardless of backend
+    /// attachment* (D4, #1447). That is no longer achievable for a tunnel-backed
+    /// source: D-20 deleted the built-in catalog that let one advertise before
+    /// its backend had ever spoken, so such a source now publishes nothing until
+    /// its first discovery round. The surviving rule is the narrower one above —
+    /// do not shrink a catalog you have already published.
     fn tools(&self, ctx: Option<&SessionCtx>) -> Vec<Tool>;
 
     /// Execute one tool. Returns `(payload, is_error)` mirroring the MCP
