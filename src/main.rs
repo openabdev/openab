@@ -528,8 +528,10 @@ async fn main() -> anyhow::Result<()> {
     // Only read under the acp feature (pool facade wiring below).
     #[cfg(feature = "acp")]
     let facade_serving = cfg.mcp.is_some();
-    // Startup, not per-session: OPENAB_BROWSER_MODE selects nothing any more, and an operator
-    // still setting it needs to be told that here rather than discovering it as missing tools.
+    // Startup, not per-session: report whether the facade is serving, so an operator learns it
+    // here rather than by inferring it from tools that never appear. This is NOT the
+    // `OPENAB_BROWSER_MODE` migration notice — that was removed (see `acp_mcp`), and nothing
+    // reports the variable now.
     // Gated on `acp` (the root feature that pulls in core's `acp-mcp`), not on `acp-mcp` itself —
     // that is a core feature and naming it here is an unknown-cfg error.
     #[cfg(feature = "acp")]
