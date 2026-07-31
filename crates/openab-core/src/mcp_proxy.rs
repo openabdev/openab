@@ -6,25 +6,9 @@
 //!
 //! What remains is the seam between core and the colocated agent CLI:
 //!
-//! - [`browser_tools`] — the static `katashiro` tool set (D4 static-advertise). **It no longer has
-//!   any caller in this workspace.** It was consumed by the facade's capability source as a schema
-//!   seed until 2026-07-30, when D-20 deleted the built-in catalog: `katashiro` is an example
-//!   implementation of the client side, not a component of openab, so product code must not carry
-//!   its schemas. Schemas now come only from discovery over the tunnel.
-//!
-//!   Left in place deliberately rather than deleted — it is `pub`, so removing it is a public API
-//!   change and that is not this loop's call to make.
-//! - [`AcpMcpTunnel`] — the trait core calls to reach a session's tunnel, implemented in the root.
-//! - [`write_facade_mcp_config`] — authors `.openab/mcp-facade.json`, the ONE file openab owns.
-//!   It does not write, merge into, or read any vendor's MCP config, and it does not invoke a
-//!   vendor CLI (D-2026-07-30-15). Putting the entry in place is the operator's step for EVERY
-//!   vendor today. Pointing Claude Code at it with `--mcp-config` at spawn is decided but NOT
-//!   implemented — it needs a way to identify the vendor at spawn time, which this codebase has
-//!   deliberately never had.
 //! - [`report_browser_control`] — startup report of whether browser control is on, plus the
 //!   migration notice for the removed `OPENAB_BROWSER_MODE`.
 
-use rmcp::model::{object, Tool};
 use serde_json::{json, Value};
 
 /// Core-side interface to the browser MCP-over-ACP tunnel (D6-a'). Implemented by the ROOT
@@ -67,55 +51,6 @@ pub trait AcpMcpTunnel: Send + Sync {
     fn resolve_by_name(&self, channel_id: &str, server_name: &str) -> Option<String>;
 }
 
-/// The fixed set of browser tools OpenAB advertises over MCP (D4 static-advertise). DOM-
-/// semantic actions the extension executes in the user's active tab; model-agnostic.
-pub fn browser_tools() -> Vec<Tool> {
-    vec![
-        Tool::new(
-            "katashiro.click",
-            "Click the element matching a CSS selector in the active browser tab.",
-            object(json!({
-                "type": "object",
-                "properties": { "selector": { "type": "string", "description": "CSS selector" } },
-                "required": ["selector"]
-            })),
-        ),
-        Tool::new(
-            "katashiro.read_dom",
-            "Read a snapshot of the active tab's DOM (optionally scoped to a selector).",
-            object(json!({
-                "type": "object",
-                "properties": { "selector": { "type": "string", "description": "optional CSS selector to scope the snapshot" } }
-            })),
-        ),
-        Tool::new(
-            "katashiro.navigate",
-            "Navigate the active browser tab to a URL.",
-            object(json!({
-                "type": "object",
-                "properties": { "url": { "type": "string", "description": "absolute URL" } },
-                "required": ["url"]
-            })),
-        ),
-        Tool::new(
-            "katashiro.type",
-            "Type text into the element matching a CSS selector in the active tab.",
-            object(json!({
-                "type": "object",
-                "properties": {
-                    "selector": { "type": "string", "description": "CSS selector" },
-                    "text": { "type": "string", "description": "text to type" }
-                },
-                "required": ["selector", "text"]
-            })),
-        ),
-        Tool::new(
-            "katashiro.screenshot",
-            "Capture a screenshot of the active browser tab.",
-            object(json!({ "type": "object", "properties": {} })),
-        ),
-    ]
-}
 
 
 
@@ -481,7 +416,7 @@ mod facade_config_writer {
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_mode_migration_notice, browser_tools,
+        browser_mode_migration_notice,
     };
 
     /// The variable is inert now, so the notice must fire for every value an operator could have
@@ -552,34 +487,7 @@ mod tests {
 
 
 
-    #[test]
-    fn browser_tools_advertises_the_fixed_set() {
-        let tools = browser_tools();
-        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
-        assert_eq!(
-            names,
-            [
-                "katashiro.click",
-                "katashiro.read_dom",
-                "katashiro.navigate",
-                "katashiro.type",
-                "katashiro.screenshot"
-            ]
-        );
-    }
 
-    #[test]
-    fn every_browser_tool_has_an_object_input_schema() {
-        for t in browser_tools() {
-            assert_eq!(
-                t.input_schema.get("type").and_then(|v| v.as_str()),
-                Some("object"),
-                "tool {} must have an object input schema",
-                t.name
-            );
-            assert!(t.description.is_some(), "tool {} needs a description", t.name);
-        }
-    }
 
     const INIT_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
 
