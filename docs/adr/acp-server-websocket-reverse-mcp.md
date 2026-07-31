@@ -427,9 +427,11 @@ files, and does not invoke a vendor CLI to do it either. It authors `.openab/mcp
 operator puts that entry in place (`kiro-cli mcp import --file … workspace` for kiro, by hand for
 cursor, which has no include/extends and no launch flag). The cost is stated rather than hidden:
 kiro and cursor both lose zero-config onboarding, which is wider than the cursor-only regression
-first recorded. Whether Claude Code is pointed at the file with `--mcp-config` at spawn is a
-separate open question — it needs spawn-time vendor identification, which this codebase has
-deliberately never had.
+first recorded. Whether Claude Code is pointed at the file with `--mcp-config` at spawn was SETTLED on
+2026-07-31 (D-21, shipped in `54223aea`): openab does not pass it. `[agent]` is an opaque
+command line spawned verbatim, so the operator adds the flag to `args` themselves. Having
+openab identify the vendor at spawn time was rejected — this codebase negotiates capability
+from the protocol and deliberately has no vendor-identity concept.
 
 **Remaining to fulfil this section** — F1′, F3′, F4 and F5 all landed in #1447 and are struck
 through; **F6 genuinely remains**:

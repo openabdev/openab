@@ -169,8 +169,9 @@ pub async fn write_facade_mcp_config(workdir: &str, facade_url: &str) -> std::io
 /// The one file openab authors: `<workdir>/.openab/mcp-facade.json`.
 ///
 /// Source for the operator's `kiro-cli mcp import --file … workspace`, and the intended source for
-/// Claude Code's `--mcp-config` once spawn-time vendor identification is decided. openab never puts
-/// it in place itself (D-15).
+/// Claude Code's `--mcp-config`, which the OPERATOR adds to `[agent] args` — openab does not
+/// pass it and identifies no vendor at spawn time (D-21). openab never puts the entry in
+/// place itself either (D-15).
 pub fn facade_config_path(workdir: &str) -> std::path::PathBuf {
     std::path::Path::new(workdir).join(".openab").join("mcp-facade.json")
 }
