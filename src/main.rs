@@ -1433,6 +1433,9 @@ async fn main() -> anyhow::Result<()> {
                 stt_config: cfg.stt.clone(),
                 #[cfg(feature = "filestore")]
                 filestore: filestore.clone(),
+                // One set for the whole bridge: the per-event task below would
+                // otherwise get a private copy of every limit.
+                ingress: Default::default(),
             });
 
             // Spawn the event bridge (event_tx → process_gateway_event)

@@ -238,16 +238,33 @@ fn goes_to_filestore(attachment_type: &str, source_bytes: u64, has_filestore: bo
 
 /// Bytes an assembled block keeps on top of its source. Only bytes that reach the
 /// prompt count: an externalized attachment carries a URL, whatever it weighs.
-fn inline_payload_bytes(attachment_type: &str, source_bytes: u64, has_filestore: bool) -> u64 {
+///
+/// `lossy_text` covers the one type that renders larger than it reads: lossy UTF-8
+/// conversion spends a three-byte replacement character on every bad byte, so
+/// malformed input trebles. Callers that have not read the bytes yet must pass
+/// `true`, since the only safe assumption before reading is the worst one.
+fn inline_payload_bytes(
+    attachment_type: &str,
+    source_bytes: u64,
+    has_filestore: bool,
+    lossy_text: bool,
+) -> u64 {
     if goes_to_filestore(attachment_type, source_bytes, has_filestore) {
         return 0;
     }
     match attachment_type {
         // base64 spends four characters on every three bytes.
         "image" => source_bytes.div_ceil(3).saturating_mul(4),
+        "text_file" if lossy_text => source_bytes.saturating_mul(3),
         "text_file" => source_bytes,
         _ => 0,
     }
+}
+
+/// Whether rendering these bytes as text will grow them. Checked without
+/// allocating, so the answer is known before the expansion it predicts.
+fn renders_lossily(attachment_type: &str, bytes: &[u8]) -> bool {
+    attachment_type == "text_file" && std::str::from_utf8(bytes).is_err()
 }
 
 /// Bytes an upload transiently copies: the request body owns its own buffer while
@@ -275,6 +292,7 @@ fn retained_upper_bound(
             attachment_type,
             source_bytes,
             has_filestore,
+            true,
         ))
         .saturating_add(upload_copy_bytes(
             attachment_type,
@@ -371,10 +389,15 @@ async fn read_at_most(path: &str, limit: u64) -> Result<Vec<u8>, String> {
         .await
         .map_err(|e| e.to_string())?;
     let mut bytes = Vec::new();
-    file.take(limit)
+    // One byte past the reservation: coming back with it means the file grew after
+    // its length was measured, and a prefix of a file is not the file.
+    file.take(limit.saturating_add(1))
         .read_to_end(&mut bytes)
         .await
         .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > limit {
+        return Err("file grew past the size it was admitted at".to_string());
+    }
     Ok(bytes)
 }
 
@@ -438,8 +461,12 @@ async fn assemble_attachment_blocks(
         // Charged before the payload is built, so the cap bounds the peak and not
         // just what survives it.
         if let Ok(ref bytes) = bytes_result {
-            let payload =
-                inline_payload_bytes(&att.attachment_type, bytes.len() as u64, has_filestore);
+            let payload = inline_payload_bytes(
+                &att.attachment_type,
+                bytes.len() as u64,
+                has_filestore,
+                renders_lossily(&att.attachment_type, bytes),
+            );
             if !fits_inline_budget(inlined, payload, inline_limit) {
                 tracing::warn!(
                     filename = %att.filename,
@@ -1895,6 +1922,66 @@ pub async fn run_gateway_adapter(
 
 /// Context required to process a gateway event without a WebSocket connection.
 /// Used by the unified binary to dispatch webhook events directly.
+/// Limits shared by every event on the unified path.
+///
+/// The WebSocket loop owns one set for its whole connection. The unified bridge
+/// spawns a task per event, so anything built inside that task is per-event: a
+/// budget each is the same as no budget at all.
+#[derive(Clone)]
+pub struct GatewayIngressLimits {
+    source_budget: SourceBudget,
+    fetch_slots: Arc<tokio::sync::Semaphore>,
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    max_in_flight: usize,
+}
+
+impl Default for GatewayIngressLimits {
+    fn default() -> Self {
+        Self {
+            source_budget: SourceBudget::new(MAX_ADMITTED_SOURCE_BYTES),
+            fetch_slots: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_ATTACHMENT_FETCHES,
+            )),
+            in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_in_flight: MAX_PENDING_DISPATCH_EVENTS,
+        }
+    }
+}
+
+impl GatewayIngressLimits {
+    fn source_budget(&self) -> &SourceBudget {
+        &self.source_budget
+    }
+
+    async fn fetch_slot(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        self.fetch_slots.acquire().await.ok()
+    }
+
+    /// `None` when the ingress is already at capacity. The returned guard releases
+    /// the slot however the event ends.
+    fn admit(&self) -> Option<InFlightGuard> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let max = self.max_in_flight;
+        self.in_flight
+            .fetch_update(Relaxed, Relaxed, |n| admits_event(n, max).then_some(n + 1))
+            .ok()?;
+        Some(InFlightGuard {
+            in_flight: self.in_flight.clone(),
+        })
+    }
+}
+
+struct InFlightGuard {
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub struct GatewayEventContext {
     pub adapter: Arc<dyn ChatAdapter>,
     pub dispatcher: Arc<crate::dispatch::Dispatcher>,
@@ -1905,6 +1992,8 @@ pub struct GatewayEventContext {
     pub stt_config: crate::config::SttConfig,
     #[cfg(feature = "filestore")]
     pub filestore: Option<Arc<crate::filestore::Filestore>>,
+    /// Shared across every event on this ingress. See `GatewayIngressLimits`.
+    pub ingress: GatewayIngressLimits,
 }
 
 /// Process a single gateway event JSON string and submit to the dispatcher.
@@ -2089,24 +2178,6 @@ pub async fn process_gateway_event(
         message_id: event.message_id.clone(),
     };
 
-    // Convert gateway attachments to ContentBlocks
-    let budget = SourceBudget::new(MAX_ADMITTED_SOURCE_BYTES);
-    #[cfg(feature = "filestore")]
-    let has_filestore = ctx.filestore.is_some();
-    #[cfg(not(feature = "filestore"))]
-    let has_filestore = false;
-    let (sources, _guards) =
-        read_attachment_sources(&mut event.content.attachments, &budget, has_filestore).await;
-    let extra_blocks = assemble_attachment_blocks(
-        &event.content.attachments,
-        sources,
-        MAX_INLINE_BLOCK_BYTES,
-        &ctx.stt_config,
-        #[cfg(feature = "filestore")]
-        ctx.filestore.as_deref(),
-    )
-    .await;
-
     // Slash command interception
     let prompt = event.content.text.clone();
     let trimmed = prompt.trim();
@@ -2139,6 +2210,40 @@ pub async fn process_gateway_event(
             return Ok(false);
         }
     }
+
+    // After the commands, so a `/cancel` carrying audio does not upload and
+    // transcribe work that is discarded on the next line.
+    let Some(_admitted) = ctx.ingress.admit() else {
+        tracing::warn!(
+            channel = %event.channel.id,
+            "gateway: unified ingress at capacity, refusing the event"
+        );
+        let _ = ctx.adapter.send_message(&channel, OVERLOADED_REPLY).await;
+        return Ok(false);
+    };
+    #[cfg(feature = "filestore")]
+    let has_filestore = ctx.filestore.is_some();
+    #[cfg(not(feature = "filestore"))]
+    let has_filestore = false;
+    let (sources, _guards) = read_attachment_sources(
+        &mut event.content.attachments,
+        ctx.ingress.source_budget(),
+        has_filestore,
+    )
+    .await;
+    let extra_blocks = {
+        // Err only if the semaphore is closed, which it never is.
+        let _permit = ctx.ingress.fetch_slot().await;
+        assemble_attachment_blocks(
+            &event.content.attachments,
+            sources,
+            MAX_INLINE_BLOCK_BYTES,
+            &ctx.stt_config,
+            #[cfg(feature = "filestore")]
+            ctx.filestore.as_deref(),
+        )
+        .await
+    };
 
     // Submit to dispatcher
     let adapter = ctx.adapter.clone();
@@ -2559,13 +2664,16 @@ mod tests {
         );
 
         assert_eq!(
-            inline_payload_bytes("image", 3, false),
+            inline_payload_bytes("image", 3, false, false),
             4,
             "base64 spends four characters on three bytes"
         );
-        assert_eq!(inline_payload_bytes("text_file", 3, false), 3);
+        assert_eq!(inline_payload_bytes("text_file", 3, false, false), 3);
         for carries_a_url in ["audio", "video"] {
-            assert_eq!(inline_payload_bytes(carries_a_url, 1_000_000, false), 0);
+            assert_eq!(
+                inline_payload_bytes(carries_a_url, 1_000_000, false, false),
+                0
+            );
         }
         assert_eq!(
             retained_upper_bound("image", 3, 0, false),
@@ -2607,17 +2715,17 @@ mod tests {
         let big = crate::media::TEXT_INLINE_LIMIT + 1;
 
         assert_eq!(
-            inline_payload_bytes("text_file", big, true),
+            inline_payload_bytes("text_file", big, true, false),
             0,
             "an externalized text file is delivered as a URL"
         );
         assert_eq!(
-            inline_payload_bytes("text_file", big, false),
+            inline_payload_bytes("text_file", big, false, false),
             big,
             "with no store to take it, the same file is inlined whole"
         );
         assert_eq!(
-            inline_payload_bytes("text_file", crate::media::TEXT_INLINE_LIMIT, true),
+            inline_payload_bytes("text_file", crate::media::TEXT_INLINE_LIMIT, true, false),
             crate::media::TEXT_INLINE_LIMIT,
             "under the limit it is inlined even when a store exists"
         );
@@ -2701,6 +2809,100 @@ mod tests {
         );
     }
 
+    /// Lossy conversion is the one rendering that grows: a malformed byte becomes
+    /// a three-byte replacement character, so charging the input would let a file
+    /// treble past the cap on its way into the prompt.
+    #[test]
+    fn malformed_text_is_charged_for_what_it_renders_to() {
+        let malformed = [0xff_u8, 0xfe, 0xfd];
+        assert!(
+            renders_lossily("text_file", &malformed),
+            "invalid UTF-8 renders lossily"
+        );
+        assert!(
+            !renders_lossily("text_file", b"plain ascii"),
+            "valid UTF-8 renders unchanged"
+        );
+        assert!(
+            !renders_lossily("image", &malformed),
+            "only text is rendered as text"
+        );
+
+        assert_eq!(
+            inline_payload_bytes("text_file", 20, false, true),
+            60,
+            "three bytes out for every bad byte in"
+        );
+        assert_eq!(
+            inline_payload_bytes("text_file", 20, false, false),
+            20,
+            "valid text is charged what it weighs"
+        );
+        assert_eq!(
+            retained_upper_bound("text_file", 20, 0, false),
+            80,
+            "before the bytes are read the only safe assumption is the worst one"
+        );
+    }
+
+    /// A file can be replaced between the length that was reserved and the read
+    /// that follows it. A prefix of the new file is not the attachment.
+    #[tokio::test]
+    async fn a_source_that_grew_after_admission_is_not_delivered_as_a_prefix() {
+        let dir = std::env::temp_dir().join(format!("oab-grow-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("grows.bin");
+        tokio::fs::write(&path, b"small").await.unwrap();
+        let reserved = tokio::fs::metadata(&path).await.unwrap().len();
+
+        tokio::fs::write(&path, b"small plus a great deal more")
+            .await
+            .unwrap();
+        let read = read_at_most(path.to_str().unwrap(), reserved).await;
+
+        assert!(
+            read.is_err(),
+            "a truncated read must fail rather than publish a prefix: {read:?}"
+        );
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    /// The unified bridge spawns a task per event, so limits built inside the task
+    /// are per-event. These have to come off the shared context.
+    #[test]
+    fn unified_ingress_limits_are_shared_not_per_event() {
+        let limits = GatewayIngressLimits::default();
+        let clone = limits.clone();
+
+        let held = limits.source_budget().reserve(MAX_ADMITTED_SOURCE_BYTES);
+        assert!(held.is_some(), "the whole budget fits once");
+        assert!(
+            clone.source_budget().reserve(1).is_none(),
+            "a clone must see the same budget, not a fresh one"
+        );
+
+        drop(held);
+        assert!(
+            clone.source_budget().reserve(1).is_some(),
+            "and must see it come back"
+        );
+    }
+
+    #[test]
+    fn unified_admission_releases_its_slot() {
+        let limits = GatewayIngressLimits {
+            max_in_flight: 1,
+            ..Default::default()
+        };
+        let first = limits.admit().expect("the first is admitted");
+        assert!(
+            limits.clone().admit().is_none(),
+            "at capacity a second event is refused, across clones"
+        );
+        drop(first);
+        assert!(limits.admit().is_some(), "the slot comes back");
+    }
+
     #[test]
     fn admission_stops_at_the_limit() {
         assert!(admits_event(0, 2));
@@ -2723,7 +2925,7 @@ mod tests {
         let budget = SourceBudget::new(MAX_ADMITTED_SOURCE_BYTES);
         let (sources, _guards) = read_attachment_sources(&mut attachments, &budget, false).await;
         // Eleven decoded bytes encode to sixteen, so exactly one of them fits.
-        let limit = inline_payload_bytes("image", 11, false);
+        let limit = inline_payload_bytes("image", 11, false, false);
 
         let blocks = assemble_attachment_blocks(
             &attachments,

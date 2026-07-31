@@ -169,7 +169,7 @@ has a load problem to report rather than a value to raise.
 | Concurrent attachment fetches | 4 | Further events queue for a slot. Their sources are already read by then (see below), so queueing costs latency, not content |
 | Pending pre-dispatch events | 32 | The next event's attachment bytes are **not** fetched, and the bytes it arrived with are released before it queues. The agent still receives the message, carrying the same `[System: attachment ... was not delivered ...]` line a platform-side rejection produces, with the limit named as the reason |
 | Retained attachment bytes | 256 MiB | Same effect as the pending-event limit, per attachment rather than per event: that attachment is delivered as a `not delivered` line and the rest of the message goes through. Charged against bytes actually held (the encoded input, the buffer decoded from it, and whatever the block or upload adds), never against the platform's declared size, and the read is capped at what was reserved so an under-reported size cannot overshoot |
-| Inlined bytes per message | 24 MiB | The attachment that would cross it is described rather than inlined, again as a `not delivered` line |
+| Inlined bytes per message | 24 MiB | The attachment that would cross it is described rather than inlined, again as a `not delivered` line. A text file is charged what it renders to, not what it reads: lossy UTF-8 conversion spends three bytes on every malformed one |
 | Tracked thread keys | 256 | Idle threads are forgotten; keys with work in flight are kept |
 
 **Inline input is released as soon as it is decoded.** An attachment can arrive as
@@ -178,6 +178,14 @@ allocated when the event is parsed. It is taken off the event before decoding, s
 it is freed at that point rather than riding along through assembly and dispatch,
 and it is taken on the refusal paths too: an attachment refused for being over
 budget must not go on holding the very bytes the refusal existed to avoid.
+
+**The same limits cover both ingress paths.** The WebSocket loop holds one set for
+the life of its connection. The unified bridge spawns a task per event, so its
+limits live on the shared event context instead: built per event they would be
+per event, which for a budget is the same as having none. Control commands
+(`/reset`, `/cancel`, config) are handled before any attachment is read on both
+paths, so a command that happens to carry audio never uploads or transcribes work
+that the next line discards.
 
 **Sources are read before an event queues.** A colocated attachment is read out of
 the store as soon as its event is admitted, ahead of waiting for a fetch slot,
