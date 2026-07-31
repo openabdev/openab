@@ -54,7 +54,7 @@ pub struct SessionPool {
     meta_path: PathBuf,
     default_config_options: HashMap<String, String>,
     #[cfg(feature = "acp-mcp")]
-    session_registrar: Option<Arc<dyn crate::mcp_proxy::SessionTokenRegistrar>>,
+    session_registrar: Option<Arc<dyn crate::acp_mcp::SessionTokenRegistrar>>,
     #[cfg(feature = "acp-mcp")]
     facade_url: Option<String>,
 }
@@ -120,9 +120,9 @@ async fn setup_facade_session(
     workdir: &str,
     facade_url: &str,
     channel_id: &str,
-    registrar: &Arc<dyn crate::mcp_proxy::SessionTokenRegistrar>,
+    registrar: &Arc<dyn crate::acp_mcp::SessionTokenRegistrar>,
 ) -> Option<String> {
-    match crate::mcp_proxy::write_facade_mcp_config(workdir, facade_url).await {
+    match crate::acp_mcp::write_facade_mcp_config(workdir, facade_url).await {
         Ok(()) => Some(registrar.mint(channel_id)),
         Err(e) => {
             tracing::error!(
@@ -249,7 +249,7 @@ impl SessionPool {
     #[cfg(feature = "acp-mcp")]
     pub fn with_facade_sessions(
         mut self,
-        registrar: Option<Arc<dyn crate::mcp_proxy::SessionTokenRegistrar>>,
+        registrar: Option<Arc<dyn crate::acp_mcp::SessionTokenRegistrar>>,
         facade_url: Option<String>,
     ) -> Self {
         self.session_registrar = registrar;
@@ -940,7 +940,7 @@ mod tests {
     }
 
     #[cfg(feature = "acp-mcp")]
-    impl crate::mcp_proxy::SessionTokenRegistrar for CountingRegistrar {
+    impl crate::acp_mcp::SessionTokenRegistrar for CountingRegistrar {
         fn mint(&self, channel_id: &str) -> String {
             self.minted.lock().unwrap().push(channel_id.to_string());
             "token-xyz".to_string()
@@ -965,7 +965,7 @@ mod tests {
         std::fs::write(dir.path().join(".openab"), b"not a directory").unwrap();
 
         let counting = Arc::new(CountingRegistrar::default());
-        let registrar: Arc<dyn crate::mcp_proxy::SessionTokenRegistrar> = counting.clone();
+        let registrar: Arc<dyn crate::acp_mcp::SessionTokenRegistrar> = counting.clone();
         let token = super::setup_facade_session(
             dir.path().to_str().unwrap(),
             "http://127.0.0.1:8848/mcp",
@@ -987,7 +987,7 @@ mod tests {
     async fn a_successful_facade_config_write_mints_one_token() {
         let dir = tempfile::tempdir().unwrap();
         let counting = Arc::new(CountingRegistrar::default());
-        let registrar: Arc<dyn crate::mcp_proxy::SessionTokenRegistrar> = counting.clone();
+        let registrar: Arc<dyn crate::acp_mcp::SessionTokenRegistrar> = counting.clone();
         let token = super::setup_facade_session(
             dir.path().to_str().unwrap(),
             "http://127.0.0.1:8848/mcp",

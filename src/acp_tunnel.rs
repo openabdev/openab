@@ -5,11 +5,11 @@
 //! preserving the two crates' sibling independence (mirroring the existing `ChatAdapter` glue at
 //! the root).
 
-use openab_core::mcp_proxy::AcpMcpTunnel;
+use openab_core::acp_mcp::AcpMcpTunnel;
 use openab_gateway::adapters::acp_server::AcpTunnelRegistry;
 use serde_json::Value;
 
-pub struct RootBrowserTunnel {
+pub struct RootAcpTunnel {
     registry: AcpTunnelRegistry,
     /// Operator-configurable ceiling for one tunnelled request (`[mcp] tunnel_timeout_seconds`).
     /// Carried here rather than read per call so the value a session runs under is fixed when the
@@ -17,7 +17,7 @@ pub struct RootBrowserTunnel {
     timeout_secs: u64,
 }
 
-impl RootBrowserTunnel {
+impl RootAcpTunnel {
     pub fn new(registry: AcpTunnelRegistry, timeout_secs: u64) -> Self {
         Self {
             registry,
@@ -27,7 +27,7 @@ impl RootBrowserTunnel {
 }
 
 #[async_trait::async_trait]
-impl AcpMcpTunnel for RootBrowserTunnel {
+impl AcpMcpTunnel for RootAcpTunnel {
     async fn call(
         &self,
         channel_id: &str,

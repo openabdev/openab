@@ -11,9 +11,9 @@ mod ctl;
 ))]
 mod unified_adapter;
 #[cfg(feature = "acp")]
-mod browser_tunnel;
+mod acp_tunnel;
 #[cfg(feature = "acp")]
-mod browser_source;
+mod acp_tunnel_source;
 use openab_core::acp;
 use openab_core::adapter::{self, AdapterRouter};
 use openab_core::bot_turns;
@@ -490,13 +490,13 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown_hook = cfg.hooks.pre_shutdown.clone();
 
-    // Shared MCP-over-ACP tunnel registry (D6-a'): the gateway populates it per browser
-    // session; the core MCP proxy reads it via the RootBrowserTunnel bridge below.
+    // Shared MCP-over-ACP tunnel registry (D6-a'): the gateway populates it per session; the
+    // core's `acp_mcp` module reads it through the `RootAcpTunnel` implementation below.
     #[cfg(feature = "acp")]
     let acp_tunnel_registry = openab_gateway::adapters::acp_server::new_tunnel_registry();
     #[cfg(feature = "acp")]
-    let browser_tunnel: Arc<dyn openab_core::mcp_proxy::AcpMcpTunnel> = Arc::new(
-        browser_tunnel::RootBrowserTunnel::new(
+    let acp_tunnel: Arc<dyn openab_core::acp_mcp::AcpMcpTunnel> = Arc::new(
+        acp_tunnel::RootAcpTunnel::new(
             acp_tunnel_registry.clone(),
             // Browser control requires `[mcp]`, so the absent case is unreachable in practice;
             // fall back through the SAME function serde uses rather than repeating the literal.
@@ -533,7 +533,7 @@ async fn main() -> anyhow::Result<()> {
     // Gated on `acp` (the root feature that pulls in core's `acp-mcp`), not on `acp-mcp` itself —
     // that is a core feature and naming it here is an unknown-cfg error.
     #[cfg(feature = "acp")]
-    openab_core::mcp_proxy::report_browser_control(cfg.mcp.is_some(), &cfg.agent.working_dir);
+    openab_core::acp_mcp::report_facade_status(cfg.mcp.is_some(), &cfg.agent.working_dir);
     if let Some(mcp_cfg) = cfg.mcp.clone() {
         let listen = mcp_cfg.listen.clone();
         let tokens = facade_sessions.clone();
@@ -542,8 +542,8 @@ async fn main() -> anyhow::Result<()> {
         // runs without it.
         #[cfg(feature = "acp")]
         let sources: Vec<Arc<dyn openab_mcp::mcp::sources::CapabilitySource>> =
-            vec![Arc::new(browser_source::AcpTunnelSource::with_config(
-                browser_tunnel.clone(),
+            vec![Arc::new(acp_tunnel_source::AcpTunnelSource::with_config(
+                acp_tunnel.clone(),
                 &mcp_cfg.acp_servers,
             ))];
         #[cfg(not(feature = "acp"))]
@@ -572,8 +572,8 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "acp")]
     let pool_inner = pool_inner.with_facade_sessions(
         facade_serving.then(|| {
-            Arc::new(browser_source::FacadeRegistrar(facade_sessions.clone()))
-                as Arc<dyn openab_core::mcp_proxy::SessionTokenRegistrar>
+            Arc::new(acp_tunnel_source::FacadeRegistrar(facade_sessions.clone()))
+                as Arc<dyn openab_core::acp_mcp::SessionTokenRegistrar>
         }),
         facade_serving.then(|| {
             format!(
@@ -1178,7 +1178,7 @@ async fn main() -> anyhow::Result<()> {
             // Build gateway AppState from env vars (shared factory with standalone gateway)
             let mut gw_state_inner = openab_gateway::AppState::from_env(event_tx.clone(), None);
             // Share the tunnel registry the core MCP proxy reads (D6-a'), so the gateway
-            // populates the same map the RootBrowserTunnel bridge looks up.
+            // populates the same map the RootAcpTunnel bridge looks up.
             #[cfg(feature = "acp")]
             {
                 gw_state_inner.acp_tunnel_registry = Some(acp_tunnel_registry.clone());

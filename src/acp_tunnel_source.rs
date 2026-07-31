@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use openab_core::mcp_proxy::AcpMcpTunnel;
+use openab_core::acp_mcp::AcpMcpTunnel;
 use openab_mcp::mcp::sources::{CapabilitySource, SessionCtx};
 use openab_mcp::rmcp::model::Tool;
 use serde_json::{json, Map, Value};
@@ -348,7 +348,7 @@ impl CapabilitySource for AcpTunnelSource {
 /// core's `SessionTokenRegistrar` hook (core cannot depend on openab-mcp).
 pub struct FacadeRegistrar(pub openab_mcp::mcp::sources::SessionTokens);
 
-impl openab_core::mcp_proxy::SessionTokenRegistrar for FacadeRegistrar {
+impl openab_core::acp_mcp::SessionTokenRegistrar for FacadeRegistrar {
     fn mint(&self, channel_id: &str) -> String {
         self.0.mint(channel_id)
     }
@@ -361,7 +361,7 @@ impl openab_core::mcp_proxy::SessionTokenRegistrar for FacadeRegistrar {
 #[cfg(test)]
 mod tests {
     use super::{AcpTunnelSource, CapabilitySource, SessionCtx};
-    use openab_core::mcp_proxy::AcpMcpTunnel;
+    use openab_core::acp_mcp::AcpMcpTunnel;
     use std::collections::HashSet;
     use serde_json::{json, Map, Value};
     use std::sync::Arc;
@@ -691,16 +691,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configuring_other_servers_drops_the_browser_default() {
-        // Writing any entry takes over the allowlist wholesale — browser is not
-        // silently retained alongside the operator's list.
+    async fn configuring_one_server_does_not_admit_another() {
+        // Renamed: this was `configuring_other_servers_drops_the_browser_default`, which named a
+        // built-in default that D-20 deleted — there is no default left to drop. What the test
+        // actually pins is unchanged and still worth pinning: the allowlist is exhaustive, so a
+        // server the operator did not list is refused even though a tunnel for it is attached.
         let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
         let src = AcpTunnelSource::with_config(tunnel.clone(), &[cfg("notes", &["notes.list"])]);
         let (_v, is_err) = src
             .call(Some(&ctx()), "katashiro.click", &Map::new())
             .await
             .unwrap();
-        assert!(is_err, "browser is no longer allowlisted once config is written");
+        assert!(is_err, "an unlisted server is refused even with a live tunnel attached");
         assert!(tunnel.forwarded.lock().unwrap().is_empty());
     }
 

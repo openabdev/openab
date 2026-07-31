@@ -74,7 +74,7 @@ flowchart LR
     CORE["<b>openab-core</b><br/>OAB MCP Facade"]
     AGENT["<b>agent CLI</b><br/>Cursor · Kiro · Claude · Codex<br/>LLM = MCP CLIENT"]
     GW <--> CORE
-    CORE ==>|"<b>OAB MCP Facade</b> (only path)<br/>one listener, requires [mcp]<br/>static {url, Bearer ${OPENAB_SESSION_TOKEN}} → .cursor / .kiro mcp.json<br/>token in agent env, revoked on evict"| AGENT
+    CORE ==>|"<b>OAB MCP Facade</b> (only path)<br/>one listener, requires [mcp]<br/>openab authors .openab/mcp-facade.json — operator wires it in<br/>static {url, Bearer ${OPENAB_SESSION_TOKEN}}<br/>token in agent env, revoked on evict"| AGENT
   end
   EXT <==>|"UPSTREAM — only remote hop<br/>MCP-over-ACP · mcp/message framing<br/>multiplexed with ACP chat on ONE /acp WSS<br/>8 MiB frame cap · JPEG screenshots"| GW
   classDef remote fill:#fde68a,stroke:#b45309,color:#111;
@@ -265,10 +265,15 @@ carry a tool manifest in the `session/new` declaration so the catalog is known w
 of this section said an un-cached server "contributes an empty set", which contradicted the
 static-advertise posture §6.4's pinned sets and D4 both depend on):
 
-- The §6.4 policy entry for a server is its **pre-attach seed** as well as its filter. A server the
+- ~~The §6.4 policy entry for a server is its **pre-attach seed** as well as its filter. A server the
   operator has pinned advertises those tools from the moment the source is registered — it never drops
   to empty just because nothing has attached yet. This is what preserves D4's "the browser tools are
-  discoverable before the extension connects".
+  discoverable before the extension connects".~~ **The seed mechanism was removed on 2026-07-30
+  (D-20)**: `policy_from_config` now sets `seed: Vec::new()` for every entry, so a policy entry is a
+  filter and nothing else. D4's "discoverable before the extension connects" no longer holds — there
+  is a cold-start window in which a configured server advertises nothing until its first `tools/list`
+  returns. The strikethroughs at `:334` and `:421` retire the *katashiro five tools* claim; this one
+  retires the *mechanism*, which outlived it.
 - The per-`(channel_id, name)` cache holds what the server published and is read as
   `fetched ∩ allowed`, **replacing the seed once a fetch succeeds**, so the catalog narrows to what the
   server actually publishes (a server may publish fewer tools than the operator permitted) without ever
@@ -382,8 +387,9 @@ per §6.3, tunnel failures surfaced as MCP error results — and a `FacadeRegist
 a **static `openab` entry** whose
 `Authorization` references `${OPENAB_SESSION_TOKEN}`, so the per-session secret rides the agent's
 process environment rather than a config file — which also removes the shared-workdir exposure of the
-old per-session `mcp.json` write. Capabilities publish under the provider name `openab-browser` (`openab` is the mcp.json entry key,
-a different thing). Both
+old per-session `mcp.json` write. Capabilities publish under the provider name `openab-browser` (`openab` is the key of the entry
+inside `.openab/mcp-facade.json` — a different thing, and no longer a key openab writes into anyone
+else's `mcp.json`). Both
 legacy transports were removed on 2026-07-28 — bridge first, then the per-session proxy — and
 `OPENAB_BROWSER_MODE` no longer selects anything; `[mcp]` is now required for browser control.
 This covers §6.2's source seam and session identity for the **browser** case.
@@ -391,9 +397,14 @@ This covers §6.2's source seam and session identity for the **browser** case.
 ⚠️ **Divergence to reconcile with the adapter ADR (not resolved here).** Adapter ADR §6.2 says delivery
 is via ACP `session/new` `mcpServers`, and that "if a backing CLI does not honor ACP `mcpServers`, the
 facade is unavailable for that CLI in the MVP **rather than falling back to editing the CLI's config
-files**". The as-built `write_facade_mcp_config` does write a static entry into the CLI's config —
+files**". ~~The as-built `write_facade_mcp_config` does write a static entry into the CLI's config —
 deliberately, because the browser path's D2 established that Cursor ignores ACP-passed `mcpServers`
-(**§7.2** D2, [zed#50924](https://github.com/zed-industries/zed/issues/50924)).
+(**§7.2** D2, [zed#50924](https://github.com/zed-industries/zed/issues/50924)).~~
+
+That premise is struck rather than rewritten, because it is the *statement of what the divergence
+was*: editing it into present truth would leave a resolution with nothing to resolve. As of
+`30e04758`, `write_facade_mcp_config` authors `.openab/mcp-facade.json` and edits no CLI config at
+all, which is what removes the conflict — see the resolution note immediately below.
 ~~Both positions are defensible; recording the conflict rather than silently picking a side. Owner of the
 facade contract should confirm whether config-file injection is an accepted exception for CLIs that
 ignore `mcpServers`, or whether Facade mode should be unavailable for them.~~

@@ -6,7 +6,7 @@
 //!
 //! What remains is the seam between core and the colocated agent CLI:
 //!
-//! - [`report_browser_control`] — startup report of whether browser control is on.
+//! - [`report_facade_status`] — startup report of whether browser control is on.
 
 use serde_json::{json, Value};
 
@@ -21,9 +21,11 @@ pub trait AcpMcpTunnel: Send + Sync {
     /// tunnel is currently attached to that session.
     ///
     /// `server_id` selects among multiple `type:acp` servers on one session (compound-key
-    /// registry, P1). During the single-browser transition an empty `server_id` is a sentinel
-    /// meaning "the sole tunnel on this channel" — the proxy/bridge callers don't yet know the
-    /// client-declared id at spawn time (real per-server routing lands in P2).
+    /// registry, P1). An empty `server_id` is a sentinel meaning "the sole tunnel on this
+    /// channel". This used to say the "proxy/bridge callers" do not yet know the client-declared
+    /// id at spawn time; those callers were removed with the proxy and the bridge, so the sentinel
+    /// now exists for the facade source's own single-server path (real per-server routing lands
+    /// in P2).
     async fn call(
         &self,
         channel_id: &str,
@@ -204,7 +206,7 @@ pub trait SessionTokenRegistrar: Send + Sync {
 /// 2026-07-31 (D-23): that variable was introduced and retired entirely within this changeset and
 /// never appeared in any release, so the notice told operators that something they never had is
 /// now ignored.
-pub fn report_browser_control(mcp_configured: bool, workdir: &str) {
+pub fn report_facade_status(mcp_configured: bool, workdir: &str) {
     if mcp_configured {
         // "enabled" alone became false when openab stopped wiring vendor configs (D-15). The
         // facade IS running, but no agent can reach it until the entry is placed, and an operator
