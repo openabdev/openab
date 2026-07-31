@@ -248,7 +248,9 @@ pub fn report_facade_status(mcp_configured: bool, workdir: &str) {
 
 
 
-/// The destructive cases for the only code that touches a user's `mcp.json`.
+/// The destructive cases for the facade config writer — the one file openab owns,
+/// `.openab/mcp-facade.json`. It touches a user's `mcp.json` nowhere at all any more; the
+/// boundary test below is what asserts that.
 ///
 /// Each of these previously either destroyed a file or panicked the process, and none of them is
 /// exotic: a comment in a JSON config is common, `[]` is what an empty array-shaped config looks
