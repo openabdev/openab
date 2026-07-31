@@ -385,7 +385,6 @@ mod tests {
 
 
 
-    // --- F4: facade setup retires the direct transport it replaces ---
 
 
 

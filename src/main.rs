@@ -1177,7 +1177,7 @@ async fn main() -> anyhow::Result<()> {
 
             // Build gateway AppState from env vars (shared factory with standalone gateway)
             let mut gw_state_inner = openab_gateway::AppState::from_env(event_tx.clone(), None);
-            // Share the tunnel registry the core MCP proxy reads (D6-a'), so the gateway
+            // Share the tunnel registry the facade's capability source reads (D6-a'), so the gateway
             // populates the same map the RootAcpTunnel bridge looks up.
             #[cfg(feature = "acp")]
             {

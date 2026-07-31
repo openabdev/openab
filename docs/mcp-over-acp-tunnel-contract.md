@@ -186,8 +186,8 @@ per-call consent UX yet. Fine-grained consent is a later addition to this contra
 
 ## Notes for implementers
 
-- One `connectionId` per `mcp/connect`; the gateway may reconnect (the MCP server / HTTP
-  proxy inside OpenAB is decoupled from the WS lifecycle, so the extension may attach after a
+- One `connectionId` per `mcp/connect`; the gateway may reconnect (the facade listener inside
+  OpenAB is decoupled from the WS lifecycle, so the extension may attach after a
   session has already started — ADR D4).
 - Never assume an inner MCP `id`; always correlate by the outer ACP frame `id`.
 - Keep tool execution idempotent where possible; the agent may retry.

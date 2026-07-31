@@ -382,7 +382,7 @@ leftover bridge entry is now the operator's step, and it is a policy question ra
 
 This paragraph said `bridge` "degrades to `facade`", which was true for one commit. The per-session
 proxy was removed hours later, taking `BrowserMode` and the whole `OPENAB_BROWSER_MODE` mechanism
-with it: the variable now selects nothing at all and is merely reported at startup.
+with it. The variable was deleted outright on 2026-07-31 (D-23), once it was verified never to have shipped outside this branch — not in `origin/main` and not in any release — so it is neither read nor reported, and nobody upgrading can have it set.
 
 **Open question (not decided).** Under the facade the LLM reaches a browser action via
 `search_capabilities` → `execute_capability`, one hop more per turn than today's direct

@@ -13,8 +13,8 @@ shipped. See [Removed transports](#removed-transports) if you ran a development 
 **Browser control now requires `[mcp]` in `config.toml`.** This is a breaking change. Without that
 section there is no browser control — openab does **not** start a listener you did not configure.
 
-openab reports which of the two you are in once at startup, so it is never something you have to
-infer from tools that do not appear:
+openab reports at startup whether the facade is running, so that much is never something you have to
+infer:
 
 ```
 INFO browser control: enabled via the OAB MCP Facade ([mcp] configured)
@@ -70,7 +70,7 @@ INFO browser control: unconfigured — no [mcp] section in config.toml, so brows
 
 ---
 
-## Facade mode (default)
+## How browser control works
 
 Browser tools are a **session-aware in-process capability source** of the
 [OAB MCP Facade](./oab-mcp-facade.md) — the same aggregation point that serves every other

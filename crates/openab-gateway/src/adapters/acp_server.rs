@@ -477,7 +477,7 @@ pub fn new_reply_registry() -> AcpReplyRegistry {
 /// Registry of open MCP-over-ACP tunnels: `(channel_id, server_id)` → `TunnelHandle`.
 ///
 /// The gateway inserts a handle once it has `mcp/connect`ed to a session's declared `type:acp`
-/// server; the core MCP proxy looks one up to route a tool call to the right server (T5.3). Keyed
+/// server; the facade's capability source looks one up to route a tool call to the right server (T5.3). Keyed
 /// by the compound `(channel_id, server_id)` (P1) so one session can carry several `type:acp`
 /// servers without collision. Same `std::sync::Mutex` rationale as `AcpReplyRegistry`.
 ///
@@ -832,8 +832,9 @@ static TUNNEL_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// per-connection outbound channel + pending-request map + id counter + the `connectionId`
 /// from `mcp/connect`, so a holder can issue `mcp/message` requests to that browser and await
 /// the result. Built by the gateway once the tunnel is open and (next) registered under the
-/// session's `channel_id` in a shared registry, so the core MCP proxy can route a tool call
-/// to the right browser. D5-agnostic: both the per-session and shared core-server designs use
+/// session's `channel_id` in a shared registry, so the facade's capability source can route a tool call
+/// to the right browser. This was written as D5-agnostic, when a per-session MCP server and a
+/// shared core server were both live options; only the shared facade exists now, and it uses
 /// this same handle.
 #[derive(Clone)]
 pub struct TunnelHandle {
@@ -1024,7 +1025,7 @@ async fn inner_mcp_handshake(
 }
 
 /// Open the MCP-over-ACP tunnel to a session's declared `"type":"acp"` server and register a
-/// `TunnelHandle` under the session's `channel_id` so the core MCP proxy can reach it (T5.3).
+/// `TunnelHandle` under the session's `channel_id` so the facade's capability source can reach it (T5.3).
 /// MUST run in a spawned task, never inline in the connection read loop: `mcp_connect` awaits
 /// the client's response, which only that same read loop can deliver — awaiting it inline
 /// would deadlock.
@@ -1517,7 +1518,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
 
                 // If the client declared "type":"acp" MCP servers, open + register a tunnel to
-                // each so the core MCP proxy can reach this browser. SPAWNED, not awaited
+                // each so the facade's capability source can reach this browser. SPAWNED, not awaited
                 // inline: `establish_and_register_tunnel` awaits `mcp/connect`, whose response
                 // only THIS read loop delivers — awaiting inline would deadlock.
                 if let Some(registry) = state.acp_tunnel_registry.clone() {

@@ -221,7 +221,9 @@ North star: the agent's LLM autonomously operating the user's real browser (gene
 
 ### Critical path (next) — everything the browser goal requires
 > **Done in #1447** — all four items below shipped (agent→client request direction, the
-> MCP-over-ACP tunnel + core MCP proxy, and the generated v1 wire types). See the
+> MCP-over-ACP tunnel + the core-side capability source, and the generated v1 wire types). That
+> source was called the "core MCP proxy" while a per-session proxy existed; both the proxy and the
+> stdio bridge were removed in the same PR. See the
 > [Reverse MCP-over-ACP ADR](./acp-server-websocket-reverse-mcp.md).
 - **agent→client REQUEST direction** — the base does only client→agent + agent→client
   *notifications*; browser/tool use needs the agent to send *requests* to the client and
