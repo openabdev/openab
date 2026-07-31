@@ -99,12 +99,12 @@ sequenceDiagram
     participant LLM as agent LLM<br/>MCP client
 
     Note over Ext,LLM: PHASE 1 — connect & agent wiring (no tool discovery yet)
-    Ext->>GW: WS GET /acp — initialize<br/>mcpServers = [ type:acp, "openab-browser" ]
+    Ext->>GW: WS GET /acp — initialize<br/>mcpServers = [ type:acp, name:"katashiro" ]
     GW-->>Ext: initialize result (agentCapabilities)
     Ext->>GW: session/new  (or session/resume on reconnect)
     GW->>GW: register per-session TunnelHandle<br/>(AcpTunnelRegistry)
     GW->>Core: spawn agent (mint facade session token)
-    Core->>Core: write static "openab" facade entry into agent's mcp.json<br/>{url, Authorization: Bearer ${OPENAB_SESSION_TOKEN}}
+    Core->>Core: author .openab/mcp-facade.json (the ONE file openab owns)<br/>{url, Authorization: Bearer ${OPENAB_SESSION_TOKEN}}<br/>operator puts the entry in front of their agent
     LLM->>Core: MCP initialize + tools/list
     Core-->>LLM: the facade's TWO meta-tools ONLY<br/>(search_capabilities · execute_capability) — returns at once,<br/>no upstream call; katashiro.* are NOT in the model's tool list
 
