@@ -1656,7 +1656,8 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 // Re-open + register the browser tunnel(s) on resume too. katashiro persists its
                 // ACP session and RECONNECTS via session/resume (not session/new), re-declaring its
                 // "type":"acp" browser server each time. Without this, a resumed session records the
-                // server but never opens a tunnel, so the core proxy reports "no browser attached".
+                // server but never opens a tunnel, so the facade's capability source reports "no browser
+                // attached" — there is no core proxy to report it.
                 // ONLY on a resume the handler accepted — `resumed_channel` is that signal. A
                 // rejected resume must not touch tunnels: same-name re-attach is last-write-wins,
                 // so spawning here would let a refused request (busy, over-cap, unknown session)

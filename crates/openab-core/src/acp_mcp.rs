@@ -11,8 +11,9 @@
 use serde_json::{json, Value};
 
 /// Core-side interface to the browser MCP-over-ACP tunnel (D6-a'). Implemented by the ROOT
-/// (which bridges to the gateway's per-connection tunnel registry) and consumed by the MCP
-/// proxy here. Keeping the trait in core with the impl in root preserves the core/gateway
+/// (which bridges to the gateway's per-connection tunnel registry) and consumed by the facade's
+/// capability source (`src/acp_tunnel_source.rs`) — nothing here consumes it, and this module
+/// hosts no proxy. Keeping the trait in core with the impl in root preserves the core/gateway
 /// sibling independence, matching the existing `ChatAdapter` pattern.
 #[async_trait::async_trait]
 pub trait AcpMcpTunnel: Send + Sync {
