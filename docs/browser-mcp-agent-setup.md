@@ -127,8 +127,39 @@ CLI for you either — configuring your own agent stays your decision.
 | Agent | What you do |
 |---|---|
 | **kiro** | `kiro-cli mcp import --file <workdir>/.openab/mcp-facade.json workspace` — the vendor performs the merge with its own semantics. Do **not** pass `--force`: it would overwrite a same-named server of yours. |
+| **Claude Code** | Add the flag to `[agent] args` in `config.toml` yourself — see below. openab does not add it for you. |
 | **cursor** | No import mechanism exists — there is no include/extends and no launch flag. Paste the `mcpServers` object below into `.cursor/mcp.json` yourself. |
 | **any other MCP-capable CLI** | Point it at `http://127.0.0.1:8848/mcp` with the bearer header above. Because the entry is static, a hand-written one keeps working — the practical difference from proxy mode, where the endpoint was per-session ephemeral and a hand-written entry went stale on the next session. |
+
+#### Claude Code: `--mcp-config`, and why openab does not pass it for you
+
+`[agent]` is an opaque command line — `command` plus `args`, spawned verbatim — so **you already
+control this with no code on our side**:
+
+```toml
+[agent]
+command = "claude-agent-acp"
+args = ["--mcp-config", "/home/agent/.openab/mcp-facade.json"]
+```
+
+openab deliberately does not add that flag itself. Doing so would mean deciding *which vendor you
+are running*, and nothing in openab identifies a vendor: by spawn time the agent is a command
+string, and this codebase negotiates capability from the protocol rather than sniffing the binary.
+Guessing from the command name would break for absolute paths, wrappers and renamed binaries, and
+it would put openab back inside a decision that is yours. kiro runs an import, Claude Code takes a
+flag; both are your step, and openab touches neither.
+
+**`--strict-mcp-config` is your call, and it is a real trade-off — read both halves:**
+
+| | What you get | What it costs |
+|---|---|---|
+| **with** `--strict-mcp-config` | *Only* the file you name is loaded, so the facade is the sole MCP source and nothing else can shadow it | **Every MCP server you configured for yourself is silently dropped.** Not an error — they simply do not appear |
+| **without** it | Your own MCP servers keep working alongside the facade entry | A leftover `openab-browser` bridge entry from an older openab **also** keeps working — and that is a route to the browser that does **not** pass through facade policy or the audit trail |
+
+The second row is the one to act on rather than skim. openab no longer removes that stale entry
+(it stopped editing your config), so if this deployment ever ran bridge mode, clear it with the
+`jq` snippet above before relying on the allowlist in `[[mcp.acp_servers]]` — until then, the
+allowlist is not the only way in.
 
 The startup log prints the resolved path and these commands, so the value is not guessed from this
 page.
