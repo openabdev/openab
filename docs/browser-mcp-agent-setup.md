@@ -6,10 +6,9 @@ The browser MCP server exposes five DOM-semantic tools —
 [tunnel contract](./mcp-over-acp-tunnel-contract.md)). This doc covers the *other* hop: how the
 colocated agent CLI actually **sees** those tools.
 
-There is **one** transport: the OAB MCP Facade. The per-session `proxy` and the `openab
-browser-bridge` stdio relay both existed before it and have been removed, along with the
-`OPENAB_BROWSER_MODE` variable that selected between them. See [Removed
-transports](#removed-transports) if you are upgrading from either.
+There is **one** transport: the OAB MCP Facade. Two earlier designs — a per-session `proxy` and an
+`openab browser-bridge` stdio relay — existed during development and were removed before any of this
+shipped. See [Removed transports](#removed-transports) if you ran a development build of either.
 
 **Browser control now requires `[mcp]` in `config.toml`.** This is a breaking change. Without that
 section there is no browser control — openab does **not** start a listener you did not configure.
@@ -198,10 +197,6 @@ removed: the per-session server, its bearer, and the per-session config write an
 **`bridge` mode (Option C)** ran a per-pod unix-socket server plus an `openab browser-bridge`
 stdio-MCP relay that resolved its session channel by walking `/proc`. It is removed: the
 subcommand, the socket server, the ancestry resolver and the static config entry.
-
-`OPENAB_BROWSER_MODE` no longer selects anything and can be unset. If it is still set to any value,
-openab logs one warning at startup naming the value and reporting what is actually in force —
-`facade` when `[mcp]` is configured, `disabled` when it is not.
 
 **What to do when upgrading:** configure `[mcp]` in `config.toml`. Without it there is no browser
 control at all — nothing is auto-started, because starting a listener you did not ask for is the

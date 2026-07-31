@@ -6,8 +6,7 @@
 //!
 //! What remains is the seam between core and the colocated agent CLI:
 //!
-//! - [`report_browser_control`] — startup report of whether browser control is on, plus the
-//!   migration notice for the removed `OPENAB_BROWSER_MODE`.
+//! - [`report_browser_control`] — startup report of whether browser control is on.
 
 use serde_json::{json, Value};
 
@@ -196,18 +195,15 @@ pub trait SessionTokenRegistrar: Send + Sync {
     fn revoke(&self, token: &str);
 }
 
-/// Report, once at startup, whether browser control is enabled — and that
-/// `OPENAB_BROWSER_MODE` no longer selects anything.
+/// Report, once at startup, whether browser control is enabled.
 ///
 /// Call this from configuration/startup, **not** from a session path: nothing per-session is
-/// decided by it any more, and a warning on that path would repeat for every spawn.
+/// decided by it, and a warning on that path would repeat for every spawn.
 ///
-/// The variable used to choose between three transports. Two are gone and the third is no longer
-/// optional, so any value it holds is inert. Ignoring it silently would leave an operator
-/// believing they had configured something — the same failure the removed-bridge warning existed
-/// to prevent, one level up. So the message says the value is ignored *and* reports what is
-/// actually in force, since "ignored" alone does not tell them whether they still have browser
-/// control at all.
+/// There used to be a migration notice here for `OPENAB_BROWSER_MODE`. It was removed on
+/// 2026-07-31 (D-23): that variable was introduced and retired entirely within this changeset and
+/// never appeared in any release, so the notice told operators that something they never had is
+/// now ignored.
 pub fn report_browser_control(mcp_configured: bool, workdir: &str) {
     if mcp_configured {
         // "enabled" alone became false when openab stopped wiring vendor configs (D-15). The
@@ -244,41 +240,8 @@ pub fn report_browser_control(mcp_configured: bool, workdir: &str) {
              are unavailable and nothing was started. Add [mcp] to enable them."
         );
     }
-    let raw = std::env::var("OPENAB_BROWSER_MODE").ok();
-    if let Some((requested, browser_control)) =
-        browser_mode_migration_notice(raw.as_deref(), mcp_configured)
-    {
-        tracing::warn!(
-            requested,
-            browser_control,
-            "OPENAB_BROWSER_MODE is ignored — it no longer selects a transport and can be unset. \
-             Browser control is configured by the [mcp] section of config.toml; `browser_control` \
-             reports what is actually in force for this process."
-        );
-    }
 }
 
-/// Decide whether to warn and what to say: `(requested, browser_control)`, or `None` to stay quiet.
-///
-/// Split out from the logging so the decision is testable without a subscriber or process env.
-///
-/// **Every** non-empty value warns, `proxy` and `facade` included. `proxy` no longer selects
-/// anything either, so staying quiet for it would be the same silence this notice exists to
-/// remove; `facade` is merely redundant, but reporting it costs one line at startup and saying
-/// "this variable is read" of some values and not others would be false.
-fn browser_mode_migration_notice(
-    raw: Option<&str>,
-    mcp_configured: bool,
-) -> Option<(&str, &'static str)> {
-    let requested = raw?.trim();
-    if requested.is_empty() {
-        return None;
-    }
-    Some((
-        requested,
-        if mcp_configured { "facade" } else { "disabled" },
-    ))
-}
 
 
 /// The destructive cases for the only code that touches a user's `mcp.json`.
@@ -416,46 +379,9 @@ mod facade_config_writer {
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_mode_migration_notice,
     };
 
-    /// The variable is inert now, so the notice must fire for every value an operator could have
-    /// set — including `proxy`, which used to be a real selection. Staying quiet for it would
-    /// reproduce the silence this notice exists to remove.
-    #[test]
-    fn every_set_browser_mode_value_is_reported_as_ignored() {
-        for v in ["bridge", "proxy", "facade", "  Bridge  ", "typo"] {
-            assert!(
-                browser_mode_migration_notice(Some(v), true).is_some(),
-                "{v:?} is a value someone deliberately set; it must not be ignored silently"
-            );
-        }
-        // Unset and blank express no preference — warning on them would fire for every default
-        // deployment and train operators to skip the line.
-        assert_eq!(browser_mode_migration_notice(None, true), None);
-        assert_eq!(browser_mode_migration_notice(Some(""), true), None);
-        assert_eq!(browser_mode_migration_notice(Some("   "), true), None);
-    }
 
-    /// The second field is the one an operator actually needs: not which mode they are in (there
-    /// are none left) but whether they still have browser control at all. Without `[mcp]` they do
-    /// not, and the removed Facade->Proxy fallback no longer hides that.
-    #[test]
-    fn the_notice_reports_whether_browser_control_survives_not_which_mode() {
-        assert_eq!(
-            browser_mode_migration_notice(Some("bridge"), true),
-            Some(("bridge", "facade"))
-        );
-        assert_eq!(
-            browser_mode_migration_notice(Some("bridge"), false),
-            Some(("bridge", "disabled"))
-        );
-        // Trimmed, so the log shows what was set rather than the surrounding whitespace.
-        assert_eq!(
-            browser_mode_migration_notice(Some("  proxy  "), false),
-            Some(("proxy", "disabled"))
-        );
-    }
 
     // --- F4: facade setup retires the direct transport it replaces ---
 
