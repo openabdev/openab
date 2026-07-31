@@ -28,6 +28,7 @@ struct PoolState {
     /// normally revokes it cannot fire while a hung streaming task still holds an Arc of the
     /// connection, and `AcpTunnelSource` authorizes by channel alone, so an un-revoked predecessor
     /// token would keep reaching whatever tunnel a successor registers for that channel (F3).
+    #[cfg(feature = "acp-mcp")]
     facade_tokens: HashMap<String, String>,
     /// Lock-free activity handles for hung-session detection without the connection mutex.
     activity: HashMap<String, Arc<SessionActivity>>,
@@ -290,6 +291,7 @@ impl SessionPool {
             state: RwLock::new(PoolState {
                 active: HashMap::new(),
                 cancel_handles: HashMap::new(),
+                #[cfg(feature = "acp-mcp")]
                 facade_tokens: HashMap::new(),
                 activity: HashMap::new(),
                 pgids: HashMap::new(),
@@ -1329,6 +1331,7 @@ mod tests {
         let mut state = PoolState {
             active: HashMap::new(),
             cancel_handles: HashMap::new(),
+            #[cfg(feature = "acp-mcp")]
             facade_tokens: HashMap::new(),
             activity: HashMap::from([
                 ("hung".to_string(), Arc::new(SessionActivity::new())),
