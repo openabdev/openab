@@ -541,7 +541,14 @@ Two id spaces (never mixed)
              mcp/message FLATTENS the inner method/params and does NOT carry an inner MCP id, so
              mcp#7 never travels on the tunnel.
   - acp#55 = outer ACP-envelope id correlating the whole upstream round-trip (steps 4<->8); the
-             response result IS the inner MCP result payload. The proxy maps mcp#7 <-> acp#55.
+             response result IS the inner MCP result payload. `AcpTunnelSource::call` in the facade
+             capability source maps mcp#7 <-> acp#55.
+
+             This said "the proxy maps" until 2026-07-31. The per-session proxy was removed on
+             2026-07-28 and this is §7.3 Runtime detail — a description of how the CURRENT
+             round-trip works, not history — so the sentence named a component that no longer
+             exists. The hop in step 4 is the facade's in-process capability source; the shape of
+             the diagram is unchanged, only what performs the hop.
   - acp#1  = downstream ACP permission id; unrelated to the two above
 
 Only steps 5/7/12 leave the pod (all on the /acp WS).
