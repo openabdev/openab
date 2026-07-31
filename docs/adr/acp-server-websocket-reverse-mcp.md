@@ -176,11 +176,21 @@ and the §6.4 allowlist are the **`name`**. Consequences, all confirmed by revie
   name never contains.
 - Trust gating (§6.4) is keyed by **`name`**. An allowlist of `id`s is meaningless when they are
   per-connection UUIDs.
-- **Same-name collisions resolve last-attach-wins (LWW):** a newly attached tunnel whose `name` matches
-  an existing one on the same channel **replaces and evicts** the older entry. Because the client mints
-  a new `id` on every reconnect, the stale entry would otherwise linger beside the live one; answering
-  "ambiguous, disambiguate by server_id" there would wedge the client out of its own tools on every
-  reconnect. LWW keeps reconnect self-healing; the eviction is what stops unbounded growth.
+- **Same-name collisions resolve by rank, `(connection_generation, generation)`:** a newly attached
+  tunnel whose `name` matches an existing one on the same channel **replaces and evicts** the older
+  entry only if it outranks it. Because the client mints a new `id` on every reconnect, the stale
+  entry would otherwise linger beside the live one; answering "ambiguous, disambiguate by server_id"
+  there would wedge the client out of its own tools on every reconnect. The rule keeps reconnect
+  self-healing; the eviction is what stops unbounded growth.
+
+  **Not plain last-attach-wins, and the difference is the defect.** This document originally said
+  LWW unqualified. Attach order is stamped when an establish *starts*, so an older connection's LATE
+  `session/resume` spawns an establish with a HIGHER attach number — precisely because it ran later
+  — and under plain LWW it would evict the newer connection's live tunnel. **Connection age** is
+  what says which declaration set is current, so it is compared first; attach order is only the
+  tiebreak *within* one connection, where the connection ages are equal and last-attach-wins is
+  exactly right. Left uncorrected, this bullet is the copy that could get the code "restored" back
+  into that bug.
 
 ### 6.2 Downstream exposure — one `CapabilitySource` behind the OAB MCP Facade
 
@@ -290,7 +300,7 @@ the seed, is now exactly what happens):
   of this section said `server_id`). Ids are minted per connection, so an id-keyed entry would be
   orphaned by exactly the reconnect the cache exists to survive — it could never outlive the attach it
   was populated from, which is the opposite of "serve regardless of current attach state". Same-name
-  collisions are impossible by §6.1's last-attach-wins rule, so the name is a safe key.
+  collisions are impossible by §6.1's rank rule, so the name is a safe key.
 - Discovery is **pull-triggered**: a declared server with no cache entry has its fetch started from the
   next `tools(ctx)` call, and its real set appears one discovery round later. The facade re-reads the
   catalog on every call, so a single round of staleness is the entire cost, and it avoids threading an
