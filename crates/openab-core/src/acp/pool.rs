@@ -98,6 +98,22 @@ fn classify_hung(
     in_flight && last_active_age > threshold
 }
 
+/// Emit the force-evict warning with **both** ids redacted.
+///
+/// `key` is a pool key `<platform>:<channel_id>` (`acp_<uuid>`) and `session_id` is `sess_<uuid>`;
+/// either resumes the session, so both are credentials. Extracted from the loop in `cleanup_idle`
+/// so the redaction can be exercised by a test for real — R1 redacted the sites it enumerated and
+/// this force-evict site was outside that list, logging both ids raw.
+fn warn_force_evicting_hung(key: &str, session_id: Option<&str>, age_secs: u64, threshold_secs: u64) {
+    warn!(
+        thread_id = %crate::redact::redact_session_ids(key),
+        session_id = %session_id.map(crate::redact::redact_session_ids).unwrap_or_default(),
+        age_secs,
+        threshold_secs,
+        "force-evicting hung session"
+    );
+}
+
 /// Returns true when `candidate_last_active` is a better eviction target than `current_oldest`.
 fn better_candidate(current_oldest: Option<Instant>, candidate_last_active: Instant) -> bool {
     match current_oldest {
@@ -804,12 +820,11 @@ impl SessionPool {
                 if let Some(activity) = activity_map.get(&key) {
                     if classify_hung(activity.in_flight(), activity.age(), hung_threshold) {
                         let session_id = cancel_map.get(&key).map(|(_, sid)| sid.clone());
-                        warn!(
-                            thread_id = %key,
-                            session_id = session_id.as_deref().unwrap_or(""),
-                            age_secs = activity.age().as_secs(),
-                            threshold_secs = self.hung_threshold_secs,
-                            "force-evicting hung session"
+                        warn_force_evicting_hung(
+                            &key,
+                            session_id.as_deref(),
+                            activity.age().as_secs(),
+                            self.hung_threshold_secs,
                         );
                         // Best-effort session/cancel via the lock-free stdin
                         // handle, detached so a wedged stdin can never block
@@ -1115,6 +1130,51 @@ mod tests {
     fn better_candidate_keeps_existing_on_equal_last_active() {
         let ts = Instant::now() - std::time::Duration::from_secs(60);
         assert!(!better_candidate(Some(ts), ts));
+    }
+
+    /// The force-evict warning must log NEITHER id raw — both the `acp_<uuid>` channel (inside the
+    /// `<platform>:<channel_id>` pool key) and the `sess_<uuid>` session id resume the session. A
+    /// capture subscriber exercises the real `warn!` macro, so a revert to raw fields fails here
+    /// rather than silently shipping a credential to the logs (F6 / round 6).
+    #[test]
+    fn force_evict_warning_redacts_both_ids() {
+        use std::io::Write;
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+        #[derive(Clone)]
+        struct Cap(StdArc<StdMutex<Vec<u8>>>);
+        impl Write for Cap {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let uuid = "00000000-0000-0000-0000-000000000000";
+        let buf = StdArc::new(StdMutex::new(Vec::new()));
+        let cap = Cap(buf.clone());
+        let sub = tracing_subscriber::fmt()
+            .with_writer(move || cap.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(sub, || {
+            super::warn_force_evicting_hung(
+                &format!("discord:acp_{uuid}"),
+                Some(&format!("sess_{uuid}")),
+                999,
+                600,
+            );
+        });
+
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("force-evicting hung session"), "the warning must fire: {out}");
+        assert!(!out.contains(uuid), "no raw uuid may reach the log: {out}");
+        assert!(!out.contains("acp_") && !out.contains("sess_"), "no raw id prefix either: {out}");
+        assert!(out.contains('#'), "the redaction tag must be present: {out}");
+        assert!(out.contains("discord"), "the readable platform half must survive: {out}");
     }
 
     #[test]
