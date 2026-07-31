@@ -342,8 +342,14 @@ struct AcpMcpServer {
 }
 
 /// Extract the `"type":"acp"` entries from a `session/new` / `session/resume` params
-/// `mcpServers` array. http/sse/stdio servers are ignored here — the agent connects to those
-/// itself; only the `acp`-transport ones are tunnelled over this WS.
+/// `mcpServers` array. Only the `acp`-transport ones are tunnelled over this WS.
+///
+/// http/sse/stdio entries are **dropped, and nothing else ever sees them**. This used to say they
+/// are "ignored here — the agent connects to those itself", which describes a hand-off that does
+/// not exist: `session/new` calls this, keeps the `acp` entries, and then calls
+/// `handle_session_new(&sessions, id)` without passing `req.params` anywhere. There is no
+/// downstream consumer. That sentence had already misled a reader who reasoned from it before
+/// checking, which is why `mcpCapabilities` now advertises `http: false` and `sse: false`.
 fn parse_acp_mcp_servers(params: Option<&Value>) -> Vec<AcpMcpServer> {
     params
         .and_then(|p| p.get("mcpServers"))
@@ -1872,6 +1878,24 @@ fn handle_initialize(req: &JsonRpcRequest) -> JsonRpcResponse {
             "protocolVersion": negotiated,
             "agentCapabilities": {
                 "loadSession": false,
+                // Advertised because the serde default is {http:false, sse:false}, so saying
+                // NOTHING already claims "no MCP transport support" — while this gateway ships
+                // MCP-over-ACP. Silence was not neutral (R4).
+                //
+                // http and sse are FALSE, and that is verified rather than assumed: `session/new`
+                // runs `parse_acp_mcp_servers`, keeps only `"type":"acp"` entries, and then calls
+                // `handle_session_new(&sessions, id)` — `req.params` reaches nothing else. An http
+                // or sse declaration is silently dropped, so advertising `true` would be a claim
+                // with no implementation behind it.
+                //
+                // The ACP capability rides `_meta` because upstream `McpCapabilities` has only
+                // `http`, `sse` and `_meta` (`acp_schema.rs:6201`). Move it to the real field once
+                // upstream gains one; the ADR carries that note.
+                "mcpCapabilities": {
+                    "http": false,
+                    "sse": false,
+                    "_meta": { "acp": true }
+                },
                 "sessionCapabilities": {
                     "resume": {}
                 },
@@ -2493,6 +2517,11 @@ mod acp_conformance {
             "protocolVersion": 1,
             "agentCapabilities": {
                 "loadSession": false,
+                // Mirrors handle_initialize, INCLUDING mcpCapabilities — a mirror that stops
+                // mirroring is worse than no mirror, because it still looks like coverage. This
+                // also proves `_meta` is schema-legal here, which is what makes the ACP capability
+                // expressible before upstream has a real field for it.
+                "mcpCapabilities": { "http": false, "sse": false, "_meta": { "acp": true } },
                 "sessionCapabilities": { "resume": {} },
                 "promptCapabilities": { "image": false, "audio": false, "embeddedContext": false }
             },
@@ -3465,6 +3494,17 @@ mod acp_handlers {
         assert_eq!(result["agentCapabilities"]["loadSession"], json!(false));
         assert!(result["agentCapabilities"]["sessionCapabilities"]["resume"].is_object());
         assert!(result["authMethods"].is_array());
+
+        // R4: advertised explicitly. Before this, `mcpCapabilities` was absent and clients read
+        // the serde default {http:false, sse:false} — the same VALUES, but arrived at by silence
+        // while the gateway ships MCP-over-ACP and says so nowhere.
+        let mcp = &result["agentCapabilities"]["mcpCapabilities"];
+        assert_eq!(mcp["http"], json!(false), "no code forwards an http declaration anywhere");
+        assert_eq!(mcp["sse"], json!(false), "same for sse — parse_acp_mcp_servers drops both");
+        assert_eq!(
+            mcp["_meta"]["acp"], json!(true),
+            "the ACP capability rides _meta until upstream McpCapabilities gains a real field"
+        );
     }
 
     #[test]
