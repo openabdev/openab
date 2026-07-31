@@ -22,6 +22,13 @@ struct PoolState {
     /// Lock-free cancel handles: thread_key → (stdin, session_id).
     /// Stored separately so cancel can work without locking the connection.
     cancel_handles: HashMap<String, CancelHandle>,
+    /// Lock-free facade tokens: thread_key → the exact `OPENAB_SESSION_TOKEN` minted for the
+    /// connection currently under that key. Stored here, not just inside the connection, so hung
+    /// eviction can revoke the exact token **synchronously** — the `AcpConnection` DropGuard that
+    /// normally revokes it cannot fire while a hung streaming task still holds an Arc of the
+    /// connection, and `AcpTunnelSource` authorizes by channel alone, so an un-revoked predecessor
+    /// token would keep reaching whatever tunnel a successor registers for that channel (F3).
+    facade_tokens: HashMap<String, String>,
     /// Lock-free activity handles for hung-session detection without the connection mutex.
     activity: HashMap<String, Arc<SessionActivity>>,
     /// Child process-group ids, captured at insert time so hung eviction can
@@ -220,6 +227,49 @@ fn apply_hung_eviction(
     true
 }
 
+/// Record `token` as the facade token for `key`, revoking whatever token it supersedes.
+///
+/// A superseded token belongs to a predecessor connection under the same key. Its `AcpConnection`
+/// DropGuard normally revokes it, but if that predecessor is hung (a stuck streaming task still
+/// holds an Arc) the guard never fires — so revoking the superseded token here is what stops it
+/// staying valid for the channel after a successor takes over (F3). Revocation is by exact token
+/// and idempotent, so overlapping with the guard on a clean replacement is harmless.
+#[cfg(feature = "acp-mcp")]
+fn install_facade_token(
+    state: &mut PoolState,
+    key: &str,
+    token: String,
+    registrar: Option<&Arc<dyn crate::acp_mcp::SessionTokenRegistrar>>,
+) {
+    if let Some(superseded) = state.facade_tokens.insert(key.to_string(), token) {
+        if let Some(registrar) = registrar {
+            registrar.revoke(&superseded);
+        }
+    }
+}
+
+/// Revoke and forget the facade token recorded for `key`, if any.
+///
+/// Called from every path that removes a connection from `active` (hung eviction, idle eviction,
+/// reset, suspend). On the clean paths the connection also drops and its guard revokes the same
+/// token — idempotent — but the hung path is the one that needs this: the guard cannot fire while
+/// the hung task holds an Arc, so without a synchronous revoke here the token outlives the eviction
+/// and `AcpTunnelSource` (channel-only authorization) would let the hung predecessor reach a
+/// successor's tunnel (F3). `purge_session_entries` deliberately does NOT touch `facade_tokens`, so
+/// this can run *after* `apply_hung_eviction` and still find the token to revoke.
+#[cfg(feature = "acp-mcp")]
+fn revoke_facade_token_for_key(
+    state: &mut PoolState,
+    key: &str,
+    registrar: Option<&Arc<dyn crate::acp_mcp::SessionTokenRegistrar>>,
+) {
+    if let Some(token) = state.facade_tokens.remove(key) {
+        if let Some(registrar) = registrar {
+            registrar.revoke(&token);
+        }
+    }
+}
+
 impl SessionPool {
     pub fn new(
         config: AgentConfig,
@@ -240,6 +290,7 @@ impl SessionPool {
             state: RwLock::new(PoolState {
                 active: HashMap::new(),
                 cancel_handles: HashMap::new(),
+                facade_tokens: HashMap::new(),
                 activity: HashMap::new(),
                 pgids: HashMap::new(),
                 persisted: suspended.clone(),
@@ -590,6 +641,8 @@ impl SessionPool {
                     state.cancel_handles.remove(&key);
                     state.activity.remove(&key);
                     state.pgids.remove(&key);
+                    #[cfg(feature = "acp-mcp")]
+                    revoke_facade_token_for_key(&mut state, &key, self.session_registrar.as_ref());
                     info!(evicted = %crate::redact::redact_session_ids(&key), "pool full, suspending oldest idle session");
                     if let Some(sid) = sid {
                         state.persisted.insert(key.clone(), sid.clone());
@@ -632,6 +685,12 @@ impl SessionPool {
             state
                 .cancel_handles
                 .insert(thread_id.to_string(), (cancel_handle, cancel_session_id));
+        }
+        // Record this connection's exact token lock-free, revoking any predecessor token it
+        // supersedes under the same key (its guard cannot fire if that predecessor is hung). F3.
+        #[cfg(feature = "acp-mcp")]
+        if let Some(token) = session_token {
+            install_facade_token(&mut state, thread_id, token, self.session_registrar.as_ref());
         }
         self.save_mapping(&state.persisted);
 
@@ -781,6 +840,10 @@ impl SessionPool {
         // copy of the list: the copies are what let the two drift, and the gate rule is precisely
         // the kind of line that gets dropped from a duplicate without anyone noticing.
         purge_session_entries(&mut state, thread_id);
+        // Resetting a hung session drops the map's Arc but not the one the stuck task holds, so the
+        // guard cannot revoke — do it synchronously here too (F3).
+        #[cfg(feature = "acp-mcp")]
+        revoke_facade_token_for_key(&mut state, thread_id, self.session_registrar.as_ref());
         self.save_mapping(&state.persisted);
         self.save_meta(&state.session_workdirs);
         if had_active {
@@ -889,6 +952,8 @@ impl SessionPool {
                 state.cancel_handles.remove(&key);
                 state.activity.remove(&key);
                 state.pgids.remove(&key);
+                #[cfg(feature = "acp-mcp")]
+                revoke_facade_token_for_key(&mut state, &key, self.session_registrar.as_ref());
                 if let Some(sid) = sid {
                     state.persisted.insert(key.clone(), sid.clone());
                     state.suspended.insert(key, sid);
@@ -899,7 +964,15 @@ impl SessionPool {
             }
         }
         for (key, expected_conn) in hung {
-            if !apply_hung_eviction(&mut state, &key, &expected_conn) {
+            if apply_hung_eviction(&mut state, &key, &expected_conn) {
+                // The DropGuard cannot fire — the hung streaming task still holds an Arc, so the
+                // connection never drops. Revoke the exact token synchronously, or it keeps
+                // resolving to the channel and a successor's tunnel becomes reachable by the hung
+                // predecessor (F3). Safe after `apply_hung_eviction`: its `purge_session_entries`
+                // leaves `facade_tokens` alone.
+                #[cfg(feature = "acp-mcp")]
+                revoke_facade_token_for_key(&mut state, &key, self.session_registrar.as_ref());
+            } else {
                 warn!(thread_id = %crate::redact::redact_session_ids(&key), "hung session was replaced before eviction; maps untouched");
             }
         }
@@ -960,6 +1033,14 @@ mod tests {
     #[derive(Default)]
     struct CountingRegistrar {
         minted: std::sync::Mutex<Vec<String>>,
+        revoked: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[cfg(feature = "acp-mcp")]
+    impl CountingRegistrar {
+        fn revoked(&self) -> Vec<String> {
+            self.revoked.lock().unwrap().clone()
+        }
     }
 
     #[cfg(feature = "acp-mcp")]
@@ -968,7 +1049,73 @@ mod tests {
             self.minted.lock().unwrap().push(channel_id.to_string());
             "token-xyz".to_string()
         }
-        fn revoke(&self, _token: &str) {}
+        fn revoke(&self, token: &str) {
+            self.revoked.lock().unwrap().push(token.to_string());
+        }
+    }
+
+    /// Build an empty `PoolState` for a helper-level test.
+    #[cfg(feature = "acp-mcp")]
+    fn empty_pool_state() -> super::PoolState {
+        super::PoolState {
+            active: HashMap::new(),
+            cancel_handles: HashMap::new(),
+            facade_tokens: HashMap::new(),
+            activity: HashMap::new(),
+            pgids: HashMap::new(),
+            suspended: HashMap::new(),
+            persisted: HashMap::new(),
+            creating: HashMap::new(),
+            session_workdirs: HashMap::new(),
+        }
+    }
+
+    /// F3: replacing a hung predecessor's token revokes the predecessor's EXACT token and leaves
+    /// the successor's standing. Without the revoke the predecessor token keeps resolving to the
+    /// channel and — since `AcpTunnelSource` authorizes by channel — could reach the successor's
+    /// tunnel. Exercises the production `install_facade_token`.
+    #[cfg(feature = "acp-mcp")]
+    #[test]
+    fn installing_a_successor_token_revokes_only_the_superseded_predecessor() {
+        let reg = Arc::new(CountingRegistrar::default());
+        let registrar: Arc<dyn crate::acp_mcp::SessionTokenRegistrar> = reg.clone();
+        let mut state = empty_pool_state();
+
+        // Predecessor registers, then a successor takes over the SAME key.
+        super::install_facade_token(&mut state, "discord:acp_x", "T_pred".into(), Some(&registrar));
+        assert!(reg.revoked().is_empty(), "nothing to revoke on the first install");
+        super::install_facade_token(&mut state, "discord:acp_x", "T_succ".into(), Some(&registrar));
+
+        assert_eq!(reg.revoked(), vec!["T_pred"], "the predecessor token must be revoked");
+        assert_eq!(
+            state.facade_tokens.get("discord:acp_x").map(String::as_str),
+            Some("T_succ"),
+            "the successor's token stands"
+        );
+    }
+
+    /// F3: hung eviction revokes the exact facade token synchronously (the DropGuard cannot fire
+    /// while the hung task holds an Arc). Exercises the production `revoke_facade_token_for_key`,
+    /// which the hung-eviction loop calls after `apply_hung_eviction`.
+    #[cfg(feature = "acp-mcp")]
+    #[test]
+    fn hung_eviction_revokes_the_exact_facade_token_and_forgets_it() {
+        let reg = Arc::new(CountingRegistrar::default());
+        let registrar: Arc<dyn crate::acp_mcp::SessionTokenRegistrar> = reg.clone();
+        let mut state = empty_pool_state();
+        state.facade_tokens.insert("discord:acp_x".into(), "T_hung".into());
+        // A different session's token must be untouched.
+        state.facade_tokens.insert("discord:acp_y".into(), "T_other".into());
+
+        super::revoke_facade_token_for_key(&mut state, "discord:acp_x", Some(&registrar));
+
+        assert_eq!(reg.revoked(), vec!["T_hung"], "only the evicted session's token is revoked");
+        assert!(!state.facade_tokens.contains_key("discord:acp_x"), "and it is forgotten");
+        assert_eq!(
+            state.facade_tokens.get("discord:acp_y").map(String::as_str),
+            Some("T_other"),
+            "an unrelated session's token is untouched"
+        );
     }
 
     /// A failed facade config write must not mint a token. The agent has no `openab` entry, so it
@@ -1182,6 +1329,7 @@ mod tests {
         let mut state = PoolState {
             active: HashMap::new(),
             cancel_handles: HashMap::new(),
+            facade_tokens: HashMap::new(),
             activity: HashMap::from([
                 ("hung".to_string(), Arc::new(SessionActivity::new())),
                 ("other".to_string(), Arc::new(SessionActivity::new())),
