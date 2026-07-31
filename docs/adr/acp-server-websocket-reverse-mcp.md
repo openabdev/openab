@@ -215,7 +215,7 @@ Reverse-MCP adds:         acp-tunnel(channel_id, server_id)     ← client diall
   precisely the case #1454 was built for ("browser control, where `browser.click` must reach *that
   conversation's* browser tab").
 - `AcpTunnelSource` lives in the **root binary**, where the tunnel state (`AcpTunnelRegistry`) already
-  lives — keeping `openab-core` and `openab-gateway` sibling-independent, as with `RootBrowserTunnel`.
+  lives — keeping `openab-core` and `openab-gateway` sibling-independent, as with `RootAcpTunnel`.
 - `requires_session() == true`: anonymous facade clients neither discover nor can execute these tools.
 - **One source, N servers.** Facade sources are registered **once at construction**
   (`facade::serve_http_with(addr, sources, tokens)`; there is no runtime registration API), so a source
@@ -331,7 +331,7 @@ Therefore this ADR requires, before the source is enabled by default:
 > ⚠️ **Two gaps between this section and the code, recorded rather than quietly reworded.**
 >
 > **No logging.** This section said twice that a refused declaration and a dropped tool are "logged".
-> `src/browser_source.rs` contains no logging call at all — both refusals are silent. An operator
+> `src/acp_tunnel_source.rs` contains no logging call at all — both refusals are silent. An operator
 > who mis-types a server name in `[[mcp.acp_servers]]` gets missing tools and no signal, which is
 > the shape of failure this ADR spends §6.4 preventing. **Fixing this is a code change, so it is
 > filed as follow-up F7 rather than made here.**
@@ -529,7 +529,7 @@ Five **DOM-semantic** MCP tools, served by the extension: `katashiro.read_dom` (
   `DropGuard`. Superseded by the single facade listener (§6.2). `proxy` mode kept this behaviour
   until it too was removed on 2026-07-28, so this section is now purely historical.
 - **D6 — tunnel trait in core, impl in root.** `openab-core` defines the tunnel trait (`AcpMcpTunnel`,
-  §6.1); the **root** binary implements it (`src/browser_tunnel.rs`) by looking up the gateway's
+  §6.1); the **root** binary implements it (`src/acp_tunnel.rs`) by looking up the gateway's
   `AcpTunnelRegistry` and calling `TunnelHandle::mcp_message`. This keeps `openab-core` and
   `openab-gateway` sibling-independent (no cross-crate dep), mirroring the `ChatAdapter` root-glue
   pattern, and is why the `CapabilitySource` in §6.2 also lives in the root binary.
