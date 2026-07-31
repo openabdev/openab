@@ -434,9 +434,11 @@ deliberately never had.
 **Remaining to fulfil this section** — F1′, F3′, F4 and F5 all landed in #1447 and are struck
 through; **F6 genuinely remains**:
 - ~~**F1′ generalize the source to N client-declared servers.**~~ **Done in #1447**: the source
-  holds an N-entry policy map, enumerates `tunnel.servers(channel_id)` and routes on the
-  `<server>.<tool>` prefix to `(channel_id, server_id)`. Browser-ness is data in `builtin_catalogs`,
-  not a branch.
+  holds an N-entry policy map and routes on the `<server>.<tool>` prefix, resolving the declared
+  name to its tunnel. It no longer *enumerates* — `tunnel.servers(channel_id)` was deleted because
+  enumerate-and-match was the wrong route (`74315a60`), and `builtin_catalogs` was deleted by D-20,
+  so browser-ness is not data here either: openab holds no catalog at all. What makes the source
+  generic is that it knows only names the operator listed.
 - ~~**F3′ per-`(channel_id, name)` discovery cache**~~ **Done in #1447**: `ToolsCache` keyed
   `(channel_id, declared_name)` with in-flight dedupe and pull-triggered discovery (§6.3).
 - ~~**F4 trust gate** — operator allowlist + **deny-all-by-default** per-declared-server

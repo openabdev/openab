@@ -16,10 +16,15 @@
 //! **The prefix is a declared `name`, not a registry key** (ADR §6.1). A
 //! declaration is `{type:"acp", id, name}`; the reference client mints `id` as
 //! a fresh UUID per connection while `name` (`"katashiro"`) is stable. Routing
-//! therefore resolves `name` → `(channel_id, id)` through the tunnel
-//! registry's enumeration, and forwards the **full** published tool name
+//! therefore resolves `name` → `(channel_id, id)` through the registry's
+//! `resolve_by_name`, and forwards the **full** published tool name
 //! (`katashiro.click`) — the prefix selects the tunnel, it is not stripped,
 //! because the server's own `tools/call` expects its full name.
+//!
+//! Not through enumeration: `tunnel.servers(channel_id)` was deleted in
+//! `74315a60` precisely because enumerate-and-match was the wrong route — it
+//! collapsed same-name entries in registry order rather than by generation, so
+//! it could resolve to a stale tunnel.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -670,9 +675,9 @@ mod tests {
 
     #[tokio::test]
     async fn operator_may_admit_an_unknown_server_by_name_alone() {
-        // No built-in catalog for "notes": it contributes no seed yet (schemas
-        // arrive with discovery caching), but its listed tool is permitted and
-        // routes to the declared id.
+        // No server has a seed any more (D-20 deleted the catalog), so "notes"
+        // contributes nothing to the catalog until discovery runs — but its listed
+        // tool is permitted and routes to the declared id.
         let tunnel = FakeTunnel::with(&[("notes", "uuid-n")]);
         let src = AcpTunnelSource::with_config(tunnel.clone(), &[cfg("notes", &["notes.list"])]);
         assert!(

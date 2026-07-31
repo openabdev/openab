@@ -178,7 +178,7 @@ cat "$HOME/.kiro/settings/mcp.json"     # Kiro — written by `kiro-cli mcp impo
 
 # does the catalog contain the browser capabilities for a session-bound client?
 #   -> call search_capabilities from the agent; expect provider "openab-browser"
-#      with exactly the pinned katashiro.* tools
+#      with exactly the tools you allowlisted in [[mcp.acp_servers]], once discovery has run
 ```
 
 Gateway log confirms the extension side: `ACP: browser tunnel registered — extension attached`.

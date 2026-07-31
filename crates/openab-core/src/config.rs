@@ -167,8 +167,15 @@ pub struct AcpServerPolicy {
     pub name: String,
     /// Exactly the tool names this server may publish. **Deny-all**: omitted or
     /// empty means the server is accepted but may publish nothing. Names alone
-    /// are enough — schemas come from the built-in catalog for known servers,
-    /// or from the server's own `tools/list` once discovery caching lands.
+    /// are enough — schemas come from the server's own `tools/list`, fetched over
+    /// the tunnel and cached.
+    ///
+    /// This said schemas come "from the built-in catalog for known servers, or
+    /// from the server's own `tools/list` once discovery caching lands". Both
+    /// halves are now wrong: D-20 deleted the catalog, and discovery caching has
+    /// shipped. The struct doc above was corrected at the time and this field doc
+    /// was not — it justified itself by the parent's old behaviour, which is how
+    /// it survived a sweep.
     #[serde(default)]
     pub tools: Vec<String>,
 }
