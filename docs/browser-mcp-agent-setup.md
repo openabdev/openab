@@ -205,8 +205,14 @@ openab logs one warning at startup naming the value and reporting what is actual
 
 **What to do when upgrading:** configure `[mcp]` in `config.toml`. Without it there is no browser
 control at all — nothing is auto-started, because starting a listener you did not ask for is the
-coupling this design deliberately avoids. A leftover `openab-browser` bridge entry is deleted for
-you on the next session; a leftover proxy entry is not, for the ownership reason given above.
+coupling this design deliberately avoids.
+
+**Then remove any leftover `openab-browser` entry yourself — neither the bridge one nor the proxy
+one is cleaned up for you.** openab stopped editing files it does not own, and that cleanup went
+with it. This is worth doing rather than deferring: a surviving bridge entry is a *working* route
+to the browser that does not pass through facade policy or the audit trail, so until it is gone the
+allowlist in `[[mcp.acp_servers]]` is not the only way in. The shape-matched `jq` snippet earlier in
+this document removes it without touching a same-named server of your own.
 
 Proxy mode also only ever auto-wrote two of the five CLI variants (Cursor and Kiro); the other
 three had to be configured by hand. The facade's static entry removes that gap rather than
