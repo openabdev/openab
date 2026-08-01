@@ -58,7 +58,7 @@ Extension replies with a fresh, extension-assigned connection handle:
 
 `connectionId` scopes all subsequent `mcp/message` traffic for this MCP connection.
 
-## 4. Carrying MCP — `mcp/message` (bidirectional)
+## 4. Carrying MCP — `mcp/message` (gateway-initiated)
 
 The inner MCP method + params are **flattened** into the `mcp/message` params (there is **no**
 inner MCP `id`; correlation is by the outer ACP JSON-RPC id):
@@ -74,10 +74,30 @@ inner MCP `id`; correlation is by the outer ACP JSON-RPC id):
   { "jsonrpc":"2.0", "id":<n>, "result": { ...inner MCP result... } }
   ```
   An inner MCP-level error is returned as the outer JSON-RPC `error`.
-- **Notification** (outer frame has no `id`): fire-and-forget inner MCP notification; no reply.
-  These travel in **both** directions. The extension sends them upward for server-originated MCP
-  notifications; the gateway sends them downward, and the extension must forward them to its inner
-  MCP server exactly as it forwards requests — see `notifications/initialized` below.
+- **Notification** (outer frame has no `id`): fire-and-forget inner MCP notification; no reply. In
+  the shipped tunnel these travel **gateway → extension only** — e.g. `notifications/initialized`
+  below. The wire is bidirectional and the extension MAY send a server-originated notification
+  upward, but the gateway does **not** consume an inbound `mcp/message` today (it has no dispatch
+  arm for it), by the deliberate choice recorded in the note below.
+
+> **Server-initiated MCP is deliberately not implemented, and this is spec-aligned.** The shipped
+> tunnel is **gateway-initiated**: the gateway asks (`initialize`, `tools/list`, `tools/call`) and
+> the extension answers — the only direction the example exercises. Server-originated **requests**
+> (`sampling/createMessage`, `elicitation/create`, `roots/list`) and push **notifications**
+> (`tools/list_changed`) are **not carried inbound**. This is not an oversight: the 2026-07-28 MCP
+> spec is retiring exactly that surface.
+> - Server-initiated requests are **deprecated** (SEP-2577) and redesigned into multi-round-trip
+>   requests (SEP-2322: the server returns `InputRequiredResult` / `inputRequests` and the client
+>   re-issues with `inputResponses`) — a 12-month offramp for the old server→client request form.
+> - Change-notification **delivery** is moving off HTTP GET/SSE push to `subscriptions/listen`, with
+>   cache-expiry + refetch as the preferred, lower-push way to keep catalogs fresh.
+> - The streamable-HTTP **session** model (`Mcp-Session-Id`, the initialize handshake) is being
+>   removed as the transport goes stateless.
+>
+> The example extension (`katashiro`) has a **static** tool set and never emits `tools/list_changed`,
+> so there is no consumer to build for today. openab will align with the new mechanisms
+> (`subscriptions/listen`, multi-round-trip requests) if and when a real client-provided server needs
+> them, rather than shipping a form already on a deprecation offramp.
 
 ### Lifecycle: the gateway initializes before it asks for anything
 
@@ -127,8 +147,9 @@ extension's first `tools/list` returns. `tools/call` executes in the **active ta
 
 `tools/call` returns an MCP `CallToolResult` (`{ "content": [ { "type":"text", "text":... } ] }`,
 or an image content block for `screenshot`). On failure return an MCP tool error result. The
-extension MAY expose additional tools beyond this baseline; they surface to the agent via
-`tools/list` + a `tools/list_changed` notification.
+extension MAY expose additional tools beyond this baseline; they surface to the agent on the next
+`tools/list` discovery fetch. The gateway does **not** consume an inbound `tools/list_changed` push
+(see §4) — a changed set is picked up by re-discovery, not by a server-originated notification.
 
 ## 7. Cancellation and limits
 

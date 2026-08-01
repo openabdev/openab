@@ -258,7 +258,21 @@ The facade's discovery is **pull-based**: the agent sees only `search_capabiliti
 
 - **`notifications/tools/list_changed` is dropped.** There is no cached client-side tool list to
   invalidate, so the notification has no consumer. (The earlier draft's `list_changed` lifecycle,
-  debouncing included, is removed rather than deferred.)
+  debouncing included, is removed rather than deferred.) The example extension (`katashiro`) has a
+  **static** tool set and never emits it, so nothing is lost today.
+- **Server-initiated inbound MCP is deliberately not implemented, and this is spec-aligned
+  (2026-08-01, D-34).** The shipped tunnel is **gateway-initiated** — the gateway asks
+  (`initialize` / `tools/list` / `tools/call`) and the extension answers. Inbound `mcp/message` is
+  not carried: neither server-originated **requests** (`sampling/createMessage`, `elicitation/create`,
+  `roots/list`) nor push **notifications** (`tools/list_changed`) have a dispatch arm. This tracks
+  the 2026-07-28 MCP spec, which is retiring exactly that surface: server-initiated requests are
+  **deprecated** (SEP-2577) and redesigned into multi-round-trip requests (SEP-2322 —
+  `InputRequiredResult` / `inputRequests`, the client re-issuing with `inputResponses`);
+  change-notification **delivery** is moving off HTTP GET/SSE push to `subscriptions/listen` with
+  cache-expiry + refetch preferred; and the streamable-HTTP **session** model (`Mcp-Session-Id`) is
+  being removed as the transport goes stateless. openab will adopt the new mechanisms if and when a
+  real client-provided server needs them, rather than build a form already on a deprecation offramp.
+  See the tunnel contract §4.
 - **A catalog that does not flap is the right posture**, per the facade's source contract —
   implemented as *dynamically sourced, then cached*, because tools for arbitrary declared servers
   cannot be hardcoded. (This bullet said "static-advertise is the right posture" until D-20 deleted
