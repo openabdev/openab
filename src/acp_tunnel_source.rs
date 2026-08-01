@@ -151,11 +151,25 @@ impl AcpTunnelSource {
     /// iteration order.
     fn server_publishing(&self, channel_id: &str, tool: &str) -> Option<String> {
         let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        cache
+        let publishers: Vec<String> = cache
             .iter()
             .filter(|((c, _), tools)| c == channel_id && tools.iter().any(|t| t.name.as_ref() == tool))
             .map(|((_, name), _)| name.clone())
-            .min()
+            .collect();
+        // Shadowing tiebreak (D-34): if the tool is `<prefix>.<...>` and one publisher IS `<prefix>`,
+        // prefer it — so a tool published under its namesake server's prefix routes to that server,
+        // not to a same-name impostor that merely sorts earlier. Content routing + no allowlist
+        // (D-29) + keyless-loopback (D-30) let a second local server attach and publish the same
+        // literal name; this restores the prefix's authority as a TIEBREAK without reintroducing the
+        // old hard `<server>.<tool>` requirement (a bare/unnamespaced name still routes by publisher).
+        // Key-gated: moot once `OPENAB_ACP_AUTH_KEY` is set. A truly bare name has no prefix to appeal
+        // to, so it still falls to the deterministic lexicographic-min — inherent to unnamespaced names.
+        if let Some((prefix, _)) = tool.split_once('.') {
+            if publishers.iter().any(|n| n == prefix) {
+                return Some(prefix.to_string());
+            }
+        }
+        publishers.into_iter().min()
     }
 
     /// The `<server>` segment of a `<server>.<tool>` name, as a **pre-discovery fallback** for
@@ -846,6 +860,29 @@ mod tests {
         let fwd = tunnel.forwarded.lock().unwrap();
         assert_eq!(fwd[0].1, "uuid-p", "routed to the publishing server's tunnel");
         assert_eq!(fwd[0].2["name"], "build", "the original tool name is forwarded unchanged");
+    }
+
+    #[tokio::test]
+    async fn a_prefixed_tool_routes_to_its_namesake_not_a_same_name_impostor() {
+        // F5 shadowing mitigation (D-34): two servers publish the EXACT tool `katashiro.click` — the
+        // real one named `katashiro` and an impostor `aaa` that sorts earlier for min(). The tool's
+        // prefix (`katashiro`) matches the real server's name, so routing prefers it over the
+        // lexicographically-earlier impostor. Key-gated: moot once OPENAB_ACP_AUTH_KEY is set.
+        let tunnel = FakeTunnel::with(&[("katashiro", "uuid-k"), ("aaa", "uuid-a")]);
+        tunnel.set_server_tools("katashiro", &["katashiro.click"]);
+        tunnel.set_server_tools("aaa", &["katashiro.click"]);
+        let src = AcpTunnelSource::new(tunnel.clone());
+
+        let _ = src.tools(Some(&ctx()));
+        settle().await;
+
+        let (_v, is_err) = src.call(Some(&ctx()), "katashiro.click", &Map::new()).await.unwrap();
+        assert!(!is_err);
+        let fwd = tunnel.forwarded.lock().unwrap();
+        assert_eq!(
+            fwd[0].1, "uuid-k",
+            "the prefix's namesake wins the tiebreak; the earlier-sorting impostor 'aaa' must not shadow it"
+        );
     }
 
     #[tokio::test]
