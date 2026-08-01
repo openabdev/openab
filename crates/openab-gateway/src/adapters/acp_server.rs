@@ -1952,13 +1952,19 @@ fn handle_initialize(req: &JsonRpcRequest) -> JsonRpcResponse {
                 // or sse declaration is silently dropped, so advertising `true` would be a claim
                 // with no implementation behind it.
                 //
-                // The ACP capability rides `_meta` because upstream `McpCapabilities` has only
-                // `http`, `sse` and `_meta` (`acp_schema.rs:6201`). Move it to the real field once
-                // upstream gains one; the ADR carries that note.
+                // The ACP capability is declared as a **reverse-DNS-namespaced extension key** under
+                // `_meta`, per the 2026-07-28 MCP extensions framework (whose reserved keys look
+                // like `io.modelcontextprotocol/logLevel`). `dev.openab/acp` is the reverse-DNS of
+                // openab's domain (openab.dev) plus the capability key. It rides `_meta` rather than
+                // a typed `extensions` map because the vendored v1 `McpCapabilities` has only
+                // `http`, `sse` and a free-form `_meta` (`acp_schema.rs:6201`); adding an
+                // `extensions` field would fork the generated types, which F1(a) deliberately
+                // avoided. Negotiated via `_meta` until the vendored schema gains the extensions
+                // map; the ADR carries the forward-looking note.
                 "mcpCapabilities": {
                     "http": false,
                     "sse": false,
-                    "_meta": { "acp": true }
+                    "_meta": { "dev.openab/acp": true }
                 },
                 "sessionCapabilities": {
                     "resume": {}
@@ -2591,7 +2597,7 @@ mod acp_conformance {
                 // mirroring is worse than no mirror, because it still looks like coverage. This
                 // also proves `_meta` is schema-legal here, which is what makes the ACP capability
                 // expressible before upstream has a real field for it.
-                "mcpCapabilities": { "http": false, "sse": false, "_meta": { "acp": true } },
+                "mcpCapabilities": { "http": false, "sse": false, "_meta": { "dev.openab/acp": true } },
                 "sessionCapabilities": { "resume": {} },
                 "promptCapabilities": { "image": false, "audio": false, "embeddedContext": false }
             },
@@ -3572,9 +3578,14 @@ mod acp_handlers {
         assert_eq!(mcp["http"], json!(false), "no code forwards an http declaration anywhere");
         assert_eq!(mcp["sse"], json!(false), "same for sse — parse_acp_mcp_servers drops both");
         assert_eq!(
-            mcp["_meta"]["acp"], json!(true),
-            "the ACP capability rides _meta until upstream McpCapabilities gains a real field"
+            mcp["_meta"]["dev.openab/acp"], json!(true),
+            "the ACP capability is a reverse-DNS-namespaced extension under _meta (F1(b))"
         );
+        assert!(
+            mcp["_meta"]["acp"].is_null(),
+            "the bare `_meta.acp` key is gone — the informal convention the framework supersedes"
+        );
+        assert!(mcp.get("acp").is_none(), "no core mcpCapabilities.acp field (would fork the schema)");
     }
 
     #[test]

@@ -63,6 +63,20 @@ client to do X and awaits a result). The WS is already bidirectional; `acp_serve
 adds the agent-initiated-request path. This is also where the wire types move from hand-rolled to
 **generated** (see §9).
 
+### 3.1 Advertising the capability
+
+`handle_initialize` advertises MCP-over-ACP support as a **reverse-DNS-namespaced extension key**
+under `agentCapabilities.mcpCapabilities._meta`: `"dev.openab/acp": true` — the reverse-DNS of
+openab's domain (`openab.dev`) plus the capability key, following the **2026-07-28 MCP extensions
+framework** whose reserved keys look like `io.modelcontextprotocol/logLevel`. It rides `_meta`
+rather than a typed `extensions` map because the vendored v1 `McpCapabilities` has only `http`, `sse`
+and a free-form `_meta`; adding an `extensions` field would fork the generated wire types, which this
+PR deliberately avoids. This is alignment to the new extensions convention, **not** a core-field
+divergence — the review's original ask (a core `mcpCapabilities.acp` field) is the pre-framework
+direction, and a bare `_meta.acp` key (an earlier draft) is the informal convention the framework
+now supersedes. The capability moves to the typed `extensions` map if and when the vendored schema
+gains it.
+
 ## 4. Architecture (browser control as the example)
 
 ```mermaid
