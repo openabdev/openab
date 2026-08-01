@@ -175,7 +175,7 @@ notification is simply never delivered, so do not treat its absence as "keep goi
 
 | Limit | Value | Meaning |
 |---|---|---|
-| Tunnel request timeout | `[mcp] tunnel_timeout_seconds`, default **180s** | one `mcp/message` request |
+| Tunnel request timeout | `[mcp] tunnel_timeout_seconds`, default **170s** | one `mcp/message` request. 180s is the *ceiling*, not the default: it is the agent-side `ACP_PROMPT_IDLE_TIMEOUT_SECS`, and the 170s default keeps a margin under it so a hung tunnel call fails as a tunnel timeout rather than as a prompt-idle timeout. A larger value is accepted and simply loses that margin |
 | Connect / handshake timeout | 30s | `mcp/connect` and the `initialize` that follows it |
 | Servers per session | 8 (`MAX_ACP_SERVERS_PER_SESSION`) | `type:acp` entries accepted per `session/new` |
 | In-flight establishes | 64 (`MAX_INFLIGHT_ESTABLISHES`) | concurrent tunnel setups per connection |
