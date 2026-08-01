@@ -1952,15 +1952,15 @@ fn handle_initialize(req: &JsonRpcRequest) -> JsonRpcResponse {
                 // or sse declaration is silently dropped, so advertising `true` would be a claim
                 // with no implementation behind it.
                 //
-                // The ACP capability is declared as a **reverse-DNS-namespaced extension key** under
-                // `_meta`, per the 2026-07-28 MCP extensions framework (whose reserved keys look
-                // like `io.modelcontextprotocol/logLevel`). `dev.openab/acp` is the reverse-DNS of
-                // openab's domain (openab.dev) plus the capability key. It rides `_meta` rather than
-                // a typed `extensions` map because the vendored v1 `McpCapabilities` has only
-                // `http`, `sse` and a free-form `_meta` (`acp_schema.rs:6201`); adding an
-                // `extensions` field would fork the generated types, which F1(a) deliberately
-                // avoided. Negotiated via `_meta` until the vendored schema gains the extensions
-                // map; the ADR carries the forward-looking note.
+                // The ACP capability is declared as a **reverse-DNS-namespaced `_meta` key**, per
+                // the 2026-07-28 MCP `_meta` namespaced-key convention (SEP-1788 — its own reserved
+                // keys look like `io.modelcontextprotocol/logLevel`). `dev.openab/acp` is the
+                // reverse-DNS of openab's domain (openab.dev) plus the capability key. This is the
+                // `_meta` convention, NOT the separate typed `extensions` map (also new in the
+                // 2026-07-28 spec): the vendored v1 `McpCapabilities` has only `http`, `sse` and a
+                // free-form `_meta` (`acp_schema.rs:6201`), and adding an `extensions` field would
+                // fork the generated types, which F1(a) deliberately avoided. It would move to that
+                // typed map if and when the vendored schema gains it; the ADR carries that note.
                 "mcpCapabilities": {
                     "http": false,
                     "sse": false,

@@ -65,17 +65,21 @@ adds the agent-initiated-request path. This is also where the wire types move fr
 
 ### 3.1 Advertising the capability
 
-`handle_initialize` advertises MCP-over-ACP support as a **reverse-DNS-namespaced extension key**
+`handle_initialize` advertises MCP-over-ACP support as a **reverse-DNS-namespaced `_meta` key**
 under `agentCapabilities.mcpCapabilities._meta`: `"dev.openab/acp": true` — the reverse-DNS of
-openab's domain (`openab.dev`) plus the capability key, following the **2026-07-28 MCP extensions
-framework** whose reserved keys look like `io.modelcontextprotocol/logLevel`. It rides `_meta`
-rather than a typed `extensions` map because the vendored v1 `McpCapabilities` has only `http`, `sse`
-and a free-form `_meta`; adding an `extensions` field would fork the generated wire types, which this
-PR deliberately avoids. This is alignment to the new extensions convention, **not** a core-field
-divergence — the review's original ask (a core `mcpCapabilities.acp` field) is the pre-framework
-direction, and a bare `_meta.acp` key (an earlier draft) is the informal convention the framework
-now supersedes. The capability moves to the typed `extensions` map if and when the vendored schema
-gains it.
+openab's domain (`openab.dev`) plus the capability key, following the **2026-07-28 MCP `_meta`
+namespaced-key convention** (SEP-1788), whose own reserved keys look like
+`io.modelcontextprotocol/logLevel`.
+
+Two 2026-07-28 mechanisms are easy to conflate, so name them apart: this is the **`_meta`
+namespaced-key convention** (a reverse-DNS key on the free-form `_meta` map), **not** the separate
+**typed `extensions` map**. openab uses the former. It rides `_meta` because the vendored v1
+`McpCapabilities` has only `http`, `sse` and a free-form `_meta`; adding an `extensions` field would
+fork the generated wire types, which this PR deliberately avoids (F1(a)). This is alignment to the
+`_meta` convention, **not** a core-field divergence — the review's original ask (a core
+`mcpCapabilities.acp` field) is the pre-convention direction, and a bare `_meta.acp` key (an earlier
+draft) is the informal form the reserved-key convention supersedes. The capability would move to the
+typed `extensions` map if and when the vendored schema gains it.
 
 ## 4. Architecture (browser control as the example)
 
