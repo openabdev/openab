@@ -251,14 +251,25 @@ Reverse-MCP adds:         acp-tunnel(channel_id, server_id)     ← client diall
   (`facade::serve_http_with(addr, sources, tokens)`; there is no runtime registration API), so a source
   *per* client-declared server is not possible — and not needed. `AcpTunnelSource` fans out internally:
   `tools(ctx)` returns the tools of **every** `type:acp` server declared by the client of that
-  `channel_id`, and `call` routes on the **`<server>.<tool>`** prefix to the matching tunnel. Today's
-  names (`katashiro.click`, `katashiro.read_dom`) already carry the server segment, so this generalizes
-  with no renaming — but note the segment is the declared **`name`**, not the registry key: resolving
-  it to a tunnel goes `name` → `(channel_id, id)` via the recorded declaration (§6.1), never straight
-  to the key. The tool name forwarded over the tunnel stays the **full** name the server published
-  (`katashiro.click`), since that is what the server's own `tools/call` expects; the prefix selects the
-  tunnel, it is not stripped. The facade additionally publishes a `<provider>:<tool>` form to resolve
-  shadowing against `mcp.json` servers.
+  `channel_id`. ~~and `call` routes on the **`<server>.<tool>`** prefix to the matching tunnel~~ —
+  **routing is by what was discovered, not by the name's shape** (F5), and since 2026-08-01 both the
+  advertised names and the routes come from **one catalog** built per channel: every advertised name is
+  paired with the `(declared_server, published_tool)` that produced it. Resolving the route separately
+  from the advertised name is what let a colliding name be advertised with one server's schema and
+  dispatched to another's tunnel. The declared **`name`** (never the registry key) resolves to a tunnel
+  as `name` → `(channel_id, id)` via the recorded declaration (§6.1). The tool name forwarded over the
+  tunnel is the name the server **published** (`katashiro.click`), since that is what the server's own
+  `tools/call` expects.
+- **Colliding tool names are named apart, not shadowed.** With no allowlist (D-29) and keyless
+  loopback (D-30), two declared servers may publish the same literal tool name. The **keeper** of a
+  published name advertises it verbatim — the prefix's namesake if the name is `<prefix>.<...>` and one
+  publisher is `<prefix>` (the D-34 shadowing mitigation, promoted from a routing tiebreak to a naming
+  rule), otherwise the lexicographically-first publisher — and every other publisher of that name is
+  advertised as `<declared_server>.<published_tool>`, routed to its own tunnel and forwarded under the
+  name it published. Before this the second publisher was advertised but unreachable: the facade's
+  `<provider>:<tool>` alias is built from the source's single provider string, which cannot tell two of
+  *its own* servers apart, so both names dispatched to the same one. That alias still resolves
+  shadowing against `mcp.json` servers, which is the collision it was designed for.
 - **Adding another client-side MCP service is therefore declaration + policy work, not architecture
   work.** The source must contain no browser-specific branch.
 
@@ -330,6 +341,16 @@ D-29 removed the allowlist, so there is no filter table beneath the cache):
   orphaned by exactly the reconnect the cache exists to survive — it could never outlive the attach it
   was populated from, which is the opposite of "serve regardless of current attach state". Same-name
   collisions are impossible by §6.1's rank rule, so the name is a safe key.
+- **An entry also records the `server_id` it was fetched from, and a changed id refetches**
+  (2026-08-01). Surviving a reconnect is the point of name-keying, but nothing compared the surviving
+  entry against the connection now attached, so a server that reconnected with a different tool set
+  served its predecessor's catalog for the rest of the session — and no `tools/list_changed` is coming
+  to invalidate it, the tunnel being gateway-initiated (§6.3 above). `tools()` therefore fetches when
+  the cached id differs from the one now resolved, and keeps serving the inherited set until the
+  refetch lands, so the refresh never shrinks the catalog. A fetch that started before the reconnect
+  and lands after it writes the superseded set under the *old* id, which the next round sees as a
+  mismatch and refetches — the staleness is self-correcting rather than sticky. This is
+  cache-expiry-and-refetch, the mechanism the 2026-07-28 spec prefers over push invalidation.
 - Discovery is **pull-triggered**: an attached server with no cache entry has its fetch started from the
   next `tools(ctx)` call, and its real set appears one discovery round later. `tools()` drives this from
   `attached_server_names` (the per-channel enumeration re-introduced by D-29), resolving each name to a

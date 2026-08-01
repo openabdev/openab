@@ -19,9 +19,22 @@
 //! segment is not its own, and both stay callable. The declared server `name`
 //! (from `{type:"acp", id, name}`; the client mints a fresh `id` per connection
 //! while `name` is stable) then resolves to `(channel_id, id)` through the
-//! registry's `resolve_by_name`, and the **full** published tool name is
-//! forwarded unchanged because the server's own `tools/call` expects it. The
-//! `<server>.` prefix is only a pre-discovery fallback for routing.
+//! registry's `resolve_by_name`, and the published tool name is forwarded
+//! unchanged because the server's own `tools/call` expects it. The `<server>.`
+//! prefix is only a pre-discovery fallback for routing.
+//!
+//! **One catalog builds both the advertised names and the routes** ([`catalog`]).
+//! Looking the publisher up per call was not enough once two servers could
+//! publish the same name: the catalog advertised both, the second was
+//! unreachable (nothing addressed it), and which of the two schemas was shown
+//! for the shared name depended on iteration order while the call resolved
+//! elsewhere. Every advertised name is now paired with the
+//! `(declared_server, published_tool)` that produced it, in one deterministic
+//! construction that `tools()` advertises and `call()` routes by — so a name
+//! that was advertised is callable, and reaches the server whose schema was
+//! shown for it. Collisions are named apart rather than dropped: the keeper of
+//! a published name advertises it verbatim and the rest appear as
+//! `<declared_server>.<published_tool>`.
 //!
 //! **Admission is the transport, not an allowlist** (D-29, reversing D-20).
 //! There is no operator `[[mcp.acp_servers]]` gate: any server that authenticates
@@ -36,7 +49,7 @@
 //! enumerator returns names, and the single `resolve_by_name` still does every
 //! name → id resolution beside the eviction that makes it unique.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -59,6 +72,10 @@ pub struct AcpTunnelSource {
     ///
     /// Holds what the server published, and that is what is advertised — with the
     /// allowlist gone (D-29) there is no read-time filter to narrow it.
+    ///
+    /// Each entry records the `server_id` it was fetched from, so a name-keyed
+    /// entry that survived a reconnect can still be recognised as describing the
+    /// *previous* connection and refetched.
     cache: ToolsCache,
     /// Discovery fetches currently in flight, so repeated discovery rounds do
     /// not pile up duplicate `tools/list` requests on one tunnel.
@@ -66,7 +83,21 @@ pub struct AcpTunnelSource {
 }
 
 /// Tool sets discovered from client servers, keyed `(channel_id, declared_name)`.
-type ToolsCache = Arc<std::sync::Mutex<HashMap<(String, String), Vec<Tool>>>>;
+type ToolsCache = Arc<std::sync::Mutex<HashMap<(String, String), Discovered>>>;
+
+/// One server's discovered tool set, and the connection it was fetched from.
+#[derive(Clone)]
+struct Discovered {
+    /// The `server_id` whose `tools/list` produced `tools`.
+    ///
+    /// The cache is keyed by declared *name* so an entry survives a reconnect (the client mints a
+    /// fresh id each time), which is what keeps the catalog from collapsing mid-session. That same
+    /// property made a reconnected server serve its predecessor's catalog forever: nothing compared
+    /// the entry against the connection now attached. Recording the id is what lets `tools()` tell a
+    /// surviving entry from a current one.
+    server_id: String,
+    tools: Vec<Tool>,
+}
 
 /// `(channel_id, declared_name)` pairs with a discovery fetch already running.
 type InflightKeys = Arc<std::sync::Mutex<HashSet<(String, String)>>>;
@@ -77,6 +108,119 @@ fn sorted(tools: impl IntoIterator<Item = Tool>) -> Vec<Tool> {
     let mut out: Vec<Tool> = tools.into_iter().collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// One advertised capability, with the identity it routes by.
+struct CatalogEntry {
+    /// The name the facade publishes: the published name when this server keeps it, otherwise
+    /// `<server>.<published>`.
+    advertised: String,
+    /// Declared name of the server that published it — what `resolve_by_name` takes.
+    server: String,
+    /// The name the server published, forwarded verbatim in `tools/call` because that is the only
+    /// name the server itself knows.
+    published: String,
+    /// The advertised `Tool`: the published one, renamed to `advertised`. Its schema therefore
+    /// always belongs to `server`, the tunnel the call will reach.
+    tool: Tool,
+}
+
+/// Which server keeps a published name when several publish it: the prefix's namesake if there is
+/// one, else the lexicographically-first.
+///
+/// The namesake preference is the D-34 shadowing mitigation, promoted from a routing tiebreak to a
+/// naming rule. Content routing + no allowlist (D-29) + keyless loopback (D-30) let a second local
+/// server attach and publish the same literal name, so a tool published as `<prefix>.<...>` must
+/// stay with the server actually called `<prefix>` rather than fall to whoever sorts earlier.
+/// Key-gated: moot once `OPENAB_ACP_AUTH_KEY` is set. A truly bare name has no prefix to appeal to,
+/// so it falls to the lexicographic minimum — arbitrary, but deterministic, and the loser is now
+/// named apart rather than shadowed.
+fn keeper<'a>(published: &str, publishers: &[&'a str]) -> &'a str {
+    if let Some((prefix, _)) = published.split_once('.') {
+        if let Some(namesake) = publishers.iter().copied().find(|server| *server == prefix) {
+            return namesake;
+        }
+    }
+    publishers
+        .iter()
+        .copied()
+        .min()
+        .expect("a published name has at least one publisher")
+}
+
+/// Build the advertised catalog from one channel's discovered sets: one entry per
+/// `(server, published tool)`, each under a **unique** advertised name.
+///
+/// Deterministic by construction — `discovered` is sorted, each server's tools are sorted, and the
+/// keeper of a colliding name is chosen by rule rather than by arrival. Two servers publishing the
+/// same name previously produced two entries under one name: the facade advertised the second under
+/// an alias built from the source's own provider string, which could not tell the two apart, so the
+/// alias and the bare name both dispatched to the same server and the second server's tool was
+/// advertised but unreachable.
+fn catalog(discovered: &BTreeMap<String, Discovered>) -> Vec<CatalogEntry> {
+    let mut publishers: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (server, entry) in discovered {
+        for tool in &entry.tools {
+            publishers
+                .entry(tool.name.as_ref())
+                .or_default()
+                .push(server.as_str());
+        }
+    }
+    let keepers: BTreeMap<&str, &str> = publishers
+        .iter()
+        .map(|(published, servers)| (*published, keeper(published, servers.as_slice())))
+        .collect();
+
+    // `(server, tool)` in the order both passes below walk them.
+    let mut entries: Vec<(&String, &Tool)> = Vec::new();
+    for (server, entry) in discovered {
+        let mut published: Vec<&Tool> = entry.tools.iter().collect();
+        published.sort_by(|a, b| a.name.cmp(&b.name));
+        entries.extend(published.into_iter().map(|tool| (server, tool)));
+    }
+
+    let mut advertised: Vec<Option<String>> = vec![None; entries.len()];
+    let mut used: HashSet<String> = HashSet::new();
+    // Keepers first, so a rename below can never take a name some server actually published.
+    for (i, (server, tool)) in entries.iter().enumerate() {
+        if keepers.get(tool.name.as_ref()) == Some(&server.as_str())
+            && used.insert(tool.name.to_string())
+        {
+            advertised[i] = Some(tool.name.to_string());
+        }
+    }
+    for (i, (server, tool)) in entries.iter().enumerate() {
+        if advertised[i].is_some() {
+            continue;
+        }
+        // Namespaced under the server that published it, which `keeper` then routes back to that
+        // server if the two ever collide again. The numeric suffix is the last resort for a server
+        // that publishes both `x` and its own `<server>.x`, or the same name twice.
+        let mut candidate = format!("{server}.{}", tool.name);
+        let mut suffix = 2;
+        while !used.insert(candidate.clone()) {
+            candidate = format!("{server}.{}.{suffix}", tool.name);
+            suffix += 1;
+        }
+        advertised[i] = Some(candidate);
+    }
+
+    entries
+        .into_iter()
+        .zip(advertised)
+        .map(|((server, tool), advertised)| {
+            let advertised = advertised.expect("both passes assign every entry");
+            let mut renamed = tool.clone();
+            renamed.name = advertised.clone().into();
+            CatalogEntry {
+                advertised,
+                server: server.clone(),
+                published: tool.name.to_string(),
+                tool: renamed,
+            }
+        })
+        .collect()
 }
 
 impl AcpTunnelSource {
@@ -126,10 +270,13 @@ impl AcpTunnelSource {
                 .ok()
                 .and_then(|v| serde_json::from_value::<Vec<Tool>>(v.get("tools")?.clone()).ok());
             if let Some(tools) = fetched {
+                // Stamped with the id it was fetched from. A fetch started before a reconnect can
+                // land after it and write the superseded set; the stamp makes that self-correcting,
+                // because the next round sees an id that no longer matches and refetches.
                 cache
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(key.clone(), tools);
+                    .insert(key.clone(), Discovered { server_id, tools });
             }
             // Always clear the flag: a failed fetch must be retryable on the
             // next discovery round, not wedged as permanently "in flight".
@@ -140,36 +287,28 @@ impl AcpTunnelSource {
         });
     }
 
-    /// The declared name of the connected server that published `tool` on `channel_id`, from the
-    /// discovery cache.
-    ///
-    /// This is how a tool is routed since F5 dropped the `<server>.<tool>` name-prefix assumption: a
-    /// generic server may publish a bare `build`, or a name whose first segment is not its own, so
-    /// the publisher is looked up by what was actually discovered rather than parsed out of the tool
-    /// string. Deterministic on the (already-ambiguous) case of two servers publishing the same bare
-    /// name — the lexicographically-first server name wins — so routing never depends on `HashMap`
-    /// iteration order.
-    fn server_publishing(&self, channel_id: &str, tool: &str) -> Option<String> {
+    /// This channel's discovered tool sets, `declared_name -> discovered`, in a **sorted** map so
+    /// the catalog built from it does not vary with `HashMap` iteration order.
+    fn discovered(&self, channel_id: &str) -> BTreeMap<String, Discovered> {
         let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        let publishers: Vec<String> = cache
+        cache
             .iter()
-            .filter(|((c, _), tools)| c == channel_id && tools.iter().any(|t| t.name.as_ref() == tool))
-            .map(|((_, name), _)| name.clone())
-            .collect();
-        // Shadowing tiebreak (D-34): if the tool is `<prefix>.<...>` and one publisher IS `<prefix>`,
-        // prefer it — so a tool published under its namesake server's prefix routes to that server,
-        // not to a same-name impostor that merely sorts earlier. Content routing + no allowlist
-        // (D-29) + keyless-loopback (D-30) let a second local server attach and publish the same
-        // literal name; this restores the prefix's authority as a TIEBREAK without reintroducing the
-        // old hard `<server>.<tool>` requirement (a bare/unnamespaced name still routes by publisher).
-        // Key-gated: moot once `OPENAB_ACP_AUTH_KEY` is set. A truly bare name has no prefix to appeal
-        // to, so it still falls to the deterministic lexicographic-min — inherent to unnamespaced names.
-        if let Some((prefix, _)) = tool.split_once('.') {
-            if publishers.iter().any(|n| n == prefix) {
-                return Some(prefix.to_string());
-            }
-        }
-        publishers.into_iter().min()
+            .filter(|((c, _), _)| c == channel_id)
+            .map(|((_, name), discovered)| (name.clone(), discovered.clone()))
+            .collect()
+    }
+
+    /// The `(declared_server, published_tool)` an advertised name routes to, resolved through the
+    /// same [`catalog`] `tools()` advertises.
+    ///
+    /// One construction serves both directions, which is the point: resolving the route separately
+    /// from the advertised name is what let a colliding name be advertised with one server's schema
+    /// and dispatched to another's tunnel.
+    fn route(&self, channel_id: &str, advertised: &str) -> Option<(String, String)> {
+        catalog(&self.discovered(channel_id))
+            .into_iter()
+            .find(|entry| entry.advertised == advertised)
+            .map(|entry| (entry.server, entry.published))
     }
 
     /// The `<server>` segment of a `<server>.<tool>` name, as a **pre-discovery fallback** for
@@ -229,37 +368,38 @@ impl CapabilitySource for AcpTunnelSource {
         };
 
         // Snapshot this channel's discovered catalog once, rather than re-locking per name.
-        let cached: HashMap<String, Vec<Tool>> = {
-            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-            cache
-                .iter()
-                .filter(|((c, _), _)| *c == ctx.channel_id)
-                .map(|((_, name), tools)| (name.clone(), tools.clone()))
-                .collect()
-        };
+        let discovered = self.discovered(&ctx.channel_id);
 
-        // Names to advertise: attached now, UNION already-discovered (§6.3 no-shrink).
-        let mut names: HashSet<String> =
-            self.tunnel.attached_server_names(&ctx.channel_id).into_iter().collect();
-        names.extend(cached.keys().cloned());
+        // Servers to consider: attached now, UNION already-discovered (§6.3 no-shrink). Sorted,
+        // because the union decides which server keeps a colliding name.
+        let mut names: BTreeSet<String> = self
+            .tunnel
+            .attached_server_names(&ctx.channel_id)
+            .into_iter()
+            .collect();
+        names.extend(discovered.keys().cloned());
 
-        let mut out: Vec<Tool> = Vec::new();
         for name in &names {
-            match cached.get(name) {
-                // Unfiltered: with the allowlist gone, every tool the server published is admitted.
-                Some(fetched) => out.extend(fetched.iter().cloned()),
-                None => {
-                    // Attached but not discovered yet — the cold-start window. Resolve through the
-                    // same route calls use (one resolution rule, §6.1); a name that appears only
-                    // because it is still cached but detached resolves to None here and simply is
-                    // not re-fetched, while its cached tools above keep it in the catalog.
-                    if let Some(server_id) = self.tunnel.resolve_by_name(&ctx.channel_id, name) {
-                        self.spawn_discovery(&ctx.channel_id, name, &server_id);
-                    }
-                }
+            // Resolve through the same route calls use (one resolution rule, §6.1); a name that
+            // appears only because it is still cached but detached resolves to None here and simply
+            // is not re-fetched, while its cached tools keep it in the catalog.
+            let Some(server_id) = self.tunnel.resolve_by_name(&ctx.channel_id, name) else {
+                continue;
+            };
+            // Fetch when there is nothing cached (the cold-start window) and when what is cached
+            // came from a DIFFERENT connection: a name-keyed entry survives a reconnect by design,
+            // so a reconnected server would otherwise serve its predecessor's catalog for the rest
+            // of the session, with no `tools/list_changed` to invalidate it (and none coming — the
+            // tunnel is gateway-initiated). The stale set keeps being served until the refetch
+            // lands, so this refreshes without shrinking the catalog (§6.3).
+            if discovered.get(name).map(|d| d.server_id.as_str()) != Some(server_id.as_str()) {
+                self.spawn_discovery(&ctx.channel_id, name, &server_id);
             }
         }
-        sorted(out)
+
+        // Unfiltered: with the allowlist gone, every tool the server published is admitted — under
+        // the advertised name `call()` will route by.
+        sorted(catalog(&discovered).into_iter().map(|entry| entry.tool))
     }
 
     async fn call(
@@ -271,15 +411,16 @@ impl CapabilitySource for AcpTunnelSource {
         // requires_session() guarantees ctx in practice; defend anyway.
         let ctx = ctx.ok_or_else(|| anyhow!("ACP tunnel capabilities require a session token"))?;
 
-        // Route by what was DISCOVERED, not by parsing the tool name (F5). A generic server may
-        // publish a bare `build` or a name whose first segment is not the server's own; both are
-        // callable because the publisher is looked up from the cache. The `<server>.` prefix is only
-        // a pre-discovery fallback (see `split_prefix`). No allowlist gate (D-29): the only refusal
-        // left is not-connected, a liveness answer.
-        let Some(server_name) = self
-            .server_publishing(&ctx.channel_id, tool)
-            .or_else(|| Self::split_prefix(tool).map(str::to_string))
-        else {
+        // Route through the advertised catalog, not by parsing the tool name (F5). A generic server
+        // may publish a bare `build` or a name whose first segment is not the server's own; both are
+        // callable because the catalog carries the publisher and the published name for every name
+        // it advertised. The `<server>.` prefix is only a pre-discovery fallback (see
+        // `split_prefix`), where the name given is also the name to forward. No allowlist gate
+        // (D-29): the only refusal left is not-connected, a liveness answer.
+        let routed = self.route(&ctx.channel_id, tool).or_else(|| {
+            Self::split_prefix(tool).map(|prefix| (prefix.to_string(), tool.to_string()))
+        });
+        let Some((server_name, published)) = routed else {
             return Ok(Self::error_result(format!(
                 "tool {tool:?} is not available: no connected server has published it, and it \
                  carries no <server>.<tool> prefix to route by before discovery"
@@ -297,7 +438,9 @@ impl CapabilitySource for AcpTunnelSource {
             )));
         };
 
-        let params = json!({ "name": tool, "arguments": args });
+        // The PUBLISHED name, which differs from the advertised one when a collision named it apart:
+        // the server only knows what it published.
+        let params = json!({ "name": published, "arguments": args });
         match self
             .tunnel
             .call(&ctx.channel_id, &server_id, "tools/call", Some(params))
@@ -339,7 +482,7 @@ impl openab_core::acp_mcp::SessionTokenRegistrar for FacadeRegistrar {
 
 #[cfg(test)]
 mod tests {
-    use super::{AcpTunnelSource, CapabilitySource, SessionCtx};
+    use super::{AcpTunnelSource, CapabilitySource, SessionCtx, Tool};
     use openab_core::acp_mcp::AcpMcpTunnel;
     use std::collections::HashSet;
     use serde_json::{json, Map, Value};
@@ -480,9 +623,21 @@ mod tests {
                             .collect()
                     }
                 };
+                // The schema carries its server's name, so a test can tell WHOSE schema was
+                // advertised for a name two servers published — the half of a collision that is
+                // invisible if you only check where the call landed.
+                let served_by = server_name.clone().unwrap_or_else(|| "-".to_string());
                 let tools: Vec<Value> = names
                     .iter()
-                    .map(|n| json!({ "name": n, "inputSchema": { "type": "object" } }))
+                    .map(|n| {
+                        json!({
+                            "name": n,
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": { "served_by": { "const": served_by.as_str() } }
+                            }
+                        })
+                    })
                     .collect();
                 return Ok(json!({ "tools": tools }));
             }
@@ -882,6 +1037,210 @@ mod tests {
         assert_eq!(
             fwd[0].1, "uuid-k",
             "the prefix's namesake wins the tiebreak; the earlier-sorting impostor 'aaa' must not shadow it"
+        );
+    }
+
+    // --- Round 5 F1: a colliding name keeps a routable identity ---
+    //
+    // Two servers may publish the same name (no allowlist, D-29; keyless loopback, D-30). Before
+    // this, both were advertised under that one name: the facade published the second under an alias
+    // built from this source's single provider string, which cannot tell two of its servers apart, so
+    // the alias and the bare name both dispatched to the same server and the second server's tool was
+    // advertised but unreachable. Which of the two schemas was shown for the shared name also
+    // depended on `HashSet` iteration order, while the call resolved to the minimum — so the schema
+    // could belong to one server and the call reach another.
+
+    /// The name the tunnel double was told to serve, from the advertised schema.
+    fn served_by(tool: &Tool) -> String {
+        tool.input_schema
+            .get("properties")
+            .and_then(|p| p.get("served_by"))
+            .and_then(|s| s.get("const"))
+            .and_then(Value::as_str)
+            .unwrap_or("<none>")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn two_servers_publishing_one_bare_name_are_both_advertised_and_callable() {
+        let tunnel = FakeTunnel::with(&[("alpha", "uuid-a"), ("beta", "uuid-b")]);
+        tunnel.set_server_tools("alpha", &["screenshot"]);
+        tunnel.set_server_tools("beta", &["screenshot"]);
+        let src = AcpTunnelSource::new(tunnel.clone());
+
+        let _ = src.tools(Some(&ctx()));
+        settle().await;
+
+        let advertised = src.tools(Some(&ctx()));
+        let names: Vec<String> = advertised.iter().map(|t| t.name.to_string()).collect();
+        assert_eq!(
+            names,
+            ["beta.screenshot", "screenshot"],
+            "the keeper holds the published name and the other is named apart, not dropped"
+        );
+        // The schema shown for the shared name must belong to the server the call will reach.
+        assert_eq!(
+            advertised.iter().map(served_by).collect::<Vec<_>>(),
+            ["beta", "alpha"],
+            "each advertised name carries its own publisher's schema"
+        );
+
+        for tool in ["screenshot", "beta.screenshot"] {
+            let (_v, is_err) = src.call(Some(&ctx()), tool, &Map::new()).await.unwrap();
+            assert!(!is_err, "{tool} must dispatch — being advertised is the promise");
+        }
+        let fwd = tunnel.forwarded.lock().unwrap();
+        let routed: Vec<(String, String)> = fwd
+            .iter()
+            .map(|(_c, id, params)| (id.clone(), params["name"].as_str().unwrap().to_string()))
+            .collect();
+        assert_eq!(
+            routed,
+            [
+                ("uuid-a".to_string(), "screenshot".to_string()),
+                ("uuid-b".to_string(), "screenshot".to_string())
+            ],
+            "the two names reach DIFFERENT tunnels, each under the name its server published"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rename_never_takes_a_name_some_server_actually_published() {
+        // `beta` publishes both `screenshot` and, literally, `beta.screenshot`. `alpha` keeps the
+        // bare name (lexicographic), so beta's `screenshot` wants to be advertised as
+        // `beta.screenshot` — which beta itself published and keeps. The rename must step aside
+        // rather than shadow a real tool.
+        let tunnel = FakeTunnel::with(&[("alpha", "uuid-a"), ("beta", "uuid-b")]);
+        tunnel.set_server_tools("alpha", &["screenshot"]);
+        tunnel.set_server_tools("beta", &["screenshot", "beta.screenshot"]);
+        let src = AcpTunnelSource::new(tunnel.clone());
+
+        let _ = src.tools(Some(&ctx()));
+        settle().await;
+
+        let names: Vec<String> = src
+            .tools(Some(&ctx()))
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            ["beta.screenshot", "beta.screenshot.2", "screenshot"],
+            "the literal `beta.screenshot` keeps its name; the renamed one gets the suffix"
+        );
+
+        for tool in ["beta.screenshot", "beta.screenshot.2"] {
+            let (_v, is_err) = src.call(Some(&ctx()), tool, &Map::new()).await.unwrap();
+            assert!(!is_err, "{tool} must dispatch");
+        }
+        let fwd = tunnel.forwarded.lock().unwrap();
+        let published: Vec<String> = fwd
+            .iter()
+            .map(|(_c, _id, params)| params["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            published,
+            ["beta.screenshot", "screenshot"],
+            "each is forwarded under the name its server published, not under the advertised one"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_namesake_keeps_the_name_and_the_impostor_is_advertised_apart() {
+        // The D-34 mitigation as a NAMING rule: `katashiro` keeps `katashiro.click` against an
+        // impostor that sorts earlier, and the impostor's copy is still reachable under its own name
+        // rather than silently shadowed.
+        let tunnel = FakeTunnel::with(&[("katashiro", "uuid-k"), ("aaa", "uuid-a")]);
+        tunnel.set_server_tools("katashiro", &["katashiro.click"]);
+        tunnel.set_server_tools("aaa", &["katashiro.click"]);
+        let src = AcpTunnelSource::new(tunnel.clone());
+
+        let _ = src.tools(Some(&ctx()));
+        settle().await;
+
+        let advertised = src.tools(Some(&ctx()));
+        let names: Vec<String> = advertised.iter().map(|t| t.name.to_string()).collect();
+        assert_eq!(names, ["aaa.katashiro.click", "katashiro.click"]);
+        assert_eq!(
+            advertised.iter().map(served_by).collect::<Vec<_>>(),
+            ["aaa", "katashiro"],
+            "the namesake's schema is the one shown for the namesake's name"
+        );
+
+        let (_v, is_err) = src
+            .call(Some(&ctx()), "katashiro.click", &Map::new())
+            .await
+            .unwrap();
+        assert!(!is_err);
+        let fwd = tunnel.forwarded.lock().unwrap();
+        assert_eq!(
+            fwd[0].1, "uuid-k",
+            "the prefix's namesake keeps the name; the earlier-sorting impostor must not take it"
+        );
+    }
+
+    // --- Round 5 F2: a reconnect refreshes the catalog it inherited ---
+
+    #[tokio::test]
+    async fn a_reconnect_with_a_new_id_refreshes_the_cached_catalog() {
+        // The cache is keyed by NAME so an entry survives a reconnect (see `ToolsCache`). Nothing
+        // compared that surviving entry against the connection now attached, so a reconnected server
+        // served its predecessor's catalog for the rest of the session — and no `tools/list_changed`
+        // is coming to invalidate it, the tunnel being gateway-initiated.
+        let tunnel = FakeTunnel::with(&[("katashiro", "uuid-old")]);
+        tunnel.set_server_tools("katashiro", &["read_dom"]);
+        let src = AcpTunnelSource::new(tunnel.clone());
+
+        let _ = src.tools(Some(&ctx()));
+        settle().await;
+        assert_eq!(src.tools(Some(&ctx())).len(), 1, "discovered the first set");
+        assert_eq!(tunnel.tools_list_calls(), 1);
+
+        // Reconnect: same declared name, fresh id, and the server now publishes one tool more.
+        tunnel.reattach_as("katashiro", "uuid-new");
+        tunnel.set_server_tools("katashiro", &["read_dom", "screenshot"]);
+
+        let during = src.tools(Some(&ctx()));
+        assert_eq!(
+            during.len(),
+            1,
+            "the inherited set is still served while the refetch is in flight (§6.3 no-shrink)"
+        );
+        settle().await;
+
+        let names: Vec<String> = src
+            .tools(Some(&ctx()))
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            ["read_dom", "screenshot"],
+            "the new connection's set replaces the one it inherited"
+        );
+        assert_eq!(
+            tunnel.tools_list_calls(),
+            2,
+            "exactly one refetch: the id change triggers it, and a matching id must not"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_settled_catalog_is_not_refetched_while_the_connection_is_unchanged() {
+        // The other half of the rule above: refreshing on a CHANGED id must not turn into
+        // refetching on every discovery round.
+        let tunnel = FakeTunnel::with(&[("katashiro", "uuid-old")]);
+        tunnel.set_server_tools("katashiro", &["read_dom"]);
+        let src = AcpTunnelSource::new(tunnel.clone());
+
+        for _ in 0..3 {
+            let _ = src.tools(Some(&ctx()));
+            settle().await;
+        }
+        assert_eq!(
+            tunnel.tools_list_calls(),
+            1,
+            "one fetch for one connection, however many rounds read the catalog"
         );
     }
 
