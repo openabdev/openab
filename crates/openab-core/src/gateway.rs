@@ -1877,48 +1877,76 @@ mod tests {
     }
 }
 
-/// Render a channel id for logs, hashing it when it is an ACP channel.
+/// Render a channel id for logs, hashing it when it is an ACP channel or session id.
 ///
 /// An ACP `channel_id` is `acp_<uuid>` and the session id is `sess_<same uuid>`, so the two are
-/// mutually derivable: the channel id printed here IS a resume credential. Anyone reading operator
+/// mutually derivable: either form printed in full IS a resume credential. Anyone reading operator
 /// logs could resume the session, and logs travel further than the sessions they describe.
+///
+/// **The uuid is hashed, not the prefixed string.** One session reaches this function as
+/// `acp_<uuid>` and elsewhere as `sess_<uuid>`; hashing the whole string gives those two forms a
+/// different tag each, and a third different again from [`crate::redact::redact_session_ids`] and
+/// the gateway's `redact_id`, which strip the prefix first. Several tags for one session defeat the
+/// only purpose the tag has — following that session across logs — more completely than not
+/// redacting would, and it has already read as zero overlap between two logs describing the same
+/// session.
 ///
 /// Only ACP ids are hashed. A Discord or Slack channel id is a public identifier that operators
 /// legitimately grep for, and redacting it would cost real debuggability to protect nothing.
 ///
-/// Hashed rather than dropped so the same session still tags identically on every line — that
-/// correlation is the whole reason the id is in the log. **The tag must match the one produced in
-/// the other crates that log channel ids**, or a session cannot be followed across them; each copy
-/// is pinned to the same vector by its own test. The copies exist because these crates deliberately
-/// do not depend on one another, and adding an edge to share five lines would trade a documented
-/// architectural boundary for a duplicate.
+/// Copies of this function live in `openab-gateway` and `openab-mcp` because those crates
+/// deliberately do not depend on this one. Each is pinned to the same vector; where a crate has a
+/// redactor of its own, its test compares against that rather than against a copied literal.
 fn redact_channel(id: &str) -> String {
-    if !id.starts_with("acp_") {
+    let Some(uuid) = id
+        .strip_prefix("acp_")
+        .or_else(|| id.strip_prefix("sess_"))
+        .filter(|uuid| !uuid.is_empty())
+    else {
         return id.to_string();
-    }
+    };
     use sha2::{Digest as _, Sha256};
-    let digest = Sha256::digest(id.as_bytes());
+    let digest = Sha256::digest(uuid.as_bytes());
     let short: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
     format!("#{short}")
 }
 
 #[cfg(test)]
 mod redact_channel_tests {
-    /// The tag for a given session must be IDENTICAL in every crate that logs a channel id.
+    const CHANNEL: &str = "acp_00000000-0000-0000-0000-000000000000";
+    const SESSION: &str = "sess_00000000-0000-0000-0000-000000000000";
+
+    /// The tag for a given session must be IDENTICAL in every crate that logs a channel id, and
+    /// identical across the two forms one session is addressed by.
     ///
-    /// This exact vector and expectation are repeated in `openab-gateway`, `openab-core` and
-    /// `openab-mcp`. The three copies of `redact_channel` exist because those crates deliberately
-    /// do not depend on one another; pinning the same vector in each is what makes a divergence
-    /// fail a build instead of quietly splitting one session into three untraceable tags.
+    /// `#12b9377c` is the uuid's tag, shared with `redact_session_ids` and the gateway's
+    /// `redact_id`. It used to be `#850414fa` here, the hash of the whole `acp_<uuid>` string, which
+    /// is why one session could appear under two tags depending on which log you were reading.
     ///
-    /// If this assertion is ever changed, change it in all three or the redaction stops doing the
-    /// one job that justifies keeping an identifier in the log at all.
+    /// The literal is pinned in all three crates, but this crate has its own redactor, so the
+    /// assertion that matters is the comparison against it: a divergence then fails without anyone
+    /// having to remember to update three copied literals.
     #[test]
-    fn an_acp_channel_hashes_to_the_shared_vector_and_others_pass_through() {
+    fn an_acp_id_hashes_its_uuid_to_the_shared_vector_and_others_pass_through() {
         assert_eq!(
-            super::redact_channel("acp_00000000-0000-0000-0000-000000000000"),
-            "#850414fa",
+            super::redact_channel(CHANNEL),
+            "#12b9377c",
             "ACP channel ids must hash to the tag the other crates produce for the same session"
+        );
+        assert_eq!(
+            super::redact_channel(SESSION),
+            "#12b9377c",
+            "both forms of one session must share a tag — hashing the prefix is what split them"
+        );
+        assert_eq!(
+            super::redact_channel(CHANNEL),
+            crate::redact::redact_session_ids(CHANNEL),
+            "this crate's two redactors must agree without relying on a copied literal"
+        );
+        assert_eq!(
+            super::redact_channel(SESSION),
+            crate::redact::redact_session_ids(SESSION),
+            "including on the session form, which used to pass through here unredacted"
         );
         assert_eq!(
             super::redact_channel("1234567890"),

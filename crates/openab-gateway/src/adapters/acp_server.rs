@@ -2171,7 +2171,7 @@ async fn handle_session_cancel(
 /// Dropping the lines to `debug!` would hide them from the operators who need them ("did the
 /// extension attach?"), so the id is hashed instead: the same session tags identically on every
 /// line, which is what makes a log readable, but the tag cannot be turned back into the id.
-fn redact_id(id: &str) -> String {
+pub(crate) fn redact_id(id: &str) -> String {
     // Hash the UUID, not the prefixed string. One session is addressed as `sess_<uuid>` and as
     // `acp_<uuid>`; hashing the whole string gives those two a different tag each, and a third
     // different from `openab-core`, which strips the prefix. That is three tags for one session —

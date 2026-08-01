@@ -891,37 +891,50 @@ mod tests {
 ///
 /// Only ACP ids are hashed; a Discord or Slack channel id is public and operators grep for it.
 ///
-/// **The tag must match the one produced in `openab-gateway` and `openab-core`**, or one session
-/// cannot be followed across the reply log, the event log and this audit log — which is the only
-/// reason to keep an identifier here at all. Each copy is pinned to the same vector by its own
-/// test. The copies exist because these crates deliberately do not depend on one another.
+/// **The uuid is hashed, not the prefixed string.** One session is addressed as `acp_<uuid>` here
+/// and as `sess_<uuid>` in the gateway; hashing the whole string gives those two forms a different
+/// tag each, and a third different again from `openab-gateway`'s `redact_id` and `openab-core`'s
+/// `redact_session_ids`, which strip the prefix first. Several tags for one session defeat the only
+/// reason to keep an identifier here at all — following that session from the audit log into the
+/// tunnel log.
+///
+/// Copies of this function live in `openab-gateway` and `openab-core` because these crates
+/// deliberately do not depend on one another. This crate has no second redactor to compare against,
+/// so the shared vector is asserted as a literal; the other two compare against their own.
 fn redact_channel(id: &str) -> String {
-    if !id.starts_with("acp_") {
+    let Some(uuid) = id
+        .strip_prefix("acp_")
+        .or_else(|| id.strip_prefix("sess_"))
+        .filter(|uuid| !uuid.is_empty())
+    else {
         return id.to_string();
-    }
+    };
     use sha2::{Digest as _, Sha256};
-    let digest = Sha256::digest(id.as_bytes());
+    let digest = Sha256::digest(uuid.as_bytes());
     let short: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
     format!("#{short}")
 }
 
 #[cfg(test)]
 mod redact_channel_tests {
-    /// The tag for a given session must be IDENTICAL in every crate that logs a channel id.
+    /// The tag for a given session must be IDENTICAL in every crate that logs a channel id, and
+    /// identical across the two forms one session is addressed by.
     ///
-    /// This exact vector and expectation are repeated in `openab-gateway`, `openab-core` and
-    /// `openab-mcp`. The three copies of `redact_channel` exist because those crates deliberately
-    /// do not depend on one another; pinning the same vector in each is what makes a divergence
-    /// fail a build instead of quietly splitting one session into three untraceable tags.
-    ///
-    /// If this assertion is ever changed, change it in all three or the redaction stops doing the
-    /// one job that justifies keeping an identifier in the log at all.
+    /// `#12b9377c` is the uuid's tag, shared with `openab-gateway`'s `redact_id` and
+    /// `openab-core`'s `redact_session_ids`. It used to be `#850414fa` here, the hash of the whole
+    /// `acp_<uuid>` string, which is why the facade audit log and the tunnel log could describe one
+    /// session under two different tags — and did, reading as zero overlap between them.
     #[test]
-    fn an_acp_channel_hashes_to_the_shared_vector_and_others_pass_through() {
+    fn an_acp_id_hashes_its_uuid_to_the_shared_vector_and_others_pass_through() {
         assert_eq!(
             super::redact_channel("acp_00000000-0000-0000-0000-000000000000"),
-            "#850414fa",
+            "#12b9377c",
             "ACP channel ids must hash to the tag the other crates produce for the same session"
+        );
+        assert_eq!(
+            super::redact_channel("sess_00000000-0000-0000-0000-000000000000"),
+            "#12b9377c",
+            "both forms of one session must share a tag — hashing the prefix is what split them"
         );
         assert_eq!(
             super::redact_channel("1234567890"),
