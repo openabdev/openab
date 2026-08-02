@@ -1,6 +1,7 @@
 #[cfg(feature = "agentcore")]
 pub mod agentcore;
 pub mod connection;
+pub mod kiro_auth;
 pub mod pool;
 pub mod protocol;
 

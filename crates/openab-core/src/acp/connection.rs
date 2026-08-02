@@ -92,6 +92,38 @@ pub enum ContentBlock {
     Image { media_type: String, data: String },
 }
 
+/// Merge consecutive Text blocks into a single Text block (joined with `\n\n`).
+/// Non-text blocks act as boundaries — text before and after an image remain separate.
+/// This is required because kiro v3 forwards the prompt array directly to Bedrock,
+/// which rejects multiple text content blocks in a single message.
+fn merge_text_blocks(blocks: &[ContentBlock]) -> Vec<ContentBlock> {
+    let mut merged: Vec<ContentBlock> = Vec::with_capacity(blocks.len());
+    let mut text_buf = String::new();
+
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text } => {
+                if !text_buf.is_empty() {
+                    text_buf.push_str("\n\n");
+                }
+                text_buf.push_str(text);
+            }
+            other => {
+                if !text_buf.is_empty() {
+                    merged.push(ContentBlock::Text {
+                        text: std::mem::take(&mut text_buf),
+                    });
+                }
+                merged.push(other.clone());
+            }
+        }
+    }
+    if !text_buf.is_empty() {
+        merged.push(ContentBlock::Text { text: text_buf });
+    }
+    merged
+}
+
 impl ContentBlock {
     pub fn to_json(&self) -> Value {
         match self {
@@ -258,6 +290,46 @@ pub(crate) async fn run_reader_loop<R, W>(
         debug!(line = line.trim(), "acp_recv");
 
         // Auto-reply session/request_permission
+
+        // Auto-reply _kiro/auth/getAccessToken (v3 engine auth callback)
+        if msg.method.as_deref() == Some("_kiro/auth/getAccessToken") {
+            if let Some(id) = msg.id {
+                let result =
+                    match tokio::task::spawn_blocking(crate::acp::kiro_auth::build_auth_response)
+                        .await
+                    {
+                        Ok(Some(v)) => {
+                            info!("_kiro/auth/getAccessToken: providing token");
+                            v
+                        }
+                        Ok(None) => {
+                            tracing::warn!("_kiro/auth/getAccessToken: no token available");
+                            serde_json::json!({})
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "_kiro/auth/getAccessToken: failed to build response: {e}"
+                            );
+                            serde_json::json!({})
+                        }
+                    };
+                let reply = JsonRpcResponse::new(id, result);
+                if let Ok(data) = serde_json::to_string(&reply) {
+                    let mut w = writer.lock().await;
+                    let _ = w.write_all(format!("{data}\n").as_bytes()).await;
+                    let _ = w.flush().await;
+                }
+            }
+            continue;
+        }
+
+        // Detect auth errors in prompt responses and kill connection to force re-auth
+        if let Some(ref err) = msg.error {
+            if err.message.contains("Access denied") || err.message.contains("bearer token") {
+                tracing::warn!("auth error detected — connection will be dropped for re-auth");
+                break;
+            }
+        }
         if msg.method.as_deref() == Some("session/request_permission") {
             if let Some(id) = msg.id {
                 let title = msg
@@ -575,6 +647,19 @@ impl AcpConnection {
             load_session = self.supports_load_session,
             "initialized"
         );
+
+        // ACP protocol: notify agent that initialization is complete.
+        // Required by kiro-cli v3 engine before it accepts session requests.
+        let notif = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        });
+        self.send_raw(&serde_json::to_string(&notif)?).await?;
+        tracing::debug!("notifications/initialized sent");
+
+        // Small delay to allow v3 agent to process the notification
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
         Ok(())
     }
 
@@ -725,8 +810,11 @@ impl AcpConnection {
 
         let id = self.next_id();
 
-        // Convert content blocks to JSON
-        let prompt_json: Vec<Value> = content_blocks.iter().map(|b| b.to_json()).collect();
+        // Convert content blocks to JSON.
+        // Merge consecutive text blocks into one to satisfy v3 engine's stricter
+        // Bedrock validation (rejects multiple text blocks in prompt array).
+        let merged = merge_text_blocks(&content_blocks);
+        let prompt_json: Vec<Value> = merged.iter().map(|b| b.to_json()).collect();
 
         let req = JsonRpcRequest::new(
             id,
