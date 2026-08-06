@@ -369,6 +369,14 @@ impl ChatAdapter for UnifiedGatewayAdapter {
             "telegram" => StreamingStrategy::Disabled,
             #[cfg(feature = "feishu")]
             "feishu" => {
+                // Honor the streaming enablement decision before selecting a
+                // strategy. When streaming is explicitly disabled (e.g.
+                // TELEGRAM_STREAMING=false), Feishu must also be Disabled -
+                // otherwise Draft would set streaming=true, run a useless edit
+                // loop, and force keep_full_text=true (narration replay).
+                if !self.use_streaming(false) {
+                    return StreamingStrategy::Disabled;
+                }
                 match self
                     .gw_state
                     .feishu
@@ -444,6 +452,7 @@ mod tests {
     fn feishu_uses_real_editable_placeholder() {
         let (event_tx, _) = tokio::sync::broadcast::channel(16);
         let mut state = AppState::test_default(event_tx);
+        state.telegram_rich_messages = true;
         let mut pairs = std::collections::HashMap::new();
         pairs.insert("FEISHU_APP_ID".into(), "app".into());
         pairs.insert("FEISHU_APP_SECRET".into(), "secret".into());
@@ -466,6 +475,7 @@ mod tests {
     fn feishu_post_mode_keeps_draft_strategy() {
         let (event_tx, _) = tokio::sync::broadcast::channel(16);
         let mut state = AppState::test_default(event_tx);
+        state.telegram_rich_messages = true;
         let mut pairs = std::collections::HashMap::new();
         pairs.insert("FEISHU_APP_ID".into(), "app".into());
         pairs.insert("FEISHU_APP_SECRET".into(), "secret".into());
@@ -481,6 +491,26 @@ mod tests {
         );
         assert_eq!(
             adapter.streaming_strategy(&channel("feishu"), true),
+            StreamingStrategy::Disabled,
+        );
+    }
+
+    #[cfg(feature = "feishu")]
+    #[test]
+    fn feishu_disabled_when_streaming_off() {
+        let (event_tx, _) = tokio::sync::broadcast::channel(16);
+        let mut state = AppState::test_default(event_tx);
+        // telegram_rich_messages defaults to false -> use_streaming == false.
+        let mut pairs = std::collections::HashMap::new();
+        pairs.insert("FEISHU_APP_ID".into(), "app".into());
+        pairs.insert("FEISHU_APP_SECRET".into(), "secret".into());
+        pairs.insert("FEISHU_CARD_STREAMING_MODE".into(), "card".into());
+        state.apply_feishu_config(openab_gateway::GatewayFeishuConfig { pairs });
+        let adapter = UnifiedGatewayAdapter::new(Arc::new(state));
+
+        // Even in card mode, streaming must be Disabled when use_streaming is false.
+        assert_eq!(
+            adapter.streaming_strategy(&channel("feishu"), false),
             StreamingStrategy::Disabled,
         );
     }

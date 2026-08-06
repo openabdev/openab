@@ -832,9 +832,24 @@ impl AdapterRouter {
                         };
                         let msg = match streaming_strategy {
                             StreamingStrategy::EditablePlaceholder => {
-                                adapter
+                                match adapter
                                     .send_streaming_placeholder(&thread_channel, &initial)
-                                    .await?
+                                    .await
+                                {
+                                    Ok(msg) => msg,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = ?e,
+                                            platform = %thread_channel.platform,
+                                            "streaming placeholder creation failed; \
+                                             falling back to draft sentinel",
+                                        );
+                                        MessageRef {
+                                            message_id: "draft".to_string(),
+                                            channel: thread_channel.clone(),
+                                        }
+                                    }
+                                }
                             }
                             StreamingStrategy::Draft => MessageRef {
                                 message_id: "draft".to_string(),
