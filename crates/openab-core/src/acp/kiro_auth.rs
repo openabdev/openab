@@ -5,11 +5,24 @@
 //! a fresh token from AWS SSO OIDC and persists it back.
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, error, info};
 
 const DB_RELATIVE_PATH: &str = ".local/share/kiro-cli/data.sqlite3";
 const TOKEN_KEY: &str = "kirocli:odic:token";
 const REGISTRATION_KEY: &str = "kirocli:odic:device-registration";
+/// Cooldown after a failed refresh to avoid hammering AWS SSO OIDC and
+/// spawning `kiro-cli whoami` in a tight loop when the token is genuinely
+/// dead. Reset to 0 on a successful refresh.
+static LAST_REFRESH_FAIL_MS: AtomicU64 = AtomicU64::new(0);
+const REFRESH_FAIL_COOLDOWN_MS: u64 = 30_000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct TokenData {
@@ -217,6 +230,16 @@ pub fn get_access_token() -> Option<KiroAuthResult> {
     let mut token_data = read_token_data(&conn)?;
 
     if is_expired(&token_data.expires_at) {
+        // If a recent refresh attempt failed, skip the expensive OIDC HTTP
+        // call and `kiro-cli whoami` subprocess for the cooldown window so a
+        // dead token can't drive a retry storm.
+        let now = now_ms();
+        if now.saturating_sub(LAST_REFRESH_FAIL_MS.load(Ordering::Relaxed))
+            < REFRESH_FAIL_COOLDOWN_MS
+        {
+            debug!("kiro token expired but refresh in cooldown — skipping");
+            return None;
+        }
         info!("kiro token expired, refreshing...");
         let reg = read_registration(&conn);
 
@@ -226,6 +249,7 @@ pub fn get_access_token() -> Option<KiroAuthResult> {
             Some(new_data) => {
                 token_data = new_data;
                 save_token_data(&conn, &token_data);
+                LAST_REFRESH_FAIL_MS.store(0, Ordering::Relaxed);
                 info!("kiro token refreshed via OIDC");
             }
             None => {
@@ -253,9 +277,11 @@ pub fn get_access_token() -> Option<KiroAuthResult> {
                 .ok()?;
                 token_data = read_token_data(&conn2)?;
                 if is_expired(&token_data.expires_at) {
+                    LAST_REFRESH_FAIL_MS.store(now, Ordering::Relaxed);
                     error!("kiro-cli whoami fallback also failed");
                     return None;
                 }
+                LAST_REFRESH_FAIL_MS.store(0, Ordering::Relaxed);
                 info!("kiro token refreshed via kiro-cli fallback");
                 return Some(KiroAuthResult {
                     access_token: token_data.access_token,
