@@ -2837,10 +2837,19 @@ async fn handle_card_edit(
     };
 
     match existing {
-        // Idle reaper already closed the stream; content is complete. Further
-        // cosmetic edits are no-ops that still "succeed" (core keeps om_post).
+        // Idle reaper already closed the stream. Report failure so core's
+        // delete-and-resend fallback can trigger (requires a working
+        // `delete_message` override on the adapter). Without this, the reply
+        // after the idle-finalize would be silently dropped - core sees Ok and
+        // never falls back to send-once. See issue #1464 / #1159.
         Existing::Finalized => {
-            emit_response(event_tx, &reply.request_id, true, Some(om_post), None);
+            emit_response(
+                event_tx,
+                &reply.request_id,
+                false,
+                None,
+                Some("session_finalized".into()),
+            );
         }
         Existing::Active { card_id, seq } => {
             let token = match adapter.token_cache.get_token(&adapter.client).await {
@@ -4923,6 +4932,33 @@ mod tests {
         let resp: crate::schema::GatewayResponse =
             serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert!(!resp.success, "failure must surface so core finalize takes over");
+    }
+
+    /// A finalized session (idle reaper closed it mid-turn) must report failure
+    /// so core's delete-and-resend fallback can trigger. Without this, the reply
+    /// after the idle-finalize would be silently dropped. See issue #1464.
+    #[tokio::test]
+    async fn s5_edit_finalized_session_reports_failure() {
+        let mut config = test_config();
+        config.streaming_mode = StreamingMode::Card;
+        let adapter = FeishuAdapter::new(config);
+        // Promote then mark finalized (simulates idle reaper mid-turn).
+        adapter
+            .stream_sessions
+            .lock()
+            .promote("om_ph5", "card_f".into(), "om_cardmsg_f".into(), "seed".into());
+        {
+            let mut reg = adapter.stream_sessions.lock();
+            reg.get_mut("om_ph5").unwrap().mark_finalized();
+        }
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+
+        handle_reply(&edit_reply("om_ph5", "text after idle", None, Some("r5")), &adapter, &tx).await;
+
+        let resp: crate::schema::GatewayResponse =
+            serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert!(!resp.success, "finalized session must report failure so core falls back");
+        assert_eq!(resp.error.as_deref(), Some("session_finalized"));
     }
 
     /// Card mode: the FIRST reply (command=None) goes straight to a card with no

@@ -304,6 +304,25 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         Ok(())
     }
 
+    /// Override default `delete_message` (which falls back to edit-to-zero-width)
+    /// so platforms with native delete APIs (e.g. Feishu `DELETE /im/v1/messages/{id}`)
+    /// can perform real deletions. Critical for the streaming-edit-cap recovery
+    /// path: when Feishu's 20-edits-per-message cap is hit and we send full
+    /// content as a fresh message, we need to remove the half-edited placeholder
+    /// to avoid duplicated content. The default zero-width-edit fallback would
+    /// itself fail on a cap-reached message, leaving the placeholder visible.
+    ///
+    /// Fire-and-forget: Feishu's delete branch (`feishu.rs`) handles the command
+    /// and does not require a response. We do not wait on a response here: the
+    /// recovery path sends fresh content regardless of whether the delete landed,
+    /// so a response would only buy an extra log line at the cost of a per-finalize wait.
+    async fn delete_message(&self, msg: &MessageRef) -> Result<()> {
+        let mut reply = self.build_reply(&msg.channel, "", Some("delete_message"), None);
+        reply.reply_to = msg.message_id.clone();
+        self.dispatch_reply(&reply).await;
+        Ok(())
+    }
+
     async fn send_message_with_reply(
         &self,
         channel: &ChannelRef,
@@ -356,13 +375,18 @@ impl ChatAdapter for UnifiedGatewayAdapter {
                     .as_ref()
                     .map(|feishu| feishu.config.streaming_mode)
                 {
-                    // Card mode is an explicit operator opt-in. Keep the
-                    // existing unified send-once behavior for post/auto so the
-                    // bug fix does not change backward-compatible defaults.
+                    // Card mode is an explicit operator opt-in for CardKit
+                    // typewriter streaming via a real om_ placeholder.
                     Some(openab_gateway::adapters::feishu::StreamingMode::Card) => {
                         StreamingStrategy::EditablePlaceholder
                     }
-                    _ => StreamingStrategy::Disabled,
+                    // post/auto: keep Draft to preserve v0.9.0 behavior. The
+                    // edit loop's edits are rejected by is_valid_feishu_message_id
+                    // (synthetic "draft" sentinel), so streaming is effectively a
+                    // no-op and the turn is delivered send-once at turn end - but
+                    // `keep_full_text` stays true (streaming || narration_display),
+                    // so the send-once includes inter-tool narration as before.
+                    _ => StreamingStrategy::Draft,
                 }
             }
             _ if !self.use_streaming(false) => StreamingStrategy::Disabled,
@@ -430,6 +454,30 @@ mod tests {
         assert_eq!(
             adapter.streaming_strategy(&channel("feishu"), false),
             StreamingStrategy::EditablePlaceholder,
+        );
+        assert_eq!(
+            adapter.streaming_strategy(&channel("feishu"), true),
+            StreamingStrategy::Disabled,
+        );
+    }
+
+    #[cfg(feature = "feishu")]
+    #[test]
+    fn feishu_post_mode_keeps_draft_strategy() {
+        let (event_tx, _) = tokio::sync::broadcast::channel(16);
+        let mut state = AppState::test_default(event_tx);
+        let mut pairs = std::collections::HashMap::new();
+        pairs.insert("FEISHU_APP_ID".into(), "app".into());
+        pairs.insert("FEISHU_APP_SECRET".into(), "secret".into());
+        // No FEISHU_CARD_STREAMING_MODE -> defaults to Post.
+        state.apply_feishu_config(openab_gateway::GatewayFeishuConfig { pairs });
+        let adapter = UnifiedGatewayAdapter::new(Arc::new(state));
+
+        // post/auto keeps Draft to preserve v0.9.0 behavior: keep_full_text
+        // stays true so send-once includes inter-tool narration.
+        assert_eq!(
+            adapter.streaming_strategy(&channel("feishu"), false),
+            StreamingStrategy::Draft,
         );
         assert_eq!(
             adapter.streaming_strategy(&channel("feishu"), true),
