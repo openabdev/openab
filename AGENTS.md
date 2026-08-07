@@ -150,6 +150,7 @@ cargo check --target x86_64-pc-windows-gnu
 ## ADRs
 
 Read `docs/adr/` before implementing features in these areas:
+- Agent control plane / inter-agent delegation → `docs/adr/agent-control-plane.md`
 - Cron scheduler → `docs/adr/basic-cronjob.md`
 - Custom Gateway → `docs/adr/custom-gateway.md`
 - LINE adapter → `docs/adr/line-adapter.md`
