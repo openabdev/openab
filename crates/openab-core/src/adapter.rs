@@ -913,7 +913,7 @@ impl AdapterRouter {
                             }
                         };
                         if let Some(notification_id) = notification.id {
-                            if notification_id != request_id {
+                            if notification_id.as_u64() != Some(request_id) {
                                 // Stale response from a previously-abandoned prompt.
                                 // No automated test seam: this path only triggers when a
                                 // real subprocess emits a late response after the broker

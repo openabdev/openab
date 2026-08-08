@@ -1,6 +1,6 @@
 use crate::acp::protocol::{
-    parse_config_options, parse_usage_report, ConfigOption, JsonRpcMessage, JsonRpcRequest,
-    JsonRpcResponse, UsageReport,
+    parse_config_options, parse_usage_report, ConfigOption, JsonRpcId, JsonRpcMessage,
+    JsonRpcRequest, JsonRpcResponse, UsageReport,
 };
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -259,7 +259,7 @@ pub(crate) async fn run_reader_loop<R, W>(
 
         // Auto-reply session/request_permission
         if msg.method.as_deref() == Some("session/request_permission") {
-            if let Some(id) = msg.id {
+            if let Some(id) = msg.id.clone() {
                 let title = msg
                     .params
                     .as_ref()
@@ -281,7 +281,7 @@ pub(crate) async fn run_reader_loop<R, W>(
         }
 
         // Response (has id) → resolve pending AND forward to subscriber
-        if let Some(id) = msg.id {
+        if let Some(id) = msg.id.as_ref().and_then(JsonRpcId::as_u64) {
             let mut map = pending.lock().await;
             if let Some(tx) = map.remove(&id) {
                 // Forward to subscriber so they see the completion
@@ -289,7 +289,7 @@ pub(crate) async fn run_reader_loop<R, W>(
                 if let Some(ntx) = sub.as_ref() {
                     // Clone the essential fields for the subscriber
                     let _ = ntx.send(JsonRpcMessage {
-                        id: Some(id),
+                        id: Some(JsonRpcId::Number(id)),
                         method: None,
                         result: msg.result.clone(),
                         error: msg.error.clone(),
@@ -992,7 +992,7 @@ mod reader_loop_tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use tokio::io::{duplex, AsyncWriteExt};
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{mpsc, oneshot, Mutex};
 
     /// #732 stale-id path: when a response arrives for an id the broker has
@@ -1029,7 +1029,7 @@ mod reader_loop_tests {
             .await
             .expect("subscriber should receive stale message before timeout")
             .expect("subscriber channel should not be closed");
-        assert_eq!(forwarded.id, Some(42));
+        assert_eq!(forwarded.id, Some(JsonRpcId::Number(42)));
         assert!(pending.lock().await.is_empty());
 
         drop(agent_stdout_writer);
@@ -1072,13 +1072,54 @@ mod reader_loop_tests {
             .await
             .expect("oneshot should resolve")
             .expect("oneshot should not be cancelled");
-        assert_eq!(resolved.id, Some(7));
+        assert_eq!(resolved.id, Some(JsonRpcId::Number(7)));
 
         let forwarded = tokio::time::timeout(std::time::Duration::from_secs(2), sub_rx.recv())
             .await
             .expect("subscriber should receive forwarded copy")
             .expect("subscriber channel should not be closed");
-        assert_eq!(forwarded.id, Some(7));
+        assert_eq!(forwarded.id, Some(JsonRpcId::Number(7)));
+        assert!(pending.lock().await.is_empty());
+
+        drop(agent_stdout_writer);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn string_id_permission_request_is_auto_approved() {
+        let (mut agent_stdout_writer, agent_stdout_reader) = duplex(8 * 1024);
+        let (agent_stdin_writer, mut agent_stdin_reader) = duplex(8 * 1024);
+
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(None));
+
+        let writer = Arc::new(Mutex::new(agent_stdin_writer));
+        let handle = tokio::spawn(run_reader_loop(
+            agent_stdout_reader,
+            writer,
+            pending.clone(),
+            notify_tx.clone(),
+        ));
+
+        let permission = br#"{"jsonrpc":"2.0","id":"permission-uuid","method":"session/request_permission","params":{"toolCall":{"title":"Ran command"},"options":[{"optionId":"allow_once","kind":"allow_once"},{"optionId":"reject_once","kind":"reject_once"}]}}"#;
+        agent_stdout_writer.write_all(permission).await.unwrap();
+        agent_stdout_writer.write_all(b"\n").await.unwrap();
+        agent_stdout_writer.flush().await.unwrap();
+
+        let mut reply = vec![0; 1024];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            agent_stdin_reader.read(&mut reply),
+        )
+        .await
+        .expect("reader loop should auto-reply before timeout")
+        .expect("agent stdin should be readable");
+        let reply = std::str::from_utf8(&reply[..n]).unwrap();
+
+        assert!(reply.contains(r#""id":"permission-uuid""#));
+        assert!(reply.contains(r#""optionId":"allow_once""#));
         assert!(pending.lock().await.is_empty());
 
         drop(agent_stdout_writer);
