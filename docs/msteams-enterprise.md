@@ -122,6 +122,11 @@ Create a directory with three files:
 
 - `id` — Teams app ID (generate a fresh UUID v4, not the same as `botId`)
 - `botId` — Azure Entra ID Application (client) ID from Step 1
+- Keep this base profile at `supportsFiles: false`. Inline pasted images still
+  work when attachment ingress is enabled. To accept Personal-chat paperclip
+  files, create a separate reviewed manifest package with `supportsFiles: true`;
+  Microsoft file consent is Personal-only and does not enable group-chat or
+  channel files without Graph.
 
 ### Icons
 
@@ -238,6 +243,7 @@ agents:
       # reactions_enabled = true # public-preview live-tenant test only
       # processing_indicator = "message" # default off; no Graph/RSC
       # streaming = true # default off; progressive bot-owned content edits
+      # inbound_attachments = true # default off; post-trust image/text materialization
 
       [agent]
       command = "kiro-cli"
@@ -403,6 +409,8 @@ stringData:
   TEAMS_APP_SECRET: "<YOUR_CLIENT_SECRET>"
   TEAMS_OAUTH_ENDPOINT: "https://login.microsoftonline.com/<YOUR_TENANT_ID>/oauth2/v2.0/token"
   TEAMS_ALLOWED_TENANTS: "<YOUR_TENANT_ID>"
+  # Optional, default off. Core must enable the same switch below.
+  TEAMS_INBOUND_ATTACHMENTS: "true"
 ```
 
 > **⚠️ Single Tenant bots must set `TEAMS_OAUTH_ENDPOINT`** to the tenant-specific endpoint. The default (`botframework.com`) only works for Multi Tenant bots and will cause `401 Unauthorized` errors. This is the #1 setup pitfall.
@@ -521,6 +529,7 @@ agents:
       allow_group_chats = false
       processing_indicator = "off" # set "message" after Gateway capability validation
       streaming = false # enable only after Gateway capability validation
+      inbound_attachments = true # must match the Standalone Gateway env switch
       allowed_users = ["29:1abc..."]
 
       [agent]
@@ -537,6 +546,8 @@ agents:
 The chart mounts `configToml` verbatim. The sample uses first-class `[teams]` typed L2 policy plus an explicit L3 `allowed_users` list for least privilege; find each user's `29:…` sender ID in OAB logs. To admit every user that passed the Gateway's tenant and Core scope checks, use the explicit `[teams].allow_all_users = true` opt-in instead.
 
 For a rolling deployment with an older Gateway, absent additive scope falls back to the legacy `[gateway].allowed_channels` conversation-ID policy. Do not put Team IDs into that legacy field: they are not Bot Connector conversation IDs. Upgrade the Gateway before relying exclusively on Team/channel typed allowlists.
+
+Attachment ingress must be explicitly enabled on both processes. Core downloads nothing unless a valid Gateway hello advertises `supports_attachment_materialization`; Gateway stores only bounded metadata until Core has admitted structural, typed L2, and L3 trust. Do not pass Microsoft download URLs or bot credentials through Core configuration.
 
 Install the chart version validated with Gateway 0.5.4:
 
@@ -635,6 +646,7 @@ set transport variables on the Gateway through `openab-gateway-teams`. Typed sco
 | `TEAMS_REACTIONS_ENABLED` | No | `false` | Opt in to public-preview Bot Connector add/remove reactions; no Graph/RSC grant required |
 | `TEAMS_PROCESSING_INDICATOR` | No | `off` | Core processing UX: `off` or `message`; malformed values fail closed to `off` |
 | `TEAMS_STREAMING` | No | `false` | Core progressive-content opt-in; accepts only `true`/`false` or `1`/`0`, malformed values fail closed |
+| `TEAMS_INBOUND_ATTACHMENTS` | No | `false` | Core/Gateway metadata-first image/text opt-in; set identically on both Standalone processes. Only `true`/`false` or `1`/`0`; malformed values fail closed. |
 | `TEAMS_ALLOWED_TEAMS` | No | (empty) | Core typed L2 Team-ID allowlist, comma-separated; Team OR channel match |
 | `TEAMS_ALLOWED_CHANNELS` | No | (empty) | Core typed L2 channel-ID allowlist, comma-separated; both lists empty means all Team channels |
 | `TEAMS_ALLOW_PERSONAL` | No | `true` | Core typed L2 Personal-chat switch |
@@ -754,9 +766,14 @@ kubectl run openab-metadata-check --rm -i --restart=Never \
   the minimum outbound destinations. The M0 public-cloud profile permits the
   `login.microsoftonline.com` token endpoint, `login.botframework.com` metadata
   and JWKS, and validated HTTPS Bot Connector service URLs on
-  `smba.trafficmanager.net`. Sovereign-cloud and custom proxy hosts are rejected.
-  The OAB/ACP pod also needs the authentication/API endpoints for the selected
-  agent backend and any model or tool services it uses. In Unified Mode these
+  `smba.trafficmanager.net`. Attachment-enabled Gateway pods additionally need
+  HTTPS egress to the compiled commercial Microsoft file-host profile:
+  `api.asm.skype.com`, `files.teams.microsoft.com`, and the corresponding root
+  or subdomains under `sharepoint.com`, `sharepointonline.com`, `1drv.com`,
+  `onedrive.com`, and `blob.core.windows.net`. Sovereign-cloud and custom proxy
+  hosts are rejected. The OAB/ACP pod does not fetch Microsoft attachments; it
+  still needs the authentication/API endpoints for the selected agent backend
+  and any model or tool services it uses. In Unified Mode these
   rules apply to the OAB pod. In Standalone Gateway Mode, give the Gateway the
   Microsoft egress, allow OAB to reach `openab-gateway:8080`, and give only OAB
   the agent/model/tool egress.

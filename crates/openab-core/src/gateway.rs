@@ -1,19 +1,24 @@
 use crate::acp::ContentBlock;
 use crate::adapter::{
-    AdapterCapabilities, AdapterRouter, ChannelRef, ChatAdapter, MessageLimit, MessageRef,
-    SenderContext, StatusBackend, StreamingMode, WriteFailure, WriteOutcome, WriteOutcomeKind,
+    AdapterCapabilities, AdapterRouter, ChannelRef, ChatAdapter, MaterializedAttachment,
+    MessageLimit, MessageRef, SenderContext, StatusBackend, StreamingMode, WriteFailure,
+    WriteOutcome, WriteOutcomeKind,
 };
 use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
 const LEGACY_GATEWAY_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const ATTACHMENT_MATERIALIZATION_RESPONSE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(45);
+const GATEWAY_WS_MESSAGE_LIMIT: usize = 8 * 1024 * 1024;
 
 fn write_failure(outcome: WriteOutcome) -> anyhow::Error {
     WriteFailure::new(outcome).into()
@@ -61,6 +66,7 @@ fn legacy_gateway_capabilities(
         delete_ack: false,
         supports_target_message_id: false,
         supports_reactions: true,
+        supports_attachment_materialization: false,
         can_edit,
         can_delete: platform == "feishu",
         streaming_mode: if streaming && can_edit {
@@ -292,6 +298,8 @@ struct GwAttachment {
     filename: String,
     mime_type: String,
     #[serde(default)]
+    reference: Option<String>,
+    #[serde(default)]
     data: String,
     #[allow(dead_code)]
     size: u64,
@@ -468,6 +476,8 @@ struct GatewayReply {
     /// command target in `reply_to` instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     target_message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attachment_ref: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -499,6 +509,8 @@ struct GatewayResponse {
     error_code: Option<String>,
     #[serde(default)]
     retry_after_ms: Option<u64>,
+    #[serde(default)]
+    attachment: Option<GwAttachment>,
 }
 
 impl GatewayResponse {
@@ -594,6 +606,14 @@ impl GatewayCapabilityState {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hello);
     }
 
+    fn topology_supported(&self) -> bool {
+        self.hello
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|hello| hello.topology.supported && hello.topology.active_consumers == 1)
+    }
+
     fn resolve(&self, platform: &str, legacy: &AdapterCapabilities) -> (bool, AdapterCapabilities) {
         let hello = self
             .hello
@@ -616,6 +636,25 @@ impl GatewayCapabilityState {
 // --- GatewayAdapter: ChatAdapter over WebSocket ---
 
 type PendingRequests = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<GatewayResponse>>>>;
+
+/// Removes a pending attachment request when its future is cancelled by the
+/// whole-batch deadline. Normal responses remove the same key in the reader,
+/// so this cleanup is a no-op on the success path.
+struct PendingAttachmentRequest {
+    pending: PendingRequests,
+    request_id: String,
+}
+
+impl Drop for PendingAttachmentRequest {
+    fn drop(&mut self) {
+        let pending = self.pending.clone();
+        let request_id = self.request_id.clone();
+        tokio::spawn(async move {
+            pending.lock().await.remove(&request_id);
+        });
+    }
+}
+
 type SharedWsTx = Arc<
     Mutex<
         futures_util::stream::SplitSink<
@@ -634,12 +673,14 @@ struct GatewayAdapterOptions {
     telegram_rich_messages: bool,
     teams_processing_indicator: bool,
     teams_streaming: bool,
+    teams_inbound_attachments: bool,
     gateway_ack_timeout_secs: u64,
 }
 
 pub struct GatewayAdapter {
     ws_tx: SharedWsTx,
     pending: PendingRequests,
+    connection_active: Arc<AtomicBool>,
     capability_state: Arc<GatewayCapabilityState>,
     legacy_capabilities: AdapterCapabilities,
     platform_name: &'static str,
@@ -648,6 +689,7 @@ pub struct GatewayAdapter {
     telegram_rich_messages: bool,
     teams_processing_indicator: bool,
     teams_streaming: bool,
+    teams_inbound_attachments: bool,
     ack_timeout: std::time::Duration,
 }
 
@@ -655,6 +697,7 @@ impl GatewayAdapter {
     fn new(
         ws_tx: SharedWsTx,
         pending: PendingRequests,
+        connection_active: Arc<AtomicBool>,
         capability_state: Arc<GatewayCapabilityState>,
         options: GatewayAdapterOptions,
     ) -> Self {
@@ -665,11 +708,13 @@ impl GatewayAdapter {
             telegram_rich_messages,
             teams_processing_indicator,
             teams_streaming,
+            teams_inbound_attachments,
             gateway_ack_timeout_secs,
         } = options;
         Self {
             ws_tx,
             pending,
+            connection_active,
             capability_state,
             legacy_capabilities: legacy_gateway_capabilities(
                 platform_name,
@@ -682,6 +727,7 @@ impl GatewayAdapter {
             telegram_rich_messages,
             teams_processing_indicator,
             teams_streaming,
+            teams_inbound_attachments,
             ack_timeout: std::time::Duration::from_secs(gateway_ack_timeout_secs.max(1)),
         }
     }
@@ -692,6 +738,9 @@ impl GatewayAdapter {
             .resolve(platform, &self.legacy_capabilities);
         let teams = platform.eq_ignore_ascii_case("teams");
         if teams {
+            capabilities.supports_attachment_materialization &= self.teams_inbound_attachments
+                && negotiated
+                && self.capability_state.topology_supported();
             // Teams has an independent default-off opt-in. Do not inherit the
             // generic Gateway streaming or placeholder switches.
             apply_teams_progressive_capabilities(
@@ -744,6 +793,7 @@ impl GatewayAdapter {
             None
         };
         let reply = GatewayReply {
+            attachment_ref: None,
             schema: "openab.gateway.reply.v1".into(),
             reply_to: channel.origin_event_id.clone().unwrap_or_default(),
             platform: channel.platform.clone(),
@@ -844,6 +894,107 @@ impl GatewayAdapter {
             message_id: msg_id,
         })
     }
+
+    async fn request_attachment_materialization(
+        &self,
+        channel: &ChannelRef,
+        reference: &str,
+    ) -> Result<MaterializedAttachment> {
+        let request_id = format!("req_{}", uuid::Uuid::new_v4());
+        let (pending_tx, pending_rx) = tokio::sync::oneshot::channel();
+        {
+            let mut pending = self.pending.lock().await;
+            if !self.connection_active.load(AtomicOrdering::Acquire) {
+                anyhow::bail!("attachment materialization connection is unavailable");
+            }
+            pending.insert(request_id.clone(), pending_tx);
+        }
+        let _pending_cleanup = PendingAttachmentRequest {
+            pending: self.pending.clone(),
+            request_id: request_id.clone(),
+        };
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: channel.origin_event_id.clone().unwrap_or_default(),
+            platform: channel.platform.clone(),
+            channel: ReplyChannel {
+                id: channel.channel_id.clone(),
+                thread_id: channel.thread_id.clone(),
+            },
+            content: ReplyContent {
+                content_type: "text".into(),
+                text: String::new(),
+            },
+            command: Some("materialize_attachment".into()),
+            request_id: Some(request_id.clone()),
+            quote_message_id: None,
+            target_message_id: None,
+            attachment_ref: Some(reference.to_owned()),
+        };
+        let json = serde_json::to_string(&reply)?;
+        if let Err(error) = self.ws_tx.lock().await.send(Message::Text(json)).await {
+            self.pending.lock().await.remove(&request_id);
+            anyhow::bail!("attachment materialization request failed: {error}");
+        }
+        let response = match tokio::time::timeout(
+            ATTACHMENT_MATERIALIZATION_RESPONSE_TIMEOUT,
+            pending_rx,
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => anyhow::bail!("attachment materialization response channel closed"),
+            Err(_) => {
+                self.pending.lock().await.remove(&request_id);
+                anyhow::bail!("attachment materialization response timed out");
+            }
+        };
+        if !response.success {
+            anyhow::bail!(
+                "attachment materialization rejected: {}",
+                response.error_code.as_deref().unwrap_or("gateway_rejected")
+            );
+        }
+        let attachment = response
+            .attachment
+            .ok_or_else(|| anyhow::anyhow!("materialization response has no attachment"))?;
+        if attachment.reference.is_some() || attachment.path.is_some() {
+            anyhow::bail!("materialization response contains an invalid attachment envelope");
+        }
+        if !matches!(attachment.attachment_type.as_str(), "image" | "text_file")
+            || attachment.filename.chars().count() > 200
+            || attachment.filename.chars().any(char::is_control)
+            || attachment.mime_type.len() > 128
+            || attachment.mime_type.chars().any(char::is_control)
+            || attachment
+                .status
+                .as_ref()
+                .is_some_and(|status| status.len() > 256 || status.chars().any(char::is_control))
+        {
+            anyhow::bail!("materialization response contains invalid attachment metadata");
+        }
+        let data = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(&attachment.data)
+                .map_err(|_| anyhow::anyhow!("materialization response has malformed data"))?
+        };
+        if attachment.status.is_some() {
+            if !data.is_empty() {
+                anyhow::bail!("rejected materialization response contains payload data");
+            }
+        } else if attachment.size != data.len() as u64 {
+            anyhow::bail!("materialization response size does not match its payload");
+        }
+        Ok(MaterializedAttachment {
+            attachment_type: attachment.attachment_type,
+            filename: attachment.filename,
+            mime_type: attachment.mime_type,
+            data,
+            size: attachment.size,
+            status: attachment.status,
+        })
+    }
 }
 
 /// Send a fire-and-forget reply via the shared WebSocket (no request-response).
@@ -854,6 +1005,7 @@ async fn send_fire_and_forget(
     content: &str,
 ) -> Result<()> {
     let reply = GatewayReply {
+        attachment_ref: None,
         schema: "openab.gateway.reply.v1".into(),
         reply_to: channel.origin_event_id.clone().unwrap_or_default(),
         platform: channel.platform.clone(),
@@ -1015,6 +1167,34 @@ impl ChatAdapter for GatewayAdapter {
         self.resolved_capabilities(platform)
     }
 
+    async fn materialize_attachment(
+        &self,
+        channel: &ChannelRef,
+        reference: &str,
+    ) -> Result<MaterializedAttachment> {
+        let (negotiated, capabilities) = self.resolved_capabilities_with_mode(&channel.platform);
+        if !negotiated
+            || !self.capability_state.topology_supported()
+            || !capabilities.supports_attachment_materialization
+        {
+            anyhow::bail!("attachment materialization capability is unavailable");
+        }
+        if channel
+            .origin_event_id
+            .as_deref()
+            .is_none_or(|event_id| event_id.trim().is_empty())
+            || reference.trim().is_empty()
+            || reference.len() > 128
+            || !reference
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            anyhow::bail!("attachment materialization route is unavailable");
+        }
+        self.request_attachment_materialization(channel, reference)
+            .await
+    }
+
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
         self.send_gateway_reply(channel, content, None).await
     }
@@ -1040,6 +1220,7 @@ impl ChatAdapter for GatewayAdapter {
         self.pending.lock().await.insert(req_id.clone(), tx);
 
         let reply = GatewayReply {
+            attachment_ref: None,
             schema: "openab.gateway.reply.v1".into(),
             reply_to: String::new(),
             platform: channel.platform.clone(),
@@ -1085,6 +1266,7 @@ impl ChatAdapter for GatewayAdapter {
             self.resolved_capabilities_with_mode(&msg.channel.platform);
         let (reply_to, target_message_id) = command_target_fields(msg, negotiated, &capabilities);
         let reply = GatewayReply {
+            attachment_ref: None,
             schema: "openab.gateway.reply.v1".into(),
             reply_to,
             platform: msg.channel.platform.clone(),
@@ -1111,6 +1293,7 @@ impl ChatAdapter for GatewayAdapter {
             self.resolved_capabilities_with_mode(&msg.channel.platform);
         let (reply_to, target_message_id) = command_target_fields(msg, negotiated, &capabilities);
         let reply = GatewayReply {
+            attachment_ref: None,
             schema: "openab.gateway.reply.v1".into(),
             reply_to,
             platform: msg.channel.platform.clone(),
@@ -1167,6 +1350,7 @@ impl ChatAdapter for GatewayAdapter {
         };
         let (reply_to, target_message_id) = command_target_fields(msg, negotiated, &capabilities);
         let reply = GatewayReply {
+            attachment_ref: None,
             schema: "openab.gateway.reply.v1".into(),
             reply_to,
             platform: msg.channel.platform.clone(),
@@ -1266,6 +1450,7 @@ impl ChatAdapter for GatewayAdapter {
         };
         let (reply_to, target_message_id) = command_target_fields(msg, negotiated, &capabilities);
         let reply = GatewayReply {
+            attachment_ref: None,
             schema: "openab.gateway.reply.v1".into(),
             reply_to,
             platform: msg.channel.platform.clone(),
@@ -1368,6 +1553,7 @@ pub struct GatewayParams {
     pub telegram_rich_messages: bool,
     pub teams_processing_indicator: bool,
     pub teams_streaming: bool,
+    pub teams_inbound_attachments: bool,
     pub gateway_ack_timeout_secs: u64,
     pub stt: crate::config::SttConfig,
     pub teams_scope_policy: TeamsScopePolicy,
@@ -1395,6 +1581,7 @@ pub async fn run_gateway_adapter(
     let telegram_rich_messages = params.telegram_rich_messages;
     let teams_processing_indicator = params.teams_processing_indicator;
     let teams_streaming = params.teams_streaming;
+    let teams_inbound_attachments = params.teams_inbound_attachments;
     let gateway_ack_timeout_secs = params.gateway_ack_timeout_secs;
     let stt_config = params.stt;
     let teams_scope_policy = params.teams_scope_policy;
@@ -1421,7 +1608,18 @@ pub async fn run_gateway_adapter(
 
         info!(url = %gateway_url, "connecting to custom gateway");
 
-        let ws_stream = match tokio_tungstenite::connect_async(&connect_url).await {
+        let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+            max_message_size: Some(GATEWAY_WS_MESSAGE_LIMIT),
+            max_frame_size: Some(GATEWAY_WS_MESSAGE_LIMIT),
+            ..Default::default()
+        };
+        let ws_stream = match tokio_tungstenite::connect_async_with_config(
+            &connect_url,
+            Some(ws_config),
+            false,
+        )
+        .await
+        {
             Ok((stream, _)) => {
                 backoff_secs = 1; // reset on success
                 info!("connected to gateway");
@@ -1441,6 +1639,7 @@ pub async fn run_gateway_adapter(
         let (ws_tx, mut ws_rx) = ws_stream.split();
         let ws_tx: SharedWsTx = Arc::new(Mutex::new(ws_tx));
         let pending: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
+        let connection_active = Arc::new(AtomicBool::new(true));
         let capability_state = Arc::new(GatewayCapabilityState::default());
         let client_hello = build_client_hello();
         let hello_json = serde_json::to_string(&client_hello)?;
@@ -1450,6 +1649,7 @@ pub async fn run_gateway_adapter(
         let adapter: Arc<dyn ChatAdapter> = Arc::new(GatewayAdapter::new(
             ws_tx.clone(),
             pending.clone(),
+            connection_active.clone(),
             capability_state.clone(),
             GatewayAdapterOptions {
                 platform_name: platform,
@@ -1458,6 +1658,7 @@ pub async fn run_gateway_adapter(
                 telegram_rich_messages,
                 teams_processing_indicator,
                 teams_streaming,
+                teams_inbound_attachments,
                 gateway_ack_timeout_secs,
             },
         ));
@@ -1479,6 +1680,20 @@ pub async fn run_gateway_adapter(
             trusted_bot_ids: &trusted_bot_ids,
             bot_username: bot_username.as_deref(),
         };
+        let teams_event_context = Arc::new(GatewayEventContext {
+            adapter: adapter.clone(),
+            dispatcher: dispatcher.clone(),
+            router: router.clone(),
+            allow_bot_messages,
+            trusted_bot_ids: trusted_bot_ids.clone(),
+            bot_username: bot_username.clone(),
+            stt_config: stt_config.clone(),
+            teams_scope_policy: teams_scope_policy.clone(),
+            teams_inbound_attachments,
+            #[cfg(feature = "filestore")]
+            filestore: filestore.clone(),
+        });
+        let teams_event_order = Arc::new(Mutex::new(()));
 
         loop {
             tokio::select! {
@@ -1534,6 +1749,22 @@ pub async fn run_gateway_adapter(
 
                             match serde_json::from_str::<GatewayEvent>(text_str) {
                                 Ok(event) => {
+                                    if event.platform.eq_ignore_ascii_case("teams")
+                                        && !event.content.attachments.is_empty()
+                                    {
+                                        let event_json = text_str.to_owned();
+                                        let event_context = teams_event_context.clone();
+                                        let event_order = teams_event_order.clone();
+                                        tasks.spawn(async move {
+                                            let _guard = event_order.lock().await;
+                                            if let Err(error) =
+                                                process_gateway_event(&event_json, &event_context).await
+                                            {
+                                                warn!(error = %error, "teams attachment event processing failed");
+                                            }
+                                        });
+                                        continue;
+                                    }
                                     if should_skip_event(&event, &filter) {
                                         continue;
                                     }
@@ -1869,6 +2100,8 @@ pub async fn run_gateway_adapter(
                 }
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
+                        connection_active.store(false, AtomicOrdering::Release);
+                        pending.lock().await.clear();
                         info!("gateway adapter shutting down, waiting for {} in-flight tasks", tasks.len());
                         while tasks.join_next().await.is_some() {}
                         return Ok(());
@@ -1876,6 +2109,12 @@ pub async fn run_gateway_adapter(
                 }
             }
         } // inner loop — break here means reconnect
+
+        // Stop new attachment commands and wake any request waiting on a
+        // response that cannot arrive on this connection. Queued event tasks
+        // then fail materialization immediately and can still dispatch text.
+        connection_active.store(false, AtomicOrdering::Release);
+        pending.lock().await.clear();
 
         // Drain in-flight tasks before reconnecting
         while tasks.join_next().await.is_some() {}
@@ -1893,6 +2132,7 @@ pub async fn run_gateway_adapter(
 
 /// Context required to process a gateway event without a WebSocket connection.
 /// Used by the unified binary to dispatch webhook events directly.
+#[derive(Clone)]
 pub struct GatewayEventContext {
     pub adapter: Arc<dyn ChatAdapter>,
     pub dispatcher: Arc<crate::dispatch::Dispatcher>,
@@ -1902,6 +2142,7 @@ pub struct GatewayEventContext {
     pub bot_username: Option<String>,
     pub stt_config: crate::config::SttConfig,
     pub teams_scope_policy: TeamsScopePolicy,
+    pub teams_inbound_attachments: bool,
     #[cfg(feature = "filestore")]
     pub filestore: Option<Arc<crate::filestore::Filestore>>,
 }
@@ -2118,9 +2359,83 @@ pub async fn process_gateway_event(
         message_id: event.message_id.clone(),
     };
 
-    // Convert gateway attachments to ContentBlocks
+    // Convert gateway attachments to ContentBlocks. Teams references are
+    // resolved only here, after the authoritative structural + L2 + L3 gate.
     let mut extra_blocks = Vec::new();
-    for att in &event.content.attachments {
+    let teams_event = event.platform.eq_ignore_ascii_case("teams");
+    let attachment_limit = if teams_event { 10 } else { usize::MAX };
+    let attachment_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+    let attachment_capabilities = ctx.adapter.capabilities(&event.platform);
+    for metadata in event.content.attachments.iter().take(attachment_limit) {
+        if teams_event && !ctx.teams_inbound_attachments {
+            continue;
+        }
+        let mut att = metadata.clone();
+        let mut materialized_data = None;
+        if teams_event
+            && (att.attachment_type.len() > 32
+                || att.attachment_type.chars().any(char::is_control)
+                || att.filename.chars().count() > 200
+                || att.filename.chars().any(char::is_control)
+                || att.mime_type.len() > 128
+                || att.mime_type.chars().any(char::is_control)
+                || att.status.as_ref().is_some_and(|status| {
+                    status.len() > 256 || status.chars().any(char::is_control)
+                }))
+        {
+            continue;
+        }
+        let reference = att.reference.take();
+        // Teams never accepts pre-materialized bytes or a Gateway-local path.
+        // A no-reference entry is usable only as bounded rejected metadata.
+        if teams_event && reference.is_none() && att.status.is_none() {
+            continue;
+        }
+        if let Some(reference) = reference {
+            if !teams_event || !attachment_capabilities.supports_attachment_materialization {
+                continue;
+            }
+            if tokio::time::Instant::now() >= attachment_deadline {
+                att.status =
+                    Some("download failed: attachment materialization batch timed out".into());
+            } else {
+                match tokio::time::timeout_at(
+                    attachment_deadline,
+                    ctx.adapter.materialize_attachment(&channel, &reference),
+                )
+                .await
+                {
+                    Ok(Ok(materialized)) => {
+                        att.attachment_type = materialized.attachment_type;
+                        att.filename = materialized.filename;
+                        att.mime_type = materialized.mime_type;
+                        att.size = materialized.size;
+                        att.path = None;
+                        att.data.clear();
+                        att.status = materialized.status;
+                        if att.status.is_none()
+                            && att.attachment_type == "text_file"
+                            && std::str::from_utf8(&materialized.data).is_err()
+                        {
+                            att.status =
+                                Some("invalid content: text attachment is not valid UTF-8".into());
+                        } else {
+                            materialized_data = Some(materialized.data);
+                        }
+                    }
+                    Ok(Err(_)) => {
+                        att.status =
+                            Some("download failed: attachment materialization failed".into());
+                    }
+                    Err(_) => {
+                        att.status = Some(
+                            "download failed: attachment materialization batch timed out".into(),
+                        );
+                    }
+                }
+            }
+        }
+
         if let Some(ref reason) = att.status {
             let size_str = format_size(att.size);
             extra_blocks.push(ContentBlock::Text {
@@ -2132,7 +2447,9 @@ pub async fn process_gateway_event(
             continue;
         }
 
-        let bytes_result = if let Some(ref path) = att.path {
+        let bytes_result = if let Some(bytes) = materialized_data {
+            Ok(bytes)
+        } else if let Some(ref path) = att.path {
             tokio::fs::read(path).await.map_err(|e| e.to_string())
         } else if !att.data.is_empty() {
             use base64::Engine;
@@ -2353,7 +2670,228 @@ fn format_size(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use async_trait::async_trait;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct AttachmentProbeAdapter {
+        materializations: AtomicUsize,
+        sends: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ChatAdapter for AttachmentProbeAdapter {
+        fn platform(&self) -> &'static str {
+            "probe"
+        }
+
+        fn message_limit(&self) -> usize {
+            4096
+        }
+
+        fn capabilities(&self, platform: &str) -> AdapterCapabilities {
+            AdapterCapabilities {
+                supports_attachment_materialization: platform == "teams",
+                ..AdapterCapabilities::default()
+            }
+        }
+
+        fn use_streaming(&self, _other_bot_present: bool) -> bool {
+            false
+        }
+
+        async fn materialize_attachment(
+            &self,
+            _channel: &ChannelRef,
+            _reference: &str,
+        ) -> Result<MaterializedAttachment> {
+            self.materializations.fetch_add(1, Ordering::SeqCst);
+            Ok(MaterializedAttachment {
+                attachment_type: "text_file".into(),
+                filename: "notes.txt".into(),
+                mime_type: "text/plain; charset=utf-8".into(),
+                data: b"secret bytes".to_vec(),
+                size: 12,
+                status: None,
+            })
+        }
+
+        async fn send_message(&self, channel: &ChannelRef, _content: &str) -> Result<MessageRef> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Ok(MessageRef {
+                channel: channel.clone(),
+                message_id: "echo".into(),
+            })
+        }
+
+        async fn create_thread(
+            &self,
+            channel: &ChannelRef,
+            _trigger_msg: &MessageRef,
+            _title: &str,
+        ) -> Result<ChannelRef> {
+            Ok(channel.clone())
+        }
+
+        async fn add_reaction(&self, _msg: &MessageRef, _emoji: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn remove_reaction(&self, _msg: &MessageRef, _emoji: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn attachment_event_json(sender_id: &str) -> String {
+        serde_json::json!({
+            "schema": "openab.gateway.event.v1",
+            "event_id": "event-attachment",
+            "timestamp": "",
+            "platform": "teams",
+            "event_type": "message",
+            "channel": {
+                "id": "conversation-1",
+                "type": "personal",
+                "thread_id": null
+            },
+            "sender": {
+                "id": sender_id,
+                "name": "Attachment User",
+                "display_name": "Attachment User",
+                "is_bot": false
+            },
+            "content": {
+                "type": "text",
+                "text": "",
+                "attachments": [{
+                    "type": "text_file",
+                    "filename": "notes.txt",
+                    "mime_type": "text/plain",
+                    "reference": "att-opaque",
+                    "data": "",
+                    "path": null,
+                    "size": 0,
+                    "status": null
+                }]
+            },
+            "mentions": [],
+            "message_id": "activity-1",
+            "scope": {
+                "tenant_id": "tenant-1",
+                "team_id": null,
+                "channel_id": null,
+                "conversation_type": "personal",
+                "trust_scope_id": "teams:tenant-1:personal:conversation-1",
+                "is_dm": true
+            },
+            "recipient": null,
+            "mention_entities": []
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn identity_denial_precedes_attachment_materialization() -> anyhow::Result<()> {
+        let pool = Arc::new(crate::acp::SessionPool::new(
+            crate::config::AgentConfig::default(),
+            1,
+            900,
+            HashMap::new(),
+        ));
+        let router = Arc::new(AdapterRouter::new(
+            pool,
+            crate::config::ReactionsConfig::default(),
+            crate::markdown::TableMode::default(),
+            900,
+            30,
+            HashMap::new(),
+            std::env::temp_dir(),
+        ));
+        let dispatcher = Arc::new(crate::dispatch::Dispatcher::with_idle_timeout(
+            router.clone(),
+            1,
+            24_000,
+            crate::dispatch::BatchGrouping::Thread,
+            std::time::Duration::from_secs(1),
+        ));
+        let probe = Arc::new(AttachmentProbeAdapter {
+            materializations: AtomicUsize::new(0),
+            sends: AtomicUsize::new(0),
+        });
+        let adapter: Arc<dyn ChatAdapter> = probe.clone();
+        let context = GatewayEventContext {
+            adapter,
+            dispatcher,
+            router,
+            allow_bot_messages: false,
+            trusted_bot_ids: HashSet::new(),
+            bot_username: None,
+            stt_config: crate::config::SttConfig::default(),
+            teams_scope_policy: TeamsScopePolicy::default(),
+            teams_inbound_attachments: true,
+            #[cfg(feature = "filestore")]
+            filestore: None,
+        };
+        let event_json = attachment_event_json("untrusted-user");
+        assert!(!process_gateway_event(&event_json, &context).await?);
+        assert_eq!(probe.materializations.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.sends.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admitted_attachment_is_materialized_before_dispatch() -> anyhow::Result<()> {
+        let router = Arc::new(teams_router(vec!["trusted-user".into()]));
+        let dispatcher = Arc::new(crate::dispatch::Dispatcher::with_idle_timeout(
+            router.clone(),
+            1,
+            24_000,
+            crate::dispatch::BatchGrouping::Thread,
+            std::time::Duration::from_secs(60),
+        ));
+        let probe = Arc::new(AttachmentProbeAdapter {
+            materializations: AtomicUsize::new(0),
+            sends: AtomicUsize::new(0),
+        });
+        let mut context = GatewayEventContext {
+            adapter: probe.clone(),
+            dispatcher,
+            router,
+            allow_bot_messages: false,
+            trusted_bot_ids: HashSet::new(),
+            bot_username: None,
+            stt_config: crate::config::SttConfig::default(),
+            teams_scope_policy: TeamsScopePolicy::default(),
+            teams_inbound_attachments: true,
+            #[cfg(feature = "filestore")]
+            filestore: None,
+        };
+
+        assert!(process_gateway_event(
+            &attachment_event_json("trusted-user"),
+            &context,
+        )
+        .await?);
+        assert_eq!(probe.materializations.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.sends.load(Ordering::SeqCst), 0);
+
+        let mut injected: serde_json::Value =
+            serde_json::from_str(&attachment_event_json("trusted-user"))?;
+        injected["event_id"] = "event-pre-materialized".into();
+        injected["content"]["attachments"][0]["reference"] = serde_json::Value::Null;
+        injected["content"]["attachments"][0]["data"] = "c2VjcmV0".into();
+        assert!(!process_gateway_event(&injected.to_string(), &context).await?);
+        assert_eq!(probe.materializations.load(Ordering::SeqCst), 1);
+
+        context.teams_inbound_attachments = false;
+        assert!(!process_gateway_event(
+            &attachment_event_json("trusted-user"),
+            &context,
+        )
+        .await?);
+        assert_eq!(probe.materializations.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
 
     #[test]
     fn legacy_non_editable_platforms_are_send_once() {
@@ -3197,7 +3735,17 @@ mod tests {
                 "is_bot": false
             },
             "channel": { "id": "conversation-1", "type": "channel" },
-            "content": { "type": "text", "text": "<at>OpenAB</at> hello" },
+            "content": {
+                "type": "text",
+                "text": "<at>OpenAB</at> hello",
+                "attachments": [{
+                    "type": "image",
+                    "filename": "image.png",
+                    "mime_type": "image/png",
+                    "reference": "att-opaque",
+                    "size": 0
+                }]
+            },
             "mentions": ["28:bot"],
             "message_id": "msg1",
             "scope": {

@@ -4,6 +4,8 @@ How OAB handles images, audio, and files sent by users across all platforms.
 
 ## Architecture
 
+Most colocated adapters use the shared filesystem path:
+
 ```
 User sends media (photo/voice/file)
   → Platform webhook delivers to Gateway
@@ -15,6 +17,13 @@ User sends media (photo/voice/file)
   → Processes: image → LLM, audio → STT, text_file → code block
   → File auto-evicted after 2 minutes
 ```
+
+Teams deliberately uses a different two-phase path in Unified and Standalone
+modes. Gateway first publishes sanitized metadata plus an opaque process-local
+reference. Core runs structural, L2, and L3 trust gates, then requests bounded
+materialization. Gateway downloads and returns normalized base64 bytes; the
+Microsoft URL, query, and credential never leave Gateway. See
+[Teams metadata-first attachment ingress](adr/teams-attachment-ingress.md).
 
 ## Platform Support Matrix
 
@@ -51,6 +60,7 @@ OpenAB can create the ACP image block, but downstream coding agents and selected
 4. If STT disabled: silently skipped
 
 LINE-specific note:
+
 - LINE voice-message STT currently works in **1:1 chats only**.
 - LINE group/room voice messages are still blocked by mention gating because LINE does not attach mention metadata to audio messages.
 
@@ -73,6 +83,9 @@ Binary files (zip, pdf, exe, docx), video, and stickers are **rejected with a st
 | Images | 10 MB | Gateway (pre-download Content-Length + post-download bytes) |
 | Audio | 20 MB | Gateway |
 | Text files | 20 MB | Gateway (same as store cap) |
+| Teams text files | 512 KiB | Teams materializer |
+| Teams aggregate raw bytes | 20 MiB/event | Route-scoped materialization budget |
+| Teams materialized WS frame | 8 MiB | Gateway and Core WebSocket limits |
 | GIF passthrough | 5 MB | `resize_and_compress()` |
 | Store (defense-in-depth) | 20 MB | `store_media()` |
 
@@ -94,11 +107,20 @@ Media is stored at `~/.openab/media/inbound/<uuid>`:
 
 ### Future: HTTP Proxy Mode
 
-For separated deployments (Gateway ≠ Core pod), a future PR will add `GET /media/<uuid>` on the Gateway, allowing Core to fetch via internal HTTP. The `attachments[].path` field will be replaced by `attachments[].url` in that mode.
+Other separated deployments may eventually add an authenticated media proxy.
+Teams does not wait for that work: its reviewed contract already uses one
+bounded opaque-reference request and base64 response, never `Attachment.path`
+or a Microsoft URL in Core.
 
 ## Configuration
 
-No additional configuration required. The filesystem store is always active when Gateway is running. Ensure Gateway and Core share the same `$HOME` (default in Helm colocate/sidecar mode).
+The filesystem store used by existing colocated adapters requires no additional
+setting; Gateway and Core must share `$HOME`.
+
+Teams is explicitly default-off. Set `[teams].inbound_attachments = true` (or
+`TEAMS_INBOUND_ATTACHMENTS=true`) on Core and Gateway. Personal paperclip files
+also require a separate Teams manifest profile with `supportsFiles: true`;
+inline images do not.
 
 ## Related
 

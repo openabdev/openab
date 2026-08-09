@@ -468,6 +468,9 @@ agents:
         allowedTenants: []     # List of tenant IDs → TEAMS_ALLOWED_TENANTS
         webhookPath: ""        # Gateway default: /webhook/teams → TEAMS_WEBHOOK_PATH
         reactionsEnabled: false # Public-preview Bot Connector reactions → TEAMS_REACTIONS_ENABLED
+        # Default-off metadata-first image/text ingress. Sets the same env on
+        # Core and Gateway; no Microsoft URL or token crosses into Core.
+        inboundAttachments: false # → TEAMS_INBOUND_ATTACHMENTS
       # Feishu/Lark adapter config (gateway-side env vars)
       # See docs/feishu.md for full setup guide
       feishu:

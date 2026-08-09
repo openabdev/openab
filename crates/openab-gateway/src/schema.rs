@@ -1,3 +1,4 @@
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -86,6 +87,10 @@ pub struct Attachment {
     pub attachment_type: String, // "image", "text_file", "audio"
     pub filename: String,
     pub mime_type: String,
+    /// Gateway-local opaque reference. Core may request materialization only
+    /// after trust admission and only when the peer advertises support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
     /// Base64-encoded data (deprecated — use `path` for colocate mode).
     /// Kept for backward compatibility; Core prefers `path` when present.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -116,6 +121,10 @@ pub struct Attachment {
 }
 
 impl Attachment {
+    pub fn decoded_data(&self) -> Result<Vec<u8>, base64::DecodeError> {
+        base64::engine::general_purpose::STANDARD.decode(&self.data)
+    }
+
     /// Create a rejected attachment carrying a human-readable status reason.
     /// `size` should be the original file size in bytes (0 if unknown).
     pub fn rejected(
@@ -129,6 +138,7 @@ impl Attachment {
             attachment_type: attachment_type.into(),
             filename: filename.into(),
             mime_type: mime_type.into(),
+            reference: None,
             data: String::new(),
             size,
             path: None,
@@ -195,6 +205,9 @@ pub struct AdapterCapabilities {
     /// Native reactions may coexist with a different transient status backend.
     #[serde(default)]
     pub supports_reactions: bool,
+    /// Resolve opaque inbound attachment references after Core admission.
+    #[serde(default)]
+    pub supports_attachment_materialization: bool,
     pub can_edit: bool,
     pub can_delete: bool,
     pub streaming_mode: StreamingMode,
@@ -211,6 +224,7 @@ impl Default for AdapterCapabilities {
             delete_ack: false,
             supports_target_message_id: false,
             supports_reactions: false,
+            supports_attachment_materialization: false,
             can_edit: false,
             can_delete: false,
             streaming_mode: StreamingMode::Disabled,
@@ -271,6 +285,9 @@ pub struct GatewayReply {
     /// support; old peers continue to place the command target in `reply_to`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_message_id: Option<String>,
+    /// Opaque Gateway-local inbound attachment selected for materialization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_ref: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -323,6 +340,9 @@ pub struct GatewayResponse {
     pub error_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<u64>,
+    /// Normalized result for `materialize_attachment`; absent for writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<Attachment>,
 }
 
 impl GatewayResponse {
@@ -339,6 +359,7 @@ impl GatewayResponse {
                 outcome: Some(WriteOutcomeKind::Delivered),
                 error_code: None,
                 retry_after_ms: None,
+                attachment: None,
             },
             WriteOutcome::Rejected {
                 code,
@@ -354,6 +375,7 @@ impl GatewayResponse {
                 outcome: Some(WriteOutcomeKind::Rejected),
                 error_code: Some(code),
                 retry_after_ms,
+                attachment: None,
             },
             WriteOutcome::Unknown { code, message } => Self {
                 schema: "openab.gateway.response.v1".into(),
@@ -365,7 +387,42 @@ impl GatewayResponse {
                 outcome: Some(WriteOutcomeKind::Unknown),
                 error_code: Some(code),
                 retry_after_ms: None,
+                attachment: None,
             },
+        }
+    }
+
+    pub fn from_attachment(request_id: impl Into<String>, attachment: Attachment) -> Self {
+        Self {
+            schema: "openab.gateway.response.v1".into(),
+            request_id: request_id.into(),
+            success: true,
+            thread_id: None,
+            message_id: None,
+            error: None,
+            outcome: None,
+            error_code: None,
+            retry_after_ms: None,
+            attachment: Some(attachment),
+        }
+    }
+
+    pub fn from_command_error(
+        request_id: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema: "openab.gateway.response.v1".into(),
+            request_id: request_id.into(),
+            success: false,
+            thread_id: None,
+            message_id: None,
+            error: Some(message.into()),
+            outcome: None,
+            error_code: Some(code.into()),
+            retry_after_ms: None,
+            attachment: None,
         }
     }
 
@@ -541,6 +598,7 @@ mod protocol_tests {
             request_id: Some("request-1".into()),
             quote_message_id: None,
             target_message_id: Some("activity-1".into()),
+            attachment_ref: None,
         };
         let json = serde_json::to_string(&reply)?;
         let legacy: LegacyReply = serde_json::from_str(&json)?;
@@ -558,7 +616,62 @@ mod protocol_tests {
             "quote_message_id": null
         }))?;
         assert!(decoded_without_target.target_message_id.is_none());
+        assert!(decoded_without_target.attachment_ref.is_none());
         assert_eq!(decoded_without_target.reply_to, "legacy-activity");
+        Ok(())
+    }
+
+    #[test]
+    fn attachment_materialization_fields_are_additive_and_bounded_envelopes() -> anyhow::Result<()> {
+        #[derive(serde::Deserialize)]
+        struct LegacyAttachment {
+            filename: String,
+            mime_type: String,
+            #[serde(default)]
+            data: String,
+        }
+
+        let metadata = Attachment {
+            attachment_type: "image".into(),
+            filename: "image.png".into(),
+            mime_type: "image/png".into(),
+            reference: Some("att_opaque".into()),
+            data: String::new(),
+            size: 0,
+            path: None,
+            status: None,
+        };
+        let metadata_json = serde_json::to_string(&metadata)?;
+        let legacy: LegacyAttachment = serde_json::from_str(&metadata_json)?;
+        assert_eq!(legacy.filename, "image.png");
+        assert_eq!(legacy.mime_type, "image/png");
+        assert!(legacy.data.is_empty());
+        assert!(!metadata_json.contains("http"));
+
+        let materialized = Attachment {
+            reference: None,
+            data: "aGVsbG8=".into(),
+            size: 5,
+            ..metadata
+        };
+        let response = GatewayResponse::from_attachment("request-1", materialized);
+        let decoded: GatewayResponse =
+            serde_json::from_str(&serde_json::to_string(&response)?)?;
+        let attachment = decoded
+            .attachment
+            .ok_or_else(|| anyhow::anyhow!("materialized attachment is missing"))?;
+        assert_eq!(attachment.decoded_data()?, b"hello");
+
+        let old_wire: Attachment = serde_json::from_value(serde_json::json!({
+            "type": "image",
+            "filename": "legacy.png",
+            "mime_type": "image/png",
+            "data": "",
+            "size": 0,
+            "path": null,
+            "status": null
+        }))?;
+        assert!(old_wire.reference.is_none());
         Ok(())
     }
 
@@ -662,6 +775,7 @@ mod protocol_tests {
         assert!(!capabilities.delete_ack);
         assert!(!capabilities.supports_target_message_id);
         assert!(!capabilities.supports_reactions);
+        assert!(!capabilities.supports_attachment_materialization);
         assert!(!capabilities.can_edit);
         assert!(!capabilities.can_delete);
         assert_eq!(capabilities.streaming_mode, StreamingMode::Disabled);

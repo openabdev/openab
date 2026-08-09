@@ -112,6 +112,10 @@ spec:
             - name: TEAMS_REACTIONS_ENABLED
               value: {{ ($cfg.gateway).teams.reactionsEnabled | quote }}
             {{- end }}
+            {{- if hasKey (($cfg.gateway).teams) "inboundAttachments" }}
+            - name: TEAMS_INBOUND_ATTACHMENTS
+              value: {{ ($cfg.gateway).teams.inboundAttachments | quote }}
+            {{- end }}
             {{- end }}
             {{- $hasFeishu := and (($cfg.gateway).feishu).appId (($cfg.gateway).feishu).appSecret }}
             {{- if $hasFeishu }}

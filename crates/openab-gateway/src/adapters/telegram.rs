@@ -438,6 +438,7 @@ pub async fn handle_reply(
                         outcome: Some(crate::schema::WriteOutcomeKind::Delivered),
                         error_code: None,
                         retry_after_ms: None,
+                        attachment: None,
                     }
                 } else {
                     let err = body["description"]
@@ -455,6 +456,7 @@ pub async fn handle_reply(
                         outcome: Some(crate::schema::WriteOutcomeKind::Rejected),
                         error_code: Some("platform_rejected".into()),
                         retry_after_ms: None,
+                        attachment: None,
                     }
                 }
             }
@@ -468,6 +470,7 @@ pub async fn handle_reply(
                 outcome: Some(crate::schema::WriteOutcomeKind::Unknown),
                 error_code: Some("transport_error".into()),
                 retry_after_ms: None,
+                attachment: None,
             },
         };
         let json = serde_json::to_string(&gw_resp).unwrap();
@@ -800,6 +803,7 @@ async fn download_telegram_media(
             MediaKind::Audio => crate::media::audio_extension(&mime),
         }),
         mime_type: mime,
+        reference: None,
         data: String::new(), // No base64 — using file path
         size: data_bytes.len() as u64,
         path: Some(path),
@@ -928,6 +932,7 @@ async fn download_telegram_document(
         attachment_type: "text_file".into(),
         filename: file_name.to_string(),
         mime_type: mime_type.to_string(),
+        reference: None,
         data: String::new(),
         size: bytes.len() as u64,
         path: Some(path),

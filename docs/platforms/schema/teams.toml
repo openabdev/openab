@@ -203,9 +203,14 @@ pr = ""
 
 [[openab_features]]
 feature = "media_inbound"
-status = "not_implemented"
-note = "Webhook reads text plus structured recipient/mention entities, but attachments are neither parsed nor forwarded. The `Activity` DTO still does not model attachment payloads."
-source = ["crates/openab-gateway/src/adapters/teams.rs#Activity"]
+status = "partial"
+note = "Default off. With `[teams].inbound_attachments = true` and an explicitly negotiated materialization capability, Gateway publishes at most ten sanitized metadata entries plus route-scoped opaque references. Core invokes sequential materialization only after structural, typed L2, and L3 Allow. Inline images work in all scopes; Personal file-download cards accept image extensions and strict UTF-8 text only. URLs/tokens remain Gateway-local, redirects and size budgets fail closed, and Standalone/Unified return the same bounded base64 envelope. Automated tests pass; Microsoft 365 live validation remains pending."
+source = [
+  "crates/openab-gateway/src/adapters/teams.rs#prepare_attachment_metadata",
+  "crates/openab-gateway/src/adapters/teams.rs#materialize_attachment",
+  "crates/openab-core/src/gateway.rs#process_gateway_event",
+  "docs/adr/teams-attachment-ingress.md",
+]
 pr = ""
 
 [[openab_features]]

@@ -3910,6 +3910,7 @@ mod acp_review_fixes {
             request_id: None,
             quote_message_id: None,
             target_message_id: None,
+            attachment_ref: None,
         }
     }
 

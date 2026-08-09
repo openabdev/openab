@@ -1352,6 +1352,9 @@ pub struct TeamsConfig {
     /// Opt in to progressive content through one real bot-owned placeholder.
     /// Env fallback: `TEAMS_STREAMING`; default `false`.
     pub streaming: Option<bool>,
+    /// Permit post-admission materialization of bounded inbound image/text
+    /// attachments. Env fallback: `TEAMS_INBOUND_ATTACHMENTS`; default `false`.
+    pub inbound_attachments: Option<bool>,
     /// Team IDs admitted by typed channel scope. Env fallback:
     /// `TEAMS_ALLOWED_TEAMS` (comma-separated). Both scope lists empty = open.
     pub allowed_teams: Option<Vec<String>>,
@@ -1385,6 +1388,7 @@ pub struct ResolvedTeams {
     pub reactions_enabled: bool,
     pub processing_indicator: TeamsProcessingIndicator,
     pub streaming: bool,
+    pub inbound_attachments: bool,
     pub allowed_teams: Vec<String>,
     pub allowed_channels: Vec<String>,
     pub allow_personal: bool,
@@ -1503,6 +1507,11 @@ impl TeamsConfig {
             }),
             processing_indicator,
             streaming: bool_with_default(self.streaming, "TEAMS_STREAMING", false),
+            inbound_attachments: bool_with_default(
+                self.inbound_attachments,
+                "TEAMS_INBOUND_ATTACHMENTS",
+                false,
+            ),
             allowed_teams: csv(&self.allowed_teams, "TEAMS_ALLOWED_TEAMS"),
             allowed_channels: csv(&self.allowed_channels, "TEAMS_ALLOWED_CHANNELS"),
             allow_personal: bool_with_default(self.allow_personal, "TEAMS_ALLOW_PERSONAL", true),
@@ -3200,6 +3209,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             "TEAMS_REACTIONS_ENABLED",
             "TEAMS_PROCESSING_INDICATOR",
             "TEAMS_STREAMING",
+            "TEAMS_INBOUND_ATTACHMENTS",
             "TEAMS_ALLOWED_TEAMS",
             "TEAMS_ALLOWED_CHANNELS",
             "TEAMS_ALLOW_PERSONAL",
@@ -3220,6 +3230,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         assert!(!r.reactions_enabled);
         assert_eq!(r.processing_indicator, TeamsProcessingIndicator::Off);
         assert!(!r.streaming);
+        assert!(!r.inbound_attachments);
         assert!(r.allowed_teams.is_empty());
         assert!(r.allowed_channels.is_empty());
         assert!(r.allow_personal);
@@ -3243,6 +3254,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         std::env::set_var("TEAMS_REACTIONS_ENABLED", "false");
         std::env::set_var("TEAMS_PROCESSING_INDICATOR", "off");
         std::env::set_var("TEAMS_STREAMING", "false");
+        std::env::set_var("TEAMS_INBOUND_ATTACHMENTS", "false");
         std::env::set_var("TEAMS_ALLOWED_TEAMS", "env-team");
         std::env::set_var("TEAMS_ALLOWED_CHANNELS", "env-channel");
         std::env::set_var("TEAMS_ALLOW_PERSONAL", "false");
@@ -3257,6 +3269,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             reactions_enabled: Some(true),
             processing_indicator: Some(TeamsProcessingIndicator::Message),
             streaming: Some(true),
+            inbound_attachments: Some(true),
             allowed_teams: Some(vec!["cfg-team".into()]),
             allowed_channels: Some(vec![]),
             allow_personal: Some(true),
@@ -3276,6 +3289,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             TeamsProcessingIndicator::Message
         );
         assert!(r.streaming);
+        assert!(r.inbound_attachments);
         assert_eq!(r.allowed_teams, vec!["cfg-team"]);
         assert!(r.allowed_channels.is_empty());
         assert!(r.allow_personal);
@@ -3286,6 +3300,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         std::env::set_var("TEAMS_REACTIONS_ENABLED", "true");
         std::env::set_var("TEAMS_PROCESSING_INDICATOR", "message");
         std::env::set_var("TEAMS_STREAMING", "true");
+        std::env::set_var("TEAMS_INBOUND_ATTACHMENTS", "true");
         let cfg = TeamsConfig {
             app_id: Some("".into()),
             ..Default::default()
@@ -3302,6 +3317,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             TeamsProcessingIndicator::Message
         );
         assert!(r.streaming);
+        assert!(r.inbound_attachments);
         assert_eq!(r.allowed_teams, vec!["env-team"]);
         assert_eq!(r.allowed_channels, vec!["env-channel"]);
         assert!(!r.allow_personal);
@@ -3310,18 +3326,24 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
 
         // --- strict numeric boolean forms ---
         std::env::set_var("TEAMS_STREAMING", "1");
+        std::env::set_var("TEAMS_INBOUND_ATTACHMENTS", "1");
         assert!(TeamsConfig::default().resolve().streaming);
+        assert!(TeamsConfig::default().resolve().inbound_attachments);
         std::env::set_var("TEAMS_STREAMING", "0");
+        std::env::set_var("TEAMS_INBOUND_ATTACHMENTS", "0");
         assert!(!TeamsConfig::default().resolve().streaming);
+        assert!(!TeamsConfig::default().resolve().inbound_attachments);
 
         // --- malformed switches fail closed ---
         std::env::set_var("TEAMS_ALLOW_PERSONAL", "not-a-boolean");
         std::env::set_var("TEAMS_PROCESSING_INDICATOR", "typing");
         std::env::set_var("TEAMS_STREAMING", "not-a-boolean");
+        std::env::set_var("TEAMS_INBOUND_ATTACHMENTS", "not-a-boolean");
         let r = TeamsConfig::default().resolve();
         assert!(!r.allow_personal);
         assert_eq!(r.processing_indicator, TeamsProcessingIndicator::Off);
         assert!(!r.streaming);
+        assert!(!r.inbound_attachments);
         assert!(r.scope_policy_configured);
 
         // --- trust_config() view ---
@@ -3346,6 +3368,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             "TEAMS_REACTIONS_ENABLED",
             "TEAMS_PROCESSING_INDICATOR",
             "TEAMS_STREAMING",
+            "TEAMS_INBOUND_ATTACHMENTS",
             "TEAMS_ALLOWED_TEAMS",
             "TEAMS_ALLOWED_CHANNELS",
             "TEAMS_ALLOW_PERSONAL",
@@ -3369,6 +3392,12 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
     fn teams_streaming_rejects_non_boolean_toml_value() {
         let error = parse_config("[teams]\nstreaming = \"yes\"\n", "test").unwrap_err();
         assert!(error.to_string().contains("streaming"));
+    }
+
+    #[test]
+    fn teams_inbound_attachments_rejects_non_boolean_toml_value() {
+        let error = parse_config("[teams]\ninbound_attachments = \"yes\"\n", "test").unwrap_err();
+        assert!(error.to_string().contains("inbound_attachments"));
     }
 
     #[test]

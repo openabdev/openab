@@ -7,6 +7,7 @@ use tracing::warn;
 pub(super) const DEFAULT_DEDUPE_TTL_SECS: u64 = 10 * 60;
 pub(super) const DEFAULT_ROUTE_TTL_SECS: u64 = 60 * 60;
 pub(super) const DEFAULT_MAX_ROUTE_ENTRIES: usize = 10_000;
+pub(super) const TEAMS_ATTACHMENT_AGGREGATE_MAX_BYTES: u64 = 20 * 1024 * 1024;
 
 const PUBLISHING_STALE_TTL: Duration = Duration::from_secs(30);
 const PUBLISH_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -44,6 +45,37 @@ impl TeamsRouteKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TeamsAttachmentSourceKind {
+    InlineImage,
+    PersonalFileImage,
+    PersonalTextFile,
+}
+
+#[derive(Clone)]
+pub(super) struct TeamsAttachmentSource {
+    pub(super) kind: TeamsAttachmentSourceKind,
+    pub(super) url: Url,
+    pub(super) service_origin: Url,
+    pub(super) attachment_type: String,
+    pub(super) filename: String,
+    pub(super) mime_type: String,
+    pub(super) max_bytes: u64,
+}
+
+pub(super) struct ClaimedTeamsAttachment {
+    pub(super) source: TeamsAttachmentSource,
+    pub(super) reserved_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AttachmentLookupError {
+    RouteNotFound,
+    ConversationMismatch,
+    ReferenceNotFound,
+    AggregateLimitExceeded,
+}
+
 /// Gateway-local routing material for one authenticated Teams activity.
 ///
 /// The service URL is intentionally kept out of the wire schema and logging.
@@ -62,6 +94,8 @@ pub(super) struct TeamsIngressRoute {
     pub(super) service_url: Url,
     pub(super) team_id: Option<String>,
     pub(super) channel_id: Option<String>,
+    pub(super) attachment_sources: HashMap<String, TeamsAttachmentSource>,
+    pub(super) attachment_materialized_bytes: u64,
     pub(super) created_at: Instant,
 }
 
@@ -316,6 +350,59 @@ impl TeamsIngressRegistry {
         Ok((route, quote_activity_id))
     }
 
+    pub(super) fn claim_attachment(
+        &mut self,
+        event_id: &str,
+        conversation_id: &str,
+        reference: &str,
+        now: Instant,
+    ) -> Result<ClaimedTeamsAttachment, AttachmentLookupError> {
+        self.cleanup(now);
+        let route = self
+            .routes_by_event
+            .get_mut(event_id)
+            .ok_or(AttachmentLookupError::RouteNotFound)?;
+        if route.conversation_id != conversation_id {
+            return Err(AttachmentLookupError::ConversationMismatch);
+        }
+
+        let remaining = TEAMS_ATTACHMENT_AGGREGATE_MAX_BYTES
+            .saturating_sub(route.attachment_materialized_bytes);
+        if remaining == 0 {
+            return Err(AttachmentLookupError::AggregateLimitExceeded);
+        }
+        let source = route
+            .attachment_sources
+            .remove(reference)
+            .ok_or(AttachmentLookupError::ReferenceNotFound)?;
+        let reserved_bytes = source.max_bytes.min(remaining);
+        if reserved_bytes == 0 {
+            return Err(AttachmentLookupError::AggregateLimitExceeded);
+        }
+        route.attachment_materialized_bytes = route
+            .attachment_materialized_bytes
+            .saturating_add(reserved_bytes);
+        Ok(ClaimedTeamsAttachment {
+            source,
+            reserved_bytes,
+        })
+    }
+
+    pub(super) fn finish_attachment(
+        &mut self,
+        event_id: &str,
+        reserved_bytes: u64,
+        materialized_bytes: u64,
+    ) {
+        let Some(route) = self.routes_by_event.get_mut(event_id) else {
+            return;
+        };
+        route.attachment_materialized_bytes = route
+            .attachment_materialized_bytes
+            .saturating_sub(reserved_bytes)
+            .saturating_add(materialized_bytes.min(reserved_bytes));
+    }
+
     pub(super) fn route_for_reaction_target(
         &mut self,
         app_id: &str,
@@ -410,10 +497,16 @@ impl TeamsIngressRegistry {
                 );
             }
         }
+        // Ownership needs the authenticated Connector route but never the
+        // presigned attachment URLs. Do not duplicate attachment capabilities
+        // into every bot-owned activity entry.
+        let mut owned_route = route.clone();
+        owned_route.attachment_sources.clear();
+        owned_route.attachment_materialized_bytes = 0;
         self.owned.insert(
             key,
             OwnedActivityEntry {
-                route: route.clone(),
+                route: owned_route,
                 created_at: now,
             },
         );
@@ -555,6 +648,18 @@ mod tests {
         TeamsRouteKey::new("app", "tenant", "conversation", format!("activity-{index}"))
     }
 
+    fn attachment_source(max_bytes: u64) -> anyhow::Result<TeamsAttachmentSource> {
+        Ok(TeamsAttachmentSource {
+            kind: TeamsAttachmentSourceKind::PersonalTextFile,
+            url: Url::parse("https://tenant.sharepoint.com/download?opaque=1")?,
+            service_origin: Url::parse("https://smba.trafficmanager.net/emea/")?,
+            attachment_type: "text_file".into(),
+            filename: "notes.txt".into(),
+            mime_type: "text/plain; charset=utf-8".into(),
+            max_bytes,
+        })
+    }
+
     fn route(
         key: TeamsRouteKey,
         event_id: &str,
@@ -569,6 +674,8 @@ mod tests {
             service_url: Url::parse("https://smba.trafficmanager.net/emea/")?,
             team_id: None,
             channel_id: None,
+            attachment_sources: HashMap::new(),
+            attachment_materialized_bytes: 0,
             key,
             event_id: event_id.into(),
             created_at,
@@ -883,7 +990,10 @@ mod tests {
         let mut registry =
             TeamsIngressRegistry::new(Duration::from_secs(60), Duration::from_secs(10), 2);
         let route_key = key(1);
-        let owned_route = route(route_key.clone(), "event-1", base)?;
+        let mut owned_route = route(route_key.clone(), "event-1", base)?;
+        owned_route
+            .attachment_sources
+            .insert("secret-ref".into(), attachment_source(1024)?);
         assert!(matches!(
             registry.reserve(route_key.clone(), "event-1".into(), base),
             PublishReservation::Owner
@@ -893,6 +1003,10 @@ mod tests {
         registry.record_owned(&owned_route, "bot-0", base);
         registry.record_owned(&owned_route, "bot-1", base + Duration::from_secs(1));
         registry.record_owned(&owned_route, "bot-2", base + Duration::from_secs(2));
+        assert!(registry
+            .owned
+            .get(&route_key.with_activity_id("bot-1"))
+            .is_some_and(|entry| entry.route.attachment_sources.is_empty()));
 
         assert!(matches!(
             registry.owned_route_for_target(
@@ -989,6 +1103,57 @@ mod tests {
                 now
             ),
             Err(OwnershipLookupError::ConversationMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn attachment_claim_is_route_scoped_single_use_and_budgeted() -> anyhow::Result<()> {
+        let now = Instant::now();
+        let mut registry =
+            TeamsIngressRegistry::new(Duration::from_secs(60), Duration::from_secs(60), 10);
+        let route_key = key(1);
+        let mut accepted_route = route(route_key.clone(), "event-1", now)?;
+        for reference in ["ref-1", "ref-2", "ref-3"] {
+            accepted_route
+                .attachment_sources
+                .insert(reference.into(), attachment_source(10 * 1024 * 1024)?);
+        }
+        assert!(matches!(
+            registry.reserve(route_key.clone(), "event-1".into(), now),
+            PublishReservation::Owner
+        ));
+        assert!(registry.accept(&route_key, "event-1", accepted_route, now));
+
+        assert!(matches!(
+            registry.claim_attachment("event-1", "other", "ref-1", now),
+            Err(AttachmentLookupError::ConversationMismatch)
+        ));
+        let first = registry
+            .claim_attachment("event-1", "conversation", "ref-1", now)
+            .map_err(|error| anyhow::anyhow!("unexpected attachment error: {error:?}"))?;
+        assert_eq!(first.reserved_bytes, 10 * 1024 * 1024);
+        assert_eq!(
+            first.source.kind,
+            TeamsAttachmentSourceKind::PersonalTextFile
+        );
+        assert!(matches!(
+            registry.claim_attachment("event-1", "conversation", "ref-1", now),
+            Err(AttachmentLookupError::ReferenceNotFound)
+        ));
+        registry.finish_attachment("event-1", first.reserved_bytes, first.reserved_bytes);
+
+        let second = registry
+            .claim_attachment("event-1", "conversation", "ref-2", now)
+            .map_err(|error| anyhow::anyhow!("unexpected attachment error: {error:?}"))?;
+        registry.finish_attachment("event-1", second.reserved_bytes, second.reserved_bytes);
+        assert!(matches!(
+            registry.claim_attachment("event-1", "conversation", "ref-3", now),
+            Err(AttachmentLookupError::AggregateLimitExceeded)
+        ));
+        assert!(matches!(
+            registry.claim_attachment("missing", "conversation", "ref-3", now),
+            Err(AttachmentLookupError::RouteNotFound)
         ));
         Ok(())
     }

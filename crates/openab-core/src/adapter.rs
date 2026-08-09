@@ -386,6 +386,9 @@ pub struct AdapterCapabilities {
     /// Native reaction writes are available independently from the selected
     /// transient progress backend. Used for permanent batch receipts.
     pub supports_reactions: bool,
+    /// Gateway can resolve one opaque inbound attachment reference after Core
+    /// trust admission and return bounded normalized bytes.
+    pub supports_attachment_materialization: bool,
     pub can_edit: bool,
     pub can_delete: bool,
     pub streaming_mode: StreamingMode,
@@ -402,6 +405,7 @@ impl Default for AdapterCapabilities {
             delete_ack: false,
             supports_target_message_id: false,
             supports_reactions: false,
+            supports_attachment_materialization: false,
             can_edit: false,
             can_delete: false,
             streaming_mode: StreamingMode::Disabled,
@@ -479,6 +483,17 @@ pub enum WriteOutcomeKind {
     Unknown,
 }
 
+/// Bounded attachment result returned by an adapter after trust admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedAttachment {
+    pub attachment_type: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub data: Vec<u8>,
+    pub size: u64,
+    pub status: Option<String>,
+}
+
 // --- ChatAdapter trait ---
 
 #[async_trait]
@@ -524,6 +539,16 @@ pub trait ChatAdapter: Send + Sync + 'static {
             status_backend,
             ..AdapterCapabilities::default()
         }
+    }
+
+    /// Resolve one Gateway-local opaque attachment reference after the caller
+    /// has completed structural, scope, and identity admission.
+    async fn materialize_attachment(
+        &self,
+        _channel: &ChannelRef,
+        _reference: &str,
+    ) -> Result<MaterializedAttachment> {
+        Err(anyhow::anyhow!("attachment materialization not supported"))
     }
 
     /// Send a new message, returns a reference to the sent message.

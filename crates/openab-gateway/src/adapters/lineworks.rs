@@ -787,6 +787,7 @@ async fn download_attachment(
                             Some(path) => {
                                 let ext = if mime == "image/gif" { "gif" } else { "jpg" };
                                 Attachment {
+                                    reference: None,
                                     attachment_type: "image".into(),
                                     filename: format!("lineworks_{file_id}.{ext}"),
                                     mime_type: mime,
@@ -831,6 +832,7 @@ async fn download_attachment(
                     Some(path) => {
                         let ext = audio_extension(&ct);
                         Attachment {
+                            reference: None,
                             attachment_type: "audio".into(),
                             filename: format!("lineworks_{file_id}.{ext}"),
                             mime_type: ct,
@@ -877,6 +879,7 @@ async fn download_attachment(
             match fetch_attachment_bytes(adapter, file_id, FILE_MAX_DOWNLOAD).await {
                 Ok((bytes, _ct)) => match store::store_media(&bytes).await {
                     Some(path) => Attachment {
+                        reference: None,
                         attachment_type: "text_file".into(),
                         filename,
                         mime_type: "text/plain".into(),
@@ -2129,6 +2132,7 @@ mod tests {
 
     fn text_reply(channel_id: &str, text: &str, command: Option<&str>) -> GatewayReply {
         GatewayReply {
+            attachment_ref: None,
             schema: "openab.gateway.reply.v1".into(),
             reply_to: "evt_1".into(),
             platform: "lineworks".into(),

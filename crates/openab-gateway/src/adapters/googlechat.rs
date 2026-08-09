@@ -1385,6 +1385,7 @@ pub async fn download_googlechat_image(
         attachment_type: "image".into(),
         filename: content_name.to_string(),
         mime_type: mime,
+        reference: None,
         data: String::new(),
         size: compressed.len() as u64,
         path: Some(path),
@@ -1493,6 +1494,7 @@ pub async fn download_googlechat_file(
         attachment_type: "text_file".into(),
         filename: content_name.to_string(),
         mime_type: "text/plain".into(),
+        reference: None,
         data: String::new(),
         size: bytes.len() as u64,
         path: Some(path),
@@ -1589,6 +1591,7 @@ pub async fn download_googlechat_audio(
         attachment_type: "audio".into(),
         filename: content_name.to_string(),
         mime_type: content_type.to_string(),
+        reference: None,
         data: String::new(),
         size: bytes.len() as u64,
         path: Some(path),
@@ -2070,6 +2073,7 @@ mod tests {
             request_id: Some("req_123".into()),
             quote_message_id: None,
             target_message_id: None,
+            attachment_ref: None,
         };
 
         adapter.handle_reply(&reply, &event_tx).await;
@@ -2116,6 +2120,7 @@ mod tests {
             request_id: Some("req_fail".into()),
             quote_message_id: None,
             target_message_id: None,
+            attachment_ref: None,
         };
 
         adapter.handle_reply(&reply, &event_tx).await;
@@ -2167,6 +2172,7 @@ mod tests {
             request_id: Some("req_empty".into()),
             quote_message_id: None,
             target_message_id: None,
+            attachment_ref: None,
         };
 
         adapter.handle_reply(&reply, &event_tx).await;
@@ -2213,6 +2219,7 @@ mod tests {
             request_id: Some("req_multi_fail".into()),
             quote_message_id: None,
             target_message_id: None,
+            attachment_ref: None,
         };
 
         adapter.handle_reply(&reply, &event_tx).await;
@@ -2249,6 +2256,7 @@ mod tests {
             request_id: Some("req_notoken".into()),
             quote_message_id: None,
             target_message_id: None,
+            attachment_ref: None,
         };
 
         adapter.handle_reply(&reply, &event_tx).await;
@@ -2296,6 +2304,7 @@ mod tests {
             request_id: None,
             quote_message_id: None,
             target_message_id: None,
+            attachment_ref: None,
         };
 
         adapter.handle_reply(&reply, &event_tx).await;
@@ -2340,6 +2349,7 @@ mod tests {
             request_id: Some("req_multi".into()),
             quote_message_id: None,
             target_message_id: None,
+            attachment_ref: None,
         };
 
         adapter.handle_reply(&reply, &event_tx).await;
@@ -2399,6 +2409,7 @@ mod tests {
             request_id: Some("req_partial".into()),
             quote_message_id: None,
             target_message_id: None,
+            attachment_ref: None,
         };
 
         adapter.handle_reply(&reply, &event_tx).await;

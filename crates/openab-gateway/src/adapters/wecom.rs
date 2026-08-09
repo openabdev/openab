@@ -469,6 +469,7 @@ impl WecomAdapter {
                     outcome: None,
                     error_code: None,
                     retry_after_ms: None,
+                    attachment: None,
                 };
                 if let Ok(json) = serde_json::to_string(&resp) {
                     let _ = event_tx.send(json);
@@ -508,6 +509,7 @@ impl WecomAdapter {
                         outcome: None,
                         error_code: None,
                         retry_after_ms: None,
+                        attachment: None,
                     };
                     if let Ok(json) = serde_json::to_string(&resp) {
                         let _ = event_tx.send(json);
@@ -545,6 +547,7 @@ impl WecomAdapter {
                 outcome: None,
                 error_code: None,
                 retry_after_ms: None,
+                attachment: None,
             };
             if let Ok(json) = serde_json::to_string(&resp) {
                 let _ = event_tx.send(json);
@@ -1219,6 +1222,7 @@ async fn download_wecom_image(
         attachment_type: "image".into(),
         filename: format!("wecom_{}.{}", chrono::Utc::now().timestamp(), ext),
         mime_type: mime,
+        reference: None,
         data: String::new(),
         size: compressed.len() as u64,
         path: Some(path),
@@ -1409,6 +1413,7 @@ async fn download_wecom_file(
         attachment_type: "text_file".into(),
         filename: filename.to_string(),
         mime_type: "text/plain".into(),
+        reference: None,
         data: String::new(),
         size,
         path: Some(path),

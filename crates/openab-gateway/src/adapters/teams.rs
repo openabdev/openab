@@ -1,14 +1,17 @@
 use super::teams_ingress::{
-    wait_for_publish, OwnershipLookupError, PublishReservation, PublishState, ReactionLookupError,
-    RouteLookupError, TeamsIngressCleanupStats, TeamsIngressRegistry, TeamsIngressRoute,
+    wait_for_publish, AttachmentLookupError, OwnershipLookupError, PublishReservation,
+    PublishState, ReactionLookupError, RouteLookupError, TeamsAttachmentSource,
+    TeamsAttachmentSourceKind, TeamsIngressCleanupStats, TeamsIngressRegistry, TeamsIngressRoute,
     TeamsRouteKey, DEFAULT_DEDUPE_TTL_SECS, DEFAULT_MAX_ROUTE_ENTRIES, DEFAULT_ROUTE_TTL_SECS,
 };
 use crate::schema::*;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
+use base64::Engine;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -36,6 +39,8 @@ pub struct Activity {
     pub reply_to_id: Option<String>,
     #[serde(default)]
     pub entities: Vec<ActivityEntity>,
+    #[serde(default)]
+    pub attachments: Vec<ActivityAttachment>,
 }
 
 #[allow(dead_code)]
@@ -54,6 +59,16 @@ pub struct ActivityEntity {
     pub entity_type: String,
     pub mentioned: Option<ChannelAccount>,
     pub text: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityAttachment {
+    #[serde(default)]
+    pub content_type: String,
+    pub content_url: Option<String>,
+    pub name: Option<String>,
+    pub content: Option<serde_json::Value>,
 }
 
 #[allow(dead_code)]
@@ -280,6 +295,7 @@ pub struct TeamsConfig {
     pub route_ttl_secs: u64,
     pub max_route_entries: usize,
     pub reactions_enabled: bool,
+    pub inbound_attachments: bool,
 }
 
 impl TeamsConfig {
@@ -326,6 +342,10 @@ impl TeamsConfig {
             reactions_enabled: parse_opt_in_bool(
                 read("TEAMS_REACTIONS_ENABLED"),
                 "TEAMS_REACTIONS_ENABLED",
+            ),
+            inbound_attachments: parse_opt_in_bool(
+                read("TEAMS_INBOUND_ATTACHMENTS"),
+                "TEAMS_INBOUND_ATTACHMENTS",
             ),
         })
     }
@@ -381,6 +401,7 @@ fn parse_positive_usize(raw: Option<String>, key: &str, default: usize) -> usize
 pub struct TeamsAdapter {
     config: TeamsConfig,
     client: reqwest::Client,
+    attachment_client: reqwest::Client,
     token_cache: RwLock<Option<CachedToken>>,
     token_refresh_lock: Mutex<()>,
     openid_cache: RwLock<Option<CachedOpenId>>,
@@ -399,6 +420,11 @@ const TEAMS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const TEAMS_ERROR_BODY_LIMIT: usize = 4 * 1024;
 const TEAMS_MAX_REDIRECTS: usize = 5;
 const TEAMS_WRITE_SHARDS: usize = 64;
+const TEAMS_ATTACHMENT_METADATA_LIMIT: usize = 10;
+const TEAMS_IMAGE_DOWNLOAD_LIMIT: u64 = 10 * 1024 * 1024;
+const TEAMS_TEXT_DOWNLOAD_LIMIT: u64 = 512 * 1024;
+const TEAMS_MATERIALIZED_FRAME_LIMIT: usize = 8 * 1024 * 1024;
+const TEAMS_FILENAME_LIMIT: usize = 200;
 const TEAMS_MUTATION_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 const TEAMS_PUBLIC_SERVICE_HOST: &str = "smba.trafficmanager.net";
 const TEAMS_PUBLIC_OAUTH_HOST: &str = "login.microsoftonline.com";
@@ -413,13 +439,19 @@ enum ConnectorWriteBody<'a> {
 
 impl TeamsAdapter {
     pub fn new(config: TeamsConfig) -> Self {
-        Self::with_client(config, build_http_client(TEAMS_REQUEST_TIMEOUT), false)
+        Self::with_client(
+            config,
+            build_http_client(TEAMS_REQUEST_TIMEOUT),
+            false,
+            TEAMS_REQUEST_TIMEOUT,
+        )
     }
 
     fn with_client(
         config: TeamsConfig,
         client: reqwest::Client,
         allow_non_public_endpoints: bool,
+        attachment_timeout: Duration,
     ) -> Self {
         if config.reactions_enabled {
             warn!("teams message reactions are enabled through a Microsoft public-preview API");
@@ -432,6 +464,7 @@ impl TeamsAdapter {
         Self {
             config,
             client,
+            attachment_client: build_attachment_http_client(attachment_timeout),
             token_cache: RwLock::new(None),
             token_refresh_lock: Mutex::new(()),
             openid_cache: RwLock::new(None),
@@ -446,12 +479,22 @@ impl TeamsAdapter {
 
     #[cfg(test)]
     pub(crate) fn new_for_test(config: TeamsConfig) -> Self {
-        Self::with_client(config, build_http_client(TEAMS_REQUEST_TIMEOUT), true)
+        Self::with_client(
+            config,
+            build_http_client(TEAMS_REQUEST_TIMEOUT),
+            true,
+            TEAMS_REQUEST_TIMEOUT,
+        )
     }
 
     #[cfg(test)]
     fn new_for_test_with_timeout(config: TeamsConfig, request_timeout: Duration) -> Self {
-        Self::with_client(config, build_http_client(request_timeout), true)
+        Self::with_client(
+            config,
+            build_http_client(request_timeout),
+            true,
+            request_timeout,
+        )
     }
 
     #[cfg(test)]
@@ -482,6 +525,63 @@ impl TeamsAdapter {
             service_url: reqwest::Url::parse(service_url)?,
             team_id: None,
             channel_id: None,
+            attachment_sources: HashMap::new(),
+            attachment_materialized_bytes: 0,
+            created_at: now,
+        };
+        let mut ingress = self.ingress.lock().await;
+        assert!(matches!(
+            ingress.reserve(route_key.clone(), event_id.into(), now),
+            PublishReservation::Owner
+        ));
+        assert!(ingress.accept(&route_key, event_id, route, now));
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn accept_text_attachment_route_for_test(
+        &self,
+        service_url: &str,
+        event_id: &str,
+        conversation_id: &str,
+        activity_id: &str,
+        reference: &str,
+        download_url: &str,
+    ) -> anyhow::Result<()> {
+        let now = Instant::now();
+        let route_key = TeamsRouteKey::new(
+            self.config.app_id.clone(),
+            "tenant-1",
+            conversation_id,
+            activity_id,
+        );
+        let service_origin = reqwest::Url::parse(service_url)?;
+        let mut attachment_sources = HashMap::new();
+        attachment_sources.insert(
+            reference.into(),
+            TeamsAttachmentSource {
+                kind: TeamsAttachmentSourceKind::PersonalTextFile,
+                url: reqwest::Url::parse(download_url)?,
+                service_origin: service_origin.clone(),
+                attachment_type: "text_file".into(),
+                filename: "notes.txt".into(),
+                mime_type: "text/plain; charset=utf-8".into(),
+                max_bytes: TEAMS_TEXT_DOWNLOAD_LIMIT,
+            },
+        );
+        let route = TeamsIngressRoute {
+            key: route_key.clone(),
+            event_id: event_id.into(),
+            tenant_id: "tenant-1".into(),
+            conversation_id: conversation_id.into(),
+            conversation_type: "personal".into(),
+            inbound_activity_id: activity_id.into(),
+            reply_chain_root_id: None,
+            service_url: service_origin,
+            team_id: None,
+            channel_id: None,
+            attachment_sources,
+            attachment_materialized_bytes: 0,
             created_at: now,
         };
         let mut ingress = self.ingress.lock().await;
@@ -499,6 +599,10 @@ impl TeamsAdapter {
 
     pub fn reactions_enabled(&self) -> bool {
         self.config.reactions_enabled
+    }
+
+    pub fn inbound_attachments_enabled(&self) -> bool {
+        self.config.inbound_attachments
     }
 
     fn conversation_write_shard(route: &TeamsIngressRoute) -> usize {
@@ -1206,6 +1310,15 @@ fn build_http_client(request_timeout: Duration) -> reqwest::Client {
         .unwrap_or_else(|error| panic!("teams: failed to build hardened HTTP client: {error}"))
 }
 
+fn build_attachment_http_client(request_timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(TEAMS_CONNECT_TIMEOUT)
+        .timeout(request_timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_else(|error| panic!("teams: failed to build attachment HTTP client: {error}"))
+}
+
 fn validate_public_cloud_endpoint(
     raw_url: &str,
     label: &str,
@@ -1612,6 +1725,668 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) {
     value.truncate(boundary);
 }
 
+const TEAMS_FILE_DOWNLOAD_INFO_TYPE: &str = "application/vnd.microsoft.teams.file.download.info";
+const TEAMS_ATTACHMENT_MAX_REDIRECTS: usize = 4;
+const TEAMS_FILE_HOST_SUFFIXES: &[&str] = &[
+    "api.asm.skype.com",
+    "files.teams.microsoft.com",
+    "sharepoint.com",
+    "sharepointonline.com",
+    "1drv.com",
+    "onedrive.com",
+    "blob.core.windows.net",
+];
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TeamsFileDownloadInfo {
+    download_url: String,
+    #[serde(default)]
+    file_size: Option<u64>,
+}
+
+#[derive(Default)]
+struct PreparedTeamsAttachments {
+    metadata: Vec<Attachment>,
+    sources: HashMap<String, TeamsAttachmentSource>,
+}
+
+struct AttachmentFailure {
+    category: &'static str,
+    detail: &'static str,
+    bytes_read: u64,
+}
+
+impl AttachmentFailure {
+    fn new(category: &'static str, detail: &'static str) -> Self {
+        Self {
+            category,
+            detail,
+            bytes_read: 0,
+        }
+    }
+
+    fn with_bytes_read(mut self, bytes_read: u64) -> Self {
+        self.bytes_read = bytes_read;
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttachmentMaterializationError {
+    code: &'static str,
+    message: &'static str,
+}
+
+impl AttachmentMaterializationError {
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
+    pub fn message(&self) -> &'static str {
+        self.message
+    }
+}
+
+impl std::fmt::Display for AttachmentMaterializationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.message)
+    }
+}
+
+impl std::error::Error for AttachmentMaterializationError {}
+
+fn sanitize_attachment_filename(value: Option<&str>, fallback: &str) -> String {
+    let mut sanitized: String = value
+        .unwrap_or_default()
+        .chars()
+        .filter_map(|character| match character {
+            '/' | '\\' => Some('_'),
+            character if character.is_control() => None,
+            character => Some(character),
+        })
+        .take(TEAMS_FILENAME_LIMIT)
+        .collect();
+    sanitized = sanitized.trim().to_owned();
+    if sanitized.is_empty() {
+        fallback.to_owned()
+    } else {
+        sanitized
+    }
+}
+
+fn sanitized_declared_mime(value: &str) -> String {
+    value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '/' | '+' | '-' | '.')
+        })
+        .take(128)
+        .collect()
+}
+
+fn image_mime_for_filename(filename: &str) -> Option<&'static str> {
+    let extension = filename.rsplit_once('.')?.1.to_ascii_lowercase();
+    match extension.as_str() {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        _ => None,
+    }
+}
+
+fn rejected_attachment(
+    attachment_type: &str,
+    filename: String,
+    mime_type: String,
+    size: u64,
+    category: &'static str,
+    detail: &'static str,
+) -> Attachment {
+    Attachment {
+        attachment_type: attachment_type.into(),
+        filename,
+        mime_type,
+        reference: None,
+        data: String::new(),
+        size,
+        path: None,
+        status: Some(format!("{category}: {detail}")),
+    }
+}
+
+fn parse_file_download_info(content: Option<&serde_json::Value>) -> Option<TeamsFileDownloadInfo> {
+    match content? {
+        serde_json::Value::String(value) => serde_json::from_str(value).ok(),
+        value => serde_json::from_value(value.clone()).ok(),
+    }
+}
+
+fn attachment_url_base(
+    raw_url: &str,
+    label: &str,
+    allow_non_public_endpoints: bool,
+) -> anyhow::Result<reqwest::Url> {
+    let url =
+        reqwest::Url::parse(raw_url).map_err(|_| anyhow::anyhow!("{label} is not a valid URL"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("{label} must not contain userinfo");
+    }
+    if url.fragment().is_some() {
+        anyhow::bail!("{label} must not contain a fragment");
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("{label} is missing a host"))?;
+    if allow_non_public_endpoints {
+        if !matches!(url.scheme(), "http" | "https") {
+            anyhow::bail!("{label} must use HTTP or HTTPS in tests");
+        }
+        return Ok(url);
+    }
+    if url.scheme() != "https" {
+        anyhow::bail!("{label} must use HTTPS");
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        anyhow::bail!("{label} must not use an IP literal");
+    }
+    if url.port_or_known_default() != Some(443) {
+        anyhow::bail!("{label} must use HTTPS port 443");
+    }
+    Ok(url)
+}
+
+fn same_origin(left: &reqwest::Url, right: &reqwest::Url) -> bool {
+    left.scheme() == right.scheme()
+        && left
+            .host_str()
+            .zip(right.host_str())
+            .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn validate_inline_attachment_url(
+    raw_url: &str,
+    service_origin: &reqwest::Url,
+    allow_non_public_endpoints: bool,
+) -> anyhow::Result<reqwest::Url> {
+    let url = attachment_url_base(
+        raw_url,
+        "Teams inline attachment URL",
+        allow_non_public_endpoints,
+    )?;
+    if !same_origin(&url, service_origin) {
+        anyhow::bail!("Teams inline attachment URL must match the Connector origin");
+    }
+    Ok(url)
+}
+
+fn is_allowed_file_host(host: &str) -> bool {
+    TEAMS_FILE_HOST_SUFFIXES.iter().any(|suffix| {
+        host.eq_ignore_ascii_case(suffix)
+            || host.to_ascii_lowercase().ends_with(&format!(".{suffix}"))
+    })
+}
+
+fn validate_file_attachment_url(
+    raw_url: &str,
+    allow_non_public_endpoints: bool,
+) -> anyhow::Result<reqwest::Url> {
+    let url = attachment_url_base(
+        raw_url,
+        "Teams file attachment URL",
+        allow_non_public_endpoints,
+    )?;
+    if allow_non_public_endpoints {
+        return Ok(url);
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("Teams file attachment URL is missing a host"))?;
+    if !is_allowed_file_host(host) {
+        anyhow::bail!("Teams file attachment host is not in the public-cloud profile");
+    }
+    Ok(url)
+}
+
+fn prepare_attachment_metadata(
+    teams: &TeamsAdapter,
+    activity: &Activity,
+    service_origin: &reqwest::Url,
+    conversation_type: &str,
+) -> PreparedTeamsAttachments {
+    let mut prepared = PreparedTeamsAttachments::default();
+    let explicit_personal_scope = activity
+        .conversation
+        .as_ref()
+        .and_then(|conversation| conversation.conversation_type.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .is_some_and(|value| canonical_conversation_type(value) == "personal");
+    for attachment in activity
+        .attachments
+        .iter()
+        .take(TEAMS_ATTACHMENT_METADATA_LIMIT)
+    {
+        let declared_mime = sanitized_declared_mime(&attachment.content_type);
+        let filename = sanitize_attachment_filename(attachment.name.as_deref(), "attachment");
+        if declared_mime.starts_with("image/") {
+            let Some(content_url) = attachment
+                .content_url
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            else {
+                prepared.metadata.push(rejected_attachment(
+                    "image",
+                    filename,
+                    declared_mime,
+                    0,
+                    "invalid content",
+                    "inline image has no content URL",
+                ));
+                continue;
+            };
+            let url = match validate_inline_attachment_url(
+                content_url,
+                service_origin,
+                teams.allow_non_public_endpoints,
+            ) {
+                Ok(url) => url,
+                Err(_) => {
+                    prepared.metadata.push(rejected_attachment(
+                        "image",
+                        filename,
+                        declared_mime,
+                        0,
+                        "security rejected",
+                        "inline image URL is outside the Connector origin",
+                    ));
+                    continue;
+                }
+            };
+            let reference = format!("att_{}", uuid::Uuid::new_v4());
+            prepared.sources.insert(
+                reference.clone(),
+                TeamsAttachmentSource {
+                    kind: TeamsAttachmentSourceKind::InlineImage,
+                    url,
+                    service_origin: service_origin.clone(),
+                    attachment_type: "image".into(),
+                    filename: filename.clone(),
+                    mime_type: declared_mime.clone(),
+                    max_bytes: TEAMS_IMAGE_DOWNLOAD_LIMIT,
+                },
+            );
+            prepared.metadata.push(Attachment {
+                attachment_type: "image".into(),
+                filename,
+                mime_type: declared_mime,
+                reference: Some(reference),
+                data: String::new(),
+                size: 0,
+                path: None,
+                status: None,
+            });
+            continue;
+        }
+
+        if declared_mime == TEAMS_FILE_DOWNLOAD_INFO_TYPE {
+            let Some(info) = parse_file_download_info(attachment.content.as_ref()) else {
+                prepared.metadata.push(rejected_attachment(
+                    "file",
+                    filename,
+                    declared_mime,
+                    0,
+                    "invalid content",
+                    "file download metadata is malformed",
+                ));
+                continue;
+            };
+            let declared_size = info.file_size.unwrap_or(0);
+            if conversation_type != "personal" || !explicit_personal_scope {
+                prepared.metadata.push(rejected_attachment(
+                    "file",
+                    filename,
+                    declared_mime,
+                    declared_size,
+                    "unsupported format",
+                    "Teams file download is Personal-only",
+                ));
+                continue;
+            }
+            let (kind, attachment_type, normalized_mime, max_bytes) =
+                if let Some(image_mime) = image_mime_for_filename(&filename) {
+                    (
+                        TeamsAttachmentSourceKind::PersonalFileImage,
+                        "image",
+                        image_mime,
+                        TEAMS_IMAGE_DOWNLOAD_LIMIT,
+                    )
+                } else if crate::media::is_text_extension(&filename) {
+                    (
+                        TeamsAttachmentSourceKind::PersonalTextFile,
+                        "text_file",
+                        "text/plain; charset=utf-8",
+                        TEAMS_TEXT_DOWNLOAD_LIMIT,
+                    )
+                } else {
+                    prepared.metadata.push(rejected_attachment(
+                        "file",
+                        filename,
+                        declared_mime,
+                        declared_size,
+                        "unsupported format",
+                        "file extension is not supported",
+                    ));
+                    continue;
+                };
+            if declared_size > max_bytes {
+                prepared.metadata.push(rejected_attachment(
+                    attachment_type,
+                    filename,
+                    normalized_mime.into(),
+                    declared_size,
+                    "size exceeded",
+                    "declared file size exceeds the limit",
+                ));
+                continue;
+            }
+            let url = match validate_file_attachment_url(
+                &info.download_url,
+                teams.allow_non_public_endpoints,
+            ) {
+                Ok(url) => url,
+                Err(_) => {
+                    prepared.metadata.push(rejected_attachment(
+                        attachment_type,
+                        filename,
+                        normalized_mime.into(),
+                        declared_size,
+                        "security rejected",
+                        "file URL is outside the public-cloud profile",
+                    ));
+                    continue;
+                }
+            };
+            let reference = format!("att_{}", uuid::Uuid::new_v4());
+            prepared.sources.insert(
+                reference.clone(),
+                TeamsAttachmentSource {
+                    kind,
+                    url,
+                    service_origin: service_origin.clone(),
+                    attachment_type: attachment_type.into(),
+                    filename: filename.clone(),
+                    mime_type: normalized_mime.into(),
+                    max_bytes,
+                },
+            );
+            prepared.metadata.push(Attachment {
+                attachment_type: attachment_type.into(),
+                filename,
+                mime_type: normalized_mime.into(),
+                reference: Some(reference),
+                data: String::new(),
+                size: declared_size,
+                path: None,
+                status: None,
+            });
+            continue;
+        }
+
+        if declared_mime.starts_with("application/vnd.microsoft.card.") {
+            continue;
+        }
+        if attachment.content_url.is_some() || attachment.name.is_some() {
+            prepared.metadata.push(rejected_attachment(
+                "file",
+                filename,
+                declared_mime,
+                0,
+                "unsupported format",
+                "attachment type is not supported",
+            ));
+        }
+    }
+    prepared
+}
+
+fn materialization_protocol_error(error: AttachmentLookupError) -> AttachmentMaterializationError {
+    match error {
+        AttachmentLookupError::RouteNotFound => AttachmentMaterializationError {
+            code: "attachment_route_not_found",
+            message: "attachment route is unavailable",
+        },
+        AttachmentLookupError::ConversationMismatch => AttachmentMaterializationError {
+            code: "attachment_scope_mismatch",
+            message: "attachment conversation does not match its route",
+        },
+        AttachmentLookupError::ReferenceNotFound => AttachmentMaterializationError {
+            code: "attachment_reference_not_found",
+            message: "attachment reference is unavailable",
+        },
+        AttachmentLookupError::AggregateLimitExceeded => AttachmentMaterializationError {
+            code: "attachment_budget_exceeded",
+            message: "attachment event budget is exhausted",
+        },
+    }
+}
+
+impl TeamsAdapter {
+    async fn download_attachment_bytes(
+        &self,
+        source: &TeamsAttachmentSource,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, AttachmentFailure> {
+        let bearer = if source.kind == TeamsAttachmentSourceKind::InlineImage {
+            Some(self.get_token().await.map_err(|_| {
+                AttachmentFailure::new("download failed", "Bot token is unavailable")
+            })?)
+        } else {
+            None
+        };
+        let mut url = source.url.clone();
+        let mut redirects = 0usize;
+        loop {
+            let mut request = self.attachment_client.get(url.clone());
+            if let Some(token) = bearer.as_deref() {
+                request = request.bearer_auth(token);
+            }
+            let mut response = request.send().await.map_err(|_| {
+                AttachmentFailure::new("download failed", "attachment request failed")
+            })?;
+            if response.status().is_redirection() {
+                if redirects >= TEAMS_ATTACHMENT_MAX_REDIRECTS {
+                    return Err(AttachmentFailure::new(
+                        "security rejected",
+                        "attachment redirect limit exceeded",
+                    ));
+                }
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| {
+                        AttachmentFailure::new(
+                            "download failed",
+                            "attachment redirect has no valid location",
+                        )
+                    })?;
+                let candidate = url.join(location).map_err(|_| {
+                    AttachmentFailure::new("security rejected", "attachment redirect is invalid")
+                })?;
+                url = match source.kind {
+                    TeamsAttachmentSourceKind::InlineImage => validate_inline_attachment_url(
+                        candidate.as_str(),
+                        &source.service_origin,
+                        self.allow_non_public_endpoints,
+                    ),
+                    TeamsAttachmentSourceKind::PersonalFileImage
+                    | TeamsAttachmentSourceKind::PersonalTextFile => validate_file_attachment_url(
+                        candidate.as_str(),
+                        self.allow_non_public_endpoints,
+                    ),
+                }
+                .map_err(|_| {
+                    AttachmentFailure::new(
+                        "security rejected",
+                        "attachment redirect is outside the allowed origin profile",
+                    )
+                })?;
+                redirects += 1;
+                continue;
+            }
+            if !response.status().is_success() {
+                return Err(AttachmentFailure::new(
+                    "download failed",
+                    "Microsoft attachment response was not successful",
+                ));
+            }
+            if response
+                .content_length()
+                .is_some_and(|size| size > max_bytes)
+            {
+                return Err(AttachmentFailure::new(
+                    "size exceeded",
+                    "attachment Content-Length exceeds the limit",
+                ));
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|_| {
+                AttachmentFailure::new("download failed", "attachment body read failed")
+                    .with_bytes_read(bytes.len() as u64)
+            })? {
+                let next_len = bytes.len().saturating_add(chunk.len());
+                if next_len as u64 > max_bytes {
+                    return Err(AttachmentFailure::new(
+                        "size exceeded",
+                        "attachment body exceeds the limit",
+                    )
+                    .with_bytes_read(max_bytes));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            return Ok(bytes);
+        }
+    }
+
+    pub async fn materialize_attachment(
+        &self,
+        event_id: &str,
+        conversation_id: &str,
+        reference: &str,
+    ) -> Result<Attachment, AttachmentMaterializationError> {
+        if !self.inbound_attachments_enabled() {
+            return Err(AttachmentMaterializationError {
+                code: "attachment_materialization_disabled",
+                message: "attachment materialization is disabled",
+            });
+        }
+        let claim = self
+            .ingress
+            .lock()
+            .await
+            .claim_attachment(event_id, conversation_id, reference, Instant::now())
+            .map_err(materialization_protocol_error)?;
+        let download = self
+            .download_attachment_bytes(&claim.source, claim.reserved_bytes)
+            .await;
+        let raw_bytes = download
+            .as_ref()
+            .map(|bytes| bytes.len() as u64)
+            .unwrap_or_else(|failure| failure.bytes_read);
+        self.ingress
+            .lock()
+            .await
+            .finish_attachment(event_id, claim.reserved_bytes, raw_bytes);
+
+        let bytes = match download {
+            Ok(bytes) => bytes,
+            Err(failure) => {
+                return Ok(rejected_attachment(
+                    &claim.source.attachment_type,
+                    claim.source.filename,
+                    claim.source.mime_type,
+                    raw_bytes,
+                    failure.category,
+                    failure.detail,
+                ));
+            }
+        };
+        let normalized = match claim.source.kind {
+            TeamsAttachmentSourceKind::InlineImage
+            | TeamsAttachmentSourceKind::PersonalFileImage => {
+                match tokio::task::spawn_blocking(move || {
+                    crate::media::resize_and_compress(&bytes)
+                })
+                .await
+                {
+                    Ok(result) => result.map_err(|_| {
+                        AttachmentFailure::new(
+                            "processing failed",
+                            "image decoding or normalization failed",
+                        )
+                    }),
+                    Err(_) => Err(AttachmentFailure::new(
+                        "processing failed",
+                        "image normalization task failed",
+                    )),
+                }
+            }
+            TeamsAttachmentSourceKind::PersonalTextFile => {
+                if std::str::from_utf8(&bytes).is_err() {
+                    Err(AttachmentFailure::new(
+                        "invalid content",
+                        "text attachment is not valid UTF-8",
+                    ))
+                } else {
+                    Ok((bytes, "text/plain; charset=utf-8".into()))
+                }
+            }
+        };
+        let (normalized_bytes, mime_type) = match normalized {
+            Ok(normalized) => normalized,
+            Err(failure) => {
+                return Ok(rejected_attachment(
+                    &claim.source.attachment_type,
+                    claim.source.filename,
+                    claim.source.mime_type,
+                    raw_bytes,
+                    failure.category,
+                    failure.detail,
+                ));
+            }
+        };
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&normalized_bytes);
+        if encoded.len().saturating_add(4096) > TEAMS_MATERIALIZED_FRAME_LIMIT {
+            return Ok(rejected_attachment(
+                &claim.source.attachment_type,
+                claim.source.filename,
+                mime_type,
+                raw_bytes,
+                "size exceeded",
+                "normalized attachment exceeds the internal frame limit",
+            ));
+        }
+        Ok(Attachment {
+            attachment_type: claim.source.attachment_type,
+            filename: claim.source.filename,
+            mime_type,
+            reference: None,
+            data: encoded,
+            size: normalized_bytes.len() as u64,
+            path: None,
+            status: None,
+        })
+    }
+}
+
 // --- Webhook handler ---
 
 /// Max webhook body size: 256 KB. Real Teams activities are a few KB; the
@@ -1714,10 +2489,11 @@ async fn accept_message_activity(state: Arc<crate::AppState>, activity: Activity
         return StatusCode::BAD_REQUEST;
     }
 
-    let text = match activity.text.as_deref() {
-        Some(text) if !text.trim().is_empty() => text.trim(),
-        _ => return StatusCode::OK,
-    };
+    let text = activity.text.as_deref().unwrap_or_default().trim();
+    if text.is_empty() && (!teams.inbound_attachments_enabled() || activity.attachments.is_empty())
+    {
+        return StatusCode::OK;
+    }
     let Some(tenant_id) = activity
         .resolved_tenant_id()
         .filter(|value| !value.trim().is_empty())
@@ -1777,6 +2553,14 @@ async fn accept_message_activity(state: Arc<crate::AppState>, activity: Activity
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("personal"),
     );
+    let prepared_attachments = if teams.inbound_attachments_enabled() {
+        prepare_attachment_metadata(teams, &activity, &validated_service_url, &conversation_type)
+    } else {
+        PreparedTeamsAttachments::default()
+    };
+    if text.is_empty() && prepared_attachments.metadata.is_empty() {
+        return StatusCode::OK;
+    }
     let sender_name = activity
         .from
         .as_ref()
@@ -1809,6 +2593,7 @@ async fn accept_message_activity(state: Arc<crate::AppState>, activity: Activity
     event.scope = Some(scope);
     event.recipient = recipient;
     event.mention_entities = mention_entities;
+    event.content.attachments = prepared_attachments.metadata;
     let event_id = event.event_id.clone();
     let route_key = TeamsRouteKey::new(
         teams.config.app_id.clone(),
@@ -1828,6 +2613,8 @@ async fn accept_message_activity(state: Arc<crate::AppState>, activity: Activity
         service_url: validated_service_url.clone(),
         team_id: route_team_id,
         channel_id: route_channel_id,
+        attachment_sources: prepared_attachments.sources,
+        attachment_materialized_bytes: 0,
         created_at: now,
     };
     let json = match serde_json::to_string(&event) {
@@ -2337,6 +3124,7 @@ mod tests {
             route_ttl_secs: DEFAULT_ROUTE_TTL_SECS,
             max_route_entries: DEFAULT_MAX_ROUTE_ENTRIES,
             reactions_enabled: false,
+            inbound_attachments: false,
         }
     }
 
@@ -2370,6 +3158,7 @@ mod tests {
 
     fn make_reply(command: Option<&str>) -> GatewayReply {
         GatewayReply {
+            attachment_ref: None,
             schema: "openab.gateway.reply.v1".into(),
             reply_to: "evt-1".into(),
             platform: "teams".into(),
@@ -2425,7 +3214,22 @@ mod tests {
             channel_data: None,
             reply_to_id: None,
             entities: vec![],
+            attachments: vec![],
         }
+    }
+
+    fn make_attachment_state(
+        config: TeamsConfig,
+    ) -> (
+        Arc<crate::AppState>,
+        tokio::sync::broadcast::Receiver<String>,
+    ) {
+        let (event_tx, event_rx) = tokio::sync::broadcast::channel(16);
+        let state = Arc::new(crate::AppState {
+            teams: Some(TeamsAdapter::new_for_test(config)),
+            ..crate::AppState::test_default(event_tx)
+        });
+        (state, event_rx)
     }
 
     fn make_routable_activity(activity_id: &str) -> Activity {
@@ -2466,7 +3270,467 @@ mod tests {
             }),
             reply_to_id: Some("root-activity".into()),
             entities: vec![],
+            attachments: vec![],
         }
+    }
+
+    fn make_personal_attachment_activity(
+        activity_id: &str,
+        service_url: &str,
+        attachment: ActivityAttachment,
+    ) -> Activity {
+        let mut activity = make_routable_activity(activity_id);
+        activity.service_url = Some(service_url.into());
+        activity.text = None;
+        activity.conversation = Some(ConversationAccount {
+            id: Some("conversation-1".into()),
+            conversation_type: Some("personal".into()),
+            is_group: Some(false),
+            tenant_id: None,
+        });
+        activity.channel_data = Some(ChannelData {
+            tenant: None,
+            team: None,
+            channel: None,
+        });
+        activity.attachments = vec![attachment];
+        activity
+    }
+
+    fn inline_image_attachment(url: &str) -> ActivityAttachment {
+        ActivityAttachment {
+            content_type: "image/png".into(),
+            content_url: Some(url.into()),
+            name: Some("image.png".into()),
+            content: None,
+        }
+    }
+
+    fn personal_file_attachment(
+        url: &str,
+        filename: &str,
+        file_size: Option<u64>,
+    ) -> ActivityAttachment {
+        ActivityAttachment {
+            content_type: TEAMS_FILE_DOWNLOAD_INFO_TYPE.into(),
+            content_url: None,
+            name: Some(filename.into()),
+            content: Some(serde_json::json!({
+                "downloadUrl": url,
+                "fileSize": file_size,
+            })),
+        }
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        let image = image::DynamicImage::new_rgb8(2, 2);
+        let mut output = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut output, image::ImageFormat::Png)
+            .expect("test PNG encoding");
+        output.into_inner()
+    }
+
+    #[tokio::test]
+    async fn attachment_only_is_ignored_when_disabled_and_publishes_opaque_metadata_when_enabled(
+    ) -> anyhow::Result<()> {
+        let content_url = "https://smba.trafficmanager.net/emea/v3/attachments/private/views/original?opaque=secret";
+        let activity = make_personal_attachment_activity(
+            "attachment-disabled",
+            "https://smba.trafficmanager.net/emea/",
+            inline_image_attachment(content_url),
+        );
+        let (disabled_state, mut disabled_rx) = make_routable_state();
+        assert_eq!(
+            accept_message_activity(disabled_state.clone(), activity.clone()).await,
+            StatusCode::OK
+        );
+        assert!(matches!(
+            disabled_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        let mut config = make_config(vec![]);
+        config.inbound_attachments = true;
+        let (enabled_state, mut enabled_rx) = make_attachment_state(config);
+        assert_eq!(
+            accept_message_activity(enabled_state.clone(), activity).await,
+            StatusCode::OK
+        );
+        let event_json = enabled_rx.recv().await?;
+        assert!(!event_json.contains("opaque=secret"));
+        assert!(!event_json.contains("/attachments/private/"));
+        let event: GatewayEvent = serde_json::from_str(&event_json)?;
+        assert!(event.content.text.is_empty());
+        assert_eq!(event.content.attachments.len(), 1);
+        let reference = event.content.attachments[0]
+            .reference
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("opaque reference missing"))?;
+        assert!(reference.starts_with("att_"));
+        assert!(event.content.attachments[0].data.is_empty());
+        assert!(event.content.attachments[0].path.is_none());
+
+        let route = enabled_state
+            .teams
+            .as_ref()
+            .expect("Teams adapter")
+            .ingress
+            .lock()
+            .await
+            .route_for_event(&event.event_id, Instant::now())
+            .ok_or_else(|| anyhow::anyhow!("attachment route missing"))?;
+        assert_eq!(route.attachment_sources.len(), 1);
+        assert!(route.attachment_sources.contains_key(reference));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inline_image_materializes_once_with_bot_auth_after_route_acceptance(
+    ) -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let _token = Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "attachment-token",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let png = tiny_png();
+        let _image = Mock::given(method("GET"))
+            .and(path("/inline"))
+            .and(header("authorization", "Bearer attachment-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(png))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut config = make_http_test_config(&server);
+        config.inbound_attachments = true;
+        let (state, mut event_rx) = make_attachment_state(config);
+        let activity = make_personal_attachment_activity(
+            "inline-materialize",
+            &server.uri(),
+            inline_image_attachment(&format!("{}/inline?sig=private", server.uri())),
+        );
+        assert_eq!(
+            accept_message_activity(state.clone(), activity).await,
+            StatusCode::OK
+        );
+        let event_json = event_rx.recv().await?;
+        assert!(!event_json.contains("sig=private"));
+        let event: GatewayEvent = serde_json::from_str(&event_json)?;
+        let reference = event.content.attachments[0]
+            .reference
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("opaque reference missing"))?;
+        let teams = state.teams.as_ref().expect("Teams adapter");
+        let attachment = teams
+            .materialize_attachment(&event.event_id, &event.channel.id, reference)
+            .await?;
+        assert!(attachment.status.is_none());
+        assert_eq!(attachment.mime_type, "image/jpeg");
+        assert!(attachment.reference.is_none());
+        assert!(attachment.path.is_none());
+        let decoded = attachment.decoded_data()?;
+        assert!(!decoded.is_empty());
+        assert_eq!(attachment.size, decoded.len() as u64);
+
+        let second = teams
+            .materialize_attachment(&event.event_id, &event.channel.id, reference)
+            .await
+            .expect_err("an opaque reference must be single-use");
+        assert_eq!(second.code(), "attachment_reference_not_found");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn personal_text_materialization_never_sends_bot_auth_and_rejects_non_utf8(
+    ) -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let _text = Mock::given(method("GET"))
+            .and(path("/notes"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello teams"))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _binary = Mock::given(method("GET"))
+            .and(path("/invalid"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes([0xff, 0xfe]))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut config = make_http_test_config(&server);
+        config.inbound_attachments = true;
+        let (state, mut event_rx) = make_attachment_state(config);
+        let text_activity = make_personal_attachment_activity(
+            "text-materialize",
+            &server.uri(),
+            personal_file_attachment(
+                &format!("{}/notes?sig=private", server.uri()),
+                "notes.md",
+                Some(11),
+            ),
+        );
+        assert_eq!(
+            accept_message_activity(state.clone(), text_activity).await,
+            StatusCode::OK
+        );
+        let event: GatewayEvent = serde_json::from_str(&event_rx.recv().await?)?;
+        let reference = event.content.attachments[0]
+            .reference
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("text reference missing"))?;
+        let teams = state.teams.as_ref().expect("Teams adapter");
+        let attachment = teams
+            .materialize_attachment(&event.event_id, &event.channel.id, reference)
+            .await?;
+        assert_eq!(attachment.decoded_data()?, b"hello teams");
+        assert_eq!(attachment.mime_type, "text/plain; charset=utf-8");
+
+        let invalid_activity = make_personal_attachment_activity(
+            "invalid-text",
+            &server.uri(),
+            personal_file_attachment(
+                &format!("{}/invalid?sig=private", server.uri()),
+                "invalid.txt",
+                Some(2),
+            ),
+        );
+        assert_eq!(
+            accept_message_activity(state.clone(), invalid_activity).await,
+            StatusCode::OK
+        );
+        let invalid_event: GatewayEvent = serde_json::from_str(&event_rx.recv().await?)?;
+        let invalid_reference = invalid_event.content.attachments[0]
+            .reference
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("invalid text reference missing"))?;
+        let rejected = teams
+            .materialize_attachment(
+                &invalid_event.event_id,
+                &invalid_event.channel.id,
+                invalid_reference,
+            )
+            .await?;
+        assert!(rejected.data.is_empty());
+        assert!(rejected
+            .status
+            .as_deref()
+            .is_some_and(|status| status.starts_with("invalid content:")));
+
+        let requests = server
+            .received_requests()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("request recording is disabled"))?;
+        for request in requests
+            .iter()
+            .filter(|request| matches!(request.url.path(), "/notes" | "/invalid"))
+        {
+            assert!(!request.headers.contains_key("authorization"));
+        }
+        assert!(!requests
+            .iter()
+            .any(|request| request.url.path() == "/token"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inline_redirect_cannot_forward_bot_auth_to_another_origin() -> anyhow::Result<()> {
+        let source = MockServer::start().await;
+        let target = MockServer::start().await;
+        let _token = Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "attachment-token",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount_as_scoped(&source)
+            .await;
+        let _redirect = Mock::given(method("GET"))
+            .and(path("/inline"))
+            .and(header("authorization", "Bearer attachment-token"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/target", target.uri())),
+            )
+            .expect(1)
+            .mount_as_scoped(&source)
+            .await;
+        let _target = Mock::given(method("GET"))
+            .and(path("/target"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tiny_png()))
+            .expect(0)
+            .mount_as_scoped(&target)
+            .await;
+
+        let mut config = make_http_test_config(&source);
+        config.inbound_attachments = true;
+        let (state, mut event_rx) = make_attachment_state(config);
+        let activity = make_personal_attachment_activity(
+            "redirect-image",
+            &source.uri(),
+            inline_image_attachment(&format!("{}/inline", source.uri())),
+        );
+        assert_eq!(
+            accept_message_activity(state.clone(), activity).await,
+            StatusCode::OK
+        );
+        let event: GatewayEvent = serde_json::from_str(&event_rx.recv().await?)?;
+        let reference = event.content.attachments[0]
+            .reference
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("redirect reference missing"))?;
+        let rejected = state
+            .teams
+            .as_ref()
+            .expect("Teams adapter")
+            .materialize_attachment(&event.event_id, &event.channel.id, reference)
+            .await?;
+        assert!(rejected
+            .status
+            .as_deref()
+            .is_some_and(|status| status.starts_with("security rejected:")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attachment_metadata_and_download_limits_are_enforced() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let _oversized = Mock::given(method("GET"))
+            .and(path("/oversized"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![
+                0;
+                TEAMS_TEXT_DOWNLOAD_LIMIT
+                    as usize
+                    + 1
+            ]))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let mut config = make_http_test_config(&server);
+        config.inbound_attachments = true;
+        let (state, mut event_rx) = make_attachment_state(config);
+        let activity = make_personal_attachment_activity(
+            "oversized-text",
+            &server.uri(),
+            personal_file_attachment(
+                &format!("{}/oversized?sig=private", server.uri()),
+                "notes.txt",
+                None,
+            ),
+        );
+        assert_eq!(
+            accept_message_activity(state.clone(), activity).await,
+            StatusCode::OK
+        );
+        let event: GatewayEvent = serde_json::from_str(&event_rx.recv().await?)?;
+        let reference = event.content.attachments[0]
+            .reference
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("oversized reference missing"))?;
+        let rejected = state
+            .teams
+            .as_ref()
+            .expect("Teams adapter")
+            .materialize_attachment(&event.event_id, &event.channel.id, reference)
+            .await?;
+        let rejection = rejected
+            .status
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("oversized attachment was not rejected"))?;
+        assert!(rejection.starts_with("size exceeded:"), "{rejection}");
+
+        let teams = state.teams.as_ref().expect("Teams adapter");
+        let service = reqwest::Url::parse(&server.uri())?;
+        let mut many = make_personal_attachment_activity(
+            "many-attachments",
+            &server.uri(),
+            inline_image_attachment(&format!("{}/image-0", server.uri())),
+        );
+        many.attachments = (0..12)
+            .map(|index| ActivityAttachment {
+                content_type: "image/png".into(),
+                content_url: Some(format!("{}/image-{index}", server.uri())),
+                name: Some(format!("{}-{index}.png", "a".repeat(240))),
+                content: None,
+            })
+            .collect();
+        let prepared = prepare_attachment_metadata(teams, &many, &service, "personal");
+        assert_eq!(prepared.metadata.len(), TEAMS_ATTACHMENT_METADATA_LIMIT);
+        assert_eq!(prepared.sources.len(), TEAMS_ATTACHMENT_METADATA_LIMIT);
+        assert!(prepared
+            .metadata
+            .iter()
+            .all(|attachment| attachment.filename.chars().count() <= TEAMS_FILENAME_LIMIT));
+        Ok(())
+    }
+
+    #[test]
+    fn attachment_url_and_scope_policy_is_fail_closed() -> anyhow::Result<()> {
+        let service = reqwest::Url::parse("https://smba.trafficmanager.net/emea/")?;
+        assert!(validate_inline_attachment_url(
+            "https://smba.trafficmanager.net/emea/attachment?sig=opaque",
+            &service,
+            false,
+        )
+        .is_ok());
+        assert!(
+            validate_inline_attachment_url("https://evil.example/attachment", &service, false,)
+                .is_err()
+        );
+        assert!(validate_file_attachment_url(
+            "https://tenant.sharepoint.com/file?sig=opaque",
+            false,
+        )
+        .is_ok());
+        for unsafe_url in [
+            "http://tenant.sharepoint.com/file",
+            "https://127.0.0.1/file",
+            "https://evilsharepoint.com/file",
+            "https://tenant.sharepoint.com:444/file",
+            "https://user@tenant.sharepoint.com/file",
+            "https://tenant.sharepoint.com/file#fragment",
+        ] {
+            assert!(validate_file_attachment_url(unsafe_url, false).is_err());
+        }
+
+        let mut config = make_config(vec![]);
+        config.inbound_attachments = true;
+        let adapter = TeamsAdapter::new(config);
+        let group_attachment = personal_file_attachment(
+            "https://tenant.sharepoint.com/file?sig=opaque",
+            "notes.txt",
+            Some(5),
+        );
+        let activity =
+            make_personal_attachment_activity("group-file", service.as_str(), group_attachment);
+        let prepared = prepare_attachment_metadata(&adapter, &activity, &service, "groupChat");
+        assert!(prepared.sources.is_empty());
+        assert_eq!(prepared.metadata.len(), 1);
+        assert!(prepared.metadata[0]
+            .status
+            .as_deref()
+            .is_some_and(|status| status.starts_with("unsupported format:")));
+
+        let mut missing_scope = activity;
+        missing_scope
+            .conversation
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("test activity is missing its conversation"))?
+            .conversation_type = None;
+        let prepared =
+            prepare_attachment_metadata(&adapter, &missing_scope, &service, "personal");
+        assert!(prepared.sources.is_empty());
+        assert!(prepared.metadata[0]
+            .status
+            .as_deref()
+            .is_some_and(|status| status.starts_with("unsupported format:")));
+        Ok(())
     }
 
     // --- webhook body limit ---
@@ -3946,22 +5210,27 @@ mod tests {
         assert_eq!(config.route_ttl_secs, 84);
         assert_eq!(config.max_route_entries, 123);
         assert!(!config.reactions_enabled);
+        assert!(!config.inbound_attachments);
 
         values.insert("TEAMS_REACTIONS_ENABLED", "true");
+        values.insert("TEAMS_INBOUND_ATTACHMENTS", "1");
         let config = TeamsConfig::from_reader(|key| values.get(key).map(ToString::to_string))
             .ok_or_else(|| anyhow::anyhow!("complete credentials should resolve"))?;
         assert!(config.reactions_enabled);
+        assert!(config.inbound_attachments);
 
         values.insert("TEAMS_DEDUPE_TTL_SECS", "0");
         values.insert("TEAMS_ROUTE_TTL_SECS", "invalid");
         values.insert("TEAMS_MAX_ROUTE_ENTRIES", "0");
         values.insert("TEAMS_REACTIONS_ENABLED", "invalid");
+        values.insert("TEAMS_INBOUND_ATTACHMENTS", "invalid");
         let config = TeamsConfig::from_reader(|key| values.get(key).map(ToString::to_string))
             .ok_or_else(|| anyhow::anyhow!("complete credentials should resolve"))?;
         assert_eq!(config.dedupe_ttl_secs, DEFAULT_DEDUPE_TTL_SECS);
         assert_eq!(config.route_ttl_secs, DEFAULT_ROUTE_TTL_SECS);
         assert_eq!(config.max_route_entries, DEFAULT_MAX_ROUTE_ENTRIES);
         assert!(!config.reactions_enabled);
+        assert!(!config.inbound_attachments);
         Ok(())
     }
 

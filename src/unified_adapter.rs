@@ -4,8 +4,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use openab_core::adapter::{
-    AdapterCapabilities, ChannelRef, ChatAdapter, MessageLimit, MessageRef, StatusBackend,
-    StreamingMode,
+    AdapterCapabilities, ChannelRef, ChatAdapter, MaterializedAttachment, MessageLimit, MessageRef,
+    StatusBackend, StreamingMode,
 };
 #[cfg(feature = "teams")]
 use openab_core::adapter::{WriteFailure, WriteOutcome as CoreWriteOutcome};
@@ -27,6 +27,8 @@ pub struct UnifiedGatewayAdapter {
     teams_processing_indicator: bool,
     /// Core-side default-off Teams progressive-content policy.
     teams_streaming: bool,
+    /// Core-side default-off Teams inbound attachment policy.
+    teams_inbound_attachments: bool,
 }
 
 impl UnifiedGatewayAdapter {
@@ -36,6 +38,7 @@ impl UnifiedGatewayAdapter {
             telegram_reaction_state: Arc::new(Mutex::new(HashMap::new())),
             teams_processing_indicator: false,
             teams_streaming: false,
+            teams_inbound_attachments: false,
         }
     }
 
@@ -46,6 +49,11 @@ impl UnifiedGatewayAdapter {
 
     pub fn with_teams_streaming(mut self, enabled: bool) -> Self {
         self.teams_streaming = enabled;
+        self
+    }
+
+    pub fn with_teams_inbound_attachments(mut self, enabled: bool) -> Self {
+        self.teams_inbound_attachments = enabled;
         self
     }
 
@@ -213,6 +221,7 @@ impl UnifiedGatewayAdapter {
             request_id: None,
             quote_message_id: quote_message_id.map(|s| s.into()),
             target_message_id: None,
+            attachment_ref: None,
         }
     }
 
@@ -255,6 +264,14 @@ impl ChatAdapter for UnifiedGatewayAdapter {
             .is_some_and(|teams| teams.reactions_enabled());
         #[cfg(not(feature = "teams"))]
         let teams_reactions = false;
+        #[cfg(feature = "teams")]
+        let teams_materialization = self
+            .gw_state
+            .teams
+            .as_ref()
+            .is_some_and(|teams| teams.inbound_attachments_enabled());
+        #[cfg(not(feature = "teams"))]
+        let teams_materialization = false;
         let (can_edit, can_delete, streaming_mode, supports_reactions, status_backend) =
             match platform {
                 "telegram" => (
@@ -325,6 +342,10 @@ impl ChatAdapter for UnifiedGatewayAdapter {
             edit_ack: cfg!(feature = "teams") && platform == "teams",
             delete_ack: cfg!(feature = "teams") && platform == "teams",
             supports_target_message_id: cfg!(feature = "teams") && platform == "teams",
+            supports_attachment_materialization: platform == "teams"
+                && teams_available
+                && teams_materialization
+                && self.teams_inbound_attachments,
             can_edit,
             can_delete,
             streaming_mode,
@@ -347,6 +368,72 @@ impl ChatAdapter for UnifiedGatewayAdapter {
             );
         }
         capabilities
+    }
+
+    async fn materialize_attachment(
+        &self,
+        channel: &ChannelRef,
+        reference: &str,
+    ) -> Result<MaterializedAttachment> {
+        if !self
+            .capabilities(&channel.platform)
+            .supports_attachment_materialization
+        {
+            anyhow::bail!("attachment materialization is unavailable");
+        }
+        #[cfg(feature = "teams")]
+        {
+            let event_id = channel
+                .origin_event_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("attachment route is unavailable"))?;
+            let teams = self
+                .gw_state
+                .teams
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Teams adapter is not configured"))?;
+            let attachment = teams
+                .materialize_attachment(event_id, &channel.channel_id, reference)
+                .await?;
+            if attachment.path.is_some() || attachment.reference.is_some() {
+                anyhow::bail!("materialized Teams attachment returned an invalid envelope");
+            }
+            if !matches!(attachment.attachment_type.as_str(), "image" | "text_file")
+                || attachment.filename.chars().count() > 200
+                || attachment.filename.chars().any(char::is_control)
+                || attachment.mime_type.len() > 128
+                || attachment.mime_type.chars().any(char::is_control)
+                || attachment.status.as_ref().is_some_and(|status| {
+                    status.len() > 256 || status.chars().any(char::is_control)
+                })
+            {
+                anyhow::bail!("materialized Teams attachment returned invalid metadata");
+            }
+            let data = attachment
+                .decoded_data()
+                .map_err(|_| anyhow::anyhow!("materialized attachment data is malformed"))?;
+            if attachment.status.is_some() {
+                if !data.is_empty() {
+                    anyhow::bail!("rejected Teams attachment returned payload data");
+                }
+            } else if attachment.size != data.len() as u64 {
+                anyhow::bail!("materialized Teams attachment size does not match its payload");
+            }
+            return Ok(MaterializedAttachment {
+                attachment_type: attachment.attachment_type,
+                filename: attachment.filename,
+                mime_type: attachment.mime_type,
+                data,
+                size: attachment.size,
+                status: attachment.status,
+            });
+        }
+        #[cfg(not(feature = "teams"))]
+        {
+            let _ = (channel, reference);
+            anyhow::bail!("Teams attachment materialization is not compiled")
+        }
     }
 
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
@@ -471,6 +558,7 @@ mod tests {
         assert!(capabilities.edit_ack);
         assert!(capabilities.delete_ack);
         assert!(capabilities.supports_target_message_id);
+        assert!(!capabilities.supports_attachment_materialization);
         assert_eq!(capabilities.streaming_mode, StreamingMode::Disabled);
         assert_eq!(
             adapter
@@ -500,19 +588,24 @@ mod tests {
             route_ttl_secs: 3600,
             max_route_entries: 10_000,
             reactions_enabled: true,
+            inbound_attachments: true,
         });
-        let adapter = UnifiedGatewayAdapter::new(Arc::new(state));
+        let state = Arc::new(state);
+        let adapter = UnifiedGatewayAdapter::new(state.clone());
         let reaction_capabilities = adapter.capabilities("teams");
         assert!(reaction_capabilities.supports_reactions);
+        assert!(!reaction_capabilities.supports_attachment_materialization);
         assert_eq!(
             reaction_capabilities.status_backend,
             StatusBackend::Reactions
         );
 
-        let message_adapter = adapter
+        let message_adapter = UnifiedGatewayAdapter::new(state)
             .with_teams_processing_indicator(true)
-            .with_teams_streaming(true);
+            .with_teams_streaming(true)
+            .with_teams_inbound_attachments(true);
         let message_capabilities = message_adapter.capabilities("teams");
+        assert!(message_capabilities.supports_attachment_materialization);
         assert!(message_capabilities.supports_reactions);
         assert_eq!(message_capabilities.status_backend, StatusBackend::Message);
         assert_eq!(message_capabilities.streaming_mode, StreamingMode::Edit);

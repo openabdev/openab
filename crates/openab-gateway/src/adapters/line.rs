@@ -237,6 +237,7 @@ async fn build_gateway_event_from_line_event(
                     "LINE external image content is not supported yet"
                 );
                 attachments.push(Attachment {
+                    reference: None,
                     attachment_type: "image".into(),
                     filename: format!("line_{}.jpg", msg.id),
                     mime_type: "image/jpeg".into(),
@@ -254,6 +255,7 @@ async fn build_gateway_event_from_line_event(
                 } else {
                     warn!(message_id = %msg.id, "LINE image received but LINE_CHANNEL_ACCESS_TOKEN is not configured");
                     attachments.push(Attachment {
+                        reference: None,
                         attachment_type: "image".into(),
                         filename: format!("line_{}.jpg", msg.id),
                         mime_type: "image/jpeg".into(),
@@ -285,6 +287,7 @@ async fn build_gateway_event_from_line_event(
                     "LINE external audio content is not supported yet"
                 );
                 attachments.push(Attachment {
+                    reference: None,
                     attachment_type: "audio".into(),
                     filename: format!("line_{}.audio", msg.id),
                     mime_type: "audio/ogg".into(),
@@ -302,6 +305,7 @@ async fn build_gateway_event_from_line_event(
                 } else {
                     warn!(message_id = %msg.id, "LINE audio received but LINE_CHANNEL_ACCESS_TOKEN is not configured");
                     attachments.push(Attachment {
+                        reference: None,
                         attachment_type: "audio".into(),
                         filename: format!("line_{}.audio", msg.id),
                         mime_type: "audio/ogg".into(),
@@ -405,6 +409,7 @@ pub async fn download_line_image(
     api_base: &str,
 ) -> Attachment {
     let rejected = |size: u64, reason: String| Attachment {
+        reference: None,
         attachment_type: "image".into(),
         filename: format!("line_{}.jpg", message_id),
         mime_type: "image/jpeg".into(),
@@ -498,6 +503,7 @@ pub async fn download_line_image(
     };
     let ext = if mime == "image/gif" { "gif" } else { "jpg" };
     Attachment {
+        reference: None,
         attachment_type: "image".into(),
         filename: format!("line_{}.{}", message_id, ext),
         mime_type: mime,
@@ -515,6 +521,7 @@ pub async fn download_line_audio(
     api_base: &str,
 ) -> Attachment {
     let rejected = |filename: String, mime_type: String, size: u64, reason: String| Attachment {
+        reference: None,
         attachment_type: "audio".into(),
         filename,
         mime_type,
@@ -628,6 +635,7 @@ pub async fn download_line_audio(
     };
 
     Attachment {
+        reference: None,
         attachment_type: "audio".into(),
         filename,
         mime_type: content_type,
@@ -1301,6 +1309,7 @@ mod tests {
         let cache: crate::ReplyTokenCache =
             Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let reply = GatewayReply {
+            attachment_ref: None,
             schema: "openab.gateway.reply.v1".into(),
             reply_to: "evt1".into(),
             platform: "line".into(),

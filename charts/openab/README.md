@@ -49,6 +49,7 @@ Each agent lives under `agents.<name>`.
 | `gateway.enabled` | Enable the gateway config block for webhook-based platforms. | `false` |
 | `gateway.deploy` | Deploy the gateway Deployment and Service. | `true` |
 | `gateway.teams.reactionsEnabled` | Opt in to Microsoft public-preview Bot Connector reactions. | `false` |
+| `gateway.teams.inboundAttachments` | Enable metadata-first Teams image/text ingress on both Core and Gateway. | `false` |
 | `cron.usercronEnabled` | Enable user-provided cron configuration. | `false` |
 | `cronjobs` | Config-driven scheduled messages for an agent. | `[]` |
 | `persistence.enabled` | Enable persistent storage for auth and settings. | `true` |
@@ -124,6 +125,8 @@ allow_group_chats = true
 ```
 
 Presence of any of these four fields opts into typed L2 policy. In Standalone Gateway mode, the policy still belongs to the OpenAB Core `configToml`; `gateway.teams.*` configures transport credentials and reaction preview on the Gateway container.
+
+`gateway.teams.inboundAttachments=true` is the exception that must stay aligned across processes: the chart emits `TEAMS_INBOUND_ATTACHMENTS=true` into both Core and Gateway. It enables bounded metadata-first image/text materialization only after Core trust admission. When `gateway.deploy=false`, configure the same environment variable on the external Gateway yourself.
 
 ### Discord ID precision warning
 

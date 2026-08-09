@@ -328,6 +328,7 @@ impl AppState {
                     show_streaming_placeholder: true,
                     message_limit: characters(4096),
                     supports_reactions: teams.reactions_enabled(),
+                    supports_attachment_materialization: teams.inbound_attachments_enabled(),
                     status_backend: if teams.reactions_enabled() {
                         StatusBackend::Reactions
                     } else {
@@ -606,6 +607,7 @@ impl AppState {
         let route_ttl_secs = cfg.route_ttl_secs.to_string();
         let max_route_entries = cfg.max_route_entries.to_string();
         let reactions_enabled = cfg.reactions_enabled.to_string();
+        let inbound_attachments = cfg.inbound_attachments.to_string();
         self.teams = adapters::teams::TeamsConfig::from_reader(|k| match k {
             "TEAMS_APP_ID" => cfg.app_id.clone(),
             "TEAMS_APP_SECRET" => cfg.app_secret.clone(),
@@ -616,6 +618,7 @@ impl AppState {
             "TEAMS_ROUTE_TTL_SECS" => Some(route_ttl_secs.clone()),
             "TEAMS_MAX_ROUTE_ENTRIES" => Some(max_route_entries.clone()),
             "TEAMS_REACTIONS_ENABLED" => Some(reactions_enabled.clone()),
+            "TEAMS_INBOUND_ATTACHMENTS" => Some(inbound_attachments.clone()),
             _ => None,
         })
         .map(adapters::teams::TeamsAdapter::new);
@@ -713,6 +716,7 @@ pub struct GatewayTeamsConfig {
     pub route_ttl_secs: u64,
     pub max_route_entries: usize,
     pub reactions_enabled: bool,
+    pub inbound_attachments: bool,
 }
 
 /// Start the shared Teams state sweeper for Standalone or Unified mode.
@@ -1099,6 +1103,8 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
 
 // --- Internal handler functions used by serve() ---
 
+const GATEWAY_WS_MESSAGE_LIMIT: usize = 8 * 1024 * 1024;
+
 async fn ws_handler(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     query: axum::extract::Query<HashMap<String, String>>,
@@ -1114,7 +1120,9 @@ async fn ws_handler(
             return axum::http::StatusCode::UNAUTHORIZED.into_response();
         }
     }
-    ws.on_upgrade(move |socket| handle_oab_connection(state, socket))
+    ws.max_message_size(GATEWAY_WS_MESSAGE_LIMIT)
+        .max_frame_size(GATEWAY_WS_MESSAGE_LIMIT)
+        .on_upgrade(move |socket| handle_oab_connection(state, socket))
 }
 
 struct ActiveConsumerGuard {
@@ -1238,6 +1246,8 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
         Arc::new(Mutex::new(HashMap::new()));
     let mut recv_task = tokio::spawn(async move {
         let client = reqwest::Client::new();
+        #[cfg(feature = "teams")]
+        let mut attachment_materialization_negotiated = false;
         while let Some(Ok(msg)) = ws_rx.next().await {
             if let Message::Text(text) = msg {
                 if let Ok(envelope) = serde_json::from_str::<schema::GatewayEnvelope>(&text) {
@@ -1252,6 +1262,15 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                                     );
                                 }
                                 let hello = build_gateway_hello(&state_for_recv, &client_hello);
+                                #[cfg(feature = "teams")]
+                                {
+                                    attachment_materialization_negotiated = client_hello
+                                        .protocol_version
+                                        == schema::GATEWAY_PROTOCOL_VERSION
+                                        && hello.capabilities.get("teams").is_some_and(|capability| {
+                                            capability.supports_attachment_materialization
+                                        });
+                                }
                                 if let Ok(json) = serde_json::to_string(&hello) {
                                     if control_tx.send(json).await.is_err() {
                                         break;
@@ -1309,6 +1328,91 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                             }
                             #[cfg(feature = "teams")]
                             "teams" => {
+                                if reply.command.as_deref() == Some("materialize_attachment") {
+                                    let Some(request_id) = reply
+                                        .request_id
+                                        .as_deref()
+                                        .filter(|value| !value.trim().is_empty())
+                                    else {
+                                        warn!("teams: materialization command has no request id");
+                                        continue;
+                                    };
+                                    let response = match (
+                                        attachment_materialization_negotiated,
+                                        state_for_recv
+                                            .active_oab_consumers
+                                            .load(Ordering::Acquire)
+                                            == 1,
+                                        state_for_recv.teams.as_ref(),
+                                        reply.attachment_ref.as_deref().filter(|value| {
+                                            !value.trim().is_empty()
+                                        }),
+                                    ) {
+                                        (false, _, _, _) => {
+                                            schema::GatewayResponse::from_command_error(
+                                                request_id,
+                                                "capability_not_negotiated",
+                                                "attachment materialization capability was not negotiated",
+                                            )
+                                        }
+                                        (true, false, _, _) => {
+                                            schema::GatewayResponse::from_command_error(
+                                                request_id,
+                                                "unsupported_topology",
+                                                "attachment materialization requires one active Core consumer",
+                                            )
+                                        }
+                                        (true, true, Some(teams), Some(reference)) => {
+                                            match teams
+                                                .materialize_attachment(
+                                                    &reply.reply_to,
+                                                    &reply.channel.id,
+                                                    reference,
+                                                )
+                                                .await
+                                            {
+                                                Ok(attachment) => {
+                                                    schema::GatewayResponse::from_attachment(
+                                                        request_id,
+                                                        attachment,
+                                                    )
+                                                }
+                                                Err(error) => {
+                                                    schema::GatewayResponse::from_command_error(
+                                                        request_id,
+                                                        error.code(),
+                                                        error.message(),
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        (true, true, None, _) => {
+                                            schema::GatewayResponse::from_command_error(
+                                                request_id,
+                                                "adapter_not_configured",
+                                                "Teams adapter is not configured",
+                                            )
+                                        }
+                                        (true, true, _, None) => {
+                                            schema::GatewayResponse::from_command_error(
+                                                request_id,
+                                                "attachment_reference_missing",
+                                                "attachment materialization reference is missing",
+                                            )
+                                        }
+                                    };
+                                    match serde_json::to_string(&response) {
+                                        Ok(json) => {
+                                            if control_tx.send(json).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                        Err(error) => {
+                                            error!(error = %error, "teams: failed to serialize materialization response");
+                                        }
+                                    }
+                                    continue;
+                                }
                                 let outcome = if let Some(ref teams) = state_for_recv.teams {
                                     adapters::teams::handle_reply(&reply, teams).await
                                 } else {
@@ -1544,6 +1648,7 @@ mod l1_audit_tests {
             route_ttl_secs: 3600,
             max_route_entries: 10_000,
             reactions_enabled: true,
+            inbound_attachments: true,
         });
         assert!(s.teams.is_some());
         assert_eq!(s.teams_webhook_path, "/hook/teams");
@@ -1555,6 +1660,7 @@ mod l1_audit_tests {
         assert!(teams.edit_ack);
         assert!(teams.delete_ack);
         assert!(teams.supports_target_message_id);
+        assert!(teams.supports_attachment_materialization);
         assert!(teams.can_edit);
         assert!(teams.can_delete);
         assert_eq!(teams.streaming_mode, super::schema::StreamingMode::Disabled);
@@ -1576,6 +1682,7 @@ mod l1_audit_tests {
             route_ttl_secs: 3600,
             max_route_entries: 10_000,
             reactions_enabled: false,
+            inbound_attachments: false,
         });
         assert!(s.teams.is_none());
     }
@@ -1714,6 +1821,7 @@ mod gateway_protocol_tests {
             route_ttl_secs: 3600,
             max_route_entries: 10_000,
             reactions_enabled: false,
+            inbound_attachments: false,
         }
     }
 
@@ -1851,6 +1959,7 @@ mod gateway_protocol_tests {
         socket
             .send(Message::Text(serde_json::to_string(
                 &schema::GatewayReply {
+                    attachment_ref: None,
                     schema: "openab.gateway.reply.v1".into(),
                     reply_to: "event-1".into(),
                     platform: "teams".into(),
@@ -1887,6 +1996,7 @@ mod gateway_protocol_tests {
             socket
                 .send(Message::Text(serde_json::to_string(
                     &schema::GatewayReply {
+                        attachment_ref: None,
                         schema: "openab.gateway.reply.v1".into(),
                         reply_to: "event-1".into(),
                         platform: "teams".into(),
@@ -1966,6 +2076,7 @@ mod gateway_protocol_tests {
         socket
             .send(Message::Text(serde_json::to_string(
                 &schema::GatewayReply {
+                    attachment_ref: None,
                     schema: "openab.gateway.reply.v1".into(),
                     reply_to: "legacy-event".into(),
                     platform: "teams".into(),
@@ -2013,6 +2124,7 @@ mod gateway_protocol_tests {
             route_ttl_secs: 3600,
             max_route_entries: 10_000,
             reactions_enabled: false,
+            inbound_attachments: true,
         });
         let hello = build_gateway_hello(
             &state,
@@ -2031,7 +2143,126 @@ mod gateway_protocol_tests {
         assert!(teams.edit_ack);
         assert!(teams.delete_ack);
         assert!(teams.supports_target_message_id);
+        assert!(teams.supports_attachment_materialization);
         assert!(!teams.supports_reactions);
+    }
+
+    #[cfg(feature = "teams")]
+    #[tokio::test]
+    async fn teams_materialization_command_returns_one_correlated_attachment() -> anyhow::Result<()>
+    {
+        let attachment_server = MockServer::start().await;
+        let _download = Mock::given(method("GET"))
+            .and(path("/notes"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"standalone bytes"))
+            .expect(1)
+            .mount_as_scoped(&attachment_server)
+            .await;
+        let mut config = teams_test_config(&attachment_server);
+        config.inbound_attachments = true;
+        let teams = adapters::teams::TeamsAdapter::new_for_test(config);
+        teams
+            .accept_text_attachment_route_for_test(
+                &attachment_server.uri(),
+                "event-attachment",
+                "conversation-1",
+                "activity-1",
+                "att-opaque",
+                &format!("{}/notes?sig=private", attachment_server.uri()),
+            )
+            .await?;
+
+        let (event_tx, _event_rx) = broadcast::channel(8);
+        let mut app_state = AppState::test_default(event_tx);
+        app_state.teams = Some(teams);
+        let (addr, state, server) = start_server(app_state).await?;
+        let url = format!("ws://{addr}/ws");
+        let (mut socket, _) = tokio_tungstenite::connect_async(&url).await?;
+        wait_for_consumers(&state, 1).await?;
+        let materialization_command = |request_id: &str| schema::GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "event-attachment".into(),
+            platform: "teams".into(),
+            channel: schema::ReplyChannel {
+                id: "conversation-1".into(),
+                thread_id: None,
+            },
+            content: schema::Content {
+                content_type: "text".into(),
+                text: String::new(),
+                attachments: Vec::new(),
+            },
+            command: Some("materialize_attachment".into()),
+            request_id: Some(request_id.into()),
+            quote_message_id: None,
+            target_message_id: None,
+            attachment_ref: Some("att-opaque".into()),
+        };
+        socket
+            .send(Message::Text(serde_json::to_string(
+                &materialization_command("request-before-hello"),
+            )?))
+            .await?;
+        let before_hello: schema::GatewayResponse =
+            serde_json::from_str(&next_text(&mut socket).await?)?;
+        assert!(!before_hello.success);
+        assert_eq!(
+            before_hello.error_code.as_deref(),
+            Some("capability_not_negotiated")
+        );
+
+        socket
+            .send(Message::Text(serde_json::to_string(
+                &schema::GatewayClientHello {
+                    schema: schema::CLIENT_HELLO_SCHEMA.into(),
+                    protocol_version: schema::GATEWAY_PROTOCOL_VERSION,
+                    client_name: Some("test-core".into()),
+                    requested_platforms: vec!["teams".into()],
+                },
+            )?))
+            .await?;
+        let hello: schema::GatewayHello = serde_json::from_str(&next_text(&mut socket).await?)?;
+        assert!(hello
+            .capabilities
+            .get("teams")
+            .is_some_and(|capability| capability.supports_attachment_materialization));
+
+        let (mut second_socket, _) = tokio_tungstenite::connect_async(&url).await?;
+        wait_for_consumers(&state, 2).await?;
+        socket
+            .send(Message::Text(serde_json::to_string(
+                &materialization_command("request-unsupported-topology"),
+            )?))
+            .await?;
+        let unsupported_topology: schema::GatewayResponse =
+            serde_json::from_str(&next_text(&mut socket).await?)?;
+        assert_eq!(
+            unsupported_topology.error_code.as_deref(),
+            Some("unsupported_topology")
+        );
+        second_socket.close(None).await?;
+        wait_for_consumers(&state, 1).await?;
+
+        socket
+            .send(Message::Text(serde_json::to_string(
+                &materialization_command("request-attachment"),
+            )?))
+            .await?;
+        let response: schema::GatewayResponse =
+            serde_json::from_str(&next_text(&mut socket).await?)?;
+        assert_eq!(response.request_id, "request-attachment");
+        assert!(response.success);
+        let attachment = response
+            .attachment
+            .expect("materialized attachment response");
+        assert_eq!(attachment.decoded_data()?, b"standalone bytes");
+        assert!(attachment.reference.is_none());
+        assert!(attachment.path.is_none());
+
+        socket.close(None).await?;
+        wait_for_consumers(&state, 0).await?;
+        server.abort();
+        Ok(())
     }
 
     #[cfg(feature = "teams")]
@@ -2057,6 +2288,7 @@ mod gateway_protocol_tests {
     async fn teams_structured_outcome_is_emitted_only_when_requested() -> anyhow::Result<()> {
         let (event_tx, mut event_rx) = broadcast::channel(8);
         let mut reply = schema::GatewayReply {
+            attachment_ref: None,
             schema: "openab.gateway.reply.v1".into(),
             reply_to: "event-1".into(),
             platform: "teams".into(),
@@ -2123,6 +2355,7 @@ mod gateway_protocol_tests {
         wait_for_consumers(&state, 1).await?;
 
         let legacy_reply = schema::GatewayReply {
+            attachment_ref: None,
             schema: "openab.gateway.reply.v1".into(),
             reply_to: "evt-1".into(),
             platform: "unknown".into(),

@@ -194,6 +194,10 @@ Notes:
 - `id` is the **Teams app id** — generate a fresh UUID v4 (`uuidgen`). It is **not** the same as `botId`.
 - `botId` is the **Microsoft App (Bot) id** from step 1 (the value you put in `TEAMS_APP_ID`).
 - The three `developer.*` URLs are required by the schema. They can point at your GitHub repo / privacy page / license — they just have to resolve.
+- Keep the base package at `supportsFiles: false`; inline pasted images do not
+  require file consent. For Personal paperclip image/text files, make a separate
+  package with `supportsFiles: true`. This does not enable group-chat or channel
+  paperclip files without Microsoft Graph.
 
 > If your tenant requires admin approval, an admin must approve the published app in Teams Admin Center → Manage apps.
 
@@ -214,6 +218,10 @@ TEAMS_OAUTH_ENDPOINT="https://login.microsoftonline.com/<YOUR_TENANT_ID>/oauth2/
 
 # Optional Microsoft public-preview status reactions
 # TEAMS_REACTIONS_ENABLED=true
+
+# Optional metadata-first image/text ingress on the Gateway. If enabled, also
+# set inbound_attachments=true in Core config.toml below.
+# TEAMS_INBOUND_ATTACHMENTS=true
 
 # Only needed if you use the Cloudflare Tunnel service below.
 # Skip this line if you expose the gateway via a different reverse proxy.
@@ -285,9 +293,18 @@ allowed_channels = [] # both empty = all Team channels
 allow_personal = true
 allow_group_chats = true
 allowed_users = ["29:1abc..."]
+# Default off. Requires TEAMS_INBOUND_ATTACHMENTS=true on the Gateway and a
+# valid negotiated materialization capability.
+# inbound_attachments = true
 # Or replace allowed_users with the explicit broad opt-in:
 # allow_all_users = true
 ```
+
+When enabled, Gateway sends only sanitized attachment metadata and an opaque
+process-local reference. Core asks for bytes only after structural, typed L2,
+and L3 identity admission. Microsoft URLs, URL queries, and bot credentials stay
+inside Gateway; old peers, route expiry, restart, scope mismatch, and malformed
+or oversized data fail closed without automatic retry.
 
 ### Start the stack
 

@@ -140,6 +140,7 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # reactions_enabled = false             # public-preview reactions; env: TEAMS_REACTIONS_ENABLED
 # processing_indicator = "off"          # off | message; env: TEAMS_PROCESSING_INDICATOR
 # streaming = false                      # progressive bot-owned edits; env: TEAMS_STREAMING
+# inbound_attachments = false            # post-trust image/text materialization; env: TEAMS_INBOUND_ATTACHMENTS
 # allowed_teams = []                    # Team IDs; env: TEAMS_ALLOWED_TEAMS (comma-separated)
 # allowed_channels = []                 # channel IDs; env: TEAMS_ALLOWED_CHANNELS
 #                                       # both empty = all Team channels; Team OR channel match

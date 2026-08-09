@@ -88,6 +88,10 @@ spec:
                   name: {{ include "openab.agentFullname" $d }}
                   key: gateway-ws-token
             {{- end }}
+            {{- if and ($cfg.gateway).enabled (hasKey (($cfg.gateway).teams) "inboundAttachments") }}
+            - name: TEAMS_INBOUND_ATTACHMENTS
+              value: {{ ($cfg.gateway).teams.inboundAttachments | quote }}
+            {{- end }}
             - name: HOME
               value: {{ $cfg.workingDir | default "/home/agent" }}
             {{- range $k, $v := $cfg.env }}

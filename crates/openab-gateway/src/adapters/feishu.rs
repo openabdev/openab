@@ -1927,6 +1927,7 @@ pub async fn download_feishu_image(
         attachment_type: "image".into(),
         filename: format!("{}.{}", image_key, ext),
         mime_type: mime,
+        reference: None,
         data: String::new(),
         size: compressed.len() as u64,
         path: Some(path),
@@ -2044,6 +2045,7 @@ pub async fn download_feishu_file(
         attachment_type: "text_file".into(),
         filename: file_name.to_string(),
         mime_type: "text/plain".into(),
+        reference: None,
         data: String::new(),
         size: bytes.len() as u64,
         path: Some(path),
@@ -2151,6 +2153,7 @@ pub async fn download_feishu_audio(
         attachment_type: "audio".into(),
         filename: format!("{}.ogg", file_key),
         mime_type: content_type,
+        reference: None,
         data: String::new(),
         size: bytes.len() as u64,
         path: Some(path),
@@ -4270,6 +4273,7 @@ mod tests {
             request_id: None,
             quote_message_id: Some("om_specific".into()),
             target_message_id: None,
+            attachment_ref: None,
         };
         // quote_message_id should take priority
         let reply_target = reply.quote_message_id.as_deref()
@@ -4297,6 +4301,7 @@ mod tests {
             request_id: None,
             quote_message_id: None,
             target_message_id: None,
+            attachment_ref: None,
         };
         let reply_target = reply.quote_message_id.as_deref()
             .or(reply.channel.thread_id.as_deref());
@@ -4323,6 +4328,7 @@ mod tests {
             request_id: None,
             quote_message_id: None,
             target_message_id: None,
+            attachment_ref: None,
         };
         let reply_target = reply.quote_message_id.as_deref()
             .or(reply.channel.thread_id.as_deref());
@@ -4390,6 +4396,7 @@ mod tests {
             request_id: None,
             quote_message_id: Some("om_invalid".into()),
             target_message_id: None,
+            attachment_ref: None,
         };
 
         handle_reply(&reply, &adapter, &event_tx).await;
@@ -4667,6 +4674,7 @@ mod tests {
             request_id: Some("req_seam_1".into()),
             quote_message_id: None,
             target_message_id: None,
+            attachment_ref: None,
         };
 
         handle_reply(&reply, &adapter, &event_tx).await;
@@ -4702,6 +4710,7 @@ mod tests {
             request_id: None,
             quote_message_id: None,
             target_message_id: None,
+            attachment_ref: None,
         };
 
         handle_reply(&reply, &adapter, &event_tx).await;
@@ -4762,6 +4771,7 @@ mod tests {
             request_id: request_id.map(|s| s.into()),
             quote_message_id: None,
             target_message_id: None,
+            attachment_ref: None,
         }
     }
 
@@ -4984,6 +4994,7 @@ mod tests {
             request_id: Some("r1".into()),
             quote_message_id: None,
             target_message_id: None,
+            attachment_ref: None,
         };
 
         handle_reply(&reply, &adapter, &tx).await;

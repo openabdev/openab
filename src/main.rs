@@ -278,6 +278,14 @@ fn teams_streaming_enabled(cfg: &config::Config) -> bool {
     cfg.teams.clone().unwrap_or_default().resolve().streaming
 }
 
+fn teams_inbound_attachments_enabled(cfg: &config::Config) -> bool {
+    cfg.teams
+        .clone()
+        .unwrap_or_default()
+        .resolve()
+        .inbound_attachments
+}
+
 fn teams_scope_policy(cfg: &config::Config) -> gateway::TeamsScopePolicy {
     let legacy_allowed: Vec<String> = std::env::var("GATEWAY_ALLOWED_CHANNELS")
         .unwrap_or_default()
@@ -537,6 +545,7 @@ async fn main() -> anyhow::Result<()> {
     let teams_scope_policy = teams_scope_policy(&cfg);
     let teams_processing_indicator = teams_processing_indicator_enabled(&cfg);
     let teams_streaming = teams_streaming_enabled(&cfg);
+    let teams_inbound_attachments = teams_inbound_attachments_enabled(&cfg);
     let teams_routing_active = cfg
         .gateway
         .as_ref()
@@ -1177,6 +1186,7 @@ async fn main() -> anyhow::Result<()> {
             telegram_rich_messages: gw_cfg.telegram_rich_messages,
             teams_processing_indicator,
             teams_streaming,
+            teams_inbound_attachments,
             gateway_ack_timeout_secs: gw_cfg.gateway_ack_timeout_secs,
             stt: cfg.stt.clone(),
             teams_scope_policy: teams_scope_policy.clone(),
@@ -1379,6 +1389,7 @@ async fn main() -> anyhow::Result<()> {
                     route_ttl_secs: r.route_ttl_secs,
                     max_route_entries: r.max_route_entries,
                     reactions_enabled: r.reactions_enabled,
+                    inbound_attachments: r.inbound_attachments,
                 });
             }
             // First-class `[feishu]` config overrides env-derived values
@@ -1564,7 +1575,8 @@ async fn main() -> anyhow::Result<()> {
             let unified_adapter: Arc<dyn adapter::ChatAdapter> = Arc::new(
                 unified_adapter::UnifiedGatewayAdapter::new(gw_state.clone())
                     .with_teams_processing_indicator(teams_processing_indicator)
-                    .with_teams_streaming(teams_streaming),
+                    .with_teams_streaming(teams_streaming)
+                    .with_teams_inbound_attachments(teams_inbound_attachments),
             );
 
             // Bot gating still reads env here (structural, not L2/L3):
@@ -1594,6 +1606,7 @@ async fn main() -> anyhow::Result<()> {
                 bot_username: gw_bot_username,
                 stt_config: cfg.stt.clone(),
                 teams_scope_policy: teams_scope_policy.clone(),
+                teams_inbound_attachments,
                 #[cfg(feature = "filestore")]
                 filestore: filestore.clone(),
             });
@@ -2001,14 +2014,16 @@ mod tests {
         let default_cfg = config::parse_config_str("", "test").unwrap();
         assert!(!teams_processing_indicator_enabled(&default_cfg));
         assert!(!teams_streaming_enabled(&default_cfg));
+        assert!(!teams_inbound_attachments_enabled(&default_cfg));
 
         let enabled_cfg = config::parse_config_str(
-            "[teams]\nprocessing_indicator = \"message\"\nstreaming = true\n",
+            "[teams]\nprocessing_indicator = \"message\"\nstreaming = true\ninbound_attachments = true\n",
             "test",
         )
         .unwrap();
         assert!(teams_processing_indicator_enabled(&enabled_cfg));
         assert!(teams_streaming_enabled(&enabled_cfg));
+        assert!(teams_inbound_attachments_enabled(&enabled_cfg));
     }
 
     #[test]
