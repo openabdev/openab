@@ -2,9 +2,9 @@ name: platform-schema conformance
 
 # Verify docs/platforms/schema/*.toml stays in sync with the code: structural
 # schema validation + that every `source` code-ref still exists in the tree.
-# Runs on any change to the schema files, the checker itself, or the adapter/core
-# source trees that schema code-refs point into (so a rename/delete there is
-# caught immediately, not by the next unrelated schema PR).
+# Runs on any change to the schema files, the checker itself, this workflow, or
+# the adapter/core source trees that schema code-refs point into (so a
+# rename/delete there is caught immediately, not by the next unrelated schema PR).
 on:
   pull_request:
     paths:
@@ -14,6 +14,9 @@ on:
       - "crates/openab-gateway/src/**"
       - "crates/openab-core/src/**"
       - "src/main.rs"
+      # Self-trigger: a workflow-only edit (trigger coverage, cache, test
+      # command) must exercise the job it changes.
+      - ".github/workflows/platform-schema-conformance.yml"
   push:
     branches: [main]
     paths:
@@ -23,6 +26,7 @@ on:
       - "crates/openab-gateway/src/**"
       - "crates/openab-core/src/**"
       - "src/main.rs"
+      - ".github/workflows/platform-schema-conformance.yml"
   schedule:
     # Safety net: catch drift from renames/deletes even if a PR touching the
     # source tree somehow bypassed the path triggers above (e.g. merged via
