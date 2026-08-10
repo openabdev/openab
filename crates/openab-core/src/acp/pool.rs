@@ -816,7 +816,7 @@ impl SessionPool {
 mod tests {
     use super::{
         better_candidate, classify_hung, classify_idle, get_or_insert_gate, purge_session_entries,
-        remove_if_same_handle, PoolState,
+        remove_if_same_handle, PoolState, SessionPool,
     };
     use crate::acp::connection::SessionActivity;
     use std::collections::HashMap;
@@ -861,21 +861,72 @@ mod tests {
 
     #[test]
     fn classify_idle_marks_stale_by_time() {
+        let ttl = std::time::Duration::from_secs(60);
         let now = Instant::now();
         let last_active = now - std::time::Duration::from_secs(120);
-        assert!(classify_idle(last_active, true, now, std::time::Duration::from_secs(60)));
+        assert!(classify_idle(last_active, true, now, ttl));
     }
 
     #[test]
     fn classify_idle_marks_stale_by_death() {
+        let ttl = std::time::Duration::from_secs(60);
         let now = Instant::now();
-        assert!(classify_idle(now, false, now, std::time::Duration::from_secs(60)));
+        assert!(classify_idle(now, false, now, ttl));
     }
 
     #[test]
     fn classify_idle_keeps_fresh_alive_sessions() {
+        let ttl = std::time::Duration::from_secs(60);
         let now = Instant::now();
-        assert!(!classify_idle(now, true, now, std::time::Duration::from_secs(60)));
+        assert!(!classify_idle(now, true, now, ttl));
+    }
+
+    /// The expiry boundary is strict: elapsed == ttl is still fresh. Pins that
+    /// the switch from `last_active < now - ttl` to `elapsed > ttl` did not
+    /// shift the comparison by one tick.
+    #[test]
+    fn classify_idle_keeps_sessions_at_the_exact_ttl_boundary() {
+        let ttl = std::time::Duration::from_secs(60);
+        let now = Instant::now();
+        assert!(!classify_idle(now - ttl, true, now, ttl));
+    }
+
+    /// `now` is sampled once at the top of `cleanup_idle`, but a turn can finish
+    /// and touch `last_active` before this connection's `try_lock` is reached —
+    /// so `last_active > now` is reachable in production. `saturating_duration_since`
+    /// yields ZERO there, which must classify the session as fresh rather than
+    /// underflowing.
+    #[test]
+    fn classify_idle_keeps_sessions_touched_after_now() {
+        let ttl = std::time::Duration::from_secs(60);
+        let now = Instant::now();
+        assert!(!classify_idle(now + ttl, true, now, ttl));
+    }
+
+    /// Regression for the panic this PR fixes: `cleanup_idle` used to compute
+    /// `Instant::now() - ttl` before touching the pool, which panics whenever the
+    /// TTL exceeds the monotonic clock's age (uptime). An oversized TTL reproduces
+    /// that unconditionally on every platform — this test panics on the old
+    /// implementation and completes on the current one. The helper tests above
+    /// cannot catch it: the panic happened before `classify_idle` was called.
+    #[tokio::test]
+    async fn cleanup_idle_survives_ttl_larger_than_monotonic_clock() {
+        let pool = SessionPool::new(
+            crate::config::AgentConfig {
+                command: "/bin/true".into(),
+                args: vec![],
+                working_dir: "/tmp".into(),
+                env: HashMap::new(),
+                inherit_env: vec![],
+                command_explicit: true,
+            },
+            1,
+            crate::config::default_prompt_hard_timeout_secs(),
+            HashMap::new(),
+        );
+
+        // No sessions are needed: the panicking subtraction ran unconditionally.
+        pool.cleanup_idle(u64::MAX).await;
     }
 
     #[test]
