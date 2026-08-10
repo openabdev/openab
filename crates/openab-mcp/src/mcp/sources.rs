@@ -53,10 +53,17 @@ pub trait CapabilitySource: Send + Sync {
     fn provider(&self) -> &str;
 
     /// The advertised tool set. `ctx` is `None` for anonymous clients.
-    /// Sources may vary the set by session, but static-advertising
-    /// regardless of backend attachment (D4, #1447) is the recommended
-    /// default — availability problems belong in call errors, not in
-    /// catalog flapping.
+    ///
+    /// Sources may vary the set by session. Availability problems belong in call
+    /// errors, not in catalog flapping — a backend that detaches for a moment
+    /// must not make its tools vanish and reappear.
+    ///
+    /// This used to recommend *static-advertising regardless of backend
+    /// attachment* (D4, #1447). That is no longer achievable for a tunnel-backed
+    /// source: D-20 deleted the built-in catalog that let one advertise before
+    /// its backend had ever spoken, so such a source now publishes nothing until
+    /// its first discovery round. The surviving rule is the narrower one above —
+    /// do not shrink a catalog you have already published.
     fn tools(&self, ctx: Option<&SessionCtx>) -> Vec<Tool>;
 
     /// Execute one tool. Returns `(payload, is_error)` mirroring the MCP
@@ -88,15 +95,25 @@ impl SessionTokens {
         Self::default()
     }
 
-    /// Mint a fresh opaque token bound to `channel_id`. A prior token for
-    /// the same channel (e.g. a respawned session) is replaced — exactly one
-    /// live token per channel.
+    /// Mint a fresh opaque token bound to `channel_id`.
+    ///
+    /// Tokens for a channel **coexist**: a respawned or racing session gets its own credential and
+    /// any already-issued token keeps resolving. There is deliberately no "one live token per
+    /// channel" invariant — enforcing it here invalidated credentials that a running agent was
+    /// still presenting. Each token is retired individually through [`Self::revoke_token`], which
+    /// is what keeps the map bounded.
     pub fn mint(&self, channel_id: &str) -> String {
         let mut buf = [0u8; 32];
         getrandom::fill(&mut buf).expect("os rng");
         let token = B64_URL.encode(buf);
         let mut map = self.inner.write().expect("session token lock");
-        map.retain(|_, ctx| ctx.channel_id != channel_id);
+        // Deliberately does NOT evict the channel's existing tokens. Session lifetimes overlap:
+        // two builders can race for one channel, and a pool reset can start a replacement while
+        // the predecessor is still serving. Clobbering here invalidated a token whose agent was
+        // still using it — the agent holds OPENAB_SESSION_TOKEN in its environment, so it cannot
+        // notice, and every facade call then fails auth with `requires_session` tools silently
+        // vanishing. Each mint is paired with a token-specific revoke on its own drop guard, so
+        // the map stays bounded without this.
         map.insert(
             token.clone(),
             SessionCtx {
@@ -106,12 +123,28 @@ impl SessionTokens {
         token
     }
 
-    /// Revoke every token for `channel_id` (session evict / respawn).
+    /// Revoke **every** token for `channel_id` — a deliberate channel-wide eviction.
+    ///
+    /// Prefer [`Self::revoke_token`] when tearing down one specific session. Because tokens for a
+    /// channel coexist, revoking by channel here also destroys credentials belonging to any other
+    /// live session on it, which is only correct when the intent really is "end this channel".
     pub fn revoke_channel(&self, channel_id: &str) {
         self.inner
             .write()
             .expect("session token lock")
             .retain(|_, ctx| ctx.channel_id != channel_id);
+    }
+
+    /// Revoke exactly one token, leaving every other token for that channel intact.
+    ///
+    /// This is the teardown a session's drop guard should use: it retires the credential that
+    /// session minted and nothing else, so a late teardown cannot cut off a session that started
+    /// alongside or after it. A no-op if the token was already revoked.
+    pub fn revoke_token(&self, token: &str) {
+        self.inner
+            .write()
+            .expect("session token lock")
+            .remove(token);
     }
 
     /// Resolve a presented token. Constant-time comparison over stored
@@ -168,17 +201,78 @@ pub fn session_ctx_from_extensions(
 mod tests {
     use super::*;
 
+    /// Two builders racing for one channel must not invalidate each other (review round 4, T1).
+    ///
+    /// R1 made revocation token-specific but left `mint` evicting by channel, so the second mint
+    /// killed the first agent's live token. That agent holds `OPENAB_SESSION_TOKEN` in its
+    /// environment and cannot observe the change: every facade call simply starts failing auth and
+    /// its `requires_session` tools vanish from discovery, with nothing pointing at the cause.
+    #[test]
+    fn a_second_mint_for_one_channel_does_not_invalidate_the_first() {
+        let tokens = SessionTokens::new();
+        let first = tokens.mint("chan-a");
+        let second = tokens.mint("chan-a");
+
+        assert_ne!(first, second, "each mint is a distinct credential");
+        assert_eq!(
+            tokens.resolve(&first).map(|c| c.channel_id),
+            Some("chan-a".to_string()),
+            "the first builder's token must survive a concurrent second mint"
+        );
+        assert_eq!(
+            tokens.resolve(&second).map(|c| c.channel_id),
+            Some("chan-a".to_string())
+        );
+
+        // Each is still independently revocable, so the map stays bounded by guard pairing
+        // rather than by eviction-on-mint.
+        tokens.revoke_token(&first);
+        assert!(tokens.resolve(&first).is_none());
+        assert!(
+            tokens.resolve(&second).is_some(),
+            "revoking one credential must not disturb the other"
+        );
+    }
+
+    /// An evicted session's teardown must not cut off the session that replaced it (review R1).
+    ///
+    /// Session lifetimes overlap: the successor mints while the predecessor's drop guard is still
+    /// pending. Revoking by channel at that point removes the *live* token, and the new agent
+    /// loses facade access with nothing pointing at the cause. Revoking the specific token makes
+    /// the late teardown a no-op.
+    #[test]
+    fn a_replaced_sessions_teardown_cannot_revoke_its_successors_token() {
+        let tokens = SessionTokens::new();
+        let old = tokens.mint("chan-a");
+        let new = tokens.mint("chan-a"); // successor takes over the channel
+
+        // The predecessor's guard fires late, carrying the token IT minted.
+        tokens.revoke_token(&old);
+
+        assert_eq!(
+            tokens.resolve(&new).map(|c| c.channel_id),
+            Some("chan-a".to_string()),
+            "the successor's token must survive a late teardown of the session it replaced"
+        );
+
+        // And revoking the current token still works.
+        tokens.revoke_token(&new);
+        assert!(tokens.resolve(&new).is_none());
+    }
+
     #[test]
     fn mint_resolve_revoke_lifecycle() {
         let tokens = SessionTokens::new();
         let t1 = tokens.mint("chan-a");
         assert_eq!(tokens.resolve(&t1).unwrap().channel_id, "chan-a");
         assert!(tokens.resolve("nope").is_none());
-        // Re-mint for the same channel replaces the old token.
+        // A second mint for the channel coexists with the first — it used to evict it, which is
+        // the bug T1 fixes; see a_second_mint_for_one_channel_does_not_invalidate_the_first.
         let t2 = tokens.mint("chan-a");
-        assert!(tokens.resolve(&t1).is_none(), "old token must be dead");
         assert_eq!(tokens.resolve(&t2).unwrap().channel_id, "chan-a");
+        // revoke_channel is the deliberate channel-wide evict and still clears both.
         tokens.revoke_channel("chan-a");
+        assert!(tokens.resolve(&t1).is_none());
         assert!(tokens.resolve(&t2).is_none());
     }
 

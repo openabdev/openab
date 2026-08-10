@@ -49,6 +49,11 @@ aws-credential-types = { version = "1", optional = true }
 urlencoding = { version = "2", optional = true }
 hex = { version = "0.4", optional = true }
 http = { version = "1", optional = true }
+# Browser tool definitions for the facade's capability source. Only `rmcp::model` is used now —
+# the loopback MCP server that needed the server + streamable-http transport features (and its own
+# axum listener) was removed with the per-session proxy.
+rmcp = { version = "1.7", default-features = false, optional = true }
+tokio-util = { version = "0.7", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -65,3 +70,6 @@ config-s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
 pre-seed = ["dep:aws-sdk-s3", "dep:aws-config", "dep:zip", "dep:hex", "dep:flate2", "dep:tar"]
 filestore = ["dep:aws-sdk-s3", "dep:aws-config"]
 agentcore = ["dep:aws-config", "dep:aws-sigv4", "dep:aws-credential-types", "dep:urlencoding", "dep:hex", "dep:http", "dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
+# Core-side wiring for MCP-over-ACP browser control (enabled by the root `acp`): the browser tool
+# definitions and the agent's facade MCP config. Core hosts no MCP server of its own any more.
+acp-mcp = ["dep:rmcp", "dep:tokio-util"]

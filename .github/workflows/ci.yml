@@ -56,6 +56,41 @@ jobs:
       # `-p openab-gateway` to avoid the workspace hooks::tests parallel flake.
       - name: cargo test (acp gateway)
         run: cargo test -p openab-gateway --features acp
+      # Same default-features gap on the core side: `mcp_proxy` is the only `acp-mcp`-gated module,
+      # so its tunnel-trait, tools-cache and bridge-dispatch tests never compile above either.
+      # Filtered to `acp_mcp::` for the same reason the gateway step is scoped to one package —
+      # it keeps the flaky hooks::tests out of this job.
+      - name: cargo test (acp-mcp core)
+        # `cargo test` exits 0 when a filter selects NOTHING, so "selected nothing" and "everything
+        # passed" are indistinguishable — that is precisely how a compiled-but-never-selected test
+        # shipped here before. Count the selection first and fail on zero.
+        #
+        # The filter lives in a variable inside a block scalar: written inline after `run:`, its
+        # trailing `::` reads as a YAML mapping indicator and makes the whole file unparseable.
+        run: |
+          set -euo pipefail
+          FILTER='acp_mcp::'
+          n=$(cargo test -p openab-core --features acp-mcp "$FILTER" -- --list | grep -c ': test$' || true)
+          echo "filter '$FILTER' selected $n test(s)"
+          [ "$n" -gt 0 ] || { echo "::error::filter '$FILTER' selected ZERO tests — stale or mistyped"; exit 1; }
+          cargo test -p openab-core --features acp-mcp "$FILTER"
+      # The pool's facade-session tests are `acp-mcp`-gated too but live outside `acp_mcp::`, so
+      # the filter above compiled them and then selected them away. Naming the module runs them
+      # while still leaving the flaky hooks::tests out.
+      - name: cargo test (acp-mcp pool)
+        # Same zero-match guard as above, and the same reason for the block scalar.
+        run: |
+          set -euo pipefail
+          FILTER='acp::pool::'
+          n=$(cargo test -p openab-core --features acp-mcp "$FILTER" -- --list | grep -c ': test$' || true)
+          echo "filter '$FILTER' selected $n test(s)"
+          [ "$n" -gt 0 ] || { echo "::error::filter '$FILTER' selected ZERO tests — stale or mistyped"; exit 1; }
+          cargo test -p openab-core --features acp-mcp "$FILTER"
+      # And the root package's own tests — the ACP-tunnel capability source (acp_tunnel_source.rs) and
+      # are `acp`-gated, so `--workspace` above skips
+      # them too. This is where the source's routing and trust-gate coverage lives.
+      - name: cargo test (acp root)
+        run: cargo test --features acp
       - name: cargo build (unified)
         run: cargo build --features unified
 

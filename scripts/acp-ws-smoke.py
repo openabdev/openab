@@ -277,16 +277,63 @@ async def section_lifecycle():
     except Exception as e:  # noqa: BLE001
         record("life", False, "valid token via Authorization: Bearer header accepted", repr(e))
 
-    # oversized frame → the server closes the connection (no fabricated JSON-RPC response)
+    # There are TWO ceilings with DIFFERENT outcomes, and this used to cover neither.
+    #
+    # It sent 1 MiB + 64 bytes against a comment reading "> MAX_FRAME_BYTES (1 MiB)". The transport
+    # ceiling is 8 MiB, so that payload stopped reaching it — and being a bare "x" string rather
+    # than JSON, the close it still saw came from the parse path. Green, wrong mechanism.
+    #
+    # Both cases are also covered by Rust WS integration tests, which the gate runs; these are the
+    # end-to-end versions against a real deployment.
+
+    # 1. Over the TRANSPORT ceiling (8 MiB) → connection closes, no JSON-RPC response. The frame
+    #    cannot be parsed, so the server cannot tell request from notification or recover an id,
+    #    and answering could mean answering a notification.
     async with await try_connect(TOKEN) as ws:
-        await ws.send("x" * ((1 << 20) + 64))  # > MAX_FRAME_BYTES (1 MiB)
+        oversized = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                "pad": "x" * ((8 << 20) + 64)})
+        await ws.send(oversized)
         try:
             await asyncio.wait_for(ws.recv(), timeout=8)
-            record("life", False, "oversized frame closes the connection", "got a frame back")
+            record("life", False, "frame over the transport ceiling closes the connection",
+                   "got a frame back")
         except ConnectionClosed:
-            record("life", True, "oversized frame closes the connection")
+            record("life", True, "frame over the transport ceiling closes the connection")
         except asyncio.TimeoutError:
-            record("life", False, "oversized frame closes the connection", "no close within 8s")
+            record("life", False, "frame over the transport ceiling closes the connection",
+                   "no close within 8s")
+
+    # 2. Over the PER-KIND ceiling (1 MiB for anything carrying a `method`) but under the transport
+    #    ceiling → answered with an error, and the connection SURVIVES. The 8 MiB allowance is for
+    #    tunnel results, which are responses; letting method frames use it would turn the allowance
+    #    into a way to park MAX_INFLIGHT_PROMPTS x 8 MiB of prompt text per connection.
+    async with await try_connect(TOKEN) as ws:
+        big_method = json.dumps({"jsonrpc": "2.0", "id": 7, "method": "initialize",
+                                 "params": {"protocolVersion": 1, "clientCapabilities": {},
+                                            "pad": "y" * ((1 << 20) + 4096)}})
+        await ws.send(big_method)
+        try:
+            resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=8))
+            if resp.get("error") is None:
+                record("life", False, "oversized method frame is refused with an error",
+                       f"no error in {resp}")
+            else:
+                record("life", True, "oversized method frame is refused with an error")
+                # The discriminating half: a server that closed instead would pass the check above
+                # only by never getting here.
+                await ws.send(json.dumps({"jsonrpc": "2.0", "id": 8, "method": "initialize",
+                                          "params": {"protocolVersion": 1,
+                                                     "clientCapabilities": {}}}))
+                after = json.loads(await asyncio.wait_for(ws.recv(), timeout=8))
+                record("life", after.get("result") is not None,
+                       "connection survives a per-kind refusal",
+                       "" if after.get("result") is not None else f"got {after}")
+        except ConnectionClosed:
+            record("life", False, "oversized method frame is refused with an error",
+                   "connection closed — that is the transport-ceiling behaviour, not this one")
+        except asyncio.TimeoutError:
+            record("life", False, "oversized method frame is refused with an error",
+                   "no response within 8s")
 
     # session/cancel → the in-flight prompt ends with stopReason:"cancelled"
     async with await try_connect(TOKEN) as ws:
@@ -314,6 +361,67 @@ async def section_lifecycle():
         record("life", stop == "cancelled", "session/cancel → prompt ends stopReason:cancelled", f"got {stop!r}")
 
 
+async def collect_mcp_connects(c: Conn, ws, mcp_servers, window=6.0):
+    """session/new with the given mcpServers, then collect the server-initiated mcp/connect
+    requests the gateway issues within `window` seconds, answering each with a connectionId.
+    Returns (sessionId, [mcp/connect frames])."""
+    r = await c.call("session/new", {"cwd": "/home/agent", "mcpServers": mcp_servers})
+    sid = r.get("result", {}).get("sessionId", "")
+    connects = []
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + window
+    while loop.time() < deadline:
+        try:
+            m = json.loads(await asyncio.wait_for(ws.recv(), timeout=max(0.1, deadline - loop.time())))
+        except asyncio.TimeoutError:
+            break
+        if m.get("method") == "mcp/connect":
+            connects.append(m)
+            await ws.send(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": {"connectionId": f"conn-{len(connects)}"}}))
+    return sid, connects
+
+
+async def section_tunnel():
+    """MCP-over-ACP tunnel producer (T5.3): a `type:acp` mcpServers entry makes the gateway
+    open a tunnel to us (a server-initiated mcp/connect). Covers the single case, fan-out over
+    multiple servers, and mixed-transport filtering. Exercises the live read-loop spawn path
+    the unit tests can't reach. (The agent→tool→browser leg needs a real extension — T6.)"""
+    # 1) single type:acp → exactly one mcp/connect carrying the declared id
+    async with await try_connect(TOKEN) as ws:
+        c = Conn(ws)
+        await c.initialize()
+        sid, connects = await collect_mcp_connects(c, ws, [{"type": "acp", "id": "srv-solo", "name": "browser"}])
+        record("tunnel", sid.startswith("sess_"), "session/new with a type:acp mcpServers entry is accepted")
+        record("tunnel", len(connects) == 1, "single type:acp server → exactly one server-initiated mcp/connect", f"got {len(connects)}")
+        if connects:
+            p = connects[0].get("params", {})
+            record("tunnel", p.get("acpId") == "srv-solo", "mcp/connect carries the declared acpId", str(p))
+            record("tunnel", connects[0].get("id") is not None, "mcp/connect is a request (has an id)")
+
+    # 2) fan-out: two type:acp servers → one distinct mcp/connect each
+    async with await try_connect(TOKEN) as ws:
+        c = Conn(ws)
+        await c.initialize()
+        _, connects = await collect_mcp_connects(
+            c, ws, [{"type": "acp", "id": "srv-a", "name": "a"}, {"type": "acp", "id": "srv-b", "name": "b"}]
+        )
+        ids = sorted(x.get("params", {}).get("acpId") for x in connects)
+        record("tunnel", ids == ["srv-a", "srv-b"], "two type:acp servers → one mcp/connect each (fan-out)", str(ids))
+        outer = [x.get("id") for x in connects]
+        record("tunnel", len(set(outer)) == len(outer) and all(i is not None for i in outer),
+               "each mcp/connect uses a distinct request id", str(outer))
+
+    # 3) mixed transports: only the acp server is tunnelled (http is the agent's own concern)
+    async with await try_connect(TOKEN) as ws:
+        c = Conn(ws)
+        await c.initialize()
+        _, connects = await collect_mcp_connects(
+            c, ws, [{"type": "acp", "id": "srv-x", "name": "browser"}, {"type": "http", "url": "http://example/mcp"}]
+        )
+        ids = [x.get("params", {}).get("acpId") for x in connects]
+        record("tunnel", ids == ["srv-x"], "mixed acp+http mcpServers → only the acp one gets mcp/connect", str(ids))
+
+
 async def main() -> int:
     if not TOKEN:
         print("ERROR: OPENAB_ACP_TOKEN is required (the /acp endpoint mandates a transport token off loopback).", file=sys.stderr)
@@ -323,6 +431,7 @@ async def main() -> int:
     await section_compliance()
     await section_edges()
     await section_lifecycle()
+    await section_tunnel()
 
     total = len(results)
     passed = sum(1 for _, ok, _ in results if ok)
@@ -333,7 +442,7 @@ async def main() -> int:
         if ok:
             s[0] += 1
     print("\n" + "-" * 60, flush=True)
-    labels = {"auth": "Transport / Auth", "comp": "Protocol compliance", "edge": "Protocol edge cases", "life": "Lifecycle / transport"}
+    labels = {"auth": "Transport / Auth", "comp": "Protocol compliance", "edge": "Protocol edge cases", "life": "Lifecycle / transport", "tunnel": "MCP-over-ACP tunnel"}
     for sec, (p, t) in by_section.items():
         print(f"  {labels.get(sec, sec):22} {p}/{t}", flush=True)
     print(f"\nRESULT: {passed}/{total} checks passed", flush=True)

@@ -14,6 +14,8 @@ Each `schema/<platform>.toml` has three schema-driven parts:
 
 **Sourcing rule:** attach the source that answers *"why should I trust or keep this?"* — intrinsic `(A)` facts link the **official platform doc** (a `source` URL); OpenAB `(B)` decisions/findings point at the **code** (`file.rs#symbol`) and, where relevant, the **PR** (`pr` / `refs`). Code refs use a grep-stable `#symbol` (no line numbers), so conformance can confirm they still exist without breaking on unrelated edits above the target.
 
+> **Decision:** unlike `[[quirks]]`, every `[[openab_features]]` source must currently be a code-ref — `feature_sources_exist_in_tree` rejects URL sources rather than skipping them. This is intentional, not an oversight: no feature currently needs to cite an official-doc URL, and relaxing the check preemptively would let feature sources silently drift to unverifiable doc links instead of code. Revisit if/when a feature genuinely needs a URL source (see #1340).
+
 ## Conformance
 
 `crates/platform-schema` deserializes every `schema/*.toml` into typed structs and, in CI, enforces:
@@ -23,6 +25,8 @@ Each `schema/<platform>.toml` has three schema-driven parts:
 - **anti-drift** — every `source` code-ref still resolves to a real file + `#symbol` in the tree.
 
 - **Current schema version: `2026-07-08`** — the top-line `schema_version` in each file. Bump it when the schema changes; the conformance test then flags every file that hasn't been re-verified.
+
+**Known limitation:** conformance only checks that a code-ref's file/symbol still *exists* — it can't detect a symbol whose behavior changed without being renamed or removed, or a `note`/`status` that has quietly gone stale while the code-ref it cites remains technically valid. That kind of semantic drift is caught only by PR review (see `CONTRIBUTING.md`), not by CI. No dedicated per-platform owner is assigned to periodically audit for it; revisit if this proves insufficient in practice.
 
 ## Platforms
 

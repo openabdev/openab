@@ -51,7 +51,7 @@ feishu = ["dep:openab-gateway", "dep:axum", "openab-gateway/feishu"]
 googlechat = ["dep:openab-gateway", "dep:axum", "openab-gateway/googlechat"]
 wecom = ["dep:openab-gateway", "dep:axum", "openab-gateway/wecom"]
 teams = ["dep:openab-gateway", "dep:axum", "openab-gateway/teams"]
-acp = ["dep:openab-gateway", "dep:axum", "openab-gateway/acp"]
+acp = ["dep:openab-gateway", "dep:axum", "openab-gateway/acp", "openab-core/acp-mcp"]
 lineworks = ["dep:openab-gateway", "dep:axum", "openab-gateway/lineworks"]
 
 [dev-dependencies]

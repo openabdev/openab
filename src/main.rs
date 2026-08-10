@@ -10,6 +10,10 @@ mod ctl;
     feature = "lineworks",
 ))]
 mod unified_adapter;
+#[cfg(feature = "acp")]
+mod acp_tunnel;
+#[cfg(feature = "acp")]
+mod acp_tunnel_source;
 use openab_core::acp;
 use openab_core::adapter::{self, AdapterRouter};
 use openab_core::bot_turns;
@@ -486,30 +490,100 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown_hook = cfg.hooks.pre_shutdown.clone();
 
+    // Shared MCP-over-ACP tunnel registry (D6-a'): the gateway populates it per session; the
+    // core's `acp_mcp` module reads it through the `RootAcpTunnel` implementation below.
+    #[cfg(feature = "acp")]
+    let acp_tunnel_registry = openab_gateway::adapters::acp_server::new_tunnel_registry();
+    #[cfg(feature = "acp")]
+    let acp_tunnel: Arc<dyn openab_core::acp_mcp::AcpMcpTunnel> = Arc::new(
+        acp_tunnel::RootAcpTunnel::new(
+            acp_tunnel_registry.clone(),
+            // Browser control requires `[mcp]`, so the absent case is unreachable in practice;
+            // fall back through the SAME function serde uses rather than repeating the literal.
+            {
+                let t = cfg
+                    .mcp
+                    .as_ref()
+                    .map(|m| m.tunnel_timeout_seconds)
+                    .unwrap_or_else(openab_core::config::default_tunnel_timeout_seconds);
+                // The comparison and the ceiling both live beside the constant in the gateway; this
+                // only hands over the configured value.
+                openab_gateway::adapters::acp_server::warn_if_tunnel_timeout_is_ineffective(t);
+                t
+            },
+        ),
+    );
+
     // OAB MCP Facade (`[mcp]` in config.toml — OAB MCP Adapter ADR §6.2):
     // serve the loopback Streamable HTTP MCP server in-process so any coding
     // CLI on this host can reach authorized external capabilities via
     // http://<listen>/mcp. Absent section = no listener (backward compat).
     // A bind failure is fatal at startup (fail fast, like a bad platform
     // token) rather than a silently missing capability surface.
+    //
+    // Browser capabilities (Facade mode, default): registered as a
+    // session-aware in-process source — one listener, per-session identity
+    // via broker-minted tokens; no per-session proxy servers.
+    let facade_sessions = openab_mcp::mcp::sources::SessionTokens::new();
+    // Only read under the acp feature (pool facade wiring below).
+    #[cfg(feature = "acp")]
+    let facade_serving = cfg.mcp.is_some();
+    // Startup, not per-session: report whether the facade is serving, so an operator learns it
+    // here rather than by inferring it from tools that never appear. This is NOT the
+    // `OPENAB_BROWSER_MODE` migration notice — that was removed (see `acp_mcp`), and nothing
+    // reports the variable now.
+    // Gated on `acp` (the root feature that pulls in core's `acp-mcp`), not on `acp-mcp` itself —
+    // that is a core feature and naming it here is an unknown-cfg error.
+    #[cfg(feature = "acp")]
+    openab_core::acp_mcp::report_facade_status(cfg.mcp.is_some(), &cfg.agent.working_dir);
     if let Some(mcp_cfg) = cfg.mcp.clone() {
         let listen = mcp_cfg.listen.clone();
+        let tokens = facade_sessions.clone();
+        // The ACP tunnel source is registered unconditionally under the `acp` feature. It used to
+        // be skipped in bridge mode; with the bridge gone there is no mode in which the facade
+        // runs without it.
+        #[cfg(feature = "acp")]
+        let sources: Vec<Arc<dyn openab_mcp::mcp::sources::CapabilitySource>> =
+            vec![Arc::new(acp_tunnel_source::AcpTunnelSource::new(
+                acp_tunnel.clone(),
+            ))];
+        #[cfg(not(feature = "acp"))]
+        let sources: Vec<Arc<dyn openab_mcp::mcp::sources::CapabilitySource>> = Vec::new();
         tokio::spawn(async move {
-            if let Err(e) = openab_mcp::mcp::facade::serve_http(&listen).await {
+            if let Err(e) =
+                openab_mcp::mcp::facade::serve_http_with(&listen, sources, tokens).await
+            {
                 tracing::error!(error = %format!("{e:#}"), listen, "OAB MCP facade exited");
                 std::process::exit(1);
             }
         });
     }
 
-    let pool = Arc::new(acp::SessionPool::new(
+    let pool_inner = acp::SessionPool::new(
         cfg.agent,
         cfg.pool.max_sessions,
         cfg.pool
             .prompt_hard_timeout_secs
             .saturating_add(cfg.pool.hung_grace_secs),
         cfg.pool.default_config_options,
-    ));
+    );
+    // Facade session wiring: only when the facade is actually serving. With no `[mcp]` there is
+    // no registrar and no facade url, and the pool simply starts sessions without browser
+    // capabilities — there is no longer a proxy path for it to fall back to.
+    #[cfg(feature = "acp")]
+    let pool_inner = pool_inner.with_facade_sessions(
+        facade_serving.then(|| {
+            Arc::new(acp_tunnel_source::FacadeRegistrar(facade_sessions.clone()))
+                as Arc<dyn openab_core::acp_mcp::SessionTokenRegistrar>
+        }),
+        facade_serving.then(|| {
+            format!(
+                "http://{}/mcp",
+                cfg.mcp.as_ref().map(|m| m.listen.as_str()).unwrap_or("127.0.0.1:8848")
+            )
+        }),
+    );
+    let pool = Arc::new(pool_inner);
     let ttl_secs = cfg.pool.session_ttl_hours * 3600;
 
     // Resolve STT config (auto-detect GROQ_API_KEY from env)
@@ -1104,6 +1178,12 @@ async fn main() -> anyhow::Result<()> {
 
             // Build gateway AppState from env vars (shared factory with standalone gateway)
             let mut gw_state_inner = openab_gateway::AppState::from_env(event_tx.clone(), None);
+            // Share the tunnel registry the facade's capability source reads (D6-a'), so the gateway
+            // populates the same map the RootAcpTunnel bridge looks up.
+            #[cfg(feature = "acp")]
+            {
+                gw_state_inner.acp_tunnel_registry = Some(acp_tunnel_registry.clone());
+            }
 
             // Pre-download identity probe: lets adapters consult the shared
             // L3 identity gate BEFORE spending resources on attachment
@@ -1750,8 +1830,42 @@ fn parse_id_set(raw: &[String], label: &str) -> anyhow::Result<HashSet<u64>> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use clap::Parser;
+
+    /// The shipped tunnel-timeout default must stay strictly beneath the ceiling that overtakes it.
+    ///
+    /// This pairing can only be asserted here. The gateway owns the ceiling and cannot see the
+    /// default; the core crate owns the default and cannot see the ceiling, since the gateway does
+    /// not depend on it. The binary is the only place both are visible — which is also why the
+    /// warning that reports a violation is wired up here.
+    ///
+    /// Raising the default to or above the ceiling would silently restore the condition several
+    /// commits were spent removing: two clocks starting together, with the wrong one able to fire
+    /// first, and no cancellation reaching the peer when it does.
+    ///
+    /// Feature-gated because it names `openab_gateway`, which is an OPTIONAL dependency: the crate
+    /// is absent under default features, so without this gate the whole `openab` test binary fails
+    /// to compile for anyone building without `acp` — including CI, whose `check` job runs a plain
+    /// `cargo test --workspace`. The surrounding `mod tests` is `#[cfg(test)]` only, so the gate has
+    /// to be here.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn the_default_tunnel_timeout_stays_beneath_the_idle_timeout() {
+        let default = openab_core::config::default_tunnel_timeout_seconds();
+        let ceiling = openab_gateway::adapters::acp_server::ACP_PROMPT_IDLE_TIMEOUT_SECS;
+        assert!(
+            default < ceiling,
+            "the default tunnel timeout ({default}s) must be strictly beneath the ACP prompt idle \
+             timeout ({ceiling}s); at or above it the turn ends there first and no `mcp/cancel` is \
+             ever sent"
+        );
+        assert!(
+            !openab_gateway::adapters::acp_server::tunnel_timeout_is_ineffective(default),
+            "the shipped default must not be a value the startup warning fires on"
+        );
+    }
 
     #[test]
     fn cli_no_args_defaults_to_run() {

@@ -8,7 +8,7 @@
 use platform_schema::*;
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// The 9 platforms that must have a schema file.
 const EXPECTED_PLATFORMS: &[&str] = &[
@@ -175,17 +175,88 @@ fn quirk_code_sources_exist_in_tree() {
 
 fn check_code_ref(root: &Path, src: &str) -> Result<(), String> {
     let r = parse_code_ref(src);
+    // Containment first, and lexically: a code-ref must be a plain relative path
+    // inside the repo. Rejecting `..`/root/prefix components before touching the
+    // filesystem keeps the guard reachable when the escaping target does not
+    // exist — a canonicalize-only check can't run on a missing path, so it would
+    // silently degrade to the "does not exist" error below and hide the escape.
+    if Path::new(r.file)
+        .components()
+        .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(format!("source path {:?} escapes repo root", r.file));
+    }
     let path = root.join(r.file);
     if !path.is_file() {
         return Err(format!("source file {:?} does not exist", r.file));
     }
+    // Defence in depth: a lexically-clean ref can still traverse a symlink out
+    // of the tree, which only resolving both real paths catches.
+    let canonical_root = root.canonicalize().map_err(|e| e.to_string())?;
+    let canonical_path = path.canonicalize().map_err(|e| e.to_string())?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(format!("source path {:?} escapes repo root", r.file));
+    }
     if let Some(sym) = r.symbol {
+        // `trim` matters as much as the emptiness check itself: `contains("")` is
+        // unconditionally true, and a whitespace-only symbol matches virtually
+        // any source file. Both are vacuous passes, not anti-drift checks.
+        if sym.trim().is_empty() {
+            return Err(format!("empty symbol after '#' in {:?}", r.file));
+        }
         let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
         if !text.contains(sym) {
             return Err(format!("symbol {sym:?} not found in {:?} (renamed/deleted?)", r.file));
         }
     }
     Ok(())
+}
+
+#[test]
+fn check_code_ref_rejects_empty_symbol() {
+    let root = repo_root();
+    let err = check_code_ref(&root, "docs/platforms/README.md#")
+        .expect_err("empty symbol must be rejected");
+    assert!(err.contains("empty symbol"), "unexpected error: {err}");
+}
+
+#[test]
+fn check_code_ref_rejects_whitespace_only_symbol() {
+    // Same vacuous-pass class as the empty symbol: `contains(" ")` matches
+    // virtually any file, so a whitespace-only `#symbol` asserts nothing.
+    let root = repo_root();
+    let err = check_code_ref(&root, "docs/platforms/README.md#   ")
+        .expect_err("whitespace-only symbol must be rejected");
+    assert!(err.contains("empty symbol"), "unexpected error: {err}");
+}
+
+#[test]
+fn check_code_ref_rejects_path_traversal() {
+    let root = repo_root();
+    let err = check_code_ref(&root, "../../etc/passwd")
+        .expect_err("path escaping repo root must be rejected");
+    assert!(err.contains("escapes repo root"), "unexpected error: {err}");
+}
+
+#[test]
+fn check_code_ref_rejects_absolute_path() {
+    // Path::join replaces the base entirely when the joined path is absolute,
+    // so this exercises a different component than the "../" traversal above.
+    let root = repo_root();
+    let err = check_code_ref(&root, "/etc/passwd").expect_err("absolute path must be rejected");
+    assert!(err.contains("escapes repo root"), "unexpected error: {err}");
+}
+
+#[test]
+fn check_code_ref_reports_escape_even_when_target_is_missing() {
+    // The containment check runs before the existence check, so an escaping ref
+    // is reported as an escape regardless of what happens to exist on the host.
+    // That is what lets the two assertions above be exact instead of accepting
+    // "does not exist" as an alternative pass.
+    let root = repo_root();
+    let err = check_code_ref(&root, "../no-such-file-4f21c9.rs")
+        .expect_err("escaping path must be rejected");
+    assert!(err.contains("escapes repo root"), "unexpected error: {err}");
 }
 
 /// The template must keep enumerating every capability section + feature key, so

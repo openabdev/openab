@@ -482,14 +482,14 @@ async fn ambient_consumer_loop(
     target: Arc<dyn DispatchTarget>,
     instructions: String,
 ) {
-    info!(channel_id = %channel_id, "ambient consumer started");
+    info!(channel_id = %crate::redact::redact_session_ids(&channel_id), "ambient consumer started");
 
     loop {
         // Wait for first message (blocks until one arrives or channel closes).
         let first = match rx.recv().await {
             Some(msg) => msg,
             None => {
-                info!(channel_id = %channel_id, "ambient consumer channel closed, exiting");
+                info!(channel_id = %crate::redact::redact_session_ids(&channel_id), "ambient consumer channel closed, exiting");
                 return;
             }
         };
@@ -535,7 +535,7 @@ async fn ambient_consumer_loop(
 
         let batch_size = batch.len();
         debug!(
-            channel_id = %channel_id,
+            channel_id = %crate::redact::redact_session_ids(&channel_id),
             batch_size,
             "ambient flush triggered"
         );
@@ -544,7 +544,7 @@ async fn ambient_consumer_loop(
         let _permit = match flush_semaphore.acquire().await {
             Ok(permit) => permit,
             Err(_) => {
-                warn!(channel_id = %channel_id, "flush semaphore closed, exiting");
+                warn!(channel_id = %crate::redact::redact_session_ids(&channel_id), "flush semaphore closed, exiting");
                 return;
             }
         };
@@ -558,7 +558,7 @@ async fn ambient_consumer_loop(
             // Don't drain — messages buffered after the mention are still valid
             // for the next batch cycle. The current batch is discarded but future
             // messages will be picked up when the loop restarts and reset() clears.
-            debug!(channel_id = %channel_id, "ambient flush cancelled by mention during accumulation");
+            debug!(channel_id = %crate::redact::redact_session_ids(&channel_id), "ambient flush cancelled by mention during accumulation");
             continue;
         }
 
@@ -590,14 +590,14 @@ async fn ambient_consumer_loop(
                 debug_msg.push_str("\n…(truncated)");
             }
             if let Err(e) = adapter.send_message(&channel_ref, &debug_msg).await {
-                warn!(channel_id = %channel_id, error = %e, "ambient debug message send failed");
+                warn!(channel_id = %crate::redact::redact_session_ids(&channel_id), error = %e, "ambient debug message send failed");
             }
         }
 
         // Ensure session exists.
         if let Err(e) = target.ensure_session(&session_key, None).await {
             warn!(
-                channel_id = %channel_id,
+                channel_id = %crate::redact::redact_session_ids(&channel_id),
                 error = %e,
                 "failed to create ambient session, discarding batch"
             );
@@ -630,7 +630,7 @@ async fn ambient_consumer_loop(
 
         // Check post_guard before dispatching (mention may have cancelled).
         if !post_guard.can_post() {
-            debug!(channel_id = %channel_id, "ambient flush cancelled by mention before dispatch");
+            debug!(channel_id = %crate::redact::redact_session_ids(&channel_id), "ambient flush cancelled by mention before dispatch");
             continue;
         }
 
@@ -647,11 +647,11 @@ async fn ambient_consumer_loop(
             .await
         {
             Ok(()) => {
-                debug!(channel_id = %channel_id, "ambient flush dispatched");
+                debug!(channel_id = %crate::redact::redact_session_ids(&channel_id), "ambient flush dispatched");
             }
             Err(e) => {
                 warn!(
-                    channel_id = %channel_id,
+                    channel_id = %crate::redact::redact_session_ids(&channel_id),
                     error = %e,
                     "ambient flush failed, discarding batch"
                 );

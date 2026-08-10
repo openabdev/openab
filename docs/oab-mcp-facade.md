@@ -21,7 +21,7 @@ flowchart LR
         end
 
         subgraph runtime["Shared MCP runtime (openab-mcp)"]
-            policy["tool_filter (least-privilege)<br/>JSON-Schema arg validation<br/>timeouts · circuit breaker<br/>secret redaction · audit log"]
+            policy["tool_filter (least-privilege)<br/>JSON-Schema arg validation<br/>timeouts<br/>secret redaction · audit log"]
         end
 
         adapter["gmail-native adapter<br/>loopback :8850/mcp"]
@@ -81,8 +81,8 @@ connections stay in `mcp.json` — `[mcp]` carries listener settings only
    by each server's `tool_filter` **before** anything reaches the agent.
 2. `execute_capability` (`name` + `arguments`) — execute an exact capability
    returned by discovery. Arguments are validated against the capability's
-   JSON Schema before dispatch; timeouts, circuit breaking, and secret
-   redaction apply on the same path the native agent uses.
+   JSON Schema before dispatch; timeouts and secret redaction apply on the
+   same path the native agent uses.
 
 An audit line is logged for every dispatch (tool name + args SHA-256 — never
 plaintext arguments):
@@ -91,6 +91,19 @@ plaintext arguments):
 mcp.audit: mcp call_tool entry server="gmail" tool="search_threads" args_sha256=…
 mcp.audit: mcp call_tool exit  server="gmail" tool="search_threads" … outcome="ok"
 ```
+
+> **`mcp.audit` must be enabled in `RUST_LOG`, or these lines are silently dropped.**
+> The audit events use `mcp.audit` as a *bare* tracing target — it is not under the
+> `openab` prefix, so a filter like `RUST_LOG=openab=debug,openab_agent=debug` matches
+> nothing for them and no audit line is ever emitted. Nothing warns you that auditing
+> is effectively off. Name the target explicitly:
+>
+> ```
+> RUST_LOG=openab=debug,openab_agent=debug,mcp.audit=info
+> ```
+>
+> Any filter that raises the global default (`RUST_LOG=info`, `RUST_LOG=debug`, …) also
+> emits them.
 
 ## Client registration examples
 
@@ -115,8 +128,10 @@ claude mcp add --transport http oab http://127.0.0.1:8848/mcp
 ## Trust model
 
 Loopback-only, **no authentication layer** — the host/pod boundary is the
-trust boundary. Any process on the host can invoke every authorized
-capability while the facade runs. Do not enable it on hosts that colocate
+trust boundary. Any process on the host can invoke every capability that does **not** require a session.
+Session-bound sources are different: since the per-session bearer shipped, the facade filters
+them out unless the request resolves to a session, so a host process without that token can
+neither discover nor call them. Do not enable it on hosts that colocate
 untrusted processes. Least-privilege is enforced per provider with
 `tool_filter` include/exclude lists in `mcp.json`; excluded tools are
 invisible to discovery and rejected at execution.

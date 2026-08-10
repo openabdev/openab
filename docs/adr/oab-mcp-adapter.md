@@ -428,11 +428,13 @@ listen = "127.0.0.1:8848"   # loopback only; this is the default
   facade; `openab-agent` re-exports the same crate. One implementation, two
   hosts — no duplicated runtime, which this ADR forbids.
 - **Security posture:** the listener refuses to bind any non-loopback
-  address; the endpoint itself carries no authentication layer in the MVP,
-  so the host/pod boundary is the trust boundary. Every process on the host
-  that can reach loopback can call authorized capabilities — deployments
-  that colocate untrusted processes must not enable `[mcp]`. A token or
-  socket-permission scheme is a documented follow-up.
+  address; the endpoint itself carries no authentication layer,
+  so the host/pod boundary is the trust boundary for every capability that
+  does not require a session. Deployments that colocate untrusted processes
+  must not enable `[mcp]`. Session-bound sources are the exception: the
+  per-session bearer shipped in #1447, so the facade hides and refuses them
+  unless the request resolves to a session. A socket-permission scheme for
+  the remaining session-free capabilities is still a documented follow-up.
 - **Native `openab-agent`:** the dispatcher is invoked in-process via the
   existing `mcp` meta-tool. No HTTP hop is required because the facade
   contract and policy checks are implemented by the same dispatcher component
@@ -443,7 +445,7 @@ listen = "127.0.0.1:8848"   # loopback only; this is the default
   CLI the operator points at it.
 
 This is the same architectural role that
-[`acp-server-websocket-mcp-browser.md`](./acp-server-websocket-mcp-browser.md)
+[`acp-server-websocket-reverse-mcp.md`](./acp-server-websocket-reverse-mcp.md)
 assigns to OpenAB core: an MCP proxy/aggregator between the agent and upstream
 capability sources, delivered to the agent via `mcpServers`. The OAB MCP Facade
 is that inbound component for external service capabilities; browser tools and
@@ -679,7 +681,7 @@ escape hatch for operators who intentionally configure a server outside OAB.
 
 Rejected as unnecessary for this MVP. The OAB MCP facade is the intentionally
 scoped inbound server for the coding agent, filling the MCP proxy/aggregator
-role that [`acp-server-websocket-mcp-browser.md`](./acp-server-websocket-mcp-browser.md)
+role that [`acp-server-websocket-reverse-mcp.md`](./acp-server-websocket-reverse-mcp.md)
 already assigns to OpenAB core (§6.2). A separate generic server for
 arbitrary OAB workflows would require another authentication, tenancy, and
 authorization design and would blur the two-method capability boundary.

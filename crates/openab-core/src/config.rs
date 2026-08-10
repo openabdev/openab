@@ -71,13 +71,61 @@ impl<'de> Deserialize<'de> for AllowBots {
 /// same host connects to `http://<listen>/mcp`. Provider connections stay in
 /// `~/.openab/agent/mcp.json` (the facade has no provider config here —
 /// single source of truth, ADR §6.3 / Alternative E).
+/// **Strict.** An unknown key here is a hard startup failure, not a warning — a mistyped `listen`
+/// or `tunnel_timeout_seconds` should stop startup, not be silently ignored into its default.
+///
+/// **The operator allowlist this attribute used to guard was removed on 2026-07-31 (D-29),
+/// reversing D-20's fail-closed default.** `[[mcp.acp_servers]]` is gone: admission for
+/// client-declared `type:acp` servers is now the `/acp` transport auth alone
+/// (`OPENAB_ACP_AUTH_KEY`, or loopback + `OPENAB_ACP_ALLOWED_ORIGINS`), because the extension
+/// already authenticates to reach the tunnel and a second operator allowlist duplicated that
+/// intent. `deny_unknown_fields` keeps a sharper edge for it: a config still carrying an
+/// `[[mcp.acp_servers]]` block HARD-FAILS to parse rather than ignoring it — intended, so a stale
+/// allowlist announces itself instead of looking effective.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpFacadeConfig {
     /// Loopback listen address. Non-loopback addresses are refused at
     /// startup — the endpoint has no authentication layer, so the host
     /// boundary is the trust boundary.
     #[serde(default = "default_mcp_listen")]
     pub listen: String,
+    /// How long a single request tunnelled to a client-declared `type:acp` server may run
+    /// before openab gives up on it, in seconds.
+    ///
+    /// Enforced server-side because on this tunnel OPENAB is the requester and the peer is a
+    /// browser extension we neither ship nor control, so there is nobody else to bound it.
+    /// The default sits STRICTLY beneath the ACP per-chunk idle timeout in `handle_session_prompt`
+    /// (`ACP_PROMPT_IDLE_TIMEOUT_SECS`, 180s), and the margin is the point. Referenced by name, not
+    /// by line: the same claim was written as a line number twice and was wrong both times, because
+    /// every edit above it moves the target. Setting the two equal makes which one fires
+    /// first undecidable at the boundary, and they do different things: only when this one wins
+    /// does the peer receive `mcp/cancel` and the caller see a timeout error. If the idle timeout
+    /// wins the turn simply ends, which leaves exactly the stranded work on the extension that
+    /// cancellation exists to prevent.
+    ///
+    /// **180s is therefore the effective ceiling.** A larger value here is not an error and is not
+    /// clamped, but it cannot take effect: the idle timeout is not operator-configurable, so the turn
+    /// ends there first and this setting stops mattering. Startup warns when it is set that high
+    /// rather than letting the number look effective.
+    ///
+    /// The check lives in the gateway, beside the constant, as
+    /// `warn_if_tunnel_timeout_is_ineffective`; the binary only hands it this value. That keeps the
+    /// ceiling and the comparison in one place, so changing it — or making it configurable — is a
+    /// single edit. It does not remove coupling: this crate cannot see the constant, since
+    /// `openab-gateway` does not depend on `openab-core`, and the gateway never sees this value. The
+    /// binary is the only place both are visible, and it already depends on the gateway. Moving the
+    /// constant into this crate would ADD a dependency edge to save nothing. Earlier wording said to "raise both, in that
+    /// order" — there is no second knob to raise, so that instruction could not be followed.
+    #[serde(default = "default_tunnel_timeout_seconds")]
+    pub tunnel_timeout_seconds: u64,
+}
+
+/// Public so the binary can use the same value instead of repeating the literal. A private
+/// default plus an `unwrap_or(180)` at the call site is two records of one fact, and the one in
+/// the binary would silently keep the old number the day this changes.
+pub fn default_tunnel_timeout_seconds() -> u64 {
+    170
 }
 
 fn default_mcp_listen() -> String {
@@ -2447,6 +2495,41 @@ mod tests {
         let cfg = parse_config_str("[discord]\nbot_token = \"x\"\n[mcp]\n", "test").unwrap();
         let mcp = cfg.mcp.expect("[mcp] presence is the opt-in signal");
         assert_eq!(mcp.listen, "127.0.0.1:8848");
+    }
+
+    /// The operator allowlist was removed on 2026-07-31 (D-29), reversing D-20. `[[mcp.acp_servers]]`
+    /// is no longer a field on `McpFacadeConfig`, and `deny_unknown_fields` turns a leftover block
+    /// from a silent no-op into a hard parse failure — a stale allowlist must announce itself rather
+    /// than look effective. This replaces the pair of tests that pinned the allowlist's
+    /// mistyped-vs-correct spellings: there is no correct spelling any more, and the entry-key test
+    /// went with the `AcpServerPolicy` struct it exercised.
+    #[test]
+    fn an_acp_servers_block_is_now_refused_because_the_allowlist_was_removed() {
+        let err = parse_config_str(
+            "[discord]\nbot_token = \"x\"\n[mcp]\n[[mcp.acp_servers]]\nname = \"katashiro\"\n\
+             tools = [\"katashiro.read_dom\"]\n",
+            "test",
+        )
+        .expect_err("a leftover allowlist block must fail the parse, not be silently ignored");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("acp_servers"),
+            "the error must name the offending key so the operator can find it, got: {msg}"
+        );
+    }
+
+    /// Positive control for the test above: the `[mcp]` shape that SURVIVES D-29 — `listen` and
+    /// `tunnel_timeout_seconds` only — still parses, so the rejection above is about the removed
+    /// key and not a parser that refuses everything.
+    #[test]
+    fn a_bare_mcp_section_still_parses() {
+        let cfg = parse_config_str(
+            "[discord]\nbot_token = \"x\"\n[mcp]\nlisten = \"127.0.0.1:9000\"\n",
+            "test",
+        )
+        .expect("the surviving [mcp] shape must keep working");
+        let mcp = cfg.mcp.expect("[mcp] present");
+        assert_eq!(mcp.listen, "127.0.0.1:9000");
     }
 
     #[test]
