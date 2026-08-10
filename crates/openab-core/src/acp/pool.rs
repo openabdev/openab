@@ -862,8 +862,12 @@ mod tests {
     #[test]
     fn classify_idle_marks_stale_by_time() {
         let ttl = std::time::Duration::from_secs(60);
-        let now = Instant::now();
-        let last_active = now - std::time::Duration::from_secs(120);
+        // Build fixtures forward from `last_active`, never backward from `now`:
+        // `Instant::now() - d` carries the very underflow panic this PR removes
+        // from production, and would fire on a host whose monotonic clock is
+        // younger than `d`.
+        let last_active = Instant::now();
+        let now = last_active + ttl + std::time::Duration::from_secs(60);
         assert!(classify_idle(last_active, true, now, ttl));
     }
 
@@ -887,8 +891,9 @@ mod tests {
     #[test]
     fn classify_idle_keeps_sessions_at_the_exact_ttl_boundary() {
         let ttl = std::time::Duration::from_secs(60);
-        let now = Instant::now();
-        assert!(!classify_idle(now - ttl, true, now, ttl));
+        let last_active = Instant::now();
+        let now = last_active + ttl;
+        assert!(!classify_idle(last_active, true, now, ttl));
     }
 
     /// `now` is sampled once at the top of `cleanup_idle`, but a turn can finish
