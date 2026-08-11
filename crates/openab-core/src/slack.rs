@@ -695,6 +695,11 @@ const MAX_CONSECUTIVE_BOT_TURNS: usize = 1000;
 pub(crate) const SLACK_URL_REQUIREMENT: &str =
     "Slack private file, requires an `Authorization: Bearer <bot token>` header to download";
 
+/// Distinct from `AUDIO_NO_URL_NOTE`: no filestore would help, because Slack
+/// itself handed over no location for these bytes.
+pub(crate) const SLACK_NO_FILE_URL_NOTE: &str =
+    "Slack provided no download URL for this file, so there is nothing to fetch";
+
 /// Socket Mode keepalive. Slack's inbound WebSocket can go half-open (e.g. a NAT
 /// idle-timeout silently drops inbound frames with no Close/FIN), which leaves
 /// `read.next()` blocked forever, so the reconnect loop never fires and the bot
@@ -1515,12 +1520,29 @@ async fn handle_message(
             // Slack private files require Bearer token to download
             let url = slack_file_download_url(file);
 
+            // Classified ahead of the skip so audio always yields a block: a
+            // dropped voice note is indistinguishable from one never sent.
+            let audio = media::audio_mime(filename, Some(mimetype_raw));
+
             if url.is_empty() {
-                debug!(filename, "slack file has no private URL, skipping");
+                match audio.as_deref() {
+                    Some(audio_mime) => {
+                        debug!(filename, "slack audio has no private URL, describing it");
+                        extra_blocks.extend(media::audio_attachment_blocks(
+                            filename,
+                            audio_mime,
+                            size,
+                            None,
+                            Some(SLACK_NO_FILE_URL_NOTE),
+                            None,
+                        ));
+                    }
+                    None => debug!(filename, "slack file has no private URL, skipping"),
+                }
                 continue;
             }
 
-            if let Some(audio_mime) = media::audio_mime(filename, Some(mimetype_raw)) {
+            if let Some(audio_mime) = audio {
                 let mimetype = audio_mime.as_str();
                 let mut stt_line: Option<String> = None;
                 if stt_config.enabled {
@@ -2471,7 +2493,8 @@ mod tests {
         );
     }
 
-    /// Externally-backed files with no private URL return empty — caller skips.
+    /// Externally-backed files with no private URL return empty. The caller
+    /// skips these, except audio, which it describes instead of dropping.
     #[test]
     fn slack_file_url_empty_for_external_only() {
         let file = serde_json::json!({
