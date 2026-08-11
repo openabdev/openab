@@ -1181,26 +1181,56 @@ pub async fn download_and_upload_any_file(
             tracing::info!(filename, mime, size = actual_bytes, "file uploaded to filestore (any-file path)");
             Some((ContentBlock::Text { text: hint }, 0))
         }
-        Err(PresignError::TooLarge | PresignError::DownloadFailed) => None,
-        Err(PresignError::UploadFailed) => {
+        Err(e) => any_file_failure_block(&e, &safe_filename, &safe_mime, size)
+            .map(|block| (block, 0)),
+    }
+}
+
+/// The `#738` block for a failed store, or `None` where `main` emitted nothing.
+/// Split out from the `await` so the byte-identity is pinnable without a store.
+#[cfg(feature = "filestore")]
+fn any_file_failure_block(
+    err: &PresignError,
+    safe_filename: &str,
+    safe_mime: &str,
+    size: u64,
+) -> Option<ContentBlock> {
+    match err {
+        // `main` returned before it ever called the upload, with no block at all.
+        PresignError::TooLarge(PresignPhase::Precheck)
+        | PresignError::DownloadFailed(PresignPhase::Precheck) => None,
+        // `main` funnelled everything the upload call returned into this one
+        // hint, a mid-stream read failure and a mid-stream overrun included.
+        PresignError::TooLarge(PresignPhase::Upload)
+        | PresignError::DownloadFailed(PresignPhase::Upload)
+        | PresignError::UploadFailed => {
             let size_kb = size / 1024;
-            let hint = format!(
-                "[File: {safe_filename}]\n\
-                 Type: {safe_mime}\n\
-                 This file ({size_kb} KB) could not be uploaded to temporary storage. \
-                 The file content is unavailable."
-            );
-            Some((ContentBlock::Text { text: hint }, 0))
+            Some(ContentBlock::Text {
+                text: format!(
+                    "[File: {safe_filename}]\n\
+                     Type: {safe_mime}\n\
+                     This file ({size_kb} KB) could not be uploaded to temporary storage. \
+                     The file content is unavailable."
+                ),
+            })
         }
-        Err(PresignError::UploadTimedOut) => {
-            let hint = format!(
+        PresignError::UploadTimedOut => Some(ContentBlock::Text {
+            text: format!(
                 "[File: {safe_filename}]\n\
                  Type: {safe_mime}\n\
                  This file upload timed out. The file content is unavailable."
-            );
-            Some((ContentBlock::Text { text: hint }, 0))
-        }
+            ),
+        }),
     }
+}
+
+/// Which side of the upload call a failure came from. `main` told them apart by
+/// position, so collapsing them loses which ones it gave a degraded hint for.
+#[cfg(feature = "filestore")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresignPhase {
+    Precheck,
+    Upload,
 }
 
 /// Distinguished so the hint-block wrapper keeps its three distinct degraded
@@ -1210,9 +1240,9 @@ pub async fn download_and_upload_any_file(
 enum PresignError {
     /// Over the cap, either by the advisory prechecks or by the count measured
     /// while streaming, which is the only authoritative one.
-    TooLarge,
+    TooLarge(PresignPhase),
     /// The platform did not hand over the bytes, so there was nothing to upload.
-    DownloadFailed,
+    DownloadFailed(PresignPhase),
     UploadFailed,
     UploadTimedOut,
 }
@@ -1222,8 +1252,12 @@ enum PresignError {
 #[cfg(feature = "filestore")]
 fn presign_error_for_upload(err: &anyhow::Error) -> PresignError {
     match err.downcast_ref::<crate::filestore::StreamUploadCause>() {
-        Some(crate::filestore::StreamUploadCause::SourceRead) => PresignError::DownloadFailed,
-        Some(crate::filestore::StreamUploadCause::TooLarge) => PresignError::TooLarge,
+        Some(crate::filestore::StreamUploadCause::SourceRead) => {
+            PresignError::DownloadFailed(PresignPhase::Upload)
+        }
+        Some(crate::filestore::StreamUploadCause::TooLarge) => {
+            PresignError::TooLarge(PresignPhase::Upload)
+        }
         None => PresignError::UploadFailed,
     }
 }
@@ -1240,7 +1274,7 @@ async fn download_and_presign_any_file(
     let max_size = filestore.max_file_size();
     if size > max_size {
         tracing::warn!(filename, size, max = max_size, "file exceeds filestore size limit, skipping");
-        return Err(PresignError::TooLarge);
+        return Err(PresignError::TooLarge(PresignPhase::Precheck));
     }
 
     const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
@@ -1253,19 +1287,19 @@ async fn download_and_presign_any_file(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(url, error = %e, "file download failed (filestore any-file path)");
-            return Err(PresignError::DownloadFailed);
+            return Err(PresignError::DownloadFailed(PresignPhase::Precheck));
         }
     };
     if !resp.status().is_success() {
         tracing::warn!(url, status = %resp.status(), "file download failed (filestore any-file path)");
-        return Err(PresignError::DownloadFailed);
+        return Err(PresignError::DownloadFailed(PresignPhase::Precheck));
     }
 
     // Content-Length pre-check
     if let Some(content_length) = resp.content_length() {
         if content_length > max_size {
             tracing::warn!(filename, content_length, max = max_size, "Content-Length exceeds filestore limit");
-            return Err(PresignError::TooLarge);
+            return Err(PresignError::TooLarge(PresignPhase::Precheck));
         }
     }
 
@@ -1311,8 +1345,8 @@ pub(crate) async fn download_and_presign_attachment(
             measured_bytes,
         })
         .map_err(|e| match e {
-            PresignError::TooLarge => AudioStoreError::TooLarge,
-            PresignError::DownloadFailed => AudioStoreError::DownloadFailed,
+            PresignError::TooLarge(_) => AudioStoreError::TooLarge,
+            PresignError::DownloadFailed(_) => AudioStoreError::DownloadFailed,
             PresignError::UploadFailed | PresignError::UploadTimedOut => {
                 AudioStoreError::UploadFailed
             }
@@ -1477,13 +1511,13 @@ mod tests {
             (
                 anyhow::Error::new(StreamUploadCause::SourceRead)
                     .context("stream read error: connection reset"),
-                PresignError::DownloadFailed,
+                PresignError::DownloadFailed(PresignPhase::Upload),
                 "did not return the bytes",
             ),
             (
                 anyhow::Error::new(StreamUploadCause::TooLarge)
                     .context("file exceeds max size (300000000 > 262144000)"),
-                PresignError::TooLarge,
+                PresignError::TooLarge(PresignPhase::Upload),
                 "exceeds the configured upload limit",
             ),
             (
@@ -1500,14 +1534,49 @@ mod tests {
             assert_eq!(classified, expected, "{displayed}");
 
             let store_err = match classified {
-                PresignError::TooLarge => AudioStoreError::TooLarge,
-                PresignError::DownloadFailed => AudioStoreError::DownloadFailed,
+                PresignError::TooLarge(_) => AudioStoreError::TooLarge,
+                PresignError::DownloadFailed(_) => AudioStoreError::DownloadFailed,
                 PresignError::UploadFailed | PresignError::UploadTimedOut => {
                     AudioStoreError::UploadFailed
                 }
             };
             let note = store_failure_note(store_err, "fetch it with a bearer token");
             assert!(note.contains(expected_reason), "{note}");
+        }
+    }
+
+    // `main` gave a hint for every error the upload call handed back, mid-stream
+    // ones included, so collapsing those to `None` goes silent on a live fault.
+    #[cfg(feature = "filestore")]
+    #[test]
+    fn the_any_file_failure_block_routes_the_way_main_did() {
+        let unavailable = "[File: clip.zip]\n\
+                           Type: application/zip\n\
+                           This file (2048 KB) could not be uploaded to temporary storage. \
+                           The file content is unavailable.";
+        let timed_out = "[File: clip.zip]\n\
+                         Type: application/zip\n\
+                         This file upload timed out. The file content is unavailable.";
+
+        let cases = [
+            (PresignError::TooLarge(PresignPhase::Precheck), None),
+            (PresignError::DownloadFailed(PresignPhase::Precheck), None),
+            (
+                PresignError::TooLarge(PresignPhase::Upload),
+                Some(unavailable),
+            ),
+            (
+                PresignError::DownloadFailed(PresignPhase::Upload),
+                Some(unavailable),
+            ),
+            (PresignError::UploadFailed, Some(unavailable)),
+            (PresignError::UploadTimedOut, Some(timed_out)),
+        ];
+
+        for (err, expected) in cases {
+            let got = any_file_failure_block(&err, "clip.zip", "application/zip", 2048 * 1024)
+                .map(block_text);
+            assert_eq!(got.as_deref(), expected, "{err:?}");
         }
     }
 
@@ -2039,6 +2108,29 @@ mod tests {
         // sees only \n and would read four whether or not U+2028 survived.
         let rendered_lines = text.split(['\n', '\u{2028}', '\u{2029}']).count();
         assert_eq!(rendered_lines, 4, "got {text}");
+    }
+
+    // One interior point per range lets a range narrow at either end and stay
+    // green, so both endpoints are asserted along with the chars just outside.
+    #[test]
+    fn the_sanitizer_covers_each_range_to_its_endpoints() {
+        for (low, high) in [
+            ('\u{202A}', '\u{202E}'),   // bidi embedding and override
+            ('\u{2066}', '\u{2069}'),   // bidi isolates
+            ('\u{E0000}', '\u{E007F}'), // tags block
+        ] {
+            for c in [low, high] {
+                let name = format!("a{c}b.ogg");
+                let text = block_text(audio_attachment_block(&name, "audio/ogg", 1, None, None));
+                assert!(!text.contains(c), "{c:?} survived sanitisation");
+                assert!(text.contains("filename: ab.ogg"), "got {text}");
+            }
+        }
+        // Hand-picked, not derived: U+2029 sits below one range and is stripped
+        // anyway, and the surrogate gap sits below another.
+        for c in ['\u{202F}', '\u{2065}', '\u{206A}', '\u{E0080}'] {
+            assert!(!splits_a_prompt_line(c), "{c:?} is outside every range");
+        }
     }
 
     #[test]
