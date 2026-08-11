@@ -5,7 +5,11 @@
 # are IMMUTABLE and owned by this file — a runtime's own [control_plane]
 # config is verified against them at registration and rejected on mismatch.
 
-listen = "0.0.0.0:9800"
+# The CP terminates no TLS itself. The safe default is loopback; to bind a
+# non-loopback address you must front it with a TLS proxy (wss://) or a
+# private network (e.g. tailnet) AND set allow_insecure_bind = true.
+listen = "127.0.0.1:9800"
+# allow_insecure_bind = true
 
 # Runtimes must heartbeat at this interval; missing heartbeats past the lease
 # window deregisters the instance and fails its in-flight delegations.

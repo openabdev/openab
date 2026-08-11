@@ -14,9 +14,18 @@ use crate::proto::AgentType;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CpConfig {
-    /// Bind address, e.g. "0.0.0.0:9800".
+    /// Bind address. Defaults to loopback: the CP carries bearer
+    /// credentials and terminates no TLS itself, so non-loopback binds
+    /// require `allow_insecure_bind = true` and a TLS-terminating proxy
+    /// (or a private overlay network) in front.
     #[serde(default = "default_listen")]
     pub listen: String,
+
+    /// Explicit opt-in to bind a non-loopback address WITHOUT in-process
+    /// TLS. Only set this when a trusted TLS proxy terminates wss:// in
+    /// front of the CP, or the network is private (e.g. a tailnet).
+    #[serde(default)]
+    pub allow_insecure_bind: bool,
 
     /// Heartbeat interval communicated to runtimes.
     #[serde(default = "default_heartbeat_secs")]
@@ -60,7 +69,7 @@ pub struct CpConfig {
 }
 
 fn default_listen() -> String {
-    "0.0.0.0:9800".to_string()
+    "127.0.0.1:9800".to_string()
 }
 fn default_heartbeat_secs() -> u64 {
     15
@@ -158,6 +167,17 @@ impl CpConfig {
         if self.lease_expiry_secs <= self.heartbeat_interval_secs {
             bail!("lease_expiry_secs must exceed heartbeat_interval_secs");
         }
+        // Bearer keys over cleartext TCP must never reach an untrusted
+        // network: non-loopback binds require the explicit override
+        // (review round-2 F4).
+        if !self.allow_insecure_bind && !is_loopback(&self.listen) {
+            bail!(
+                "listen = \"{}\" is not loopback and the CP terminates no TLS. \
+                 Put a TLS proxy (wss://) or a private network in front and set \
+                 allow_insecure_bind = true to acknowledge this",
+                self.listen
+            );
+        }
         Ok(())
     }
 
@@ -179,6 +199,20 @@ impl CpConfig {
     pub fn policy_for(&self, namespace: &str) -> NamespacePolicy {
         self.namespaces.get(namespace).cloned().unwrap_or_default()
     }
+}
+
+/// Whether a `host:port` bind address is loopback.
+fn is_loopback(listen: &str) -> bool {
+    let host = match listen.rsplit_once(':') {
+        Some((h, _)) => h.trim_start_matches('[').trim_end_matches(']'),
+        None => listen,
+    };
+    if host == "localhost" {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 /// `${ENV_VAR}` expansion, mirroring openab-core config behavior. Unset vars
@@ -279,6 +313,20 @@ lease_expiry_secs = 30
 "#;
         let cfg: CpConfig = toml::from_str(toml_str).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn non_loopback_bind_requires_override() {
+        let cfg: CpConfig = toml::from_str("listen = \"0.0.0.0:9800\"").unwrap();
+        assert!(cfg.validate().is_err());
+        let cfg: CpConfig =
+            toml::from_str("listen = \"0.0.0.0:9800\"\nallow_insecure_bind = true").unwrap();
+        cfg.validate().unwrap();
+        // Loopback variants pass without the override.
+        for l in ["127.0.0.1:9800", "localhost:9800", "[::1]:9800"] {
+            let cfg: CpConfig = toml::from_str(&format!("listen = \"{l}\"")).unwrap();
+            cfg.validate().unwrap();
+        }
     }
 
     #[test]

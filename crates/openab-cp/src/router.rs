@@ -261,19 +261,20 @@ impl Router {
 
         registry.adjust_sessions(entry.to_handle, -1);
 
-        // Truncate oversized results (keep the head; delegation already ran).
+        // Truncate oversized results (keep the head; delegation already
+        // ran). The marker counts against the cap: the final value never
+        // exceeds max_result_bytes (review round-2 F5).
         if let Some(r) = &params.result {
             if r.len() > max_result_bytes {
-                let mut cut = max_result_bytes;
-                while !r.is_char_boundary(cut) {
-                    cut -= 1;
+                let marker = format!("\n…[truncated by control plane: {} bytes total]", r.len());
+                let budget = max_result_bytes.saturating_sub(marker.len());
+                let cut = floor_char_boundary(r, budget);
+                let mut out = format!("{}{}", &r[..cut], marker);
+                if out.len() > max_result_bytes {
+                    // Degenerate tiny cap: keep whatever fits.
+                    out.truncate(floor_char_boundary(&out, max_result_bytes));
                 }
-                params.result = Some(format!(
-                    "{}\n…[truncated by control plane: {} of {} bytes]",
-                    &r[..cut],
-                    cut,
-                    r.len()
-                ));
+                params.result = Some(out);
             }
         }
 
@@ -461,6 +462,15 @@ impl Router {
     pub fn inflight_count(&self) -> usize {
         self.inflight.lock().len()
     }
+}
+
+/// Largest index `<= max` that lands on a char boundary of `s`.
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    let mut cut = max.min(s.len());
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    cut
 }
 
 impl Default for Router {
@@ -765,14 +775,42 @@ type = "worker"
         let result = DelegateResultParams {
             delegation_id: "d-1".into(),
             status: DelegationStatus::Completed,
-            result: Some("x".repeat(100)),
+            result: Some("x".repeat(200)),
             error: None,
         };
+        let cap = 96usize;
         let (_, frame) = w
             .router
-            .complete(&w.registry, w.h_worker, result, 10, 2)
+            .complete(&w.registry, w.h_worker, result, cap, 2)
             .unwrap();
-        assert!(frame.contains("truncated by control plane"));
+        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        let out = v["params"]["result"].as_str().unwrap();
+        assert!(out.contains("truncated by control plane"));
+        assert!(
+            out.len() <= cap,
+            "marker must count against the cap: {} > {}",
+            out.len(),
+            cap
+        );
+
+        // Degenerate tiny cap still never exceeds the cap.
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-2", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        w.worker_rx.try_recv().unwrap();
+        let result2 = DelegateResultParams {
+            delegation_id: "d-2".into(),
+            status: DelegationStatus::Completed,
+            result: Some("y".repeat(100)),
+            error: None,
+        };
+        let (_, frame2) = w
+            .router
+            .complete(&w.registry, w.h_worker, result2, 8, 3)
+            .unwrap();
+        let v2: serde_json::Value = serde_json::from_str(&frame2).unwrap();
+        assert!(v2["params"]["result"].as_str().unwrap().len() <= 8);
     }
 
     #[test]
