@@ -3589,14 +3589,14 @@ mod tests {
     fn image_attachment_block_includes_url_and_metadata() {
         // Simulates the format string used in the image attachment handler.
         let filename = "screenshot.png";
-        let content_type = Some("image/png");
+        let content_type = "image/png";
         let size: u32 = 142048;
         let url = "https://cdn.discordapp.com/attachments/123/456/screenshot.png";
 
         let text = format!(
             "[Image attachment]\nfilename: {}\ncontent_type: {}\nsize_bytes: {}\nurl: {} (expires ~24h)",
             filename,
-            content_type.unwrap_or("unknown"),
+            content_type,
             size,
             url,
         );
@@ -3611,11 +3611,10 @@ mod tests {
 
     #[test]
     fn image_attachment_block_missing_content_type_falls_back() {
-        let content_type: Option<&str> = None;
         let text = format!(
             "[Image attachment]\nfilename: {}\ncontent_type: {}\nsize_bytes: {}\nurl: {} (expires ~24h)",
             "photo.jpg",
-            content_type.unwrap_or("unknown"),
+            "unknown",
             99999,
             "https://cdn.discordapp.com/attachments/1/2/photo.jpg",
         );

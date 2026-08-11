@@ -434,7 +434,7 @@ mod tests {
     #[test]
     fn fenced_hard_split_grapheme_safe() {
         // Emoji inside a code fence: grapheme-safe, all content preserved.
-        let content: String = std::iter::repeat("🎉❤️你").take(20).collect();
+        let content: String = std::iter::repeat_n("🎉❤️你", 20).collect();
         let text = format!("```\n{content}\n```");
         let chunks = split_message(&text, 20);
         assert_length_invariant(&chunks, 20);
