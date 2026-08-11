@@ -1,0 +1,22 @@
+[package]
+name = "openab-cp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "OpenAB Agent Control Plane — registry, router, and policy for direct inter-agent delegation"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+parking_lot = "0.12"
+clap = { version = "4", features = ["derive"] }
+subtle = "2"

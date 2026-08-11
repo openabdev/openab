@@ -1,0 +1,44 @@
+# openab-cp example configuration
+#
+# Identity table: every runtime authenticates with a per-agent key
+# (Authorization: Bearer <key> on the WebSocket upgrade). The claims below
+# are IMMUTABLE and owned by this file — a runtime's own [control_plane]
+# config is verified against them at registration and rejected on mismatch.
+
+listen = "0.0.0.0:9800"
+
+# Runtimes must heartbeat at this interval; missing heartbeats past the lease
+# window deregisters the instance and fails its in-flight delegations.
+heartbeat_interval_secs = 15
+lease_expiry_secs = 45
+
+# Hard cap on delegation deadlines (seconds from now).
+max_deadline_secs = 1800
+
+# Results larger than this are truncated (head kept) with a marker.
+max_result_bytes = 262144
+
+# Transport-level cap on inbound WebSocket messages (enforced pre-parse).
+max_frame_bytes = 1048576
+
+# Delegation prompts larger than this are rejected.
+max_prompt_bytes = 262144
+
+[[agents]]
+key = "${CP_KEY_KOUDU}"          # per-agent secret, never shared
+namespace = "prod"
+name = "koudu"
+type = "primary"
+
+[[agents]]
+key = "${CP_KEY_WORKER1}"
+namespace = "prod"
+name = "worker-1"
+type = "worker"
+max_delegated_sessions_cap = 4   # CP-side clamp on advertised capacity
+
+# Per-namespace policy. Absent namespaces use the conservative defaults:
+# max_depth = 1, allow_worker_initiation = false.
+[namespaces.prod]
+max_depth = 1
+allow_worker_initiation = false

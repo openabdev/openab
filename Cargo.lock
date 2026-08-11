@@ -2576,6 +2576,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "openab-cp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "clap",
+ "futures-util",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "openab-gateway"
 version = "0.5.4"
 dependencies = [

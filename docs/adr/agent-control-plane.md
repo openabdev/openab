@@ -209,6 +209,69 @@ complete until the serving runtime returns a structured result frame
 The serving **runtime** emits this frame when the agent's turn ends — result
 delivery never depends on the sub-agent model "remembering" to report.
 
+### v1 contract amendments (from PR #1465 review)
+
+The first implementation (`crates/openab-cp`) freezes the following
+behaviors, resolving the review findings on identity, lifecycle, and
+recovery semantics:
+
+- **Identity binding.** CP config owns an immutable identity table: auth key
+  → (`namespace`, `name`, `type`, optional capacity cap). The runtime's
+  registration claims are *verified against* the key's bound identity and
+  rejected on mismatch (`IDENTITY_MISMATCH`). Authorization never derives
+  from self-asserted registration fields. Keys are per-agent
+  (individually revocable) and presented as `Authorization: Bearer` on the
+  WebSocket upgrade — never in URLs.
+- **CP-constructed chain.** `cp/delegate` carries only
+  `parent_delegation_id`; the CP derives the ancestry chain from its
+  in-flight table and the authenticated caller identity, then stamps it on
+  the forwarded frame. A runtime cannot forge ancestry, so depth/cycle
+  checks operate on trusted data. Policy (role, depth, cycle, namespace,
+  deadline caps) is enforced by the CP authoritatively; facade checks are
+  defense in depth only.
+- **Registration lifecycle.** The first frame on a connection MUST be
+  `cp/register` (JSON-RPC 2.0 envelope validated — `jsonrpc: "2.0"` and a
+  request id are required; `protocol_version` field). Registrations are
+  keyed by a **CP-generated handle**, never the client-supplied
+  `instance_id`: a colliding `instance_id` cannot replace or tear down
+  another connection's registration, and all in-flight ownership checks
+  (completion, cancellation, parent linkage) compare handles. The ack
+  carries the heartbeat interval, lease window, and the effective (possibly
+  clamped) concurrency budget. Instances missing heartbeats past the lease
+  are deregistered; their in-flight delegations fail immediately with
+  `target_disconnected`. Heartbeats refresh the lease only — CP-owned
+  in-flight accounting is authoritative and never merged from runtime
+  reports.
+- **Resource bounds.** The WS transport rejects messages over
+  `max_frame_bytes` before parsing; oversized `prompt`s are rejected
+  (`max_prompt_bytes`); per-connection outbound queues are bounded and a
+  peer that cannot drain its queue is treated as disconnected. Delegation
+  admission (duplicate check → target selection → capacity reservation →
+  in-flight insert) is one atomic sequence, and the in-flight entry exists
+  before the forward frame is sent.
+- **Saturation = fast-fail.** When all matching targets are at capacity the
+  CP replies `SATURATED` immediately. The CP never queues — v1 has no
+  durable state, and a hidden in-memory queue would contradict that.
+  `NO_TARGET` (nothing matches) is a distinct error.
+- **CP restart semantics.** The in-flight table is in-memory. After a CP
+  restart, in-flight delegations end as initiator-side timeouts (the
+  propagated deadline is the upper bound); late `cp/delegate_result` frames
+  for unknown ids are acknowledged, logged, and dropped so reconnecting
+  runtimes do not error-loop.
+- **Timeout and disconnect synthesis.** A deadline sweep terminates overdue
+  delegations: the initiator receives a synthesized `timeout` result and the
+  serving runtime a best-effort `cp/cancel` (stop burning tokens). Worker
+  disconnect → `target_disconnected` to the initiator; initiator disconnect
+  → best-effort `cp/cancel` downstream.
+- **Result size cap.** `cp/delegate_result.result` larger than the
+  configured `max_result_bytes` (default 256 KiB) is truncated head-first
+  with an explicit marker.
+- **Idempotency.** `delegation_id` is the caller-generated idempotency key;
+  a duplicate in-flight id is rejected (`DUPLICATE_DELEGATION`). Only the
+  instance a delegation was routed to may complete it; only the initiating
+  instance may cancel it.
+
+
 ---
 
 ## 5. Delegation Policy
@@ -365,14 +428,22 @@ of scope for v1.
 
 ## 11. Open Questions
 
-1. **Streaming intermediate output** — should `cp/delegate` stream
-   `session/update`-style chunks back to the primary, or only the final
-   result frame? v1 leans final-only; streaming is additive.
+1. ~~**Streaming intermediate output**~~ — *resolved (PR #1465 review):
+   committed scope as a fast-follow behind the same wire contract. Worker
+   runtimes will stream `session/update`-style chunks back through the CP.
+   Rationale: streaming is the observability substrate, not a feature — it
+   restores the free human visibility that Discord-mediated collaboration
+   provides today. It enables a read-only observer endpoint on the CP
+   (e.g. `wss://cp/.../observe?ns=prod`; separate read-only credential
+   class, namespace-scoped) so a human can tail all delegation traffic
+   across the fleet from one terminal. v1 ships final-result-only; the
+   stream frame shape is reserved in the wire contract.
 2. **CP high availability** — single instance + fast re-registration is
-   acceptable for v1; is active/standby needed before multi-tenant use?
-3. **Human-visibility directives** — should a primary be able to mirror
-   selected delegation traffic into a Discord thread (observability) via
-   existing output directives?
+   acceptable for v1 (restart semantics are now defined in §4); is
+   active/standby needed before multi-tenant use?
+3. **Human-visibility directives** — Discord mirroring becomes a consumer
+   of the delegation stream (Q1) rather than a separate mechanism; exact
+   directive syntax TBD when streaming lands.
 4. **AgentCore/remote runtimes** — an `agentcore-acp`-backed OAB registers
    like any other runtime; verify deadline propagation across the SDK
    boundary.
