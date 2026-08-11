@@ -205,6 +205,7 @@ pub struct FilestoreConfig {
     #[serde(default = "default_filestore_prefix")]
     pub prefix: String,
     /// Presigned URL TTL in seconds. Default: 3600 (1 hour).
+    /// Clamped to 1 second minimum and 7 days maximum.
     #[serde(default = "default_filestore_presigned_ttl")]
     pub presigned_ttl: u64,
     /// Maximum file size in MB for filestore uploads. Default: 250 MB.

@@ -80,8 +80,9 @@ field table.
 - **Markdown renders as flexible templates** (headings, lists, shaded code
   boxes, inline bold/code) with automatic plain-text fallback. Long replies
   split at the 10,000-char text cap.
-- **Attachments**: inbound images feed the LLM (vision), audio is stored for
-  STT, text files pass a whitelist; binaries are rejected with a reason the
+- **Attachments**: inbound images feed the LLM (vision), audio is passed
+  through to the agent as a fetchable URL (and transcribed when STT is on),
+  text files pass a whitelist; binaries are rejected with a reason the
   agent can see. Video/location/sticker events are ignored.
 - **Cron targeting**: group jobs use the channel UUID (copyable from the
   app); 1:1 jobs can use `channel = "user:<loginId>"` — the send API accepts
