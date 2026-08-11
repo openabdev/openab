@@ -225,6 +225,9 @@ const SOURCE_BUDGET_REASON: &str =
 const INLINE_BUDGET_REASON: &str =
     "the message was over its attachment payload limit and it was not included";
 
+/// The reason an attachment whose bytes never arrived reports to the agent.
+const READ_FAILED_REASON: &str = "its bytes could not be read from the source";
+
 /// Whether a filestore takes this attachment's bytes instead of the prompt. Text
 /// only crosses over above the inline limit; audio always does.
 fn goes_to_filestore(attachment_type: &str, source_bytes: u64, has_filestore: bool) -> bool {
@@ -499,6 +502,14 @@ async fn assemble_attachment_blocks(
                 }
                 Err(e) => {
                     tracing::warn!(filename = %att.filename, error = %e, "gateway image read failed");
+                    extra_blocks.push(ContentBlock::Text {
+                        text: undelivered_attachment_line(
+                            &att.filename,
+                            &att.mime_type,
+                            &format_size(att.size),
+                            READ_FAILED_REASON,
+                        ),
+                    });
                 }
             },
             "text_file" => match bytes_result {
@@ -554,6 +565,14 @@ async fn assemble_attachment_blocks(
                 }
                 Err(e) => {
                     tracing::warn!(filename = %att.filename, error = %e, "gateway text_file read failed");
+                    extra_blocks.push(ContentBlock::Text {
+                        text: undelivered_attachment_line(
+                            &att.filename,
+                            &att.mime_type,
+                            &format_size(att.size),
+                            READ_FAILED_REASON,
+                        ),
+                    });
                 }
             },
             "audio" => {
@@ -599,7 +618,6 @@ const MAX_PENDING_ATTACHMENT_EVENTS: usize = 32;
 /// runs for weeks otherwise keeps an entry per channel it has ever seen.
 const MAX_TRACKED_ORDER_KEYS: usize = 256;
 
-/// Whether this event's attachments must be described rather than fetched.
 /// Events that may be in preparation at once. Past this the broker refuses rather
 /// than admitting work it has no way to bound, and says so to the sender: a
 /// refusal a user can act on beats a queue that grows until the process dies.
@@ -2652,6 +2670,49 @@ mod tests {
         // The marker that separates "we still had the bytes" from "we went back
         // for them and they were gone".
         assert!(!text.contains("read failed"), "{text}");
+    }
+
+    // Audio reported a failed read while image and text_file only warn-logged,
+    // so those two reached the agent as if nothing had been attached at all.
+    #[tokio::test]
+    async fn an_unreadable_image_or_text_file_is_reported_rather_than_dropped() {
+        for (kind, filename, mime) in [
+            ("image", "shot.png", "image/png"),
+            ("text_file", "notes.txt", "text/plain"),
+        ] {
+            let mut att = gw_attachment(kind, filename, mime, "");
+            att.path = Some(format!("/nonexistent/openab-{kind}-{filename}"));
+            let mut attachments = [att];
+            let (sources, _guards) = read_attachment_sources(
+                &mut attachments,
+                &SourceBudget::new(MAX_ADMITTED_SOURCE_BYTES),
+                false,
+            )
+            .await;
+            assert!(
+                sources[0].is_err(),
+                "{kind}: the source must really be gone"
+            );
+
+            let blocks = assemble_attachment_blocks(
+                &attachments,
+                sources,
+                MAX_INLINE_BLOCK_BYTES,
+                &stt_off(),
+                #[cfg(feature = "filestore")]
+                None,
+            )
+            .await;
+
+            let text = block_text(
+                blocks
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| panic!("{kind}: emitted no block at all")),
+            );
+            assert!(text.contains(filename), "{kind}: {text}");
+            assert!(text.contains(READ_FAILED_REASON), "{kind}: {text}");
+        }
     }
 
     #[test]
