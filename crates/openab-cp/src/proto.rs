@@ -188,6 +188,10 @@ pub mod codes {
 pub enum AgentType {
     Primary,
     Worker,
+    /// Read-only lobby client (Phase 1 of the observer/lobby roadmap): it
+    /// receives `cp/event` notifications and may call `cp/list_agents`, but
+    /// can never initiate, serve, cancel, or complete delegations.
+    Observer,
 }
 
 impl std::fmt::Display for AgentType {
@@ -195,6 +199,7 @@ impl std::fmt::Display for AgentType {
         match self {
             AgentType::Primary => write!(f, "primary"),
             AgentType::Worker => write!(f, "worker"),
+            AgentType::Observer => write!(f, "observer"),
         }
     }
 }
@@ -444,6 +449,113 @@ pub struct CancelParams {
     pub reason: String,
 }
 
+// --- cp/event (CP → observer, JSON-RPC notification) ---
+
+/// JSON-RPC 2.0 **notification** (no id): observers never reply to events.
+#[derive(Debug, Serialize)]
+pub struct JsonRpcNotification {
+    pub jsonrpc: &'static str,
+    pub method: String,
+    pub params: Value,
+}
+
+impl JsonRpcNotification {
+    pub fn new(method: impl Into<String>, params: Value) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            method: method.into(),
+            params,
+        }
+    }
+}
+
+/// Envelope of one `cp/event` notification.
+///
+/// `seq` is a CP-process-monotonic sequence number: observers detect gaps
+/// (dropped frames on a saturated queue, CP restart) by discontinuity and
+/// resynchronize via `cp/list_agents`. It is not durable across CP restarts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventParams {
+    pub seq: u64,
+    pub ts: chrono::DateTime<chrono::Utc>,
+    /// Namespace this event is scoped to (matches the observer's own).
+    pub namespace: String,
+    #[serde(flatten)]
+    pub event: CpEvent,
+}
+
+/// Lobby-visible control-plane events. Prompt/result bodies are carried as
+/// bounded excerpts (`max_event_excerpt_bytes`): the lobby is an audit
+/// surface, not a second delivery path for full payloads.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum CpEvent {
+    AgentRegistered {
+        /// Logical id, `namespace/name`.
+        agent: String,
+        #[serde(rename = "type")]
+        agent_type: AgentType,
+        instance_id: String,
+        labels: std::collections::BTreeMap<String, String>,
+    },
+    AgentDeregistered {
+        agent: String,
+        instance_id: String,
+        /// `"disconnect"` or `"lease_expired"`.
+        reason: String,
+    },
+    DelegationRequested {
+        delegation_id: String,
+        from: String,
+        to: String,
+        prompt_excerpt: String,
+        deadline: chrono::DateTime<chrono::Utc>,
+        chain: Vec<String>,
+    },
+    DelegationCompleted {
+        delegation_id: String,
+        from: String,
+        to: String,
+        status: DelegationStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result_excerpt: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    DelegationCancelled {
+        delegation_id: String,
+        /// Who cancelled: the initiator's logical id, or `"control-plane"`
+        /// for deadline/disconnect synthesis.
+        by: String,
+        reason: String,
+    },
+}
+
+// --- cp/list_agents ---
+
+/// Params of `cp/list_agents`. v1 takes no arguments (the caller's
+/// authenticated namespace is the scope); the struct exists so the params
+/// object can grow filters without a wire break.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ListAgentsParams {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSummary {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub agent_type: AgentType,
+    pub instance_id: String,
+    pub labels: std::collections::BTreeMap<String, String>,
+    pub active_sessions: u32,
+    pub max_delegated_sessions: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListAgentsResult {
+    pub namespace: String,
+    pub agents: Vec<AgentSummary>,
+}
+
 // --- method names ---
 
 pub mod methods {
@@ -452,6 +564,10 @@ pub mod methods {
     pub const DELEGATE: &str = "cp/delegate";
     pub const DELEGATE_RESULT: &str = "cp/delegate_result";
     pub const CANCEL: &str = "cp/cancel";
+    /// CP → observer notification carrying an [`EventParams`] payload.
+    pub const EVENT: &str = "cp/event";
+    /// Namespace-scoped registry snapshot (any registered client).
+    pub const LIST_AGENTS: &str = "cp/list_agents";
 }
 
 #[cfg(test)]
@@ -740,6 +856,57 @@ mod tests {
         let resp: JsonRpcMessage =
             serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#).unwrap();
         assert!(resp.method.is_none() && resp.result.is_some());
+    }
+
+    #[test]
+    fn observer_type_roundtrip() {
+        let json = serde_json::json!({
+            "protocol_version": 1,
+            "namespace": "prod",
+            "name": "lobby-app",
+            "type": "observer",
+            "instance_id": "i-app"
+        });
+        let p: RegisterParams = serde_json::from_value(json).unwrap();
+        assert_eq!(p.agent_type, AgentType::Observer);
+        assert_eq!(serde_json::to_value(&p.agent_type).unwrap(), "observer");
+    }
+
+    #[test]
+    fn event_notification_has_no_id_and_flattens_event() {
+        let ev = EventParams {
+            seq: 7,
+            ts: chrono::Utc::now(),
+            namespace: "prod".into(),
+            event: CpEvent::DelegationRequested {
+                delegation_id: "d-1".into(),
+                from: "prod/koudu".into(),
+                to: "prod/worker-1".into(),
+                prompt_excerpt: "do it".into(),
+                deadline: chrono::Utc::now(),
+                chain: vec!["prod/koudu".into()],
+            },
+        };
+        let n = JsonRpcNotification::new(methods::EVENT, serde_json::to_value(&ev).unwrap());
+        let v = serde_json::to_value(&n).unwrap();
+        assert_eq!(v["method"], "cp/event");
+        assert!(v.get("id").is_none(), "notifications carry no id");
+        assert_eq!(v["params"]["event"], "delegation_requested");
+        assert_eq!(v["params"]["seq"], 7);
+        assert_eq!(v["params"]["from"], "prod/koudu");
+    }
+
+    #[test]
+    fn event_tag_snake_case() {
+        let ev = CpEvent::AgentDeregistered {
+            agent: "prod/w1".into(),
+            instance_id: "i-1".into(),
+            reason: "lease_expired".into(),
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["event"], "agent_deregistered");
+        let back: CpEvent = serde_json::from_value(v).unwrap();
+        assert_eq!(back, ev);
     }
 
     #[test]

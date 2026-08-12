@@ -90,6 +90,11 @@ pub struct CpConfig {
     /// short enough that a dead one frees its quota promptly.
     #[serde(default = "default_write_timeout_secs")]
     pub write_timeout_secs: u64,
+    /// Maximum size of prompt/result excerpts mirrored to observers in
+    /// `cp/event` frames. The lobby is an audit surface, not a second
+    /// delivery path: excerpts are truncated with a marker, never rejected.
+    #[serde(default = "default_max_event_excerpt_bytes")]
+    pub max_event_excerpt_bytes: usize,
 
     /// Memory ceiling for ONE connection's outbound queue, in bytes.
     ///
@@ -178,6 +183,10 @@ fn default_max_inflight_delegations() -> usize {
 }
 fn default_max_delegated_sessions_cap() -> u32 {
     16
+}
+
+fn default_max_event_excerpt_bytes() -> usize {
+    4 * 1024
 }
 
 /// Immutable identity claims bound to one auth key.

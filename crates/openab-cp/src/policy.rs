@@ -32,11 +32,20 @@ pub struct PolicyInput<'a> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum PolicyDenial {
     WorkerInitiation,
-    DepthExceeded { max: u32, would_be: u32 },
-    Cycle { target: String },
+    /// Observers are read-only: no config can relax this.
+    ObserverInitiation,
+    DepthExceeded {
+        max: u32,
+        would_be: u32,
+    },
+    Cycle {
+        target: String,
+    },
     CrossNamespace,
     DeadlinePast,
-    DeadlineTooLong { max_secs: u64 },
+    DeadlineTooLong {
+        max_secs: u64,
+    },
     DeadlineExceedsParent,
 }
 
@@ -45,6 +54,12 @@ impl std::fmt::Display for PolicyDenial {
         match self {
             PolicyDenial::WorkerInitiation => {
                 write!(f, "workers may not initiate delegations in this namespace")
+            }
+            PolicyDenial::ObserverInitiation => {
+                write!(
+                    f,
+                    "observers are read-only and may never initiate delegations"
+                )
             }
             PolicyDenial::DepthExceeded { max, would_be } => write!(
                 f,
@@ -70,6 +85,11 @@ impl std::fmt::Display for PolicyDenial {
 /// Evaluate the full CP-side policy for one delegation attempt.
 pub fn check(input: &PolicyInput<'_>, ns_policy: &NamespacePolicy) -> Result<(), PolicyDenial> {
     // 1. Initiator role.
+    if *input.from_type == AgentType::Observer {
+        // Unconditional: observers are read-only regardless of namespace
+        // config; there is no relaxation knob by design.
+        return Err(PolicyDenial::ObserverInitiation);
+    }
     if *input.from_type == AgentType::Worker && !ns_policy.allow_worker_initiation {
         return Err(PolicyDenial::WorkerInitiation);
     }
@@ -160,6 +180,27 @@ mod tests {
             allow_worker_initiation: true,
         };
         assert!(check(&input, &relaxed).is_ok());
+    }
+
+    #[test]
+    fn observer_initiation_always_denied() {
+        let now = Utc::now();
+        let chain: Vec<String> = vec![];
+        let mut input = base(now, &chain);
+        input.from_type = &AgentType::Observer;
+        assert_eq!(
+            check(&input, &default_policy()),
+            Err(PolicyDenial::ObserverInitiation)
+        );
+        // No namespace relaxation can grant it.
+        let relaxed = NamespacePolicy {
+            max_depth: 99,
+            allow_worker_initiation: true,
+        };
+        assert_eq!(
+            check(&input, &relaxed),
+            Err(PolicyDenial::ObserverInitiation)
+        );
     }
 
     #[test]

@@ -327,7 +327,8 @@ impl Registry {
 
     /// Select a serving instance within `namespace` by exact name or labels.
     ///
-    /// Unsaturated matches only. Ordering:
+    /// Observers are never selectable: they are read-only lobby clients,
+    /// not delegation targets. Unsaturated matches only. Ordering:
     /// - exact-name selection → replicas of one logical agent: newest
     ///   registration first (rolling-deploy rule), load as tie-breaker
     /// - label selection → across logical agents: least loaded first,
@@ -342,6 +343,7 @@ impl Registry {
         let mut matches: Vec<&Instance> = g
             .values()
             .map(|e| &e.inst)
+            .filter(|i| i.agent_type != AgentType::Observer)
             .filter(|i| i.namespace == namespace)
             .filter(|i| match name {
                 Some(n) => i.name == n,
@@ -391,6 +393,17 @@ impl Registry {
             .values()
             .map(|e| &e.inst)
             .filter(|i| i.namespace == namespace)
+            .cloned()
+            .collect()
+    }
+
+    /// Observer connections in one namespace — the `cp/event` fan-out set.
+    pub fn observers(&self, namespace: &str) -> Vec<Instance> {
+        self.inner
+            .read()
+            .values()
+            .map(|e| &e.inst)
+            .filter(|i| i.agent_type == AgentType::Observer && i.namespace == namespace)
             .cloned()
             .collect()
     }
@@ -588,6 +601,24 @@ mod tests {
         assert!(!r.heartbeat(h + 999));
         std::thread::sleep(Duration::from_millis(2));
         assert_eq!(r.expired(Duration::ZERO), vec![h]);
+    }
+
+    #[test]
+    fn observers_never_selectable_but_listed() {
+        let r = Registry::new();
+        let mut ob = inst("prod", "lobby", "i-app", 0);
+        ob.agent_type = AgentType::Observer;
+        r.register(ob);
+        // Even an exact-name selection cannot route to an observer.
+        assert!(matches!(
+            r.select("prod", Some("lobby"), None),
+            Err(SelectError::NoTarget)
+        ));
+        // Observer fan-out set is namespace-scoped.
+        assert_eq!(r.observers("prod").len(), 1);
+        assert!(r.observers("dev").is_empty());
+        // list() still shows it (lobby sees itself in the roster).
+        assert_eq!(r.list("prod").len(), 1);
     }
 
     #[test]
