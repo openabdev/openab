@@ -112,7 +112,7 @@ presigned_ttl = 7200
 | `region` | ✅ | — | AWS region (`"auto"` for R2) |
 | `endpoint` | ❌ | AWS default | Custom S3-compatible endpoint URL |
 | `prefix` | ❌ | `"incoming/"` | Object key prefix |
-| `presigned_ttl` | ❌ | `3600` | Presigned URL lifetime in seconds (capped at 604800, i.e. 7 days; the configured value is never raised, with one exception: `0` becomes `1`, because S3 rejects `X-Amz-Expires=0` outright and a URL that cannot work at all is worse than one that expires immediately. A sub-minute lifetime is reported to the agent in seconds) |
+| `presigned_ttl` | ❌ | `3600` | Presigned URL lifetime in seconds, capped at 604800 (7 days). The configured value is never raised, with one exception: `0` becomes `1`, because S3 rejects `X-Amz-Expires=0` outright and a URL that cannot work at all is worse than one that expires immediately. A sub-minute lifetime is reported to the agent in seconds, and is accepted exactly as configured, so a few seconds can expire before the agent fetches the link. Note also that a presigned URL dies with the credentials that signed it: under IRSA or an instance role those are temporary STS credentials, so a lifetime of hours or days can stop working well before the stated expiry. |
 | `max_file_size_mb` | ❌ | `250` | Maximum file size for upload in MB (max 500) |
 | `access_key_id` | ❌ | provider chain | Explicit access key |
 | `secret_access_key` | ❌ | provider chain | Explicit secret key |
@@ -136,7 +136,7 @@ The streaming approach means a 500 MB file uses the same ~16 MB of memory as a 1
 |----------|----------------|---------------|------------|
 | Discord | Streaming download | Streaming multipart (~16 MB chunks) | Text > 512KB + PDF/ZIP/binary + audio; video excluded, its CDN link already needs no credentials |
 | Slack | Streaming download | Streaming multipart (~16 MB chunks) | Text > 512KB + PDF/ZIP/binary + audio + video, since neither Slack URL form is fetchable by the agent |
-| Gateway (Telegram, Feishu, Google Chat, WeCom, LINE) | File on local disk | Single PUT | Text files delivered by adapter pipeline, plus audio bytes on the adapters that emit them (Telegram, Feishu, Google Chat, LINE; WeCom drops `voice` outright); binary limited by adapter validation |
+| Gateway (Telegram, Feishu, Google Chat, WeCom, LINE, LINE WORKS) | File on local disk | Single PUT | Text files delivered by adapter pipeline, plus audio bytes on the adapters that emit them (Telegram, Feishu, Google Chat, LINE, LINE WORKS; WeCom drops `voice` outright); binary limited by adapter validation |
 
 Gateway adapters use their existing text-file pipeline (extension whitelist).
 When filestore is configured, large text files (>512 KB) that pass through
