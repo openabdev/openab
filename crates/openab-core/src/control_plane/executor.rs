@@ -316,12 +316,41 @@ impl DelegationExecutor {
                 DelegateResultParams {
                     delegation_id: id.clone(),
                     status: DelegationStatus::Completed,
-                    result: Some(outcome.text),
+                    result: Some(cap_result(outcome.text)),
                     error: None,
                 }
             }
         }
     }
+}
+
+/// Client-side ceiling on a `cp/delegate_result` body.
+///
+/// The CP enforces `max_frame_bytes` (default 1 MiB) at the WS transport,
+/// BEFORE parsing — its own `max_result_bytes` truncation therefore can never
+/// save an oversized frame: the transport drops the connection, and every
+/// in-flight delegation on this worker dies as `target_disconnected`. Capping
+/// here keeps the frame safely under the transport limit; the CP still applies
+/// its (typically smaller) `max_result_bytes` on what arrives.
+const MAX_RESULT_BYTES: usize = 512 * 1024;
+
+fn cap_result(text: String) -> String {
+    if text.len() <= MAX_RESULT_BYTES {
+        return text;
+    }
+    let marker = format!(
+        "\n…[truncated by worker: {} bytes total exceeded the transport budget]",
+        text.len()
+    );
+    let budget = MAX_RESULT_BYTES.saturating_sub(marker.len());
+    let mut cut = budget.min(text.len());
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = String::with_capacity(cut + marker.len());
+    out.push_str(&text[..cut]);
+    out.push_str(&marker);
+    out
 }
 
 fn failed(delegation_id: &str, error: impl Into<String>) -> DelegateResultParams {
@@ -812,5 +841,26 @@ mod tests {
         assert!(!SinkAdapter.use_streaming(true));
         assert!(!SinkAdapter.uses_native_streaming(false));
         assert!(!SinkAdapter.uses_assistant_status());
+    }
+
+    #[test]
+    fn oversized_results_are_capped_below_the_transport_limit() {
+        // An uncapped result larger than the CP's max_frame_bytes (1 MiB)
+        // would be dropped at the WS transport before the CP's own
+        // max_result_bytes truncation could run, killing the connection and
+        // every in-flight delegation with it.
+        let big = "x".repeat(2 * 1024 * 1024);
+        let capped = cap_result(big);
+        assert!(capped.len() <= MAX_RESULT_BYTES);
+        assert!(capped.ends_with("bytes total exceeded the transport budget]"));
+
+        // Multibyte char straddling the cut must not split a boundary.
+        let emoji = "\u{1F980}".repeat(MAX_RESULT_BYTES / 4 + 64);
+        let capped = cap_result(emoji);
+        assert!(capped.len() <= MAX_RESULT_BYTES);
+        assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
+
+        // Under the cap: untouched.
+        assert_eq!(cap_result("small".into()), "small");
     }
 }
