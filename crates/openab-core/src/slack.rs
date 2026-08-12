@@ -1520,24 +1520,33 @@ async fn handle_message(
             // Slack private files require Bearer token to download
             let url = slack_file_download_url(file);
 
-            // Classified ahead of the skip so audio always yields a block: a
-            // dropped voice note is indistinguishable from one never sent.
+            // Classified ahead of the skip so the two classes this adapter
+            // promises a block for still get one: a dropped voice note or video
+            // is indistinguishable from one never sent.
             let audio = media::audio_mime(filename, Some(mimetype_raw));
 
             if url.is_empty() {
-                match audio.as_deref() {
-                    Some(audio_mime) => {
-                        debug!(filename, "slack audio has no private URL, describing it");
-                        extra_blocks.extend(media::audio_attachment_blocks(
-                            filename,
-                            audio_mime,
-                            size,
-                            None,
-                            Some(SLACK_NO_FILE_URL_NOTE),
-                            None,
-                        ));
-                    }
-                    None => debug!(filename, "slack file has no private URL, skipping"),
+                if let Some(audio_mime) = audio.as_deref() {
+                    debug!(filename, "slack audio has no private URL, describing it");
+                    extra_blocks.extend(media::audio_attachment_blocks(
+                        filename,
+                        audio_mime,
+                        size,
+                        None,
+                        Some(SLACK_NO_FILE_URL_NOTE),
+                        None,
+                    ));
+                } else if media::is_video_file(filename, Some(mimetype)) {
+                    debug!(filename, "slack video has no private URL, describing it");
+                    extra_blocks.push(media::video_attachment_block(
+                        filename,
+                        Some(mimetype),
+                        size,
+                        None,
+                        Some(SLACK_NO_FILE_URL_NOTE),
+                    ));
+                } else {
+                    debug!(filename, "slack file has no private URL, skipping");
                 }
                 continue;
             }
@@ -1562,7 +1571,7 @@ async fn handle_message(
                                 chars = transcript.len(),
                                 "voice transcript injected"
                             );
-                            stt_line = Some(format!("[Voice message transcript]: {transcript}"));
+                            stt_line = Some(media::voice_transcript_line(&transcript));
                             echo_entries.push(crate::stt::EchoEntry::Success(transcript));
                         }
                         None => {
@@ -1729,7 +1738,7 @@ async fn handle_message(
                                 filename,
                                 Some(mimetype),
                                 video_size,
-                                link,
+                                Some(link),
                                 Some(&note),
                             ));
                         } else {

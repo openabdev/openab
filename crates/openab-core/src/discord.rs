@@ -894,7 +894,7 @@ impl EventHandler for Handler {
                     {
                         Some(transcript) => {
                             debug!(filename = %attachment.filename, chars = transcript.len(), "voice transcript injected");
-                            stt_line = Some(format!("[Voice message transcript]: {transcript}"));
+                            stt_line = Some(media::voice_transcript_line(&transcript));
                             echo_entries.push(crate::stt::EchoEntry::Success(transcript));
                         }
                         None => {
@@ -1024,7 +1024,7 @@ impl EventHandler for Handler {
                                 &attachment.filename,
                                 attachment.content_type.as_deref(),
                                 u64::from(attachment.size),
-                                &attachment.url,
+                                Some(attachment.url.as_str()),
                                 None,
                             ));
                         }

@@ -117,7 +117,7 @@ pub(crate) async fn gateway_audio_blocks(
         )
         .await
         {
-            Some(transcript) => Some(format!("[Voice message transcript]: {transcript}")),
+            Some(transcript) => Some(crate::media::voice_transcript_line(&transcript)),
             None => {
                 tracing::warn!(filename, "gateway audio STT failed");
                 // The adjacent metadata block already names the file, so this
@@ -212,8 +212,9 @@ async fn read_attachment_sources(
 /// colocated file from being swept, and this is the memory that costs.
 const MAX_ADMITTED_SOURCE_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Bytes one message may inline. The dispatcher queue these blocks outlive the
-/// source budget in is bounded by message count, so nothing else bounds its size.
+/// Bytes one message may inline. These blocks outlive the source budget by
+/// sitting in the dispatcher queue, which bounds itself by message count rather
+/// than by size, so without this nothing bounds how large one message gets.
 const MAX_INLINE_BLOCK_BYTES: u64 = 24 * 1024 * 1024;
 
 /// The reason an attachment the broker refused to hold reports to the agent.
@@ -227,6 +228,9 @@ const INLINE_BUDGET_REASON: &str =
 
 /// The reason an attachment whose bytes never arrived reports to the agent.
 const READ_FAILED_REASON: &str = "its bytes could not be read from the source";
+
+/// The reason an attachment the gateway has no branch for reports to the agent.
+const UNSUPPORTED_TYPE_REASON: &str = "the broker has no handler for this attachment type";
 
 /// Whether a filestore takes this attachment's bytes instead of the prompt. Text
 /// only crosses over above the inline limit; audio always does.
@@ -375,7 +379,16 @@ enum SourceFailure {
 /// reading it so the budget can be charged first.
 async fn source_upper_bound(att: &GwAttachment, encoded: &str) -> Option<u64> {
     if let Some(ref path) = att.path {
-        tokio::fs::metadata(path).await.ok().map(|m| m.len())
+        match tokio::fs::metadata(path).await {
+            Ok(m) => Some(m.len()),
+            // A vanished source is ordinary; anything else is worth a line,
+            // since the caller can only report it as "no path or data".
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                tracing::warn!(path, error = %e, "gateway could not measure a colocated source");
+                None
+            }
+        }
     } else if !encoded.is_empty() {
         // base64 yields at most three bytes per four characters.
         Some(encoded.len() as u64 / 4 * 3 + 3)
@@ -597,7 +610,23 @@ async fn assemble_attachment_blocks(
                 .await;
                 extra_blocks.extend(blocks);
             }
-            _ => {}
+            // Silence here is the failure class this module exists to remove:
+            // the bytes were reserved and read, so say what became of them.
+            other => {
+                tracing::warn!(
+                    filename = %att.filename,
+                    attachment_type = %other,
+                    "gateway has no branch for this attachment type"
+                );
+                extra_blocks.push(ContentBlock::Text {
+                    text: undelivered_attachment_line(
+                        &att.filename,
+                        &att.mime_type,
+                        &format_size(att.size),
+                        UNSUPPORTED_TYPE_REASON,
+                    ),
+                });
+            }
         }
     }
     extra_blocks
@@ -1787,7 +1816,9 @@ pub async fn run_gateway_adapter(
                                             channel = %event.channel.id,
                                             "gateway: pending-event limit reached, refusing the event"
                                         );
-                                        let _ = send_fire_and_forget(&slash_ws_tx, &channel, OVERLOADED_REPLY).await;
+                                        if let Err(e) = send_fire_and_forget(&slash_ws_tx, &channel, OVERLOADED_REPLY).await {
+                                            warn!(platform, error = %e, "could not tell the sender the broker is overloaded");
+                                        }
                                         continue;
                                     }
                                     let has_attachments = !event.content.attachments.is_empty();
@@ -1826,8 +1857,12 @@ pub async fn run_gateway_adapter(
                                                 has_filestore,
                                             )
                                             .await;
-                                            // Err only if the semaphore is closed, which it never is.
-                                            let _permit = fetch_slots.acquire().await.ok();
+                                            let permit = fetch_slots.acquire().await;
+                                            debug_assert!(
+                                                permit.is_ok(),
+                                                "fetch semaphore closed; the concurrency limit is no longer enforced"
+                                            );
+                                            let _permit = permit.ok();
                                             let blocks = assemble_attachment_blocks(
                                                 &event.content.attachments,
                                                 sources,
@@ -1972,7 +2007,12 @@ impl GatewayIngressLimits {
     }
 
     async fn fetch_slot(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
-        self.fetch_slots.acquire().await.ok()
+        let permit = self.fetch_slots.acquire().await;
+        debug_assert!(
+            permit.is_ok(),
+            "fetch semaphore closed; the concurrency limit is no longer enforced"
+        );
+        permit.ok()
     }
 
     /// `None` when the ingress is already at capacity. The returned guard releases
@@ -2119,6 +2159,10 @@ fn gate_gateway_event(router: &crate::adapter::AdapterRouter, event: &GatewayEve
     }
 }
 
+/// The unified ingress. It shares the WebSocket path's limits (source budget,
+/// fetch slots, in-flight admission) but deliberately not its arrival-ordering
+/// ticket or reset fencing: those are receive-loop properties, and this path has
+/// no receive loop to anchor them to.
 pub async fn process_gateway_event(
     event_json: &str,
     ctx: &GatewayEventContext,
@@ -2236,7 +2280,9 @@ pub async fn process_gateway_event(
             channel = %event.channel.id,
             "gateway: unified ingress at capacity, refusing the event"
         );
-        let _ = ctx.adapter.send_message(&channel, OVERLOADED_REPLY).await;
+        if let Err(e) = ctx.adapter.send_message(&channel, OVERLOADED_REPLY).await {
+            tracing::warn!(error = %e, "could not tell the sender the broker is overloaded");
+        }
         return Ok(false);
     };
     #[cfg(feature = "filestore")]
@@ -2365,7 +2411,7 @@ mod tests {
     /// The loop this covers was inline in two entry points and had no test at all;
     /// extracting it to get it off the receive path is what made one possible.
     #[tokio::test]
-    async fn attachment_assembly_keeps_arrival_order_and_skips_what_it_cannot_render() {
+    async fn attachment_assembly_keeps_arrival_order_and_accounts_for_every_attachment() {
         let mut rejected = gw_attachment("image", "huge.png", "image/png", "");
         rejected.status = Some("too large for the gateway store".into());
 
@@ -2391,12 +2437,20 @@ mod tests {
         )
         .await;
 
-        // Rejected reason then the audio block. The sticker has no branch, so it
-        // contributes nothing rather than an empty block.
-        assert_eq!(blocks.len(), 2, "{blocks:?}");
-        let first = block_text(blocks.into_iter().next().unwrap());
-        assert!(first.starts_with("[System: attachment"), "{first}");
-        assert!(first.contains("too large for the gateway store"), "{first}");
+        // Rejected reason, the audio block, then the sticker: no in-tree adapter
+        // emits a type outside the three handled here, but the gateway schema is
+        // an external contract, so an unknown one is reported, not dropped.
+        assert_eq!(blocks.len(), 3, "{blocks:?}");
+        let texts: Vec<String> = blocks.into_iter().map(block_text).collect();
+        assert!(texts[0].starts_with("[System: attachment"), "{}", texts[0]);
+        assert!(
+            texts[0].contains("too large for the gateway store"),
+            "{}",
+            texts[0]
+        );
+        assert!(texts[1].contains("[Audio attachment]"), "{}", texts[1]);
+        assert!(texts[2].contains("wave.tgs"), "{}", texts[2]);
+        assert!(texts[2].contains(UNSUPPORTED_TYPE_REASON), "{}", texts[2]);
     }
 
     /// A rejected attachment is the one row that never touches the filestore, so it
