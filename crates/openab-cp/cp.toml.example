@@ -28,6 +28,18 @@ max_frame_bytes = 1048576
 # Delegation prompts larger than this are rejected.
 max_prompt_bytes = 262144
 
+# A connection must send its cp/register first frame within this many seconds
+# of the WebSocket upgrade, or it is closed. Authentication alone is not a
+# bound: without this, an authenticated peer could park idle sockets
+# indefinitely (pings do not extend the deadline).
+register_timeout_secs = 10
+
+# Maximum simultaneous connections per identity, counted from the upgrade —
+# so sockets that have not registered yet count too — and released as soon as
+# a connection ends. Replicas share one identity, so this is also the ceiling
+# on concurrent replicas of one logical agent.
+max_connections_per_identity = 8
+
 [[agents]]
 key = "${CP_KEY_KOUDU}"          # per-agent secret, never shared
 namespace = "prod"

@@ -20,3 +20,8 @@ chrono = { version = "0.4", features = ["serde"] }
 parking_lot = "0.12"
 clap = { version = "4", features = ["derive"] }
 subtle = "2"
+
+[dev-dependencies]
+# WebSocket client for the end-to-end admission/lifecycle tests. Same version
+# axum 0.8 already uses, so it adds no new dependency to the workspace.
+tokio-tungstenite = "0.29"

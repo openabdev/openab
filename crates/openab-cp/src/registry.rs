@@ -8,10 +8,11 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::proto::AgentType;
 
@@ -22,6 +23,32 @@ pub type FrameTx = mpsc::Sender<String>;
 
 /// Capacity of each per-connection outbound queue.
 pub const OUTBOUND_QUEUE: usize = 256;
+
+/// Shutdown signal for one WS connection, held by the registry so the CP can
+/// terminate a connection it no longer considers registered (review round-3
+/// F1: lease expiry must close the socket — otherwise the connection task
+/// lives on with a registry entry that no longer exists, silently dropping
+/// every subsequent frame and unable to re-register, since registration is
+/// first-frame-only).
+///
+/// `watch` (not `oneshot`) so the connection task can select on it repeatedly,
+/// and wrapped in `Arc` so the registry entry and the connection task share
+/// one signal without either side's drop cancelling it.
+pub type ShutdownTx = Arc<watch::Sender<bool>>;
+
+/// Create a fresh connection shutdown signal. The connection task keeps the
+/// returned handle (to `subscribe()`), the registry keeps a clone.
+pub fn shutdown_signal() -> ShutdownTx {
+    Arc::new(watch::channel(false).0)
+}
+
+/// Registry slot: the public instance view plus CP-internal connection
+/// control that is deliberately not part of `Instance` (nothing routed or
+/// serialized should carry it).
+struct Entry {
+    inst: Instance,
+    shutdown: ShutdownTx,
+}
 
 /// A live, authenticated, registered runtime instance.
 #[derive(Clone, Debug)]
@@ -65,7 +92,7 @@ impl Instance {
 #[derive(Default)]
 pub struct Registry {
     /// Keyed by CP-generated registration handle.
-    inner: RwLock<BTreeMap<u64, Instance>>,
+    inner: RwLock<BTreeMap<u64, Entry>>,
     next_handle: AtomicU64,
 }
 
@@ -78,17 +105,41 @@ impl Registry {
     /// (returned). Re-registrations (reconnects) get a new handle; the stale
     /// entry disappears when its socket closes or its lease expires — it can
     /// never be replaced by another connection's registration.
-    pub fn register(&self, mut inst: Instance) -> u64 {
+    ///
+    /// `shutdown` is the owning connection's termination signal: the CP
+    /// triggers it whenever it drops the registration on its own initiative
+    /// (lease expiry — review round-3 F1).
+    pub fn register_conn(&self, mut inst: Instance, shutdown: ShutdownTx) -> u64 {
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed) + 1;
         inst.handle = handle;
-        self.inner.write().insert(handle, inst);
+        self.inner.write().insert(handle, Entry { inst, shutdown });
         handle
+    }
+
+    /// Register an instance with a detached shutdown signal (no connection
+    /// task is listening). For tests and non-WS callers.
+    pub fn register(&self, inst: Instance) -> u64 {
+        self.register_conn(inst, shutdown_signal())
+    }
+
+    /// Ask the owning connection task to close. Returns whether a live
+    /// registration was signalled. Must be called BEFORE `deregister`, which
+    /// drops the registry's handle on the signal.
+    pub fn signal_shutdown(&self, handle: u64) -> bool {
+        match self.inner.read().get(&handle) {
+            Some(e) => {
+                // `send_replace` cannot fail even with no receivers left.
+                e.shutdown.send_replace(true);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Remove an instance by its registration handle (disconnect or lease
     /// expiry). Only the owning connection or the sweeper knows the handle.
     pub fn deregister(&self, handle: u64) -> Option<Instance> {
-        self.inner.write().remove(&handle)
+        self.inner.write().remove(&handle).map(|e| e.inst)
     }
 
     /// Refresh the lease. The runtime-reported session count is intentionally
@@ -97,8 +148,8 @@ impl Registry {
     pub fn heartbeat(&self, handle: u64) -> bool {
         let mut g = self.inner.write();
         match g.get_mut(&handle) {
-            Some(i) => {
-                i.last_heartbeat = Instant::now();
+            Some(e) => {
+                e.inst.last_heartbeat = Instant::now();
                 true
             }
             None => false,
@@ -111,13 +162,13 @@ impl Registry {
         self.inner
             .read()
             .values()
-            .filter(|i| now.duration_since(i.last_heartbeat) > lease)
-            .map(|i| i.handle)
+            .filter(|e| now.duration_since(e.inst.last_heartbeat) > lease)
+            .map(|e| e.inst.handle)
             .collect()
     }
 
     pub fn get(&self, handle: u64) -> Option<Instance> {
-        self.inner.read().get(&handle).cloned()
+        self.inner.read().get(&handle).map(|e| e.inst.clone())
     }
 
     /// Select a serving instance within `namespace` by exact name or labels.
@@ -136,6 +187,7 @@ impl Registry {
         let g = self.inner.read();
         let mut matches: Vec<&Instance> = g
             .values()
+            .map(|e| &e.inst)
             .filter(|i| i.namespace == namespace)
             .filter(|i| match name {
                 Some(n) => i.name == n,
@@ -173,8 +225,8 @@ impl Registry {
     /// Adjust the CP-owned in-flight count for an instance.
     pub fn adjust_sessions(&self, handle: u64, delta: i32) {
         let mut g = self.inner.write();
-        if let Some(i) = g.get_mut(&handle) {
-            i.active_sessions = i.active_sessions.saturating_add_signed(delta);
+        if let Some(e) = g.get_mut(&handle) {
+            e.inst.active_sessions = e.inst.active_sessions.saturating_add_signed(delta);
         }
     }
 
@@ -183,6 +235,7 @@ impl Registry {
         self.inner
             .read()
             .values()
+            .map(|e| &e.inst)
             .filter(|i| i.namespace == namespace)
             .cloned()
             .collect()
@@ -346,5 +399,38 @@ mod tests {
         assert_eq!(r.get(h).unwrap().active_sessions, 1);
         r.adjust_sessions(h, -5);
         assert_eq!(r.get(h).unwrap().active_sessions, 0);
+    }
+
+    #[tokio::test]
+    async fn signal_shutdown_reaches_the_owning_connection() {
+        // Review round-3 F1: the CP must be able to terminate a connection
+        // whose registration it drops on its own initiative.
+        let r = Registry::new();
+        let sig = shutdown_signal();
+        let mut rx = sig.subscribe();
+        let h = r.register_conn(inst("prod", "w1", "i-1", 1), sig);
+        assert!(!*rx.borrow());
+
+        assert!(r.signal_shutdown(h));
+        rx.changed().await.unwrap();
+        assert!(*rx.borrow(), "connection task must observe the signal");
+
+        // After deregistration there is nothing left to signal.
+        r.deregister(h);
+        assert!(!r.signal_shutdown(h));
+    }
+
+    #[tokio::test]
+    async fn signal_shutdown_survives_registry_drop_of_the_entry() {
+        // The connection task keeps its own handle on the signal, so a
+        // signal delivered before deregistration is never lost.
+        let r = Registry::new();
+        let sig = shutdown_signal();
+        let mut rx = sig.subscribe();
+        let h = r.register_conn(inst("prod", "w1", "i-1", 1), sig);
+        r.signal_shutdown(h);
+        r.deregister(h);
+        rx.changed().await.unwrap();
+        assert!(*rx.borrow());
     }
 }

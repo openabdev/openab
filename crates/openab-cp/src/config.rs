@@ -57,6 +57,21 @@ pub struct CpConfig {
     #[serde(default = "default_max_prompt_bytes")]
     pub max_prompt_bytes: usize,
 
+    /// Deadline for the mandatory `cp/register` first frame, in seconds from
+    /// the completed WebSocket upgrade. A connection that authenticates but
+    /// never registers is closed when this elapses (review round-3 F4):
+    /// otherwise an authenticated peer could park unlimited sockets in the
+    /// pre-registration state, keeping them alive with pings forever.
+    #[serde(default = "default_register_timeout_secs")]
+    pub register_timeout_secs: u64,
+
+    /// Maximum simultaneous connections per identity, counted from the
+    /// upgrade (so pre-registration sockets count too) and released on every
+    /// exit path (review round-3 F4). Replicas of one logical agent share one
+    /// identity, so this is the replica ceiling as well.
+    #[serde(default = "default_max_connections_per_identity")]
+    pub max_connections_per_identity: u32,
+
     /// Identity table: auth key → immutable claims.
     /// Keyed by the key id (`kid`), with the secret alongside, so logs can
     /// reference identities without printing secrets.
@@ -88,6 +103,12 @@ fn default_max_frame_bytes() -> usize {
 }
 fn default_max_prompt_bytes() -> usize {
     256 * 1024
+}
+fn default_register_timeout_secs() -> u64 {
+    10
+}
+fn default_max_connections_per_identity() -> u32 {
+    8
 }
 
 /// Immutable identity claims bound to one auth key.
@@ -166,6 +187,14 @@ impl CpConfig {
         }
         if self.lease_expiry_secs <= self.heartbeat_interval_secs {
             bail!("lease_expiry_secs must exceed heartbeat_interval_secs");
+        }
+        // Admission bounds must actually bound something (review round-3 F4):
+        // zero would mean "no registration deadline" / "no connection allowed".
+        if self.register_timeout_secs == 0 {
+            bail!("register_timeout_secs must be greater than 0");
+        }
+        if self.max_connections_per_identity == 0 {
+            bail!("max_connections_per_identity must be at least 1");
         }
         // Bearer keys over cleartext TCP must never reach an untrusted
         // network: non-loopback binds require the explicit override
@@ -326,6 +355,30 @@ lease_expiry_secs = 30
         for l in ["127.0.0.1:9800", "localhost:9800", "[::1]:9800"] {
             let cfg: CpConfig = toml::from_str(&format!("listen = \"{l}\"")).unwrap();
             cfg.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn admission_bounds_default_and_are_validated() {
+        // Review round-3 F4: absent fields keep working (serde defaults) and
+        // a zero bound is rejected rather than silently disabling the guard.
+        let cfg: CpConfig = toml::from_str(base_toml()).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.register_timeout_secs, 10);
+        assert_eq!(cfg.max_connections_per_identity, 8);
+
+        let explicit: CpConfig =
+            toml::from_str("register_timeout_secs = 3\nmax_connections_per_identity = 2").unwrap();
+        explicit.validate().unwrap();
+        assert_eq!(explicit.register_timeout_secs, 3);
+        assert_eq!(explicit.max_connections_per_identity, 2);
+
+        for bad in [
+            "register_timeout_secs = 0",
+            "max_connections_per_identity = 0",
+        ] {
+            let cfg: CpConfig = toml::from_str(bad).unwrap();
+            assert!(cfg.validate().is_err(), "{bad} must be rejected");
         }
     }
 

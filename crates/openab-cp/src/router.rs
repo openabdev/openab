@@ -34,6 +34,10 @@ use crate::registry::{Instance, Registry, SelectError};
 /// registration handles, never client-supplied ids (review F1).
 #[derive(Clone)]
 pub struct InFlight {
+    /// Namespace the delegation lives in — part of its identity (review
+    /// round-3 F3): `delegation_id` is client-supplied and only unique within
+    /// the namespace that produced it.
+    pub namespace: String,
     pub delegation_id: String,
     /// Authenticated initiator (`namespace/name`) and its registration handle.
     pub from_logical: String,
@@ -47,8 +51,30 @@ pub struct InFlight {
     pub chain: Vec<String>,
 }
 
+/// In-flight table key: `(namespace, delegation_id)` (review round-3 F3).
+///
+/// Keying on the client-supplied `delegation_id` alone made one namespace's
+/// ids observable from another: a colliding id was denied with
+/// `DUPLICATE_DELEGATION`, and `cp/cancel` distinguished "no such id" from
+/// "someone else's live id" — a cross-tenant existence oracle. The composite
+/// key confines both to the namespace that owns the id.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DelegationKey {
+    namespace: String,
+    delegation_id: String,
+}
+
+impl DelegationKey {
+    fn new(namespace: &str, delegation_id: &str) -> Self {
+        Self {
+            namespace: namespace.to_string(),
+            delegation_id: delegation_id.to_string(),
+        }
+    }
+}
+
 pub struct Router {
-    inflight: Mutex<BTreeMap<String, InFlight>>,
+    inflight: Mutex<BTreeMap<DelegationKey, InFlight>>,
     /// Serializes the delegate admission sequence (duplicate check → target
     /// selection → capacity reservation → in-flight insert) so concurrent
     /// requests cannot double-admit one id or oversubscribe capacity
@@ -92,7 +118,11 @@ impl Router {
         // in-flight insertion all happen under this guard.
         let _admission = self.admission.lock();
 
-        if self.inflight.lock().contains_key(&params.delegation_id) {
+        // Delegation identity is namespace-scoped (review round-3 F3): the
+        // same id in another namespace is a different delegation, so it
+        // neither collides here nor leaks its existence.
+        let key = DelegationKey::new(from_namespace, &params.delegation_id);
+        if self.inflight.lock().contains_key(&key) {
             return DelegateOutcome::Rejected(ErrorObject::new(
                 codes::DUPLICATE_DELEGATION,
                 format!("delegation {} is already in flight", params.delegation_id),
@@ -111,18 +141,22 @@ impl Router {
         // Parent linkage: chain and deadline derive from the CP's own table,
         // never from the client. The caller must BE the instance serving the
         // parent delegation — otherwise any runtime knowing a live id could
-        // borrow its trusted chain and deadline budget (review F3). Unknown
-        // and unauthorized parent ids return the same error (no enumeration).
+        // borrow its trusted chain and deadline budget (review F3). The
+        // lookup is namespace-scoped (review round-3 F3). Unknown and
+        // unauthorized parent ids return the same error (no enumeration).
         let (parent_chain, parent_deadline) = match &params.parent_delegation_id {
-            Some(pid) => match self.inflight.lock().get(pid) {
-                Some(p) if p.to_handle == from_handle => (p.chain.clone(), Some(p.deadline)),
-                _ => {
-                    return DelegateOutcome::Rejected(ErrorObject::new(
-                        codes::INVALID_PARAMS,
-                        format!("parent delegation {pid} is not in flight for this instance"),
-                    ))
+            Some(pid) => {
+                let parent_key = DelegationKey::new(from_namespace, pid);
+                match self.inflight.lock().get(&parent_key) {
+                    Some(p) if p.to_handle == from_handle => (p.chain.clone(), Some(p.deadline)),
+                    _ => {
+                        return DelegateOutcome::Rejected(ErrorObject::new(
+                            codes::INVALID_PARAMS,
+                            format!("parent delegation {pid} is not in flight for this instance"),
+                        ))
+                    }
                 }
-            },
+            }
             None => (Vec::new(), None),
         };
 
@@ -186,6 +220,7 @@ impl Router {
         // back if the send fails.
         registry.adjust_sessions(target.handle, 1);
         let entry = InFlight {
+            namespace: from_namespace.to_string(),
             delegation_id: params.delegation_id.clone(),
             from_logical,
             from_handle,
@@ -194,13 +229,11 @@ impl Router {
             deadline: params.deadline,
             chain,
         };
-        self.inflight
-            .lock()
-            .insert(params.delegation_id.clone(), entry.clone());
+        self.inflight.lock().insert(key.clone(), entry.clone());
 
         if target.tx.try_send(text).is_err() {
             // Disconnected or backpressured beyond its queue: roll back.
-            self.inflight.lock().remove(&params.delegation_id);
+            self.inflight.lock().remove(&key);
             registry.adjust_sessions(target.handle, -1);
             return DelegateOutcome::Rejected(ErrorObject::new(
                 codes::TARGET_DISCONNECTED,
@@ -226,6 +259,12 @@ impl Router {
     /// Handle `cp/delegate_result` from the serving runtime. Returns the
     /// initiator-bound frame if the delegation is known; unknown ids (e.g.
     /// results arriving after a CP restart) are dropped with a log.
+    ///
+    /// Ownership is validated under the SAME lock acquisition that removes
+    /// the entry (review round-3 F2): the previous remove-check-reinsert
+    /// dance opened a window in which a genuine result saw an empty table and
+    /// was dropped, and left the entry momentarily invisible to the deadline
+    /// sweep.
     pub fn complete(
         &self,
         registry: &Registry,
@@ -234,30 +273,47 @@ impl Router {
         max_result_bytes: usize,
         next_rpc_id: u64,
     ) -> Option<(Instance, String)> {
-        let entry = { self.inflight.lock().remove(&params.delegation_id) };
-        let entry = match entry {
-            Some(e) => e,
+        // The namespace comes from the authenticated sender's registration,
+        // never from the frame (review round-3 F3).
+        let namespace = match registry.get(serving_handle) {
+            Some(i) => i.namespace,
             None => {
                 warn!(
+                    handle = serving_handle,
                     delegation = %params.delegation_id,
-                    "result for unknown delegation (late arrival or CP restart) — dropped"
+                    "result from an unregistered connection — dropped"
                 );
                 return None;
             }
         };
-        if entry.to_handle != serving_handle {
-            // Only the instance the delegation was routed to may complete it.
-            warn!(
-                delegation = %params.delegation_id,
-                expected = entry.to_handle,
-                got = serving_handle,
-                "result from unexpected instance — dropped, delegation restored"
-            );
-            self.inflight
-                .lock()
-                .insert(params.delegation_id.clone(), entry);
-            return None;
-        }
+        let key = DelegationKey::new(&namespace, &params.delegation_id);
+        let entry = {
+            let mut g = self.inflight.lock();
+            match g.get(&key) {
+                Some(e) if e.to_handle == serving_handle => {}
+                Some(e) => {
+                    // Only the instance the delegation was routed to may
+                    // complete it. The entry stays exactly where it is.
+                    warn!(
+                        delegation = %params.delegation_id,
+                        namespace = %namespace,
+                        expected = e.to_handle,
+                        got = serving_handle,
+                        "result from unexpected instance — dropped, delegation untouched"
+                    );
+                    return None;
+                }
+                None => {
+                    warn!(
+                        delegation = %params.delegation_id,
+                        namespace = %namespace,
+                        "result for unknown delegation (late arrival or CP restart) — dropped"
+                    );
+                    return None;
+                }
+            }
+            g.remove(&key).expect("present under the same lock")
+        };
 
         registry.adjust_sessions(entry.to_handle, -1);
 
@@ -301,6 +357,13 @@ impl Router {
     /// Handle `cp/cancel` from the initiator. Returns the frame to forward
     /// to the serving runtime, if the delegation is in flight and owned by
     /// the caller.
+    ///
+    /// Ownership is validated under the same lock acquisition that removes
+    /// the entry (review round-3 F2 — no remove/reinsert window), and every
+    /// refusal returns ONE byte-identical error (review round-3 F3): an
+    /// unknown id and another instance's live id are indistinguishable to the
+    /// caller, so `cp/cancel` cannot be used to probe for delegation ids.
+    /// The distinction is kept in the CP's own logs only.
     pub fn cancel(
         &self,
         registry: &Registry,
@@ -308,25 +371,47 @@ impl Router {
         params: &CancelParams,
         next_rpc_id: u64,
     ) -> Result<Option<(Instance, String)>, ErrorObject> {
-        let entry = { self.inflight.lock().remove(&params.delegation_id) };
-        let entry = match entry {
-            Some(e) => e,
+        let refused = || {
+            ErrorObject::new(
+                codes::POLICY_DENIED,
+                "delegation is not in flight for this instance",
+            )
+        };
+        let namespace = match registry.get(from_handle) {
+            Some(i) => i.namespace,
             None => {
-                return Err(ErrorObject::new(
-                    codes::INVALID_PARAMS,
-                    format!("delegation {} is not in flight", params.delegation_id),
-                ))
+                warn!(
+                    handle = from_handle,
+                    "cancel from an unregistered connection"
+                );
+                return Err(refused());
             }
         };
-        if entry.from_handle != from_handle {
-            self.inflight
-                .lock()
-                .insert(params.delegation_id.clone(), entry);
-            return Err(ErrorObject::new(
-                codes::POLICY_DENIED,
-                "only the initiating instance may cancel a delegation",
-            ));
-        }
+        let key = DelegationKey::new(&namespace, &params.delegation_id);
+        let entry = {
+            let mut g = self.inflight.lock();
+            match g.get(&key) {
+                Some(e) if e.from_handle == from_handle => {}
+                Some(_) => {
+                    warn!(
+                        delegation = %params.delegation_id,
+                        namespace = %namespace,
+                        handle = from_handle,
+                        "cancel refused: only the initiating instance may cancel"
+                    );
+                    return Err(refused());
+                }
+                None => {
+                    warn!(
+                        delegation = %params.delegation_id,
+                        namespace = %namespace,
+                        "cancel refused: delegation not in flight"
+                    );
+                    return Err(refused());
+                }
+            }
+            g.remove(&key).expect("present under the same lock")
+        };
         registry.adjust_sessions(entry.to_handle, -1);
         info!(delegation = %params.delegation_id, "delegation cancelled by initiator");
         let target = registry.get(entry.to_handle);
@@ -355,12 +440,12 @@ impl Router {
         let mut affected = Vec::new();
         let entries: Vec<InFlight> = {
             let mut g = self.inflight.lock();
-            let ids: Vec<String> = g
-                .values()
-                .filter(|e| e.to_handle == handle || e.from_handle == handle)
-                .map(|e| e.delegation_id.clone())
+            let keys: Vec<DelegationKey> = g
+                .iter()
+                .filter(|(_, e)| e.to_handle == handle || e.from_handle == handle)
+                .map(|(k, _)| k.clone())
                 .collect();
-            ids.iter().filter_map(|id| g.remove(id)).collect()
+            keys.iter().filter_map(|k| g.remove(k)).collect()
         };
         for e in entries {
             if e.to_handle == handle {
@@ -410,12 +495,12 @@ impl Router {
     ) -> Vec<(Instance, String)> {
         let overdue: Vec<InFlight> = {
             let mut g = self.inflight.lock();
-            let ids: Vec<String> = g
-                .values()
-                .filter(|e| e.deadline <= now)
-                .map(|e| e.delegation_id.clone())
+            let keys: Vec<DelegationKey> = g
+                .iter()
+                .filter(|(_, e)| e.deadline <= now)
+                .map(|(k, _)| k.clone())
                 .collect();
-            ids.iter().filter_map(|id| g.remove(id)).collect()
+            keys.iter().filter_map(|k| g.remove(k)).collect()
         };
         let mut frames = Vec::new();
         for e in overdue {
@@ -451,11 +536,13 @@ impl Router {
         frames
     }
 
-    /// Chain of an in-flight delegation (for tests/inspection).
-    pub fn chain_of(&self, delegation_id: &str) -> Option<Vec<String>> {
+    /// Chain of an in-flight delegation (for tests/inspection). Delegation
+    /// ids are namespace-scoped (review round-3 F3), so the namespace is part
+    /// of the lookup.
+    pub fn chain_of(&self, namespace: &str, delegation_id: &str) -> Option<Vec<String>> {
         self.inflight
             .lock()
-            .get(delegation_id)
+            .get(&DelegationKey::new(namespace, delegation_id))
             .map(|e| e.chain.clone())
     }
 
@@ -729,7 +816,7 @@ type = "worker"
     }
 
     #[test]
-    fn result_from_wrong_handle_dropped_and_restored() {
+    fn result_from_wrong_handle_dropped_and_entry_untouched() {
         let w = world();
         assert!(matches!(
             do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
@@ -961,7 +1048,7 @@ allow_worker_initiation = true
             DelegateOutcome::Accepted(_)
         ));
         assert_eq!(
-            w.router.chain_of("d-root").unwrap(),
+            w.router.chain_of("prod", "d-root").unwrap(),
             vec!["prod/koudu".to_string()]
         );
 
@@ -1003,7 +1090,7 @@ allow_worker_initiation = true
             DelegateOutcome::Accepted(_)
         ));
         assert_eq!(
-            w.router.chain_of("d-child").unwrap(),
+            w.router.chain_of("prod", "d-child").unwrap(),
             vec!["prod/koudu".to_string(), "prod/worker-1".to_string()]
         );
 
@@ -1026,5 +1113,406 @@ allow_worker_initiation = true
             }
             _ => panic!("expected cycle rejection"),
         }
+    }
+
+    fn result_of(id: &str, body: &str) -> DelegateResultParams {
+        DelegateResultParams {
+            delegation_id: id.into(),
+            status: DelegationStatus::Completed,
+            result: Some(body.into()),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn wrong_handle_result_never_hides_the_genuine_one() {
+        // Review round-3 F2: ownership is validated under the same lock
+        // acquisition that removes the entry. The old remove → validate →
+        // reinsert sequence made the entry briefly invisible, so a genuine
+        // result arriving in that window was dropped as "unknown id".
+        for spoof_first in [true, false] {
+            let mut w = world();
+            assert!(matches!(
+                do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+                DelegateOutcome::Accepted(_)
+            ));
+            w.worker_rx.try_recv().unwrap();
+
+            if spoof_first {
+                // h_primary is registered but is NOT the serving instance.
+                assert!(w
+                    .router
+                    .complete(
+                        &w.registry,
+                        w.h_primary,
+                        result_of("d-1", "spoofed"),
+                        1024,
+                        2
+                    )
+                    .is_none());
+                assert_eq!(
+                    w.router.inflight_count(),
+                    1,
+                    "a non-owner frame must not remove the entry"
+                );
+            }
+
+            let (init, frame) = w
+                .router
+                .complete(
+                    &w.registry,
+                    w.h_worker,
+                    result_of("d-1", "genuine"),
+                    1024,
+                    3,
+                )
+                .expect("genuine result must be delivered, never dropped");
+            assert_eq!(init.handle, w.h_primary);
+            assert!(frame.contains("genuine"));
+            assert_eq!(w.router.inflight_count(), 0);
+            assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 0);
+
+            if !spoof_first {
+                // A late non-owner frame after completion is a plain no-op.
+                assert!(w
+                    .router
+                    .complete(
+                        &w.registry,
+                        w.h_primary,
+                        result_of("d-1", "spoofed"),
+                        1024,
+                        4
+                    )
+                    .is_none());
+                assert_eq!(w.router.inflight_count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn genuine_result_survives_concurrent_non_owner_frames() {
+        // Review round-3 F2, the racing case the sequential test above cannot
+        // observe: with remove → validate → reinsert, a genuine result that
+        // lands inside the window sees an empty table and is dropped, and the
+        // delegation then stalls to its deadline. Under a single lock
+        // acquisition the outcome is order-independent by construction.
+        for _ in 0..200 {
+            let w = world();
+            assert!(matches!(
+                do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+                DelegateOutcome::Accepted(_)
+            ));
+            let gate = std::sync::Barrier::new(2);
+            let (spoofed, genuine) = std::thread::scope(|s| {
+                let spoof = s.spawn(|| {
+                    gate.wait();
+                    // Registered, but not the serving instance.
+                    w.router
+                        .complete(
+                            &w.registry,
+                            w.h_primary,
+                            result_of("d-1", "spoofed"),
+                            1024,
+                            2,
+                        )
+                        .is_some()
+                });
+                gate.wait();
+                let genuine = w
+                    .router
+                    .complete(
+                        &w.registry,
+                        w.h_worker,
+                        result_of("d-1", "genuine"),
+                        1024,
+                        3,
+                    )
+                    .is_some();
+                (spoof.join().unwrap(), genuine)
+            });
+            assert!(!spoofed, "a non-owner must never complete a delegation");
+            assert!(genuine, "the genuine result must never be dropped");
+            assert_eq!(w.router.inflight_count(), 0);
+        }
+    }
+
+    #[test]
+    fn genuine_cancel_survives_concurrent_non_owner_frames() {
+        // Review round-3 F2 (cancel side), racing case: with the old
+        // remove → validate → reinsert pattern, a genuine initiator cancel
+        // landing inside a non-owner cancel's window would see an empty table
+        // and be refused, leaving the delegation to stall to its deadline.
+        // Under a single lock acquisition the outcome is order-independent.
+        for _ in 0..200 {
+            let w = world();
+            assert!(matches!(
+                do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+                DelegateOutcome::Accepted(_)
+            ));
+            let params = CancelParams {
+                delegation_id: "d-1".into(),
+                reason: "race".into(),
+            };
+            let gate = std::sync::Barrier::new(2);
+            let (spoofed, genuine) = std::thread::scope(|s| {
+                let spoof = s.spawn(|| {
+                    gate.wait();
+                    // Registered, but not the initiator.
+                    w.router.cancel(&w.registry, w.h_worker, &params, 1).is_ok()
+                });
+                gate.wait();
+                let genuine = w
+                    .router
+                    .cancel(&w.registry, w.h_primary, &params, 2)
+                    .is_ok();
+                (spoof.join().unwrap(), genuine)
+            });
+            assert!(!spoofed, "a non-initiator must never cancel a delegation");
+            assert!(genuine, "the genuine cancel must never be refused");
+            assert_eq!(w.router.inflight_count(), 0);
+            assert_eq!(
+                w.registry.get(w.h_worker).unwrap().active_sessions,
+                0,
+                "capacity must be released exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn refused_cancel_leaves_the_delegation_cancellable() {
+        // Review round-3 F2 (cancel side): a wrong-handle cancel must not
+        // remove-and-reinsert the entry, and must not disturb accounting.
+        let w = world();
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        let params = CancelParams {
+            delegation_id: "d-1".into(),
+            reason: "not mine".into(),
+        };
+        assert!(w
+            .router
+            .cancel(&w.registry, w.h_worker, &params, 1)
+            .is_err());
+        assert_eq!(w.router.inflight_count(), 1);
+        assert_eq!(
+            w.registry.get(w.h_worker).unwrap().active_sessions,
+            1,
+            "a refused cancel must not release capacity"
+        );
+        // The genuine initiator can still cancel.
+        let fwd = w
+            .router
+            .cancel(&w.registry, w.h_primary, &params, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fwd.0.handle, w.h_worker);
+        assert_eq!(w.router.inflight_count(), 0);
+    }
+
+    #[test]
+    fn cancel_refusals_are_byte_identical() {
+        // Review round-3 F3: `cp/cancel` must not be an existence oracle —
+        // an unknown id and another instance's live id return the same error
+        // object, byte for byte.
+        let w = world();
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        let unknown = CancelParams {
+            delegation_id: "d-does-not-exist".into(),
+            reason: "probe".into(),
+        };
+        let foreign = CancelParams {
+            delegation_id: "d-1".into(),
+            reason: "probe".into(),
+        };
+        // Both probes come from the worker: it initiated neither.
+        let e_unknown = w
+            .router
+            .cancel(&w.registry, w.h_worker, &unknown, 1)
+            .unwrap_err();
+        let e_foreign = w
+            .router
+            .cancel(&w.registry, w.h_worker, &foreign, 2)
+            .unwrap_err();
+        assert_eq!(
+            serde_json::to_string(&e_unknown).unwrap(),
+            serde_json::to_string(&e_foreign).unwrap(),
+            "unknown and foreign delegation ids must be indistinguishable"
+        );
+        assert_eq!(e_unknown.code, codes::POLICY_DENIED);
+        assert_eq!(w.router.inflight_count(), 1);
+    }
+
+    #[test]
+    fn same_delegation_id_in_two_namespaces_is_independent() {
+        // Review round-3 F3: the in-flight table is keyed by
+        // (namespace, delegation_id). A client-supplied id in one namespace
+        // must neither collide with nor be observable from another.
+        let registry = Registry::new();
+        let router = Router::new();
+        let cfg = cfg();
+        let (p_prod, _prod_init_rx) = instance("prod", "koudu", AgentType::Primary, 4);
+        let (w_prod, mut prod_rx) = instance("prod", "worker-1", AgentType::Worker, 2);
+        let (p_dev, _dev_init_rx) = instance("dev", "koudu", AgentType::Primary, 4);
+        let (w_dev, mut dev_rx) = instance("dev", "worker-1", AgentType::Worker, 2);
+        let hp_prod = registry.register(p_prod);
+        let hw_prod = registry.register(w_prod);
+        let hp_dev = registry.register(p_dev);
+        let hw_dev = registry.register(w_dev);
+
+        for (ns, hp) in [("prod", hp_prod), ("dev", hp_dev)] {
+            match router.delegate(
+                &cfg,
+                &registry,
+                ns,
+                "koudu",
+                &AgentType::Primary,
+                hp,
+                delegate_params("d-1", "worker-1", 60),
+                1,
+            ) {
+                DelegateOutcome::Accepted(ack) => {
+                    assert_eq!(ack.assigned_to, format!("{ns}/worker-1"))
+                }
+                DelegateOutcome::Rejected(e) => {
+                    panic!("{ns} rejected ({}): {}", e.code, e.message)
+                }
+            }
+        }
+        assert_eq!(
+            router.inflight_count(),
+            2,
+            "one `d-1` per namespace, both in flight"
+        );
+        prod_rx.try_recv().unwrap();
+        dev_rx.try_recv().unwrap();
+
+        // A dev instance cannot cancel prod's `d-1` — and cannot learn that
+        // it exists: same error as for an id that exists nowhere.
+        let probe = CancelParams {
+            delegation_id: "d-1".into(),
+            reason: "probe".into(),
+        };
+        let nowhere = CancelParams {
+            delegation_id: "d-nowhere".into(),
+            reason: "probe".into(),
+        };
+        let e_cross = router
+            .cancel(&registry, hw_dev, &probe, 10)
+            .unwrap_err()
+            .message;
+        let e_nowhere = router
+            .cancel(&registry, hw_dev, &nowhere, 11)
+            .unwrap_err()
+            .message;
+        assert_eq!(e_cross, e_nowhere);
+        assert_eq!(router.inflight_count(), 2);
+
+        // Results route to the initiator of the SAME namespace only.
+        let (init, frame) = router
+            .complete(&registry, hw_dev, result_of("d-1", "dev-done"), 1024, 12)
+            .unwrap();
+        assert_eq!(init.handle, hp_dev);
+        assert!(frame.contains("dev-done"));
+        assert!(
+            router.chain_of("prod", "d-1").is_some(),
+            "prod's delegation must be untouched"
+        );
+
+        let (init, frame) = router
+            .complete(&registry, hw_prod, result_of("d-1", "prod-done"), 1024, 13)
+            .unwrap();
+        assert_eq!(init.handle, hp_prod);
+        assert!(frame.contains("prod-done"));
+        assert_eq!(router.inflight_count(), 0);
+    }
+
+    #[test]
+    fn parent_lookup_is_namespace_scoped() {
+        // Review round-3 F3: parent-chain resolution must not reach into
+        // another namespace's in-flight table.
+        let cfg: CpConfig = toml::from_str(
+            r#"
+[namespaces.prod]
+max_depth = 5
+allow_worker_initiation = true
+
+[namespaces.dev]
+max_depth = 5
+allow_worker_initiation = true
+"#,
+        )
+        .unwrap();
+        let registry = Registry::new();
+        let router = Router::new();
+        let (p_prod, _rx1) = instance("prod", "koudu", AgentType::Primary, 4);
+        let (w_prod, mut rx2) = instance("prod", "worker-1", AgentType::Worker, 2);
+        let (t_prod, _rx3) = instance("prod", "worker-2", AgentType::Worker, 2);
+        let (w_dev, _rx4) = instance("dev", "worker-1", AgentType::Worker, 2);
+        let (t_dev, _rx5) = instance("dev", "worker-2", AgentType::Worker, 2);
+        let hp_prod = registry.register(p_prod);
+        let hw_prod = registry.register(w_prod);
+        registry.register(t_prod);
+        let hw_dev = registry.register(w_dev);
+        registry.register(t_dev);
+
+        assert!(matches!(
+            router.delegate(
+                &cfg,
+                &registry,
+                "prod",
+                "koudu",
+                &AgentType::Primary,
+                hp_prod,
+                delegate_params("d-root", "worker-1", 120),
+                1,
+            ),
+            DelegateOutcome::Accepted(_)
+        ));
+        rx2.try_recv().unwrap();
+
+        // dev/worker-1 claims prod's `d-root` as its parent: invisible.
+        let mut child = delegate_params("d-child", "worker-2", 60);
+        child.parent_delegation_id = Some("d-root".into());
+        match router.delegate(
+            &cfg,
+            &registry,
+            "dev",
+            "worker-1",
+            &AgentType::Worker,
+            hw_dev,
+            child,
+            2,
+        ) {
+            DelegateOutcome::Rejected(e) => {
+                assert_eq!(e.code, codes::INVALID_PARAMS);
+                assert!(e.message.contains("not in flight for this instance"));
+            }
+            _ => panic!("cross-namespace parent must be rejected"),
+        }
+        // ...and the legitimate in-namespace child still works.
+        let mut ok_child = delegate_params("d-child", "worker-2", 60);
+        ok_child.parent_delegation_id = Some("d-root".into());
+        assert!(matches!(
+            router.delegate(
+                &cfg,
+                &registry,
+                "prod",
+                "worker-1",
+                &AgentType::Worker,
+                hw_prod,
+                ok_child,
+                3,
+            ),
+            DelegateOutcome::Accepted(_)
+        ));
+        assert_eq!(
+            router.chain_of("prod", "d-child").unwrap(),
+            vec!["prod/koudu".to_string(), "prod/worker-1".to_string()]
+        );
     }
 }

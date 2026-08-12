@@ -7,10 +7,16 @@
 //! Resource bounds (review F5): the WS transport enforces
 //! `max_frame_bytes` before parsing; each connection's outbound queue is
 //! bounded — a peer that cannot drain it is treated as disconnected.
+//!
+//! Admission bounds (review round-3 F4): authentication alone is not a
+//! bound. Every connection holds a per-identity slot from the upgrade until
+//! it ends (`ConnPermit`, released on every exit path), and must complete
+//! `cp/register` within `register_timeout_secs` or be closed.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
@@ -19,6 +25,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router as AxumRouter;
 use futures_util::{SinkExt, StreamExt};
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -28,7 +35,7 @@ use crate::proto::{
     JsonRpcErrorResponse, JsonRpcMessage, JsonRpcResponse, RegisterAck, RegisterParams,
     PROTOCOL_VERSION,
 };
-use crate::registry::{Instance, Registry, OUTBOUND_QUEUE};
+use crate::registry::{shutdown_signal, Instance, Registry, OUTBOUND_QUEUE};
 use crate::router::{DelegateOutcome, Router};
 
 pub struct AppState {
@@ -36,6 +43,10 @@ pub struct AppState {
     pub registry: Registry,
     pub router: Router,
     rpc_id: AtomicU64,
+    /// Live connections per identity (`namespace/name`), counted from the
+    /// upgrade so pre-registration sockets are bounded too (review round-3
+    /// F4).
+    conns: Mutex<BTreeMap<String, u32>>,
 }
 
 impl AppState {
@@ -45,11 +56,54 @@ impl AppState {
             registry: Registry::new(),
             router: Router::new(),
             rpc_id: AtomicU64::new(1),
+            conns: Mutex::new(BTreeMap::new()),
         }
     }
 
     pub fn next_rpc_id(&self) -> u64 {
         self.rpc_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Take a connection slot for `identity`, or `None` when the identity is
+    /// already at `max_connections_per_identity`. The returned guard releases
+    /// the slot on drop — including on every early return and on an upgrade
+    /// that never completes (review round-3 F4).
+    pub fn try_acquire_conn(self: &Arc<Self>, identity: &AgentIdentity) -> Option<ConnPermit> {
+        let key = format!("{}/{}", identity.namespace, identity.name);
+        let mut g = self.conns.lock();
+        let n = g.entry(key.clone()).or_insert(0);
+        if *n >= self.cfg.max_connections_per_identity {
+            return None;
+        }
+        *n += 1;
+        Some(ConnPermit {
+            state: Arc::clone(self),
+            key,
+        })
+    }
+
+    /// Live connection count for an identity (`namespace/name`).
+    pub fn conn_count(&self, logical_id: &str) -> u32 {
+        self.conns.lock().get(logical_id).copied().unwrap_or(0)
+    }
+}
+
+/// RAII connection slot. Dropping it frees the identity's quota; it is never
+/// released explicitly, so no early return can leak it (review round-3 F4).
+pub struct ConnPermit {
+    state: Arc<AppState>,
+    key: String,
+}
+
+impl Drop for ConnPermit {
+    fn drop(&mut self) {
+        let mut g = self.state.conns.lock();
+        if let Some(n) = g.get_mut(&self.key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                g.remove(&self.key);
+            }
+        }
     }
 }
 
@@ -80,24 +134,65 @@ async fn ws_handler(
             return StatusCode::UNAUTHORIZED.into_response();
         }
     };
+    // Per-identity connection quota, taken before the upgrade so an
+    // over-quota peer is refused at the HTTP layer (review round-3 F4).
+    let permit = match state.try_acquire_conn(&identity) {
+        Some(p) => p,
+        None => {
+            warn!(
+                agent = %format!("{}/{}", identity.namespace, identity.name),
+                max = state.cfg.max_connections_per_identity,
+                "WS rejected: identity is at its connection quota"
+            );
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
     let max_frame = state.cfg.max_frame_bytes;
     ws.max_message_size(max_frame)
         .max_frame_size(max_frame)
-        .on_upgrade(move |socket| handle_connection(state, socket, identity))
+        .on_upgrade(move |socket| handle_connection(state, socket, identity, permit))
 }
 
-async fn handle_connection(state: Arc<AppState>, socket: WebSocket, identity: AgentIdentity) {
+async fn handle_connection(
+    state: Arc<AppState>,
+    socket: WebSocket,
+    identity: AgentIdentity,
+    // Held for the connection's whole lifetime; dropped here on every exit
+    // path, including the early returns below (review round-3 F4).
+    _permit: ConnPermit,
+) {
     let (mut sink, mut stream) = socket.split();
 
-    // --- Registration: mandatory first frame ---
-    let register = loop {
-        match stream.next().await {
-            Some(Ok(Message::Text(text))) => break text,
-            Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
-            _ => {
-                warn!(agent = %identity.name, "connection closed before registration");
-                return;
+    // --- Registration: mandatory first frame, within a deadline ---
+    // An authenticated peer must not be able to park idle sockets: pings keep
+    // the transport alive but do not extend this deadline (review round-3 F4).
+    let register = match tokio::time::timeout(
+        Duration::from_secs(state.cfg.register_timeout_secs),
+        async {
+            loop {
+                match stream.next().await {
+                    Some(Ok(Message::Text(text))) => return Some(text),
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                    _ => return None,
+                }
             }
+        },
+    )
+    .await
+    {
+        Ok(Some(text)) => text,
+        Ok(None) => {
+            warn!(agent = %identity.name, "connection closed before registration");
+            return;
+        }
+        Err(_) => {
+            warn!(
+                agent = %format!("{}/{}", identity.namespace, identity.name),
+                timeout_secs = state.cfg.register_timeout_secs,
+                "no cp/register within the registration deadline — closing"
+            );
+            let _ = sink.send(Message::Close(None)).await;
+            return;
         }
     };
     let (reg, reg_rpc_id) = match parse_register(&register, &identity) {
@@ -117,25 +212,36 @@ async fn handle_connection(state: Arc<AppState>, socket: WebSocket, identity: Ag
     // cannot drain OUTBOUND_QUEUE frames is disconnected, not buffered.
     let (tx, mut rx) = mpsc::channel::<String>(OUTBOUND_QUEUE);
 
+    // Shutdown signal so the CP can close this socket when it drops the
+    // registration on its own initiative (lease expiry — review round-3 F1).
+    // Subscribed BEFORE registering so no signal can be missed, and kept
+    // alive here for the whole connection: closing is driven by an explicit
+    // signal, never by the registry happening to drop its side.
+    let shutdown = shutdown_signal();
+    let mut shutdown_rx = shutdown.subscribe();
+
     let effective_max = match identity.max_delegated_sessions_cap {
         Some(cap) => reg.max_delegated_sessions.min(cap),
         None => reg.max_delegated_sessions,
     };
     // The registry assigns the CP-generated handle (review F1): ownership
     // and teardown never key on the client-supplied instance_id.
-    let handle = state.registry.register(Instance {
-        handle: 0,
-        namespace: identity.namespace.clone(),
-        name: identity.name.clone(),
-        agent_type: identity.agent_type.clone(),
-        instance_id: reg.instance_id.clone(),
-        labels: reg.labels.clone(),
-        max_delegated_sessions: effective_max,
-        active_sessions: 0,
-        registered_at: Instant::now(),
-        last_heartbeat: Instant::now(),
-        tx: tx.clone(),
-    });
+    let handle = state.registry.register_conn(
+        Instance {
+            handle: 0,
+            namespace: identity.namespace.clone(),
+            name: identity.name.clone(),
+            agent_type: identity.agent_type.clone(),
+            instance_id: reg.instance_id.clone(),
+            labels: reg.labels.clone(),
+            max_delegated_sessions: effective_max,
+            active_sessions: 0,
+            registered_at: Instant::now(),
+            last_heartbeat: Instant::now(),
+            tx: tx.clone(),
+        },
+        Arc::clone(&shutdown),
+    );
     info!(
         agent = %format!("{}/{}", identity.namespace, identity.name),
         instance = %reg.instance_id,
@@ -167,9 +273,20 @@ async fn handle_connection(state: Arc<AppState>, socket: WebSocket, identity: Ag
         return;
     }
 
-    // --- Main loop: interleave inbound frames and outbound channel ---
+    // --- Main loop: interleave inbound frames, outbound channel, shutdown ---
+    let mut cp_closed = false;
     loop {
         tokio::select! {
+            // The CP dropped this registration (lease expiry): the socket
+            // must go too (review round-3 F1). Keeping it open would leave a
+            // connection whose every frame hits an absent registry entry and
+            // which can never re-register, since registration is
+            // first-frame-only. Closing lets the client reconnect,
+            // re-authenticate, and register again.
+            _ = shutdown_rx.changed() => {
+                cp_closed = true;
+                break;
+            }
             outbound = rx.recv() => {
                 match outbound {
                     Some(text) => {
@@ -203,6 +320,15 @@ async fn handle_connection(state: Arc<AppState>, socket: WebSocket, identity: Ag
                 }
             }
         }
+    }
+
+    if cp_closed {
+        info!(
+            agent = %format!("{}/{}", identity.namespace, identity.name),
+            handle,
+            "closing connection at the CP's request (registration dropped)"
+        );
+        let _ = sink.send(Message::Close(None)).await;
     }
 
     teardown(&state, handle, &identity);
@@ -429,26 +555,41 @@ fn handle_frame(state: &Arc<AppState>, handle: u64, text: &str) -> Option<String
     }
 }
 
+/// One lease-expiry pass: drop registrations whose lease elapsed, close their
+/// connections, and fail their in-flight delegations.
+///
+/// Signalling the connection is what makes the deregistration complete
+/// (review round-3 F1): without it the connection task keeps running against
+/// a registration that no longer exists — every later frame (heartbeats
+/// included) finds no registry entry and gets no reply, and the client cannot
+/// re-register because registration is first-frame-only.
+pub fn sweep_leases(state: &Arc<AppState>, lease: Duration) {
+    for handle in state.registry.expired(lease) {
+        warn!(
+            handle,
+            "lease expired — deregistering and closing connection"
+        );
+        // Signal first: `deregister` drops the registry's side of the signal.
+        state.registry.signal_shutdown(handle);
+        state.registry.deregister(handle);
+        let mut next = || state.next_rpc_id();
+        for (inst, frame) in state
+            .router
+            .fail_instance(&state.registry, handle, &mut next)
+        {
+            let _ = inst.tx.try_send(frame);
+        }
+    }
+}
+
 /// Background sweeps: lease expiry and delegation deadlines.
 pub async fn run_sweeper(state: Arc<AppState>) {
-    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tick.tick().await;
 
-        // Lease expiry → deregister + fail in-flight.
-        let lease = std::time::Duration::from_secs(state.cfg.lease_expiry_secs);
-        for handle in state.registry.expired(lease) {
-            warn!(handle, "lease expired — deregistering");
-            state.registry.deregister(handle);
-            let mut next = || state.next_rpc_id();
-            for (inst, frame) in state
-                .router
-                .fail_instance(&state.registry, handle, &mut next)
-            {
-                let _ = inst.tx.try_send(frame);
-            }
-        }
+        sweep_leases(&state, Duration::from_secs(state.cfg.lease_expiry_secs));
 
         // Deadline sweep.
         let mut next = || state.next_rpc_id();
@@ -593,5 +734,95 @@ mod tests {
         .to_string();
         let (_, err) = parse_register(&no_id, &identity()).unwrap_err();
         assert_eq!(err.code, codes::INVALID_REQUEST);
+    }
+
+    fn state_with(cfg_toml: &str) -> Arc<AppState> {
+        let cfg: CpConfig = toml::from_str(cfg_toml).unwrap();
+        cfg.validate().unwrap();
+        Arc::new(AppState::new(cfg))
+    }
+
+    #[test]
+    fn conn_quota_bounds_and_recycles_slots() {
+        // Review round-3 F4(b): the quota is a hard bound and the guard
+        // releases the slot on drop, so no exit path can leak it.
+        let state = state_with("max_connections_per_identity = 2");
+        let id = identity();
+        let p1 = state.try_acquire_conn(&id).expect("slot 1");
+        let p2 = state.try_acquire_conn(&id).expect("slot 2");
+        assert_eq!(state.conn_count("prod/koudu"), 2);
+        assert!(
+            state.try_acquire_conn(&id).is_none(),
+            "third concurrent connection must be refused"
+        );
+
+        drop(p1);
+        assert_eq!(state.conn_count("prod/koudu"), 1);
+        let p3 = state
+            .try_acquire_conn(&id)
+            .expect("released slot is reusable");
+        drop(p2);
+        drop(p3);
+        assert_eq!(state.conn_count("prod/koudu"), 0);
+        assert!(state.try_acquire_conn(&id).is_some());
+    }
+
+    #[test]
+    fn conn_quota_is_per_identity() {
+        let state = state_with("max_connections_per_identity = 1");
+        let a = identity();
+        let mut b = identity();
+        b.key = "k2".into();
+        b.name = "worker-1".into();
+        let _pa = state.try_acquire_conn(&a).expect("koudu slot");
+        let _pb = state
+            .try_acquire_conn(&b)
+            .expect("worker-1 has its own quota");
+        assert!(
+            state.try_acquire_conn(&a).is_none(),
+            "quota is per identity, not global"
+        );
+        assert_eq!(state.conn_count("prod/koudu"), 1);
+        assert_eq!(state.conn_count("prod/worker-1"), 1);
+    }
+
+    #[tokio::test]
+    async fn sweep_leases_signals_the_connection_before_dropping_it() {
+        // Review round-3 F1 at the sweeper level: the shutdown signal is
+        // delivered, not just the registry entry removed. (The end-to-end
+        // proof over a real socket lives in tests/ws_lifecycle.rs.)
+        let state = state_with("heartbeat_interval_secs = 1\nlease_expiry_secs = 2");
+        let signal = crate::registry::shutdown_signal();
+        let mut observer = signal.subscribe();
+        let (tx, _rx) = mpsc::channel::<String>(OUTBOUND_QUEUE);
+        let handle = state.registry.register_conn(
+            Instance {
+                handle: 0,
+                namespace: "prod".into(),
+                name: "koudu".into(),
+                agent_type: AgentType::Primary,
+                instance_id: "i-1".into(),
+                labels: Default::default(),
+                max_delegated_sessions: 1,
+                active_sessions: 0,
+                registered_at: Instant::now(),
+                last_heartbeat: Instant::now(),
+                tx,
+            },
+            Arc::clone(&signal),
+        );
+
+        // A live lease is left alone.
+        sweep_leases(&state, Duration::from_secs(60));
+        assert!(state.registry.get(handle).is_some());
+        assert!(!*observer.borrow());
+
+        sweep_leases(&state, Duration::ZERO);
+        assert!(state.registry.get(handle).is_none());
+        observer.changed().await.unwrap();
+        assert!(
+            *observer.borrow(),
+            "the owning connection must be told to close"
+        );
     }
 }
