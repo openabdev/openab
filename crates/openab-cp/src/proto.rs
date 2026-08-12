@@ -473,11 +473,17 @@ impl JsonRpcNotification {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventParams {
     /// **Per-namespace** monotonic sequence number: an observer sees a dense
-    /// `1, 2, 3, …` stream for its own namespace, so a discontinuity means
+    /// `n, n+1, n+2, …` stream for its own namespace, so a discontinuity means
     /// frames were dropped (saturated queue) or the CP restarted, and the
     /// observer resynchronizes via `cp/list_agents`. A process-global counter
     /// would show false gaps caused purely by activity in other namespaces.
-    /// Not durable across CP restarts.
+    ///
+    /// Client contract: the **first frame received sets the baseline** — an
+    /// observer joining mid-stream may see any starting value (events already
+    /// flowed to earlier observers), and only a gap *after* that first frame
+    /// signals loss. A `seq` lower than the last seen value means the CP
+    /// restarted; treat it as a new baseline and resync. Not durable across
+    /// CP restarts.
     pub seq: u64,
     pub ts: chrono::DateTime<chrono::Utc>,
     /// Namespace this event is scoped to (matches the observer's own).

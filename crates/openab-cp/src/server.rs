@@ -399,7 +399,10 @@ async fn handle_connection(
     }
 
     // The lobby learns about every arrival — observers included, so one
-    // lobby client sees the others.
+    // lobby client sees the others. Announced only after a successful ack:
+    // if the ack send fails, teardown emits an `agent_deregistered` with no
+    // matching `agent_registered` — roster clients must treat removal of an
+    // unknown agent as a no-op (they may have joined mid-stream anyway).
     announce_registration(&state, handle);
 
     // --- Main loop: interleave inbound frames, outbound channel, shutdown ---
