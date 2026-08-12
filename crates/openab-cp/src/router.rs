@@ -68,9 +68,10 @@ use parking_lot::Mutex;
 use tracing::{info, warn};
 
 use crate::config::CpConfig;
+use crate::events::EventHub;
 use crate::policy::{self, PolicyInput};
 use crate::proto::{
-    codes, methods, AgentType, CancelParams, DelegateAck, DelegateForward, DelegateParams,
+    codes, methods, AgentType, CancelParams, CpEvent, DelegateAck, DelegateForward, DelegateParams,
     DelegateResultParams, DelegationStatus, ErrorObject, JsonRpcRequest,
 };
 use crate::registry::{Instance, Registry, SelectError};
@@ -83,15 +84,12 @@ use crate::registry::{Instance, Registry, SelectError};
 pub struct InFlight {
     /// Namespace that owns this delegation — part of its identity, not just a
     /// lookup key: `delegation_id` is client-supplied and only unique within
-    /// the namespace that produced it.
-    ///
-    /// Stored on the entry because the delegation outlives the request that
-    /// created it, and the paths that end it without a client request —
-    /// `fail_instance` and `sweep_deadlines` — have no namespace of their own
-    /// to work from. Its consumer is the observer event layer added by the
-    /// next PR in this stack (per-namespace `cp/event` fan-out reads
-    /// `e.namespace` in exactly those two paths), so the field is part of the
-    /// entry's contract rather than an unused remnant.
+    /// the namespace that produced it. Both endpoints share it (v1 delegation
+    /// is same-namespace only), so it is also the scope of the `cp/event`
+    /// fan-out for this delegation: the paths that end a delegation without a
+    /// client request — `fail_instance` and `sweep_deadlines` — read
+    /// `e.namespace` to emit their terminal events. Always the authenticated
+    /// initiator's namespace — the same value as the in-flight key's.
     pub namespace: String,
     pub delegation_id: String,
     /// Authenticated initiator (`namespace/name`) and its registration handle.
@@ -330,11 +328,14 @@ impl Router {
     }
 
     /// Handle `cp/delegate` from an authenticated, registered initiator.
+    /// Observers in the initiator's namespace are notified after the forward
+    /// leaves the CP (best effort — see [`EventHub`]).
     #[allow(clippy::too_many_arguments)]
     pub fn delegate(
         &self,
         cfg: &CpConfig,
         registry: &Registry,
+        events: &EventHub,
         from_namespace: &str,
         from_name: &str,
         from_type: &AgentType,
@@ -617,6 +618,20 @@ impl Router {
             "delegation routed"
         );
 
+        // Lobby fan-out: after the forward, never in its way.
+        events.emit(
+            registry,
+            from_namespace,
+            CpEvent::DelegationRequested {
+                delegation_id: entry.delegation_id.clone(),
+                from: entry.from_logical.clone(),
+                to: entry.to_logical.clone(),
+                prompt_excerpt: events.excerpt(from_namespace, &forward.prompt),
+                deadline: entry.deadline,
+                chain: entry.chain.clone(),
+            },
+        );
+
         DelegateOutcome::Accepted(DelegateAck {
             delegation_id: params.delegation_id,
             admission: generation,
@@ -804,9 +819,19 @@ impl Router {
     /// Only the instance the delegation was routed to may complete it; a
     /// non-owner frame can never make the delegation momentarily invisible
     /// to a genuine result or to the deadline sweep.
+    ///
+    /// Observers in the delegation's namespace are notified of the terminal
+    /// status as soon as the peek validates the frame — before the initiator
+    /// is even looked up — so the lobby sees the delegation end even when the
+    /// initiator is already gone or its queue refuses the result. Like every
+    /// `cp/event` fan-out this is best effort and shares the initiator's
+    /// "first terminal frame wins" semantics: the peek-send window can put a
+    /// second terminal event on the wire for one `delegation_id`, and
+    /// observers MUST treat the first as authoritative (see [`EventHub`]).
     pub fn complete(
         &self,
         registry: &Registry,
+        events: &EventHub,
         serving_handle: u64,
         mut params: DelegateResultParams,
         max_result_bytes: usize,
@@ -878,17 +903,30 @@ impl Router {
         // exceeds max_result_bytes.
         if let Some(r) = &params.result {
             if r.len() > max_result_bytes {
-                let marker = format!("\n…[truncated by control plane: {} bytes total]", r.len());
-                let budget = max_result_bytes.saturating_sub(marker.len());
-                let cut = floor_char_boundary(r, budget);
-                let mut out = format!("{}{}", &r[..cut], marker);
-                if out.len() > max_result_bytes {
-                    // Degenerate tiny cap: keep whatever fits.
-                    out.truncate(floor_char_boundary(&out, max_result_bytes));
-                }
-                params.result = Some(out);
+                params.result = Some(truncate_with_marker(r, max_result_bytes));
             }
         }
+
+        // Lobby fan-out: the peek has validated the entry snapshot and the
+        // serving handle, so the delegation HAS reached a terminal status as
+        // far as the CP is concerned. Emitting here — before the initiator
+        // lookup and its `try_send` — is deliberate: observers see the
+        // terminal status even when the initiator is gone or its queue
+        // refuses the frame. Not moved into the commit phase, which reports
+        // who won a race rather than what happened; observers get the same
+        // at-least-once, first-terminal-wins contract as initiators.
+        events.emit(
+            registry,
+            &entry.namespace,
+            CpEvent::DelegationCompleted {
+                delegation_id: params.delegation_id.clone(),
+                from: entry.from_logical.clone(),
+                to: entry.to_logical.clone(),
+                status: params.status.clone(),
+                result_excerpt: events.excerpt_opt(&entry.namespace, params.result.as_deref()),
+                error: events.excerpt_opt(&entry.namespace, params.error.as_deref()),
+            },
+        );
 
         let Some(initiator) = registry.get(entry.from_handle) else {
             // The initiator deregistered concurrently: its `fail_instance`
@@ -977,6 +1015,7 @@ impl Router {
     pub fn cancel(
         &self,
         registry: &Registry,
+        events: &EventHub,
         from_handle: u64,
         params: &CancelParams,
         next_rpc_id: u64,
@@ -1043,6 +1082,17 @@ impl Router {
             admission = entry.generation,
             "delegation cancelled by initiator"
         );
+        events.emit(
+            registry,
+            &entry.namespace,
+            CpEvent::DelegationCancelled {
+                delegation_id: params.delegation_id.clone(),
+                from: entry.from_logical.clone(),
+                to: entry.to_logical.clone(),
+                by: entry.from_logical.clone(),
+                reason: events.bounded(&params.reason),
+            },
+        );
         let target = registry.get(entry.to_handle);
         Ok(target.map(|t| {
             // Forwarded verbatim: the token was just matched against the live
@@ -1065,6 +1115,7 @@ impl Router {
     pub fn fail_instance(
         &self,
         registry: &Registry,
+        events: &EventHub,
         handle: u64,
         rpc_id: &mut impl FnMut() -> u64,
     ) -> Vec<(Instance, String)> {
@@ -1081,6 +1132,7 @@ impl Router {
         for e in entries {
             if e.to_handle == handle {
                 // Serving side died → tell the initiator.
+                let error = format!("{} disconnected", e.to_logical);
                 if let Some(init) = registry.get(e.from_handle) {
                     let params = DelegateResultParams {
                         delegation_id: e.delegation_id.clone(),
@@ -1090,7 +1142,7 @@ impl Router {
                         admission: e.generation,
                         status: DelegationStatus::TargetDisconnected,
                         result: None,
-                        error: Some(format!("{} disconnected", e.to_logical)),
+                        error: Some(error.clone()),
                     };
                     let frame = JsonRpcRequest::new(
                         rpc_id(),
@@ -1099,9 +1151,24 @@ impl Router {
                     );
                     affected.push((init, serde_json::to_string(&frame).expect("serializable")));
                 }
+                // Emitted even when the initiator is already gone: the lobby
+                // must see the delegation reach a terminal state.
+                events.emit(
+                    registry,
+                    &e.namespace,
+                    CpEvent::DelegationCompleted {
+                        delegation_id: e.delegation_id.clone(),
+                        from: e.from_logical.clone(),
+                        to: e.to_logical.clone(),
+                        status: DelegationStatus::TargetDisconnected,
+                        result_excerpt: None,
+                        error: Some(events.bounded(&error)),
+                    },
+                );
             } else {
                 // Initiator died → cancel downstream, free worker capacity.
                 registry.adjust_sessions(e.to_handle, -1);
+                let reason = format!("initiator {} disconnected", e.from_logical);
                 if let Some(target) = registry.get(e.to_handle) {
                     let params = CancelParams {
                         delegation_id: e.delegation_id.clone(),
@@ -1110,7 +1177,7 @@ impl Router {
                         // this best-effort frame reaches the worker, the frame
                         // still names the admission that is over.
                         admission: e.generation,
-                        reason: format!("initiator {} disconnected", e.from_logical),
+                        reason: reason.clone(),
                     };
                     let frame = JsonRpcRequest::new(
                         rpc_id(),
@@ -1119,6 +1186,17 @@ impl Router {
                     );
                     affected.push((target, serde_json::to_string(&frame).expect("serializable")));
                 }
+                events.emit(
+                    registry,
+                    &e.namespace,
+                    CpEvent::DelegationCancelled {
+                        delegation_id: e.delegation_id.clone(),
+                        from: e.from_logical.clone(),
+                        to: e.to_logical.clone(),
+                        by: "control-plane".to_string(),
+                        reason: events.bounded(&reason),
+                    },
+                );
             }
             warn!(delegation = %e.delegation_id, handle, "in-flight delegation failed by disconnect");
         }
@@ -1130,6 +1208,7 @@ impl Router {
     pub fn sweep_deadlines(
         &self,
         registry: &Registry,
+        events: &EventHub,
         now: DateTime<Utc>,
         rpc_id: &mut impl FnMut() -> u64,
     ) -> Vec<(Instance, String)> {
@@ -1146,6 +1225,18 @@ impl Router {
         for e in overdue {
             registry.adjust_sessions(e.to_handle, -1);
             warn!(delegation = %e.delegation_id, deadline = %e.deadline, "delegation deadline exceeded");
+            events.emit(
+                registry,
+                &e.namespace,
+                CpEvent::DelegationCompleted {
+                    delegation_id: e.delegation_id.clone(),
+                    from: e.from_logical.clone(),
+                    to: e.to_logical.clone(),
+                    status: DelegationStatus::Timeout,
+                    result_excerpt: None,
+                    error: Some(events.bounded("deadline exceeded")),
+                },
+            );
             if let Some(init) = registry.get(e.from_handle) {
                 let params = DelegateResultParams {
                     delegation_id: e.delegation_id.clone(),
@@ -1199,6 +1290,26 @@ impl Router {
     pub fn inflight_count(&self) -> usize {
         self.inflight.lock().len()
     }
+}
+
+/// Truncate `s` to at most `cap` bytes, keeping the head and appending a
+/// marker. The marker counts against the cap: the returned value never
+/// exceeds `cap` (review round-2 F5), and cuts always land on UTF-8 char
+/// boundaries. Shared by result capping and observer excerpts so both use
+/// one implementation.
+pub(crate) fn truncate_with_marker(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
+        return s.to_string();
+    }
+    let marker = format!("\n…[truncated by control plane: {} bytes total]", s.len());
+    let budget = cap.saturating_sub(marker.len());
+    let cut = floor_char_boundary(s, budget);
+    let mut out = format!("{}{}", &s[..cut], marker);
+    if out.len() > cap {
+        // Degenerate tiny cap: keep whatever fits.
+        out.truncate(floor_char_boundary(&out, cap));
+    }
+    out
 }
 
 /// Largest index `<= max` that lands on a char boundary of `s`.
@@ -1308,6 +1419,7 @@ type = "worker"
 
     struct World {
         cfg: CpConfig,
+        events: EventHub,
         registry: Registry,
         router: Router,
         h_primary: u64,
@@ -1317,13 +1429,18 @@ type = "worker"
     }
 
     fn world() -> World {
+        world_with_cfg(cfg())
+    }
+
+    fn world_with_cfg(cfg: CpConfig) -> World {
         let registry = Registry::new();
         let (p, primary_rx) = instance("prod", "koudu", AgentType::Primary, 4);
         let (w, worker_rx) = instance("prod", "worker-1", AgentType::Worker, 1);
         let h_primary = registry.register(p);
         let h_worker = registry.register(w);
         World {
-            cfg: cfg(),
+            events: EventHub::new(&cfg),
+            cfg,
             registry,
             router: Router::new(),
             h_primary,
@@ -1333,10 +1450,29 @@ type = "worker"
         }
     }
 
+    /// Register a lobby observer in `ns` and return its outbound queue.
+    fn observe(w: &World, ns: &str) -> crate::registry::FrameRx {
+        let (ob, rx) = instance(ns, "lobby", AgentType::Observer, 0);
+        w.registry.register(ob);
+        rx
+    }
+
+    /// Every `cp/event` params object queued for an observer.
+    fn events_of(rx: &mut crate::registry::FrameRx) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        while let Ok(text) = rx.try_recv() {
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(v["method"], "cp/event");
+            out.push(v["params"].clone());
+        }
+        out
+    }
+
     fn do_delegate(w: &World, params: DelegateParams) -> DelegateOutcome {
         w.router.delegate(
             &w.cfg,
             &w.registry,
+            &w.events,
             "prod",
             "koudu",
             &AgentType::Primary,
@@ -1389,7 +1525,7 @@ type = "worker"
             reason: "changed my mind".into(),
         };
         w.router
-            .cancel(&w.registry, w.h_primary, &cancel, 2)
+            .cancel(&w.registry, &w.events, w.h_primary, &cancel, 2)
             .expect("the initiator may cancel");
         drain(&mut w);
 
@@ -1408,6 +1544,7 @@ type = "worker"
         assert_eq!(
             w.router.complete(
                 &w.registry,
+                &w.events,
                 w.h_worker,
                 result_of("d-1", a.admission, "A's stale payload"),
                 1024,
@@ -1436,6 +1573,7 @@ type = "worker"
         assert_eq!(
             w.router.complete(
                 &w.registry,
+                &w.events,
                 w.h_worker,
                 result_of("d-1", b.admission, "B's genuine result"),
                 1024,
@@ -1480,9 +1618,12 @@ type = "worker"
             id += 1;
             id
         };
-        let swept =
-            w.router
-                .sweep_deadlines(&w.registry, Utc::now() + Duration::seconds(120), &mut next);
+        let swept = w.router.sweep_deadlines(
+            &w.registry,
+            &w.events,
+            Utc::now() + Duration::seconds(120),
+            &mut next,
+        );
         assert_eq!(w.router.inflight_count(), 0, "A expired");
         assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 0);
 
@@ -1547,7 +1688,7 @@ type = "worker"
             reason: "changed my mind".into(),
         };
         w.router
-            .cancel(&w.registry, w.h_primary, &first, 2)
+            .cancel(&w.registry, &w.events, w.h_primary, &first, 2)
             .expect("the initiator may cancel its live admission");
         drain(&mut w);
 
@@ -1561,7 +1702,7 @@ type = "worker"
         // The retry: same initiator, same id, A's token.
         let err = w
             .router
-            .cancel(&w.registry, w.h_primary, &first, 3)
+            .cancel(&w.registry, &w.events, w.h_primary, &first, 3)
             .expect_err("a cancel naming a superseded admission must be refused");
         assert_eq!(err.code, codes::POLICY_DENIED);
         // Byte-identical to the unknown-id refusal: the retry learns nothing
@@ -1575,7 +1716,7 @@ type = "worker"
             serde_json::to_string(&err).unwrap(),
             serde_json::to_string(
                 &w.router
-                    .cancel(&w.registry, w.h_primary, &unknown, 4)
+                    .cancel(&w.registry, &w.events, w.h_primary, &unknown, 4)
                     .unwrap_err()
             )
             .unwrap(),
@@ -1598,6 +1739,7 @@ type = "worker"
         assert_eq!(
             w.router.complete(
                 &w.registry,
+                &w.events,
                 w.h_worker,
                 result_of("d-1", b.admission, "B's genuine result"),
                 1024,
@@ -1630,9 +1772,12 @@ type = "worker"
             seq += 1;
             seq
         };
-        let swept =
-            w.router
-                .sweep_deadlines(&w.registry, Utc::now() + Duration::seconds(3600), &mut next);
+        let swept = w.router.sweep_deadlines(
+            &w.registry,
+            &w.events,
+            Utc::now() + Duration::seconds(3600),
+            &mut next,
+        );
         let timeout = swept
             .iter()
             .map(|(_, f)| f.clone())
@@ -1653,6 +1798,7 @@ type = "worker"
         assert_eq!(
             w.router.complete(
                 &w.registry,
+                &w.events,
                 w.h_worker,
                 result_of("d-1", b.admission, "B done"),
                 1024,
@@ -1672,7 +1818,9 @@ type = "worker"
         let c = accept(do_delegate(&w, delegate_params("d-2", "worker-1", 60)));
         drain(&mut w);
         w.registry.deregister(w.h_worker);
-        let frames = w.router.fail_instance(&w.registry, w.h_worker, &mut next);
+        let frames = w
+            .router
+            .fail_instance(&w.registry, &w.events, w.h_worker, &mut next);
         assert_eq!(frames.len(), 1);
         assert!(frames[0].1.contains("target_disconnected"));
         assert_eq!(
@@ -1706,6 +1854,7 @@ type = "primary"
         cfg.validate().unwrap();
         let registry = Registry::new();
         let router = Router::new();
+        let events = EventHub::new(&cfg);
         // Capacity 8 on the target, so the GLOBAL bound is the binding limit.
         let (p, mut primary_rx) = instance("prod", "koudu", AgentType::Primary, 8);
         let (wk, mut worker_rx) = instance("prod", "worker-1", AgentType::Worker, 8);
@@ -1715,6 +1864,7 @@ type = "primary"
             router.delegate(
                 &cfg,
                 &registry,
+                &events,
                 "prod",
                 "koudu",
                 &AgentType::Primary,
@@ -1748,6 +1898,7 @@ type = "primary"
         assert_eq!(
             router.complete(
                 &registry,
+                &events,
                 hw,
                 result_of("d-1", first.admission, "done"),
                 1024,
@@ -1765,7 +1916,9 @@ type = "primary"
             admission: second.admission,
             reason: "no longer needed".into(),
         };
-        router.cancel(&registry, hp, &cancel, 3).expect("owned");
+        router
+            .cancel(&registry, &events, hp, &cancel, 3)
+            .expect("owned");
         assert_eq!(router.inflight_count(), 0);
         assert_ne!(second.admission, accept(go("d-3")).admission);
         drain_all();
@@ -1777,14 +1930,19 @@ type = "primary"
             seq
         };
         assert!(!router
-            .sweep_deadlines(&registry, Utc::now() + Duration::seconds(3600), &mut next)
+            .sweep_deadlines(
+                &registry,
+                &events,
+                Utc::now() + Duration::seconds(3600),
+                &mut next
+            )
             .is_empty());
         assert_eq!(router.inflight_count(), 0);
         accept(go("d-4"));
         drain_all();
 
         // 4. fail_instance (the initiator's own disconnect).
-        router.fail_instance(&registry, hp, &mut next);
+        router.fail_instance(&registry, &events, hp, &mut next);
         assert_eq!(router.inflight_count(), 0);
         accept(go("d-5"));
         drain_all();
@@ -1794,7 +1952,7 @@ type = "primary"
         // must come back with it, which a second target proves.
         let (wk2, mut worker2_rx) = instance("prod", "worker-2", AgentType::Worker, 8);
         registry.register(wk2);
-        router.fail_instance(&registry, hp, &mut next);
+        router.fail_instance(&registry, &events, hp, &mut next);
         assert_eq!(router.inflight_count(), 0);
         worker_rx.close();
         match go("d-6") {
@@ -1805,6 +1963,7 @@ type = "primary"
         match router.delegate(
             &cfg,
             &registry,
+            &events,
             "prod",
             "koudu",
             &AgentType::Primary,
@@ -1849,9 +2008,12 @@ type = "primary"
             error: None,
         };
         assert_eq!(
-            w.router.complete(&w.registry, w.h_worker, result, 1024, 2),
+            w.router
+                .complete(&w.registry, &w.events, w.h_worker, result, 1024, 2),
             CompleteOutcome::Delivered { committed: true }
         );
+        // Delivery lands on the initiator's own queue — the frame arriving on
+        // `primary_rx` IS the `init.handle == h_primary` assertion.
         let frame = w.primary_rx.try_recv().unwrap();
         assert!(frame.contains("\"completed\""));
         // The initiator-bound terminal frame names the admission it ends.
@@ -1879,7 +2041,8 @@ type = "primary"
             error: None,
         };
         assert_eq!(
-            w.router.complete(&w.registry, w.h_worker, result, 1024, 2),
+            w.router
+                .complete(&w.registry, &w.events, w.h_worker, result, 1024, 2),
             CompleteOutcome::Delivered { committed: true }
         );
         w.worker_rx.try_recv().unwrap();
@@ -1915,6 +2078,7 @@ type = "primary"
             let registry = Registry::new();
             let router = Router::new();
             let cfg = cfg();
+            let events = EventHub::new(&cfg);
             let (p1, _p1_rx) = instance("prod", "koudu", AgentType::Primary, 4);
             let (p2, _p2_rx) = instance("prod", "koudu-2", AgentType::Primary, 4);
             let (wk, mut worker_rx) = instance("prod", "worker-1", AgentType::Worker, 4);
@@ -1926,6 +2090,7 @@ type = "primary"
             match router.delegate(
                 &cfg,
                 &registry,
+                &events,
                 "prod",
                 "koudu",
                 &AgentType::Primary,
@@ -1947,12 +2112,13 @@ type = "primary"
                     gate.wait();
                     // p2 dies while its delegate call is in flight.
                     let mut next = || 99;
-                    router.fail_instance(&registry, hp2, &mut next);
+                    router.fail_instance(&registry, &events, hp2, &mut next);
                 });
                 gate.wait();
                 let _ = router.delegate(
                     &cfg,
                     &registry,
+                    &events,
                     "prod",
                     "koudu-2",
                     &AgentType::Primary,
@@ -1994,6 +2160,7 @@ type = "primary"
         assert_eq!(
             w.router.complete(
                 &w.registry,
+                &w.events,
                 w.h_worker,
                 result_of("d-1", tok, "late"),
                 1024,
@@ -2013,7 +2180,9 @@ type = "primary"
         // The stalled initiator is then failed (disconnect path): capacity
         // is released exactly once and the serving side is told to cancel.
         let mut next = || 3;
-        let frames = w.router.fail_instance(&w.registry, w.h_primary, &mut next);
+        let frames = w
+            .router
+            .fail_instance(&w.registry, &w.events, w.h_primary, &mut next);
         assert_eq!(frames.len(), 1);
         assert!(frames[0].1.contains("cp/cancel"));
         assert_eq!(w.router.inflight_count(), 0);
@@ -2069,6 +2238,7 @@ type = "primary"
         let out = w.router.delegate(
             &w.cfg,
             &w.registry,
+            &w.events,
             "prod",
             "worker-1",
             &AgentType::Worker,
@@ -2107,7 +2277,8 @@ type = "primary"
         };
         // h_primary is a valid handle but NOT the serving instance.
         assert_eq!(
-            w.router.complete(&w.registry, w.h_primary, result, 1024, 2),
+            w.router
+                .complete(&w.registry, &w.events, w.h_primary, result, 1024, 2),
             CompleteOutcome::Dropped
         );
         assert_eq!(w.router.inflight_count(), 1);
@@ -2126,7 +2297,8 @@ type = "primary"
             error: None,
         };
         assert_eq!(
-            w.router.complete(&w.registry, w.h_worker, result, 1024, 2),
+            w.router
+                .complete(&w.registry, &w.events, w.h_worker, result, 1024, 2),
             CompleteOutcome::Dropped
         );
     }
@@ -2148,7 +2320,8 @@ type = "primary"
         };
         let cap = 96usize;
         assert_eq!(
-            w.router.complete(&w.registry, w.h_worker, result, cap, 2),
+            w.router
+                .complete(&w.registry, &w.events, w.h_worker, result, cap, 2),
             CompleteOutcome::Delivered { committed: true }
         );
         let frame = w.primary_rx.try_recv().unwrap();
@@ -2176,7 +2349,8 @@ type = "primary"
             error: None,
         };
         assert_eq!(
-            w.router.complete(&w.registry, w.h_worker, result2, 8, 3),
+            w.router
+                .complete(&w.registry, &w.events, w.h_worker, result2, 8, 3),
             CompleteOutcome::Delivered { committed: true }
         );
         let frame2 = w.primary_rx.try_recv().unwrap();
@@ -2200,11 +2374,14 @@ type = "primary"
         };
         assert!(w
             .router
-            .sweep_deadlines(&w.registry, Utc::now(), &mut next)
+            .sweep_deadlines(&w.registry, &w.events, Utc::now(), &mut next)
             .is_empty());
-        let frames =
-            w.router
-                .sweep_deadlines(&w.registry, Utc::now() + Duration::seconds(120), &mut next);
+        let frames = w.router.sweep_deadlines(
+            &w.registry,
+            &w.events,
+            Utc::now() + Duration::seconds(120),
+            &mut next,
+        );
         assert_eq!(frames.len(), 2);
         assert_eq!(w.router.inflight_count(), 0);
         assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 0);
@@ -2237,7 +2414,9 @@ type = "primary"
             id += 1;
             id
         };
-        let frames = w.router.fail_instance(&w.registry, w.h_worker, &mut next);
+        let frames = w
+            .router
+            .fail_instance(&w.registry, &w.events, w.h_worker, &mut next);
         assert_eq!(frames.len(), 1);
         let (inst, frame) = &frames[0];
         assert_eq!(inst.handle, w.h_primary);
@@ -2262,7 +2441,9 @@ type = "primary"
             id += 1;
             id
         };
-        let frames = w.router.fail_instance(&w.registry, w.h_primary, &mut next);
+        let frames = w
+            .router
+            .fail_instance(&w.registry, &w.events, w.h_primary, &mut next);
         assert_eq!(frames.len(), 1);
         let (inst, frame) = &frames[0];
         assert_eq!(inst.handle, w.h_worker);
@@ -2286,13 +2467,13 @@ type = "primary"
         };
         let err = w
             .router
-            .cancel(&w.registry, w.h_worker, &params, 5)
+            .cancel(&w.registry, &w.events, w.h_worker, &params, 5)
             .unwrap_err();
         assert_eq!(err.code, codes::POLICY_DENIED);
         assert_eq!(w.router.inflight_count(), 1);
         let fwd = w
             .router
-            .cancel(&w.registry, w.h_primary, &params, 6)
+            .cancel(&w.registry, &w.events, w.h_primary, &params, 6)
             .unwrap();
         let (inst, frame) = fwd.unwrap();
         assert_eq!(inst.handle, w.h_worker);
@@ -2327,6 +2508,7 @@ allow_worker_initiation = true
         let root = accept(w.router.delegate(
             &cfg,
             &w.registry,
+            &w.events,
             "prod",
             "koudu",
             &AgentType::Primary,
@@ -2348,6 +2530,7 @@ allow_worker_initiation = true
         match w.router.delegate(
             &cfg,
             &w.registry,
+            &w.events,
             "prod",
             "worker-2",
             &AgentType::Worker,
@@ -2367,6 +2550,7 @@ allow_worker_initiation = true
         let child_ack = accept(w.router.delegate(
             &cfg,
             &w.registry,
+            &w.events,
             "prod",
             "worker-1",
             &AgentType::Worker,
@@ -2386,6 +2570,7 @@ allow_worker_initiation = true
         match w.router.delegate(
             &cfg,
             &w.registry,
+            &w.events,
             "prod",
             "worker-2",
             &AgentType::Worker,
@@ -2462,14 +2647,24 @@ allow_worker_initiation = true
         params: DelegateParams,
         rpc: u64,
     ) -> DelegateOutcome {
-        w.router
-            .delegate(cfg, &w.registry, "prod", name, ty, handle, params, rpc)
+        w.router.delegate(
+            cfg,
+            &w.registry,
+            &w.events,
+            "prod",
+            name,
+            ty,
+            handle,
+            params,
+            rpc,
+        )
     }
 
     fn cancel_admission(w: &World, delegation_id: &str, admission: u64, rpc: u64) {
         w.router
             .cancel(
                 &w.registry,
+                &w.events,
                 w.h_primary,
                 &CancelParams {
                     delegation_id: delegation_id.into(),
@@ -2610,9 +2805,12 @@ allow_worker_initiation = true
             id += 1;
             id
         };
-        let swept =
-            w.router
-                .sweep_deadlines(&w.registry, Utc::now() + Duration::seconds(60), &mut next);
+        let swept = w.router.sweep_deadlines(
+            &w.registry,
+            &w.events,
+            Utc::now() + Duration::seconds(60),
+            &mut next,
+        );
         assert!(!swept.is_empty(), "A expired and was swept");
         assert_eq!(w.router.inflight_count(), 0);
         assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 0);
@@ -2861,6 +3059,7 @@ allow_worker_initiation = true
                 assert_eq!(
                     w.router.complete(
                         &w.registry,
+                        &w.events,
                         w.h_primary,
                         result_of("d-1", tok, "spoofed"),
                         1024,
@@ -2878,6 +3077,7 @@ allow_worker_initiation = true
             assert_eq!(
                 w.router.complete(
                     &w.registry,
+                    &w.events,
                     w.h_worker,
                     result_of("d-1", tok, "genuine"),
                     1024,
@@ -2896,6 +3096,7 @@ allow_worker_initiation = true
                 assert_eq!(
                     w.router.complete(
                         &w.registry,
+                        &w.events,
                         w.h_primary,
                         result_of("d-1", tok, "spoofed"),
                         1024,
@@ -2929,6 +3130,7 @@ allow_worker_initiation = true
                     // Registered, but not the serving instance.
                     w.router.complete(
                         &w.registry,
+                        &w.events,
                         w.h_primary,
                         result_of("d-1", tok, "spoofed"),
                         1024,
@@ -2938,6 +3140,7 @@ allow_worker_initiation = true
                 gate.wait();
                 let genuine = w.router.complete(
                     &w.registry,
+                    &w.events,
                     w.h_worker,
                     result_of("d-1", tok, "genuine"),
                     1024,
@@ -2974,12 +3177,14 @@ allow_worker_initiation = true
                 let spoof = s.spawn(|| {
                     gate.wait();
                     // Registered, but not the initiator.
-                    w.router.cancel(&w.registry, w.h_worker, &params, 1).is_ok()
+                    w.router
+                        .cancel(&w.registry, &w.events, w.h_worker, &params, 1)
+                        .is_ok()
                 });
                 gate.wait();
                 let genuine = w
                     .router
-                    .cancel(&w.registry, w.h_primary, &params, 2)
+                    .cancel(&w.registry, &w.events, w.h_primary, &params, 2)
                     .is_ok();
                 (spoof.join().unwrap(), genuine)
             });
@@ -3010,7 +3215,7 @@ allow_worker_initiation = true
         };
         assert!(w
             .router
-            .cancel(&w.registry, w.h_worker, &params, 1)
+            .cancel(&w.registry, &w.events, w.h_worker, &params, 1)
             .is_err());
         assert_eq!(w.router.inflight_count(), 1);
         assert_eq!(
@@ -3021,7 +3226,7 @@ allow_worker_initiation = true
         // The genuine initiator can still cancel.
         let fwd = w
             .router
-            .cancel(&w.registry, w.h_primary, &params, 2)
+            .cancel(&w.registry, &w.events, w.h_primary, &params, 2)
             .unwrap()
             .unwrap();
         assert_eq!(fwd.0.handle, w.h_worker);
@@ -3052,11 +3257,11 @@ allow_worker_initiation = true
         // Both probes come from the worker: it initiated neither.
         let e_unknown = w
             .router
-            .cancel(&w.registry, w.h_worker, &unknown, 1)
+            .cancel(&w.registry, &w.events, w.h_worker, &unknown, 1)
             .unwrap_err();
         let e_foreign = w
             .router
-            .cancel(&w.registry, w.h_worker, &foreign, 2)
+            .cancel(&w.registry, &w.events, w.h_worker, &foreign, 2)
             .unwrap_err();
         // This one comes from the genuine initiator, naming a token that is
         // not the live admission's.
@@ -3067,7 +3272,7 @@ allow_worker_initiation = true
         };
         let e_stale = w
             .router
-            .cancel(&w.registry, w.h_primary, &stale, 3)
+            .cancel(&w.registry, &w.events, w.h_primary, &stale, 3)
             .unwrap_err();
         let as_json = |e: &ErrorObject| serde_json::to_string(e).unwrap();
         assert_eq!(
@@ -3096,6 +3301,7 @@ allow_worker_initiation = true
         let registry = Registry::new();
         let router = Router::new();
         let cfg = cfg();
+        let events = EventHub::new(&cfg);
         let (p_prod, mut prod_init_rx) = instance("prod", "koudu", AgentType::Primary, 4);
         let (w_prod, mut prod_rx) = instance("prod", "worker-1", AgentType::Worker, 2);
         let (p_dev, mut dev_init_rx) = instance("dev", "koudu", AgentType::Primary, 4);
@@ -3109,6 +3315,7 @@ allow_worker_initiation = true
             match router.delegate(
                 &cfg,
                 &registry,
+                &events,
                 ns,
                 "koudu",
                 &AgentType::Primary,
@@ -3145,11 +3352,11 @@ allow_worker_initiation = true
             reason: "probe".into(),
         };
         let e_cross = router
-            .cancel(&registry, hw_dev, &probe, 10)
+            .cancel(&registry, &events, hw_dev, &probe, 10)
             .unwrap_err()
             .message;
         let e_nowhere = router
-            .cancel(&registry, hw_dev, &nowhere, 11)
+            .cancel(&registry, &events, hw_dev, &nowhere, 11)
             .unwrap_err()
             .message;
         assert_eq!(e_cross, e_nowhere);
@@ -3159,6 +3366,7 @@ allow_worker_initiation = true
         assert_eq!(
             router.complete(
                 &registry,
+                &events,
                 hw_dev,
                 result_of("d-1", token(&router, "dev", "d-1"), "dev-done"),
                 1024,
@@ -3166,6 +3374,8 @@ allow_worker_initiation = true
             ),
             CompleteOutcome::Delivered { committed: true }
         );
+        // Landing on `dev_init_rx` is what "routed to hp_dev" means now that
+        // delivery happens inside `complete`.
         let frame = dev_init_rx.try_recv().unwrap();
         assert!(frame.contains("dev-done"));
         assert!(
@@ -3180,6 +3390,7 @@ allow_worker_initiation = true
         assert_eq!(
             router.complete(
                 &registry,
+                &events,
                 hw_prod,
                 result_of("d-1", token(&router, "prod", "d-1"), "prod-done"),
                 1024,
@@ -3208,6 +3419,7 @@ allow_worker_initiation = true
 "#,
         )
         .unwrap();
+        let events = EventHub::new(&cfg);
         let registry = Registry::new();
         let router = Router::new();
         let (p_prod, _rx1) = instance("prod", "koudu", AgentType::Primary, 4);
@@ -3226,6 +3438,7 @@ allow_worker_initiation = true
         let root = accept(router.delegate(
             &cfg,
             &registry,
+            &events,
             "prod",
             "koudu",
             &AgentType::Primary,
@@ -3242,6 +3455,7 @@ allow_worker_initiation = true
         match router.delegate(
             &cfg,
             &registry,
+            &events,
             "dev",
             "worker-1",
             &AgentType::Worker,
@@ -3261,6 +3475,7 @@ allow_worker_initiation = true
             router.delegate(
                 &cfg,
                 &registry,
+                &events,
                 "prod",
                 "worker-1",
                 &AgentType::Worker,
@@ -3308,7 +3523,7 @@ allow_worker_initiation = true
                     reason: "changed my mind".into(),
                 };
                 w.router
-                    .cancel(&w.registry, w.h_primary, &params, 90)
+                    .cancel(&w.registry, &w.events, w.h_primary, &params, 90)
                     .expect("the initiator may cancel")
                     .map(|(_, frame)| frame)
                     .into_iter()
@@ -3322,6 +3537,7 @@ allow_worker_initiation = true
                 };
                 let frames = w.router.sweep_deadlines(
                     &w.registry,
+                    &w.events,
                     Utc::now() + Duration::seconds(3600),
                     &mut next,
                 );
@@ -3413,6 +3629,7 @@ allow_worker_initiation = true
             assert_eq!(
                 w.router.complete(
                     &w.registry,
+                    &w.events,
                     w.h_worker,
                     result_of("d-1", b.generation, "genuine"),
                     1024,
@@ -3554,6 +3771,7 @@ allow_worker_initiation = true
         assert_eq!(
             w.router.complete(
                 &w.registry,
+                &w.events,
                 w.h_worker,
                 result_of("d-1", a.generation, "late"),
                 1024,
@@ -3603,6 +3821,7 @@ allow_worker_initiation = true
         match w.router.delegate(
             &w.cfg,
             &w.registry,
+            &w.events,
             "dev",
             "koudu",
             &AgentType::Primary,
@@ -3619,5 +3838,315 @@ allow_worker_initiation = true
             }
         }
         dev_rx.try_recv().unwrap();
+    }
+
+    // --- observer / lobby event emission (Phase 1) ---
+
+    #[test]
+    fn delegate_emits_requested_event_with_bounded_prompt_excerpt() {
+        let mut w = world_with_cfg(
+            toml::from_str(
+                r#"
+max_event_excerpt_bytes = 64
+
+[[agents]]
+key = "kp"
+namespace = "prod"
+name = "koudu"
+type = "primary"
+"#,
+            )
+            .unwrap(),
+        );
+        let mut lobby = observe(&w, "prod");
+        let mut p = delegate_params("d-1", "worker-1", 60);
+        p.prompt = "私はとても長いプロンプトです".repeat(20);
+        let prompt_len = p.prompt.len();
+        assert!(matches!(do_delegate(&w, p), DelegateOutcome::Accepted(_)));
+
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0]["event"], "delegation_requested");
+        assert_eq!(ev[0]["seq"], 1);
+        assert_eq!(ev[0]["namespace"], "prod");
+        assert_eq!(ev[0]["delegation_id"], "d-1");
+        assert_eq!(ev[0]["from"], "prod/koudu");
+        assert_eq!(ev[0]["to"], "prod/worker-1");
+        assert_eq!(ev[0]["chain"], serde_json::json!(["prod/koudu"]));
+        let excerpt = ev[0]["prompt_excerpt"].as_str().unwrap();
+        assert!(excerpt.len() <= 64, "excerpt must respect the cap");
+        assert!(excerpt.contains("truncated by control plane"));
+        assert!(prompt_len > 64);
+
+        // The worker still received the FULL prompt: the lobby is a mirror,
+        // not a filter on the delegation path.
+        let fwd: serde_json::Value =
+            serde_json::from_str(&w.worker_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(fwd["params"]["prompt"].as_str().unwrap().len(), prompt_len);
+    }
+
+    #[test]
+    fn result_emits_completed_event() {
+        let w = world();
+        let mut lobby = observe(&w, "prod");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        let result = DelegateResultParams {
+            delegation_id: "d-1".into(),
+            admission: token(&w.router, "prod", "d-1"),
+            status: DelegationStatus::Completed,
+            result: Some("all done".into()),
+            error: None,
+        };
+        assert_eq!(
+            w.router
+                .complete(&w.registry, &w.events, w.h_worker, result, 1024, 2),
+            CompleteOutcome::Delivered { committed: true }
+        );
+
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 2, "requested + completed");
+        assert_eq!(ev[1]["event"], "delegation_completed");
+        assert_eq!(ev[1]["seq"], 2, "per-namespace seq stays dense");
+        assert_eq!(ev[1]["status"], "completed");
+        assert_eq!(ev[1]["from"], "prod/koudu");
+        assert_eq!(ev[1]["to"], "prod/worker-1");
+        assert_eq!(ev[1]["result_excerpt"], "all done");
+        assert!(ev[1].get("error").is_none());
+    }
+
+    #[test]
+    fn completed_event_emitted_even_when_initiator_is_gone() {
+        let w = world();
+        let mut lobby = observe(&w, "prod");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        w.registry.deregister(w.h_primary);
+        let result = DelegateResultParams {
+            delegation_id: "d-1".into(),
+            admission: token(&w.router, "prod", "d-1"),
+            status: DelegationStatus::Failed,
+            result: None,
+            error: Some("boom".into()),
+        };
+        assert_eq!(
+            w.router
+                .complete(&w.registry, &w.events, w.h_worker, result, 1024, 2),
+            CompleteOutcome::Dropped,
+            "nobody left to receive the result"
+        );
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 2);
+        assert_eq!(ev[1]["event"], "delegation_completed");
+        assert_eq!(ev[1]["status"], "failed");
+        assert_eq!(ev[1]["error"], "boom");
+    }
+
+    #[test]
+    fn cancel_emits_cancelled_event_with_from_and_to() {
+        let w = world();
+        let mut lobby = observe(&w, "prod");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        let params = CancelParams {
+            delegation_id: "d-1".into(),
+            admission: token(&w.router, "prod", "d-1"),
+            reason: "changed my mind".into(),
+        };
+        // A denied cancel emits nothing.
+        assert!(w
+            .router
+            .cancel(&w.registry, &w.events, w.h_worker, &params, 5)
+            .is_err());
+        assert_eq!(events_of(&mut lobby).len(), 1, "only delegation_requested");
+
+        assert!(w
+            .router
+            .cancel(&w.registry, &w.events, w.h_primary, &params, 6)
+            .is_ok());
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0]["event"], "delegation_cancelled");
+        assert_eq!(ev[0]["seq"], 2);
+        assert_eq!(ev[0]["from"], "prod/koudu");
+        assert_eq!(ev[0]["to"], "prod/worker-1");
+        assert_eq!(ev[0]["by"], "prod/koudu");
+        assert_eq!(ev[0]["reason"], "changed my mind");
+    }
+
+    #[test]
+    fn deadline_sweep_emits_timeout_completion() {
+        let mut w = world();
+        let mut lobby = observe(&w, "prod");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        w.worker_rx.try_recv().unwrap();
+        let mut id = 100u64;
+        let mut next = || {
+            id += 1;
+            id
+        };
+        w.router.sweep_deadlines(
+            &w.registry,
+            &w.events,
+            Utc::now() + Duration::seconds(120),
+            &mut next,
+        );
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 2);
+        assert_eq!(ev[1]["event"], "delegation_completed");
+        assert_eq!(ev[1]["status"], "timeout");
+        assert_eq!(ev[1]["error"], "deadline exceeded");
+    }
+
+    #[test]
+    fn target_disconnect_emits_target_disconnected_completion() {
+        let w = world();
+        let mut lobby = observe(&w, "prod");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        w.registry.deregister(w.h_worker);
+        let mut id = 0u64;
+        let mut next = || {
+            id += 1;
+            id
+        };
+        w.router
+            .fail_instance(&w.registry, &w.events, w.h_worker, &mut next);
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 2);
+        assert_eq!(ev[1]["event"], "delegation_completed");
+        assert_eq!(ev[1]["status"], "target_disconnected");
+        assert_eq!(ev[1]["error"], "prod/worker-1 disconnected");
+    }
+
+    #[test]
+    fn initiator_disconnect_emits_control_plane_cancellation() {
+        let w = world();
+        let mut lobby = observe(&w, "prod");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        w.registry.deregister(w.h_primary);
+        let mut id = 0u64;
+        let mut next = || {
+            id += 1;
+            id
+        };
+        w.router
+            .fail_instance(&w.registry, &w.events, w.h_primary, &mut next);
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 2);
+        assert_eq!(ev[1]["event"], "delegation_cancelled");
+        assert_eq!(ev[1]["by"], "control-plane");
+        assert_eq!(ev[1]["from"], "prod/koudu");
+        assert_eq!(ev[1]["to"], "prod/worker-1");
+        assert!(ev[1]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("initiator prod/koudu disconnected"));
+    }
+
+    #[test]
+    fn metadata_only_namespace_omits_prompt_and_result_excerpts() {
+        let w = world_with_cfg(
+            toml::from_str(
+                r#"
+[[agents]]
+key = "kp"
+namespace = "prod"
+name = "koudu"
+type = "primary"
+
+[namespaces.prod]
+metadata_only = true
+"#,
+            )
+            .unwrap(),
+        );
+        let mut lobby = observe(&w, "prod");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        let result = DelegateResultParams {
+            delegation_id: "d-1".into(),
+            admission: token(&w.router, "prod", "d-1"),
+            status: DelegationStatus::Completed,
+            result: Some("secret output".into()),
+            error: Some("secret error".into()),
+        };
+        assert_eq!(
+            w.router
+                .complete(&w.registry, &w.events, w.h_worker, result, 1024, 2),
+            CompleteOutcome::Delivered { committed: true }
+        );
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 2);
+        assert!(ev[0].get("prompt_excerpt").is_none());
+        assert_eq!(ev[0]["to"], "prod/worker-1", "metadata still present");
+        assert!(ev[1].get("result_excerpt").is_none());
+        assert!(
+            ev[1].get("error").is_none(),
+            "runtime-reported error bodies are payload too"
+        );
+        assert_eq!(ev[1]["status"], "completed");
+    }
+
+    #[test]
+    fn observer_in_another_namespace_sees_nothing() {
+        let w = world();
+        let mut other = observe(&w, "dev");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        assert!(events_of(&mut other).is_empty());
+    }
+
+    #[test]
+    fn saturated_observer_queue_never_affects_the_delegation() {
+        let mut w = world();
+        let lobby_rx = observe(&w, "prod");
+        let lobby = w
+            .registry
+            .observers("prod")
+            .into_iter()
+            .next()
+            .expect("observer registered");
+        for _ in 0..crate::registry::OUTBOUND_QUEUE {
+            lobby.tx.try_send("filler".into()).unwrap();
+        }
+        // Delegation must still be accepted, forwarded, and completed.
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        assert!(w.worker_rx.try_recv().unwrap().contains("cp/delegate"));
+        let result = DelegateResultParams {
+            delegation_id: "d-1".into(),
+            admission: token(&w.router, "prod", "d-1"),
+            status: DelegationStatus::Completed,
+            result: Some("done".into()),
+            error: None,
+        };
+        assert_eq!(
+            w.router
+                .complete(&w.registry, &w.events, w.h_worker, result, 1024, 2),
+            CompleteOutcome::Delivered { committed: true }
+        );
+        assert_eq!(w.router.inflight_count(), 0);
+        drop(lobby_rx);
     }
 }

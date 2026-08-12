@@ -178,6 +178,7 @@ mod tests {
         let relaxed = NamespacePolicy {
             max_depth: 2,
             allow_worker_initiation: true,
+            metadata_only: false,
         };
         assert!(check(&input, &relaxed).is_ok());
     }
@@ -196,6 +197,7 @@ mod tests {
         let relaxed = NamespacePolicy {
             max_depth: 99,
             allow_worker_initiation: true,
+            metadata_only: false,
         };
         assert_eq!(
             check(&input, &relaxed),
@@ -218,6 +220,7 @@ mod tests {
         let relaxed = NamespacePolicy {
             max_depth: 2,
             allow_worker_initiation: true,
+            metadata_only: false,
         };
         assert!(check(&input, &relaxed).is_ok());
     }
@@ -229,6 +232,7 @@ mod tests {
         let relaxed = NamespacePolicy {
             max_depth: 5,
             allow_worker_initiation: true,
+            metadata_only: false,
         };
         let input = base(now, &chain);
         assert!(matches!(

@@ -218,6 +218,12 @@ pub struct NamespacePolicy {
     /// Whether workers may initiate delegations (depth still applies).
     #[serde(default)]
     pub allow_worker_initiation: bool,
+    /// Withhold prompt/result bodies from `cp/event`: observers still see
+    /// every event, with attribution, timing, and status, but no payload
+    /// excerpts. Defaults to false (excerpts included, bounded by
+    /// `max_event_excerpt_bytes`) — the pre-existing behavior.
+    #[serde(default)]
+    pub metadata_only: bool,
 }
 
 fn default_depth() -> u32 {
@@ -229,6 +235,7 @@ impl Default for NamespacePolicy {
         Self {
             max_depth: default_depth(),
             allow_worker_initiation: false,
+            metadata_only: false,
         }
     }
 }
@@ -426,6 +433,31 @@ allow_worker_initiation = false
         let d = cfg.policy_for("dev");
         assert_eq!(d.max_depth, 1);
         assert!(!d.allow_worker_initiation);
+    }
+
+    #[test]
+    fn metadata_only_defaults_off_and_is_per_namespace() {
+        let cfg: CpConfig = toml::from_str(base_toml()).unwrap();
+        assert!(
+            !cfg.policy_for("prod").metadata_only,
+            "backward-compatible default: excerpts are included"
+        );
+        assert!(!cfg.policy_for("unlisted").metadata_only);
+
+        let cfg: CpConfig = toml::from_str(
+            r#"
+[namespaces.prod]
+metadata_only = true
+
+[namespaces.dev]
+max_depth = 3
+"#,
+        )
+        .unwrap();
+        assert!(cfg.policy_for("prod").metadata_only);
+        // Unrelated knobs keep their defaults when only metadata_only is set.
+        assert_eq!(cfg.policy_for("prod").max_depth, 1);
+        assert!(!cfg.policy_for("dev").metadata_only);
     }
 
     #[test]

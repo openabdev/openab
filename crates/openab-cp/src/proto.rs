@@ -470,12 +470,14 @@ impl JsonRpcNotification {
 }
 
 /// Envelope of one `cp/event` notification.
-///
-/// `seq` is a CP-process-monotonic sequence number: observers detect gaps
-/// (dropped frames on a saturated queue, CP restart) by discontinuity and
-/// resynchronize via `cp/list_agents`. It is not durable across CP restarts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventParams {
+    /// **Per-namespace** monotonic sequence number: an observer sees a dense
+    /// `1, 2, 3, …` stream for its own namespace, so a discontinuity means
+    /// frames were dropped (saturated queue) or the CP restarted, and the
+    /// observer resynchronizes via `cp/list_agents`. A process-global counter
+    /// would show false gaps caused purely by activity in other namespaces.
+    /// Not durable across CP restarts.
     pub seq: u64,
     pub ts: chrono::DateTime<chrono::Utc>,
     /// Namespace this event is scoped to (matches the observer's own).
@@ -484,9 +486,30 @@ pub struct EventParams {
     pub event: CpEvent,
 }
 
+/// Why an instance left the registry.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeregisterReason {
+    /// The WebSocket closed (graceful close, transport error, or a peer that
+    /// could not drain its outbound queue).
+    Disconnect,
+    /// Heartbeats stopped arriving and the lease window elapsed.
+    LeaseExpired,
+}
+
+impl std::fmt::Display for DeregisterReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeregisterReason::Disconnect => write!(f, "disconnect"),
+            DeregisterReason::LeaseExpired => write!(f, "lease_expired"),
+        }
+    }
+}
+
 /// Lobby-visible control-plane events. Prompt/result bodies are carried as
 /// bounded excerpts (`max_event_excerpt_bytes`): the lobby is an audit
-/// surface, not a second delivery path for full payloads.
+/// surface, not a second delivery path for full payloads. Namespaces marked
+/// `metadata_only` omit those excerpts entirely.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum CpEvent {
@@ -501,14 +524,15 @@ pub enum CpEvent {
     AgentDeregistered {
         agent: String,
         instance_id: String,
-        /// `"disconnect"` or `"lease_expired"`.
-        reason: String,
+        reason: DeregisterReason,
     },
     DelegationRequested {
         delegation_id: String,
         from: String,
         to: String,
-        prompt_excerpt: String,
+        /// Absent when the namespace is `metadata_only`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_excerpt: Option<String>,
         deadline: chrono::DateTime<chrono::Utc>,
         chain: Vec<String>,
     },
@@ -524,6 +548,12 @@ pub enum CpEvent {
     },
     DelegationCancelled {
         delegation_id: String,
+        /// Initiator of the cancelled delegation (`namespace/name`) — an
+        /// observer that missed `delegation_requested` still gets full
+        /// attribution.
+        from: String,
+        /// Serving instance of the cancelled delegation (`namespace/name`).
+        to: String,
         /// Who cancelled: the initiator's logical id, or `"control-plane"`
         /// for deadline/disconnect synthesis.
         by: String,
@@ -882,7 +912,7 @@ mod tests {
                 delegation_id: "d-1".into(),
                 from: "prod/koudu".into(),
                 to: "prod/worker-1".into(),
-                prompt_excerpt: "do it".into(),
+                prompt_excerpt: Some("do it".into()),
                 deadline: chrono::Utc::now(),
                 chain: vec!["prod/koudu".into()],
             },
@@ -901,10 +931,64 @@ mod tests {
         let ev = CpEvent::AgentDeregistered {
             agent: "prod/w1".into(),
             instance_id: "i-1".into(),
-            reason: "lease_expired".into(),
+            reason: DeregisterReason::LeaseExpired,
         };
         let v = serde_json::to_value(&ev).unwrap();
         assert_eq!(v["event"], "agent_deregistered");
+        let back: CpEvent = serde_json::from_value(v).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn deregister_reason_serde_roundtrip() {
+        for (reason, wire) in [
+            (DeregisterReason::Disconnect, "disconnect"),
+            (DeregisterReason::LeaseExpired, "lease_expired"),
+        ] {
+            let v = serde_json::to_value(reason).unwrap();
+            assert_eq!(v, serde_json::json!(wire));
+            assert_eq!(
+                serde_json::from_value::<DeregisterReason>(v).unwrap(),
+                reason
+            );
+            assert_eq!(reason.to_string(), wire);
+        }
+    }
+
+    #[test]
+    fn delegation_cancelled_carries_from_and_to() {
+        let ev = CpEvent::DelegationCancelled {
+            delegation_id: "d-1".into(),
+            from: "prod/koudu".into(),
+            to: "prod/worker-1".into(),
+            by: "control-plane".into(),
+            reason: "deadline exceeded".into(),
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["event"], "delegation_cancelled");
+        assert_eq!(v["from"], "prod/koudu");
+        assert_eq!(v["to"], "prod/worker-1");
+        assert_eq!(v["by"], "control-plane");
+        let back: CpEvent = serde_json::from_value(v).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn absent_prompt_excerpt_is_omitted_from_the_wire() {
+        let ev = CpEvent::DelegationRequested {
+            delegation_id: "d-1".into(),
+            from: "prod/koudu".into(),
+            to: "prod/worker-1".into(),
+            prompt_excerpt: None,
+            deadline: chrono::Utc::now(),
+            chain: vec!["prod/koudu".into()],
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert!(
+            v.get("prompt_excerpt").is_none(),
+            "metadata-only events carry no excerpt key"
+        );
+        // ... and the omission deserializes back to None.
         let back: CpEvent = serde_json::from_value(v).unwrap();
         assert_eq!(back, ev);
     }

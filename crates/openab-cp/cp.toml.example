@@ -101,7 +101,12 @@ name = "lobby-app"
 type = "observer"
 
 # Per-namespace policy. Absent namespaces use the conservative defaults:
-# max_depth = 1, allow_worker_initiation = false.
+# max_depth = 1, allow_worker_initiation = false, metadata_only = false.
 [namespaces.prod]
 max_depth = 1
 allow_worker_initiation = false
+# Withhold prompt/result bodies from cp/event: observers still see every
+# event with full attribution (from/to/chain), timing, and status, but no
+# payload excerpts. Default false (excerpts included, bounded by
+# max_event_excerpt_bytes).
+# metadata_only = true
