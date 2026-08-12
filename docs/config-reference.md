@@ -765,6 +765,76 @@ permissions scoped to the bucket.
 
 ---
 
+## `[control_plane]`
+
+Enrol this runtime with an [Agent Control Plane](adr/agent-control-plane.md) so
+it can delegate to, or serve delegations from, other OAB agents.
+
+Presence of the section is the opt-in — there is no cargo feature and no
+env-var switch. Absent section = no outbound connection, no delegation serving,
+and no behaviour change. Unknown keys are a hard startup failure.
+
+```toml
+[control_plane]
+url = "wss://cp.example.internal/cp"   # the CP mounts the socket at /cp
+auth_key = "${OPENAB_CP_KEY}"          # per-agent credential, never shared
+namespace = "prod"
+name = "koudu"
+type = "worker"                        # "primary" | "worker"
+max_delegated_sessions = 2             # local concurrency budget
+
+[control_plane.labels]                 # optional selector labels
+backend = "kiro"
+tier = "batch"
+```
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `url` | ✅ | — | CP WebSocket endpoint (`ws://` or `wss://`), path `/cp` |
+| `auth_key` | ✅ | — | Bearer key sent on the upgrade request. Use `${ENV}` or `[secrets.refs]` — never a literal |
+| `namespace` | ✅ | — | Asserted namespace; the CP verifies it against the key's claims |
+| `name` | ✅ | — | Asserted logical agent name; likewise verified |
+| `type` | ✅ | — | `primary` (initiates delegations) or `worker` (serves them) |
+| `labels` | — | `{}` | Selector labels other agents can target by |
+| `max_delegated_sessions` | — | `1` | Concurrency advertised at registration; the CP may clamp it, and the runtime enforces the lower of the two |
+
+`namespace`, `name`, and `type` are **assertions the CP verifies**, not
+authorization inputs: each auth key is bound to immutable claims in CP config,
+and a mismatch is rejected at registration. They live in config so a
+misconfigured runtime fails loudly instead of being silently re-identified.
+`observer` is not accepted here — it is a read-only lobby role, not a runtime
+one.
+
+### Headless (no chat adapter)
+
+A config with `[agent]` and `[control_plane] type = "worker"` and **no** chat
+adapter is a valid deployment: the runtime's work arrives as delegations rather
+than chat messages.
+
+| Config | Result |
+|--------|--------|
+| `[control_plane] type = "worker"`, no adapter | Worker mode — pool + control-plane client, no chat platform |
+| `[control_plane] type = "primary"`, no adapter | Startup error — a primary's prompts come from a chat platform |
+| `[mcp]` only, no adapter | Facade-only mode (unchanged) |
+| `[mcp]` + worker, no adapter | Both — the facade listener and the control-plane client |
+
+### Operational notes
+
+- **The key never reaches the agent.** Agent subprocesses start from
+  `env_clear()` with a fixed baseline plus explicit `[agent].env` keys;
+  `auth_key` is in neither, and it is never logged.
+- **Reconnects are automatic** with 1/2/4/8/16/30s backoff. One instance id is
+  generated per process and reused across reconnects, so the CP can tell a
+  reconnecting replica from a new one.
+- **Per-turn ceiling.** A delegation is bounded by the nearer of its CP
+  deadline and `[pool].prompt_hard_timeout_secs`; exceeding the local one is
+  reported to the initiator as `timeout`.
+- **One session per delegation.** Each delegation runs in a fresh ACP session
+  that is discarded when it ends, so delegations never see each other's
+  conversation and none of them counts against the pool afterwards.
+
+---
+
 ## `[cron]`
 
 Everything cron-related lives under `[cron]`.

@@ -447,6 +447,26 @@ pub trait ChatAdapter: Send + Sync + 'static {
 
 // --- AdapterRouter ---
 
+/// Outcome of one ACP turn driven by [`AdapterRouter::stream_prompt_blocks`].
+///
+/// Platform callers discard this — for them a turn either delivered (`Ok`) or
+/// did not (`Err`), which is what they always consumed. It exists for callers
+/// that are not a chat platform and therefore cannot read the reply back off a
+/// channel: the control-plane executor has to turn one turn into a
+/// `cp/delegate_result` status, and needs the text plus the two failure signals
+/// the rendered message merely *hints* at.
+#[derive(Debug, Clone, Default)]
+pub struct PromptExecution {
+    /// The final content as delivered (post table-conversion, pre-chunking).
+    pub final_text: String,
+    /// The agent/broker-level error that ended the turn, if any — the raw
+    /// message, without the `⚠️` presentation prefix.
+    pub terminal_error: Option<String>,
+    /// The turn produced no content and reported zero output tokens: a
+    /// provider/model/auth failure masquerading as an empty success.
+    pub silent_failure: bool,
+}
+
 /// Shared logic for routing messages to ACP agents, managing sessions,
 /// streaming edits, and controlling reactions. Platform-independent.
 pub struct AdapterRouter {
@@ -682,11 +702,20 @@ impl AdapterRouter {
             None,
         )
         .await
+        // This path delivers to a chat platform: the turn summary has no
+        // consumer here, only its success/failure.
+        .map(|_| ())
     }
 
     /// Drive one ACP turn with the given pre-packed ContentBlocks.
     /// Called by both `handle_message` (per-message mode) and `dispatch::dispatch_batch`
     /// (batched mode).
+    ///
+    /// Returns the [`PromptExecution`] summary of the turn. Platform callers
+    /// ignore it (`.map(|_| ())`) — they only ever cared about `Ok`/`Err` — but
+    /// the control-plane executor has no channel to read the reply back out of,
+    /// so it needs the turn's outcome as a value. `Err` still means exactly what
+    /// it meant before: the user-visible delivery is incomplete.
     #[allow(clippy::too_many_arguments)]
     pub async fn stream_prompt_blocks(
         &self,
@@ -697,7 +726,7 @@ impl AdapterRouter {
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
         recipient: Option<(String, String)>,
-    ) -> Result<()> {
+    ) -> Result<PromptExecution> {
         let adapter = adapter.clone();
         let thread_channel = thread_channel.clone();
         let message_limit = reply_message_limit(&thread_channel.platform, adapter.message_limit());
@@ -1116,6 +1145,14 @@ impl AdapterRouter {
                     // Build final content
                     let final_content =
                         display_for(platform_is_acp, &tool_lines, &text_buf, false, tool_display);
+                    // Captured for `PromptExecution` before the composition
+                    // below consumes `response_error` and rewrites the body:
+                    // a caller that has no channel to read (the control-plane
+                    // executor) needs the *classification*, not the rendered
+                    // "⚠️ …" prefix, to decide Completed vs Failed.
+                    let terminal_error = response_error.clone();
+                    let silent_failure =
+                        final_content.is_empty() && turn_result.is_silent_failure();
                     let final_content = if final_content.is_empty() {
                         if turn_result.is_silent_failure() {
                             warn!(
@@ -1352,7 +1389,11 @@ impl AdapterRouter {
                             "streaming finalization had delivery failures; user view is incomplete"
                         ))
                     } else {
-                        Ok(())
+                        Ok(PromptExecution {
+                            final_text: final_content,
+                            terminal_error,
+                            silent_failure,
+                        })
                     }
                 })
             })

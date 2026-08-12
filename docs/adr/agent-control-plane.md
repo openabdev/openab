@@ -125,7 +125,7 @@ The config section and subsystem are named `control_plane`, not
 
 ```toml
 [control_plane]
-url = "wss://cp.example.internal/acp"
+url = "wss://cp.example.internal/cp"
 auth_key = "${OPENAB_CP_KEY}"          # per-agent credential, never shared
 namespace = "prod"
 name = "koudu"
