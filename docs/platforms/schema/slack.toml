@@ -337,6 +337,6 @@ refs   = ["#1055"]
 [[quirks]]
 date   = "2026-08-11"
 title  = "File objects can arrive with no private URL"
-note   = "slack_file_download_url falls back url_private_download → url_private → empty. An access-limited or tombstoned file object carries neither, and the loop skips it. Audio is classified before that skip so a voice note still yields an [Audio attachment] block carrying SLACK_NO_FILE_URL_NOTE rather than vanishing: a dropped voice note is indistinguishable from one never sent. Non-audio files are still skipped, since there is nothing to fetch and no block to degrade."
+note   = "slack_file_download_url falls back url_private_download → url_private → empty. An access-limited or tombstoned file object carries neither, and the loop skips it. Audio and video are both classified before that skip, so a voice note still yields an [Audio attachment] block and a video a [Video attachment] block, each carrying SLACK_NO_FILE_URL_NOTE rather than vanishing: a dropped voice note or video is indistinguishable from one never sent. Every other file is still skipped, since there is nothing to fetch and no block to degrade."
 kind   = "openab_decision"
 source = "crates/openab-core/src/slack.rs#SLACK_NO_FILE_URL_NOTE"

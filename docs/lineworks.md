@@ -81,9 +81,10 @@ field table.
   boxes, inline bold/code) with automatic plain-text fallback. Long replies
   split at the 10,000-char text cap.
 - **Attachments**: inbound images feed the LLM (vision), audio always emits an
-  `[Audio attachment]` block (a fetchable URL when a filestore is configured,
-  metadata only otherwise) and is transcribed on top when STT is on, text files
-  pass a whitelist; binaries are rejected with a reason the agent can see.
+  `[Audio attachment]` block (a fetchable URL when a filestore successfully
+  stores it, metadata only otherwise) and is transcribed on top when STT is on,
+  text files pass a whitelist; binaries are rejected with a reason the agent can
+  see.
   Video/location/sticker events are ignored.
 - **Cron targeting**: group jobs use the channel UUID (copyable from the
   app); 1:1 jobs can use `channel = "user:<loginId>"` — the send API accepts

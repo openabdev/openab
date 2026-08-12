@@ -77,12 +77,16 @@ Which `url` the agent gets depends on the platform and whether a
 
 **Slack caveat.** Slack forwards a fetchable attachment only when its file JSON
 carries `url_private_download` or `url_private`; an externally-backed or
-access-limited object carries neither. Audio is classified before that check, so
-a voice note still emits its `[Audio attachment]` block, carrying a note that
-Slack gave no download URL and no `url:` line. Non-audio files with neither URL
-are skipped, since there is nothing to fetch and no block worth degrading. The
-guarantee on Slack therefore reads "audio is always emitted for any file that
-appears in `event["files"]`."
+access-limited object carries neither. Audio and video are both classified before
+that skip, so a voice note still emits its `[Audio attachment]` block and a video
+still emits its `[Video attachment]` block, each carrying a note that Slack gave no
+download URL and no `url:` line. Every other file with neither URL is skipped, since
+there is nothing to fetch and no block worth degrading. The guarantee on Slack
+therefore reads "audio is always emitted for any file that appears in
+`event["files"]`." Video is emitted on the same terms except for one case a URL
+introduces: a file Slack labels `image/*` takes the image path whatever its
+extension, so a mislabelled video is reported as a failed image rather than
+described as a video.
 
 Gateway attachments reach Core as bytes (base64 or a colocate path), never as a
 platform URL, so a filestore is the only way to give the agent a fetchable link
@@ -206,9 +210,11 @@ size, so the per-message inline cap is what bounds it in bytes.
 
 Only bytes that reach the prompt are charged against that cap. Images and text
 files under `TEXT_INLINE_LIMIT` are inlined and pay for it; audio, and text above
-that limit when a filestore is configured, are delivered as a URL and pay
-nothing, whatever their source weighs. Gateway video is not a case here at all:
-it is rejected before Core sees it, per [Unsupported Types](#unsupported-types).
+that limit once a filestore has stored them, are delivered as a URL and pay
+nothing, whatever their source weighs. A configured store that then fails yields
+a metadata-only block, which likewise pays nothing. Gateway video is not a case
+here at all: it is rejected before Core sees it, per
+[Unsupported Types](#unsupported-types).
 An attachment a filestore takes is charged against the 256 MiB budget instead,
 and for twice its size, because the upload body is a second buffer alive with the
 source it was copied from.
