@@ -1,14 +1,19 @@
 //! UnifiedGatewayAdapter — routes ChatAdapter calls through in-process gateway
 //! platform adapters based on the ChannelRef.platform field.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use openab_core::adapter::{ChannelRef, ChatAdapter, MessageRef};
-use openab_gateway::schema::{Content, GatewayReply, ReplyChannel};
+use openab_gateway::schema::{Content, GatewayReply, GatewayResponse, ReplyChannel};
 use openab_gateway::AppState;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tracing::warn;
+use uuid::Uuid;
+
+/// How long `create_thread` waits for the platform `create_topic` response.
+const CREATE_TOPIC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub struct UnifiedGatewayAdapter {
     pub gw_state: Arc<AppState>,
@@ -22,6 +27,34 @@ impl UnifiedGatewayAdapter {
             gw_state,
             telegram_reaction_state: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// If `json` is a gateway command response (`openab.gateway.response.v1`),
+    /// deliver it to any waiter registered via [`Self::create_thread`] and
+    /// return `true`. Returns `false` for ordinary inbound events so the
+    /// caller can keep processing them as `GatewayEvent`s.
+    ///
+    /// Without this demux, `createForumTopic` responses are fed into
+    /// `process_gateway_event`, which fails with
+    /// `invalid type: null, expected a string` (response fields do not match
+    /// the event schema) and the real `message_thread_id` is discarded.
+    pub async fn try_complete_pending(&self, json: &str) -> bool {
+        let Ok(resp) = serde_json::from_str::<GatewayResponse>(json) else {
+            return false;
+        };
+        if resp.schema != "openab.gateway.response.v1" {
+            return false;
+        }
+        if let Some(tx) = self
+            .gw_state
+            .pending_commands
+            .lock()
+            .await
+            .remove(&resp.request_id)
+        {
+            let _ = tx.send(resp);
+        }
+        true
     }
 
     /// Dispatch a GatewayReply to the correct platform adapter.
@@ -168,19 +201,69 @@ impl ChatAdapter for UnifiedGatewayAdapter {
     async fn create_thread(
         &self,
         channel: &ChannelRef,
-        trigger_msg: &MessageRef,
+        _trigger_msg: &MessageRef,
         title: &str,
     ) -> Result<ChannelRef> {
-        let reply = self.build_reply(channel, title, Some("create_topic"), None);
+        // Mirror the standalone GatewayAdapter path: register a oneshot, send
+        // create_topic with request_id, wait for GatewayResponse carrying the
+        // real platform thread id (Telegram message_thread_id).
+        //
+        // The previous implementation ignored the response and returned
+        // trigger_msg.message_id as thread_id. For Telegram forums that value
+        // is a *message* id, not a topic id, so replies fail with
+        // "Bad Request: message thread not found" after a topic was created.
+        let req_id = format!("req_{}", Uuid::new_v4());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.gw_state
+            .pending_commands
+            .lock()
+            .await
+            .insert(req_id.clone(), tx);
+
+        let mut reply = self.build_reply(channel, title, Some("create_topic"), None);
+        reply.request_id = Some(req_id.clone());
         self.dispatch_reply(&reply).await;
-        // Return a thread channel ref with the trigger message as thread_id
-        Ok(ChannelRef {
-            platform: channel.platform.clone(),
-            channel_id: channel.channel_id.clone(),
-            thread_id: Some(trigger_msg.message_id.clone()),
-            parent_id: Some(channel.channel_id.clone()),
-            origin_event_id: channel.origin_event_id.clone(),
-        })
+
+        match tokio::time::timeout(CREATE_TOPIC_TIMEOUT, rx).await {
+            Ok(Ok(resp)) if resp.success => {
+                if let Some(thread_id) = resp.thread_id {
+                    Ok(ChannelRef {
+                        platform: channel.platform.clone(),
+                        channel_id: channel.channel_id.clone(),
+                        thread_id: Some(thread_id),
+                        parent_id: Some(channel.channel_id.clone()),
+                        origin_event_id: channel.origin_event_id.clone(),
+                    })
+                } else {
+                    warn!(
+                        request_id = %req_id,
+                        "create_topic succeeded but thread_id missing; falling back to parent channel"
+                    );
+                    Ok(channel.clone())
+                }
+            }
+            Ok(Ok(resp)) => {
+                warn!(
+                    err = ?resp.error,
+                    request_id = %req_id,
+                    "create_topic failed, falling back to same channel"
+                );
+                Ok(channel.clone())
+            }
+            Ok(Err(_)) => {
+                // oneshot dropped — treat as failure
+                self.gw_state.pending_commands.lock().await.remove(&req_id);
+                Err(anyhow!("create_topic response channel closed"))
+            }
+            Err(_) => {
+                warn!(
+                    request_id = %req_id,
+                    "create_topic timeout, falling back to same channel"
+                );
+                self.gw_state.pending_commands.lock().await.remove(&req_id);
+                Ok(channel.clone())
+            }
+        }
     }
 
     async fn add_reaction(&self, msg: &MessageRef, emoji: &str) -> Result<()> {

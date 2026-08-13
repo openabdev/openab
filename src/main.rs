@@ -1481,9 +1481,12 @@ async fn main() -> anyhow::Result<()> {
             let app = app.with_state(gw_state.clone());
 
             // Bridge task: receive events from adapters via event_tx, dispatch to core
-            let unified_adapter: Arc<dyn adapter::ChatAdapter> = Arc::new(
-                unified_adapter::UnifiedGatewayAdapter::new(gw_state.clone()),
-            );
+            // Keep a typed Arc so create_topic responses can complete oneshot waiters
+            // on UnifiedGatewayAdapter before ordinary GatewayEvent processing.
+            let unified_adapter_impl = Arc::new(unified_adapter::UnifiedGatewayAdapter::new(
+                gw_state.clone(),
+            ));
+            let unified_adapter: Arc<dyn adapter::ChatAdapter> = unified_adapter_impl.clone();
 
             // Bot gating still reads env here (structural, not L2/L3):
             // channel/user gating moved to the shared trust registry, seeded
@@ -1515,15 +1518,22 @@ async fn main() -> anyhow::Result<()> {
                 filestore: filestore.clone(),
             });
 
-            // Spawn the event bridge (event_tx → process_gateway_event)
+            // Spawn the event bridge (event_tx → process_gateway_event).
+            // Demux GatewayResponse first so create_topic waiters receive the
+            // real message_thread_id and responses are not mis-parsed as events.
             let mut event_rx = event_tx.subscribe();
             let bridge_ctx = event_ctx.clone();
+            let bridge_adapter = unified_adapter_impl.clone();
             tokio::spawn(async move {
                 loop {
                     match event_rx.recv().await {
                         Ok(event_json) => {
                             let ctx = bridge_ctx.clone();
+                            let adapter = bridge_adapter.clone();
                             tokio::spawn(async move {
+                                if adapter.try_complete_pending(&event_json).await {
+                                    return;
+                                }
                                 if let Err(e) = process_gateway_event(&event_json, &ctx).await {
                                     tracing::warn!(error = %e, "unified bridge: event processing failed");
                                 }

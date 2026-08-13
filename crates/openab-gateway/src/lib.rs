@@ -95,6 +95,16 @@ pub struct AppState {
     /// Optional pre-download identity probe (see [`IngressTrustProbe`]).
     pub trust_probe: Option<IngressTrustProbe>,
     pub client: reqwest::Client,
+    /// In-process oneshot waiters for gateway command responses
+    /// (`create_topic`, etc.). Used by the unified binary so `create_thread`
+    /// can await the real Telegram `message_thread_id` instead of inventing
+    /// one. The standalone gateway WS path keeps its own `pending` map on
+    /// `GatewayAdapter` and does not use this field.
+    pub pending_commands: Arc<
+        tokio::sync::Mutex<
+            HashMap<String, tokio::sync::oneshot::Sender<crate::schema::GatewayResponse>>,
+        >,
+    >,
 }
 
 
@@ -145,6 +155,7 @@ impl AppState {
         lineworks_ingress_queue: Arc::new(Semaphore::new(LINEWORKS_INGRESS_QUEUE_MAX)),
         trust_probe: None,
             client: reqwest::Client::new(),
+            pending_commands: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -267,6 +278,7 @@ impl AppState {
         lineworks_ingress_queue: Arc::new(Semaphore::new(LINEWORKS_INGRESS_QUEUE_MAX)),
         trust_probe: None,
             client,
+            pending_commands: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -849,6 +861,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         lineworks_ingress_queue: Arc::new(Semaphore::new(LINEWORKS_INGRESS_QUEUE_MAX)),
         trust_probe: None,
         client,
+        pending_commands: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     });
 
     // Phase 1 L1 audit (#1356): warn if any active webhook platform has no

@@ -1,0 +1,60 @@
+# Build a unified openab binary for local install (e.g. arm64 host) without
+# compiling on the developer machine. Triggered on this branch and manually.
+
+name: Build Unified Binary (PR)
+
+on:
+  push:
+    branches:
+      - fix/telegram-unified-create-thread
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/build-unified-binary.yml"
+
+jobs:
+  build-unified:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, os: linux, arch: arm64 }
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-latest, os: linux, arch: x64 }
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: unified-${{ matrix.target }}
+
+      - name: Build unified release binary
+        run: cargo build --release --features unified --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          NAME="openab-unified-${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/openab" "dist/openab-unified"
+          cp config.toml.example dist/ 2>/dev/null || true
+          tar -C dist -czf "${NAME}.tar.gz" .
+          ls -la "${NAME}.tar.gz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openab-unified-${{ matrix.os }}-${{ matrix.arch }}
+          path: openab-unified-*.tar.gz
+          retention-days: 14
