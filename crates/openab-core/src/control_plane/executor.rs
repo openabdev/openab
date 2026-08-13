@@ -219,9 +219,16 @@ impl DelegationExecutor {
                 return failed(&id, error);
             }
         };
-        let outcome = self.execute(&forward, cancel).await;
-        self.release(&id);
-        outcome
+        // RAII: the slot must free even if this task is ABORTED mid-await —
+        // the client aborts serving tasks that outlive the drain window on
+        // disconnect, and a plain post-await release would be skipped there,
+        // leaking the inflight entry forever (with the default cap of 1, the
+        // worker would refuse every delegation after reconnecting).
+        let _slot = SlotGuard {
+            executor: self.as_ref(),
+            id: id.clone(),
+        };
+        self.execute(&forward, cancel).await
     }
 
     async fn execute(
@@ -351,6 +358,19 @@ fn cap_result(text: String) -> String {
     out.push_str(&text[..cut]);
     out.push_str(&marker);
     out
+}
+
+/// Frees a delegation's inflight slot on drop — including the drop that
+/// happens when the serving task is aborted at an await point.
+struct SlotGuard<'a> {
+    executor: &'a DelegationExecutor,
+    id: String,
+}
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        self.executor.release(&self.id);
+    }
 }
 
 fn failed(delegation_id: &str, error: impl Into<String>) -> DelegateResultParams {
@@ -862,5 +882,35 @@ mod tests {
 
         // Under the cap: untouched.
         assert_eq!(cap_result("small".into()), "small");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_aborted_serving_task_still_frees_its_slot() {
+        // The client aborts serving tasks that outlive the drain window on
+        // disconnect. A plain post-await release would be skipped by the
+        // abort, leaking the inflight entry: with the default cap of 1 the
+        // worker would then refuse every delegation after reconnecting.
+        let runner = Arc::new(FakeRunner {
+            delay: Some(Duration::from_secs(300)),
+            ..Default::default()
+        });
+        let ex = executor(Arc::clone(&runner), 1);
+        let task = {
+            let ex = Arc::clone(&ex);
+            tokio::spawn(async move { ex.serve(forward("d-abort", 600)).await })
+        };
+        while ex.active() < 1 {
+            tokio::task::yield_now().await;
+        }
+
+        task.abort();
+        let _ = task.await; // JoinError::Cancelled — the abort landed
+
+        assert_eq!(ex.active(), 0, "abort must free the slot via the guard");
+        // And the freed slot is genuinely reusable.
+        let done = FakeRunner::completing("ok");
+        let ex2 = executor(done, 1);
+        let r = ex2.serve(forward("d-after", 600)).await;
+        assert_eq!(r.status, DelegationStatus::Completed);
     }
 }
