@@ -522,20 +522,45 @@ impl Router {
         // Phase 2 — commit. If a concurrent path (duplicate result, cancel,
         // sweep, fail_instance) removed the entry between peek and now, that
         // path also released the capacity — do not decrement twice.
-        if let Claim::Owned(e) = self.claim(
+        match self.claim(
             registry,
             serving_handle,
             &params.delegation_id,
             Owner::Server,
         ) {
-            registry.adjust_sessions(e.to_handle, -1);
-            info!(
-                delegation = %params.delegation_id,
-                status = ?params.status,
-                from = %e.to_logical,
-                to = %e.from_logical,
-                "delegation completed"
-            );
+            Claim::Owned(e) => {
+                registry.adjust_sessions(e.to_handle, -1);
+                info!(
+                    delegation = %params.delegation_id,
+                    status = ?params.status,
+                    from = %e.to_logical,
+                    to = %e.from_logical,
+                    "delegation completed"
+                );
+            }
+            Claim::WrongOwner {
+                namespace,
+                owner_handle,
+            } => {
+                // Only possible if the id was removed and re-admitted between
+                // peek and commit. The new delegation is not ours to touch.
+                warn!(
+                    delegation = %params.delegation_id,
+                    namespace = %namespace,
+                    owner = owner_handle,
+                    "delegation re-owned between delivery and commit — entry left untouched"
+                );
+            }
+            Claim::NotFound { namespace } => {
+                // Concurrent removal (duplicate result, cancel, sweep, or
+                // fail_instance): whoever removed it released the capacity.
+                info!(
+                    delegation = %params.delegation_id,
+                    namespace = %namespace,
+                    "entry removed concurrently after delivery — capacity already released"
+                );
+            }
+            Claim::Unregistered => {}
         }
         CompleteOutcome::Delivered
     }
