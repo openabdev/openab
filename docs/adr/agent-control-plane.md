@@ -279,6 +279,27 @@ recovery semantics:
   admission (duplicate check → target selection → capacity reservation →
   in-flight insert) is one atomic sequence, and the in-flight entry exists
   before the forward frame is sent.
+- **Terminal results are never silently dropped.** `cp/delegate_result`
+  delivery commits only after the initiator's queue accepts the frame: the
+  CP validates ownership, sends, and only then removes the in-flight entry
+  and releases the serving instance's capacity. If the initiator's bounded
+  queue refuses the frame, the serving runtime receives an error (not
+  `ok: true`), the initiator is closed (WS 1008, reason
+  `outbound queue overflow` — the "cannot drain → disconnected" rule applied
+  to the frame where it matters most), and the delegation resolves through
+  the disconnect path: `cp/cancel` to the serving runtime and exactly one
+  capacity release. Two concurrent duplicate results may both be delivered
+  (correlation is by `delegation_id`; delivery is idempotent for the
+  initiator), but capacity is released exactly once. Best-effort frames
+  (`cp/cancel`, sweep-synthesized `timeout`) remain fire-and-forget: the
+  propagated deadline is their backstop.
+- **Capacity release follows entry removal.** Whichever path removes an
+  in-flight entry (result commit, cancel, deadline sweep, instance failure,
+  or a failed forward's rollback) releases its capacity reservation — and
+  only that path does, exactly once. A rollback that finds its entry already
+  removed by a concurrent sweep or disconnect must not decrement again:
+  session counts are saturating, so a double release is silent and would
+  let `saturated()` admit work to a full instance.
 - **Saturation = fast-fail.** When all matching targets are at capacity the
   CP replies `SATURATED` immediately. The CP never queues — v1 has no
   durable state, and a hidden in-memory queue would contradict that.
@@ -413,11 +434,24 @@ facade without changing anything shipped in v1.
 
 ## 7. Security
 
+Two distinct auth boundaries exist, and they must not be conflated:
+
+1. **Runtime ↔ CP (shipped in PR 1/4):** the OAB runtime authenticates to the
+   CP with `Authorization: Bearer <key>` on the WebSocket upgrade, over TCP.
+   The CP binds loopback by default; any non-loopback bind requires the
+   explicit `allow_insecure_bind` override and a TLS-terminating proxy (or a
+   private network) in front — bearer keys must never cross untrusted
+   cleartext TCP. See the "v1 contract amendments" in §4 for the enforced
+   registration semantics.
+2. **Agent subprocess ↔ local facade (PR 3/4, not yet shipped):** the UDS
+   path is the only thing the child needs; filesystem permissions on the
+   socket are the local auth boundary. The *local facade* is never exposed
+   on TCP — this claim is about the UDS facade, not about the CP itself,
+   which is a TCP service by design.
+
 - **No CP credentials in the agent process.** `OPENAB_CP_KEY` lives in the
   OAB runtime env; agent subprocesses keep the existing `env_clear`
-  whitelist. The UDS path is the only thing the child needs; filesystem
-  permissions on the socket are the local auth boundary. The local API is
-  never exposed on TCP.
+  whitelist.
 - **Per-agent auth keys** to the CP (not one shared fleet key), so a single
   compromised runtime is individually revocable.
 - **Per-peer identity.** Delegated prompts arrive attributed to the sending

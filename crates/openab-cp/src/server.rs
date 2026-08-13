@@ -43,7 +43,7 @@ use crate::proto::{
     PROTOCOL_VERSION,
 };
 use crate::registry::{shutdown_signal, Instance, Registry, OUTBOUND_QUEUE};
-use crate::router::{DelegateOutcome, Router};
+use crate::router::{CompleteOutcome, DelegateOutcome, Router};
 
 pub struct AppState {
     pub cfg: CpConfig,
@@ -129,6 +129,10 @@ pub const REASON_REGISTER_TIMEOUT: &str = "registration timeout";
 /// Reason string on the close frame sent when the CP drops a registration
 /// because its lease elapsed.
 pub const REASON_LEASE_EXPIRED: &str = "lease expired";
+/// Reason string on the close frame sent when a peer's bounded outbound
+/// queue refused a terminal frame: per the queue contract the peer is
+/// treated as disconnected, not buffered.
+pub const REASON_BACKPRESSURE: &str = "outbound queue overflow";
 
 /// A CP-initiated close that states why. Code 1008 (policy violation) plus a
 /// short reason, so a client can distinguish "the CP closed me on purpose"
@@ -305,17 +309,18 @@ async fn handle_connection(
     }
 
     // --- Main loop: interleave inbound frames, outbound channel, shutdown ---
-    let mut cp_closed = false;
+    let mut cp_close_reason: Option<&'static str> = None;
     loop {
         tokio::select! {
-            // The CP dropped this registration (lease expiry): the socket
-            // must go too. Keeping it open would leave a
+            // The CP dropped this registration (lease expiry) or must
+            // terminate the connection (terminal-frame backpressure): the
+            // socket must go too. Keeping it open would leave a
             // connection whose every frame hits an absent registry entry and
             // which can never re-register, since registration is
             // first-frame-only. Closing lets the client reconnect,
             // re-authenticate, and register again.
             _ = shutdown_rx.changed() => {
-                cp_closed = true;
+                cp_close_reason = *shutdown_rx.borrow_and_update();
                 break;
             }
             outbound = rx.recv() => {
@@ -353,13 +358,14 @@ async fn handle_connection(
         }
     }
 
-    if cp_closed {
+    if let Some(reason) = cp_close_reason {
         info!(
             agent = %format!("{}/{}", identity.namespace, identity.name),
             handle,
-            "closing connection at the CP's request (registration dropped)"
+            reason,
+            "closing connection at the CP's request"
         );
-        let _ = sink.send(policy_close(REASON_LEASE_EXPIRED)).await;
+        let _ = sink.send(policy_close(reason)).await;
     }
 
     teardown(&state, handle, &identity);
@@ -367,6 +373,13 @@ async fn handle_connection(
 
 /// Deregister this connection's own registration (by handle — cannot touch
 /// another connection's entry) and fail its in-flight delegations.
+///
+/// Deliberately idempotent with the sweeper: when `sweep_leases` already ran
+/// `deregister` + `fail_instance` for this handle, both calls here find
+/// nothing (the registry entry and the in-flight entries are gone) and are
+/// no-ops. That idempotency is a contract — `fail_instance` releases
+/// capacity only for entries it actually removes, so a second pass can never
+/// double-release (see the capacity note in `Router::delegate`'s rollback).
 fn teardown(state: &Arc<AppState>, handle: u64, identity: &AgentIdentity) {
     state.registry.deregister(handle);
     let mut next = || state.next_rpc_id();
@@ -570,17 +583,40 @@ fn handle_frame(state: &Arc<AppState>, handle: u64, text: &str) -> Option<String
         }
         methods::DELEGATE_RESULT => {
             let p = params_or_err!(DelegateResultParams);
-            if let Some((initiator, frame)) = state.router.complete(
+            match state.router.complete(
                 &state.registry,
                 handle,
                 p,
                 state.cfg.max_result_bytes,
                 state.next_rpc_id(),
             ) {
-                let _ = initiator.tx.try_send(frame);
+                CompleteOutcome::InitiatorStalled { initiator_handle } => {
+                    // The initiator cannot drain its bounded queue: per the
+                    // queue contract it is treated as disconnected, never
+                    // silently skipped. Its teardown fails the delegation
+                    // over the fail_instance path (capacity released once,
+                    // cp/cancel to this serving runtime). Do NOT ack the
+                    // result as delivered — the serving side must know its
+                    // result did not reach the initiator.
+                    state
+                        .registry
+                        .signal_shutdown(initiator_handle, REASON_BACKPRESSURE);
+                    let resp = JsonRpcErrorResponse::new(
+                        rpc_id,
+                        ErrorObject::new(
+                            codes::TARGET_DISCONNECTED,
+                            "initiator cannot receive the result; the delegation will be cancelled",
+                        ),
+                    );
+                    Some(serde_json::to_string(&resp).expect("serializable"))
+                }
+                // Delivered, or dropped as unknown/foreign (each case is
+                // logged; late results after a CP restart are expected).
+                _ => {
+                    let resp = JsonRpcResponse::new(rpc_id, serde_json::json!({"ok": true}));
+                    Some(serde_json::to_string(&resp).expect("serializable"))
+                }
             }
-            let resp = JsonRpcResponse::new(rpc_id, serde_json::json!({"ok": true}));
-            Some(serde_json::to_string(&resp).expect("serializable"))
         }
         methods::CANCEL => {
             let p = params_or_err!(CancelParams);
@@ -626,7 +662,7 @@ pub fn sweep_leases(state: &Arc<AppState>, lease: Duration) {
             "lease expired — deregistering and closing connection"
         );
         // Signal first: `deregister` drops the registry's side of the signal.
-        state.registry.signal_shutdown(handle);
+        state.registry.signal_shutdown(handle, REASON_LEASE_EXPIRED);
         state.registry.deregister(handle);
         let mut next = || state.next_rpc_id();
         for (inst, frame) in state
@@ -871,14 +907,15 @@ mod tests {
         // A live lease is left alone.
         sweep_leases(&state, Duration::from_secs(60));
         assert!(state.registry.get(handle).is_some());
-        assert!(!*observer.borrow());
+        assert!(observer.borrow().is_none());
 
         sweep_leases(&state, Duration::ZERO);
         assert!(state.registry.get(handle).is_none());
         observer.changed().await.unwrap();
-        assert!(
+        assert_eq!(
             *observer.borrow(),
-            "the owning connection must be told to close"
+            Some(REASON_LEASE_EXPIRED),
+            "the owning connection must be told to close, and why"
         );
     }
 
@@ -943,6 +980,101 @@ mod tests {
         let v2: serde_json::Value =
             serde_json::from_str(&handle_frame(&state, handle, &del).expect("answered")).unwrap();
         assert_eq!(v2["error"]["code"], codes::NOT_REGISTERED);
+        assert_eq!(state.router.inflight_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stalled_initiator_is_disconnected_and_serving_side_not_falsely_acked() {
+        // The bounded-queue contract for the one frame that matters most:
+        // when the initiator's queue refuses the terminal result, the
+        // serving side must NOT receive `ok: true`, and the initiator must
+        // be closed (treated as disconnected) rather than silently skipped.
+        let state = state_with("");
+
+        // Initiator with a full single-slot queue.
+        let signal_i = crate::registry::shutdown_signal();
+        let mut observer = signal_i.subscribe();
+        let (tx_i, _rx_i) = mpsc::channel::<String>(1);
+        let h_i = state.registry.register_conn(
+            Instance {
+                handle: 0,
+                namespace: "prod".into(),
+                name: "koudu".into(),
+                agent_type: AgentType::Primary,
+                instance_id: "i-1".into(),
+                labels: Default::default(),
+                max_delegated_sessions: 4,
+                active_sessions: 0,
+                registered_at: Instant::now(),
+                last_heartbeat: Instant::now(),
+                tx: tx_i.clone(),
+            },
+            Arc::clone(&signal_i),
+        );
+        let (tx_w, mut rx_w) = mpsc::channel::<String>(OUTBOUND_QUEUE);
+        let h_w = state.registry.register_conn(
+            Instance {
+                handle: 0,
+                namespace: "prod".into(),
+                name: "worker-1".into(),
+                agent_type: AgentType::Worker,
+                instance_id: "i-2".into(),
+                labels: Default::default(),
+                max_delegated_sessions: 1,
+                active_sessions: 0,
+                registered_at: Instant::now(),
+                last_heartbeat: Instant::now(),
+                tx: tx_w,
+            },
+            crate::registry::shutdown_signal(),
+        );
+
+        // Route one delegation through the wire-facing handler.
+        let deadline = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+        let del = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "cp/delegate",
+            "params": {
+                "delegation_id": "d-1",
+                "target": {"name": "worker-1"},
+                "prompt": "do it",
+                "deadline": deadline
+            }
+        })
+        .to_string();
+        let ack: serde_json::Value =
+            serde_json::from_str(&handle_frame(&state, h_i, &del).expect("answered")).unwrap();
+        assert!(ack.get("error").is_none(), "delegation must be accepted");
+        rx_w.try_recv().expect("worker received the forward frame");
+
+        // Fill the initiator's queue, then complete.
+        tx_i.try_send("filler".into()).unwrap();
+        let res = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "cp/delegate_result",
+            "params": {"delegation_id": "d-1", "status": "completed", "result": "done"}
+        })
+        .to_string();
+        let reply: serde_json::Value =
+            serde_json::from_str(&handle_frame(&state, h_w, &res).expect("answered")).unwrap();
+        assert_eq!(
+            reply["error"]["code"],
+            codes::TARGET_DISCONNECTED,
+            "the serving side must not be acked as delivered"
+        );
+        assert_eq!(reply["id"], 2, "the error must correlate with the request");
+
+        // The initiator is told to close, with the backpressure reason.
+        observer.changed().await.unwrap();
+        assert_eq!(*observer.borrow(), Some(REASON_BACKPRESSURE));
+
+        // The delegation is still in flight: teardown of the stalled
+        // initiator resolves it through fail_instance (capacity released
+        // once, cp/cancel to the serving runtime).
+        assert_eq!(state.router.inflight_count(), 1);
+        let mut next = || 9;
+        let frames = state.router.fail_instance(&state.registry, h_i, &mut next);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].1.contains("cp/cancel"));
+        assert_eq!(state.registry.get(h_w).unwrap().active_sessions, 0);
         assert_eq!(state.router.inflight_count(), 0);
     }
 }

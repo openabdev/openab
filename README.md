@@ -58,6 +58,7 @@ webhook platforms and `WS/webhook` for Feishu/Lark.
 - **@mention trigger** — mention the bot in an allowed channel to start a conversation
 - **Thread-based multi-turn** — auto-creates threads; no @mention needed for follow-ups
 - **Multi-agent collaboration** — bot-to-bot messaging for coordinated workflows ([docs/multi-agent.md](docs/multi-agent.md))
+- **Agent control plane (preview)** — standalone `openab-cp` service for direct agent-to-agent delegation over WebSocket, with identity-bound registration and CP-authoritative policy; runtime client and facade land in follow-up releases ([docs/control-plane.md](docs/control-plane.md))
 - **Agent-controlled reply-to** — agents choose which message to reply to via `[[reply_to:id]]` directive, enabling clear conversation threads in multi-bot channels ([docs/output-directives.md](docs/output-directives.md))
 - **Edit-streaming** — live-updates the Discord message every 1.5s as tokens arrive
 - **Emoji status reactions** — 👀→🤔→🔥/👨‍💻/⚡→👍+random mood face

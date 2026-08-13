@@ -162,6 +162,27 @@ enum Claim {
     Unregistered,
 }
 
+/// Outcome of a `cp/delegate_result` frame (see [`Router::complete`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum CompleteOutcome {
+    /// The result was accepted by the initiator's queue; the delegation is
+    /// finished and the serving instance's capacity was released.
+    Delivered,
+    /// The frame was refused or the delegation is unknown (wrong owner,
+    /// unknown id, unregistered caller, or the initiator is gone). Nothing
+    /// changed; each case is logged.
+    Dropped,
+    /// The initiator's bounded outbound queue refused the terminal result.
+    /// The entry is still in flight: the caller must treat the initiator as
+    /// disconnected (close its connection), whose teardown then fails the
+    /// delegation through `fail_instance` — capacity is released exactly
+    /// once and the serving runtime receives `cp/cancel`.
+    InitiatorStalled {
+        /// Registration handle of the stalled initiator.
+        initiator_handle: u64,
+    },
+}
+
 impl Router {
     pub fn new() -> Self {
         Self {
@@ -306,8 +327,18 @@ impl Router {
 
         if target.tx.try_send(text).is_err() {
             // Disconnected or backpressured beyond its queue: roll back.
-            self.inflight.lock().remove(&key);
-            registry.adjust_sessions(target.handle, -1);
+            //
+            // Roll back only what this call still owns. `fail_instance` and
+            // `sweep_deadlines` take the in-flight lock without the admission
+            // lock, so they can remove this very entry between the insert
+            // above and this branch — and whoever removes an entry also
+            // releases its capacity reservation. Decrementing here after a
+            // concurrent removal would double-release: the saturating math
+            // hides the underflow and `saturated()` then admits new work to
+            // an instance that is actually full.
+            if self.inflight.lock().remove(&key).is_some() {
+                registry.adjust_sessions(target.handle, -1);
+            }
             return DelegateOutcome::Rejected(ErrorObject::new(
                 codes::TARGET_DISCONNECTED,
                 "target disconnected or unresponsive during routing",
@@ -362,14 +393,33 @@ impl Router {
         Claim::Owned(entry)
     }
 
-    /// Handle `cp/delegate_result` from the serving runtime. Returns the
-    /// initiator-bound frame if the delegation is known; unknown ids (e.g.
-    /// results arriving after a CP restart) are dropped with a log.
+    /// Handle `cp/delegate_result` from the serving runtime.
     ///
-    /// Only the instance the delegation was routed to may complete it, and
-    /// that check shares the lock acquisition that removes the entry (see
-    /// [`Claim`]), so a non-owner frame can never make the delegation
-    /// momentarily invisible to a genuine result or to the deadline sweep.
+    /// The terminal result is the one frame that must never be silently
+    /// dropped, so delivery happens in two phases:
+    ///
+    /// 1. **Peek** — validate ownership under one in-flight lock acquisition
+    ///    without removing the entry, then build and `try_send` the
+    ///    initiator-bound frame.
+    /// 2. **Commit** — only after the initiator's queue accepted the frame,
+    ///    remove the entry (via [`Claim`], same single-lock property) and
+    ///    release the serving instance's capacity.
+    ///
+    /// If the initiator's bounded queue refuses the frame, the entry stays
+    /// in flight and [`CompleteOutcome::InitiatorStalled`] tells the caller
+    /// to treat the initiator as disconnected (per the bounded-queue
+    /// contract): its teardown runs `fail_instance`, which releases capacity
+    /// exactly once and sends `cp/cancel` to the serving runtime.
+    ///
+    /// Peek-then-commit admits one benign race: two concurrent genuine
+    /// results for the same id can both pass the peek and both be delivered,
+    /// but only the first commit releases capacity (the second finds the
+    /// entry gone and does nothing). Duplicate `cp/delegate_result` frames
+    /// are correlated by `delegation_id` and idempotent for the initiator.
+    ///
+    /// Only the instance the delegation was routed to may complete it; a
+    /// non-owner frame can never make the delegation momentarily invisible
+    /// to a genuine result or to the deadline sweep.
     pub fn complete(
         &self,
         registry: &Registry,
@@ -377,48 +427,48 @@ impl Router {
         mut params: DelegateResultParams,
         max_result_bytes: usize,
         next_rpc_id: u64,
-    ) -> Option<(Instance, String)> {
-        let entry = match self.claim(
-            registry,
-            serving_handle,
-            &params.delegation_id,
-            Owner::Server,
-        ) {
-            Claim::Owned(entry) => entry,
-            Claim::WrongOwner {
-                namespace,
-                owner_handle,
-            } => {
-                // Only the instance the delegation was routed to may
-                // complete it. The entry stays exactly where it is.
-                warn!(
-                    delegation = %params.delegation_id,
-                    namespace = %namespace,
-                    expected = owner_handle,
-                    got = serving_handle,
-                    "result from unexpected instance — dropped, delegation untouched"
-                );
-                return None;
-            }
-            Claim::NotFound { namespace } => {
-                warn!(
-                    delegation = %params.delegation_id,
-                    namespace = %namespace,
-                    "result for unknown delegation (late arrival or CP restart) — dropped"
-                );
-                return None;
-            }
-            Claim::Unregistered => {
+    ) -> CompleteOutcome {
+        // Phase 1 — peek: validate without removing. Removing before the
+        // send would make a refused send unrecoverable (silent loss of a
+        // computed result while the serving side is acked as delivered).
+        let namespace = match registry.get(serving_handle) {
+            Some(i) => i.namespace,
+            None => {
                 warn!(
                     handle = serving_handle,
                     delegation = %params.delegation_id,
                     "result from an unregistered connection — dropped"
                 );
-                return None;
+                return CompleteOutcome::Dropped;
             }
         };
-
-        registry.adjust_sessions(entry.to_handle, -1);
+        let key = DelegationKey::new(&namespace, &params.delegation_id);
+        let entry = {
+            let g = self.inflight.lock();
+            match g.get(&key) {
+                Some(e) if e.to_handle == serving_handle => e.clone(),
+                Some(e) => {
+                    // Only the instance the delegation was routed to may
+                    // complete it. The entry stays exactly where it is.
+                    warn!(
+                        delegation = %params.delegation_id,
+                        namespace = %namespace,
+                        expected = e.to_handle,
+                        got = serving_handle,
+                        "result from unexpected instance — dropped, delegation untouched"
+                    );
+                    return CompleteOutcome::Dropped;
+                }
+                None => {
+                    warn!(
+                        delegation = %params.delegation_id,
+                        namespace = %namespace,
+                        "result for unknown delegation (late arrival or CP restart) — dropped"
+                    );
+                    return CompleteOutcome::Dropped;
+                }
+            }
+        };
 
         // Truncate oversized results (keep the head; delegation already
         // ran). The marker counts against the cap: the final value never
@@ -437,24 +487,57 @@ impl Router {
             }
         }
 
-        info!(
-            delegation = %params.delegation_id,
-            status = ?params.status,
-            from = %entry.to_logical,
-            to = %entry.from_logical,
-            "delegation completed"
-        );
-
-        let initiator = registry.get(entry.from_handle)?;
+        let Some(initiator) = registry.get(entry.from_handle) else {
+            // The initiator deregistered concurrently: its `fail_instance`
+            // pass removes this entry, releases capacity, and cancels the
+            // serving side — nothing to do here.
+            warn!(
+                delegation = %params.delegation_id,
+                "result for a delegation whose initiator is gone — dropped"
+            );
+            return CompleteOutcome::Dropped;
+        };
         let frame = JsonRpcRequest::new(
             next_rpc_id,
             methods::DELEGATE_RESULT,
             Some(serde_json::to_value(&params).expect("serializable")),
         );
-        Some((
-            initiator,
-            serde_json::to_string(&frame).expect("serializable"),
-        ))
+        let text = serde_json::to_string(&frame).expect("serializable");
+
+        if initiator.tx.try_send(text).is_err() {
+            // Bounded-queue contract: a peer that cannot drain its queue is
+            // treated as disconnected, never silently skipped. The entry
+            // stays in flight; the caller closes the initiator, whose
+            // teardown fails the delegation over the `fail_instance` path.
+            warn!(
+                delegation = %params.delegation_id,
+                initiator = %entry.from_logical,
+                "initiator queue full — terminal result refused, treating initiator as disconnected"
+            );
+            return CompleteOutcome::InitiatorStalled {
+                initiator_handle: entry.from_handle,
+            };
+        }
+
+        // Phase 2 — commit. If a concurrent path (duplicate result, cancel,
+        // sweep, fail_instance) removed the entry between peek and now, that
+        // path also released the capacity — do not decrement twice.
+        if let Claim::Owned(e) = self.claim(
+            registry,
+            serving_handle,
+            &params.delegation_id,
+            Owner::Server,
+        ) {
+            registry.adjust_sessions(e.to_handle, -1);
+            info!(
+                delegation = %params.delegation_id,
+                status = ?params.status,
+                from = %e.to_logical,
+                to = %e.from_logical,
+                "delegation completed"
+            );
+        }
+        CompleteOutcome::Delivered
     }
 
     /// Handle `cp/cancel` from the initiator. Returns the frame to forward
@@ -794,11 +877,11 @@ type = "worker"
             result: Some("done".into()),
             error: None,
         };
-        let (init, frame) = w
-            .router
-            .complete(&w.registry, w.h_worker, result, 1024, 2)
-            .unwrap();
-        assert_eq!(init.handle, w.h_primary);
+        assert_eq!(
+            w.router.complete(&w.registry, w.h_worker, result, 1024, 2),
+            CompleteOutcome::Delivered
+        );
+        let frame = w.primary_rx.try_recv().unwrap();
         assert!(frame.contains("\"completed\""));
         assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 0);
         assert_eq!(w.router.inflight_count(), 0);
@@ -820,10 +903,10 @@ type = "worker"
             result: Some("instant".into()),
             error: None,
         };
-        assert!(w
-            .router
-            .complete(&w.registry, w.h_worker, result, 1024, 2)
-            .is_some());
+        assert_eq!(
+            w.router.complete(&w.registry, w.h_worker, result, 1024, 2),
+            CompleteOutcome::Delivered
+        );
         w.worker_rx.try_recv().unwrap();
     }
 
@@ -842,6 +925,118 @@ type = "worker"
             0,
             "capacity reservation must be rolled back"
         );
+    }
+
+    #[test]
+    fn concurrent_fail_instance_never_double_releases_capacity() {
+        // delegate's rollback and fail_instance can race on the same entry:
+        // fail_instance takes the in-flight lock without the admission lock,
+        // so it can remove the entry (and release its reservation) between
+        // delegate's insert and a failing try_send. Whoever removes the
+        // entry releases the capacity — exactly once. A double release
+        // silently undercounts the target (saturating math) and lets
+        // `saturated()` admit work to an instance that is actually full.
+        for _ in 0..200 {
+            let registry = Registry::new();
+            let router = Router::new();
+            let cfg = cfg();
+            let (p1, _p1_rx) = instance("prod", "koudu", AgentType::Primary, 4);
+            let (p2, _p2_rx) = instance("prod", "koudu-2", AgentType::Primary, 4);
+            let (wk, mut worker_rx) = instance("prod", "worker-1", AgentType::Worker, 4);
+            let hp1 = registry.register(p1);
+            let hp2 = registry.register(p2);
+            let hw = registry.register(wk);
+
+            // Baseline: a live delegation from p1 keeps the true count at 1.
+            match router.delegate(
+                &cfg,
+                &registry,
+                "prod",
+                "koudu",
+                &AgentType::Primary,
+                hp1,
+                delegate_params("d-0", "worker-1", 60),
+                1,
+            ) {
+                DelegateOutcome::Accepted(_) => {}
+                DelegateOutcome::Rejected(e) => panic!("baseline rejected: {}", e.message),
+            }
+            worker_rx.try_recv().unwrap();
+            // Close the worker's queue so p2's forward frame is refused and
+            // its delegate call takes the rollback path.
+            worker_rx.close();
+
+            let gate = std::sync::Barrier::new(2);
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    gate.wait();
+                    // p2 dies while its delegate call is in flight.
+                    let mut next = || 99;
+                    router.fail_instance(&registry, hp2, &mut next);
+                });
+                gate.wait();
+                let _ = router.delegate(
+                    &cfg,
+                    &registry,
+                    "prod",
+                    "koudu-2",
+                    &AgentType::Primary,
+                    hp2,
+                    delegate_params("d-1", "worker-1", 60),
+                    2,
+                );
+            });
+
+            assert_eq!(
+                registry.get(hw).unwrap().active_sessions,
+                1,
+                "exactly the baseline delegation must stay reserved"
+            );
+            assert_eq!(router.inflight_count(), 1);
+        }
+    }
+
+    #[test]
+    fn stalled_initiator_result_is_never_silently_lost() {
+        // Terminal results honor the bounded-queue contract: if the
+        // initiator cannot drain its queue, the entry stays in flight and
+        // the caller is told to treat the initiator as disconnected. The
+        // delegation then resolves through fail_instance (cp/cancel to the
+        // serving side, capacity released once) — never by silently
+        // dropping a computed result while acking the serving side.
+        let mut w = world();
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        w.worker_rx.try_recv().unwrap();
+
+        // Fill the initiator's bounded queue so the result frame is refused.
+        let initiator_tx = w.registry.get(w.h_primary).unwrap().tx;
+        while initiator_tx.try_send("filler".into()).is_ok() {}
+
+        assert_eq!(
+            w.router
+                .complete(&w.registry, w.h_worker, result_of("d-1", "late"), 1024, 2),
+            CompleteOutcome::InitiatorStalled {
+                initiator_handle: w.h_primary
+            }
+        );
+        assert_eq!(w.router.inflight_count(), 1, "entry must stay in flight");
+        assert_eq!(
+            w.registry.get(w.h_worker).unwrap().active_sessions,
+            1,
+            "capacity must not be released while the delegation is unresolved"
+        );
+
+        // The stalled initiator is then failed (disconnect path): capacity
+        // is released exactly once and the serving side is told to cancel.
+        let mut next = || 3;
+        let frames = w.router.fail_instance(&w.registry, w.h_primary, &mut next);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].1.contains("cp/cancel"));
+        assert_eq!(w.router.inflight_count(), 0);
+        assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 0);
     }
 
     #[test]
@@ -929,10 +1124,10 @@ type = "worker"
             error: None,
         };
         // h_primary is a valid handle but NOT the serving instance.
-        assert!(w
-            .router
-            .complete(&w.registry, w.h_primary, result, 1024, 2)
-            .is_none());
+        assert_eq!(
+            w.router.complete(&w.registry, w.h_primary, result, 1024, 2),
+            CompleteOutcome::Dropped
+        );
         assert_eq!(w.router.inflight_count(), 1);
     }
 
@@ -945,10 +1140,10 @@ type = "worker"
             result: None,
             error: None,
         };
-        assert!(w
-            .router
-            .complete(&w.registry, w.h_worker, result, 1024, 2)
-            .is_none());
+        assert_eq!(
+            w.router.complete(&w.registry, w.h_worker, result, 1024, 2),
+            CompleteOutcome::Dropped
+        );
     }
 
     #[test]
@@ -966,10 +1161,11 @@ type = "worker"
             error: None,
         };
         let cap = 96usize;
-        let (_, frame) = w
-            .router
-            .complete(&w.registry, w.h_worker, result, cap, 2)
-            .unwrap();
+        assert_eq!(
+            w.router.complete(&w.registry, w.h_worker, result, cap, 2),
+            CompleteOutcome::Delivered
+        );
+        let frame = w.primary_rx.try_recv().unwrap();
         let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
         let out = v["params"]["result"].as_str().unwrap();
         assert!(out.contains("truncated by control plane"));
@@ -992,10 +1188,11 @@ type = "worker"
             result: Some("y".repeat(100)),
             error: None,
         };
-        let (_, frame2) = w
-            .router
-            .complete(&w.registry, w.h_worker, result2, 8, 3)
-            .unwrap();
+        assert_eq!(
+            w.router.complete(&w.registry, w.h_worker, result2, 8, 3),
+            CompleteOutcome::Delivered
+        );
+        let frame2 = w.primary_rx.try_recv().unwrap();
         let v2: serde_json::Value = serde_json::from_str(&frame2).unwrap();
         assert!(v2["params"]["result"].as_str().unwrap().len() <= 8);
     }
@@ -1241,16 +1438,16 @@ allow_worker_initiation = true
 
             if spoof_first {
                 // h_primary is registered but is NOT the serving instance.
-                assert!(w
-                    .router
-                    .complete(
+                assert_eq!(
+                    w.router.complete(
                         &w.registry,
                         w.h_primary,
                         result_of("d-1", "spoofed"),
                         1024,
                         2
-                    )
-                    .is_none());
+                    ),
+                    CompleteOutcome::Dropped
+                );
                 assert_eq!(
                     w.router.inflight_count(),
                     1,
@@ -1258,33 +1455,34 @@ allow_worker_initiation = true
                 );
             }
 
-            let (init, frame) = w
-                .router
-                .complete(
+            assert_eq!(
+                w.router.complete(
                     &w.registry,
                     w.h_worker,
                     result_of("d-1", "genuine"),
                     1024,
                     3,
-                )
-                .expect("genuine result must be delivered, never dropped");
-            assert_eq!(init.handle, w.h_primary);
+                ),
+                CompleteOutcome::Delivered,
+                "genuine result must be delivered, never dropped"
+            );
+            let frame = w.primary_rx.try_recv().unwrap();
             assert!(frame.contains("genuine"));
             assert_eq!(w.router.inflight_count(), 0);
             assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 0);
 
             if !spoof_first {
                 // A late non-owner frame after completion is a plain no-op.
-                assert!(w
-                    .router
-                    .complete(
+                assert_eq!(
+                    w.router.complete(
                         &w.registry,
                         w.h_primary,
                         result_of("d-1", "spoofed"),
                         1024,
                         4
-                    )
-                    .is_none());
+                    ),
+                    CompleteOutcome::Dropped
+                );
                 assert_eq!(w.router.inflight_count(), 0);
             }
         }
@@ -1308,27 +1506,22 @@ allow_worker_initiation = true
                 let spoof = s.spawn(|| {
                     gate.wait();
                     // Registered, but not the serving instance.
-                    w.router
-                        .complete(
-                            &w.registry,
-                            w.h_primary,
-                            result_of("d-1", "spoofed"),
-                            1024,
-                            2,
-                        )
-                        .is_some()
+                    w.router.complete(
+                        &w.registry,
+                        w.h_primary,
+                        result_of("d-1", "spoofed"),
+                        1024,
+                        2,
+                    ) == CompleteOutcome::Delivered
                 });
                 gate.wait();
-                let genuine = w
-                    .router
-                    .complete(
-                        &w.registry,
-                        w.h_worker,
-                        result_of("d-1", "genuine"),
-                        1024,
-                        3,
-                    )
-                    .is_some();
+                let genuine = w.router.complete(
+                    &w.registry,
+                    w.h_worker,
+                    result_of("d-1", "genuine"),
+                    1024,
+                    3,
+                ) == CompleteOutcome::Delivered;
                 (spoof.join().unwrap(), genuine)
             });
             assert!(!spoofed, "a non-owner must never complete a delegation");
@@ -1456,9 +1649,9 @@ allow_worker_initiation = true
         let registry = Registry::new();
         let router = Router::new();
         let cfg = cfg();
-        let (p_prod, _prod_init_rx) = instance("prod", "koudu", AgentType::Primary, 4);
+        let (p_prod, mut prod_init_rx) = instance("prod", "koudu", AgentType::Primary, 4);
         let (w_prod, mut prod_rx) = instance("prod", "worker-1", AgentType::Worker, 2);
-        let (p_dev, _dev_init_rx) = instance("dev", "koudu", AgentType::Primary, 4);
+        let (p_dev, mut dev_init_rx) = instance("dev", "koudu", AgentType::Primary, 4);
         let (w_dev, mut dev_rx) = instance("dev", "worker-1", AgentType::Worker, 2);
         let hp_prod = registry.register(p_prod);
         let hw_prod = registry.register(w_prod);
@@ -1514,20 +1707,26 @@ allow_worker_initiation = true
         assert_eq!(router.inflight_count(), 2);
 
         // Results route to the initiator of the SAME namespace only.
-        let (init, frame) = router
-            .complete(&registry, hw_dev, result_of("d-1", "dev-done"), 1024, 12)
-            .unwrap();
-        assert_eq!(init.handle, hp_dev);
+        assert_eq!(
+            router.complete(&registry, hw_dev, result_of("d-1", "dev-done"), 1024, 12),
+            CompleteOutcome::Delivered
+        );
+        let frame = dev_init_rx.try_recv().unwrap();
         assert!(frame.contains("dev-done"));
+        assert!(
+            prod_init_rx.try_recv().is_err(),
+            "prod's initiator must not receive dev's result"
+        );
         assert!(
             router.chain_of("prod", "d-1").is_some(),
             "prod's delegation must be untouched"
         );
 
-        let (init, frame) = router
-            .complete(&registry, hw_prod, result_of("d-1", "prod-done"), 1024, 13)
-            .unwrap();
-        assert_eq!(init.handle, hp_prod);
+        assert_eq!(
+            router.complete(&registry, hw_prod, result_of("d-1", "prod-done"), 1024, 13),
+            CompleteOutcome::Delivered
+        );
+        let frame = prod_init_rx.try_recv().unwrap();
         assert!(frame.contains("prod-done"));
         assert_eq!(router.inflight_count(), 0);
     }

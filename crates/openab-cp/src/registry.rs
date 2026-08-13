@@ -33,12 +33,14 @@ pub const OUTBOUND_QUEUE: usize = 256;
 /// `watch` (not `oneshot`) so the connection task can select on it repeatedly,
 /// and wrapped in `Arc` so the registry entry and the connection task share
 /// one signal without either side's drop cancelling it.
-pub type ShutdownTx = Arc<watch::Sender<bool>>;
+pub type ShutdownTx = Arc<watch::Sender<Option<&'static str>>>;
 
 /// Create a fresh connection shutdown signal. The connection task keeps the
-/// returned handle (to `subscribe()`), the registry keeps a clone.
+/// returned handle (to `subscribe()`), the registry keeps a clone. The value
+/// is `None` until the CP requests the close, then the close reason (sent on
+/// the WS close frame so the client knows why it was terminated).
 pub fn shutdown_signal() -> ShutdownTx {
-    Arc::new(watch::channel(false).0)
+    Arc::new(watch::channel(None).0)
 }
 
 /// Registry slot: the public instance view plus CP-internal connection
@@ -121,14 +123,15 @@ impl Registry {
         self.register_conn(inst, shutdown_signal())
     }
 
-    /// Ask the owning connection task to close. Returns whether a live
-    /// registration was signalled. Must be called BEFORE `deregister`, which
-    /// drops the registry's handle on the signal.
-    pub fn signal_shutdown(&self, handle: u64) -> bool {
+    /// Ask the owning connection task to close, with the reason to put on
+    /// the close frame. Returns whether a live registration was signalled.
+    /// Must be called BEFORE `deregister`, which drops the registry's handle
+    /// on the signal.
+    pub fn signal_shutdown(&self, handle: u64, reason: &'static str) -> bool {
         match self.inner.read().get(&handle) {
             Some(e) => {
                 // `send_replace` cannot fail even with no receivers left.
-                e.shutdown.send_replace(true);
+                e.shutdown.send_replace(Some(reason));
                 true
             }
             None => false,
@@ -409,15 +412,19 @@ mod tests {
         let sig = shutdown_signal();
         let mut rx = sig.subscribe();
         let h = r.register_conn(inst("prod", "w1", "i-1", 1), sig);
-        assert!(!*rx.borrow());
+        assert!(rx.borrow().is_none());
 
-        assert!(r.signal_shutdown(h));
+        assert!(r.signal_shutdown(h, "lease expired"));
         rx.changed().await.unwrap();
-        assert!(*rx.borrow(), "connection task must observe the signal");
+        assert_eq!(
+            *rx.borrow(),
+            Some("lease expired"),
+            "connection task must observe the signal and its reason"
+        );
 
         // After deregistration there is nothing left to signal.
         r.deregister(h);
-        assert!(!r.signal_shutdown(h));
+        assert!(!r.signal_shutdown(h, "lease expired"));
     }
 
     #[tokio::test]
@@ -428,9 +435,9 @@ mod tests {
         let sig = shutdown_signal();
         let mut rx = sig.subscribe();
         let h = r.register_conn(inst("prod", "w1", "i-1", 1), sig);
-        r.signal_shutdown(h);
+        r.signal_shutdown(h, "lease expired");
         r.deregister(h);
         rx.changed().await.unwrap();
-        assert!(*rx.borrow());
+        assert_eq!(*rx.borrow(), Some("lease expired"));
     }
 }
