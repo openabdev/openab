@@ -89,7 +89,7 @@ pub struct JsonRpcMessage {
 }
 
 impl JsonRpcMessage {
-    /// Validate this frame as a JSON-RPC 2.0 **request** (review F4): the
+    /// Validate this frame as a JSON-RPC 2.0 **request**: the
     /// `jsonrpc` field must be exactly "2.0", and a request id must be
     /// present (all `cp/*` client→CP methods are requests, not
     /// notifications). Returns the request id.
@@ -143,8 +143,13 @@ pub mod codes {
     /// Matching targets exist but all are at their advertised capacity.
     /// Explicit fast-fail: the CP never queues (v1 has no durable state).
     pub const SATURATED: i64 = -32005;
-    /// Delegation deadline elapsed before a result frame arrived.
-    pub const DEADLINE_EXCEEDED: i64 = -32006;
+    // -32006 is deliberately unassigned. It held a `DEADLINE_EXCEEDED` code
+    // that nothing could ever emit: a deadline already in the past is
+    // rejected at admission by the policy check (`POLICY_DENIED`, "deadline
+    // is in the past"), and a deadline that elapses while the delegation runs
+    // is not an error response at all — the sweeper synthesizes a
+    // `cp/delegate_result` with status `timeout`. Leaving the slot empty keeps
+    // the published numbering stable for anyone who saw the earlier constant.
     /// Serving runtime disconnected while the delegation was in flight.
     pub const TARGET_DISCONNECTED: i64 = -32007;
     /// `delegation_id` already in flight (idempotency guard).

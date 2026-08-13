@@ -1,6 +1,6 @@
 //! CP-side configuration.
 //!
-//! Identity binding is the security core (review F1 on the ADR): every auth
+//! Identity binding is the security core: every auth
 //! key maps to **immutable claims** (`namespace`, `name`, `type`, optional
 //! caps) owned by CP config. Registration frames are verified against these
 //! claims — never the other way around. A compromised runtime cannot escalate
@@ -48,7 +48,8 @@ pub struct CpConfig {
     pub max_result_bytes: usize,
 
     /// Maximum WebSocket message size accepted from a runtime, enforced by
-    /// the transport before any parsing/allocation (review F5).
+    /// the transport before any parsing/allocation, so an oversized frame is
+    /// never buffered in full.
     #[serde(default = "default_max_frame_bytes")]
     pub max_frame_bytes: usize,
 
@@ -59,16 +60,17 @@ pub struct CpConfig {
 
     /// Deadline for the mandatory `cp/register` first frame, in seconds from
     /// the completed WebSocket upgrade. A connection that authenticates but
-    /// never registers is closed when this elapses (review round-3 F4):
-    /// otherwise an authenticated peer could park unlimited sockets in the
+    /// never registers is closed when this elapses: otherwise an
+    /// authenticated peer could park unlimited sockets in the
     /// pre-registration state, keeping them alive with pings forever.
     #[serde(default = "default_register_timeout_secs")]
     pub register_timeout_secs: u64,
 
     /// Maximum simultaneous connections per identity, counted from the
     /// upgrade (so pre-registration sockets count too) and released on every
-    /// exit path (review round-3 F4). Replicas of one logical agent share one
-    /// identity, so this is the replica ceiling as well.
+    /// exit path. Authentication alone is not a bound: one leaked key could
+    /// otherwise open unlimited sockets. Replicas of one logical agent share
+    /// one identity, so this is the replica ceiling as well.
     #[serde(default = "default_max_connections_per_identity")]
     pub max_connections_per_identity: u32,
 
@@ -188,7 +190,7 @@ impl CpConfig {
         if self.lease_expiry_secs <= self.heartbeat_interval_secs {
             bail!("lease_expiry_secs must exceed heartbeat_interval_secs");
         }
-        // Admission bounds must actually bound something (review round-3 F4):
+        // Admission bounds must actually bound something:
         // zero would mean "no registration deadline" / "no connection allowed".
         if self.register_timeout_secs == 0 {
             bail!("register_timeout_secs must be greater than 0");
@@ -197,8 +199,7 @@ impl CpConfig {
             bail!("max_connections_per_identity must be at least 1");
         }
         // Bearer keys over cleartext TCP must never reach an untrusted
-        // network: non-loopback binds require the explicit override
-        // (review round-2 F4).
+        // network: non-loopback binds require the explicit override.
         if !self.allow_insecure_bind && !is_loopback(&self.listen) {
             bail!(
                 "listen = \"{}\" is not loopback and the CP terminates no TLS. \
@@ -360,7 +361,7 @@ lease_expiry_secs = 30
 
     #[test]
     fn admission_bounds_default_and_are_validated() {
-        // Review round-3 F4: absent fields keep working (serde defaults) and
+        // Absent fields keep working (serde defaults) and
         // a zero bound is rejected rather than silently disabling the guard.
         let cfg: CpConfig = toml::from_str(base_toml()).unwrap();
         cfg.validate().unwrap();

@@ -18,18 +18,17 @@ use crate::proto::AgentType;
 
 /// Outbound frame sender for one WS connection (serialized JSON text).
 /// Bounded: a peer that cannot drain its queue is disconnected rather than
-/// growing CP memory (review F5).
+/// growing CP memory.
 pub type FrameTx = mpsc::Sender<String>;
 
 /// Capacity of each per-connection outbound queue.
 pub const OUTBOUND_QUEUE: usize = 256;
 
 /// Shutdown signal for one WS connection, held by the registry so the CP can
-/// terminate a connection it no longer considers registered (review round-3
-/// F1: lease expiry must close the socket — otherwise the connection task
-/// lives on with a registry entry that no longer exists, silently dropping
-/// every subsequent frame and unable to re-register, since registration is
-/// first-frame-only).
+/// terminate a connection it no longer considers registered. Lease expiry must
+/// close the socket — otherwise the connection task lives on with a registry
+/// entry that no longer exists, and the client cannot re-register because
+/// registration is first-frame-only.
 ///
 /// `watch` (not `oneshot`) so the connection task can select on it repeatedly,
 /// and wrapped in `Arc` so the registry entry and the connection task share
@@ -54,8 +53,8 @@ struct Entry {
 #[derive(Clone, Debug)]
 pub struct Instance {
     /// CP-generated registration handle — the registry key and the basis of
-    /// all ownership checks. Never client-supplied (review F1): a colliding
-    /// client `instance_id` cannot replace or tear down another identity's
+    /// all ownership checks. Never client-supplied: a colliding client
+    /// `instance_id` cannot replace or tear down another identity's
     /// registration.
     pub handle: u64,
     pub namespace: String,
@@ -67,7 +66,7 @@ pub struct Instance {
     pub labels: BTreeMap<String, String>,
     pub max_delegated_sessions: u32,
     /// Delegations currently routed to this instance. CP-owned and
-    /// authoritative — never merged from runtime reports (review F6).
+    /// authoritative — never merged from runtime reports.
     pub active_sessions: u32,
     pub registered_at: Instant,
     pub last_heartbeat: Instant,
@@ -108,7 +107,7 @@ impl Registry {
     ///
     /// `shutdown` is the owning connection's termination signal: the CP
     /// triggers it whenever it drops the registration on its own initiative
-    /// (lease expiry — review round-3 F1).
+    /// (lease expiry).
     pub fn register_conn(&self, mut inst: Instance, shutdown: ShutdownTx) -> u64 {
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed) + 1;
         inst.handle = handle;
@@ -143,8 +142,8 @@ impl Registry {
     }
 
     /// Refresh the lease. The runtime-reported session count is intentionally
-    /// ignored: CP-owned in-flight accounting is authoritative (review F6 —
-    /// merging reports could pin an instance saturated forever).
+    /// ignored: CP-owned in-flight accounting is authoritative, and merging
+    /// runtime reports could pin an instance saturated forever.
     pub fn heartbeat(&self, handle: u64) -> bool {
         let mut g = self.inner.write();
         match g.get_mut(&handle) {
@@ -173,7 +172,7 @@ impl Registry {
 
     /// Select a serving instance within `namespace` by exact name or labels.
     ///
-    /// Unsaturated matches only. Ordering (review F6):
+    /// Unsaturated matches only. Ordering:
     /// - exact-name selection → replicas of one logical agent: newest
     ///   registration first (rolling-deploy rule), load as tie-breaker
     /// - label selection → across logical agents: least loaded first,
@@ -312,7 +311,8 @@ mod tests {
     fn label_selection_least_loaded_first() {
         let r = Registry::new();
         // Older but less loaded instance must win under label selection
-        // (inverse recency/load — review F6).
+        // (load first, recency only as tie-breaker — the inverse of the
+        // exact-name replica rule).
         let mut a = inst("prod", "wa", "i-a", 4);
         a.labels.insert("backend".into(), "kiro".into());
         a.active_sessions = 0;
@@ -363,7 +363,7 @@ mod tests {
 
     #[test]
     fn colliding_instance_id_cannot_replace_other_registration() {
-        // Review F1: a second connection registering the same client-supplied
+        // A second connection registering the same client-supplied
         // instance_id gets its own handle; the first registration survives
         // and can only be torn down via its own handle.
         let r = Registry::new();
@@ -403,7 +403,7 @@ mod tests {
 
     #[tokio::test]
     async fn signal_shutdown_reaches_the_owning_connection() {
-        // Review round-3 F1: the CP must be able to terminate a connection
+        // The CP must be able to terminate a connection
         // whose registration it drops on its own initiative.
         let r = Registry::new();
         let sig = shutdown_signal();

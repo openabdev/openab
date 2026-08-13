@@ -100,8 +100,8 @@ Key properties:
    contract (§9).
 4. **CP connectivity is strictly additive.** Loss of the CP link never
    affects normal platform (Discord/Slack) operation; the runtime reconnects
-   with backoff. The CP itself is stateless enough that a restart only means
-   re-registration.
+   with backoff. The CP holds no durable state, so a restart costs
+   re-registration plus whatever delegations were in flight (§4).
 
 ### Naming
 
@@ -238,10 +238,40 @@ recovery semantics:
   (completion, cancellation, parent linkage) compare handles. The ack
   carries the heartbeat interval, lease window, and the effective (possibly
   clamped) concurrency budget. Instances missing heartbeats past the lease
-  are deregistered; their in-flight delegations fail immediately with
-  `target_disconnected`. Heartbeats refresh the lease only — CP-owned
+  are deregistered, and their in-flight delegations fail immediately with a
+  **side-specific** outcome: delegations the expired instance was *serving*
+  send `target_disconnected` to the initiator, while delegations it had
+  *initiated* send a best-effort `cp/cancel` to the still-live server (and
+  release its reserved capacity). The two are mutually exclusive — one dead
+  instance never produces both frames for the same delegation. Heartbeats
+  refresh the lease only — CP-owned
   in-flight accounting is authoritative and never merged from runtime
   reports.
+- **Registration deadline.** `cp/register` must arrive within
+  `register_timeout_secs` of the completed WebSocket upgrade. WS Ping/Pong
+  keeps the transport alive but does **not** extend the deadline, and a
+  `cp/register` that arrives after it is never acked. On expiry the CP closes
+  the socket with WS code **1008** (policy violation) and reason
+  `registration timeout`. Rationale: authentication alone bounds nothing — an
+  authenticated peer could otherwise park sockets indefinitely in the
+  pre-registration state.
+- **Registration is per-connection and first-frame-only, so lease expiry ends
+  the connection.** When the CP drops a registration on its own initiative it
+  also closes the socket — WS code **1008**, reason `lease expired`. Leaving
+  it open would strand a connection whose every subsequent frame hits an
+  absent registry entry and which can never re-register. Recovery is
+  therefore always the same shape: **reconnect, re-authenticate, re-register**
+  (a new handle; the old one is gone for good). Frames that arrive in the
+  window between the sweep and the close are answered `NOT_REGISTERED` rather
+  than dropped silently, so a client can tell a swept lease from a hung CP.
+- **Per-identity connection quota.** `max_connections_per_identity` bounds
+  concurrent sockets per identity and is counted **from the upgrade**, so
+  pre-registration sockets occupy a slot too. An over-quota upgrade is refused
+  at the HTTP layer with **503** and a body naming the quota (a bare 503 is
+  indistinguishable from an overloaded CP). The slot is held by an RAII guard
+  released on every exit path, so no early return, failed handshake, or panic
+  can leak it. Replicas of one logical agent share one identity, so this is
+  also the replica ceiling.
 - **Resource bounds.** The WS transport rejects messages over
   `max_frame_bytes` before parsing; oversized `prompt`s are rejected
   (`max_prompt_bytes`); per-connection outbound queues are bounded and a
@@ -253,11 +283,34 @@ recovery semantics:
   CP replies `SATURATED` immediately. The CP never queues — v1 has no
   durable state, and a hidden in-memory queue would contradict that.
   `NO_TARGET` (nothing matches) is a distinct error.
-- **CP restart semantics.** The in-flight table is in-memory. After a CP
-  restart, in-flight delegations end as initiator-side timeouts (the
-  propagated deadline is the upper bound); late `cp/delegate_result` frames
-  for unknown ids are acknowledged, logged, and dropped so reconnecting
-  runtimes do not error-loop.
+- **Delegation ids are scoped to `(namespace, delegation_id)`.** The id is
+  client-supplied, so it is only unique within the namespace that produced
+  it. Two namespaces may hold the same id concurrently, legally and
+  invisibly: `DUPLICATE_DELEGATION` only ever refers to the caller's own
+  namespace, parent-chain lookup never reaches across namespaces, and result
+  routing resolves the id inside the sender's registered namespace. `cp/cancel`
+  refusals are deliberately **indistinguishable**: an unknown id and another
+  instance's live id return the same `POLICY_DENIED` error object, byte for
+  byte, so cancel cannot be used as an existence oracle for other tenants'
+  delegation ids. The CP's own logs keep the distinction.
+- **CP restart semantics.** A CP restart is equivalent to every lease
+  expiring at once *with* the connection closure that implies — except that
+  the CP is not there to send it: the in-flight table and the sockets die
+  together with the process, so no synthesized `timeout` or
+  `target_disconnected` frame can be emitted for delegations that were in
+  flight. Runtimes observe the transport drop, reconnect with backoff, and
+  re-register (new handles, empty in-flight table). Initiators reconcile
+  against the deadline they already propagated, which is the upper bound on
+  every orphaned delegation. Once the CP is back, late
+  `cp/delegate_result` frames for unknown ids are acknowledged, logged, and
+  dropped so reconnecting runtimes do not error-loop, and a frame from a
+  connection that has not re-registered is answered `NOT_REGISTERED`. Within a
+  *live* CP the synthesized failures do happen, but per side, not both at
+  once: lease expiry or disconnect sends `target_disconnected` to the
+  initiator when the *serving* instance died, and a best-effort `cp/cancel`
+  downstream when the *initiating* instance died. Only a deadline sweep emits
+  both frames for one delegation (see below), because there both peers are
+  still connected.
 - **Timeout and disconnect synthesis.** A deadline sweep terminates overdue
   delegations: the initiator receives a synthesized `timeout` result and the
   serving runtime a best-effort `cp/cancel` (stop burning tokens). Worker
@@ -267,7 +320,8 @@ recovery semantics:
   configured `max_result_bytes` (default 256 KiB) is truncated head-first
   with an explicit marker.
 - **Idempotency.** `delegation_id` is the caller-generated idempotency key;
-  a duplicate in-flight id is rejected (`DUPLICATE_DELEGATION`). Only the
+  a duplicate id already in flight **in the caller's own namespace** is
+  rejected (`DUPLICATE_DELEGATION`). Only the
   instance a delegation was routed to may complete it; only the initiating
   instance may cancel it.
 

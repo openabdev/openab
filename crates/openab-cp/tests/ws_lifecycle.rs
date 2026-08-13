@@ -1,6 +1,6 @@
 //! End-to-end WebSocket lifecycle tests: connection termination on lease
-//! expiry (review round-3 F1) and pre-registration admission bounds
-//! (review round-3 F4).
+//! expiry, pre-registration admission bounds, and the meaning the CP attaches
+//! to its own closes (WS 1008 + reason, HTTP 503 naming the quota).
 //!
 //! These drive a real CP over a loopback socket with a real WS client, which
 //! is the only way to prove that the connection *task* reacts — the earlier
@@ -102,26 +102,63 @@ async fn register(ws: &mut Ws, instance_id: &str) -> serde_json::Value {
     serde_json::from_str(msg.to_text().unwrap()).unwrap()
 }
 
-/// Wait until the peer closes the socket (Close frame, error, or EOF).
-async fn wait_closed(ws: &mut Ws, within: Duration) -> bool {
+/// How a connection ended, as observed by the client.
+#[derive(Debug, PartialEq, Eq)]
+enum Closed {
+    /// A WS Close frame carrying a code and a reason.
+    Frame { code: u16, reason: String },
+    /// A Close frame with no payload — the CP never sends these on purpose.
+    Bare,
+    /// EOF or transport error with no Close frame at all.
+    Dropped,
+}
+
+/// Wait until the peer closes the socket, and report how. `None` means the
+/// socket was still open when `within` elapsed.
+async fn wait_closed(ws: &mut Ws, within: Duration) -> Option<Closed> {
     let deadline = Instant::now() + within;
     while Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(200), ws.next()).await {
-            Ok(None) | Ok(Some(Err(_))) => return true,
-            Ok(Some(Ok(Message::Close(_)))) => return true,
+            Ok(None) | Ok(Some(Err(_))) => return Some(Closed::Dropped),
+            Ok(Some(Ok(Message::Close(Some(cf))))) => {
+                return Some(Closed::Frame {
+                    code: cf.code.into(),
+                    reason: cf.reason.to_string(),
+                })
+            }
+            Ok(Some(Ok(Message::Close(None)))) => return Some(Closed::Bare),
             Ok(Some(Ok(_))) => continue,
             Err(_) => continue, // read timeout: keep waiting
         }
     }
-    false
+    None
+}
+
+/// The close a CP-initiated termination must carry: 1008 (policy violation)
+/// plus a short reason the client can act on.
+fn policy_close(reason: &str) -> Closed {
+    Closed::Frame {
+        code: 1008,
+        reason: reason.to_string(),
+    }
+}
+
+/// Body of a refused upgrade, as text.
+fn http_body(resp: &tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>) -> String {
+    resp.body()
+        .as_ref()
+        .map(|b| String::from_utf8_lossy(b).to_string())
+        .unwrap_or_default()
 }
 
 #[tokio::test]
 async fn lease_expiry_closes_the_connection_and_permits_reregistration() {
-    // Review round-3 F1: deregistering on lease expiry without terminating
+    // Deregistering on lease expiry without terminating
     // the connection left a live socket bound to a registration that no
     // longer existed — heartbeats got no reply and re-registration was
-    // impossible (registration is first-frame-only). The CP must close it.
+    // impossible (registration is first-frame-only). The CP must close it,
+    // and the close must say why so the client can distinguish it from a
+    // network drop.
     let (state, url) = spawn_cp(cfg("max_connections_per_identity = 1")).await;
 
     let mut ws = connect(&url).await.expect("first connection accepted");
@@ -136,9 +173,13 @@ async fn lease_expiry_closes_the_connection_and_permits_reregistration() {
         "lease expiry deregisters"
     );
 
-    assert!(
-        wait_closed(&mut ws, Duration::from_secs(5)).await,
-        "the connection task must observe the shutdown signal and close"
+    let closed = wait_closed(&mut ws, Duration::from_secs(5))
+        .await
+        .expect("the connection task must observe the shutdown signal and close");
+    assert_eq!(
+        closed,
+        policy_close("lease expired"),
+        "a lease-expiry close must be 1008 with a reason, not an anonymous close"
     );
     drop(ws);
 
@@ -154,37 +195,32 @@ async fn lease_expiry_closes_the_connection_and_permits_reregistration() {
 
 #[tokio::test]
 async fn ping_only_pre_registration_socket_is_closed_at_the_deadline() {
-    // Review round-3 F4(a): pings keep the transport alive but must not
-    // extend the registration deadline.
+    // Pings keep the transport alive but must not
+    // extend the registration deadline — and the close must name the reason.
     let (state, url) = spawn_cp(cfg("register_timeout_secs = 1")).await;
     let mut ws = connect(&url).await.expect("connection accepted");
 
     let started = Instant::now();
-    let mut closed = false;
+    let mut closed = None;
     while started.elapsed() < Duration::from_secs(10) {
         let _ = ws.send(Message::Ping(vec![7].into())).await;
-        match tokio::time::timeout(Duration::from_millis(250), ws.next()).await {
-            Ok(None) | Ok(Some(Err(_))) => {
-                closed = true;
-                break;
-            }
-            Ok(Some(Ok(Message::Close(_)))) => {
-                closed = true;
-                break;
-            }
-            _ => continue,
+        if let Some(how) = wait_closed(&mut ws, Duration::from_millis(250)).await {
+            closed = Some(how);
+            break;
         }
     }
-    assert!(
+    let closed = closed.expect("an authenticated socket that never registers must be closed");
+    assert_eq!(
         closed,
-        "an authenticated socket that never registers must be closed"
+        policy_close("registration timeout"),
+        "a registration-timeout close must be 1008 with a reason"
     );
     assert!(state.registry.list("prod").is_empty());
 }
 
 #[tokio::test]
 async fn registration_after_the_deadline_is_not_accepted() {
-    // Review round-3 F4(a): the deadline is enforced, not merely advisory.
+    // The deadline is enforced, not merely advisory.
     let (state, url) = spawn_cp(cfg("register_timeout_secs = 1")).await;
     let mut ws = connect(&url).await.expect("connection accepted");
     tokio::time::sleep(Duration::from_millis(1_600)).await;
@@ -202,9 +238,10 @@ async fn registration_after_the_deadline_is_not_accepted() {
 
 #[tokio::test]
 async fn connection_quota_rejects_over_limit_and_recycles_on_disconnect() {
-    // Review round-3 F4(b): the quota bounds concurrent sockets per identity
+    // The quota bounds concurrent sockets per identity
     // and is released on every exit path (RAII), so connect → disconnect →
-    // connect always succeeds.
+    // connect always succeeds. The refusal names the quota: 503 alone cannot
+    // be told apart from an overloaded CP.
     let (state, url) = spawn_cp(cfg(
         "max_connections_per_identity = 1\nregister_timeout_secs = 30",
     ))
@@ -215,11 +252,18 @@ async fn connection_quota_rejects_over_limit_and_recycles_on_disconnect() {
     assert_eq!(state.conn_count("prod/koudu"), 1);
 
     match connect(&url).await {
-        Err(WsError::Http(resp)) => assert_eq!(
-            resp.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "over-quota upgrade must be refused before the WS handshake"
-        ),
+        Err(WsError::Http(resp)) => {
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "over-quota upgrade must be refused before the WS handshake"
+            );
+            let body = http_body(&resp);
+            assert!(
+                body.contains("max_connections_per_identity"),
+                "the 503 body must name the quota, got {body:?}"
+            );
+        }
         Err(e) => panic!("unexpected error: {e}"),
         Ok(_) => panic!("over-quota connection must be rejected"),
     }
@@ -238,7 +282,7 @@ async fn connection_quota_rejects_over_limit_and_recycles_on_disconnect() {
 
 #[tokio::test]
 async fn pre_registration_sockets_count_against_the_quota() {
-    // Review round-3 F4(b): the quota is taken at the upgrade, so parked
+    // The quota is taken at the upgrade, so parked
     // pre-registration sockets cannot be multiplied for free.
     let (_state, url) = spawn_cp(cfg(
         "max_connections_per_identity = 1\nregister_timeout_secs = 30",
@@ -247,7 +291,10 @@ async fn pre_registration_sockets_count_against_the_quota() {
     let _parked = connect(&url).await.expect("connection accepted");
 
     match connect(&url).await {
-        Err(WsError::Http(resp)) => assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE),
+        Err(WsError::Http(resp)) => {
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(http_body(&resp).contains("max_connections_per_identity"));
+        }
         Err(e) => panic!("unexpected error: {e}"),
         Ok(_) => panic!("an unregistered socket must still occupy its quota slot"),
     }

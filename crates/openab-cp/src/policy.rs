@@ -1,4 +1,4 @@
-//! CP-authoritative delegation policy (review F4 on the ADR).
+//! CP-authoritative delegation policy.
 //!
 //! Every check here operates exclusively on CP-owned data: authenticated
 //! identity claims, the CP-constructed ancestry chain, and CP config. Facade

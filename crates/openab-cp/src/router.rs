@@ -1,5 +1,5 @@
 //! Delegation router: in-flight table, target selection, result routing, and
-//! the failure semantics the ADR review required to be explicit:
+//! the failure semantics the ADR requires to be explicit rather than implied:
 //!
 //! - **Deadline sweep** — an in-flight delegation whose deadline passes is
 //!   terminated: the initiator receives a synthesized `timeout` result and
@@ -9,12 +9,36 @@
 //!   instance fail immediately with `target_disconnected`.
 //! - **Initiator disconnect** — its in-flight delegations are cancelled
 //!   downstream (best effort); nobody is left to receive the result.
-//! - **CP restart** — the table is in-memory; all in-flight delegations
-//!   effectively end as initiator-side timeouts. Late `cp/delegate_result`
-//!   frames for unknown ids are acknowledged and dropped (logged), so
-//!   reconnecting runtimes do not error-loop.
+//! - **CP restart** — the table dies with the process, and the connections
+//!   die with it, so the CP cannot synthesize anything: in-flight delegations
+//!   end as initiator-side timeouts against the already-propagated deadline.
+//!   Late `cp/delegate_result` frames for unknown ids are acknowledged and
+//!   dropped (logged), so reconnecting runtimes do not error-loop.
 //! - **Saturation** — routing never queues; `SATURATED` is returned
 //!   immediately (fast-fail, no hidden buffer).
+//!
+//! # Lock hierarchy
+//!
+//! The router holds two locks and acquires them in ONE order only:
+//!
+//! ```text
+//! admission  →  inflight        (never the reverse)
+//! ```
+//!
+//! `admission` serializes the whole delegate admission sequence; `inflight`
+//! guards the in-flight table itself and is taken for short, self-contained
+//! critical sections. Every path that needs both — only `delegate` does —
+//! takes `admission` first and then `inflight`, possibly several times.
+//! No path may take `inflight` and then reach for `admission`: because
+//! `delegate` holds `admission` across `inflight` acquisitions, doing so
+//! would close a deadlock cycle. Paths that need only the table
+//! (`complete`, `cancel`, `fail_instance`, `sweep_deadlines`, `chain_of`)
+//! take `inflight` alone and never touch `admission`.
+//!
+//! Registry access is a third, independent lock owned by [`Registry`]. It is
+//! always acquired and released *outside* an `inflight` critical section
+//! (e.g. `registry.get(...)` completes before the table is locked), so it
+//! does not participate in this hierarchy.
 
 use std::collections::BTreeMap;
 
@@ -31,12 +55,22 @@ use crate::proto::{
 use crate::registry::{Instance, Registry, SelectError};
 
 /// One in-flight delegation. Ownership is tracked by CP-generated
-/// registration handles, never client-supplied ids (review F1).
+/// registration handles, never client-supplied ids: a colliding
+/// `instance_id` on another connection can neither complete nor cancel this
+/// delegation.
 #[derive(Clone)]
 pub struct InFlight {
-    /// Namespace the delegation lives in — part of its identity (review
-    /// round-3 F3): `delegation_id` is client-supplied and only unique within
+    /// Namespace that owns this delegation — part of its identity, not just a
+    /// lookup key: `delegation_id` is client-supplied and only unique within
     /// the namespace that produced it.
+    ///
+    /// Stored on the entry because the delegation outlives the request that
+    /// created it, and the paths that end it without a client request —
+    /// `fail_instance` and `sweep_deadlines` — have no namespace of their own
+    /// to work from. Its consumer is the observer event layer added by the
+    /// next PR in this stack (per-namespace `cp/event` fan-out reads
+    /// `e.namespace` in exactly those two paths), so the field is part of the
+    /// entry's contract rather than an unused remnant.
     pub namespace: String,
     pub delegation_id: String,
     /// Authenticated initiator (`namespace/name`) and its registration handle.
@@ -51,7 +85,7 @@ pub struct InFlight {
     pub chain: Vec<String>,
 }
 
-/// In-flight table key: `(namespace, delegation_id)` (review round-3 F3).
+/// In-flight table key: `(namespace, delegation_id)`.
 ///
 /// Keying on the client-supplied `delegation_id` alone made one namespace's
 /// ids observable from another: a colliding id was denied with
@@ -77,9 +111,10 @@ pub struct Router {
     inflight: Mutex<BTreeMap<DelegationKey, InFlight>>,
     /// Serializes the delegate admission sequence (duplicate check → target
     /// selection → capacity reservation → in-flight insert) so concurrent
-    /// requests cannot double-admit one id or oversubscribe capacity
-    /// (review F2). Delegation rates are LLM-scale; a coarse admission lock
-    /// is simple and more than sufficient.
+    /// requests cannot double-admit one id or oversubscribe capacity: without
+    /// it, two racing delegates both see a free slot and both reserve it.
+    /// Delegation rates are LLM-scale; a coarse admission lock is simple and
+    /// more than sufficient.
     admission: Mutex<()>,
 }
 
@@ -88,6 +123,43 @@ pub enum DelegateOutcome {
     Accepted(DelegateAck),
     /// Rejected; error for the initiator.
     Rejected(ErrorObject),
+}
+
+/// Which side of a delegation a caller must be to act on it.
+#[derive(Clone, Copy)]
+enum Owner {
+    /// The instance the delegation was routed to — the only one that may
+    /// complete it.
+    Server,
+    /// The instance that initiated the delegation — the only one that may
+    /// cancel it.
+    Initiator,
+}
+
+/// Result of looking up an in-flight delegation on a caller's behalf and
+/// asserting the caller owns it.
+///
+/// The whole check happens under ONE acquisition of the in-flight lock, which
+/// is the property that matters: an earlier version removed the entry,
+/// validated ownership, then reinserted it on refusal, and a genuine frame
+/// landing in that window saw an empty table and was dropped as "unknown id",
+/// leaving the delegation to stall until its deadline. Here the entry is
+/// either removed because the caller owns it, or never touched at all.
+enum Claim {
+    /// The caller owns it; the entry has already been removed from the table.
+    Owned(InFlight),
+    /// The entry exists but belongs to another instance. Left in place.
+    WrongOwner {
+        namespace: String,
+        /// Handle of the instance that does own it (CP-side logs only — it is
+        /// never disclosed to the caller).
+        owner_handle: u64,
+    },
+    /// No entry for `(namespace, delegation_id)`.
+    NotFound { namespace: String },
+    /// The calling connection has no registration: it was swept (lease
+    /// expiry) or never registered, so it has no namespace to look in.
+    Unregistered,
 }
 
 impl Router {
@@ -113,14 +185,15 @@ impl Router {
     ) -> DelegateOutcome {
         let now = Utc::now();
 
-        // Admission is one atomic sequence (review F2): duplicate check,
-        // parent lookup, target selection, capacity reservation, and
-        // in-flight insertion all happen under this guard.
+        // Admission is one atomic sequence: duplicate check, parent lookup,
+        // target selection, capacity reservation, and in-flight insertion all
+        // happen under this guard, so two racing delegates can neither
+        // double-admit an id nor both claim the last free slot.
         let _admission = self.admission.lock();
 
-        // Delegation identity is namespace-scoped (review round-3 F3): the
-        // same id in another namespace is a different delegation, so it
-        // neither collides here nor leaks its existence.
+        // Delegation identity is namespace-scoped: the same id in another
+        // namespace is a different delegation, so it neither collides here
+        // nor leaks its existence.
         let key = DelegationKey::new(from_namespace, &params.delegation_id);
         if self.inflight.lock().contains_key(&key) {
             return DelegateOutcome::Rejected(ErrorObject::new(
@@ -141,9 +214,9 @@ impl Router {
         // Parent linkage: chain and deadline derive from the CP's own table,
         // never from the client. The caller must BE the instance serving the
         // parent delegation — otherwise any runtime knowing a live id could
-        // borrow its trusted chain and deadline budget (review F3). The
-        // lookup is namespace-scoped (review round-3 F3). Unknown and
-        // unauthorized parent ids return the same error (no enumeration).
+        // borrow its trusted chain and deadline budget. The lookup is
+        // namespace-scoped. Unknown and unauthorized parent ids return the
+        // same error (no enumeration).
         let (parent_chain, parent_deadline) = match &params.parent_delegation_id {
             Some(pid) => {
                 let parent_key = DelegationKey::new(from_namespace, pid);
@@ -216,8 +289,8 @@ impl Router {
         let text = serde_json::to_string(&frame).expect("serializable");
 
         // Reserve capacity and record the in-flight entry BEFORE sending, so
-        // an immediately-arriving result finds it (review F2). Roll both
-        // back if the send fails.
+        // an immediately-arriving result finds it. Roll both back if the send
+        // fails.
         registry.adjust_sessions(target.handle, 1);
         let entry = InFlight {
             namespace: from_namespace.to_string(),
@@ -256,15 +329,47 @@ impl Router {
         })
     }
 
+    /// Look up `delegation_id` in the caller's namespace, assert the caller is
+    /// the delegation's `owner` side, and remove the entry if so — all under
+    /// one acquisition of the in-flight lock (see [`Claim`]).
+    ///
+    /// The namespace is taken from the caller's authenticated registration,
+    /// never from the frame, so a delegation id can only ever be resolved
+    /// inside the namespace of the connection that named it.
+    fn claim(&self, registry: &Registry, handle: u64, delegation_id: &str, owner: Owner) -> Claim {
+        // Registry lookup completes before the in-flight lock is taken; the
+        // two locks are never held together (see the lock hierarchy above).
+        let namespace = match registry.get(handle) {
+            Some(i) => i.namespace,
+            None => return Claim::Unregistered,
+        };
+        let key = DelegationKey::new(&namespace, delegation_id);
+        let mut g = self.inflight.lock();
+        let owner_handle = match g.get(&key) {
+            Some(e) => match owner {
+                Owner::Server => e.to_handle,
+                Owner::Initiator => e.from_handle,
+            },
+            None => return Claim::NotFound { namespace },
+        };
+        if owner_handle != handle {
+            return Claim::WrongOwner {
+                namespace,
+                owner_handle,
+            };
+        }
+        let entry = g.remove(&key).expect("present under the same lock");
+        Claim::Owned(entry)
+    }
+
     /// Handle `cp/delegate_result` from the serving runtime. Returns the
     /// initiator-bound frame if the delegation is known; unknown ids (e.g.
     /// results arriving after a CP restart) are dropped with a log.
     ///
-    /// Ownership is validated under the SAME lock acquisition that removes
-    /// the entry (review round-3 F2): the previous remove-check-reinsert
-    /// dance opened a window in which a genuine result saw an empty table and
-    /// was dropped, and left the entry momentarily invisible to the deadline
-    /// sweep.
+    /// Only the instance the delegation was routed to may complete it, and
+    /// that check shares the lock acquisition that removes the entry (see
+    /// [`Claim`]), so a non-owner frame can never make the delegation
+    /// momentarily invisible to a genuine result or to the deadline sweep.
     pub fn complete(
         &self,
         registry: &Registry,
@@ -273,11 +378,37 @@ impl Router {
         max_result_bytes: usize,
         next_rpc_id: u64,
     ) -> Option<(Instance, String)> {
-        // The namespace comes from the authenticated sender's registration,
-        // never from the frame (review round-3 F3).
-        let namespace = match registry.get(serving_handle) {
-            Some(i) => i.namespace,
-            None => {
+        let entry = match self.claim(
+            registry,
+            serving_handle,
+            &params.delegation_id,
+            Owner::Server,
+        ) {
+            Claim::Owned(entry) => entry,
+            Claim::WrongOwner {
+                namespace,
+                owner_handle,
+            } => {
+                // Only the instance the delegation was routed to may
+                // complete it. The entry stays exactly where it is.
+                warn!(
+                    delegation = %params.delegation_id,
+                    namespace = %namespace,
+                    expected = owner_handle,
+                    got = serving_handle,
+                    "result from unexpected instance — dropped, delegation untouched"
+                );
+                return None;
+            }
+            Claim::NotFound { namespace } => {
+                warn!(
+                    delegation = %params.delegation_id,
+                    namespace = %namespace,
+                    "result for unknown delegation (late arrival or CP restart) — dropped"
+                );
+                return None;
+            }
+            Claim::Unregistered => {
                 warn!(
                     handle = serving_handle,
                     delegation = %params.delegation_id,
@@ -286,40 +417,12 @@ impl Router {
                 return None;
             }
         };
-        let key = DelegationKey::new(&namespace, &params.delegation_id);
-        let entry = {
-            let mut g = self.inflight.lock();
-            match g.get(&key) {
-                Some(e) if e.to_handle == serving_handle => {}
-                Some(e) => {
-                    // Only the instance the delegation was routed to may
-                    // complete it. The entry stays exactly where it is.
-                    warn!(
-                        delegation = %params.delegation_id,
-                        namespace = %namespace,
-                        expected = e.to_handle,
-                        got = serving_handle,
-                        "result from unexpected instance — dropped, delegation untouched"
-                    );
-                    return None;
-                }
-                None => {
-                    warn!(
-                        delegation = %params.delegation_id,
-                        namespace = %namespace,
-                        "result for unknown delegation (late arrival or CP restart) — dropped"
-                    );
-                    return None;
-                }
-            }
-            g.remove(&key).expect("present under the same lock")
-        };
 
         registry.adjust_sessions(entry.to_handle, -1);
 
         // Truncate oversized results (keep the head; delegation already
         // ran). The marker counts against the cap: the final value never
-        // exceeds max_result_bytes (review round-2 F5).
+        // exceeds max_result_bytes.
         if let Some(r) = &params.result {
             if r.len() > max_result_bytes {
                 let marker = format!("\n…[truncated by control plane: {} bytes total]", r.len());
@@ -358,12 +461,12 @@ impl Router {
     /// to the serving runtime, if the delegation is in flight and owned by
     /// the caller.
     ///
-    /// Ownership is validated under the same lock acquisition that removes
-    /// the entry (review round-3 F2 — no remove/reinsert window), and every
-    /// refusal returns ONE byte-identical error (review round-3 F3): an
-    /// unknown id and another instance's live id are indistinguishable to the
-    /// caller, so `cp/cancel` cannot be used to probe for delegation ids.
-    /// The distinction is kept in the CP's own logs only.
+    /// Ownership is validated under the same lock acquisition that removes the
+    /// entry (see [`Claim`] — no remove/reinsert window), and every refusal
+    /// returns ONE byte-identical error: an unknown id and another instance's
+    /// live id are indistinguishable to the caller, so `cp/cancel` cannot be
+    /// used to probe for delegation ids. The distinction is kept in the CP's
+    /// own logs only.
     pub fn cancel(
         &self,
         registry: &Registry,
@@ -377,40 +480,37 @@ impl Router {
                 "delegation is not in flight for this instance",
             )
         };
-        let namespace = match registry.get(from_handle) {
-            Some(i) => i.namespace,
-            None => {
+        let entry = match self.claim(
+            registry,
+            from_handle,
+            &params.delegation_id,
+            Owner::Initiator,
+        ) {
+            Claim::Owned(entry) => entry,
+            Claim::WrongOwner { namespace, .. } => {
+                warn!(
+                    delegation = %params.delegation_id,
+                    namespace = %namespace,
+                    handle = from_handle,
+                    "cancel refused: only the initiating instance may cancel"
+                );
+                return Err(refused());
+            }
+            Claim::NotFound { namespace } => {
+                warn!(
+                    delegation = %params.delegation_id,
+                    namespace = %namespace,
+                    "cancel refused: delegation not in flight"
+                );
+                return Err(refused());
+            }
+            Claim::Unregistered => {
                 warn!(
                     handle = from_handle,
                     "cancel from an unregistered connection"
                 );
                 return Err(refused());
             }
-        };
-        let key = DelegationKey::new(&namespace, &params.delegation_id);
-        let entry = {
-            let mut g = self.inflight.lock();
-            match g.get(&key) {
-                Some(e) if e.from_handle == from_handle => {}
-                Some(_) => {
-                    warn!(
-                        delegation = %params.delegation_id,
-                        namespace = %namespace,
-                        handle = from_handle,
-                        "cancel refused: only the initiating instance may cancel"
-                    );
-                    return Err(refused());
-                }
-                None => {
-                    warn!(
-                        delegation = %params.delegation_id,
-                        namespace = %namespace,
-                        "cancel refused: delegation not in flight"
-                    );
-                    return Err(refused());
-                }
-            }
-            g.remove(&key).expect("present under the same lock")
         };
         registry.adjust_sessions(entry.to_handle, -1);
         info!(delegation = %params.delegation_id, "delegation cancelled by initiator");
@@ -537,8 +637,7 @@ impl Router {
     }
 
     /// Chain of an in-flight delegation (for tests/inspection). Delegation
-    /// ids are namespace-scoped (review round-3 F3), so the namespace is part
-    /// of the lookup.
+    /// ids are namespace-scoped, so the namespace is part of the lookup.
     pub fn chain_of(&self, namespace: &str, delegation_id: &str) -> Option<Vec<String>> {
         self.inflight
             .lock()
@@ -707,7 +806,8 @@ type = "worker"
 
     #[test]
     fn inflight_exists_before_target_receives_frame() {
-        // Review F2: an immediately-arriving result must find the entry.
+        // An immediately-arriving result must find the entry: it is inserted
+        // before the forward frame is sent.
         let mut w = world();
         assert!(matches!(
             do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
@@ -1052,8 +1152,9 @@ allow_worker_initiation = true
             vec!["prod/koudu".to_string()]
         );
 
-        // Review F3: worker-2 (NOT serving d-root) tries to borrow d-root
-        // as parent — rejected.
+        // Borrowed ancestry: worker-2 (NOT serving d-root) tries to use
+        // d-root as its parent — rejected, so a trusted chain and deadline
+        // budget cannot be inherited by a stranger.
         let mut foreign = delegate_params("d-foreign", "worker-2", 60);
         foreign.parent_delegation_id = Some("d-root".into());
         match w.router.delegate(
@@ -1126,8 +1227,8 @@ allow_worker_initiation = true
 
     #[test]
     fn wrong_handle_result_never_hides_the_genuine_one() {
-        // Review round-3 F2: ownership is validated under the same lock
-        // acquisition that removes the entry. The old remove → validate →
+        // Ownership is validated under the same lock acquisition that removes
+        // the entry. The old remove → validate →
         // reinsert sequence made the entry briefly invisible, so a genuine
         // result arriving in that window was dropped as "unknown id".
         for spoof_first in [true, false] {
@@ -1191,7 +1292,7 @@ allow_worker_initiation = true
 
     #[test]
     fn genuine_result_survives_concurrent_non_owner_frames() {
-        // Review round-3 F2, the racing case the sequential test above cannot
+        // The racing case the sequential test above cannot
         // observe: with remove → validate → reinsert, a genuine result that
         // lands inside the window sees an empty table and is dropped, and the
         // delegation then stalls to its deadline. Under a single lock
@@ -1238,7 +1339,7 @@ allow_worker_initiation = true
 
     #[test]
     fn genuine_cancel_survives_concurrent_non_owner_frames() {
-        // Review round-3 F2 (cancel side), racing case: with the old
+        // Cancel side, racing case: with the old
         // remove → validate → reinsert pattern, a genuine initiator cancel
         // landing inside a non-owner cancel's window would see an empty table
         // and be refused, leaving the delegation to stall to its deadline.
@@ -1280,7 +1381,7 @@ allow_worker_initiation = true
 
     #[test]
     fn refused_cancel_leaves_the_delegation_cancellable() {
-        // Review round-3 F2 (cancel side): a wrong-handle cancel must not
+        // Cancel side: a wrong-handle cancel must not
         // remove-and-reinsert the entry, and must not disturb accounting.
         let w = world();
         assert!(matches!(
@@ -1313,7 +1414,7 @@ allow_worker_initiation = true
 
     #[test]
     fn cancel_refusals_are_byte_identical() {
-        // Review round-3 F3: `cp/cancel` must not be an existence oracle —
+        // `cp/cancel` must not be an existence oracle —
         // an unknown id and another instance's live id return the same error
         // object, byte for byte.
         let w = world();
@@ -1349,7 +1450,7 @@ allow_worker_initiation = true
 
     #[test]
     fn same_delegation_id_in_two_namespaces_is_independent() {
-        // Review round-3 F3: the in-flight table is keyed by
+        // The in-flight table is keyed by
         // (namespace, delegation_id). A client-supplied id in one namespace
         // must neither collide with nor be observable from another.
         let registry = Registry::new();
@@ -1433,7 +1534,7 @@ allow_worker_initiation = true
 
     #[test]
     fn parent_lookup_is_namespace_scoped() {
-        // Review round-3 F3: parent-chain resolution must not reach into
+        // Parent-chain resolution must not reach into
         // another namespace's in-flight table.
         let cfg: CpConfig = toml::from_str(
             r#"
