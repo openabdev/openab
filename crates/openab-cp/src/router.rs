@@ -328,8 +328,11 @@ impl Router {
     }
 
     /// Handle `cp/delegate` from an authenticated, registered initiator.
-    /// Observers in the initiator's namespace are notified after the forward
-    /// leaves the CP (best effort — see [`EventHub`]).
+    /// Observers in the initiator's namespace are notified once admission is
+    /// committed, BEFORE the forward is attempted — outside the admission
+    /// critical section (best effort — see [`EventHub`]). A forward that is
+    /// refused emits a matching `delegation_cancelled` terminal, so the
+    /// stream never carries a `requested` without a terminal.
     #[allow(clippy::too_many_arguments)]
     pub fn delegate(
         &self,
@@ -583,6 +586,34 @@ impl Router {
         };
         self.inflight.lock().insert(key.clone(), entry.clone());
 
+        // Admission is committed: the token is minted, capacity is reserved,
+        // and the entry is inserted — the duplicate check rides the in-flight
+        // table, so nothing below needs the admission guard. Dropping it here
+        // keeps observer fan-out (serialization + per-observer try_send) out
+        // of the one critical section that serializes every delegation in
+        // every namespace: a saturated lobby must never slow admission.
+        drop(admission);
+
+        // Lobby fan-out BEFORE the forward: a worker cannot complete a
+        // delegation it has not yet seen, so emitting here anchors the
+        // stream causally — `delegation_completed` can never precede
+        // `delegation_requested` for the same admission. The rollback below
+        // emits a matching terminal so a refused forward never leaves a
+        // `requested` dangling without one.
+        events.emit(
+            registry,
+            from_namespace,
+            CpEvent::DelegationRequested {
+                delegation_id: entry.delegation_id.clone(),
+                admission: entry.generation,
+                from: entry.from_logical.clone(),
+                to: entry.to_logical.clone(),
+                prompt_excerpt: events.excerpt(from_namespace, &forward.prompt),
+                deadline: entry.deadline,
+                chain: entry.chain.clone(),
+            },
+        );
+
         if target.tx.try_send(text).is_err() {
             // Disconnected or backpressured beyond its queue: roll back.
             //
@@ -595,12 +626,24 @@ impl Router {
             // hides the underflow and `saturated()` then admits new work to
             // an instance that is actually full.
             //
-            // Matched on the generation, not just the key: the admission lock
-            // happens to rule out a re-admission of this id while we are
-            // here, but the rollback does not need that argument to be
-            // correct — it removes the exact entry it inserted or nothing.
+            // Matched on the generation, not just the key: the rollback
+            // removes the exact entry it inserted or nothing. Whoever wins
+            // the removal also owns the terminal event, so exactly one
+            // authoritative terminal reaches observers for this admission.
             if self.remove_generation(&key, entry.generation).is_some() {
                 registry.adjust_sessions(target.handle, -1);
+                events.emit(
+                    registry,
+                    from_namespace,
+                    CpEvent::DelegationCancelled {
+                        delegation_id: entry.delegation_id.clone(),
+                        admission: entry.generation,
+                        from: entry.from_logical.clone(),
+                        to: entry.to_logical.clone(),
+                        by: "control-plane".to_string(),
+                        reason: Some(events.cp_diagnostic("target disconnected during routing")),
+                    },
+                );
             }
             return DelegateOutcome::Rejected(ErrorObject::new(
                 codes::TARGET_DISCONNECTED,
@@ -616,20 +659,6 @@ impl Router {
             chain = ?entry.chain,
             deadline = %entry.deadline,
             "delegation routed"
-        );
-
-        // Lobby fan-out: after the forward, never in its way.
-        events.emit(
-            registry,
-            from_namespace,
-            CpEvent::DelegationRequested {
-                delegation_id: entry.delegation_id.clone(),
-                from: entry.from_logical.clone(),
-                to: entry.to_logical.clone(),
-                prompt_excerpt: events.excerpt(from_namespace, &forward.prompt),
-                deadline: entry.deadline,
-                chain: entry.chain.clone(),
-            },
         );
 
         DelegateOutcome::Accepted(DelegateAck {
@@ -821,13 +850,14 @@ impl Router {
     /// to a genuine result or to the deadline sweep.
     ///
     /// Observers in the delegation's namespace are notified of the terminal
-    /// status as soon as the peek validates the frame — before the initiator
-    /// is even looked up — so the lobby sees the delegation end even when the
-    /// initiator is already gone or its queue refuses the result. Like every
-    /// `cp/event` fan-out this is best effort and shares the initiator's
-    /// "first terminal frame wins" semantics: the peek-send window can put a
-    /// second terminal event on the wire for one `delegation_id`, and
-    /// observers MUST treat the first as authoritative (see [`EventHub`]).
+    /// status only when THIS path authoritatively ends the delegation
+    /// (`Commit::Claimed`). Every other ending — cancel, sweep, initiator or
+    /// target disconnect, forward rollback — emits its own terminal from its
+    /// own removal, so the event stream carries exactly one authoritative
+    /// terminal per admission and it always matches CP state: a result whose
+    /// delivery stalls terminates through `fail_instance` and observers see
+    /// `delegation_cancelled`, the same outcome the initiator records.
+    /// Dropped and stale results emit nothing.
     pub fn complete(
         &self,
         registry: &Registry,
@@ -907,27 +937,6 @@ impl Router {
             }
         }
 
-        // Lobby fan-out: the peek has validated the entry snapshot and the
-        // serving handle, so the delegation HAS reached a terminal status as
-        // far as the CP is concerned. Emitting here — before the initiator
-        // lookup and its `try_send` — is deliberate: observers see the
-        // terminal status even when the initiator is gone or its queue
-        // refuses the frame. Not moved into the commit phase, which reports
-        // who won a race rather than what happened; observers get the same
-        // at-least-once, first-terminal-wins contract as initiators.
-        events.emit(
-            registry,
-            &entry.namespace,
-            CpEvent::DelegationCompleted {
-                delegation_id: params.delegation_id.clone(),
-                from: entry.from_logical.clone(),
-                to: entry.to_logical.clone(),
-                status: params.status.clone(),
-                result_excerpt: events.excerpt_opt(&entry.namespace, params.result.as_deref()),
-                error: events.excerpt_opt(&entry.namespace, params.error.as_deref()),
-            },
-        );
-
         let Some(initiator) = registry.get(entry.from_handle) else {
             // The initiator deregistered concurrently: its `fail_instance`
             // pass removes this entry, releases capacity, and cancels the
@@ -970,6 +979,27 @@ impl Router {
                     from = %entry.to_logical,
                     to = %entry.from_logical,
                     "delegation completed"
+                );
+                // Lobby fan-out AFTER the authoritative removal: this path
+                // owns the entry's end, so it owns the terminal event. Every
+                // removal path (commit here, cancel, sweep, fail_instance,
+                // forward rollback) emits exactly one terminal from its own
+                // removal, so observers never see divergent or duplicate
+                // terminals for one admission, and a dropped or stale result
+                // emits nothing at all.
+                events.emit(
+                    registry,
+                    &entry.namespace,
+                    CpEvent::DelegationCompleted {
+                        delegation_id: params.delegation_id.clone(),
+                        admission: entry.generation,
+                        from: entry.from_logical.clone(),
+                        to: entry.to_logical.clone(),
+                        status: params.status.clone(),
+                        result_excerpt: events
+                            .excerpt_opt(&entry.namespace, params.result.as_deref()),
+                        error: events.excerpt_opt(&entry.namespace, params.error.as_deref()),
+                    },
                 );
                 true
             }
@@ -1087,10 +1117,16 @@ impl Router {
             &entry.namespace,
             CpEvent::DelegationCancelled {
                 delegation_id: params.delegation_id.clone(),
+                admission: entry.generation,
                 from: entry.from_logical.clone(),
                 to: entry.to_logical.clone(),
                 by: entry.from_logical.clone(),
-                reason: events.bounded(&params.reason),
+                // Initiator-supplied free text is agent content, not a CP
+                // diagnostic: it goes through the metadata_only-aware path,
+                // so a `metadata_only` namespace never mirrors it to
+                // observers (the counterparty still receives it verbatim in
+                // the forwarded cp/cancel below).
+                reason: events.excerpt(&entry.namespace, &params.reason),
             },
         );
         let target = registry.get(entry.to_handle);
@@ -1158,11 +1194,12 @@ impl Router {
                     &e.namespace,
                     CpEvent::DelegationCompleted {
                         delegation_id: e.delegation_id.clone(),
+                        admission: e.generation,
                         from: e.from_logical.clone(),
                         to: e.to_logical.clone(),
                         status: DelegationStatus::TargetDisconnected,
                         result_excerpt: None,
-                        error: Some(events.bounded(&error)),
+                        error: Some(events.cp_diagnostic(&error)),
                     },
                 );
             } else {
@@ -1191,10 +1228,11 @@ impl Router {
                     &e.namespace,
                     CpEvent::DelegationCancelled {
                         delegation_id: e.delegation_id.clone(),
+                        admission: e.generation,
                         from: e.from_logical.clone(),
                         to: e.to_logical.clone(),
                         by: "control-plane".to_string(),
-                        reason: events.bounded(&reason),
+                        reason: Some(events.cp_diagnostic(&reason)),
                     },
                 );
             }
@@ -1230,11 +1268,12 @@ impl Router {
                 &e.namespace,
                 CpEvent::DelegationCompleted {
                     delegation_id: e.delegation_id.clone(),
+                    admission: e.generation,
                     from: e.from_logical.clone(),
                     to: e.to_logical.clone(),
                     status: DelegationStatus::Timeout,
                     result_excerpt: None,
-                    error: Some(events.bounded("deadline exceeded")),
+                    error: Some(events.cp_diagnostic("deadline exceeded")),
                 },
             );
             if let Some(init) = registry.get(e.from_handle) {
@@ -3919,16 +3958,23 @@ type = "primary"
 
     #[test]
     fn completed_event_emitted_even_when_initiator_is_gone() {
+        // Renamed contract (review round-7 F4/F5): an undelivered result is
+        // NOT an authoritative terminal. When the initiator is gone the
+        // result is dropped with NO observer event; the one terminal the
+        // lobby sees comes from the initiator's teardown (`fail_instance`)
+        // and matches what actually happened: the delegation was cancelled,
+        // its result never delivered.
         let w = world();
         let mut lobby = observe(&w, "prod");
         assert!(matches!(
             do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
             DelegateOutcome::Accepted(_)
         ));
+        let admission = token(&w.router, "prod", "d-1");
         w.registry.deregister(w.h_primary);
         let result = DelegateResultParams {
             delegation_id: "d-1".into(),
-            admission: token(&w.router, "prod", "d-1"),
+            admission,
             status: DelegationStatus::Failed,
             result: None,
             error: Some("boom".into()),
@@ -3940,10 +3986,222 @@ type = "primary"
             "nobody left to receive the result"
         );
         let ev = events_of(&mut lobby);
+        assert_eq!(
+            ev.len(),
+            1,
+            "a dropped result must not emit a terminal event"
+        );
+        assert_eq!(ev[0]["event"], "delegation_requested");
+        assert_eq!(ev[0]["admission"], admission);
+
+        // The teardown path owns the end of the delegation and its terminal.
+        let mut next = || 7;
+        w.router
+            .fail_instance(&w.registry, &w.events, w.h_primary, &mut next);
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 1, "exactly one authoritative terminal");
+        assert_eq!(ev[0]["event"], "delegation_cancelled");
+        assert_eq!(ev[0]["admission"], admission);
+        assert_eq!(ev[0]["by"], "control-plane");
+    }
+
+    #[test]
+    fn stalled_initiator_produces_single_cancelled_terminal_for_observers() {
+        // Review round-7 F4: previously `complete()` emitted
+        // `delegation_completed` before the initiator try_send, so a stalled
+        // initiator produced completed-then-cancelled — opposite outcomes
+        // for the two audiences. Now the observer records exactly what the
+        // initiator records: one cancelled terminal from `fail_instance`.
+        let mut w = world();
+        let mut lobby = observe(&w, "prod");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        w.worker_rx.try_recv().unwrap();
+        let admission = token(&w.router, "prod", "d-1");
+
+        let initiator_tx = w.registry.get(w.h_primary).unwrap().tx;
+        while initiator_tx.try_send("filler".into()).is_ok() {}
+
+        assert_eq!(
+            w.router.complete(
+                &w.registry,
+                &w.events,
+                w.h_worker,
+                result_of("d-1", admission, "late"),
+                1024,
+                2
+            ),
+            CompleteOutcome::InitiatorStalled {
+                initiator_handle: w.h_primary
+            }
+        );
+        let ev = events_of(&mut lobby);
+        assert_eq!(
+            ev.len(),
+            1,
+            "no terminal while the delegation is unresolved"
+        );
+        assert_eq!(ev[0]["event"], "delegation_requested");
+
+        let mut next = || 9;
+        w.router
+            .fail_instance(&w.registry, &w.events, w.h_primary, &mut next);
+        let ev = events_of(&mut lobby);
+        assert_eq!(
+            ev.len(),
+            1,
+            "one authoritative terminal, no completed+cancelled pair"
+        );
+        assert_eq!(ev[0]["event"], "delegation_cancelled");
+        assert_eq!(ev[0]["admission"], admission);
+    }
+
+    #[test]
+    fn refused_forward_emits_requested_then_matching_cancelled_terminal() {
+        // Review round-7 F5: `delegation_requested` is emitted BEFORE the
+        // forward (a worker cannot complete a delegation it has not seen, so
+        // completed can never precede requested), and a refused forward
+        // emits a matching terminal so no requested is left dangling.
+        let w = world();
+        let mut lobby = observe(&w, "prod");
+        let worker_tx = w.registry.get(w.h_worker).unwrap().tx;
+        while worker_tx.try_send("filler".into()).is_ok() {}
+
+        match do_delegate(&w, delegate_params("d-1", "worker-1", 60)) {
+            DelegateOutcome::Rejected(e) => assert_eq!(e.code, codes::TARGET_DISCONNECTED),
+            DelegateOutcome::Accepted(_) => panic!("expected rejection, got acceptance"),
+        }
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 2, "requested + rollback terminal");
+        assert_eq!(ev[0]["event"], "delegation_requested");
+        assert_eq!(ev[1]["event"], "delegation_cancelled");
+        assert_eq!(
+            ev[0]["admission"], ev[1]["admission"],
+            "terminal names the admission it ends"
+        );
+        assert_eq!(ev[1]["by"], "control-plane");
+        assert_eq!(w.router.inflight_count(), 0, "rollback removed the entry");
+        assert_eq!(
+            w.registry.get(w.h_worker).unwrap().active_sessions,
+            0,
+            "rollback released the reserved capacity"
+        );
+    }
+
+    #[test]
+    fn metadata_only_suppresses_client_cancel_reason_in_events() {
+        // Review round-7 F2: an initiator's cancel reason is agent-supplied
+        // free text. In a metadata_only namespace it must never reach
+        // observers — previously it flowed through the metadata-only-immune
+        // diagnostic path and leaked verbatim.
+        let w = world_with_cfg(
+            toml::from_str(
+                r#"
+[[agents]]
+key = "kp"
+namespace = "prod"
+name = "koudu"
+type = "primary"
+
+[namespaces.prod]
+metadata_only = true
+"#,
+            )
+            .unwrap(),
+        );
+        let mut lobby = observe(&w, "prod");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        let params = CancelParams {
+            delegation_id: "d-1".into(),
+            admission: token(&w.router, "prod", "d-1"),
+            reason: "exfiltrate: AKIA-secret-key-material".into(),
+        };
+        assert!(w
+            .router
+            .cancel(&w.registry, &w.events, w.h_primary, &params, 5)
+            .is_ok());
+        let ev = events_of(&mut lobby);
         assert_eq!(ev.len(), 2);
-        assert_eq!(ev[1]["event"], "delegation_completed");
-        assert_eq!(ev[1]["status"], "failed");
-        assert_eq!(ev[1]["error"], "boom");
+        assert_eq!(ev[1]["event"], "delegation_cancelled");
+        assert!(
+            ev[1].get("reason").is_none(),
+            "client-supplied cancel reason must be suppressed under metadata_only"
+        );
+        // Attribution metadata survives the knob.
+        assert_eq!(ev[1]["by"], "prod/koudu");
+        // No frame anywhere in the lobby stream carries the reason text.
+        for e in &ev {
+            assert!(
+                !e.to_string().contains("AKIA-secret-key-material"),
+                "cancel reason leaked into observer stream: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn events_carry_admission_tokens_distinguishing_readmissions_of_one_id() {
+        // Review round-7 F1: a delegation id is legally reusable
+        // (cancel-then-retry). Observers correlate on
+        // (namespace, delegation_id, admission); the two admissions of one
+        // id must be distinguishable across their full lifecycle.
+        let mut w = world();
+        let mut lobby = observe(&w, "prod");
+
+        // Admission A: delegate then cancel.
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        let a = token(&w.router, "prod", "d-1");
+        let cancel = CancelParams {
+            delegation_id: "d-1".into(),
+            admission: a,
+            reason: "retrying".into(),
+        };
+        assert!(w
+            .router
+            .cancel(&w.registry, &w.events, w.h_primary, &cancel, 5)
+            .is_ok());
+        w.worker_rx.try_recv().unwrap();
+
+        // Admission B: same id, re-admitted, completed.
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        let b = token(&w.router, "prod", "d-1");
+        assert_ne!(a, b, "re-admission mints a fresh token");
+        assert_eq!(
+            w.router.complete(
+                &w.registry,
+                &w.events,
+                w.h_worker,
+                result_of("d-1", b, "done"),
+                1024,
+                2
+            ),
+            CompleteOutcome::Delivered { committed: true }
+        );
+
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 4);
+        assert_eq!(ev[0]["event"], "delegation_requested");
+        assert_eq!(ev[0]["admission"], a);
+        assert_eq!(ev[1]["event"], "delegation_cancelled");
+        assert_eq!(ev[1]["admission"], a);
+        assert_eq!(ev[2]["event"], "delegation_requested");
+        assert_eq!(ev[2]["admission"], b);
+        assert_eq!(ev[3]["event"], "delegation_completed");
+        assert_eq!(ev[3]["admission"], b);
+        // Same reusable id throughout — only the token separates A from B.
+        for e in &ev {
+            assert_eq!(e["delegation_id"], "d-1");
+        }
     }
 
     #[test]

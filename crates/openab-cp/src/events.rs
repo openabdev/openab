@@ -73,10 +73,16 @@ impl EventHub {
         body.and_then(|b| self.excerpt(namespace, b))
     }
 
-    /// Bound a short CP-synthesized string (a cancellation reason, a timeout
-    /// or disconnect diagnostic). These are metadata, not payload, so
+    /// Bound a short **CP-synthesized** diagnostic (a timeout or disconnect
+    /// reason the CP itself composed). These are metadata, not payload, so
     /// `metadata_only` does not suppress them.
-    pub fn bounded(&self, text: &str) -> String {
+    ///
+    /// NEVER pass agent-supplied content here: anything that originated in a
+    /// client frame (prompts, results, errors, an initiator's cancel reason)
+    /// must go through [`EventHub::excerpt`]/[`EventHub::excerpt_opt`], which
+    /// honor `metadata_only`. The name is deliberately specific so a call
+    /// site feeding client input through it reads as wrong.
+    pub fn cp_diagnostic(&self, text: &str) -> String {
         truncate_with_marker(text, self.max_excerpt_bytes)
     }
 
@@ -359,7 +365,7 @@ max_depth = 2
         );
         assert_eq!(h.excerpt_opt("prod", None), None);
         // CP-synthesized diagnostics are metadata and survive the knob.
-        assert_eq!(h.bounded("deadline exceeded"), "deadline exceeded");
+        assert_eq!(h.cp_diagnostic("deadline exceeded"), "deadline exceeded");
 
         // On the wire, the excerpt key disappears entirely.
         let registry = Registry::new();
@@ -369,6 +375,7 @@ max_depth = 2
             "secret",
             CpEvent::DelegationRequested {
                 delegation_id: "d-1".into(),
+                admission: 1,
                 from: "secret/koudu".into(),
                 to: "secret/worker-1".into(),
                 prompt_excerpt: h.excerpt("secret", "top secret prompt"),
