@@ -13,13 +13,23 @@
 //!   to which routing decision — uses the CP-minted
 //!   [`AdmissionToken`]: carried on the `cp/delegate` ack and forwarded frame,
 //!   echoed by the serving runtime in `cp/delegate_result` (required), carried
-//!   on `cp/cancel` in both directions (required), and stamped on every
-//!   initiator-bound terminal frame.
+//!   on `cp/cancel` in both directions (required), carried on `cp/delegate` as
+//!   `parent_admission` whenever the request names a parent (required), and
+//!   stamped on every initiator-bound terminal frame. Every surface that
+//!   references an *existing* delegation names it by the (id, admission) pair;
+//!   a bare reusable id is never accepted as a reference.
 //! - The first frame on a new connection MUST be `cp/register`. Anything else
 //!   is rejected with `NOT_REGISTERED` and the connection is closed.
-//! - Delegation ancestry (`chain`) is **CP-constructed**: callers supply only
-//!   `parent_delegation_id`; the CP derives the chain from authenticated
-//!   identities and its in-flight table. A runtime cannot forge ancestry.
+//! - Delegation ancestry (`chain`) is **CP-constructed**: callers never supply
+//!   a chain. They supply a parent *reference*, and that reference is the
+//!   coupled pair `parent_delegation_id` + `parent_admission` — a parented
+//!   `cp/delegate` MUST carry both (an id without a token is
+//!   `INVALID_PARAMS`), so the parent is named by a specific admission rather
+//!   than by a reusable id. The CP derives the chain, depth, cycle and
+//!   deadline-budget inputs from the entry that reference resolves to, using
+//!   authenticated identities and its in-flight table. A root delegation
+//!   carries neither field. A runtime cannot forge ancestry, nor inherit the
+//!   chain and budget of an admission it was not serving.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -255,6 +265,15 @@ pub struct TargetSelector {
 }
 
 /// Params of `cp/delegate` as sent by the initiating runtime.
+///
+/// The parent reference is a **pair**: `parent_delegation_id` names the
+/// delegation, `parent_admission` names which admission of it (see
+/// [`AdmissionToken`]). Both are `Option` on the struct because a root
+/// delegation carries neither — that shape is unchanged on the wire — but the
+/// CP enforces their coupling at admission: an id without a token is
+/// `INVALID_PARAMS`, never "whatever admission holds that id now". An optional
+/// token on a parented request would be exactly the wildcard that lets stale
+/// work inherit a live re-admission's chain and deadline budget.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegateParams {
     /// Caller-generated unique id (idempotency key). The CP rejects a second
@@ -269,8 +288,28 @@ pub struct DelegateParams {
     /// If this delegation is issued while serving another delegation, the id
     /// of that parent. The CP derives the ancestry chain from this — the
     /// chain is never client-supplied.
+    ///
+    /// Present ⇒ `parent_admission` MUST also be present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_delegation_id: Option<String>,
+    /// Which admission of `parent_delegation_id` this delegation is a child
+    /// of — the token the serving runtime learned from
+    /// [`DelegateForward::admission`] for the parent it is currently serving.
+    ///
+    /// Required whenever `parent_delegation_id` is present, and meaningless
+    /// without it (the CP refuses a token-without-id as malformed rather than
+    /// ignoring it, so a client bug surfaces instead of silently producing a
+    /// root delegation). `delegation_id` alone names a *slot* that
+    /// cancel-then-retry legitimately reuses; the parent lookup feeds the
+    /// CP's own policy inputs — ancestry chain, depth, cycle, and the
+    /// deadline budget a child is clamped to — so it must name the admission
+    /// those inputs were computed for. Without the token, a residual task
+    /// from a parent admission A that has already ended could submit a child
+    /// against the same id after it was re-admitted as B to the same worker,
+    /// and the child would inherit B's trusted chain and B's remaining
+    /// budget.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_admission: Option<AdmissionToken>,
 }
 
 /// Params of `cp/delegate` as forwarded to the serving runtime. The CP stamps
@@ -328,6 +367,14 @@ pub struct DelegateAck {
 ///   best-effort cancel that overtakes a same-id re-admission's forward is
 ///   identifiable at the worker as belonging to the admission that is already
 ///   over.
+/// - the parent reference on `cp/delegate` carries it
+///   (`parent_admission`, required whenever `parent_delegation_id` is
+///   present). The parent lookup is what lets a child inherit a
+///   CP-constructed chain and a parent's remaining deadline budget, so it
+///   must name the admission those were derived for: after a parent
+///   admission ends and its id is re-admitted, a child composed against the
+///   ended admission is refused instead of adopting the live one's policy
+///   envelope.
 ///
 /// The value is a per-namespace monotonic counter. Namespace-scoped on
 /// purpose: a single global counter placed on the wire would disclose
@@ -498,6 +545,20 @@ mod tests {
                         "the initiator-sent cp/delegate example must not show an \
                          `admission` — the CP mints it and returns it in the ack"
                     );
+                    // The parent reference is a pair, and key-set equality
+                    // alone cannot catch a missing half: an example with
+                    // `parent_delegation_id` and no `parent_admission` parses
+                    // into `None`, which is then skipped on serialization, so
+                    // the key sets would still match. Assert the coupling
+                    // directly — an example showing a bare parent id would
+                    // document exactly the wildcard the CP refuses, and it is
+                    // what a client implementer copies.
+                    assert_eq!(
+                        params.get("parent_delegation_id").is_some(),
+                        params.get("parent_admission").is_some(),
+                        "the cp/delegate example must show `parent_delegation_id` \
+                         and `parent_admission` together, or neither (root)"
+                    );
                     let p: DelegateParams = serde_json::from_value(params.clone())
                         .expect("cp/delegate example must parse as DelegateParams");
                     serde_json::to_value(&p).expect("serializable")
@@ -574,6 +635,56 @@ mod tests {
             serde_json::to_value(DelegationStatus::TargetDisconnected).unwrap(),
             serde_json::json!("target_disconnected")
         );
+    }
+
+    #[test]
+    fn parent_reference_is_a_pair_and_root_delegations_are_unchanged_on_the_wire() {
+        // A root delegation carries neither field, and neither appears when it
+        // is serialized — the pre-token root shape is byte-compatible, which is
+        // why the wire break is confined to parented requests.
+        let root = serde_json::json!({
+            "delegation_id": "d-1",
+            "target": {"name": "w1"},
+            "prompt": "hi",
+            "deadline": "2026-08-06T22:45:00Z"
+        });
+        let p: DelegateParams = serde_json::from_value(root).unwrap();
+        assert!(p.parent_delegation_id.is_none());
+        assert!(p.parent_admission.is_none());
+        let back = serde_json::to_value(&p).unwrap();
+        assert!(back.get("parent_delegation_id").is_none());
+        assert!(
+            back.get("parent_admission").is_none(),
+            "a root delegation must not put an empty parent reference on the wire"
+        );
+
+        // A parented request carries both halves, and both round-trip.
+        let parented = serde_json::json!({
+            "delegation_id": "d-2",
+            "target": {"name": "w1"},
+            "prompt": "hi",
+            "deadline": "2026-08-06T22:45:00Z",
+            "parent_delegation_id": "d-1",
+            "parent_admission": 42
+        });
+        let p: DelegateParams = serde_json::from_value(parented).unwrap();
+        assert_eq!(p.parent_delegation_id.as_deref(), Some("d-1"));
+        assert_eq!(p.parent_admission, Some(42));
+        let back = serde_json::to_value(&p).unwrap();
+        assert_eq!(back["parent_admission"], 42);
+        // Deserialization deliberately accepts a half-filled pair: the coupling
+        // is a CP admission rule (`INVALID_PARAMS`, with a message naming the
+        // missing half) rather than a serde error, so the refusal is a protocol
+        // error the caller can act on instead of a parse failure.
+        let half = serde_json::json!({
+            "delegation_id": "d-3",
+            "target": {"name": "w1"},
+            "prompt": "hi",
+            "deadline": "2026-08-06T22:45:00Z",
+            "parent_delegation_id": "d-1"
+        });
+        let p: DelegateParams = serde_json::from_value(half).unwrap();
+        assert!(p.parent_admission.is_none());
     }
 
     #[test]

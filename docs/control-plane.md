@@ -77,11 +77,27 @@ issue #1474).
   incoming cancels on the token: a CP-synthesized cancel carries the token of
   the admission it ends, and it can arrive *after* a forward that reused the
   same `delegation_id` — cancelling on the id alone would abort the wrong work.
+- **Name the parent's admission when you delegate a child.** If you issue
+  `cp/delegate` *while serving* another delegation, send
+  `parent_delegation_id` **and** `parent_admission` — the token you were
+  forwarded for that parent. Both or neither: an id without a token is
+  refused, and so is a token without an id. "The instance currently serving
+  that parent" means the specific admission you were forwarded, not your
+  connection plus the parent's `delegation_id`, because that id is reusable —
+  otherwise a task whose parent has already ended could inherit the chain and
+  deadline budget of whatever was re-admitted under the same id. Refusals here
+  use the same shape for an unknown parent, a parent you do not serve, and a
+  superseded admission, so treat one as "that parent admission is over" and
+  stop fanning out rather than retrying with a different token. A **root**
+  delegation omits both fields and is unchanged.
 - ⚠️ **Wire-breaking change (pre-1.0).** `admission` is required on
-  `cp/delegate_result` and on `cp/cancel`. A runtime built against the earlier
-  contract has every result and every cancel refused with `INVALID_PARAMS`
+  `cp/delegate_result` and on `cp/cancel`, and `parent_admission` is required
+  on any `cp/delegate` that names a parent. A runtime built against the earlier
+  contract has every result, every cancel, and every parented delegation
+  refused with `INVALID_PARAMS`
   after upgrading the CP; there is no compatible optional spelling, because an
-  absent token would be the wildcard the field exists to remove.
+  absent token would be the wildcard the field exists to remove. Root
+  delegations are unaffected.
 - **The first terminal frame for an `admission` token wins.** A `completed`
   result can race the CP's synthesized `timeout`, so an initiator may receive
   more than one terminal frame for the same admission. Treat the first as

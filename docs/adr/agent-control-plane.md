@@ -181,9 +181,10 @@ Agent A ◄──── result ◄──────── OAB-A ◄────
 ### Delegate frame
 
 What the initiator sends. Note what is *absent*: there is no `chain` field.
-Callers supply at most `parent_delegation_id`; the CP constructs the ancestry
+Callers supply at most a parent reference; the CP constructs the ancestry
 from authenticated identities and its own in-flight table, so a runtime cannot
-forge it.
+forge it. This example is a *parented* delegation — a root one simply omits
+both parent fields.
 
 ```json
 {
@@ -193,15 +194,26 @@ forge it.
     "target": { "name": "worker-1" },
     "prompt": "…",
     "parent_delegation_id": "d-01H...",
+    "parent_admission": 41,
     "deadline": "2026-08-06T22:45:00Z"
   }
 }
 ```
 
 - `target` — exact `name` or a `labels` selector (CP schedules among matches)
-- `parent_delegation_id` — omitted for a root delegation. If present, the
-  caller must be the instance currently *serving* that parent, in the caller's
-  own namespace; the CP appends to that parent's chain.
+- `parent_delegation_id` + `parent_admission` — a **pair**, both omitted for a
+  root delegation and both required together otherwise. If present, the caller
+  must be the instance currently serving *that specific admission* of the
+  parent, in the caller's own namespace; the CP appends to that admission's
+  chain. "Currently serving that parent" means the exact forwarded admission —
+  the serving handle plus the `admission` token the CP stamped on the parent's
+  forwarded `cp/delegate` — **not** the serving handle plus the reusable
+  `delegation_id`. The id alone names a slot that cancel-then-retry
+  legitimately reuses, so handle + id would let a task from an admission that
+  has already ended inherit the chain and deadline budget of whatever was
+  re-admitted under the same id (see "Admissions carry a protocol-visible
+  token"). An id without a token is `INVALID_PARAMS`; so is a token without an
+  id, rather than being ignored as an accidental root delegation.
 - `deadline` — propagated absolute deadline. A child's timeout can never
   exceed its parent's remaining budget, so orphaned workers cannot keep
   consuming tokens after the root gave up.
@@ -294,8 +306,9 @@ recovery semantics:
   from self-asserted registration fields. Keys are per-agent
   (individually revocable) and presented as `Authorization: Bearer` on the
   WebSocket upgrade — never in URLs.
-- **CP-constructed chain.** `cp/delegate` carries only
-  `parent_delegation_id`; the CP derives the ancestry chain from its
+- **CP-constructed chain.** `cp/delegate` carries only a parent *reference*
+  (`parent_delegation_id` + `parent_admission`); the CP derives the ancestry
+  chain from its
   in-flight table and the authenticated caller identity, then stamps it on
   the forwarded frame. A runtime cannot forge ancestry, so depth/cycle
   checks operate on trusted data. Policy (role, depth, cycle, namespace,
@@ -307,7 +320,9 @@ recovery semantics:
   keyed by a **CP-generated handle**, never the client-supplied
   `instance_id`: a colliding `instance_id` cannot replace or tear down
   another connection's registration, and all in-flight ownership checks
-  (completion, cancellation, parent linkage) compare handles. The ack
+  (completion, cancellation, parent linkage) compare handles — each paired
+  with the `admission` token, since the handle alone cannot say *which*
+  admission of a reusable id is meant. The ack
   carries the heartbeat interval, lease window, and the effective (possibly
   clamped) concurrency budget. Instances missing heartbeats past the lease
   are deregistered, and their in-flight delegations fail immediately with a
@@ -387,7 +402,9 @@ recovery semantics:
     entry it removed;
   - every initiator-bound terminal frame carries it, CP-synthesized `timeout`
     and `target_disconnected` included (both are built from the in-flight
-    entry).
+    entry);
+  - a **parent reference** on `cp/delegate` carries it as `parent_admission`,
+    required whenever `parent_delegation_id` is present.
 
   The CP checks the echoed token *before* building the initiator-bound frame,
   and the commit phase removes an in-flight entry only when key, serving
@@ -427,15 +444,44 @@ recovery semantics:
   admission's token makes that frame identifiable as belonging to work that is
   already over.
 
+  Parent linkage is the third surface, and the one that feeds the CP's own
+  authorization decisions rather than frame delivery. The parent lookup exists
+  to stop any runtime that knows a live id from borrowing its trusted chain and
+  deadline budget, and it checks that the caller is the instance *serving* that
+  parent — but "serving" resolved through `(namespace, delegation_id)` plus the
+  serving handle is not an admission. Once parent admission A ends (cancel,
+  completion, or sweep) and the id is re-admitted as B — with a single replica,
+  to the same worker — a residual task from A submitting
+  `cp/delegate { parent_delegation_id: P }` satisfies every one of those checks
+  against B. The child then inherits B's CP-constructed chain and B's remaining
+  deadline budget: depth, cycle, and parent-budget are evaluated for the wrong
+  admission, and the audit chain attributes A's work to B's root. Unlike the
+  result and cancel cases this is not misdelivery but a policy-envelope hijack,
+  and the CP cannot push it onto the worker: `cp/cancel` is best effort, and the
+  runtime holding the serving connection is precisely who would trigger it
+  deliberately. So the reference is a pair — `parent_delegation_id` plus
+  `parent_admission` — matched together with the serving handle under the one
+  in-flight lock acquisition the parent branch already takes, and the chain and
+  deadline are read from the entry that acquisition validated rather than from a
+  second lookup. Unknown, unauthorized and stale parents share one refusal
+  shape, so the reply is not an oracle for whether an id is currently
+  re-admitted.
+
   ⚠️ **Wire-breaking (pre-1.0).** `admission` is a **required** field on both
   `cp/delegate_result` (added in the round-8 revision of this contract) and
-  `cp/cancel` (added here). Optional would be a wildcard, which is exactly the
+  `cp/cancel` (added in round 9), and a **parented** `cp/delegate` must carry
+  `parent_admission` alongside `parent_delegation_id` (added here). Optional
+  would be a wildcard, which is exactly the
   misdelivery path the token exists to close, so there is no
   backward-compatible spelling of it. A runtime built against the pre-token
   contract will have **every** result and **every** cancel refused with
-  `INVALID_PARAMS` after the CP is upgraded. Runtimes must echo
-  `DelegateForward::admission` on results and name the target admission on
-  cancels. There are no shipped clients at this point in the stack — every
+  `INVALID_PARAMS` after the CP is upgraded, and every *parented* delegation
+  refused with it too. Runtimes must echo
+  `DelegateForward::admission` on results, name the target admission on
+  cancels, and name the parent's admission when delegating a child while
+  serving that parent. Root delegations are unaffected — they carry neither
+  parent field, so their wire shape is unchanged. There are no shipped clients
+  at this point in the stack — every
   serving runtime learns the token from the forwarded `cp/delegate` — so the
   migration is mechanical, but it is not silent and it is not optional.
 - **First terminal frame per admission wins.** More than one terminal frame may

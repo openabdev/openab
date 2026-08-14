@@ -402,26 +402,77 @@ impl Router {
         }
 
         // Parent linkage: chain and deadline derive from the CP's own table,
-        // never from the client. The caller must BE the instance serving the
-        // parent delegation — otherwise any runtime knowing a live id could
-        // borrow its trusted chain and deadline budget. The lookup is
-        // namespace-scoped. Unknown and unauthorized parent ids return the
-        // same error (no enumeration).
-        let (parent_chain, parent_deadline) = match &params.parent_delegation_id {
-            Some(pid) => {
-                let parent_key = DelegationKey::new(from_namespace, pid);
-                match self.inflight.lock().get(&parent_key) {
-                    Some(p) if p.to_handle == from_handle => (p.chain.clone(), Some(p.deadline)),
-                    _ => {
-                        return DelegateOutcome::Rejected(ErrorObject::new(
-                            codes::INVALID_PARAMS,
-                            format!("parent delegation {pid} is not in flight for this instance"),
-                        ))
+        // never from the client. Three things must hold together, and the
+        // admission token is the one that makes the other two sufficient:
+        //
+        // 1. the parent lives in the CALLER's namespace (scoped lookup);
+        // 2. the caller IS the instance serving it (`to_handle`) — otherwise
+        //    any runtime knowing a live id could borrow its trusted chain and
+        //    deadline budget;
+        // 3. the caller names the SPECIFIC admission it is serving. Without
+        //    this, "currently serving that parent" degrades to "holds the
+        //    connection that serves whatever wears this id now": once parent
+        //    admission A ends (cancel, completion, or sweep) and the id is
+        //    re-admitted as B — with a single replica, to the same worker — a
+        //    residual child request composed against A satisfies 1 and 2
+        //    against B and inherits B's CP-constructed chain and B's remaining
+        //    deadline budget, so depth, cycle, and parent-budget are evaluated
+        //    for the wrong admission. Cancels are best effort, so the CP
+        //    cannot delegate policing of this to the worker: a buggy or
+        //    malicious runtime holding the serving connection could trigger it
+        //    deliberately.
+        //
+        // The id and the token are a coupled pair, enforced here because this
+        // is where parent presence is decided. An id without a token is
+        // malformed, never a wildcard; a token without an id is malformed too,
+        // rather than silently ignored, so a client that drops the id sees its
+        // bug instead of getting an unintended root delegation.
+        //
+        // Unknown, unauthorized (wrong serving handle) and stale (superseded
+        // admission) parents all return the SAME error — one refusal shape, no
+        // enumeration. A distinguishable stale refusal would be an oracle
+        // telling the caller whether the id it references is currently
+        // re-admitted, which is CP scheduling state no frame reports.
+        let (parent_chain, parent_deadline) =
+            match (&params.parent_delegation_id, params.parent_admission) {
+                (Some(pid), Some(padmission)) => {
+                    let parent_key = DelegationKey::new(from_namespace, pid);
+                    // ONE acquisition of the in-flight lock resolves the parent and
+                    // validates all three conditions, and the chain and deadline
+                    // below are read from the very entry that was validated — the
+                    // `p` binding, not a second lookup. A re-lookup after
+                    // validation would reintroduce the race the token closes.
+                    match self.inflight.lock().get(&parent_key) {
+                        Some(p) if p.to_handle == from_handle && p.generation == padmission => {
+                            (p.chain.clone(), Some(p.deadline))
+                        }
+                        _ => {
+                            return DelegateOutcome::Rejected(ErrorObject::new(
+                                codes::INVALID_PARAMS,
+                                format!(
+                                    "parent delegation {pid} is not in flight for this instance"
+                                ),
+                            ))
+                        }
                     }
                 }
-            }
-            None => (Vec::new(), None),
-        };
+                (Some(_), None) => {
+                    return DelegateOutcome::Rejected(ErrorObject::new(
+                        codes::INVALID_PARAMS,
+                        "parent_delegation_id requires parent_admission: name the \
+                     admission token this instance was forwarded for that parent \
+                     (a delegation id alone is reusable and cannot identify it)",
+                    ))
+                }
+                (None, Some(_)) => {
+                    return DelegateOutcome::Rejected(ErrorObject::new(
+                        codes::INVALID_PARAMS,
+                        "parent_admission is meaningless without parent_delegation_id: \
+                     omit both for a root delegation, or send both",
+                    ))
+                }
+                (None, None) => (Vec::new(), None),
+            };
 
         // Resolve target within the initiator's namespace (v1 boundary).
         let target = match registry.select(from_namespace, sel_name, sel_labels) {
@@ -1234,6 +1285,24 @@ type = "worker"
             prompt: "do it".into(),
             deadline: Utc::now() + Duration::seconds(secs),
             parent_delegation_id: None,
+            parent_admission: None,
+        }
+    }
+
+    /// A child request naming a parent as a well-behaved serving runtime
+    /// composes it: the parent id AND the admission token that runtime was
+    /// forwarded for it. The pair is what the CP requires.
+    fn child_params(
+        id: &str,
+        target: &str,
+        secs: i64,
+        parent_id: &str,
+        parent_admission: u64,
+    ) -> DelegateParams {
+        DelegateParams {
+            parent_delegation_id: Some(parent_id.into()),
+            parent_admission: Some(parent_admission),
+            ..delegate_params(id, target, secs)
         }
     }
 
@@ -2252,18 +2321,18 @@ allow_worker_initiation = true
         let (w2, _rx2) = instance("prod", "worker-2", AgentType::Worker, 1);
         let h_w2 = w.registry.register(w2);
 
-        assert!(matches!(
-            w.router.delegate(
-                &cfg,
-                &w.registry,
-                "prod",
-                "koudu",
-                &AgentType::Primary,
-                w.h_primary,
-                delegate_params("d-root", "worker-1", 120),
-                1,
-            ),
-            DelegateOutcome::Accepted(_)
+        // Capturing the ack (rather than asserting the shape) because every
+        // parented request below must name the admission token of the parent it
+        // references — the ack is where a real initiator learns it.
+        let root = accept(w.router.delegate(
+            &cfg,
+            &w.registry,
+            "prod",
+            "koudu",
+            &AgentType::Primary,
+            w.h_primary,
+            delegate_params("d-root", "worker-1", 120),
+            1,
         ));
         assert_eq!(
             w.router.chain_of("prod", "d-root").unwrap(),
@@ -2272,9 +2341,10 @@ allow_worker_initiation = true
 
         // Borrowed ancestry: worker-2 (NOT serving d-root) tries to use
         // d-root as its parent — rejected, so a trusted chain and deadline
-        // budget cannot be inherited by a stranger.
-        let mut foreign = delegate_params("d-foreign", "worker-2", 60);
-        foreign.parent_delegation_id = Some("d-root".into());
+        // budget cannot be inherited by a stranger. It names the CORRECT
+        // admission token, so the refusal is still attributable to the wrong
+        // serving handle rather than to a bad token.
+        let foreign = child_params("d-foreign", "worker-2", 60, "d-root", root.admission);
         match w.router.delegate(
             &cfg,
             &w.registry,
@@ -2293,29 +2363,26 @@ allow_worker_initiation = true
         }
 
         // worker-1 (serving d-root) delegates a legitimate child to worker-2.
-        let mut child = delegate_params("d-child", "worker-2", 60);
-        child.parent_delegation_id = Some("d-root".into());
-        assert!(matches!(
-            w.router.delegate(
-                &cfg,
-                &w.registry,
-                "prod",
-                "worker-1",
-                &AgentType::Worker,
-                w.h_worker,
-                child,
-                3,
-            ),
-            DelegateOutcome::Accepted(_)
+        let child = child_params("d-child", "worker-2", 60, "d-root", root.admission);
+        let child_ack = accept(w.router.delegate(
+            &cfg,
+            &w.registry,
+            "prod",
+            "worker-1",
+            &AgentType::Worker,
+            w.h_worker,
+            child,
+            3,
         ));
         assert_eq!(
             w.router.chain_of("prod", "d-child").unwrap(),
             vec!["prod/koudu".to_string(), "prod/worker-1".to_string()]
         );
 
-        // Cycle: worker-2 delegating back to koudu is rejected.
-        let mut cyc = delegate_params("d-cyc", "koudu", 30);
-        cyc.parent_delegation_id = Some("d-child".into());
+        // Cycle: worker-2 delegating back to koudu is rejected. Naming
+        // d-child's real admission token, so the request clears parent
+        // validation and the refusal comes from the policy engine.
+        let cyc = child_params("d-cyc", "koudu", 30, "d-child", child_ack.admission);
         match w.router.delegate(
             &cfg,
             &w.registry,
@@ -2332,6 +2399,434 @@ allow_worker_initiation = true
             }
             _ => panic!("expected cycle rejection"),
         }
+    }
+
+    /// The full in-flight entry for `(namespace, delegation_id)` — so a test
+    /// can assert that a refused operation left a live admission's
+    /// CP-authoritative state (chain, deadline, stamp, endpoints) untouched,
+    /// not merely that the entry still exists.
+    fn entry(router: &Router, namespace: &str, delegation_id: &str) -> InFlight {
+        router
+            .inflight
+            .lock()
+            .get(&DelegationKey::new(namespace, delegation_id))
+            .expect("delegation must be in flight")
+            .clone()
+    }
+
+    fn rejected(out: DelegateOutcome) -> ErrorObject {
+        match out {
+            DelegateOutcome::Rejected(e) => e,
+            DelegateOutcome::Accepted(a) => {
+                panic!("expected a refusal, got admission {}", a.admission)
+            }
+        }
+    }
+
+    /// `world()`'s identity table plus a depth budget and worker initiation,
+    /// so an instance serving a parent may legitimately delegate a child.
+    fn deep_cfg() -> CpConfig {
+        toml::from_str(
+            r#"
+[[agents]]
+key = "kp"
+namespace = "prod"
+name = "koudu"
+type = "primary"
+
+[namespaces.prod]
+max_depth = 5
+allow_worker_initiation = true
+"#,
+        )
+        .unwrap()
+    }
+
+    /// A world with a second worker, so a child can be routed somewhere other
+    /// than the instance serving its parent. The returned `FrameRx` must stay
+    /// alive: dropping it closes worker-2's outbound channel and every send to
+    /// it would fail as a disconnect.
+    fn parent_world() -> (World, CpConfig, u64, FrameRx) {
+        let w = world();
+        let (w2, rx2) = instance("prod", "worker-2", AgentType::Worker, 2);
+        let h_w2 = w.registry.register(w2);
+        (w, deep_cfg(), h_w2, rx2)
+    }
+
+    fn delegate_as(
+        w: &World,
+        cfg: &CpConfig,
+        name: &str,
+        ty: &AgentType,
+        handle: u64,
+        params: DelegateParams,
+        rpc: u64,
+    ) -> DelegateOutcome {
+        w.router
+            .delegate(cfg, &w.registry, "prod", name, ty, handle, params, rpc)
+    }
+
+    fn cancel_admission(w: &World, delegation_id: &str, admission: u64, rpc: u64) {
+        w.router
+            .cancel(
+                &w.registry,
+                w.h_primary,
+                &CancelParams {
+                    delegation_id: delegation_id.into(),
+                    admission,
+                    reason: "changed my mind".into(),
+                },
+                rpc,
+            )
+            .expect("the initiator may cancel its own live admission");
+    }
+
+    /// Admit parent id `d-parent` on worker-1 as admission A (120s of budget),
+    /// end A, then re-admit the SAME id as B (60s) — which, with a single
+    /// replica, routes to the same worker. Returns (A's token, B's token).
+    ///
+    /// The asymmetric budgets are load-bearing: 60s is strictly inside A's
+    /// 120s, so a child clamped against the wrong admission is observable.
+    fn parent_aba_via_cancel(w: &World, cfg: &CpConfig) -> (u64, u64) {
+        let a = accept(delegate_as(
+            w,
+            cfg,
+            "koudu",
+            &AgentType::Primary,
+            w.h_primary,
+            delegate_params("d-parent", "worker-1", 120),
+            1,
+        ));
+        cancel_admission(w, "d-parent", a.admission, 2);
+        assert_eq!(w.router.inflight_count(), 0, "A is over");
+        let b = accept(delegate_as(
+            w,
+            cfg,
+            "koudu",
+            &AgentType::Primary,
+            w.h_primary,
+            delegate_params("d-parent", "worker-1", 60),
+            3,
+        ));
+        assert_ne!(a.admission, b.admission, "a re-admission gets a new token");
+        (a.admission, b.admission)
+    }
+
+    /// Assert that the refusal is the single parent refusal shape, and that a
+    /// stale child changed nothing: no child exists, and B is exactly the
+    /// entry it was — chain, deadline, admission stamp, endpoints, capacity.
+    fn assert_stale_child_refused_and_b_untouched(
+        w: &World,
+        b: u64,
+        before: &InFlight,
+        out: DelegateOutcome,
+        h_w2: u64,
+    ) {
+        let e = rejected(out);
+        assert_eq!(e.code, codes::INVALID_PARAMS);
+        assert!(
+            e.message.contains("not in flight for this instance"),
+            "{}",
+            e.message
+        );
+        assert!(
+            w.router.chain_of("prod", "d-child").is_none(),
+            "no child may have been admitted"
+        );
+        let after = entry(&w.router, "prod", "d-parent");
+        assert_eq!(after.generation, b, "B's admission stamp is unchanged");
+        assert_eq!(after.chain, before.chain, "B's CP-constructed chain");
+        assert_eq!(after.deadline, before.deadline, "B's deadline budget");
+        assert_eq!(after.to_handle, before.to_handle, "B's serving instance");
+        assert_eq!(after.from_handle, before.from_handle, "B's initiator");
+        assert_eq!(w.router.inflight_count(), 1, "B and nothing else");
+        assert_eq!(
+            w.registry.get(w.h_worker).unwrap().active_sessions,
+            1,
+            "B's capacity reservation is intact"
+        );
+        assert_eq!(
+            w.registry.get(h_w2).unwrap().active_sessions,
+            0,
+            "the refused child reserved nothing on its target"
+        );
+    }
+
+    #[test]
+    fn child_naming_a_cancelled_parent_admission_cannot_hijack_the_re_admission() {
+        // The parent-linkage ABA, cancel flavour — the third reusable-id
+        // surface after results and cancels. worker-1 serves admission A of
+        // parent id P. A is cancelled and the initiator retries (an ordinary
+        // pattern), so P is re-admitted as B to the SAME worker. A residual
+        // task from A then submits a child against P over that same
+        // connection.
+        //
+        // Every check that predates the token still passes: the namespace is
+        // right and the caller IS the instance serving P. So the child would
+        // have inherited B's CP-constructed chain and B's remaining deadline
+        // budget, and depth, cycle and parent-budget would all have been
+        // evaluated for an admission it has nothing to do with. Worker-side
+        // discipline cannot substitute: cancels are best effort, and the
+        // runtime holding the serving connection is exactly who would exploit
+        // this deliberately.
+        let (w, cfg, h_w2, _rx2) = parent_world();
+        let (a, b) = parent_aba_via_cancel(&w, &cfg);
+        let before = entry(&w.router, "prod", "d-parent");
+        assert_eq!(before.generation, b);
+
+        let out = delegate_as(
+            &w,
+            &cfg,
+            "worker-1",
+            &AgentType::Worker,
+            w.h_worker,
+            child_params("d-child", "worker-2", 30, "d-parent", a),
+            4,
+        );
+        assert_stale_child_refused_and_b_untouched(&w, b, &before, out, h_w2);
+    }
+
+    #[test]
+    fn child_naming_a_swept_parent_admission_cannot_hijack_the_re_admission() {
+        // Same defect, reached without any client error at all. The deadline
+        // sweep removes the expired parent under the in-flight lock, and the
+        // initiator legitimately re-admits the id afterwards; a task the sweep
+        // could only *best-effort* cancel is still running and still composes
+        // children against the admission it was forwarded. This is the path
+        // the CP cannot delegate to client discipline, only survive by
+        // identity.
+        let (w, cfg, h_w2, _rx2) = parent_world();
+        let a = accept(delegate_as(
+            &w,
+            &cfg,
+            "koudu",
+            &AgentType::Primary,
+            w.h_primary,
+            delegate_params("d-parent", "worker-1", 1),
+            1,
+        ));
+        let mut id = 900u64;
+        let mut next = || {
+            id += 1;
+            id
+        };
+        let swept =
+            w.router
+                .sweep_deadlines(&w.registry, Utc::now() + Duration::seconds(60), &mut next);
+        assert!(!swept.is_empty(), "A expired and was swept");
+        assert_eq!(w.router.inflight_count(), 0);
+        assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 0);
+
+        // The gap the sweep leaves open: B is admitted to the same worker.
+        let b = accept(delegate_as(
+            &w,
+            &cfg,
+            "koudu",
+            &AgentType::Primary,
+            w.h_primary,
+            delegate_params("d-parent", "worker-1", 60),
+            2,
+        ));
+        assert_ne!(a.admission, b.admission);
+        let before = entry(&w.router, "prod", "d-parent");
+
+        let out = delegate_as(
+            &w,
+            &cfg,
+            "worker-1",
+            &AgentType::Worker,
+            w.h_worker,
+            child_params("d-child", "worker-2", 30, "d-parent", a.admission),
+            3,
+        );
+        assert_stale_child_refused_and_b_untouched(&w, b.admission, &before, out, h_w2);
+    }
+
+    #[test]
+    fn child_naming_the_live_parent_admission_extends_it_normally() {
+        // The positive control for both regressions above: the token is an
+        // identity check, not a new obstacle. A child naming the admission its
+        // worker is actually serving is admitted, extends THAT admission's
+        // chain, and is clamped to THAT admission's remaining budget.
+        let (w, cfg, _h_w2, _rx2) = parent_world();
+        let (_a, b) = parent_aba_via_cancel(&w, &cfg);
+        let b_deadline = entry(&w.router, "prod", "d-parent").deadline;
+
+        accept(delegate_as(
+            &w,
+            &cfg,
+            "worker-1",
+            &AgentType::Worker,
+            w.h_worker,
+            child_params("d-child", "worker-2", 30, "d-parent", b),
+            4,
+        ));
+        assert_eq!(
+            w.router.chain_of("prod", "d-child").unwrap(),
+            vec!["prod/koudu".to_string(), "prod/worker-1".to_string()],
+            "the child extends the live parent admission's chain"
+        );
+        let child_deadline = entry(&w.router, "prod", "d-child").deadline;
+        assert!(
+            child_deadline <= b_deadline,
+            "child deadline {child_deadline} must sit inside B's budget {b_deadline}"
+        );
+
+        // And the clamp is B's, not the id's. 90s is comfortably inside the
+        // 120s that admission A carried and outside B's 60s: if the derivation
+        // ever read the wrong admission for this id, this child would be
+        // admitted.
+        let e = rejected(delegate_as(
+            &w,
+            &cfg,
+            "worker-1",
+            &AgentType::Worker,
+            w.h_worker,
+            child_params("d-child-2", "worker-2", 90, "d-parent", b),
+            5,
+        ));
+        assert_eq!(e.code, codes::POLICY_DENIED);
+        assert!(
+            e.message.contains("parent's remaining budget"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn parent_reference_requires_both_the_id_and_the_admission() {
+        // The pair is coupled at admission, where parent presence is decided.
+        let (w, cfg, _h_w2, _rx2) = parent_world();
+        let a = accept(delegate_as(
+            &w,
+            &cfg,
+            "koudu",
+            &AgentType::Primary,
+            w.h_primary,
+            delegate_params("d-parent", "worker-1", 120),
+            1,
+        ));
+
+        // (1) An id with no token is the wildcard shape, and it is refused —
+        // this request names a real, live parent from its genuine serving
+        // instance, so the ONLY thing wrong with it is the missing token.
+        // Accepting it would restore the whole defect under a different name.
+        let mut no_token = child_params("d-child", "worker-2", 30, "d-parent", a.admission);
+        no_token.parent_admission = None;
+        let e = rejected(delegate_as(
+            &w,
+            &cfg,
+            "worker-1",
+            &AgentType::Worker,
+            w.h_worker,
+            no_token,
+            2,
+        ));
+        assert_eq!(e.code, codes::INVALID_PARAMS);
+        assert!(
+            e.message.contains("requires parent_admission"),
+            "{}",
+            e.message
+        );
+
+        // (2) A token with no id is refused rather than ignored — the
+        // documented choice. Silently treating it as a root delegation would
+        // hide a client bug and hand the caller an unintended delegation with
+        // no ancestry, no depth accounting and no parent budget; a request
+        // that names an admission plainly means to be parented.
+        let mut no_id = delegate_params("d-orphan", "worker-2", 30);
+        no_id.parent_admission = Some(a.admission);
+        let e = rejected(delegate_as(
+            &w,
+            &cfg,
+            "worker-1",
+            &AgentType::Worker,
+            w.h_worker,
+            no_id,
+            3,
+        ));
+        assert_eq!(e.code, codes::INVALID_PARAMS);
+        assert!(
+            e.message.contains("without parent_delegation_id"),
+            "{}",
+            e.message
+        );
+
+        // Neither refusal admitted anything, and the ROOT shape — neither
+        // field present — is unchanged on the wire and still accepted.
+        assert_eq!(w.router.inflight_count(), 1, "only the parent");
+        accept(delegate_as(
+            &w,
+            &cfg,
+            "koudu",
+            &AgentType::Primary,
+            w.h_primary,
+            delegate_params("d-root-2", "worker-2", 30),
+            4,
+        ));
+    }
+
+    #[test]
+    fn parent_refusals_are_byte_identical() {
+        // The parent lookup must not become an existence oracle. For ONE
+        // parent id, three different CP states return the same error object
+        // byte for byte: no such parent, a live parent this caller does not
+        // serve, and a parent whose live admission is newer than the one the
+        // caller names. The third is the case added with the token, and it
+        // matters as much as the others — a distinguishable stale refusal
+        // would tell the caller that the id it references has been
+        // re-admitted, which is CP scheduling state no frame reports. The id
+        // itself appears in the message, but that is the caller's own input.
+        let (w, cfg, h_w2, _rx2) = parent_world();
+        let (a, b) = parent_aba_via_cancel(&w, &cfg);
+
+        // (i) Right serving instance, superseded admission.
+        let e_stale = rejected(delegate_as(
+            &w,
+            &cfg,
+            "worker-1",
+            &AgentType::Worker,
+            w.h_worker,
+            child_params("d-child", "worker-2", 30, "d-parent", a),
+            4,
+        ));
+        // (ii) Live parent, correct token, caller does not serve it.
+        let e_foreign = rejected(delegate_as(
+            &w,
+            &cfg,
+            "worker-2",
+            &AgentType::Worker,
+            h_w2,
+            child_params("d-child", "worker-1", 30, "d-parent", b),
+            5,
+        ));
+        // (iii) No such parent at all, with a token that was live a moment ago.
+        cancel_admission(&w, "d-parent", b, 6);
+        assert_eq!(w.router.inflight_count(), 0);
+        let e_unknown = rejected(delegate_as(
+            &w,
+            &cfg,
+            "worker-1",
+            &AgentType::Worker,
+            w.h_worker,
+            child_params("d-child", "worker-2", 30, "d-parent", b),
+            7,
+        ));
+
+        let as_json = |e: &ErrorObject| serde_json::to_string(e).unwrap();
+        assert_eq!(
+            as_json(&e_stale),
+            as_json(&e_foreign),
+            "a stale admission must be indistinguishable from a parent this \
+             caller does not serve"
+        );
+        assert_eq!(
+            as_json(&e_stale),
+            as_json(&e_unknown),
+            "a stale admission must be indistinguishable from no such parent — \
+             otherwise the refusal reports whether the id was re-admitted"
+        );
+        assert_eq!(e_stale.code, codes::INVALID_PARAMS);
     }
 
     /// A `cp/delegate_result` frame as a well-behaved serving runtime builds
@@ -2726,24 +3221,24 @@ allow_worker_initiation = true
         let hw_dev = registry.register(w_dev);
         registry.register(t_dev);
 
-        assert!(matches!(
-            router.delegate(
-                &cfg,
-                &registry,
-                "prod",
-                "koudu",
-                &AgentType::Primary,
-                hp_prod,
-                delegate_params("d-root", "worker-1", 120),
-                1,
-            ),
-            DelegateOutcome::Accepted(_)
+        // Captured for its admission token: both children below must name the
+        // admission of the parent they reference.
+        let root = accept(router.delegate(
+            &cfg,
+            &registry,
+            "prod",
+            "koudu",
+            &AgentType::Primary,
+            hp_prod,
+            delegate_params("d-root", "worker-1", 120),
+            1,
         ));
         rx2.try_recv().unwrap();
 
-        // dev/worker-1 claims prod's `d-root` as its parent: invisible.
-        let mut child = delegate_params("d-child", "worker-2", 60);
-        child.parent_delegation_id = Some("d-root".into());
+        // dev/worker-1 claims prod's `d-root` as its parent: invisible. It
+        // names prod's real admission token, so only the namespace scope can
+        // account for the refusal.
+        let child = child_params("d-child", "worker-2", 60, "d-root", root.admission);
         match router.delegate(
             &cfg,
             &registry,
@@ -2761,8 +3256,7 @@ allow_worker_initiation = true
             _ => panic!("cross-namespace parent must be rejected"),
         }
         // ...and the legitimate in-namespace child still works.
-        let mut ok_child = delegate_params("d-child", "worker-2", 60);
-        ok_child.parent_delegation_id = Some("d-root".into());
+        let ok_child = child_params("d-child", "worker-2", 60, "d-root", root.admission);
         assert!(matches!(
             router.delegate(
                 &cfg,
