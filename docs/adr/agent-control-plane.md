@@ -625,10 +625,19 @@ integration. v1 tool surface, intentionally minimal:
 
 | Tool | Behavior |
 |------|----------|
-| `spawn_agent` | Delegate a task. Blocking (waits up to deadline) or async (returns `delegation_id` immediately). |
-| `check_delegation` | Status / result by `delegation_id`. |
+| `spawn_agent` | Delegate a task. Blocking (waits up to deadline) or async (returns a `delegation` handle immediately). |
+| `check_delegation` | Status / result by `delegation` handle. |
 | `list_agents` | Registry view for the caller's namespace (names, types, labels, availability) — lets the model discover targets by label. |
-| `cancel_delegation` | Cancel an in-flight delegation. |
+| `cancel_delegation` | Cancel an in-flight delegation by `delegation` handle. |
+
+The `delegation` handle returned by `spawn_agent` is opaque to callers and
+encapsulates the `(delegation_id, admission)` pair. This extends the wire
+invariant ("every surface that references an existing delegation names it by
+the (id, admission) pair; a bare reusable id is never accepted as a
+reference") to the local API: `check_delegation` and `cancel_delegation`
+resolve the handle to the exact admission it was minted for, so a delayed
+check or cancel can never observe or abort a same-id re-admission. Callers
+never see or construct the two halves separately.
 
 The facade is where policy is enforced *before* frames leave the box: schema
 validation, chain/depth checks, deadline clamping, audit logging. A
@@ -646,7 +655,10 @@ evolves underneath.
 ### CLI (`openab agent <verb>`) — secondary client, same socket
 
 - **Ops/debugging:** exec into a task and run `openab agent list` /
-  `openab agent status <id>` when a delegation hangs
+  `openab agent status <handle>` when a delegation hangs — the handle is the
+  same opaque `(delegation_id, admission)` value `spawn` printed, so a status
+  or cancel typed minutes later still names the exact admission, never a
+  same-id re-admission
 - **Hooks & cron:** lifecycle hooks and cron jobs can fire
   `openab agent spawn …` without new plumbing
 - **Escape hatch** for backends where MCP injection proves awkward
