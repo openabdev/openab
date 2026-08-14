@@ -91,6 +91,44 @@ pub struct CpConfig {
     #[serde(default = "default_write_timeout_secs")]
     pub write_timeout_secs: u64,
 
+    /// Memory ceiling for ONE connection's outbound queue, in bytes.
+    ///
+    /// The queue is bounded in entries as well, but entries are not a memory
+    /// bound: frame sizes are independently configurable, so 256 queued frames
+    /// of `max_frame_bytes` each is entry-legal and megabytes-to-gigabytes
+    /// large. Bytes are reserved before a frame is enqueued and released when
+    /// it is dequeued (or when the connection is torn down); a frame that would
+    /// exceed the budget is refused exactly like a full queue — the peer is
+    /// treated as disconnected, never buffered.
+    ///
+    /// `write_timeout_secs` bounds how long a stalled writer *lives*; this
+    /// bounds how much it can have accumulated in the meantime.
+    #[serde(default = "default_max_outbound_queue_bytes")]
+    pub max_outbound_queue_bytes: usize,
+
+    /// Process-wide ceiling on simultaneously in-flight delegations, enforced
+    /// at admission (before any capacity is reserved) with `SATURATED`.
+    ///
+    /// Per-target `max_delegated_sessions` is advertised by the runtime and
+    /// bounds one target's concurrency; it does not bound the CP's own state.
+    /// The in-flight table retains identity and ancestry per live admission, so
+    /// without a global ceiling an authenticated initiator with enough targets
+    /// can grow control-plane memory without limit.
+    #[serde(default = "default_max_inflight_delegations")]
+    pub max_inflight_delegations: usize,
+
+    /// Default clamp on a runtime's advertised `max_delegated_sessions`,
+    /// applied to every identity that does not set its own
+    /// `max_delegated_sessions_cap`.
+    ///
+    /// The advertised value is self-asserted, and saturation is the CP's only
+    /// backpressure signal: an uncapped identity advertising a huge budget
+    /// disables it entirely. A per-identity cap overrides this default (up or
+    /// down), so raising a specific worker's ceiling stays a deliberate,
+    /// CP-side act.
+    #[serde(default = "default_max_delegated_sessions_cap")]
+    pub default_max_delegated_sessions_cap: u32,
+
     /// Identity table: auth key → immutable claims.
     /// Keyed by the key id (`kid`), with the secret alongside, so logs can
     /// reference identities without printing secrets.
@@ -132,6 +170,15 @@ fn default_max_connections_per_identity() -> u32 {
 fn default_write_timeout_secs() -> u64 {
     30
 }
+fn default_max_outbound_queue_bytes() -> usize {
+    16 * 1024 * 1024
+}
+fn default_max_inflight_delegations() -> usize {
+    4096
+}
+fn default_max_delegated_sessions_cap() -> u32 {
+    16
+}
 
 /// Immutable identity claims bound to one auth key.
 #[derive(Debug, Clone, Deserialize)]
@@ -143,7 +190,11 @@ pub struct AgentIdentity {
     pub name: String,
     #[serde(rename = "type")]
     pub agent_type: AgentType,
-    /// Optional CP-side clamp on the advertised concurrency budget.
+    /// Optional CP-side clamp on the advertised concurrency budget. When
+    /// absent, `default_max_delegated_sessions_cap` applies — a runtime is
+    /// never trusted with an unclamped budget, because saturation is the CP's
+    /// only backpressure signal. Setting it here overrides the default in
+    /// either direction.
     #[serde(default)]
     pub max_delegated_sessions_cap: Option<u32>,
 }
@@ -223,6 +274,26 @@ impl CpConfig {
         if self.write_timeout_secs == 0 {
             bail!("write_timeout_secs must be greater than 0");
         }
+        // A budget that cannot hold one maximum-size frame would refuse every
+        // enqueue and disconnect every peer the moment a large frame is routed
+        // to it.
+        if self.max_outbound_queue_bytes <= self.max_frame_bytes {
+            bail!(
+                "max_outbound_queue_bytes ({}) must exceed max_frame_bytes ({}) — \
+                 a queue that cannot hold one maximum-size frame refuses every peer",
+                self.max_outbound_queue_bytes,
+                self.max_frame_bytes
+            );
+        }
+        // Zero would refuse every delegation the CP could ever route.
+        if self.max_inflight_delegations == 0 {
+            bail!("max_inflight_delegations must be at least 1");
+        }
+        // Zero would clamp every uncapped identity to no capacity at all, so
+        // every delegation to it would be SATURATED.
+        if self.default_max_delegated_sessions_cap == 0 {
+            bail!("default_max_delegated_sessions_cap must be at least 1");
+        }
         // Bearer keys over cleartext TCP must never reach an untrusted
         // network: non-loopback binds require the explicit override.
         if !self.allow_insecure_bind && !is_loopback(&self.listen) {
@@ -253,6 +324,22 @@ impl CpConfig {
 
     pub fn policy_for(&self, namespace: &str) -> NamespacePolicy {
         self.namespaces.get(namespace).cloned().unwrap_or_default()
+    }
+
+    /// Effective concurrency budget for `identity` given what its runtime
+    /// advertised at registration.
+    ///
+    /// The advertised value is self-asserted, so it is always clamped: by the
+    /// identity's own `max_delegated_sessions_cap` when set, otherwise by
+    /// `default_max_delegated_sessions_cap`. There is no uncapped path — an
+    /// omitted per-identity cap used to mean "trust the runtime", which let a
+    /// buggy or compromised worker advertise a budget large enough to nullify
+    /// saturation as a backpressure signal.
+    pub fn effective_max_sessions(&self, identity: &AgentIdentity, advertised: u32) -> u32 {
+        let cap = identity
+            .max_delegated_sessions_cap
+            .unwrap_or(self.default_max_delegated_sessions_cap);
+        advertised.min(cap)
     }
 }
 
@@ -411,6 +498,85 @@ lease_expiry_secs = 30
             let cfg: CpConfig = toml::from_str(bad).unwrap();
             assert!(cfg.validate().is_err(), "{bad} must be rejected");
         }
+    }
+
+    #[test]
+    fn resource_bounds_default_and_are_validated() {
+        // The byte budget, the global in-flight ceiling, and the default
+        // session clamp all default to safe values, and every degenerate
+        // setting is rejected rather than silently disabling the guard.
+        let cfg: CpConfig = toml::from_str(base_toml()).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.max_outbound_queue_bytes, 16 * 1024 * 1024);
+        assert_eq!(cfg.max_inflight_delegations, 4096);
+        assert_eq!(cfg.default_max_delegated_sessions_cap, 16);
+
+        let explicit: CpConfig = toml::from_str(
+            "max_outbound_queue_bytes = 2097152
+max_inflight_delegations = 32
+default_max_delegated_sessions_cap = 3",
+        )
+        .unwrap();
+        explicit.validate().unwrap();
+        assert_eq!(explicit.max_outbound_queue_bytes, 2 * 1024 * 1024);
+        assert_eq!(explicit.max_inflight_delegations, 32);
+        assert_eq!(explicit.default_max_delegated_sessions_cap, 3);
+
+        for bad in [
+            "max_inflight_delegations = 0",
+            "default_max_delegated_sessions_cap = 0",
+            // Equal to max_frame_bytes is not enough: one maximum-size frame
+            // must fit, or the connection is unusable.
+            "max_outbound_queue_bytes = 1048576",
+            "max_outbound_queue_bytes = 4096\nmax_frame_bytes = 8192",
+        ] {
+            let cfg: CpConfig = toml::from_str(bad).unwrap();
+            assert!(cfg.validate().is_err(), "{bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn advertised_capacity_is_always_clamped() {
+        // An identity WITHOUT its own cap is clamped by the global default —
+        // there is no uncapped path, so a worker advertising u32::MAX cannot
+        // nullify saturation as a backpressure signal.
+        let cfg: CpConfig = toml::from_str(base_toml()).unwrap();
+        let uncapped = cfg.identity_for_key("k-primary").unwrap();
+        assert!(uncapped.max_delegated_sessions_cap.is_none());
+        assert_eq!(
+            cfg.effective_max_sessions(uncapped, u32::MAX),
+            16,
+            "the global default clamps an identity with no cap of its own"
+        );
+        // Below the clamp, the advertised value stands.
+        assert_eq!(cfg.effective_max_sessions(uncapped, 2), 2);
+
+        // A per-identity cap overrides the default in either direction.
+        let capped = cfg.identity_for_key("k-worker").unwrap();
+        assert_eq!(capped.max_delegated_sessions_cap, Some(2));
+        assert_eq!(cfg.effective_max_sessions(capped, u32::MAX), 2);
+
+        let raised: CpConfig = toml::from_str(
+            r#"
+default_max_delegated_sessions_cap = 4
+
+[[agents]]
+key = "k-big"
+namespace = "prod"
+name = "fat-worker"
+type = "worker"
+max_delegated_sessions_cap = 64
+"#,
+        )
+        .unwrap();
+        raised.validate().unwrap();
+        let big = raised.identity_for_key("k-big").unwrap();
+        assert_eq!(
+            raised.effective_max_sessions(big, 32),
+            32,
+            "a per-identity cap above the default raises the ceiling deliberately"
+        );
+        assert_eq!(raised.effective_max_sessions(big, 128), 64);
     }
 
     #[test]

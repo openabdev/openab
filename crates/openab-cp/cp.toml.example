@@ -50,6 +50,30 @@ max_connections_per_identity = 8
 # draining a large result, short enough that a dead one frees its quota.
 write_timeout_secs = 30
 
+# Memory ceiling for ONE connection's outbound queue, in bytes. The queue is
+# also bounded in entries, but entries are not a memory bound: frame sizes are
+# configured independently, so a queue full of maximum-size frames is
+# entry-legal and megabytes-to-gigabytes large. Bytes are reserved before a
+# frame is enqueued and released when it is dequeued or when the connection is
+# torn down; a frame that would exceed the budget is refused exactly like a full
+# queue (the peer is treated as disconnected, never buffered). Must exceed
+# max_frame_bytes so one maximum-size frame always fits.
+max_outbound_queue_bytes = 16777216
+
+# Process-wide ceiling on simultaneously in-flight delegations, enforced at
+# admission (before any capacity is reserved) with SATURATED. Per-target
+# max_delegated_sessions is advertised by the runtime and bounds one target's
+# concurrency; it does not bound the CP's own state, and the in-flight table
+# retains identity and ancestry per live admission.
+max_inflight_delegations = 4096
+
+# Default clamp on a runtime's advertised max_delegated_sessions, applied to
+# every identity that does not set its own max_delegated_sessions_cap below.
+# The advertised value is self-asserted and saturation is the CP's only
+# backpressure signal, so there is no uncapped path: a worker advertising an
+# enormous budget would otherwise disable saturation entirely.
+default_max_delegated_sessions_cap = 16
+
 [[agents]]
 key = "${CP_KEY_KOUDU}"          # per-agent secret, never shared
 namespace = "prod"
@@ -61,7 +85,7 @@ key = "${CP_KEY_WORKER1}"
 namespace = "prod"
 name = "worker-1"
 type = "worker"
-max_delegated_sessions_cap = 4   # CP-side clamp on advertised capacity
+max_delegated_sessions_cap = 4   # overrides default_max_delegated_sessions_cap
 
 # Per-namespace policy. Absent namespaces use the conservative defaults:
 # max_depth = 1, allow_worker_initiation = false.

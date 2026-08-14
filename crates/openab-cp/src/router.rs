@@ -22,15 +22,21 @@
 //! Ending a delegation is a two-sided event: a frame goes out on the wire and
 //! CP state is committed. The commit is exact — it claims the one admission it
 //! delivered a result for (key + serving handle + [`InFlight::generation`]) or
-//! nothing at all — so CP state stays consistent under any interleaving.
+//! nothing at all — so CP state stays consistent under any interleaving. The
+//! same admission stamp is protocol-visible as
+//! [`crate::proto::AdmissionToken`]: the serving runtime echoes it in
+//! `cp/delegate_result` and a frame naming a stale admission is dropped before
+//! anything is delivered, so exactness does not stop at the CP boundary.
 //!
 //! The wire is a different matter: a `completed` result racing the deadline
 //! sweep's synthesized `timeout` can put TWO terminal frames on the wire for
-//! one `delegation_id`. v1 resolves that by contract instead of CP-side
-//! suppression (which would need per-id terminal state the CP deliberately
-//! does not keep): **the first terminal frame for a `delegation_id` wins**, and
-//! initiators MUST ignore later ones. See the v1 contract amendments in
-//! `docs/adr/agent-control-plane.md`.
+//! one admission. v1 resolves that by contract instead of CP-side suppression
+//! (which would need per-id terminal state the CP deliberately does not
+//! keep): **the first terminal frame for an admission token wins**, and
+//! initiators MUST ignore later ones for that token. Because every
+//! initiator-bound terminal frame carries the token, a frame for a superseded
+//! admission is distinguishable from — and cannot mask — the live one. See the
+//! v1 contract amendments in `docs/adr/agent-control-plane.md`.
 //!
 //! # Lock hierarchy
 //!
@@ -56,7 +62,6 @@
 //! does not participate in this hierarchy.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
@@ -99,7 +104,8 @@ pub struct InFlight {
     /// CP-constructed chain for THIS delegation (root first, ends with the
     /// initiator). Children extend it.
     pub chain: Vec<String>,
-    /// CP-generated, never-reused admission stamp. `(namespace,
+    /// CP-generated, never-reused admission stamp — the value carried on the
+    /// wire as [`crate::proto::AdmissionToken`]. `(namespace,
     /// delegation_id)` is NOT a stable identity over time: the id is
     /// client-supplied, and cancel-then-retry — a natural client pattern —
     /// legitimately re-admits the same id, which with a single replica routes
@@ -108,8 +114,17 @@ pub struct InFlight {
     /// later, unrelated admission wearing the same clothes (an ABA race).
     ///
     /// The generation makes that distinction total: it is minted once per
-    /// admission from a monotonic counter and never reused, so the commit
-    /// step claims the entry it actually delivered a result for, or nothing.
+    /// admission from a **per-namespace** monotonic counter and never reused
+    /// for that namespace, so the commit step claims the entry it actually
+    /// delivered a result for, or nothing. Because the value is on the wire,
+    /// the serving runtime echoes it in `cp/delegate_result` and the CP
+    /// refuses a result that does not name the live admission — the same
+    /// exactness, extended past the CP boundary.
+    ///
+    /// Per-namespace rather than global precisely because it is
+    /// protocol-visible: a global counter would let one namespace observe
+    /// another's delegation volume. Commit matching only needs never-reuse per
+    /// `(namespace, delegation_id)` key, which per-namespace counters give.
     pub generation: u64,
 }
 
@@ -137,18 +152,26 @@ impl DelegationKey {
 
 pub struct Router {
     inflight: Mutex<BTreeMap<DelegationKey, InFlight>>,
-    /// Serializes the delegate admission sequence (duplicate check → target
-    /// selection → capacity reservation → in-flight insert) so concurrent
-    /// requests cannot double-admit one id or oversubscribe capacity: without
-    /// it, two racing delegates both see a free slot and both reserve it.
-    /// Delegation rates are LLM-scale; a coarse admission lock is simple and
-    /// more than sufficient.
-    admission: Mutex<()>,
-    /// Source of [`InFlight::generation`] stamps. Monotonic and never reset
-    /// (the table dies with the process, so a restart cannot collide with
-    /// anything still in flight): every admission gets a value no earlier or
-    /// later admission has worn.
-    next_generation: AtomicU64,
+    /// Serializes the delegate admission sequence (duplicate check → global
+    /// in-flight bound → target selection → capacity reservation → in-flight
+    /// insert) so concurrent requests cannot double-admit one id or
+    /// oversubscribe capacity: without it, two racing delegates both see a
+    /// free slot and both reserve it. Delegation rates are LLM-scale; a coarse
+    /// admission lock is simple and more than sufficient.
+    ///
+    /// The guarded value is the source of [`InFlight::generation`] stamps:
+    /// namespace → last minted generation. Keeping the counters *inside* the
+    /// admission lock makes it structurally impossible to mint a generation
+    /// outside the sequence that consumes it. Never reset (the table dies with
+    /// the process, so a restart cannot collide with anything still in
+    /// flight): every admission in a namespace gets a value no earlier or
+    /// later admission in that namespace has worn.
+    ///
+    /// Per-namespace, not global, because the value is now protocol-visible
+    /// (see [`crate::proto::AdmissionToken`]): a global counter on the wire
+    /// would disclose other namespaces' delegation volume. Commit matching
+    /// only requires never-reuse per `(namespace, delegation_id)` key.
+    admission: Mutex<BTreeMap<String, u64>>,
 }
 
 pub enum DelegateOutcome {
@@ -194,7 +217,8 @@ enum Claim {
 /// including its [`InFlight::generation`] stamp, or why no result can be
 /// delivered for it. A peek never removes anything.
 enum Peek {
-    /// The caller is the instance the delegation was routed to.
+    /// The caller is the instance the delegation was routed to, and the frame
+    /// names that instance's live admission.
     Serving(InFlight),
     /// The entry exists but another instance serves it. Left in place — a
     /// non-owner frame must never make the delegation momentarily invisible
@@ -202,6 +226,18 @@ enum Peek {
     Foreign {
         /// CP-side logs only; never disclosed to the caller.
         owner_handle: u64,
+    },
+    /// The entry exists and the caller serves it, but the frame echoes a
+    /// DIFFERENT admission token than the live one: a late result for an
+    /// admission that was cancelled/expired before the same `delegation_id`
+    /// was re-admitted. Left strictly in place — delivering this payload would
+    /// hand the initiator one admission's result as another's, and the commit
+    /// that followed would remove a delegation that is genuinely running.
+    StaleAdmission {
+        /// Token the frame echoed (CP-side logs only).
+        echoed: u64,
+        /// Token of the live admission (CP-side logs only).
+        live: u64,
     },
     /// No entry for `(namespace, delegation_id)`.
     Unknown,
@@ -267,8 +303,7 @@ impl Router {
     pub fn new() -> Self {
         Self {
             inflight: Mutex::new(BTreeMap::new()),
-            admission: Mutex::new(()),
-            next_generation: AtomicU64::new(0),
+            admission: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -287,11 +322,13 @@ impl Router {
     ) -> DelegateOutcome {
         let now = Utc::now();
 
-        // Admission is one atomic sequence: duplicate check, parent lookup,
-        // target selection, capacity reservation, and in-flight insertion all
-        // happen under this guard, so two racing delegates can neither
-        // double-admit an id nor both claim the last free slot.
-        let _admission = self.admission.lock();
+        // Admission is one atomic sequence: duplicate check, global in-flight
+        // bound, parent lookup, target selection, capacity reservation, and
+        // in-flight insertion all happen under this guard, so two racing
+        // delegates can neither double-admit an id nor both claim the last
+        // free slot. The guard also owns the per-namespace generation
+        // counters, so a token cannot be minted outside this sequence.
+        let mut admission = self.admission.lock();
 
         // Delegation identity is namespace-scoped: the same id in another
         // namespace is a different delegation, so it neither collides here
@@ -301,6 +338,35 @@ impl Router {
             return DelegateOutcome::Rejected(ErrorObject::new(
                 codes::DUPLICATE_DELEGATION,
                 format!("delegation {} is already in flight", params.delegation_id),
+            ));
+        }
+
+        // Process-wide bound on live admissions, checked before any capacity
+        // is reserved and before a target is even selected (nothing to roll
+        // back on refusal). Per-target `max_delegated_sessions` is
+        // runtime-advertised, so it bounds one target's concurrency, not the
+        // CP's own memory: the in-flight table retains the chain and identity
+        // of every live admission. The bound is the table's own length rather
+        // than a separate counter, which is why no removal path has to
+        // remember to decrement it — commit, cancel, sweep, fail_instance and
+        // the send-failure rollback all remove the entry, and the count
+        // follows by construction. A parallel counter would be one refactor
+        // away from drifting, and a drifted global bound wedges the whole CP.
+        let live = self.inflight.lock().len();
+        if live >= cfg.max_inflight_delegations {
+            warn!(
+                live,
+                max = cfg.max_inflight_delegations,
+                namespace = %from_namespace,
+                "global in-flight delegation bound reached — refusing admission"
+            );
+            return DelegateOutcome::Rejected(ErrorObject::new(
+                codes::SATURATED,
+                format!(
+                    "control plane is at its global in-flight limit \
+                     (max_inflight_delegations = {}); retry later",
+                    cfg.max_inflight_delegations
+                ),
             ));
         }
 
@@ -372,12 +438,44 @@ impl Router {
             ));
         }
 
-        // Build the forward frame with the CP-stamped chain.
+        // Mint the admission token BEFORE anything is reserved or sent, so
+        // exhaustion cannot leave a reserved slot behind — and because the
+        // forwarded frame carries the token, the serving runtime learns which
+        // admission it is serving and can echo it back.
+        //
+        // Counters are per namespace and never wrap: an exhausted counter must
+        // NOT be bumped (wrapping would re-issue tokens from 0 and silently
+        // recreate the ABA this stamp exists to prevent), so exhaustion fails
+        // the admission and leaves the counter parked at the ceiling — every
+        // later admission in that namespace is refused too. Fail closed,
+        // permanently, with no wrapping path. (Unreachable in practice: one
+        // admission per nanosecond exhausts a u64 after ~584 years; this is
+        // insurance, not a path.)
+        let counter = admission.entry(from_namespace.to_string()).or_insert(0);
+        if *counter >= u64::MAX - 1 {
+            tracing::error!(
+                namespace = %from_namespace,
+                "admission token space exhausted for this namespace — refusing admission"
+            );
+            // -32603 = JSON-RPC internal error; no protocol-specific code
+            // is warranted for a condition that cannot occur in a
+            // process's realistic lifetime.
+            return DelegateOutcome::Rejected(ErrorObject::new(
+                -32603,
+                "control plane admission token space exhausted; restart the CP",
+            ));
+        }
+        *counter += 1;
+        let generation = *counter;
+
+        // Build the forward frame with the CP-stamped chain and admission
+        // token.
         let from_logical = format!("{from_namespace}/{from_name}");
         let mut chain = parent_chain;
         chain.push(from_logical.clone());
         let forward = DelegateForward {
             delegation_id: params.delegation_id.clone(),
+            admission: generation,
             prompt: params.prompt,
             deadline: params.deadline,
             from: from_logical.clone(),
@@ -393,40 +491,6 @@ impl Router {
         // Reserve capacity and record the in-flight entry BEFORE sending, so
         // an immediately-arriving result finds it. Roll both back if the send
         // fails.
-        //
-        // Minted BEFORE the capacity reservation so exhaustion cannot leave a
-        // reserved slot behind. `fetch_add` on an exhausted counter would wrap
-        // and re-issue generation values, silently recreating the ABA this
-        // stamp exists to prevent — so exhaustion fails the admission instead.
-        // (Unreachable in practice: one admission per nanosecond exhausts a
-        // u64 after ~584 years; this is fail-closed insurance, not a path.)
-        // `fetch_update` rather than `fetch_add`: an exhausted counter must
-        // NOT be written (fetch_add would wrap the atomic itself and re-issue
-        // generations from 0). Refusal leaves the counter parked at the
-        // ceiling, so every later admission is refused too — fail closed,
-        // permanently, with no wrapping path.
-        let generation =
-            match self
-                .next_generation
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |g| {
-                    if g >= u64::MAX - 1 {
-                        None
-                    } else {
-                        Some(g + 1)
-                    }
-                }) {
-                Ok(prev) => prev + 1,
-                Err(_) => {
-                    tracing::error!("delegation generation space exhausted — refusing admission");
-                    // -32603 = JSON-RPC internal error; no protocol-specific code
-                    // is warranted for a condition that cannot occur in a
-                    // process's realistic lifetime.
-                    return DelegateOutcome::Rejected(ErrorObject::new(
-                        -32603,
-                        "control plane generation space exhausted; restart the CP",
-                    ));
-                }
-            };
         registry.adjust_sessions(target.handle, 1);
         let entry = InFlight {
             namespace: from_namespace.to_string(),
@@ -439,7 +503,8 @@ impl Router {
             chain,
             // Stamped under the admission lock, so every admission — including
             // a re-admission of an id that was just cancelled — is
-            // distinguishable from every other for the life of the process.
+            // distinguishable from every other in this namespace for the life
+            // of the process.
             generation,
         };
         self.inflight.lock().insert(key.clone(), entry.clone());
@@ -471,6 +536,7 @@ impl Router {
 
         info!(
             delegation = %entry.delegation_id,
+            admission = entry.generation,
             from = %entry.from_logical,
             to = %entry.to_logical,
             chain = ?entry.chain,
@@ -480,6 +546,7 @@ impl Router {
 
         DelegateOutcome::Accepted(DelegateAck {
             delegation_id: params.delegation_id,
+            admission: generation,
             assigned_to: target.logical_id(),
         })
     }
@@ -526,8 +593,16 @@ impl Router {
     }
 
     /// Phase 1 of a completion: snapshot the entry for `(namespace,
-    /// delegation_id)` and assert `serving_handle` is the instance it was
-    /// routed to — under one in-flight lock acquisition, removing nothing.
+    /// delegation_id)`, assert `serving_handle` is the instance it was routed
+    /// to, and assert the frame's echoed admission token names that live
+    /// admission — under one in-flight lock acquisition, removing nothing.
+    ///
+    /// The token check happens HERE, before the initiator-bound frame is
+    /// built, because delivery is the irreversible half: a stale result that
+    /// passed the peek would be handed to the initiator as the live
+    /// admission's terminal frame (and, being the first terminal frame for
+    /// that id, would mask the genuine one) even if the commit later declined
+    /// to touch anything.
     ///
     /// The returned [`InFlight`] carries the [`InFlight::generation`] the
     /// commit step must match, so delivery can happen outside the lock without
@@ -537,14 +612,19 @@ impl Router {
         namespace: &str,
         delegation_id: &str,
         serving_handle: u64,
+        admission: u64,
     ) -> Peek {
         let key = DelegationKey::new(namespace, delegation_id);
         let g = self.inflight.lock();
         match g.get(&key) {
-            Some(e) if e.to_handle == serving_handle => Peek::Serving(e.clone()),
-            Some(e) => Peek::Foreign {
+            Some(e) if e.to_handle != serving_handle => Peek::Foreign {
                 owner_handle: e.to_handle,
             },
+            Some(e) if e.generation != admission => Peek::StaleAdmission {
+                echoed: admission,
+                live: e.generation,
+            },
+            Some(e) => Peek::Serving(e.clone()),
             None => Peek::Unknown,
         }
     }
@@ -591,14 +671,23 @@ impl Router {
     /// The terminal result is the one frame that must never be silently
     /// dropped, so delivery happens in two phases:
     ///
-    /// 1. **Peek** — validate ownership under one in-flight lock acquisition
-    ///    without removing the entry ([`Router::peek_for_completion`]), then
-    ///    build and `try_send` the initiator-bound frame.
+    /// 1. **Peek** — validate ownership AND the echoed admission token under
+    ///    one in-flight lock acquisition without removing the entry
+    ///    ([`Router::peek_for_completion`]), then build and `try_send` the
+    ///    initiator-bound frame.
     /// 2. **Commit** — only after the initiator's queue accepted the frame,
     ///    end the delegation ([`Router::commit_completion`]): remove the
     ///    entry and release the serving instance's capacity, but only if the
     ///    live entry is still the very admission that was peeked (key +
     ///    serving handle + [`InFlight::generation`]).
+    ///
+    /// The token check in phase 1 is what extends admission exactness past the
+    /// CP boundary. Without it a late result for a cancelled admission A,
+    /// arriving after the same `delegation_id` was re-admitted as B to the same
+    /// worker, would peek B, be delivered to the initiator as B's terminal
+    /// frame, and then commit B (peek and commit both saw B, so B's own
+    /// generation matched) — releasing capacity B still occupies and leaving
+    /// B's genuine result to be dropped later as unknown.
     ///
     /// If the initiator's bounded queue refuses the frame, the entry stays
     /// in flight and [`CompleteOutcome::InitiatorStalled`] tells the caller
@@ -616,9 +705,12 @@ impl Router {
     /// the wire for one `delegation_id` — a `completed` result racing the
     /// sweep's synthesized `timeout`, or two duplicate results both passing
     /// the peek. That is resolved by contract, not by CP-side suppression:
-    /// initiators MUST treat the FIRST terminal frame for a `delegation_id` as
-    /// authoritative and ignore later ones (see "first terminal frame wins"
-    /// in the ADR's v1 contract amendments).
+    /// initiators MUST treat the FIRST terminal frame for a given **admission
+    /// token** as authoritative and ignore later ones for that token (see
+    /// "first terminal frame wins" in the ADR's v1 contract amendments). Every
+    /// initiator-bound terminal frame carries the token of the admission it
+    /// ends — CP-synthesized `timeout` and `target_disconnected` included — so
+    /// a late frame for a superseded admission can never mask the live one.
     ///
     /// Only the instance the delegation was routed to may complete it; a
     /// non-owner frame can never make the delegation momentarily invisible
@@ -645,30 +737,52 @@ impl Router {
                 return CompleteOutcome::Dropped;
             }
         };
-        let entry =
-            match self.peek_for_completion(&namespace, &params.delegation_id, serving_handle) {
-                Peek::Serving(e) => e,
-                Peek::Foreign { owner_handle } => {
-                    // Only the instance the delegation was routed to may
-                    // complete it. The entry stays exactly where it is.
-                    warn!(
-                        delegation = %params.delegation_id,
-                        namespace = %namespace,
-                        expected = owner_handle,
-                        got = serving_handle,
-                        "result from unexpected instance — dropped, delegation untouched"
-                    );
-                    return CompleteOutcome::Dropped;
-                }
-                Peek::Unknown => {
-                    warn!(
-                        delegation = %params.delegation_id,
-                        namespace = %namespace,
-                        "result for unknown delegation (late arrival or CP restart) — dropped"
-                    );
-                    return CompleteOutcome::Dropped;
-                }
-            };
+        let entry = match self.peek_for_completion(
+            &namespace,
+            &params.delegation_id,
+            serving_handle,
+            params.admission,
+        ) {
+            Peek::Serving(e) => e,
+            Peek::Foreign { owner_handle } => {
+                // Only the instance the delegation was routed to may
+                // complete it. The entry stays exactly where it is.
+                warn!(
+                    delegation = %params.delegation_id,
+                    namespace = %namespace,
+                    expected = owner_handle,
+                    got = serving_handle,
+                    "result from unexpected instance — dropped, delegation untouched"
+                );
+                return CompleteOutcome::Dropped;
+            }
+            Peek::StaleAdmission { echoed, live } => {
+                // A late result for an admission that no longer exists, while
+                // the same id is live under a new one (cancel-then-retry).
+                // Logged distinctly for operators, but answered with the same
+                // generic ack as any other drop: a distinguishable reply would
+                // tell the serving side whether the id is currently
+                // re-admitted, which is exactly the kind of existence oracle
+                // the namespace-scoped keys and byte-identical cancel
+                // refusals removed.
+                warn!(
+                    delegation = %params.delegation_id,
+                    namespace = %namespace,
+                    echoed_admission = echoed,
+                    live_admission = live,
+                    "result echoes a stale admission token — dropped, live delegation untouched"
+                );
+                return CompleteOutcome::Dropped;
+            }
+            Peek::Unknown => {
+                warn!(
+                    delegation = %params.delegation_id,
+                    namespace = %namespace,
+                    "result for unknown delegation (late arrival or CP restart) — dropped"
+                );
+                return CompleteOutcome::Dropped;
+            }
+        };
 
         // Truncate oversized results (keep the head; delegation already
         // ran). The marker counts against the cap: the final value never
@@ -855,6 +969,10 @@ impl Router {
                 if let Some(init) = registry.get(e.from_handle) {
                     let params = DelegateResultParams {
                         delegation_id: e.delegation_id.clone(),
+                        // The admission this frame ends — the initiator
+                        // correlates terminal frames on the token, not on the
+                        // reusable id.
+                        admission: e.generation,
                         status: DelegationStatus::TargetDisconnected,
                         result: None,
                         error: Some(format!("{} disconnected", e.to_logical)),
@@ -911,6 +1029,10 @@ impl Router {
             if let Some(init) = registry.get(e.from_handle) {
                 let params = DelegateResultParams {
                     delegation_id: e.delegation_id.clone(),
+                    // The admission that expired. A retry of the same id gets
+                    // its own token, so this timeout can never be mistaken for
+                    // the retry's terminal frame.
+                    admission: e.generation,
                     status: DelegationStatus::Timeout,
                     result: None,
                     error: Some("deadline exceeded".to_string()),
@@ -971,10 +1093,9 @@ impl Default for Router {
 mod tests {
     use super::*;
     use crate::proto::TargetSelector;
-    use crate::registry::OUTBOUND_QUEUE;
+    use crate::registry::{outbound_channel, FrameRx};
     use chrono::Duration;
     use std::time::Instant;
-    use tokio::sync::mpsc;
 
     fn cfg() -> CpConfig {
         toml::from_str(
@@ -995,13 +1116,8 @@ type = "worker"
         .unwrap()
     }
 
-    fn instance(
-        ns: &str,
-        name: &str,
-        ty: AgentType,
-        max: u32,
-    ) -> (Instance, mpsc::Receiver<String>) {
-        let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE);
+    fn instance(ns: &str, name: &str, ty: AgentType, max: u32) -> (Instance, FrameRx) {
+        let (tx, rx) = outbound_channel(1024 * 1024);
         (
             Instance {
                 handle: 0,
@@ -1018,6 +1134,18 @@ type = "worker"
             },
             rx,
         )
+    }
+
+    /// The live admission token for `(namespace, delegation_id)` — what a
+    /// well-behaved serving runtime echoes, since it learned it from the
+    /// forwarded `cp/delegate`.
+    fn token(router: &Router, namespace: &str, delegation_id: &str) -> u64 {
+        router
+            .inflight
+            .lock()
+            .get(&DelegationKey::new(namespace, delegation_id))
+            .expect("delegation must be in flight to have a token")
+            .generation
     }
 
     fn delegate_params(id: &str, target: &str, secs: i64) -> DelegateParams {
@@ -1039,8 +1167,8 @@ type = "worker"
         router: Router,
         h_primary: u64,
         h_worker: u64,
-        worker_rx: mpsc::Receiver<String>,
-        primary_rx: mpsc::Receiver<String>,
+        worker_rx: FrameRx,
+        primary_rx: FrameRx,
     }
 
     fn world() -> World {
@@ -1073,6 +1201,320 @@ type = "worker"
         )
     }
 
+    /// Unwrap an accepted admission, keeping its ack (and with it the
+    /// admission token the initiator learns).
+    fn accept(out: DelegateOutcome) -> DelegateAck {
+        match out {
+            DelegateOutcome::Accepted(a) => a,
+            DelegateOutcome::Rejected(e) => panic!("rejected ({}): {}", e.code, e.message),
+        }
+    }
+
+    /// The `params.admission` of a JSON-RPC frame the CP put on the wire.
+    fn frame_admission(frame: &str) -> u64 {
+        let v: serde_json::Value = serde_json::from_str(frame).unwrap();
+        v["params"]["admission"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("frame carries no admission token: {frame}"))
+    }
+
+    #[test]
+    fn late_result_for_a_superseded_admission_is_dropped() {
+        // The protocol-level half of the ABA. Cancel-then-retry re-admits the
+        // same client-supplied id and, with a single replica, to the SAME
+        // worker. A late `cp/delegate_result` for the cancelled admission A
+        // therefore matches the live admission B on everything the CP used to
+        // check — namespace, delegation_id, serving handle — so before the
+        // token existed A's payload was delivered to the initiator as B's
+        // terminal frame, and the commit then removed B (peek and commit both
+        // saw B, so B's own generation matched), releasing capacity B still
+        // occupied and leaving B's genuine result to be dropped as unknown.
+        let mut w = world(); // worker max_delegated_sessions = 1
+        let a = accept(do_delegate(&w, delegate_params("d-1", "worker-1", 60)));
+        assert_eq!(
+            frame_admission(&w.worker_rx.try_recv().unwrap()),
+            a.admission,
+            "the worker learns the token it must echo"
+        );
+
+        // A is cancelled; the id and the worker's slot are free again.
+        let cancel = CancelParams {
+            delegation_id: "d-1".into(),
+            reason: "changed my mind".into(),
+        };
+        w.router
+            .cancel(&w.registry, w.h_primary, &cancel, 2)
+            .expect("the initiator may cancel");
+        drain(&mut w);
+
+        // B: the same id, re-admitted, routed to the same worker.
+        let b = accept(do_delegate(&w, delegate_params("d-1", "worker-1", 60)));
+        assert_ne!(
+            a.admission, b.admission,
+            "each admission of a reusable id gets its own token"
+        );
+        assert_eq!(
+            frame_admission(&w.worker_rx.try_recv().unwrap()),
+            b.admission
+        );
+
+        // The late result for A arrives, echoing A's token.
+        assert_eq!(
+            w.router.complete(
+                &w.registry,
+                w.h_worker,
+                result_of("d-1", a.admission, "A's stale payload"),
+                1024,
+                3
+            ),
+            CompleteOutcome::Dropped,
+            "a result naming a superseded admission must be dropped"
+        );
+        assert!(
+            w.primary_rx.try_recv().is_err(),
+            "A's payload must never be delivered as B's result"
+        );
+        assert_eq!(w.router.inflight_count(), 1, "B must remain in flight");
+        assert_eq!(
+            w.registry.get(w.h_worker).unwrap().active_sessions,
+            1,
+            "B's capacity reservation must be intact"
+        );
+        assert_eq!(
+            w.router.chain_of("prod", "d-1").as_deref(),
+            Some(&["prod/koudu".to_string()][..]),
+            "B must still be visible to its own result and to the sweep"
+        );
+
+        // B then completes normally with its own token.
+        assert_eq!(
+            w.router.complete(
+                &w.registry,
+                w.h_worker,
+                result_of("d-1", b.admission, "B's genuine result"),
+                1024,
+                4
+            ),
+            CompleteOutcome::Delivered { committed: true }
+        );
+        let frame = w.primary_rx.try_recv().expect("initiator got B's result");
+        assert!(frame.contains("B's genuine result"));
+        assert_eq!(
+            frame_admission(&frame),
+            b.admission,
+            "the terminal frame names the admission it ends"
+        );
+        assert_eq!(w.router.inflight_count(), 0);
+        assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 0);
+    }
+
+    #[test]
+    fn terminal_frames_carry_the_token_of_the_admission_they_end() {
+        // "First terminal frame wins" is only usable if the initiator can tell
+        // WHICH admission a terminal frame ends: for a reusable id, a late
+        // frame for a superseded admission would otherwise mask the live one
+        // permanently. Every initiator-bound terminal frame therefore carries
+        // the token — CP-synthesized `timeout` and `target_disconnected`
+        // included, since both are built from the in-flight entry.
+        let mut w = world();
+        let a = accept(do_delegate(&w, delegate_params("d-1", "worker-1", 60)));
+        drain(&mut w);
+
+        // A's terminal frame is the sweep's synthesized timeout.
+        let mut seq = 900u64;
+        let mut next = || {
+            seq += 1;
+            seq
+        };
+        let swept =
+            w.router
+                .sweep_deadlines(&w.registry, Utc::now() + Duration::seconds(3600), &mut next);
+        let timeout = swept
+            .iter()
+            .map(|(_, f)| f.clone())
+            .find(|f| f.contains("\"timeout\""))
+            .expect("the sweep must synthesize a timeout for the initiator");
+        assert_eq!(
+            frame_admission(&timeout),
+            a.admission,
+            "the synthesized timeout must name the admission that expired"
+        );
+        drain(&mut w);
+
+        // B reuses the id and gets its own token; its terminal frame is
+        // therefore distinguishable from A's.
+        let b = accept(do_delegate(&w, delegate_params("d-1", "worker-1", 60)));
+        assert_ne!(a.admission, b.admission);
+        drain(&mut w);
+        assert_eq!(
+            w.router.complete(
+                &w.registry,
+                w.h_worker,
+                result_of("d-1", b.admission, "B done"),
+                1024,
+                5
+            ),
+            CompleteOutcome::Delivered { committed: true }
+        );
+        let terminal_b = w.primary_rx.try_recv().unwrap();
+        assert_eq!(frame_admission(&terminal_b), b.admission);
+        assert_ne!(
+            frame_admission(&timeout),
+            frame_admission(&terminal_b),
+            "A's and B's terminal frames must be distinguishable on the wire"
+        );
+
+        // The disconnect-synthesized terminal frame carries it too.
+        let c = accept(do_delegate(&w, delegate_params("d-2", "worker-1", 60)));
+        drain(&mut w);
+        w.registry.deregister(w.h_worker);
+        let frames = w.router.fail_instance(&w.registry, w.h_worker, &mut next);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].1.contains("target_disconnected"));
+        assert_eq!(
+            frame_admission(&frames[0].1),
+            c.admission,
+            "target_disconnected must name the admission it ends"
+        );
+    }
+
+    #[test]
+    fn global_inflight_bound_refuses_and_is_released_by_every_removal_path() {
+        // Per-target `max_delegated_sessions` is runtime-advertised and bounds
+        // one target's concurrency, not the CP's own state: the in-flight table
+        // retains identity and ancestry per live admission. The global bound is
+        // the ceiling on that table — and because the bound IS the table's
+        // length, every path that removes an entry releases it by construction.
+        // Each removal path below is followed by a fresh admission that only
+        // succeeds if the slot came back.
+        let cfg: CpConfig = toml::from_str(
+            r#"
+max_inflight_delegations = 1
+
+[[agents]]
+key = "kp"
+namespace = "prod"
+name = "koudu"
+type = "primary"
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let registry = Registry::new();
+        let router = Router::new();
+        // Capacity 8 on the target, so the GLOBAL bound is the binding limit.
+        let (p, mut primary_rx) = instance("prod", "koudu", AgentType::Primary, 8);
+        let (wk, mut worker_rx) = instance("prod", "worker-1", AgentType::Worker, 8);
+        let hp = registry.register(p);
+        let hw = registry.register(wk);
+        let go = |id: &str| {
+            router.delegate(
+                &cfg,
+                &registry,
+                "prod",
+                "koudu",
+                &AgentType::Primary,
+                hp,
+                delegate_params(id, "worker-1", 60),
+                1,
+            )
+        };
+        let mut drain_all = || {
+            while worker_rx.try_recv().is_ok() {}
+            while primary_rx.try_recv().is_ok() {}
+        };
+
+        let first = accept(go("d-1"));
+        match go("d-2") {
+            DelegateOutcome::Rejected(e) => {
+                assert_eq!(e.code, codes::SATURATED);
+                assert!(
+                    e.message.contains("max_inflight_delegations"),
+                    "the refusal must name the bound it hit: {}",
+                    e.message
+                );
+            }
+            _ => panic!("the global in-flight bound must refuse the second admission"),
+        }
+        // Refusal reserves nothing.
+        assert_eq!(registry.get(hw).unwrap().active_sessions, 1);
+        drain_all();
+
+        // 1. commit (a delivered terminal result).
+        assert_eq!(
+            router.complete(
+                &registry,
+                hw,
+                result_of("d-1", first.admission, "done"),
+                1024,
+                2
+            ),
+            CompleteOutcome::Delivered { committed: true }
+        );
+        assert_eq!(router.inflight_count(), 0);
+        let second = accept(go("d-2"));
+        drain_all();
+
+        // 2. cancel.
+        let cancel = CancelParams {
+            delegation_id: "d-2".into(),
+            reason: "no longer needed".into(),
+        };
+        router.cancel(&registry, hp, &cancel, 3).expect("owned");
+        assert_eq!(router.inflight_count(), 0);
+        assert_ne!(second.admission, accept(go("d-3")).admission);
+        drain_all();
+
+        // 3. deadline sweep.
+        let mut seq = 500u64;
+        let mut next = || {
+            seq += 1;
+            seq
+        };
+        assert!(!router
+            .sweep_deadlines(&registry, Utc::now() + Duration::seconds(3600), &mut next)
+            .is_empty());
+        assert_eq!(router.inflight_count(), 0);
+        accept(go("d-4"));
+        drain_all();
+
+        // 4. fail_instance (the initiator's own disconnect).
+        router.fail_instance(&registry, hp, &mut next);
+        assert_eq!(router.inflight_count(), 0);
+        accept(go("d-5"));
+        drain_all();
+
+        // 5. send-failure rollback. The worker's queue is closed, so the
+        // forward is refused and the admission rolls back — the global slot
+        // must come back with it, which a second target proves.
+        let (wk2, mut worker2_rx) = instance("prod", "worker-2", AgentType::Worker, 8);
+        registry.register(wk2);
+        router.fail_instance(&registry, hp, &mut next);
+        assert_eq!(router.inflight_count(), 0);
+        worker_rx.close();
+        match go("d-6") {
+            DelegateOutcome::Rejected(e) => assert_eq!(e.code, codes::TARGET_DISCONNECTED),
+            _ => panic!("a closed target queue must fail the forward"),
+        }
+        assert_eq!(router.inflight_count(), 0, "the rollback removed the entry");
+        match router.delegate(
+            &cfg,
+            &registry,
+            "prod",
+            "koudu",
+            &AgentType::Primary,
+            hp,
+            delegate_params("d-7", "worker-2", 60),
+            9,
+        ) {
+            DelegateOutcome::Accepted(_) => {}
+            DelegateOutcome::Rejected(e) => {
+                panic!("the rolled-back admission must free the global slot: {e:?}")
+            }
+        }
+        worker2_rx.try_recv().expect("worker-2 got the forward");
+    }
+
     #[test]
     fn happy_path_roundtrip() {
         let mut w = world();
@@ -1088,10 +1530,15 @@ type = "worker"
         assert_eq!(v["method"], "cp/delegate");
         assert_eq!(v["params"]["from"], "prod/koudu");
         assert_eq!(v["params"]["chain"], serde_json::json!(["prod/koudu"]));
+        // The serving runtime learns the admission token it must echo, and it
+        // is the same one the initiator was acked with.
+        assert_eq!(v["params"]["admission"], ack.admission);
+        assert_eq!(ack.admission, token(&w.router, "prod", "d-1"));
         assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 1);
 
         let result = DelegateResultParams {
             delegation_id: "d-1".into(),
+            admission: ack.admission,
             status: DelegationStatus::Completed,
             result: Some("done".into()),
             error: None,
@@ -1102,6 +1549,9 @@ type = "worker"
         );
         let frame = w.primary_rx.try_recv().unwrap();
         assert!(frame.contains("\"completed\""));
+        // The initiator-bound terminal frame names the admission it ends.
+        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["params"]["admission"], ack.admission);
         assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 0);
         assert_eq!(w.router.inflight_count(), 0);
     }
@@ -1118,6 +1568,7 @@ type = "worker"
         // Complete BEFORE draining the worker's queue — entry must exist.
         let result = DelegateResultParams {
             delegation_id: "d-1".into(),
+            admission: token(&w.router, "prod", "d-1"),
             status: DelegationStatus::Completed,
             result: Some("instant".into()),
             error: None,
@@ -1229,14 +1680,20 @@ type = "worker"
             DelegateOutcome::Accepted(_)
         ));
         w.worker_rx.try_recv().unwrap();
+        let tok = token(&w.router, "prod", "d-1");
 
         // Fill the initiator's bounded queue so the result frame is refused.
         let initiator_tx = w.registry.get(w.h_primary).unwrap().tx;
         while initiator_tx.try_send("filler".into()).is_ok() {}
 
         assert_eq!(
-            w.router
-                .complete(&w.registry, w.h_worker, result_of("d-1", "late"), 1024, 2),
+            w.router.complete(
+                &w.registry,
+                w.h_worker,
+                result_of("d-1", tok, "late"),
+                1024,
+                2
+            ),
             CompleteOutcome::InitiatorStalled {
                 initiator_handle: w.h_primary
             }
@@ -1338,6 +1795,7 @@ type = "worker"
         ));
         let result = DelegateResultParams {
             delegation_id: "d-1".into(),
+            admission: token(&w.router, "prod", "d-1"),
             status: DelegationStatus::Completed,
             result: Some("spoofed".into()),
             error: None,
@@ -1355,6 +1813,9 @@ type = "worker"
         let w = world();
         let result = DelegateResultParams {
             delegation_id: "d-unknown".into(),
+            // Any token at all: with no entry for the id there is nothing to
+            // match against, so the frame is dropped as unknown.
+            admission: 1,
             status: DelegationStatus::Completed,
             result: None,
             error: None,
@@ -1375,6 +1836,7 @@ type = "worker"
         w.worker_rx.try_recv().unwrap();
         let result = DelegateResultParams {
             delegation_id: "d-1".into(),
+            admission: token(&w.router, "prod", "d-1"),
             status: DelegationStatus::Completed,
             result: Some("x".repeat(200)),
             error: None,
@@ -1403,6 +1865,7 @@ type = "worker"
         w.worker_rx.try_recv().unwrap();
         let result2 = DelegateResultParams {
             delegation_id: "d-2".into(),
+            admission: token(&w.router, "prod", "d-2"),
             status: DelegationStatus::Completed,
             result: Some("y".repeat(100)),
             error: None,
@@ -1632,9 +2095,12 @@ allow_worker_initiation = true
         }
     }
 
-    fn result_of(id: &str, body: &str) -> DelegateResultParams {
+    /// A `cp/delegate_result` frame as a well-behaved serving runtime builds
+    /// it: echoing the admission token it was forwarded.
+    fn result_of(id: &str, admission: u64, body: &str) -> DelegateResultParams {
         DelegateResultParams {
             delegation_id: id.into(),
+            admission,
             status: DelegationStatus::Completed,
             result: Some(body.into()),
             error: None,
@@ -1654,6 +2120,7 @@ allow_worker_initiation = true
                 DelegateOutcome::Accepted(_)
             ));
             w.worker_rx.try_recv().unwrap();
+            let tok = token(&w.router, "prod", "d-1");
 
             if spoof_first {
                 // h_primary is registered but is NOT the serving instance.
@@ -1661,7 +2128,7 @@ allow_worker_initiation = true
                     w.router.complete(
                         &w.registry,
                         w.h_primary,
-                        result_of("d-1", "spoofed"),
+                        result_of("d-1", tok, "spoofed"),
                         1024,
                         2
                     ),
@@ -1678,7 +2145,7 @@ allow_worker_initiation = true
                 w.router.complete(
                     &w.registry,
                     w.h_worker,
-                    result_of("d-1", "genuine"),
+                    result_of("d-1", tok, "genuine"),
                     1024,
                     3,
                 ),
@@ -1696,7 +2163,7 @@ allow_worker_initiation = true
                     w.router.complete(
                         &w.registry,
                         w.h_primary,
-                        result_of("d-1", "spoofed"),
+                        result_of("d-1", tok, "spoofed"),
                         1024,
                         4
                     ),
@@ -1720,6 +2187,7 @@ allow_worker_initiation = true
                 do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
                 DelegateOutcome::Accepted(_)
             ));
+            let tok = token(&w.router, "prod", "d-1");
             let gate = std::sync::Barrier::new(2);
             let (spoofed, genuine) = std::thread::scope(|s| {
                 let spoof = s.spawn(|| {
@@ -1728,7 +2196,7 @@ allow_worker_initiation = true
                     w.router.complete(
                         &w.registry,
                         w.h_primary,
-                        result_of("d-1", "spoofed"),
+                        result_of("d-1", tok, "spoofed"),
                         1024,
                         2,
                     ) == CompleteOutcome::Delivered { committed: true }
@@ -1737,7 +2205,7 @@ allow_worker_initiation = true
                 let genuine = w.router.complete(
                     &w.registry,
                     w.h_worker,
-                    result_of("d-1", "genuine"),
+                    result_of("d-1", tok, "genuine"),
                     1024,
                     3,
                 ) == CompleteOutcome::Delivered { committed: true };
@@ -1927,7 +2395,13 @@ allow_worker_initiation = true
 
         // Results route to the initiator of the SAME namespace only.
         assert_eq!(
-            router.complete(&registry, hw_dev, result_of("d-1", "dev-done"), 1024, 12),
+            router.complete(
+                &registry,
+                hw_dev,
+                result_of("d-1", token(&router, "dev", "d-1"), "dev-done"),
+                1024,
+                12
+            ),
             CompleteOutcome::Delivered { committed: true }
         );
         let frame = dev_init_rx.try_recv().unwrap();
@@ -1942,7 +2416,13 @@ allow_worker_initiation = true
         );
 
         assert_eq!(
-            router.complete(&registry, hw_prod, result_of("d-1", "prod-done"), 1024, 13),
+            router.complete(
+                &registry,
+                hw_prod,
+                result_of("d-1", token(&router, "prod", "d-1"), "prod-done"),
+                1024,
+                13
+            ),
             CompleteOutcome::Delivered { committed: true }
         );
         let frame = prod_init_rx.try_recv().unwrap();
@@ -2040,7 +2520,8 @@ allow_worker_initiation = true
     /// operation and then drive the commit step directly — deterministic,
     /// no barrier timing.
     fn peek(w: &World, id: &str) -> InFlight {
-        match w.router.peek_for_completion("prod", id, w.h_worker) {
+        let live = token(&w.router, "prod", id);
+        match w.router.peek_for_completion("prod", id, w.h_worker, live) {
             Peek::Serving(e) => e,
             _ => panic!("{id} must be in flight and served by the worker"),
         }
@@ -2171,7 +2652,7 @@ allow_worker_initiation = true
                 w.router.complete(
                     &w.registry,
                     w.h_worker,
-                    result_of("d-1", "genuine"),
+                    result_of("d-1", b.generation, "genuine"),
                     1024,
                     7
                 ),
@@ -2309,34 +2790,72 @@ allow_worker_initiation = true
         // Through the public path: the entry is gone, so the frame is not
         // even delivered — a peek that finds nothing is a plain drop.
         assert_eq!(
-            w.router
-                .complete(&w.registry, w.h_worker, result_of("d-1", "late"), 1024, 8),
+            w.router.complete(
+                &w.registry,
+                w.h_worker,
+                result_of("d-1", a.generation, "late"),
+                1024,
+                8
+            ),
             CompleteOutcome::Dropped
         );
         assert!(w.primary_rx.try_recv().is_err());
     }
 
     #[test]
-    fn generation_exhaustion_fails_closed_instead_of_wrapping() {
-        // fetch_add on an exhausted counter would wrap and re-issue
-        // generations, silently recreating the ABA the stamp prevents.
-        // Unreachable in a realistic process lifetime; pinned here so a
-        // refactor cannot quietly downgrade it to wrapping arithmetic.
+    fn admission_token_exhaustion_fails_closed_instead_of_wrapping() {
+        // Wrapping an exhausted counter would re-issue tokens and silently
+        // recreate the ABA the stamp prevents. Unreachable in a realistic
+        // process lifetime; pinned here so a refactor cannot quietly downgrade
+        // it to wrapping arithmetic. The counters are per namespace now, so
+        // the ceiling is set on the namespace under test — and exhaustion in
+        // one namespace must not refuse another's admissions.
         let w = world();
         w.router
-            .next_generation
-            .store(u64::MAX - 1, Ordering::Relaxed);
-        // At the ceiling, fetch_update declines to store: the admission is
-        // refused and the counter stays parked at MAX-1 forever.
+            .admission
+            .lock()
+            .insert("prod".to_string(), u64::MAX - 1);
+        // At the ceiling the counter is NOT bumped: the admission is refused
+        // and the counter stays parked at MAX-1 forever.
         let out = do_delegate(&w, delegate_params("d-last", "worker-1", 60));
         assert!(
             matches!(out, DelegateOutcome::Rejected(ref e) if e.code == -32603),
-            "exhausted generation space must refuse admission"
+            "exhausted admission token space must refuse admission"
         );
         // No capacity was reserved by the refused admission.
         assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 0);
         // And it stays parked: the next attempt is refused too.
         let out2 = do_delegate(&w, delegate_params("d-next", "worker-1", 60));
         assert!(matches!(out2, DelegateOutcome::Rejected(ref e) if e.code == -32603));
+        assert_eq!(
+            *w.router.admission.lock().get("prod").unwrap(),
+            u64::MAX - 1,
+            "a refused admission must not advance (or wrap) the counter"
+        );
+
+        // A different namespace is unaffected — counters are independent.
+        let (p_dev, _dev_init_rx) = instance("dev", "koudu", AgentType::Primary, 4);
+        let (w_dev, mut dev_rx) = instance("dev", "worker-1", AgentType::Worker, 1);
+        let hp_dev = w.registry.register(p_dev);
+        w.registry.register(w_dev);
+        match w.router.delegate(
+            &w.cfg,
+            &w.registry,
+            "dev",
+            "koudu",
+            &AgentType::Primary,
+            hp_dev,
+            delegate_params("d-dev", "worker-1", 60),
+            9,
+        ) {
+            DelegateOutcome::Accepted(ack) => assert_eq!(
+                ack.admission, 1,
+                "each namespace starts its own token sequence at 1"
+            ),
+            DelegateOutcome::Rejected(e) => {
+                panic!("dev must be unaffected by prod exhaustion: {}", e.message)
+            }
+        }
+        dev_rx.try_recv().unwrap();
     }
 }

@@ -36,7 +36,7 @@ use axum::routing::get;
 use axum::Router as AxumRouter;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::config::{AgentIdentity, CpConfig};
@@ -45,7 +45,7 @@ use crate::proto::{
     JsonRpcErrorResponse, JsonRpcMessage, JsonRpcResponse, RegisterAck, RegisterParams,
     PROTOCOL_VERSION,
 };
-use crate::registry::{shutdown_signal, Instance, Registry, OUTBOUND_QUEUE};
+use crate::registry::{outbound_channel, shutdown_signal, Instance, Registry};
 use crate::router::{CompleteOutcome, DelegateOutcome, Router};
 
 pub struct AppState {
@@ -310,14 +310,16 @@ async fn handle_connection(
         }
     };
 
-    // Outbound channel for this connection. Bounded: a peer that
-    // cannot drain OUTBOUND_QUEUE frames is disconnected, not buffered.
-    let (tx, mut rx) = mpsc::channel::<String>(OUTBOUND_QUEUE);
+    // Outbound channel for this connection. Bounded twice: a peer that cannot
+    // drain OUTBOUND_QUEUE frames — or that has accumulated
+    // max_outbound_queue_bytes of them — is disconnected, not buffered.
+    let (tx, mut rx) = outbound_channel(state.cfg.max_outbound_queue_bytes);
 
-    let effective_max = match identity.max_delegated_sessions_cap {
-        Some(cap) => reg.max_delegated_sessions.min(cap),
-        None => reg.max_delegated_sessions,
-    };
+    // The advertised budget is self-asserted and therefore always clamped:
+    // by this identity's own cap when set, otherwise by the global default.
+    let effective_max = state
+        .cfg
+        .effective_max_sessions(&identity, reg.max_delegated_sessions);
     // The registry assigns the CP-generated handle: ownership
     // and teardown never key on the client-supplied instance_id.
     let handle = state.registry.register_conn(
@@ -336,6 +338,18 @@ async fn handle_connection(
         },
         Arc::clone(&shutdown),
     );
+    // From here on, teardown is owned by an RAII guard rather than the return
+    // path: a panic anywhere below (the `expect("serializable")` sites are on
+    // production paths) would otherwise skip deregistration and leave this
+    // instance's in-flight delegations — and the capacity they reserve on
+    // OTHER instances — pinned until the lease expires. The guard runs on both
+    // the normal return and an unwind, and is the ONLY caller of `teardown`
+    // here, so the two paths cannot diverge.
+    let _registered = RegistrationGuard {
+        state: Arc::clone(&state),
+        handle,
+        identity: identity.clone(),
+    };
     info!(
         agent = %format!("{}/{}", identity.namespace, identity.name),
         instance = %reg.instance_id,
@@ -376,7 +390,7 @@ async fn handle_connection(
             )
             .await;
         }
-        teardown(&state, handle, &identity);
+        // `_registered` runs teardown on the way out.
         return;
     }
 
@@ -466,11 +480,48 @@ async fn handle_connection(
         .await;
     }
 
-    teardown(&state, handle, &identity);
+    // Teardown runs here, when `_registered` drops — on this path and on an
+    // unwind alike.
+}
+
+/// RAII owner of a *registered* connection's CP-side state.
+///
+/// Scoped to the registered lifetime: constructed immediately after
+/// `register_conn`, dropped when the connection task returns **or unwinds**.
+/// [`ConnPermit`] already made the identity's connection quota panic-safe;
+/// this does the same for the registry entry and the in-flight rows, which a
+/// panic between registration and return would otherwise leave for the lease
+/// sweeper — up to `lease_expiry_secs` of capacity reserved on *other*
+/// instances for delegations nobody is serving any more.
+///
+/// [`teardown`] is idempotent by construction, which is what makes a guard
+/// safe here: `deregister` is keyed by handle and returns `None` for an
+/// already-removed entry, and `fail_instance` releases capacity only for
+/// entries it actually removes. A guard that fires after `sweep_leases`
+/// already tore this handle down therefore finds nothing and changes nothing
+/// (proved by `teardown_runs_twice_without_double_releasing`).
+struct RegistrationGuard {
+    state: Arc<AppState>,
+    handle: u64,
+    identity: AgentIdentity,
+}
+
+impl Drop for RegistrationGuard {
+    fn drop(&mut self) {
+        // Must not panic: a panic here during an unwind aborts the process.
+        // Everything it touches is lock-guarded map mutation and non-blocking
+        // sends — no `expect`, no allocation-dependent invariants. parking_lot
+        // locks are not poisoned and are released by the unwind itself, so a
+        // panic taken while holding one cannot deadlock this call.
+        teardown(&self.state, self.handle, &self.identity);
+    }
 }
 
 /// Deregister this connection's own registration (by handle — cannot touch
 /// another connection's entry) and fail its in-flight delegations.
+///
+/// Invoked from [`RegistrationGuard::drop`], so it runs on the normal return
+/// path and on an unwind alike.
 ///
 /// Deliberately idempotent with the sweeper: when `sweep_leases` already ran
 /// `deregister` + `fail_instance` for this handle, both calls here find
@@ -993,6 +1044,167 @@ mod tests {
         assert_eq!(state.conn_count("prod/worker-1"), 1);
     }
 
+    /// Register one instance on `state` with a fresh outbound queue.
+    fn register_test_instance(
+        state: &Arc<AppState>,
+        name: &str,
+        agent_type: AgentType,
+        max_sessions: u32,
+    ) -> (u64, crate::registry::FrameRx) {
+        let (tx, rx) = outbound_channel(1024 * 1024);
+        let handle = state.registry.register_conn(
+            Instance {
+                handle: 0,
+                namespace: "prod".into(),
+                name: name.into(),
+                agent_type,
+                instance_id: format!("i-{name}"),
+                labels: Default::default(),
+                max_delegated_sessions: max_sessions,
+                active_sessions: 0,
+                registered_at: Instant::now(),
+                last_heartbeat: Instant::now(),
+                tx,
+            },
+            crate::registry::shutdown_signal(),
+        );
+        (handle, rx)
+    }
+
+    /// Route one delegation through the wire-facing handler and return the
+    /// admission token from the ack.
+    fn delegate_through_handler(state: &Arc<AppState>, from: u64, id: &str, target: &str) -> u64 {
+        let deadline = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "cp/delegate",
+            "params": {
+                "delegation_id": id,
+                "target": {"name": target},
+                "prompt": "do it",
+                "deadline": deadline
+            }
+        })
+        .to_string();
+        let ack: serde_json::Value =
+            serde_json::from_str(&handle_frame(state, from, &frame).expect("answered")).unwrap();
+        assert!(
+            ack.get("error").is_none(),
+            "delegation must be accepted: {ack}"
+        );
+        ack["result"]["admission"]
+            .as_u64()
+            .expect("token on the ack")
+    }
+
+    #[test]
+    fn registered_teardown_survives_a_panic() {
+        // Teardown used to run only on the connection task's normal return
+        // path. A panic after successful registration — reachable from the
+        // `expect("serializable")` sites on production paths — skipped it: the
+        // RAII `ConnPermit` still freed the identity's quota, but the registry
+        // entry and the in-flight rows survived until the lease swept them,
+        // keeping capacity reserved on OTHER instances for up to
+        // `lease_expiry_secs`. The Drop guard makes the unwind path identical
+        // to the normal one.
+        let state = state_with("");
+        let (h_i, _rx_i) = register_test_instance(&state, "koudu", AgentType::Primary, 4);
+        let (h_w, mut rx_w) = register_test_instance(&state, "worker-1", AgentType::Worker, 1);
+        delegate_through_handler(&state, h_i, "d-1", "worker-1");
+        rx_w.try_recv().expect("worker received the forward");
+        assert_eq!(state.registry.get(h_w).unwrap().active_sessions, 1);
+        assert_eq!(state.router.inflight_count(), 1);
+
+        // Panic inside the registered lifetime of the INITIATOR's connection.
+        let silent = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _registered = RegistrationGuard {
+                state: Arc::clone(&state),
+                handle: h_i,
+                identity: identity(),
+            };
+            panic!("expect(\"serializable\") on a production path");
+        }));
+        std::panic::set_hook(silent);
+        assert!(panicked.is_err(), "the test must actually unwind");
+
+        // Everything the guard owns is reclaimed immediately — not at lease
+        // expiry.
+        assert!(
+            state.registry.get(h_i).is_none(),
+            "the registry entry must be gone"
+        );
+        assert_eq!(
+            state.router.inflight_count(),
+            0,
+            "in-flight rows must be reclaimed"
+        );
+        assert_eq!(
+            state.registry.get(h_w).unwrap().active_sessions,
+            0,
+            "capacity reserved on the serving instance must be released"
+        );
+        // ...and the serving runtime is told to stop working.
+        let cancel = rx_w.try_recv().expect("downstream cancel was queued");
+        assert!(cancel.contains("cp/cancel") && cancel.contains("d-1"));
+    }
+
+    #[test]
+    fn teardown_runs_twice_without_double_releasing() {
+        // The guard can fire on a handle that was already torn down — the lease
+        // sweeper runs the same `deregister` + `fail_instance` pair on its own
+        // initiative. A second pass must change nothing: `deregister` is keyed
+        // by handle and returns `None` for an absent entry, and `fail_instance`
+        // releases capacity only for entries it actually removes. A double
+        // release would be silent (session counts saturate) and would let
+        // `saturated()` admit work to a full instance.
+        let state = state_with("");
+        let (h_i, _rx_i) = register_test_instance(&state, "koudu", AgentType::Primary, 4);
+        let (h_w, mut rx_w) = register_test_instance(&state, "worker-1", AgentType::Worker, 4);
+        // A second initiator keeps one delegation alive on the same worker, so
+        // an over-release shows up as a wrong count rather than a clamp at zero.
+        let (h_i2, _rx_i2) = register_test_instance(&state, "koudu-2", AgentType::Primary, 4);
+        delegate_through_handler(&state, h_i, "d-1", "worker-1");
+        delegate_through_handler(&state, h_i2, "d-2", "worker-1");
+        assert_eq!(state.registry.get(h_w).unwrap().active_sessions, 2);
+        while rx_w.try_recv().is_ok() {}
+
+        let guard = || RegistrationGuard {
+            state: Arc::clone(&state),
+            handle: h_i,
+            identity: identity(),
+        };
+
+        // First pass.
+        drop(guard());
+        assert!(state.registry.get(h_i).is_none());
+        assert_eq!(state.router.inflight_count(), 1, "only d-1 was failed");
+        assert_eq!(
+            state.registry.get(h_w).unwrap().active_sessions,
+            1,
+            "exactly d-1's reservation was released"
+        );
+
+        // Second pass on the same handle: a no-op.
+        drop(guard());
+        assert!(state.registry.get(h_i).is_none());
+        assert_eq!(state.router.inflight_count(), 1);
+        assert_eq!(
+            state.registry.get(h_w).unwrap().active_sessions,
+            1,
+            "a repeated teardown must not release capacity a second time"
+        );
+        // And the sweeper's own pass over the same handle is equally inert.
+        sweep_leases(&state, Duration::ZERO);
+        assert_eq!(
+            state.router.inflight_count(),
+            0,
+            "the sweeper expired the remaining leases"
+        );
+        drop(guard());
+        assert_eq!(state.router.inflight_count(), 0);
+    }
+
     #[tokio::test]
     async fn sweep_leases_signals_the_connection_before_dropping_it() {
         // At the sweeper level: the shutdown signal is
@@ -1001,7 +1213,7 @@ mod tests {
         let state = state_with("heartbeat_interval_secs = 1\nlease_expiry_secs = 2");
         let signal = crate::registry::shutdown_signal();
         let mut observer = signal.subscribe();
-        let (tx, _rx) = mpsc::channel::<String>(OUTBOUND_QUEUE);
+        let (tx, _rx) = outbound_channel(1024 * 1024);
         let handle = state.registry.register_conn(
             Instance {
                 handle: 0,
@@ -1042,7 +1254,7 @@ mod tests {
         // client needs to know it has to reconnect and register again.
         let state = state_with("heartbeat_interval_secs = 1\nlease_expiry_secs = 2");
         let signal = crate::registry::shutdown_signal();
-        let (tx, _rx) = mpsc::channel::<String>(OUTBOUND_QUEUE);
+        let (tx, _rx) = outbound_channel(1024 * 1024);
         let handle = state.registry.register_conn(
             Instance {
                 handle: 0,
@@ -1106,10 +1318,13 @@ mod tests {
         // be closed (treated as disconnected) rather than silently skipped.
         let state = state_with("");
 
-        // Initiator with a full single-slot queue.
+        // Initiator whose outbound byte budget one filler frame exhausts —
+        // the queue refuses on bytes here, which is the same
+        // "cannot drain → disconnected" contract as an exhausted entry count.
+        const FILLER: &str = "filler";
         let signal_i = crate::registry::shutdown_signal();
         let mut observer = signal_i.subscribe();
-        let (tx_i, _rx_i) = mpsc::channel::<String>(1);
+        let (tx_i, _rx_i) = outbound_channel(FILLER.len());
         let h_i = state.registry.register_conn(
             Instance {
                 handle: 0,
@@ -1126,7 +1341,7 @@ mod tests {
             },
             Arc::clone(&signal_i),
         );
-        let (tx_w, mut rx_w) = mpsc::channel::<String>(OUTBOUND_QUEUE);
+        let (tx_w, mut rx_w) = outbound_channel(1024 * 1024);
         let h_w = state.registry.register_conn(
             Instance {
                 handle: 0,
@@ -1159,13 +1374,21 @@ mod tests {
         let ack: serde_json::Value =
             serde_json::from_str(&handle_frame(&state, h_i, &del).expect("answered")).unwrap();
         assert!(ack.get("error").is_none(), "delegation must be accepted");
+        let admission = ack["result"]["admission"]
+            .as_u64()
+            .expect("the ack must carry the admission token");
         rx_w.try_recv().expect("worker received the forward frame");
 
-        // Fill the initiator's queue, then complete.
-        tx_i.try_send("filler".into()).unwrap();
+        // Fill the initiator's queue to its byte budget, then complete.
+        tx_i.try_send(FILLER.into()).unwrap();
         let res = serde_json::json!({
             "jsonrpc": "2.0", "id": 2, "method": "cp/delegate_result",
-            "params": {"delegation_id": "d-1", "status": "completed", "result": "done"}
+            "params": {
+                "delegation_id": "d-1",
+                "admission": admission,
+                "status": "completed",
+                "result": "done"
+            }
         })
         .to_string();
         let reply: serde_json::Value =

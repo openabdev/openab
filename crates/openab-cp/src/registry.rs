@@ -7,7 +7,7 @@
 //! instance and fails its in-flight delegations.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,13 +16,165 @@ use tokio::sync::{mpsc, watch};
 
 use crate::proto::AgentType;
 
-/// Outbound frame sender for one WS connection (serialized JSON text).
-/// Bounded: a peer that cannot drain its queue is disconnected rather than
-/// growing CP memory.
-pub type FrameTx = mpsc::Sender<String>;
-
-/// Capacity of each per-connection outbound queue.
+/// Capacity of each per-connection outbound queue, in entries. Entries alone
+/// are not a memory bound — see [`OutboundBudget`], which bounds the bytes.
 pub const OUTBOUND_QUEUE: usize = 256;
+
+/// Byte budget shared by one connection's [`FrameTx`] clones and its
+/// [`FrameRx`].
+///
+/// The entry-bounded queue does not bound memory: frame sizes are
+/// independently configurable, so 256 queued frames is entry-legal and
+/// arbitrarily large in bytes (a stalled initiator with an 8 MiB result budget
+/// could hold ~2 GiB). Bytes are reserved before an enqueue and released on
+/// dequeue or teardown, so a stalled peer is refused on whichever bound it hits
+/// first.
+#[derive(Debug)]
+pub struct OutboundBudget {
+    reserved: AtomicUsize,
+    max: usize,
+}
+
+impl OutboundBudget {
+    fn new(max: usize) -> Self {
+        Self {
+            reserved: AtomicUsize::new(0),
+            max,
+        }
+    }
+
+    /// Reserve `n` bytes, or refuse. Refusal is not an error state: the caller
+    /// treats it exactly like a full queue (the peer is disconnected).
+    fn reserve(&self, n: usize) -> bool {
+        self.reserved
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                match cur.checked_add(n) {
+                    Some(next) if next <= self.max => Some(next),
+                    _ => None,
+                }
+            })
+            .is_ok()
+    }
+
+    fn release(&self, n: usize) {
+        self.reserved.fetch_sub(n, Ordering::AcqRel);
+    }
+
+    /// Bytes currently reserved (queued but not yet dequeued).
+    pub fn reserved_bytes(&self) -> usize {
+        self.reserved.load(Ordering::Acquire)
+    }
+
+    pub fn max_bytes(&self) -> usize {
+        self.max
+    }
+}
+
+/// Why an outbound frame was refused. Both outcomes mean the same thing to
+/// callers — this peer cannot take the frame, so treat it as disconnected —
+/// and are distinguished only for logs and tests.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SendRefused {
+    /// The connection is gone (receiver dropped).
+    Closed,
+    /// The queue is full, in entries or in bytes.
+    Full,
+}
+
+/// Outbound frame sender for one WS connection (serialized JSON text).
+///
+/// Bounded twice — in entries by the channel and in bytes by
+/// [`OutboundBudget`] — because a peer that cannot drain its queue must be
+/// disconnected rather than grow CP memory. Cloneable: the registry hands
+/// clones to every path that routes a frame to this connection.
+#[derive(Clone, Debug)]
+pub struct FrameTx {
+    tx: mpsc::Sender<String>,
+    budget: Arc<OutboundBudget>,
+}
+
+impl FrameTx {
+    /// Enqueue one frame without blocking. Bytes are reserved BEFORE the
+    /// enqueue (and released again if the enqueue fails), so the budget can
+    /// never be observed lower than what the queue actually holds.
+    pub fn try_send(&self, text: String) -> Result<(), SendRefused> {
+        let n = text.len();
+        if !self.budget.reserve(n) {
+            return Err(SendRefused::Full);
+        }
+        match self.tx.try_send(text) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.budget.release(n);
+                Err(SendRefused::Full)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.budget.release(n);
+                Err(SendRefused::Closed)
+            }
+        }
+    }
+
+    /// The connection's byte budget (for observability and tests).
+    pub fn budget(&self) -> &Arc<OutboundBudget> {
+        &self.budget
+    }
+}
+
+/// Receiving half of one connection's outbound queue, owned by that
+/// connection's task. Dequeueing releases the frame's byte reservation;
+/// dropping it (connection teardown) releases whatever is still queued, so a
+/// torn-down connection never leaves reservations behind.
+pub struct FrameRx {
+    rx: mpsc::Receiver<String>,
+    budget: Arc<OutboundBudget>,
+}
+
+impl FrameRx {
+    pub async fn recv(&mut self) -> Option<String> {
+        let text = self.rx.recv().await?;
+        self.budget.release(text.len());
+        Some(text)
+    }
+
+    /// Non-blocking dequeue (tests and drain loops).
+    pub fn try_recv(&mut self) -> Result<String, mpsc::error::TryRecvError> {
+        let text = self.rx.try_recv()?;
+        self.budget.release(text.len());
+        Ok(text)
+    }
+
+    /// Stop accepting frames (tests simulate a dead peer with this).
+    pub fn close(&mut self) {
+        self.rx.close();
+    }
+}
+
+impl Drop for FrameRx {
+    fn drop(&mut self) {
+        // Teardown release: drain what is still queued so any surviving
+        // sender clone sees the budget freed rather than permanently consumed
+        // by a connection that no longer exists.
+        self.rx.close();
+        while let Ok(text) = self.rx.try_recv() {
+            self.budget.release(text.len());
+        }
+    }
+}
+
+/// Create one connection's outbound queue: bounded in entries by
+/// [`OUTBOUND_QUEUE`] and in bytes by `max_bytes`.
+pub fn outbound_channel(max_bytes: usize) -> (FrameTx, FrameRx) {
+    let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE);
+    let budget = Arc::new(OutboundBudget::new(max_bytes));
+    (
+        FrameTx {
+            tx,
+            budget: Arc::clone(&budget),
+        },
+        FrameRx { rx, budget },
+    )
+}
 
 /// Shutdown signal for one WS connection, held by the registry so the CP can
 /// terminate a connection it no longer considers registered. Lease expiry must
@@ -255,7 +407,7 @@ mod tests {
     use super::*;
 
     fn inst(ns: &str, name: &str, id: &str, max: u32) -> Instance {
-        let (tx, _rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (tx, _rx) = outbound_channel(1024 * 1024);
         Instance {
             handle: 0, // assigned by register()
             namespace: ns.into(),
@@ -269,6 +421,80 @@ mod tests {
             last_heartbeat: Instant::now(),
             tx,
         }
+    }
+
+    #[test]
+    fn outbound_queue_is_bounded_in_bytes_not_only_entries() {
+        // 256 entries is not a memory bound: with independently configurable
+        // frame sizes a stalled peer can hold entries × max-frame bytes. The
+        // byte budget must refuse well before the entry count is exhausted.
+        const BUDGET: usize = 64 * 1024;
+        const FRAME: usize = 8 * 1024;
+        let (tx, rx) = outbound_channel(BUDGET);
+
+        let mut accepted = 0;
+        loop {
+            match tx.try_send("x".repeat(FRAME)) {
+                Ok(()) => accepted += 1,
+                Err(e) => {
+                    assert_eq!(e, SendRefused::Full);
+                    break;
+                }
+            }
+            assert!(accepted <= OUTBOUND_QUEUE, "entry bound would have won");
+        }
+        assert_eq!(
+            accepted,
+            BUDGET / FRAME,
+            "the byte budget, not the entry count, must be the binding limit"
+        );
+        assert!(
+            accepted < OUTBOUND_QUEUE,
+            "refusal must happen well before entry-count exhaustion ({accepted} < {OUTBOUND_QUEUE})"
+        );
+        assert_eq!(tx.budget().reserved_bytes(), BUDGET);
+
+        // A frame that cannot fit is refused without consuming budget, and a
+        // smaller one that does fit is still accepted (no sticky refusal).
+        drop(rx);
+        let (tx2, mut rx2) = outbound_channel(BUDGET);
+        assert!(tx2.try_send("y".repeat(BUDGET + 1)).is_err());
+        assert_eq!(
+            tx2.budget().reserved_bytes(),
+            0,
+            "a refused reservation must not leak budget"
+        );
+        assert!(tx2.try_send("y".repeat(FRAME)).is_ok());
+        assert_eq!(tx2.budget().reserved_bytes(), FRAME);
+
+        // Dequeueing releases the reservation.
+        assert_eq!(rx2.try_recv().unwrap().len(), FRAME);
+        assert_eq!(tx2.budget().reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn teardown_releases_the_whole_outbound_reservation() {
+        // Dropping the receiving half is connection teardown: whatever is
+        // still queued must be released, or a surviving sender clone would see
+        // the budget permanently consumed by a connection that is gone.
+        const BUDGET: usize = 32 * 1024;
+        let (tx, rx) = outbound_channel(BUDGET);
+        let observer = Arc::clone(tx.budget());
+        for _ in 0..4 {
+            tx.try_send("z".repeat(4 * 1024)).unwrap();
+        }
+        assert_eq!(observer.reserved_bytes(), 16 * 1024);
+
+        drop(rx);
+        assert_eq!(
+            observer.reserved_bytes(),
+            0,
+            "teardown must release every queued frame's reservation"
+        );
+        // The connection is gone, so further sends are refused as closed —
+        // and still leak no budget.
+        assert_eq!(tx.try_send("more".into()), Err(SendRefused::Closed));
+        assert_eq!(observer.reserved_bytes(), 0);
     }
 
     #[test]

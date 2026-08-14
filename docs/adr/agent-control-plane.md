@@ -209,6 +209,25 @@ complete until the serving runtime returns a structured result frame
 The serving **runtime** emits this frame when the agent's turn ends — result
 delivery never depends on the sub-agent model "remembering" to report.
 
+The frame MUST echo the `admission` token the CP stamped on the forwarded
+`cp/delegate` (see "Admissions carry a protocol-visible token" below):
+
+```json
+{
+  "method": "cp/delegate_result",
+  "params": {
+    "delegation_id": "d-01J...",
+    "admission": 42,
+    "status": "completed",
+    "result": "…"
+  }
+}
+```
+
+`delegation_id` says *which delegation*; `admission` says *which admission of
+it*, and the id is reusable. A frame without the token is rejected as
+malformed, and one naming a superseded admission is dropped.
+
 ### v1 contract amendments (from PR #1465 review)
 
 The first implementation (`crates/openab-cp`) freezes the following
@@ -297,28 +316,76 @@ recovery semantics:
   the disconnect path: `cp/cancel` to the serving runtime and exactly one
   capacity release. Best-effort frames (`cp/cancel`, sweep-synthesized
   `timeout`) remain fire-and-forget: the propagated deadline is their backstop.
-- **Admissions carry a generation; commits are exact.** Every admission is
-  stamped with a CP-generated, never-reused generation. The commit phase of a
-  completion removes an in-flight entry only when key, serving handle, AND
-  generation all match the admission it delivered a result for; anything else
-  is left strictly untouched, capacity included. `(namespace, delegation_id)`
-  is deliberately not a stable identity over time — the id is client-supplied
-  and cancel-then-retry is an ordinary client pattern, which with a single
-  replica re-admits the same id to the same worker — so without the generation
-  a stale commit could remove a *live* delegation's entry, making it invisible
-  to its own genuine result and to the deadline sweep while freeing a slot it
-  still occupies.
-- **First terminal frame wins.** More than one terminal frame may reach an
-  initiator for one `delegation_id`: a `completed` result can race the deadline
-  sweep's synthesized `timeout`, and duplicate results are possible in the
-  window between delivery and commit. **Initiators MUST treat the first
+- **Admissions carry a protocol-visible token; commits are exact.** Every
+  admission is stamped with a CP-minted, never-reused **admission token**
+  (`admission`, a per-namespace monotonic counter). `(namespace,
+  delegation_id)` is deliberately not a stable identity over time — the id is
+  client-supplied and cancel-then-retry is an ordinary client pattern, which
+  with a single replica re-admits the same id to the same worker — so the token
+  is what identifies one admission, and it travels the whole round trip:
+  - the `cp/delegate` ack carries it, so the initiator can correlate;
+  - the forwarded `cp/delegate` carries it, so the serving runtime learns it;
+  - `cp/delegate_result` MUST echo it. It is a **required** field: a missing
+    token is `INVALID_PARAMS`, never a wildcard;
+  - every initiator-bound terminal frame carries it, CP-synthesized `timeout`
+    and `target_disconnected` included (both are built from the in-flight
+    entry).
+
+  The CP checks the echoed token *before* building the initiator-bound frame,
+  and the commit phase removes an in-flight entry only when key, serving
+  handle, AND token all match the admission it delivered a result for; anything
+  else is left strictly untouched, capacity included. Without the token on the
+  wire, a late result for a cancelled admission A — arriving after the same id
+  was re-admitted as B to the same worker — would be delivered to the initiator
+  as B's terminal frame and would then commit B (peek and commit both saw B),
+  releasing capacity B still occupies and leaving B's genuine result to be
+  dropped later as unknown. A stale-token result is dropped and answered with
+  the same generic ack as any other drop: a distinguishable reply would tell
+  the serving side whether an id is currently re-admitted, the class of oracle
+  namespace-scoped keys and byte-identical `cp/cancel` refusals removed. The
+  counter is per namespace for the same reason: a single global counter on the
+  wire would disclose other namespaces' delegation volume, while commit
+  matching only needs never-reuse per `(namespace, delegation_id)`. Exhaustion
+  fails closed (the admission is refused; the counter never wraps).
+  `cp/cancel` does not carry the token yet — it lands with the runtime-client
+  slice, where the serving side gains the state to disambiguate cancellation
+  targets.
+- **First terminal frame per admission wins.** More than one terminal frame may
+  reach an initiator for one admission: a `completed` result can race the
+  deadline sweep's synthesized `timeout`, and duplicate results are possible in
+  the window between delivery and commit. **Initiators MUST treat the first
   terminal frame (`completed`, `failed`, `timeout`, `target_disconnected`) for
-  a `delegation_id` as authoritative and ignore every later terminal frame for
-  that id.** The CP does not suppress the later frames: doing so would require
-  per-id terminal state that a CP with no durable state deliberately does not
-  keep, and the initiator already correlates by `delegation_id`. CP-side state
-  is unaffected either way — the generation rule above makes the commit exact,
-  so exactly one path ever releases the capacity.
+  a given `admission` token as authoritative and ignore every later terminal
+  frame for that token.** Correlation is per admission, not per
+  `delegation_id`: keyed on the reusable id, a late frame for a superseded
+  admission would permanently mask the live admission's genuine terminal frame.
+  The CP does not suppress the later frames: doing so would require per-id
+  terminal state that a CP with no durable state deliberately does not keep.
+  CP-side state is unaffected either way — the token rule above makes the
+  commit exact, so exactly one path ever releases the capacity.
+- **Global admission and memory bounds.** Beyond per-frame and per-connection
+  limits the CP bounds its own aggregate state:
+  `max_inflight_delegations` (default 4096) caps simultaneously in-flight
+  delegations process-wide, enforced at admission before any capacity is
+  reserved and refused with `SATURATED` — per-target
+  `max_delegated_sessions` is runtime-advertised and bounds one target's
+  concurrency, not the CP's memory; `max_outbound_queue_bytes` (default 16 MiB)
+  caps each connection's outbound queue in **bytes** as well as entries, since
+  256 queued frames of a configurable frame size is not a memory bound; and
+  `default_max_delegated_sessions_cap` (default 16) clamps every advertised
+  capacity that has no per-identity cap, so a runtime can never advertise its
+  way out of saturation-based backpressure.
+- **Teardown of a registered connection is panic-safe.** Deregistration,
+  failing the connection's in-flight delegations, and downstream cancellation
+  run from an RAII guard scoped to the registered lifetime, so they happen on
+  the normal return path and on an unwind alike (the `expect("serializable")`
+  sites on production paths make a panic reachable). Without it a panicking
+  connection task left its registry entry and in-flight rows — and the capacity
+  they reserve on *other* instances — for the lease sweeper to reclaim up to
+  `lease_expiry_secs` later. Teardown is idempotent by construction:
+  deregistration is keyed by handle and capacity is released only for in-flight
+  entries actually removed, so the guard and the sweeper can both run over the
+  same handle without double-releasing.
 - **Capacity release follows entry removal.** Whichever path removes an
   in-flight entry (result commit, cancel, deadline sweep, instance failure,
   or a failed forward's rollback) releases its capacity reservation — and

@@ -8,6 +8,12 @@
 //! - Every request carries `jsonrpc: "2.0"` and a `u64` id; responses echo the
 //!   id. Correlation of *delegations* (which span multiple request/response
 //!   pairs across two connections) uses `delegation_id`, never the JSON-RPC id.
+//! - `delegation_id` is client-supplied and REUSABLE (cancel-then-retry), so
+//!   correlation of one *admission* of that id — which terminal frame belongs
+//!   to which routing decision — uses the CP-minted
+//!   [`AdmissionToken`]: carried on the `cp/delegate` ack and forwarded frame,
+//!   echoed by the serving runtime in `cp/delegate_result` (required), and
+//!   stamped on every initiator-bound terminal frame.
 //! - The first frame on a new connection MUST be `cp/register`. Anything else
 //!   is rejected with `NOT_REGISTERED` and the connection is closed.
 //! - Delegation ancestry (`chain`) is **CP-constructed**: callers supply only
@@ -271,6 +277,10 @@ pub struct DelegateParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegateForward {
     pub delegation_id: String,
+    /// The CP-minted admission token for THIS admission of
+    /// `delegation_id` — see [`AdmissionToken`]. The serving runtime MUST
+    /// echo it in the matching `cp/delegate_result`.
+    pub admission: AdmissionToken,
     pub prompt: String,
     pub deadline: chrono::DateTime<chrono::Utc>,
     /// Authenticated identity of the initiating agent (`namespace/name`).
@@ -284,9 +294,43 @@ pub struct DelegateForward {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegateAck {
     pub delegation_id: String,
+    /// The CP-minted admission token for this admission — see
+    /// [`AdmissionToken`]. The initiator correlates terminal frames on it,
+    /// because `delegation_id` alone is reusable.
+    pub admission: AdmissionToken,
     /// The chosen serving instance's logical name (`namespace/name`).
     pub assigned_to: String,
 }
+
+/// Protocol-visible identity of ONE admission of a `delegation_id`.
+///
+/// `delegation_id` is client-supplied and deliberately reusable:
+/// cancel-then-retry is an ordinary client pattern, and with a single replica
+/// the retry routes to the same worker, so `(namespace, delegation_id)` +
+/// serving instance is not a stable identity over time. Every frame that
+/// belongs to a specific admission therefore carries this token:
+///
+/// - `cp/delegate` ack → the initiator learns it;
+/// - forwarded `cp/delegate` → the serving runtime learns it;
+/// - `cp/delegate_result` → the serving runtime MUST echo it (required field);
+///   the CP drops a result whose token is not the live admission's, so a late
+///   result for a cancelled admission can never be delivered as, or commit,
+///   the delegation that reused the id;
+/// - every initiator-bound terminal frame, CP-synthesized `timeout` and
+///   `target_disconnected` included, carries the token of the admission it
+///   ends, so "first terminal frame wins" is keyed per admission rather than
+///   per reusable id.
+///
+/// The value is a per-namespace monotonic counter. Namespace-scoped on
+/// purpose: a single global counter placed on the wire would disclose
+/// cross-namespace delegation volume, the class of oracle the namespace-scoped
+/// in-flight key exists to remove. Within a namespace the number is no more
+/// than what `cp/list_agents` already shows that namespace about itself.
+///
+/// `cp/cancel` does not carry a token yet; it lands with the runtime-client
+/// slice (PR 3/4), where the serving side gains the state to disambiguate
+/// cancellation targets.
+pub type AdmissionToken = u64;
 
 // --- cp/delegate_result ---
 
@@ -303,9 +347,19 @@ pub enum DelegationStatus {
 /// Params of `cp/delegate_result` — emitted by the serving **runtime** when
 /// the agent's turn ends (protocol-mandatory; never depends on the model),
 /// or synthesized by the CP on timeout/disconnect.
+///
+/// `admission` is REQUIRED, not optional: it is the only thing that ties the
+/// frame to one admission of a reusable `delegation_id`. A missing token is a
+/// malformed frame (`INVALID_PARAMS`), never a wildcard — an optional token
+/// would leave exactly the misdelivery path it exists to close. The wire is
+/// pre-1.0 and every serving runtime in this stack learns the token from the
+/// forwarded `cp/delegate`, so echoing it costs nothing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegateResultParams {
     pub delegation_id: String,
+    /// Echo of [`DelegateForward::admission`]. On CP-synthesized terminal
+    /// frames the CP fills in the token of the admission it is ending.
+    pub admission: AdmissionToken,
     pub status: DelegationStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
@@ -385,6 +439,50 @@ mod tests {
             serde_json::to_value(DelegationStatus::TargetDisconnected).unwrap(),
             serde_json::json!("target_disconnected")
         );
+    }
+
+    #[test]
+    fn delegate_result_requires_the_admission_token() {
+        // The token is the only thing tying a result frame to ONE admission of
+        // a reusable delegation_id. A frame without it must be malformed, not
+        // a wildcard that matches whatever admission is live.
+        let without = serde_json::json!({
+            "delegation_id": "d-1",
+            "status": "completed",
+            "result": "done"
+        });
+        assert!(serde_json::from_value::<DelegateResultParams>(without).is_err());
+
+        let with = serde_json::json!({
+            "delegation_id": "d-1",
+            "admission": 7,
+            "status": "completed",
+            "result": "done"
+        });
+        let p: DelegateResultParams = serde_json::from_value(with).unwrap();
+        assert_eq!(p.admission, 7);
+        // And it round-trips onto the wire (initiator-bound frames carry it).
+        let back = serde_json::to_value(&p).unwrap();
+        assert_eq!(back["admission"], 7);
+    }
+
+    #[test]
+    fn ack_and_forward_carry_the_admission_token() {
+        let ack = DelegateAck {
+            delegation_id: "d-1".into(),
+            admission: 3,
+            assigned_to: "prod/worker-1".into(),
+        };
+        assert_eq!(serde_json::to_value(&ack).unwrap()["admission"], 3);
+        let fwd = DelegateForward {
+            delegation_id: "d-1".into(),
+            admission: 3,
+            prompt: "hi".into(),
+            deadline: chrono::Utc::now(),
+            from: "prod/koudu".into(),
+            chain: vec!["prod/koudu".into()],
+        };
+        assert_eq!(serde_json::to_value(&fwd).unwrap()["admission"], 3);
     }
 
     #[test]
