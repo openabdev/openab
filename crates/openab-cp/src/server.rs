@@ -809,45 +809,41 @@ fn handle_frame(state: &Arc<AppState>, handle: u64, text: &str) -> Option<String
                 state.cfg.max_result_bytes,
                 state.next_rpc_id(),
             ) {
-                CompleteOutcome::InitiatorStalled { initiator_handle } => {
-                    // The initiator cannot drain its bounded queue: per the
-                    // queue contract it is treated as disconnected, never
-                    // silently skipped. Its teardown fails the delegation
-                    // over the fail_instance path (capacity released once,
-                    // cp/cancel to this serving runtime). Do NOT ack the
-                    // result as delivered — the serving side must know its
-                    // result did not reach the initiator.
-                    state
-                        .registry
-                        .signal_shutdown(initiator_handle, REASON_BACKPRESSURE);
-                    let resp = JsonRpcErrorResponse::new(
-                        rpc_id,
-                        ErrorObject::new(
-                            codes::TARGET_DISCONNECTED,
-                            "initiator cannot receive the result; the delegation will be cancelled",
-                        ),
-                    );
-                    Some(serde_json::to_string(&resp).expect("serializable"))
-                }
-                // The result reached the initiator, which is what the serving
-                // side is being acked for. Whether THIS frame also committed
-                // the state transition is a CP-internal matter: a concurrent
-                // cancel/sweep/disconnect may have ended the delegation
-                // first, and the initiator resolves competing terminal frames
-                // by "first one wins" (see the ADR wire contract).
-                CompleteOutcome::Delivered { committed } => {
-                    if !committed {
+                CompleteOutcome::Completed {
+                    delivered,
+                    stalled_initiator,
+                } => {
+                    if let Some(initiator_handle) = stalled_initiator {
+                        // The initiator cannot drain its bounded queue: per
+                        // the queue contract it is treated as disconnected,
+                        // never silently skipped. The delegation itself
+                        // already committed (entry removed, capacity
+                        // released, terminal emitted), so the teardown finds
+                        // nothing to fail and synthesizes nothing.
+                        state
+                            .registry
+                            .signal_shutdown(initiator_handle, REASON_BACKPRESSURE);
+                    }
+                    if !delivered {
                         info!(
                             handle,
-                            "terminal result delivered, but the delegation had already been \
-                             ended (or its id re-admitted) — no state change"
+                            "delegation completed and committed, but the terminal \
+                             frame did not reach the initiator (gone or stalled)"
                         );
                     }
+                    // The commit is what the serving side is acked for: its
+                    // work is done and the delegation is over. Whether the
+                    // initiator's connection survived long enough to receive
+                    // the frame is a CP-internal matter, and the ack stays
+                    // byte-identical to the dropped case so the reply is
+                    // never an oracle for initiator liveness.
                     let resp = JsonRpcResponse::new(rpc_id, serde_json::json!({"ok": true}));
                     Some(serde_json::to_string(&resp).expect("serializable"))
                 }
-                // Dropped as unknown/foreign; each case is logged in the
-                // router (late results after a CP restart are expected).
+                // Dropped as unknown/foreign/stale, or a concurrent path
+                // (cancel, sweep, disconnect) ended the delegation first and
+                // owns its terminals; each case is logged in the router (late
+                // results after a CP restart are expected).
                 CompleteOutcome::Dropped => {
                     let resp = JsonRpcResponse::new(rpc_id, serde_json::json!({"ok": true}));
                     Some(serde_json::to_string(&resp).expect("serializable"))
@@ -1421,11 +1417,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stalled_initiator_is_disconnected_and_serving_side_not_falsely_acked() {
-        // The bounded-queue contract for the one frame that matters most:
-        // when the initiator's queue refuses the terminal result, the
-        // serving side must NOT receive `ok: true`, and the initiator must
-        // be closed (treated as disconnected) rather than silently skipped.
+    async fn stalled_initiator_is_disconnected_and_result_still_commits() {
+        // The bounded-queue contract for the terminal result under
+        // commit-first: the commit ends the delegation before delivery, so
+        // the serving side is acked for the commit (`ok: true`, its work is
+        // done), the stalled initiator is closed (treated as disconnected)
+        // rather than silently skipped, and its teardown finds nothing —
+        // capacity was already released exactly once by the commit.
         let state = state_with("");
 
         // Initiator whose outbound byte budget one filler frame exhausts —
@@ -1503,29 +1501,28 @@ mod tests {
         .to_string();
         let reply: serde_json::Value =
             serde_json::from_str(&handle_frame(&state, h_w, &res).expect("answered")).unwrap();
-        assert_eq!(
-            reply["error"]["code"],
-            codes::TARGET_DISCONNECTED,
-            "the serving side must not be acked as delivered"
+        assert!(
+            reply.get("error").is_none(),
+            "the commit ended the delegation; the serving side is acked for it"
         );
-        assert_eq!(reply["id"], 2, "the error must correlate with the request");
+        assert_eq!(reply["result"]["ok"], true);
+        assert_eq!(reply["id"], 2, "the ack must correlate with the request");
 
         // The initiator is told to close, with the backpressure reason.
         observer.changed().await.unwrap();
         assert_eq!(*observer.borrow(), Some(REASON_BACKPRESSURE));
 
-        // The delegation is still in flight: teardown of the stalled
-        // initiator resolves it through fail_instance (capacity released
-        // once, cp/cancel to the serving runtime).
-        assert_eq!(state.router.inflight_count(), 1);
+        // The commit already ended the delegation and released capacity:
+        // teardown of the stalled initiator finds nothing to fail, so no
+        // second terminal and no double release can occur.
+        assert_eq!(state.router.inflight_count(), 0);
+        assert_eq!(state.registry.get(h_w).unwrap().active_sessions, 0);
         let mut next = || 9;
         let frames = state
             .router
             .fail_instance(&state.registry, &state.events, h_i, &mut next);
-        assert_eq!(frames.len(), 1);
-        assert!(frames[0].1.contains("cp/cancel"));
+        assert!(frames.is_empty());
         assert_eq!(state.registry.get(h_w).unwrap().active_sessions, 0);
-        assert_eq!(state.router.inflight_count(), 0);
     }
 
     // --- observer / lobby wiring (Phase 1) ---
