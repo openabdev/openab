@@ -180,6 +180,11 @@ Agent A ◄──── result ◄──────── OAB-A ◄────
 
 ### Delegate frame
 
+What the initiator sends. Note what is *absent*: there is no `chain` field.
+Callers supply at most `parent_delegation_id`; the CP constructs the ancestry
+from authenticated identities and its own in-flight table, so a runtime cannot
+forge it.
+
 ```json
 {
   "method": "cp/delegate",
@@ -187,19 +192,44 @@ Agent A ◄──── result ◄──────── OAB-A ◄────
     "delegation_id": "d-01J...",
     "target": { "name": "worker-1" },
     "prompt": "…",
-    "chain": ["koudu"],
+    "parent_delegation_id": "d-01H...",
     "deadline": "2026-08-06T22:45:00Z"
   }
 }
 ```
 
 - `target` — exact `name` or a `labels` selector (CP schedules among matches)
-- `chain` — the full delegation ancestry, appended at every hop. Enables
-  cycle rejection (target already in chain), depth enforcement, fan-out
-  budgets, and audit tracing back to the human-facing root.
+- `parent_delegation_id` — omitted for a root delegation. If present, the
+  caller must be the instance currently *serving* that parent, in the caller's
+  own namespace; the CP appends to that parent's chain.
 - `deadline` — propagated absolute deadline. A child's timeout can never
   exceed its parent's remaining budget, so orphaned workers cannot keep
   consuming tokens after the root gave up.
+
+What the serving runtime receives is a different frame: the CP adds the
+authenticated `from`, the constructed `chain`, and the `admission` token for
+this admission.
+
+```json
+{
+  "method": "cp/delegate",
+  "params": {
+    "delegation_id": "d-01J...",
+    "admission": 42,
+    "prompt": "…",
+    "deadline": "2026-08-06T22:45:00Z",
+    "from": "prod/koudu",
+    "chain": ["prod/koudu", "prod/worker-2"]
+  }
+}
+```
+
+- `chain` — the full delegation ancestry, root first, appended at every hop.
+  Enables cycle rejection (target already in chain), depth enforcement, and
+  audit tracing back to the human-facing root. Every element was authenticated
+  by the CP, so the serving runtime can trust it.
+- `admission` — the token this runtime must echo on `cp/delegate_result` and
+  match on `cp/cancel` (see "Admissions carry a protocol-visible token").
 
 ### Result delivery is protocol-mandatory
 
@@ -227,6 +257,29 @@ The frame MUST echo the `admission` token the CP stamped on the forwarded
 `delegation_id` says *which delegation*; `admission` says *which admission of
 it*, and the id is reusable. A frame without the token is rejected as
 malformed, and one naming a superseded admission is dropped.
+
+### Cancel frame
+
+`cp/cancel` travels both ways — initiator → CP → serving runtime — and carries
+the token in both, for the same reason results do:
+
+```json
+{
+  "method": "cp/cancel",
+  "params": {
+    "delegation_id": "d-01J...",
+    "admission": 42,
+    "reason": "changed my mind"
+  }
+}
+```
+
+From the initiator, `admission` is the abort target: a cancel naming a
+superseded admission is refused rather than removing whatever holds the id now.
+CP-synthesized cancels (deadline sweep, initiator disconnect,
+stalled-initiator teardown) stamp the token of the admission they are ending, so
+a best-effort cancel that overtakes a same-id re-admission's forward is
+identifiable at the worker as belonging to work that is already over.
 
 ### v1 contract amendments (from PR #1465 review)
 
@@ -327,6 +380,11 @@ recovery semantics:
   - the forwarded `cp/delegate` carries it, so the serving runtime learns it;
   - `cp/delegate_result` MUST echo it. It is a **required** field: a missing
     token is `INVALID_PARAMS`, never a wildcard;
+  - `cp/cancel` carries it in **both** directions, also required. From the
+    initiator it names the admission to abort; on every CP-synthesized cancel
+    (deadline sweep, initiator disconnect, stalled-initiator teardown) the CP
+    stamps the token of the admission it is ending, built from the in-flight
+    entry it removed;
   - every initiator-bound terminal frame carries it, CP-synthesized `timeout`
     and `target_disconnected` included (both are built from the in-flight
     entry).
@@ -347,9 +405,39 @@ recovery semantics:
   wire would disclose other namespaces' delegation volume, while commit
   matching only needs never-reuse per `(namespace, delegation_id)`. Exhaustion
   fails closed (the admission is refused; the counter never wraps).
-  `cp/cancel` does not carry the token yet — it lands with the runtime-client
-  slice, where the serving side gains the state to disambiguate cancellation
-  targets.
+
+  Cancellation needs the token for the same reason results do, in both
+  directions. `cp/cancel` from the initiator is matched on `(from_handle,
+  namespace + delegation_id, admission)` — all three under the one lock
+  acquisition that removes the entry — and any mismatch is refused with the
+  same byte-identical `POLICY_DENIED` as an unknown id or another instance's
+  live id, so a caller cannot learn whether the id it reused is currently
+  re-admitted. Without the token, an ordinary application-level *retry* of
+  `cancel(A)` landing after the same id was re-admitted as B matched B and
+  removed it: B's capacity was released while its work continued, and B's
+  genuine result was later dropped as unknown with no synthesized terminal
+  frame, because the entry was gone. In the CP-synthesized direction the gap is
+  structural rather than client-dependent: the deadline sweep removes an
+  expired entry under the in-flight lock and builds its best-effort
+  `cp/cancel` after releasing it, so a same-id re-admission can be admitted and
+  its forward enqueued to the same worker first. The worker would then receive
+  `forward(B)` followed by an id-only cancel for A — different producers into
+  one queue, so connection ordering does not help — and B's work would be
+  aborted at the source while the CP still shows it live. Stamping the ended
+  admission's token makes that frame identifiable as belonging to work that is
+  already over.
+
+  ⚠️ **Wire-breaking (pre-1.0).** `admission` is a **required** field on both
+  `cp/delegate_result` (added in the round-8 revision of this contract) and
+  `cp/cancel` (added here). Optional would be a wildcard, which is exactly the
+  misdelivery path the token exists to close, so there is no
+  backward-compatible spelling of it. A runtime built against the pre-token
+  contract will have **every** result and **every** cancel refused with
+  `INVALID_PARAMS` after the CP is upgraded. Runtimes must echo
+  `DelegateForward::admission` on results and name the target admission on
+  cancels. There are no shipped clients at this point in the stack — every
+  serving runtime learns the token from the forwarded `cp/delegate` — so the
+  migration is mechanical, but it is not silent and it is not optional.
 - **First terminal frame per admission wins.** More than one terminal frame may
   reach an initiator for one admission: a `completed` result can race the
   deadline sweep's synthesized `timeout`, and duplicate results are possible in

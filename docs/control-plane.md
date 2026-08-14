@@ -67,6 +67,21 @@ issue #1474).
   admission is dropped (the ack looks the same as any other, so do not treat
   `ok: true` as proof of delivery — that is what the initiator's terminal frame
   is for).
+- **Name the admission on `cp/cancel` too.** `admission` is required there as
+  well, in both directions. As an initiator, send the token of the admission
+  you mean to abort: a cancel naming a superseded admission is refused, which
+  is what stops a retried cancel from killing the re-admission that replaced
+  its target. Refusals are deliberately indistinguishable from an unknown id,
+  so treat one as "not mine / not live" and reconcile against your own state
+  rather than inferring anything about the CP's. As a serving runtime, match
+  incoming cancels on the token: a CP-synthesized cancel carries the token of
+  the admission it ends, and it can arrive *after* a forward that reused the
+  same `delegation_id` — cancelling on the id alone would abort the wrong work.
+- ⚠️ **Wire-breaking change (pre-1.0).** `admission` is required on
+  `cp/delegate_result` and on `cp/cancel`. A runtime built against the earlier
+  contract has every result and every cancel refused with `INVALID_PARAMS`
+  after upgrading the CP; there is no compatible optional spelling, because an
+  absent token would be the wildcard the field exists to remove.
 - **The first terminal frame for an `admission` token wins.** A `completed`
   result can race the CP's synthesized `timeout`, so an initiator may receive
   more than one terminal frame for the same admission. Treat the first as

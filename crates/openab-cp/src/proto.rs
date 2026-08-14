@@ -12,8 +12,9 @@
 //!   correlation of one *admission* of that id — which terminal frame belongs
 //!   to which routing decision — uses the CP-minted
 //!   [`AdmissionToken`]: carried on the `cp/delegate` ack and forwarded frame,
-//!   echoed by the serving runtime in `cp/delegate_result` (required), and
-//!   stamped on every initiator-bound terminal frame.
+//!   echoed by the serving runtime in `cp/delegate_result` (required), carried
+//!   on `cp/cancel` in both directions (required), and stamped on every
+//!   initiator-bound terminal frame.
 //! - The first frame on a new connection MUST be `cp/register`. Anything else
 //!   is rejected with `NOT_REGISTERED` and the connection is closed.
 //! - Delegation ancestry (`chain`) is **CP-constructed**: callers supply only
@@ -319,17 +320,20 @@ pub struct DelegateAck {
 /// - every initiator-bound terminal frame, CP-synthesized `timeout` and
 ///   `target_disconnected` included, carries the token of the admission it
 ///   ends, so "first terminal frame wins" is keyed per admission rather than
-///   per reusable id.
+///   per reusable id;
+/// - `cp/cancel` carries it in BOTH directions (required field). From the
+///   initiator it names the admission to abort, so a retried cancel cannot
+///   remove the re-admission that replaced its target; on every CP-synthesized
+///   cancel the CP stamps the token of the admission it is ending, so a
+///   best-effort cancel that overtakes a same-id re-admission's forward is
+///   identifiable at the worker as belonging to the admission that is already
+///   over.
 ///
 /// The value is a per-namespace monotonic counter. Namespace-scoped on
 /// purpose: a single global counter placed on the wire would disclose
 /// cross-namespace delegation volume, the class of oracle the namespace-scoped
 /// in-flight key exists to remove. Within a namespace the number is no more
 /// than what `cp/list_agents` already shows that namespace about itself.
-///
-/// `cp/cancel` does not carry a token yet; it lands with the runtime-client
-/// slice (PR 3/4), where the serving side gains the state to disambiguate
-/// cancellation targets.
 pub type AdmissionToken = u64;
 
 // --- cp/delegate_result ---
@@ -372,9 +376,24 @@ pub struct DelegateResultParams {
 /// Params of `cp/cancel`: from the initiator to abort an in-flight
 /// delegation, or from the CP to the serving runtime (best effort) after a
 /// timeout or initiator cancellation.
+///
+/// `admission` is REQUIRED for the same reason it is required on
+/// [`DelegateResultParams`], and the asymmetry would have been the hole:
+/// `delegation_id` alone names a *slot* that cancel-then-retry legitimately
+/// reuses, not the work being aborted. From the initiator the token is the
+/// abort target, so a retried cancel is refused instead of removing the
+/// re-admission that replaced its target. On CP-synthesized cancels the CP
+/// stamps the token of the admission it is ending, so a best-effort cancel for
+/// an expired admission that reaches the worker *after* a same-id
+/// re-admission's forward names the finished admission rather than the live
+/// one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelParams {
     pub delegation_id: String,
+    /// The admission being cancelled — see [`AdmissionToken`]. Required: a
+    /// missing token is a malformed frame (`INVALID_PARAMS`), never a
+    /// "cancel whatever holds this id now" wildcard.
+    pub admission: AdmissionToken,
     pub reason: String,
 }
 
@@ -391,6 +410,122 @@ pub mod methods {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every ` ```json ` block in the ADR, in document order.
+    ///
+    /// `include_str!` is a compile-time read: the examples become part of this
+    /// crate's source, so the check costs no runtime filesystem access and
+    /// obeys the crate's no-fs-in-unit-tests rule. It does couple the test to
+    /// the repository layout — deliberately. `openab-cp` is a workspace binary
+    /// crate, never vendored on its own, and a fixture copied into this file
+    /// would drift from the ADR exactly the way the ADR drifted from the
+    /// structs.
+    fn adr_json_examples() -> Vec<Value> {
+        const ADR: &str = include_str!("../../../docs/adr/agent-control-plane.md");
+        let mut out = Vec::new();
+        let mut open: Option<String> = None;
+        for line in ADR.lines() {
+            let line = line.trim_end();
+            match (&mut open, line) {
+                (None, "```json") => open = Some(String::new()),
+                (Some(_), "```") => {
+                    let body = open.take().expect("block is open");
+                    out.push(serde_json::from_str(&body).unwrap_or_else(|e| {
+                        panic!("an ADR ```json block is not valid JSON: {e}\n{body}")
+                    }));
+                }
+                (Some(buf), l) => {
+                    buf.push_str(l);
+                    buf.push('\n');
+                }
+                (None, _) => {}
+            }
+        }
+        assert!(open.is_none(), "unterminated ```json block in the ADR");
+        out
+    }
+
+    fn sorted_keys(v: &Value) -> Vec<String> {
+        let mut k: Vec<String> = v
+            .as_object()
+            .unwrap_or_else(|| panic!("expected a JSON object, got {v}"))
+            .keys()
+            .cloned()
+            .collect();
+        k.sort();
+        k
+    }
+
+    #[test]
+    fn adr_wire_examples_round_trip_through_the_serde_structs() {
+        // `docs/adr/agent-control-plane.md` is the authoritative wire contract
+        // and its examples are what a client implementer copies. They drifted
+        // once: the `cp/delegate` example showed a client-sent `chain`, a field
+        // `DelegateParams` has never had, and serde silently ignored it, so
+        // nothing failed. This test makes the examples part of the compiled
+        // contract — each block must parse into the struct its `method` names,
+        // and the round trip must reproduce the exact key set, so a field the
+        // example has and the struct does not (or the reverse) fails here.
+        //
+        // A new ADR example with a shape this dispatch does not recognize
+        // fails rather than being skipped: extend both together.
+        let examples = adr_json_examples();
+        assert!(
+            examples.len() >= 4,
+            "expected the delegate, forwarded-delegate, result, and cancel \
+             examples; found {}",
+            examples.len()
+        );
+        for ex in &examples {
+            let method = ex["method"]
+                .as_str()
+                .unwrap_or_else(|| panic!("ADR example carries no method: {ex}"));
+            let params = &ex["params"];
+            // `from` is stamped by the CP and appears only on the forwarded
+            // frame, so it distinguishes the two `cp/delegate` shapes.
+            let forwarded = params.get("from").is_some();
+            let round_tripped = match (method, forwarded) {
+                (methods::DELEGATE, false) => {
+                    // The finding, pinned: what an initiator sends carries
+                    // neither the CP-constructed chain nor the CP-minted token.
+                    assert!(
+                        params.get("chain").is_none(),
+                        "the initiator-sent cp/delegate example must not show a \
+                         client-supplied `chain` — the CP constructs it"
+                    );
+                    assert!(
+                        params.get("admission").is_none(),
+                        "the initiator-sent cp/delegate example must not show an \
+                         `admission` — the CP mints it and returns it in the ack"
+                    );
+                    let p: DelegateParams = serde_json::from_value(params.clone())
+                        .expect("cp/delegate example must parse as DelegateParams");
+                    serde_json::to_value(&p).expect("serializable")
+                }
+                (methods::DELEGATE, true) => {
+                    let p: DelegateForward = serde_json::from_value(params.clone())
+                        .expect("forwarded cp/delegate example must parse as DelegateForward");
+                    serde_json::to_value(&p).expect("serializable")
+                }
+                (methods::DELEGATE_RESULT, _) => {
+                    let p: DelegateResultParams = serde_json::from_value(params.clone())
+                        .expect("cp/delegate_result example must parse as DelegateResultParams");
+                    serde_json::to_value(&p).expect("serializable")
+                }
+                (methods::CANCEL, _) => {
+                    let p: CancelParams = serde_json::from_value(params.clone())
+                        .expect("cp/cancel example must parse as CancelParams");
+                    serde_json::to_value(&p).expect("serializable")
+                }
+                (m, _) => panic!("the ADR documents a `{m}` example this test does not check"),
+            };
+            assert_eq!(
+                sorted_keys(params),
+                sorted_keys(&round_tripped),
+                "the `{method}` example in the ADR has drifted from its struct"
+            );
+        }
+    }
 
     #[test]
     fn register_params_roundtrip_with_type_rename() {

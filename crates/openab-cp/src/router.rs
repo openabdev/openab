@@ -192,12 +192,21 @@ pub enum DelegateOutcome {
 /// either removed because the caller owns it, or never touched at all.
 ///
 /// Single-phase by construction — the caller acts on the returned entry
-/// without going back to the table — so no window exists in which the id
-/// could be re-admitted under the caller's feet. Contrast the two-phase
-/// completion path, which needs [`InFlight::generation`] for exactly that
-/// reason. `cp/cancel` is this helper's only caller.
+/// without going back to the table — so no window exists in which the id could
+/// be re-admitted under the caller's feet. That is a statement about *this
+/// operation's atomicity*, and it is deliberately NOT a claim that the cancel
+/// path needs no admission identity: the frame the caller sent was composed
+/// against whatever it last observed, and by the time it arrives the id may
+/// legitimately hold a different admission. Atomicity keeps the CP's table
+/// consistent; the [`AdmissionToken`] the caller must name keeps the operation
+/// aimed at the admission it meant. Both are required, and the two-phase
+/// completion path needs the token for the additional reason that it has a
+/// peek-to-commit window of its own.
+///
+/// `cp/cancel` is this helper's only caller.
 enum Claim {
-    /// The caller initiated it; the entry has already been removed.
+    /// The caller initiated it and named its live admission; the entry has
+    /// already been removed.
     Owned(InFlight),
     /// The entry exists but was initiated by another instance. Left in place.
     WrongOwner {
@@ -205,6 +214,19 @@ enum Claim {
         /// Handle of the instance that does own it (CP-side logs only — it is
         /// never disclosed to the caller).
         owner_handle: u64,
+    },
+    /// The caller initiated the entry that holds the id, but named a
+    /// DIFFERENT admission: its target was already ended (cancelled, swept,
+    /// or completed) and the id re-admitted. Left strictly in place —
+    /// removing it would abort work the caller never asked to abort, release
+    /// capacity the live admission still occupies, and orphan its result with
+    /// no synthesized terminal frame.
+    StaleAdmission {
+        namespace: String,
+        /// Token the frame named (CP-side logs only).
+        named: u64,
+        /// Token of the live admission (CP-side logs only).
+        live: u64,
     },
     /// No entry for `(namespace, delegation_id)`.
     NotFound { namespace: String },
@@ -563,13 +585,22 @@ impl Router {
     }
 
     /// Look up `delegation_id` in the caller's namespace, assert the caller
-    /// initiated it, and remove the entry if so — all under one acquisition of
-    /// the in-flight lock (see [`Claim`]).
+    /// initiated it AND that `admission` names its live admission, and remove
+    /// the entry if so — all under one acquisition of the in-flight lock (see
+    /// [`Claim`]).
     ///
     /// The namespace is taken from the caller's authenticated registration,
     /// never from the frame, so a delegation id can only ever be resolved
-    /// inside the namespace of the connection that named it.
-    fn claim(&self, registry: &Registry, handle: u64, delegation_id: &str) -> Claim {
+    /// inside the namespace of the connection that named it. The token, by
+    /// contrast, is the caller's statement of intent: it says *which admission*
+    /// of that id is meant to end, which the reusable id cannot.
+    fn claim(
+        &self,
+        registry: &Registry,
+        handle: u64,
+        delegation_id: &str,
+        admission: u64,
+    ) -> Claim {
         // Registry lookup completes before the in-flight lock is taken; the
         // two locks are never held together (see the lock hierarchy above).
         let namespace = match registry.get(handle) {
@@ -578,14 +609,21 @@ impl Router {
         };
         let key = DelegationKey::new(&namespace, delegation_id);
         let mut g = self.inflight.lock();
-        let owner_handle = match g.get(&key) {
-            Some(e) => e.from_handle,
+        let (owner_handle, live) = match g.get(&key) {
+            Some(e) => (e.from_handle, e.generation),
             None => return Claim::NotFound { namespace },
         };
         if owner_handle != handle {
             return Claim::WrongOwner {
                 namespace,
                 owner_handle,
+            };
+        }
+        if live != admission {
+            return Claim::StaleAdmission {
+                namespace,
+                named: admission,
+                live,
             };
         }
         let entry = g.remove(&key).expect("present under the same lock");
@@ -875,15 +913,16 @@ impl Router {
     }
 
     /// Handle `cp/cancel` from the initiator. Returns the frame to forward
-    /// to the serving runtime, if the delegation is in flight and owned by
-    /// the caller.
+    /// to the serving runtime, if the delegation is in flight, owned by the
+    /// caller, and the caller named its live admission.
     ///
-    /// Ownership is validated under the same lock acquisition that removes the
-    /// entry (see [`Claim`] — no remove/reinsert window), and every refusal
-    /// returns ONE byte-identical error: an unknown id and another instance's
-    /// live id are indistinguishable to the caller, so `cp/cancel` cannot be
-    /// used to probe for delegation ids. The distinction is kept in the CP's
-    /// own logs only.
+    /// All three facts are established under the same lock acquisition that
+    /// removes the entry (see [`Claim`] — no remove/reinsert window), and every
+    /// refusal returns ONE byte-identical error: an unknown id, another
+    /// instance's live id, and the caller's own id under a superseded admission
+    /// are indistinguishable to the caller, so `cp/cancel` cannot be used to
+    /// probe for delegation ids or for whether an id is currently re-admitted.
+    /// The distinctions are kept in the CP's own logs only.
     pub fn cancel(
         &self,
         registry: &Registry,
@@ -897,7 +936,12 @@ impl Router {
                 "delegation is not in flight for this instance",
             )
         };
-        let entry = match self.claim(registry, from_handle, &params.delegation_id) {
+        let entry = match self.claim(
+            registry,
+            from_handle,
+            &params.delegation_id,
+            params.admission,
+        ) {
             Claim::Owned(entry) => entry,
             Claim::WrongOwner {
                 namespace,
@@ -909,6 +953,20 @@ impl Router {
                     handle = from_handle,
                     initiator = owner_handle,
                     "cancel refused: only the initiating instance may cancel"
+                );
+                return Err(refused());
+            }
+            Claim::StaleAdmission {
+                namespace,
+                named,
+                live,
+            } => {
+                warn!(
+                    delegation = %params.delegation_id,
+                    namespace = %namespace,
+                    named_admission = named,
+                    live_admission = live,
+                    "cancel refused: names a superseded admission; the live one is untouched"
                 );
                 return Err(refused());
             }
@@ -929,9 +987,15 @@ impl Router {
             }
         };
         registry.adjust_sessions(entry.to_handle, -1);
-        info!(delegation = %params.delegation_id, "delegation cancelled by initiator");
+        info!(
+            delegation = %params.delegation_id,
+            admission = entry.generation,
+            "delegation cancelled by initiator"
+        );
         let target = registry.get(entry.to_handle);
         Ok(target.map(|t| {
+            // Forwarded verbatim: the token was just matched against the live
+            // entry, so it names exactly the admission the worker is serving.
             let frame = JsonRpcRequest::new(
                 next_rpc_id,
                 methods::CANCEL,
@@ -990,6 +1054,11 @@ impl Router {
                 if let Some(target) = registry.get(e.to_handle) {
                     let params = CancelParams {
                         delegation_id: e.delegation_id.clone(),
+                        // The admission this cancel ends. Built from the entry
+                        // this loop removed, so if the id is re-admitted before
+                        // this best-effort frame reaches the worker, the frame
+                        // still names the admission that is over.
+                        admission: e.generation,
                         reason: format!("initiator {} disconnected", e.from_logical),
                     };
                     let frame = JsonRpcRequest::new(
@@ -1047,6 +1116,13 @@ impl Router {
             if let Some(target) = registry.get(e.to_handle) {
                 let params = CancelParams {
                     delegation_id: e.delegation_id.clone(),
+                    // The admission that expired. The frame is built from the
+                    // entry this sweep removed, and the removal happened under
+                    // the in-flight lock while the send happens after it is
+                    // released: a same-id retry can be admitted and forwarded
+                    // in that gap, so the token is what keeps this cancel aimed
+                    // at the expired admission instead of the live one.
+                    admission: e.generation,
                     reason: "deadline exceeded".to_string(),
                 };
                 let frame = JsonRpcRequest::new(
@@ -1240,6 +1316,7 @@ type = "worker"
         // A is cancelled; the id and the worker's slot are free again.
         let cancel = CancelParams {
             delegation_id: "d-1".into(),
+            admission: a.admission,
             reason: "changed my mind".into(),
         };
         w.router
@@ -1304,6 +1381,164 @@ type = "worker"
             b.admission,
             "the terminal frame names the admission it ends"
         );
+        assert_eq!(w.router.inflight_count(), 0);
+        assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 0);
+    }
+
+    #[test]
+    fn swept_admissions_cancel_frame_cannot_target_a_reused_id() {
+        // The cancel-direction ABA, and the one that needs no client error at
+        // all. `sweep_deadlines` removes the expired entry under the in-flight
+        // lock and builds its best-effort `cp/cancel` AFTER releasing it. In
+        // that gap the initiator can legitimately re-admit the same id, and
+        // with a single replica admission B routes to the SAME worker and its
+        // forward is enqueued first. The worker then sees `forward(B)` followed
+        // by a cancel for the id — two different producers into one queue, so
+        // per-connection ordering guarantees say nothing. Keyed only on the
+        // reusable `delegation_id` that cancel terminates B at the source: the
+        // CP's table still shows B live, but its work is aborted and it can
+        // only resolve by deadline. The token is what makes the frame name the
+        // admission that is over.
+        let mut w = world(); // worker max_delegated_sessions = 1
+        let a = accept(do_delegate(&w, delegate_params("d-1", "worker-1", 1)));
+        assert_eq!(
+            frame_admission(&w.worker_rx.try_recv().unwrap()),
+            a.admission
+        );
+
+        let mut id = 500u64;
+        let mut next = || {
+            id += 1;
+            id
+        };
+        let swept =
+            w.router
+                .sweep_deadlines(&w.registry, Utc::now() + Duration::seconds(120), &mut next);
+        assert_eq!(w.router.inflight_count(), 0, "A expired");
+        assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 0);
+
+        // The gap: B is admitted and forwarded before the sweep's frames are
+        // sent. This is the interleaving the sweep cannot prevent, only survive.
+        let b = accept(do_delegate(&w, delegate_params("d-1", "worker-1", 60)));
+        assert_ne!(a.admission, b.admission);
+        assert_eq!(
+            frame_admission(&w.worker_rx.try_recv().unwrap()),
+            b.admission
+        );
+
+        let cancel = swept
+            .iter()
+            .map(|(_, f)| f)
+            .find(|f| f.contains("cp/cancel"))
+            .expect("the sweep synthesizes a best-effort cancel");
+        assert_eq!(
+            frame_admission(cancel),
+            a.admission,
+            "the swept cancel names the admission it ended, not the id"
+        );
+        assert_ne!(
+            frame_admission(cancel),
+            b.admission,
+            "a worker matching on the token cannot mistake it for B"
+        );
+        // The timeout frame is A's too, so the initiator does not mistake it
+        // for B's terminal frame either.
+        let timeout = swept
+            .iter()
+            .map(|(_, f)| f)
+            .find(|f| f.contains("cp/delegate_result"))
+            .expect("the sweep synthesizes a timeout result");
+        assert_eq!(frame_admission(timeout), a.admission);
+
+        // B is untouched by A's expiry: still in flight, capacity still held.
+        assert_eq!(w.router.inflight_count(), 1, "B must remain in flight");
+        assert_eq!(
+            w.registry.get(w.h_worker).unwrap().active_sessions,
+            1,
+            "B's capacity reservation must be intact"
+        );
+        assert_eq!(token(&w.router, "prod", "d-1"), b.admission);
+    }
+
+    #[test]
+    fn retried_cancel_for_a_superseded_admission_never_removes_the_live_one() {
+        // The initiator-facing direction. An application-level retry of
+        // cancel(A) — an ordinary thing to do when the first attempt's ack was
+        // not observed — arrives after the same id was re-admitted as B. Keyed
+        // on `(namespace, delegation_id)` + `from_handle` alone it matched B
+        // and removed it: B's capacity was released while its work continued,
+        // and B's genuine result was later dropped as unknown, with no
+        // synthesized terminal frame because the entry was gone. So an ordinary
+        // retry became a silent kill of the retry it was cleaning up after.
+        let mut w = world();
+        let a = accept(do_delegate(&w, delegate_params("d-1", "worker-1", 60)));
+        let first = CancelParams {
+            delegation_id: "d-1".into(),
+            admission: a.admission,
+            reason: "changed my mind".into(),
+        };
+        w.router
+            .cancel(&w.registry, w.h_primary, &first, 2)
+            .expect("the initiator may cancel its live admission");
+        drain(&mut w);
+
+        let b = accept(do_delegate(&w, delegate_params("d-1", "worker-1", 60)));
+        assert_ne!(a.admission, b.admission);
+        assert_eq!(
+            frame_admission(&w.worker_rx.try_recv().unwrap()),
+            b.admission
+        );
+
+        // The retry: same initiator, same id, A's token.
+        let err = w
+            .router
+            .cancel(&w.registry, w.h_primary, &first, 3)
+            .expect_err("a cancel naming a superseded admission must be refused");
+        assert_eq!(err.code, codes::POLICY_DENIED);
+        // Byte-identical to the unknown-id refusal: the retry learns nothing
+        // about whether its id was re-admitted.
+        let unknown = CancelParams {
+            delegation_id: "d-nope".into(),
+            admission: a.admission,
+            reason: "probe".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&err).unwrap(),
+            serde_json::to_string(
+                &w.router
+                    .cancel(&w.registry, w.h_primary, &unknown, 4)
+                    .unwrap_err()
+            )
+            .unwrap(),
+        );
+
+        // B untouched in every respect the refusal could have disturbed.
+        assert_eq!(w.router.inflight_count(), 1, "B must remain in flight");
+        assert_eq!(
+            w.registry.get(w.h_worker).unwrap().active_sessions,
+            1,
+            "B's capacity must not be released by A's cancel"
+        );
+        assert_eq!(token(&w.router, "prod", "d-1"), b.admission);
+        assert!(
+            w.worker_rx.try_recv().is_err(),
+            "no cancel is forwarded downstream for a refused cancel"
+        );
+
+        // And B still completes normally with its own token.
+        assert_eq!(
+            w.router.complete(
+                &w.registry,
+                w.h_worker,
+                result_of("d-1", b.admission, "B's genuine result"),
+                1024,
+                5
+            ),
+            CompleteOutcome::Delivered { committed: true }
+        );
+        let frame = w.primary_rx.try_recv().expect("initiator got B's result");
+        assert!(frame.contains("B's genuine result"));
+        assert_eq!(frame_admission(&frame), b.admission);
         assert_eq!(w.router.inflight_count(), 0);
         assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 0);
     }
@@ -1458,6 +1693,7 @@ type = "primary"
         // 2. cancel.
         let cancel = CancelParams {
             delegation_id: "d-2".into(),
+            admission: second.admission,
             reason: "no longer needed".into(),
         };
         router.cancel(&registry, hp, &cancel, 3).expect("owned");
@@ -1974,6 +2210,9 @@ type = "primary"
         ));
         let params = CancelParams {
             delegation_id: "d-1".into(),
+            // The live token: the refusal must be about who is asking, not
+            // about which admission was named.
+            admission: token(&w.router, "prod", "d-1"),
             reason: "changed my mind".into(),
         };
         let err = w
@@ -2232,6 +2471,7 @@ allow_worker_initiation = true
             ));
             let params = CancelParams {
                 delegation_id: "d-1".into(),
+                admission: token(&w.router, "prod", "d-1"),
                 reason: "race".into(),
             };
             let gate = std::sync::Barrier::new(2);
@@ -2270,6 +2510,7 @@ allow_worker_initiation = true
         ));
         let params = CancelParams {
             delegation_id: "d-1".into(),
+            admission: token(&w.router, "prod", "d-1"),
             reason: "not mine".into(),
         };
         assert!(w
@@ -2295,19 +2536,22 @@ allow_worker_initiation = true
     #[test]
     fn cancel_refusals_are_byte_identical() {
         // `cp/cancel` must not be an existence oracle —
-        // an unknown id and another instance's live id return the same error
-        // object, byte for byte.
+        // an unknown id, another instance's live id, and the caller's OWN id
+        // under a superseded admission token all return the same error object,
+        // byte for byte. The last case matters as much as the first two: a
+        // distinguishable refusal would tell an initiator whether the id it
+        // reused is currently re-admitted, which is a fact about the CP's
+        // scheduling state it has no frame that reports.
         let w = world();
-        assert!(matches!(
-            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
-            DelegateOutcome::Accepted(_)
-        ));
+        let live = accept(do_delegate(&w, delegate_params("d-1", "worker-1", 60))).admission;
         let unknown = CancelParams {
             delegation_id: "d-does-not-exist".into(),
+            admission: live,
             reason: "probe".into(),
         };
         let foreign = CancelParams {
             delegation_id: "d-1".into(),
+            admission: live,
             reason: "probe".into(),
         };
         // Both probes come from the worker: it initiated neither.
@@ -2319,13 +2563,34 @@ allow_worker_initiation = true
             .router
             .cancel(&w.registry, w.h_worker, &foreign, 2)
             .unwrap_err();
+        // This one comes from the genuine initiator, naming a token that is
+        // not the live admission's.
+        let stale = CancelParams {
+            delegation_id: "d-1".into(),
+            admission: live.wrapping_add(1),
+            reason: "probe".into(),
+        };
+        let e_stale = w
+            .router
+            .cancel(&w.registry, w.h_primary, &stale, 3)
+            .unwrap_err();
+        let as_json = |e: &ErrorObject| serde_json::to_string(e).unwrap();
         assert_eq!(
-            serde_json::to_string(&e_unknown).unwrap(),
-            serde_json::to_string(&e_foreign).unwrap(),
+            as_json(&e_unknown),
+            as_json(&e_foreign),
             "unknown and foreign delegation ids must be indistinguishable"
         );
+        assert_eq!(
+            as_json(&e_unknown),
+            as_json(&e_stale),
+            "a stale admission token must be indistinguishable from an unknown id"
+        );
         assert_eq!(e_unknown.code, codes::POLICY_DENIED);
+        assert_eq!(e_stale.code, codes::POLICY_DENIED);
+        // Every refusal left the delegation exactly as it was.
         assert_eq!(w.router.inflight_count(), 1);
+        assert_eq!(token(&w.router, "prod", "d-1"), live);
+        assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 1);
     }
 
     #[test]
@@ -2376,10 +2641,12 @@ allow_worker_initiation = true
         // it exists: same error as for an id that exists nowhere.
         let probe = CancelParams {
             delegation_id: "d-1".into(),
+            admission: token(&router, "prod", "d-1"),
             reason: "probe".into(),
         };
         let nowhere = CancelParams {
             delegation_id: "d-nowhere".into(),
+            admission: 1,
             reason: "probe".into(),
         };
         let e_cross = router
@@ -2543,6 +2810,7 @@ allow_worker_initiation = true
             Interleaved::Cancel => {
                 let params = CancelParams {
                     delegation_id: id.into(),
+                    admission: token(&w.router, "prod", id),
                     reason: "changed my mind".into(),
                 };
                 w.router

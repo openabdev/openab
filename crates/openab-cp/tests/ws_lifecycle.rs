@@ -446,9 +446,11 @@ async fn a_late_result_for_a_superseded_admission_is_not_delivered() {
     );
 
     // The initiator cancels A, then retries the SAME id: admission B.
+    // The cancel names admission A explicitly — `delegation_id` alone would
+    // name whatever holds the id when the frame lands, not the work to abort.
     let cancel = serde_json::json!({
         "jsonrpc": "2.0", "id": 11, "method": "cp/cancel",
-        "params": {"delegation_id": "d-1", "reason": "changed my mind"}
+        "params": {"delegation_id": "d-1", "admission": a, "reason": "changed my mind"}
     })
     .to_string();
     initiator.send(Message::Text(cancel.into())).await.unwrap();
