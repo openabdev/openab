@@ -202,6 +202,30 @@ pub enum DelegateOutcome {
 /// peek-to-commit window of its own.
 ///
 /// `cp/cancel` is this helper's only caller.
+/// Outcome of resolving a `cp/delegate`'s parent reference, read under the one
+/// admission-time in-flight acquisition.
+///
+/// A parent reference is the coupled `(parent_delegation_id, parent_admission)`
+/// pair: a delegation id alone is reusable and cannot identify the admission a
+/// caller was actually forwarded, so half a pair is a client bug and the three
+/// failure shapes below stay distinct *internally* while collapsing to one wire
+/// refusal (see `delegate`).
+enum ParentRef {
+    /// Both halves present and they name a live admission this caller serves.
+    Resolved {
+        chain: Vec<String>,
+        deadline: DateTime<Utc>,
+    },
+    /// Neither half present: a root delegation.
+    Root,
+    /// Both halves present but they name no live admission this caller serves
+    /// — unknown id, wrong serving handle, or a superseded admission. Kept as
+    /// one variant because the wire must not distinguish them.
+    Unresolved,
+    IdWithoutToken,
+    TokenWithoutId,
+}
+
 enum Claim {
     /// The caller initiated it and named its live admission; the entry has
     /// already been removed.
@@ -360,7 +384,49 @@ impl Router {
         // namespace is a different delegation, so it neither collides here
         // nor leaks its existence.
         let key = DelegationKey::new(from_namespace, &params.delegation_id);
-        if self.inflight.lock().contains_key(&key) {
+
+        // ONE in-flight acquisition covers all three admission-time reads:
+        // the duplicate check, the global bound, and parent resolution. They
+        // are adjacent by design. The insert further down is a second,
+        // deliberate acquisition rather than a missed merge — target
+        // selection, policy evaluation and frame serialization sit between
+        // the two, and holding the in-flight lock across a registry scan and
+        // a 256 KiB serialization would trade three cheap round-trips for a
+        // long hold on the table every other path also needs. Atomicity of
+        // "check duplicate, then insert" does not come from one in-flight
+        // acquisition anyway: it comes from the admission guard spanning both.
+        //
+        // Nothing formats or logs inside the scope: the refusal paths below
+        // read their values back out and report after the guard is released.
+        let (duplicate, live, parent) = {
+            let inflight = self.inflight.lock();
+            let duplicate = inflight.contains_key(&key);
+            let live = inflight.len();
+            let parent = match (&params.parent_delegation_id, params.parent_admission) {
+                (Some(pid), Some(padmission)) => {
+                    let parent_key = DelegationKey::new(from_namespace, pid);
+                    // The chain and deadline are read from the very entry that
+                    // was validated — the `p` binding, not a second lookup. A
+                    // re-lookup after validation would reintroduce the race the
+                    // admission token closes.
+                    match inflight.get(&parent_key) {
+                        Some(p) if p.to_handle == from_handle && p.generation == padmission => {
+                            ParentRef::Resolved {
+                                chain: p.chain.clone(),
+                                deadline: p.deadline,
+                            }
+                        }
+                        _ => ParentRef::Unresolved,
+                    }
+                }
+                (Some(_), None) => ParentRef::IdWithoutToken,
+                (None, Some(_)) => ParentRef::TokenWithoutId,
+                (None, None) => ParentRef::Root,
+            };
+            (duplicate, live, parent)
+        };
+
+        if duplicate {
             return DelegateOutcome::Rejected(ErrorObject::new(
                 codes::DUPLICATE_DELEGATION,
                 format!("delegation {} is already in flight", params.delegation_id),
@@ -378,7 +444,6 @@ impl Router {
         // the send-failure rollback all remove the entry, and the count
         // follows by construction. A parallel counter would be one refactor
         // away from drifting, and a drifted global bound wedges the whole CP.
-        let live = self.inflight.lock().len();
         if live >= cfg.max_inflight_delegations {
             warn!(
                 live,
@@ -396,6 +461,45 @@ impl Router {
             ));
         }
 
+        // A parent reference is the coupled (id, admission) pair — see
+        // `ParentRef`. Unknown, unauthorized (wrong serving handle) and stale
+        // (superseded admission) parents all return the SAME error — one
+        // refusal shape, no enumeration. A distinguishable stale refusal would
+        // be an oracle telling the caller whether the id it references is
+        // currently re-admitted, which is CP scheduling state no frame reports.
+        // A half-filled pair is rejected rather than silently ignored, so a
+        // client that drops one half sees its bug instead of getting an
+        // unintended root delegation.
+        let (parent_chain, parent_deadline) = match parent {
+            ParentRef::Resolved { chain, deadline } => (chain, Some(deadline)),
+            ParentRef::Root => (Vec::new(), None),
+            ParentRef::Unresolved => {
+                let pid = params
+                    .parent_delegation_id
+                    .as_deref()
+                    .expect("Unresolved implies a parent id was supplied");
+                return DelegateOutcome::Rejected(ErrorObject::new(
+                    codes::INVALID_PARAMS,
+                    format!("parent delegation {pid} is not in flight for this instance"),
+                ));
+            }
+            ParentRef::IdWithoutToken => {
+                return DelegateOutcome::Rejected(ErrorObject::new(
+                    codes::INVALID_PARAMS,
+                    "parent_delegation_id requires parent_admission: name the \
+                     admission token this instance was forwarded for that parent \
+                     (a delegation id alone is reusable and cannot identify it)",
+                ))
+            }
+            ParentRef::TokenWithoutId => {
+                return DelegateOutcome::Rejected(ErrorObject::new(
+                    codes::INVALID_PARAMS,
+                    "parent_admission is meaningless without parent_delegation_id: \
+                     omit both for a root delegation, or send both",
+                ))
+            }
+        };
+
         // Selector sanity: exactly one of name/labels.
         let (sel_name, sel_labels) = (params.target.name.as_deref(), params.target.labels.as_ref());
         if sel_name.is_some() == sel_labels.is_some() {
@@ -404,79 +508,6 @@ impl Router {
                 "target must set exactly one of `name` or `labels`",
             ));
         }
-
-        // Parent linkage: chain and deadline derive from the CP's own table,
-        // never from the client. Three things must hold together, and the
-        // admission token is the one that makes the other two sufficient:
-        //
-        // 1. the parent lives in the CALLER's namespace (scoped lookup);
-        // 2. the caller IS the instance serving it (`to_handle`) — otherwise
-        //    any runtime knowing a live id could borrow its trusted chain and
-        //    deadline budget;
-        // 3. the caller names the SPECIFIC admission it is serving. Without
-        //    this, "currently serving that parent" degrades to "holds the
-        //    connection that serves whatever wears this id now": once parent
-        //    admission A ends (cancel, completion, or sweep) and the id is
-        //    re-admitted as B — with a single replica, to the same worker — a
-        //    residual child request composed against A satisfies 1 and 2
-        //    against B and inherits B's CP-constructed chain and B's remaining
-        //    deadline budget, so depth, cycle, and parent-budget are evaluated
-        //    for the wrong admission. Cancels are best effort, so the CP
-        //    cannot delegate policing of this to the worker: a buggy or
-        //    malicious runtime holding the serving connection could trigger it
-        //    deliberately.
-        //
-        // The id and the token are a coupled pair, enforced here because this
-        // is where parent presence is decided. An id without a token is
-        // malformed, never a wildcard; a token without an id is malformed too,
-        // rather than silently ignored, so a client that drops the id sees its
-        // bug instead of getting an unintended root delegation.
-        //
-        // Unknown, unauthorized (wrong serving handle) and stale (superseded
-        // admission) parents all return the SAME error — one refusal shape, no
-        // enumeration. A distinguishable stale refusal would be an oracle
-        // telling the caller whether the id it references is currently
-        // re-admitted, which is CP scheduling state no frame reports.
-        let (parent_chain, parent_deadline) =
-            match (&params.parent_delegation_id, params.parent_admission) {
-                (Some(pid), Some(padmission)) => {
-                    let parent_key = DelegationKey::new(from_namespace, pid);
-                    // ONE acquisition of the in-flight lock resolves the parent and
-                    // validates all three conditions, and the chain and deadline
-                    // below are read from the very entry that was validated — the
-                    // `p` binding, not a second lookup. A re-lookup after
-                    // validation would reintroduce the race the token closes.
-                    match self.inflight.lock().get(&parent_key) {
-                        Some(p) if p.to_handle == from_handle && p.generation == padmission => {
-                            (p.chain.clone(), Some(p.deadline))
-                        }
-                        _ => {
-                            return DelegateOutcome::Rejected(ErrorObject::new(
-                                codes::INVALID_PARAMS,
-                                format!(
-                                    "parent delegation {pid} is not in flight for this instance"
-                                ),
-                            ))
-                        }
-                    }
-                }
-                (Some(_), None) => {
-                    return DelegateOutcome::Rejected(ErrorObject::new(
-                        codes::INVALID_PARAMS,
-                        "parent_delegation_id requires parent_admission: name the \
-                     admission token this instance was forwarded for that parent \
-                     (a delegation id alone is reusable and cannot identify it)",
-                    ))
-                }
-                (None, Some(_)) => {
-                    return DelegateOutcome::Rejected(ErrorObject::new(
-                        codes::INVALID_PARAMS,
-                        "parent_admission is meaningless without parent_delegation_id: \
-                     omit both for a root delegation, or send both",
-                    ))
-                }
-                (None, None) => (Vec::new(), None),
-            };
 
         // Resolve target within the initiator's namespace (v1 boundary).
         let target = match registry.select(from_namespace, sel_name, sel_labels) {
@@ -928,48 +959,25 @@ impl Router {
             }
         };
 
-        // Truncate oversized results (keep the head; delegation already
-        // ran). The marker counts against the cap: the final value never
-        // exceeds max_result_bytes.
-        if let Some(r) = &params.result {
-            if r.len() > max_result_bytes {
-                params.result = Some(truncate_with_marker(r, max_result_bytes));
+        // Phase 2 — cap the payload (in place: the capped value is what the
+        // initiator and the lobby both see).
+        cap_result(&mut params, max_result_bytes);
+
+        // Phase 3 — deliver. Irreversible: once the frame is queued the
+        // initiator will see this terminal, which is why the commit that makes
+        // it authoritative comes after, and why a refusal here must NOT emit a
+        // terminal event (`fail_instance` owns that path).
+        match deliver_result(registry, &entry, &params, next_rpc_id) {
+            Deliver::Queued => {}
+            Deliver::InitiatorGone => return CompleteOutcome::Dropped,
+            Deliver::Refused => {
+                return CompleteOutcome::InitiatorStalled {
+                    initiator_handle: entry.from_handle,
+                }
             }
         }
 
-        let Some(initiator) = registry.get(entry.from_handle) else {
-            // The initiator deregistered concurrently: its `fail_instance`
-            // pass removes this entry, releases capacity, and cancels the
-            // serving side — nothing to do here.
-            warn!(
-                delegation = %params.delegation_id,
-                "result for a delegation whose initiator is gone — dropped"
-            );
-            return CompleteOutcome::Dropped;
-        };
-        let frame = JsonRpcRequest::new(
-            next_rpc_id,
-            methods::DELEGATE_RESULT,
-            Some(serde_json::to_value(&params).expect("serializable")),
-        );
-        let text = serde_json::to_string(&frame).expect("serializable");
-
-        if initiator.tx.try_send(text).is_err() {
-            // Bounded-queue contract: a peer that cannot drain its queue is
-            // treated as disconnected, never silently skipped. The entry
-            // stays in flight; the caller closes the initiator, whose
-            // teardown fails the delegation over the `fail_instance` path.
-            warn!(
-                delegation = %params.delegation_id,
-                initiator = %entry.from_logical,
-                "initiator queue full — terminal result refused, treating initiator as disconnected"
-            );
-            return CompleteOutcome::InitiatorStalled {
-                initiator_handle: entry.from_handle,
-            };
-        }
-
-        // Phase 2 — commit. Claims ONLY the admission that was peeked; see
+        // Phase 4 — commit. Claims ONLY the admission that was peeked; see
         // `commit_completion` for why key + serving handle is not enough.
         let committed = match self.commit_completion(registry, &entry) {
             Commit::Claimed => {
@@ -1155,6 +1163,22 @@ impl Router {
         handle: u64,
         rpc_id: &mut impl FnMut() -> u64,
     ) -> Vec<(Instance, String)> {
+        // Scale note (shared with `sweep_deadlines`): this is an O(live) scan of
+        // the whole table plus an intermediate key `Vec`, and `complete` clones
+        // the full `InFlight` (chain included) per terminal. That is deliberate
+        // at this size: `max_inflight_delegations` caps the table at 4096 by
+        // default, so a scan is a few thousand comparisons under a lock held for
+        // microseconds, and the clone keeps the emit and frame construction off
+        // the lock entirely.
+        //
+        // Upgrade path when the cap is raised materially: keep two secondary
+        // indexes beside the primary map — `handle -> {DelegationKey}` for this
+        // function and a deadline-ordered structure (BTreeMap<deadline, keys> or
+        // a binary heap) for the sweep — so both become O(affected) instead of
+        // O(live). Both indexes must be maintained by the same five removal
+        // paths that own the primary map, which is the reason not to add them
+        // before the size justifies it: a drifted index is a silent
+        // wrong-delegation bug, where a slow scan is only slow.
         let mut affected = Vec::new();
         let entries: Vec<InFlight> = {
             let mut g = self.inflight.lock();
@@ -1336,6 +1360,69 @@ impl Router {
 /// exceeds `cap` (review round-2 F5), and cuts always land on UTF-8 char
 /// boundaries. Shared by result capping and observer excerpts so both use
 /// one implementation.
+/// Outcome of the delivery phase of a completion. Delivery is the irreversible
+/// half of `complete`: the commit that makes a terminal authoritative — and the
+/// lobby event that records it — happen only after `Queued`.
+enum Deliver {
+    /// The frame is on the initiator's outbound queue.
+    Queued,
+    /// The initiator deregistered concurrently; its own `fail_instance` pass
+    /// removes the entry, releases capacity and cancels the serving side, and
+    /// owns the terminal event.
+    InitiatorGone,
+    /// The initiator's bounded queue refused the frame. The entry stays in
+    /// flight; the caller closes that connection and its teardown fails the
+    /// delegation over `fail_instance`, which emits the single authoritative
+    /// terminal. Emitting `completed` here too would publish two contradictory
+    /// terminals for one admission.
+    Refused,
+}
+
+/// Cap an oversized result in place (keep the head — the delegation already
+/// ran). The marker counts against the cap, so the final value never exceeds
+/// `max_result_bytes`, and the capped value is what the initiator and the lobby
+/// both see.
+fn cap_result(params: &mut DelegateResultParams, max_result_bytes: usize) {
+    if let Some(r) = &params.result {
+        if r.len() > max_result_bytes {
+            params.result = Some(truncate_with_marker(r, max_result_bytes));
+        }
+    }
+}
+
+/// Queue the terminal result on the initiator's connection.
+fn deliver_result(
+    registry: &Registry,
+    entry: &InFlight,
+    params: &DelegateResultParams,
+    next_rpc_id: u64,
+) -> Deliver {
+    let Some(initiator) = registry.get(entry.from_handle) else {
+        warn!(
+            delegation = %params.delegation_id,
+            "result for a delegation whose initiator is gone — dropped"
+        );
+        return Deliver::InitiatorGone;
+    };
+    let frame = JsonRpcRequest::new(
+        next_rpc_id,
+        methods::DELEGATE_RESULT,
+        Some(serde_json::to_value(params).expect("serializable")),
+    );
+    let text = serde_json::to_string(&frame).expect("serializable");
+    if initiator.tx.try_send(text).is_err() {
+        // Bounded-queue contract: a peer that cannot drain its queue is
+        // treated as disconnected, never silently skipped.
+        warn!(
+            delegation = %params.delegation_id,
+            initiator = %entry.from_logical,
+            "initiator queue full — terminal result refused, treating initiator as disconnected"
+        );
+        return Deliver::Refused;
+    }
+    Deliver::Queued
+}
+
 pub(crate) fn truncate_with_marker(s: &str, cap: usize) -> String {
     if s.len() <= cap {
         return s.to_string();

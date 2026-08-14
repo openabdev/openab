@@ -855,7 +855,19 @@ fn handle_frame(state: &Arc<AppState>, handle: u64, text: &str) -> Option<String
             }
         }
         methods::CANCEL => {
-            let p = params_or_err!(CancelParams);
+            let mut p = params_or_err!(CancelParams);
+            // Defence in depth on initiator free text. The event path already
+            // redacts this string in `metadata_only` namespaces and truncates
+            // it elsewhere, but capping at the entry keeps an oversized reason
+            // from being carried through the router and the forwarded frame at
+            // all — the same posture `max_prompt_bytes` takes on the delegate
+            // path, one layer earlier than the excerpt cap.
+            if p.reason.len() > state.cfg.max_event_excerpt_bytes {
+                p.reason = crate::router::truncate_with_marker(
+                    &p.reason,
+                    state.cfg.max_event_excerpt_bytes,
+                );
+            }
             match state.router.cancel(
                 &state.registry,
                 &state.events,
@@ -1774,5 +1786,60 @@ mod tests {
         assert_eq!(seen[1]["result_excerpt"], "ok");
         assert_eq!(seen[0]["seq"], 1);
         assert_eq!(seen[1]["seq"], 2);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_cancel_reason_is_capped_at_the_entry() {
+        // Initiator free text is capped before the router or the forwarded
+        // frame ever sees it. The event path redacts/truncates too, but this
+        // keeps a multi-megabyte reason from riding through the CP at all.
+        let state = state_with("max_event_excerpt_bytes = 256");
+        let (h_primary, _p_rx) = join(&state, "prod", "koudu", AgentType::Primary);
+        let (_h_worker, mut w_rx) = join(&state, "prod", "worker-1", AgentType::Worker);
+
+        let ack = call(
+            &state,
+            h_primary,
+            methods::DELEGATE,
+            serde_json::json!({
+                "delegation_id": "d-cap",
+                "target": {"name": "worker-1"},
+                "prompt": "work",
+                "deadline": (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339()
+            }),
+        );
+        let v: serde_json::Value = serde_json::from_str(&ack).unwrap();
+        let admission = v["result"]["admission"]
+            .as_u64()
+            .expect("ack carries the token");
+        w_rx.try_recv().expect("forwarded");
+
+        let huge = "A".repeat(64 * 1024);
+        let reply = call(
+            &state,
+            h_primary,
+            methods::CANCEL,
+            serde_json::json!({
+                "delegation_id": "d-cap",
+                "admission": admission,
+                "reason": huge
+            }),
+        );
+        assert!(
+            reply.contains("\"ok\":true"),
+            "the cancel itself succeeds: {reply}"
+        );
+
+        // The forwarded cp/cancel carries the capped reason, not 64 KiB.
+        let forwarded = w_rx.try_recv().expect("cancel forwarded to the worker");
+        assert!(
+            forwarded.len() < 2048,
+            "the forwarded cancel must not carry the untruncated reason ({} bytes)",
+            forwarded.len()
+        );
+        assert!(
+            forwarded.contains("truncated by control plane"),
+            "the cap leaves its marker: {forwarded}"
+        );
     }
 }
