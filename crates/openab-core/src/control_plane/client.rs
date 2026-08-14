@@ -442,7 +442,9 @@ impl ControlPlaneClient {
                     msg.params.and_then(|p| serde_json::from_value(p).ok());
                 match params {
                     Some(params) => {
-                        let known = self.executor.cancel(&params.delegation_id);
+                        let known = self
+                            .executor
+                            .cancel(&params.delegation_id, params.admission);
                         info!(
                             delegation_id = %params.delegation_id,
                             reason = %params.reason,
@@ -622,6 +624,7 @@ max_delegated_sessions = 3
             "jsonrpc": "2.0", "id": 9, "method": "cp/delegate",
             "params": {
                 "delegation_id": "d-1",
+                "admission": 7,
                 "prompt": "hi",
                 "deadline": (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339(),
                 "from": "prod/koudu",
@@ -639,6 +642,10 @@ max_delegated_sessions = 3
                     "the ack says nothing about the outcome"
                 );
                 assert_eq!(forward.delegation_id, "d-1");
+                assert_eq!(
+                    forward.admission, 7,
+                    "the token must survive into the forward"
+                );
                 assert_eq!(forward.from, "prod/koudu");
                 assert_eq!(forward.chain, vec!["prod/koudu".to_string()]);
             }
@@ -668,7 +675,7 @@ max_delegated_sessions = 3
         let c = client();
         let frame = serde_json::json!({
             "jsonrpc": "2.0", "id": 4, "method": "cp/cancel",
-            "params": {"delegation_id": "gone", "reason": "initiator gave up"}
+            "params": {"delegation_id": "gone", "admission": 3, "reason": "initiator gave up"}
         })
         .to_string();
         let FrameAction::Reply(reply) = c.handle_frame(&frame) else {

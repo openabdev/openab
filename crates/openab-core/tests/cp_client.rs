@@ -445,12 +445,16 @@ async fn a_cancel_stops_the_turn_and_frees_the_slot() {
 
     let mut initiator = connect_initiator(&url).await;
     delegate(&mut initiator, 4, "d-cancel", "hang forever", 300).await;
-    assert_eq!(next_json(&mut initiator).await["id"], 4, "delegate ack");
+    let ack = next_json(&mut initiator).await;
+    assert_eq!(ack["id"], 4, "delegate ack");
+    let admission = ack["result"]["admission"]
+        .as_u64()
+        .expect("the ack names the admission this cancel must target");
     wait_for("the turn to start", || runner.started() == 1).await;
 
     let cancel = serde_json::json!({
         "jsonrpc": "2.0", "id": 5, "method": "cp/cancel",
-        "params": {"delegation_id": "d-cancel", "reason": "initiator changed its mind"}
+        "params": {"delegation_id": "d-cancel", "admission": admission, "reason": "initiator changed its mind"}
     })
     .to_string();
     initiator.send(Message::Text(cancel)).await.unwrap();

@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use openab_cp::proto::{DelegateForward, DelegateResultParams, DelegationStatus};
+use openab_cp::proto::{AdmissionToken, DelegateForward, DelegateResultParams, DelegationStatus};
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 use tracing::{info, warn};
@@ -86,7 +86,7 @@ pub struct DelegationExecutor {
     /// Admitted delegations → their cancel signal. Also the capacity counter:
     /// its length is the number of active delegated sessions reported in
     /// `cp/heartbeat`.
-    inflight: Mutex<BTreeMap<String, Arc<Notify>>>,
+    inflight: Mutex<BTreeMap<String, (AdmissionToken, Arc<Notify>)>>,
 }
 
 /// Why admission refused, as the message sent back in `status = failed`.
@@ -141,7 +141,11 @@ impl DelegationExecutor {
     }
 
     /// Reserve a slot for `delegation_id`, or explain why not.
-    fn admit(&self, delegation_id: &str) -> std::result::Result<Arc<Notify>, Refusal> {
+    fn admit(
+        &self,
+        delegation_id: &str,
+        admission: AdmissionToken,
+    ) -> std::result::Result<Arc<Notify>, Refusal> {
         let max = self.effective_max();
         let mut g = self.inflight.lock().expect("inflight mutex");
         if g.contains_key(delegation_id) {
@@ -152,7 +156,7 @@ impl DelegationExecutor {
             return Err(Refusal::OverCapacity { active, max });
         }
         let signal = Arc::new(Notify::new());
-        g.insert(delegation_id.to_string(), Arc::clone(&signal));
+        g.insert(delegation_id.to_string(), (admission, Arc::clone(&signal)));
         Ok(signal)
     }
 
@@ -170,13 +174,28 @@ impl DelegationExecutor {
     /// `notify_one` rather than `notify_waiters`: it leaves a permit behind, so
     /// a cancel that arrives between admission and the first poll of the
     /// serving task is still observed instead of being lost.
-    pub fn cancel(&self, delegation_id: &str) -> bool {
-        let signal = self
-            .inflight
-            .lock()
-            .expect("inflight mutex")
-            .get(delegation_id)
-            .map(Arc::clone);
+    pub fn cancel(&self, delegation_id: &str, admission: AdmissionToken) -> bool {
+        let signal = {
+            let g = self.inflight.lock().expect("inflight mutex");
+            match g.get(delegation_id) {
+                // The token names ONE admission of this reusable id. A stale
+                // cancel — the CP swept admission A, this worker was already
+                // re-serving B under the same id — must not abort B: that is
+                // the worker-side half of the misdelivery the wire token
+                // exists to close.
+                Some((adm, s)) if *adm == admission => Some(Arc::clone(s)),
+                Some((adm, _)) => {
+                    tracing::info!(
+                        delegation_id,
+                        live = *adm,
+                        stale = admission,
+                        "cp/cancel names a superseded admission — ignoring"
+                    );
+                    None
+                }
+                None => None,
+            }
+        };
         match signal {
             Some(s) => {
                 s.notify_one();
@@ -197,7 +216,7 @@ impl DelegationExecutor {
             .lock()
             .expect("inflight mutex")
             .values()
-            .map(Arc::clone)
+            .map(|(_, s)| Arc::clone(s))
             .collect();
         for s in signals {
             s.notify_one();
@@ -211,12 +230,12 @@ impl DelegationExecutor {
     /// that had already decided not to run.
     pub async fn serve(self: Arc<Self>, forward: DelegateForward) -> DelegateResultParams {
         let id = forward.delegation_id.clone();
-        let cancel = match self.admit(&id) {
+        let cancel = match self.admit(&id, forward.admission) {
             Ok(signal) => signal,
             Err(refusal) => {
                 let error = refusal.message();
                 warn!(delegation_id = %id, from = %forward.from, %error, "delegation refused");
-                return failed(&id, error);
+                return failed(&id, forward.admission, error);
             }
         };
         // RAII: the slot must free even if this task is ABORTED mid-await —
@@ -244,7 +263,7 @@ impl DelegationExecutor {
         // elapsed deadline means there is nothing worth starting.
         let Ok(remaining) = (forward.deadline - chrono::Utc::now()).to_std() else {
             warn!(delegation_id = %id, deadline = %forward.deadline, "delegation arrived past its deadline");
-            return timed_out(id);
+            return timed_out(id, forward.admission);
         };
         let budget = remaining.min(self.prompt_hard_timeout);
         info!(
@@ -275,6 +294,7 @@ impl DelegationExecutor {
                 self.runner.discard(&session_key).await;
                 return DelegateResultParams {
                     delegation_id: id.clone(),
+                    admission: forward.admission,
                     status: DelegationStatus::Cancelled,
                     result: None,
                     error: None,
@@ -296,25 +316,26 @@ impl DelegationExecutor {
                 )
                 .await;
                 self.runner.discard(&session_key).await;
-                timed_out(id)
+                timed_out(id, forward.admission)
             }
             Ok(Err(e)) => {
                 // The turn could not be driven at all (no session, dead agent).
                 let error = format!("{e:#}");
                 warn!(delegation_id = %id, %error, "delegation failed before completion");
                 self.runner.discard(&session_key).await;
-                failed(id, error)
+                failed(id, forward.admission, error)
             }
             Ok(Ok(outcome)) => {
                 self.runner.discard(&session_key).await;
                 if let Some(error) = outcome.error {
                     warn!(delegation_id = %id, %error, "delegation ended in an agent error");
-                    return failed(id, error);
+                    return failed(id, forward.admission, error);
                 }
                 if outcome.silent_failure {
                     warn!(delegation_id = %id, "delegation produced an empty turn (silent failure)");
                     return failed(
                         id,
+                        forward.admission,
                         "agent returned an empty turn (0 output tokens) — \
                          likely a provider/model/auth failure",
                     );
@@ -322,6 +343,7 @@ impl DelegationExecutor {
                 info!(delegation_id = %id, bytes = outcome.text.len(), "delegation completed");
                 DelegateResultParams {
                     delegation_id: id.clone(),
+                    admission: forward.admission,
                     status: DelegationStatus::Completed,
                     result: Some(cap_result(outcome.text)),
                     error: None,
@@ -373,18 +395,27 @@ impl Drop for SlotGuard<'_> {
     }
 }
 
-fn failed(delegation_id: &str, error: impl Into<String>) -> DelegateResultParams {
+fn failed(
+    delegation_id: &str,
+    admission: AdmissionToken,
+    error: impl Into<String>,
+) -> DelegateResultParams {
     DelegateResultParams {
         delegation_id: delegation_id.to_string(),
+        // Echoed verbatim from the forward: the CP correlates terminal frames
+        // per admission, so a late result for a superseded admission of this
+        // id is dropped instead of completing the wrong delegation.
+        admission,
         status: DelegationStatus::Failed,
         result: None,
         error: Some(error.into()),
     }
 }
 
-fn timed_out(delegation_id: &str) -> DelegateResultParams {
+fn timed_out(delegation_id: &str, admission: AdmissionToken) -> DelegateResultParams {
     DelegateResultParams {
         delegation_id: delegation_id.to_string(),
+        admission,
         status: DelegationStatus::Timeout,
         result: None,
         error: Some("delegation deadline elapsed at the serving runtime".into()),
@@ -569,6 +600,7 @@ mod tests {
     fn forward(id: &str, secs: i64) -> DelegateForward {
         DelegateForward {
             delegation_id: id.into(),
+            admission: 1,
             prompt: "do the thing".into(),
             deadline: chrono::Utc::now() + chrono::Duration::seconds(secs),
             from: "prod/koudu".into(),
@@ -672,7 +704,7 @@ mod tests {
         let ex = executor(Arc::clone(&runner), 1);
         // Occupy the only slot: `admit` is what reserves capacity, so the
         // entry stands until the (never-spawned) serving task releases it.
-        let _held = ex.admit("d-held").expect("first slot");
+        let _held = ex.admit("d-held", 1).expect("first slot");
         let res = Arc::clone(&ex).serve(forward("d-2", 60)).await;
         assert_eq!(res.status, DelegationStatus::Failed);
         assert!(res.error.unwrap().contains("local delegation capacity"));
@@ -684,7 +716,7 @@ mod tests {
     async fn duplicate_delegation_id_is_refused_without_executing() {
         let runner = FakeRunner::completing("ok");
         let ex = executor(Arc::clone(&runner), 4);
-        let _held = ex.admit("d-3").expect("slot");
+        let _held = ex.admit("d-3", 1).expect("slot");
         let res = Arc::clone(&ex).serve(forward("d-3", 60)).await;
         assert_eq!(res.status, DelegationStatus::Failed);
         assert!(res.error.unwrap().contains("already in flight"));
@@ -696,7 +728,7 @@ mod tests {
         let runner = FakeRunner::completing("ok");
         let ex = executor(Arc::clone(&runner), 4);
         ex.set_effective_max(1); // CP clamped us
-        let _held = ex.admit("d-a").expect("slot");
+        let _held = ex.admit("d-a", 1).expect("slot");
         let res = Arc::clone(&ex).serve(forward("d-b", 60)).await;
         assert_eq!(res.status, DelegationStatus::Failed);
         assert!(
@@ -788,7 +820,7 @@ mod tests {
         while ex.active() == 0 {
             tokio::task::yield_now().await;
         }
-        assert!(ex.cancel("d-9"), "the id is in flight");
+        assert!(ex.cancel("d-9", 1), "the id is in flight");
         let res = serving.await.unwrap();
         assert_eq!(res.status, DelegationStatus::Cancelled);
         assert!(res.result.is_none());
@@ -826,7 +858,7 @@ mod tests {
     #[test]
     fn cancel_of_an_unknown_id_is_a_no_op() {
         let ex = executor(FakeRunner::completing("ok"), 1);
-        assert!(!ex.cancel("never-seen"));
+        assert!(!ex.cancel("never-seen", 1));
     }
 
     #[test]
@@ -912,5 +944,37 @@ mod tests {
         let ex2 = executor(done, 1);
         let r = ex2.serve(forward("d-after", 600)).await;
         assert_eq!(r.status, DelegationStatus::Completed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_cancel_does_not_abort_a_reserving_admission() {
+        // Worker-side half of the wire-token contract: the CP swept admission
+        // A of "d-1" and its best-effort cancel (stamped with A's token) can
+        // arrive after this worker started serving re-admission B. The cancel
+        // must not abort B.
+        let runner = Arc::new(FakeRunner {
+            delay: Some(Duration::from_secs(300)),
+            ..Default::default()
+        });
+        let ex = executor(Arc::clone(&runner), 1);
+        let mut fwd = forward("d-1", 600);
+        fwd.admission = 42; // B's admission
+        let task = {
+            let ex = Arc::clone(&ex);
+            tokio::spawn(async move { ex.serve(fwd).await })
+        };
+        while ex.active() < 1 {
+            tokio::task::yield_now().await;
+        }
+
+        // A's stale cancel: same id, older token.
+        assert!(!ex.cancel("d-1", 7), "a stale token must be ignored");
+        assert_eq!(ex.active(), 1, "B keeps running");
+
+        // B's own cancel works.
+        assert!(ex.cancel("d-1", 42));
+        let result = task.await.unwrap();
+        assert_eq!(result.status, DelegationStatus::Cancelled);
+        assert_eq!(result.admission, 42, "the terminal frame names B");
     }
 }
