@@ -540,7 +540,7 @@ pub enum CpEvent {
         /// `(namespace, delegation_id, admission)` — the token is what ties a
         /// terminal event to the exact admission it ends, mirroring the wire
         /// frames (ack/result/cancel), which all carry it.
-        admission: u64,
+        admission: AdmissionToken,
         from: String,
         to: String,
         /// Absent when the namespace is `metadata_only`.
@@ -555,12 +555,19 @@ pub enum CpEvent {
         /// `(namespace, delegation_id, admission)`, never on the reusable id
         /// alone. First terminal event for a given admission wins; later ones
         /// for that admission are duplicates.
-        admission: u64,
+        admission: AdmissionToken,
         from: String,
         to: String,
         status: DelegationStatus,
         #[serde(skip_serializing_if = "Option::is_none")]
         result_excerpt: Option<String>,
+        /// Bounded excerpt of the terminal error text, when there is one.
+        /// Its `metadata_only` behavior depends on who wrote it: a
+        /// worker-reported error (`failed` results) is agent content and is
+        /// suppressed (key absent) exactly like `result_excerpt`, while a
+        /// CP-synthesized diagnostic (`timeout`, `target_disconnected`) is
+        /// metadata the CP composed and survives the knob — mirroring
+        /// `DelegationCancelled::reason`.
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
@@ -570,7 +577,7 @@ pub enum CpEvent {
         /// `(namespace, delegation_id, admission)`, never on the reusable id
         /// alone. First terminal event for a given admission wins; later ones
         /// for that admission are duplicates.
-        admission: u64,
+        admission: AdmissionToken,
         /// Initiator of the cancelled delegation (`namespace/name`) — an
         /// observer that missed `delegation_requested` still gets full
         /// attribution.

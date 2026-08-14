@@ -105,8 +105,11 @@ type = "observer"
 [namespaces.prod]
 max_depth = 1
 allow_worker_initiation = false
-# Withhold prompt/result bodies from cp/event: observers still see every
-# event with full attribution (from/to/chain), timing, and status, but no
-# payload excerpts. Default false (excerpts included, bounded by
-# max_event_excerpt_bytes).
+# Withhold agent-supplied content from cp/event: prompt/result excerpts,
+# worker-reported error text, and initiator cancel reasons are all
+# suppressed. Observers still see every event with full attribution
+# (from/to/chain), timing, and status, and CP-synthesized diagnostics
+# (timeout / disconnect reasons) remain visible by design — the stream is
+# metadata-complete but content-free. Default false (excerpts included,
+# bounded by max_event_excerpt_bytes).
 # metadata_only = true

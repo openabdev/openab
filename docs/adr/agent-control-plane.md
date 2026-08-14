@@ -484,18 +484,21 @@ recovery semantics:
   at this point in the stack — every
   serving runtime learns the token from the forwarded `cp/delegate` — so the
   migration is mechanical, but it is not silent and it is not optional.
-- **First terminal frame per admission wins.** More than one terminal frame may
-  reach an initiator for one admission: a `completed` result can race the
-  deadline sweep's synthesized `timeout`, and duplicate results are possible in
-  the window between delivery and commit. **Initiators MUST treat the first
-  terminal frame (`completed`, `failed`, `timeout`, `target_disconnected`) for
-  a given `admission` token as authoritative and ignore every later terminal
+- **First terminal frame per admission wins.** Delivery is commit-gated:
+  only the one path that authoritatively ended an admission (completion
+  commit, cancel, deadline sweep, disconnect teardown) may put an
+  initiator-bound terminal frame on the wire, and a result whose commit
+  loses the race is discarded undelivered — so under one CP process an
+  initiator receives at most one terminal frame per admission, and the
+  observer event stream records the same outcome. The rule is retained as
+  client-side defence in depth (frames straddling a CP restart, future
+  multi-instance deployments): **initiators MUST treat the first terminal
+  frame (`completed`, `failed`, `timeout`, `target_disconnected`) for a
+  given `admission` token as authoritative and ignore every later terminal
   frame for that token.** Correlation is per admission, not per
   `delegation_id`: keyed on the reusable id, a late frame for a superseded
-  admission would permanently mask the live admission's genuine terminal frame.
-  The CP does not suppress the later frames: doing so would require per-id
-  terminal state that a CP with no durable state deliberately does not keep.
-  CP-side state is unaffected either way — the token rule above makes the
+  admission would permanently mask the live admission's genuine terminal
+  frame. CP-side state is exact either way — the token rule above makes the
   commit exact, so exactly one path ever releases the capacity.
 - **Global admission and memory bounds.** Beyond per-frame and per-connection
   limits the CP bounds its own aggregate state:
@@ -760,11 +763,17 @@ of scope for v1.
    runtimes will stream `session/update`-style chunks back through the CP.
    Rationale: streaming is the observability substrate, not a feature — it
    restores the free human visibility that Discord-mediated collaboration
-   provides today. It enables a read-only observer endpoint on the CP
-   (e.g. `wss://cp/.../observe?ns=prod`; separate read-only credential
-   class, namespace-scoped) so a human can tail all delegation traffic
-   across the fleet from one terminal. v1 ships final-result-only; the
-   stream frame shape is reserved in the wire contract.
+   provides today. *Phase 1 of the observer surface has since shipped
+   (PR #1470): the read-only `observer` identity type, the `cp/event`
+   lifecycle notification stream (per-namespace `seq`, admission-token
+   correlation, `metadata_only` redaction), and `cp/list_agents` — wire
+   contract documented in `docs/control-plane.md` ("Observer surface").
+   Accepted operational limits of that slice: delivery to observers is
+   best-effort (bounded queues, `seq`-gap detection), `seq` is not durable
+   across CP restarts, and there is no event replay — a lobby needing
+   history must retain its own.* Intermediate `session_*` relay streaming
+   remains future scope. v1 of the *delegation wire contract* ships
+   final-result-only; the stream frame shape is reserved.
 2. **CP high availability** — single instance + fast re-registration is
    acceptable for v1 (restart semantics are now defined in §4); is
    active/standby needed before multi-tenant use?

@@ -218,10 +218,14 @@ pub struct NamespacePolicy {
     /// Whether workers may initiate delegations (depth still applies).
     #[serde(default)]
     pub allow_worker_initiation: bool,
-    /// Withhold prompt/result bodies from `cp/event`: observers still see
-    /// every event, with attribution, timing, and status, but no payload
-    /// excerpts. Defaults to false (excerpts included, bounded by
-    /// `max_event_excerpt_bytes`) — the pre-existing behavior.
+    /// Withhold agent-supplied content from `cp/event`: prompt excerpts,
+    /// result excerpts, worker-reported error text, and initiator-supplied
+    /// cancel reasons are all suppressed (their keys absent). Observers still
+    /// see every event with full attribution (`from`/`to`/`chain`), timing,
+    /// status, and CP-synthesized diagnostics — timeout and disconnect
+    /// reasons are metadata the CP composed, not agent content, so they
+    /// survive this knob by design. Defaults to false (excerpts included,
+    /// bounded by `max_event_excerpt_bytes`) — the pre-existing behavior.
     #[serde(default)]
     pub metadata_only: bool,
 }
