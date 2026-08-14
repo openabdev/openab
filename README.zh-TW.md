@@ -58,6 +58,7 @@ platforms 使用 `webhook/API`，Feishu/Lark 則使用 `WS/webhook`。
 - **@mention 觸發** — 在允許的頻道中 mention bot，即可開始對話
 - **以討論串進行多輪對話** — 自動建立討論串；後續訊息不需再次 @mention
 - **多 agent 協作** — 支援 bot-to-bot 訊息，實現協調式工作流程（[docs/multi-agent.md](docs/multi-agent.md)）
+- **Agent control plane（預覽）** — 獨立的 `openab-cp` 服務，讓 agent 之間可透過 WebSocket 直接委派任務，具備綁定身分的註冊機制與由 CP 主導的政策控管；runtime client 與 facade 將於後續版本推出（[docs/control-plane.md](docs/control-plane.md)）
 - **由 agent 控制回覆對象** — agent 可透過 `[[reply_to:id]]` 指令選擇要回覆的訊息，讓多 bot 頻道中的對話脈絡更清楚（[docs/output-directives.md](docs/output-directives.md)）
 - **編輯式串流輸出** — token 產生時每 1.5 秒即時更新 Discord 訊息
 - **Emoji 狀態反應** — 👀→🤔→🔥/👨‍💻/⚡→👍+隨機情緒表情

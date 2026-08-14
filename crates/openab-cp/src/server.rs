@@ -6,7 +6,10 @@
 //!
 //! Resource bounds: the WS transport enforces `max_frame_bytes` before
 //! parsing; each connection's outbound queue is bounded — a peer that cannot
-//! drain it is treated as disconnected.
+//! drain it is treated as disconnected — and every outbound write is itself
+//! bounded by `write_timeout_secs` and raced against the CP's close signal, so
+//! a peer that stops reading cannot park the connection task (and with it the
+//! identity's connection quota and its in-flight delegations).
 //!
 //! Admission bounds: authentication alone is not a bound. Every connection
 //! holds a per-identity slot from the upgrade until it ends (`ConnPermit`,
@@ -33,7 +36,7 @@ use axum::routing::get;
 use axum::Router as AxumRouter;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use crate::config::{AgentIdentity, CpConfig};
@@ -144,6 +147,49 @@ fn policy_close(reason: &'static str) -> Message {
     }))
 }
 
+/// Why a bounded write did not complete. Either way the connection ends.
+enum WriteStop {
+    /// Transport error, or the peer did not accept the frame within
+    /// `write_timeout_secs` — a peer that cannot be written to is treated as
+    /// disconnected, exactly like one that cannot drain its queue.
+    Disconnected,
+    /// The CP asked this connection to close while the write was pending,
+    /// with the reason to put on the close frame (`None` if the signal
+    /// carried none).
+    Shutdown(Option<&'static str>),
+}
+
+/// Send one frame with a bound on how long it may block, while remaining
+/// responsive to the CP's own close signal.
+///
+/// Both properties are load-bearing. `sink.send().await` inside a `select!`
+/// arm body is NOT cancelled by the other arms, so an unbounded write parks
+/// the whole connection task: it stops reading inbound frames, stops
+/// observing the shutdown watch, and — because [`ConnPermit`] is released
+/// only when the task returns — pins its identity's connection quota. A peer
+/// with a closed TCP receive window or a half-open connection could hold
+/// those slots indefinitely and no lease expiry could reclaim them, since
+/// lease expiry works by signalling this very task.
+///
+/// A cancelled or timed-out write can leave a partially written frame on the
+/// wire; that is acceptable precisely because both outcomes end the
+/// connection (the caller breaks to teardown, dropping the socket).
+async fn send_bounded(
+    sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    msg: Message,
+    write_timeout: Duration,
+    shutdown_rx: &mut watch::Receiver<Option<&'static str>>,
+) -> Result<(), WriteStop> {
+    tokio::select! {
+        _ = shutdown_rx.changed() => Err(WriteStop::Shutdown(*shutdown_rx.borrow_and_update())),
+        sent = tokio::time::timeout(write_timeout, sink.send(msg)) => match sent {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(WriteStop::Disconnected),
+            Err(_) => Err(WriteStop::Disconnected),
+        },
+    }
+}
+
 async fn ws_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -197,6 +243,19 @@ async fn handle_connection(
     _permit: ConnPermit,
 ) {
     let (mut sink, mut stream) = socket.split();
+    let write_timeout = Duration::from_secs(state.cfg.write_timeout_secs);
+
+    // Shutdown signal so the CP can close this socket when it drops the
+    // registration on its own initiative (lease expiry) or must terminate the
+    // connection (terminal-frame backpressure).
+    //
+    // Created BEFORE the registration read — and therefore before the registry
+    // ever holds a clone — so no signal can be missed, and every write in this
+    // task, registration-phase writes included, can be raced against it. Kept
+    // alive here for the whole connection: closing is driven by an explicit
+    // signal, never by the registry happening to drop its side.
+    let shutdown = shutdown_signal();
+    let mut shutdown_rx = shutdown.subscribe();
 
     // --- Registration: mandatory first frame, within a deadline ---
     // An authenticated peer must not be able to park idle sockets: pings keep
@@ -226,7 +285,13 @@ async fn handle_connection(
                 timeout_secs = state.cfg.register_timeout_secs,
                 "no cp/register within the registration deadline — closing"
             );
-            let _ = sink.send(policy_close(REASON_REGISTER_TIMEOUT)).await;
+            let _ = send_bounded(
+                &mut sink,
+                policy_close(REASON_REGISTER_TIMEOUT),
+                write_timeout,
+                &mut shutdown_rx,
+            )
+            .await;
             return;
         }
     };
@@ -234,11 +299,13 @@ async fn handle_connection(
         Ok(ok) => ok,
         Err((id, err)) => {
             let resp = JsonRpcErrorResponse::new(id, err);
-            let _ = sink
-                .send(Message::Text(
-                    serde_json::to_string(&resp).expect("serializable").into(),
-                ))
-                .await;
+            let _ = send_bounded(
+                &mut sink,
+                Message::Text(serde_json::to_string(&resp).expect("serializable").into()),
+                write_timeout,
+                &mut shutdown_rx,
+            )
+            .await;
             return;
         }
     };
@@ -246,14 +313,6 @@ async fn handle_connection(
     // Outbound channel for this connection. Bounded: a peer that
     // cannot drain OUTBOUND_QUEUE frames is disconnected, not buffered.
     let (tx, mut rx) = mpsc::channel::<String>(OUTBOUND_QUEUE);
-
-    // Shutdown signal so the CP can close this socket when it drops the
-    // registration on its own initiative (lease expiry).
-    // Subscribed BEFORE registering so no signal can be missed, and kept
-    // alive here for the whole connection: closing is driven by an explicit
-    // signal, never by the registry happening to drop its side.
-    let shutdown = shutdown_signal();
-    let mut shutdown_rx = shutdown.subscribe();
 
     let effective_max = match identity.max_delegated_sessions_cap {
         Some(cap) => reg.max_delegated_sessions.min(cap),
@@ -297,19 +356,59 @@ async fn handle_connection(
         reg_rpc_id,
         serde_json::to_value(&ack).expect("serializable"),
     );
-    if sink
-        .send(Message::Text(
-            serde_json::to_string(&resp).expect("serializable").into(),
-        ))
-        .await
-        .is_err()
+    if let Err(stop) = send_bounded(
+        &mut sink,
+        Message::Text(serde_json::to_string(&resp).expect("serializable").into()),
+        write_timeout,
+        &mut shutdown_rx,
+    )
+    .await
     {
+        // CP-initiated closes carry meaning even here: if the CP signalled
+        // this connection while the ack was in flight, still tell the client
+        // why before tearing down.
+        if let WriteStop::Shutdown(Some(reason)) = stop {
+            let _ = send_bounded(
+                &mut sink,
+                policy_close(reason),
+                write_timeout,
+                &mut shutdown_rx,
+            )
+            .await;
+        }
         teardown(&state, handle, &identity);
         return;
     }
 
     // --- Main loop: interleave inbound frames, outbound channel, shutdown ---
+    //
+    // Every write goes through `send_bounded`: a `select!` arm body is not
+    // cancelled by the other arms, so an unbounded write here would stop this
+    // task from observing the shutdown watch and from releasing its
+    // `ConnPermit` — see `send_bounded`.
     let mut cp_close_reason: Option<&'static str> = None;
+    // A macro, not a closure: each expansion borrows `sink` only for the
+    // duration of its own arm body, and `break` acts on the loop below.
+    macro_rules! write_or_break {
+        ($msg:expr) => {
+            match send_bounded(&mut sink, $msg, write_timeout, &mut shutdown_rx).await {
+                Ok(()) => {}
+                Err(WriteStop::Shutdown(reason)) => {
+                    cp_close_reason = reason;
+                    break;
+                }
+                Err(WriteStop::Disconnected) => {
+                    warn!(
+                        handle,
+                        timeout_secs = state.cfg.write_timeout_secs,
+                        "outbound write failed or exceeded write_timeout_secs — \
+                         treating the peer as disconnected"
+                    );
+                    break;
+                }
+            }
+        };
+    }
     loop {
         tokio::select! {
             // The CP dropped this registration (lease expiry) or must
@@ -325,11 +424,7 @@ async fn handle_connection(
             }
             outbound = rx.recv() => {
                 match outbound {
-                    Some(text) => {
-                        if sink.send(Message::Text(text.into())).await.is_err() {
-                            break;
-                        }
-                    }
+                    Some(text) => write_or_break!(Message::Text(text.into())),
                     None => break,
                 }
             }
@@ -337,16 +432,10 @@ async fn handle_connection(
                 match inbound {
                     Some(Ok(Message::Text(text))) => {
                         if let Some(reply) = handle_frame(&state, handle, &text) {
-                            if sink.send(Message::Text(reply.into())).await.is_err() {
-                                break;
-                            }
+                            write_or_break!(Message::Text(reply.into()));
                         }
                     }
-                    Some(Ok(Message::Ping(p))) => {
-                        if sink.send(Message::Pong(p)).await.is_err() {
-                            break;
-                        }
-                    }
+                    Some(Ok(Message::Ping(p))) => write_or_break!(Message::Pong(p)),
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(_)) => {} // binary/pong ignored
                     Some(Err(e)) => {
@@ -365,7 +454,16 @@ async fn handle_connection(
             reason,
             "closing connection at the CP's request"
         );
-        let _ = sink.send(policy_close(reason)).await;
+        // Bounded like every other write: a peer that has stopped reading must
+        // not be able to delay teardown (and its quota slot) by refusing to
+        // accept the close frame.
+        let _ = send_bounded(
+            &mut sink,
+            policy_close(reason),
+            write_timeout,
+            &mut shutdown_rx,
+        )
+        .await;
     }
 
     teardown(&state, handle, &identity);
@@ -610,9 +708,26 @@ fn handle_frame(state: &Arc<AppState>, handle: u64, text: &str) -> Option<String
                     );
                     Some(serde_json::to_string(&resp).expect("serializable"))
                 }
-                // Delivered, or dropped as unknown/foreign (each case is
-                // logged; late results after a CP restart are expected).
-                _ => {
+                // The result reached the initiator, which is what the serving
+                // side is being acked for. Whether THIS frame also committed
+                // the state transition is a CP-internal matter: a concurrent
+                // cancel/sweep/disconnect may have ended the delegation
+                // first, and the initiator resolves competing terminal frames
+                // by "first one wins" (see the ADR wire contract).
+                CompleteOutcome::Delivered { committed } => {
+                    if !committed {
+                        info!(
+                            handle,
+                            "terminal result delivered, but the delegation had already been \
+                             ended (or its id re-admitted) — no state change"
+                        );
+                    }
+                    let resp = JsonRpcResponse::new(rpc_id, serde_json::json!({"ok": true}));
+                    Some(serde_json::to_string(&resp).expect("serializable"))
+                }
+                // Dropped as unknown/foreign; each case is logged in the
+                // router (late results after a CP restart are expected).
+                CompleteOutcome::Dropped => {
                     let resp = JsonRpcResponse::new(rpc_id, serde_json::json!({"ok": true}));
                     Some(serde_json::to_string(&resp).expect("serializable"))
                 }

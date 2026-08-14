@@ -74,6 +74,23 @@ pub struct CpConfig {
     #[serde(default = "default_max_connections_per_identity")]
     pub max_connections_per_identity: u32,
 
+    /// How long one outbound WebSocket write may block before the peer is
+    /// treated as disconnected.
+    ///
+    /// A bounded outbound queue does not bound the *writer*: a peer whose TCP
+    /// receive window is closed (or whose connection is half-open) leaves the
+    /// CP parked inside a single `send`, holding that identity's connection
+    /// slot and its in-flight delegations for as long as the socket survives —
+    /// which defeats lease-expiry recovery, because the connection task is
+    /// what reacts to the CP's own close signal. Every write is therefore
+    /// bounded by this timeout and raced against the shutdown signal; a
+    /// timeout is a disconnect.
+    ///
+    /// Generous enough for a slow-but-alive peer draining a large result,
+    /// short enough that a dead one frees its quota promptly.
+    #[serde(default = "default_write_timeout_secs")]
+    pub write_timeout_secs: u64,
+
     /// Identity table: auth key → immutable claims.
     /// Keyed by the key id (`kid`), with the secret alongside, so logs can
     /// reference identities without printing secrets.
@@ -111,6 +128,9 @@ fn default_register_timeout_secs() -> u64 {
 }
 fn default_max_connections_per_identity() -> u32 {
     8
+}
+fn default_write_timeout_secs() -> u64 {
+    30
 }
 
 /// Immutable identity claims bound to one auth key.
@@ -197,6 +217,11 @@ impl CpConfig {
         }
         if self.max_connections_per_identity == 0 {
             bail!("max_connections_per_identity must be at least 1");
+        }
+        // Zero would mean "every write times out instantly", i.e. no peer
+        // could ever be written to.
+        if self.write_timeout_secs == 0 {
+            bail!("write_timeout_secs must be greater than 0");
         }
         // Bearer keys over cleartext TCP must never reach an untrusted
         // network: non-loopback binds require the explicit override.
@@ -367,16 +392,21 @@ lease_expiry_secs = 30
         cfg.validate().unwrap();
         assert_eq!(cfg.register_timeout_secs, 10);
         assert_eq!(cfg.max_connections_per_identity, 8);
+        assert_eq!(cfg.write_timeout_secs, 30);
 
-        let explicit: CpConfig =
-            toml::from_str("register_timeout_secs = 3\nmax_connections_per_identity = 2").unwrap();
+        let explicit: CpConfig = toml::from_str(
+            "register_timeout_secs = 3\nmax_connections_per_identity = 2\nwrite_timeout_secs = 5",
+        )
+        .unwrap();
         explicit.validate().unwrap();
         assert_eq!(explicit.register_timeout_secs, 3);
         assert_eq!(explicit.max_connections_per_identity, 2);
+        assert_eq!(explicit.write_timeout_secs, 5);
 
         for bad in [
             "register_timeout_secs = 0",
             "max_connections_per_identity = 0",
+            "write_timeout_secs = 0",
         ] {
             let cfg: CpConfig = toml::from_str(bad).unwrap();
             assert!(cfg.validate().is_err(), "{bad} must be rejected");

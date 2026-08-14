@@ -40,6 +40,16 @@ register_timeout_secs = 10
 # on concurrent replicas of one logical agent.
 max_connections_per_identity = 8
 
+# How long a single outbound WebSocket write may block before the peer is
+# treated as disconnected. A bounded queue does not bound the writer: a peer
+# that stops reading (closed TCP receive window, half-open connection) would
+# otherwise park the CP inside one send, pinning that identity's connection
+# slots and its in-flight delegations for as long as the socket survives — and
+# lease expiry cannot recover it, because the connection task is what acts on
+# the CP's close signal. Keep it generous enough for a slow-but-alive peer
+# draining a large result, short enough that a dead one frees its quota.
+write_timeout_secs = 30
+
 [[agents]]
 key = "${CP_KEY_KOUDU}"          # per-agent secret, never shared
 namespace = "prod"

@@ -32,13 +32,13 @@ rationale. The essentials:
   TLS-terminating proxy (`wss://`) or a private network in front is
   required: runtimes authenticate with bearer keys that must never cross
   untrusted cleartext TCP.
-- `[[identity]]` — one entry per agent identity: the auth key (supports
+- `[[agents]]` — one entry per agent identity: the auth key (supports
   `${ENV_VAR}` expansion) and its immutable `namespace`/`name`/`type`
   claims. A connecting runtime must register as exactly the identity its
   key is bound to.
 - Heartbeats, lease expiry, registration deadline, per-identity connection
-  quotas, and frame/prompt/result size caps are all configurable with safe
-  defaults.
+  quotas, the outbound write timeout, and frame/prompt/result size caps are
+  all configurable with safe defaults.
 
 ## Health
 
@@ -50,5 +50,12 @@ issue #1474).
 - CP-initiated closes use WS code 1008 with a reason: `registration
   timeout`, `lease expired`, or `outbound queue overflow`. On any of these,
   reconnect, re-authenticate, and re-register.
+- A peer that stops reading is disconnected: any single outbound write that
+  blocks longer than `write_timeout_secs` is treated as a dead peer, so keep
+  draining the socket even while busy.
+- **The first terminal frame for a `delegation_id` wins.** A `completed`
+  result can race the CP's synthesized `timeout`, so an initiator may receive
+  more than one terminal frame for the same delegation. Treat the first as
+  authoritative and ignore later ones; the CP does not suppress them.
 - After a lease expires or the CP restarts, in-flight delegations are gone:
   initiators reconcile against their own deadlines and re-delegate.

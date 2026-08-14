@@ -17,6 +17,21 @@
 //! - **Saturation** — routing never queues; `SATURATED` is returned
 //!   immediately (fast-fail, no hidden buffer).
 //!
+//! # Terminal frames
+//!
+//! Ending a delegation is a two-sided event: a frame goes out on the wire and
+//! CP state is committed. The commit is exact — it claims the one admission it
+//! delivered a result for (key + serving handle + [`InFlight::generation`]) or
+//! nothing at all — so CP state stays consistent under any interleaving.
+//!
+//! The wire is a different matter: a `completed` result racing the deadline
+//! sweep's synthesized `timeout` can put TWO terminal frames on the wire for
+//! one `delegation_id`. v1 resolves that by contract instead of CP-side
+//! suppression (which would need per-id terminal state the CP deliberately
+//! does not keep): **the first terminal frame for a `delegation_id` wins**, and
+//! initiators MUST ignore later ones. See the v1 contract amendments in
+//! `docs/adr/agent-control-plane.md`.
+//!
 //! # Lock hierarchy
 //!
 //! The router holds two locks and acquires them in ONE order only:
@@ -41,6 +56,7 @@
 //! does not participate in this hierarchy.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
@@ -83,6 +99,18 @@ pub struct InFlight {
     /// CP-constructed chain for THIS delegation (root first, ends with the
     /// initiator). Children extend it.
     pub chain: Vec<String>,
+    /// CP-generated, never-reused admission stamp. `(namespace,
+    /// delegation_id)` is NOT a stable identity over time: the id is
+    /// client-supplied, and cancel-then-retry — a natural client pattern —
+    /// legitimately re-admits the same id, which with a single replica routes
+    /// to the same serving instance again. Key plus serving handle therefore
+    /// cannot distinguish the entry a two-phase completion peeked from a
+    /// later, unrelated admission wearing the same clothes (an ABA race).
+    ///
+    /// The generation makes that distinction total: it is minted once per
+    /// admission from a monotonic counter and never reused, so the commit
+    /// step claims the entry it actually delivered a result for, or nothing.
+    pub generation: u64,
 }
 
 /// In-flight table key: `(namespace, delegation_id)`.
@@ -116,6 +144,11 @@ pub struct Router {
     /// Delegation rates are LLM-scale; a coarse admission lock is simple and
     /// more than sufficient.
     admission: Mutex<()>,
+    /// Source of [`InFlight::generation`] stamps. Monotonic and never reset
+    /// (the table dies with the process, so a restart cannot collide with
+    /// anything still in flight): every admission gets a value no earlier or
+    /// later admission has worn.
+    next_generation: AtomicU64,
 }
 
 pub enum DelegateOutcome {
@@ -125,19 +158,8 @@ pub enum DelegateOutcome {
     Rejected(ErrorObject),
 }
 
-/// Which side of a delegation a caller must be to act on it.
-#[derive(Clone, Copy)]
-enum Owner {
-    /// The instance the delegation was routed to — the only one that may
-    /// complete it.
-    Server,
-    /// The instance that initiated the delegation — the only one that may
-    /// cancel it.
-    Initiator,
-}
-
-/// Result of looking up an in-flight delegation on a caller's behalf and
-/// asserting the caller owns it.
+/// Result of looking up an in-flight delegation on behalf of its claimed
+/// initiator and removing it if the claim holds.
 ///
 /// The whole check happens under ONE acquisition of the in-flight lock, which
 /// is the property that matters: an earlier version removed the entry,
@@ -145,10 +167,16 @@ enum Owner {
 /// landing in that window saw an empty table and was dropped as "unknown id",
 /// leaving the delegation to stall until its deadline. Here the entry is
 /// either removed because the caller owns it, or never touched at all.
+///
+/// Single-phase by construction — the caller acts on the returned entry
+/// without going back to the table — so no window exists in which the id
+/// could be re-admitted under the caller's feet. Contrast the two-phase
+/// completion path, which needs [`InFlight::generation`] for exactly that
+/// reason. `cp/cancel` is this helper's only caller.
 enum Claim {
-    /// The caller owns it; the entry has already been removed from the table.
+    /// The caller initiated it; the entry has already been removed.
     Owned(InFlight),
-    /// The entry exists but belongs to another instance. Left in place.
+    /// The entry exists but was initiated by another instance. Left in place.
     WrongOwner {
         namespace: String,
         /// Handle of the instance that does own it (CP-side logs only — it is
@@ -162,12 +190,64 @@ enum Claim {
     Unregistered,
 }
 
+/// Phase-1 snapshot of a completion: the entry as it existed at peek time,
+/// including its [`InFlight::generation`] stamp, or why no result can be
+/// delivered for it. A peek never removes anything.
+enum Peek {
+    /// The caller is the instance the delegation was routed to.
+    Serving(InFlight),
+    /// The entry exists but another instance serves it. Left in place — a
+    /// non-owner frame must never make the delegation momentarily invisible
+    /// to a genuine result or to the deadline sweep.
+    Foreign {
+        /// CP-side logs only; never disclosed to the caller.
+        owner_handle: u64,
+    },
+    /// No entry for `(namespace, delegation_id)`.
+    Unknown,
+}
+
+/// Phase-2 result of committing a delivered completion (see
+/// [`Router::commit_completion`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Commit {
+    /// The peeked admission was still the live one: entry removed and the
+    /// serving instance's capacity released, exactly once.
+    Claimed,
+    /// The entry is gone — a concurrent cancel, sweep, disconnect, or a
+    /// duplicate result's commit removed it. Whichever path removed it
+    /// released the capacity; this one must not decrement again.
+    Vanished,
+    /// A DIFFERENT admission holds `(namespace, delegation_id)` now: the id
+    /// was removed and re-admitted between peek and commit (cancel-then-retry
+    /// routed back to the same worker is the ordinary way this happens, and
+    /// with a single replica it is the *only* way it happens). The live entry
+    /// and its capacity are left untouched: claiming it would erase a
+    /// delegation that is genuinely running and silently drop its real result
+    /// later.
+    Superseded {
+        /// Generation now holding the id (CP-side logs only).
+        generation: u64,
+    },
+}
+
 /// Outcome of a `cp/delegate_result` frame (see [`Router::complete`]).
+///
+/// Wire delivery and state commit are distinct events: the initiator can have
+/// received the result while the CP's own bookkeeping was concluded by
+/// somebody else (a concurrent cancel, sweep, or disconnect). Collapsing the
+/// two hid whether this frame is the one that ended the delegation.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CompleteOutcome {
-    /// The result was accepted by the initiator's queue; the delegation is
-    /// finished and the serving instance's capacity was released.
-    Delivered,
+    /// The result reached the initiator's queue.
+    Delivered {
+        /// Whether THIS frame also committed the state transition — removed
+        /// the in-flight entry it peeked and released the serving instance's
+        /// capacity. `false` means a concurrent path had already ended the
+        /// delegation (or its id was re-admitted), so nothing was changed
+        /// here; the frame was still delivered.
+        committed: bool,
+    },
     /// The frame was refused or the delegation is unknown (wrong owner,
     /// unknown id, unregistered caller, or the initiator is gone). Nothing
     /// changed; each case is logged.
@@ -188,6 +268,7 @@ impl Router {
         Self {
             inflight: Mutex::new(BTreeMap::new()),
             admission: Mutex::new(()),
+            next_generation: AtomicU64::new(0),
         }
     }
 
@@ -312,6 +393,40 @@ impl Router {
         // Reserve capacity and record the in-flight entry BEFORE sending, so
         // an immediately-arriving result finds it. Roll both back if the send
         // fails.
+        //
+        // Minted BEFORE the capacity reservation so exhaustion cannot leave a
+        // reserved slot behind. `fetch_add` on an exhausted counter would wrap
+        // and re-issue generation values, silently recreating the ABA this
+        // stamp exists to prevent — so exhaustion fails the admission instead.
+        // (Unreachable in practice: one admission per nanosecond exhausts a
+        // u64 after ~584 years; this is fail-closed insurance, not a path.)
+        // `fetch_update` rather than `fetch_add`: an exhausted counter must
+        // NOT be written (fetch_add would wrap the atomic itself and re-issue
+        // generations from 0). Refusal leaves the counter parked at the
+        // ceiling, so every later admission is refused too — fail closed,
+        // permanently, with no wrapping path.
+        let generation =
+            match self
+                .next_generation
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |g| {
+                    if g >= u64::MAX - 1 {
+                        None
+                    } else {
+                        Some(g + 1)
+                    }
+                }) {
+                Ok(prev) => prev + 1,
+                Err(_) => {
+                    tracing::error!("delegation generation space exhausted — refusing admission");
+                    // -32603 = JSON-RPC internal error; no protocol-specific code
+                    // is warranted for a condition that cannot occur in a
+                    // process's realistic lifetime.
+                    return DelegateOutcome::Rejected(ErrorObject::new(
+                        -32603,
+                        "control plane generation space exhausted; restart the CP",
+                    ));
+                }
+            };
         registry.adjust_sessions(target.handle, 1);
         let entry = InFlight {
             namespace: from_namespace.to_string(),
@@ -322,6 +437,10 @@ impl Router {
             to_handle: target.handle,
             deadline: params.deadline,
             chain,
+            // Stamped under the admission lock, so every admission — including
+            // a re-admission of an id that was just cancelled — is
+            // distinguishable from every other for the life of the process.
+            generation,
         };
         self.inflight.lock().insert(key.clone(), entry.clone());
 
@@ -336,7 +455,12 @@ impl Router {
             // concurrent removal would double-release: the saturating math
             // hides the underflow and `saturated()` then admits new work to
             // an instance that is actually full.
-            if self.inflight.lock().remove(&key).is_some() {
+            //
+            // Matched on the generation, not just the key: the admission lock
+            // happens to rule out a re-admission of this id while we are
+            // here, but the rollback does not need that argument to be
+            // correct — it removes the exact entry it inserted or nothing.
+            if self.remove_generation(&key, entry.generation).is_some() {
                 registry.adjust_sessions(target.handle, -1);
             }
             return DelegateOutcome::Rejected(ErrorObject::new(
@@ -360,14 +484,25 @@ impl Router {
         })
     }
 
-    /// Look up `delegation_id` in the caller's namespace, assert the caller is
-    /// the delegation's `owner` side, and remove the entry if so — all under
-    /// one acquisition of the in-flight lock (see [`Claim`]).
+    /// Remove `key` only if it still holds `generation` — the exact admission
+    /// the caller is acting for — under one lock acquisition. Any other entry
+    /// (or none) is left untouched.
+    fn remove_generation(&self, key: &DelegationKey, generation: u64) -> Option<InFlight> {
+        let mut g = self.inflight.lock();
+        match g.get(key) {
+            Some(e) if e.generation == generation => g.remove(key),
+            _ => None,
+        }
+    }
+
+    /// Look up `delegation_id` in the caller's namespace, assert the caller
+    /// initiated it, and remove the entry if so — all under one acquisition of
+    /// the in-flight lock (see [`Claim`]).
     ///
     /// The namespace is taken from the caller's authenticated registration,
     /// never from the frame, so a delegation id can only ever be resolved
     /// inside the namespace of the connection that named it.
-    fn claim(&self, registry: &Registry, handle: u64, delegation_id: &str, owner: Owner) -> Claim {
+    fn claim(&self, registry: &Registry, handle: u64, delegation_id: &str) -> Claim {
         // Registry lookup completes before the in-flight lock is taken; the
         // two locks are never held together (see the lock hierarchy above).
         let namespace = match registry.get(handle) {
@@ -377,10 +512,7 @@ impl Router {
         let key = DelegationKey::new(&namespace, delegation_id);
         let mut g = self.inflight.lock();
         let owner_handle = match g.get(&key) {
-            Some(e) => match owner {
-                Owner::Server => e.to_handle,
-                Owner::Initiator => e.from_handle,
-            },
+            Some(e) => e.from_handle,
             None => return Claim::NotFound { namespace },
         };
         if owner_handle != handle {
@@ -393,17 +525,80 @@ impl Router {
         Claim::Owned(entry)
     }
 
+    /// Phase 1 of a completion: snapshot the entry for `(namespace,
+    /// delegation_id)` and assert `serving_handle` is the instance it was
+    /// routed to — under one in-flight lock acquisition, removing nothing.
+    ///
+    /// The returned [`InFlight`] carries the [`InFlight::generation`] the
+    /// commit step must match, so delivery can happen outside the lock without
+    /// the commit ever being able to claim a different admission.
+    fn peek_for_completion(
+        &self,
+        namespace: &str,
+        delegation_id: &str,
+        serving_handle: u64,
+    ) -> Peek {
+        let key = DelegationKey::new(namespace, delegation_id);
+        let g = self.inflight.lock();
+        match g.get(&key) {
+            Some(e) if e.to_handle == serving_handle => Peek::Serving(e.clone()),
+            Some(e) => Peek::Foreign {
+                owner_handle: e.to_handle,
+            },
+            None => Peek::Unknown,
+        }
+    }
+
+    /// Phase 2 of a completion: end the delegation `peeked` describes.
+    ///
+    /// Under ONE in-flight lock acquisition, the entry is removed and the
+    /// serving instance's capacity released only if the live entry is still
+    /// the same admission — key, serving handle, AND generation all match.
+    /// Anything else is left strictly untouched, including its capacity:
+    ///
+    /// - a concurrent cancel/sweep/disconnect already ended it → [`Commit::Vanished`],
+    ///   and that path already released the capacity (releasing it here too
+    ///   would let `saturated()` admit work to a full instance);
+    /// - the id was re-admitted in the meantime → [`Commit::Superseded`]. This
+    ///   is the ABA case that made a stale commit destructive: matching on
+    ///   key + serving handle alone, a commit for delegation *n* would remove
+    ///   the live entry of delegation *n+1* (cancel-then-retry re-admits the
+    ///   same id, and with one replica it routes to the same worker), making a
+    ///   running delegation invisible to its own genuine result and to the
+    ///   sweep, and wrongly freeing its slot.
+    fn commit_completion(&self, registry: &Registry, peeked: &InFlight) -> Commit {
+        let key = DelegationKey::new(&peeked.namespace, &peeked.delegation_id);
+        let removed = {
+            let mut g = self.inflight.lock();
+            match g.get(&key) {
+                Some(e) if e.to_handle == peeked.to_handle && e.generation == peeked.generation => {
+                    g.remove(&key).expect("present under the same lock")
+                }
+                Some(e) => {
+                    return Commit::Superseded {
+                        generation: e.generation,
+                    }
+                }
+                None => return Commit::Vanished,
+            }
+        };
+        registry.adjust_sessions(removed.to_handle, -1);
+        Commit::Claimed
+    }
+
     /// Handle `cp/delegate_result` from the serving runtime.
     ///
     /// The terminal result is the one frame that must never be silently
     /// dropped, so delivery happens in two phases:
     ///
     /// 1. **Peek** — validate ownership under one in-flight lock acquisition
-    ///    without removing the entry, then build and `try_send` the
-    ///    initiator-bound frame.
+    ///    without removing the entry ([`Router::peek_for_completion`]), then
+    ///    build and `try_send` the initiator-bound frame.
     /// 2. **Commit** — only after the initiator's queue accepted the frame,
-    ///    remove the entry (via [`Claim`], same single-lock property) and
-    ///    release the serving instance's capacity.
+    ///    end the delegation ([`Router::commit_completion`]): remove the
+    ///    entry and release the serving instance's capacity, but only if the
+    ///    live entry is still the very admission that was peeked (key +
+    ///    serving handle + [`InFlight::generation`]).
     ///
     /// If the initiator's bounded queue refuses the frame, the entry stays
     /// in flight and [`CompleteOutcome::InitiatorStalled`] tells the caller
@@ -411,11 +606,19 @@ impl Router {
     /// contract): its teardown runs `fail_instance`, which releases capacity
     /// exactly once and sends `cp/cancel` to the serving runtime.
     ///
-    /// Peek-then-commit admits one benign race: two concurrent genuine
-    /// results for the same id can both pass the peek and both be delivered,
-    /// but only the first commit releases capacity (the second finds the
-    /// entry gone and does nothing). Duplicate `cp/delegate_result` frames
-    /// are correlated by `delegation_id` and idempotent for the initiator.
+    /// Nothing outside the commit's exact-match window is touched, so the
+    /// peek-send window cannot corrupt CP state: a concurrent cancel, sweep,
+    /// or disconnect that already ended the delegation leaves this frame with
+    /// `Delivered { committed: false }`, and an id re-admitted in the window
+    /// keeps its own live entry and capacity.
+    ///
+    /// What the window *can* still produce is more than one terminal frame on
+    /// the wire for one `delegation_id` — a `completed` result racing the
+    /// sweep's synthesized `timeout`, or two duplicate results both passing
+    /// the peek. That is resolved by contract, not by CP-side suppression:
+    /// initiators MUST treat the FIRST terminal frame for a `delegation_id` as
+    /// authoritative and ignore later ones (see "first terminal frame wins"
+    /// in the ADR's v1 contract amendments).
     ///
     /// Only the instance the delegation was routed to may complete it; a
     /// non-owner frame can never make the delegation momentarily invisible
@@ -442,24 +645,22 @@ impl Router {
                 return CompleteOutcome::Dropped;
             }
         };
-        let key = DelegationKey::new(&namespace, &params.delegation_id);
-        let entry = {
-            let g = self.inflight.lock();
-            match g.get(&key) {
-                Some(e) if e.to_handle == serving_handle => e.clone(),
-                Some(e) => {
+        let entry =
+            match self.peek_for_completion(&namespace, &params.delegation_id, serving_handle) {
+                Peek::Serving(e) => e,
+                Peek::Foreign { owner_handle } => {
                     // Only the instance the delegation was routed to may
                     // complete it. The entry stays exactly where it is.
                     warn!(
                         delegation = %params.delegation_id,
                         namespace = %namespace,
-                        expected = e.to_handle,
+                        expected = owner_handle,
                         got = serving_handle,
                         "result from unexpected instance — dropped, delegation untouched"
                     );
                     return CompleteOutcome::Dropped;
                 }
-                None => {
+                Peek::Unknown => {
                     warn!(
                         delegation = %params.delegation_id,
                         namespace = %namespace,
@@ -467,8 +668,7 @@ impl Router {
                     );
                     return CompleteOutcome::Dropped;
                 }
-            }
-        };
+            };
 
         // Truncate oversized results (keep the head; delegation already
         // ran). The marker counts against the cap: the final value never
@@ -519,50 +719,45 @@ impl Router {
             };
         }
 
-        // Phase 2 — commit. If a concurrent path (duplicate result, cancel,
-        // sweep, fail_instance) removed the entry between peek and now, that
-        // path also released the capacity — do not decrement twice.
-        match self.claim(
-            registry,
-            serving_handle,
-            &params.delegation_id,
-            Owner::Server,
-        ) {
-            Claim::Owned(e) => {
-                registry.adjust_sessions(e.to_handle, -1);
+        // Phase 2 — commit. Claims ONLY the admission that was peeked; see
+        // `commit_completion` for why key + serving handle is not enough.
+        let committed = match self.commit_completion(registry, &entry) {
+            Commit::Claimed => {
                 info!(
                     delegation = %params.delegation_id,
                     status = ?params.status,
-                    from = %e.to_logical,
-                    to = %e.from_logical,
+                    from = %entry.to_logical,
+                    to = %entry.from_logical,
                     "delegation completed"
                 );
+                true
             }
-            Claim::WrongOwner {
-                namespace,
-                owner_handle,
-            } => {
-                // Only possible if the id was removed and re-admitted between
-                // peek and commit. The new delegation is not ours to touch.
-                warn!(
-                    delegation = %params.delegation_id,
-                    namespace = %namespace,
-                    owner = owner_handle,
-                    "delegation re-owned between delivery and commit — entry left untouched"
-                );
-            }
-            Claim::NotFound { namespace } => {
+            Commit::Vanished => {
                 // Concurrent removal (duplicate result, cancel, sweep, or
                 // fail_instance): whoever removed it released the capacity.
                 info!(
                     delegation = %params.delegation_id,
-                    namespace = %namespace,
+                    namespace = %entry.namespace,
                     "entry removed concurrently after delivery — capacity already released"
                 );
+                false
             }
-            Claim::Unregistered => {}
-        }
-        CompleteOutcome::Delivered
+            Commit::Superseded { generation } => {
+                // The id was cancelled/expired and re-admitted between peek
+                // and commit. That new delegation is live and not ours to
+                // touch: removing it would strand a running delegation and
+                // free a slot it still occupies.
+                warn!(
+                    delegation = %params.delegation_id,
+                    namespace = %entry.namespace,
+                    peeked_generation = entry.generation,
+                    live_generation = generation,
+                    "delegation id re-admitted between delivery and commit — live entry left untouched"
+                );
+                false
+            }
+        };
+        CompleteOutcome::Delivered { committed }
     }
 
     /// Handle `cp/cancel` from the initiator. Returns the frame to forward
@@ -588,18 +783,17 @@ impl Router {
                 "delegation is not in flight for this instance",
             )
         };
-        let entry = match self.claim(
-            registry,
-            from_handle,
-            &params.delegation_id,
-            Owner::Initiator,
-        ) {
+        let entry = match self.claim(registry, from_handle, &params.delegation_id) {
             Claim::Owned(entry) => entry,
-            Claim::WrongOwner { namespace, .. } => {
+            Claim::WrongOwner {
+                namespace,
+                owner_handle,
+            } => {
                 warn!(
                     delegation = %params.delegation_id,
                     namespace = %namespace,
                     handle = from_handle,
+                    initiator = owner_handle,
                     "cancel refused: only the initiating instance may cancel"
                 );
                 return Err(refused());
@@ -904,7 +1098,7 @@ type = "worker"
         };
         assert_eq!(
             w.router.complete(&w.registry, w.h_worker, result, 1024, 2),
-            CompleteOutcome::Delivered
+            CompleteOutcome::Delivered { committed: true }
         );
         let frame = w.primary_rx.try_recv().unwrap();
         assert!(frame.contains("\"completed\""));
@@ -930,7 +1124,7 @@ type = "worker"
         };
         assert_eq!(
             w.router.complete(&w.registry, w.h_worker, result, 1024, 2),
-            CompleteOutcome::Delivered
+            CompleteOutcome::Delivered { committed: true }
         );
         w.worker_rx.try_recv().unwrap();
     }
@@ -1188,7 +1382,7 @@ type = "worker"
         let cap = 96usize;
         assert_eq!(
             w.router.complete(&w.registry, w.h_worker, result, cap, 2),
-            CompleteOutcome::Delivered
+            CompleteOutcome::Delivered { committed: true }
         );
         let frame = w.primary_rx.try_recv().unwrap();
         let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
@@ -1215,7 +1409,7 @@ type = "worker"
         };
         assert_eq!(
             w.router.complete(&w.registry, w.h_worker, result2, 8, 3),
-            CompleteOutcome::Delivered
+            CompleteOutcome::Delivered { committed: true }
         );
         let frame2 = w.primary_rx.try_recv().unwrap();
         let v2: serde_json::Value = serde_json::from_str(&frame2).unwrap();
@@ -1488,7 +1682,7 @@ allow_worker_initiation = true
                     1024,
                     3,
                 ),
-                CompleteOutcome::Delivered,
+                CompleteOutcome::Delivered { committed: true },
                 "genuine result must be delivered, never dropped"
             );
             let frame = w.primary_rx.try_recv().unwrap();
@@ -1537,7 +1731,7 @@ allow_worker_initiation = true
                         result_of("d-1", "spoofed"),
                         1024,
                         2,
-                    ) == CompleteOutcome::Delivered
+                    ) == CompleteOutcome::Delivered { committed: true }
                 });
                 gate.wait();
                 let genuine = w.router.complete(
@@ -1546,7 +1740,7 @@ allow_worker_initiation = true
                     result_of("d-1", "genuine"),
                     1024,
                     3,
-                ) == CompleteOutcome::Delivered;
+                ) == CompleteOutcome::Delivered { committed: true };
                 (spoof.join().unwrap(), genuine)
             });
             assert!(!spoofed, "a non-owner must never complete a delegation");
@@ -1734,7 +1928,7 @@ allow_worker_initiation = true
         // Results route to the initiator of the SAME namespace only.
         assert_eq!(
             router.complete(&registry, hw_dev, result_of("d-1", "dev-done"), 1024, 12),
-            CompleteOutcome::Delivered
+            CompleteOutcome::Delivered { committed: true }
         );
         let frame = dev_init_rx.try_recv().unwrap();
         assert!(frame.contains("dev-done"));
@@ -1749,7 +1943,7 @@ allow_worker_initiation = true
 
         assert_eq!(
             router.complete(&registry, hw_prod, result_of("d-1", "prod-done"), 1024, 13),
-            CompleteOutcome::Delivered
+            CompleteOutcome::Delivered { committed: true }
         );
         let frame = prod_init_rx.try_recv().unwrap();
         assert!(frame.contains("prod-done"));
@@ -1839,5 +2033,310 @@ allow_worker_initiation = true
             router.chain_of("prod", "d-child").unwrap(),
             vec!["prod/koudu".to_string(), "prod/worker-1".to_string()]
         );
+    }
+
+    /// Phase-1 snapshot exactly as `complete` takes it, so a test can hold a
+    /// real pre-delivery entry (generation included) across an interleaved
+    /// operation and then drive the commit step directly — deterministic,
+    /// no barrier timing.
+    fn peek(w: &World, id: &str) -> InFlight {
+        match w.router.peek_for_completion("prod", id, w.h_worker) {
+            Peek::Serving(e) => e,
+            _ => panic!("{id} must be in flight and served by the worker"),
+        }
+    }
+
+    /// How the in-flight entry is removed between peek and commit.
+    #[derive(Debug, Clone, Copy)]
+    enum Interleaved {
+        /// The initiator cancels (`cp/cancel`).
+        Cancel,
+        /// The deadline sweep expires it.
+        Sweep,
+    }
+
+    /// Perform the interleaved removal and return the frames it synthesized
+    /// for delivery (the router builds them; the caller is what sends them).
+    fn interleave(w: &World, how: Interleaved, id: &str) -> Vec<String> {
+        match how {
+            Interleaved::Cancel => {
+                let params = CancelParams {
+                    delegation_id: id.into(),
+                    reason: "changed my mind".into(),
+                };
+                w.router
+                    .cancel(&w.registry, w.h_primary, &params, 90)
+                    .expect("the initiator may cancel")
+                    .map(|(_, frame)| frame)
+                    .into_iter()
+                    .collect()
+            }
+            Interleaved::Sweep => {
+                let mut id_seq = 900u64;
+                let mut next = || {
+                    id_seq += 1;
+                    id_seq
+                };
+                let frames = w.router.sweep_deadlines(
+                    &w.registry,
+                    Utc::now() + Duration::seconds(3600),
+                    &mut next,
+                );
+                assert!(!frames.is_empty(), "the sweep must have expired something");
+                frames.into_iter().map(|(_, frame)| frame).collect()
+            }
+        }
+    }
+
+    fn drain(w: &mut World) {
+        while w.worker_rx.try_recv().is_ok() {}
+        while w.primary_rx.try_recv().is_ok() {}
+    }
+
+    #[test]
+    fn stale_commit_never_claims_a_reused_delegation_id() {
+        // The ABA case. `(namespace, delegation_id)` + serving handle is not a
+        // stable identity: cancel-then-retry is an ordinary client pattern, the
+        // id is client-supplied, and with a single replica the retry routes to
+        // the SAME worker. A commit that matched on those alone would remove
+        // the RETRY's live entry and release its capacity — the running
+        // delegation becomes invisible to its own genuine result and to the
+        // sweep, and its slot is handed out while still occupied.
+        //
+        // The generation stamp makes the commit claim the admission it
+        // actually delivered for, or nothing.
+        for how in [Interleaved::Cancel, Interleaved::Sweep] {
+            let mut w = world(); // worker max_delegated_sessions = 1
+            assert!(matches!(
+                do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+                DelegateOutcome::Accepted(_)
+            ));
+            // A: peeked, its initiator-bound frame notionally sent.
+            let a = peek(&w, "d-1");
+
+            // A is removed and its capacity released by another path.
+            interleave(&w, how, "d-1");
+            assert_eq!(w.router.inflight_count(), 0, "{how:?}");
+            assert_eq!(
+                w.registry.get(w.h_worker).unwrap().active_sessions,
+                0,
+                "{how:?}: the removing path releases the capacity"
+            );
+            drain(&mut w);
+
+            // B: the initiator retries the same id; the only replica is the
+            // same worker, so key AND serving handle repeat exactly.
+            assert!(
+                matches!(
+                    do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+                    DelegateOutcome::Accepted(_)
+                ),
+                "{how:?}: the freed slot must admit the retry"
+            );
+            let b = peek(&w, "d-1");
+            assert_eq!(a.to_handle, b.to_handle, "{how:?}: same worker");
+            assert_eq!(a.delegation_id, b.delegation_id);
+            assert_ne!(
+                a.generation, b.generation,
+                "{how:?}: generations are never reused"
+            );
+
+            // The stale commit for A lands. It must claim nothing.
+            assert_eq!(
+                w.router.commit_completion(&w.registry, &a),
+                Commit::Superseded {
+                    generation: b.generation
+                },
+                "{how:?}: a stale commit must not claim the re-admitted entry"
+            );
+            assert_eq!(
+                w.router.inflight_count(),
+                1,
+                "{how:?}: B must remain in flight"
+            );
+            assert_eq!(
+                w.router.chain_of("prod", "d-1").as_deref(),
+                Some(&["prod/koudu".to_string()][..]),
+                "{how:?}: B must still be visible to results and to the sweep"
+            );
+            assert_eq!(
+                w.registry.get(w.h_worker).unwrap().active_sessions,
+                1,
+                "{how:?}: B's capacity reservation must be intact"
+            );
+
+            // B then completes normally — its genuine result is delivered and
+            // commits, releasing the capacity exactly once.
+            assert_eq!(
+                w.router.complete(
+                    &w.registry,
+                    w.h_worker,
+                    result_of("d-1", "genuine"),
+                    1024,
+                    7
+                ),
+                CompleteOutcome::Delivered { committed: true },
+                "{how:?}"
+            );
+            let frame = w.primary_rx.try_recv().expect("initiator got the result");
+            assert!(frame.contains("genuine"), "{how:?}");
+            assert_eq!(w.router.inflight_count(), 0, "{how:?}");
+            assert_eq!(
+                w.registry.get(w.h_worker).unwrap().active_sessions,
+                0,
+                "{how:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn commit_after_cancel_releases_capacity_exactly_once() {
+        // commit-vs-cancel, driven directly: the initiator cancels between the
+        // peek and the commit and no retry follows. The commit finds its
+        // admission gone and must not decrement again — session counts are
+        // saturating, so a double release is silent and `saturated()` would
+        // then admit work to a full instance.
+        let mut w = world();
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        // Second delegation on a 4-slot target, to make an underflow visible
+        // as a wrong count rather than a saturating clamp at zero.
+        let (extra, _extra_rx) = instance("prod", "worker-2", AgentType::Worker, 4);
+        let h_extra = w.registry.register(extra);
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-2", "worker-2", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        let a = peek(&w, "d-1");
+
+        interleave(&w, Interleaved::Cancel, "d-1");
+        assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 0);
+        drain(&mut w);
+
+        assert_eq!(
+            w.router.commit_completion(&w.registry, &a),
+            Commit::Vanished
+        );
+        assert_eq!(
+            w.registry.get(w.h_worker).unwrap().active_sessions,
+            0,
+            "capacity must be released exactly once, by the cancel"
+        );
+        // The unrelated delegation is untouched by any of this.
+        assert_eq!(w.router.inflight_count(), 1);
+        assert_eq!(w.registry.get(h_extra).unwrap().active_sessions, 1);
+    }
+
+    #[test]
+    fn commit_after_deadline_sweep_releases_capacity_exactly_once() {
+        // commit-vs-sweep, driven directly: the deadline sweep expires the
+        // delegation between the peek and the commit. Same requirement as the
+        // cancel case, and the initiator has already been sent the sweep's
+        // `timeout` — the wire then carries two terminal frames for one id,
+        // which the ADR resolves with "first terminal frame wins".
+        let mut w = world();
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        let a = peek(&w, "d-1");
+
+        // The sweep's `timeout` is the first terminal frame for this id; the
+        // late `completed` result below is the second, which the initiator
+        // ignores per the ADR's "first terminal frame wins".
+        let swept = interleave(&w, Interleaved::Sweep, "d-1");
+        assert!(
+            swept.iter().any(|f| f.contains("\"timeout\"")),
+            "the sweep must synthesize a timeout result for the initiator"
+        );
+        assert_eq!(w.router.inflight_count(), 0);
+        assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 0);
+        drain(&mut w);
+
+        assert_eq!(
+            w.router.commit_completion(&w.registry, &a),
+            Commit::Vanished
+        );
+        assert_eq!(
+            w.registry.get(w.h_worker).unwrap().active_sessions,
+            0,
+            "capacity must be released exactly once, by the sweep"
+        );
+        assert_eq!(w.router.inflight_count(), 0);
+        // The freed slot is genuinely free (a double release would have made
+        // the count underflow and this admission could exceed max=1).
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-2", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        match do_delegate(&w, delegate_params("d-3", "worker-1", 60)) {
+            DelegateOutcome::Rejected(e) => assert_eq!(
+                e.code,
+                codes::SATURATED,
+                "the worker's single slot must still bound admission"
+            ),
+            _ => panic!("expected SATURATED — capacity accounting drifted"),
+        }
+    }
+
+    #[test]
+    fn delivered_reports_whether_it_committed() {
+        // Wire delivery and state commit are separate events, and the outcome
+        // says which happened: an unconditional `Delivered` could not
+        // distinguish "this frame ended the delegation" from "somebody else
+        // already had".
+        let mut w = world();
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        let a = peek(&w, "d-1");
+        assert_eq!(
+            w.router.commit_completion(&w.registry, &a),
+            Commit::Claimed,
+            "the live admission is claimed exactly once"
+        );
+        assert_eq!(
+            w.router.commit_completion(&w.registry, &a),
+            Commit::Vanished,
+            "a repeated commit of the same admission is a no-op"
+        );
+        assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 0);
+        drain(&mut w);
+
+        // Through the public path: the entry is gone, so the frame is not
+        // even delivered — a peek that finds nothing is a plain drop.
+        assert_eq!(
+            w.router
+                .complete(&w.registry, w.h_worker, result_of("d-1", "late"), 1024, 8),
+            CompleteOutcome::Dropped
+        );
+        assert!(w.primary_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn generation_exhaustion_fails_closed_instead_of_wrapping() {
+        // fetch_add on an exhausted counter would wrap and re-issue
+        // generations, silently recreating the ABA the stamp prevents.
+        // Unreachable in a realistic process lifetime; pinned here so a
+        // refactor cannot quietly downgrade it to wrapping arithmetic.
+        let w = world();
+        w.router
+            .next_generation
+            .store(u64::MAX - 1, Ordering::Relaxed);
+        // At the ceiling, fetch_update declines to store: the admission is
+        // refused and the counter stays parked at MAX-1 forever.
+        let out = do_delegate(&w, delegate_params("d-last", "worker-1", 60));
+        assert!(
+            matches!(out, DelegateOutcome::Rejected(ref e) if e.code == -32603),
+            "exhausted generation space must refuse admission"
+        );
+        // No capacity was reserved by the refused admission.
+        assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 0);
+        // And it stays parked: the next attempt is refused too.
+        let out2 = do_delegate(&w, delegate_params("d-next", "worker-1", 60));
+        assert!(matches!(out2, DelegateOutcome::Rejected(ref e) if e.code == -32603));
     }
 }

@@ -275,10 +275,17 @@ recovery semantics:
 - **Resource bounds.** The WS transport rejects messages over
   `max_frame_bytes` before parsing; oversized `prompt`s are rejected
   (`max_prompt_bytes`); per-connection outbound queues are bounded and a
-  peer that cannot drain its queue is treated as disconnected. Delegation
-  admission (duplicate check → target selection → capacity reservation →
-  in-flight insert) is one atomic sequence, and the in-flight entry exists
-  before the forward frame is sent.
+  peer that cannot drain its queue is treated as disconnected. Every outbound
+  write is additionally bounded by `write_timeout_secs` and raced against the
+  CP's own close signal, because a bounded queue does not bound the *writer*:
+  a peer that stops reading (closed TCP receive window, half-open connection)
+  would otherwise park the connection task inside one `send`, pinning that
+  identity's connection quota and its in-flight delegations for as long as the
+  socket survives — and lease expiry could not reclaim them, since lease
+  expiry works by signalling that very task. A write that times out is a
+  disconnect. Delegation admission (duplicate check → target selection →
+  capacity reservation → in-flight insert) is one atomic sequence, and the
+  in-flight entry exists before the forward frame is sent.
 - **Terminal results are never silently dropped.** `cp/delegate_result`
   delivery commits only after the initiator's queue accepts the frame: the
   CP validates ownership, sends, and only then removes the in-flight entry
@@ -288,11 +295,30 @@ recovery semantics:
   `outbound queue overflow` — the "cannot drain → disconnected" rule applied
   to the frame where it matters most), and the delegation resolves through
   the disconnect path: `cp/cancel` to the serving runtime and exactly one
-  capacity release. Two concurrent duplicate results may both be delivered
-  (correlation is by `delegation_id`; delivery is idempotent for the
-  initiator), but capacity is released exactly once. Best-effort frames
-  (`cp/cancel`, sweep-synthesized `timeout`) remain fire-and-forget: the
-  propagated deadline is their backstop.
+  capacity release. Best-effort frames (`cp/cancel`, sweep-synthesized
+  `timeout`) remain fire-and-forget: the propagated deadline is their backstop.
+- **Admissions carry a generation; commits are exact.** Every admission is
+  stamped with a CP-generated, never-reused generation. The commit phase of a
+  completion removes an in-flight entry only when key, serving handle, AND
+  generation all match the admission it delivered a result for; anything else
+  is left strictly untouched, capacity included. `(namespace, delegation_id)`
+  is deliberately not a stable identity over time — the id is client-supplied
+  and cancel-then-retry is an ordinary client pattern, which with a single
+  replica re-admits the same id to the same worker — so without the generation
+  a stale commit could remove a *live* delegation's entry, making it invisible
+  to its own genuine result and to the deadline sweep while freeing a slot it
+  still occupies.
+- **First terminal frame wins.** More than one terminal frame may reach an
+  initiator for one `delegation_id`: a `completed` result can race the deadline
+  sweep's synthesized `timeout`, and duplicate results are possible in the
+  window between delivery and commit. **Initiators MUST treat the first
+  terminal frame (`completed`, `failed`, `timeout`, `target_disconnected`) for
+  a `delegation_id` as authoritative and ignore every later terminal frame for
+  that id.** The CP does not suppress the later frames: doing so would require
+  per-id terminal state that a CP with no durable state deliberately does not
+  keep, and the initiator already correlates by `delegation_id`. CP-side state
+  is unaffected either way — the generation rule above makes the commit exact,
+  so exactly one path ever releases the capacity.
 - **Capacity release follows entry removal.** Whichever path removes an
   in-flight entry (result commit, cancel, deadline sweep, instance failure,
   or a failed forward's rollback) releases its capacity reservation — and
