@@ -31,6 +31,7 @@ use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info, warn};
@@ -47,6 +48,16 @@ const STABLE_SESSION_SECS: u64 = 60;
 /// How long a lost connection's in-flight delegations get to unwind (cancel the
 /// agent, drop the session) before their tasks are aborted outright.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Inbound WS message/frame ceiling, mirroring the CP server's own
+/// `max_frame_bytes` default (1 MiB). Outbound frames are already capped at
+/// the executor; this closes the other direction.
+const MAX_INBOUND_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Bound on the wait for the `cp/register` ack, mirroring the CP's own
+/// `register_timeout_secs` default. A CP that upgrades the socket but never
+/// acks must land in backoff, not hang the client until shutdown.
+const REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// Write half. Split from the read half because the serve loop must be able to
@@ -161,7 +172,14 @@ impl ControlPlaneClient {
     ) -> anyhow::Result<Outcome> {
         let ws = self.connect().await?;
         let (mut sink, mut stream) = ws.split();
-        let ack = self.register(&mut sink, &mut stream).await?;
+        let ack = tokio::time::timeout(REGISTER_TIMEOUT, self.register(&mut sink, &mut stream))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "control plane did not ack registration within {}s",
+                    REGISTER_TIMEOUT.as_secs()
+                )
+            })??;
         self.executor
             .set_effective_max(ack.effective_max_delegated_sessions);
         info!(
@@ -184,9 +202,19 @@ impl ControlPlaneClient {
         // Belt and braces: the key must not surface in a `{:?}` of the request.
         value.set_sensitive(true);
         request.headers_mut().insert("Authorization", value);
-        let (ws, _resp) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(|e| anyhow::anyhow!("control-plane handshake failed: {e}"))?;
+        // Mirror the CP's accept-side transport cap (`max_frame_bytes`,
+        // default 1 MiB). Without this the client would buffer tungstenite's
+        // 64 MiB default from an anomalous or misconfigured hub before any
+        // parsing runs.
+        let ws_config = WebSocketConfig {
+            max_message_size: Some(MAX_INBOUND_FRAME_BYTES),
+            max_frame_size: Some(MAX_INBOUND_FRAME_BYTES),
+            ..Default::default()
+        };
+        let (ws, _resp) =
+            tokio_tungstenite::connect_async_with_config(request, Some(ws_config), false)
+                .await
+                .map_err(|e| anyhow::anyhow!("control-plane handshake failed: {e}"))?;
         Ok(ws)
     }
 

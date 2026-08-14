@@ -796,7 +796,7 @@ tier = "batch"
 | `name` | ✅ | — | Asserted logical agent name; likewise verified |
 | `type` | ✅ | — | `primary` (initiates delegations) or `worker` (serves them) |
 | `labels` | — | `{}` | Selector labels other agents can target by |
-| `max_delegated_sessions` | — | `1` | Concurrency advertised at registration; the CP may clamp it, and the runtime enforces the lower of the two |
+| `max_delegated_sessions` | — | `1` | Concurrency advertised at registration; the CP may clamp it, and the runtime enforces whatever the ack returns |
 
 `namespace`, `name`, and `type` are **assertions the CP verifies**, not
 authorization inputs: each auth key is bound to immutable claims in CP config,

@@ -459,8 +459,11 @@ async fn a_cancel_stops_the_turn_and_frees_the_slot() {
     .to_string();
     initiator.send(Message::Text(cancel)).await.unwrap();
 
-    let expected_session =
-        openab_core::control_plane::delegation_session_key(client.instance_id(), "d-cancel");
+    let expected_session = openab_core::control_plane::delegation_session_key(
+        client.instance_id(),
+        "d-cancel",
+        admission,
+    );
     wait_for("the worker to unwind the cancelled turn", || {
         runner.cancelled().contains(&expected_session)
             && runner.discarded().contains(&expected_session)

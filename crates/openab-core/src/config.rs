@@ -168,8 +168,9 @@ pub struct ControlPlaneConfig {
     /// `cp/delegate` label targeting.
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
-    /// Concurrency budget advertised at registration. The CP may clamp it; the
-    /// runtime enforces whatever the ack returns, and its own local cap on top.
+    /// Concurrency budget advertised at registration. The CP may clamp it
+    /// (the ack may return a lower value); the runtime enforces whatever the
+    /// ack returns.
     #[serde(default = "default_max_delegated_sessions")]
     pub max_delegated_sessions: u32,
 }

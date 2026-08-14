@@ -29,17 +29,26 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
-/// Session-pool key for one delegation.
+/// Session-pool key for one ADMISSION of one delegation.
 ///
 /// Hashed rather than concatenated so an operator-visible key can never carry
 /// a `delegation_id` chosen to collide with a chat thread key (they share one
 /// namespace in the pool) and so its length is bounded regardless of what the
-/// initiator sent. `instance_id` is mixed in so the same id seen after a
-/// reconnect maps to a different session.
-pub fn delegation_session_key(instance_id: &str, delegation_id: &str) -> String {
+/// initiator sent. `instance_id` distinguishes replicas of the same logical
+/// agent. The CP admission token is mixed in so a re-admission of the same
+/// reusable id can never resume an earlier admission's session — in
+/// particular one orphaned by a drain-timeout abort, whose transcript and
+/// tool state would otherwise leak into the new run through the pool's
+/// get-or-create semantics.
+pub fn delegation_session_key(
+    instance_id: &str,
+    delegation_id: &str,
+    admission: AdmissionToken,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(instance_id.as_bytes());
     hasher.update(delegation_id.as_bytes());
+    hasher.update(admission.to_be_bytes());
     format!("control-plane:{:x}", hasher.finalize())
 }
 
@@ -256,7 +265,7 @@ impl DelegationExecutor {
         cancel: Arc<Notify>,
     ) -> DelegateResultParams {
         let id = &forward.delegation_id;
-        let session_key = delegation_session_key(&self.instance_id, id);
+        let session_key = delegation_session_key(&self.instance_id, id, forward.admission);
 
         // Two clocks bound the turn: the CP-enforced delegation deadline and
         // the runtime's own per-turn ceiling. Take the nearer one — an already
@@ -282,16 +291,7 @@ impl DelegationExecutor {
             biased;
             _ = cancelled => {
                 info!(delegation_id = %id, "delegation cancelled");
-                // Best-effort, BOUNDED: session/cancel writes to the agent's
-                // stdin, which can wedge (dead child, full pipe). The pool's
-                // own cleanup uses the same 5s bound. Discard must run either
-                // way or the slot leaks.
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    self.runner.cancel(&session_key),
-                )
-                .await;
-                self.runner.discard(&session_key).await;
+                self.cancel_and_discard(&session_key).await;
                 return DelegateResultParams {
                     delegation_id: id.clone(),
                     admission: forward.admission,
@@ -306,27 +306,18 @@ impl DelegationExecutor {
         match outcome {
             Err(_elapsed) => {
                 warn!(delegation_id = %id, budget_secs = budget.as_secs(), "delegation exceeded its local deadline");
-                // Best-effort, BOUNDED: session/cancel writes to the agent's
-                // stdin, which can wedge (dead child, full pipe). The pool's
-                // own cleanup uses the same 5s bound. Discard must run either
-                // way or the slot leaks.
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    self.runner.cancel(&session_key),
-                )
-                .await;
-                self.runner.discard(&session_key).await;
+                self.cancel_and_discard(&session_key).await;
                 timed_out(id, forward.admission)
             }
             Ok(Err(e)) => {
                 // The turn could not be driven at all (no session, dead agent).
                 let error = format!("{e:#}");
                 warn!(delegation_id = %id, %error, "delegation failed before completion");
-                self.runner.discard(&session_key).await;
+                self.bounded_discard(&session_key).await;
                 failed(id, forward.admission, error)
             }
             Ok(Ok(outcome)) => {
-                self.runner.discard(&session_key).await;
+                self.bounded_discard(&session_key).await;
                 if let Some(error) = outcome.error {
                     warn!(delegation_id = %id, %error, "delegation ended in an agent error");
                     return failed(id, forward.admission, error);
@@ -351,7 +342,31 @@ impl DelegationExecutor {
             }
         }
     }
+
+    /// Best-effort, BOUNDED session teardown: `session/cancel` writes to the
+    /// agent's stdin, which can wedge (dead child, full pipe), and the pool's
+    /// discard takes its write lock, which can be starved. Both are bounded so
+    /// a wedged teardown cannot burn the client's disconnect drain window.
+    async fn cancel_and_discard(&self, session_key: &str) {
+        let _ = tokio::time::timeout(TEARDOWN_BOUND, self.runner.cancel(session_key)).await;
+        self.bounded_discard(session_key).await;
+    }
+
+    /// Discard with the same bound as cancel; on overrun the session is left
+    /// to the pool's own idle/hung cleanup rather than blocking this task.
+    async fn bounded_discard(&self, session_key: &str) {
+        if tokio::time::timeout(TEARDOWN_BOUND, self.runner.discard(session_key))
+            .await
+            .is_err()
+        {
+            warn!(session_key, "session discard exceeded its bound; leaving it to pool cleanup");
+        }
+    }
 }
+
+/// Bound on each session-teardown step (cancel, discard). Matches the pool's
+/// own cleanup bound and stays under the client's disconnect drain window.
+const TEARDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Client-side ceiling on a `cp/delegate_result` body.
 ///
@@ -363,16 +378,24 @@ impl DelegationExecutor {
 /// its (typically smaller) `max_result_bytes` on what arrives.
 const MAX_RESULT_BYTES: usize = 512 * 1024;
 
-fn cap_result(text: String) -> String {
-    if text.len() <= MAX_RESULT_BYTES {
+/// Ceiling on a `cp/delegate_result` error string. Errors ride the same
+/// transport frame as results but are diagnostics, not payloads, so the
+/// budget is far tighter. Without this, an unbounded `anyhow` chain or an
+/// agent-authored error would hit the CP's pre-parse `max_frame_bytes` and
+/// drop the connection — the exact failure `MAX_RESULT_BYTES` closes for the
+/// success path.
+const MAX_ERROR_BYTES: usize = 64 * 1024;
+
+fn cap_text(text: String, budget: usize) -> String {
+    if text.len() <= budget {
         return text;
     }
     let marker = format!(
         "\n…[truncated by worker: {} bytes total exceeded the transport budget]",
         text.len()
     );
-    let budget = MAX_RESULT_BYTES.saturating_sub(marker.len());
-    let mut cut = budget.min(text.len());
+    let keep = budget.saturating_sub(marker.len());
+    let mut cut = keep.min(text.len());
     while cut > 0 && !text.is_char_boundary(cut) {
         cut -= 1;
     }
@@ -380,6 +403,10 @@ fn cap_result(text: String) -> String {
     out.push_str(&text[..cut]);
     out.push_str(&marker);
     out
+}
+
+fn cap_result(text: String) -> String {
+    cap_text(text, MAX_RESULT_BYTES)
 }
 
 /// Frees a delegation's inflight slot on drop — including the drop that
@@ -408,7 +435,10 @@ fn failed(
         admission,
         status: DelegationStatus::Failed,
         result: None,
-        error: Some(error.into()),
+        // Capped HERE, not at call sites: every error source (anyhow chains,
+        // agent-authored errors) must share the transport-safe bound, and a
+        // new call site must not be able to forget it.
+        error: Some(cap_text(error.into(), MAX_ERROR_BYTES)),
     }
 }
 
@@ -692,7 +722,7 @@ mod tests {
         assert!(res.error.is_none());
         assert_eq!(
             runner.discarded(),
-            vec![delegation_session_key("i-test", "d-1")],
+            vec![delegation_session_key("i-test", "d-1", 1)],
             "a fresh-per-delegation session must not survive its delegation"
         );
         assert_eq!(ex.active(), 0, "the slot is released");
@@ -799,7 +829,7 @@ mod tests {
         let res = Arc::clone(&ex).serve(forward("d-8", 5)).await;
         assert_eq!(res.status, DelegationStatus::Timeout);
         assert_eq!(runner.starts(), 1, "it did start");
-        let key = delegation_session_key("i-test", "d-8");
+        let key = delegation_session_key("i-test", "d-8", 1);
         assert_eq!(runner.cancelled(), vec![key.clone()]);
         assert_eq!(runner.discarded(), vec![key]);
         assert_eq!(ex.active(), 0);
@@ -824,7 +854,7 @@ mod tests {
         let res = serving.await.unwrap();
         assert_eq!(res.status, DelegationStatus::Cancelled);
         assert!(res.result.is_none());
-        let key = delegation_session_key("i-test", "d-9");
+        let key = delegation_session_key("i-test", "d-9", 1);
         assert_eq!(runner.cancelled(), vec![key.clone()]);
         assert_eq!(runner.discarded(), vec![key]);
         assert_eq!(ex.active(), 0);
@@ -863,13 +893,17 @@ mod tests {
 
     #[test]
     fn session_keys_are_namespaced_bounded_and_instance_scoped() {
-        let a = delegation_session_key("i-1", "d-1");
-        let b = delegation_session_key("i-2", "d-1");
+        let a = delegation_session_key("i-1", "d-1", 1);
+        let b = delegation_session_key("i-2", "d-1", 1);
         assert!(a.starts_with("control-plane:"));
-        assert_ne!(a, b, "a replayed id after reconnect gets a fresh session");
+        assert_ne!(a, b, "another replica's session never collides");
         assert_eq!(a.len(), "control-plane:".len() + 64);
+        // A re-admission of the same reusable id gets a fresh session: an
+        // orphaned session from an aborted admission can never be resumed.
+        let c = delegation_session_key("i-1", "d-1", 2);
+        assert_ne!(a, c, "a re-admission of the same id gets a fresh session");
         // A hostile id cannot forge another platform's key shape.
-        let hostile = delegation_session_key("i-1", "discord:12345");
+        let hostile = delegation_session_key("i-1", "discord:12345", 1);
         assert!(hostile.starts_with("control-plane:"));
         assert_eq!(hostile.len(), a.len());
     }
@@ -914,6 +948,32 @@ mod tests {
 
         // Under the cap: untouched.
         assert_eq!(cap_result("small".into()), "small");
+    }
+
+    #[test]
+    fn oversized_errors_are_capped_below_the_transport_limit() {
+        // The error field rides the same frame as the result and hits the
+        // same pre-parse max_frame_bytes ceiling at the CP. failed() must
+        // bound every error source (anyhow chains, agent-authored errors),
+        // no matter the call site.
+        let big = "e".repeat(2 * 1024 * 1024);
+        let res = failed("d-err", 7, big);
+        let err = res.error.expect("failed() always carries an error");
+        assert!(err.len() <= MAX_ERROR_BYTES);
+        assert!(err.ends_with("bytes total exceeded the transport budget]"));
+        assert_eq!(res.admission, 7, "the admission echo survives the cap");
+        assert_eq!(res.status, DelegationStatus::Failed);
+
+        // Multibyte char straddling the cut must not split a boundary.
+        let emoji = "\u{1F980}".repeat(MAX_ERROR_BYTES / 4 + 64);
+        let res = failed("d-err", 7, emoji);
+        let err = res.error.expect("failed() always carries an error");
+        assert!(err.len() <= MAX_ERROR_BYTES);
+        assert!(std::str::from_utf8(err.as_bytes()).is_ok());
+
+        // Under the cap: untouched.
+        let res = failed("d-err", 7, "short");
+        assert_eq!(res.error.as_deref(), Some("short"));
     }
 
     #[tokio::test(start_paused = true)]
