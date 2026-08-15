@@ -15,7 +15,7 @@ A distinct user need exists that OAB's ACP model does not serve:
 
 > "I don't need multi-agent orchestration for this task. I have one or more coding CLIs (Claude Code, Codex, Kiro, or plain bash) and I want to drive them **directly** — full terminal, keyboard input, real-time output — from any device, with the session surviving my laptop."
 
-Adjacent tools each carry a trade-off: Herdr is laptop-local (laptop dies, session dies), OpenDray is host-resident (shell shares host credentials). A **remote + sandboxed + raw-terminal** offering does not exist.
+Adjacent tools each carry a trade-off: Herdr is laptop-local (laptop dies, session dies), OpenDray is host-resident (shell shares host credentials). Cloud IDEs and managed web terminals (Codespaces, Cloud Shell) serve related needs but are vendor-hosted. A **self-hostable, K8s-pod-sandboxed** raw-terminal offering -- one that can live beside your ACP agents' workspace -- does not exist.
 
 A previous proposal (PR #1477) made this a second in-process backend inside the OAB unified binary. Group review rejected that *form* — not the need — on five grounds:
 
@@ -64,8 +64,8 @@ Profile 3 (colocated) — K8s Pod
 |               |   (colocated profile only, Phase 4)|               |
 |               +<--- notification webhook ----------+               |
 |                                                                    |
-|  Shared: workspace volume (PVC)   |   NOT shared: credentials,     |
-|                                   |   PID/cgroup, listeners        |
+|  Shared: workspace volume (PVC),  |   NOT shared: credentials,     |
+|  pod network namespace, pod fate  |   PID/cgroup, filesystem mounts|
 +--------------------------------------------------------------------+
 
 Profile 2 (standalone) is the right half alone: openab-pty + workspace PVC.
@@ -80,7 +80,7 @@ Profile 2 makes `openab-pty` a small standalone product in OpenDray's category (
 | Review blocker (PR #1477) | How the sidecar form resolves it |
 |---|---|
 | Positioning vs Thin Bridge | OAB binary is untouched; the broker stays a pure transport. `openab-pty` is an adjacent tool that shares deployment infrastructure only — no dual persona |
-| Same-pod blast radius | Separate container = separate PID namespace, cgroup, filesystem, and mounts. The shell user cannot signal the broker, exhaust its cgroup, or read its credential files. Broker platform tokens are **never mounted** into the sidecar |
+| Same-pod blast radius | Separate container = separate PID namespace, cgroup, filesystem, and mounts: the shell user cannot signal the broker, exhaust its container cgroup, or read its credential files. Broker platform tokens are **never mounted** into the PTY container. Residual sharing in the colocated profile (pod network namespace, pod fate) is graded honestly in Isolation tiers below; full isolation = profiles 1+2 as separate pods |
 | Auth below capability | The sidecar designs its token model from scratch for shell-equivalent trust (see Security model) with no ACP-key coupling |
 | Pool incompatibility | The sidecar has its **own session manager** built for byte-stream lifecycle. No refactor of the shipped ACP pool; zero regression risk to the broker |
 | Reversibility | Default-off runtime with its own image/release. If demand does not materialize, deprecate the image; nothing in the broker to unwind. If demand proves out, later extraction of a shared lifecycle crate — or even single-process merge — remains open |
@@ -90,55 +90,79 @@ Profile 2 makes `openab-pty` a small standalone product in OpenDray's category (
 ACP and PTY coexist per deployment, not per process:
 
 - **Same pod, two containers (profile 3)** — one Helm toggle (`pty.enabled=true`) adds the sidecar; the broker container is byte-identical across all three profiles
-- **Shared workspace volume** — the PTY shell and ACP agents can see the same working tree (same PVC mount), which is the practical point of coexistence: drive a CLI by hand in the terminal, then let ACP agents continue in the same workspace from Discord
-- **Nothing else shared** — listeners, tokens, session state, and failure domains are independent; a crashed or compromised sidecar does not take the broker down
+- **Shared workspace volume (opt-in)** — the PTY shell and ACP agents can see the same working tree (same PVC mount), which is the practical point of coexistence: drive a CLI by hand in the terminal, then let ACP agents continue in the same workspace from Discord. This sharing is an **explicit cross-runtime trust and concurrency bridge**, stated rather than implied:
+  - *Trust*: the workspace is a single trust zone. Workspace-resident credentials (`.git/credentials`, `.env` files, agent OAuth stores) are readable by the shell regardless of mount hygiene, and either side can plant content (hooks, PATH-shadowing binaries) the other later executes. Treat ACP and PTY principals as sharing workspace authority when sharing is enabled
+  - *Concurrency*: concurrent writes are best-effort and uncoordinated (a runtime non-goal). Recommended convention: separate git worktrees or session directories per principal; document RWO/RWX PVC implications in the chart
+  - PTY cannot attach to a running ACP agent subprocess — the runtimes share files, never processes
+- **Separated in every profile**: credential mounts, PID namespaces, cgroups, filesystems, tokens, and session state
+- **Shared in profile 3 (accepted residual risk)**: the pod network namespace (containers reach each other on localhost; Kubernetes NetworkPolicy selects pods, not containers, and cannot block intra-pod traffic), pod scheduling/restart fate, and pod-level resource pressure. "Independent failure domains" is therefore NOT a property of profile 3 -- it is a property of profiles 1+2
 
-### Configuration: one source, two views
+**Isolation tiers** (operators choose deliberately):
 
-Operators keep a **single logical `config.toml`** (the existing `configUrl` flow); the two runtimes consume different projections of it. In the standalone profile (PTY only), the same file format applies — `openab-pty` reads `[pty]` plus shared basics (workspace path, log level) and ignores everything else; no Discord/Slack tokens or ACP agent config are required or accepted.
+| Profile | Isolation tier |
+|---|---|
+| 1 + 2 as separate pods | Full: independent network identity, NetworkPolicy, failure domains -- **recommended for production when strong isolation is required** |
+| 3 (colocated sidecar) | Partial: process/filesystem/credential-mount separation only; shared pod network and fate; the per-session token requirement and auth on every broker listener are the remaining intra-pod barriers. A convenience tier for teams that accept this trade for same-workspace ergonomics |
+
+### Configuration: one source, two projected views
+
+Operators keep a **single logical `config.toml`** (the existing `configUrl` flow); each runtime consumes a **projection materialized outside its trust boundary**. In the standalone profile (PTY only), the same file format applies -- `openab-pty` reads `[pty]` plus shared basics (workspace path, log level); no Discord/Slack tokens or ACP agent config are required or accepted.
 
 - The broker reads its existing sections; it ignores `[pty]`
-- The sidecar reads **only** `[pty]`; it must never receive platform tokens, because any secret mounted into the sidecar is readable by the human at the terminal (the shell runs in that container)
-- Delivery of the split follows the configUrl ADR: the chart (or operator) passes each container its own config source. For MVP this can be two URLs/objects derived from one source of truth; a `openab-pty run -c <url> --section pty` style filter is an acceptable alternative
-- `${VAR}` interpolation and `[secrets.refs]` resolution behave identically in both binaries; the PTY auth material is sourced via the secrets resolver per `secrets-management.md`, not a raw env var
+- The PTY runtime receives **only** a pre-filtered `[pty]` projection. Self-filtering a shared config is NOT an accepted secure delivery: `--section pty` limits parsing, not access -- if the PTY container holds the source URL and fetch credentials, a shell user can fetch the full broker config directly. The sanitized projection MUST be generated outside the PTY trust boundary (CI, chart, or operator tooling) and delivered via its own object/URL with a fetch identity scoped to that object only
+- **Deployment contract -- the PTY container spec MUST NOT mount**: the ServiceAccount token (`automountServiceAccountToken: false`; note IRSA identity is pod-level, so the PTY signing secret is fetched via a narrowly-scoped mechanism, not the broker's role), the broker config or its source credentials, platform secrets, or any volume broader than the workspace (workspace-only volume or `subPath`; never the broker HOME PVC, which contains caches and session state)
+- `${VAR}` interpolation and `[secrets.refs]` resolution behave identically in both binaries; the PTY-only projection's `[secrets.refs]` contains exactly one entry -- the signing key
 
 ```toml
-# one config.toml — two consumers
-[discord]                    # broker only — never mounted into the sidecar
+# one logical config.toml -- projected into two filtered views;
+# neither container ever mounts the other's sections
+
+[secrets.refs]                      # PTY projection carries ONLY this entry
+pty_signing_key = "aws-sm://openab/pty-signing-key#value"
+
+[discord]                           # broker view only -- never delivered to the PTY runtime
 bot_token = "${DISCORD_BOT_TOKEN}"
 
-[agent]                      # broker only
+[agent]                             # broker view only
 # ...
 
-[pty]                        # sidecar only
+[pty]                               # PTY view only
 enabled = true
-listen = "0.0.0.0:8090"      # separate port -> separate NetworkPolicy
-command = "/bin/bash"        # operator-configured; never client-specified
+listen = "0.0.0.0:8090"             # own port; TLS contract below
+command = "/bin/bash"               # operator-configured; never client-specified
 max_sessions = 4
-absolute_session_ttl = "12h" # applies even while attached
-scrollback_kib = 1024        # in-memory only; cleared on teardown
-scrollback_replay = false    # off by default (secrets-safe)
-auth_secret_ref = "aws-sm://openab/pty-signing-key"
+absolute_session_ttl = "12h"        # applies even while attached
+scrollback_kib = 1024               # in-memory only; cleared on teardown
+scrollback_replay = false           # governs fresh-attach full-history dump only (see lifecycle)
+auth_secret = "${secrets.pty_signing_key}"
 ```
 
 ### Security model
 
-- **Transport**: WSS required; plain WS permitted only on loopback for local dev. Fail-closed: the listener refuses to bind off-loopback without auth material configured (same guard the `/acp` endpoint enforces)
-- **Browser credential transport**: reuse the validated `/acp` scheme — `Authorization: Bearer` for non-browser clients, `Sec-WebSocket-Protocol: openab.bearer.<token>` for browsers (browsers cannot set the Authorization header on upgrade); origin policy and constant-time comparison carry over
-- **Token model**: short-lived per-session tokens minted from the configured signing secret (attach = present a token scoped to one session name with an expiry), replacing the static-shared-key model the review rejected. Revocation = rotate the signing secret. An identity layer is explicitly out of MVP scope; the ADR states this per `identity-trust-none.md` rather than implying otherwise
+- **Transport / TLS contract**: WSS is mandatory for external clients. Two supported terminations, chosen explicitly per deployment: (a) `openab-pty` terminates TLS itself (cert mounted into the container), or (b) a trusted Ingress terminates TLS and forwards plain WS internally -- in which case the internal listener accepts non-loopback plain WS only when the deployment declares `tls_terminated_upstream = true`, and the residual internal-hop exposure is documented. Fail-closed in all cases: the listener refuses to bind off-loopback without auth material configured (same guard the `/acp` endpoint enforces)
+- **Browser credential transport**: reuse the validated `/acp` scheme -- `Authorization: Bearer` for non-browser clients, `Sec-WebSocket-Protocol: openab.bearer.<token>` for browsers (browsers cannot set the Authorization header on upgrade); origin policy and constant-time comparison carry over
+- **Token control plane** (MVP model; an identity layer remains explicitly out of scope per `identity-trust-none.md`):
+  - **Create requires authentication**: sessions are created by the operator via a loopback/Unix-socket CLI (`openab-pty session create <name>`) or an admin bootstrap credential. Unauthenticated remote create/list/kill is NOT provided in MVP
+  - **One-time issuance at creation**: creating a session mints an immutable `generation`, signs one scoped attach token (claims: session ID + generation, audience, action scope, expiry), and returns it exactly once
+  - **Attach only verifies, never issues**: `GET /pty/{session}` validates the presented token; there is no minting path on the attach surface
+  - **Per-session revocation**: kill/recreate bumps the generation, immediately invalidating outstanding tokens for that session; signing-key rotation remains the global escape hatch and supports an old/new overlap window for zero-downtime rotation
+  - **Format direction**: HMAC-SHA256 opaque token; token expiry defaults shorter than the session TTL (re-issue via the authenticated create/renew path)
 - **Command authority**: the spawned command is operator configuration only; clients can never specify it. Session names are allowlist-validated (`[a-z0-9-]{1,32}`)
-- **Isolation**: the sidecar container mounts the workspace volume and its own config view; no service-account token, no broker config, no platform secrets. NetworkPolicy can (and the chart docs will recommend) restrict sidecar egress independently of the broker
+- **Isolation**: the PTY container mounts only the workspace volume (workspace-scoped, never the broker HOME PVC) and its own config projection; no service-account token, no broker config, no platform secrets (see the deployment contract above). NetworkPolicy applies at pod scope: it can restrict the standalone profile's pod independently; in the colocated profile it cannot separate the two containers (see Isolation tiers)
+- **Container defaults**: the `openab-pty` image runs as a non-root user (UID 1000), `allowPrivilegeEscalation: false`, capabilities dropped, `readOnlyRootFilesystem` with the workspace as the only writable mount
+- **Rate limiting in MVP**: per-IP WS-upgrade failure limits (e.g. 5 failures/min then a short ban) ship in Phase 1 -- audit is detection, rate limiting is prevention
 - **Audit in MVP**: attach/detach, session create/kill, and auth failures are logged from Phase 1; a leaked token must be observable
 - **Env**: the PTY child gets an explicit allowlist (TERM, LANG/LC_*, PATH, HOME, USER, SHELL) and nothing else; `OPENAB_*` and cloud-credential variables are never inherited
 
-### Session lifecycle (owned by the sidecar, designed for byte streams)
+### Session lifecycle (owned by `openab-pty`, designed for byte streams)
 
-- **Liveness**: activity = client input OR PTY output OR a live attached socket (WS ping/pong; a half-open socket counts as detached after the ping timeout)
-- **TTLs**: detached-idle TTL (default 30m) plus an absolute session lifetime cap (default 12h) that applies even while attached — capacity cannot be pinned forever by an open browser tab
+- **Liveness**: activity = client input OR PTY output OR a live attached socket (WS ping/pong at a 15-30s interval; a half-open socket counts as detached after 2-3 missed pings -- exact values are Phase 1 config with these recommended defaults, balancing flaky mobile networks against dead-client slot pinning)
+- **TTLs**: detached-idle TTL (default 30m) plus an absolute session lifetime cap (default 12h) that applies even while attached -- capacity cannot be pinned forever by an open browser tab. Expiry is client-visible: a warning control frame precedes forced teardown, and the WebSocket closes with a distinct close code so clients surface "session expired" instead of retrying a network error
 - **Attach semantics (MVP)**: single-attach exclusive; a second attach with a valid token detaches the first (documented; multi-viewer is Phase 3)
-- **Reconnect**: monotonic byte cursor from day one — the ring buffer tracks total bytes written; clients reconnect with `since=<offset>` and receive only missed bytes, with an explicit gap signal on overflow (fresh attach = terminal reset + full replay only when `scrollback_replay=true`)
+- **Reconnect**: monotonic byte cursor from day one -- the ring buffer tracks total bytes written; clients reconnect with `since=<offset>` and receive only missed bytes. The replay-to-live handoff is **atomic**: the subscriber registers under the buffer lock, captures the end offset, replays through it, then drains queued live bytes -- with connection-generation fencing so teardown of a replaced connection cannot affect its successor. On overflow the server sends an explicit `gap` control frame (bytes-dropped count) so the client can trigger a full clear/redraw instead of rendering a sliced ANSI stream
+- **`scrollback_replay` vs cursor semantics** (distinct controls): incremental `since` replay is always available within the ring buffer's retention; `scrollback_replay` governs only the cursor-less full-history dump on a fresh attach (default off -- secrets-safe); setting `scrollback_kib = 0` disables retention entirely, which also disables `since` replay (every reconnect starts with a `gap` + reset)
 - **Teardown**: setpgid on spawn; SIGTERM-grace-SIGKILL escalation on the process group; evict-while-attached order = notify client, close socket, kill group, close master fd, release slot; buffers cleared on teardown; scrollback never touches disk
-- **Recovery taxonomy** (stated, not implied): detach/reattach survives (process alive); pod restart does not (process dead) — reattach-to-dead returns a distinct error and offers restart-in-place. Pod-lifetime durability is out of scope and documented as such
+- **Recovery taxonomy** (stated, not implied): detach/reattach survives (process alive); pod restart does not (process dead) -- reattach-to-dead returns a distinct error and offers **restart-in-place**: same session name, a fresh process and a new generation (old tokens invalid, empty scrollback). Pod-lifetime durability is out of scope and documented as such
 
 ---
 
@@ -194,11 +218,12 @@ Leaves the need unserved; users accept Herdr's laptop fragility or OpenDray's ho
 ### Phase 1: `openab-pty` MVP (new crate, new binary)
 
 - Own session manager: named sessions, operator-configured command, allowlist-validated names
+- **Session bootstrap**: sessions are created via the authenticated loopback/UDS operator CLI (`openab-pty session create <name>`), which spawns the PTY and returns the one-time attach token; `GET /pty/{session}` is attach-only. No remote create/list/kill in Phase 1 (Phase 2 adds them behind admin auth)
 - portable-pty spawner with setpgid, escalating kill, and the teardown order above
-- `GET /pty/{session}` WSS endpoint: binary frames = PTY bytes; text frames = versioned control schema (`resize`, `ping`, `detach`) with a defined close-code table
-- Auth: per-session tokens from the signing secret; fail-closed off-loopback; `/acp`-style browser subprotocol transport
-- Monotonic cursor reconnect with gap signaling; scrollback in-memory, off-by-default replay, cleared on teardown
-- Detached-idle TTL + absolute lifetime cap; single-attach exclusive
+- `GET /pty/{session}` WSS endpoint: binary frames = PTY bytes; text frames = versioned control schema (`resize`, `ping`, `detach`, `gap`, `ttl-warning`) with a defined close-code table
+- Auth: the token control plane above (authenticated create, one-time issuance bound to session generation, attach-only verification); fail-closed off-loopback; `/acp`-style browser subprotocol transport; per-IP upgrade-failure rate limiting
+- Monotonic cursor reconnect with atomic replay/live handoff and gap signaling; scrollback in-memory, off-by-default fresh-attach replay, cleared on teardown
+- Detached-idle TTL + absolute lifetime cap (with client-visible expiry warning + close code); single-attach exclusive
 - Audit log (attach/detach/create/kill/auth-failure) and basic metrics
 - Resize propagation (TIOCSWINSZ) including attach-time initial size
 - Terminal-capability response filtering at the PTY boundary (known Ink-CLI startup breakage)
@@ -217,11 +242,13 @@ Leaves the need unserved; users accept Herdr's laptop fragility or OpenDray's ho
 ### Phase 4: Messaging bridge (optional, colocated profile only)
 
 - `openab-pty` posts a webhook to the broker when a detached session emits no output for N seconds after a prompt-like burst (stated heuristic, not magic); broker relays to the platform thread. Bridge is one-way and feature-gated
+- **Bridge authentication is required by design, stated now**: the webhook carries an HMAC signature from a dedicated bridge secret delivered at deploy time (or travels over a loopback/UDS-only endpoint) -- separate from platform tokens and from the PTY signing key, and never usable as a PTY identity plane. A compromised PTY runtime must not be able to inject arbitrary notifications
 - **Not available in the PTY-only profile** — there is no broker to relay through, and `openab-pty` will not grow its own notifier (that would recreate the scope creep this ADR exists to avoid). Users who want notifications deploy profile 3
 
 ### Later (demand-gated, explicitly deferred)
 
-- Shared lifecycle crate extraction (if the ACP pool and PTY manager converge naturally)
+- Shared lifecycle crate extraction (if the ACP pool and PTY manager converge naturally). Candidate shared surface: spawn mechanics, env-allowlist construction, pgid kill/escalation; deliberately NOT shared: liveness definitions, TTL/eviction policy, persistence
+- **Adoption review point**: 12 months after the standalone profile ships, review its usage; below a threshold the maintainers set then, consider deprecating the standalone image or folding PTY back to colocate-only
 - Single-process merge (only if operations prove the sidecar split is more cost than benefit)
 - Identity layer for PTY tokens; semantic agent-state detection; JSONL transcript channel (see Alternative B)
 
