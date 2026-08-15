@@ -38,7 +38,7 @@ Ship **`openab-pty`**: a separate binary that is an **independently runnable run
 | Profile | Processes | Use case |
 |---|---|---|
 | 1. ACP only (current default) | `openab` | Message-broker deployments; no change from today |
-| 2. PTY only | `openab-pty` | Standalone remote terminal service: workspace PVC + `[pty]` config + PTY auth secret; no Discord/Slack tokens, no platform adapters, no ACP protocol |
+| 2. PTY only | `openab-pty` | Standalone remote terminal service: workspace PVC + `[pty]` config + admin bootstrap credential; no Discord/Slack tokens, no platform adapters, no ACP protocol |
 | 3. ACP + PTY (colocated) | `openab` + `openab-pty` sidecar | Both in one pod sharing the workspace volume: drive a CLI by hand, let ACP agents continue in the same working tree from Discord |
 
 Deployment mechanics:
@@ -62,7 +62,7 @@ Profile 3 (colocated) — K8s Pod
 |  +------------+--------------+       |  [pty] section only]      | |
 |               |                      +-------------+-------------+ |
 |               |   (colocated profile only, Phase 4)|               |
-|               +<--- notification webhook ----------+               |
+|               +---- notification bridge (pull) --->+               |
 |                                                                    |
 |  Shared: workspace volume (PVC),  |   NOT shared: credentials,     |
 |  pod network namespace, pod fate  |   PID/cgroup, filesystem mounts|
@@ -112,17 +112,30 @@ Operators keep a **single logical `config.toml`** (the existing `configUrl` flow
 - The PTY runtime receives **only** a pre-filtered `[pty]` projection. Self-filtering a shared config is NOT an accepted secure delivery: `--section pty` limits parsing, not access -- if the PTY container holds the source URL and fetch credentials, a shell user can fetch the full broker config directly. The sanitized projection MUST be generated outside the PTY trust boundary (CI, chart, or operator tooling) and delivered via its own object/URL with a fetch identity scoped to that object only
 - **Deployment contract -- the PTY container spec MUST NOT mount**: the ServiceAccount token (set `automountServiceAccountToken: false` at **pod** level -- it is not per-container -- and, when the broker needs IRSA/configUrl credentials in the colocated profile, project an audience-scoped token volume **into the broker container only**), the broker config or its source credentials, platform secrets, or any volume broader than the workspace (workspace-only volume or `subPath`; never the broker HOME PVC, which contains caches and session state)
 - **Credential-material delivery (MUST)**: MVP has no signing key to deliver (see Token format). The only secret the PTY runtime holds is the **hash of the admin bootstrap credential**, and its delivery follows this rule: **external tooling (operator/Helm/CI) resolves any logical `aws-sm://` reference at deploy time and materializes the literal value into the delivered projection -- `openab-pty` itself never resolves cloud references at runtime and holds no cloud identity.** Delivered material is owned by the runtime UID, mode 0400, never enters the child's environment, logs, or core dumps (dumpable disabled)
+- **Filesystem layout (MUST)** -- the layout is what enforces "never in the child's filesystem view", so it is specified, not implied:
+  - `/run/openab-pty/` -- runtime-only directory holding the control socket and any runtime state; created by the runtime at startup, **never** exported to the child (not in its environment, not under its HOME or cwd)
+  - `/etc/openab-pty/` (read-only mount) -- the delivered config projection including the admin credential hash
+  - the workspace volume -- the child's HOME and cwd, and the **only writable mount** in the container (`readOnlyRootFilesystem: true`)
+  - the child never inherits a writable runtime directory; nothing under `/run/openab-pty/` or `/etc/openab-pty/` is reachable from the child's HOME/cwd tree
 - **Same-container containment (MVP model)**: with the keyless token design, runtime state contains no minting authority to steal -- only non-reversible hashes. The security basis is: the admin bootstrap credential is CSPRNG high-entropy and the runtime stores **only its verifier hash** (reading the hash neither authorizes requests nor enables practical offline guessing); every control operation is authenticated by presenting the credential itself, even on a locally reachable socket; and the runtime sets `PR_SET_DUMPABLE=0`. **Optional hardening (not MVP)**: spawning PTY children under a distinct unprivileged UID gives defense-in-depth, but a non-root UID-1000 process cannot `setuid` without `CAP_SETUID` or a privileged launcher -- deployments that can provide a narrowly-scoped launcher may adopt it; the default container contract (non-root, all capabilities dropped, `allowPrivilegeEscalation: false`) is preserved either way
-- `${VAR}` interpolation and `[secrets.refs]` resolution behave identically in both binaries; the PTY-only projection's `[secrets.refs]` contains exactly one entry -- the admin credential hash
+- **Same-UID residual-risk checklist (MUST)** -- because file modes are not a boundary between same-UID processes, the following are requirements, not recommendations:
+  - Config projection and any secret material are delivered on **read-only mounts** (tamper-proofing comes from the mount, not the file mode)
+  - Admin-credential verification is **constant-time** against the stored hash
+  - Attach-token plaintext is **zeroized promptly after hashing**; only the hash is retained
+  - The admin bootstrap credential has a stated **minimum entropy of 128 bits** (generated, never operator-chosen)
+  - `PR_SET_DUMPABLE=0` is a **Linux-specific** mitigation; non-Linux targets are out of scope for MVP and must not be assumed covered
+  - **Accepted risk, stated**: a same-UID child can signal (including SIGKILL) the runtime process; this is availability, not confidentiality -- sessions die with the runtime and no credential is exposed by the crash
+- **Resolution asymmetry (deliberate)**: the broker resolves `${VAR}` interpolation and `[secrets.refs]` cloud references itself, as today. The PTY runtime accepts only literal values, `${VAR}` environment interpolation, and local file paths in its delivered projection -- it MUST NOT link or invoke a cloud secrets resolver at runtime. A delivered PTY projection that still contains a `[secrets.refs]` table or any unresolved cloud reference (`aws-sm://` etc.) is a **startup error** (fail closed): this guard prevents an implementer from re-importing a cloud fetch identity into the PTY trust boundary
 
 ```toml
-# one logical config.toml -- projected into two filtered views;
-# neither container ever mounts the other's sections
+# ---- LOGICAL operator source (what the operator maintains) ----
+# Deploy tooling projects this into two delivered views; neither
+# container ever receives the other's sections.
 
-[secrets.refs]                      # LOGICAL operator source only. Deploy tooling
-                                    # materializes the literal value into the delivered
-                                    # PTY projection -- openab-pty never resolves
-                                    # aws-sm:// itself and holds no cloud identity
+[secrets.refs]                      # broker view only. For the PTY projection, deploy
+                                    # tooling resolves this at deploy time and writes the
+                                    # literal value -- openab-pty never resolves aws-sm://
+                                    # itself and holds no cloud identity
 pty_admin_hash = "aws-sm://openab/pty-admin#hash"
 
 [discord]                           # broker view only -- never delivered to the PTY runtime
@@ -140,7 +153,24 @@ max_sessions = 4
 absolute_session_ttl = "12h"        # applies even while attached
 scrollback_kib = 1024               # in-memory only; cleared on teardown
 scrollback_replay = false           # governs fresh-attach full-history dump only (see lifecycle)
-admin_credential_hash = "${secrets.pty_admin_hash}"  # verifies the admin bootstrap credential; attach tokens are in-memory only (no key)
+admin_credential_hash = "${secrets.pty_admin_hash}"  # logical reference in the source only
+```
+
+```toml
+# ---- DELIVERED PTY projection (what openab-pty actually receives) ----
+# Generated outside the PTY trust boundary; contains no [secrets.refs],
+# no cloud references, no broker sections. Anything else = startup error.
+
+[pty]
+enabled = true
+listen = "0.0.0.0:8090"
+tls_terminated_upstream = false
+command = "/bin/bash"
+max_sessions = 4
+absolute_session_ttl = "12h"
+scrollback_kib = 1024
+scrollback_replay = false
+admin_credential_hash = "argon2id$..."  # literal verifier hash, materialized at deploy time
 ```
 
 ### Security model
@@ -149,7 +179,8 @@ admin_credential_hash = "${secrets.pty_admin_hash}"  # verifies the admin bootst
 - **Browser credential transport**: reuse the validated `/acp` scheme -- `Authorization: Bearer` for non-browser clients, `Sec-WebSocket-Protocol: openab.bearer.<token>` for browsers (browsers cannot set the Authorization header on upgrade); origin policy and constant-time comparison carry over
 - **Token control plane** (MVP model; an identity layer remains explicitly out of scope per `identity-trust-none.md`):
   - **Create requires authentication -- and locality is not authentication**: the shell child may share the container (and potentially the UID) with the runtime, so a loopback/UDS endpoint alone is not an auth barrier. MVP mechanism: session creation (`openab-pty session create <name>`) requires an **admin bootstrap credential** delivered to the operator at deploy time and never present in the PTY child's environment or filesystem view. Hardening alternative (non-MVP): a distinct privileged UID/group for the runtime with UDS peer-credential verification. Unauthenticated remote create/list/kill is NOT provided in MVP; the admin credential and the attach token are distinct planes -- an attach token can never create, list, or kill
-  - **One-time issuance at creation**: creating a session mints an immutable `generation` and a fresh attach token, returned exactly once. **Issued once, not single-use**: the bearer token remains valid for reattach until its expiry or a generation bump -- reconnecting clients are not locked out; theft exposure is bounded by a short default TTL (well below the session TTL) and renewal happens only through the authenticated create/renew path
+  - **One-time issuance at creation**: creating a session mints an immutable `generation` and a fresh attach token, returned exactly once. **Issued once, not single-use**: the bearer token remains valid for reattach until its expiry or a generation bump -- reconnecting clients are not locked out; theft exposure is bounded by a short default TTL (well below the session TTL)
+  - **Renewal (`openab-pty session renew <name>`)**: admin-authenticated like create; the session **process survives** (scrollback and state intact), the generation is bumped (all outstanding tokens for the session become invalid immediately), and a fresh attach token is returned exactly once. Renew is the re-issue path for expired or suspected-stolen tokens, and is distinct from **restart-in-place** (which replaces the process). MVP tokens are otherwise valid until expiry or kill; there is no client-side refresh on the attach surface
   - **Attach only verifies, never issues**: `GET /pty/{session}` validates the presented token; there is no minting path on the attach surface
   - **Per-session revocation**: kill/recreate bumps the generation and deletes the stored token hash, immediately invalidating outstanding tokens for that session; runtime restart clears all token state (sessions die with the process anyway, so this is not a loss)
   - **Token format (MVP): no signing key exists.** Each attach token is a CSPRNG 256-bit opaque bearer value; the runtime stores only its hash together with `(session ID, generation, scope = attach-only, expiry)` in memory and deletes it on kill/expiry. Because sessions deliberately do not survive a runtime restart, self-contained signed tokens buy nothing in MVP -- and eliminating the signing key eliminates the minting authority a same-container shell could steal. Signed (HMAC) tokens are a later option and require either an external signer outside the PTY container or the runtime/child privilege boundary below
@@ -168,6 +199,7 @@ admin_credential_hash = "${secrets.pty_admin_hash}"  # verifies the admin bootst
 - **Reconnect**: monotonic byte cursor from day one -- the ring buffer tracks total bytes written; clients reconnect with `since=<offset>` and receive only missed bytes. The replay-to-live handoff is **atomic**: the subscriber registers under the buffer lock, captures the end offset, replays through it, then drains queued live bytes -- with connection-generation fencing so teardown of a replaced connection cannot affect its successor. On overflow the server sends an explicit `gap` control frame (bytes-dropped count) so the client can trigger a full clear/redraw instead of rendering a sliced ANSI stream
 - **`scrollback_replay` vs cursor semantics** (distinct controls): incremental `since` replay is always available within the ring buffer's retention; `scrollback_replay` governs only the cursor-less full-history dump on a fresh attach (default off -- secrets-safe); setting `scrollback_kib = 0` disables retention entirely, which also disables `since` replay (every reconnect starts with a `gap` + reset)
 - **Teardown**: setpgid on spawn; SIGTERM-grace-SIGKILL escalation on the process group; evict-while-attached order = notify client, close socket, kill group, close master fd, release slot; buffers cleared on teardown; scrollback never touches disk
+- **Kill domain (MUST)**: the process group is only the first signal path, not the containment guarantee -- a child that calls `setsid` or double-forks escapes the pgid. Phase 1 MUST implement at least one hard kill boundary: a per-session cgroup killed via `cgroup.kill` (or freeze-then-kill), or a pidfd-based descendant reaper that tracks and kills all session descendants. Slot release and the absolute TTL are enforced against this boundary, never against the pgid alone
 - **Recovery taxonomy** (stated, not implied): detach/reattach survives (process alive); pod restart does not (process dead) -- reattach-to-dead returns a distinct error and offers **restart-in-place**: same session name, a fresh process and a new generation (old tokens invalid, empty scrollback). Pod-lifetime durability is out of scope and documented as such
 
 ---
@@ -180,7 +212,7 @@ admin_credential_hash = "${secrets.pty_admin_hash}"  # verifies the admin bootst
 - Fills the remote + sandboxed + raw-terminal quadrant with a real container boundary instead of a claimed one
 - Highest reversibility: default-off, separately versioned, separately deprecable
 - Coexistence where it matters (shared workspace) without shared process or credential-mount domains; network namespace and pod fate are shared only in the colocated profile (see Isolation tiers)
-- The Phase 4 notification bridge (sidecar webhook -> broker -> Discord) later reconnects the feature to OAB's messaging strength without merging the runtimes
+- The Phase 4 notification bridge (broker pulls from the sidecar -> relays to Discord) later reconnects the feature to OAB's messaging strength without merging the runtimes
 
 ### Negative
 
@@ -224,7 +256,7 @@ Leaves the need unserved; users accept Herdr's laptop fragility or OpenDray's ho
 ### Phase 1: `openab-pty` MVP (new crate, new binary)
 
 - Own session manager: named sessions, operator-configured command, allowlist-validated names
-- **Session bootstrap**: sessions are created via the authenticated loopback/UDS operator CLI (`openab-pty session create <name>`), which spawns the PTY and returns the one-time attach token; `GET /pty/{session}` is attach-only. No remote create/list/kill in Phase 1 (Phase 2 adds them behind admin auth)
+- **Session bootstrap**: sessions are created via the authenticated loopback/UDS operator CLI (`openab-pty session create <name>`; `session renew <name>` re-issues a token per the token control plane), which spawns the PTY and returns the one-time attach token; `GET /pty/{session}` is attach-only. No remote create/list/kill in Phase 1 (Phase 2 adds them behind admin auth)
 - portable-pty spawner with setpgid, escalating kill, and the teardown order above
 - `GET /pty/{session}` WSS endpoint: binary frames = PTY bytes; text frames = versioned control schema (`resize`, `ping`, `detach`, `gap`, `ttl-warning`) with a defined close-code table. Frame validation is strict allowlist: bounded max frame size, unknown control types rejected, resize values bounds-checked; malformed frames count toward an abuse metric and can disconnect
 - Input backpressure: per-connection write watermark toward the PTY master; a client exceeding it is disconnected (fail closed) rather than growing unbounded queues or stalling the reader
@@ -248,8 +280,8 @@ Leaves the need unserved; users accept Herdr's laptop fragility or OpenDray's ho
 
 ### Phase 4: Messaging bridge (optional, colocated profile only)
 
-- `openab-pty` posts a webhook to the broker when a detached session emits no output for N seconds after a prompt-like burst (stated heuristic, not magic); broker relays to the platform thread. Bridge is one-way and feature-gated
-- **Bridge authentication is required by design, stated now**: the webhook carries an HMAC signature from a dedicated bridge secret delivered at deploy time (or travels over a loopback/UDS-only endpoint) -- separate from platform tokens and from the PTY signing key, and never usable as a PTY identity plane. A compromised PTY runtime must not be able to inject arbitrary notifications
+- `openab-pty` exposes a pod-local, loopback-only notification stream; the **broker pulls** (long-poll/SSE on localhost) when a detached session emits no output for N seconds after a prompt-like burst (stated heuristic, not magic); the broker relays to the platform thread. Bridge is one-way and feature-gated
+- **No bridge secret enters the PTY container -- by design, stated now**: a delivered HMAC key would recreate exactly the in-container authority the keyless token model eliminated (a same-UID child can read any file the runtime can read; 0400 at the same UID is not a boundary). The pull model removes the broker-side ingress entirely: there is no webhook endpoint to leave open and no shared key to steal. Residual risk, stated: a same-UID child that kills the runtime (an accepted same-UID risk) could bind the freed port and forge events -- therefore the broker treats bridge events as **display-only, rate-limited hints**: they never carry commands, never mutate broker state, and are labeled best-effort in the relayed message. A push/webhook variant with an HMAC secret is permitted only with an external signer outside the PTY container or the runtime/child privilege boundary from the Security model (non-MVP hardening)
 - **Not available in the PTY-only profile** — there is no broker to relay through, and `openab-pty` will not grow its own notifier (that would recreate the scope creep this ADR exists to avoid). Users who want notifications deploy profile 3
 
 ### Later (demand-gated, explicitly deferred)
