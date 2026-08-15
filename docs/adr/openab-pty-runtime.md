@@ -110,7 +110,8 @@ Operators keep a **single logical `config.toml`** (the existing `configUrl` flow
 
 - The broker reads its existing sections; it ignores `[pty]`
 - The PTY runtime receives **only** a pre-filtered `[pty]` projection. Self-filtering a shared config is NOT an accepted secure delivery: `--section pty` limits parsing, not access -- if the PTY container holds the source URL and fetch credentials, a shell user can fetch the full broker config directly. The sanitized projection MUST be generated outside the PTY trust boundary (CI, chart, or operator tooling) and delivered via its own object/URL with a fetch identity scoped to that object only
-- **Deployment contract -- the PTY container spec MUST NOT mount**: the ServiceAccount token (`automountServiceAccountToken: false`; note IRSA identity is pod-level, so the PTY signing secret is fetched via a narrowly-scoped mechanism, not the broker's role), the broker config or its source credentials, platform secrets, or any volume broader than the workspace (workspace-only volume or `subPath`; never the broker HOME PVC, which contains caches and session state)
+- **Deployment contract -- the PTY container spec MUST NOT mount**: the ServiceAccount token (set `automountServiceAccountToken: false` at **pod** level -- it is not per-container -- and, when the broker needs IRSA/configUrl credentials in the colocated profile, project an audience-scoped token volume **into the broker container only**), the broker config or its source credentials, platform secrets, or any volume broader than the workspace (workspace-only volume or `subPath`; never the broker HOME PVC, which contains caches and session state)
+- **Signing-key delivery (MUST)**: the PTY signing key is materialized at deploy time (operator/Helm/CI resolves the `aws-sm://` reference) and mounted read-only (0400) at a path readable by the runtime process but not by the PTY child; the PTY container never performs runtime cloud-secret fetches and holds no cloud identity. The key never enters the child's environment, logs, or core dumps (dumpable disabled)
 - `${VAR}` interpolation and `[secrets.refs]` resolution behave identically in both binaries; the PTY-only projection's `[secrets.refs]` contains exactly one entry -- the signing key
 
 ```toml
@@ -129,6 +130,7 @@ bot_token = "${DISCORD_BOT_TOKEN}"
 [pty]                               # PTY view only
 enabled = true
 listen = "0.0.0.0:8090"             # own port; TLS contract below
+tls_terminated_upstream = false     # true only behind a trusted TLS-terminating Ingress
 command = "/bin/bash"               # operator-configured; never client-specified
 max_sessions = 4
 absolute_session_ttl = "12h"        # applies even while attached
@@ -142,8 +144,8 @@ auth_secret = "${secrets.pty_signing_key}"
 - **Transport / TLS contract**: WSS is mandatory for external clients. Two supported terminations, chosen explicitly per deployment: (a) `openab-pty` terminates TLS itself (cert mounted into the container), or (b) a trusted Ingress terminates TLS and forwards plain WS internally -- in which case the internal listener accepts non-loopback plain WS only when the deployment declares `tls_terminated_upstream = true`, and the residual internal-hop exposure is documented. Fail-closed in all cases: the listener refuses to bind off-loopback without auth material configured (same guard the `/acp` endpoint enforces)
 - **Browser credential transport**: reuse the validated `/acp` scheme -- `Authorization: Bearer` for non-browser clients, `Sec-WebSocket-Protocol: openab.bearer.<token>` for browsers (browsers cannot set the Authorization header on upgrade); origin policy and constant-time comparison carry over
 - **Token control plane** (MVP model; an identity layer remains explicitly out of scope per `identity-trust-none.md`):
-  - **Create requires authentication**: sessions are created by the operator via a loopback/Unix-socket CLI (`openab-pty session create <name>`) or an admin bootstrap credential. Unauthenticated remote create/list/kill is NOT provided in MVP
-  - **One-time issuance at creation**: creating a session mints an immutable `generation`, signs one scoped attach token (claims: session ID + generation, audience, action scope, expiry), and returns it exactly once
+  - **Create requires authentication -- and locality is not authentication**: the shell child may share the container (and potentially the UID) with the runtime, so a loopback/UDS endpoint alone is not an auth barrier. MVP mechanism: session creation (`openab-pty session create <name>`) requires an **admin bootstrap credential** delivered to the operator at deploy time and never present in the PTY child's environment or filesystem view. Hardening alternative (non-MVP): a distinct privileged UID/group for the runtime with UDS peer-credential verification. Unauthenticated remote create/list/kill is NOT provided in MVP; the admin credential and the attach token are distinct planes -- an attach token can never create, list, or kill
+  - **One-time issuance at creation**: creating a session mints an immutable `generation`, signs one scoped attach token (claims: session ID + generation, audience, action scope = attach only, expiry), and returns it exactly once. **Issued once, not single-use**: the bearer token remains valid for reattach until its expiry or a generation bump -- reconnecting clients are not locked out; theft exposure is bounded by a short default TTL (well below the session TTL) and renewal happens only through the authenticated create/renew path
   - **Attach only verifies, never issues**: `GET /pty/{session}` validates the presented token; there is no minting path on the attach surface
   - **Per-session revocation**: kill/recreate bumps the generation, immediately invalidating outstanding tokens for that session; signing-key rotation remains the global escape hatch and supports an old/new overlap window for zero-downtime rotation
   - **Format direction**: HMAC-SHA256 opaque token; token expiry defaults shorter than the session TTL (re-issue via the authenticated create/renew path)
@@ -158,7 +160,7 @@ auth_secret = "${secrets.pty_signing_key}"
 
 - **Liveness**: activity = client input OR PTY output OR a live attached socket (WS ping/pong at a 15-30s interval; a half-open socket counts as detached after 2-3 missed pings -- exact values are Phase 1 config with these recommended defaults, balancing flaky mobile networks against dead-client slot pinning)
 - **TTLs**: detached-idle TTL (default 30m) plus an absolute session lifetime cap (default 12h) that applies even while attached -- capacity cannot be pinned forever by an open browser tab. Expiry is client-visible: a warning control frame precedes forced teardown, and the WebSocket closes with a distinct close code so clients surface "session expired" instead of retrying a network error
-- **Attach semantics (MVP)**: single-attach exclusive; a second attach with a valid token detaches the first (documented; multi-viewer is Phase 3)
+- **Attach semantics (MVP)**: single-attach exclusive, enforced by a session-level `owner_conn_generation` compare-and-swap: only the connection that wins the CAS holds the PTY write end; the replaced connection's write path is dropped before its socket closes, the PTY writer task honors only the current generation, and teardown of a replaced connection can never affect its successor. A second attach with a valid token takes over via this CAS (documented; multi-viewer is Phase 3)
 - **Reconnect**: monotonic byte cursor from day one -- the ring buffer tracks total bytes written; clients reconnect with `since=<offset>` and receive only missed bytes. The replay-to-live handoff is **atomic**: the subscriber registers under the buffer lock, captures the end offset, replays through it, then drains queued live bytes -- with connection-generation fencing so teardown of a replaced connection cannot affect its successor. On overflow the server sends an explicit `gap` control frame (bytes-dropped count) so the client can trigger a full clear/redraw instead of rendering a sliced ANSI stream
 - **`scrollback_replay` vs cursor semantics** (distinct controls): incremental `since` replay is always available within the ring buffer's retention; `scrollback_replay` governs only the cursor-less full-history dump on a fresh attach (default off -- secrets-safe); setting `scrollback_kib = 0` disables retention entirely, which also disables `since` replay (every reconnect starts with a `gap` + reset)
 - **Teardown**: setpgid on spawn; SIGTERM-grace-SIGKILL escalation on the process group; evict-while-attached order = notify client, close socket, kill group, close master fd, release slot; buffers cleared on teardown; scrollback never touches disk
@@ -173,7 +175,7 @@ auth_secret = "${secrets.pty_signing_key}"
 - OAB keeps its thin-broker identity untouched — zero changes to the shipped binary, pool, or ACP path
 - Fills the remote + sandboxed + raw-terminal quadrant with a real container boundary instead of a claimed one
 - Highest reversibility: default-off, separately versioned, separately deprecable
-- Coexistence where it matters (shared workspace) without shared failure or credential domains
+- Coexistence where it matters (shared workspace) without shared process or credential-mount domains; network namespace and pod fate are shared only in the colocated profile (see Isolation tiers)
 - The Phase 4 notification bridge (sidecar webhook -> broker -> Discord) later reconnects the feature to OAB's messaging strength without merging the runtimes
 
 ### Negative
@@ -220,7 +222,8 @@ Leaves the need unserved; users accept Herdr's laptop fragility or OpenDray's ho
 - Own session manager: named sessions, operator-configured command, allowlist-validated names
 - **Session bootstrap**: sessions are created via the authenticated loopback/UDS operator CLI (`openab-pty session create <name>`), which spawns the PTY and returns the one-time attach token; `GET /pty/{session}` is attach-only. No remote create/list/kill in Phase 1 (Phase 2 adds them behind admin auth)
 - portable-pty spawner with setpgid, escalating kill, and the teardown order above
-- `GET /pty/{session}` WSS endpoint: binary frames = PTY bytes; text frames = versioned control schema (`resize`, `ping`, `detach`, `gap`, `ttl-warning`) with a defined close-code table
+- `GET /pty/{session}` WSS endpoint: binary frames = PTY bytes; text frames = versioned control schema (`resize`, `ping`, `detach`, `gap`, `ttl-warning`) with a defined close-code table. Frame validation is strict allowlist: bounded max frame size, unknown control types rejected, resize values bounds-checked; malformed frames count toward an abuse metric and can disconnect
+- Input backpressure: per-connection write watermark toward the PTY master; a client exceeding it is disconnected (fail closed) rather than growing unbounded queues or stalling the reader
 - Auth: the token control plane above (authenticated create, one-time issuance bound to session generation, attach-only verification); fail-closed off-loopback; `/acp`-style browser subprotocol transport; per-IP upgrade-failure rate limiting
 - Monotonic cursor reconnect with atomic replay/live handoff and gap signaling; scrollback in-memory, off-by-default fresh-attach replay, cleared on teardown
 - Detached-idle TTL + absolute lifetime cap (with client-visible expiry warning + close code); single-attach exclusive
@@ -231,7 +234,7 @@ Leaves the need unserved; users accept Herdr's laptop fragility or OpenDray's ho
 ### Phase 2: Deployment + web client
 
 - Helm: independent `openab.enabled` / `pty.enabled` toggles (or `--set profile=acp|pty|full`); standalone profile gets its own Service/Ingress (`/pty/*`) and NetworkPolicy example; config split documented per the configUrl pattern; `ghcr.io/openabdev/openab-pty` image published from the existing release pipeline
-- Minimal xterm.js page served by the sidecar; session list/create/kill endpoints (same auth bar as attach)
+- Minimal xterm.js page served by `openab-pty`; remote session list/create/kill endpoints gated by the **admin bootstrap credential** (the same control-plane contract as the Phase 1 CLI -- never attach tokens; attach-token scope remains attach-only)
 - Rollback procedure: disabling the toggle drains (notify + grace) then kills sessions; broker unaffected
 
 ### Phase 3: Lifecycle hardening
