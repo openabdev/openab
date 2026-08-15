@@ -190,10 +190,50 @@ Ship `openab-pty` as a separate sidecar to keep the core untouched.
 
 ---
 
-## 6. References
+## 6. Prior Art Learnings
+
+Techniques surveyed from adjacent projects, mapped to the implementation phases above.
+
+### OpenDray (`internal/session/`, Go)
+
+| Technique | What it does | Adopt in |
+|---|---|---|
+| Ring buffer with monotonic cursor (`ringbuf.go`) | The buffer tracks a monotonic `written` byte counter; clients pass their last offset as `since` on reconnect and receive only the missed bytes. If a client lags past the buffer capacity, the reply's `Start > since` gap explicitly reports how many bytes were dropped. | Phase 1 |
+| Terminal-capability response filtering (`terminal_capabilities.go`) | xterm.js auto-answers CLI capability queries (Primary DA, CPR, Status Report); those escape sequences injected into stdin reliably break some Ink-based CLIs at startup. OpenDray strips well-formed answer patterns at the PTY boundary — one chokepoint protects every client emulator. | Phase 1 |
+| Pure lifecycle state machine (`transitions.go`) | A side-effect-free `(State, Event)` transition table, exhaustively table-tested. Termination is split three ways — `user_stop`, `exit` (CLI died on its own), `gateway_shutdown` (daemon took the PTY down) — so post-restart reconciliation auto-resumes only the `interrupted` class. | Phase 3 |
+| Server-side virtual terminal (`pump.go` + vt10x) | PTY output feeds a headless VT emulator in parallel with the ring buffer and live fanout, so the server can snapshot the post-ANSI rendered screen for notifications. Rust equivalents: `avt`, `vt100`. | Phase 4 |
+| Idle detection → notification pipeline (`pump.go`) | Output marks activity; a watcher fires `session.idle` past a threshold and ships the last N lines from the ring buffer as the notification snippet. | Phase 4 |
+| TUI chrome filtering (`claude_chrome.go`, `term.go`) | Conservative regex passes strip agent-CLI chrome (spinners, model bars, key hints) from screen snapshots so notifications read cleanly. False positives lose a line; they never delete real content. | Phase 4 |
+| JSONL transcript as a second channel (`claude_jsonl.go`, `codex_jsonl.go`) | Reads the agent's own transcript files alongside the raw PTY — structured events without waiting for protocol evolution. | Future ADR |
+
+### Herdr (Rust)
+
+| Technique | What it does | Adopt in |
+|---|---|---|
+| Semantic agent state detection | Classifies each pane as `working` / `blocked` / `idle` / `done` from the PTY screen using per-agent detection manifests (TOML, remotely updatable, locally overridable), with an `agent.explain` API that reports which rule matched and why. `blocked` (waiting on approval) and `idle` (done) warrant different notifications. | Phase 4 |
+| Race-safe waits | `agent.wait --until blocked/done` is server-owned and event-driven, and pins the resolved pane occupant so a replacement process cannot satisfy a stale wait; `agent.prompt` accepts an atomic `wait` object to eliminate the prompt-then-wait race. | Phase 1 API design |
+| Layered restore taxonomy | Five distinct paths: live persistence (detach/reattach), live handoff (transfer live PTYs to a replacement server on upgrade), native agent session restore (integrations report the agent's own session ID; restart resumes via `claude --resume <id>` instead of replaying bytes), pane history replay (**off by default — scrollback may contain secrets**), and layout-only snapshot restore. | Phases 1/3; secrets-safe default adopted |
+| Multiple read projections | `pane.read` offers `visible` (viewport), `recent` (scrollback), `recent-unwrapped` (logs, ignores soft wrap), and `detection` (state-detection snapshot) views of one PTY. | Phase 2/3 |
+| Callback env injection | Spawned pane processes receive `HERDR_SOCKET_PATH` / `HERDR_PANE_ID`, so agents inside panes can drive the multiplexer — spawn peers, prompt each other, wait on each other. | Phase 3 |
+
+### Claude Code cross-session messaging (v2.1.224+)
+
+| Technique | What it does | Adopt in |
+|---|---|---|
+| Per-session UDS inbox + filesystem discovery | Each session binds a Unix socket restricted to the OS user and registers itself in files on disk; peers discover each other by reading those files. Filesystem visibility *is* the reachability boundary — container isolation falls out for free. | Future pod-internal multi-session messaging |
+| Deliberately small message contract | Messages are plain-text summaries only, never conversation history or files; moving a conversation is the session-resume feature's job. Avoids context leakage, size blowups, and schema evolution. | A2A semantics for PTY-mode sessions |
+| Permission-class trust model | Inbound messages can never approve permissions, change configuration, or execute embedded commands. The default deliver/hold decision derives from both sessions' permission-mode classes (bypassing vs prompting); held messages expire (default 5 min) and report back to the sender. | A2A semantics |
+| Own-child verification, dual-track | A hook posting back to its own session's socket is verified by process evidence (peer credentials) where available, falling back to a per-session token sent as a first-line auth frame where it is not (macOS after process exit, PID-1 containers). | Phase 1 auth design |
+| Message-storm prevention | Messages are read between tool calls (a running tool is never interrupted), rate-limited per sender, deduplicated within a short window, and capped at 50 queued — loops between two sessions stop on their own. | A2A semantics |
+
+---
+
+## 7. References
 
 - [portable-pty crate](https://crates.io/crates/portable-pty) — cross-platform PTY handling (wezterm project)
 - [xterm.js](https://xtermjs.org/) — browser terminal renderer
-- [OpenDray](https://opendray.dev/) — host-resident PTY session persistence (prior art, different security model)
+- [OpenDray](https://opendray.dev/) — host-resident PTY session persistence (prior art, different security model); `internal/session/` package
+- [Herdr](https://herdr.dev/) — agent multiplexer with semantic state detection and socket API (prior art, laptop-local)
+- [Claude Code cross-session messaging](https://code.claude.com/docs/en/cross-session-messaging) — UDS inbox, trust model, and loop throttling (prior art for A2A semantics)
 - [ADR: ACP Server with WebSocket Transport](./acp-server-websocket.md) — shared axum listener and auth pattern
 - `crates/openab-core/src/acp/pool.rs` — session pool to be extended with the PTY backend
