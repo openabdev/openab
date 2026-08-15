@@ -1509,6 +1509,15 @@ fn cap_payload(params: &mut DelegateResultParams, max_result_bytes: usize) {
 }
 
 /// Queue the terminal result on the initiator's connection.
+///
+/// The `expect("serializable")` here is INTENTIONAL, unlike the fail-soft
+/// [`synthesized_frame`] used by teardown paths: this runs on the
+/// `cp/delegate_result` request path (never from a Drop or the sweeper), its
+/// params were just deserialized from a client frame (provably
+/// serializable), and a panic here is absorbed by `RegistrationGuard`'s
+/// fail-soft teardown. Do not convert it to fail-soft without understanding
+/// that distinction — silently losing a genuine terminal on the request path
+/// is worse than the loud failure.
 fn deliver_result(
     registry: &Registry,
     entry: &InFlight,
@@ -2851,6 +2860,53 @@ type = "primary"
             "drops deliver nothing to the initiator"
         );
         assert_eq!(w.router.inflight_count(), 1, "live entry untouched");
+    }
+
+    #[test]
+    fn precomputed_prompt_excerpt_is_truncated_and_metadata_only_aware() {
+        // Review round-12 F65: the prompt excerpt is computed BEFORE the
+        // announce/forward critical section and passed in as a value. This
+        // pins the precomputed path directly: the requested event carries a
+        // properly truncated excerpt in a normal namespace, and no excerpt
+        // key at all in a metadata_only namespace — proving the hoisting
+        // changed neither the truncation nor the redaction behavior.
+        let w = world();
+        let mut lobby = observe(&w, "prod");
+        let mut p = delegate_params("d-big", "worker-1", 60);
+        p.prompt = "p".repeat(64 * 1024);
+        assert!(matches!(do_delegate(&w, p), DelegateOutcome::Accepted(_)));
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0]["event"], "delegation_requested");
+        let excerpt = ev[0]["prompt_excerpt"].as_str().unwrap();
+        assert!(excerpt.contains("truncated by control plane"));
+        assert!(
+            excerpt.len() <= 4096,
+            "excerpt bounded by max_event_excerpt_bytes: {}",
+            excerpt.len()
+        );
+
+        // metadata_only namespace: the key is absent entirely.
+        let cfg: CpConfig = toml::from_str(
+            r#"
+[namespaces.prod]
+metadata_only = true
+"#,
+        )
+        .unwrap();
+        let w = world_with_cfg(cfg);
+        let mut lobby = observe(&w, "prod");
+        let mut p = delegate_params("d-quiet", "worker-1", 60);
+        p.prompt = "secret payload".into();
+        assert!(matches!(do_delegate(&w, p), DelegateOutcome::Accepted(_)));
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0]["event"], "delegation_requested");
+        assert!(
+            ev[0].get("prompt_excerpt").is_none(),
+            "metadata_only suppresses the excerpt key entirely"
+        );
+        assert!(!ev[0].to_string().contains("secret payload"));
     }
 
     #[test]

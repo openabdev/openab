@@ -556,12 +556,14 @@ impl Drop for RegistrationGuard {
     fn drop(&mut self) {
         // Must not panic: a panic here during an unwind aborts the process.
         // Teardown is lock-guarded map mutation, non-blocking sends, and
-        // FAIL-SOFT frame/event serialization: `fail_instance`,
-        // `sweep_deadlines`, and `EventHub::emit` drop a frame with an error
-        // log instead of panicking on a serialization error (see
-        // `synthesized_frame` and `emit`), so no `expect`/`unwrap` lies on
-        // this path. parking_lot locks are not poisoned and are released by
-        // the unwind itself, so a panic taken while holding one cannot
+        // FAIL-SOFT frame/event serialization. This Drop chain reaches
+        // `fail_instance` and `EventHub::emit`; the teardown-adjacent
+        // `sweep_deadlines` (called from the lease sweeper task, not from
+        // here) shares the same fail-soft discipline. All three drop a frame
+        // with an error log instead of panicking on a serialization error
+        // (see `synthesized_frame` and `emit`), so no `expect`/`unwrap` lies
+        // on this path. parking_lot locks are not poisoned and are released
+        // by the unwind itself, so a panic taken while holding one cannot
         // deadlock this call.
         teardown(&self.state, self.handle, &self.identity);
     }

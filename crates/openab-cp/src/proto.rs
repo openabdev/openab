@@ -157,8 +157,19 @@ pub mod codes {
     pub const POLICY_DENIED: i64 = -32003;
     /// No registered, healthy runtime matches the target selector.
     pub const NO_TARGET: i64 = -32004;
-    /// Matching targets exist but all are at their advertised capacity.
-    /// Explicit fast-fail: the CP never queues (v1 has no durable state).
+    /// A capacity ceiling is exhausted. Explicit fast-fail: the CP never
+    /// queues (v1 has no durable state).
+    ///
+    /// Deliberately ONE code for three capacity domains — all matching
+    /// targets at their advertised capacity, the CP at its global
+    /// `max_inflight_delegations` ceiling, or a namespace at its
+    /// `max_observers_per_namespace` ceiling (registration refusal). Every
+    /// message names the exhausted bound and, where applicable, the config
+    /// knob, so a human can attribute the refusal; a client's reaction is
+    /// the same in all three cases (back off / retry / raise the bound), so
+    /// splitting the code would grow the wire surface without changing any
+    /// client decision. Revisit if machine-readable attribution is ever
+    /// needed for alerting.
     pub const SATURATED: i64 = -32005;
     // -32006 is deliberately unassigned. It held a `DEADLINE_EXCEEDED` code
     // that nothing could ever emit: a deadline already in the past is

@@ -139,19 +139,37 @@ impl EventHub {
                 return;
             }
         };
-        for o in observers {
+        let mut dropped = 0usize;
+        for o in &observers {
             // Best effort by design: a saturated lobby queue drops the frame.
-            // Logged at warn: systemic frame loss (a saturated lobby) must be
-            // visible at default log levels, not only under debug.
             if o.tx.try_send(text.clone()).is_err() {
-                tracing::warn!(
+                dropped += 1;
+                // Per-observer detail stays at debug; the aggregated warn
+                // below is the default-level signal.
+                tracing::debug!(
                     observer = %o.logical_id(),
                     instance = %o.instance_id,
                     seq = params.seq,
-                    "observer queue full or closed — event frame dropped \
-                     (client resyncs via the seq gap)"
+                    "observer queue full or closed — event frame dropped"
                 );
             }
+        }
+        // One aggregated warn per emission, not one per observer: systemic
+        // lobby saturation must be visible at default log levels, but a
+        // persistently saturated full-cap namespace must not multiply log
+        // I/O by observer count on the delegation path (review round-12
+        // F63 — this emit can run inside the router's in-flight critical
+        // section).
+        if dropped > 0 {
+            tracing::warn!(
+                namespace,
+                seq = params.seq,
+                dropped,
+                observers = observers.len(),
+                "observer queues full or closed — event frame dropped for \
+                 {dropped} of {} observers (clients resync via the seq gap)",
+                observers.len()
+            );
         }
     }
 }

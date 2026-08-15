@@ -113,8 +113,10 @@ issue #1474).
   would otherwise mask the retry's genuine result. Every terminal frame carries
   the token, including CP-synthesized `timeout` and `target_disconnected`.
 - A delegation may be refused with `SATURATED` because the target is at
-  capacity *or* because the CP is at `max_inflight_delegations`; the error
-  message says which. The CP never queues — retry later.
+  capacity *or* because the CP is at `max_inflight_delegations`; an observer
+  registration may be refused with the same code when its namespace is at
+  `max_observers_per_namespace`. The error message always says which bound
+  was hit. The CP never queues — retry later (or raise the named knob).
 - The capacity a runtime advertises in `max_delegated_sessions` is clamped by
   the CP (`default_max_delegated_sessions_cap`, or a per-identity override).
   The ack's `effective_max_delegated_sessions` is the value that counts.

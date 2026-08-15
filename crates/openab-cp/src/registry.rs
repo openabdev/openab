@@ -285,8 +285,6 @@ impl Registry {
         shutdown: ShutdownTx,
         max_observers_per_namespace: usize,
     ) -> Result<u64, usize> {
-        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed) + 1;
-        inst.handle = handle;
         let mut g = self.inner.write();
         if inst.agent_type == AgentType::Observer {
             let observers = g
@@ -299,6 +297,10 @@ impl Registry {
                 return Err(observers);
             }
         }
+        // Allocated only after the cap check: a refused registration must
+        // not consume a handle id.
+        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed) + 1;
+        inst.handle = handle;
         g.insert(handle, Entry { inst, shutdown });
         Ok(handle)
     }
