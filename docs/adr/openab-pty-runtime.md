@@ -302,7 +302,7 @@ Leaves the need unserved; users accept Herdr's laptop fragility or OpenDray's ho
 - Detached-idle TTL + absolute lifetime cap (with client-visible expiry warning + close code); single-attach exclusive
 - Audit log (attach/detach/create/kill/auth-failure) and basic metrics
 - `openab-pty --validate-projection <file>`: the fail-closed startup guard exposed as a standalone subcommand, so operators can verify a hand-generated projection from day one (Phase 2 CI reuses it as the guard test)
-- **Same-UID adversary tests**: ptrace/`/proc/<pid>/{mem,fd}` probes against every credential-handling process return `EPERM`; dumpability asserted to remain 0 after startup (regression guard against a dependency re-enabling it); `prctl(PR_SET_DUMPABLE, 0)` failure refuses service (fail-closed); `session create` invoked from inside a managed child is denied and audited; kill-domain convergence test with a `setsid`/double-fork escapee and a SIGTERM-trapping stubborn child (zero orphans, zero FD leaks)
+- **Same-UID adversary tests**: ptrace/`/proc/<pid>/{mem,fd}` probes against every credential-handling process return `EPERM` -- **explicitly including the splice-only CLI's file descriptors, not just the runtime**; dumpability asserted to remain 0 after startup (regression guard against a dependency re-enabling it); `prctl(PR_SET_DUMPABLE, 0)` failure refuses service (fail-closed); `session create` invoked from inside a managed child is denied and audited; kill-domain convergence test with a `setsid`/double-fork escapee and a SIGTERM-trapping stubborn child (zero orphans, zero FD leaks)
 - Resize propagation (TIOCSWINSZ) including attach-time initial size
 - Terminal-capability response filtering at the PTY boundary (known Ink-CLI startup breakage)
 
