@@ -117,19 +117,39 @@ impl EventHub {
             event,
         };
         // Serialized once per emission; registry/hub map locks are not held.
-        let text = serde_json::to_string(&JsonRpcNotification::new(
-            methods::EVENT,
-            serde_json::to_value(&params).expect("serializable"),
-        ))
-        .expect("serializable");
+        // Fail SOFT on a serialization error: this function is reachable from
+        // connection teardown (`RegistrationGuard`'s Drop, which may already
+        // be unwinding — a second panic would abort the process) and from the
+        // lease sweeper. The lobby is an audit surface; dropping one frame
+        // beats killing the control plane. Practically unreachable for these
+        // types, but the audit path must not be able to panic by
+        // construction.
+        let text = match serde_json::to_value(&params)
+            .and_then(|v| serde_json::to_string(&JsonRpcNotification::new(methods::EVENT, v)))
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(
+                    namespace,
+                    seq = params.seq,
+                    error = %e,
+                    "cp/event serialization failed — frame dropped (observers \
+                     will detect the seq gap and resync)"
+                );
+                return;
+            }
+        };
         for o in observers {
             // Best effort by design: a saturated lobby queue drops the frame.
+            // Logged at warn: systemic frame loss (a saturated lobby) must be
+            // visible at default log levels, not only under debug.
             if o.tx.try_send(text.clone()).is_err() {
-                tracing::debug!(
+                tracing::warn!(
                     observer = %o.logical_id(),
                     instance = %o.instance_id,
                     seq = params.seq,
-                    "observer queue full or closed — event frame dropped"
+                    "observer queue full or closed — event frame dropped \
+                     (client resyncs via the seq gap)"
                 );
             }
         }

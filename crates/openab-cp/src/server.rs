@@ -326,7 +326,11 @@ async fn handle_connection(
         .effective_max_sessions(&identity, reg.max_delegated_sessions);
     // The registry assigns the CP-generated handle: ownership
     // and teardown never key on the client-supplied instance_id.
-    let handle = state.registry.register_conn(
+    // Observers are additionally bounded per namespace: fan-out does
+    // bounded per-observer work inside the delegation path's in-flight
+    // critical section, so the observer count is a configured latency
+    // budget, not an open-ended population.
+    let handle = match state.registry.register_conn_capped(
         Instance {
             handle: 0,
             namespace: identity.namespace.clone(),
@@ -341,7 +345,38 @@ async fn handle_connection(
             tx: tx.clone(),
         },
         Arc::clone(&shutdown),
-    );
+        state.cfg.max_observers_per_namespace,
+    ) {
+        Ok(h) => h,
+        Err(current) => {
+            warn!(
+                agent = %format!("{}/{}", identity.namespace, identity.name),
+                observers = current,
+                max = state.cfg.max_observers_per_namespace,
+                "registration refused: namespace is at its observer cap"
+            );
+            let resp = JsonRpcErrorResponse::new(
+                reg_rpc_id,
+                ErrorObject::new(
+                    codes::SATURATED,
+                    format!(
+                        "namespace is at its observer cap \
+                         (max_observers_per_namespace = {}); retry later or \
+                         raise the cap",
+                        state.cfg.max_observers_per_namespace
+                    ),
+                ),
+            );
+            let _ = send_bounded(
+                &mut sink,
+                Message::Text(serde_json::to_string(&resp).expect("serializable").into()),
+                write_timeout,
+                &mut shutdown_rx,
+            )
+            .await;
+            return;
+        }
+    };
     // From here on, teardown is owned by an RAII guard rather than the return
     // path: a panic anywhere below (the `expect("serializable")` sites are on
     // production paths) would otherwise skip deregistration and leave this
@@ -520,10 +555,14 @@ struct RegistrationGuard {
 impl Drop for RegistrationGuard {
     fn drop(&mut self) {
         // Must not panic: a panic here during an unwind aborts the process.
-        // Everything it touches is lock-guarded map mutation and non-blocking
-        // sends — no `expect`, no allocation-dependent invariants. parking_lot
-        // locks are not poisoned and are released by the unwind itself, so a
-        // panic taken while holding one cannot deadlock this call.
+        // Teardown is lock-guarded map mutation, non-blocking sends, and
+        // FAIL-SOFT frame/event serialization: `fail_instance`,
+        // `sweep_deadlines`, and `EventHub::emit` drop a frame with an error
+        // log instead of panicking on a serialization error (see
+        // `synthesized_frame` and `emit`), so no `expect`/`unwrap` lies on
+        // this path. parking_lot locks are not poisoned and are released by
+        // the unwind itself, so a panic taken while holding one cannot
+        // deadlock this call.
         teardown(&self.state, self.handle, &self.identity);
     }
 }
@@ -1215,8 +1254,17 @@ mod tests {
         let state = state_with("");
         let (h_i, _rx_i) = register_test_instance(&state, "koudu", AgentType::Primary, 4);
         let (h_w, mut rx_w) = register_test_instance(&state, "worker-1", AgentType::Worker, 1);
+        // An observer is attached so the unwind exercises the FULL teardown
+        // emit surface — the deregister announcement and the per-admission
+        // terminal — which must be fail-soft: this Drop may already be
+        // unwinding, where a second panic aborts the process (review
+        // round-10 F62).
+        let (h_o, mut rx_o) = register_test_instance(&state, "lobby", AgentType::Observer, 0);
+        let _ = h_o;
         delegate_through_handler(&state, h_i, "d-1", "worker-1");
         rx_w.try_recv().expect("worker received the forward");
+        // Drain the events the delegation produced so far.
+        while rx_o.try_recv().is_ok() {}
         assert_eq!(state.registry.get(h_w).unwrap().active_sessions, 1);
         assert_eq!(state.router.inflight_count(), 1);
 
@@ -1253,6 +1301,17 @@ mod tests {
         // ...and the serving runtime is told to stop working.
         let cancel = rx_w.try_recv().expect("downstream cancel was queued");
         assert!(cancel.contains("cp/cancel") && cancel.contains("d-1"));
+        // The observer received the teardown's whole emit surface — produced
+        // during the unwind without a second panic: the deregister
+        // announcement and the delegation's terminal.
+        let mut saw_deregistered = false;
+        let mut saw_cancelled = false;
+        while let Ok(f) = rx_o.try_recv() {
+            saw_deregistered |= f.contains("agent_deregistered");
+            saw_cancelled |= f.contains("delegation_cancelled");
+        }
+        assert!(saw_deregistered, "deregister announcement emitted in Drop");
+        assert!(saw_cancelled, "delegation terminal emitted in Drop");
     }
 
     #[test]

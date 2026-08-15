@@ -490,7 +490,9 @@ recovery semantics:
   initiator-bound terminal frame on the wire, and a result whose commit
   loses the race is discarded undelivered — so under one CP process an
   initiator receives at most one terminal frame per admission, and the
-  observer event stream records the same outcome. The rule is retained as
+  observer event stream records the committed outcome (an initiator whose
+  connection cannot accept its terminal frame is disconnected and misses it;
+  the stream still shows what the CP committed). The rule is retained as
   client-side defence in depth (frames straddling a CP restart, future
   multi-instance deployments): **initiators MUST treat the first terminal
   frame (`completed`, `failed`, `timeout`, `target_disconnected`) for a

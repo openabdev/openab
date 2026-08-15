@@ -661,10 +661,21 @@ impl Router {
         // Admission is committed: the token is minted, capacity is reserved,
         // and the entry is inserted — the duplicate check rides the in-flight
         // table, so nothing below needs the admission guard. Dropping it here
-        // keeps observer fan-out (serialization + per-observer try_send) out
-        // of the one critical section that serializes every delegation in
-        // every namespace: a saturated lobby must never slow admission.
+        // keeps the announce/forward critical section below out of the
+        // admission lock: that section holds the (also global) in-flight
+        // lock across the requested-emit and the forward — see the lock
+        // hierarchy note for why, and F51 in the review record for the
+        // acknowledged latency tradeoff. What dropping the guard buys is
+        // that new admissions in other connections are not serialized behind
+        // this delegation's fan-out.
         drop(admission);
+
+        // Everything expensive that does not need the table lock is computed
+        // BEFORE taking it: the prompt excerpt scans up to max_prompt_bytes
+        // of client input, and the forward frame was serialized above. The
+        // critical section below performs only the generation re-check, the
+        // announce flag, one bounded event emission, and non-blocking sends.
+        let prompt_excerpt = events.excerpt(from_namespace, &forward.prompt);
 
         // Announce/forward critical section. One in-flight lock acquisition
         // covers three things that must be atomic with respect to entry
@@ -687,12 +698,15 @@ impl Router {
         //    forward — and run work every other party had already recorded
         //    as cancelled, with its capacity reservation already released.
         //
-        // The work under the lock is bounded: one serialization, one
-        // non-blocking `try_send` per observer, one non-blocking `try_send`
-        // to the target. If a teardown or the deadline sweep removed the
-        // entry first, the admission is over before it was ever announced:
-        // emit nothing, forward nothing, report the loss to the initiator
-        // (whose own teardown is usually what removed it).
+        // Work under the lock: one event serialization (excerpt precomputed
+        // above, body bounded by the validated max_event_excerpt_bytes
+        // ceiling), one non-blocking `try_send` per observer (population
+        // bounded by max_observers_per_namespace at registration), and one
+        // non-blocking `try_send` to the target — bounded by configuration,
+        // not merely by expectation. If a teardown or the deadline sweep
+        // removed the entry first, the admission is over before it was ever
+        // announced: emit nothing, forward nothing, report the loss to the
+        // initiator (whose own teardown is usually what removed it).
         enum Forward {
             Sent,
             SendFailed(InFlight),
@@ -711,7 +725,7 @@ impl Router {
                             admission: entry.generation,
                             from: entry.from_logical.clone(),
                             to: entry.to_logical.clone(),
-                            prompt_excerpt: events.excerpt(from_namespace, &forward.prompt),
+                            prompt_excerpt,
                             deadline: entry.deadline,
                             chain: entry.chain.clone(),
                         },
@@ -874,7 +888,8 @@ impl Router {
         }
     }
 
-    /// Phase 2 of a completion: end the delegation `peeked` describes.
+    /// The commit step of `complete`'s peek -> cap -> commit -> emit ->
+    /// deliver sequence: end the delegation `peeked` describes.
     ///
     /// Under ONE in-flight lock acquisition, the entry is removed and the
     /// serving instance's capacity released only if the live entry is still
@@ -1040,7 +1055,7 @@ impl Router {
 
         // Phase 2 — cap the payload (in place: the capped value is what the
         // initiator and the lobby both see).
-        cap_result(&mut params, max_result_bytes);
+        cap_payload(&mut params, max_result_bytes);
 
         // Phase 3 — commit. Claims ONLY the admission that was peeked; see
         // `commit_completion` for why key + serving handle is not enough.
@@ -1300,12 +1315,11 @@ impl Router {
                             result: None,
                             error: Some(error.clone()),
                         };
-                        let frame = JsonRpcRequest::new(
-                            rpc_id(),
-                            methods::DELEGATE_RESULT,
-                            Some(serde_json::to_value(&params).expect("serializable")),
-                        );
-                        affected.push((init, serde_json::to_string(&frame).expect("serializable")));
+                        if let Some(text) =
+                            synthesized_frame(rpc_id(), methods::DELEGATE_RESULT, &params)
+                        {
+                            affected.push((init, text));
+                        }
                     }
                     // Emitted even when the initiator is already gone: the
                     // lobby must see the delegation reach a terminal state.
@@ -1339,13 +1353,9 @@ impl Router {
                             admission: e.generation,
                             reason: reason.clone(),
                         };
-                        let frame = JsonRpcRequest::new(
-                            rpc_id(),
-                            methods::CANCEL,
-                            Some(serde_json::to_value(&params).expect("serializable")),
-                        );
-                        affected
-                            .push((target, serde_json::to_string(&frame).expect("serializable")));
+                        if let Some(text) = synthesized_frame(rpc_id(), methods::CANCEL, &params) {
+                            affected.push((target, text));
+                        }
                     }
                     events.emit(
                         registry,
@@ -1420,12 +1430,9 @@ impl Router {
                     result: None,
                     error: Some("deadline exceeded".to_string()),
                 };
-                let frame = JsonRpcRequest::new(
-                    rpc_id(),
-                    methods::DELEGATE_RESULT,
-                    Some(serde_json::to_value(&params).expect("serializable")),
-                );
-                frames.push((init, serde_json::to_string(&frame).expect("serializable")));
+                if let Some(text) = synthesized_frame(rpc_id(), methods::DELEGATE_RESULT, &params) {
+                    frames.push((init, text));
+                }
             }
             if let Some(target) = registry.get(e.to_handle) {
                 let params = CancelParams {
@@ -1439,12 +1446,9 @@ impl Router {
                     admission: e.generation,
                     reason: "deadline exceeded".to_string(),
                 };
-                let frame = JsonRpcRequest::new(
-                    rpc_id(),
-                    methods::CANCEL,
-                    Some(serde_json::to_value(&params).expect("serializable")),
-                );
-                frames.push((target, serde_json::to_string(&frame).expect("serializable")));
+                if let Some(text) = synthesized_frame(rpc_id(), methods::CANCEL, &params) {
+                    frames.push((target, text));
+                }
             }
         }
         frames
@@ -1491,7 +1495,7 @@ enum Deliver {
 /// same sender as `result`, so it gets the same bound — an uncapped error
 /// would ride up to the transport frame limit while the result beside it is
 /// capped.
-fn cap_result(params: &mut DelegateResultParams, max_result_bytes: usize) {
+fn cap_payload(params: &mut DelegateResultParams, max_result_bytes: usize) {
     if let Some(r) = &params.result {
         if r.len() > max_result_bytes {
             params.result = Some(truncate_with_marker(r, max_result_bytes));
@@ -1535,6 +1539,29 @@ fn deliver_result(
         return Deliver::Refused;
     }
     Deliver::Queued
+}
+
+/// Serialize a CP-synthesized wire frame, failing SOFT. Callers include
+/// `fail_instance` and `sweep_deadlines`, which are reachable from connection
+/// teardown — `RegistrationGuard`'s Drop, possibly already unwinding, where a
+/// second panic aborts the whole process — and from the lease sweeper. A
+/// frame that cannot serialize (practically unreachable for these types) is
+/// dropped with an error log instead of panicking: the peer reconciles via
+/// its own deadline, and the CP stays up.
+fn synthesized_frame(rpc_id: u64, method: &str, params: &impl serde::Serialize) -> Option<String> {
+    match serde_json::to_value(params)
+        .and_then(|v| serde_json::to_string(&JsonRpcRequest::new(rpc_id, method, Some(v))))
+    {
+        Ok(t) => Some(t),
+        Err(e) => {
+            tracing::error!(
+                method,
+                error = %e,
+                "CP-synthesized frame serialization failed — frame dropped"
+            );
+            None
+        }
+    }
 }
 
 /// Truncate `s` to at most `cap` bytes, keeping the head and appending a
@@ -2663,6 +2690,230 @@ type = "primary"
             "marker must count against the cap: {} > {}",
             out.len(),
             cap
+        );
+    }
+
+    #[test]
+    fn concurrent_completes_yield_exactly_one_claim() {
+        // Review round-10 F52 (completing R4-F34): two results for the same
+        // admission racing each other must resolve to exactly one authority.
+        // The commit is the serialization point, so driving both frames
+        // through the same peek->commit seams `complete` uses proves the
+        // exactly-once property at the racy boundary, and the full wire path
+        // confirms the loser is dropped end to end.
+        let mut w = world();
+        let mut lobby = observe(&w, "prod");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        w.worker_rx.try_recv().unwrap();
+        let admission = token(&w.router, "prod", "d-1");
+
+        // Both duplicate results pass the peek before either commits — the
+        // widest possible race window.
+        let peek_a = match w
+            .router
+            .peek_for_completion("prod", "d-1", w.h_worker, admission)
+        {
+            Peek::Serving(e) => e,
+            _ => panic!("expected the live admission"),
+        };
+        let peek_b = match w
+            .router
+            .peek_for_completion("prod", "d-1", w.h_worker, admission)
+        {
+            Peek::Serving(e) => e,
+            _ => panic!("expected the live admission"),
+        };
+
+        // Exactly one commit claims; the other finds the entry gone.
+        assert_eq!(
+            w.router.commit_completion(&w.registry, &peek_a),
+            Commit::Claimed
+        );
+        assert_eq!(
+            w.router.commit_completion(&w.registry, &peek_b),
+            Commit::Vanished
+        );
+        assert_eq!(
+            w.registry.get(w.h_worker).unwrap().active_sessions,
+            0,
+            "capacity released exactly once"
+        );
+
+        // A duplicate arriving through the full wire path after the first
+        // committed is dropped at the peek — no second delivery, no second
+        // terminal.
+        assert_eq!(
+            w.router.complete(
+                &w.registry,
+                &w.events,
+                w.h_worker,
+                result_of("d-1", admission, "dup"),
+                1024,
+                5
+            ),
+            CompleteOutcome::Dropped
+        );
+        assert!(
+            w.primary_rx.try_recv().is_err(),
+            "the seam-driven commit did not deliver, and the duplicate must not either"
+        );
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 1, "requested only — seam commits do not emit");
+        assert_eq!(ev[0]["event"], "delegation_requested");
+    }
+
+    #[test]
+    fn teardown_of_unannounced_entry_target_side_is_silent_too() {
+        // Review round-10 F53: the initiator-teardown case is covered above;
+        // this is the symmetric case — the TARGET disconnects while the entry
+        // is inserted but not yet announced. Same contract: no synthesized
+        // result frame to the initiator (whose `cp/delegate` call is itself
+        // returning an error), no observer terminal, entry gone.
+        let w = world();
+        let mut lobby = observe(&w, "prod");
+        w.registry.adjust_sessions(w.h_worker, 1);
+        let entry = InFlight {
+            namespace: "prod".into(),
+            delegation_id: "d-race".into(),
+            from_logical: "prod/koudu".into(),
+            from_handle: w.h_primary,
+            to_logical: "prod/worker-1".into(),
+            to_handle: w.h_worker,
+            deadline: Utc::now() + Duration::seconds(60),
+            chain: vec!["prod/koudu".into()],
+            generation: 1,
+            announced: false,
+        };
+        w.router
+            .inflight
+            .lock()
+            .insert(DelegationKey::new("prod", "d-race"), entry);
+
+        let mut next = || 17;
+        let frames = w
+            .router
+            .fail_instance(&w.registry, &w.events, w.h_worker, &mut next);
+
+        assert!(
+            frames.is_empty(),
+            "no synthesized result for a never-announced admission"
+        );
+        assert!(events_of(&mut lobby).is_empty(), "no observer event");
+        assert_eq!(w.router.inflight_count(), 0, "entry removed");
+    }
+
+    #[test]
+    fn dropped_and_stale_results_emit_no_observer_events() {
+        // Review round-10 F54 (completing R6-F17): the "dropped results emit
+        // nothing" invariant asserted with an observer attached, for both the
+        // stale-admission drop and the unknown-id drop.
+        let mut w = world();
+        let mut lobby = observe(&w, "prod");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        w.worker_rx.try_recv().unwrap();
+        let admission = token(&w.router, "prod", "d-1");
+        // Drain the requested event.
+        assert_eq!(events_of(&mut lobby).len(), 1);
+
+        // Stale admission token → dropped, no event, no delivery.
+        assert_eq!(
+            w.router.complete(
+                &w.registry,
+                &w.events,
+                w.h_worker,
+                result_of("d-1", admission + 999, "stale"),
+                1024,
+                6
+            ),
+            CompleteOutcome::Dropped
+        );
+        // Unknown id → dropped, no event, no delivery.
+        assert_eq!(
+            w.router.complete(
+                &w.registry,
+                &w.events,
+                w.h_worker,
+                result_of("d-unknown", 1, "ghost"),
+                1024,
+                7
+            ),
+            CompleteOutcome::Dropped
+        );
+        assert!(events_of(&mut lobby).is_empty(), "drops emit nothing");
+        assert!(
+            w.primary_rx.try_recv().is_err(),
+            "drops deliver nothing to the initiator"
+        );
+        assert_eq!(w.router.inflight_count(), 1, "live entry untouched");
+    }
+
+    #[test]
+    fn saturated_observer_crowd_does_not_block_delegation() {
+        // Review round-10 F51 (functional contention floor): a full cap's
+        // worth of observers, every one of them saturated, must not block or
+        // fail admission, forwarding, or completion — sends are non-blocking
+        // and the per-observer work is bounded. (Latency budgeting is the
+        // config cap's job; this pins the functional non-interference.)
+        let mut w = world();
+        let mut lobbies = Vec::new();
+        for i in 0..16 {
+            let (tx, rx) = crate::registry::outbound_channel(8);
+            w.registry.register(Instance {
+                handle: 0,
+                namespace: "prod".into(),
+                name: format!("lobby-{i}"),
+                agent_type: AgentType::Observer,
+                instance_id: format!("o-{i}"),
+                labels: Default::default(),
+                max_delegated_sessions: 0,
+                active_sessions: 0,
+                registered_at: Instant::now(),
+                last_heartbeat: Instant::now(),
+                tx,
+            });
+            lobbies.push(rx);
+        }
+        // Saturate every observer queue (8-byte budgets refuse any frame
+        // after one filler).
+        for i in 0..16 {
+            let inst = w
+                .registry
+                .observers("prod")
+                .into_iter()
+                .find(|o| o.instance_id == format!("o-{i}"))
+                .unwrap();
+            while inst.tx.try_send("12345678".into()).is_ok() {}
+        }
+
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        w.worker_rx.try_recv().expect("forward reached the worker");
+        let admission = token(&w.router, "prod", "d-1");
+        assert_eq!(
+            w.router.complete(
+                &w.registry,
+                &w.events,
+                w.h_worker,
+                result_of("d-1", admission, "done"),
+                1024,
+                8
+            ),
+            CompleteOutcome::Completed {
+                delivered: true,
+                stalled_initiator: None
+            }
+        );
+        assert!(
+            w.primary_rx.try_recv().unwrap().contains("delegate_result"),
+            "the initiator got its terminal despite the saturated lobby crowd"
         );
     }
 
@@ -4512,6 +4763,15 @@ type = "primary"
         assert_eq!(ev[0]["event"], "delegation_requested");
         assert_eq!(ev[1]["event"], "delegation_completed");
         assert_eq!(ev[1]["admission"], admission);
+
+        // The refused frame must not have reached the initiator: its queue
+        // holds only the filler frames this test packed it with.
+        while let Ok(f) = w.primary_rx.try_recv() {
+            assert!(
+                !f.contains("delegate_result"),
+                "a refused terminal frame must not be delivered"
+            );
+        }
 
         let mut next = || 9;
         w.router

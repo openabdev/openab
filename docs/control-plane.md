@@ -168,9 +168,13 @@ Client contract:
   forward reaches the worker, and a terminal event is published only by the
   path that authoritatively ended the admission — so you never see a terminal
   before its `requested`, never more than one terminal per admission, and the
-  terminal you see is the same outcome the initiator was sent. An
-  `agent_deregistered` without a matching `agent_registered` is possible
-  (registration ack failure); treat removal of an unknown agent as a no-op.
+  terminal you see is the outcome the CP committed. One edge to know: if the
+  initiator's connection cannot accept its terminal frame (queue refused, or
+  it died first), the CP disconnects it and the frame is not delivered — the
+  observer still sees the committed outcome, which that initiator never
+  received. An `agent_deregistered` without a matching `agent_registered` is
+  possible (registration ack failure); treat removal of an unknown agent as
+  a no-op.
 - **Terminal asymmetry.** Completion-shaped endings (`completed`, `failed`,
   `timeout`, `target_disconnected`) arrive as `delegation_completed` with a
   `status`; cancellations (initiator cancel, initiator disconnect) arrive as
@@ -178,7 +182,13 @@ Client contract:
   literal `"control-plane"` for CP-synthesized cancellations.
 - **Best-effort delivery.** Fan-out uses the same bounded per-connection
   queue as everything else: a lobby that cannot keep up loses frames and
-  detects it via the `seq` gap. Observers can never slow the delegation path.
+  detects it via the `seq` gap. Sends are non-blocking, so a single slow
+  observer cannot block a delegation — but fan-out serialization runs inside
+  the delegation path's in-flight critical section, so the observer
+  population adds bounded latency to delegation bookkeeping. The bound is
+  configuration, not hope: `max_observers_per_namespace` (default 16) caps
+  the population and `max_event_excerpt_bytes` (validated to at most 64 KiB)
+  caps the per-frame work.
 - **Content redaction.** Prompt/result excerpts are bounded by
   `max_event_excerpt_bytes` (default 4 KiB). In a `metadata_only = true`
   namespace, agent-supplied content (prompt/result excerpts, worker-reported

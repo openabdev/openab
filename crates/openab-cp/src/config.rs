@@ -95,6 +95,15 @@ pub struct CpConfig {
     /// delivery path: excerpts are truncated with a marker, never rejected.
     #[serde(default = "default_max_event_excerpt_bytes")]
     pub max_event_excerpt_bytes: usize,
+    /// Ceiling on simultaneously registered observer connections per
+    /// namespace. Observer fan-out does bounded per-observer work inside the
+    /// delegation path's in-flight critical section (see the router's lock
+    /// hierarchy note), so the total is deliberately capped: this knob is
+    /// what makes "bounded" a guarantee instead of an operational hope. A
+    /// registration that would exceed it is refused; agents (primary/worker)
+    /// are unaffected.
+    #[serde(default = "default_max_observers_per_namespace")]
+    pub max_observers_per_namespace: usize,
 
     /// Memory ceiling for ONE connection's outbound queue, in bytes.
     ///
@@ -187,6 +196,10 @@ fn default_max_delegated_sessions_cap() -> u32 {
 
 fn default_max_event_excerpt_bytes() -> usize {
     4 * 1024
+}
+
+fn default_max_observers_per_namespace() -> usize {
+    16
 }
 
 /// Immutable identity claims bound to one auth key.
@@ -313,6 +326,33 @@ impl CpConfig {
         // every delegation to it would be SATURATED.
         if self.default_max_delegated_sessions_cap == 0 {
             bail!("default_max_delegated_sessions_cap must be at least 1");
+        }
+        // Zero silently reduces every excerpt to the bare truncation marker
+        // (a content-free lobby that LOOKS configured); an oversized cap
+        // multiplies the per-observer work the delegation path performs
+        // inside its in-flight critical section. Bound it on both sides.
+        if self.max_event_excerpt_bytes == 0 {
+            bail!(
+                "max_event_excerpt_bytes must be at least 1 (0 would silently \
+                 replace every excerpt with the bare truncation marker; use \
+                 [namespaces.X] metadata_only = true to suppress content)"
+            );
+        }
+        if self.max_event_excerpt_bytes > 64 * 1024 {
+            bail!(
+                "max_event_excerpt_bytes ({}) exceeds the 65536-byte ceiling — \
+                 excerpts are serialized on the delegation path, and the lobby \
+                 is an audit surface, not a delivery path",
+                self.max_event_excerpt_bytes
+            );
+        }
+        // Zero observers would refuse every lobby client while the surface
+        // is configured; the ceiling itself is what bounds fan-out work.
+        if self.max_observers_per_namespace == 0 {
+            bail!(
+                "max_observers_per_namespace must be at least 1 (omit observer \
+                 identities from [[agents]] to disable the lobby instead)"
+            );
         }
         // Bearer keys over cleartext TCP must never reach an untrusted
         // network: non-loopback binds require the explicit override.
@@ -499,6 +539,35 @@ heartbeat_interval_secs = 30
 lease_expiry_secs = 30
 "#;
         let cfg: CpConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn event_excerpt_bytes_bounded_on_both_sides() {
+        // Review rounds 4/10 (R4-F17 + F51): zero silently reduced every
+        // excerpt to the bare truncation marker, and an oversized cap
+        // multiplies work done on the delegation path. Both refused now.
+        let cfg: CpConfig = toml::from_str("max_event_excerpt_bytes = 0").unwrap();
+        assert!(cfg.validate().is_err(), "zero excerpt cap must be refused");
+        let cfg: CpConfig = toml::from_str("max_event_excerpt_bytes = 65537").unwrap();
+        assert!(cfg.validate().is_err(), "oversized excerpt cap refused");
+        let cfg: CpConfig = toml::from_str("max_event_excerpt_bytes = 65536").unwrap();
+        cfg.validate().unwrap();
+        // Default remains valid and unchanged.
+        let cfg: CpConfig = toml::from_str(base_toml()).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.max_event_excerpt_bytes, 4096);
+    }
+
+    #[test]
+    fn observer_cap_defaults_and_zero_is_refused() {
+        // Review round-10 F51 (facet d): the observer population is a
+        // configured latency budget; zero would refuse every lobby client
+        // while the surface is configured.
+        let cfg: CpConfig = toml::from_str(base_toml()).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.max_observers_per_namespace, 16);
+        let cfg: CpConfig = toml::from_str("max_observers_per_namespace = 0").unwrap();
         assert!(cfg.validate().is_err());
     }
 
