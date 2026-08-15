@@ -1,4 +1,4 @@
-# ADR: openab-pty — Optional Sidecar Runtime for Remote Sandboxed Terminals
+# ADR: openab-pty — Composable Runtime for Remote Sandboxed Terminals
 
 - **Status:** Proposed
 - **Date:** 2026-08-15
@@ -31,10 +31,24 @@ This ADR proposes the same capability in a shape that answers all five.
 
 ## 2. Decision
 
-Ship **`openab-pty`**: a separate binary running as an **optional sidecar container** in the OAB pod. Not deployed by default. OAB remains a pure ACP broker; the sidecar owns everything terminal.
+Ship **`openab-pty`**: a separate binary that is an **independently runnable runtime** — deployable standalone or colocated with the OAB broker. Not deployed by default. OAB remains a pure ACP broker; `openab-pty` owns everything terminal.
+
+**One codebase, two composable runtimes, three deployment modes:**
+
+| Profile | Processes | Use case |
+|---|---|---|
+| 1. ACP only (current default) | `openab` | Message-broker deployments; no change from today |
+| 2. PTY only | `openab-pty` | Standalone remote terminal service: workspace PVC + `[pty]` config + PTY auth secret; no Discord/Slack tokens, no platform adapters, no ACP protocol |
+| 3. ACP + PTY (colocated) | `openab` + `openab-pty` sidecar | Both in one pod sharing the workspace volume: drive a CLI by hand, let ACP agents continue in the same working tree from Discord |
+
+Deployment mechanics:
+
+- **Own image**: `ghcr.io/openabdev/openab-pty` — smaller than the broker image (no platform adapter dependencies)
+- **Own Service/Ingress**: `/pty/*` routes to the `openab-pty` port in both profile 2 and 3; the broker listener never serves terminal traffic
+- **Helm UX**: independent toggles (`openab.enabled` / `pty.enabled`) or a convenience `--set profile=acp|pty|full`
 
 ```
-K8s Pod
+Profile 3 (colocated) — K8s Pod
 +--------------------------------------------------------------------+
 |                                                                    |
 |  Container: openab (broker)          Container: openab-pty         |
@@ -47,18 +61,21 @@ K8s Pod
 |  |  platform tokens, agents] |       | [own config view:         | |
 |  +------------+--------------+       |  [pty] section only]      | |
 |               |                      +-------------+-------------+ |
-|               |   (optional, Phase 4)              |               |
+|               |   (colocated profile only, Phase 4)|               |
 |               +<--- notification webhook ----------+               |
 |                                                                    |
 |  Shared: workspace volume (PVC)   |   NOT shared: credentials,     |
 |                                   |   PID/cgroup, listeners        |
 +--------------------------------------------------------------------+
-        |                                     |
-   Discord / Slack                    Web terminal (xterm.js)
-   (turn-based)                       Mobile/desktop terminal client
+
+Profile 2 (standalone) is the right half alone: openab-pty + workspace PVC.
 ```
 
-### Why sidecar (and what it fixes)
+### Positioning statement for the standalone profile
+
+Profile 2 makes `openab-pty` a small standalone product in OpenDray's category (self-hosted persistent terminal sessions), differentiated by the K8s pod sandbox and the short-lived per-session token model. This is deliberate and bounded: `openab-pty` never grows platform adapters, agent orchestration, or memory features — users who need those deploy profile 3 and get them from the broker. This boundary is what keeps the OAB broker's thin-bridge identity untouched in every profile.
+
+### Why a separate runtime (and what it fixes)
 
 | Review blocker (PR #1477) | How the sidecar form resolves it |
 |---|---|
@@ -66,19 +83,19 @@ K8s Pod
 | Same-pod blast radius | Separate container = separate PID namespace, cgroup, filesystem, and mounts. The shell user cannot signal the broker, exhaust its cgroup, or read its credential files. Broker platform tokens are **never mounted** into the sidecar |
 | Auth below capability | The sidecar designs its token model from scratch for shell-equivalent trust (see Security model) with no ACP-key coupling |
 | Pool incompatibility | The sidecar has its **own session manager** built for byte-stream lifecycle. No refactor of the shipped ACP pool; zero regression risk to the broker |
-| Reversibility | Default-off sidecar with its own image/release. If demand does not materialize, deprecate the image; nothing in the broker to unwind. If demand proves out, later extraction of a shared lifecycle crate — or even single-process merge — remains open |
+| Reversibility | Default-off runtime with its own image/release. If demand does not materialize, deprecate the image; nothing in the broker to unwind. If demand proves out, later extraction of a shared lifecycle crate — or even single-process merge — remains open |
 
 ### Coexistence with ACP
 
 ACP and PTY coexist per deployment, not per process:
 
-- **Same pod, two containers** — one Helm toggle (`pty.enabled=true`) adds the sidecar; the broker container is byte-identical with or without it
+- **Same pod, two containers (profile 3)** — one Helm toggle (`pty.enabled=true`) adds the sidecar; the broker container is byte-identical across all three profiles
 - **Shared workspace volume** — the PTY shell and ACP agents can see the same working tree (same PVC mount), which is the practical point of coexistence: drive a CLI by hand in the terminal, then let ACP agents continue in the same workspace from Discord
 - **Nothing else shared** — listeners, tokens, session state, and failure domains are independent; a crashed or compromised sidecar does not take the broker down
 
 ### Configuration: one source, two views
 
-Operators keep a **single logical `config.toml`** (the existing `configUrl` flow); the two containers consume different projections of it:
+Operators keep a **single logical `config.toml`** (the existing `configUrl` flow); the two runtimes consume different projections of it. In the standalone profile (PTY only), the same file format applies — `openab-pty` reads `[pty]` plus shared basics (workspace path, log level) and ignores everything else; no Discord/Slack tokens or ACP agent config are required or accepted.
 
 - The broker reads its existing sections; it ignores `[pty]`
 - The sidecar reads **only** `[pty]`; it must never receive platform tokens, because any secret mounted into the sidecar is readable by the human at the terminal (the shell runs in that container)
@@ -188,7 +205,7 @@ Leaves the need unserved; users accept Herdr's laptop fragility or OpenDray's ho
 
 ### Phase 2: Deployment + web client
 
-- Helm: `pty.enabled` toggle adds the sidecar container, its port, and a NetworkPolicy example; config split documented per the configUrl pattern
+- Helm: independent `openab.enabled` / `pty.enabled` toggles (or `--set profile=acp|pty|full`); standalone profile gets its own Service/Ingress (`/pty/*`) and NetworkPolicy example; config split documented per the configUrl pattern; `ghcr.io/openabdev/openab-pty` image published from the existing release pipeline
 - Minimal xterm.js page served by the sidecar; session list/create/kill endpoints (same auth bar as attach)
 - Rollback procedure: disabling the toggle drains (notify + grace) then kills sessions; broker unaffected
 
@@ -197,9 +214,10 @@ Leaves the need unserved; users accept Herdr's laptop fragility or OpenDray's ho
 - Multi-viewer (one writer, N readers) with writer-lease semantics and read-only token scope
 - Reconnect backoff, richer capacity controls (per-token limits)
 
-### Phase 4: Messaging bridge (optional)
+### Phase 4: Messaging bridge (optional, colocated profile only)
 
-- Sidecar posts a webhook to the broker when a detached session emits no output for N seconds after a prompt-like burst (stated heuristic, not magic); broker relays to the platform thread. Bridge is one-way and feature-gated
+- `openab-pty` posts a webhook to the broker when a detached session emits no output for N seconds after a prompt-like burst (stated heuristic, not magic); broker relays to the platform thread. Bridge is one-way and feature-gated
+- **Not available in the PTY-only profile** — there is no broker to relay through, and `openab-pty` will not grow its own notifier (that would recreate the scope creep this ADR exists to avoid). Users who want notifications deploy profile 3
 
 ### Later (demand-gated, explicitly deferred)
 
