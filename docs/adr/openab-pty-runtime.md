@@ -251,7 +251,7 @@ admin_credential_hash = "sha256:9f2c..."  # literal verifier hash, materialized 
 ### Negative
 
 - A second binary and image to build, test, and release (mitigated by the existing multi-binary workspace and release pipeline)
-- **No HA or horizontal scale by design**: the keyless in-memory token model binds every session and token to one runtime process -- no multi-replica serving, no failover; a runtime crash or OOM invalidates all sessions and tokens simultaneously. This is consistent with the sessions-die-with-the-process contract, but it is a real availability trade accepted for the elimination of at-rest minting authority
+- **The keyless in-memory model's cost, consolidated**: every session and token is bound to one runtime process -- no HA, no multi-replica serving, no failover; a crash, OOM, restart, projection rollout, or admin-credential rotation (which requires a restart) invalidates **all** sessions and tokens simultaneously. This is the deliberate exchange for eliminating at-rest minting authority, and it is why the rotation runbook (Phase 2) must state the blast radius up front
 - Cross-container coordination (notification bridge, future shared-crate extraction) is more ceremony than in-process calls
 - Some duplication with the ACP pool (capacity accounting, pgid kill) until a shared lifecycle crate is justified by real usage
 
