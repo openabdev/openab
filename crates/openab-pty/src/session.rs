@@ -1702,10 +1702,16 @@ mod tests {
         }
     }
 
-    struct RecordingWriter(Arc<Mutex<Vec<u8>>>);
+    struct RecordingWriter(Arc<Mutex<Vec<u8>>>, Arc<AtomicBool>);
 
     impl Write for RecordingWriter {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            // A stalled PTY master: the writer thread parks here, so the bounded
+            // input queue is the only thing standing between a flooding client
+            // and unbounded memory.
+            while self.1.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             self.0.lock().extend_from_slice(bytes);
             Ok(bytes.len())
         }
@@ -1719,6 +1725,7 @@ mod tests {
         written: Arc<Mutex<Vec<u8>>>,
         output: Mutex<Option<std_mpsc::Sender<Vec<u8>>>>,
         last_env: Mutex<Vec<(String, String)>>,
+        stall: Arc<AtomicBool>,
         fail: bool,
     }
 
@@ -1729,6 +1736,7 @@ mod tests {
                 written: Arc::new(Mutex::new(Vec::new())),
                 output: Mutex::new(None),
                 last_env: Mutex::new(Vec::new()),
+                stall: Arc::new(AtomicBool::new(false)),
                 fail: false,
             })
         }
@@ -1739,6 +1747,7 @@ mod tests {
                 written: Arc::new(Mutex::new(Vec::new())),
                 output: Mutex::new(None),
                 last_env: Mutex::new(Vec::new()),
+                stall: Arc::new(AtomicBool::new(false)),
                 fail: true,
             })
         }
@@ -1774,7 +1783,7 @@ mod tests {
             Ok(SpawnedPty {
                 pid: Some(4242),
                 reader: Box::new(ChannelReader(rx, Vec::new())),
-                writer: Box::new(RecordingWriter(self.written.clone())),
+                writer: Box::new(RecordingWriter(self.written.clone(), self.stall.clone())),
                 control: Arc::new(FakeControl(self.pty.clone())),
             })
         }
@@ -2105,23 +2114,24 @@ mod tests {
         let spawner = FakeSpawner::new();
         let manager = manager_with(spawner.clone(), "", SessionPolicy::default());
         let created = manager.create(name("flood"), WindowSize::default()).unwrap();
-        let session = manager.get(&name("flood")).unwrap();
         let attached = manager
             .attach(&name("flood"), created.generation, WindowSize::default(), None)
             .unwrap();
 
-        // Fence the writer thread off so nothing drains, then flood the queue.
-        session.io.owner_conn.store(u64::MAX, Ordering::Release);
-        session.io.owner_conn.store(attached.conn.0, Ordering::Release);
-        let mut rejected = false;
+        // Stall the PTY master so nothing drains, then flood: the queue must
+        // refuse rather than grow, and the server disconnects such a client.
+        spawner.stall.store(true, Ordering::Release);
+        let mut rejected = None;
         for _ in 0..(INPUT_QUEUE_CHUNKS * 4) {
-            if attached.write_input(b"x") == Err(InputError::Backpressure) {
-                rejected = true;
+            if let Err(error) = attached.write_input(b"x") {
+                rejected = Some(error);
                 break;
             }
         }
-        assert!(
-            rejected || spawner.written.lock().len() > 0,
+        spawner.stall.store(false, Ordering::Release);
+        assert_eq!(
+            rejected,
+            Some(InputError::Backpressure),
             "input must be bounded, never queued without limit"
         );
     }
@@ -2451,5 +2461,35 @@ mod tests {
             }
         }
         assert!(saw_close);
+    }
+
+    // ---- integration: a real PTY child --------------------------------------
+    // Ignored by default: this is the only test here that leaves the process.
+
+    #[tokio::test]
+    #[ignore = "spawns a real shell through portable-pty"]
+    async fn the_real_spawner_runs_a_shell_and_reports_self_exit() {
+        let manager = manager_with(
+            Arc::new(PortablePtySpawner),
+            "command = \"/bin/sh\"\n",
+            SessionPolicy::default(),
+        );
+        let created = manager.create(name("real"), WindowSize::default()).unwrap();
+        let attached = manager
+            .attach(&name("real"), created.generation, WindowSize::default(), None)
+            .unwrap();
+        attached.write_input(b"exit 0\n").unwrap();
+
+        for _ in 0..200 {
+            if manager.get(&name("real")).is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(manager.get(&name("real")).is_none(), "self-exit released the slot");
+        assert_eq!(
+            attached.outbound.close_code(),
+            Some(close_code::SESSION_ENDED)
+        );
     }
 }

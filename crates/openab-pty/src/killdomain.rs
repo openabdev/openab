@@ -1821,4 +1821,77 @@ mod tests {
         )
         .is_err());
     }
+
+    // ---- integration: real processes and real cgroups -----------------------
+    // Ignored by default. These are the only tests here that leave the process.
+
+    #[tokio::test]
+    #[ignore = "spawns real processes"]
+    async fn tier1_teardown_against_a_real_process_group() {
+        let domain = KillDomain::new(
+            KillDomainSelection::tier1(Tier2Unavailable::NotLinux),
+            TrackingLimits::default(),
+            AuditLogger,
+        );
+        let mut session_domain = domain
+            .open_session(&SessionName::parse("real-tier1").unwrap(), Generation(1))
+            .unwrap();
+        let child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .expect("spawn a real child");
+        let pid = child.id() as i32;
+        session_domain.set_leader(pid).unwrap();
+
+        let outcome = session_domain.terminate(Duration::from_secs(2)).await;
+        assert!(outcome.converged(), "survivors: {:?}", outcome.survivors);
+        assert!(outcome.is_best_effort());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "touches cgroups; needs cgroup v2 delegation to this container"]
+    async fn tier2_probe_and_teardown_against_the_real_kernel() {
+        let base = match probe_tier2() {
+            Ok(base) => base,
+            Err(reason) => panic!("tier 2 unavailable here: {reason}"),
+        };
+        let selection = resolve_tier(
+            KillDomainRequirement::Tier2Required,
+            Ok(base),
+            SpawnCapability::PreExecCgroupJoin,
+        )
+        .unwrap();
+        assert_eq!(selection.tier, KillDomainTier::Tier2GuaranteedCgroup);
+
+        let domain = KillDomain::new(selection, TrackingLimits::default(), AuditLogger);
+        let mut session_domain = domain
+            .open_session(&SessionName::parse("real-tier2").unwrap(), Generation(1))
+            .unwrap();
+        let procs_fd = session_domain.procs_fd().unwrap().expect("tier 2 fd");
+
+        // Join before exec, exactly as the spawner must: the child writes its own
+        // pid through the inherited descriptor before it becomes the target
+        // program, so adversary code never runs outside its cgroup.
+        let child = unsafe {
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("exec sleep 30")
+                .pre_exec(move || preexec_join_cgroup(procs_fd))
+                .spawn()
+                .expect("spawn")
+        };
+        let pid = child.id() as i32;
+        session_domain.set_leader(pid).unwrap();
+        assert!(
+            session_domain.members().unwrap().contains(&pid),
+            "membership must come from cgroup.procs"
+        );
+
+        let outcome = session_domain.terminate(Duration::from_secs(2)).await;
+        assert_eq!(outcome.guarantee, TeardownGuarantee::Hard);
+        assert!(outcome.converged(), "cgroup.kill must leave zero survivors");
+        session_domain.release();
+    }
 }
