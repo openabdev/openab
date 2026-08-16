@@ -379,6 +379,13 @@ pub enum ControlEvent {
     /// First-class "workspace volume full" rather than an opaque write error
     /// inside the terminal.
     WorkspaceVolumeFull { used_kib: u64, budget_kib: u64 },
+    /// The runtime is draining before replacement. Sent before the grace so a
+    /// client can externalise work; the socket then closes with
+    /// `close_code::RUNTIME_REPLACED`.
+    ShuttingDown {
+        seconds_remaining: u64,
+        ephemeral_workspace_reset: bool,
+    },
 }
 
 /// One item for the socket writer task.
@@ -397,6 +404,11 @@ pub struct Outbound {
     queue: Mutex<ByteQueue>,
     controls: Mutex<VecDeque<ControlEvent>>,
     close_code: Mutex<Option<u16>>,
+    /// Whether the close code has already been handed to a consumer. Without
+    /// this, `try_next` would return `Close` forever and [`Outbound::next`] would
+    /// never return `None` — its documented termination condition — so a writer
+    /// loop trusting that contract would spin hot instead of finishing.
+    close_emitted: AtomicBool,
     notify: Notify,
 }
 
@@ -407,6 +419,7 @@ impl Outbound {
             queue: Mutex::new(ByteQueue::new(bounds)),
             controls: Mutex::new(VecDeque::new()),
             close_code: Mutex::new(None),
+            close_emitted: AtomicBool::new(false),
             notify: Notify::new(),
         })
     }
@@ -449,7 +462,7 @@ impl Outbound {
     }
 
     /// Non-blocking drain step, in priority order: pending gap, control frames,
-    /// bytes, then the close code.
+    /// bytes, then the close code — which is yielded exactly once.
     pub fn try_next(&self) -> Option<OutboundItem> {
         if let Some(dropped) = self.queue.lock().take_unreported_gap() {
             return Some(OutboundItem::Control(ControlEvent::Gap {
@@ -464,17 +477,18 @@ impl Outbound {
         if !bytes.is_empty() {
             return Some(OutboundItem::Bytes(bytes));
         }
-        self.close_code().map(OutboundItem::Close)
+        let code = self.close_code()?;
+        if self.close_emitted.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        Some(OutboundItem::Close(code))
     }
 
-    /// Await the next item. Returns `None` only when the connection is closed
-    /// and fully drained, so a server writer loop terminates deterministically.
+    /// Await the next item. Returns `None` once the connection is closed and
+    /// fully drained, so a server writer loop terminates deterministically.
     pub async fn next(&self) -> Option<OutboundItem> {
         loop {
             if let Some(item) = self.try_next() {
-                if matches!(item, OutboundItem::Close(_)) {
-                    return Some(item);
-                }
                 return Some(item);
             }
             if self.close_code().is_some() {
@@ -1117,6 +1131,29 @@ impl SessionManager {
         size: WindowSize,
         source: Option<&str>,
     ) -> Result<AttachedConnection, Error> {
+        self.attach_with_replay(name, generation, size, source, None)
+            .map(|(connection, _)| connection)
+    }
+
+    /// Attach with an explicit `since=<offset>` cursor.
+    ///
+    /// The cursor has to be honoured *inside* the attach lock, not by a
+    /// follow-up [`Self::replay_since`] call: bytes written between the
+    /// subscriber registration and a later read would be delivered twice — once
+    /// live, once in the replay — and a terminal cannot recover from duplicated
+    /// bytes. Registration and the replay read therefore share one critical
+    /// section, which is what makes the replay-to-live handoff atomic.
+    ///
+    /// Returns the connection and the stream offset the replayed data ends at,
+    /// so a client can keep its own monotonic cursor across a gap.
+    pub fn attach_with_replay(
+        &self,
+        name: &SessionName,
+        generation: Generation,
+        size: WindowSize,
+        source: Option<&str>,
+        since: Option<u64>,
+    ) -> Result<(AttachedConnection, u64), Error> {
         let session = match self.get(name) {
             Some(session) => session,
             None => {
@@ -1135,6 +1172,7 @@ impl SessionManager {
         let evicted: Option<Arc<Outbound>>;
         let conn: ConnGeneration;
         let replay: Option<Replay>;
+        let stream_offset: u64;
         let was_takeover: bool;
         {
             let mut state = session.state.lock();
@@ -1175,10 +1213,16 @@ impl SessionManager {
             // replay-to-live handoff atomic: live bytes written after this point
             // go to the new subscriber, not into the replay slice.
             let buffer = session.io.buffer.lock();
-            replay = if self.config.scrollback_replay && buffer.retention_enabled() {
-                Some(buffer.read_since(0))
-            } else {
-                None
+            stream_offset = buffer.total_written();
+            replay = match since {
+                // An explicit cursor is always honoured within retention;
+                // `read_since` itself reports a gap (and, with retention off, a
+                // full reset) so the client knows to clear and redraw.
+                Some(offset) => Some(buffer.read_since(offset)),
+                None if self.config.scrollback_replay && buffer.retention_enabled() => {
+                    Some(buffer.read_since(0))
+                }
+                None => None,
             };
             drop(buffer);
 
@@ -1234,13 +1278,16 @@ impl SessionManager {
                 .session(name, generation)
                 .source(source.unwrap_or("unknown")),
         );
-        Ok(AttachedConnection {
-            session: name.clone(),
-            generation,
-            conn,
-            outbound,
-            session_handle: session,
-        })
+        Ok((
+            AttachedConnection {
+                session: name.clone(),
+                generation,
+                conn,
+                outbound,
+                session_handle: session,
+            },
+            stream_offset,
+        ))
     }
 
     /// Incremental reconnect within the retained window.
@@ -1307,6 +1354,28 @@ impl SessionManager {
         self.forget(name);
         self.remember_dead(name, session.generation(), TerminationClass::UserKill);
         Ok(report)
+    }
+
+    /// Drain notice: tell every attached client that the runtime is being
+    /// replaced, before the grace and the teardown that follows it.
+    ///
+    /// This exists because ephemerality has to be *stated* in the product
+    /// surface. Without it the only signal is the close code, which arrives
+    /// after the workspace is already gone; the notice is what gives a client the
+    /// grace window to externalise work.
+    pub fn notify_shutdown(&self, grace: Duration) {
+        let sessions: Vec<Arc<Session>> = self.state.lock().sessions.values().cloned().collect();
+        for session in sessions {
+            // Subscriber lock only — never the state lock, so a drain cannot be
+            // blocked by an in-flight attach.
+            let subscriber = session.io.subscriber.lock().clone();
+            if let Some(outbound) = subscriber {
+                outbound.push_control(ControlEvent::ShuttingDown {
+                    seconds_remaining: grace.as_secs(),
+                    ephemeral_workspace_reset: true,
+                });
+            }
+        }
     }
 
     /// Runtime shutdown: every session ends with the runtime-replaced code so
