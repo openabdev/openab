@@ -942,9 +942,12 @@ fn error_response(error: &Error) -> Response {
     (status, Json(json!({ "error": message }))).into_response()
 }
 
-/// Gate an admin request. Every failure path is audited by
-/// [`AdminAuthenticator`] itself, so this only translates to HTTP.
-fn require_admin(state: &Arc<AppState>, headers: &HeaderMap, peer: &SocketAddr) -> Result<(), Response> {
+/// Gate an admin request: `Some(response)` is the rejection to return, `None`
+/// means the credential verified.
+///
+/// Every failure path is audited by [`AdminAuthenticator`] itself, so this only
+/// translates the outcome to HTTP.
+fn admin_gate(state: &Arc<AppState>, headers: &HeaderMap, peer: &SocketAddr) -> Option<Response> {
     let source = peer.to_string();
     let Some(mut presented) = admin_credential(headers) else {
         AbuseMetrics::bump(&state.abuse.admin_auth_failures);
@@ -953,22 +956,19 @@ fn require_admin(state: &Arc<AppState>, headers: &HeaderMap, peer: &SocketAddr) 
                 .source(source)
                 .detail("missing_or_malformed_authorization_header"),
         );
-        return Err(StatusCode::UNAUTHORIZED.into_response());
+        return Some(StatusCode::UNAUTHORIZED.into_response());
     };
     match state.admin.verify(&mut presented, Some(&source)) {
-        Ok(()) => Ok(()),
+        Ok(()) => None,
         Err(failure) => {
             AbuseMetrics::bump(&state.abuse.admin_auth_failures);
-            Err(match failure {
+            Some(match failure {
                 AdminAuthFailure::Invalid => StatusCode::UNAUTHORIZED.into_response(),
                 AdminAuthFailure::TooLarge => StatusCode::PAYLOAD_TOO_LARGE.into_response(),
                 AdminAuthFailure::Busy => StatusCode::SERVICE_UNAVAILABLE.into_response(),
                 AdminAuthFailure::Throttled { retry_after } => (
                     StatusCode::TOO_MANY_REQUESTS,
-                    [(
-                        "retry-after",
-                        retry_after.as_secs().max(1).to_string(),
-                    )],
+                    [("retry-after", retry_after.as_secs().max(1).to_string())],
                 )
                     .into_response(),
             })
@@ -981,7 +981,7 @@ async fn admin_list(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(response) = require_admin(&state, &headers, &peer) {
+    if let Some(response) = admin_gate(&state, &headers, &peer) {
         return response;
     }
     let metrics = state.manager.metrics();
@@ -1011,7 +1011,7 @@ async fn admin_create(
     headers: HeaderMap,
     Json(request): Json<CreateRequest>,
 ) -> Response {
-    if let Err(response) = require_admin(&state, &headers, &peer) {
+    if let Some(response) = admin_gate(&state, &headers, &peer) {
         return response;
     }
     if state.is_draining() {
@@ -1041,7 +1041,7 @@ async fn admin_renew(
     Path(session): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(response) = require_admin(&state, &headers, &peer) {
+    if let Some(response) = admin_gate(&state, &headers, &peer) {
         return response;
     }
     let name = match SessionName::parse(&session) {
@@ -1060,7 +1060,7 @@ async fn admin_restart(
     Path(session): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(response) = require_admin(&state, &headers, &peer) {
+    if let Some(response) = admin_gate(&state, &headers, &peer) {
         return response;
     }
     let name = match SessionName::parse(&session) {
@@ -1079,7 +1079,7 @@ async fn admin_kill(
     Path(session): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(response) = require_admin(&state, &headers, &peer) {
+    if let Some(response) = admin_gate(&state, &headers, &peer) {
         return response;
     }
     let name = match SessionName::parse(&session) {
