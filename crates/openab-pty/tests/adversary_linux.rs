@@ -538,7 +538,7 @@ fn wait_for_exit(pid: i32, budget: Duration) -> i32 {
 
 /// A delivered `[pty]` projection. Loopback listener, because the fail-closed
 /// listener guard is not what these tests are measuring.
-fn projection(port: u16, command: &Path, verifier: &str, extra: &str) -> String {
+fn projection(port: u16, command: &Path, verifier: &str) -> String {
     format!(
         r#"[pty]
 enabled = true
@@ -550,7 +550,7 @@ absolute_session_ttl = "12h"
 scrollback_kib = 1024
 scrollback_replay = false
 admin_credential_hash = "{verifier}"
-{extra}"#,
+"#,
         command.display()
     )
 }
@@ -653,12 +653,12 @@ fn spawn_runtime_process(config: &Path, block_set_dumpable: bool) -> std::proces
 /// another test in this file — can take it. That race was real: a runtime that
 /// lost it exited with `Address already in use` while the probe loop happily
 /// connected to the *other* test's listener and then measured the wrong process.
-fn start_runtime(scratch: &Scratch, command: &Path, extra: &str) -> Runtime {
+fn start_runtime(scratch: &Scratch, command: &Path) -> Runtime {
     let generated = AdminAuthenticator::generate();
     let credential =
         String::from_utf8(generated.plaintext.as_bytes().to_vec()).expect("hex credential");
     let config = scratch.path("config.toml");
-    std::fs::write(&config, projection(0, command, &generated.verifier, extra))
+    std::fs::write(&config, projection(0, command, &generated.verifier))
         .expect("write projection");
     // Validated here too, so a bad projection fails as a test error rather than
     // as an opaque "the runtime did not come up".
@@ -785,7 +785,7 @@ fn the_shipped_runtime_serves_with_dumpability_already_off() {
     let control_pid = control.id() as i32;
 
     let session_command = scratch.script("session.sh", "#!/bin/sh\nwhile : ; do sleep 5; done\n");
-    let runtime = start_runtime(&scratch, &session_command, "");
+    let runtime = start_runtime(&scratch, &session_command);
     let runtime_pid = runtime.pid();
 
     // Serving, not merely alive: a runtime that failed to start would trivially
@@ -975,11 +975,8 @@ fn a_runtime_that_cannot_set_dumpable_refuses_to_serve_before_reading_a_credenti
 
     // (b) A *valid* projection: the only reason to refuse is the barrier.
     let good = scratch.path("good.toml");
-    std::fs::write(
-        &good,
-        projection(port, &session_command, &generated.verifier, ""),
-    )
-    .expect("write projection");
+    std::fs::write(&good, projection(port, &session_command, &generated.verifier))
+        .expect("write projection");
     let (code, output) = wait_with_output(spawn_runtime_process(&good, true), READY_BUDGET);
     assert_ne!(code, Some(0), "the runtime must not exit successfully");
     assert!(
@@ -994,7 +991,7 @@ fn a_runtime_that_cannot_set_dumpable_refuses_to_serve_before_reading_a_credenti
     // (c) A *poisoned* projection under the same filter. If the runtime read the
     //     credential-bearing input before establishing containment, we would see
     //     the projection rejection instead of the containment refusal.
-    let poisoned_body = projection(port, &session_command, &generated.verifier, "")
+    let poisoned_body = projection(port, &session_command, &generated.verifier)
         .replace(&generated.verifier, "${secrets.pty_admin_hash}");
     let poisoned = scratch.path("poisoned.toml");
     std::fs::write(&poisoned, &poisoned_body).expect("write poisoned projection");
@@ -1118,7 +1115,7 @@ while : ; do sleep 5; done
     let tcp_before = listening_tcp_ports();
     let unix_before = unix_socket_paths();
 
-    let runtime = start_runtime(&scratch, &probe, "");
+    let runtime = start_runtime(&scratch, &probe);
     let runtime_pid = runtime.pid();
     let port = runtime.port;
     std::fs::write(&port_file, port.to_string()).expect("publish the port to the probe");
@@ -1221,19 +1218,18 @@ while : ; do sleep 5; done
 fn adversary_manager(scratch: &Scratch, command: &Path) -> (Arc<SessionManager>, Arc<KillDomain>) {
     let audit = AuditLogger;
     let generated = AdminAuthenticator::generate();
-    let text = projection(
-        free_port(),
-        command,
-        &generated.verifier,
-        // A short grace keeps the SIGTERM→SIGKILL escalation observable without
-        // making the suite wait out the 5s default.
-        "teardown_grace = \"1s\"\n",
-    );
+    let text = projection(free_port(), command, &generated.verifier);
     let parsed = config::validate_projection(&text).expect("projection must validate");
     let spawner = Arc::new(PortablePtySpawner);
     let kill = Arc::new(KillDomain::new(TrackingLimits::default(), audit.clone()));
     eprintln!("[{}] {}", scratch.marker(), kill.tier().describe());
-    let policy = SessionPolicy::from_config(&parsed);
+    let policy = SessionPolicy {
+        // A short grace keeps the SIGTERM→SIGKILL escalation observable without
+        // making the suite wait out the 5s default. The grace is a constant, not
+        // a projection knob, so it is set here rather than in the TOML.
+        teardown_grace: Duration::from_secs(1),
+        ..SessionPolicy::from_config(&parsed)
+    };
     let manager = SessionManager::new(
         parsed,
         policy,
