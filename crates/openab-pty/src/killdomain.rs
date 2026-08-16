@@ -1884,6 +1884,7 @@ mod tests {
         // pid through the inherited descriptor before it becomes the target
         // program, so adversary code never runs outside its cgroup.
         let mut child = unsafe {
+            use std::os::unix::process::CommandExt;
             std::process::Command::new("/bin/sh")
                 .arg("-c")
                 .arg("exec sleep 30")
