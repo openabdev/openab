@@ -998,11 +998,7 @@ impl SessionKillDomain {
         }
 
         // Reap before reporting: a zombie is exited, not a survivor.
-        for child in &self.tracked {
-            if !self.signals.pid_alive(child.pid) {
-                self.signals.reap_nonblocking(child.pid);
-            }
-        }
+        self.reap_tracked();
 
         let mut survivors: Vec<i32> = self
             .tracked
@@ -1029,9 +1025,26 @@ impl SessionKillDomain {
         }
     }
 
+    /// Reap every tracked pid, unconditionally.
+    ///
+    /// The attempt must not be gated on `!pid_alive`: a zombie is still
+    /// signalable, so `kill(pid, 0)` succeeds for it and the gate would never
+    /// fire. Two consequences of getting this wrong were observed for real —
+    /// every teardown reported its own session leader as a survivor (making the
+    /// leak metric fire unconditionally, which hides the leaks it exists to
+    /// surface), and every teardown burned the full grace plus kill wait because
+    /// an exited-but-unreaped child reads as alive. `waitpid` on a pid that is
+    /// not our child returns `ECHILD`, which is harmless.
+    fn reap_tracked(&self) {
+        for child in &self.tracked {
+            self.signals.reap_nonblocking(child.pid);
+        }
+    }
+
     async fn wait_until_drained(&self, budget: Duration) -> bool {
         let deadline = Instant::now() + budget;
         loop {
+            self.reap_tracked();
             let alive = self
                 .tracked
                 .iter()
@@ -1336,7 +1349,8 @@ mod tests {
         pgid: i32,
         /// Ignores SIGTERM; only SIGKILL ends it.
         traps_term: bool,
-        alive: bool,
+        /// Has not exited yet.
+        running: bool,
         reaped: bool,
     }
 
@@ -1352,11 +1366,12 @@ mod tests {
             })
         }
 
+        /// Processes that have not exited.
         fn alive_pids(&self) -> Vec<i32> {
             self.table
                 .lock()
                 .iter()
-                .filter(|p| p.alive)
+                .filter(|p| p.running)
                 .map(|p| p.pid)
                 .collect()
         }
@@ -1372,11 +1387,11 @@ mod tests {
 
         fn deliver(&self, matches: impl Fn(&FakeProcess) -> bool, signal: Signal) {
             for process in self.table.lock().iter_mut() {
-                if !process.alive || !matches(process) {
+                if !process.running || !matches(process) {
                     continue;
                 }
                 if signal == Signal::Kill || !process.traps_term {
-                    process.alive = false;
+                    process.running = false;
                 }
             }
         }
@@ -1393,17 +1408,24 @@ mod tests {
             Ok(())
         }
 
+        // Liveness answers what the kernel answers: an exited-but-unreaped child
+        // is a zombie, and `kill(pid, 0)` on a zombie succeeds. Modelling a
+        // zombie as absent — which this fake used to do — is a diagnostic that
+        // disagrees with the shipping code, and it hid two real teardown defects.
         fn group_alive(&self, pgid: i32) -> bool {
-            self.table.lock().iter().any(|p| p.alive && p.pgid == pgid)
+            self.table
+                .lock()
+                .iter()
+                .any(|p| p.pgid == pgid && !p.reaped)
         }
 
         fn pid_alive(&self, pid: i32) -> bool {
-            self.table.lock().iter().any(|p| p.alive && p.pid == pid)
+            self.table.lock().iter().any(|p| p.pid == pid && !p.reaped)
         }
 
         fn reap_nonblocking(&self, pid: i32) -> bool {
             for process in self.table.lock().iter_mut() {
-                if process.pid == pid && !process.alive {
+                if process.pid == pid && !process.running {
                     process.reaped = true;
                     return true;
                 }
@@ -1417,7 +1439,7 @@ mod tests {
             pid,
             pgid,
             traps_term,
-            alive: true,
+            running: true,
             reaped: false,
         }
     }
@@ -1465,6 +1487,35 @@ mod tests {
         );
         assert!(signals.alive_pids().is_empty());
         assert_eq!(signals.reaped_pids(), vec![100, 101], "no zombies left");
+    }
+
+    #[tokio::test]
+    async fn tier1_does_not_report_its_own_reaped_leader_as_a_survivor() {
+        // Regression guard for a defect found by running the binary, not the
+        // suite: a zombie is signalable, so an exited-but-unreaped session leader
+        // read as "alive". Every teardown therefore reported one survivor and
+        // bumped the leak metric — a counter that always fires cannot surface the
+        // leaks it exists for — and every teardown waited out the full grace plus
+        // kill window before saying so.
+        let signals = FakeSignals::new(vec![process(500, 500, false)]);
+        let domain = tier1_domain(signals.clone());
+        let mut session_domain = domain.open_session(&session(), Generation(1)).unwrap();
+        session_domain.set_leader(500).unwrap();
+
+        let started = std::time::Instant::now();
+        let outcome = session_domain.terminate(Duration::from_secs(5)).await;
+
+        assert!(
+            outcome.converged(),
+            "a child that exits on SIGTERM is not a survivor: {:?}",
+            outcome.survivors
+        );
+        assert_eq!(domain.leaked_process_count(), 0);
+        assert_eq!(signals.reaped_pids(), vec![500], "the leader must be reaped");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "teardown must converge as soon as the child is gone, not after the grace"
+        );
     }
 
     #[tokio::test]
