@@ -259,7 +259,7 @@ impl PtySpawner for PortablePtySpawner {
         request: SpawnRequest,
         containment: &mut SessionKillDomain,
     ) -> Result<SpawnedPty, Error> {
-        use portable_pty::{native_pty_system, CommandBuilder, PtySize, PtySystem};
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
         if containment.tier() == KillDomainTier::Tier2GuaranteedCgroup {
             // Fail closed rather than migrate after `exec`: a post-`exec` write
@@ -1233,7 +1233,10 @@ impl SessionManager {
     /// Incremental reconnect within the retained window.
     pub fn replay_since(&self, name: &SessionName, since: u64) -> Result<Replay, Error> {
         let session = self.get(name).ok_or_else(|| Error::NotFound(name.clone()))?;
-        Ok(session.io.buffer.lock().read_since(since))
+        // Copy the replay out and drop the guard before returning: a guard in a
+        // tail expression outlives the local it borrows from.
+        let replay = session.io.buffer.lock().read_since(since);
+        Ok(replay)
     }
 
     /// Remote-admin `renew`: the process survives, the generation bumps, every
@@ -1911,9 +1914,9 @@ mod tests {
     fn a_full_workspace_volume_is_a_first_class_admission_failure() {
         let manager = manager_with(FakeSpawner::new(), "", SessionPolicy::default());
         manager.report_volume_usage(manager.config.volume_capacity_kib as u64);
-        let error = manager
-            .create(name("blocked"), WindowSize::default())
-            .expect_err("must refuse rather than fail opaquely inside the terminal");
+        let Err(error) = manager.create(name("blocked"), WindowSize::default()) else {
+            panic!("must refuse rather than fail opaquely inside the terminal");
+        };
         assert!(error.to_string().contains("workspace volume full"));
         assert_eq!(manager.metrics().workspace_full.load(Ordering::Relaxed), 1);
     }
@@ -2260,11 +2263,14 @@ mod tests {
 
     // ---- TTLs -----------------------------------------------------------
 
-    #[tokio::test(start_paused = true)]
+    // TTL tests use short real durations rather than tokio's paused clock: the
+    // crate's dev-dependencies do not enable tokio's `test-util` feature, and
+    // adding it is outside this change.
+    #[tokio::test]
     async fn the_absolute_ttl_applies_even_while_attached() {
         let policy = SessionPolicy {
-            absolute_ttl: Duration::from_secs(600),
-            ttl_warning_lead: Duration::from_secs(30),
+            absolute_ttl: Duration::from_millis(400),
+            ttl_warning_lead: Duration::from_millis(250),
             ..SessionPolicy::default()
         };
         let manager = manager_with(FakeSpawner::new(), "", policy);
@@ -2274,9 +2280,9 @@ mod tests {
             .unwrap();
         drain(&attached.outbound);
 
-        assert!(manager.tick().await.is_empty());
+        assert!(manager.tick().await.is_empty(), "nothing is due yet");
 
-        tokio::time::advance(Duration::from_secs(580)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         let warned = manager.tick().await;
         assert_eq!(
             warned,
@@ -2294,7 +2300,7 @@ mod tests {
             "expiry must be client-visible before teardown: {items:?}"
         );
 
-        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
         let expired = manager.tick().await;
         assert_eq!(
             expired,
@@ -2307,11 +2313,11 @@ mod tests {
         assert!(manager.list().is_empty());
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn the_detached_idle_ttl_only_runs_while_detached() {
         let policy = SessionPolicy {
-            detached_idle_ttl: Duration::from_secs(300),
-            ttl_warning_lead: Duration::from_secs(30),
+            detached_idle_ttl: Duration::from_millis(200),
+            ttl_warning_lead: Duration::from_millis(1),
             ..SessionPolicy::default()
         };
         let manager = manager_with(FakeSpawner::new(), "", policy);
@@ -2320,12 +2326,12 @@ mod tests {
             .attach(&name("idle"), created.generation, WindowSize::default(), None)
             .unwrap();
 
-        // Attached: an idle socket is still liveness.
-        tokio::time::advance(Duration::from_secs(400)).await;
+        // Attached: a live socket is liveness, however idle the user is.
+        tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(manager.tick().await.is_empty());
 
         attached.detach();
-        tokio::time::advance(Duration::from_secs(400)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
         let actions = manager.tick().await;
         assert_eq!(
             actions,
