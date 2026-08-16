@@ -600,6 +600,13 @@ async fn attach(
     let since = query.since;
     upgrade
         .protocols([PTY_SUBPROTOCOL])
+        // Hard protocol-level backstop at twice the accepted size. The in-handler
+        // check below is what increments the abuse metric and reports a policy
+        // violation; this bound is what stops a client from making the protocol
+        // layer buffer a multi-megabyte message before that check can run
+        // (tungstenite defaults to 64 MiB per message).
+        .max_message_size(2 * MAX_INPUT_FRAME_BYTES)
+        .max_frame_size(2 * MAX_INPUT_FRAME_BYTES)
         .on_upgrade(move |socket| async move {
             serve_attached(state, socket, name, generation, size, since, peer_label).await;
         })
