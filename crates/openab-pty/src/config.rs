@@ -158,11 +158,7 @@ pub fn validate_projection(input: &str) -> Result<PtyConfig, Error> {
         absolute_session_ttl: duration_with_default(pty, "absolute_session_ttl", "12h")?,
         detached_idle_ttl: duration_with_default(pty, "detached_idle_ttl", "30m")?,
         ping_interval: duration_with_default(pty, "ping_interval", "20s")?,
-        missed_pings_before_detached: u32_with_default(
-            pty,
-            "missed_pings_before_detached",
-            3,
-        )?,
+        missed_pings_before_detached: u32_with_default(pty, "missed_pings_before_detached", 3)?,
         ttl_warning_lead: duration_with_default(pty, "ttl_warning_lead", "30s")?,
         max_takeovers_per_window: u32_with_default(pty, "max_takeovers_per_window", 3)?,
         takeover_window: duration_with_default(pty, "takeover_window", "60s")?,
@@ -346,13 +342,13 @@ fn u32_with_default(
 }
 
 fn parse_duration(key: &str, value: &str) -> Result<Duration, Error> {
-    let split = value.find(|c: char| !c.is_ascii_digit()).ok_or_else(|| {
-        Error::Config(format!("{key} needs a unit (s, m, h, d)"))
-    })?;
+    let split = value
+        .find(|c: char| !c.is_ascii_digit())
+        .ok_or_else(|| Error::Config(format!("{key} needs a unit (s, m, h, d)")))?;
     let (number, unit) = value.split_at(split);
-    let amount: u64 = number.parse().map_err(|_| {
-        Error::Config(format!("{key} must be a positive integer duration"))
-    })?;
+    let amount: u64 = number
+        .parse()
+        .map_err(|_| Error::Config(format!("{key} must be a positive integer duration")))?;
     if amount == 0 {
         return Err(Error::Config(format!("{key} must be greater than zero")));
     }
@@ -361,11 +357,7 @@ fn parse_duration(key: &str, value: &str) -> Result<Duration, Error> {
         "m" => amount.checked_mul(60),
         "h" => amount.checked_mul(60 * 60),
         "d" => amount.checked_mul(24 * 60 * 60),
-        _ => {
-            return Err(Error::Config(format!(
-                "{key} unit must be s, m, h, or d"
-            )))
-        }
+        _ => return Err(Error::Config(format!("{key} unit must be s, m, h, or d"))),
     }
     .ok_or_else(|| Error::Config(format!("{key} overflows")))?;
     Ok(Duration::from_secs(seconds))
@@ -395,7 +387,11 @@ fn validate_lifecycle(config: &PtyConfig) -> Result<(), Error> {
     let detach_after = config
         .ping_interval
         .checked_mul(config.missed_pings_before_detached)
-        .ok_or_else(|| Error::Config("ping_interval multiplied by missed_pings_before_detached overflows".into()))?;
+        .ok_or_else(|| {
+            Error::Config(
+                "ping_interval multiplied by missed_pings_before_detached overflows".into(),
+            )
+        })?;
     if detach_after >= config.detached_idle_ttl {
         return Err(Error::Config(
             "ping_interval × missed_pings_before_detached must be shorter than detached_idle_ttl so half-open sockets detach before idle teardown".into(),
@@ -517,7 +513,11 @@ admin_credential_hash = "{HASH}"
             ("detached_idle_ttl", "\"0s\"", "greater than zero"),
             ("ping_interval", "\"14s\"", "between 15s and 30s"),
             ("missed_pings_before_detached", "1", "must be 2 or 3"),
-            ("ttl_warning_lead", "\"30m\"", "shorter than detached_idle_ttl"),
+            (
+                "ttl_warning_lead",
+                "\"30m\"",
+                "shorter than detached_idle_ttl",
+            ),
             ("max_takeovers_per_window", "0", "greater than zero"),
             ("takeover_window", "\"0s\"", "greater than zero"),
             ("teardown_grace", "\"0s\"", "greater than zero"),
