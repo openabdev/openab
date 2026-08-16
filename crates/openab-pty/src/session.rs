@@ -72,9 +72,8 @@ pub struct ConnGeneration(pub u64);
 
 /// Liveness, TTL, and abuse-control knobs.
 ///
-/// These are not in the delivered `[pty]` projection yet — `config.rs` rejects
-/// unknown keys, and it is outside this change — so the ADR's recommended
-/// defaults live here and the integrator can override them programmatically.
+/// The delivered `[pty]` projection supplies these values; defaults here match
+/// the ADR so programmatic construction has the same behaviour as an omitted key.
 #[derive(Clone, Copy, Debug)]
 pub struct SessionPolicy {
     /// Detached-idle TTL.
@@ -111,12 +110,18 @@ impl Default for SessionPolicy {
 }
 
 impl SessionPolicy {
-    /// Take the absolute TTL from the delivered projection, keep ADR defaults
-    /// for the rest.
+    /// Build the runtime policy exclusively from the validated delivered
+    /// projection, so every operator-visible lifecycle knob takes effect.
     pub fn from_config(config: &PtyConfig) -> Self {
         Self {
+            detached_idle_ttl: config.detached_idle_ttl,
             absolute_ttl: config.absolute_session_ttl,
-            ..Self::default()
+            ping_interval: config.ping_interval,
+            missed_pings_before_detached: config.missed_pings_before_detached,
+            ttl_warning_lead: config.ttl_warning_lead,
+            max_takeovers_per_window: config.max_takeovers_per_window,
+            takeover_window: config.takeover_window,
+            teardown_grace: config.teardown_grace,
         }
     }
 

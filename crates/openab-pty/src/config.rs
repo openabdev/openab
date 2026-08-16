@@ -25,6 +25,13 @@ pub struct PtyConfig {
     pub command: PathBuf,
     pub max_sessions: usize,
     pub absolute_session_ttl: Duration,
+    pub detached_idle_ttl: Duration,
+    pub ping_interval: Duration,
+    pub missed_pings_before_detached: u32,
+    pub ttl_warning_lead: Duration,
+    pub max_takeovers_per_window: u32,
+    pub takeover_window: Duration,
+    pub teardown_grace: Duration,
     pub scrollback_kib: usize,
     pub scrollback_replay: bool,
     /// Literal `sha256:<64 lowercase hex>`; retained as a verifier, never a credential.
@@ -71,6 +78,13 @@ const PTY_KEYS: &[&str] = &[
     "command",
     "max_sessions",
     "absolute_session_ttl",
+    "detached_idle_ttl",
+    "ping_interval",
+    "missed_pings_before_detached",
+    "ttl_warning_lead",
+    "max_takeovers_per_window",
+    "takeover_window",
+    "teardown_grace",
     "scrollback_kib",
     "scrollback_replay",
     "admin_credential_hash",
@@ -141,11 +155,18 @@ pub fn validate_projection(input: &str) -> Result<PtyConfig, Error> {
         tls_terminated_upstream: bool_with_default(pty, "tls_terminated_upstream", true)?,
         command: PathBuf::from(string_with_default(pty, "command", "/bin/bash")?),
         max_sessions: usize_with_default(pty, "max_sessions", 4)?,
-        absolute_session_ttl: parse_duration(string_with_default(
+        absolute_session_ttl: duration_with_default(pty, "absolute_session_ttl", "12h")?,
+        detached_idle_ttl: duration_with_default(pty, "detached_idle_ttl", "30m")?,
+        ping_interval: duration_with_default(pty, "ping_interval", "20s")?,
+        missed_pings_before_detached: u32_with_default(
             pty,
-            "absolute_session_ttl",
-            "12h",
-        )?)?,
+            "missed_pings_before_detached",
+            3,
+        )?,
+        ttl_warning_lead: duration_with_default(pty, "ttl_warning_lead", "30s")?,
+        max_takeovers_per_window: u32_with_default(pty, "max_takeovers_per_window", 3)?,
+        takeover_window: duration_with_default(pty, "takeover_window", "60s")?,
+        teardown_grace: duration_with_default(pty, "teardown_grace", "5s")?,
         scrollback_kib: usize_with_default(pty, "scrollback_kib", 1024)?,
         scrollback_replay: bool_with_default(pty, "scrollback_replay", false)?,
         admin_credential_hash: raw_hash,
@@ -167,6 +188,7 @@ pub fn validate_projection(input: &str) -> Result<PtyConfig, Error> {
             "tier1",
         )?)?,
     };
+    validate_lifecycle(&config)?;
     validate_admission(&config)?;
     Ok(config)
 }
@@ -300,18 +322,39 @@ fn usize_with_default(
     }
 }
 
-fn parse_duration(value: &str) -> Result<Duration, Error> {
-    let split = value
-        .find(|c: char| !c.is_ascii_digit())
-        .ok_or_else(|| Error::Config("absolute_session_ttl needs a unit (s, m, h, d)".into()))?;
+fn duration_with_default(
+    table: &toml::map::Map<String, Value>,
+    key: &str,
+    default: &str,
+) -> Result<Duration, Error> {
+    parse_duration(key, string_with_default(table, key, default)?)
+}
+
+fn u32_with_default(
+    table: &toml::map::Map<String, Value>,
+    key: &str,
+    default: u32,
+) -> Result<u32, Error> {
+    match table.get(key).and_then(Value::as_integer) {
+        None if !table.contains_key(key) => Ok(default),
+        Some(value) if value >= 0 => u32::try_from(value)
+            .map_err(|_| Error::Config(format!("[pty].{key} is too large for a u32"))),
+        _ => Err(Error::Config(format!(
+            "[pty].{key} must be a non-negative integer"
+        ))),
+    }
+}
+
+fn parse_duration(key: &str, value: &str) -> Result<Duration, Error> {
+    let split = value.find(|c: char| !c.is_ascii_digit()).ok_or_else(|| {
+        Error::Config(format!("{key} needs a unit (s, m, h, d)"))
+    })?;
     let (number, unit) = value.split_at(split);
-    let amount: u64 = number
-        .parse()
-        .map_err(|_| Error::Config("absolute_session_ttl has an invalid number".into()))?;
+    let amount: u64 = number.parse().map_err(|_| {
+        Error::Config(format!("{key} must be a positive integer duration"))
+    })?;
     if amount == 0 {
-        return Err(Error::Config(
-            "absolute_session_ttl must be non-zero".into(),
-        ));
+        return Err(Error::Config(format!("{key} must be greater than zero")));
     }
     let seconds = match unit {
         "s" => Some(amount),
@@ -319,12 +362,12 @@ fn parse_duration(value: &str) -> Result<Duration, Error> {
         "h" => amount.checked_mul(60 * 60),
         "d" => amount.checked_mul(24 * 60 * 60),
         _ => {
-            return Err(Error::Config(
-                "absolute_session_ttl unit must be s, m, h, or d".into(),
-            ))
+            return Err(Error::Config(format!(
+                "{key} unit must be s, m, h, or d"
+            )))
         }
     }
-    .ok_or_else(|| Error::Config("absolute_session_ttl overflows".into()))?;
+    .ok_or_else(|| Error::Config(format!("{key} overflows")))?;
     Ok(Duration::from_secs(seconds))
 }
 
@@ -336,6 +379,44 @@ fn parse_kill_domain(value: &str) -> Result<KillDomainRequirement, Error> {
             "kill_domain_tier must be tier1 or tier2-required".into(),
         )),
     }
+}
+
+fn validate_lifecycle(config: &PtyConfig) -> Result<(), Error> {
+    if !(Duration::from_secs(15)..=Duration::from_secs(30)).contains(&config.ping_interval) {
+        return Err(Error::Config(
+            "ping_interval must be between 15s and 30s".into(),
+        ));
+    }
+    if !(2..=3).contains(&config.missed_pings_before_detached) {
+        return Err(Error::Config(
+            "missed_pings_before_detached must be 2 or 3".into(),
+        ));
+    }
+    let detach_after = config
+        .ping_interval
+        .checked_mul(config.missed_pings_before_detached)
+        .ok_or_else(|| Error::Config("ping_interval multiplied by missed_pings_before_detached overflows".into()))?;
+    if detach_after >= config.detached_idle_ttl {
+        return Err(Error::Config(
+            "ping_interval × missed_pings_before_detached must be shorter than detached_idle_ttl so half-open sockets detach before idle teardown".into(),
+        ));
+    }
+    if config.ttl_warning_lead >= config.detached_idle_ttl {
+        return Err(Error::Config(
+            "ttl_warning_lead must be shorter than detached_idle_ttl so expiry warning precedes teardown".into(),
+        ));
+    }
+    if config.absolute_session_ttl < config.detached_idle_ttl {
+        return Err(Error::Config(
+            "absolute_session_ttl must not be shorter than detached_idle_ttl".into(),
+        ));
+    }
+    if config.max_takeovers_per_window == 0 {
+        return Err(Error::Config(
+            "max_takeovers_per_window must be greater than zero".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_admission(config: &PtyConfig) -> Result<(), Error> {
@@ -384,6 +465,91 @@ scrollback_replay = false
 admin_credential_hash = "{HASH}"
 "#
         )
+    }
+
+    #[test]
+    fn lifecycle_knobs_default_to_the_adr_values_when_absent() {
+        let config = validate_projection(&valid()).unwrap();
+        assert_eq!(config.detached_idle_ttl, Duration::from_secs(30 * 60));
+        assert_eq!(config.ping_interval, Duration::from_secs(20));
+        assert_eq!(config.missed_pings_before_detached, 3);
+        assert_eq!(config.ttl_warning_lead, Duration::from_secs(30));
+        assert_eq!(config.max_takeovers_per_window, 3);
+        assert_eq!(config.takeover_window, Duration::from_secs(60));
+        assert_eq!(config.teardown_grace, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn lifecycle_knobs_parse_and_round_trip_into_session_policy() {
+        let config = validate_projection(&format!(
+            concat!(
+                "{}detached_idle_ttl = \"40m\"\n",
+                "ping_interval = \"15s\"\n",
+                "missed_pings_before_detached = 2\n",
+                "ttl_warning_lead = \"20s\"\n",
+                "max_takeovers_per_window = 7\n",
+                "takeover_window = \"2m\"\n",
+                "teardown_grace = \"9s\"\n",
+            ),
+            valid()
+        ))
+        .unwrap();
+        let policy = crate::session::SessionPolicy::from_config(&config);
+        assert_eq!(policy.absolute_ttl, config.absolute_session_ttl);
+        assert_eq!(policy.detached_idle_ttl, config.detached_idle_ttl);
+        assert_eq!(policy.ping_interval, config.ping_interval);
+        assert_eq!(
+            policy.missed_pings_before_detached,
+            config.missed_pings_before_detached
+        );
+        assert_eq!(policy.ttl_warning_lead, config.ttl_warning_lead);
+        assert_eq!(
+            policy.max_takeovers_per_window,
+            config.max_takeovers_per_window
+        );
+        assert_eq!(policy.takeover_window, config.takeover_window);
+        assert_eq!(policy.teardown_grace, config.teardown_grace);
+    }
+
+    #[test]
+    fn lifecycle_knobs_reject_out_of_range_values() {
+        for (key, value, constraint) in [
+            ("detached_idle_ttl", "\"0s\"", "greater than zero"),
+            ("ping_interval", "\"14s\"", "between 15s and 30s"),
+            ("missed_pings_before_detached", "1", "must be 2 or 3"),
+            ("ttl_warning_lead", "\"30m\"", "shorter than detached_idle_ttl"),
+            ("max_takeovers_per_window", "0", "greater than zero"),
+            ("takeover_window", "\"0s\"", "greater than zero"),
+            ("teardown_grace", "\"0s\"", "greater than zero"),
+        ] {
+            let error = validate_projection(&format!("{}{key} = {value}\n", valid()))
+                .expect_err("invalid lifecycle knob must fail closed");
+            let message = error.to_string();
+            assert!(message.contains(key), "{message}");
+            assert!(message.contains(constraint), "{message}");
+        }
+    }
+
+    #[test]
+    fn lifecycle_cross_field_constraints_fail_closed() {
+        for (key, value, constraint) in [
+            (
+                "absolute_session_ttl",
+                "\"29m\"",
+                "must not be shorter than detached_idle_ttl",
+            ),
+            (
+                "detached_idle_ttl",
+                "\"30s\"",
+                "missed_pings_before_detached must be shorter than detached_idle_ttl",
+            ),
+        ] {
+            let error = validate_projection(&format!("{}{key} = {value}\n", valid()))
+                .expect_err("incompatible lifecycle values must fail closed");
+            let message = error.to_string();
+            assert!(message.contains(key), "{message}");
+            assert!(message.contains(constraint), "{message}");
+        }
     }
 
     #[test]
