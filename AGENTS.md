@@ -32,6 +32,7 @@ src/
 
 **Helm chart:** `charts/openab/` — Go templates, values.yaml, NOTES.txt
 **Gateway:** `gateway/` — standalone Rust binary for Telegram/LINE/Teams
+**PTY runtime:** `crates/openab-pty/` — remote sandboxed terminal sessions (**internal, unpublished**: no image, no chart, no user docs — see the Gate A revision on the tracking issue). Design of record: [`docs/adr/openab-pty-runtime.md`](docs/adr/openab-pty-runtime.md). Two invariants that must not be quietly relaxed: the **admin plane is remote-only** (no in-container socket — that is what makes admin operations unreachable from a managed session by construction), and **teardown is best-effort in Tier 1** (the default) and must be labelled as such wherever surfaced. Linux-only mechanisms (`PR_SET_DUMPABLE`, cgroup Tier 2) are `#[cfg]`-gated and inert on macOS; the adversary tests in `tests/adversary_linux.rs` only run on Linux.
 **Docs:** `docs/` — user-facing guides, ADRs, config reference
 
 ## Message Flow
