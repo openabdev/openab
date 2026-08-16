@@ -389,7 +389,30 @@ impl ProcessSignals for SystemSignals {
     }
 
     fn group_alive(&self, pgid: i32) -> bool {
-        unsafe { libc::kill(-pgid, 0) == 0 }
+        if unsafe { libc::kill(-pgid, 0) } != 0 {
+            // EPERM: the group exists but is not ours to signal. Treat as alive
+            // so a survivor is reported rather than assumed gone.
+            return io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        }
+        // `kill(-pgid, 0)` succeeds while *any* member exists, including one that
+        // has already exited. That distinction is load-bearing here, for the same
+        // reason `reap_tracked` is unconditional: `PR_SET_CHILD_SUBREAPER`
+        // reparents a killed session's untracked descendants to the runtime,
+        // which does not wait on processes it never tracked, so their zombies
+        // stay in the process group. A signal-only probe therefore reports every
+        // teardown of a shell that ever forked as leaking — measured on kernel
+        // 6.8, three zombies with `ppid == runtime` remained in the group and the
+        // session leader's pgid was reported as a survivor on every teardown,
+        // after burning the full grace and kill budget waiting for them. A
+        // counter that always fires cannot surface the leaks it exists for.
+        #[cfg(target_os = "linux")]
+        {
+            linux_group_has_live_member(pgid)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            true
+        }
     }
 
     fn pid_alive(&self, pid: i32) -> bool {
@@ -406,6 +429,37 @@ impl ProcessSignals for SystemSignals {
         let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
         rc == pid || rc == -1
     }
+}
+
+/// True when the process group has at least one member that has not exited.
+///
+/// Read from `/proc/<pid>/stat` because no signal can express the difference: a
+/// zombie is still a member of its process group and still accepts `kill(pgid,
+/// 0)`, but it has exited and is not a survivor.
+#[cfg(target_os = "linux")]
+fn linux_group_has_live_member(pgid: i32) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        // Cannot tell. Report alive rather than claim a convergence we did not
+        // observe.
+        return true;
+    };
+    for entry in entries.flatten() {
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // `comm` may contain spaces and parentheses, so parse after the last ')'.
+        let Some((_, tail)) = stat.rsplit_once(") ") else {
+            continue;
+        };
+        let mut fields = tail.split_whitespace();
+        let state = fields.next().unwrap_or("Z");
+        let _ppid = fields.next();
+        let group = fields.next().and_then(|value| value.parse::<i32>().ok());
+        if group == Some(pgid) && state != "Z" {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(not(unix))]
