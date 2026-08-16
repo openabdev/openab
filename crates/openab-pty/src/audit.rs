@@ -9,11 +9,20 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 /// The actor that ended a session. This is deliberately explicit: lifecycle
-/// recovery must distinguish an operator kill from child self-exit and shutdown.
+/// recovery must distinguish an operator kill from child self-exit, from TTL
+/// expiry, and from shutdown.
+///
+/// `AdminKill` and `TtlExpired` used to be one `UserKill` variant, which made an
+/// operator kill and an expiry indistinguishable in the audit trail — and, paired
+/// with the shared close code, made a client report "session expired" for a kill
+/// the operator had just issued.
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminationClass {
-    UserKill,
+    /// Remote-admin `kill`, or the teardown half of an admin `restart`.
+    AdminKill,
+    /// The absolute or detached-idle TTL elapsed.
+    TtlExpired,
     SelfExit,
     RuntimeShutdown,
 }
@@ -141,10 +150,13 @@ mod tests {
 
     #[test]
     fn termination_classes_are_distinct() {
-        assert_ne!(TerminationClass::UserKill, TerminationClass::SelfExit);
+        assert_ne!(TerminationClass::AdminKill, TerminationClass::SelfExit);
         assert_ne!(
             TerminationClass::SelfExit,
             TerminationClass::RuntimeShutdown
         );
+        // An operator kill and a TTL expiry must be separable in the audit trail:
+        // one is somebody's decision, the other is the clock.
+        assert_ne!(TerminationClass::AdminKill, TerminationClass::TtlExpired);
     }
 }

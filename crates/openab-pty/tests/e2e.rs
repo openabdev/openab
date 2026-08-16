@@ -457,7 +457,7 @@ async fn a_revoked_token_is_refused_after_kill() {
 
     let (status, report) = harness.admin("DELETE", "/admin/sessions/delta", None).await;
     assert_eq!(status, 200, "kill failed: {report}");
-    assert_eq!(report["class"], serde_json::json!("user_kill"));
+    assert_eq!(report["class"], serde_json::json!("admin_kill"));
 
     assert_eq!(
         attach_with_header(harness.addr, "delta", &token)
@@ -722,6 +722,7 @@ async fn no_admin_operation_succeeds_without_the_credential() {
     let harness = Harness::start(Duration::from_secs(60)).await;
 
     let create_body = r#"{"name":"unauthorized","rows":24,"cols":80}"#;
+    let mut first_attempt = true;
     for (method, path, body) in [
         ("GET", "/admin/sessions", None),
         ("POST", "/admin/sessions", Some(create_body)),
@@ -730,7 +731,19 @@ async fn no_admin_operation_succeeds_without_the_credential() {
         ("POST", "/admin/sessions/unauthorized/restart", None),
     ] {
         let (status, _) = harness.request(method, path, None, body).await;
-        assert_eq!(status, 401, "{method} {path} must require the credential");
+        if first_attempt {
+            assert_eq!(status, 401, "{method} {path} must require the credential");
+            first_attempt = false;
+        } else {
+            // A request with a missing or malformed header is counted on the same
+            // per-source throttle as a wrong credential — it used to bypass the
+            // throttle entirely, which made omitting the header a free retry — so
+            // from the second attempt onwards this source may be answered 429.
+            assert!(
+                status == 401 || status == 429,
+                "{method} {path} without a credential returned {status}"
+            );
+        }
 
         let wrong = "f".repeat(64);
         let (status, _) = harness.request(method, path, Some(&wrong), body).await;
@@ -740,9 +753,12 @@ async fn no_admin_operation_succeeds_without_the_credential() {
         );
     }
 
-    // The real credential works immediately, *while* the throttle those
-    // rejections armed is still in force: the throttle applies to failures only,
-    // so nothing that can reach this listener can lock the operator out.
+    // Every source on this test runs from 127.0.0.1, and the throttle those
+    // rejections armed is still in force: the throttle governs *failed* attempts,
+    // so the real credential is accepted immediately. Nothing that can reach this
+    // listener — a process inside a managed session included — can lock the
+    // operator out. Cross-source independence is unit tested in `admin_auth`,
+    // which can synthesise two sources without a second local address.
     let (status, listed) = harness.admin("GET", "/admin/sessions", None).await;
     assert_eq!(
         status, 200,
@@ -815,6 +831,48 @@ async fn validate_projection_accepts_a_delivered_projection() {
         output.status.success(),
         "a valid projection must be accepted: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The printed tier must be the vocabulary a projection accepts, not the Debug
+    // name: an operator copying this line back into config had it rejected.
+    assert!(
+        stdout.contains("kill_domain_tier        = tier1"),
+        "the validator must print the config token: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Tier1Allowed"),
+        "the Debug name is not config vocabulary: {stdout}"
+    );
+    // And the tier is never surfaced without its guarantee label.
+    assert!(
+        stdout.contains("BEST-EFFORT"),
+        "the kill-domain tier must carry its best-effort label wherever it is surfaced: {stdout}"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+#[ignore = "spawns the built binary"]
+async fn validate_projection_refuses_a_projection_the_runtime_would_not_start_on() {
+    // `tier2-required` parses, and startup refuses it because Tier 2 is not
+    // implemented. The validator has to refuse it too: printing OK for a
+    // projection that cannot boot is a broken CI guard.
+    let path = write_projection(
+        "tier2",
+        &format!(
+            "{}kill_domain_tier = \"tier2-required\"\n",
+            projection(test_command(), GOOD_HASH, 4)
+        ),
+    );
+    let output = run_validate(&path);
+    assert!(
+        !output.status.success(),
+        "tier2-required must exit non-zero: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("REJECTED"),
+        "it must say why"
     );
     let _ = std::fs::remove_file(path);
 }

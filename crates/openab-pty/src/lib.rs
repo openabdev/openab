@@ -8,10 +8,15 @@
 //!
 //! 1. **The admin plane is remote-only, and the credential is its whole
 //!    boundary.** No admin socket, UDS, or in-container CLI exists, so no code
-//!    path treats being *inside* the container as authorization. Being inside is
-//!    not the same as being unable to knock: a managed session shares this
-//!    container's network namespace and can connect to the one listener, where it
-//!    is refused for want of the credential — which never enters the container.
+//!    path treats being *inside* the container as authorization. That is not the
+//!    same as being unreachable, and the ADR no longer claims it is: a managed
+//!    session shares this container's network namespace and *can* connect to the
+//!    one listener, where it gets `401`. The claim is the weaker, true one — **a
+//!    managed session cannot authenticate to, or successfully invoke, admin
+//!    operations** — because the credential exists in-container only as a
+//!    non-reversible hash, and tokens are never written to a PTY master. Residual
+//!    risks of that reachability are stated in the ADR: bounded local DoS from
+//!    inside a session, and in-session guessing against a 256-bit CSPRNG value.
 //! 2. **Teardown is best-effort.** Tier 1 (process group + subreaper/pidfd) is
 //!    the only kill domain implemented, and that must be labelled wherever it is
 //!    surfaced. Tier 2 (per-session cgroup) is the ADR's demand-gated plan, is
@@ -92,6 +97,13 @@ pub mod close_code {
     pub const RUNTIME_REPLACED: u16 = 4006;
     /// Session capacity, tracking capacity, or an admission bound was hit.
     pub const CAPACITY: u16 = 4007;
+    /// An operator killed the session through the admin plane. Distinct from
+    /// [`TTL_EXPIRED`] because a client that reports "session expired" for a kill
+    /// somebody just issued is telling its user something untrue.
+    pub const ADMIN_KILL: u16 = 4008;
+    /// An internal fault, not a client-correctable condition. Distinct from
+    /// [`CAPACITY`], which invites an immediate retry-create.
+    pub const INTERNAL_ERROR: u16 = 4009;
 }
 
 /// Errors surfaced across module boundaries.

@@ -64,6 +64,11 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
+    // DEFERRED to Gate B: a JSON logging layer. Nothing ingests these logs while
+    // the crate is internal and unpublished; `tracing`'s text output is what an
+    // operator reads with `kubectl logs`/`ecs execute-command` today, and the
+    // audit trail — the part that must be machine-readable — is already
+    // structured and serialised by `crate::audit`.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -143,9 +148,21 @@ fn validate_only(path: &PathBuf) -> Result<()> {
                 projection.absolute_session_ttl.as_secs()
             );
             println!(
-                "  kill_domain_tier        = {:?}",
-                projection.kill_domain_requirement
+                "  kill_domain_tier        = {}",
+                projection.kill_domain_requirement.as_config_value()
             );
+            // The tier is never surfaced without its guarantee label, here
+            // included: `describe()` carries the BEST-EFFORT wording the ADR
+            // requires wherever the tier appears.
+            match killdomain::resolve_tier(projection.kill_domain_requirement) {
+                Ok(tier) => println!("  {}", tier.describe()),
+                Err(error) => {
+                    // A validator that prints OK for a projection the runtime
+                    // refuses to start on is a broken measurement.
+                    eprintln!("{}: REJECTED: {error}", path.display());
+                    std::process::exit(1);
+                }
+            }
             Ok(())
         }
         Err(error) => {

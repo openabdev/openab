@@ -12,6 +12,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::atomic::{compiler_fence, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
@@ -209,6 +210,9 @@ fn zero_array(bytes: &mut [u8; 32]) {
     for byte in bytes {
         unsafe { std::ptr::write_volatile(byte, 0) };
     }
+    // Same shape as `SecretBytes::zeroize`: the volatile writes are not reordered
+    // past this point, so a later drop cannot let the erase be sunk or elided.
+    compiler_fence(Ordering::SeqCst);
 }
 
 #[cfg(test)]

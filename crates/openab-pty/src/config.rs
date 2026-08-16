@@ -26,6 +26,20 @@ pub enum KillDomainRequirement {
     Tier2Required,
 }
 
+impl KillDomainRequirement {
+    /// The `kill_domain_tier` token that produces this value.
+    ///
+    /// Surfaces (`--validate-projection`, logs) must print *this*, not the Debug
+    /// name: `Tier1Allowed` is not accepted by [`parse_kill_domain`], so printing
+    /// it hands the operator a value their config will reject.
+    pub fn as_config_value(self) -> &'static str {
+        match self {
+            Self::Tier1Allowed => "tier1",
+            Self::Tier2Required => "tier2-required",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PtyConfig {
     pub enabled: bool,
@@ -499,5 +513,21 @@ admin_credential_hash = "{HASH}"
             KillDomainRequirement::Tier2Required
         );
         assert!(crate::killdomain::resolve_tier(config.kill_domain_requirement).is_err());
+    }
+
+    #[test]
+    fn the_printed_tier_vocabulary_is_the_one_config_accepts() {
+        // `--validate-projection` used to print the Debug name (`Tier1Allowed`),
+        // which `parse_kill_domain` rejects — so copying the validator's own
+        // output into a projection produced an invalid projection.
+        for requirement in [
+            KillDomainRequirement::Tier1Allowed,
+            KillDomainRequirement::Tier2Required,
+        ] {
+            assert_eq!(
+                parse_kill_domain(requirement.as_config_value()).unwrap(),
+                requirement
+            );
+        }
     }
 }
