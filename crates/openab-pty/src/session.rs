@@ -1772,7 +1772,12 @@ mod tests {
     struct FakeSpawner {
         pty: Arc<FakePtyState>,
         written: Arc<Mutex<Vec<u8>>>,
-        output: Mutex<Option<std_mpsc::Sender<Vec<u8>>>>,
+        /// One sender per spawned session, retained. Overwriting a single slot
+        /// dropped the previous session's sender, which its reader saw as EOF and
+        /// the manager as a self-exit — a fake that quietly killed sessions the
+        /// code under test believed were live, and it made a capacity test read
+        /// three admissions where the code had allowed two.
+        output: Mutex<Vec<std_mpsc::Sender<Vec<u8>>>>,
         last_env: Mutex<Vec<(String, String)>>,
         stall: Arc<AtomicBool>,
         /// How many PTYs this spawner was asked for. The concurrent-create
@@ -1788,7 +1793,7 @@ mod tests {
             Arc::new(Self {
                 pty: Arc::new(FakePtyState::default()),
                 written: Arc::new(Mutex::new(Vec::new())),
-                output: Mutex::new(None),
+                output: Mutex::new(Vec::new()),
                 last_env: Mutex::new(Vec::new()),
                 stall: Arc::new(AtomicBool::new(false)),
                 spawns: AtomicU64::new(0),
@@ -1800,7 +1805,7 @@ mod tests {
             Arc::new(Self {
                 pty: Arc::new(FakePtyState::default()),
                 written: Arc::new(Mutex::new(Vec::new())),
-                output: Mutex::new(None),
+                output: Mutex::new(Vec::new()),
                 last_env: Mutex::new(Vec::new()),
                 stall: Arc::new(AtomicBool::new(false)),
                 spawns: AtomicU64::new(0),
@@ -1809,7 +1814,7 @@ mod tests {
         }
 
         fn emit(&self, bytes: &[u8]) {
-            let sender = self.output.lock().clone();
+            let sender = self.output.lock().last().cloned();
             if let Some(sender) = sender {
                 sender.send(bytes.to_vec()).unwrap();
             }
@@ -1818,7 +1823,7 @@ mod tests {
         /// Simulate the child exiting on its own: EOF on the master.
         fn end_child(&self, code: i32) {
             *self.pty.exit.lock() = Some(code);
-            *self.output.lock() = None;
+            self.output.lock().clear();
         }
     }
 
@@ -1834,7 +1839,7 @@ mod tests {
             self.spawns.fetch_add(1, Ordering::Relaxed);
             *self.last_env.lock() = request.env.clone();
             let (tx, rx) = std_mpsc::channel();
-            *self.output.lock() = Some(tx);
+            self.output.lock().push(tx);
             self.pty.resizes.lock().push(request.size);
             containment.set_leader(4242)?;
             Ok(SpawnedPty {
