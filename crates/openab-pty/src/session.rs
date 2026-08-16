@@ -1995,7 +1995,11 @@ mod tests {
         // child, and the last insert won — leaving the others alive with nothing
         // holding them and nothing that would ever tear them down.
         let spawner = FakeSpawner::new();
-        let manager = manager_with(spawner.clone(), "max_sessions = 4\n", SessionPolicy::default());
+        let manager = manager_with(
+            spawner.clone(),
+            "max_sessions = 4\n",
+            SessionPolicy::default(),
+        );
         let mut tasks = Vec::new();
         for _ in 0..8 {
             let manager = manager.clone();
@@ -2022,7 +2026,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_creates_cannot_exceed_max_sessions() {
         let spawner = FakeSpawner::new();
-        let manager = manager_with(spawner.clone(), "max_sessions = 2\n", SessionPolicy::default());
+        let manager = manager_with(
+            spawner.clone(),
+            "max_sessions = 2\n",
+            SessionPolicy::default(),
+        );
         let mut tasks = Vec::new();
         for index in 0..8 {
             let manager = manager.clone();
@@ -2038,7 +2046,10 @@ mod tests {
                 succeeded += 1;
             }
         }
-        assert_eq!(succeeded, 2, "capacity is checked with the claim, not before");
+        assert_eq!(
+            succeeded, 2,
+            "capacity is checked with the claim, not before"
+        );
         assert_eq!(spawner.spawns.load(Ordering::Relaxed), 2);
     }
 

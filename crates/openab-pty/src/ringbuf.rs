@@ -299,7 +299,6 @@ impl ByteQueue {
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
     }
-
 }
 
 #[cfg(test)]
