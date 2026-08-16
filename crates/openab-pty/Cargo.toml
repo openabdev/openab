@@ -29,3 +29,5 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio-tungstenite = "0.29"
+
+[workspace]

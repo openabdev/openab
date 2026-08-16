@@ -1,0 +1,43 @@
+name: CI openab-pty
+
+on:
+  push:
+    paths:
+      - 'crates/openab-pty/**'
+      - '.github/workflows/ci-openab-pty.yml'
+  pull_request:
+    paths:
+      - 'crates/openab-pty/**'
+      - '.github/workflows/ci-openab-pty.yml'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/openab-pty
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable (2026-07-13)
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2026-03-12)
+        with:
+          workspaces: crates/openab-pty
+      - run: cargo fmt --check
+      - run: cargo clippy --all-features --all-targets -- -D warnings
+      - run: cargo test
+      # The adversary tests are the evidence base for the ADR's containment and
+      # kill-domain claims, so they run in CI rather than only on a homelab box.
+      # They are #[ignore]d (they spawn real processes and probe /proc) and
+      # Linux-only, hence the explicit target and --include-ignored.
+      #
+      # They are written to hold on any Linux host: they read and report Yama's
+      # ptrace_scope, use the parent-child relationship it permits, and assert
+      # per the *active* kill-domain tier. A runner without cgroup delegation
+      # exercises Tier 1 and says so, which is a real result rather than a skip.
+      - run: cargo test --test adversary_linux -- --include-ignored --nocapture
+      # The end-to-end suite spawns shells over real WebSockets and takes ~20s.
+      # Deliberately left out of the required path to keep CI deterministic; run
+      # it with `cargo test -p openab-pty -- --include-ignored` when touching the
+      # session, server, or token modules.

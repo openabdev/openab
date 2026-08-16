@@ -1,6 +1,12 @@
 [workspace]
-members = ["crates/openab-core", "crates/openab-gateway", "crates/openab-mcp", "crates/openab-cp", "crates/openab-pty"]
-exclude = ["openab-agent", "crates/platform-schema"]
+members = ["crates/openab-core", "crates/openab-gateway", "crates/openab-mcp", "crates/openab-cp"]
+# openab-pty is excluded rather than a member: every image Dockerfile stubs each
+# workspace member by name in its dependency-cache layer, so adding a member
+# breaks all 19 of them. It is unpublished (no image, no chart) and so has no
+# business in the image build at all. CI coverage comes from
+# .github/workflows/ci-openab-pty.yml, the same arrangement openab-agent and
+# platform-schema use.
+exclude = ["openab-agent", "crates/platform-schema", "crates/openab-pty"]
 
 [package]
 name = "openab"
