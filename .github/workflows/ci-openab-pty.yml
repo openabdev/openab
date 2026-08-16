@@ -25,8 +25,11 @@ jobs:
         with:
           workspaces: crates/openab-pty
       - run: cargo fmt --check
-      - run: cargo clippy --all-features --all-targets -- -D warnings
-      - run: cargo test
+      # `--locked` is what makes the committed Cargo.lock mean something: this crate
+      # is a standalone binary outside the root workspace, so without a lockfile CI
+      # resolved fresh dependency versions on every run.
+      - run: cargo clippy --locked --all-features --all-targets -- -D warnings
+      - run: cargo test --locked
       # The adversary tests are the evidence base for the ADR's containment and
       # kill-domain claims, so they run in CI rather than only on a homelab box.
       # They are #[ignore]d (they spawn real processes and probe /proc) and
@@ -36,8 +39,11 @@ jobs:
       # ptrace_scope, use the parent-child relationship it permits, and assert
       # per the *active* kill-domain tier. A runner without cgroup delegation
       # exercises Tier 1 and says so, which is a real result rather than a skip.
-      - run: cargo test --test adversary_linux -- --include-ignored --nocapture
-      # The end-to-end suite spawns shells over real WebSockets and takes ~20s.
-      # Deliberately left out of the required path to keep CI deterministic; run
-      # it with `cargo test -p openab-pty -- --include-ignored` when touching the
+      - run: cargo test --locked --test adversary_linux -- --include-ignored --nocapture
+      # DEFERRED to Gate B (publishing an image/chart/docs): running the e2e suite
+      # here. It spawns real shells over real WebSockets and takes ~20s, and its
+      # value is release confidence for a published artifact; while the crate is
+      # internal it is run by hand on Linux and macOS before every push, which is
+      # what the branch's verification record shows. Run it with
+      # `cargo test -- --include-ignored` from crates/openab-pty when touching the
       # session, server, or token modules.

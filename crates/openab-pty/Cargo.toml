@@ -6,6 +6,10 @@ license = "MIT"
 description = "OpenAB PTY runtime — remote sandboxed terminal sessions over WebSocket (internal, unpublished)"
 
 [dependencies]
+# DEFERRED to Gate B: trimming `full` to the feature set actually used. `full` is
+# a build-time cost only, this crate is unpublished and ships no image, and the
+# trim is a per-feature bisect that has to be redone as the crate changes. It
+# belongs with the first published image, where binary size starts to matter.
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
