@@ -544,7 +544,15 @@ admin_credential_hash = "{HASH}"
                 "missed_pings_before_detached must be shorter than detached_idle_ttl",
             ),
         ] {
-            let error = validate_projection(&format!("{}{key} = {value}\n", valid()))
+            let projection = if key == "absolute_session_ttl" {
+                valid().replace(
+                    "absolute_session_ttl = \"12h\"",
+                    &format!("{key} = {value}"),
+                )
+            } else {
+                format!("{}{key} = {value}\n", valid())
+            };
+            let error = validate_projection(&projection)
                 .expect_err("incompatible lifecycle values must fail closed");
             let message = error.to_string();
             assert!(message.contains(key), "{message}");
