@@ -24,6 +24,12 @@
 //!    a `parking_lot` guard keeps that guard alive for the *whole* statement, so
 //!    a body that re-locks self-deadlocks against a non-reentrant mutex.
 //!
+//! DEFERRED to Gate B: splitting this file into modules. It is large, and the
+//! split is a real improvement — but the three rules above are file-local
+//! invariants that a split would have to re-state at every new boundary, and the
+//! crate is unpublished with one reader. Cutting dead code took it down first;
+//! the split waits until the module boundaries are load-bearing for somebody.
+//!
 //! The I/O threads never take the state lock. They read the fence and activity
 //! clock from [`SessionIo`]'s atomics, which are written under the state lock —
 //! the lock stays authoritative, the atomics are its I/O-side mirror.
@@ -858,6 +864,22 @@ struct ManagerState {
     tombstones: VecDeque<(SessionName, Tombstone)>,
 }
 
+/// RAII release for a [`ManagerState::claimed`] entry.
+///
+/// The normal path releases the claim in the same critical section that publishes
+/// the session (see `publish`), so capacity is never counted twice; this `Drop` is
+/// what covers every abandoned path — each `?` on the spawn, and a panic in it.
+struct NameClaim<'a> {
+    manager: &'a SessionManager,
+    name: SessionName,
+}
+
+impl Drop for NameClaim<'_> {
+    fn drop(&mut self) {
+        self.manager.state.lock().claimed.remove(&self.name);
+    }
+}
+
 /// The session manager.
 pub struct SessionManager {
     state: Mutex<ManagerState>,
@@ -961,7 +983,7 @@ impl SessionManager {
                 if session.is_alive() {
                     self.teardown(
                         &session,
-                        TerminationClass::UserKill,
+                        TerminationClass::AdminKill,
                         close_code::SESSION_ENDED,
                     )
                     .await;
@@ -989,7 +1011,11 @@ impl SessionManager {
 
     /// Claim a name and a capacity slot in **one** critical section, so nothing
     /// can spawn a second PTY under the same name while this spawn is in flight.
-    fn claim_name(&self, name: &SessionName) -> Result<(), Error> {
+    ///
+    /// The claim is returned as a guard: releasing it is the guard's `Drop`, so no
+    /// `?` on the spawn path — and no panic in it — can leave a name claimed
+    /// forever, which would make that name permanently uncreatable.
+    fn claim_name<'a>(&'a self, name: &SessionName) -> Result<NameClaim<'a>, Error> {
         let mut state = self.state.lock();
         if state.sessions.contains_key(name) || !state.claimed.insert(name.clone()) {
             return Err(Error::AlreadyExists(name.clone()));
@@ -1007,7 +1033,10 @@ impl SessionManager {
                 limit: self.config.max_sessions,
             });
         }
-        Ok(())
+        Ok(NameClaim {
+            manager: self,
+            name: name.clone(),
+        })
     }
 
     fn spawn_session(
@@ -1016,10 +1045,10 @@ impl SessionManager {
         size: WindowSize,
         generation: Generation,
     ) -> Result<SessionCredential, Error> {
-        self.claim_name(&name)?;
-        let outcome = self.spawn_claimed(name.clone(), size, generation);
-        self.state.lock().claimed.remove(&name);
-        outcome
+        // Held for the whole spawn: the claim is what makes the name and the
+        // capacity slot exclusive across the PTY spawn, not just across the check.
+        let _claim = self.claim_name(&name)?;
+        self.spawn_claimed(name, size, generation)
     }
 
     fn spawn_claimed(
@@ -1091,7 +1120,7 @@ impl SessionManager {
         spawn_reader_thread(self.clone(), session.clone(), spawned.reader);
 
         let token = self.tokens.mint_for_session(name.clone(), generation)?;
-        self.state.lock().sessions.insert(name.clone(), session);
+        self.publish(name.clone(), session);
         Metrics::bump(&self.metrics.sessions_created);
         self.audit.record(
             AuditEvent::new(AuditKind::SessionCreate)
@@ -1103,6 +1132,43 @@ impl SessionManager {
             generation,
             token,
         })
+    }
+
+    /// Publish a spawned session and release its name claim in **one** critical
+    /// section: releasing the claim separately would count this session against
+    /// capacity twice, or open a window in which neither the claim nor the map
+    /// names it.
+    ///
+    /// Reading `insert`'s return value is the re-check before publishing. The
+    /// claim already makes a collision impossible, but the failure mode it guards
+    /// is the one this crate exists to prevent: a replaced `Arc<Session>` is a
+    /// live PTY with no handle, invisible to kill, to TTL ticking, and to
+    /// shutdown. So if that invariant ever breaks, the displaced session is torn
+    /// down instead of dropped on the floor.
+    fn publish(self: &Arc<Self>, name: SessionName, session: Arc<Session>) {
+        let displaced = {
+            let mut state = self.state.lock();
+            state.claimed.remove(&name);
+            state.sessions.insert(name.clone(), session)
+        };
+        let Some(displaced) = displaced else { return };
+        tracing::error!(
+            session = %name,
+            "BUG: publish displaced an existing session the name claim should have excluded; \
+             tearing the displaced session down so it cannot survive unreachable"
+        );
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let manager = self.clone();
+            handle.spawn(async move {
+                manager
+                    .teardown(
+                        &displaced,
+                        TerminationClass::RuntimeShutdown,
+                        close_code::RUNTIME_REPLACED,
+                    )
+                    .await;
+            });
+        }
     }
 
     fn workspace(&self) -> PathBuf {
@@ -1327,12 +1393,12 @@ impl SessionManager {
         let report = self
             .teardown(
                 &session,
-                TerminationClass::UserKill,
-                close_code::TTL_EXPIRED,
+                TerminationClass::AdminKill,
+                close_code::ADMIN_KILL,
             )
             .await;
         self.forget(name);
-        self.remember_dead(name, session.generation(), TerminationClass::UserKill);
+        self.remember_dead(name, session.generation(), TerminationClass::AdminKill);
         Ok(report)
     }
 
@@ -1578,12 +1644,12 @@ impl SessionManager {
                     let name = session.name.clone();
                     self.teardown(
                         &session,
-                        TerminationClass::UserKill,
+                        TerminationClass::TtlExpired,
                         close_code::TTL_EXPIRED,
                     )
                     .await;
                     self.forget(&name);
-                    self.remember_dead(&name, session.generation(), TerminationClass::UserKill);
+                    self.remember_dead(&name, session.generation(), TerminationClass::TtlExpired);
                     Metrics::bump(&self.metrics.ttl_expired);
                     actions.push(TtlAction::Expired {
                         session: name,
@@ -1999,25 +2065,37 @@ mod tests {
         // between, so every racing caller passed the check, every one spawned a
         // child, and the last insert won — leaving the others alive with nothing
         // holding them and nothing that would ever tear them down.
+        //
+        // A barrier is what makes this a race rather than a hope: every thread is
+        // already inside `create` before any of them is allowed past the claim.
         let spawner = FakeSpawner::new();
         let manager = manager_with(
             spawner.clone(),
             "max_sessions = 4\n",
             SessionPolicy::default(),
         );
-        let mut tasks = Vec::new();
-        for _ in 0..8 {
-            let manager = manager.clone();
-            tasks.push(tokio::task::spawn_blocking(move || {
-                manager.create(name("race"), WindowSize::default()).is_ok()
-            }));
-        }
-        let mut succeeded = 0;
-        for task in tasks {
-            if task.await.unwrap() {
-                succeeded += 1;
+        const RACERS: usize = 8;
+        let barrier = std::sync::Barrier::new(RACERS);
+        // `create` spawns the session's output task, so each racer needs the
+        // runtime context; `enter()` is what a scoped OS thread does not inherit.
+        let handle = tokio::runtime::Handle::current();
+        let succeeded: usize = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..RACERS {
+                let manager = manager.clone();
+                let barrier = &barrier;
+                let runtime = handle.clone();
+                handles.push(scope.spawn(move || {
+                    let _entered = runtime.enter();
+                    barrier.wait();
+                    manager.create(name("race"), WindowSize::default()).is_ok()
+                }));
             }
-        }
+            handles
+                .into_iter()
+                .map(|handle| usize::from(handle.join().unwrap()))
+                .sum()
+        });
         assert_eq!(succeeded, 1, "exactly one create may win the name");
         assert_eq!(manager.list().len(), 1);
         assert_eq!(
@@ -2026,6 +2104,18 @@ mod tests {
             "a losing create must never have spawned a PTY: an unreferenced live child is a leak \
              no teardown path can reach"
         );
+        // Every loser released its claim: the remaining 3 slots of `max_sessions`
+        // are still available, and the 4th is not. A leaked reservation would show
+        // up here as capacity that never comes back.
+        for index in 0..3 {
+            manager
+                .create(name(&format!("after{index}")), WindowSize::default())
+                .expect("a losing racer must not hold capacity after it returns");
+        }
+        assert!(matches!(
+            manager.create(name("after3"), WindowSize::default()),
+            Err(Error::CapacityExceeded { limit: 4 })
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2033,29 +2123,41 @@ mod tests {
         let spawner = FakeSpawner::new();
         let manager = manager_with(
             spawner.clone(),
-            "max_sessions = 2\n",
+            "max_sessions = 1\n",
             SessionPolicy::default(),
         );
-        let mut tasks = Vec::new();
-        for index in 0..8 {
-            let manager = manager.clone();
-            tasks.push(tokio::task::spawn_blocking(move || {
-                manager
-                    .create(name(&format!("s{index}")), WindowSize::default())
-                    .is_ok()
-            }));
-        }
-        let mut succeeded = 0;
-        for task in tasks {
-            if task.await.unwrap() {
-                succeeded += 1;
+        const RACERS: usize = 8;
+        let barrier = std::sync::Barrier::new(RACERS);
+        let handle = tokio::runtime::Handle::current();
+        let succeeded: usize = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for index in 0..RACERS {
+                let manager = manager.clone();
+                let barrier = &barrier;
+                let runtime = handle.clone();
+                handles.push(scope.spawn(move || {
+                    let _entered = runtime.enter();
+                    barrier.wait();
+                    manager
+                        .create(name(&format!("s{index}")), WindowSize::default())
+                        .is_ok()
+                }));
             }
-        }
+            handles
+                .into_iter()
+                .map(|handle| usize::from(handle.join().unwrap()))
+                .sum()
+        });
         assert_eq!(
-            succeeded, 2,
-            "capacity is checked with the claim, not before"
+            succeeded, 1,
+            "capacity is taken with the claim, not checked before it"
         );
-        assert_eq!(spawner.spawns.load(Ordering::Relaxed), 2);
+        assert_eq!(manager.list().len(), 1);
+        assert_eq!(
+            spawner.spawns.load(Ordering::Relaxed),
+            1,
+            "a rejected admission must not have spawned a PTY first"
+        );
     }
 
     #[test]
@@ -2402,7 +2504,7 @@ mod tests {
             .unwrap();
 
         let report = manager.kill(&name("bye")).await.unwrap();
-        assert_eq!(report.class, TerminationClass::UserKill);
+        assert_eq!(report.class, TerminationClass::AdminKill);
         assert!(report.kill_domain.converged());
         assert!(report.kill_domain.is_best_effort());
         assert!(attached.outbound.close_code().is_some());
