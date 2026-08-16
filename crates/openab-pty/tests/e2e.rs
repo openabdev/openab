@@ -298,7 +298,10 @@ async fn connect(addr: SocketAddr, session: &str, header: Option<(&str, String)>
 async fn connect_url(url: &str, header: Option<(&str, String)>) -> Attach {
     use tungstenite::client::IntoClientRequest;
 
-    let mut request = url.to_string().into_client_request().expect("client request");
+    let mut request = url
+        .to_string()
+        .into_client_request()
+        .expect("client request");
     if let Some((name, value)) = header {
         request.headers_mut().insert(
             tungstenite::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
@@ -672,12 +675,9 @@ async fn input_reaches_the_child_and_output_replays_from_a_cursor() {
     let _ = wait_for_close(&mut socket).await;
 
     let url = format!("ws://{}/pty/kappa?since=0&rows=40&cols=132", harness.addr);
-    let mut reattached = connect_url(
-        &url,
-        Some(("authorization", format!("Bearer {token}"))),
-    )
-    .await
-    .connected();
+    let mut reattached = connect_url(&url, Some(("authorization", format!("Bearer {token}"))))
+        .await
+        .connected();
     let notice = next_control(&mut reattached).await;
     assert_eq!(notice["type"], serde_json::json!("attach-notice"));
     assert!(
@@ -705,9 +705,9 @@ async fn malformed_control_frames_disconnect_as_a_policy_violation() {
     );
 
     for bad in [
-        r#"{"type":"ping"}"#,                            // no version
-        r#"{"v":1,"type":"exec","cmd":"sh"}"#,           // unknown type
-        r#"{"v":1,"type":"resize","rows":0,"cols":0}"#,  // out of bounds
+        r#"{"type":"ping"}"#,                           // no version
+        r#"{"v":1,"type":"exec","cmd":"sh"}"#,          // unknown type
+        r#"{"v":1,"type":"resize","rows":0,"cols":0}"#, // out of bounds
     ] {
         socket
             .send(tungstenite::Message::Text(bad.into()))
