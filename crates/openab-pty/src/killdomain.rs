@@ -1511,7 +1511,11 @@ mod tests {
             outcome.survivors
         );
         assert_eq!(domain.leaked_process_count(), 0);
-        assert_eq!(signals.reaped_pids(), vec![500], "the leader must be reaped");
+        assert_eq!(
+            signals.reaped_pids(),
+            vec![500],
+            "the leader must be reaped"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "teardown must converge as soon as the child is gone, not after the grace"
