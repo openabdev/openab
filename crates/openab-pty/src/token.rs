@@ -90,7 +90,6 @@ impl TokenStore {
         }
         let mut raw = [0u8; 32];
         OsRng.fill_bytes(&mut raw);
-        let hash = sha256(&raw);
 
         // Lowercase hex is RFC 6455 subprotocol-token-safe, unlike padded base64.
         let mut encoded = Vec::with_capacity(64);
@@ -98,6 +97,11 @@ impl TokenStore {
             encoded.extend_from_slice(format!("{byte:02x}").as_bytes());
         }
         zero_array(&mut raw);
+
+        // Hash the ENCODED form, because that is what a client presents on attach.
+        // Hashing the raw bytes here instead would make every verification fail:
+        // sha256(raw) != sha256(hex(raw)).
+        let hash = sha256(&encoded);
 
         let expires_at = Instant::now() + self.ttl;
         let grant = AttachGrant {

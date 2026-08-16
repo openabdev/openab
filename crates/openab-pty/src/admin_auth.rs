@@ -99,12 +99,15 @@ impl AdminAuthenticator {
     pub fn generate() -> GeneratedAdminCredential {
         let mut raw = [0u8; 32];
         OsRng.fill_bytes(&mut raw);
-        let verifier = format!("sha256:{}", hex::encode(Sha256::digest(raw)));
         let mut encoded = Vec::with_capacity(64);
         for byte in raw {
             encoded.extend_from_slice(format!("{byte:02x}").as_bytes());
         }
         zero_array(&mut raw);
+        // Hash the ENCODED form: that is what the operator presents over the
+        // remote admin API, and what `verify` hashes. Digesting the raw bytes
+        // here would make every verification fail.
+        let verifier = format!("sha256:{}", hex::encode(Sha256::digest(&encoded)));
         GeneratedAdminCredential {
             plaintext: SecretBytes::new(encoded),
             verifier,
@@ -130,7 +133,12 @@ impl AdminAuthenticator {
         }
 
         let now = Instant::now();
-        if let Some(until) = self.failures.lock().blocked_until {
+        // Copy the value out and release the guard on this line. Holding it into
+        // the body would deadlock: an `if let` scrutinee temporary lives for the
+        // whole statement in edition 2021, and `record_failure` re-locks this
+        // same non-reentrant mutex.
+        let blocked_until = self.failures.lock().blocked_until;
+        if let Some(until) = blocked_until {
             if until > now {
                 presented.zeroize();
                 let retry_after = until.saturating_duration_since(now);
