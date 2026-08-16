@@ -59,10 +59,7 @@ pub struct AdminAuthenticator {
 
 impl AdminAuthenticator {
     /// Parse the literal `sha256:<lowercase-hex>` value accepted by config.
-    pub fn from_verifier_hash(
-        verifier_hash: &str,
-        audit: AuditLogger,
-    ) -> Result<Self, Error> {
+    pub fn from_verifier_hash(verifier_hash: &str, audit: AuditLogger) -> Result<Self, Error> {
         let verifier = parse_verifier_hash(verifier_hash)?;
         Ok(Self {
             fingerprint: hash_fingerprint(&verifier),
@@ -197,7 +194,11 @@ pub fn parse_verifier_hash(value: &str) -> Result<[u8; 32], Error> {
             "admin_credential_hash must start with sha256:".into(),
         ));
     };
-    if hex_hash.len() != 64 || !hex_hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+    if hex_hash.len() != 64
+        || !hex_hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
         return Err(Error::Config(
             "admin_credential_hash must be sha256: followed by exactly 64 lowercase hex characters"
                 .into(),
@@ -224,7 +225,8 @@ mod tests {
     fn generated_256_bit_credential_authenticates_and_is_erased() {
         let generated = AdminAuthenticator::generate();
         assert_eq!(generated.plaintext.len(), 64);
-        let auth = AdminAuthenticator::from_verifier_hash(&generated.verifier, AuditLogger).unwrap();
+        let auth =
+            AdminAuthenticator::from_verifier_hash(&generated.verifier, AuditLogger).unwrap();
         let mut presented = SecretBytes::from_slice(generated.plaintext.as_bytes());
         auth.verify(&mut presented, Some("test")).unwrap();
         assert!(presented.as_bytes().iter().all(|byte| *byte == 0));
@@ -254,7 +256,10 @@ mod tests {
     #[test]
     fn verifier_rejects_non_lowercase_or_wrong_length_hashes() {
         assert!(parse_verifier_hash("sha256:").is_err());
-        assert!(parse_verifier_hash("sha256:ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789").is_err());
+        assert!(parse_verifier_hash(
+            "sha256:ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        )
+        .is_err());
         assert!(parse_verifier_hash("sha256:0123").is_err());
     }
 }

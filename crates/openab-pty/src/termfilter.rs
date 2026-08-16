@@ -237,7 +237,10 @@ mod tests {
         assert!(filtered(b"\x1bP!|7E565445\x1b\\").is_empty());
         assert!(filtered(b"\x1bP>|xterm.js(5.3.0)\x1b\\").is_empty());
         assert!(filtered(b"\x1bP1$r0;1m\x1b\\").is_empty(), "DECRQSS answer");
-        assert!(filtered(b"\x1bP1+r544e=787465726d\x07").is_empty(), "XTGETTCAP");
+        assert!(
+            filtered(b"\x1bP1+r544e=787465726d\x07").is_empty(),
+            "XTGETTCAP"
+        );
     }
 
     #[test]
@@ -269,15 +272,15 @@ mod tests {
     #[test]
     fn passes_keyboard_input_unchanged() {
         for input in [
-            &b"\x1b[A"[..],      // up arrow
-            b"\x1b[B",           // down
-            b"\x1b[1;5C",        // ctrl+right
-            b"\x1b[3~",          // delete
-            b"\x1bOP",           // F1 via SS3
-            b"\x1b",             // bare Esc keypress
-            b"\x1b\x1b",         // Esc Esc (vi users do this)
-            b"\x03",             // Ctrl-C
-            b"\x1b[97;5u",       // Kitty keyboard protocol
+            &b"\x1b[A"[..],              // up arrow
+            b"\x1b[B",                   // down
+            b"\x1b[1;5C",                // ctrl+right
+            b"\x1b[3~",                  // delete
+            b"\x1bOP",                   // F1 via SS3
+            b"\x1b",                     // bare Esc keypress
+            b"\x1b\x1b",                 // Esc Esc (vi users do this)
+            b"\x03",                     // Ctrl-C
+            b"\x1b[97;5u",               // Kitty keyboard protocol
             b"\x1b[200~pasted\x1b[201~", // bracketed paste
         ] {
             assert_eq!(filtered(input), input, "must pass through: {input:?}");
@@ -324,7 +327,11 @@ mod tests {
         let mut input = Vec::from(&b"\x1b["[..]);
         input.extend_from_slice(&vec![b'1'; MAX_SEQUENCE_LEN + 8]);
         input.push(b'c');
-        assert_eq!(filtered(&input), input, "past the scan bound: leave it alone");
+        assert_eq!(
+            filtered(&input),
+            input,
+            "past the scan bound: leave it alone"
+        );
     }
 
     #[test]

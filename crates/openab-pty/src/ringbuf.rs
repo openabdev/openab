@@ -446,7 +446,11 @@ mod tests {
         let mut r = RingBuffer::new(64);
         r.write(b"abc");
         r.clear();
-        assert_eq!(r.total_written(), 3, "teardown clears bytes, not the cursor");
+        assert_eq!(
+            r.total_written(),
+            3,
+            "teardown clears bytes, not the cursor"
+        );
         assert!(r.is_empty());
 
         r.reset();

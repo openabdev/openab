@@ -161,9 +161,11 @@ pub fn validate_projection(input: &str) -> Result<PtyConfig, Error> {
         per_session_disk_kib: usize_with_default(pty, "per_session_disk_kib", 1024 * 1024)?,
         volume_capacity_kib: usize_with_default(pty, "volume_capacity_kib", 5 * 1024 * 1024)?,
         volume_overhead_kib: usize_with_default(pty, "volume_overhead_kib", 1024 * 1024)?,
-        kill_domain_requirement: parse_kill_domain(
-            string_with_default(pty, "kill_domain_tier", "tier1")?,
-        )?,
+        kill_domain_requirement: parse_kill_domain(string_with_default(
+            pty,
+            "kill_domain_tier",
+            "tier1",
+        )?)?,
     };
     validate_admission(&config)?;
     Ok(config)
@@ -224,7 +226,9 @@ fn interpolate_env(input: &str) -> Result<String, Error> {
             )));
         }
         let value = std::env::var(name).map_err(|_| {
-            Error::Config(format!("environment variable {name:?} required by PTY projection is unset"))
+            Error::Config(format!(
+                "environment variable {name:?} required by PTY projection is unset"
+            ))
         })?;
         if value.contains("://") || value.contains("${secrets.") {
             return Err(Error::Config(format!(
@@ -244,7 +248,10 @@ fn is_env_name(name: &str) -> bool {
         && chars.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
-fn required_string<'a>(table: &'a toml::map::Map<String, Value>, key: &str) -> Result<&'a str, Error> {
+fn required_string<'a>(
+    table: &'a toml::map::Map<String, Value>,
+    key: &str,
+) -> Result<&'a str, Error> {
     table
         .get(key)
         .and_then(Value::as_str)
@@ -284,9 +291,12 @@ fn usize_with_default(
 ) -> Result<usize, Error> {
     match table.get(key).and_then(Value::as_integer) {
         None if !table.contains_key(key) => Ok(default),
-        Some(value) if value >= 0 => usize::try_from(value)
-            .map_err(|_| Error::Config(format!("[pty].{key} is too large"))),
-        _ => Err(Error::Config(format!("[pty].{key} must be a non-negative integer"))),
+        Some(value) if value >= 0 => {
+            usize::try_from(value).map_err(|_| Error::Config(format!("[pty].{key} is too large")))
+        }
+        _ => Err(Error::Config(format!(
+            "[pty].{key} must be a non-negative integer"
+        ))),
     }
 }
 
@@ -299,14 +309,20 @@ fn parse_duration(value: &str) -> Result<Duration, Error> {
         .parse()
         .map_err(|_| Error::Config("absolute_session_ttl has an invalid number".into()))?;
     if amount == 0 {
-        return Err(Error::Config("absolute_session_ttl must be non-zero".into()));
+        return Err(Error::Config(
+            "absolute_session_ttl must be non-zero".into(),
+        ));
     }
     let seconds = match unit {
         "s" => Some(amount),
         "m" => amount.checked_mul(60),
         "h" => amount.checked_mul(60 * 60),
         "d" => amount.checked_mul(24 * 60 * 60),
-        _ => return Err(Error::Config("absolute_session_ttl unit must be s, m, h, or d".into())),
+        _ => {
+            return Err(Error::Config(
+                "absolute_session_ttl unit must be s, m, h, or d".into(),
+            ))
+        }
     }
     .ok_or_else(|| Error::Config("absolute_session_ttl overflows".into()))?;
     Ok(Duration::from_secs(seconds))
@@ -374,7 +390,10 @@ admin_credential_hash = "{HASH}"
     fn accepts_materialized_projection_and_applies_admission_formula() {
         let config = validate_projection(&valid()).unwrap();
         assert_eq!(config.required_memory_kib().unwrap(), 24 * 1024);
-        assert_eq!(config.kill_domain_requirement, KillDomainRequirement::Tier1Allowed);
+        assert_eq!(
+            config.kill_domain_requirement,
+            KillDomainRequirement::Tier1Allowed
+        );
     }
 
     #[test]
@@ -384,20 +403,35 @@ admin_credential_hash = "{HASH}"
             valid().replace("/bin/bash", "aws-sm://openab/pty#command"),
             format!("[discord]\nbot_token = \"x\"\n{}", valid()),
         ] {
-            assert!(validate_projection(&poisoned).is_err(), "must fail closed: {poisoned}");
+            assert!(
+                validate_projection(&poisoned).is_err(),
+                "must fail closed: {poisoned}"
+            );
         }
     }
 
     #[test]
     fn rejects_both_verifier_poisoning_cases() {
         let interpolation = valid().replace(HASH, "${secrets.pty_admin_hash}");
-        assert!(validate_projection(&interpolation).is_err(), "secrets interpolation must fail");
+        assert!(
+            validate_projection(&interpolation).is_err(),
+            "secrets interpolation must fail"
+        );
         let env_interpolation = valid().replace(HASH, "${PTY_ADMIN_HASH}");
-        assert!(validate_projection(&env_interpolation).is_err(), "verifier env interpolation must fail");
+        assert!(
+            validate_projection(&env_interpolation).is_err(),
+            "verifier env interpolation must fail"
+        );
         let malformed = valid().replace(HASH, "sha256:not-a-verifier");
-        assert!(validate_projection(&malformed).is_err(), "malformed verifier must fail");
+        assert!(
+            validate_projection(&malformed).is_err(),
+            "malformed verifier must fail"
+        );
         let empty = valid().replace(HASH, "");
-        assert!(validate_projection(&empty).is_err(), "empty verifier must fail");
+        assert!(
+            validate_projection(&empty).is_err(),
+            "empty verifier must fail"
+        );
     }
 
     #[test]
@@ -410,7 +444,14 @@ admin_credential_hash = "{HASH}"
 
     #[test]
     fn accepts_explicit_tier_two_requirement() {
-        let config = validate_projection(&format!("{}kill_domain_tier = \"tier2-required\"\n", valid())).unwrap();
-        assert_eq!(config.kill_domain_requirement, KillDomainRequirement::Tier2Required);
+        let config = validate_projection(&format!(
+            "{}kill_domain_tier = \"tier2-required\"\n",
+            valid()
+        ))
+        .unwrap();
+        assert_eq!(
+            config.kill_domain_requirement,
+            KillDomainRequirement::Tier2Required
+        );
     }
 }

@@ -65,17 +65,14 @@ impl Harness {
         let generated = AdminAuthenticator::generate();
         let admin_credential =
             String::from_utf8(generated.plaintext.as_bytes().to_vec()).expect("hex credential");
-        let parsed = config::validate_projection(&projection(
-            test_command(),
-            &generated.verifier,
-            4,
-        ))
-        .expect("the test projection must validate");
+        let parsed =
+            config::validate_projection(&projection(test_command(), &generated.verifier, 4))
+                .expect("the test projection must validate");
 
         let spawner = Arc::new(PortablePtySpawner);
         let capability = spawner.capability();
-        let selection = killdomain::detect(parsed.kill_domain_requirement, capability)
-            .expect("tier selection");
+        let selection =
+            killdomain::detect(parsed.kill_domain_requirement, capability).expect("tier selection");
         let kill = Arc::new(KillDomain::new(
             selection,
             TrackingLimits::default(),
@@ -176,7 +173,10 @@ impl Harness {
             )
             .await;
         assert_eq!(status, 200, "create failed: {body}");
-        body["token"].as_str().expect("token in response").to_owned()
+        body["token"]
+            .as_str()
+            .expect("token in response")
+            .to_owned()
     }
 }
 
@@ -228,7 +228,10 @@ async fn http_request(
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok())
         .unwrap_or(0);
-    let body = if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+    let body = if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
         dechunk(body)
     } else {
         body.to_string()
@@ -256,9 +259,8 @@ fn dechunk(body: &str) -> String {
 // WebSocket client
 // ---------------------------------------------------------------------------
 
-type Socket = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 enum Attach {
     Connected(Box<Socket>),
@@ -267,7 +269,12 @@ enum Attach {
 
 /// Attach with `Authorization: Bearer` (the non-browser path).
 async fn attach_with_header(addr: SocketAddr, session: &str, token: &str) -> Attach {
-    connect(addr, session, Some(("authorization", format!("Bearer {token}")))).await
+    connect(
+        addr,
+        session,
+        Some(("authorization", format!("Bearer {token}"))),
+    )
+    .await
 }
 
 /// Attach with the browser path: browsers cannot set `Authorization` on an
@@ -411,7 +418,10 @@ async fn a_wrong_or_missing_token_is_refused() {
             .refused_status(),
         401
     );
-    assert_eq!(connect(harness.addr, "beta", None).await.refused_status(), 401);
+    assert_eq!(
+        connect(harness.addr, "beta", None).await.refused_status(),
+        401
+    );
     // An unknown session is indistinguishable from a bad token: no enumeration.
     assert_eq!(
         attach_with_header(harness.addr, "no-such-session", &wrong)
@@ -507,7 +517,9 @@ async fn a_renew_while_attached_evicts_the_connection_with_its_own_close_code() 
         serde_json::json!("attach-notice")
     );
 
-    let (status, _) = harness.admin("POST", "/admin/sessions/zeta/renew", None).await;
+    let (status, _) = harness
+        .admin("POST", "/admin/sessions/zeta/renew", None)
+        .await;
     assert_eq!(status, 200);
     // Renew-distinct, so a client can tell renewal from takeover.
     assert_eq!(wait_for_close(&mut socket).await, close_code::RENEWED);
@@ -699,7 +711,10 @@ async fn validate_projection_rejects_a_poisoned_projection() {
             base.replace(GOOD_HASH, "sha256:not-a-verifier"),
         ),
         // Plus the surrounding class, so the guard is not narrower than the rule.
-        ("secrets-table", format!("[secrets.refs]\nx = \"y\"\n{base}")),
+        (
+            "secrets-table",
+            format!("[secrets.refs]\nx = \"y\"\n{base}"),
+        ),
         (
             "broker-section",
             format!("[discord]\nbot_token = \"x\"\n{base}"),

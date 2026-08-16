@@ -322,7 +322,11 @@ pub struct UpgradeFailureLimiter {
 
 impl Default for UpgradeFailureLimiter {
     fn default() -> Self {
-        Self::new(UPGRADE_FAILURE_LIMIT, UPGRADE_FAILURE_WINDOW, UPGRADE_FAILURE_BAN)
+        Self::new(
+            UPGRADE_FAILURE_LIMIT,
+            UPGRADE_FAILURE_WINDOW,
+            UPGRADE_FAILURE_BAN,
+        )
     }
 }
 
@@ -623,13 +627,10 @@ async fn serve_attached(
     since: Option<u64>,
     peer: String,
 ) {
-    let attached = state.manager.attach_with_replay(
-        &name,
-        generation,
-        size,
-        Some(peer.as_str()),
-        since,
-    );
+    let attached =
+        state
+            .manager
+            .attach_with_replay(&name, generation, size, Some(peer.as_str()), since);
     let (connection, stream_offset) = match attached {
         Ok(pair) => pair,
         Err(error) => {
@@ -696,14 +697,7 @@ async fn serve_attached(
         }
     });
 
-    let exit = read_loop(
-        &state,
-        &mut stream,
-        &connection,
-        &frames_tx,
-        ping_interval,
-    )
-    .await;
+    let exit = read_loop(&state, &mut stream, &connection, &frames_tx, ping_interval).await;
 
     // Terminate the write path deterministically. `close` only sets a code when
     // none is set, so a lifecycle code already chosen by the session (takeover,
@@ -1104,7 +1098,9 @@ pub async fn bind(
 ) -> Result<tokio::net::TcpListener, Error> {
     listener_guard(listen, admin_credential_hash, tls_terminated_upstream)
         .map_err(Error::Config)?;
-    tokio::net::TcpListener::bind(listen).await.map_err(Error::Io)
+    tokio::net::TcpListener::bind(listen)
+        .await
+        .map_err(Error::Io)
 }
 
 /// Serve until `shutdown` resolves, then drain.
@@ -1236,10 +1232,7 @@ fn workspace_usage(path: &FsPath) -> Option<(u64, u64)> {
     let blocks = stat.f_blocks as u64;
     let available = stat.f_bavail as u64;
     let capacity_kib = blocks.saturating_mul(frsize) / 1024;
-    let used_kib = blocks
-        .saturating_sub(available)
-        .saturating_mul(frsize)
-        / 1024;
+    let used_kib = blocks.saturating_sub(available).saturating_mul(frsize) / 1024;
     Some((capacity_kib, used_kib))
 }
 
@@ -1363,10 +1356,7 @@ mod tests {
             r#"{{"v":1,"type":"ping","pad":"{}"}}"#,
             "x".repeat(MAX_CONTROL_FRAME_BYTES)
         );
-        assert_eq!(
-            parse_client_control(&oversize),
-            Err(FrameReject::Oversize)
-        );
+        assert_eq!(parse_client_control(&oversize), Err(FrameReject::Oversize));
     }
 
     #[test]
@@ -1433,7 +1423,8 @@ mod tests {
 
     #[test]
     fn upgrade_failures_ban_a_source_then_expire() {
-        let limiter = UpgradeFailureLimiter::new(3, Duration::from_secs(60), Duration::from_secs(30));
+        let limiter =
+            UpgradeFailureLimiter::new(3, Duration::from_secs(60), Duration::from_secs(30));
         let source: IpAddr = "203.0.113.7".parse().unwrap();
         let start = Instant::now();
         assert!(limiter.check_at(source, start).is_ok());
@@ -1454,7 +1445,8 @@ mod tests {
 
     #[test]
     fn failures_outside_the_window_do_not_accumulate() {
-        let limiter = UpgradeFailureLimiter::new(3, Duration::from_secs(60), Duration::from_secs(30));
+        let limiter =
+            UpgradeFailureLimiter::new(3, Duration::from_secs(60), Duration::from_secs(30));
         let source: IpAddr = "203.0.113.9".parse().unwrap();
         let start = Instant::now();
         assert!(!limiter.record_failure_at(source, start));
@@ -1512,7 +1504,10 @@ mod tests {
             status(&Error::AlreadyExists(name.clone())),
             StatusCode::CONFLICT
         );
-        assert_eq!(status(&Error::NotFound(name.clone())), StatusCode::NOT_FOUND);
+        assert_eq!(
+            status(&Error::NotFound(name.clone())),
+            StatusCode::NOT_FOUND
+        );
         assert_eq!(status(&Error::SessionDead(name)), StatusCode::CONFLICT);
         assert_eq!(
             status(&Error::CapacityExceeded { limit: 1 }),

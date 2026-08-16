@@ -143,6 +143,9 @@ mod tests {
     #[test]
     fn termination_classes_are_distinct() {
         assert_ne!(TerminationClass::UserKill, TerminationClass::SelfExit);
-        assert_ne!(TerminationClass::SelfExit, TerminationClass::RuntimeShutdown);
+        assert_ne!(
+            TerminationClass::SelfExit,
+            TerminationClass::RuntimeShutdown
+        );
     }
 }

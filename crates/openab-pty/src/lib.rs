@@ -95,7 +95,9 @@ pub enum Error {
     InvalidSessionName(String),
     NotFound(SessionName),
     AlreadyExists(SessionName),
-    CapacityExceeded { limit: usize },
+    CapacityExceeded {
+        limit: usize,
+    },
     Unauthorized,
     /// The child is gone; the caller should offer restart-in-place.
     SessionDead(SessionName),

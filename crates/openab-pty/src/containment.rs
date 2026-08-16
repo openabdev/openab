@@ -139,7 +139,10 @@ mod tests {
     #[test]
     fn linux_barrier_is_set_and_read_back() {
         let original = unsafe { libc::prctl(libc::PR_GET_DUMPABLE) };
-        assert!(original >= 0, "PR_GET_DUMPABLE must be available for this test");
+        assert!(
+            original >= 0,
+            "PR_GET_DUMPABLE must be available for this test"
+        );
         establish_transient_secret_barrier().expect("PR_SET_DUMPABLE=0 must succeed");
         assert_dumpable_zero().expect("the regression guard must observe dumpable=0");
         let restore = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, original) };

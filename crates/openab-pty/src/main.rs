@@ -132,7 +132,10 @@ fn validate_only(path: &PathBuf) -> Result<()> {
         Ok(projection) => {
             println!("{}: OK", path.display());
             println!("  listen                  = {}", projection.listen);
-            println!("  command                 = {}", projection.command.display());
+            println!(
+                "  command                 = {}",
+                projection.command.display()
+            );
             println!("  max_sessions            = {}", projection.max_sessions);
             println!(
                 "  absolute_session_ttl    = {}s",
@@ -188,9 +191,10 @@ async fn run(projection: PtyConfig) -> Result<()> {
 
     let tokens = TokenStore::with_default_ttl(audit.clone());
     let verifier = tokens.attach_verifier();
-    let admin = AdminAuthenticator::from_verifier_hash(&projection.admin_credential_hash, audit.clone())
-        .map_err(|error| anyhow::anyhow!("{error}"))
-        .context("admin verifier")?;
+    let admin =
+        AdminAuthenticator::from_verifier_hash(&projection.admin_credential_hash, audit.clone())
+            .map_err(|error| anyhow::anyhow!("{error}"))
+            .context("admin verifier")?;
     tracing::info!(
         verifier = admin.verifier_fingerprint(),
         "remote admin plane enabled (no in-container admin socket exists by design)"
@@ -211,16 +215,9 @@ async fn run(projection: PtyConfig) -> Result<()> {
         volume_capacity_kib: projection.volume_capacity_kib as u64,
     };
 
-    let manager = SessionManager::new(
-        projection,
-        policy,
-        tokens,
-        audit.clone(),
-        kill,
-        spawner,
-    )
-    .map_err(|error| anyhow::anyhow!("{error}"))
-    .context("session manager")?;
+    let manager = SessionManager::new(projection, policy, tokens, audit.clone(), kill, spawner)
+        .map_err(|error| anyhow::anyhow!("{error}"))
+        .context("session manager")?;
 
     // (4) Bind behind the fail-closed guard.
     let listener = server::bind(&listen, &admin_hash, tls_terminated_upstream)
@@ -248,15 +245,15 @@ async fn run(projection: PtyConfig) -> Result<()> {
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        {
-            Ok(signal) => signal,
-            Err(error) => {
-                tracing::warn!(%error, "SIGTERM handler unavailable; Ctrl-C only");
-                let _ = tokio::signal::ctrl_c().await;
-                return;
-            }
-        };
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(signal) => signal,
+                Err(error) => {
+                    tracing::warn!(%error, "SIGTERM handler unavailable; Ctrl-C only");
+                    let _ = tokio::signal::ctrl_c().await;
+                    return;
+                }
+            };
         tokio::select! {
             _ = term.recv() => tracing::info!("SIGTERM received"),
             _ = tokio::signal::ctrl_c() => tracing::info!("interrupt received"),
