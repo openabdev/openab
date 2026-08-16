@@ -1836,7 +1836,7 @@ mod tests {
         let mut session_domain = domain
             .open_session(&SessionName::parse("real-tier1").unwrap(), Generation(1))
             .unwrap();
-        let child = std::process::Command::new("/bin/sh")
+        let mut child = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg("sleep 30")
             .spawn()
@@ -1847,6 +1847,7 @@ mod tests {
         let outcome = session_domain.terminate(Duration::from_secs(2)).await;
         assert!(outcome.converged(), "survivors: {:?}", outcome.survivors);
         assert!(outcome.is_best_effort());
+        let _ = child.wait();
     }
 
     #[cfg(target_os = "linux")]
@@ -1874,7 +1875,7 @@ mod tests {
         // Join before exec, exactly as the spawner must: the child writes its own
         // pid through the inherited descriptor before it becomes the target
         // program, so adversary code never runs outside its cgroup.
-        let child = unsafe {
+        let mut child = unsafe {
             std::process::Command::new("/bin/sh")
                 .arg("-c")
                 .arg("exec sleep 30")
@@ -1892,6 +1893,7 @@ mod tests {
         let outcome = session_domain.terminate(Duration::from_secs(2)).await;
         assert_eq!(outcome.guarantee, TeardownGuarantee::Hard);
         assert!(outcome.converged(), "cgroup.kill must leave zero survivors");
+        let _ = child.wait();
         session_domain.release();
     }
 }
