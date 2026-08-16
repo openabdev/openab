@@ -352,11 +352,20 @@ impl UpgradeFailureLimiter {
         // Copy the decision out and release the guard on this line: holding a
         // parking_lot guard into an `if let` body is the self-deadlock this
         // crate already hit once.
-        let banned_until = self
-            .entries
-            .lock()
-            .get(&source)
-            .and_then(|entry| entry.banned_until);
+        //
+        // `last_seen` is refreshed here, including while banned. Without that, a
+        // source that keeps knocking looks *stale* to LRU eviction, so distinct-IP
+        // churn could evict an active ban and hand the banned source a reset.
+        let banned_until = {
+            let mut entries = self.entries.lock();
+            match entries.get_mut(&source) {
+                Some(entry) => {
+                    entry.last_seen = now;
+                    entry.banned_until
+                }
+                None => None,
+            }
+        };
         match banned_until {
             Some(until) if until > now => Err(until.saturating_duration_since(now)),
             _ => Ok(()),
@@ -374,13 +383,21 @@ impl UpgradeFailureLimiter {
         if entries.len() >= MAX_TRACKED_SOURCES && !entries.contains_key(&source) {
             // Every tracked source is still live. Evict the least recently seen
             // rather than growing, and rather than dropping the new observation:
-            // an unbounded map is the worse failure of the two.
+            // an unbounded map is the worse failure of the two. Actively banned
+            // entries are not eviction candidates — dropping one would let churn
+            // across distinct addresses clear somebody's ban.
             if let Some(oldest) = entries
                 .iter()
+                .filter(|(_, entry)| !entry.banned_until.is_some_and(|until| until > now))
                 .min_by_key(|(_, entry)| entry.last_seen)
                 .map(|(ip, _)| *ip)
             {
                 entries.remove(&oldest);
+            } else {
+                // Pathological: every slot is under an active ban. Leave the map
+                // as it is rather than growing it or clearing a live ban; this
+                // source goes untracked until one expires.
+                return false;
             }
         }
         let entry = entries.entry(source).or_insert(FailureWindow {
@@ -429,6 +446,12 @@ impl UpgradeFailureLimiter {
 
 /// Listener-shaped settings, separated from [`crate::config::PtyConfig`] so tests
 /// can bind an ephemeral port without a projection on disk.
+///
+/// DEFERRED to Gate B: promoting `drain_grace` and `tick_interval` to projection
+/// knobs. They are settable here because tests need them, and the withdrawn-knob
+/// pass deliberately left them out of the operator surface: every knob is a
+/// fail-closed validation rule plus a documented default, and no deployment has
+/// asked to change either value.
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub listen: String,
@@ -501,6 +524,12 @@ impl AppState {
 // Router
 // ---------------------------------------------------------------------------
 
+/// DEFERRED to Gate B (publishing an image/chart/docs): `/healthz` and `/metrics`
+/// endpoints. Neither has a consumer while this crate is internal and unpublished
+/// — there is no chart to write a probe into and no scrape target — and liveness
+/// and counters are already observable through `GET /admin/sessions`. Adding a
+/// second unauthenticated surface on the listener a managed session can reach is
+/// not free, so it waits until something actually consumes it.
 pub fn router(state: Arc<AppState>) -> Router {
     let admin = Router::new()
         .route("/admin/sessions", get(admin_list).post(admin_create))
@@ -618,7 +647,14 @@ fn attach_failure_close_code(error: &Error) -> u16 {
         // A renew landed in the same window: the token is for a stale generation.
         Error::Unauthorized => close_code::RENEWED,
         Error::CapacityExceeded { .. } => close_code::CAPACITY,
-        _ => close_code::CAPACITY,
+        // An internal fault is not capacity. Reporting CAPACITY here told the
+        // client the exact wrong thing — that the runtime is full and it should
+        // create another session — turning one runtime fault into a create loop.
+        Error::Io(_)
+        | Error::Config(_)
+        | Error::Other(_)
+        | Error::InvalidSessionName(_)
+        | Error::AlreadyExists(_) => close_code::INTERNAL_ERROR,
     }
 }
 
@@ -760,6 +796,8 @@ impl ReadExit {
 fn close_reason(code: u16) -> &'static str {
     match code {
         close_code::TTL_EXPIRED => "session expired",
+        close_code::ADMIN_KILL => "session killed by an operator",
+        close_code::INTERNAL_ERROR => "runtime error: not retryable by re-creating",
         close_code::TAKEOVER => "another connection took over",
         close_code::RENEWED => "attach token renewed",
         close_code::SESSION_ENDED => "session ended",
@@ -946,31 +984,42 @@ fn error_response(error: &Error) -> Response {
 /// Every failure path is audited by [`AdminAuthenticator`] itself, so this only
 /// translates the outcome to HTTP.
 fn admin_gate(state: &Arc<AppState>, headers: &HeaderMap, peer: &SocketAddr) -> Option<Response> {
-    let source = peer.to_string();
+    // Keyed by the peer *address*, not `peer.to_string()`: HTTP gives every
+    // request a fresh ephemeral port, so an address:port key would put each
+    // attempt in its own bucket and throttle nothing. Same rule and same caveats
+    // as `UpgradeFailureLimiter` — `X-Forwarded-For` is client-settable and so is
+    // never consulted, which means behind a proxy this degrades to per-proxy.
+    let source = peer.ip().to_string();
     let Some(mut presented) = admin_credential(headers) else {
+        // A request with no usable credential goes through the *same* per-source
+        // throttle and audit path as a wrong one. Returning 401 straight from here
+        // made omitting the header a free, unthrottled retry — so neither the
+        // backoff nor the concurrency cap ever engaged for the cheapest way there
+        // is to hammer this endpoint.
         AbuseMetrics::bump(&state.abuse.admin_auth_failures);
-        state.audit.record(
-            AuditEvent::new(AuditKind::AdminAuthFailure)
-                .source(source)
-                .detail("missing_or_malformed_authorization_header"),
-        );
-        return Some(StatusCode::UNAUTHORIZED.into_response());
+        return Some(admin_failure_response(
+            state.admin.reject_unauthenticated(Some(&source)),
+        ));
     };
     match state.admin.verify(&mut presented, Some(&source)) {
         Ok(()) => None,
         Err(failure) => {
             AbuseMetrics::bump(&state.abuse.admin_auth_failures);
-            Some(match failure {
-                AdminAuthFailure::Invalid => StatusCode::UNAUTHORIZED.into_response(),
-                AdminAuthFailure::TooLarge => StatusCode::PAYLOAD_TOO_LARGE.into_response(),
-                AdminAuthFailure::Busy => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-                AdminAuthFailure::Throttled { retry_after } => (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    [("retry-after", retry_after.as_secs().max(1).to_string())],
-                )
-                    .into_response(),
-            })
+            Some(admin_failure_response(failure))
         }
+    }
+}
+
+fn admin_failure_response(failure: AdminAuthFailure) -> Response {
+    match failure {
+        AdminAuthFailure::Invalid => StatusCode::UNAUTHORIZED.into_response(),
+        AdminAuthFailure::TooLarge => StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        AdminAuthFailure::Busy => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        AdminAuthFailure::Throttled { retry_after } => (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", retry_after.as_secs().max(1).to_string())],
+        )
+            .into_response(),
     }
 }
 
@@ -1338,6 +1387,39 @@ mod tests {
     }
 
     #[test]
+    fn an_admin_kill_is_not_reported_as_an_expiry() {
+        // Same finding on both surfaces: an operator kill used to reuse the TTL
+        // close code, so the client told its user "session expired" about a kill
+        // the operator had just issued, and audit could not separate the two.
+        assert_ne!(close_code::ADMIN_KILL, close_code::TTL_EXPIRED);
+        assert_ne!(
+            close_reason(close_code::ADMIN_KILL),
+            close_reason(close_code::TTL_EXPIRED)
+        );
+    }
+
+    #[test]
+    fn internal_faults_do_not_close_with_a_retry_create_hint() {
+        // CAPACITY tells a client "full, try creating again". An IO/config/other
+        // fault is not that, and saying so produced a create loop on a fault.
+        for internal in [
+            Error::Io(std::io::Error::other("synthetic")),
+            Error::Config("synthetic".into()),
+            Error::Other("synthetic".into()),
+        ] {
+            assert_eq!(
+                attach_failure_close_code(&internal),
+                close_code::INTERNAL_ERROR,
+                "{internal} must not be reported as capacity"
+            );
+        }
+        assert_eq!(
+            attach_failure_close_code(&Error::CapacityExceeded { limit: 1 }),
+            close_code::CAPACITY
+        );
+    }
+
+    #[test]
     fn listener_refuses_off_loopback_without_auth_material_or_a_terminator() {
         assert!(listener_guard("127.0.0.1:8090", "", false).is_ok());
         assert!(listener_guard("localhost:8090", "", false).is_ok());
@@ -1393,6 +1475,50 @@ mod tests {
         limiter.record_failure(source);
         limiter.on_success(source);
         assert!(limiter.check(source).is_ok());
+    }
+
+    #[test]
+    fn distinct_source_churn_cannot_evict_an_active_ban() {
+        // The map is bounded, so it evicts. Eviction must not be a way to shake a
+        // ban off: `check` refreshes `last_seen` even while banned (so a knocking
+        // source is not the LRU victim), and a live ban is never a candidate.
+        let limiter =
+            UpgradeFailureLimiter::new(2, Duration::from_secs(600), Duration::from_secs(600));
+        let banned: IpAddr = "203.0.113.10".parse().unwrap();
+        let start = Instant::now();
+        assert!(!limiter.record_failure_at(banned, start));
+        assert!(
+            limiter.record_failure_at(banned, start),
+            "the ban starts here"
+        );
+        assert!(limiter.check_at(banned, start).is_err());
+
+        // `check` must refresh liveness even while banned, or a source that keeps
+        // knocking is the *stalest* entry in the map and the first one evicted.
+        let before = limiter.entries.lock().get(&banned).unwrap().last_seen;
+        let later = start + Duration::from_secs(5);
+        assert!(limiter.check_at(banned, later).is_err());
+        let after = limiter.entries.lock().get(&banned).unwrap().last_seen;
+        assert!(
+            after > before,
+            "a banned source that keeps knocking must not look stale to LRU eviction"
+        );
+
+        // Now churn distinct addresses past the map bound. Each records a single
+        // failure, so they are evictable; the ban must not be what gets evicted.
+        for index in 0..(MAX_TRACKED_SOURCES + 64) {
+            let churn = IpAddr::from(std::net::Ipv6Addr::from(index as u128 + 1));
+            limiter.record_failure_at(churn, later);
+            let _ = limiter.check_at(banned, later);
+        }
+        assert!(
+            limiter.entries.lock().len() <= MAX_TRACKED_SOURCES,
+            "the tracking map must stay bounded"
+        );
+        assert!(
+            limiter.check_at(banned, later).is_err(),
+            "an active ban must survive churn across distinct addresses"
+        );
     }
 
     #[test]
