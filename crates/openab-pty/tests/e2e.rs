@@ -261,7 +261,7 @@ type Socket = tokio_tungstenite::WebSocketStream<
 >;
 
 enum Attach {
-    Connected(Socket),
+    Connected(Box<Socket>),
     Refused(u16),
 }
 
@@ -297,7 +297,7 @@ async fn connect(addr: SocketAddr, session: &str, header: Option<(&str, String)>
     }
     match tokio::time::timeout(IO_TIMEOUT, tokio_tungstenite::connect_async(request)).await {
         Err(_) => panic!("websocket handshake timed out"),
-        Ok(Ok((socket, _response))) => Attach::Connected(socket),
+        Ok(Ok((socket, _response))) => Attach::Connected(Box::new(socket)),
         Ok(Err(tungstenite::Error::Http(response))) => Attach::Refused(response.status().as_u16()),
         Ok(Err(error)) => panic!("unexpected websocket error: {error}"),
     }
@@ -306,7 +306,7 @@ async fn connect(addr: SocketAddr, session: &str, header: Option<(&str, String)>
 impl Attach {
     fn connected(self) -> Socket {
         match self {
-            Self::Connected(socket) => socket,
+            Self::Connected(socket) => *socket,
             Self::Refused(status) => panic!("attach refused with HTTP {status}"),
         }
     }
