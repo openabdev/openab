@@ -658,8 +658,7 @@ fn start_runtime(scratch: &Scratch, command: &Path) -> Runtime {
     let credential =
         String::from_utf8(generated.plaintext.as_bytes().to_vec()).expect("hex credential");
     let config = scratch.path("config.toml");
-    std::fs::write(&config, projection(0, command, &generated.verifier))
-        .expect("write projection");
+    std::fs::write(&config, projection(0, command, &generated.verifier)).expect("write projection");
     // Validated here too, so a bad projection fails as a test error rather than
     // as an opaque "the runtime did not come up".
     config::validate_projection_file(&config).expect("the test projection must validate");
@@ -975,8 +974,11 @@ fn a_runtime_that_cannot_set_dumpable_refuses_to_serve_before_reading_a_credenti
 
     // (b) A *valid* projection: the only reason to refuse is the barrier.
     let good = scratch.path("good.toml");
-    std::fs::write(&good, projection(port, &session_command, &generated.verifier))
-        .expect("write projection");
+    std::fs::write(
+        &good,
+        projection(port, &session_command, &generated.verifier),
+    )
+    .expect("write projection");
     let (code, output) = wait_with_output(spawn_runtime_process(&good, true), READY_BUDGET);
     assert_ne!(code, Some(0), "the runtime must not exit successfully");
     assert!(
