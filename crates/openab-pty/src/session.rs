@@ -2725,7 +2725,10 @@ mod tests {
     async fn the_real_spawner_runs_a_shell_and_reports_self_exit() {
         let manager = manager_with(
             Arc::new(PortablePtySpawner),
-            "command = \"/bin/sh\"\n",
+            // `config()` already sets command = "/bin/sh"; repeating it here made
+            // the projection a duplicate-key TOML parse error, so this test could
+            // never have run.
+            "",
             SessionPolicy::default(),
         );
         let created = manager.create(name("real"), WindowSize::default()).unwrap();
