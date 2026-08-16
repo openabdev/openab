@@ -934,6 +934,11 @@ impl SessionManager {
     }
 
     /// Remote-admin `create`.
+    ///
+    /// Must be called from within a Tokio runtime: the session's output pump is
+    /// a spawned task, while the PTY reader and writer are dedicated OS threads
+    /// so a blocking `read`/`write` on the master can never occupy a runtime
+    /// worker.
     pub fn create(
         self: &Arc<Self>,
         name: SessionName,
@@ -1895,8 +1900,8 @@ mod tests {
 
     // ---- admission ------------------------------------------------------
 
-    #[test]
-    fn create_enforces_max_sessions_and_rejects_duplicates() {
+    #[tokio::test]
+    async fn create_enforces_max_sessions_and_rejects_duplicates() {
         let manager = manager_with(FakeSpawner::new(), "max_sessions = 1\n", SessionPolicy::default());
         manager.create(name("one"), WindowSize::default()).unwrap();
         assert!(matches!(
@@ -1929,8 +1934,8 @@ mod tests {
         assert_eq!(manager.kill_domain().status().tracked_processes, 0);
     }
 
-    #[test]
-    fn session_status_labels_the_best_effort_tier() {
+    #[tokio::test]
+    async fn session_status_labels_the_best_effort_tier() {
         let manager = manager_with(FakeSpawner::new(), "", SessionPolicy::default());
         manager.create(name("s"), WindowSize::default()).unwrap();
         let status = &manager.list()[0];
@@ -1941,8 +1946,8 @@ mod tests {
 
     // ---- attach / takeover ----------------------------------------------
 
-    #[test]
-    fn attach_requires_the_current_generation() {
+    #[tokio::test]
+    async fn attach_requires_the_current_generation() {
         let manager = manager_with(FakeSpawner::new(), "", SessionPolicy::default());
         let created = manager.create(name("gen"), WindowSize::default()).unwrap();
         assert!(manager
@@ -1953,8 +1958,8 @@ mod tests {
             .is_ok());
     }
 
-    #[test]
-    fn takeover_evicts_the_incumbent_and_the_successor_is_unaffected() {
+    #[tokio::test]
+    async fn takeover_evicts_the_incumbent_and_the_successor_is_unaffected() {
         let manager = manager_with(FakeSpawner::new(), "", SessionPolicy::default());
         let created = manager.create(name("cas"), WindowSize::default()).unwrap();
         let first = manager
@@ -1976,8 +1981,8 @@ mod tests {
         assert_eq!(manager.metrics().takeovers.load(Ordering::Relaxed), 1);
     }
 
-    #[test]
-    fn takeovers_are_rate_limited_per_session() {
+    #[tokio::test]
+    async fn takeovers_are_rate_limited_per_session() {
         let policy = SessionPolicy {
             max_takeovers_per_window: 2,
             ..SessionPolicy::default()
@@ -1999,8 +2004,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_generation_bump_always_reopens_the_recovery_path() {
+    #[tokio::test]
+    async fn a_generation_bump_always_reopens_the_recovery_path() {
         // A thief who exhausted the takeover budget must not be able to lock the
         // victim out of `session renew`.
         let policy = SessionPolicy {
@@ -2026,8 +2031,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn renew_evicts_with_a_renew_distinct_code_and_invalidates_old_tokens() {
+    #[tokio::test]
+    async fn renew_evicts_with_a_renew_distinct_code_and_invalidates_old_tokens() {
         let manager = manager_with(FakeSpawner::new(), "", SessionPolicy::default());
         let created = manager.create(name("renew"), WindowSize::default()).unwrap();
         let old_token = created.token.plaintext.as_bytes().to_vec();
@@ -2121,8 +2126,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resize_propagates_and_the_attach_time_size_counts() {
+    #[tokio::test]
+    async fn resize_propagates_and_the_attach_time_size_counts() {
         let spawner = FakeSpawner::new();
         let manager = manager_with(spawner.clone(), "", SessionPolicy::default());
         let created = manager.create(name("size"), WindowSize::default()).unwrap();
@@ -2377,8 +2382,8 @@ mod tests {
         assert!(SessionPolicy::default().validate().is_ok());
     }
 
-    #[test]
-    fn per_session_disk_budget_surfaces_workspace_full_to_the_client() {
+    #[tokio::test]
+    async fn per_session_disk_budget_surfaces_workspace_full_to_the_client() {
         let manager = manager_with(FakeSpawner::new(), "", SessionPolicy::default());
         let created = manager.create(name("disk"), WindowSize::default()).unwrap();
         let attached = manager

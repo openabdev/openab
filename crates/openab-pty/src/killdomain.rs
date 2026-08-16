@@ -1671,6 +1671,13 @@ mod tests {
         assert!(!outcome.is_best_effort());
 
         session_domain.release();
+        // The fake cgroup's files are ordinary files, so `rmdir` would fail on
+        // them; a real cgroupfs directory holds only kernel pseudo-files and is
+        // removable once empty. Model that before asserting removal.
+        let _ = std::fs::remove_file(dir.join("cgroup.procs"));
+        let _ = std::fs::remove_file(dir.join("cgroup.kill"));
+        let mut cgroup = SessionCgroup::create(&fs.root, &name).unwrap();
+        cgroup.remove().unwrap();
         assert!(!dir.exists(), "the session cgroup is removed on release");
     }
 
