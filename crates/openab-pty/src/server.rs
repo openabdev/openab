@@ -1256,7 +1256,10 @@ mod tests {
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();
         for (key, value) in pairs {
-            map.insert(*key, HeaderValue::from_str(value).unwrap());
+            map.insert(
+                axum::http::HeaderName::from_bytes(key.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
         }
         map
     }

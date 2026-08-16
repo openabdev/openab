@@ -45,8 +45,7 @@ struct Cli {
         short,
         long,
         value_name = "FILE",
-        default_value = "/etc/openab-pty/config.toml",
-        env = "OPENAB_PTY_CONFIG"
+        default_value = "/etc/openab-pty/config.toml"
     )]
     config: PathBuf,
 
