@@ -292,10 +292,13 @@ async fn attach_with_subprotocol(addr: SocketAddr, session: &str, token: &str) -
 }
 
 async fn connect(addr: SocketAddr, session: &str, header: Option<(&str, String)>) -> Attach {
+    connect_url(&format!("ws://{addr}/pty/{session}"), header).await
+}
+
+async fn connect_url(url: &str, header: Option<(&str, String)>) -> Attach {
     use tungstenite::client::IntoClientRequest;
 
-    let url = format!("ws://{addr}/pty/{session}");
-    let mut request = url.into_client_request().expect("client request");
+    let mut request = url.to_string().into_client_request().expect("client request");
     if let Some((name, value)) = header {
         request.headers_mut().insert(
             tungstenite::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
@@ -578,6 +581,142 @@ async fn restart_in_place_serves_a_reattach_to_dead_session() {
         next_control(&mut socket).await["type"],
         serde_json::json!("attach-notice")
     );
+
+    harness.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Byte plumbing, cursor reconnect, and frame abuse
+// ---------------------------------------------------------------------------
+
+/// Read binary frames until `needle` appears in the accumulated bytes.
+async fn expect_output_containing(socket: &mut Socket, needle: &str) -> Vec<u8> {
+    use futures_util::StreamExt;
+    let mut seen = Vec::new();
+    let deadline = tokio::time::Instant::now() + IO_TIMEOUT;
+    loop {
+        let message = tokio::time::timeout_at(deadline, socket.next())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out waiting for {needle:?}; saw {:?}",
+                    String::from_utf8_lossy(&seen)
+                )
+            })
+            .expect("socket closed")
+            .expect("websocket error");
+        match message {
+            tungstenite::Message::Binary(bytes) => {
+                seen.extend_from_slice(&bytes);
+                if String::from_utf8_lossy(&seen).contains(needle) {
+                    return seen;
+                }
+            }
+            tungstenite::Message::Close(frame) => {
+                panic!("server closed while waiting for {needle:?}: {frame:?}")
+            }
+            _ => continue,
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "binds a socket and spawns a PTY child"]
+async fn input_reaches_the_child_and_output_replays_from_a_cursor() {
+    use futures_util::SinkExt;
+
+    let harness = Harness::start(Duration::from_secs(60)).await;
+    let token = harness.create("kappa").await;
+    let mut socket = attach_with_header(harness.addr, "kappa", &token)
+        .await
+        .connected();
+    let notice = next_control(&mut socket).await;
+    assert_eq!(notice["type"], serde_json::json!("attach-notice"));
+
+    // A resize goes through the strict allowlist and reaches TIOCSWINSZ, and an
+    // application-level ping is answered without touching the PTY.
+    socket
+        .send(tungstenite::Message::Text(
+            r#"{"v":1,"type":"resize","rows":40,"cols":132}"#.into(),
+        ))
+        .await
+        .expect("send resize");
+    socket
+        .send(tungstenite::Message::Text(
+            r#"{"v":1,"type":"ping"}"#.into(),
+        ))
+        .await
+        .expect("send ping");
+    assert_eq!(
+        next_control(&mut socket).await["type"],
+        serde_json::json!("pong")
+    );
+
+    // Binary frames are PTY bytes.
+    socket
+        .send(tungstenite::Message::Binary(
+            b"echo oab-pty-marker\n".to_vec().into(),
+        ))
+        .await
+        .expect("send input");
+    expect_output_containing(&mut socket, "oab-pty-marker").await;
+
+    // Detach, then reconnect with a cursor: the replay is served from the ring
+    // buffer under the attach lock, so the missed bytes arrive exactly once.
+    socket
+        .send(tungstenite::Message::Text(
+            r#"{"v":1,"type":"detach"}"#.into(),
+        ))
+        .await
+        .expect("send detach");
+    let _ = wait_for_close(&mut socket).await;
+
+    let url = format!("ws://{}/pty/kappa?since=0&rows=40&cols=132", harness.addr);
+    let mut reattached = connect_url(
+        &url,
+        Some(("authorization", format!("Bearer {token}"))),
+    )
+    .await
+    .connected();
+    let notice = next_control(&mut reattached).await;
+    assert_eq!(notice["type"], serde_json::json!("attach-notice"));
+    assert!(
+        notice["stream_offset"].as_u64().unwrap() > 0,
+        "the cursor must be non-zero once the child has written"
+    );
+    expect_output_containing(&mut reattached, "oab-pty-marker").await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "binds a socket and spawns a PTY child"]
+async fn malformed_control_frames_disconnect_as_a_policy_violation() {
+    use futures_util::SinkExt;
+
+    let harness = Harness::start(Duration::from_secs(60)).await;
+    let token = harness.create("lambda").await;
+    let mut socket = attach_with_header(harness.addr, "lambda", &token)
+        .await
+        .connected();
+    assert_eq!(
+        next_control(&mut socket).await["type"],
+        serde_json::json!("attach-notice")
+    );
+
+    for bad in [
+        r#"{"type":"ping"}"#,                            // no version
+        r#"{"v":1,"type":"exec","cmd":"sh"}"#,           // unknown type
+        r#"{"v":1,"type":"resize","rows":0,"cols":0}"#,  // out of bounds
+    ] {
+        socket
+            .send(tungstenite::Message::Text(bad.into()))
+            .await
+            .expect("send malformed frame");
+    }
+    // 1008 policy violation: frame abuse is a protocol fault, deliberately not
+    // one of the ADR's lifecycle close codes.
+    assert_eq!(wait_for_close(&mut socket).await, 1008);
 
     harness.shutdown().await;
 }
