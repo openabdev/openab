@@ -13,9 +13,9 @@ use openab_pty::admin_auth::AdminAuthenticator;
 use openab_pty::audit::AuditLogger;
 use openab_pty::close_code;
 use openab_pty::config;
-use openab_pty::killdomain::{self, KillDomain, TrackingLimits};
+use openab_pty::killdomain::{KillDomain, TrackingLimits};
 use openab_pty::server::{self, AppState, ServerConfig};
-use openab_pty::session::{PortablePtySpawner, PtySpawner, SessionManager, SessionPolicy};
+use openab_pty::session::{PortablePtySpawner, SessionManager, SessionPolicy};
 use openab_pty::token::TokenStore;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -70,14 +70,7 @@ impl Harness {
                 .expect("the test projection must validate");
 
         let spawner = Arc::new(PortablePtySpawner);
-        let capability = spawner.capability();
-        let selection =
-            killdomain::detect(parsed.kill_domain_requirement, capability).expect("tier selection");
-        let kill = Arc::new(KillDomain::new(
-            selection,
-            TrackingLimits::default(),
-            audit.clone(),
-        ));
+        let kill = Arc::new(KillDomain::new(TrackingLimits::default(), audit.clone()));
         let tokens = TokenStore::new(token_ttl, audit.clone());
         let verifier = tokens.attach_verifier();
         // A tiny backoff keeps the real throttle path in play without making the
@@ -110,8 +103,6 @@ impl Harness {
                 // is not what is under test.
                 drain_grace: Duration::ZERO,
                 tick_interval: Duration::from_secs(1),
-                workspace: std::env::temp_dir(),
-                volume_capacity_kib: 0,
             },
         );
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -749,21 +740,14 @@ async fn no_admin_operation_succeeds_without_the_credential() {
         );
     }
 
-    // Nothing was created by any of the rejected attempts. The rejections armed
-    // the admin throttle, so wait it out rather than racing it — the backoff
-    // curve itself is unit tested in `admin_auth`.
-    let mut listed = serde_json::Value::Null;
-    let mut status = 0;
-    for _ in 0..30 {
-        let (code, body) = harness.admin("GET", "/admin/sessions", None).await;
-        status = code;
-        listed = body;
-        if status == 200 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    assert_eq!(status, 200, "admin list with the real credential: {listed}");
+    // The real credential works immediately, *while* the throttle those
+    // rejections armed is still in force: the throttle applies to failures only,
+    // so nothing that can reach this listener can lock the operator out.
+    let (status, listed) = harness.admin("GET", "/admin/sessions", None).await;
+    assert_eq!(
+        status, 200,
+        "a failed-attempt throttle must never refuse the real credential: {listed}"
+    );
     assert_eq!(
         listed["sessions"].as_array().map(Vec::len),
         Some(0),

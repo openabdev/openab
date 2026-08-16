@@ -15,8 +15,8 @@
 //! 2. **Only synthetic secrets.** The credential material probed for is
 //!    [`FAKE_SECRET`]; nothing here reads a real credential from the host.
 //!
-//! The whole file is Linux-only (`PR_SET_DUMPABLE` and `cgroup.kill` do not
-//! exist elsewhere, and the ADR scopes the containment claim to Linux) and every
+//! The whole file is Linux-only (`PR_SET_DUMPABLE` does not exist elsewhere,
+//! and the ADR scopes the containment claim to Linux) and every
 //! test is `#[ignore]`d, because they spawn real processes, bind real sockets,
 //! and read `/proc`. Run them with:
 //!
@@ -29,10 +29,8 @@ use openab_pty::admin_auth::AdminAuthenticator;
 use openab_pty::audit::AuditLogger;
 use openab_pty::config;
 use openab_pty::containment::{self, ContainmentStatus};
-use openab_pty::killdomain::{self, KillDomain, KillDomainTier, TrackingLimits};
-use openab_pty::session::{
-    PortablePtySpawner, PtySpawner, SessionManager, SessionPolicy, WindowSize,
-};
+use openab_pty::killdomain::{KillDomain, TrackingLimits};
+use openab_pty::session::{PortablePtySpawner, SessionManager, SessionPolicy, WindowSize};
 use openab_pty::token::TokenStore;
 use openab_pty::SessionName;
 use std::io::{Read, Write};
@@ -1029,7 +1027,13 @@ fn a_runtime_that_cannot_set_dumpable_refuses_to_serve_before_reading_a_credenti
 }
 
 // ---------------------------------------------------------------------------
-// 4. No session-reachable admin socket
+// 4. No privileged admin path from inside a managed session
+//
+// What is asserted is *not* unreachability. A managed session shares the
+// runtime's network namespace, so it can connect to the one listener and does —
+// the probe below gets an HTTP response. The property is that being inside
+// authorizes nothing: there is no admin-only socket (TCP or UNIX) to find, and
+// the request that does arrive is refused for want of the credential.
 // ---------------------------------------------------------------------------
 
 /// Every AF_UNIX socket path in this network namespace.
@@ -1072,16 +1076,16 @@ fn listening_tcp_ports() -> std::collections::BTreeSet<u16> {
 
 #[test]
 #[ignore = "spawns the built binary, binds a socket, and runs a probe inside a managed session"]
-fn a_managed_session_has_no_admin_socket_to_reach() {
+fn a_managed_session_can_reach_the_listener_but_is_refused_admin() {
     let scratch = Scratch::new("adminsock");
     let out = scratch.path("probe.out");
     let port_file = scratch.path("port");
 
     // The probe runs as the session's own program — a child of the runtime, in
     // the runtime's container — which is exactly the position the ADR's
-    // "unreachable from inside a managed session" claim is about. It is handed
-    // the port because an adversary in that position could read it out of
-    // /proc/net/tcp anyway; withholding it would weaken the test, not the model.
+    // admin-plane claim is about. It is handed the port because an adversary in
+    // that position could read it out of /proc/net/tcp anyway; withholding it
+    // would weaken the test, not the model.
     let probe = scratch.script(
         "session-probe.sh",
         &format!(
@@ -1185,8 +1189,8 @@ while : ; do sleep 5; done
     );
     assert!(
         report.contains("admin_status=HTTP/1.1 401 Unauthorized"),
-        "an admin request from inside a managed session must be refused; locality authorizes \
-         nothing: {report}"
+        "the request from inside a managed session must arrive and be refused: the listener is \
+         reachable, the credential is the boundary, and locality authorizes nothing: {report}"
     );
     assert!(
         report.contains("unix_sockets_matching=0"),
@@ -1227,14 +1231,8 @@ fn adversary_manager(scratch: &Scratch, command: &Path) -> (Arc<SessionManager>,
     );
     let parsed = config::validate_projection(&text).expect("projection must validate");
     let spawner = Arc::new(PortablePtySpawner);
-    let selection = killdomain::detect(parsed.kill_domain_requirement, spawner.capability())
-        .expect("tier selection");
-    eprintln!("[{}] {}", scratch.marker(), selection.describe());
-    let kill = Arc::new(KillDomain::new(
-        selection,
-        TrackingLimits::default(),
-        audit.clone(),
-    ));
+    let kill = Arc::new(KillDomain::new(TrackingLimits::default(), audit.clone()));
+    eprintln!("[{}] {}", scratch.marker(), kill.tier().describe());
     let policy = SessionPolicy::from_config(&parsed);
     let manager = SessionManager::new(
         parsed,
@@ -1294,10 +1292,10 @@ fn group_members(pgid: i32) -> Vec<(i32, char, i32)> {
     members
 }
 
-/// Run one adversary through a real session teardown and assert the **active
-/// tier's** documented semantics — never a hardcoded expectation, because the
-/// two tiers promise different things and only startup detection knows which is
-/// live.
+/// Run one adversary through a real session teardown and assert Tier 1's
+/// documented semantics. Tier 1 is the only kill domain the runtime implements,
+/// and its contract is best effort: survivors it can see are reported, audited,
+/// and counted; one that left the process group is invisible by construction.
 async fn teardown_case(label: &str, scratch: &Scratch, command: &Path) {
     let (manager, kill) = adversary_manager(scratch, command);
     let name = SessionName::parse("adversary").expect("session name");
@@ -1315,9 +1313,9 @@ async fn teardown_case(label: &str, scratch: &Scratch, command: &Path) {
         .expect("kill");
     let outcome = &report.kill_domain;
     eprintln!(
-        "[{label}] tier={} guarantee={:?} survivors={:?} elapsed={}ms leader={leader} adversary={adversary}",
+        "[{label}] tier={} best_effort={} survivors={:?} elapsed={}ms leader={leader} adversary={adversary}",
         outcome.tier.label(),
-        outcome.guarantee,
+        outcome.is_best_effort(),
         outcome.survivors,
         outcome.elapsed_ms
     );
@@ -1326,9 +1324,11 @@ async fn teardown_case(label: &str, scratch: &Scratch, command: &Path) {
         group_members(leader)
     );
 
-    // Invariants that hold in both tiers.
     assert_eq!(outcome.tier, kill.tier());
-    assert_eq!(outcome.guarantee, kill.tier().guarantee());
+    assert!(
+        outcome.is_best_effort(),
+        "tier 1 must never claim a hard guarantee"
+    );
     for pid in &outcome.survivors {
         assert!(
             pid_alive(*pid),
@@ -1346,46 +1346,27 @@ async fn teardown_case(label: &str, scratch: &Scratch, command: &Path) {
         "the session leader must be dead after teardown"
     );
 
-    match kill.tier() {
-        KillDomainTier::Tier2GuaranteedCgroup => {
+    if pid_alive(adversary) {
+        // Best effort, stated as the ADR states it: a survivor the runtime can
+        // see must be reported and counted; one that left the process group is
+        // invisible by construction, and the pod or task replacement is its
+        // documented reclamation path. Assert the disjunction and print which
+        // branch was measured, so a future improvement to discovery does not have
+        // to fight this test.
+        if outcome.survivors.contains(&adversary) {
             assert!(
-                outcome.converged(),
-                "tier 2 promises convergence to zero survivors: {:?}",
-                outcome.survivors
+                kill.leaked_process_count() >= 1,
+                "a detected survivor must be counted on the leak metric"
             );
-            assert!(
-                wait_until_gone(adversary, Duration::from_secs(5)),
-                "tier 2 must leave no survivor, cgroup.kill covers every member"
+            eprintln!("[{label}] survivor DETECTED, audited, and counted: {adversary}");
+        } else {
+            eprintln!(
+                "[{label}] survivor NOT discoverable by the runtime (left the process group; \
+                 reclaimed only when the pod or task is replaced): {adversary}"
             );
         }
-        KillDomainTier::Tier1BestEffortProcessGroup => {
-            assert!(
-                outcome.is_best_effort(),
-                "tier 1 must never claim a hard guarantee"
-            );
-            if pid_alive(adversary) {
-                // Best effort, stated as the ADR states it: a survivor the
-                // runtime can see must be reported and counted; one that left
-                // the process group is invisible by construction, and the pod or
-                // task replacement is its documented reclamation path. Assert the
-                // disjunction and print which branch was measured, so a future
-                // improvement to discovery does not have to fight this test.
-                if outcome.survivors.contains(&adversary) {
-                    assert!(
-                        kill.leaked_process_count() >= 1,
-                        "a detected survivor must be counted on the leak metric"
-                    );
-                    eprintln!("[{label}] survivor DETECTED, audited, and counted: {adversary}");
-                } else {
-                    eprintln!(
-                        "[{label}] survivor NOT discoverable by the runtime (left the process \
-                         group; reclaimed only when the pod or task is replaced): {adversary}"
-                    );
-                }
-            } else {
-                eprintln!("[{label}] the tier-1 process-group escalation reached the adversary");
-            }
-        }
+    } else {
+        eprintln!("[{label}] the tier-1 process-group escalation reached the adversary");
     }
 
     // Clean up whatever survived, then prove nothing of ours is left running.

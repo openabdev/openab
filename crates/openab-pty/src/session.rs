@@ -38,7 +38,7 @@ use crate::token::{MintedAttachToken, TokenStore};
 use crate::{Error, Generation, SessionName};
 use parking_lot::Mutex;
 use serde::Serialize;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -64,16 +64,36 @@ const INPUT_QUEUE_CHUNKS: usize = 64;
 /// growth.
 const MAX_TOMBSTONES: usize = 32;
 
+// The values below were `[pty]` knobs in the first draft of this crate. They are
+// constants because nobody has asked to configure them and no telemetry exists
+// to tune them; the ADR's numbers are the numbers. Setting any of them in a
+// delivered projection is an unknown-key startup error, not a silent no-op.
+
+/// WS ping interval (ADR band: 15–30s).
+pub const PING_INTERVAL: Duration = Duration::from_secs(20);
+/// Missed pings before a half-open socket counts as detached (ADR band: 2–3).
+pub const MISSED_PINGS_BEFORE_DETACHED: u32 = 3;
+/// How long before forced teardown the client-visible warning is sent.
+pub const TTL_WARNING_LEAD: Duration = Duration::from_secs(30);
+/// Takeovers allowed per window, per session generation.
+pub const MAX_TAKEOVERS_PER_WINDOW: u32 = 3;
+pub const TAKEOVER_WINDOW: Duration = Duration::from_secs(60);
+/// `SIGTERM`→`SIGKILL` grace handed to the kill domain.
+pub const TEARDOWN_GRACE: Duration = Duration::from_secs(5);
+/// Per-connection outbound backlog. The hard watermark (past which a client is
+/// disconnected with `SLOW_CLIENT`) is four times this.
+const OUTBOUND_BACKLOG_KIB: usize = 256;
+
 /// Per-connection identity. Distinct from [`Generation`], which fences *tokens*:
 /// this fences *connections* inside one generation, and the two must not be
 /// conflated (a takeover changes only this one).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct ConnGeneration(pub u64);
 
-/// Liveness, TTL, and abuse-control knobs.
+/// Liveness, TTL, and abuse-control values.
 ///
-/// The delivered `[pty]` projection supplies these values; defaults here match
-/// the ADR so programmatic construction has the same behaviour as an omitted key.
+/// Only the two TTLs come from the delivered `[pty]` projection; the rest are the
+/// constants above, kept as fields so tests can shorten them.
 #[derive(Clone, Copy, Debug)]
 pub struct SessionPolicy {
     /// Detached-idle TTL.
@@ -99,29 +119,24 @@ impl Default for SessionPolicy {
         Self {
             detached_idle_ttl: Duration::from_secs(30 * 60),
             absolute_ttl: Duration::from_secs(12 * 60 * 60),
-            ping_interval: Duration::from_secs(20),
-            missed_pings_before_detached: 3,
-            ttl_warning_lead: Duration::from_secs(30),
-            max_takeovers_per_window: 3,
-            takeover_window: Duration::from_secs(60),
-            teardown_grace: Duration::from_secs(5),
+            ping_interval: PING_INTERVAL,
+            missed_pings_before_detached: MISSED_PINGS_BEFORE_DETACHED,
+            ttl_warning_lead: TTL_WARNING_LEAD,
+            max_takeovers_per_window: MAX_TAKEOVERS_PER_WINDOW,
+            takeover_window: TAKEOVER_WINDOW,
+            teardown_grace: TEARDOWN_GRACE,
         }
     }
 }
 
 impl SessionPolicy {
-    /// Build the runtime policy exclusively from the validated delivered
-    /// projection, so every operator-visible lifecycle knob takes effect.
+    /// Build the runtime policy from the validated delivered projection: the two
+    /// operator-facing TTLs, then the fixed values.
     pub fn from_config(config: &PtyConfig) -> Self {
         Self {
             detached_idle_ttl: config.detached_idle_ttl,
             absolute_ttl: config.absolute_session_ttl,
-            ping_interval: config.ping_interval,
-            missed_pings_before_detached: config.missed_pings_before_detached,
-            ttl_warning_lead: config.ttl_warning_lead,
-            max_takeovers_per_window: config.max_takeovers_per_window,
-            takeover_window: config.takeover_window,
-            teardown_grace: config.teardown_grace,
+            ..Self::default()
         }
     }
 
@@ -243,9 +258,6 @@ pub trait PtySpawner: Send + Sync {
         request: SpawnRequest,
         containment: &mut SessionKillDomain,
     ) -> Result<SpawnedPty, Error>;
-    /// What the spawner can do at fork time, which decides whether Tier 2 is
-    /// selectable at all.
-    fn capability(&self) -> crate::killdomain::SpawnCapability;
 }
 
 /// The real spawner.
@@ -254,11 +266,10 @@ pub trait PtySpawner: Send + Sync {
 /// controlling terminal, and closes every descriptor above 2). That gives us the
 /// per-session process group Tier 1 needs for free — the child is a session and
 /// group leader, so `pgid == pid` — but it also means no caller-supplied
-/// pre-`execv` hook can run, so this spawner reports
-/// [`SpawnCapability::ProcessGroupOnly`] and Tier 2 is never claimed on top of
-/// it.
-///
-/// [`SpawnCapability::ProcessGroupOnly`]: crate::killdomain::SpawnCapability::ProcessGroupOnly
+/// pre-`execv` hook can run. That is why the kill domain is Tier 1 only: joining
+/// a cgroup after `execv` would mean adversary code had already run outside it,
+/// so Tier 2 was never reachable through this spawner (see
+/// [`crate::killdomain`]).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PortablePtySpawner;
 
@@ -269,17 +280,6 @@ impl PtySpawner for PortablePtySpawner {
         containment: &mut SessionKillDomain,
     ) -> Result<SpawnedPty, Error> {
         use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-
-        if containment.tier() == KillDomainTier::Tier2GuaranteedCgroup {
-            // Fail closed rather than migrate after `exec`: a post-`exec` write
-            // to cgroup.procs would mean adversary code already ran outside its
-            // cgroup, which is precisely the window Tier 2 exists to close.
-            return Err(Error::Other(
-                "tier 2 containment requires a pre-execv capable spawner; \
-                 portable-pty owns its pre-exec closure"
-                    .into(),
-            ));
-        }
 
         let pty = native_pty_system();
         let pair = pty
@@ -329,10 +329,6 @@ impl PtySpawner for PortablePtySpawner {
             }),
         })
     }
-
-    fn capability(&self) -> crate::killdomain::SpawnCapability {
-        crate::killdomain::SpawnCapability::ProcessGroupOnly
-    }
 }
 
 struct PortablePtyControl {
@@ -381,9 +377,6 @@ pub enum ControlEvent {
         seconds_remaining: u64,
         absolute: bool,
     },
-    /// First-class "workspace volume full" rather than an opaque write error
-    /// inside the terminal.
-    WorkspaceVolumeFull { used_kib: u64, budget_kib: u64 },
     /// The runtime is draining before replacement. Sent before the grace so a
     /// client can externalise work; the socket then closes with
     /// `close_code::RUNTIME_REPLACED`.
@@ -427,10 +420,6 @@ impl Outbound {
             close_emitted: AtomicBool::new(false),
             notify: Notify::new(),
         })
-    }
-
-    pub fn conn(&self) -> ConnGeneration {
-        self.conn
     }
 
     /// Enqueue PTY bytes. Never blocks and never grows without bound: past the
@@ -611,7 +600,6 @@ struct SessionState {
     warned_idle: bool,
     size: WindowSize,
     takeovers: TakeoverLimiter,
-    disk_used_kib: u64,
 }
 
 /// One live session.
@@ -633,9 +621,10 @@ pub struct Session {
 }
 
 /// A client's handle on an attached connection.
+///
+/// Load-bearing rather than a pass-through: it binds one connection generation to
+/// every call, so no caller can present another connection's fence by mistake.
 pub struct AttachedConnection {
-    pub session: SessionName,
-    pub generation: Generation,
     pub conn: ConnGeneration,
     pub outbound: Arc<Outbound>,
     session_handle: Arc<Session>,
@@ -759,10 +748,6 @@ impl Session {
         drop(outbound);
     }
 
-    pub fn name(&self) -> &SessionName {
-        &self.name
-    }
-
     pub fn generation(&self) -> Generation {
         self.state.lock().generation
     }
@@ -792,7 +777,6 @@ pub struct SessionStatus {
     pub alive: bool,
     pub attached: bool,
     pub bytes_written: u64,
-    pub disk_used_kib: u64,
     pub tier: KillDomainTier,
     /// Repeated per session because the guarantee is per-runtime but consumed
     /// per session.
@@ -809,7 +793,6 @@ pub struct Metrics {
     pub takeovers_rate_limited: AtomicU64,
     pub ttl_expired: AtomicU64,
     pub self_exits: AtomicU64,
-    pub workspace_full: AtomicU64,
 }
 
 impl Metrics {
@@ -861,6 +844,15 @@ struct Tombstone {
 
 struct ManagerState {
     sessions: BTreeMap<SessionName, Arc<Session>>,
+    /// Names claimed by a spawn that has not inserted its session yet.
+    ///
+    /// Without this, the occupancy/capacity check and the insert were two
+    /// separate critical sections with a PTY spawn in between: two concurrent
+    /// creates of one name both passed the check, both spawned a child, and the
+    /// second insert replaced the first `Session` in the map — dropping the only
+    /// handle to a live PTY that nothing would ever tear down. The same window
+    /// let concurrent creates exceed `max_sessions`.
+    claimed: BTreeSet<SessionName>,
     /// Names of ended sessions, so reattach-to-dead is a distinct error offering
     /// restart-in-place instead of an indistinguishable "not found".
     tombstones: VecDeque<(SessionName, Tombstone)>,
@@ -877,8 +869,6 @@ pub struct SessionManager {
     spawner: Arc<dyn PtySpawner>,
     metrics: Metrics,
     epoch: Instant,
-    /// Workspace usage reported by the integrator, in KiB.
-    volume_used_kib: AtomicU64,
 }
 
 impl SessionManager {
@@ -894,6 +884,7 @@ impl SessionManager {
         Ok(Arc::new(Self {
             state: Mutex::new(ManagerState {
                 sessions: BTreeMap::new(),
+                claimed: BTreeSet::new(),
                 tombstones: VecDeque::new(),
             }),
             config,
@@ -904,7 +895,6 @@ impl SessionManager {
             spawner,
             metrics: Metrics::default(),
             epoch: Instant::now(),
-            volume_used_kib: AtomicU64::new(0),
         }))
     }
 
@@ -920,17 +910,6 @@ impl SessionManager {
         &self.kill
     }
 
-    /// Admission-relevant workspace usage, reported by the integrator (the
-    /// runtime does not stat the volume itself).
-    pub fn report_volume_usage(&self, used_kib: u64) {
-        self.volume_used_kib.store(used_kib, Ordering::Relaxed);
-    }
-
-    fn volume_full(&self) -> bool {
-        let used = self.volume_used_kib.load(Ordering::Relaxed);
-        used >= self.config.volume_capacity_kib as u64
-    }
-
     pub fn list(&self) -> Vec<SessionStatus> {
         let sessions: Vec<Arc<Session>> = self.state.lock().sessions.values().cloned().collect();
         sessions
@@ -943,7 +922,6 @@ impl SessionManager {
                     alive: session.io.alive.load(Ordering::Acquire),
                     attached: state.owner_conn != ConnGeneration(0),
                     bytes_written: session.io.buffer.lock().total_written(),
-                    disk_used_kib: state.disk_used_kib,
                     tier: self.kill.tier(),
                     teardown_best_effort: self.kill.tier().is_best_effort(),
                     absolute_ttl_best_effort: self.kill.tier().is_best_effort(),
@@ -967,30 +945,6 @@ impl SessionManager {
         name: SessionName,
         size: WindowSize,
     ) -> Result<SessionCredential, Error> {
-        {
-            let state = self.state.lock();
-            if state.sessions.contains_key(&name) {
-                return Err(Error::AlreadyExists(name));
-            }
-            let live = state
-                .sessions
-                .values()
-                .filter(|session| session.io.alive.load(Ordering::Acquire))
-                .count();
-            if live >= self.config.max_sessions {
-                Metrics::bump(&self.metrics.admission_rejected);
-                return Err(Error::CapacityExceeded {
-                    limit: self.config.max_sessions,
-                });
-            }
-        }
-        if self.volume_full() {
-            Metrics::bump(&self.metrics.admission_rejected);
-            Metrics::bump(&self.metrics.workspace_full);
-            return Err(Error::Other(
-                "workspace volume full: refusing to create a session".into(),
-            ));
-        }
         self.spawn_session(name, size, Generation(1))
     }
 
@@ -1033,7 +987,42 @@ impl SessionManager {
         Ok(credential)
     }
 
+    /// Claim a name and a capacity slot in **one** critical section, so nothing
+    /// can spawn a second PTY under the same name while this spawn is in flight.
+    fn claim_name(&self, name: &SessionName) -> Result<(), Error> {
+        let mut state = self.state.lock();
+        if state.sessions.contains_key(name) || !state.claimed.insert(name.clone()) {
+            return Err(Error::AlreadyExists(name.clone()));
+        }
+        let live = state
+            .sessions
+            .values()
+            .filter(|session| session.io.alive.load(Ordering::Acquire))
+            .count()
+            + state.claimed.len();
+        if live > self.config.max_sessions {
+            state.claimed.remove(name);
+            Metrics::bump(&self.metrics.admission_rejected);
+            return Err(Error::CapacityExceeded {
+                limit: self.config.max_sessions,
+            });
+        }
+        Ok(())
+    }
+
     fn spawn_session(
+        self: &Arc<Self>,
+        name: SessionName,
+        size: WindowSize,
+        generation: Generation,
+    ) -> Result<SessionCredential, Error> {
+        self.claim_name(&name)?;
+        let outcome = self.spawn_claimed(name.clone(), size, generation);
+        self.state.lock().claimed.remove(&name);
+        outcome
+    }
+
+    fn spawn_claimed(
         self: &Arc<Self>,
         name: SessionName,
         size: WindowSize,
@@ -1083,7 +1072,6 @@ impl SessionManager {
                 warned_idle: false,
                 size,
                 takeovers: TakeoverLimiter::new(generation, Instant::now()),
-                disk_used_kib: 0,
             }),
             io: io.clone(),
             input: input_tx,
@@ -1091,8 +1079,8 @@ impl SessionManager {
             kill: tokio::sync::Mutex::new(containment),
             filter: Mutex::new(TermFilter::new()),
             backlog_bounds: QueueBounds::new(
-                self.config.outbound_backlog_kib.saturating_mul(1024),
-                Some(self.config.outbound_backlog_kib.saturating_mul(1024) as u64 * 4),
+                OUTBOUND_BACKLOG_KIB * 1024,
+                Some(OUTBOUND_BACKLOG_KIB as u64 * 1024 * 4),
             ),
             epoch: self.epoch,
             tier_best_effort: self.kill.tier().is_best_effort(),
@@ -1285,25 +1273,12 @@ impl SessionManager {
         );
         Ok((
             AttachedConnection {
-                session: name.clone(),
-                generation,
                 conn,
                 outbound,
                 session_handle: session,
             },
             stream_offset,
         ))
-    }
-
-    /// Incremental reconnect within the retained window.
-    pub fn replay_since(&self, name: &SessionName, since: u64) -> Result<Replay, Error> {
-        let session = self
-            .get(name)
-            .ok_or_else(|| Error::NotFound(name.clone()))?;
-        // Copy the replay out and drop the guard before returning: a guard in a
-        // tail expression outlives the local it borrows from.
-        let replay = session.io.buffer.lock().read_since(since);
-        Ok(replay)
     }
 
     /// Remote-admin `renew`: the process survives, the generation bumps, every
@@ -1323,7 +1298,7 @@ impl SessionManager {
             state.generation = generation;
             // Revocation before anything else, per the total order: a token from
             // the old generation must not be able to win an attach in between.
-            self.tokens.revoke_session(name, generation);
+            self.tokens.revoke_session(name);
             state.owner_conn = ConnGeneration(0);
             state.attached_since = None;
             state.missed_pings = 0;
@@ -1430,7 +1405,7 @@ impl SessionManager {
             )
         };
         if !already_dead {
-            self.tokens.revoke_session(&session.name, generation);
+            self.tokens.revoke_session(&session.name);
         }
 
         // 1+2. Notify then close. Both are non-blocking: teardown must not wait
@@ -1446,7 +1421,7 @@ impl SessionManager {
             let outcome = kill.terminate(self.policy.teardown_grace).await;
             // 4+5. Close the master fd and release the slot: dropping the input
             // sender ends the writer thread, and releasing the kill domain frees
-            // its tracking budget and cgroup.
+            // its tracking budget.
             kill.release();
             outcome
         };
@@ -1532,31 +1507,6 @@ impl SessionManager {
             .tombstones
             .remove(index)
             .map(|(_, tombstone)| tombstone)
-    }
-
-    /// Record a session's workspace usage. Returns the first-class condition
-    /// when the per-session budget is exhausted, and tells the attached client
-    /// through its own control frame rather than an opaque write error.
-    pub fn report_session_disk_usage(&self, name: &SessionName, used_kib: u64) -> bool {
-        let Some(session) = self.get(name) else {
-            return false;
-        };
-        let (full, subscriber) = {
-            let mut state = session.state.lock();
-            state.disk_used_kib = used_kib;
-            let full = used_kib >= self.config.per_session_disk_kib as u64;
-            (full, session.io.subscriber.lock().clone())
-        };
-        if full {
-            Metrics::bump(&self.metrics.workspace_full);
-            if let Some(outbound) = subscriber {
-                outbound.push_control(ControlEvent::WorkspaceVolumeFull {
-                    used_kib,
-                    budget_kib: self.config.per_session_disk_kib as u64,
-                });
-            }
-        }
-        full
     }
 
     /// TTL maintenance. Call on a timer; returns what it did so the behaviour is
@@ -1749,9 +1699,7 @@ fn spawn_reader_thread(
 mod tests {
     use super::*;
     use crate::containment::SecretBytes;
-    use crate::killdomain::{
-        KillDomainSelection, ProcessSignals, Signal, Tier2Unavailable, TrackingLimits,
-    };
+    use crate::killdomain::{ProcessSignals, Signal, TrackingLimits};
     use std::io;
     use std::sync::mpsc as std_mpsc;
 
@@ -1827,6 +1775,11 @@ mod tests {
         output: Mutex<Option<std_mpsc::Sender<Vec<u8>>>>,
         last_env: Mutex<Vec<(String, String)>>,
         stall: Arc<AtomicBool>,
+        /// How many PTYs this spawner was asked for. The concurrent-create
+        /// regression test asserts on it: "one session in the map" is not enough,
+        /// because the bug it guards against left a *second* live child that the
+        /// map no longer referenced.
+        spawns: AtomicU64,
         fail: bool,
     }
 
@@ -1838,6 +1791,7 @@ mod tests {
                 output: Mutex::new(None),
                 last_env: Mutex::new(Vec::new()),
                 stall: Arc::new(AtomicBool::new(false)),
+                spawns: AtomicU64::new(0),
                 fail: false,
             })
         }
@@ -1849,6 +1803,7 @@ mod tests {
                 output: Mutex::new(None),
                 last_env: Mutex::new(Vec::new()),
                 stall: Arc::new(AtomicBool::new(false)),
+                spawns: AtomicU64::new(0),
                 fail: true,
             })
         }
@@ -1876,6 +1831,7 @@ mod tests {
             if self.fail {
                 return Err(Error::Other("synthetic spawn failure".into()));
             }
+            self.spawns.fetch_add(1, Ordering::Relaxed);
             *self.last_env.lock() = request.env.clone();
             let (tx, rx) = std_mpsc::channel();
             *self.output.lock() = Some(tx);
@@ -1887,10 +1843,6 @@ mod tests {
                 writer: Box::new(RecordingWriter(self.written.clone(), self.stall.clone())),
                 control: Arc::new(FakeControl(self.pty.clone())),
             })
-        }
-
-        fn capability(&self) -> crate::killdomain::SpawnCapability {
-            crate::killdomain::SpawnCapability::ProcessGroupOnly
         }
     }
 
@@ -1918,7 +1870,6 @@ mod tests {
 
     fn kill_domain() -> Arc<KillDomain> {
         Arc::new(KillDomain::with_signals(
-            KillDomainSelection::tier1(Tier2Unavailable::NotLinux),
             TrackingLimits::default(),
             AuditLogger,
             Arc::new(DeadSignals),
@@ -2036,15 +1987,59 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_full_workspace_volume_is_a_first_class_admission_failure() {
-        let manager = manager_with(FakeSpawner::new(), "", SessionPolicy::default());
-        manager.report_volume_usage(manager.config.volume_capacity_kib as u64);
-        let Err(error) = manager.create(name("blocked"), WindowSize::default()) else {
-            panic!("must refuse rather than fail opaquely inside the terminal");
-        };
-        assert!(error.to_string().contains("workspace volume full"));
-        assert_eq!(manager.metrics().workspace_full.load(Ordering::Relaxed), 1);
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_creates_of_one_name_spawn_exactly_one_pty() {
+        // Regression guard for a TOCTOU that orphaned live PTYs: the occupancy
+        // check and the map insert were two critical sections with the spawn in
+        // between, so every racing caller passed the check, every one spawned a
+        // child, and the last insert won — leaving the others alive with nothing
+        // holding them and nothing that would ever tear them down.
+        let spawner = FakeSpawner::new();
+        let manager = manager_with(spawner.clone(), "max_sessions = 4\n", SessionPolicy::default());
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let manager = manager.clone();
+            tasks.push(tokio::task::spawn_blocking(move || {
+                manager.create(name("race"), WindowSize::default()).is_ok()
+            }));
+        }
+        let mut succeeded = 0;
+        for task in tasks {
+            if task.await.unwrap() {
+                succeeded += 1;
+            }
+        }
+        assert_eq!(succeeded, 1, "exactly one create may win the name");
+        assert_eq!(manager.list().len(), 1);
+        assert_eq!(
+            spawner.spawns.load(Ordering::Relaxed),
+            1,
+            "a losing create must never have spawned a PTY: an unreferenced live child is a leak \
+             no teardown path can reach"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_creates_cannot_exceed_max_sessions() {
+        let spawner = FakeSpawner::new();
+        let manager = manager_with(spawner.clone(), "max_sessions = 2\n", SessionPolicy::default());
+        let mut tasks = Vec::new();
+        for index in 0..8 {
+            let manager = manager.clone();
+            tasks.push(tokio::task::spawn_blocking(move || {
+                manager
+                    .create(name(&format!("s{index}")), WindowSize::default())
+                    .is_ok()
+            }));
+        }
+        let mut succeeded = 0;
+        for task in tasks {
+            if task.await.unwrap() {
+                succeeded += 1;
+            }
+        }
+        assert_eq!(succeeded, 2, "capacity is checked with the claim, not before");
+        assert_eq!(spawner.spawns.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -2352,18 +2347,27 @@ mod tests {
     async fn a_since_cursor_replays_only_missed_bytes() {
         let spawner = FakeSpawner::new();
         let manager = manager_with(spawner.clone(), "", SessionPolicy::default());
-        manager
+        let created = manager
             .create(name("cursor"), WindowSize::default())
             .unwrap();
         spawner.emit(b"abcdef");
         tokio::time::sleep(Duration::from_millis(50)).await;
-        match manager.replay_since(&name("cursor"), 3).unwrap() {
-            Replay::Contiguous { bytes, to_offset } => {
-                assert_eq!(bytes, b"def");
-                assert_eq!(to_offset, 6);
-            }
-            other => panic!("expected contiguous replay, got {other:?}"),
-        }
+
+        // The cursor is honoured inside the attach lock, which is what makes the
+        // replay-to-live handoff atomic; there is deliberately no separate
+        // "replay later" entry point that could deliver a byte twice.
+        let (attached, stream_offset) = manager
+            .attach_with_replay(
+                &name("cursor"),
+                created.generation,
+                WindowSize::default(),
+                None,
+                Some(3),
+            )
+            .unwrap();
+        assert_eq!(stream_offset, 6);
+        let items = drain(&attached.outbound);
+        assert_eq!(collected_bytes(&items), b"def");
     }
 
     // ---- termination ----------------------------------------------------
@@ -2635,37 +2639,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn per_session_disk_budget_surfaces_workspace_full_to_the_client() {
-        let manager = manager_with(FakeSpawner::new(), "", SessionPolicy::default());
-        let created = manager.create(name("disk"), WindowSize::default()).unwrap();
-        let attached = manager
-            .attach(
-                &name("disk"),
-                created.generation,
-                WindowSize::default(),
-                None,
-            )
-            .unwrap();
-        assert!(!manager.report_session_disk_usage(&name("disk"), 1));
-        assert!(manager
-            .report_session_disk_usage(&name("disk"), manager.config.per_session_disk_kib as u64));
-        let items = drain(&attached.outbound);
-        assert!(
-            items.iter().any(|item| matches!(
-                item,
-                OutboundItem::Control(ControlEvent::WorkspaceVolumeFull { .. })
-            )),
-            "must be a first-class condition, not an opaque write error: {items:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn a_slow_client_backlog_is_bounded_and_ends_in_slow_client() {
-        let manager = manager_with(
-            FakeSpawner::new(),
-            "outbound_backlog_kib = 1\nscrollback_kib = 1\nfixed_session_overhead_kib = 1\nreplay_queue_kib = 1\n",
-            SessionPolicy::default(),
-        );
+        let manager = manager_with(FakeSpawner::new(), "", SessionPolicy::default());
         let created = manager
             .create(name("backlog"), WindowSize::default())
             .unwrap();
@@ -2678,8 +2653,9 @@ mod tests {
             )
             .unwrap();
         let session = manager.get(&name("backlog")).unwrap();
-        let chunk = vec![b'z'; 4096];
-        for _ in 0..8 {
+        // Flood past the hard watermark (4× the backlog) without ever draining.
+        let chunk = vec![b'z'; 16 * 1024];
+        for _ in 0..(OUTBOUND_BACKLOG_KIB / 16 * 6) {
             manager.on_output(&session, &chunk);
         }
         assert_eq!(
@@ -2687,7 +2663,7 @@ mod tests {
             Some(close_code::SLOW_CLIENT),
             "past the hard watermark the connection is dropped, never queued"
         );
-        assert!(attached.outbound.queue.lock().len() <= 1024);
+        assert!(attached.outbound.queue.lock().len() <= OUTBOUND_BACKLOG_KIB * 1024);
     }
 
     #[tokio::test]

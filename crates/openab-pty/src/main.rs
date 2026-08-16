@@ -12,8 +12,9 @@
 //!    `[secrets.refs]`, a `${secrets.*}` interpolation, a broker section, an
 //!    interpolated or malformed `admin_credential_hash` — is a startup error,
 //!    never a silently degraded auth posture.
-//! 3. Kill-domain tier detection, logging the active tier *and*, when the hard
-//!    guarantee is unavailable, the distinguishing reason.
+//! 3. Kill-domain tier selection, logging the active tier and what it does not
+//!    promise. An operator who required Tier 2 is refused here: it is not
+//!    implemented, and best effort must never be served under a guarantee's name.
 //! 4. Bind, behind the fail-closed listener guard.
 //!
 //! Graceful shutdown runs the same order in reverse: notice → grace →
@@ -27,7 +28,7 @@ use openab_pty::config::{self, PtyConfig};
 use openab_pty::containment::{self, ContainmentStatus};
 use openab_pty::killdomain::{self, establish_subreaper, KillDomain, TrackingLimits};
 use openab_pty::server::{self, AppState, ServerConfig};
-use openab_pty::session::{PortablePtySpawner, PtySpawner, SessionManager, SessionPolicy};
+use openab_pty::session::{PortablePtySpawner, SessionManager, SessionPolicy};
 use openab_pty::token::TokenStore;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -145,20 +146,6 @@ fn validate_only(path: &PathBuf) -> Result<()> {
                 "  kill_domain_tier        = {:?}",
                 projection.kill_domain_requirement
             );
-            println!(
-                "  memory required / limit = {} / {} KiB",
-                projection
-                    .required_memory_kib()
-                    .map_err(|error| anyhow::anyhow!("{error}"))?,
-                projection.container_memory_request_kib
-            );
-            println!(
-                "  disk required / limit   = {} / {} KiB",
-                projection
-                    .required_disk_kib()
-                    .map_err(|error| anyhow::anyhow!("{error}"))?,
-                projection.volume_capacity_kib
-            );
             Ok(())
         }
         Err(error) => {
@@ -172,23 +159,19 @@ fn validate_only(path: &PathBuf) -> Result<()> {
 async fn run(projection: PtyConfig) -> Result<()> {
     let audit = AuditLogger;
 
-    // (3) Kill domain. Reaping first (best effort, never fail-closed), then
-    // end-to-end Tier 2 detection, then the operator-actionable log line.
+    // (3) Kill domain. Reaping first (best effort, never fail-closed), then the
+    // operator-actionable log line. Tier 2 is not implemented, so an operator
+    // who required it is refused here rather than served best effort.
     let subreaper = establish_subreaper();
     tracing::info!(?subreaper, "child-subreaper status");
 
-    let spawner = Arc::new(PortablePtySpawner);
-    let capability = spawner.capability();
-    let selection = killdomain::detect(projection.kill_domain_requirement, capability)
+    let tier = killdomain::resolve_tier(projection.kill_domain_requirement)
         .map_err(|error| anyhow::anyhow!("{error}"))
         .context("kill-domain tier selection")?;
-    tracing::info!("{}", selection.describe());
-    let kill = Arc::new(KillDomain::new(
-        selection,
-        TrackingLimits::default(),
-        audit.clone(),
-    ));
+    tracing::info!("{}", tier.describe());
+    let kill = Arc::new(KillDomain::new(TrackingLimits::default(), audit.clone()));
 
+    let spawner = Arc::new(PortablePtySpawner);
     let tokens = TokenStore::with_default_ttl(audit.clone());
     let verifier = tokens.attach_verifier();
     let admin =
@@ -197,7 +180,8 @@ async fn run(projection: PtyConfig) -> Result<()> {
             .context("admin verifier")?;
     tracing::info!(
         verifier = admin.verifier_fingerprint(),
-        "remote admin plane enabled (no in-container admin socket exists by design)"
+        "remote admin plane enabled: the credential is the only boundary (no in-container admin \
+         socket exists, and locality authorizes nothing)"
     );
 
     let policy = SessionPolicy::from_config(&projection);
@@ -209,10 +193,6 @@ async fn run(projection: PtyConfig) -> Result<()> {
         tls_terminated_upstream,
         drain_grace: Duration::from_secs(3),
         tick_interval: Duration::from_secs(1),
-        workspace: std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/")),
-        volume_capacity_kib: projection.volume_capacity_kib as u64,
     };
 
     let manager = SessionManager::new(projection, policy, tokens, audit.clone(), kill, spawner)

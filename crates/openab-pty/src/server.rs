@@ -7,12 +7,16 @@
 //!    token and nothing else. It holds an [`AttachVerifier`], which has no
 //!    issuance API at all, so "no minting path on the attach surface" is a
 //!    property of the type this handler was given, not of a routing convention.
-//! 2. **The admin plane is remote-only.** These HTTP routes are the *entire*
-//!    admin plane. There is deliberately no UDS, no loopback-only listener, and
-//!    no in-container CLI, which is what makes "admin operations are unreachable
-//!    from a managed session" true by construction: a session child has nothing
-//!    to connect to. Minted tokens are returned in the HTTP response to the
-//!    external control client and are never written to a PTY master.
+//! 2. **The admin plane is remote-only, and authentication is its whole
+//!    boundary.** These HTTP routes are the *entire* admin plane: there is
+//!    deliberately no UDS, no second loopback-only listener, and no in-container
+//!    CLI, so there is no path on which being *inside* the container authorizes
+//!    anything. What that does **not** mean is unreachability: a managed session
+//!    shares this container's network namespace and can connect to this listener,
+//!    and the adversary suite asserts exactly that — the request arrives and is
+//!    answered `401`, because the credential lives on the operator's side and
+//!    never enters the container. Minted tokens are returned in the HTTP response
+//!    to the external control client and are never written to a PTY master.
 //! 3. **`Origin` is not consulted.** Possession of a valid attach token is the
 //!    sole authorization. The as-built `/acp` endpoint checks `Origin` only on
 //!    its *keyless* loopback path; PTY has no keyless mode, so there is nothing
@@ -44,7 +48,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -434,10 +437,6 @@ pub struct ServerConfig {
     pub drain_grace: Duration,
     /// TTL maintenance interval.
     pub tick_interval: Duration,
-    /// Child cwd/HOME; also the filesystem the volume-usage reporter stats.
-    pub workspace: PathBuf,
-    /// Declared workspace budget from the projection.
-    pub volume_capacity_kib: u64,
 }
 
 impl Default for ServerConfig {
@@ -447,8 +446,6 @@ impl Default for ServerConfig {
             tls_terminated_upstream: true,
             drain_grace: Duration::from_secs(3),
             tick_interval: Duration::from_secs(1),
-            workspace: PathBuf::from("/"),
-            volume_capacity_kib: 0,
         }
     }
 }
@@ -999,7 +996,6 @@ async fn admin_list(
             "takeovers_rate_limited": metrics.takeovers_rate_limited.load(Ordering::Relaxed),
             "ttl_expired": metrics.ttl_expired.load(Ordering::Relaxed),
             "self_exits": metrics.self_exits.load(Ordering::Relaxed),
-            "workspace_full": metrics.workspace_full.load(Ordering::Relaxed),
         },
         "abuse": state.abuse.snapshot(),
     }))
@@ -1126,7 +1122,6 @@ where
     S: std::future::Future<Output = ()> + Send + 'static,
 {
     let ticker = spawn_ticker(state.clone());
-    let stats = spawn_volume_reporter(state.clone());
 
     let drain_state = state.clone();
     let graceful = async move {
@@ -1159,7 +1154,6 @@ where
     .map_err(Error::Io);
 
     ticker.abort();
-    stats.abort();
     result
 }
 
@@ -1174,78 +1168,6 @@ fn spawn_ticker(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
             }
         }
     })
-}
-
-/// Report workspace usage for the disk-admission path.
-///
-/// **Reported only when the declared budget describes this filesystem.** If the
-/// workspace filesystem is larger than `volume_capacity_kib`, the projection is
-/// describing something other than this mount (a developer `$HOME`, a node disk),
-/// and feeding its usage to the manager would raise a false "volume full" and
-/// refuse every create. Skipping with a loud log is the honest behaviour.
-///
-/// Per-*session* disk usage is deliberately not reported: on a shared workspace
-/// volume the substrate provides no per-session attribution, and inventing one
-/// (a recursive walk charged to whichever session created a path) would be a
-/// number that looks authoritative and is not. The ADR already grades quotas as
-/// advisory where the substrate cannot enforce them.
-fn spawn_volume_reporter(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let budget = state.config.volume_capacity_kib;
-        match workspace_usage(&state.config.workspace) {
-            Some((capacity_kib, _)) if budget == 0 || capacity_kib > budget => {
-                tracing::warn!(
-                    workspace = %state.config.workspace.display(),
-                    filesystem_capacity_kib = capacity_kib,
-                    declared_volume_capacity_kib = budget,
-                    "workspace filesystem is larger than the declared budget; skipping \
-                     volume-usage reporting instead of reporting a false volume-full"
-                );
-                return;
-            }
-            None => {
-                tracing::warn!(
-                    workspace = %state.config.workspace.display(),
-                    "workspace usage is not observable on this platform; disk admission is \
-                     unenforced"
-                );
-                return;
-            }
-            Some(_) => {}
-        }
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            interval.tick().await;
-            if let Some((_, used_kib)) = workspace_usage(&state.config.workspace) {
-                state.manager.report_volume_usage(used_kib);
-            }
-        }
-    })
-}
-
-/// `(capacity_kib, used_kib)` for the filesystem holding `path`.
-#[cfg(unix)]
-fn workspace_usage(path: &FsPath) -> Option<(u64, u64)> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let raw = CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(raw.as_ptr(), &mut stat) } != 0 {
-        return None;
-    }
-    let frsize = stat.f_frsize as u64;
-    let blocks = stat.f_blocks as u64;
-    let available = stat.f_bavail as u64;
-    let capacity_kib = blocks.saturating_mul(frsize) / 1024;
-    let used_kib = blocks.saturating_sub(available).saturating_mul(frsize) / 1024;
-    Some((capacity_kib, used_kib))
-}
-
-#[cfg(not(unix))]
-fn workspace_usage(_path: &FsPath) -> Option<(u64, u64)> {
-    None
 }
 
 #[cfg(test)]

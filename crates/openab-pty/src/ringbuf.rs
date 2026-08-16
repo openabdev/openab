@@ -118,16 +118,8 @@ impl RingBuffer {
         self.written - self.buf.len() as u64
     }
 
-    pub fn len(&self) -> usize {
-        self.buf.len()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.capacity
     }
 
     /// Everything currently retained, oldest first.
@@ -177,15 +169,6 @@ impl RingBuffer {
     pub fn clear(&mut self) {
         self.dropped = self.dropped.saturating_add(self.buf.len() as u64);
         self.buf.clear();
-    }
-
-    /// Restart-in-place: a fresh process gets an empty scrollback and a stream
-    /// that starts at offset 0 again (old cursors are invalid anyway, because
-    /// the generation bumped).
-    pub fn reset(&mut self) {
-        self.buf.clear();
-        self.written = 0;
-        self.dropped = 0;
     }
 
     fn slice_from(&self, start: usize) -> Vec<u8> {
@@ -317,17 +300,6 @@ impl ByteQueue {
         self.buf.is_empty()
     }
 
-    pub fn total_dropped(&self) -> u64 {
-        self.dropped
-    }
-
-    pub fn capacity_bytes(&self) -> usize {
-        self.bounds.capacity_bytes
-    }
-
-    pub fn clear(&mut self) {
-        self.buf.clear();
-    }
 }
 
 #[cfg(test)]
@@ -442,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_keeps_cursor_reset_rewinds_it() {
+    fn clear_keeps_the_cursor() {
         let mut r = RingBuffer::new(64);
         r.write(b"abc");
         r.clear();
@@ -452,9 +424,6 @@ mod tests {
             "teardown clears bytes, not the cursor"
         );
         assert!(r.is_empty());
-
-        r.reset();
-        assert_eq!(r.total_written(), 0, "restart-in-place restarts the stream");
     }
 
     #[test]

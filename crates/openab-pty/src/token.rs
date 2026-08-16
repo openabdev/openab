@@ -134,30 +134,19 @@ impl TokenStore {
 
     /// Kill/restart/renew must call this before exposing a new generation. It
     /// removes the only retained hash, invalidating every old plaintext token.
-    pub fn revoke_session(&self, session: &SessionName, generation: Generation) {
+    ///
+    /// The generation is read from the stored entry rather than passed in: the
+    /// caller's value was only ever used to label the audit event, and the
+    /// generation being revoked is the one the entry carries.
+    pub fn revoke_session(&self, session: &SessionName) {
         let removed = self.entries.lock().remove(session);
         if let Some(stored) = removed {
             self.audit.record(
                 AuditEvent::new(AuditKind::TokenRevoked)
-                    .session(session, generation)
+                    .session(session, stored.generation)
                     .fingerprint(hash_fingerprint(&stored.hash)),
             );
         }
-    }
-
-    pub fn remove_expired(&self) {
-        let now = Instant::now();
-        self.entries.lock().retain(|session, stored| {
-            let keep = stored.expires_at > now;
-            if !keep {
-                self.audit.record(
-                    AuditEvent::new(AuditKind::TokenExpired)
-                        .session(session, stored.generation)
-                        .fingerprint(hash_fingerprint(&stored.hash)),
-                );
-            }
-            keep
-        });
     }
 }
 
@@ -260,7 +249,7 @@ mod tests {
         assert!(verifier
             .verify(&name, Generation(2), &mut wrong_generation, None)
             .is_err());
-        store.revoke_session(&name, Generation(2));
+        store.revoke_session(&name);
         let mut revoked = SecretBytes::new(token);
         assert!(verifier
             .verify(&name, Generation(1), &mut revoked, None)

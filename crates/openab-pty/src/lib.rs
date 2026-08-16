@@ -6,12 +6,17 @@
 //!
 //! Two invariants from the ADR shape this crate and must not be quietly relaxed:
 //!
-//! 1. **The admin plane is remote-only.** No admin socket exists inside the
-//!    container, which is what makes "admin operations are unreachable from a
-//!    managed session" true by construction rather than by a membership check.
-//! 2. **Teardown is best-effort in Tier 1** (the default) and must be labelled
-//!    as such wherever it is surfaced. Tier 2 (per-session cgroup) upgrades it
-//!    to a hard guarantee and is selected by startup detection.
+//! 1. **The admin plane is remote-only, and the credential is its whole
+//!    boundary.** No admin socket, UDS, or in-container CLI exists, so no code
+//!    path treats being *inside* the container as authorization. Being inside is
+//!    not the same as being unable to knock: a managed session shares this
+//!    container's network namespace and can connect to the one listener, where it
+//!    is refused for want of the credential — which never enters the container.
+//! 2. **Teardown is best-effort.** Tier 1 (process group + subreaper/pidfd) is
+//!    the only kill domain implemented, and that must be labelled wherever it is
+//!    surfaced. Tier 2 (per-session cgroup) is the ADR's demand-gated plan, is
+//!    not implemented here, and `kill_domain_tier = "tier2-required"` is refused
+//!    at startup rather than silently downgraded.
 
 pub mod admin_auth;
 pub mod audit;
@@ -27,7 +32,7 @@ pub mod token;
 use std::fmt;
 
 /// Validated session name. The ADR restricts names to `[a-z0-9-]{1,32}` so they
-/// are safe in paths, URLs, log lines, and cgroup directory names.
+/// are safe in paths, URLs, and log lines.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionName(String);
 

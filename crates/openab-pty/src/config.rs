@@ -3,8 +3,15 @@
 //! This crate never resolves cloud secrets. The projection is materialized outside
 //! the PTY trust boundary, and the validator rejects any evidence that a broker
 //! config, cloud reference, or unresolved `${secrets.*}` value leaked into it.
+//!
+//! The projection is deliberately **small**: only values the ADR names as
+//! operator-facing behaviour are knobs. Liveness, takeover, and teardown-grace
+//! values are constants in [`crate::session`] — nobody asked to configure them
+//! and no telemetry exists to tune them, so an unknown `[pty]` key is a startup
+//! error rather than a silently-ignored one.
 
 use crate::admin_auth::parse_verifier_hash;
+use crate::session::{MISSED_PINGS_BEFORE_DETACHED, PING_INTERVAL, TTL_WARNING_LEAD};
 use crate::Error;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -14,6 +21,8 @@ use toml::Value;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KillDomainRequirement {
     Tier1Allowed,
+    /// Retained so an operator who requires the hard guarantee is refused at
+    /// startup. Tier 2 is not implemented — see [`crate::killdomain`].
     Tier2Required,
 }
 
@@ -26,49 +35,11 @@ pub struct PtyConfig {
     pub max_sessions: usize,
     pub absolute_session_ttl: Duration,
     pub detached_idle_ttl: Duration,
-    pub ping_interval: Duration,
-    pub missed_pings_before_detached: u32,
-    pub ttl_warning_lead: Duration,
-    pub max_takeovers_per_window: u32,
-    pub takeover_window: Duration,
-    pub teardown_grace: Duration,
     pub scrollback_kib: usize,
     pub scrollback_replay: bool,
     /// Literal `sha256:<64 lowercase hex>`; retained as a verifier, never a credential.
     pub admin_credential_hash: String,
-    pub replay_queue_kib: usize,
-    pub outbound_backlog_kib: usize,
-    pub fixed_session_overhead_kib: usize,
-    pub runtime_baseline_kib: usize,
-    pub container_memory_request_kib: usize,
-    pub per_session_disk_kib: usize,
-    pub volume_capacity_kib: usize,
-    pub volume_overhead_kib: usize,
     pub kill_domain_requirement: KillDomainRequirement,
-}
-
-impl PtyConfig {
-    pub fn per_session_memory_kib(&self) -> Result<usize, Error> {
-        self.scrollback_kib
-            .checked_add(self.replay_queue_kib)
-            .and_then(|v| v.checked_add(self.outbound_backlog_kib))
-            .and_then(|v| v.checked_add(self.fixed_session_overhead_kib))
-            .ok_or_else(|| Error::Config("per-session memory budget overflows usize".into()))
-    }
-
-    pub fn required_memory_kib(&self) -> Result<usize, Error> {
-        self.max_sessions
-            .checked_mul(self.per_session_memory_kib()?)
-            .and_then(|v| v.checked_add(self.runtime_baseline_kib))
-            .ok_or_else(|| Error::Config("total memory admission formula overflows usize".into()))
-    }
-
-    pub fn required_disk_kib(&self) -> Result<usize, Error> {
-        self.max_sessions
-            .checked_mul(self.per_session_disk_kib)
-            .and_then(|v| v.checked_add(self.volume_overhead_kib))
-            .ok_or_else(|| Error::Config("total disk admission formula overflows usize".into()))
-    }
 }
 
 const PTY_KEYS: &[&str] = &[
@@ -79,23 +50,9 @@ const PTY_KEYS: &[&str] = &[
     "max_sessions",
     "absolute_session_ttl",
     "detached_idle_ttl",
-    "ping_interval",
-    "missed_pings_before_detached",
-    "ttl_warning_lead",
-    "max_takeovers_per_window",
-    "takeover_window",
-    "teardown_grace",
     "scrollback_kib",
     "scrollback_replay",
     "admin_credential_hash",
-    "replay_queue_kib",
-    "outbound_backlog_kib",
-    "fixed_session_overhead_kib",
-    "runtime_baseline_kib",
-    "container_memory_request_kib",
-    "per_session_disk_kib",
-    "volume_capacity_kib",
-    "volume_overhead_kib",
     "kill_domain_tier",
 ];
 
@@ -157,27 +114,9 @@ pub fn validate_projection(input: &str) -> Result<PtyConfig, Error> {
         max_sessions: usize_with_default(pty, "max_sessions", 4)?,
         absolute_session_ttl: duration_with_default(pty, "absolute_session_ttl", "12h")?,
         detached_idle_ttl: duration_with_default(pty, "detached_idle_ttl", "30m")?,
-        ping_interval: duration_with_default(pty, "ping_interval", "20s")?,
-        missed_pings_before_detached: u32_with_default(pty, "missed_pings_before_detached", 3)?,
-        ttl_warning_lead: duration_with_default(pty, "ttl_warning_lead", "30s")?,
-        max_takeovers_per_window: u32_with_default(pty, "max_takeovers_per_window", 3)?,
-        takeover_window: duration_with_default(pty, "takeover_window", "60s")?,
-        teardown_grace: duration_with_default(pty, "teardown_grace", "5s")?,
         scrollback_kib: usize_with_default(pty, "scrollback_kib", 1024)?,
         scrollback_replay: bool_with_default(pty, "scrollback_replay", false)?,
         admin_credential_hash: raw_hash,
-        replay_queue_kib: usize_with_default(pty, "replay_queue_kib", 256)?,
-        outbound_backlog_kib: usize_with_default(pty, "outbound_backlog_kib", 256)?,
-        fixed_session_overhead_kib: usize_with_default(pty, "fixed_session_overhead_kib", 512)?,
-        runtime_baseline_kib: usize_with_default(pty, "runtime_baseline_kib", 16 * 1024)?,
-        container_memory_request_kib: usize_with_default(
-            pty,
-            "container_memory_request_kib",
-            32 * 1024,
-        )?,
-        per_session_disk_kib: usize_with_default(pty, "per_session_disk_kib", 1024 * 1024)?,
-        volume_capacity_kib: usize_with_default(pty, "volume_capacity_kib", 5 * 1024 * 1024)?,
-        volume_overhead_kib: usize_with_default(pty, "volume_overhead_kib", 1024 * 1024)?,
         kill_domain_requirement: parse_kill_domain(string_with_default(
             pty,
             "kill_domain_tier",
@@ -326,21 +265,6 @@ fn duration_with_default(
     parse_duration(key, string_with_default(table, key, default)?)
 }
 
-fn u32_with_default(
-    table: &toml::map::Map<String, Value>,
-    key: &str,
-    default: u32,
-) -> Result<u32, Error> {
-    match table.get(key).and_then(Value::as_integer) {
-        None if !table.contains_key(key) => Ok(default),
-        Some(value) if value >= 0 => u32::try_from(value)
-            .map_err(|_| Error::Config(format!("[pty].{key} is too large for a u32"))),
-        _ => Err(Error::Config(format!(
-            "[pty].{key} must be a non-negative integer"
-        ))),
-    }
-}
-
 fn parse_duration(key: &str, value: &str) -> Result<Duration, Error> {
     let split = value
         .find(|c: char| !c.is_ascii_digit())
@@ -373,43 +297,31 @@ fn parse_kill_domain(value: &str) -> Result<KillDomainRequirement, Error> {
     }
 }
 
+/// Cross-field checks between the two configurable TTLs and the fixed liveness
+/// constants. A projection whose idle TTL fires before a half-open socket can be
+/// detected, or before the client-visible warning can be sent, is a startup
+/// error rather than a liveness model nobody reviewed.
 fn validate_lifecycle(config: &PtyConfig) -> Result<(), Error> {
-    if !(Duration::from_secs(15)..=Duration::from_secs(30)).contains(&config.ping_interval) {
-        return Err(Error::Config(
-            "ping_interval must be between 15s and 30s".into(),
-        ));
-    }
-    if !(2..=3).contains(&config.missed_pings_before_detached) {
-        return Err(Error::Config(
-            "missed_pings_before_detached must be 2 or 3".into(),
-        ));
-    }
-    let detach_after = config
-        .ping_interval
-        .checked_mul(config.missed_pings_before_detached)
-        .ok_or_else(|| {
-            Error::Config(
-                "ping_interval multiplied by missed_pings_before_detached overflows".into(),
-            )
-        })?;
+    let detach_after = PING_INTERVAL
+        .checked_mul(MISSED_PINGS_BEFORE_DETACHED)
+        .ok_or_else(|| Error::Config("liveness constants overflow".into()))?;
     if detach_after >= config.detached_idle_ttl {
         return Err(Error::Config(
-            "ping_interval × missed_pings_before_detached must be shorter than detached_idle_ttl so half-open sockets detach before idle teardown".into(),
+            "detached_idle_ttl must be longer than the fixed ping interval × missed-ping budget \
+             so half-open sockets detach before idle teardown"
+                .into(),
         ));
     }
-    if config.ttl_warning_lead >= config.detached_idle_ttl {
+    if TTL_WARNING_LEAD >= config.detached_idle_ttl {
         return Err(Error::Config(
-            "ttl_warning_lead must be shorter than detached_idle_ttl so expiry warning precedes teardown".into(),
+            "detached_idle_ttl must be longer than the fixed TTL warning lead so the expiry \
+             warning precedes teardown"
+                .into(),
         ));
     }
     if config.absolute_session_ttl < config.detached_idle_ttl {
         return Err(Error::Config(
             "absolute_session_ttl must not be shorter than detached_idle_ttl".into(),
-        ));
-    }
-    if config.max_takeovers_per_window == 0 {
-        return Err(Error::Config(
-            "max_takeovers_per_window must be greater than zero".into(),
         ));
     }
     Ok(())
@@ -423,20 +335,6 @@ fn validate_admission(config: &PtyConfig) -> Result<(), Error> {
         return Err(Error::Config(
             "command must be a non-empty absolute local path".into(),
         ));
-    }
-    let memory = config.required_memory_kib()?;
-    if memory > config.container_memory_request_kib {
-        return Err(Error::Config(format!(
-            "memory admission failed: {memory} KiB required exceeds container_memory_request_kib {} KiB",
-            config.container_memory_request_kib
-        )));
-    }
-    let disk = config.required_disk_kib()?;
-    if disk > config.volume_capacity_kib {
-        return Err(Error::Config(format!(
-            "disk admission failed: {disk} KiB required exceeds volume_capacity_kib {} KiB",
-            config.volume_capacity_kib
-        )));
     }
     Ok(())
 }
@@ -464,110 +362,90 @@ admin_credential_hash = "{HASH}"
     }
 
     #[test]
-    fn lifecycle_knobs_default_to_the_adr_values_when_absent() {
+    fn accepts_materialized_projection() {
         let config = validate_projection(&valid()).unwrap();
+        assert_eq!(config.max_sessions, 4);
         assert_eq!(config.detached_idle_ttl, Duration::from_secs(30 * 60));
-        assert_eq!(config.ping_interval, Duration::from_secs(20));
-        assert_eq!(config.missed_pings_before_detached, 3);
-        assert_eq!(config.ttl_warning_lead, Duration::from_secs(30));
-        assert_eq!(config.max_takeovers_per_window, 3);
-        assert_eq!(config.takeover_window, Duration::from_secs(60));
-        assert_eq!(config.teardown_grace, Duration::from_secs(5));
-    }
-
-    #[test]
-    fn lifecycle_knobs_parse_and_round_trip_into_session_policy() {
-        let config = validate_projection(&format!(
-            concat!(
-                "{}detached_idle_ttl = \"40m\"\n",
-                "ping_interval = \"15s\"\n",
-                "missed_pings_before_detached = 2\n",
-                "ttl_warning_lead = \"20s\"\n",
-                "max_takeovers_per_window = 7\n",
-                "takeover_window = \"2m\"\n",
-                "teardown_grace = \"9s\"\n",
-            ),
-            valid()
-        ))
-        .unwrap();
-        let policy = crate::session::SessionPolicy::from_config(&config);
-        assert_eq!(policy.absolute_ttl, config.absolute_session_ttl);
-        assert_eq!(policy.detached_idle_ttl, config.detached_idle_ttl);
-        assert_eq!(policy.ping_interval, config.ping_interval);
-        assert_eq!(
-            policy.missed_pings_before_detached,
-            config.missed_pings_before_detached
-        );
-        assert_eq!(policy.ttl_warning_lead, config.ttl_warning_lead);
-        assert_eq!(
-            policy.max_takeovers_per_window,
-            config.max_takeovers_per_window
-        );
-        assert_eq!(policy.takeover_window, config.takeover_window);
-        assert_eq!(policy.teardown_grace, config.teardown_grace);
-    }
-
-    #[test]
-    fn lifecycle_knobs_reject_out_of_range_values() {
-        for (key, value, constraint) in [
-            ("detached_idle_ttl", "\"0s\"", "greater than zero"),
-            ("ping_interval", "\"14s\"", "between 15s and 30s"),
-            ("missed_pings_before_detached", "1", "must be 2 or 3"),
-            (
-                "ttl_warning_lead",
-                "\"30m\"",
-                "shorter than detached_idle_ttl",
-            ),
-            ("max_takeovers_per_window", "0", "greater than zero"),
-            ("takeover_window", "\"0s\"", "greater than zero"),
-            ("teardown_grace", "\"0s\"", "greater than zero"),
-        ] {
-            let error = validate_projection(&format!("{}{key} = {value}\n", valid()))
-                .expect_err("invalid lifecycle knob must fail closed");
-            let message = error.to_string();
-            assert!(message.contains(key), "{message}");
-            assert!(message.contains(constraint), "{message}");
-        }
-    }
-
-    #[test]
-    fn lifecycle_cross_field_constraints_fail_closed() {
-        for (key, value, constraint) in [
-            (
-                "absolute_session_ttl",
-                "\"29m\"",
-                "must not be shorter than detached_idle_ttl",
-            ),
-            (
-                "detached_idle_ttl",
-                "\"30s\"",
-                "missed_pings_before_detached must be shorter than detached_idle_ttl",
-            ),
-        ] {
-            let projection = if key == "absolute_session_ttl" {
-                valid().replace(
-                    "absolute_session_ttl = \"12h\"",
-                    &format!("{key} = {value}"),
-                )
-            } else {
-                format!("{}{key} = {value}\n", valid())
-            };
-            let error = validate_projection(&projection)
-                .expect_err("incompatible lifecycle values must fail closed");
-            let message = error.to_string();
-            assert!(message.contains(key), "{message}");
-            assert!(message.contains(constraint), "{message}");
-        }
-    }
-
-    #[test]
-    fn accepts_materialized_projection_and_applies_admission_formula() {
-        let config = validate_projection(&valid()).unwrap();
-        assert_eq!(config.required_memory_kib().unwrap(), 24 * 1024);
         assert_eq!(
             config.kill_domain_requirement,
             KillDomainRequirement::Tier1Allowed
         );
+    }
+
+    #[test]
+    fn the_two_configurable_ttls_round_trip_into_session_policy() {
+        let config = validate_projection(&format!("{}detached_idle_ttl = \"40m\"\n", valid()))
+            .expect("both TTLs are operator-facing");
+        let policy = crate::session::SessionPolicy::from_config(&config);
+        assert_eq!(policy.absolute_ttl, config.absolute_session_ttl);
+        assert_eq!(policy.detached_idle_ttl, Duration::from_secs(40 * 60));
+        // Everything else is a constant, not a knob.
+        assert_eq!(policy.ping_interval, PING_INTERVAL);
+        assert_eq!(
+            policy.missed_pings_before_detached,
+            MISSED_PINGS_BEFORE_DETACHED
+        );
+        assert_eq!(policy.ttl_warning_lead, TTL_WARNING_LEAD);
+        assert_eq!(
+            policy.max_takeovers_per_window,
+            crate::session::MAX_TAKEOVERS_PER_WINDOW
+        );
+        assert_eq!(policy.takeover_window, crate::session::TAKEOVER_WINDOW);
+        assert_eq!(policy.teardown_grace, crate::session::TEARDOWN_GRACE);
+    }
+
+    #[test]
+    fn withdrawn_knobs_are_rejected_as_unknown_keys() {
+        // The liveness/admission values are constants now. An operator who still
+        // sets one must be told, not silently ignored.
+        for key in [
+            "ping_interval = \"15s\"",
+            "missed_pings_before_detached = 2",
+            "ttl_warning_lead = \"20s\"",
+            "max_takeovers_per_window = 7",
+            "takeover_window = \"2m\"",
+            "teardown_grace = \"9s\"",
+            "replay_queue_kib = 256",
+            "outbound_backlog_kib = 256",
+            "fixed_session_overhead_kib = 512",
+            "runtime_baseline_kib = 16384",
+            "container_memory_request_kib = 32768",
+            "per_session_disk_kib = 1024",
+            "volume_capacity_kib = 1024",
+            "volume_overhead_kib = 1024",
+        ] {
+            let error = validate_projection(&format!("{}{key}\n", valid()))
+                .expect_err("a withdrawn knob must fail closed");
+            assert!(
+                error.to_string().contains("unknown [pty] key"),
+                "{key}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn ttl_values_are_rejected_when_out_of_range_or_incompatible() {
+        for (projection, constraint) in [
+            (
+                format!("{}detached_idle_ttl = \"0s\"\n", valid()),
+                "greater than zero",
+            ),
+            (
+                format!("{}detached_idle_ttl = \"30s\"\n", valid()),
+                "half-open sockets detach before idle teardown",
+            ),
+            (
+                valid().replace(
+                    "absolute_session_ttl = \"12h\"",
+                    "absolute_session_ttl = \"29m\"",
+                ),
+                "must not be shorter than detached_idle_ttl",
+            ),
+        ] {
+            let error =
+                validate_projection(&projection).expect_err("incompatible TTLs must fail closed");
+            assert!(error.to_string().contains(constraint), "{error}");
+        }
     }
 
     #[test]
@@ -609,15 +487,8 @@ admin_credential_hash = "{HASH}"
     }
 
     #[test]
-    fn rejects_oversubscribed_memory_and_disk() {
-        let memory = format!("{}container_memory_request_kib = 1\n", valid());
-        assert!(validate_projection(&memory).is_err());
-        let disk = format!("{}volume_capacity_kib = 1\n", valid());
-        assert!(validate_projection(&disk).is_err());
-    }
-
-    #[test]
-    fn accepts_explicit_tier_two_requirement() {
+    fn accepts_explicit_tier_two_requirement_so_startup_can_refuse_it() {
+        // Parsing succeeds; `killdomain::resolve_tier` is what refuses, loudly.
         let config = validate_projection(&format!(
             "{}kill_domain_tier = \"tier2-required\"\n",
             valid()
@@ -627,5 +498,6 @@ admin_credential_hash = "{HASH}"
             config.kill_domain_requirement,
             KillDomainRequirement::Tier2Required
         );
+        assert!(crate::killdomain::resolve_tier(config.kill_domain_requirement).is_err());
     }
 }

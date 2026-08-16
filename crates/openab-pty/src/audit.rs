@@ -33,7 +33,6 @@ pub enum AuditKind {
     AdminAuthFailure,
     TakeoverAnomaly,
     Tier1SurvivorDetected,
-    TokenExpired,
     TokenRevoked,
 }
 

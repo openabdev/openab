@@ -1,9 +1,13 @@
 //! Remote-only bootstrap-admin authentication.
 //!
-//! There is intentionally no UDS, loopback listener, peer-credential check, or
-//! in-container CLI here. Admin operations are reached only through the remote
-//! authenticated listener, so a managed session has no local admin endpoint to
-//! discover or connect to.
+//! There is intentionally no UDS, no loopback-only admin listener, no
+//! peer-credential check, and no in-container CLI: admin operations are reached
+//! only through the one authenticated listener, and **authentication is the whole
+//! boundary**. A managed session shares this container's network namespace, so it
+//! can open a socket to that listener like anything else on the network; what it
+//! cannot do is present the credential, which exists only on the operator's side
+//! and never enters the container in plaintext. Locality authorizes nothing here,
+//! in either direction.
 
 use crate::audit::{hash_fingerprint, AuditEvent, AuditKind, AuditLogger};
 use crate::containment::SecretBytes;
@@ -118,6 +122,16 @@ impl AdminAuthenticator {
     /// Verify a remote request credential. The owned buffer is always zeroized
     /// before return. Callers should reject a body larger than the endpoint cap
     /// before constructing this buffer; this second bound is defense in depth.
+    ///
+    /// **The throttle applies to failures only, and a correct credential is
+    /// always accepted.** The earlier order — consult the throttle first, and
+    /// count a throttled attempt as another failure — was a lockout: the backoff
+    /// is global (there is one credential, so there is one bucket), so anything
+    /// able to reach the listener could hold the operator out of their own admin
+    /// plane indefinitely by failing on purpose once per window, including a
+    /// process inside a managed session, which shares the network namespace.
+    /// Throttling a wrong credential is what bounds guessing; refusing the right
+    /// one buys nothing and costs the recovery path.
     pub fn verify(
         &self,
         presented: &mut SecretBytes,
@@ -129,24 +143,12 @@ impl AdminAuthenticator {
             return Err(AdminAuthFailure::TooLarge);
         }
 
-        let now = Instant::now();
-        // Copy the value out and release the guard on this line. Holding it into
-        // the body would deadlock: an `if let` scrutinee temporary lives for the
-        // whole statement in edition 2021, and `record_failure` re-locks this
-        // same non-reentrant mutex.
-        let blocked_until = self.failures.lock().blocked_until;
-        if let Some(until) = blocked_until {
-            if until > now {
-                presented.zeroize();
-                let retry_after = until.saturating_duration_since(now);
-                self.record_failure(source, "throttled");
-                return Err(AdminAuthFailure::Throttled { retry_after });
-            }
-        }
-
+        // Bounded work per attempt, and deliberately *not* a counted failure:
+        // escalating the backoff on concurrency pressure would let a burst of
+        // requests throttle the operator out.
         let Ok(_permit) = self.in_flight.clone().try_acquire_owned() else {
             presented.zeroize();
-            self.record_failure(source, "verification_concurrency_cap");
+            self.audit_failure(source, "verification_concurrency_cap".to_string());
             return Err(AdminAuthFailure::Busy);
         };
 
@@ -156,11 +158,29 @@ impl AdminAuthenticator {
             let mut failures = self.failures.lock();
             failures.consecutive_failures = 0;
             failures.blocked_until = None;
-            Ok(())
-        } else {
-            self.record_failure(source, "invalid_credential");
-            Err(AdminAuthFailure::Invalid)
+            return Ok(());
         }
+
+        // Wrong credential. Copy the value out and release the guard on this
+        // line: holding it into the body would deadlock, because an `if let`
+        // scrutinee temporary lives for the whole statement in edition 2021 and
+        // `record_failure` re-locks this same non-reentrant mutex.
+        let now = Instant::now();
+        let blocked_until = self.failures.lock().blocked_until;
+        if let Some(until) = blocked_until {
+            if until > now {
+                // Already throttled: refuse without extending the window, so the
+                // backoff always expires and cannot be held open by traffic.
+                let retry_after = until.saturating_duration_since(now);
+                self.audit_failure(
+                    source,
+                    format!("throttled; retry_after_ms={}", retry_after.as_millis()),
+                );
+                return Err(AdminAuthFailure::Throttled { retry_after });
+            }
+        }
+        self.record_failure(source, "invalid_credential");
+        Err(AdminAuthFailure::Invalid)
     }
 
     fn record_failure(&self, source: Option<&str>, detail: &'static str) {
@@ -177,11 +197,18 @@ impl AdminAuthenticator {
             failures.blocked_until = Some(Instant::now() + delay);
             delay
         };
+        self.audit_failure(
+            source,
+            format!("{detail}; retry_after_ms={}", delay.as_millis()),
+        );
+    }
+
+    fn audit_failure(&self, source: Option<&str>, detail: String) {
         self.audit.record(
             AuditEvent::new(AuditKind::AdminAuthFailure)
                 .fingerprint(self.fingerprint.clone())
                 .source(source.unwrap_or("unknown"))
-                .detail(format!("{detail}; retry_after_ms={}", delay.as_millis())),
+                .detail(detail),
         );
     }
 }
@@ -245,12 +272,43 @@ mod tests {
         let mut bad = SecretBytes::from_slice(b"synthetic-invalid-admin-credential");
         assert_eq!(auth.verify(&mut bad, None), Err(AdminAuthFailure::Invalid));
         assert!(bad.as_bytes().iter().all(|byte| *byte == 0));
-        let mut next = SecretBytes::from_slice(generated.plaintext.as_bytes());
+        // A second wrong attempt inside the window is refused as throttled.
+        let mut bad_again = SecretBytes::from_slice(b"synthetic-invalid-admin-credential");
         assert!(matches!(
-            auth.verify(&mut next, None),
+            auth.verify(&mut bad_again, None),
             Err(AdminAuthFailure::Throttled { .. })
         ));
-        assert!(next.as_bytes().iter().all(|byte| *byte == 0));
+        assert!(bad_again.as_bytes().iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn the_throttle_can_never_lock_the_real_credential_out() {
+        // The admin backoff is global — one credential, one bucket — so if it
+        // could refuse a correct credential, anything able to reach the listener
+        // (a process inside a managed session included) would be able to hold the
+        // operator out of their own admin plane by failing on purpose.
+        let generated = AdminAuthenticator::generate();
+        let auth = AdminAuthenticator::with_limits(
+            &generated.verifier,
+            4,
+            Duration::from_secs(30),
+            AuditLogger,
+        )
+        .unwrap();
+        for _ in 0..20 {
+            let mut bad = SecretBytes::from_slice(b"synthetic-invalid-admin-credential");
+            assert!(auth.verify(&mut bad, Some("attacker")).is_err());
+        }
+        let mut good = SecretBytes::from_slice(generated.plaintext.as_bytes());
+        auth.verify(&mut good, Some("operator"))
+            .expect("the real credential must be accepted while the throttle is armed");
+        assert!(good.as_bytes().iter().all(|byte| *byte == 0));
+        // Success clears the bucket, so the next wrong guess starts over.
+        let mut bad = SecretBytes::from_slice(b"synthetic-invalid-admin-credential");
+        assert_eq!(
+            auth.verify(&mut bad, Some("attacker")),
+            Err(AdminAuthFailure::Invalid)
+        );
     }
 
     #[test]
