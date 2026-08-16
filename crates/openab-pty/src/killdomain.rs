@@ -941,7 +941,8 @@ impl SessionKillDomain {
         let started = Instant::now();
         let survivors = match self.tier {
             KillDomainTier::Tier2GuaranteedCgroup => {
-                self.terminate_tier2(grace.min(TIER2_CONVERGENCE_BUDGET)).await
+                self.terminate_tier2(grace.min(TIER2_CONVERGENCE_BUDGET))
+                    .await
             }
             KillDomainTier::Tier1BestEffortProcessGroup => self.terminate_tier1(grace).await,
         };
@@ -1259,7 +1260,9 @@ mod linux_probe {
             }
         }
 
-        let cgroup = ProbeCgroup { dir: dir.to_path_buf() };
+        let cgroup = ProbeCgroup {
+            dir: dir.to_path_buf(),
+        };
         let populated = wait_for(Duration::from_millis(500), || {
             cgroup.members().contains(&pid)
         });
@@ -1277,9 +1280,7 @@ mod linux_probe {
                 "cgroup.kill write failed: {error}"
             )));
         }
-        let emptied = wait_for(Duration::from_millis(500), || {
-            cgroup.members().is_empty()
-        });
+        let emptied = wait_for(Duration::from_millis(500), || cgroup.members().is_empty());
         reap(pid);
         if emptied {
             Ok(())
@@ -1455,9 +1456,7 @@ mod tests {
         session_domain.set_leader(100).unwrap();
         session_domain.track(101).unwrap();
 
-        let outcome = session_domain
-            .terminate(Duration::from_millis(60))
-            .await;
+        let outcome = session_domain.terminate(Duration::from_millis(60)).await;
 
         assert!(outcome.converged(), "SIGKILL must finish the job");
         assert!(
@@ -1575,8 +1574,12 @@ mod tests {
             AuditLogger,
             FakeSignals::new(vec![]),
         );
-        let mut a = global.open_session(&SessionName::parse("a").unwrap(), Generation(1)).unwrap();
-        let mut b = global.open_session(&SessionName::parse("b").unwrap(), Generation(1)).unwrap();
+        let mut a = global
+            .open_session(&SessionName::parse("a").unwrap(), Generation(1))
+            .unwrap();
+        let mut b = global
+            .open_session(&SessionName::parse("b").unwrap(), Generation(1))
+            .unwrap();
         a.track(10).unwrap();
         assert!(matches!(b.track(11), Err(Error::CapacityExceeded { .. })));
 
@@ -1635,7 +1638,11 @@ mod tests {
         let name = session();
         let domain = tier2_domain(fs.root.clone());
         let session_domain = domain.open_session(&name, Generation(1)).unwrap();
-        std::fs::write(fs.session_dir(&name).join("cgroup.procs"), "11\n\n12\nbogus\n0\n").unwrap();
+        std::fs::write(
+            fs.session_dir(&name).join("cgroup.procs"),
+            "11\n\n12\nbogus\n0\n",
+        )
+        .unwrap();
         assert_eq!(session_domain.members().unwrap(), vec![11, 12]);
     }
 
@@ -1742,10 +1749,7 @@ mod tests {
                 SpawnCapability::PreExecCgroupJoin,
             )
             .unwrap();
-            assert_eq!(
-                selection.tier,
-                KillDomainTier::Tier1BestEffortProcessGroup
-            );
+            assert_eq!(selection.tier, KillDomainTier::Tier1BestEffortProcessGroup);
             assert_eq!(selection.tier2_unavailable, Some(reason.clone()));
             let described = selection.describe();
             assert!(described.contains("BEST-EFFORT"), "{described}");
@@ -1795,8 +1799,12 @@ mod tests {
     #[test]
     fn pid_formatting_for_the_pre_exec_hook_is_allocation_free_and_exact() {
         let mut buf = [0u8; 24];
-        for (pid, expected) in [(1, "1"), (7, "7"), (65535, "65535"), (2_147_483_647, "2147483647")]
-        {
+        for (pid, expected) in [
+            (1, "1"),
+            (7, "7"),
+            (65535, "65535"),
+            (2_147_483_647, "2147483647"),
+        ] {
             let len = format_pid_decimal(pid, &mut buf);
             assert_eq!(&buf[..len], expected.as_bytes());
         }

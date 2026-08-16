@@ -123,7 +123,8 @@ impl SessionPolicy {
     /// Reject values outside the ADR's stated bands rather than silently
     /// serving a liveness model nobody reviewed.
     pub fn validate(&self) -> Result<(), Error> {
-        if self.ping_interval < Duration::from_secs(15) || self.ping_interval > Duration::from_secs(30)
+        if self.ping_interval < Duration::from_secs(15)
+            || self.ping_interval > Duration::from_secs(30)
         {
             return Err(Error::Config(
                 "ping_interval must be between 15s and 30s".into(),
@@ -232,8 +233,11 @@ pub struct SpawnedPty {
 /// Spawning seam. Implemented for real by [`PortablePtySpawner`]; tests use a
 /// hand-written fake so no unit test creates a process.
 pub trait PtySpawner: Send + Sync {
-    fn spawn(&self, request: SpawnRequest, containment: &mut SessionKillDomain)
-        -> Result<SpawnedPty, Error>;
+    fn spawn(
+        &self,
+        request: SpawnRequest,
+        containment: &mut SessionKillDomain,
+    ) -> Result<SpawnedPty, Error>;
     /// What the spawner can do at fork time, which decides whether Tier 2 is
     /// selectable at all.
     fn capability(&self) -> crate::killdomain::SpawnCapability;
@@ -982,8 +986,12 @@ impl SessionManager {
             Some(session) => {
                 let generation = session.generation();
                 if session.is_alive() {
-                    self.teardown(&session, TerminationClass::UserKill, close_code::SESSION_ENDED)
-                        .await;
+                    self.teardown(
+                        &session,
+                        TerminationClass::UserKill,
+                        close_code::SESSION_ENDED,
+                    )
+                    .await;
                 }
                 self.forget(name);
                 Generation(generation.0 + 1)
@@ -1116,7 +1124,7 @@ impl SessionManager {
                     // Distinct from NotFound: the caller offers restart-in-place.
                     Some(_) => Error::SessionDead(name.clone()),
                     None => Error::NotFound(name.clone()),
-                })
+                });
             }
         };
         if !session.is_alive() {
@@ -1237,7 +1245,9 @@ impl SessionManager {
 
     /// Incremental reconnect within the retained window.
     pub fn replay_since(&self, name: &SessionName, since: u64) -> Result<Replay, Error> {
-        let session = self.get(name).ok_or_else(|| Error::NotFound(name.clone()))?;
+        let session = self
+            .get(name)
+            .ok_or_else(|| Error::NotFound(name.clone()))?;
         // Copy the replay out and drop the guard before returning: a guard in a
         // tail expression outlives the local it borrows from.
         let replay = session.io.buffer.lock().read_since(since);
@@ -1249,7 +1259,9 @@ impl SessionManager {
     /// with a renew-distinct close code so the client can tell renewal from a
     /// takeover.
     pub fn renew(&self, name: &SessionName) -> Result<SessionCredential, Error> {
-        let session = self.get(name).ok_or_else(|| Error::NotFound(name.clone()))?;
+        let session = self
+            .get(name)
+            .ok_or_else(|| Error::NotFound(name.clone()))?;
         if !session.is_alive() {
             return Err(Error::SessionDead(name.clone()));
         }
@@ -1271,9 +1283,8 @@ impl SessionManager {
             previous.close(close_code::RENEWED);
         }
         let token = self.tokens.mint_for_session(name.clone(), generation)?;
-        self.audit.record(
-            AuditEvent::new(AuditKind::SessionRenew).session(name, generation),
-        );
+        self.audit
+            .record(AuditEvent::new(AuditKind::SessionRenew).session(name, generation));
         Ok(SessionCredential {
             session: name.clone(),
             generation,
@@ -1283,9 +1294,15 @@ impl SessionManager {
 
     /// Remote-admin `kill`.
     pub async fn kill(&self, name: &SessionName) -> Result<TeardownReport, Error> {
-        let session = self.get(name).ok_or_else(|| Error::NotFound(name.clone()))?;
+        let session = self
+            .get(name)
+            .ok_or_else(|| Error::NotFound(name.clone()))?;
         let report = self
-            .teardown(&session, TerminationClass::UserKill, close_code::TTL_EXPIRED)
+            .teardown(
+                &session,
+                TerminationClass::UserKill,
+                close_code::TTL_EXPIRED,
+            )
             .await;
         self.forget(name);
         self.remember_dead(name, session.generation(), TerminationClass::UserKill);
@@ -1555,8 +1572,7 @@ impl SessionManager {
     }
 
     fn last_activity(&self, session: &Arc<Session>) -> Instant {
-        self.epoch
-            + Duration::from_millis(session.io.last_activity_ms.load(Ordering::Relaxed))
+        self.epoch + Duration::from_millis(session.io.last_activity_ms.load(Ordering::Relaxed))
     }
 
     /// Called by the reader pump for each PTY chunk: retain it, then hand it to
@@ -1574,15 +1590,26 @@ impl SessionManager {
 }
 
 enum TtlDecision {
-    Warn { absolute: bool, seconds_remaining: u64 },
-    Expire { absolute: bool },
+    Warn {
+        absolute: bool,
+        seconds_remaining: u64,
+    },
+    Expire {
+        absolute: bool,
+    },
 }
 
 /// What a [`SessionManager::tick`] did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TtlAction {
-    Warned { session: SessionName, absolute: bool },
-    Expired { session: SessionName, absolute: bool },
+    Warned {
+        session: SessionName,
+        absolute: bool,
+    },
+    Expired {
+        session: SessionName,
+        absolute: bool,
+    },
 }
 
 /// Writer thread: client bytes → PTY master.
@@ -1902,7 +1929,11 @@ mod tests {
 
     #[test]
     fn child_env_supplies_term_and_home_when_absent() {
-        let env = child_env([("PATH".to_string(), "/bin".to_string())], "/workspace", None);
+        let env = child_env(
+            [("PATH".to_string(), "/bin".to_string())],
+            "/workspace",
+            None,
+        );
         assert!(env.contains(&("TERM".to_string(), DEFAULT_TERM.to_string())));
         assert!(env.contains(&("HOME".to_string(), "/workspace".to_string())));
     }
@@ -1911,7 +1942,11 @@ mod tests {
 
     #[tokio::test]
     async fn create_enforces_max_sessions_and_rejects_duplicates() {
-        let manager = manager_with(FakeSpawner::new(), "max_sessions = 1\n", SessionPolicy::default());
+        let manager = manager_with(
+            FakeSpawner::new(),
+            "max_sessions = 1\n",
+            SessionPolicy::default(),
+        );
         manager.create(name("one"), WindowSize::default()).unwrap();
         assert!(matches!(
             manager.create(name("one"), WindowSize::default()),
@@ -1921,7 +1956,10 @@ mod tests {
             manager.create(name("two"), WindowSize::default()),
             Err(Error::CapacityExceeded { limit: 1 })
         ));
-        assert_eq!(manager.metrics().admission_rejected.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            manager.metrics().admission_rejected.load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]
@@ -1960,10 +1998,20 @@ mod tests {
         let manager = manager_with(FakeSpawner::new(), "", SessionPolicy::default());
         let created = manager.create(name("gen"), WindowSize::default()).unwrap();
         assert!(manager
-            .attach(&name("gen"), Generation(created.generation.0 + 1), WindowSize::default(), None)
+            .attach(
+                &name("gen"),
+                Generation(created.generation.0 + 1),
+                WindowSize::default(),
+                None
+            )
             .is_err());
         assert!(manager
-            .attach(&name("gen"), created.generation, WindowSize::default(), None)
+            .attach(
+                &name("gen"),
+                created.generation,
+                WindowSize::default(),
+                None
+            )
             .is_ok());
     }
 
@@ -1972,10 +2020,20 @@ mod tests {
         let manager = manager_with(FakeSpawner::new(), "", SessionPolicy::default());
         let created = manager.create(name("cas"), WindowSize::default()).unwrap();
         let first = manager
-            .attach(&name("cas"), created.generation, WindowSize::default(), Some("a"))
+            .attach(
+                &name("cas"),
+                created.generation,
+                WindowSize::default(),
+                Some("a"),
+            )
             .unwrap();
         let second = manager
-            .attach(&name("cas"), created.generation, WindowSize::default(), Some("b"))
+            .attach(
+                &name("cas"),
+                created.generation,
+                WindowSize::default(),
+                Some("b"),
+            )
             .unwrap();
 
         // The replaced connection's write path is dead before its socket closes.
@@ -1997,18 +2055,29 @@ mod tests {
             ..SessionPolicy::default()
         };
         let manager = manager_with(FakeSpawner::new(), "", policy);
-        let created = manager.create(name("abuse"), WindowSize::default()).unwrap();
+        let created = manager
+            .create(name("abuse"), WindowSize::default())
+            .unwrap();
         let session = name("abuse");
         // First attach is not a preempt; then two allowed takeovers.
-        manager.attach(&session, created.generation, WindowSize::default(), None).unwrap();
-        manager.attach(&session, created.generation, WindowSize::default(), None).unwrap();
-        manager.attach(&session, created.generation, WindowSize::default(), None).unwrap();
+        manager
+            .attach(&session, created.generation, WindowSize::default(), None)
+            .unwrap();
+        manager
+            .attach(&session, created.generation, WindowSize::default(), None)
+            .unwrap();
+        manager
+            .attach(&session, created.generation, WindowSize::default(), None)
+            .unwrap();
         assert!(matches!(
             manager.attach(&session, created.generation, WindowSize::default(), None),
             Err(Error::CapacityExceeded { .. })
         ));
         assert_eq!(
-            manager.metrics().takeovers_rate_limited.load(Ordering::Relaxed),
+            manager
+                .metrics()
+                .takeovers_rate_limited
+                .load(Ordering::Relaxed),
             1
         );
     }
@@ -2022,10 +2091,16 @@ mod tests {
             ..SessionPolicy::default()
         };
         let manager = manager_with(FakeSpawner::new(), "", policy);
-        let created = manager.create(name("recover"), WindowSize::default()).unwrap();
+        let created = manager
+            .create(name("recover"), WindowSize::default())
+            .unwrap();
         let session = name("recover");
-        manager.attach(&session, created.generation, WindowSize::default(), None).unwrap();
-        manager.attach(&session, created.generation, WindowSize::default(), None).unwrap();
+        manager
+            .attach(&session, created.generation, WindowSize::default(), None)
+            .unwrap();
+        manager
+            .attach(&session, created.generation, WindowSize::default(), None)
+            .unwrap();
         assert!(manager
             .attach(&session, created.generation, WindowSize::default(), None)
             .is_err());
@@ -2043,10 +2118,17 @@ mod tests {
     #[tokio::test]
     async fn renew_evicts_with_a_renew_distinct_code_and_invalidates_old_tokens() {
         let manager = manager_with(FakeSpawner::new(), "", SessionPolicy::default());
-        let created = manager.create(name("renew"), WindowSize::default()).unwrap();
+        let created = manager
+            .create(name("renew"), WindowSize::default())
+            .unwrap();
         let old_token = created.token.plaintext.as_bytes().to_vec();
         let attached = manager
-            .attach(&name("renew"), created.generation, WindowSize::default(), None)
+            .attach(
+                &name("renew"),
+                created.generation,
+                WindowSize::default(),
+                None,
+            )
             .unwrap();
 
         let renewed = manager.renew(&name("renew")).unwrap();
@@ -2089,7 +2171,10 @@ mod tests {
         let items = drain(&attached.outbound);
         assert_eq!(collected_bytes(&items), b"hello world");
         assert!(
-            matches!(items[0], OutboundItem::Control(ControlEvent::AttachNotice { .. })),
+            matches!(
+                items[0],
+                OutboundItem::Control(ControlEvent::AttachNotice { .. })
+            ),
             "attach must state that the workspace is ephemeral: {items:?}"
         );
         assert_eq!(manager.get(&name("io")).unwrap().total_written(), 11);
@@ -2113,9 +2198,16 @@ mod tests {
     async fn input_beyond_the_watermark_fails_closed() {
         let spawner = FakeSpawner::new();
         let manager = manager_with(spawner.clone(), "", SessionPolicy::default());
-        let created = manager.create(name("flood"), WindowSize::default()).unwrap();
+        let created = manager
+            .create(name("flood"), WindowSize::default())
+            .unwrap();
         let attached = manager
-            .attach(&name("flood"), created.generation, WindowSize::default(), None)
+            .attach(
+                &name("flood"),
+                created.generation,
+                WindowSize::default(),
+                None,
+            )
             .unwrap();
 
         // Stall the PTY master so nothing drains, then flood: the queue must
@@ -2149,15 +2241,34 @@ mod tests {
                 None,
             )
             .unwrap();
-        attached.resize(WindowSize::validated(50, 200).unwrap()).unwrap();
+        attached
+            .resize(WindowSize::validated(50, 200).unwrap())
+            .unwrap();
 
         let sizes = spawner.pty.resizes.lock().clone();
         assert_eq!(sizes[0], WindowSize::default(), "spawn size");
-        assert_eq!(sizes[1], WindowSize { rows: 40, cols: 120 }, "attach-time size");
-        assert_eq!(sizes[2], WindowSize { rows: 50, cols: 200 }, "resize frame");
+        assert_eq!(
+            sizes[1],
+            WindowSize {
+                rows: 40,
+                cols: 120
+            },
+            "attach-time size"
+        );
+        assert_eq!(
+            sizes[2],
+            WindowSize {
+                rows: 50,
+                cols: 200
+            },
+            "resize frame"
+        );
         assert_eq!(
             manager.get(&name("size")).unwrap().window_size(),
-            WindowSize { rows: 50, cols: 200 }
+            WindowSize {
+                rows: 50,
+                cols: 200
+            }
         );
         assert!(WindowSize::validated(0, 80).is_err());
         assert!(WindowSize::validated(24, 5000).is_err());
@@ -2167,7 +2278,9 @@ mod tests {
     async fn a_since_cursor_replays_only_missed_bytes() {
         let spawner = FakeSpawner::new();
         let manager = manager_with(spawner.clone(), "", SessionPolicy::default());
-        manager.create(name("cursor"), WindowSize::default()).unwrap();
+        manager
+            .create(name("cursor"), WindowSize::default())
+            .unwrap();
         spawner.emit(b"abcdef");
         tokio::time::sleep(Duration::from_millis(50)).await;
         match manager.replay_since(&name("cursor"), 3).unwrap() {
@@ -2186,7 +2299,12 @@ mod tests {
         let manager = manager_with(FakeSpawner::new(), "", SessionPolicy::default());
         let created = manager.create(name("bye"), WindowSize::default()).unwrap();
         let attached = manager
-            .attach(&name("bye"), created.generation, WindowSize::default(), None)
+            .attach(
+                &name("bye"),
+                created.generation,
+                WindowSize::default(),
+                None,
+            )
             .unwrap();
 
         let report = manager.kill(&name("bye")).await.unwrap();
@@ -2198,11 +2316,21 @@ mod tests {
 
         // Reattach-to-dead is a distinct error offering restart-in-place.
         assert!(matches!(
-            manager.attach(&name("bye"), created.generation, WindowSize::default(), None),
+            manager.attach(
+                &name("bye"),
+                created.generation,
+                WindowSize::default(),
+                None
+            ),
             Err(Error::SessionDead(_))
         ));
         assert!(matches!(
-            manager.attach(&name("never-existed"), Generation(1), WindowSize::default(), None),
+            manager.attach(
+                &name("never-existed"),
+                Generation(1),
+                WindowSize::default(),
+                None
+            ),
             Err(Error::NotFound(_))
         ));
     }
@@ -2212,11 +2340,20 @@ mod tests {
         let manager = manager_with(FakeSpawner::new(), "", SessionPolicy::default());
         let created = manager.create(name("slow"), WindowSize::default()).unwrap();
         let attached = manager
-            .attach(&name("slow"), created.generation, WindowSize::default(), None)
+            .attach(
+                &name("slow"),
+                created.generation,
+                WindowSize::default(),
+                None,
+            )
             .unwrap();
         // Nothing is ever drained from `attached.outbound`.
-        let killed = tokio::time::timeout(Duration::from_secs(2), manager.kill(&name("slow"))).await;
-        assert!(killed.is_ok(), "a non-reading client must not delay teardown");
+        let killed =
+            tokio::time::timeout(Duration::from_secs(2), manager.kill(&name("slow"))).await;
+        assert!(
+            killed.is_ok(),
+            "a non-reading client must not delay teardown"
+        );
         assert!(attached.outbound.close_code().is_some());
     }
 
@@ -2226,7 +2363,12 @@ mod tests {
         let manager = manager_with(spawner.clone(), "", SessionPolicy::default());
         let created = manager.create(name("exit"), WindowSize::default()).unwrap();
         let attached = manager
-            .attach(&name("exit"), created.generation, WindowSize::default(), None)
+            .attach(
+                &name("exit"),
+                created.generation,
+                WindowSize::default(),
+                None,
+            )
             .unwrap();
         spawner.emit(b"final output");
         spawner.end_child(0);
@@ -2265,7 +2407,12 @@ mod tests {
         let manager = manager_with(FakeSpawner::new(), "", SessionPolicy::default());
         let created = manager.create(name("shut"), WindowSize::default()).unwrap();
         let attached = manager
-            .attach(&name("shut"), created.generation, WindowSize::default(), None)
+            .attach(
+                &name("shut"),
+                created.generation,
+                WindowSize::default(),
+                None,
+            )
             .unwrap();
         let reports = manager.shutdown().await;
         assert_eq!(reports.len(), 1);
@@ -2291,7 +2438,12 @@ mod tests {
         let manager = manager_with(FakeSpawner::new(), "", policy);
         let created = manager.create(name("cap"), WindowSize::default()).unwrap();
         let attached = manager
-            .attach(&name("cap"), created.generation, WindowSize::default(), None)
+            .attach(
+                &name("cap"),
+                created.generation,
+                WindowSize::default(),
+                None,
+            )
             .unwrap();
         drain(&attached.outbound);
 
@@ -2324,7 +2476,10 @@ mod tests {
                 absolute: true
             }]
         );
-        assert_eq!(attached.outbound.close_code(), Some(close_code::TTL_EXPIRED));
+        assert_eq!(
+            attached.outbound.close_code(),
+            Some(close_code::TTL_EXPIRED)
+        );
         assert!(manager.list().is_empty());
     }
 
@@ -2338,7 +2493,12 @@ mod tests {
         let manager = manager_with(FakeSpawner::new(), "", policy);
         let created = manager.create(name("idle"), WindowSize::default()).unwrap();
         let attached = manager
-            .attach(&name("idle"), created.generation, WindowSize::default(), None)
+            .attach(
+                &name("idle"),
+                created.generation,
+                WindowSize::default(),
+                None,
+            )
             .unwrap();
 
         // Attached: a live socket is liveness, however idle the user is.
@@ -2362,7 +2522,12 @@ mod tests {
         let manager = manager_with(FakeSpawner::new(), "", SessionPolicy::default());
         let created = manager.create(name("ping"), WindowSize::default()).unwrap();
         let attached = manager
-            .attach(&name("ping"), created.generation, WindowSize::default(), None)
+            .attach(
+                &name("ping"),
+                created.generation,
+                WindowSize::default(),
+                None,
+            )
             .unwrap();
         assert!(!attached.on_missed_ping());
         attached.on_pong();
@@ -2374,7 +2539,10 @@ mod tests {
         );
         let session = manager.get(&name("ping")).unwrap();
         assert!(!session.is_attached());
-        assert!(session.is_alive(), "a half-open socket never kills a session");
+        assert!(
+            session.is_alive(),
+            "a half-open socket never kills a session"
+        );
     }
 
     #[test]
@@ -2397,13 +2565,16 @@ mod tests {
         let manager = manager_with(FakeSpawner::new(), "", SessionPolicy::default());
         let created = manager.create(name("disk"), WindowSize::default()).unwrap();
         let attached = manager
-            .attach(&name("disk"), created.generation, WindowSize::default(), None)
+            .attach(
+                &name("disk"),
+                created.generation,
+                WindowSize::default(),
+                None,
+            )
             .unwrap();
         assert!(!manager.report_session_disk_usage(&name("disk"), 1));
-        assert!(manager.report_session_disk_usage(
-            &name("disk"),
-            manager.config.per_session_disk_kib as u64
-        ));
+        assert!(manager
+            .report_session_disk_usage(&name("disk"), manager.config.per_session_disk_kib as u64));
         let items = drain(&attached.outbound);
         assert!(
             items.iter().any(|item| matches!(
@@ -2421,9 +2592,16 @@ mod tests {
             "outbound_backlog_kib = 1\nscrollback_kib = 1\nfixed_session_overhead_kib = 1\nreplay_queue_kib = 1\n",
             SessionPolicy::default(),
         );
-        let created = manager.create(name("backlog"), WindowSize::default()).unwrap();
+        let created = manager
+            .create(name("backlog"), WindowSize::default())
+            .unwrap();
         let attached = manager
-            .attach(&name("backlog"), created.generation, WindowSize::default(), None)
+            .attach(
+                &name("backlog"),
+                created.generation,
+                WindowSize::default(),
+                None,
+            )
             .unwrap();
         let session = manager.get(&name("backlog")).unwrap();
         let chunk = vec![b'z'; 4096];
@@ -2441,9 +2619,16 @@ mod tests {
     #[tokio::test]
     async fn outbound_next_terminates_once_closed_and_drained() {
         let manager = manager_with(FakeSpawner::new(), "", SessionPolicy::default());
-        let created = manager.create(name("drain"), WindowSize::default()).unwrap();
+        let created = manager
+            .create(name("drain"), WindowSize::default())
+            .unwrap();
         let attached = manager
-            .attach(&name("drain"), created.generation, WindowSize::default(), None)
+            .attach(
+                &name("drain"),
+                created.generation,
+                WindowSize::default(),
+                None,
+            )
             .unwrap();
         attached.outbound.push_bytes(b"tail");
         attached.outbound.close(close_code::TTL_EXPIRED);
@@ -2476,7 +2661,12 @@ mod tests {
         );
         let created = manager.create(name("real"), WindowSize::default()).unwrap();
         let attached = manager
-            .attach(&name("real"), created.generation, WindowSize::default(), None)
+            .attach(
+                &name("real"),
+                created.generation,
+                WindowSize::default(),
+                None,
+            )
             .unwrap();
         attached.write_input(b"exit 0\n").unwrap();
 
@@ -2486,7 +2676,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert!(manager.get(&name("real")).is_none(), "self-exit released the slot");
+        assert!(
+            manager.get(&name("real")).is_none(),
+            "self-exit released the slot"
+        );
         assert_eq!(
             attached.outbound.close_code(),
             Some(close_code::SESSION_ENDED)
