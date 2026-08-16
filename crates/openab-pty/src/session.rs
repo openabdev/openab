@@ -1080,7 +1080,15 @@ impl SessionManager {
 
         let io = Arc::new(SessionIo {
             owner_conn: AtomicU64::new(0),
-            last_activity_ms: AtomicU64::new(0),
+            // Seed activity with the creation instant, NOT 0. This counter is
+            // milliseconds since the manager epoch, so 0 means "the epoch" --
+            // i.e. process start. A session created once uptime exceeded
+            // detached_idle_ttl would therefore look idle for its whole life and
+            // be swept on its first tick, before anyone could attach: the
+            // runtime silently stops working after 30 minutes of uptime.
+            last_activity_ms: AtomicU64::new(
+                Instant::now().duration_since(self.epoch).as_millis() as u64,
+            ),
             subscriber: Mutex::new(None),
             buffer: Mutex::new(RingBuffer::with_scrollback_kib(self.config.scrollback_kib)),
             alive: AtomicBool::new(true),
@@ -2711,6 +2719,43 @@ mod tests {
                 absolute: false
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn a_session_created_on_an_old_manager_survives_its_first_tick() {
+        // Regression guard for a bug that made the runtime stop working after
+        // its own idle TTL elapsed: activity is stored as milliseconds since the
+        // manager epoch and was initialised to 0, i.e. the epoch itself, so a
+        // session created later looked idle for its entire life and was swept on
+        // the first tick -- before a client could ever attach. Nothing detects
+        // this on a freshly started process, which is why it survived three
+        // review rounds and would have failed the first real use.
+        let policy = SessionPolicy {
+            detached_idle_ttl: Duration::from_millis(100),
+            ttl_warning_lead: Duration::from_millis(1),
+            ..SessionPolicy::default()
+        };
+        let manager = manager_with(FakeSpawner::new(), "", policy);
+
+        // Age the manager past its own idle TTL before creating anything.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let created = manager.create(name("fresh"), WindowSize::default()).unwrap();
+        assert!(
+            manager.tick().await.is_empty(),
+            "a just-created session must not be expired by a manager that has \
+             merely been running a while"
+        );
+
+        // And it is still attachable, which is the property that actually broke.
+        manager
+            .attach(
+                &name("fresh"),
+                created.generation,
+                WindowSize::default(),
+                None,
+            )
+            .expect("a newly created session must be attachable");
     }
 
     #[tokio::test]
