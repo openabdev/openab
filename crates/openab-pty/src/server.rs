@@ -559,7 +559,7 @@ async fn attach(
     State(state): State<Arc<AppState>>,
     Path(session): Path<String>,
     Query(query): Query<AttachQuery>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(Peer(peer)): ConnectInfo<Peer>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
@@ -1025,7 +1025,7 @@ fn admin_failure_response(failure: AdminAuthFailure) -> Response {
 
 async fn admin_list(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(Peer(peer)): ConnectInfo<Peer>,
     headers: HeaderMap,
 ) -> Response {
     if let Some(response) = admin_gate(&state, &headers, &peer) {
@@ -1053,7 +1053,7 @@ async fn admin_list(
 
 async fn admin_create(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(Peer(peer)): ConnectInfo<Peer>,
     headers: HeaderMap,
     Json(request): Json<CreateRequest>,
 ) -> Response {
@@ -1083,7 +1083,7 @@ async fn admin_create(
 
 async fn admin_renew(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(Peer(peer)): ConnectInfo<Peer>,
     Path(session): Path<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -1102,7 +1102,7 @@ async fn admin_renew(
 
 async fn admin_restart(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(Peer(peer)): ConnectInfo<Peer>,
     Path(session): Path<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -1121,7 +1121,7 @@ async fn admin_restart(
 
 async fn admin_kill(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(Peer(peer)): ConnectInfo<Peer>,
     Path(session): Path<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -1196,7 +1196,7 @@ where
 
     let result = axum::serve(
         NoDelayListener(listener),
-        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+        router(state).into_make_service_with_connect_info::<Peer>(),
     )
     .with_graceful_shutdown(graceful)
     .await
@@ -1250,13 +1250,21 @@ impl axum::serve::Listener for NoDelayListener {
     }
 }
 
-/// Keep `ConnectInfo<SocketAddr>` working through the wrapper: the rate limiters
-/// key on the peer address, so losing it would silently disable them.
+/// Peer address carried through the nodelay listener wrapper.
+///
+/// A local newtype rather than `SocketAddr` directly: `Connected` and
+/// `IncomingStream` both belong to axum, so implementing it for `SocketAddr`
+/// against our own listener is refused by the orphan rule. The rate limiters key
+/// on this address, so it must survive the wrapper or they silently stop
+/// limiting anything.
+#[derive(Clone, Copy, Debug)]
+pub struct Peer(pub SocketAddr);
+
 impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, NoDelayListener>>
-    for SocketAddr
+    for Peer
 {
     fn connect_info(stream: axum::serve::IncomingStream<'_, NoDelayListener>) -> Self {
-        *stream.remote_addr()
+        Self(*stream.remote_addr())
     }
 }
 
