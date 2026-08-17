@@ -48,6 +48,15 @@ pub struct PtyConfig {
     pub command: PathBuf,
     pub max_sessions: usize,
     pub absolute_session_ttl: Duration,
+    /// Lifetime of an attach token.
+    ///
+    /// Earned by dogfooding rather than added speculatively: the hardcoded
+    /// 15-minute default made the product's headline case -- leave, come back
+    /// later from another device -- unreachable, because the token died while
+    /// the session lived for hours, and the only way back in was an
+    /// admin-authenticated renew. A knob the operator hit three times in one
+    /// session is a different thing from a knob nobody asked for.
+    pub attach_token_ttl: Duration,
     pub detached_idle_ttl: Duration,
     pub scrollback_kib: usize,
     pub scrollback_replay: bool,
@@ -63,6 +72,7 @@ const PTY_KEYS: &[&str] = &[
     "command",
     "max_sessions",
     "absolute_session_ttl",
+    "attach_token_ttl",
     "detached_idle_ttl",
     "scrollback_kib",
     "scrollback_replay",
@@ -127,6 +137,7 @@ pub fn validate_projection(input: &str) -> Result<PtyConfig, Error> {
         command: PathBuf::from(string_with_default(pty, "command", "/bin/bash")?),
         max_sessions: usize_with_default(pty, "max_sessions", 4)?,
         absolute_session_ttl: duration_with_default(pty, "absolute_session_ttl", "12h")?,
+        attach_token_ttl: duration_with_default(pty, "attach_token_ttl", "15m")?,
         detached_idle_ttl: duration_with_default(pty, "detached_idle_ttl", "30m")?,
         scrollback_kib: usize_with_default(pty, "scrollback_kib", 1024)?,
         scrollback_replay: bool_with_default(pty, "scrollback_replay", false)?,
@@ -332,6 +343,13 @@ fn validate_lifecycle(config: &PtyConfig) -> Result<(), Error> {
              warning precedes teardown"
                 .into(),
         ));
+    }
+    if config.attach_token_ttl > config.absolute_session_ttl {
+        return Err(Error::Config(format!(
+            "attach_token_ttl ({:?}) must not exceed absolute_session_ttl ({:?}): a token \
+             that outlives every session it could attach to only widens theft exposure",
+            config.attach_token_ttl, config.absolute_session_ttl
+        )));
     }
     if config.absolute_session_ttl < config.detached_idle_ttl {
         return Err(Error::Config(

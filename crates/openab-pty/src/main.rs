@@ -189,7 +189,7 @@ async fn run(projection: PtyConfig) -> Result<()> {
     let kill = Arc::new(KillDomain::new(TrackingLimits::default(), audit.clone()));
 
     let spawner = Arc::new(PortablePtySpawner);
-    let tokens = TokenStore::with_default_ttl(audit.clone());
+    let tokens = TokenStore::new(config.attach_token_ttl, audit.clone());
     let verifier = tokens.attach_verifier();
     let admin =
         AdminAuthenticator::from_verifier_hash(&projection.admin_credential_hash, audit.clone())
