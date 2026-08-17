@@ -1250,6 +1250,16 @@ impl axum::serve::Listener for NoDelayListener {
     }
 }
 
+/// Keep `ConnectInfo<SocketAddr>` working through the wrapper: the rate limiters
+/// key on the peer address, so losing it would silently disable them.
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, NoDelayListener>>
+    for SocketAddr
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, NoDelayListener>) -> Self {
+        *stream.remote_addr()
+    }
+}
+
 fn spawn_ticker(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(state.config.tick_interval);
