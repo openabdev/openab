@@ -1208,18 +1208,23 @@ where
 
 /// A `TcpListener` that disables Nagle's algorithm on every accepted connection.
 ///
-/// This is a latency fix, not a tuning knob. An interactive terminal writes one
-/// keystroke echo at a time, which is exactly the traffic Nagle holds back while
-/// it waits for more data to coalesce; combined with the peer's delayed ACK it
-/// quantises every round trip. Measured against a tailnet peer whose raw RTT is
-/// ~5 ms, echo latency was a median of 81 ms and a maximum of 133 ms, in the
-/// characteristic bimodal pattern. It also reads as dropped input rather than
-/// slow input: type two characters quickly and the second appears late enough
-/// that it looks eaten.
+/// Correct practice for an interactive terminal, which writes one keystroke echo
+/// at a time — exactly the traffic Nagle holds back while waiting to coalesce.
 ///
-/// Found by a human typing into the thing, not by any test here -- no unit or
-/// end-to-end assertion in this crate would notice, because they all measure
-/// what arrives and never how long it took.
+/// **Honest provenance, because the first version of this comment got it wrong.**
+/// This was added while chasing a reported ~80 ms echo lag, and it did **not**
+/// fix it: latency was identical before and after. The lag was the client's
+/// network link, not this server. Measured, same probe, same session:
+///
+/// - from a laptop over WiFi: median 81 ms (ICMP to the same host averaged 56 ms
+///   with 20 ms of jitter and a 3.7 ms minimum — the signature of WiFi power
+///   saving, not of anything in this process)
+/// - from the server host itself: **median 1.0 ms, max 1.2 ms**
+///
+/// So the application contributes about a millisecond. The option is kept
+/// because it is the right default for this traffic shape and removes one real
+/// source of delay on higher-RTT paths, not because it repaired an observed
+/// fault.
 struct NoDelayListener(tokio::net::TcpListener);
 
 impl axum::serve::Listener for NoDelayListener {
