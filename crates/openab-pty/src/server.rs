@@ -1195,7 +1195,7 @@ where
     };
 
     let result = axum::serve(
-        listener,
+        NoDelayListener(listener),
         router(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(graceful)
@@ -1204,6 +1204,50 @@ where
 
     ticker.abort();
     result
+}
+
+/// A `TcpListener` that disables Nagle's algorithm on every accepted connection.
+///
+/// This is a latency fix, not a tuning knob. An interactive terminal writes one
+/// keystroke echo at a time, which is exactly the traffic Nagle holds back while
+/// it waits for more data to coalesce; combined with the peer's delayed ACK it
+/// quantises every round trip. Measured against a tailnet peer whose raw RTT is
+/// ~5 ms, echo latency was a median of 81 ms and a maximum of 133 ms, in the
+/// characteristic bimodal pattern. It also reads as dropped input rather than
+/// slow input: type two characters quickly and the second appears late enough
+/// that it looks eaten.
+///
+/// Found by a human typing into the thing, not by any test here -- no unit or
+/// end-to-end assertion in this crate would notice, because they all measure
+/// what arrives and never how long it took.
+struct NoDelayListener(tokio::net::TcpListener);
+
+impl axum::serve::Listener for NoDelayListener {
+    type Io = tokio::net::TcpStream;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.0.accept().await {
+                Ok((stream, addr)) => {
+                    // Best effort: a peer that cannot take the option is still
+                    // worth serving, just with the latency described above.
+                    if let Err(error) = stream.set_nodelay(true) {
+                        tracing::warn!(%addr, %error, "could not disable Nagle for this peer");
+                    }
+                    return (stream, addr);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "accept failed");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.0.local_addr()
+    }
 }
 
 fn spawn_ticker(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
