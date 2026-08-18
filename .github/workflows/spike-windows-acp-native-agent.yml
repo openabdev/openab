@@ -1,0 +1,117 @@
+name: Spike Windows ACP and native agent
+
+on:
+  push:
+    branches:
+      - spike/windows-acp-native-agent
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: spike-windows-acp-native-agent
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      CARGO_TERM_COLOR: always
+      TARGET: x86_64-pc-windows-msvc
+      UPSTREAM_PIN: 280db4db9452e7e108b52720fddf18dd8c3f5181
+    steps:
+      - name: Checkout spike source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Record toolchain
+        shell: pwsh
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+          rustup target add $env:TARGET
+
+      - name: Build ACP-enabled OpenAB
+        shell: pwsh
+        run: |
+          cargo build --locked --release --target $env:TARGET --no-default-features --features acp
+
+      - name: Build repo-native OpenAB agent
+        shell: pwsh
+        run: |
+          cargo build --locked --release --target $env:TARGET --manifest-path openab-agent/Cargo.toml
+
+      - name: Bounded Windows runtime smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $openab = "target/$env:TARGET/release/openab.exe"
+          $agent = "openab-agent/target/$env:TARGET/release/openab-agent.exe"
+
+          & $openab --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "openab.exe --help failed: $LASTEXITCODE" }
+
+          & $agent --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "openab-agent.exe --help failed: $LASTEXITCODE" }
+
+          $request = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+          $response = ($request | & $agent 2> agent-stderr.log | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "openab-agent ACP initialize failed: $LASTEXITCODE" }
+          $json = $response | ConvertFrom-Json
+          if ($json.id -ne 1 -or $json.result.agentInfo.name -ne 'openab-agent') {
+            throw "unexpected ACP initialize response: $response"
+          }
+
+      - name: Create evidence bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = 'dist/windows-x64'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+
+          $openab = Get-Item "target/$env:TARGET/release/openab.exe"
+          $agent = Get-Item "openab-agent/target/$env:TARGET/release/openab-agent.exe"
+          Copy-Item $openab.FullName "$dist/openab.exe"
+          Copy-Item $agent.FullName "$dist/openab-agent.exe"
+          Copy-Item agent-stderr.log "$dist/agent-stderr.log"
+
+          $manifest = [ordered]@{
+            schemaVersion = 'l1.windows.compile-spike.v1'
+            upstreamPin = $env:UPSTREAM_PIN
+            workflowCommit = $env:GITHUB_SHA
+            target = $env:TARGET
+            openab = [ordered]@{
+              bytes = $openab.Length
+              sha256 = (Get-FileHash $openab.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              features = @('acp')
+              defaultFeatures = $false
+            }
+            openabAgent = [ordered]@{
+              bytes = $agent.Length
+              sha256 = (Get-FileHash $agent.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+            runtimeSmoke = [ordered]@{
+              openabHelp = 'PASS'
+              openabAgentHelp = 'PASS'
+              openabAgentAcpInitialize = 'PASS'
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 6 | Set-Content "$dist/manifest.json" -Encoding utf8
+          Compress-Archive -Path "$dist/*" -DestinationPath 'openab-windows-acp-native-agent-spike.zip'
+
+          "## Windows compile spike" >> $env:GITHUB_STEP_SUMMARY
+          "- Upstream pin: ``$env:UPSTREAM_PIN``" >> $env:GITHUB_STEP_SUMMARY
+          "- OpenAB bytes: ``$($openab.Length)``" >> $env:GITHUB_STEP_SUMMARY
+          "- OpenAB agent bytes: ``$($agent.Length)``" >> $env:GITHUB_STEP_SUMMARY
+          "- ACP initialize: PASS" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload bounded evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: openab-windows-acp-native-agent-spike
+          path: openab-windows-acp-native-agent-spike.zip
+          if-no-files-found: error
+          retention-days: 1
