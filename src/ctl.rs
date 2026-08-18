@@ -37,6 +37,12 @@ pub struct Request {
     /// Target thread/channel ID — daemon uses this to route to the correct adapter.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
+    /// Optional Discord numeric user id that the canonical message MUST
+    /// mention. Used by ``set thread.message`` to pin ``allowed_mentions`` so
+    /// the recipient is the only legitimate mention Discord will surface.
+    /// ``None`` for other keys.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_user_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -52,6 +58,11 @@ pub struct Response {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+    /// Optional echo of the Discord message id returned by the adapter.
+    /// ``set thread.message`` populates this so the AAP caller can correlate
+    /// the dispatch with downstream audit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
 }
 
 // ─── Server (runs inside `openab run`) ──────────────────────────────────────
@@ -61,7 +72,13 @@ pub struct Response {
 #[cfg(unix)]
 #[async_trait::async_trait]
 pub trait CtlHandler: Send + Sync + 'static {
-    async fn handle_set(&self, thread_id: Option<&str>, key: &str, value: &str) -> Response;
+    async fn handle_set(
+        &self,
+        thread_id: Option<&str>,
+        key: &str,
+        value: &str,
+        target_user_id: Option<&str>,
+    ) -> Response;
     async fn handle_get(&self, thread_id: Option<&str>, key: &str) -> Response;
 }
 
@@ -127,7 +144,7 @@ async fn handle_conn(
         let resp = match req.action {
             Action::Set => {
                 let val = req.value.as_deref().unwrap_or("");
-                handler.handle_set(req.thread_id.as_deref(), &req.key, val).await
+                handler.handle_set(req.thread_id.as_deref(), &req.key, val, req.target_user_id.as_deref()).await
             }
             Action::Get => handler.handle_get(req.thread_id.as_deref(), &req.key).await,
         };
@@ -228,7 +245,13 @@ fn resolve_platform(
 #[cfg(unix)]
 #[async_trait::async_trait]
 impl CtlHandler for RuntimeHandler {
-    async fn handle_set(&self, thread_id: Option<&str>, key: &str, value: &str) -> Response {
+    async fn handle_set(
+        &self,
+        thread_id: Option<&str>,
+        key: &str,
+        value: &str,
+        target_user_id: Option<&str>,
+    ) -> Response {
         match key {
             "thread.name" => {
                 let Some((adapter, tid)) = self.resolve(thread_id).await else {
@@ -236,6 +259,7 @@ impl CtlHandler for RuntimeHandler {
                         ok: false,
                         message: "unknown thread (use --thread or register via message dispatch)".into(),
                         value: None,
+                        message_id: None,
                     };
                 };
                 let channel = ChannelRef {
@@ -250,11 +274,13 @@ impl CtlHandler for RuntimeHandler {
                         ok: true,
                         message: format!("thread renamed to: {value}"),
                         value: None,
+                        message_id: None,
                     },
                     Err(e) => Response {
                         ok: false,
                         message: format!("rename failed: {e}"),
                         value: None,
+                        message_id: None,
                     },
                 }
             }
@@ -264,6 +290,7 @@ impl CtlHandler for RuntimeHandler {
                         ok: false,
                         message: "unknown thread (use --thread or register via message dispatch)".into(),
                         value: None,
+                        message_id: None,
                     };
                 };
                 let _archived = match value {
@@ -274,6 +301,7 @@ impl CtlHandler for RuntimeHandler {
                             ok: false,
                             message: format!("invalid value: {value} (expected true/false)"),
                             value: None,
+                            message_id: None,
                         };
                     }
                 };
@@ -288,6 +316,61 @@ impl CtlHandler for RuntimeHandler {
                     ok: false,
                     message: "archive_thread not supported in workspace mode".into(),
                     value: None,
+                    message_id: None,
+                }
+            }
+            "thread.message" => {
+                // Canonical bot-to-bot handoff control-plane primitive.
+                //
+                // ``value`` carries the rendered HANDOFF body (produced by
+                // ``render_handoff_for_discord`` in AAP). ``target_user_id``
+                // is the numeric Discord user id of the single recipient — the
+                // daemon pins ``allowed_mentions`` to that user via the
+                // adapter's ``send_message_targeted`` so Discord's REST
+                // pipeline tags ``mentions: [{user_id: <X>}]`` and the
+                // receiving bot's MultibotMentions check accepts the dispatch
+                // without the LLM ever authoring a raw Discord ID.
+                let Some((adapter, tid)) = self.resolve(thread_id).await else {
+                    return Response {
+                        ok: false,
+                        message: "unknown thread (use --thread or register via message dispatch)".into(),
+                        value: None,
+                        message_id: None,
+                    };
+                };
+                let content = if !value.is_empty() {
+                    value
+                } else {
+                    return Response {
+                        ok: false,
+                        message: "thread.message requires a non-empty value".into(),
+                        value: None,
+                        message_id: None,
+                    };
+                };
+                let channel = ChannelRef {
+                    platform: String::new(),
+                    channel_id: tid,
+                    thread_id: None,
+                    parent_id: None,
+                    origin_event_id: None,
+                };
+                match adapter
+                    .send_message_targeted(&channel, content, target_user_id)
+                    .await
+                {
+                    Ok(msg_ref) => Response {
+                        ok: true,
+                        message: "thread.message dispatched".into(),
+                        value: None,
+                        message_id: Some(msg_ref.message_id),
+                    },
+                    Err(e) => Response {
+                        ok: false,
+                        message: format!("thread.message dispatch failed: {e}"),
+                        value: None,
+                        message_id: None,
+                    },
                 }
             }
             "agent.status" => {
@@ -298,6 +381,7 @@ impl CtlHandler for RuntimeHandler {
                             ok: false,
                             message: "agent.status only supported on Discord".into(),
                             value: None,
+                            message_id: None,
                         };
                     };
                     use serenity::gateway::ActivityData;
@@ -316,6 +400,7 @@ impl CtlHandler for RuntimeHandler {
                             format!("status set to: {value}")
                         },
                         value: None,
+                        message_id: None,
                     }
                 }
                 #[cfg(not(feature = "discord"))]
@@ -325,6 +410,7 @@ impl CtlHandler for RuntimeHandler {
                         ok: false,
                         message: "agent.status requires discord feature".into(),
                         value: None,
+                        message_id: None,
                     }
                 }
             }
@@ -332,21 +418,24 @@ impl CtlHandler for RuntimeHandler {
                 ok: false,
                 message: format!("unknown key: {key}"),
                 value: None,
+                message_id: None,
             },
         }
     }
 
     async fn handle_get(&self, _thread_id: Option<&str>, key: &str) -> Response {
         match key {
-            "thread.name" | "thread.archived" | "agent.status" => Response {
+            "thread.name" | "thread.archived" | "agent.status" | "thread.message" => Response {
                 ok: false,
                 message: format!("{key} get not yet supported"),
                 value: None,
+                message_id: None,
             },
             _ => Response {
                 ok: false,
                 message: format!("unknown key: {key}"),
                 value: None,
+                message_id: None,
             },
         }
     }
@@ -463,6 +552,7 @@ mod tests {
             key: "thread.name".into(),
             value: Some("hello".into()),
             thread_id: Some("123".into()),
+            target_user_id: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -470,6 +560,7 @@ mod tests {
         assert_eq!(parsed.key, "thread.name");
         assert_eq!(parsed.value.as_deref(), Some("hello"));
         assert_eq!(parsed.thread_id.as_deref(), Some("123"));
+        assert_eq!(parsed.target_user_id, None);
     }
 
     #[tokio::test]
@@ -477,11 +568,18 @@ mod tests {
         struct MockHandler;
         #[async_trait::async_trait]
         impl CtlHandler for MockHandler {
-            async fn handle_set(&self, thread_id: Option<&str>, key: &str, value: &str) -> Response {
+            async fn handle_set(
+                &self,
+                thread_id: Option<&str>,
+                key: &str,
+                value: &str,
+                _target_user_id: Option<&str>,
+            ) -> Response {
                 Response {
                     ok: true,
                     message: format!("{key} = {value} (thread: {})", thread_id.unwrap_or("none")),
                     value: None,
+                    message_id: None,
                 }
             }
             async fn handle_get(&self, _thread_id: Option<&str>, key: &str) -> Response {
@@ -489,6 +587,7 @@ mod tests {
                     ok: true,
                     message: String::new(),
                     value: Some(format!("val-of-{key}")),
+                    message_id: None,
                 }
             }
         }
@@ -508,6 +607,7 @@ mod tests {
             key: "thread.name".into(),
             value: Some("hello world".into()),
             thread_id: Some("999".into()),
+            target_user_id: None,
         })
         .await
         .unwrap();
@@ -520,12 +620,93 @@ mod tests {
             key: "thread.name".into(),
             value: None,
             thread_id: None,
+            target_user_id: None,
         })
         .await
         .unwrap();
         assert!(resp.ok);
         assert_eq!(resp.value.as_deref(), Some("val-of-thread.name"));
 
+        server.abort();
+    }
+
+    #[test]
+    fn protocol_carries_target_user_id() {
+        let req = Request {
+            action: Action::Set,
+            key: "thread.message".into(),
+            value: Some("HANDOFF\nto: <@1536734779607879700>\n".into()),
+            thread_id: Some("1536735741642547262".into()),
+            target_user_id: Some("1536734779607879700".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("target_user_id"));
+        assert!(json.contains("1536734779607879700"));
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.target_user_id.as_deref(),
+            Some("1536734779607879700")
+        );
+        assert_eq!(parsed.key, "thread.message");
+        assert!(parsed.value.unwrap().starts_with("HANDOFF"));
+    }
+
+    #[tokio::test]
+    async fn server_client_roundtrip_carries_target_user_id() {
+        #[derive(Default)]
+        struct CapturedHandler {
+            captured_target_user_id: std::sync::Mutex<Option<String>>,
+        }
+        #[async_trait::async_trait]
+        impl CtlHandler for CapturedHandler {
+            async fn handle_set(
+                &self,
+                _thread_id: Option<&str>,
+                _key: &str,
+                _value: &str,
+                target_user_id: Option<&str>,
+            ) -> Response {
+                *self.captured_target_user_id.lock().unwrap() = target_user_id.map(str::to_string);
+                Response {
+                    ok: true,
+                    message: "captured".into(),
+                    value: None,
+                    message_id: None,
+                }
+            }
+            async fn handle_get(&self, _: Option<&str>, _: &str) -> Response {
+                Response {
+                    ok: false,
+                    message: "no get".into(),
+                    value: None,
+                    message_id: None,
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("test.sock");
+        let handler = std::sync::Arc::new(CapturedHandler::default());
+        let server = spawn_server_at(sock.clone(), handler.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let resp = send_request_to(
+            &sock,
+            &Request {
+                action: Action::Set,
+                key: "thread.message".into(),
+                value: Some("HANDOFF\n...".into()),
+                thread_id: Some("1536735741642547262".into()),
+                target_user_id: Some("1536734779607879700".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(resp.ok);
+        assert_eq!(
+            handler.captured_target_user_id.lock().unwrap().as_deref(),
+            Some("1536734779607879700"),
+        );
         server.abort();
     }
 }

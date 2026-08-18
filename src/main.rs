@@ -104,15 +104,20 @@ enum Commands {
         #[arg(long, default_value = "kiro-cli acp --trust-all-tools")]
         command: String,
     },
-    /// Set a runtime value (e.g. thread.name)
+    /// Set a runtime value (e.g. thread.name, thread.message)
     Set {
-        /// Key to set (e.g. thread.name)
+        /// Key to set (e.g. thread.name, thread.message)
         key: String,
         /// Value to set
         value: String,
         /// Target thread/channel ID
         #[arg(long)]
         thread: Option<String>,
+        /// Optional Discord numeric user id for ``thread.message`` — pins
+        /// ``allowed_mentions`` so Discord's REST pipeline tags the message
+        /// with exactly one mention (no plain-text fallback).
+        #[arg(long)]
+        target_user_id: Option<String>,
     },
     /// Get a runtime value
     Get {
@@ -346,12 +351,18 @@ async fn main() -> anyhow::Result<()> {
         } => {
             return acp::agentcore::run_bridge(&runtime_arn, &region, &command).await;
         }
-        Commands::Set { key, value, thread } => {
+        Commands::Set {
+            key,
+            value,
+            thread,
+            target_user_id,
+        } => {
             let resp = ctl::send_request(&ctl::Request {
                 action: ctl::Action::Set,
                 key,
                 value: Some(value),
                 thread_id: thread.or_else(|| std::env::var("OPENAB_THREAD_ID").ok()),
+                target_user_id,
             })
             .await?;
             if resp.ok {
@@ -368,6 +379,7 @@ async fn main() -> anyhow::Result<()> {
                 key,
                 value: None,
                 thread_id: thread.or_else(|| std::env::var("OPENAB_THREAD_ID").ok()),
+                target_user_id: None,
             })
             .await?;
             if resp.ok {

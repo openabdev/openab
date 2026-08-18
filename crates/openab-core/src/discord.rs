@@ -132,6 +132,39 @@ impl ChatAdapter for DiscordAdapter {
         }
     }
 
+    async fn send_message_targeted(
+        &self,
+        channel: &ChannelRef,
+        content: &str,
+        target_user_id: Option<&str>,
+    ) -> anyhow::Result<MessageRef> {
+        let ch_id: u64 = Self::resolve_channel(channel).parse()?;
+        // Restricted ``allowed_mentions`` so Discord's REST API tags the
+        // message with ``mentions: [{user_id: <X>}]`` and the receiving
+        // bot's MultibotMentions check accepts the dispatch without the
+        // LLM authoring a raw Discord ID.
+        let mut builder = serenity::builder::CreateMessage::new().content(content);
+        if let Some(user_id_str) = target_user_id {
+            let target_id = match user_id_str.parse::<u64>() {
+                Ok(id) => serenity::model::id::UserId::new(id),
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "send_message_targeted: invalid target_user_id {user_id_str:?}: {e}"
+                    ));
+                }
+            };
+            let allowed = serenity::builder::CreateAllowedMentions::new().users([target_id]);
+            builder = builder.allowed_mentions(allowed);
+        }
+        let msg = ChannelId::new(ch_id)
+            .send_message(&self.http, builder)
+            .await?;
+        Ok(MessageRef {
+            channel: channel.clone(),
+            message_id: msg.id.to_string(),
+        })
+    }
+
     async fn delete_message(&self, msg: &MessageRef) -> anyhow::Result<()> {
         let ch_id: u64 = Self::resolve_channel(&msg.channel).parse()?;
         let msg_id: u64 = msg.message_id.parse()?;

@@ -205,6 +205,85 @@ pub(crate) fn finalize_body(
     }
 }
 
+/// Bounded fallback when the send-once sliced delivery is empty.
+///
+/// In send-once mode (`!keep_full_text`), [`split_delivery`] slices
+/// `text_buf` to the post-tool final block to drop inter-tool narration
+/// ("let me pull the diff", "now reading the validator", …). Some ACP
+/// backends — notably Codex — may complete a tool-heavy turn WITHOUT
+/// emitting another `agent_message_chunk` after their final tool. In
+/// that case `answer_start == text_buf.len()` and the sliced body is
+/// empty even though the full buffer contains real agent text. Without
+/// this fallback the empty body would fall through to
+/// [`classify_empty_turn`] and the user would see `_(no response)_`
+/// even though the turn produced output — only inter-tool narration
+/// that streaming platforms saw live, send-once platforms never saw.
+///
+/// Returns `Some(text_buf)` when all four preconditions hold:
+///
+///   * `keep_full_text` is false (we are in send-once trimming mode)
+///   * `sliced_body` is empty/whitespace-only (the slice itself has
+///     nothing to deliver)
+///   * `text_buf` (the full accumulated buffer) is non-empty
+///   * the turn completed normally — no `response_error`, not a
+///     silent failure (`end_turn` + 0 output tokens), and not a
+///     cancelled / errored / refusal turn
+///
+/// Returns `None` in every other corner — the caller falls through to
+/// the existing behaviour unchanged:
+///
+///   * genuine no-response turns → `classify_empty_turn` → `_(no response)_`
+///   * silent failures → `classify_empty_turn` → `SILENT_FAILURE_MSG`
+///   * errored turns → `classify_empty_turn` → `⚠️ {err}`
+///   * keep_full / streaming mode → caller uses the (already complete)
+///     sliced body
+///
+/// Pure helper: deliberately mirrors the inline branch at the end of
+/// `AdapterRouter::stream_prompt_blocks` so the five-corner truth
+/// table can be exercised in isolation without a live ACP session.
+pub(crate) fn fallback_when_sliced_delivery_empty(
+    sliced_body: &str,
+    text_buf: &str,
+    keep_full_text: bool,
+    response_error: Option<&str>,
+    turn_result: &TurnResult,
+) -> Option<String> {
+    // (1) Streaming / keep_full mode: caller already has the full text
+    //     as the sliced body; no fallback needed.
+    if keep_full_text {
+        return None;
+    }
+    // (2) Error path: caller formats `⚠️ {err}`; never replace with the
+    //     full accumulated buffer because the user wants the error first.
+    if response_error.is_some() {
+        return None;
+    }
+    // (3) Sliced body is non-empty: existing narration suppression
+    //     delivered the final answer block correctly. No fallback.
+    if !sliced_body.trim().is_empty() {
+        return None;
+    }
+    // (4) Full buffer is empty: this is a genuinely empty successful
+    //     turn. Let classify_empty_turn produce `_(no response)_`.
+    if text_buf.trim().is_empty() {
+        return None;
+    }
+    // (5) Silent failure (`end_turn` + 0 output tokens): a known provider
+    //     / auth / model failure signal — classify_empty_turn handles it.
+    if turn_result.is_silent_failure() {
+        return None;
+    }
+    // (6) Non-normal stop_reason: cancelled, errored, or refused turns
+    //     did not produce a real answer; do not fall back.
+    match turn_result.stop_reason.as_deref() {
+        Some("cancelled") | Some("error") | Some("refusal") => return None,
+        _ => {}
+    }
+    // All preconditions hold: deliver the full accumulated buffer so
+    // the user sees the agent's actual output instead of `_(no response)_`.
+    Some(text_buf.to_owned())
+}
+
 // --- Platform-agnostic types ---
 
 /// Identifies a channel or thread across platforms.
@@ -354,6 +433,31 @@ pub trait ChatAdapter: Send + Sync + 'static {
         reply_to_message_id: &str,
     ) -> Result<MessageRef> {
         let _ = reply_to_message_id; // unused in default impl
+        self.send_message(channel, content).await
+    }
+
+    /// Send a message that MUST mention exactly one canonical recipient. The
+    /// implementation forwards to ``send_message`` when the platform does not
+    /// support a restricted-mentions surface; DiscordAdapter overrides this
+    /// and pins the ``allowed_mentions`` payload via Serenity so that the
+    /// ``<@USER_ID>`` markup in ``content`` is the only legitimate Discord
+    /// mention the gateway will surface.
+    ///
+    /// ``target_user_id`` is the canonical Discord numeric user id (NOT a
+    /// name, NOT a role id). When ``None`` the default impl is used and the
+    /// underlying platform may surface any mention in ``content``.
+    ///
+    /// This is the seam ``openab ctl thread.message`` calls into for
+    /// canonical bot-to-bot handoff messages. The LLM never authors
+    /// ``target_user_id`` — it is resolved by the caller from the active
+    /// workflow assignment.
+    async fn send_message_targeted(
+        &self,
+        channel: &ChannelRef,
+        content: &str,
+        target_user_id: Option<&str>,
+    ) -> Result<MessageRef> {
+        let _ = target_user_id; // unused in default impl
         self.send_message(channel, content).await
     }
 
@@ -1104,14 +1208,32 @@ impl AdapterRouter {
                     // FULL buffer (they sit at output start, which the slice may
                     // drop) so a leading [[reply_to:...]] survives the narration
                     // it was emitted alongside.
-                    let (directives, text_buf) =
+                    let (directives, body) =
                         split_delivery(&text_buf, answer_start, keep_full_text);
-                    // The session-reset notice lives at the head of the buffer; a
-                    // tool advancing answer_start past it would drop it from the
-                    // slice, so re-prepend it to the (directive-stripped) body in
-                    // exactly that case. `finalize_body` is the pure helper that
-                    // encodes the four-corner truth table so it can be unit-tested.
-                    let text_buf = finalize_body(reset, keep_full_text, answer_start, text_buf);
+                    // Bounded fallback for Codex-mode empty post-tool slices: if
+                    // the slice dropped everything (final tool completed the turn
+                    // without a trailing agent_message_chunk), substitute the
+                    // full accumulated buffer so the user sees real agent text
+                    // instead of `_(no response)_`. `fallback_when_sliced_delivery_empty`
+                    // is the pure helper that encodes the six-corner truth
+                    // table; it returns `None` for every pre-existing path so
+                    // error / streaming / genuine-empty behaviour is unchanged.
+                    // The original `text_buf` (full buffer) is still in scope
+                    // here — `split_delivery` only borrowed it — so we can
+                    // pass both the sliced body and the full buffer to the
+                    // helper without cloning either.
+                    let body = finalize_body(reset, keep_full_text, answer_start, body);
+                    let text_buf = if let Some(fallback) = fallback_when_sliced_delivery_empty(
+                        &body,
+                        &text_buf,
+                        keep_full_text,
+                        response_error.as_deref(),
+                        &turn_result,
+                    ) {
+                        fallback
+                    } else {
+                        body
+                    };
 
                     // Build final content
                     let final_content =
@@ -1883,6 +2005,205 @@ mod tests {
         );
     }
 
+    // --- fallback_when_sliced_delivery_empty: six-corner truth table for the
+    //     Codex-mode empty-post-tool-slice fallback (PR #1465 follow-up) ---
+    //
+    // Regression: ArthurCodex confirmed that the ACP backend may complete a
+    // tool-heavy turn WITHOUT emitting another `agent_message_chunk` after
+    // its final tool. In that case `answer_start == text_buf.len()`, the
+    // sliced body is empty, and the user would see `_(no response)_` even
+    // though the turn produced real text. This helper substitutes the full
+    // accumulated buffer in that single corner; every other path returns
+    // `None` so the existing behaviour (narration suppression, error path,
+    // streaming, silent-failure, genuine no-response) is unchanged.
+
+    #[test]
+    fn fallback_post_tool_final_answer_keeps_final_block_only() {
+        // Regression #1: post-tool final answer exists -> final block only.
+        // The sliced body is non-empty, so the helper MUST return `None`
+        // and the caller uses the sliced body — existing narration
+        // suppression is preserved.
+        let full = "let me pull the diff\n[tool]the final answer";
+        let sliced = "the final answer";
+        let tr = TurnResult {
+            stop_reason: Some("end_turn".into()),
+            output_tokens: Some(12),
+            ..Default::default()
+        };
+        assert_eq!(
+            fallback_when_sliced_delivery_empty(sliced, full, false, None, &tr),
+            None,
+            "non-empty sliced body in send-once mode MUST be delivered as-is"
+        );
+    }
+
+    #[test]
+    fn fallback_terminal_tool_no_later_chunk_falls_back_to_full() {
+        // Regression #2: last tool is terminal, no later agent_message_chunk,
+        // full buffer non-empty, turn completed normally -> non-empty fallback
+        // to the full buffer (the actual agent output).
+        let full = "let me pull the diff\nnow reading the validator\n";
+        let tr = TurnResult {
+            stop_reason: Some("end_turn".into()),
+            output_tokens: Some(8),
+            ..Default::default()
+        };
+        let result = fallback_when_sliced_delivery_empty("", full, false, None, &tr);
+        assert_eq!(
+            result.as_deref(),
+            Some(full),
+            "empty slice + non-empty full + normal turn MUST fall back to the full buffer"
+        );
+
+        // Whitespace-only sliced body is treated the same as empty — the
+        // Codex observation is "no text after the last tool", which
+        // manifests as the slice being purely whitespace.
+        let result_ws =
+            fallback_when_sliced_delivery_empty("   \n  ", full, false, None, &tr);
+        assert_eq!(
+            result_ws.as_deref(),
+            Some(full),
+            "whitespace-only slice must trigger the fallback"
+        );
+    }
+
+    #[test]
+    fn fallback_genuinely_empty_turn_keeps_no_response_classification() {
+        // Regression #3: genuinely empty successful turn -> existing
+        // classify_empty_turn path is used (helper returns `None`).
+        let tr = TurnResult {
+            stop_reason: Some("end_turn".into()),
+            output_tokens: Some(0),
+            ..Default::default()
+        };
+        // Full buffer also empty — no fallback.
+        assert_eq!(
+            fallback_when_sliced_delivery_empty("", "", false, None, &tr),
+            None,
+            "full buffer empty + sliced empty -> classify_empty_turn runs"
+        );
+
+        // Full buffer whitespace-only is also "empty" for the user's view.
+        assert_eq!(
+            fallback_when_sliced_delivery_empty("", "  \n", false, None, &tr),
+            None,
+            "whitespace-only full buffer is a genuinely empty turn"
+        );
+
+        // Silent failure (end_turn + 0 output tokens): classify_empty_turn
+        // emits SILENT_FAILURE_MSG, not `_(no response)_` — the helper
+        // must NOT mask that signal with a non-empty fallback.
+        let tr_silent = TurnResult {
+            stop_reason: Some("end_turn".into()),
+            output_tokens: Some(0),
+            ..Default::default()
+        };
+        assert!(tr_silent.is_silent_failure());
+        assert_eq!(
+            fallback_when_sliced_delivery_empty(
+                "",
+                "some agent text that the provider forgot to count",
+                false,
+                None,
+                &tr_silent,
+            ),
+            None,
+            "silent failure MUST keep classify_empty_turn's SILENT_FAILURE_MSG path"
+        );
+    }
+
+    #[test]
+    fn fallback_response_error_path_unchanged() {
+        // Regression #4: response_error path is unchanged — the helper
+        // returns `None` and the caller formats `⚠️ {err}` as before.
+        let full = "some agent text that arrived alongside an error";
+        let tr = TurnResult {
+            stop_reason: Some("end_turn".into()),
+            output_tokens: Some(12),
+            ..Default::default()
+        };
+        assert_eq!(
+            fallback_when_sliced_delivery_empty("", full, false, Some("agent process died"), &tr),
+            None,
+            "response_error present MUST bypass the fallback"
+        );
+
+        // Cancelled turn: no fallback, even without an error.
+        let tr_cancel = TurnResult {
+            stop_reason: Some("cancelled".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            fallback_when_sliced_delivery_empty("", full, false, None, &tr_cancel),
+            None,
+            "cancelled turn MUST bypass the fallback"
+        );
+
+        // Error turn: no fallback.
+        let tr_err = TurnResult {
+            stop_reason: Some("error".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            fallback_when_sliced_delivery_empty("", full, false, None, &tr_err),
+            None,
+            "error turn MUST bypass the fallback"
+        );
+
+        // Refusal turn: no fallback.
+        let tr_refusal = TurnResult {
+            stop_reason: Some("refusal".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            fallback_when_sliced_delivery_empty("", full, false, None, &tr_refusal),
+            None,
+            "refusal turn MUST bypass the fallback"
+        );
+
+        // keep_full_text / streaming mode: the helper is a no-op even
+        // with the ideal empty-sliced / non-empty-full shape — the caller
+        // already has the whole buffer as the sliced body.
+        assert_eq!(
+            fallback_when_sliced_delivery_empty("", full, true, None, &tr),
+            None,
+            "keep_full_text mode MUST bypass the fallback"
+        );
+    }
+
+    #[test]
+    fn fallback_existing_narration_suppression_unchanged() {
+        // Regression #5: existing narration suppression behavior is
+        // unchanged — when the sliced body is non-empty in send-once
+        // mode, the helper returns `None` so the caller delivers the
+        // slice (NOT the full buffer). The narration never reaches the
+        // user.
+        let full = "let me pull the diff\nnow reading the validator\nthe final answer";
+        let sliced = "the final answer";
+        let tr = TurnResult {
+            stop_reason: Some("end_turn".into()),
+            output_tokens: Some(20),
+            ..Default::default()
+        };
+
+        // Sliced body non-empty -> no fallback (caller uses the slice).
+        assert_eq!(
+            fallback_when_sliced_delivery_empty(sliced, full, false, None, &tr),
+            None,
+            "non-empty sliced body -> caller uses slice (narration suppressed)"
+        );
+
+        // Even if the slice ends in trailing whitespace, the helper still
+        // returns None — narration suppression relies on the slice being
+        // meaningfully non-empty, not strictly non-empty.
+        let sliced_ws = "the final answer\n   \n";
+        assert_eq!(
+            fallback_when_sliced_delivery_empty(sliced_ws, full, false, None, &tr),
+            None,
+            "slice with trailing whitespace is still a deliverable slice"
+        );
+    }
+
     /// Compile-time regression guard: use_streaming() is a required trait method
     /// (no default). Any adapter that forgets to implement it will fail to compile.
     /// This test documents the contract — see PR #503 / issue #502 for context.
@@ -1931,6 +2252,87 @@ mod tests {
         // renders_native_tables defaults to false: platforms that don't override
         // it keep the table→code/bullets conversion (e.g. Discord, Gateway).
         assert!(!adapter.renders_native_tables("discord"));
+    }
+
+    #[tokio::test]
+    async fn send_message_targeted_default_forwards_to_send_message() {
+        // The default trait impl MUST fall back to send_message so adapters that
+        // do not yet override the new seam (Slack, Gateway, Mock, Ambient) behave
+        // exactly like send_message with no behavioral regression. We assert
+        // that here by NOT overriding send_message_targeted on the test
+        // adapter — Rust's dispatch must fall through to the trait default,
+        // which delegates to send_message. The encoded ``message_id`` proves
+        // the forwarding path executed.
+        struct MinimalAdapter;
+        #[async_trait::async_trait]
+        impl ChatAdapter for MinimalAdapter {
+            fn platform(&self) -> &'static str {
+                "minimal"
+            }
+            fn message_limit(&self) -> usize {
+                2000
+            }
+            async fn send_message(&self, _: &ChannelRef, content: &str) -> Result<MessageRef> {
+                Ok(MessageRef {
+                    channel: ChannelRef {
+                        platform: "minimal".into(),
+                        channel_id: "C".into(),
+                        thread_id: None,
+                        parent_id: None,
+                        origin_event_id: None,
+                    },
+                    // Encode the content into the message_id so a regression
+                    // on the default impl (forwarding) is observable.
+                    message_id: format!("default:{content}"),
+                })
+            }
+            // No send_message_targeted override — this is what we're testing.
+            async fn create_thread(
+                &self,
+                _: &ChannelRef,
+                _: &MessageRef,
+                _: &str,
+            ) -> Result<ChannelRef> {
+                unimplemented!()
+            }
+            async fn add_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn remove_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn use_streaming(&self, _: bool) -> bool {
+                false
+            }
+        }
+
+        let adapter = MinimalAdapter;
+        let channel = ChannelRef {
+            platform: "minimal".into(),
+            channel_id: "C".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: None,
+        };
+        // Default trait impl forwards to send_message — the
+        // ``default:...`` message_id encodes the content so a regression on
+        // the default impl would surface here.
+        let msg_ref = adapter
+            .send_message_targeted(
+                &channel,
+                "HANDOFF\nto: <@1536734779607879700>",
+                Some("1536734779607879700"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            msg_ref.message_id.starts_with("default:"),
+            "default impl MUST forward to send_message"
+        );
+        assert!(
+            msg_ref.message_id.contains("<@1536734779607879700>"),
+            "default impl MUST forward content including the canonical <@USER_ID> markup"
+        );
     }
 
     #[test]
