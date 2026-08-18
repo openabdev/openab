@@ -166,6 +166,135 @@ When `allow_user_messages = "multibot-mentions"` is set alongside `allowed_role_
 
 This gives the best of both worlds: one role mention to summon all bots, but subsequent messages in the thread don't cause all bots to pile on.
 
+### `peer_agent_role_ids`
+
+Role IDs that explicitly target a **sibling / peer** agent bot in this deployment — i.e. role IDs belonging to *other* OpenAB bots that are configured to share the same Discord channels. This list is the inverse of `allowed_role_ids`:
+
+| 列表 | 語意 |
+|------|------|
+| `discord.allowed_role_ids` | 觸發「這個 bot 自己」的角色 ID（即直接 @mention 之外的角色觸發方式）|
+| `discord.peer_agent_role_ids` | 屬於「其他」已設定 OpenAB agent 的角色 ID（用於識別對等的 peer bot）|
+
+> ⚠️ **重要的邊界條件（不是建議，是硬性規定）**
+>
+> - **「自己的」角色不可放入 `peer_agent_role_ids`**。如果你把本 bot 的觸發角色同時列進 peer 列表，這個 bot 會在結構化的角色提及中被誤判為「被對等 peer 鎖定」而提前拒收訊息。
+> - **與本部署無關的 Discord 角色不可放入 `peer_agent_role_ids`**。這個列表是白名單，不是黑名單 — 任何錯誤列入的角色都會把這個 bot 在合法的角色提及場景裡提前 reject。
+> - **不要從角色名稱、附件內文、引述內容、prompt 文字或 LLM 推論**。peer 列表 100% 由 operator 手動維護。OpenAB 不會嘗試自動猜測哪個角色屬於哪個 bot。
+
+#### 這個機制在做什麼
+
+Discord 對一則訊息提供兩種**伺服器端結構化**的提及欄位：
+
+- `Message::mentions`：`@user-id` 提及（user 物件）
+- `Message::mention_roles`：`@role-id` 提及（role ID）
+
+OpenAB 的 Discord adapter 在判斷是否要處理一則訊息時，會先看這兩個欄位，並套用以下規則：
+
+1. **結構化 `@user-id` 提及另一個 bot 帳號**（`mentions` 陣列中存在 `user.bot == true` 且 `user.id != this_bot.user.id`）→ **這個 bot 直接 reject**，不會落到 `involved` / MultibotMentions 旁路。
+2. **結構化 `@role-id` 提及的 ID 出現在 `peer_agent_role_ids`，而且同一則訊息中沒有任何 `allowed_role_ids` 的角色**→ 同樣 reject，關閉「角色觸發後、multibot 快取尚未觀察到對等 bot」的時間差漏洞。
+
+#### 安全語意（必須記住）
+
+實際上 OpenAB 在判定 `is_mentioned` 時，會掃**三個**來源：
+
+| 訊息內容來源 | 是否算 routing authority？ |
+|--------------|----------------------------|
+| 結構化 `@user-id` 提及（`Message::mentions`） | ✅ 是 |
+| 結構化 `@role-id` 提及（`Message::mention_roles`，且 ID 落在 `allowed_role_ids`） | ✅ 是 |
+| 原始 `Message::content` 中的 `<@BOT_ID>` 子字串（legacy / backward-compat fallback） | ✅ 是，但**比結構化欄位寬鬆** |
+| 附件本文 / 抽取出的文字（attachment body / extracted text） | ❌ 否 |
+| OCR / STT 內容 | ❌ 否 |
+| LLM 生成的文字（prompt、reply、tool output） | ❌ 否 |
+
+換言之：**Discord 自己填入的 `mentions` / `mention_roles` 是嚴格的 routing 權威；附件、OCR/STT 抽取文字、模型輸出都**不算**。**然而，**為了 backward compatibility，目前實作同時也對原始 `Message::content` 做一次 `<@BOT_ID>` 子字串掃描，這條 legacy fallback 比 Discord 結構化欄位寬鬆，詳見下一節。**
+
+這個設計的理由：附件、OCR/STT 抽取文字、模型輸出都可以包含任意 `@user` 或 `@role` 字串，如果把它們當作 routing signal，等於把 routing 決策交給可被污染的文字內容。OpenAB 明確拒絕這條路。
+
+#### 🔐 SECURITY NOTE：legacy `Message::content` 子字串 fallback
+
+為了 backward compatibility，目前 `is_mentioned` 的計算還包含第三條路徑：
+
+```text
+is_mentioned =
+    msg.mentions_user_id(bot_id)               // 結構化 mentions
+ || msg.content.contains(format!("<@{}>", …))  // 原始 content 子字串掃描
+ || (allowed_role_ids ∩ msg.mention_roles)     // 結構化 mention_roles
+```
+
+這條 `msg.content.contains("<@BOT_ID>")` fallback 的特性：
+
+- 它是**字串層級的子字串搜尋**，掃描整個 `Message::content`，包含使用者**貼上 / 引述 / 程式碼區塊（`` ``` `` 或 `` ` ``）**裡出現的字面 ` <@BOT_ID> ` 字串。
+- 它**不會**去掃描附件本體、OCR/STT 抽取出的文字、模型生成文字 — 那些管線不會回灌到 `Message::content`，所以本節才把它們列在 ❌。
+- 但只要人類在 inline 文字（無論是手動輸入、貼上、引用、放在 code block 裡）放進字面的 `<@BOT_ID>` markup，bot 就會被視為「被提及」並通過 admission gate。
+
+> ⚠️ **已知強化機會（NOT yet mitigated）**
+>
+> 這條 legacy fallback 是**已知的強化機會**，**不是**已經解決的問題。它的存在是有意的（向後相容），但它的比對範圍比 Discord 的結構化 `mentions` 欄位寬鬆，未來硬化方向包含：
+>
+> - 只接受 `msg.content` 中**結構化解析**出的 mention（與 `msg.mentions` 對齊）
+>
+> - 或明確排除在 fenced code block / blockquote 內出現的字面 mention markup
+>
+> 目前**未實作**上述硬化；operator 在評估 threat model 時，請把「任何 inline 文字位都可能包含可觸發 bot 的字面 mention markup」列入考量。
+
+#### 向後相容
+
+`peer_agent_role_ids` 省略、或顯式設定為 `[]` 時：
+
+- role-peer 檢查**靜默**（不會 reject 任何訊息）
+- 既有部署的行為**完全保留**
+- 升級後不需要任何動作；只有在你部署了多個共用 Discord 角色的 OpenAB bot、且希望提前關閉「角色單觸發 multihop」的漏洞時，才需要填入這個欄位
+
+#### 部署範例（deployment-specific，**非**通用預設值）
+
+> ⚠️ 下面這組 ID 是特定部署的範例，**不是** OpenAB 的預設值。請依你自家 Discord 伺服器實際建立的 role ID 替換；切勿照抄。
+
+在這個部署裡，三個 OpenAB bot 分別被綁定到三個 Discord role，operator 透過手動列舉的方式設定 peer 角色：
+
+| Bot | 自身角色（放 `allowed_role_ids`）| 對等角色（放 `peer_agent_role_ids`）|
+|-----|----------------------------------|-------------------------------------|
+| Claude (`ArthurClaude`) | `1536737647253266445` | `1536737398191300661`（Codex）<br>`1536738445651615764`（Gemini）|
+| Codex (`ArthurCodex`) | `1536737398191300661` | `1536737647253266445`（Claude）<br>`1536738445651615764`（Gemini）|
+| Gemini (`ArthurGemini`) | `1536738445651615764` | `1536737647253266445`（Claude）<br>`1536737398191300661`（Codex）|
+
+對應到 `config.toml`：
+
+```toml
+# ArthurClaude — peer list = Codex + Gemini
+[discord]
+allowed_role_ids    = [1536737647253266445]              # Claude's own role
+peer_agent_role_ids  = [
+  1536737398191300661, # Codex role   (peer)
+  1536738445651615764, # Gemini role  (peer)
+]
+```
+
+```toml
+# ArthurCodex — peer list = Claude + Gemini
+[discord]
+allowed_role_ids    = [1536737398191300661]              # Codex's own role
+peer_agent_role_ids  = [
+  1536737647253266445, # Claude role  (peer)
+  1536738445651615764, # Gemini role  (peer)
+]
+```
+
+```toml
+# ArthurGemini — peer list = Claude + Codex
+[discord]
+allowed_role_ids    = [1536738445651615764]              # Gemini's own role
+peer_agent_role_ids  = [
+  1536737647253266445, # Claude role  (peer)
+  1536737398191300661, # Codex role   (peer)
+]
+```
+
+> ⚠️ 注意上面三段設定只是**同一個三 bot 部署**裡的對稱填法範例。請勿把這些 ID 當作 OpenAB 預設值；不同部署、不同 Discord 伺服器，role ID 都不一樣。
+
+#### 重新安裝時必須保留的事項
+
+`peer_agent_role_ids` 不會從任何地方自動推導出來 — 它必須由 operator 在每次重新安裝 / 重新部署時手動重新填入。如果升級或重建時漏掉這個欄位，所有 bot 都會退回 legacy 行為（角色單觸發 multihop 漏洞重新打開）。建議把它和 `bot_token`、`allowed_channels`、`allowed_users` 一起納入部署 checklist。
+
 ---
 
 ## @Mention Behavior

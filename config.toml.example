@@ -11,8 +11,39 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # allow_bot_messages = "off"  # "off" (default) | "mentions" | "all"
                                # "mentions" is recommended for multi-agent collaboration
 # trusted_bot_ids = []         # empty = any bot (mode permitting); set to restrict
-# allowed_role_ids = []        # role IDs that trigger the bot (same as direct @mention)
+# allowed_role_ids = []        # role IDs that trigger THIS bot (same as direct @mention)
                                # note: if multiple bots share the same role, all will respond simultaneously
+                               # see also peer_agent_role_ids below — that list is for OTHER configured agents
+# peer_agent_role_ids = []     # role IDs that explicitly target a sibling/peer agent bot in this deployment
+                               # (NOT configured for THIS bot). Operator-supplied; never inferred from role
+                               # names, attachment body, extracted text, OCR/STT content, or LLM output.
+                               # When a Discord message carries a structured @role-id mention listed here
+                               # AND no role from allowed_role_ids, THIS bot rejects the message before
+                               # the MultibotMentions solo-involved fallback would otherwise admit it —
+                               # closing the role-only multihop admit race for peer-targeted messages.
+                               # Self role (this bot's own triggering role) MUST NOT be listed here, and
+                               # unrelated Discord roles MUST NOT be listed. Empty (default) = role-peer
+                               # check is silent and legacy behavior is preserved.
+                               # Example (deployment-specific, NOT a universal default):
+                               #   peer_agent_role_ids = [
+                               #     1536737398191300661, # Codex role    (peer)
+                               #     1536738445651615764, # Gemini role   (peer)
+                               #   ]
+# Inbound routing authority (Discord; read-only here, behavior is in code):
+                               #   1. Structured Message::mentions    (@user-id; server-side)
+                               #   2. Structured Message::mention_roles ∩ allowed_role_ids
+                               #   3. Raw Message::content "<@BOT_ID>" substring fallback
+                               #      (legacy/backward-compat; scans the entire content string,
+                               #       including literal mention markup inside pasted/quoted/code-fenced
+                               #       text — see SECURITY NOTE below)
+                               # Attachment body, extracted text, OCR/STT content, and LLM output are
+                               # NOT consulted for inbound admission.
+                               # SECURITY NOTE: the raw "<@BOT_ID>" substring fallback is broader than
+                               # Discord's structured mention metadata and may match literal mention
+                               # markup inside inline pasted / quoted / code-fenced text. It is retained
+                               # for backward compatibility and is a KNOWN HARDENING OPPORTUNITY — not
+                               # already mitigated. See docs/discord.md ("peer_agent_role_ids" → "已知
+                               # 強化機會") for the full note.
 # allow_user_messages = "multibot-mentions"  # "multibot-mentions" (default) | "involved" | "mentions"
                                      # "involved" = reply in threads bot owns or has participated in
                                      # "mentions" = always require @mention
