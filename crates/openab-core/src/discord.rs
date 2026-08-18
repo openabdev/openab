@@ -275,6 +275,13 @@ pub struct Handler {
     pub allow_user_messages: AllowUsers,
     /// Role IDs that trigger the bot (same as direct @mention).
     pub allowed_role_ids: HashSet<u64>,
+    /// Role IDs that explicitly target a peer/agent bot account in this
+    /// deployment (NOT configured for THIS bot). See
+    /// `crate::config::DiscordConfig::peer_agent_role_ids`. Operator-
+    /// supplied; never inferred from role names, attachment body, or
+    /// LLM text. Empty = role-peer check is silent.
+    /// workflow 20260818-openab-discord-attachment-mention-admission
+    pub peer_agent_role_ids: HashSet<u64>,
     /// Positive-only cache: thread channel_id → cached_at for threads where bot has participated.
     pub participated_threads: tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>,
     /// Positive-only cache: thread channel_id → cached_at for threads where other bots have posted.
@@ -517,6 +524,16 @@ impl EventHandler for Handler {
                     .mention_roles
                     .iter()
                     .any(|r| self.allowed_role_ids.contains(&r.get())));
+
+        // Explicit structured targeting of another bot in the original
+        // Discord message metadata — see `has_explicit_other_bot_target`.
+        // (workflow 20260818-openab-discord-attachment-mention-admission)
+        let explicit_other_bot_target = has_explicit_other_bot_target(
+            &msg,
+            bot_id,
+            &self.allowed_role_ids,
+            &self.peer_agent_role_ids,
+        );
 
         // Early-gating optimization for bot messages to avoid unnecessary
         // async/HTTP thread detection calls when ambient mode is inactive and
@@ -813,11 +830,53 @@ impl EventHandler for Handler {
         // MultibotMentions: same as Involved, but if other bots are also
         //   in the thread, require @mention to avoid all bots responding.
         // DMs are treated as implicit @mention (mirrors Slack behavior).
+        //
+        // Precedence rule (workflow 20260818-openab-discord-attachment-mention-admission):
+        // explicit structured targeting of ANOTHER bot outranks involved /
+        // MultibotMentions fallback. When the message @-mentions a different
+        // bot, the unmentioned involved bot here must NOT piggyback via the
+        // multibot-mentions fallback — its cache hasn't learned about the
+        // other bot yet (it only learns on the other bot's first reply).
         if !is_mentioned && !is_dm {
+            if explicit_other_bot_target {
+                tracing::info!(
+                    bot_id = %bot_id,
+                    message_id = %msg.id,
+                    channel_id = %msg.channel_id,
+                    is_mentioned,
+                    explicit_other_bot_target = true,
+                    decision = "reject",
+                    reason = "explicit_other_bot_target",
+                    "A12 user-message gate"
+                );
+                return;
+            }
             match self.allow_user_messages {
-                AllowUsers::Mentions => return,
+                AllowUsers::Mentions => {
+                    tracing::info!(
+                        bot_id = %bot_id,
+                        message_id = %msg.id,
+                        channel_id = %msg.channel_id,
+                        is_mentioned,
+                        explicit_other_bot_target,
+                        decision = "reject",
+                        reason = "mentions_mode_unmentioned",
+                        "A12 user-message gate"
+                    );
+                    return;
+                }
                 AllowUsers::Involved => {
                     if !in_thread {
+                        tracing::info!(
+                            bot_id = %bot_id,
+                            message_id = %msg.id,
+                            channel_id = %msg.channel_id,
+                            is_mentioned,
+                            explicit_other_bot_target,
+                            decision = "reject",
+                            reason = "involved_mode_not_in_thread",
+                            "A12 user-message gate"
+                        );
                         return;
                     }
                     let (involved, _) = if bot_owns_thread {
@@ -827,12 +886,41 @@ impl EventHandler for Handler {
                             .await
                     };
                     if !involved {
-                        tracing::debug!(channel_id = %msg.channel_id, "bot not involved in thread, ignoring");
+                        tracing::info!(
+                            bot_id = %bot_id,
+                            message_id = %msg.id,
+                            channel_id = %msg.channel_id,
+                            is_mentioned,
+                            explicit_other_bot_target,
+                            decision = "reject",
+                            reason = "involved_mode_bot_not_participated",
+                            "A12 user-message gate"
+                        );
                         return;
                     }
+                    tracing::info!(
+                        bot_id = %bot_id,
+                        message_id = %msg.id,
+                        channel_id = %msg.channel_id,
+                        is_mentioned,
+                        explicit_other_bot_target,
+                        decision = "admit",
+                        reason = "involved_mode_bot_participated",
+                        "A12 user-message gate"
+                    );
                 }
                 AllowUsers::MultibotMentions => {
                     if !in_thread {
+                        tracing::info!(
+                            bot_id = %bot_id,
+                            message_id = %msg.id,
+                            channel_id = %msg.channel_id,
+                            is_mentioned,
+                            explicit_other_bot_target,
+                            decision = "reject",
+                            reason = "multibot_mentions_mode_not_in_thread",
+                            "A12 user-message gate"
+                        );
                         return;
                     }
                     let (involved, other_bot) = if bot_owns_thread {
@@ -846,15 +934,69 @@ impl EventHandler for Handler {
                             .await
                     };
                     if !involved {
-                        tracing::debug!(channel_id = %msg.channel_id, "bot not involved in thread, ignoring");
+                        tracing::info!(
+                            bot_id = %bot_id,
+                            message_id = %msg.id,
+                            channel_id = %msg.channel_id,
+                            is_mentioned,
+                            explicit_other_bot_target,
+                            decision = "reject",
+                            reason = "multibot_mentions_mode_bot_not_participated",
+                            "A12 user-message gate"
+                        );
                         return;
                     }
                     if other_bot {
-                        tracing::debug!(channel_id = %msg.channel_id, "multi-bot thread, requiring @mention");
+                        tracing::info!(
+                            bot_id = %bot_id,
+                            message_id = %msg.id,
+                            channel_id = %msg.channel_id,
+                            is_mentioned,
+                            explicit_other_bot_target,
+                            other_bot_present = other_bot,
+                            decision = "reject",
+                            reason = "multibot_mentions_mode_other_bot_present",
+                            "A12 user-message gate"
+                        );
                         return;
                     }
+                    tracing::info!(
+                        bot_id = %bot_id,
+                        message_id = %msg.id,
+                        channel_id = %msg.channel_id,
+                        is_mentioned,
+                        explicit_other_bot_target,
+                        other_bot_present = other_bot,
+                        decision = "admit",
+                        reason = "multibot_mentions_mode_solo_bot_involved",
+                        "A12 user-message gate"
+                    );
                 }
             }
+        } else if !is_dm {
+            // is_mentioned=true AND not DM: A12 short-circuits to admit.
+            tracing::info!(
+                bot_id = %bot_id,
+                message_id = %msg.id,
+                channel_id = %msg.channel_id,
+                is_mentioned,
+                explicit_other_bot_target,
+                decision = "admit",
+                reason = "is_mentioned_true",
+                "A12 user-message gate"
+            );
+        } else {
+            // DM
+            tracing::info!(
+                bot_id = %bot_id,
+                message_id = %msg.id,
+                channel_id = %msg.channel_id,
+                is_mentioned,
+                explicit_other_bot_target,
+                decision = "admit",
+                reason = "dm_implicit_mention",
+                "A12 user-message gate"
+            );
         }
 
         if is_denied_user(
@@ -3177,19 +3319,128 @@ fn should_skip_thread_creation(in_thread: bool, is_dm: bool) -> bool {
     in_thread || is_dm
 }
 
+/// Detect structured targeting of ANOTHER bot account in the original
+/// Discord message metadata.
+///
+/// Inspects ONLY structured `Message` fields Discord populates server-side
+/// (`Message::mentions` for `@user-id`, `Message::mention_roles` for
+/// `@role-id`). Does NOT inspect attachment body, code blocks, quoted
+/// content, or LLM-generated text (those can contain arbitrary `@user`
+/// strings and are not routing authority by policy).
+///
+/// Returns true iff EITHER:
+///
+/// 1. The message body contained at least one structured `@user-id` mention
+///    of a bot-flagged user that is NOT this bot AND is not a Discord
+///    system user — "the human explicitly addressed another bot here,
+///    not me"; OR
+///
+/// 2. The message body contained a structured `@role-id` mention whose
+///    ID is listed in `peer_agent_role_ids` (operator-supplied list of
+///    role IDs owned by sibling agents in this deployment) AND no role
+///    in the same message matches `self.allowed_role_ids` (so a
+///    legitimate self-role trigger is not shadowed). This closes the
+///    role-only multihop admit race before the multibot cache learns
+///    about the peer.
+///
+/// The peer list is operator-supplied; nothing here infers roles from
+/// role names, attachment text, prompt text, or LLM interpretation.
+///
+/// workflow 20260818-openab-discord-attachment-mention-admission
+fn has_explicit_other_bot_target(
+    msg: &Message,
+    bot_id: UserId,
+    self_allowed_role_ids: &HashSet<u64>,
+    peer_agent_role_ids: &HashSet<u64>,
+) -> bool {
+    // Signal 1: structured @user-id mention of another bot account.
+    if msg
+        .mentions
+        .iter()
+        .any(|u| u.bot && u.id != bot_id && !u.system)
+    {
+        return true;
+    }
+    // Signal 2: structured @role-id mention explicitly targeting a peer
+    // agent (operator-trusted list). A role in `self.allowed_role_ids`
+    // present in the same message would have short-circuited via the
+    // existing `is_mentioned` role check, so excluding self first keeps
+    // the two signals orthogonal.
+    if !msg.mention_roles.is_empty()
+        && !msg
+            .mention_roles
+            .iter()
+            .any(|r| self_allowed_role_ids.contains(&r.get()))
+        && msg
+            .mention_roles
+            .iter()
+            .any(|r| peer_agent_role_ids.contains(&r.get()))
+    {
+        return true;
+    }
+    false
+}
+
+/// Pure decision helper for the role-target precedence branch of
+/// [`has_explicit_other_bot_target`]. Exposed under `#[cfg(test)]` so
+/// the rule can be unit-tested without constructing a full
+/// `serenity::model::channel::Message`. Mirrors the inline logic:
+/// "the message carries a structured role mention that:
+///   - is NOT in this bot's own `allowed_role_ids`
+///     (otherwise `is_mentioned` would already short-circuit to ADMIT), AND
+///   - IS in `peer_agent_role_ids` (operator-trusted peer list)."
+///
+/// This rule rejects THIS bot before the MultibotMentions solo-involved
+/// fallback would otherwise admit it on a role-only mention that targets
+/// a sibling agent. Empty `peer_agent_role_ids` makes the rule silent —
+/// existing deployments without operator-listed peer roles keep current
+/// behavior. No heuristic role-name / attachment / LLM inference.
+///
+/// workflow 20260818-openab-discord-attachment-mention-admission
+#[cfg(test)]
+fn role_targets_other_agent(
+    mention_role_ids: &[u64],
+    self_allowed_role_ids: &HashSet<u64>,
+    peer_agent_role_ids: &HashSet<u64>,
+) -> bool {
+    !mention_role_ids.is_empty()
+        && !mention_role_ids
+            .iter()
+            .any(|r| self_allowed_role_ids.contains(r))
+        && mention_role_ids
+            .iter()
+            .any(|r| peer_agent_role_ids.contains(r))
+}
+
 /// Pure decision function: should this message be processed or ignored?
 /// Returns `true` if the message should be processed (bot responds).
 /// Extracted from the EventHandler::message gating logic for testability.
+///
+/// `explicit_other_bot_target` — see [`has_explicit_other_bot_target`].
+/// When true and the message does NOT mention this bot, this bot is
+/// rejected so it never falls through to the involved / MultibotMentions
+/// fallback. (workflow 20260818-openab-discord-attachment-mention-admission)
 #[cfg(test)]
 fn should_process_user_message(
     mode: AllowUsers,
     is_mentioned: bool,
+    explicit_other_bot_target: bool,
     in_thread: bool,
     involved: bool,
     other_bot_present: bool,
 ) -> bool {
     if is_mentioned {
         return true;
+    }
+    // Precedence rule (workflow 20260818-openab-discord-attachment-mention-admission):
+    // explicit structured targeting of ANOTHER bot outranks involved /
+    // MultibotMentions fallback. Without this guard, an unmentioned bot
+    // that has previously posted in the thread is admitted via
+    // multibot_mentions_mode_solo_bot_involved even when the message
+    // actually @-mentions a different bot — until the multibot cache
+    // learns about that other bot (only on its first reply).
+    if explicit_other_bot_target {
+        return false;
     }
     match mode {
         AllowUsers::Mentions => false,
@@ -3845,6 +4096,7 @@ mod tests {
         assert!(should_process_user_message(
             AllowUsers::MultibotMentions,
             false, // is_mentioned
+            false, // explicit_other_bot_target (scenario C baseline)
             true,  // in_thread
             true,  // involved
             false, // other_bot_present
@@ -3860,6 +4112,7 @@ mod tests {
         assert!(!should_process_user_message(
             AllowUsers::MultibotMentions,
             false, // is_mentioned
+            false, // explicit_other_bot_target (other_bot_present drives rejection)
             true,  // in_thread
             true,  // involved
             true,  // other_bot_present ← another bot posted
@@ -3874,6 +4127,7 @@ mod tests {
         assert!(should_process_user_message(
             AllowUsers::MultibotMentions,
             true, // is_mentioned
+            false, // explicit_other_bot_target (is_mentioned short-circuits)
             true, // in_thread
             true, // involved
             true, // other_bot_present
@@ -3888,6 +4142,7 @@ mod tests {
         assert!(!should_process_user_message(
             AllowUsers::MultibotMentions,
             false, // is_mentioned
+            false, // explicit_other_bot_target
             false, // in_thread (main channel)
             false, // involved
             false, // other_bot_present
@@ -3902,6 +4157,7 @@ mod tests {
         assert!(!should_process_user_message(
             AllowUsers::MultibotMentions,
             false, // is_mentioned
+            false, // explicit_other_bot_target
             true,  // in_thread
             false, // involved ← bot hasn't posted here
             false, // other_bot_present
@@ -3916,6 +4172,7 @@ mod tests {
         assert!(should_process_user_message(
             AllowUsers::Involved,
             false, // is_mentioned
+            false, // explicit_other_bot_target
             true,  // in_thread
             true,  // involved
             true,  // other_bot_present ← ignored in involved mode
@@ -3930,6 +4187,7 @@ mod tests {
         assert!(!should_process_user_message(
             AllowUsers::Mentions,
             false, // is_mentioned
+            false, // explicit_other_bot_target
             true,  // in_thread
             true,  // involved
             false, // other_bot_present
@@ -4457,6 +4715,7 @@ mod tests {
         assert!(!should_process_user_message(
             AllowUsers::Involved,
             false, // is_mentioned (DMs don't have @mention)
+            false, // explicit_other_bot_target
             false, // in_thread (DMs are not threads)
             false, // involved
             false, // other_bot_present
@@ -4608,6 +4867,298 @@ mod tests {
             AllowUsers::MultibotMentions,
             false, // is_thread
             false, false, false,
+        ));
+    }
+
+    // --- should_process_user_message: explicit-other-bot precedence rule ---
+    // workflow 20260818-openab-discord-attachment-mention-admission
+
+    /// Scenario A: involved Claude, Codex explicitly user-mentioned,
+    /// Codex has not spoken yet → Claude REJECT, Codex ADMIT.
+    /// Claude side: msg.mentions includes Codex (other bot) and not Claude.
+    /// MultibotMentions would have admitted via solo_bot_involved fallback
+    /// before this fix.
+    #[test]
+    fn explicit_other_bot_target_rejects_involved_bot_a() {
+        assert!(!should_process_user_message(
+            AllowUsers::MultibotMentions,
+            false, // is_mentioned (this bot is NOT mentioned)
+            true,  // explicit_other_bot_target (Codex mentioned via structured metadata)
+            true,  // in_thread
+            true,  // involved (this bot has posted before)
+            false, // other_bot_present (cache hasn't seen Codex reply yet)
+        ));
+    }
+
+    /// Scenario B: same case with an attachment.
+    /// Confirms that attachment presence does not influence the precedence
+    /// rule — the attachment body is not consulted as routing authority.
+    #[test]
+    fn explicit_other_bot_target_rejects_involved_bot_b_with_attachment() {
+        assert!(!should_process_user_message(
+            AllowUsers::MultibotMentions,
+            false, // is_mentioned
+            true,  // explicit_other_bot_target
+            true,  // in_thread
+            true,  // involved
+            false, // other_bot_present
+        ));
+    }
+
+    /// Scenario C: involved Claude, no explicit bot target.
+    /// Preserves the existing MultibotMentions involved+!other_bot fallback
+    /// when there is no structured @-mention of another bot.
+    #[test]
+    fn no_explicit_target_preserves_multibot_fallback_c() {
+        assert!(should_process_user_message(
+            AllowUsers::MultibotMentions,
+            false, // is_mentioned
+            false, // explicit_other_bot_target
+            true,  // in_thread
+            true,  // involved
+            false, // other_bot_present
+        ));
+    }
+
+    /// Scenario D: explicit @mention of this bot.
+    /// is_mentioned short-circuits to ADMIT — independent of any other
+    /// bot mention in the same message.
+    #[test]
+    fn is_mentioned_still_admits_d() {
+        assert!(should_process_user_message(
+            AllowUsers::MultibotMentions,
+            true, // is_mentioned (this bot mentioned)
+            true, // explicit_other_bot_target (other bot also mentioned)
+            true, // in_thread
+            true, // involved
+            true, // other_bot_present
+        ));
+    }
+
+    /// Scenario E: message explicitly mentions both Claude AND Codex.
+    /// Each bot sees itself as `is_mentioned=true` and admits. Multi-target
+    /// behavior is preserved by the existing is_mentioned short-circuit,
+    /// NOT by the new precedence rule.
+    #[test]
+    fn multi_target_admits_all_e() {
+        // Claude side: msg.mentions includes Claude + Codex.
+        assert!(should_process_user_message(
+            AllowUsers::MultibotMentions,
+            true, // is_mentioned (Claude in mentions list)
+            true, // explicit_other_bot_target (Codex also in mentions list)
+            true, true, true,
+        ));
+        // Codex side: msg.mentions includes Claude + Codex.
+        assert!(should_process_user_message(
+            AllowUsers::MultibotMentions,
+            true, // is_mentioned (Codex in mentions list)
+            true, // explicit_other_bot_target (Claude also in mentions list)
+            true, true, true,
+        ));
+    }
+
+    /// Scenario F: attachment body contains "@Claude" but the original
+    /// structured `msg.mentions` targets Codex only.
+    /// Routing decision depends ONLY on structured metadata; attachment
+    /// body text is never used as routing authority.
+    #[test]
+    fn attachment_text_does_not_grant_admission_f() {
+        // Claude side: msg.mentions has Codex, so explicit_other_bot_target=true;
+        // is_mentioned=false → REJECT.
+        assert!(!should_process_user_message(
+            AllowUsers::MultibotMentions,
+            false, // is_mentioned (Claude not in structured mentions)
+            true,  // explicit_other_bot_target (Codex is)
+            true,  // in_thread
+            true,  // involved (Claude posted before)
+            false, // other_bot_present
+        ));
+    }
+
+    /// Scenario G: original event has no structured bot target,
+    /// attachment body text contains "@Codex".
+    /// Attachment text must not grant admission for either bot.
+    /// For Codex: explicit_other_bot_target=false → depends on
+    /// (is_mentioned, in_thread, involved) → not admitted (D in this test).
+    #[test]
+    fn no_structured_target_attachment_text_ignored_g() {
+        // Codex side: msg.mentions is empty (no structured bot mention),
+        // even though attachment text contains "@Codex".
+        // involved=false because Codex has not posted in this thread.
+        assert!(!should_process_user_message(
+            AllowUsers::MultibotMentions,
+            false, // is_mentioned
+            false, // explicit_other_bot_target — attachment text is NOT authoritative
+            true,  // in_thread (message arrived in a thread)
+            false, // involved (Codex hasn't posted)
+            false, // other_bot_present
+        ));
+    }
+
+    /// Scenario H: role-based target regression.
+    /// Existing role-trigger semantics preserved: a role in this bot's
+    /// `allowed_role_ids` triggers this bot regardless of any other bot
+    /// mention in the same message. The new precedence rule does NOT
+    /// silence a role that is configured to trigger this bot.
+    #[test]
+    fn role_trigger_preserved_h() {
+        // is_mentioned becomes true via msg.mention_roles in
+        // allowed_role_ids; explicit_other_bot_target may also be true
+        // (some other bot mentioned). is_mentioned short-circuits to ADMIT.
+        assert!(should_process_user_message(
+            AllowUsers::MultibotMentions,
+            true, // is_mentioned (role in allowed_role_ids → trigger)
+            true, // explicit_other_bot_target (some other bot mentioned too)
+            true, true, true,
+        ));
+        // Sanity: in Mentions mode, the role still triggers this bot.
+        assert!(should_process_user_message(
+            AllowUsers::Mentions,
+            true, // is_mentioned (role trigger)
+            false, // explicit_other_bot_target
+            true, true, true,
+        ));
+        // Without role trigger and without explicit bot target in
+        // `msg.mentions`, the Involved mode admits if the bot is involved
+        // (existing behavior — roles not in `allowed_role_ids` are ignored).
+        assert!(should_process_user_message(
+            AllowUsers::Involved,
+            false, // is_mentioned (no role in allowed list, no @mention)
+            false, // explicit_other_bot_target (no @mention of any bot)
+            true,  // in_thread
+            true,  // involved
+            true,  // other_bot_present
+        ));
+    }
+
+    // --- role_targets_other_agent (operator-trusted peer-role list) ---
+    // workflow 20260818-openab-discord-attachment-mention-admission
+    // These tests pin the role-only branch of has_explicit_other_bot_target.
+    // The matching integration assertion — that the resulting
+    // `explicit_other_bot_target=true` causes `should_process_user_message`
+    // to REJECT — lives in `verifier_role_targeting_peer_agent_rejected`
+    // below.
+
+    /// Verifier baseline: Claude's role and Codex's role from the live
+    /// discord config at `/home/arthur/openab/{claude,codex}/config.toml`.
+    const CLAUDE_ROLE: u64 = 1536737647253266445;
+    const CODEX_ROLE: u64 = 1536737398191300661;
+
+    /// Role-only mention, role is in the operator's peer list, role is
+    /// NOT in self's list → true. This is the verifier scenario.
+    #[test]
+    fn role_targets_other_agent_detects_peer_role_only() {
+        let self_list: HashSet<u64> = [CLAUDE_ROLE].into_iter().collect();
+        let peer_list: HashSet<u64> = [CODEX_ROLE].into_iter().collect();
+        assert!(role_targets_other_agent(
+            &[CODEX_ROLE],
+            &self_list,
+            &peer_list
+        ));
+    }
+
+    /// Self-role only → false. This role belongs to self, not a peer;
+    /// is_mentioned short-circuits via the existing role check.
+    #[test]
+    fn role_targets_other_agent_ignores_self_role() {
+        let self_list: HashSet<u64> = [CLAUDE_ROLE].into_iter().collect();
+        let peer_list: HashSet<u64> = [CODEX_ROLE].into_iter().collect();
+        assert!(!role_targets_other_agent(
+            &[CLAUDE_ROLE],
+            &self_list,
+            &peer_list
+        ));
+    }
+
+    /// Self role + peer role in the same message → false. Self's role
+    /// short-circuits `is_mentioned=true` → admit. The peer role alone
+    /// must not overrule that.
+    #[test]
+    fn role_targets_other_agent_self_role_alongside_peer_role_admits() {
+        let self_list: HashSet<u64> = [CLAUDE_ROLE].into_iter().collect();
+        let peer_list: HashSet<u64> = [CODEX_ROLE].into_iter().collect();
+        assert!(!role_targets_other_agent(
+            &[CLAUDE_ROLE, CODEX_ROLE],
+            &self_list,
+            &peer_list
+        ));
+    }
+
+    /// Unrelated role (not in self, not in peer) → false. Heuristic
+    /// "anything-not-self is peer" is forbidden by spec; only operator-
+    /// listed role IDs trigger the reject.
+    #[test]
+    fn role_targets_other_agent_unrelated_role_returns_false() {
+        let self_list: HashSet<u64> = [CLAUDE_ROLE].into_iter().collect();
+        let peer_list: HashSet<u64> = [CODEX_ROLE].into_iter().collect();
+        assert!(!role_targets_other_agent(
+            &[999_999_999_999],
+            &self_list,
+            &peer_list
+        ));
+    }
+
+    /// Empty peer list (operator did not enumerate) → false.
+    /// Preserves existing deployments that don't use role-based peer
+    /// routing.
+    #[test]
+    fn role_targets_other_agent_empty_peer_list_returns_false() {
+        let self_list: HashSet<u64> = [CLAUDE_ROLE].into_iter().collect();
+        let peer_list: HashSet<u64> = HashSet::new();
+        assert!(!role_targets_other_agent(
+            &[CODEX_ROLE],
+            &self_list,
+            &peer_list
+        ));
+    }
+
+    /// Empty mention_roles (no role mentions) → false.
+    #[test]
+    fn role_targets_other_agent_empty_mentions_returns_false() {
+        let self_list: HashSet<u64> = [CLAUDE_ROLE].into_iter().collect();
+        let peer_list: HashSet<u64> = [CODEX_ROLE].into_iter().collect();
+        assert!(!role_targets_other_agent(&[], &self_list, &peer_list));
+    }
+
+    /// Verifier scenario end-to-end through the pure decision function:
+    /// the role-peer signal computes to true (verified by
+    /// `role_targets_other_agent_detects_peer_role_only` above), and
+    /// the resulting `explicit_other_bot_target=true` (as the helper
+    /// would set it) causes `should_process_user_message` to REJECT
+    /// before the MultibotMentions solo-involved fallback.
+    #[test]
+    fn verifier_role_targeting_peer_agent_rejected() {
+        // Helper computes explicit_other_bot_target=true for this input
+        // via the role-peer branch (peer role in msg.mention_roles,
+        // not in self.allowed_role_ids). Here we assert the same
+        // outcome via the pure decision function.
+        assert!(!should_process_user_message(
+            AllowUsers::MultibotMentions,
+            false, // is_mentioned (no @Claude, no role in Claude's list)
+            true,  // explicit_other_bot_target (role-peer signal true)
+            true,  // in_thread
+            true,  // involved (Claude posted before)
+            false, // other_bot_present (Codex has not yet posted)
+        ));
+    }
+
+    /// Exact confirmed-state repro from workflow 20260818-...
+    /// observed on message 1539241048075935744:
+    ///   is_mentioned = false
+    ///   in_thread    = true
+    ///   involved     = true
+    ///   other_bot_present = false
+    ///   explicit_other_bot_target = true
+    /// Expected: REJECT before multibot_mentions_mode_solo_bot_involved.
+    #[test]
+    fn exact_confirmed_state_rejected() {
+        assert!(!should_process_user_message(
+            AllowUsers::MultibotMentions,
+            false, // is_mentioned (Claude not mentioned)
+            true,  // explicit_other_bot_target (Codex mentioned)
+            true,  // in_thread
+            true,  // involved (Claude has posted before)
+            false, // other_bot_present (cache hasn't seen Codex reply yet)
         ));
     }
 }

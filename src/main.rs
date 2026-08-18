@@ -1658,6 +1658,8 @@ async fn main() -> anyhow::Result<()> {
             parse_id_set(&discord_cfg.trusted_bot_ids, "discord.trusted_bot_ids")?;
         let allowed_role_ids =
             parse_id_set(&discord_cfg.allowed_role_ids, "discord.allowed_role_ids")?;
+        let peer_agent_role_ids =
+            parse_id_set(&discord_cfg.peer_agent_role_ids, "discord.peer_agent_role_ids")?;
         info!(
             allow_all_channels,
             allow_all_users,
@@ -1665,6 +1667,7 @@ async fn main() -> anyhow::Result<()> {
             users = allowed_users.len(),
             trusted_bots = trusted_bot_ids.len(),
             role_triggers = allowed_role_ids.len(),
+            peer_agent_roles = peer_agent_role_ids.len(),
             allow_bot_messages = ?discord_cfg.allow_bot_messages,
             allow_user_messages = ?discord_cfg.allow_user_messages,
             allow_dm = discord_cfg.allow_dm,
@@ -1722,6 +1725,7 @@ async fn main() -> anyhow::Result<()> {
             trusted_bot_ids,
             allow_user_messages: discord_cfg.allow_user_messages,
             allowed_role_ids,
+            peer_agent_role_ids,
             participated_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             multibot_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             multibot_cache,

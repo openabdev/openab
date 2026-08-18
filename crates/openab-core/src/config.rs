@@ -533,6 +533,25 @@ pub struct DiscordConfig {
     /// Empty (default) = role mentions do not trigger the bot.
     #[serde(default)]
     pub allowed_role_ids: Vec<String>,
+    /// Role IDs that explicitly target a peer agent bot account in this
+    /// deployment (NOT configured for THIS bot). Used only by the A12
+    /// role-target precedence check in `EventHandler::message` to reject
+    /// this bot when the original Discord message carries a role mention
+    /// that targets another configured agent — so we don't piggyback via
+    /// the MultibotMentions solo-involved fallback before the multibot
+    /// cache learns about the peer.
+    ///
+    /// Operator-supplied list. Never inferred from role names, role
+    /// display strings, attachment body text, prompt text, or LLM
+    /// interpretation. Empty (default) means the role-peer check is
+    /// silent: deployments that don't use role-based peer routing keep
+    /// their existing behavior. Empty peer list + role mention alone
+    /// does NOT auto-reject — the operator must enumerate the peer
+    /// roles they trust.
+    ///
+    /// workflow 20260818-openab-discord-attachment-mention-admission
+    #[serde(default)]
+    pub peer_agent_role_ids: Vec<String>,
     /// Allow the bot to respond to Discord direct messages (DMs).
     /// Default: false (opt-in). `allowed_users` still applies in DMs.
     #[serde(default)]
