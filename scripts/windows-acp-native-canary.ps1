@@ -19,6 +19,53 @@ function Assert-Canary {
     }
 }
 
+function Redact-CanaryText {
+    param([AllowNull()][string]$Text)
+    if ($null -eq $Text) {
+        return "<null>"
+    }
+    return $Text `
+        -replace '(?i)Bearer\s+[A-Za-z0-9._~+/=-]+', 'Bearer <redacted>' `
+        -replace '(?i)(sk-ant-|sk-)[A-Za-z0-9._~-]+', '<redacted>' `
+        -replace '(?i)(api[_-]?key\s*[:=]\s*)[^,\s}]+', '$1<redacted>'
+}
+
+function Format-CanaryFrame {
+    param([AllowNull()][object]$Frame)
+    if ($null -eq $Frame) {
+        return "<null>"
+    }
+    if ($Frame -is [string]) {
+        return Redact-CanaryText ([string]$Frame)
+    }
+    try {
+        return Redact-CanaryText ($Frame | ConvertTo-Json -Compress -Depth 20)
+    }
+    catch {
+        return Redact-CanaryText ([string]$Frame)
+    }
+}
+
+function Assert-RpcSuccess {
+    param(
+        [AllowNull()][object]$Frame,
+        [int]$ExpectedId,
+        [string]$Method
+    )
+    Assert-Canary -Condition ($null -ne $Frame) -Message "$Method returned no JSON-RPC frame"
+    $properties = @($Frame.PSObject.Properties.Name)
+    if (-not ($properties -contains "id") -or [int]$Frame.id -ne $ExpectedId) {
+        throw "CANARY FAIL: $Method response id mismatch; frame=$(Format-CanaryFrame $Frame)"
+    }
+    if ($properties -contains "error") {
+        throw "CANARY FAIL: $Method returned JSON-RPC error; frame=$(Format-CanaryFrame $Frame)"
+    }
+    if (-not ($properties -contains "result")) {
+        throw "CANARY FAIL: $Method response has no result; frame=$(Format-CanaryFrame $Frame)"
+    }
+    return $Frame.result
+}
+
 function Add-BaselineEnvironment {
     param([System.Diagnostics.ProcessStartInfo]$StartInfo)
     $StartInfo.EnvironmentVariables.Clear()
@@ -75,7 +122,13 @@ function Receive-StdioJson {
     $read = $Process.StandardOutput.ReadLineAsync()
     Assert-Canary -Condition ($read.Wait([TimeSpan]::FromSeconds($TimeoutSeconds))) -Message "stdio response timed out"
     Assert-Canary -Condition ($null -ne $read.Result) -Message "stdio closed before response"
-    return $read.Result | ConvertFrom-Json
+    $raw = [string]$read.Result
+    try {
+        return $raw | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        throw "CANARY FAIL: stdio emitted invalid JSON; frame=$(Redact-CanaryText $raw)"
+    }
 }
 
 function Send-WebSocketJson {
@@ -195,7 +248,8 @@ try {
         params = @{ protocolVersion = 1; clientCapabilities = @{}; clientInfo = @{ name = "windows-canary"; version = "1" } }
     }
     $initialize = Receive-StdioJson $agent
-    Assert-Canary -Condition ($initialize.id -eq 1 -and $initialize.result.agentInfo.name -eq "openab-agent") -Message "agent initialize"
+    $initializeResult = Assert-RpcSuccess $initialize 1 "agent initialize"
+    Assert-Canary -Condition ($initializeResult.agentInfo.name -eq "openab-agent") -Message "agent initialize agentInfo"
 
     Send-StdioJson $agent @{
         jsonrpc = "2.0"
@@ -204,9 +258,8 @@ try {
         params = @{ cwd = $WorkDir; mcpServers = @() }
     }
     $newSession = Receive-StdioJson $agent
-    Assert-Canary -Condition (
-        $newSession.id -eq 2 -and -not [string]::IsNullOrWhiteSpace($newSession.result.sessionId)
-    ) -Message "agent session/new"
+    $newSessionResult = Assert-RpcSuccess $newSession 2 "agent session/new"
+    Assert-Canary -Condition (-not [string]::IsNullOrWhiteSpace($newSessionResult.sessionId)) -Message "agent session/new sessionId"
     $agent.StandardInput.Close()
     Assert-Canary -Condition ($agent.WaitForExit(10000)) -Message "agent did not stop after stdin EOF"
     Assert-Canary -Condition ($agent.ExitCode -eq 0) -Message "agent returned non-zero after stdio smoke"
@@ -256,7 +309,8 @@ max_sessions = 2
         params = @{ protocolVersion = 1; clientCapabilities = @{}; clientInfo = @{ name = "windows-canary"; version = "1" } }
     }
     $rootInitialize = Receive-WebSocketResponse $socket 1
-    Assert-Canary -Condition ($rootInitialize.result.protocolVersion -eq 1) -Message "root /acp initialize"
+    $rootInitializeResult = Assert-RpcSuccess $rootInitialize 1 "root /acp initialize"
+    Assert-Canary -Condition ($rootInitializeResult.protocolVersion -eq 1) -Message "root /acp initialize protocolVersion"
 
     Send-WebSocketJson $socket @{
         jsonrpc = "2.0"
@@ -265,7 +319,8 @@ max_sessions = 2
         params = @{ cwd = $WorkDir; mcpServers = @() }
     }
     $rootNew = Receive-WebSocketResponse $socket 2
-    $sessionId = [string]$rootNew.result.sessionId
+    $rootNewResult = Assert-RpcSuccess $rootNew 2 "root /acp session/new"
+    $sessionId = [string]$rootNewResult.sessionId
     Assert-Canary -Condition ($sessionId.StartsWith("sess_")) -Message "root /acp session/new"
 
     Send-WebSocketJson $socket @{
@@ -296,7 +351,8 @@ max_sessions = 2
         params = @{ sessionId = $sessionId }
     }
     $cancelResult = Receive-WebSocketResponse $socket 4 15
-    Assert-Canary -Condition ($cancelResult.result.stopReason -eq "cancelled") -Message "gateway cancellation did not settle as cancelled"
+    $cancelResultResult = Assert-RpcSuccess $cancelResult 4 "gateway cancellation"
+    Assert-Canary -Condition ($cancelResultResult.stopReason -eq "cancelled") -Message "gateway cancellation did not settle as cancelled"
     Write-Host "[PASS] openab.exe /acp -> openab-agent.exe full-chain spawn and gateway cancel"
 
     $socket.Dispose()
