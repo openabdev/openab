@@ -1,15 +1,16 @@
 # Windows ACP native canary
 
-This is a non-release, no-provider canary for the two Windows binaries built from the
+This is a non-release, no-provider-call canary for the two Windows binaries built from the
 `spike/windows-acp-native-agent` branch.
 
 ## Safety boundary
 
 - Use only the `openab.exe` and `openab-agent.exe` shipped in the same canary archive.
 - Verify the archive and binary SHA-256 values against `MANIFEST.json` and `SHA256SUMS.txt`.
-- The script creates an isolated temporary home and uses a non-secret sentinel credential.
+- The script creates an isolated temporary home and uses a non-secret sentinel credential with
+  an explicit Anthropic provider/model selection so provider construction is deterministic.
 - All provider HTTP(S) proxy variables point to the closed loopback port `127.0.0.1:9`.
-- It does not log in, read an existing auth store, call a usable provider credential, publish a
+- It does not log in, read an existing auth store, call a usable provider endpoint, publish a
   release, install anything, or modify the repository.
 - Temporary files are deleted in `finally`. The script force-stops any canary process left after a
   failed assertion.
@@ -35,7 +36,7 @@ process count, or surviving downstream agent fails closed with a non-zero exit.
 
 1. Both PE binaries start on Windows.
 2. `openab-agent.exe` completes ACP `initialize` and `session/new` over stdio without a provider
-   request.
+   network request.
 3. `openab.exe` serves loopback `/acp`, completes upstream `initialize` and `session/new`, and the
    first prompt crosses the full `openab.exe -> openab-agent.exe` process boundary.
 4. Gateway `session/cancel` settles the upstream waiter as `cancelled`.

@@ -135,7 +135,7 @@ jobs:
           cargo build --locked --release --target $env:TARGET --no-default-features --features acp
           cargo build --locked --release --target $env:TARGET --manifest-path openab-agent/Cargo.toml
 
-      - name: Run no-provider dual-layer runtime canary
+      - name: Run no-provider-call dual-layer runtime canary
         shell: pwsh
         run: |
           ./scripts/windows-acp-native-canary.ps1 `

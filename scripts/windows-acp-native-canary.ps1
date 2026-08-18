@@ -234,6 +234,8 @@ try {
     $isolatedAgentEnv = @{
         HOME = $homeDir
         USERPROFILE = $homeDir
+        OPENAB_AGENT_PROVIDER = "anthropic"
+        OPENAB_AGENT_MODEL = "claude-sonnet-4-6"
         ANTHROPIC_API_KEY = "ci-non-secret-no-provider-call"
         HTTPS_PROXY = "http://127.0.0.1:9"
         HTTP_PROXY = "http://127.0.0.1:9"
@@ -276,7 +278,7 @@ try {
 [agent]
 command = '$agentToml'
 working_dir = '$workToml'
-env = { ANTHROPIC_API_KEY = "ci-non-secret-no-provider-call", HTTPS_PROXY = "http://127.0.0.1:9", HTTP_PROXY = "http://127.0.0.1:9", ALL_PROXY = "http://127.0.0.1:9", NO_PROXY = "" }
+env = { OPENAB_AGENT_PROVIDER = "anthropic", OPENAB_AGENT_MODEL = "claude-sonnet-4-6", ANTHROPIC_API_KEY = "ci-non-secret-no-provider-call", HTTPS_PROXY = "http://127.0.0.1:9", HTTP_PROXY = "http://127.0.0.1:9", ALL_PROXY = "http://127.0.0.1:9", NO_PROXY = "" }
 
 [pool]
 max_sessions = 2
