@@ -477,55 +477,123 @@ fn quarantine_corrupt_auth(path: &Path, err: &anyhow::Error) {
     let _ = std::fs::rename(path, &quarantine);
 }
 
-/// Atomically replace `auth.json` with the new map via tmp + `rename(2)` +
-/// parent-dir fsync. A crash between the tmp write and the rename leaves
-/// `auth.json` unchanged; a crash after the rename has the new file
-/// already durable. Satisfies the ADR §6.1 refresh-token rotation
-/// contract — without rename atomicity, a Spot interruption mid-write
-/// would leave a half-written `auth.json` that the next task start would
-/// fail to parse, then re-restore from S3 with a now-revoked refresh
-/// token.
+/// Write a complete, synced replacement in the destination directory. Unique
+/// `create_new` names plus retry mean a stale temp left by a crashed process
+/// cannot wedge a later save even if the OS eventually reuses its process id.
+fn write_synced_auth_temp(dir: &Path, data: &str) -> Result<PathBuf> {
+    use std::fs::OpenOptions;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..1024 {
+        let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!("auth.json.tmp.{}.{seq}", std::process::id()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+
+        let mut file = match options.open(&tmp) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        };
+        if let Err(e) = file
+            .write_all(data.as_bytes())
+            .and_then(|_| file.sync_all())
+        {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        drop(file);
+        return Ok(tmp);
+    }
+    Err(anyhow!(
+        "unable to allocate a unique auth.json temp file after 1024 attempts"
+    ))
+}
+
+/// Commit a synced temp file over `auth.json` without exposing a partially
+/// written destination. Both backends keep the replacement in the same
+/// directory/volume so the namespace switch is atomic.
+fn replace_auth_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::rename(tmp, path)?;
+        // Persist the directory entry swap after the temp contents themselves
+        // were synced. Best-effort because not every Unix filesystem supports
+        // syncing directory handles.
+        if let Some(dir) = path.parent() {
+            if let Ok(dir_handle) = std::fs::File::open(dir) {
+                let _ = dir_handle.sync_all();
+            }
+        }
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, ReplaceFileW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+            REPLACEFILE_WRITE_THROUGH,
+        };
+
+        fn wide(path: &Path) -> Vec<u16> {
+            path.as_os_str().encode_wide().chain(Some(0)).collect()
+        }
+
+        let replacement = wide(tmp);
+        let destination = wide(path);
+        // ReplaceFileW preserves the destination ACL when auth.json already
+        // exists. MoveFileExW handles first creation. WRITE_THROUGH asks Windows
+        // not to report success until the move has reached durable storage.
+        let ok = unsafe {
+            if path.exists() {
+                ReplaceFileW(
+                    destination.as_ptr(),
+                    replacement.as_ptr(),
+                    std::ptr::null(),
+                    REPLACEFILE_WRITE_THROUGH,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            } else {
+                MoveFileExW(
+                    replacement.as_ptr(),
+                    destination.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            }
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        std::fs::rename(tmp, path)
+    }
+}
+
+/// Atomically replace `auth.json` with a complete, synced new map. A crash
+/// before `replace_auth_file` leaves the prior file untouched; after the atomic
+/// namespace switch, readers observe only the complete new file. This protects
+/// refresh-token rotation from half-written credential state on both Unix and
+/// Windows.
 fn write_auth_file(path: &Path, map: &HashMap<String, AuthEntry>) -> Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir)?;
     let data = serde_json::to_string_pretty(map)?;
-    #[cfg(unix)]
-    {
-        use std::fs::{File, OpenOptions};
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-        let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp = dir.join(format!("auth.json.tmp.{}.{seq}", std::process::id()));
-        let write_and_sync = || -> Result<()> {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            file.write_all(data.as_bytes())?;
-            file.sync_all()?;
-            Ok(())
-        };
-        if let Err(e) = write_and_sync() {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-        if let Err(e) = std::fs::rename(&tmp, path) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e.into());
-        }
-        // fsync the parent dir so the rename itself is durable; without
-        // this, the inode swap can be reordered after a power loss even
-        // though the tmp's contents were synced.
-        if let Ok(dir_handle) = File::open(dir) {
-            let _ = dir_handle.sync_all();
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, &data)?;
+    let tmp = write_synced_auth_temp(dir, &data)?;
+    if let Err(e) = replace_auth_file(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
     }
     Ok(())
 }
@@ -555,95 +623,88 @@ fn auth_subcommand(namespace: &str) -> &'static str {
 //       refresh per tenant so concurrent processes present a rotated `RT_old`
 //       only once, never tripping OAuth 2.1 §10.4 token-family revocation.
 //
-// `flock(2)` (not a sentinel lockfile) so the kernel auto-releases on fd close /
-// process death — no stale lock, no orphan cleanup. The lock lives on a sidecar,
-// never on `auth.json` itself, because the atomic tmp+rename swaps that inode out
-// from under any lock held on it. `#[cfg(unix)]`; a non-unix build is a no-op
-// (openab-agent is de-facto unix-only — see `write_auth_file`).
+// The standard-library API maps to OS advisory file locks, so fd/handle close
+// and process death release a lock without stale sentinel cleanup. The lock
+// lives on a sidecar, never on `auth.json` itself, because atomic replacement
+// swaps that inode/file entry.
 
 /// Sidecar lock path `auth.json.<suffix>.lock`, next to the auth file so a
 /// test-injected tempdir locks its own sidecar rather than the real `$HOME` one.
-#[cfg(unix)]
 fn lock_path_for(auth: &Path, suffix: &str) -> PathBuf {
     let dir = auth.parent().unwrap_or_else(|| Path::new("."));
     dir.join(format!("auth.json.{suffix}.lock"))
 }
 
-/// RAII guard releasing the advisory lock on drop. The kernel also drops it on
-/// fd close / process death, so a crashed holder never wedges the file.
-#[cfg(unix)]
+/// RAII guard releasing the advisory lock on drop. Supported Unix and Windows
+/// builds share this API and the kernel also releases the lock on process death.
+#[cfg(any(unix, windows))]
 pub(crate) struct AuthFileLock {
     file: std::fs::File,
 }
 
-// DISCOVERY_ONLY / NOT_SHIPPABLE:
-//
-// This zero-sized non-Unix type exists only so the bounded Windows compile
-// spike can enumerate blockers beyond the first cfg mismatch. It provides no
-// locking and must never be used for a release artifact. A production Windows
-// port still requires a real cross-process lock plus atomic credential replace.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub(crate) struct AuthFileLock;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Drop for AuthFileLock {
     fn drop(&mut self) {
-        use std::os::unix::io::AsRawFd;
-        // SAFETY: `self.file` owns a valid fd; flock has no memory effects.
-        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        let _ = self.file.unlock();
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn open_lock_file(lock: &Path) -> Result<std::fs::File> {
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
     if let Some(dir) = lock.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    Ok(std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(lock)?)
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    options.mode(0o600);
+    Ok(options.open(lock)?)
 }
 
 /// Blocking exclusive lock. Used ONLY for the global file RMW, which performs no
 /// network I/O while held, so acquisition blocks at most for another process's
 /// fast tmp+rename — never for a slow refresh (those take the per-tenant lock).
-#[cfg(unix)]
-fn flock_exclusive(lock: &Path) -> Result<AuthFileLock> {
-    use std::os::unix::io::AsRawFd;
+#[cfg(any(unix, windows))]
+fn lock_exclusive(lock: &Path) -> Result<AuthFileLock> {
     let file = open_lock_file(lock)?;
-    // SAFETY: valid fd held by `file`; flock has no memory effects.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
+    file.lock()?;
     Ok(AuthFileLock { file })
 }
 
-/// Acquire the global `auth.json` write lock (a no-op `None` guard off-unix).
+#[cfg(any(unix, windows))]
+fn try_lock_exclusive(file: &std::fs::File) -> std::io::Result<bool> {
+    match file.try_lock() {
+        Ok(()) => Ok(true),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
+/// Acquire the global `auth.json` write lock (a no-op only on unsupported
+/// platforms that are neither Unix nor Windows).
 /// Both `with_auth_locked` and `McpCredentialStore::clear` — which needs a
 /// delete-on-empty tail the funnel can't express — acquire here, so the
 /// `"global"` sidecar name and the acquire policy live in exactly one place.
 fn lock_global(path: &Path) -> Result<Option<AuthFileLock>> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
-        Ok(Some(flock_exclusive(&lock_path_for(path, "global"))?))
+        Ok(Some(lock_exclusive(&lock_path_for(path, "global"))?))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
-        // No flock(2) off-unix: every writer runs unprotected, so concurrent
-        // processes can silently corrupt auth.json (ADR §5.4). openab-agent is
-        // de-facto unix-only; warn once rather than fail silently so a non-unix
-        // build with concurrent processes is at least diagnosable.
+        // Keep unsupported targets diagnosable instead of silently claiming a
+        // lock guarantee they do not have.
         use std::sync::Once;
         static WARN_NO_LOCK: Once = Once::new();
         WARN_NO_LOCK.call_once(|| {
             tracing::warn!(
-                "auth.json cross-process file locking is unavailable on this non-unix platform; \
-                 concurrent openab-agent processes may corrupt stored credentials (ADR §5.4)"
+                "auth.json cross-process file locking is unavailable on this platform; \
+                 concurrent processes may corrupt stored credentials (ADR §5.4)"
             );
         });
         let _ = path;
@@ -691,7 +752,7 @@ fn gc_stale_pending(map: &mut HashMap<String, AuthEntry>) {
 pub(crate) const REFRESH_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Outcome of acquiring a tenant's refresh lock. See [`lock_tenant_refresh`].
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) enum RefreshLock {
     /// Lock acquired — hold across the refresh.
     Held(AuthFileLock),
@@ -708,7 +769,7 @@ pub(crate) enum RefreshLock {
 /// the MCP path makes two — rmcp's `initialize_from_store()` (authorization-server
 /// discovery) then `get_access_token()` (the refresh) — each bounded by
 /// [`REFRESH_HTTP_TIMEOUT`].
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const MAX_REFRESH_ROUND_TRIPS: u64 = 2;
 
 /// Lock-acquire deadline. Sized strictly above the worst-case lock-hold
@@ -717,7 +778,7 @@ const MAX_REFRESH_ROUND_TRIPS: u64 = 2;
 /// bounded — and, on the MCP path, multi-call — refresh; only a genuinely stuck
 /// holder trips the timeout. Derived from `REFRESH_HTTP_TIMEOUT` so the relationship
 /// can't silently drift if that bound changes.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const REFRESH_LOCK_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(REFRESH_HTTP_TIMEOUT.as_secs() * MAX_REFRESH_ROUND_TRIPS + 4);
 
@@ -750,23 +811,22 @@ const REFRESH_LOCK_TIMEOUT: std::time::Duration =
 /// token is already fresh). `force_refresh` intentionally skips that optimisation and
 /// always refreshes (it runs on a 401, where the clock-fresh token is already
 /// known-bad); it stays reuse-safe because it, too, loads inside the lock.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) async fn lock_tenant_refresh(auth: &Path, tenant: &str) -> RefreshLock {
     lock_tenant_refresh_until(auth, tenant, REFRESH_LOCK_TIMEOUT).await
 }
 
 /// [`lock_tenant_refresh`] with an injectable deadline so tests can drive the
 /// fail-closed timeout path in milliseconds instead of [`REFRESH_LOCK_TIMEOUT`].
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn lock_tenant_refresh_until(
     auth: &Path,
     tenant: &str,
     timeout: std::time::Duration,
 ) -> RefreshLock {
-    use std::os::unix::io::AsRawFd;
     let lock = lock_path_for(auth, &format!("refresh.{tenant}"));
-    // Open the lock fd once; re-issue `flock` on it each retry instead of
-    // re-opening (and re-`create_dir_all`-ing) the same file every 100 ms.
+    // Open the sidecar once; retry the same kernel lock every 100 ms instead of
+    // re-opening (and re-`create_dir_all`-ing) the file on each attempt.
     let file = match open_lock_file(&lock) {
         Ok(f) => f,
         Err(e) => {
@@ -776,17 +836,15 @@ async fn lock_tenant_refresh_until(
     };
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        // SAFETY: valid fd held by `file`; flock has no memory effects.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc == 0 {
-            return RefreshLock::Held(AuthFileLock { file });
-        }
-        let err = std::io::Error::last_os_error();
-        // EWOULDBLOCK/EAGAIN (both `ErrorKind::WouldBlock`) = another holder is
-        // refreshing; any other errno is a real failure we degrade on.
-        if err.kind() != std::io::ErrorKind::WouldBlock {
-            tracing::warn!(tenant, error = %err, "refresh lock unavailable; proceeding unserialised");
-            return RefreshLock::Unavailable;
+        match try_lock_exclusive(&file) {
+            Ok(true) => {
+                return RefreshLock::Held(AuthFileLock { file });
+            }
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(tenant, error = %err, "refresh lock unavailable; proceeding unserialised");
+                return RefreshLock::Unavailable;
+            }
         }
         if std::time::Instant::now() >= deadline {
             // Fail-closed (see fn doc): the refresh is HTTP-bounded shorter than this
@@ -949,7 +1007,7 @@ pub async fn get_valid_token_for(namespace: &str) -> Result<String> {
     //    second process does not present the same RT_old (§5.4 (b)). Fail closed
     //    on a contended-lock timeout: surface a retryable error rather than
     //    refresh unserialised (which would risk §10.4 family revocation).
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let _refresh_guard = match lock_tenant_refresh(&auth_path(), namespace).await {
         RefreshLock::Held(g) => Some(g),
         RefreshLock::Unavailable => None,
@@ -974,7 +1032,7 @@ pub async fn get_valid_token_for(namespace: &str) -> Result<String> {
 pub async fn force_refresh_for(namespace: &str) -> Result<String> {
     // Serialise even a forced refresh so two of them can't both rotate RT_old.
     // Fail closed on timeout (see get_valid_token_for) rather than refresh unserialised.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let _refresh_guard = match lock_tenant_refresh(&auth_path(), namespace).await {
         RefreshLock::Held(g) => Some(g),
         RefreshLock::Unavailable => None,
@@ -2046,6 +2104,113 @@ mod tests {
         assert_eq!(token_of(map.get("mcp:github")).expires_at, 42);
     }
 
+    #[test]
+    fn atomic_auth_replace_exposes_complete_old_or_new_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+
+        let mut old = HashMap::new();
+        old.insert("codex".to_string(), AuthEntry::Token(make_store(1)));
+        write_auth_file(&path, &old).unwrap();
+
+        let mut new = HashMap::new();
+        new.insert("codex".to_string(), AuthEntry::Token(make_store(2)));
+        new.insert("github".to_string(), AuthEntry::Mcp(make_mcp_creds()));
+        let data = serde_json::to_string_pretty(&new).unwrap();
+        let tmp = write_synced_auth_temp(dir.path(), &data).unwrap();
+
+        // Simulated crash before commit: the synced temp may remain, but the
+        // canonical file is still the complete prior generation.
+        let before = read_auth_file(&path).unwrap();
+        assert_eq!(token_of(before.get("codex")).expires_at, 1);
+        assert!(before.get("github").is_none());
+
+        replace_auth_file(&tmp, &path).unwrap();
+        assert!(!tmp.exists(), "atomic commit consumes the temp name");
+        let after = read_auth_file(&path).unwrap();
+        assert_eq!(token_of(after.get("codex")).expires_at, 2);
+        assert!(matches!(after.get("github"), Some(AuthEntry::Mcp(_))));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn auth_file_lock_is_exclusive_and_released_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        let lock_path = lock_path_for(&auth, "global");
+
+        let held = lock_exclusive(&lock_path).unwrap();
+        let contender = open_lock_file(&lock_path).unwrap();
+        assert!(
+            !try_lock_exclusive(&contender).unwrap(),
+            "second handle must observe contention"
+        );
+
+        drop(held);
+        assert!(
+            try_lock_exclusive(&contender).unwrap(),
+            "lock must be acquirable after the RAII guard drops"
+        );
+        contender.unlock().unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn auth_lock_child_process_holder() {
+        let Some(lock_path) = std::env::var_os("OPENAB_AUTH_LOCK_CHILD_PATH") else {
+            return;
+        };
+        let ready_path = std::env::var_os("OPENAB_AUTH_LOCK_CHILD_READY")
+            .expect("child ready path is required when child lock path is set");
+        let _held = lock_exclusive(Path::new(&lock_path)).unwrap();
+        std::fs::write(ready_path, b"ready").unwrap();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn auth_file_lock_is_released_after_holder_process_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        let lock_path = lock_path_for(&auth, "crash-test");
+        let ready_path = dir.path().join("child.ready");
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("auth::tests::auth_lock_child_process_holder")
+            .arg("--nocapture")
+            .env("OPENAB_AUTH_LOCK_CHILD_PATH", &lock_path)
+            .env("OPENAB_AUTH_LOCK_CHILD_READY", &ready_path)
+            .spawn()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready_path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if !ready_path.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("child did not acquire the auth lock before the deadline");
+        }
+
+        let contender = open_lock_file(&lock_path).unwrap();
+        assert!(
+            !try_lock_exclusive(&contender).unwrap(),
+            "parent must observe the child process lock"
+        );
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            try_lock_exclusive(&contender).unwrap(),
+            "kernel must release the lock when the holder process dies"
+        );
+        contender.unlock().unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn write_auth_file_creates_file_with_0600_mode() {
@@ -2374,7 +2539,7 @@ mod tests {
         assert!(map.get("codex").is_some(), "real tenant untouched");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn lock_tenant_refresh_fails_closed_when_contended() {
         // §5.4 (b), fail-closed: while one holder keeps the tenant refresh lock, a
@@ -2427,7 +2592,7 @@ mod tests {
         assert_eq!(token_of(map.get("codex")).expires_at, 1);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn lock_tenant_refresh_fails_closed_for_anthropic_and_is_per_tenant() {
         // §5.4 (b) proven for the `anthropic-oauth` tenant: while one holder keeps

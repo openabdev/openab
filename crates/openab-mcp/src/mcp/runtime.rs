@@ -669,7 +669,8 @@ impl McpRuntimeManager {
         // implicit: `mgr.initialize_from_store()` (called below) re-`load()`s
         // `auth.json` from disk, after which `get_access_token` skips the network
         // refresh when the loaded token is already fresh, so a process that loses
-        // the race adopts the token the winner wrote. Non-unix = no-op.
+        // the race adopts the token the winner wrote. Unsupported platforms
+        // outside Unix/Windows retain the legacy no-op fallback.
         //
         // Cross-module invariant: the per-tenant refresh lock and the credential
         // entry must key off the *same* server identifier. `name` is passed both
@@ -679,7 +680,7 @@ impl McpRuntimeManager {
         // Fail closed on a contended-lock timeout: a `Transient` error so the
         // caller retries WITHOUT forcing re-login (NeedsAuth) or tripping the
         // breaker. `Held`/`Unavailable` both proceed to drive the refresh.
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _refresh_guard = match crate::auth::lock_tenant_refresh(&self.auth_path, name).await {
             crate::auth::RefreshLock::Held(g) => Some(g),
             crate::auth::RefreshLock::Unavailable => None,
