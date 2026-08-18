@@ -22,11 +22,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64 = "0.22.1"
 url = "2.5.8"
+process-wrap = { version = "9.1.0", default-features = false, features = [
+    "tokio1",
+    "kill-on-drop",
+    "process-session",
+    "job-object",
+] }
 # rmcp model/service types still surface in the ACP layer (sampling bridge).
 rmcp = { version = "1.7", default-features = false, features = ["client"] }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

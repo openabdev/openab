@@ -1,11 +1,23 @@
 use anyhow::{anyhow, Result};
+use process_wrap::tokio::{CommandWrap, KillOnDrop};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Stdio};
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tracing::debug;
 
+#[cfg(windows)]
+use process_wrap::tokio::JobObject;
+#[cfg(unix)]
+use process_wrap::tokio::ProcessSession;
+
 use crate::llm::ToolDef;
+
+#[cfg(any(windows, test))]
+use base64::Engine as _;
 
 /// Validate that a path is within the allowed working directory.
 /// This function has NO side-effects — it never creates directories or files.
@@ -54,10 +66,26 @@ fn validate_path(path: &str, working_dir: &Path) -> Result<PathBuf> {
     ))
 }
 
-/// Build a filtered environment for bash tool execution.
+/// Build a filtered environment for shell tool execution.
 fn build_env(allow_list: &[String]) -> HashMap<String, String> {
     let mut env = HashMap::new();
-    for key in &["PATH", "HOME", "USER", "LANG", "TERM", "SHELL"] {
+    #[cfg(unix)]
+    let baseline = ["PATH", "HOME", "USER", "LANG", "TERM", "SHELL"];
+    #[cfg(windows)]
+    let baseline = [
+        "PATH",
+        "SystemRoot",
+        "WINDIR",
+        "ComSpec",
+        "PATHEXT",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "HOME",
+        "LANG",
+    ];
+
+    for key in baseline {
         if let Ok(val) = std::env::var(key) {
             env.insert(key.to_string(), val);
         }
@@ -181,7 +209,138 @@ fn tool_edit(input: &Value, working_dir: &Path) -> Result<String> {
     ))
 }
 
-/// Execute a shell command with process group isolation and env filtering.
+/// Prefix PowerShell scripts with deterministic UTF-8 console encodings, then encode the
+/// complete script as UTF-16LE for `-EncodedCommand`. This keeps user input out of the Windows
+/// command-line quoting layer.
+#[cfg(any(windows, test))]
+fn powershell_encoded_command(command: &str) -> String {
+    const PREFIX: &str = concat!(
+        "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); ",
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ",
+        "$OutputEncoding = [Console]::OutputEncoding;\n"
+    );
+    let script = format!("{PREFIX}{command}");
+    let utf16le: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    base64::engine::general_purpose::STANDARD.encode(utf16le)
+}
+
+#[cfg(unix)]
+fn platform_shell_command(command: &str) -> Result<Command> {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c").arg(command);
+    Ok(cmd)
+}
+
+#[cfg(windows)]
+fn platform_shell_command(command: &str) -> Result<Command> {
+    let system_root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .ok_or_else(|| {
+            anyhow!("bash: SystemRoot is unavailable; refusing PATH-based shell lookup")
+        })?;
+    let powershell = PathBuf::from(system_root)
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    let mut cmd = Command::new(powershell);
+    cmd.args([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-EncodedCommand",
+        &powershell_encoded_command(command),
+    ]);
+    Ok(cmd)
+}
+
+fn format_shell_output(status: ExitStatus, stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr = String::from_utf8_lossy(stderr);
+    let code = status.code().unwrap_or(-1);
+
+    let mut result = String::new();
+    if !stdout.is_empty() {
+        result.push_str(&stdout);
+    }
+    if !stderr.is_empty() {
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str("[stderr]\n");
+        result.push_str(&stderr);
+    }
+    if code != 0 {
+        result.push_str(&format!("\n[exit code: {code}]"));
+    }
+    result
+}
+
+/// Run the platform shell inside a dedicated Unix session or Windows Job Object. Explicit
+/// timeout cleanup kills and reaps the complete process tree before returning.
+async fn run_shell_command(
+    command: &str,
+    working_dir: &Path,
+    timeout_duration: Duration,
+    env: &HashMap<String, String>,
+) -> Result<String> {
+    let mut cmd = platform_shell_command(command)?;
+    cmd.current_dir(working_dir)
+        .env_clear()
+        .envs(env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut wrapped = CommandWrap::from(cmd);
+    wrapped.wrap(KillOnDrop);
+    #[cfg(unix)]
+    wrapped.wrap(ProcessSession);
+    #[cfg(windows)]
+    wrapped.wrap(JobObject);
+
+    let mut child = wrapped
+        .spawn()
+        .map_err(|e| anyhow!("bash: spawn failed: {e}"))?;
+    let mut stdout = child
+        .stdout()
+        .take()
+        .ok_or_else(|| anyhow!("bash: stdout pipe unavailable"))?;
+    let mut stderr = child
+        .stderr()
+        .take()
+        .ok_or_else(|| anyhow!("bash: stderr pipe unavailable"))?;
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
+
+    let execution = async {
+        let (status, _, _) = tokio::try_join!(
+            child.wait(),
+            stdout.read_to_end(&mut stdout_buf),
+            stderr.read_to_end(&mut stderr_buf),
+        )?;
+        Ok::<ExitStatus, std::io::Error>(status)
+    };
+
+    match tokio::time::timeout(timeout_duration, execution).await {
+        Ok(Ok(status)) => Ok(format_shell_output(status, &stdout_buf, &stderr_buf)),
+        Ok(Err(e)) => Err(anyhow!("bash: execution error: {e}")),
+        Err(_) => {
+            if let Err(e) = Box::into_pin(child.kill()).await {
+                return Err(anyhow!(
+                    "bash: command timed out after {}s; process-tree cleanup failed: {e}",
+                    timeout_duration.as_secs()
+                ));
+            }
+            Err(anyhow!(
+                "bash: command timed out after {}s",
+                timeout_duration.as_secs()
+            ))
+        }
+    }
+}
+
+/// Execute a shell command with process-tree isolation and env filtering.
 async fn tool_bash(input: &Value, working_dir: &Path) -> Result<String> {
     let command = input
         .get("command")
@@ -191,13 +350,8 @@ async fn tool_bash(input: &Value, working_dir: &Path) -> Result<String> {
     let cmd_working_dir = input
         .get("working_dir")
         .and_then(|v| v.as_str())
-        .map(|p| {
-            if Path::new(p).is_absolute() {
-                PathBuf::from(p)
-            } else {
-                working_dir.join(p)
-            }
-        })
+        .map(|p| validate_path(p, working_dir))
+        .transpose()?
         .unwrap_or_else(|| working_dir.to_path_buf());
 
     let timeout_secs = std::env::var("OPENAB_AGENT_TIMEOUT_SECS")
@@ -215,78 +369,13 @@ async fn tool_bash(input: &Value, working_dir: &Path) -> Result<String> {
     let env = build_env(&env_allow);
 
     debug!("bash: executing '{}' in {:?}", command, cmd_working_dir);
-
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(&cmd_working_dir)
-        .env_clear()
-        .envs(&env)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    // Create new process group on Unix for clean cleanup
-    #[cfg(unix)]
-    unsafe {
-        #[allow(unused_imports)]
-        use std::os::unix::process::CommandExt;
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-
-    let child = cmd
-        .spawn()
-        .map_err(|e| anyhow!("bash: spawn failed: {e}"))?;
-
-    // Capture pid before wait_with_output takes ownership
-    #[cfg(unix)]
-    let child_pid = child.id();
-
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        child.wait_with_output(),
+    run_shell_command(
+        command,
+        &cmd_working_dir,
+        Duration::from_secs(timeout_secs),
+        &env,
     )
-    .await;
-
-    match result {
-        Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let code = output.status.code().unwrap_or(-1);
-
-            let mut result = String::new();
-            if !stdout.is_empty() {
-                result.push_str(&stdout);
-            }
-            if !stderr.is_empty() {
-                if !result.is_empty() {
-                    result.push('\n');
-                }
-                result.push_str("[stderr]\n");
-                result.push_str(&stderr);
-            }
-            if code != 0 {
-                result.push_str(&format!("\n[exit code: {code}]"));
-            }
-            Ok(result)
-        }
-        Ok(Err(e)) => Err(anyhow!("bash: execution error: {e}")),
-        Err(_) => {
-            // Timeout — kill the process group
-            #[cfg(unix)]
-            if let Some(pid) = child_pid {
-                unsafe {
-                    libc::kill(-(pid as i32), libc::SIGKILL);
-                }
-            }
-            Err(anyhow!("bash: command timed out after {timeout_secs}s"))
-        }
-    }
+    .await
 }
 
 /// Return tool definitions for the LLM.
@@ -367,6 +456,23 @@ mod tests {
     }
 
     #[test]
+    fn test_powershell_encoded_command_preserves_unicode_and_quotes() {
+        let command = "Write-Output 'héllo 世界'; Write-Output \"quoted\"";
+        let encoded = powershell_encoded_command(command);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        assert_eq!(bytes.len() % 2, 0);
+        let utf16: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let decoded = String::from_utf16(&utf16).unwrap();
+        assert!(decoded.ends_with(command));
+        assert!(decoded.contains("UTF8Encoding"));
+    }
+
+    #[test]
     #[ignore] // Integration test: filesystem access
     fn test_tool_write_and_read() {
         let tmp = TempDir::new().unwrap();
@@ -413,13 +519,98 @@ mod tests {
         assert!(result.contains("subdir/"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    #[ignore] // Integration test: subprocess execution
     async fn test_tool_bash_simple() {
         let tmp = TempDir::new().unwrap();
         let input = json!({ "command": "echo hello" });
         let result = tool_bash(&input, tmp.path()).await.unwrap();
         assert_eq!(result.trim(), "hello");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_tool_bash_windows_unicode_and_quoting() {
+        let tmp = TempDir::new().unwrap();
+        let input =
+            json!({ "command": "Write-Output 'héllo 世界'; Write-Output \"quoted value\"" });
+        let result = tool_bash(&input, tmp.path()).await.unwrap();
+        assert!(result.contains("héllo 世界"));
+        assert!(result.contains("quoted value"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_windows_timeout_kills_descendant_process() {
+        let tmp = TempDir::new().unwrap();
+        let descendant = powershell_encoded_command(
+            "Start-Sleep -Seconds 5; [IO.File]::WriteAllText('orphan.txt', 'escaped')",
+        );
+        let command = format!(concat!(
+            "[IO.File]::WriteAllText('ready.txt', 'ready'); ",
+            "$child = Join-Path $PSHOME 'powershell.exe'; ",
+            "Start-Process -FilePath $child -ArgumentList @(",
+            "'-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand','{descendant}'); ",
+            "Start-Sleep -Seconds 120"
+        ));
+        let error = run_shell_command(
+            &command,
+            tmp.path(),
+            Duration::from_secs(2),
+            &build_env(&[]),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(tmp.path().join("ready.txt").exists());
+
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(
+            !tmp.path().join("orphan.txt").exists(),
+            "descendant escaped the Windows Job Object"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_windows_future_drop_kills_descendant_process() {
+        let tmp = TempDir::new().unwrap();
+        let descendant = powershell_encoded_command(
+            "Start-Sleep -Seconds 5; [IO.File]::WriteAllText('drop-orphan.txt', 'escaped')",
+        );
+        let command = format!(concat!(
+            "[IO.File]::WriteAllText('drop-ready.txt', 'ready'); ",
+            "$child = Join-Path $PSHOME 'powershell.exe'; ",
+            "Start-Process -FilePath $child -ArgumentList @(",
+            "'-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand','{descendant}'); ",
+            "Start-Sleep -Seconds 120"
+        ));
+        let task_dir = tmp.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            run_shell_command(
+                &command,
+                &task_dir,
+                Duration::from_secs(120),
+                &build_env(&[]),
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !tmp.path().join("drop-ready.txt").exists() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("parent shell did not start");
+        task.abort();
+        let _ = task.await;
+
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(
+            !tmp.path().join("drop-orphan.txt").exists(),
+            "descendant escaped cleanup when the shell future was dropped"
+        );
     }
 
     #[tokio::test]

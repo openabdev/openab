@@ -1,4 +1,4 @@
-name: Windows production auth gate
+name: Windows shell and process-tree gate
 
 on:
   push:
@@ -39,6 +39,27 @@ jobs:
         shell: pwsh
         run: |
           cargo test --locked --target $env:TARGET -p openab-mcp auth::tests:: -- --nocapture
+
+  test-agent-tools-windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout shell and process-tree source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Record toolchain
+        shell: pwsh
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+          rustup target add $env:TARGET
+
+      - name: Test Windows shell and Job Object cleanup
+        shell: pwsh
+        run: |
+          cargo test --locked --target $env:TARGET --manifest-path openab-agent/Cargo.toml tools::tests:: -- --nocapture
 
   build-openab:
     runs-on: windows-latest
