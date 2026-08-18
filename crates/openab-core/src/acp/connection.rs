@@ -481,6 +481,29 @@ impl AcpConnection {
             if let Ok(v) = std::env::var("SystemDrive") {
                 cmd.env("SystemDrive", v);
             }
+            // PowerShell fixtures and normal Windows CLI tools need the standard
+            // runtime locations after env_clear(). Keep this baseline explicit so
+            // credentials are not inherited accidentally.
+            for key in [
+                "WINDIR",
+                "ComSpec",
+                "PATHEXT",
+                "TEMP",
+                "TMP",
+                "APPDATA",
+                "LOCALAPPDATA",
+                "ProgramData",
+                "ProgramFiles",
+                "ProgramFiles(x86)",
+                "ProgramW6432",
+                "HOMEDRIVE",
+                "HOMEPATH",
+                "PSModulePath",
+            ] {
+                if let Ok(v) = std::env::var(key) {
+                    cmd.env(key, v);
+                }
+            }
         }
         for (k, v) in env {
             cmd.env(k, expand_env(v));
