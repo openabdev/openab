@@ -546,13 +546,16 @@ mod tests {
         let descendant = powershell_encoded_command(
             "Start-Sleep -Seconds 5; [IO.File]::WriteAllText('orphan.txt', 'escaped')",
         );
-        let command = format!(concat!(
-            "[IO.File]::WriteAllText('ready.txt', 'ready'); ",
-            "$child = Join-Path $PSHOME 'powershell.exe'; ",
-            "Start-Process -FilePath $child -ArgumentList @(",
-            "'-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand','{descendant}'); ",
-            "Start-Sleep -Seconds 120"
-        ));
+        let command = format!(
+            concat!(
+                "[IO.File]::WriteAllText('ready.txt', 'ready'); ",
+                "$child = Join-Path $PSHOME 'powershell.exe'; ",
+                "Start-Process -FilePath $child -ArgumentList @(",
+                "'-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand','{descendant}'); ",
+                "Start-Sleep -Seconds 120"
+            ),
+            descendant = descendant
+        );
         let error = run_shell_command(
             &command,
             tmp.path(),
@@ -578,13 +581,16 @@ mod tests {
         let descendant = powershell_encoded_command(
             "Start-Sleep -Seconds 5; [IO.File]::WriteAllText('drop-orphan.txt', 'escaped')",
         );
-        let command = format!(concat!(
-            "[IO.File]::WriteAllText('drop-ready.txt', 'ready'); ",
-            "$child = Join-Path $PSHOME 'powershell.exe'; ",
-            "Start-Process -FilePath $child -ArgumentList @(",
-            "'-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand','{descendant}'); ",
-            "Start-Sleep -Seconds 120"
-        ));
+        let command = format!(
+            concat!(
+                "[IO.File]::WriteAllText('drop-ready.txt', 'ready'); ",
+                "$child = Join-Path $PSHOME 'powershell.exe'; ",
+                "Start-Process -FilePath $child -ArgumentList @(",
+                "'-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand','{descendant}'); ",
+                "Start-Sleep -Seconds 120"
+            ),
+            descendant = descendant
+        );
         let task_dir = tmp.path().to_path_buf();
         let task = tokio::spawn(async move {
             run_shell_command(
