@@ -81,7 +81,17 @@ fn build_env(allow_list: &[String]) -> HashMap<String, String> {
         "TEMP",
         "TMP",
         "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
         "HOME",
+        "USERNAME",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "ProgramData",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+        "PSModulePath",
         "LANG",
     ];
 
@@ -540,18 +550,32 @@ mod tests {
     }
 
     #[cfg(windows)]
+    async fn warm_windows_shell(working_dir: &Path) {
+        let result = run_shell_command(
+            "Write-Output 'warm'",
+            working_dir,
+            Duration::from_secs(60),
+            &build_env(&[]),
+        )
+        .await
+        .expect("Windows PowerShell warmup failed");
+        assert!(result.contains("warm"));
+    }
+
+    #[cfg(windows)]
     #[tokio::test]
     async fn test_windows_timeout_kills_descendant_process() {
         let tmp = TempDir::new().unwrap();
+        warm_windows_shell(tmp.path()).await;
         let descendant = powershell_encoded_command(
-            "Start-Sleep -Seconds 5; [IO.File]::WriteAllText('orphan.txt', 'escaped')",
+            "Start-Sleep -Seconds 10; [IO.File]::WriteAllText('orphan.txt', 'escaped')",
         );
         let command = format!(
             concat!(
-                "[IO.File]::WriteAllText('ready.txt', 'ready'); ",
                 "$child = Join-Path $PSHOME 'powershell.exe'; ",
                 "Start-Process -FilePath $child -ArgumentList @(",
                 "'-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand','{descendant}'); ",
+                "[IO.File]::WriteAllText('ready.txt', 'ready'); ",
                 "Start-Sleep -Seconds 120"
             ),
             descendant = descendant
@@ -559,7 +583,7 @@ mod tests {
         let error = run_shell_command(
             &command,
             tmp.path(),
-            Duration::from_secs(2),
+            Duration::from_secs(5),
             &build_env(&[]),
         )
         .await
@@ -567,7 +591,7 @@ mod tests {
         assert!(error.to_string().contains("timed out"));
         assert!(tmp.path().join("ready.txt").exists());
 
-        tokio::time::sleep(Duration::from_secs(6)).await;
+        tokio::time::sleep(Duration::from_secs(12)).await;
         assert!(
             !tmp.path().join("orphan.txt").exists(),
             "descendant escaped the Windows Job Object"
@@ -578,15 +602,16 @@ mod tests {
     #[tokio::test]
     async fn test_windows_future_drop_kills_descendant_process() {
         let tmp = TempDir::new().unwrap();
+        warm_windows_shell(tmp.path()).await;
         let descendant = powershell_encoded_command(
-            "Start-Sleep -Seconds 5; [IO.File]::WriteAllText('drop-orphan.txt', 'escaped')",
+            "Start-Sleep -Seconds 10; [IO.File]::WriteAllText('drop-orphan.txt', 'escaped')",
         );
         let command = format!(
             concat!(
-                "[IO.File]::WriteAllText('drop-ready.txt', 'ready'); ",
                 "$child = Join-Path $PSHOME 'powershell.exe'; ",
                 "Start-Process -FilePath $child -ArgumentList @(",
                 "'-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand','{descendant}'); ",
+                "[IO.File]::WriteAllText('drop-ready.txt', 'ready'); ",
                 "Start-Sleep -Seconds 120"
             ),
             descendant = descendant
@@ -602,7 +627,7 @@ mod tests {
             .await
         });
 
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             while !tmp.path().join("drop-ready.txt").exists() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -612,7 +637,7 @@ mod tests {
         task.abort();
         let _ = task.await;
 
-        tokio::time::sleep(Duration::from_secs(6)).await;
+        tokio::time::sleep(Duration::from_secs(12)).await;
         assert!(
             !tmp.path().join("drop-orphan.txt").exists(),
             "descendant escaped cleanup when the shell future was dropped"

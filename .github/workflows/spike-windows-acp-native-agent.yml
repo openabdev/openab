@@ -59,7 +59,7 @@ jobs:
       - name: Test Windows shell and Job Object cleanup
         shell: pwsh
         run: |
-          cargo test --locked --target $env:TARGET --manifest-path openab-agent/Cargo.toml tools::tests:: -- --nocapture
+          cargo test --locked --target $env:TARGET --manifest-path openab-agent/Cargo.toml tools::tests:: -- --nocapture --test-threads=1
 
   build-openab:
     runs-on: windows-latest
