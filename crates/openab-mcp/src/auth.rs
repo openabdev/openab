@@ -576,6 +576,15 @@ pub(crate) struct AuthFileLock {
     file: std::fs::File,
 }
 
+// DISCOVERY_ONLY / NOT_SHIPPABLE:
+//
+// This zero-sized non-Unix type exists only so the bounded Windows compile
+// spike can enumerate blockers beyond the first cfg mismatch. It provides no
+// locking and must never be used for a release artifact. A production Windows
+// port still requires a real cross-process lock plus atomic credential replace.
+#[cfg(not(unix))]
+pub(crate) struct AuthFileLock;
+
 #[cfg(unix)]
 impl Drop for AuthFileLock {
     fn drop(&mut self) {
