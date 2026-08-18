@@ -3,6 +3,7 @@ use crate::acp::protocol::{
     JsonRpcResponse, UsageReport,
 };
 use anyhow::{anyhow, Result};
+#[cfg(not(windows))]
 use process_wrap::tokio::ChildWrapper as _;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -47,7 +48,9 @@ impl ProcessTreeGuard {
             loop {
                 tokio::select! {
                     request = terminate_rx.recv() => {
-                        let result = child.kill().await.map_err(|e| e.to_string());
+                        let result = Box::into_pin(child.kill())
+                            .await
+                            .map_err(|e| e.to_string());
                         if let Some(reply) = request {
                             let _ = reply.send(result);
                         }
@@ -59,7 +62,7 @@ impl ProcessTreeGuard {
                             Ok(None) => {}
                             Err(e) => {
                                 error!(error = %e, "failed to inspect Windows agent Job Object");
-                                let _ = child.kill().await;
+                                let _ = Box::into_pin(child.kill()).await;
                                 break;
                             }
                         }
