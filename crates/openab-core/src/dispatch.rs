@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use tracing::{debug, error, info, info_span, warn};
 
 use crate::acp::ContentBlock;
+use crate::acp::ProjectContext;
 use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef};
 use crate::config::ReactionsConfig;
 use crate::error_display::format_user_error;
@@ -132,7 +133,21 @@ pub trait DispatchTarget: Send + Sync + 'static {
 
     /// Ensure the ACP session for `session_key` exists (idempotent).
     /// Returns `true` if a new session was created, `false` if it already existed.
-    async fn ensure_session(&self, session_key: &str, working_dir: Option<&str>) -> Result<bool>;
+    ///
+    /// `project` carries the transport-neutral project identity (workflow
+    /// `20260818-openab-project-scoped-acp-session-bootstrap`):
+    /// - `Some(p)` with non-empty `p.project_id` pins the session to
+    ///   `(project_id, project_root)`; an existing session for the same key
+    ///   with a different binding is rejected.
+    /// - `Some(ProjectContext::anonymous(path))` flows the legacy
+    ///   `[[ws:@alias]]` workspace hint through the same seam without
+    ///   pinning.
+    /// - `None` defers to the configured `[agent].working_dir`.
+    async fn ensure_session(
+        &self,
+        session_key: &str,
+        project: Option<&ProjectContext>,
+    ) -> Result<bool>;
 
     /// Destroy the session for `session_key` (used to rollback on directive failure).
     async fn reset_session(&self, session_key: &str);
@@ -165,8 +180,12 @@ impl DispatchTarget for AdapterRouter {
         self.bot_home_path()
     }
 
-    async fn ensure_session(&self, session_key: &str, working_dir: Option<&str>) -> Result<bool> {
-        self.pool().get_or_create(session_key, working_dir).await
+    async fn ensure_session(
+        &self,
+        session_key: &str,
+        project: Option<&ProjectContext>,
+    ) -> Result<bool> {
+        self.pool().get_or_create(session_key, project).await
     }
 
     async fn reset_session(&self, session_key: &str) {
@@ -689,13 +708,19 @@ async fn dispatch_batch(
     });
 
     // Extract workspace path for ensure_session (None if no directive or resolution failed).
-    let workspace_override: Option<String> =
-        ws_resolved.as_ref().and_then(|r| r.as_ref().ok().cloned());
+    // Wrap as an anonymous ProjectContext so the legacy `[[ws:@alias]]` directive
+    // flows through the project-context seam without binding a project_id. The
+    // pool's immutability invariant for anonymous contexts (stored > anonymous
+    // path > config) preserves the existing per-thread workspace stickiness.
+    let project_override: Option<ProjectContext> = ws_resolved
+        .as_ref()
+        .and_then(|r| r.as_ref().ok())
+        .map(|path| ProjectContext::anonymous(std::path::PathBuf::from(path)));
 
     // Ensure session exists. The create_gate mutex inside get_or_create serializes
     // concurrent callers — only the winner gets created_now == true.
     let created_now = match target
-        .ensure_session(&session_key, workspace_override.as_deref())
+        .ensure_session(&session_key, project_override.as_ref())
         .await
     {
         Ok(created) => created,
@@ -1413,7 +1438,7 @@ mod tests {
         async fn ensure_session(
             &self,
             _session_key: &str,
-            _working_dir: Option<&str>,
+            _project: Option<&ProjectContext>,
         ) -> Result<bool> {
             if let Some(msg) = self.ensure_err.lock().unwrap().take() {
                 return Err(anyhow::anyhow!(msg));
