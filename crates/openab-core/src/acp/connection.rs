@@ -3,6 +3,7 @@ use crate::acp::protocol::{
     JsonRpcResponse, UsageReport,
 };
 use anyhow::{anyhow, Result};
+use process_wrap::tokio::ChildWrapper as _;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -12,6 +13,77 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace};
+
+#[cfg(windows)]
+use process_wrap::tokio::{CommandWrap, JobObject, KillOnDrop};
+
+#[cfg(windows)]
+type AgentChild = Box<dyn process_wrap::tokio::ChildWrapper>;
+
+#[cfg(windows)]
+#[derive(Clone)]
+pub struct ProcessTreeGuard {
+    terminate_tx: mpsc::UnboundedSender<oneshot::Sender<std::result::Result<(), String>>>,
+}
+
+#[cfg(not(windows))]
+#[derive(Clone, Default)]
+pub struct ProcessTreeGuard;
+
+#[cfg(not(windows))]
+impl ProcessTreeGuard {
+    pub async fn terminate(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl ProcessTreeGuard {
+    fn new(mut child: AgentChild) -> Self {
+        let (terminate_tx, mut terminate_rx) =
+            mpsc::unbounded_channel::<oneshot::Sender<std::result::Result<(), String>>>();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    request = terminate_rx.recv() => {
+                        let result = child.kill().await.map_err(|e| e.to_string());
+                        if let Some(reply) = request {
+                            let _ = reply.send(result);
+                        }
+                        break;
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                        match child.try_wait() {
+                            Ok(Some(_)) => break,
+                            Ok(None) => {}
+                            Err(e) => {
+                                error!(error = %e, "failed to inspect Windows agent Job Object");
+                                let _ = child.kill().await;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Self { terminate_tx }
+    }
+
+    /// Terminate the Job Object without acquiring the connection mutex.
+    pub async fn terminate(&self) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self.terminate_tx.send(reply_tx).is_err() {
+            return Ok(());
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
+            .await
+            .map_err(|_| anyhow!("timeout terminating Windows agent Job Object"))?
+            .map_err(|_| anyhow!("Windows agent process controller exited before replying"))?
+            .map_err(|e| anyhow!("failed to terminate Windows agent Job Object: {e}"))
+    }
+}
 
 /// Pick the most permissive selectable permission option from ACP options.
 fn pick_best_option(options: &[Value]) -> Option<String> {
@@ -171,7 +243,13 @@ impl SessionActivity {
 }
 
 pub struct AcpConnection {
+    #[cfg(not(windows))]
     _proc: Child,
+    /// Cloneable controller handle stored outside the connection mutex by the
+    /// pool. The background owner holds the Job Object child and executes
+    /// explicit termination requests; `KILL_ON_JOB_CLOSE` is only a fallback.
+    #[cfg(windows)]
+    process_tree_guard: ProcessTreeGuard,
     /// PID of the direct child, used as the process group ID for cleanup.
     child_pgid: Option<i32>,
     stdin: Arc<Mutex<ChildStdin>>,
@@ -361,10 +439,6 @@ impl AcpConnection {
                 Ok(())
             });
         }
-        #[cfg(windows)]
-        {
-            cmd.creation_flags(0x00000200); // CREATE_NEW_PROCESS_GROUP
-        }
         // Clear inherited env to prevent credential leakage (e.g. DISCORD_BOT_TOKEN).
         // Only [agent].env values + essential baseline vars are passed through.
         cmd.env_clear();
@@ -423,18 +497,27 @@ impl AcpConnection {
                 "[agent].env/inherit_env is set -- these values are accessible to the agent and could be exfiltrated via prompt injection"
             );
         }
+        #[cfg(windows)]
+        let mut proc = {
+            let mut wrapped = CommandWrap::from(cmd);
+            wrapped.wrap(KillOnDrop).wrap(JobObject);
+            wrapped
+                .spawn()
+                .map_err(|e| anyhow!("failed to spawn {command} in Windows Job Object: {e}"))?
+        };
+        #[cfg(not(windows))]
         let mut proc = cmd
             .spawn()
             .map_err(|e| anyhow!("failed to spawn {command}: {e}"))?;
         let child_pgid = proc.id().and_then(|pid| i32::try_from(pid).ok());
 
-        let stdout = proc.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
-        let stdin = proc.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
+        let stdout = proc.stdout().take().ok_or_else(|| anyhow!("no stdout"))?;
+        let stdin = proc.stdin().take().ok_or_else(|| anyhow!("no stdin"))?;
         let stdin = Arc::new(Mutex::new(stdin));
 
         // Capture agent stderr and log it (ACP spec: agents MAY write to stderr
         // for logging; clients MAY capture or ignore it).
-        let stderr_handle = if let Some(stderr) = proc.stderr.take() {
+        let stderr_handle = if let Some(stderr) = proc.stderr().take() {
             let cmd_name = command.to_string();
             Some(tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
@@ -463,6 +546,9 @@ impl AcpConnection {
             None
         };
 
+        #[cfg(windows)]
+        let process_tree_guard = ProcessTreeGuard::new(proc);
+
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
@@ -478,7 +564,10 @@ impl AcpConnection {
         let activity = Arc::new(SessionActivity::new());
 
         Ok(Self {
+            #[cfg(not(windows))]
             _proc: proc,
+            #[cfg(windows)]
+            process_tree_guard,
             child_pgid,
             stdin,
             next_id: AtomicU64::new(1),
@@ -787,6 +876,17 @@ impl AcpConnection {
         self.child_pgid
     }
 
+    pub fn process_tree_guard(&self) -> ProcessTreeGuard {
+        #[cfg(windows)]
+        {
+            self.process_tree_guard.clone()
+        }
+        #[cfg(not(windows))]
+        {
+            ProcessTreeGuard
+        }
+    }
+
     pub fn alive(&self) -> bool {
         !self._reader_handle.is_finished()
     }
@@ -854,6 +954,119 @@ impl Drop for AcpConnection {
 mod tests {
     use super::{build_agent_env, build_permission_response, pick_best_option};
     use serde_json::json;
+
+    #[cfg(windows)]
+    fn powershell_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"))
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe")
+    }
+
+    #[cfg(windows)]
+    fn process_exists(powershell: &std::path::Path, pid: u32) -> bool {
+        std::process::Command::new(powershell)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
+                ),
+            ])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn controller_guard_terminates_windows_job_descendants_while_connection_is_locked() {
+        use super::AcpConnection;
+        use std::collections::HashMap;
+
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("descendant.pid");
+        let fixture = temp.path().join("agent-fixture.ps1");
+        let pid_literal = pid_file.to_string_lossy().replace('\'', "''");
+        std::fs::write(
+            &fixture,
+            format!(
+                r#"
+$descendant = Start-Process -FilePath "$env:SystemRoot\System32\ping.exe" -ArgumentList @("127.0.0.1", "-n", "120") -PassThru
+Set-Content -LiteralPath '{pid_literal}' -Value $descendant.Id -NoNewline
+while (($line = [Console]::In.ReadLine()) -ne $null) {{
+  $request = $line | ConvertFrom-Json
+  if ($request.method -eq "initialize") {{
+    @{{jsonrpc="2.0"; id=$request.id; result=@{{protocolVersion=1; agentInfo=@{{name="job-fixture"; version="0"}}; agentCapabilities=@{{loadSession=$false}}}}}} | ConvertTo-Json -Compress -Depth 8
+  }}
+}}
+Wait-Process -Id $descendant.Id
+"#
+            ),
+        )
+        .unwrap();
+
+        let powershell = powershell_path();
+        let args = vec![
+            "-NoLogo".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-ExecutionPolicy".to_string(),
+            "Bypass".to_string(),
+            "-File".to_string(),
+            fixture.to_string_lossy().into_owned(),
+        ];
+        let powershell_command = powershell.to_string_lossy().into_owned();
+        let working_dir = temp.path().to_string_lossy().into_owned();
+        let mut conn = AcpConnection::spawn(
+            &powershell_command,
+            &args,
+            &working_dir,
+            &HashMap::new(),
+            &[],
+        )
+        .await
+        .unwrap();
+        conn.initialize().await.unwrap();
+        let direct_pid = u32::try_from(conn.child_pgid.unwrap()).unwrap();
+
+        let descendant_pid = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Ok(raw) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = raw.trim().parse::<u32>() {
+                        break pid;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("fixture did not publish descendant pid");
+        assert!(process_exists(&powershell, direct_pid));
+        assert!(process_exists(&powershell, descendant_pid));
+
+        let guard = conn.process_tree_guard();
+        let conn = std::sync::Arc::new(tokio::sync::Mutex::new(conn));
+        let connection_lock = conn.lock().await;
+        guard.terminate().await.unwrap();
+
+        let gone = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !process_exists(&powershell, direct_pid)
+                    && !process_exists(&powershell, descendant_pid)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(gone.is_ok(), "Windows Job Object left a process behind");
+        drop(connection_lock);
+    }
 
     #[test]
     fn picks_allow_always_over_other_options() {

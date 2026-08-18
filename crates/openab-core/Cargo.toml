@@ -54,6 +54,11 @@ http = { version = "1", optional = true }
 # axum listener) was removed with the per-session proxy.
 rmcp = { version = "1.7", default-features = false, optional = true }
 tokio-util = { version = "0.7", optional = true }
+process-wrap = { version = "9.1.0", default-features = false, features = [
+    "tokio1",
+    "kill-on-drop",
+    "job-object",
+] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
