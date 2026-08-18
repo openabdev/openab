@@ -73,3 +73,8 @@ agentcore = ["dep:aws-config", "dep:aws-sigv4", "dep:aws-credential-types", "dep
 # Core-side wiring for MCP-over-ACP browser control (enabled by the root `acp`): the browser tool
 # definitions and the agent's facade MCP config. Core hosts no MCP server of its own any more.
 acp-mcp = ["dep:rmcp", "dep:tokio-util"]
+# Internal test-support fixture surface for cross-crate integration tests
+# (`src/ctl.rs` integration tests need to seed a `SessionPool` with a known
+# subset of state). Enabled only via the binary's `dev-dependencies`; never
+# part of `default`. Production release builds do not see this surface.
+test-utils = []

@@ -56,3 +56,11 @@ lineworks = ["dep:openab-gateway", "dep:axum", "openab-gateway/lineworks"]
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# Re-declare `openab-core` with `test-utils` feature enabled for the binary's
+# integration tests. The `#[cfg(test)]` blocks in `src/ctl.rs` call
+# `SessionPool::with_test_state(...)` and reference `SessionPoolTestState`,
+# which are gated by `#[cfg(any(test, feature = "test-utils"))]` in the
+# library. Cross-crate `cfg(test)` does NOT propagate to the dependency,
+# so this re-declaration is the only way to make the test APIs visible
+# in the binary's test build without leaking them into production builds.
+openab-core = { path = "crates/openab-core", default-features = false, features = ["test-utils"] }

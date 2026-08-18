@@ -101,6 +101,29 @@ type CancelHandle = (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String
 type ActiveSnapshot = Vec<(String, Arc<Mutex<AcpConnection>>)>;
 type EvictionCandidate = (String, Arc<Mutex<AcpConnection>>, Instant, Option<String>);
 
+/// Public test-only DTO for `SessionPool::with_test_state`. Mirrors the
+/// subset of `PoolState` fields that integration tests need to seed
+/// (workflow `20260818-openab-project-aware-thread-routing`). Exposes
+/// only the project-binding and resumable-session fields; the rest of
+/// `PoolState` (active connections, cancel handles, etc.) is internal
+/// to the pool's runtime and is constructed empty by `with_test_state`.
+///
+/// Gated by `#[cfg(any(test, feature = "test-utils"))]` so production
+/// release builds never include this surface. Cross-crate integration
+/// tests in `src/ctl.rs` enable the feature via `dev-dependencies`.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug, Default, Clone)]
+pub struct SessionPoolTestState {
+    /// Pre-populated persisted sessionId map (thread_key → sessionId).
+    pub persisted: HashMap<String, String>,
+    /// Pre-populated suspended sessionId map (thread_key → sessionId).
+    pub suspended: HashMap<String, String>,
+    /// Pre-populated session_workdirs map (thread_key → canonical path).
+    pub session_workdirs: HashMap<String, String>,
+    /// Pre-populated session_projects map (thread_key → ProjectContext).
+    pub session_projects: HashMap<String, ProjectContext>,
+}
+
 fn remove_if_same_handle<T>(
     map: &mut HashMap<String, Arc<Mutex<T>>>,
     key: &str,
@@ -473,8 +496,16 @@ impl SessionPool {
     /// Test-only constructor: build a `SessionPool` with a pre-populated
     /// `PoolState`. Bypasses the real filesystem persistence path so tests
     /// can drive `get_or_create` directly with specific thread_key →
-    /// project bindings. Compiled out of release builds.
-    #[cfg(test)]
+    /// project bindings. Gated by `#[cfg(any(test, feature = "test-utils"))]`
+    /// so production release builds do not see this constructor. The
+    /// cross-crate integration entry point is `with_test_state` (gated by
+    /// the same predicate).
+    ///
+    /// Both gates are required because `cfg(test)` does NOT propagate
+    /// to a dependency when that dependency is compiled for an external
+    /// (binary) test build. The `test-utils` feature is activated by the
+    /// binary's `[dev-dependencies]` for the test build only.
+    #[cfg(any(test, feature = "test-utils"))]
     fn with_state_for_test(config: AgentConfig, state: PoolState, projects_path: PathBuf) -> Self {
         Self {
             state: RwLock::new(state),
@@ -497,6 +528,49 @@ impl SessionPool {
             #[cfg(feature = "acp-mcp")]
             facade_url: None,
         }
+    }
+
+    /// Test-only constructor exposed to integration tests in other crates
+    /// (workflow `20260818-openab-project-aware-thread-routing`), behind
+    /// the `test-utils` feature. Used to seed a `SessionPool` with a known
+    /// subset of state — specifically `persisted` / `suspended` /
+    /// `session_projects` / `session_workdirs` — so tests can drive the
+    /// `has_reusable_session` / `get_pinned_project` semantics without
+    /// reaching into private `PoolState` fields.
+    ///
+    /// Production release builds (the default `cargo build --release`)
+    /// do NOT compile this; only crates with `openab-core/test-utils` in
+    /// their feature list will see it. `src/ctl.rs`'s integration tests
+    /// enable the feature via `dev-dependencies`.
+    ///
+    /// The companion in-crate `with_state_for_test` is gated by
+    /// `#[cfg(test)]` and used by the pool's own internal tests.
+    ///
+    /// Workflow context: tests A, B, D, F, G, K, L, M, N, O all rely on
+    /// being able to construct a pool with a known substate and read the
+    /// resulting `session_projects` / `has_reusable_session` via the
+    /// public API. This seam is the canonical entry point for those
+    /// tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_test_state(
+        config: AgentConfig,
+        test_state: SessionPoolTestState,
+        projects_path: PathBuf,
+    ) -> Self {
+        let state = PoolState {
+            active: HashMap::new(),
+            cancel_handles: HashMap::new(),
+            #[cfg(feature = "acp-mcp")]
+            facade_tokens: HashMap::new(),
+            activity: HashMap::new(),
+            pgids: HashMap::new(),
+            suspended: test_state.suspended,
+            persisted: test_state.persisted,
+            creating: HashMap::new(),
+            session_workdirs: test_state.session_workdirs,
+            session_projects: test_state.session_projects,
+        };
+        Self::with_state_for_test(config, state, projects_path)
     }
 
     /// Test-only seam: replace the untrusted-key set so a test can drive
@@ -626,6 +700,52 @@ impl SessionPool {
             }
         }
         false
+    }
+
+    /// Read-only lookup of the project binding currently persisted for
+    /// `thread_key` in `state.session_projects`.
+    ///
+    /// This is the SINGLE source of truth for "what project is this thread
+    /// pinned to?" — the ctl layer's `thread.pin` invariant uses it to
+    /// distinguish the four pre-bootstrap cases (idempotent, mismatch,
+    /// unpinned-but-reusable, fresh). Maps to ADR §4.5 + the ctl-bootstrap
+    /// requirements of workflow
+    /// `20260818-openab-project-aware-thread-routing` (tests K, L, O).
+    ///
+    /// Returns `None` for anonymous bindings (those are deliberately not
+    /// stored — see `project.rs::ProjectContext::is_anonymous`) and for
+    /// threads that have never been pinned.
+    pub async fn get_pinned_project(
+        &self,
+        thread_key: &str,
+    ) -> Option<crate::acp::project::ProjectContext> {
+        let state = self.state.read().await;
+        state.session_projects.get(thread_key).cloned()
+    }
+
+    /// Returns true iff `get_or_create` for `session_key` would NOT spawn a
+    /// brand-new ACP session — i.e. the session key has reusable state in
+    /// one of: active connection, suspended session, or persisted session_id.
+    ///
+    /// This is the SINGLE source of truth for "does a reusable session
+    /// exist?" that the ctl layer's `thread.pin` depends on. Mirroring the
+    /// decomposition inline in the ctl layer would duplicate SessionPool
+    /// lifecycle knowledge outside the pool — every state added to
+    /// `PoolState` would need a parallel branch in ctl. Keeping the check
+    /// next to the maps that actually drive `get_or_create` is the only
+    /// way to keep the two consistent.
+    ///
+    /// Workflow `20260818-openab-project-aware-thread-routing` invariant:
+    /// if `get_pinned_project(S) == None` AND `has_reusable_session(S)` is
+    /// true, `thread.pin(S, project)` MUST fail closed with "session
+    /// already exists without trusted project binding; reset/recreate
+    /// required before pinning" — it must not silently resume the existing
+    /// session under the new ProjectContext.
+    pub async fn has_reusable_session(&self, session_key: &str) -> bool {
+        let state = self.state.read().await;
+        state.active.contains_key(session_key)
+            || state.suspended.contains_key(session_key)
+            || state.persisted.contains_key(session_key)
     }
 
     pub async fn get_or_create(

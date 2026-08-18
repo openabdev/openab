@@ -363,6 +363,7 @@ async fn main() -> anyhow::Result<()> {
                 value: Some(value),
                 thread_id: thread.or_else(|| std::env::var("OPENAB_THREAD_ID").ok()),
                 target_user_id,
+                project: None,
             })
             .await?;
             if resp.ok {
@@ -380,6 +381,7 @@ async fn main() -> anyhow::Result<()> {
                 value: None,
                 thread_id: thread.or_else(|| std::env::var("OPENAB_THREAD_ID").ok()),
                 target_user_id: None,
+                project: None,
             })
             .await?;
             if resp.ok {
@@ -979,11 +981,19 @@ async fn main() -> anyhow::Result<()> {
         if adapters.is_empty() {
             None
         } else {
-            Some(ctl::spawn_server(Arc::new(ctl::RuntimeHandler::new(
-                adapters,
-                ctl_registry.clone(),
-                ctl_shard.clone(),
-            ))))
+            // Wire the session pool so trusted ctl `thread.pin` and
+            // `thread.message(project=...)` can seed `session_projects` (workflow
+            // `20260818-openab-project-aware-thread-routing`). Without this,
+            // those keys return `pool unavailable`; legacy `thread.message`
+            // (no project) continues to work.
+            Some(ctl::spawn_server(Arc::new(
+                ctl::RuntimeHandler::new(
+                    adapters,
+                    ctl_registry.clone(),
+                    ctl_shard.clone(),
+                )
+                .with_pool(pool.clone()),
+            )))
         }
     };
     #[cfg(not(unix))]

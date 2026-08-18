@@ -331,6 +331,31 @@ impl std::hash::Hash for ChannelRef {
     }
 }
 
+impl ChannelRef {
+    /// Build the canonical SessionPool key for this channel.
+    ///
+    /// This is the SINGLE source of truth for the session key shape:
+    /// `<platform>:<logical_thread_id>`, where `logical_thread_id` is
+    /// `thread_id` if present, otherwise `channel_id`. Used by:
+    /// - `AdapterRouter::handle_message` (per-message path)
+    /// - `Dispatcher::session_key` (batched path)
+    /// - `RuntimeHandler::ensure_pinned_project` (ctl bootstrap path)
+    /// - `SessionPool::get_or_create` / `get_pinned_project` / `has_reusable_session`
+    ///
+    /// Lane-mode keys (`<platform>:<thread_id>:<sender_id>`) are a dispatcher
+    /// mpsc concern only; they are NOT the ACP session key. The session is
+    /// always shared per-thread regardless of grouping, so the project
+    /// binding uses this method.
+    ///
+    /// Workflow `20260818-openab-project-aware-thread-routing` test M:
+    /// the ctl layer and the dispatcher must construct the IDENTICAL key
+    /// for the same thread; both call this method.
+    pub fn session_pool_key(&self) -> String {
+        let logical = self.thread_id.as_deref().unwrap_or(self.channel_id.as_str());
+        format!("{}:{}", self.platform, logical)
+    }
+}
+
 /// Identifies a message across platforms.
 #[derive(Clone, Debug)]
 pub struct MessageRef {
@@ -691,14 +716,7 @@ impl AdapterRouter {
         let content_blocks =
             Self::pack_arrival_event(&ctx.sender_json, &ctx.prompt, ctx.extra_blocks);
 
-        let thread_key = format!(
-            "{}:{}",
-            adapter.platform(),
-            ctx.thread_channel
-                .thread_id
-                .as_deref()
-                .unwrap_or(&ctx.thread_channel.channel_id)
-        );
+        let thread_key = ctx.thread_channel.session_pool_key();
 
         if let Err(e) = self.pool.get_or_create(&thread_key, None).await {
             let msg = format_user_error(&e.to_string());

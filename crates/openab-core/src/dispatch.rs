@@ -322,12 +322,13 @@ impl Dispatcher {
     ///
     /// Unlike dispatcher keys, session keys never include sender identity.
     /// They track the logical conversation thread across all grouping modes.
+    ///
+    /// Delegates to `ChannelRef::session_pool_key()` so the ctl layer
+    /// (`RuntimeHandler::ensure_pinned_project`) and the dispatcher produce
+    /// byte-identical keys for the same thread (workflow
+    /// `20260818-openab-project-aware-thread-routing` test M).
     fn session_key(thread_channel: &ChannelRef) -> String {
-        let logical_thread_id = thread_channel
-            .thread_id
-            .as_deref()
-            .unwrap_or(&thread_channel.channel_id);
-        format!("{}:{}", thread_channel.platform, logical_thread_id)
+        thread_channel.session_pool_key()
     }
 
     /// Submit one arrival event for the given thread.
