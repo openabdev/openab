@@ -5,8 +5,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tracing::debug;
 
 #[cfg(windows)]
@@ -286,14 +288,124 @@ fn format_shell_output(status: ExitStatus, stdout: &[u8], stderr: &[u8]) -> Stri
     result
 }
 
-/// Run the platform shell inside a dedicated Unix session or Windows Job Object. Explicit
-/// timeout cleanup kills and reaps the complete process tree before returning.
-async fn run_shell_command(
+struct ShellExecution {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+enum ShellSupervisorOutcome {
+    Completed(ShellExecution),
+    Cancelled,
+}
+
+/// Controller-owned cancellation guard for one shell process tree.
+///
+/// The supervisor task, rather than the caller's future, owns the child handle. Dropping an
+/// in-flight caller therefore sends an explicit cancellation request while the supervisor remains
+/// alive to kill and reap the complete process tree. Callers with an orderly shutdown path should
+/// use `cancel_and_wait` so cleanup failures are observable.
+struct ShellCommandController {
+    cancel_tx: Option<oneshot::Sender<()>>,
+    outcome_rx: oneshot::Receiver<Result<ShellSupervisorOutcome>>,
+}
+
+impl ShellCommandController {
+    fn request_cancel(&mut self) {
+        if let Some(cancel_tx) = self.cancel_tx.take() {
+            let _ = cancel_tx.send(());
+        }
+    }
+
+    async fn wait(&mut self) -> Result<ShellSupervisorOutcome> {
+        let outcome = (&mut self.outcome_rx)
+            .await
+            .map_err(|_| anyhow!("bash: process supervisor stopped before reporting cleanup"))?;
+        self.cancel_tx.take();
+        outcome
+    }
+
+    async fn cancel_and_wait(&mut self) -> Result<ShellSupervisorOutcome> {
+        self.request_cancel();
+        self.wait().await
+    }
+}
+
+impl Drop for ShellCommandController {
+    fn drop(&mut self) {
+        self.request_cancel();
+    }
+}
+
+async fn read_shell_pipe<R>(mut pipe: R) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut output = Vec::new();
+    pipe.read_to_end(&mut output).await?;
+    Ok(output)
+}
+
+async fn join_shell_pipe(
+    name: &str,
+    task: JoinHandle<std::io::Result<Vec<u8>>>,
+) -> Result<Vec<u8>> {
+    task.await
+        .map_err(|e| anyhow!("bash: {name} reader task failed: {e}"))?
+        .map_err(|e| anyhow!("bash: {name} read failed: {e}"))
+}
+
+async fn supervise_shell_process(
+    mut child: Box<dyn process_wrap::tokio::ChildWrapper>,
+    stdout_task: JoinHandle<std::io::Result<Vec<u8>>>,
+    stderr_task: JoinHandle<std::io::Result<Vec<u8>>>,
+    mut cancel_rx: oneshot::Receiver<()>,
+) -> Result<ShellSupervisorOutcome> {
+    enum ProcessOutcome {
+        Completed(ExitStatus),
+        Cancelled,
+    }
+
+    let process_outcome = tokio::select! {
+        status = child.wait() => match status {
+            Ok(status) => ProcessOutcome::Completed(status),
+            Err(wait_error) => {
+                return match Box::into_pin(child.kill()).await {
+                    Ok(()) => Err(anyhow!("bash: execution error: {wait_error}")),
+                    Err(cleanup_error) => Err(anyhow!(
+                        "bash: execution error: {wait_error}; process-tree cleanup failed: {cleanup_error}"
+                    )),
+                };
+            }
+        },
+        _ = &mut cancel_rx => {
+            Box::into_pin(child.kill())
+                .await
+                .map_err(|e| anyhow!("bash: process-tree cleanup failed: {e}"))?;
+            ProcessOutcome::Cancelled
+        }
+    };
+
+    let stdout = join_shell_pipe("stdout", stdout_task).await?;
+    let stderr = join_shell_pipe("stderr", stderr_task).await?;
+
+    Ok(match process_outcome {
+        ProcessOutcome::Completed(status) => ShellSupervisorOutcome::Completed(ShellExecution {
+            status,
+            stdout,
+            stderr,
+        }),
+        ProcessOutcome::Cancelled => ShellSupervisorOutcome::Cancelled,
+    })
+}
+
+/// Spawn the platform shell inside a dedicated Unix session or Windows Job Object, then transfer
+/// process-tree ownership to a supervisor that survives cancellation of the calling future.
+fn spawn_shell_command(
     command: &str,
     working_dir: &Path,
-    timeout_duration: Duration,
     env: &HashMap<String, String>,
-) -> Result<String> {
+) -> Result<ShellCommandController> {
     let mut cmd = platform_shell_command(command)?;
     cmd.current_dir(working_dir)
         .env_clear()
@@ -312,41 +424,60 @@ async fn run_shell_command(
     let mut child = wrapped
         .spawn()
         .map_err(|e| anyhow!("bash: spawn failed: {e}"))?;
-    let mut stdout = child
+    let stdout = child
         .stdout()
         .take()
         .ok_or_else(|| anyhow!("bash: stdout pipe unavailable"))?;
-    let mut stderr = child
+    let stderr = child
         .stderr()
         .take()
         .ok_or_else(|| anyhow!("bash: stderr pipe unavailable"))?;
-    let mut stdout_buf = Vec::new();
-    let mut stderr_buf = Vec::new();
 
-    let execution = async {
-        let (status, _, _) = tokio::try_join!(
-            child.wait(),
-            stdout.read_to_end(&mut stdout_buf),
-            stderr.read_to_end(&mut stderr_buf),
-        )?;
-        Ok::<ExitStatus, std::io::Error>(status)
-    };
+    let stdout_task = tokio::spawn(read_shell_pipe(stdout));
+    let stderr_task = tokio::spawn(read_shell_pipe(stderr));
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    let (outcome_tx, outcome_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let outcome = supervise_shell_process(child, stdout_task, stderr_task, cancel_rx).await;
+        let _ = outcome_tx.send(outcome);
+    });
 
-    match tokio::time::timeout(timeout_duration, execution).await {
-        Ok(Ok(status)) => Ok(format_shell_output(status, &stdout_buf, &stderr_buf)),
-        Ok(Err(e)) => Err(anyhow!("bash: execution error: {e}")),
-        Err(_) => {
-            if let Err(e) = Box::into_pin(child.kill()).await {
-                return Err(anyhow!(
-                    "bash: command timed out after {}s; process-tree cleanup failed: {e}",
+    Ok(ShellCommandController {
+        cancel_tx: Some(cancel_tx),
+        outcome_rx,
+    })
+}
+
+/// Run a supervised shell command. Timeout is an orderly controller cancellation: kill and reap
+/// must complete before this function returns.
+async fn run_shell_command(
+    command: &str,
+    working_dir: &Path,
+    timeout_duration: Duration,
+    env: &HashMap<String, String>,
+) -> Result<String> {
+    let mut controller = spawn_shell_command(command, working_dir, env)?;
+
+    match tokio::time::timeout(timeout_duration, controller.wait()).await {
+        Ok(Ok(ShellSupervisorOutcome::Completed(execution))) => Ok(format_shell_output(
+            execution.status,
+            &execution.stdout,
+            &execution.stderr,
+        )),
+        Ok(Ok(ShellSupervisorOutcome::Cancelled)) => Err(anyhow!("bash: command cancelled")),
+        Ok(Err(e)) => Err(e),
+        Err(_) => match controller.cancel_and_wait().await {
+            Ok(ShellSupervisorOutcome::Cancelled | ShellSupervisorOutcome::Completed(_)) => {
+                Err(anyhow!(
+                    "bash: command timed out after {}s",
                     timeout_duration.as_secs()
-                ));
+                ))
             }
-            Err(anyhow!(
-                "bash: command timed out after {}s",
+            Err(e) => Err(anyhow!(
+                "bash: command timed out after {}s; {e}",
                 timeout_duration.as_secs()
-            ))
-        }
+            )),
+        },
     }
 }
 
@@ -562,6 +693,43 @@ mod tests {
         assert!(result.contains("warm"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_unix_future_drop_requests_supervised_process_tree_cleanup() {
+        let tmp = TempDir::new().unwrap();
+        let command = concat!(
+            "(sleep 2; printf escaped > drop-orphan.txt) & ",
+            "printf ready > drop-ready.txt; ",
+            "sleep 120"
+        );
+        let task_dir = tmp.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            run_shell_command(
+                command,
+                &task_dir,
+                Duration::from_secs(120),
+                &build_env(&[]),
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !tmp.path().join("drop-ready.txt").exists() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("parent shell did not start");
+        task.abort();
+        let _ = task.await;
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !tmp.path().join("drop-orphan.txt").exists(),
+            "descendant escaped supervised cleanup when the shell future was dropped"
+        );
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn test_windows_timeout_kills_descendant_process() {
@@ -641,6 +809,43 @@ mod tests {
         assert!(
             !tmp.path().join("drop-orphan.txt").exists(),
             "descendant escaped cleanup when the shell future was dropped"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_windows_controller_cancel_waits_for_descendant_cleanup() {
+        let tmp = TempDir::new().unwrap();
+        warm_windows_shell(tmp.path()).await;
+        let descendant = powershell_encoded_command(
+            "Start-Sleep -Seconds 10; [IO.File]::WriteAllText('cancel-orphan.txt', 'escaped')",
+        );
+        let command = format!(
+            concat!(
+                "$child = Join-Path $PSHOME 'powershell.exe'; ",
+                "Start-Process -FilePath $child -ArgumentList @(",
+                "'-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand','{descendant}'); ",
+                "[IO.File]::WriteAllText('cancel-ready.txt', 'ready'); ",
+                "Start-Sleep -Seconds 120"
+            ),
+            descendant = descendant
+        );
+        let mut controller = spawn_shell_command(&command, tmp.path(), &build_env(&[])).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !tmp.path().join("cancel-ready.txt").exists() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("parent shell did not start");
+        let outcome = controller.cancel_and_wait().await.unwrap();
+        assert!(matches!(outcome, ShellSupervisorOutcome::Cancelled));
+
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        assert!(
+            !tmp.path().join("cancel-orphan.txt").exists(),
+            "controller returned before the Windows process tree was cleaned up"
         );
     }
 
