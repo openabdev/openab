@@ -500,6 +500,12 @@ fn write_synced_auth_temp(dir: &Path, data: &str) -> Result<PathBuf> {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e.into()),
         };
+        #[cfg(windows)]
+        if let Err(e) = restrict_auth_temp_acl(&tmp) {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         if let Err(e) = file
             .write_all(data.as_bytes())
             .and_then(|_| file.sync_all())
@@ -514,6 +520,73 @@ fn write_synced_auth_temp(dir: &Path, data: &str) -> Result<PathBuf> {
     Err(anyhow!(
         "unable to allocate a unique auth.json temp file after 1024 attempts"
     ))
+}
+
+/// Replace inherited Windows ACLs on a fresh auth temp file with an ACL that
+/// grants full access only to the current account. `create_new` prevents a
+/// second writer from selecting the same name, but it does not prevent the
+/// parent directory's permissive ACL from exposing the temp contents during
+/// the write window.
+#[cfg(windows)]
+fn restrict_auth_temp_acl(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, NO_INHERITANCE, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        BuildExplicitAccessWithNameW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
+        SE_FILE_OBJECT, SET_ACCESS, TRUSTEE_IS_NAME, TRUSTEE_IS_USER,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+
+    let username = std::env::var("USERNAME").map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "Windows USERNAME is unavailable")
+    })?;
+    let account = match std::env::var("USERDOMAIN") {
+        Ok(domain) if !domain.is_empty() => format!("{domain}\\{username}"),
+        _ => username,
+    };
+    let account_w: Vec<u16> = account.encode_utf16().chain(Some(0)).collect();
+    let path_w: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+
+    let mut access = EXPLICIT_ACCESS_W::default();
+    unsafe {
+        BuildExplicitAccessWithNameW(
+            &mut access,
+            account_w.as_ptr(),
+            FILE_ALL_ACCESS,
+            SET_ACCESS,
+            NO_INHERITANCE,
+        );
+    }
+    access.Trustee.TrusteeForm = TRUSTEE_IS_NAME;
+    access.Trustee.TrusteeType = TRUSTEE_IS_USER;
+
+    let mut acl = std::ptr::null_mut();
+    let acl_result = unsafe { SetEntriesInAclW(1, &access, std::ptr::null(), &mut acl) };
+    if acl_result != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(acl_result as i32));
+    }
+
+    let security_result = unsafe {
+        SetNamedSecurityInfoW(
+            path_w.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            acl,
+            std::ptr::null(),
+        )
+    };
+    unsafe {
+        LocalFree(acl);
+    }
+    if security_result != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(security_result as i32));
+    }
+    Ok(())
 }
 
 /// Commit a synced temp file over `auth.json` without exposing a partially
@@ -531,7 +604,7 @@ fn replace_auth_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
                 let _ = dir_handle.sync_all();
             }
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -548,31 +621,42 @@ fn replace_auth_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
 
         let replacement = wide(tmp);
         let destination = wide(path);
-        // ReplaceFileW preserves the destination ACL when auth.json already
-        // exists. MoveFileExW handles first creation. WRITE_THROUGH asks Windows
-        // not to report success until the move has reached durable storage.
-        let ok = unsafe {
-            if path.exists() {
-                ReplaceFileW(
-                    destination.as_ptr(),
-                    replacement.as_ptr(),
-                    std::ptr::null(),
-                    REPLACEFILE_WRITE_THROUGH,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                )
+        // Try ReplaceFileW first, without a path.exists() check: that check is
+        // a TOCTOU race with another writer. MoveFileExW is only the
+        // first-creation fallback when ReplaceFileW reports FILE_NOT_FOUND.
+        let replace_error = unsafe {
+            if ReplaceFileW(
+                destination.as_ptr(),
+                replacement.as_ptr(),
+                std::ptr::null(),
+                REPLACEFILE_WRITE_THROUGH,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                Some(std::io::Error::last_os_error())
             } else {
-                MoveFileExW(
-                    replacement.as_ptr(),
-                    destination.as_ptr(),
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-                )
+                None
             }
         };
-        if ok == 0 {
-            return Err(std::io::Error::last_os_error());
+        match replace_error {
+            None => Ok(()),
+            Some(error) if error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND as i32) => {
+                let ok = unsafe {
+                    MoveFileExW(
+                        replacement.as_ptr(),
+                        destination.as_ptr(),
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                    )
+                };
+                if ok == 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            }
+            Some(error) => Err(error),
         }
-        return Ok(());
     }
 
     #[cfg(not(any(unix, windows)))]

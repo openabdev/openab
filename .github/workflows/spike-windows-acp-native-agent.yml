@@ -82,6 +82,15 @@ jobs:
         run: |
           cargo build --locked --release --target $env:TARGET --no-default-features --features acp
 
+      - name: Upload ACP-enabled OpenAB binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-openab-${{ github.sha }}
+          path: target/${{ env.TARGET }}/release/openab.exe
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
   build-openab-agent:
     runs-on: windows-latest
     timeout-minutes: 40
@@ -102,6 +111,15 @@ jobs:
         shell: pwsh
         run: |
           cargo build --locked --release --target $env:TARGET --manifest-path openab-agent/Cargo.toml
+
+      - name: Upload repo-native OpenAB agent binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-openab-agent-${{ github.sha }}
+          path: openab-agent/target/${{ env.TARGET }}/release/openab-agent.exe
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
 
   windows-dual-layer-canary:
     needs:
@@ -129,18 +147,24 @@ jobs:
         run: |
           cargo test --locked --target $env:TARGET -p openab-core --no-default-features controller_guard_terminates_windows_job_descendants_while_connection_is_locked -- --nocapture
 
-      - name: Build both Windows binaries
-        shell: pwsh
-        run: |
-          cargo build --locked --release --target $env:TARGET --no-default-features --features acp
-          cargo build --locked --release --target $env:TARGET --manifest-path openab-agent/Cargo.toml
+      - name: Download ACP-enabled OpenAB binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-openab-${{ github.sha }}
+          path: dist/binaries
+
+      - name: Download repo-native OpenAB agent binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-openab-agent-${{ github.sha }}
+          path: dist/binaries
 
       - name: Run no-provider-call dual-layer runtime canary
         shell: pwsh
         run: |
           ./scripts/windows-acp-native-canary.ps1 `
-            -OpenAbExe "target/$env:TARGET/release/openab.exe" `
-            -AgentExe "openab-agent/target/$env:TARGET/release/openab-agent.exe" `
+            -OpenAbExe "dist/binaries/openab.exe" `
+            -AgentExe "dist/binaries/openab-agent.exe" `
             -WorkDir $PWD
 
       # This step is deliberately after every runtime assertion. If any canary
@@ -154,8 +178,8 @@ jobs:
           $name = "openab-windows-canary-$short"
           $stage = Join-Path $PWD "dist/$name"
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
-          Copy-Item "target/$env:TARGET/release/openab.exe" $stage
-          Copy-Item "openab-agent/target/$env:TARGET/release/openab-agent.exe" $stage
+          Copy-Item "dist/binaries/openab.exe" $stage
+          Copy-Item "dist/binaries/openab-agent.exe" $stage
           Copy-Item "scripts/windows-acp-native-canary.ps1" $stage
           Copy-Item "docs/windows-acp-native-canary.md" (Join-Path $stage "README.md")
 

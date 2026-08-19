@@ -2,6 +2,7 @@
 pub mod agentcore;
 pub mod connection;
 pub mod pool;
+pub mod process_tree;
 pub mod protocol;
 
 pub use connection::ContentBlock;

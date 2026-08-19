@@ -17,76 +17,7 @@ use tracing::{debug, error, info, trace};
 
 #[cfg(windows)]
 use process_wrap::tokio::{CommandWrap, JobObject, KillOnDrop};
-
-#[cfg(windows)]
-type AgentChild = Box<dyn process_wrap::tokio::ChildWrapper>;
-
-#[cfg(windows)]
-#[derive(Clone)]
-pub struct ProcessTreeGuard {
-    terminate_tx: mpsc::UnboundedSender<oneshot::Sender<std::result::Result<(), String>>>,
-}
-
-#[cfg(not(windows))]
-#[derive(Clone, Default)]
-pub struct ProcessTreeGuard;
-
-#[cfg(not(windows))]
-impl ProcessTreeGuard {
-    pub async fn terminate(&self) -> Result<()> {
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
-impl ProcessTreeGuard {
-    fn new(mut child: AgentChild) -> Self {
-        let (terminate_tx, mut terminate_rx) =
-            mpsc::unbounded_channel::<oneshot::Sender<std::result::Result<(), String>>>();
-
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    request = terminate_rx.recv() => {
-                        let result = Box::into_pin(child.kill())
-                            .await
-                            .map_err(|e| e.to_string());
-                        if let Some(reply) = request {
-                            let _ = reply.send(result);
-                        }
-                        break;
-                    }
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
-                        match child.try_wait() {
-                            Ok(Some(_)) => break,
-                            Ok(None) => {}
-                            Err(e) => {
-                                error!(error = %e, "failed to inspect Windows agent Job Object");
-                                let _ = Box::into_pin(child.kill()).await;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        Self { terminate_tx }
-    }
-
-    /// Terminate the Job Object without acquiring the connection mutex.
-    pub async fn terminate(&self) -> Result<()> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if self.terminate_tx.send(reply_tx).is_err() {
-            return Ok(());
-        }
-        tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
-            .await
-            .map_err(|_| anyhow!("timeout terminating Windows agent Job Object"))?
-            .map_err(|_| anyhow!("Windows agent process controller exited before replying"))?
-            .map_err(|e| anyhow!("failed to terminate Windows agent Job Object: {e}"))
-    }
-}
+pub use crate::acp::process_tree::ProcessTreeGuard;
 
 /// Pick the most permissive selectable permission option from ACP options.
 fn pick_best_option(options: &[Value]) -> Option<String> {
@@ -482,16 +413,16 @@ impl AcpConnection {
                 cmd.env("SystemDrive", v);
             }
             // PowerShell fixtures and normal Windows CLI tools need the standard
-            // runtime locations after env_clear(). Keep this baseline explicit so
-            // credentials are not inherited accidentally.
+            // runtime locations after env_clear(). Per-user application-data
+            // paths are intentionally excluded: npmrc/pip.ini and similar files
+            // may contain credentials and must not become an implicit agent read
+            // surface after prompt injection.
             for key in [
                 "WINDIR",
                 "ComSpec",
                 "PATHEXT",
                 "TEMP",
                 "TMP",
-                "APPDATA",
-                "LOCALAPPDATA",
                 "ProgramData",
                 "ProgramFiles",
                 "ProgramFiles(x86)",

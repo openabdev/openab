@@ -53,6 +53,10 @@ struct PoolState {
     /// Per-session working directory overrides (from control directives).
     /// thread_key → canonical workspace path.
     session_workdirs: HashMap<String, String>,
+    /// Once shutdown starts, no new session may be inserted. This closes the
+    /// snapshot/terminate race where reset_session or get_or_create could
+    /// replace a guard after shutdown captured the old one.
+    shutting_down: bool,
 }
 
 pub struct SessionPool {
@@ -200,6 +204,7 @@ async fn kill_process_tree_after_grace(
     pgid: Option<i32>,
     process_tree_guard: Option<ProcessTreeGuard>,
 ) {
+    #[cfg(not(windows))]
     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     #[cfg(not(windows))]
     let _ = &process_tree_guard;
@@ -316,6 +321,7 @@ impl SessionPool {
                 suspended,
                 creating: HashMap::new(),
                 session_workdirs,
+                shutting_down: false,
             }),
             config,
             max_sessions,
@@ -417,6 +423,9 @@ impl SessionPool {
     ) -> Result<bool> {
         let create_gate = {
             let mut state = self.state.write().await;
+            if state.shutting_down {
+                return Err(anyhow!("session pool is shutting down"));
+            }
             get_or_insert_gate(&mut state.creating, thread_id)
         };
         let _create_guard = create_gate.lock().await;
@@ -637,6 +646,10 @@ impl SessionPool {
         let new_conn = Arc::new(Mutex::new(new_conn));
 
         let mut state = self.state.write().await;
+
+        if state.shutting_down {
+            return Err(anyhow!("session pool is shutting down"));
+        }
 
         // Another task may have created a healthy connection while we were
         // initializing this one.
@@ -1026,7 +1039,8 @@ impl SessionPool {
         // per-connection mutexes (lock ordering: never hold state while
         // awaiting a connection lock).
         let (snapshot, process_tree_guards): (ActiveSnapshot, ProcessTreeSnapshot) = {
-            let state = self.state.read().await;
+            let mut state = self.state.write().await;
+            state.shutting_down = true;
             (
                 state
                     .active
@@ -1139,6 +1153,7 @@ mod tests {
             persisted: HashMap::new(),
             creating: HashMap::new(),
             session_workdirs: HashMap::new(),
+            shutting_down: false,
         }
     }
 
@@ -1419,6 +1434,7 @@ mod tests {
             ]),
             creating: HashMap::from([("hung".to_string(), Arc::new(Mutex::new(())))]),
             session_workdirs: HashMap::from([("hung".to_string(), "/tmp/ws".to_string())]),
+            shutting_down: false,
         };
 
         purge_session_entries(&mut state, "hung");

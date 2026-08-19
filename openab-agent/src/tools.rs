@@ -87,8 +87,6 @@ fn build_env(allow_list: &[String]) -> HashMap<String, String> {
         "HOMEPATH",
         "HOME",
         "USERNAME",
-        "APPDATA",
-        "LOCALAPPDATA",
         "ProgramData",
         "ProgramFiles",
         "ProgramFiles(x86)",
