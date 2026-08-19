@@ -42,25 +42,21 @@ impl ProcessTreeGuard {
             mpsc::unbounded_channel::<oneshot::Sender<std::result::Result<(), String>>>();
 
         tokio::spawn(async move {
-            let mut wait = child.wait();
-            tokio::pin!(wait);
-            tokio::select! {
-                request = terminate_rx.recv() => {
-                    // `wait` borrows the child. Drop it before asking the wrapper to kill and
-                    // reap the complete Job Object.
-                    drop(wait);
-                    let result = Box::into_pin(child.kill())
-                        .await
-                        .map_err(|e| e.to_string());
-                    if let Some(reply) = request {
-                        let _ = reply.send(result);
-                    }
-                }
-                result = &mut wait => {
+            // Keep the wait future scoped to select!. If termination wins, the future is
+            // fully dropped before borrowing the child again for kill().
+            let request = tokio::select! {
+                request = terminate_rx.recv() => request,
+                result = child.wait() => {
                     if let Err(e) = result {
                         error!(error = %e, "failed to wait for Windows agent Job Object");
                     }
+                    return;
                 }
+            };
+
+            let result = Box::into_pin(child.kill()).await.map_err(|e| e.to_string());
+            if let Some(reply) = request {
+                let _ = reply.send(result);
             }
         });
 

@@ -581,7 +581,7 @@ fn restrict_auth_temp_acl(path: &Path) -> std::io::Result<()> {
         )
     };
     unsafe {
-        LocalFree(acl);
+        LocalFree(acl.cast());
     }
     if security_result != ERROR_SUCCESS {
         return Err(std::io::Error::from_raw_os_error(security_result as i32));
