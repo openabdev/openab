@@ -129,11 +129,14 @@ pr = ""
 
 [[openab_features]]
 feature = "message_split"
-status = "partial"
-note = "Core splits via `split_delivery`; `GatewayAdapter::message_limit()` returns 4096 (hardcoded 'Telegram limit', not Teams' ~100 KB / UTF-16 budget) — chunking works but the bound is generic, not Teams-tuned."
+status = "implemented"
+note = "Standalone and an available Unified Teams adapter advertise an exact 80,000 UTF-16-byte text budget; old Gateway, no-hello, and unavailable Unified paths keep the 4096-character fallback. Core applies table rendering before exact unit-aware splitting, balances fenced code blocks, and delivers required-ACK chunks sequentially until the first Rejected or Unknown outcome. Automated coverage passes; Microsoft 365 long-message presentation remains live-pending."
 source = [
-  "crates/openab-core/src/adapter.rs#message_limit",
-  "crates/openab-core/src/gateway.rs",
+  "crates/openab-core/src/format.rs#split_message_with_budget",
+  "crates/openab-core/src/adapter.rs#stream_prompt_blocks",
+  "crates/openab-core/src/progressive.rs#deliver_required_ack_chunks",
+  "crates/openab-gateway/src/lib.rs#gateway_capabilities",
+  "src/unified_adapter.rs#capabilities",
 ]
 pr = ""
 
@@ -356,6 +359,13 @@ title = "Edit and delete require process-local bot ownership"
 note = "A confirmed send records `(app, tenant, conversation, activity)` ownership. New commands carry an additive `target_message_id` while preserving origin-event `reply_to`; old peers use a unique legacy target fallback. Same-conversation writes use fixed bounded lock shards. PUT/DELETE retry at most once only after explicit `429` with `Retry-After` no greater than one second; timeouts and 5xx remain unknown."
 kind = "openab_decision"
 source = "docs/adr/teams-owned-message-mutations.md"
+
+[[quirks]]
+date = "2026-08-10"
+title = "OpenAB uses an exact conservative UTF-16 text budget"
+note = "New Teams peers advertise 80,000 UTF-16 bytes (decimal) and Core measures final rendered text exactly, including synthetic code-fence markers. Required-ACK chunks stop at the first non-delivered outcome; Unknown never causes a retry or fresh warning activity. Legacy and no-hello peers remain at 4096 characters."
+kind = "openab_decision"
+source = "docs/adr/teams-formatting-and-long-messages.md"
 
 [[quirks]]
 date = "2026-07-04"

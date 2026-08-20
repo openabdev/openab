@@ -1,209 +1,322 @@
+use std::fmt;
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Byte index after at most `max_chars` (>=1) Unicode scalar values — a last-resort
-/// split used ONLY when a single grapheme cluster is itself wider than the target width.
-/// It splits inside the cluster by codepoint (unavoidable: a cluster wider than the
-/// whole limit cannot be both kept intact and fit) so every emitted chunk still honors
-/// the caller's hard char limit. Guarantees forward progress (>=1 char).
-fn codepoint_split_point(s: &str, max_chars: usize) -> usize {
-    s.char_indices()
-        .nth(max_chars.max(1))
-        .map_or(s.len(), |(i, _)| i)
+/// Internal measurement used by the final-content splitter. Wire capabilities
+/// map to this type without collapsing byte-based limits into character counts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TextBudget {
+    Characters(usize),
+    Bytes(usize),
+    Utf16Bytes(usize),
+    Unlimited,
 }
 
-/// Byte index at which to cut `s` so the prefix is at most `max_chars` Unicode scalar
-/// values **without splitting a grapheme cluster** (emoji, ZWJ sequences, regional-
-/// indicator flags, VS16, combining marks all stay whole). When `word_wrap` and the cut
-/// would land mid-word, it backtracks to just after the last whitespace in the prefix so
-/// words / CJK runs are not broken mid-token. Returns `0` when not even the first
-/// grapheme fits in `max_chars` (the caller decides whether to flush or force it).
-fn split_point(s: &str, max_chars: usize, word_wrap: bool) -> usize {
-    let mut chars = 0usize;
+impl TextBudget {
+    fn max(self) -> Option<usize> {
+        match self {
+            Self::Characters(max) | Self::Bytes(max) | Self::Utf16Bytes(max) => Some(max),
+            Self::Unlimited => None,
+        }
+    }
+
+    pub(crate) fn measure(self, value: &str) -> usize {
+        match self {
+            Self::Characters(_) => value.chars().count(),
+            Self::Bytes(_) => value.len(),
+            Self::Utf16Bytes(_) => value.encode_utf16().count().saturating_mul(2),
+            Self::Unlimited => 0,
+        }
+    }
+
+    fn scalar_cost(self, value: char) -> usize {
+        match self {
+            Self::Characters(_) => 1,
+            Self::Bytes(_) => value.len_utf8(),
+            Self::Utf16Bytes(_) => value.len_utf16().saturating_mul(2),
+            Self::Unlimited => 0,
+        }
+    }
+
+    fn unit(self) -> &'static str {
+        match self {
+            Self::Characters(_) => "characters",
+            Self::Bytes(_) => "bytes",
+            Self::Utf16Bytes(_) => "UTF-16 bytes",
+            Self::Unlimited => "unlimited",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SplitMessageError {
+    unit: &'static str,
+    max: usize,
+    required: usize,
+}
+
+impl SplitMessageError {
+    fn new(budget: TextBudget, max: usize, required: usize) -> Self {
+        Self {
+            unit: budget.unit(),
+            max,
+            required,
+        }
+    }
+}
+
+impl fmt::Display for SplitMessageError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "message cannot be split within a {} budget of {} (smallest required unit costs {})",
+            self.unit, self.max, self.required
+        )
+    }
+}
+
+impl std::error::Error for SplitMessageError {}
+
+/// Last-resort scalar-boundary split used only when one extended grapheme is
+/// wider than the whole budget. Returns an error when even one Unicode scalar
+/// cannot fit, because emitting invalid UTF-8 or an oversized chunk is unsafe.
+fn scalar_split_point(
+    value: &str,
+    max: usize,
+    budget: TextBudget,
+) -> Result<usize, SplitMessageError> {
+    let mut used = 0usize;
     let mut byte = 0usize;
-    let mut last_ws_byte = 0usize; // byte index just past the last whitespace grapheme
-    for (start, g) in s.grapheme_indices(true) {
-        let g_chars = g.chars().count();
-        if chars + g_chars > max_chars {
+    let mut first_cost = 0usize;
+    for (start, scalar) in value.char_indices() {
+        let cost = budget.scalar_cost(scalar);
+        if first_cost == 0 {
+            first_cost = cost;
+        }
+        if used.saturating_add(cost) > max {
             break;
         }
-        chars += g_chars;
-        byte = start + g.len();
-        if g.chars().all(char::is_whitespace) {
+        used += cost;
+        byte = start + scalar.len_utf8();
+    }
+    if byte == 0 && !value.is_empty() {
+        Err(SplitMessageError::new(budget, max, first_cost))
+    } else {
+        Ok(byte)
+    }
+}
+
+/// Byte index at which to cut `value` without splitting an extended grapheme.
+/// When `word_wrap` is true, prefer the last whitespace boundary in the fitting
+/// prefix. Returns zero when the first grapheme does not fit.
+fn split_point(value: &str, max: usize, word_wrap: bool, budget: TextBudget) -> usize {
+    let mut used = 0usize;
+    let mut byte = 0usize;
+    let mut last_ws_byte = 0usize;
+    for (start, grapheme) in value.grapheme_indices(true) {
+        let cost = budget.measure(grapheme);
+        if used.saturating_add(cost) > max {
+            break;
+        }
+        used += cost;
+        byte = start + grapheme.len();
+        if grapheme.chars().all(char::is_whitespace) {
             last_ws_byte = byte;
         }
     }
-    if word_wrap && byte < s.len() && last_ws_byte > 0 {
+    if word_wrap && byte < value.len() && last_ws_byte > 0 {
         return last_ws_byte;
     }
     byte
 }
 
-/// Split text into chunks at line boundaries, each <= limit Unicode characters (UTF-8 safe).
-/// Discord's message limit counts Unicode characters, not bytes.
-///
-/// Fenced code blocks (``` ... ```) are handled specially: if a split falls inside a
-/// code block, the current chunk is closed with ``` and the next chunk is reopened with
-/// the original opener (preserving language tag), so each chunk renders correctly.
-///
-/// Hard-splitting an over-long line breaks on **grapheme cluster** boundaries (never
-/// mid-emoji / ZWJ sequence / combining mark / CJK codepoint); outside code fences it
-/// also prefers whitespace boundaries so words stay intact.
-///
-/// Invariant: every returned chunk satisfies `chunk.chars().count() <= limit`. A single
-/// grapheme cluster wider than `limit` is split by codepoint as a last resort so the
-/// limit still holds (such a cluster cannot be kept intact and also fit).
+/// Compatibility wrapper for callers whose platform limit is measured in
+/// Unicode scalar values. A zero legacy limit is clamped to one so malformed
+/// configuration cannot create an infinite loop.
 pub fn split_message(text: &str, limit: usize) -> Vec<String> {
-    if text.chars().count() <= limit {
-        return vec![text.to_string()];
+    match split_message_with_budget(text, TextBudget::Characters(limit.max(1))) {
+        Ok(chunks) => chunks,
+        // A positive character budget can fit every Unicode scalar. Retain a
+        // content-preserving fallback if that internal invariant ever regresses.
+        Err(_) => text.chars().map(|value| value.to_string()).collect(),
+    }
+}
+
+/// Split final content according to an exact platform budget. Fenced code blocks
+/// are closed and reopened around splits, with those synthetic markers charged
+/// to the same budget as the content.
+pub(crate) fn split_message_with_budget(
+    text: &str,
+    budget: TextBudget,
+) -> Result<Vec<String>, SplitMessageError> {
+    let Some(limit) = budget.max() else {
+        return Ok(vec![text.to_string()]);
+    };
+    if text.is_empty() {
+        return Ok(vec![String::new()]);
+    }
+    if limit == 0 {
+        let required = text
+            .chars()
+            .next()
+            .map_or(1, |value| budget.scalar_cost(value));
+        return Err(SplitMessageError::new(budget, limit, required));
+    }
+    if budget.measure(text) <= limit {
+        return Ok(vec![text.to_string()]);
     }
 
+    let newline_cost = budget.measure("\n");
+    let close_marker = "\n```";
+    let close_cost = budget.measure(close_marker);
     let mut chunks = Vec::new();
     let mut current = String::new();
-    let mut current_len: usize = 0;
-    // When inside a fenced code block, holds the full opener line (e.g. "```rust").
+    let mut current_len = 0usize;
     let mut fence_opener: Option<String> = None;
 
-    // Cost of appending "\n```" to close a fence before emitting a chunk.
-    const CLOSE_COST: usize = 4; // '\n' + '`' + '`' + '`'
-
     for line in text.split('\n') {
-        let line_chars = line.chars().count();
+        let line_len = budget.measure(line);
         let is_fence_line = line.starts_with("```");
-
-        // Determine overhead that must be reserved when inside a fence.
-        let close_reserve = if fence_opener.is_some() && !is_fence_line {
-            CLOSE_COST
+        let opens_fence = is_fence_line && fence_opener.is_none();
+        let close_reserve = if opens_fence || (fence_opener.is_some() && !is_fence_line) {
+            close_cost
         } else {
             0
         };
 
-        // Check whether appending this line (+ newline separator + close reserve) overflows.
-        if !current.is_empty() && current_len + 1 + line_chars + close_reserve > limit {
-            // Emit current chunk, closing fence if needed.
+        if !current.is_empty()
+            && current_len
+                .saturating_add(newline_cost)
+                .saturating_add(line_len)
+                .saturating_add(close_reserve)
+                > limit
+        {
             if let Some(ref opener) = fence_opener {
-                if !is_fence_line {
-                    current.push_str("\n```");
-                }
+                // Close the active block before every split, including when an
+                // unusually long original closing-fence line caused the split.
+                current.push_str(close_marker);
                 chunks.push(std::mem::take(&mut current));
-                // Reopen fence in next chunk with full opener (preserves language tag).
                 current.push_str(opener);
-                current_len = opener.chars().count();
+                current_len = budget.measure(opener);
 
                 if is_fence_line {
-                    // The closing fence marker itself triggers the split.
                     fence_opener = None;
                     current.push('\n');
-                    current_len += 1;
+                    current_len = current_len.saturating_add(newline_cost);
                     current.push_str(line);
-                    current_len += line_chars;
+                    current_len = current_len.saturating_add(line_len);
                     continue;
-                } else if current_len + 1 + line_chars + CLOSE_COST <= limit {
-                    // Line fits in the reopened chunk (with room for \n + line + close marker).
+                } else if current_len
+                    .saturating_add(newline_cost)
+                    .saturating_add(line_len)
+                    .saturating_add(close_cost)
+                    <= limit
+                {
                     current.push('\n');
-                    current_len += 1;
+                    current_len += newline_cost;
                     current.push_str(line);
-                    current_len += line_chars;
+                    current_len += line_len;
                     continue;
                 }
-                // Otherwise: line doesn't fit even in a fresh reopened chunk.
-                // Fall through to the normal line-processing logic below,
-                // which will hit the hard-split path if line_chars > limit,
-                // or the normal append path otherwise.
             } else {
                 chunks.push(std::mem::take(&mut current));
                 current_len = 0;
             }
         }
 
-        // Newline separator between lines within a chunk.
         if !current.is_empty() {
             current.push('\n');
-            current_len += 1;
+            current_len = current_len.saturating_add(newline_cost);
         }
 
-        // Track fence state.
         if is_fence_line {
             if fence_opener.is_some() {
                 fence_opener = None;
             } else {
+                let required = line_len.saturating_add(close_cost);
+                if required > limit {
+                    return Err(SplitMessageError::new(budget, limit, required));
+                }
                 fence_opener = Some(line.to_string());
             }
         }
 
-        // Hard-split: single line exceeds available space.
-        // This triggers when the line itself is longer than limit, OR when the
-        // line doesn't fit in the current chunk even after accounting for fence
-        // close overhead (e.g. after a reopen where opener already consumed space).
         let effective_avail = if fence_opener.is_some() {
-            limit.saturating_sub(current_len + CLOSE_COST)
+            limit.saturating_sub(current_len.saturating_add(close_cost))
         } else {
             limit.saturating_sub(current_len)
         };
-        if line_chars > effective_avail {
-            let overhead = if let Some(ref opener) = fence_opener {
-                // opener + '\n' at start, '\n```' at end
-                opener.chars().count() + 1 + CLOSE_COST
-            } else {
-                0
-            };
-            // If limit can't even fit overhead, fall back to unfenced hard-split.
+        if line_len > effective_avail {
+            let overhead = fence_opener.as_ref().map_or(0, |opener| {
+                budget
+                    .measure(opener)
+                    .saturating_add(newline_cost)
+                    .saturating_add(close_cost)
+            });
             let capacity = limit.saturating_sub(overhead);
-            if let Some(opener) = fence_opener.as_ref().filter(|_| capacity > 0) {
-                // Fenced hard-split: each mid chunk = opener\n + chars + \n```.
-                // Grapheme-safe (never split an emoji / ZWJ / combining mark); no
-                // word-wrap — code must not be reflowed at spaces.
-                let opener_len = opener.chars().count();
-                let mut rest = line;
+            if let Some(opener) = fence_opener.as_ref() {
+                if capacity == 0 {
+                    let scalar_cost = line
+                        .chars()
+                        .next()
+                        .map_or(1, |value| budget.scalar_cost(value));
+                    return Err(SplitMessageError::new(
+                        budget,
+                        limit,
+                        overhead.saturating_add(scalar_cost),
+                    ));
+                }
 
-                // Fill remaining space in current chunk first.
+                let opener_len = budget.measure(opener);
+                let mut rest = line;
                 let avail_first = if current_len > 0 {
-                    limit.saturating_sub(current_len + CLOSE_COST)
+                    limit.saturating_sub(current_len.saturating_add(close_cost))
                 } else {
                     capacity
                 };
-                let cut = split_point(rest, avail_first, false);
+                let cut = split_point(rest, avail_first, false, budget);
                 current.push_str(&rest[..cut]);
-                current_len += rest[..cut].chars().count();
+                current_len = current_len.saturating_add(budget.measure(&rest[..cut]));
                 rest = &rest[cut..];
 
                 while !rest.is_empty() {
-                    // Close current fenced chunk.
-                    current.push_str("\n```");
+                    current.push_str(close_marker);
                     chunks.push(std::mem::take(&mut current));
-                    // Reopen.
                     current.push_str(opener);
                     current.push('\n');
-                    current_len = opener_len + 1;
-                    let mut cut = split_point(rest, capacity, false);
+                    current_len = opener_len.saturating_add(newline_cost);
+                    let mut cut = split_point(rest, capacity, false, budget);
                     if cut == 0 {
-                        // grapheme wider than capacity → codepoint-split to stay <= limit
-                        cut = codepoint_split_point(rest, capacity);
+                        cut = match scalar_split_point(rest, capacity, budget) {
+                            Ok(cut) => cut,
+                            Err(error) => {
+                                return Err(SplitMessageError::new(
+                                    budget,
+                                    limit,
+                                    overhead.saturating_add(error.required),
+                                ));
+                            }
+                        };
                     }
                     current.push_str(&rest[..cut]);
-                    current_len += rest[..cut].chars().count();
+                    current_len = current_len.saturating_add(budget.measure(&rest[..cut]));
                     rest = &rest[cut..];
                 }
             } else {
-                // Plain hard-split (no fence or limit too small for fence wrapping).
-                // Grapheme-safe + prefer whitespace boundaries so words / CJK / emoji
-                // stay intact.
                 let mut rest = line;
                 while !rest.is_empty() {
                     let avail = limit.saturating_sub(current_len);
-                    let mut cut = split_point(rest, avail, true);
+                    let mut cut = split_point(rest, avail, true, budget);
                     if cut == 0 {
                         if current.is_empty() {
-                            // grapheme wider than limit → codepoint-split to stay <= limit
-                            cut = codepoint_split_point(rest, avail);
+                            cut = scalar_split_point(rest, avail, budget)?;
                         } else {
-                            // Nothing more fits in this chunk — flush and retry fresh.
                             chunks.push(std::mem::take(&mut current));
                             current_len = 0;
                             continue;
                         }
                     }
                     current.push_str(&rest[..cut]);
-                    current_len += rest[..cut].chars().count();
+                    current_len = current_len.saturating_add(budget.measure(&rest[..cut]));
                     rest = &rest[cut..];
                     if !rest.is_empty() {
                         chunks.push(std::mem::take(&mut current));
@@ -213,18 +326,25 @@ pub fn split_message(text: &str, limit: usize) -> Vec<String> {
             }
         } else {
             current.push_str(line);
-            current_len += line_chars;
+            current_len = current_len.saturating_add(line_len);
         }
     }
 
     if !current.is_empty() {
-        // Close any trailing open fence.
         if fence_opener.is_some() {
-            current.push_str("\n```");
+            current.push_str(close_marker);
         }
         chunks.push(current);
     }
-    chunks
+
+    if let Some(oversized) = chunks
+        .iter()
+        .map(|chunk| budget.measure(chunk))
+        .find(|measured| *measured > limit)
+    {
+        return Err(SplitMessageError::new(budget, limit, oversized));
+    }
+    Ok(chunks)
 }
 
 /// Shorten a prompt into a thread title: collapse GitHub URLs and cap at 40 chars.
@@ -266,6 +386,30 @@ mod tests {
                 len <= limit,
                 "chunk {i} has {len} chars, exceeds limit {limit}:\n{chunk}"
             );
+        }
+    }
+
+    fn assert_budget_invariant(chunks: &[String], budget: TextBudget, limit: usize) {
+        for (index, chunk) in chunks.iter().enumerate() {
+            let measured = budget.measure(chunk);
+            assert!(
+                measured <= limit,
+                "chunk {index} measures {measured}, exceeds {limit}: {chunk:?}"
+            );
+        }
+    }
+
+    fn split_for_test(text: &str, budget: TextBudget) -> Vec<String> {
+        match split_message_with_budget(text, budget) {
+            Ok(chunks) => chunks,
+            Err(error) => panic!("expected split success: {error}"),
+        }
+    }
+
+    fn split_error_for_test(text: &str, budget: TextBudget) -> SplitMessageError {
+        match split_message_with_budget(text, budget) {
+            Ok(chunks) => panic!("expected split failure, got {} chunks", chunks.len()),
+            Err(error) => error,
         }
     }
 
@@ -358,6 +502,55 @@ mod tests {
         let text = format!("```\n{content}\n```");
         let chunks = split_message(&text, 50);
         assert_length_invariant(&chunks, 50);
+    }
+
+    #[test]
+    fn closing_fence_with_suffix_keeps_every_split_chunk_balanced() {
+        let text = "```\naaaaaa\n``` x";
+        let budget = TextBudget::Characters(15);
+        let chunks = split_for_test(text, budget);
+        assert_eq!(chunks.len(), 2);
+        assert_budget_invariant(&chunks, budget, 15);
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.matches('a').count())
+                .sum::<usize>(),
+            6
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.lines().any(|line| line == "``` x"))
+                .count(),
+            1
+        );
+        for chunk in chunks {
+            let fences = chunk.lines().filter(|line| line.starts_with("```")).count();
+            assert!(fences.is_multiple_of(2), "unbalanced chunk: {chunk:?}");
+        }
+    }
+
+    #[test]
+    fn fence_overhead_that_cannot_fit_fails_closed() {
+        let no_content_capacity = split_error_for_test("```\nx\n```", TextBudget::Characters(8));
+        assert_eq!(no_content_capacity.max, 8);
+        assert_eq!(no_content_capacity.required, 9);
+
+        let oversized_opener = split_error_for_test("```rust\nx\n```", TextBudget::Characters(10));
+        assert_eq!(oversized_opener.max, 10);
+        assert_eq!(oversized_opener.required, 11);
+    }
+
+    #[test]
+    fn prose_splits_before_an_opener_that_needs_close_reserve() {
+        let text = "aaaaa\n```\nx\n```";
+        let budget = TextBudget::Characters(10);
+        let chunks = split_for_test(text, budget);
+        assert_eq!(chunks.len(), 2);
+        assert_budget_invariant(&chunks, budget, 10);
+        assert_eq!(chunks[0], "aaaaa");
+        assert_eq!(chunks[1], "```\nx\n```");
     }
 
     #[test]
@@ -467,5 +660,117 @@ mod tests {
         let chunks = split_message(&text, effective);
         assert_length_invariant(&chunks, effective);
         assert_eq!(chunks.concat(), text, "content lost with mention reserve");
+    }
+
+    #[test]
+    fn utf16_budget_counts_bmp_and_supplementary_scalars_exactly() {
+        let text = "A🙂B🙂C🙂D";
+        let budget = TextBudget::Utf16Bytes(10);
+        let chunks = split_for_test(text, budget);
+        assert_budget_invariant(&chunks, budget, 10);
+        assert_eq!(chunks.concat(), text);
+        assert_eq!(budget.measure("A"), 2);
+        assert_eq!(budget.measure("🙂"), 4);
+        assert!(chunks.len() > 1);
+    }
+
+    #[test]
+    fn utf8_byte_budget_differs_from_utf16_budget() {
+        let text = "éé🙂abc";
+        let byte_budget = TextBudget::Bytes(6);
+        let utf16_budget = TextBudget::Utf16Bytes(6);
+        let byte_chunks = split_for_test(text, byte_budget);
+        let utf16_chunks = split_for_test(text, utf16_budget);
+        assert_budget_invariant(&byte_chunks, byte_budget, 6);
+        assert_budget_invariant(&utf16_chunks, utf16_budget, 6);
+        assert_eq!(byte_chunks.concat(), text);
+        assert_eq!(utf16_chunks.concat(), text);
+        assert_ne!(byte_chunks, utf16_chunks);
+    }
+
+    #[test]
+    fn mixed_unicode_exact_budgets_preserve_content_and_bounds() {
+        let text = "A你e\u{301}🙂👨‍👩‍👧‍👦 Z".repeat(5);
+        let budgets = [
+            TextBudget::Characters(4),
+            TextBudget::Bytes(4),
+            TextBudget::Utf16Bytes(4),
+        ];
+        for budget in budgets {
+            let chunks = split_for_test(&text, budget);
+            let limit = budget.max().unwrap_or_default();
+            assert_budget_invariant(&chunks, budget, limit);
+            assert_eq!(chunks.concat(), text);
+        }
+    }
+
+    #[test]
+    fn teams_decimal_utf16_budget_is_exact_at_supplementary_boundary() {
+        let text = format!("{}🙂", "a".repeat(39_999));
+        let budget = TextBudget::Utf16Bytes(80_000);
+        let chunks = split_for_test(&text, budget);
+        assert_eq!(chunks.len(), 2);
+        assert_budget_invariant(&chunks, budget, 80_000);
+        assert_eq!(chunks.concat(), text);
+        assert_eq!(budget.measure(&chunks[0]), 79_998);
+        assert_eq!(budget.measure(&chunks[1]), 4);
+    }
+
+    #[test]
+    fn utf16_fenced_chunks_charge_synthetic_markers() {
+        let content = "🙂".repeat(20);
+        let text = format!("```rust\n{content}\n```");
+        let budget = TextBudget::Utf16Bytes(48);
+        let chunks = split_for_test(&text, budget);
+        assert_budget_invariant(&chunks, budget, 48);
+        assert!(chunks.len() > 1);
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.matches('🙂').count())
+                .sum::<usize>(),
+            20
+        );
+        for chunk in chunks {
+            let fences = chunk.lines().filter(|line| line.starts_with("```")).count();
+            assert!(fences.is_multiple_of(2), "unbalanced chunk: {chunk:?}");
+        }
+    }
+
+    #[test]
+    fn budget_split_keeps_graphemes_when_they_fit() {
+        let family = "👨‍👩‍👧‍👦";
+        let text = format!("{family} {family} {family}");
+        let one_family = TextBudget::Utf16Bytes(usize::MAX).measure(family);
+        let budget = TextBudget::Utf16Bytes(one_family + 2);
+        let chunks = split_for_test(&text, budget);
+        assert_budget_invariant(&chunks, budget, one_family + 2);
+        let flattened: Vec<&str> = chunks
+            .iter()
+            .flat_map(|chunk| chunk.graphemes(true))
+            .collect();
+        let original: Vec<&str> = text.graphemes(true).collect();
+        assert_eq!(flattened, original);
+    }
+
+    #[test]
+    fn unlimited_budget_returns_one_unchanged_chunk() {
+        let text = "```rust\nfn main() {}\n```\n🙂".repeat(100);
+        assert_eq!(split_for_test(&text, TextBudget::Unlimited), vec![text]);
+    }
+
+    #[test]
+    fn impossible_budget_fails_without_invalid_utf8_or_oversize() {
+        let utf16 = split_error_for_test("🙂", TextBudget::Utf16Bytes(2));
+        assert_eq!(utf16.max, 2);
+        assert_eq!(utf16.required, 4);
+
+        let utf8 = split_error_for_test("é", TextBudget::Bytes(1));
+        assert_eq!(utf8.max, 1);
+        assert_eq!(utf8.required, 2);
+
+        let zero = split_error_for_test("a", TextBudget::Characters(0));
+        assert_eq!(zero.max, 0);
+        assert_eq!(zero.required, 1);
     }
 }

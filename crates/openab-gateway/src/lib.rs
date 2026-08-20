@@ -279,6 +279,8 @@ impl AppState {
     /// flags are conservative: a platform is advertised only when its current
     /// handler emits a GatewayResponse for that operation.
     pub fn gateway_capabilities(&self) -> HashMap<String, schema::AdapterCapabilities> {
+        #[cfg(feature = "teams")]
+        use schema::TEAMS_TEXT_UTF16_BUDGET_BYTES;
         use schema::{AdapterCapabilities, MessageLimit, StatusBackend, StreamingMode};
 
         let mut capabilities = HashMap::new();
@@ -326,7 +328,9 @@ impl AppState {
                     can_edit: true,
                     can_delete: true,
                     show_streaming_placeholder: true,
-                    message_limit: characters(4096),
+                    message_limit: MessageLimit::Utf16Bytes {
+                        max: TEAMS_TEXT_UTF16_BUDGET_BYTES,
+                    },
                     supports_reactions: teams.reactions_enabled(),
                     supports_attachment_materialization: teams.inbound_attachments_enabled(),
                     status_backend: if teams.reactions_enabled() {
@@ -2145,6 +2149,12 @@ mod gateway_protocol_tests {
         assert!(teams.supports_target_message_id);
         assert!(teams.supports_attachment_materialization);
         assert!(!teams.supports_reactions);
+        assert_eq!(
+            teams.message_limit,
+            schema::MessageLimit::Utf16Bytes {
+                max: schema::TEAMS_TEXT_UTF16_BUDGET_BYTES,
+            }
+        );
     }
 
     #[cfg(feature = "teams")]

@@ -12,7 +12,7 @@ use openab_core::adapter::{WriteFailure, WriteOutcome as CoreWriteOutcome};
 use openab_core::gateway::apply_teams_progressive_capabilities;
 #[cfg(feature = "teams")]
 use openab_gateway::schema::WriteOutcome;
-use openab_gateway::schema::{Content, GatewayReply, ReplyChannel};
+use openab_gateway::schema::{Content, GatewayReply, ReplyChannel, TEAMS_TEXT_UTF16_BUDGET_BYTES};
 use openab_gateway::AppState;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -354,6 +354,9 @@ impl ChatAdapter for UnifiedGatewayAdapter {
                 && self.gw_state.telegram_rich_messages),
             message_limit: match platform {
                 "acp" => MessageLimit::Unlimited,
+                "teams" if teams_available => MessageLimit::Utf16Bytes {
+                    max: TEAMS_TEXT_UTF16_BUDGET_BYTES,
+                },
                 "lineworks" => MessageLimit::Characters { max: 2000 },
                 "wecom" => MessageLimit::Characters { max: 2048 },
                 _ => MessageLimit::Characters { max: 4096 },
@@ -572,6 +575,11 @@ mod tests {
         assert!(capabilities.can_delete);
         assert!(!capabilities.supports_reactions);
         assert_eq!(capabilities.status_backend, StatusBackend::None);
+        assert_eq!(
+            capabilities.message_limit,
+            MessageLimit::Characters { max: 4096 },
+            "an unavailable embedded Teams adapter keeps the conservative fallback"
+        );
 
         let (event_tx, _event_rx) = tokio::sync::broadcast::channel(4);
         let mut state = AppState::test_default(event_tx);
@@ -598,6 +606,12 @@ mod tests {
         assert_eq!(
             reaction_capabilities.status_backend,
             StatusBackend::Reactions
+        );
+        assert_eq!(
+            reaction_capabilities.message_limit,
+            MessageLimit::Utf16Bytes {
+                max: TEAMS_TEXT_UTF16_BUDGET_BYTES,
+            }
         );
 
         let message_adapter = UnifiedGatewayAdapter::new(state)

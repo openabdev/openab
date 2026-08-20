@@ -2,7 +2,7 @@
 """Offline regression suite for ``teams-ack-drop-proxy.py``.
 
 The suite uses raw loopback sockets and a fake Gateway. It never contacts a live
-deployment and verifies both target modes, explicit-Delivered eligibility,
+deployment and verifies all three target modes, explicit-Delivered eligibility,
 process-wide claiming, post-target classification, handshake coalescing, state
 permissions, and sensitive-field non-persistence.
 """
@@ -205,6 +205,20 @@ def placeholder_send(request_id: str = REQUEST_SENTINEL) -> dict[str, Any]:
     }
 
 
+def overflow_send(request_id: str = REQUEST_SENTINEL) -> dict[str, Any]:
+    return {
+        "schema": "openab.gateway.reply.v1",
+        "platform": "teams",
+        "command": None,
+        "request_id": request_id,
+        "reply_to": "fixture-origin-id",
+        "content": {
+            "type": "text",
+            "text": "deterministic overflow " + MARKER_SENTINEL,
+        },
+    }
+
+
 class FakeGateway:
     def __init__(
         self,
@@ -324,7 +338,7 @@ class AckDropProxyTests(unittest.TestCase):
                 "--state-file",
                 state_path.name,
             ]
-            if target_kind == PROXY.TARGET_FINAL_EDIT:
+            if target_kind in PROXY.MARKER_TARGET_KINDS:
                 arguments.extend(("--marker", MARKER_SENTINEL))
             process = subprocess.Popen(
                 arguments,
@@ -452,6 +466,24 @@ class AckDropProxyTests(unittest.TestCase):
         self.assertFalse(
             PROXY.is_target_request(final_text, PROXY.TARGET_PLACEHOLDER_SEND, None)
         )
+        self.assertTrue(
+            PROXY.is_target_request(
+                overflow_send(), PROXY.TARGET_OVERFLOW_SEND, MARKER_SENTINEL
+            )
+        )
+        self.assertFalse(
+            PROXY.is_target_request(
+                overflow_send(), PROXY.TARGET_OVERFLOW_SEND, "different-marker"
+            )
+        )
+        overflow_edit = overflow_send()
+        overflow_edit["command"] = "edit_message"
+        overflow_edit["target_message_id"] = "fixture-target-id"
+        self.assertFalse(
+            PROXY.is_target_request(
+                overflow_edit, PROXY.TARGET_OVERFLOW_SEND, MARKER_SENTINEL
+            )
+        )
 
     def test_drop_eligibility_requires_explicit_delivered(self) -> None:
         delivered_edit = delivered_ack(REQUEST_SENTINEL)
@@ -466,6 +498,9 @@ class AckDropProxyTests(unittest.TestCase):
         )
         self.assertTrue(
             PROXY.drop_eligible_ack(delivered_send, PROXY.TARGET_PLACEHOLDER_SEND)
+        )
+        self.assertTrue(
+            PROXY.drop_eligible_ack(delivered_send, PROXY.TARGET_OVERFLOW_SEND)
         )
         self.assertFalse(
             PROXY.drop_eligible_ack(
@@ -545,6 +580,12 @@ class AckDropProxyTests(unittest.TestCase):
                 "--marker",
                 MARKER_SENTINEL,
             ],
+            "missing overflow marker": [
+                "--listen-host",
+                "127.0.0.1",
+                "--target-kind",
+                PROXY.TARGET_OVERFLOW_SEND,
+            ],
             "state path traversal": [
                 "--listen-host",
                 "127.0.0.1",
@@ -595,6 +636,29 @@ class AckDropProxyTests(unittest.TestCase):
         self.assertTrue(result.state["target_ack_dropped"])
         self.assertEqual(result.state["post_target_content_commands"], [])
         self.assertEqual(result.state["post_target_reaction_commands"], 0)
+
+    def test_overflow_send_delivered_ack_with_real_id_is_dropped(self) -> None:
+        result = self.run_proxy_case(
+            target_kind=PROXY.TARGET_OVERFLOW_SEND,
+            command=overflow_send(),
+            target_ack=delivered_ack(
+                REQUEST_SENTINEL, message_id=fixture_message_reference()
+            ),
+        )
+        self.assertEqual(result.state["target_kind"], "overflow_send")
+        self.assertTrue(result.state["target_ack_dropped"])
+        self.assertEqual(result.state["dropped_ack_outcome"], "delivered")
+        self.assertEqual(result.state["post_target_content_commands"], [])
+
+    def test_overflow_send_delivered_without_real_id_is_forwarded(self) -> None:
+        result = self.run_proxy_case(
+            target_kind=PROXY.TARGET_OVERFLOW_SEND,
+            command=overflow_send(),
+            target_ack=delivered_ack(REQUEST_SENTINEL),
+        )
+        self.assertFalse(result.state["target_ack_dropped"])
+        self.assertTrue(result.state["target_ack_forwarded"])
+        self.assertEqual(result.state["forwarded_ack_outcome"], "delivered")
 
     def test_placeholder_delivered_without_real_id_is_forwarded(self) -> None:
         result = self.run_proxy_case(

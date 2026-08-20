@@ -25,8 +25,12 @@ session_ttl_hours = 1
 tool_display = "compact"
 
 [markdown]
-tables = "off"
+tables = "code" # default; Teams text-only activities do not render Markdown tables
 ```
+
+`tables = "code"` keeps tables readable as aligned fenced text before applying
+Teams' 80,000 UTF-16-byte message budget. Use `"bullets"` for a linear fallback;
+`"off"` intentionally sends raw pipes and does not claim native table rendering.
 
 Set `TEAMS_APP_ID` and `TEAMS_APP_SECRET` on the container. No `[gateway]` needed.
 

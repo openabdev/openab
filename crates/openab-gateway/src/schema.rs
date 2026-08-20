@@ -167,6 +167,10 @@ pub enum StreamingMode {
     Native,
 }
 
+/// Conservative text budget from Microsoft's recommended 80 KB Teams
+/// implementation target. Decimal bytes are intentional.
+pub const TEAMS_TEXT_UTF16_BUDGET_BYTES: usize = 80_000;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "unit", rename_all = "snake_case")]
 pub enum MessageLimit {
@@ -765,6 +769,23 @@ mod protocol_tests {
         let decoded: AdapterCapabilities = serde_json::from_value(old_wire).unwrap();
         assert!(!decoded.supports_reactions);
         assert_eq!(decoded.status_backend, StatusBackend::Reactions);
+    }
+
+    #[test]
+    fn utf16_message_limit_round_trips_without_protocol_change() -> anyhow::Result<()> {
+        let value = MessageLimit::Utf16Bytes {
+            max: TEAMS_TEXT_UTF16_BUDGET_BYTES,
+        };
+        let json = serde_json::to_value(value)?;
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "unit": "utf16_bytes",
+                "max": 80_000,
+            })
+        );
+        assert_eq!(serde_json::from_value::<MessageLimit>(json)?, value);
+        Ok(())
     }
 
     #[test]

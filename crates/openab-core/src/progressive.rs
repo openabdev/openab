@@ -86,25 +86,69 @@ pub(crate) fn is_ambiguous_delivery(error: &anyhow::Error) -> bool {
         .is_some()
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ChunkFailure {
+    pub delivered_chunks: usize,
+    pub total_chunks: usize,
+    pub failed_chunk_index: usize,
+    pub error_code: String,
+}
+
+fn sanitize_error_code(error_code: &str) -> String {
+    let error_code: String = error_code
+        .chars()
+        .filter(|value| value.is_ascii_alphanumeric() || matches!(value, '_' | '-'))
+        .take(64)
+        .collect();
+    if error_code.is_empty() {
+        "write_failed".into()
+    } else {
+        error_code
+    }
+}
+
+impl ChunkFailure {
+    fn new(delivered: usize, total: usize, failed_index: usize, error_code: &str) -> Self {
+        Self {
+            delivered_chunks: delivered,
+            total_chunks: total,
+            failed_chunk_index: failed_index,
+            error_code: sanitize_error_code(error_code),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProgressiveDelivery {
     pub failed: bool,
     pub ambiguous: bool,
+    pub chunk_failure: Option<ChunkFailure>,
 }
 
 impl ProgressiveDelivery {
-    fn rejected() -> Self {
+    fn rejected_chunk(delivered: usize, total: usize, failed_index: usize, code: &str) -> Self {
         Self {
             failed: true,
             ambiguous: false,
+            chunk_failure: Some(ChunkFailure::new(delivered, total, failed_index, code)),
         }
     }
 
-    fn unknown() -> Self {
+    fn unknown_chunk(delivered: usize, total: usize, failed_index: usize, code: &str) -> Self {
         Self {
             failed: true,
             ambiguous: true,
+            chunk_failure: Some(ChunkFailure::new(delivered, total, failed_index, code)),
         }
+    }
+
+    fn with_delivered_prefix(mut self, prefix: usize, total: usize) -> Self {
+        if let Some(failure) = &mut self.chunk_failure {
+            failure.delivered_chunks = failure.delivered_chunks.saturating_add(prefix);
+            failure.failed_chunk_index = failure.failed_chunk_index.saturating_add(prefix);
+            failure.total_chunks = total;
+        }
+        self
     }
 }
 
@@ -145,16 +189,46 @@ pub(crate) async fn deliver_fresh_chunks(
     channel: &ChannelRef,
     chunks: &[String],
 ) -> ProgressiveDelivery {
-    for chunk in chunks {
+    let total = chunks.len();
+    for (index, chunk) in chunks.iter().enumerate() {
         match adapter.send_message_outcome(channel, chunk).await {
             outcome if delivered(&outcome) => {}
             WriteOutcome::Rejected { code, .. } => {
-                tracing::warn!(error_code = %code, "progressive fresh chunk rejected");
-                return ProgressiveDelivery::rejected();
+                let code = sanitize_error_code(&code);
+                tracing::warn!(
+                    delivered_chunks = index,
+                    total_chunks = total,
+                    failed_chunk_index = index,
+                    error_code = %code,
+                    "ordered fresh chunk delivery rejected"
+                );
+                return ProgressiveDelivery::rejected_chunk(index, total, index, &code);
             }
-            WriteOutcome::Delivered { .. } | WriteOutcome::Unknown { .. } => {
-                tracing::warn!("progressive fresh chunk outcome unknown; stopping delivery");
-                return ProgressiveDelivery::unknown();
+            WriteOutcome::Unknown { code, .. } => {
+                let code = sanitize_error_code(&code);
+                tracing::warn!(
+                    delivered_chunks = index,
+                    total_chunks = total,
+                    failed_chunk_index = index,
+                    error_code = %code,
+                    "ordered fresh chunk delivery outcome unknown; stopping delivery"
+                );
+                return ProgressiveDelivery::unknown_chunk(index, total, index, &code);
+            }
+            WriteOutcome::Delivered { .. } => {
+                tracing::warn!(
+                    delivered_chunks = index,
+                    total_chunks = total,
+                    failed_chunk_index = index,
+                    error_code = "missing_activity_id",
+                    "ordered fresh chunk delivery returned no activity id"
+                );
+                return ProgressiveDelivery::unknown_chunk(
+                    index,
+                    total,
+                    index,
+                    "missing_activity_id",
+                );
             }
         }
     }
@@ -169,11 +243,15 @@ async fn recover_rejected_placeholder(
 ) -> ProgressiveDelivery {
     match adapter.delete_message_outcome(placeholder).await {
         WriteOutcome::Unknown { code, .. } => {
+            let code = sanitize_error_code(&code);
             tracing::warn!(
+                delivered_chunks = 0,
+                total_chunks = chunks.len(),
+                failed_chunk_index = 0,
                 error_code = %code,
                 "placeholder delete outcome unknown; not fresh-sending"
             );
-            ProgressiveDelivery::unknown()
+            ProgressiveDelivery::unknown_chunk(0, chunks.len(), 0, &code)
         }
         WriteOutcome::Delivered { .. } => deliver_fresh_chunks(adapter, channel, chunks).await,
         WriteOutcome::Rejected { code, .. } => {
@@ -197,15 +275,19 @@ pub(crate) async fn finalize_edit_placeholder(
     };
 
     match adapter.edit_message_outcome(placeholder, first).await {
-        WriteOutcome::Delivered { .. } => {
-            deliver_fresh_chunks(adapter, channel, &chunks[1..]).await
-        }
+        WriteOutcome::Delivered { .. } => deliver_fresh_chunks(adapter, channel, &chunks[1..])
+            .await
+            .with_delivered_prefix(1, chunks.len()),
         WriteOutcome::Unknown { code, .. } => {
+            let code = sanitize_error_code(&code);
             tracing::warn!(
+                delivered_chunks = 0,
+                total_chunks = chunks.len(),
+                failed_chunk_index = 0,
                 error_code = %code,
                 "final progressive edit outcome unknown; not deleting or fresh-sending"
             );
-            ProgressiveDelivery::unknown()
+            ProgressiveDelivery::unknown_chunk(0, chunks.len(), 0, &code)
         }
         WriteOutcome::Rejected { code, .. } => {
             tracing::warn!(
@@ -235,9 +317,9 @@ pub(crate) async fn finalize_edit_after_cosmetic(
         FinalEditPlan::Put => {
             finalize_edit_placeholder(adapter, channel, placeholder, chunks).await
         }
-        FinalEditPlan::AlreadyDelivered => {
-            deliver_fresh_chunks(adapter, channel, &chunks[1..]).await
-        }
+        FinalEditPlan::AlreadyDelivered => deliver_fresh_chunks(adapter, channel, &chunks[1..])
+            .await
+            .with_delivered_prefix(1, chunks.len()),
         FinalEditPlan::RecoverRejected => {
             tracing::warn!(
                 "last cosmetic edit explicitly rejected the final content; recovering without retry"
@@ -246,9 +328,13 @@ pub(crate) async fn finalize_edit_after_cosmetic(
         }
         FinalEditPlan::Ambiguous => {
             tracing::warn!(
-                "last cosmetic edit may already contain the final content; not retrying or recovering"
+                delivered_chunks = 0,
+                total_chunks = chunks.len(),
+                failed_chunk_index = 0,
+                error_code = "cosmetic_edit_unknown",
+                "last cosmetic edit may already contain final content; not retrying or recovering"
             );
-            ProgressiveDelivery::unknown()
+            ProgressiveDelivery::unknown_chunk(0, chunks.len(), 0, "cosmetic_edit_unknown")
         }
     }
 }
@@ -269,16 +355,55 @@ pub(crate) async fn deliver_explicit_reply_chunks(
     {
         outcome if delivered(&outcome) => {}
         WriteOutcome::Rejected { code, .. } => {
-            tracing::warn!(error_code = %code, "progressive explicit reply rejected");
-            return ProgressiveDelivery::rejected();
+            let code = sanitize_error_code(&code);
+            tracing::warn!(
+                delivered_chunks = 0,
+                total_chunks = chunks.len(),
+                failed_chunk_index = 0,
+                error_code = %code,
+                "ordered explicit reply rejected"
+            );
+            return ProgressiveDelivery::rejected_chunk(0, chunks.len(), 0, &code);
         }
-        WriteOutcome::Delivered { .. } | WriteOutcome::Unknown { .. } => {
-            tracing::warn!("progressive explicit reply outcome unknown");
-            return ProgressiveDelivery::unknown();
+        WriteOutcome::Unknown { code, .. } => {
+            let code = sanitize_error_code(&code);
+            tracing::warn!(
+                delivered_chunks = 0,
+                total_chunks = chunks.len(),
+                failed_chunk_index = 0,
+                error_code = %code,
+                "ordered explicit reply outcome unknown"
+            );
+            return ProgressiveDelivery::unknown_chunk(0, chunks.len(), 0, &code);
+        }
+        WriteOutcome::Delivered { .. } => {
+            tracing::warn!(
+                delivered_chunks = 0,
+                total_chunks = chunks.len(),
+                failed_chunk_index = 0,
+                error_code = "missing_activity_id",
+                "ordered explicit reply returned no activity id"
+            );
+            return ProgressiveDelivery::unknown_chunk(0, chunks.len(), 0, "missing_activity_id");
         }
     }
 
-    deliver_fresh_chunks(adapter, channel, &chunks[1..]).await
+    deliver_fresh_chunks(adapter, channel, &chunks[1..])
+        .await
+        .with_delivered_prefix(1, chunks.len())
+}
+
+pub(crate) async fn deliver_required_ack_chunks(
+    adapter: &Arc<dyn ChatAdapter>,
+    channel: &ChannelRef,
+    reply_to_message_id: Option<&str>,
+    chunks: &[String],
+) -> ProgressiveDelivery {
+    if let Some(reply_to_message_id) = reply_to_message_id {
+        deliver_explicit_reply_chunks(adapter, channel, reply_to_message_id, chunks).await
+    } else {
+        deliver_fresh_chunks(adapter, channel, chunks).await
+    }
 }
 
 pub(crate) async fn finalize_explicit_reply(
@@ -311,7 +436,7 @@ pub(crate) async fn finalize_explicit_reply(
             );
         }
     }
-    ProgressiveDelivery::default()
+    delivery
 }
 
 #[cfg(test)]
@@ -471,6 +596,14 @@ mod tests {
         }
     }
 
+    fn rejected_delivery(delivered: usize, total: usize, failed: usize) -> ProgressiveDelivery {
+        ProgressiveDelivery::rejected_chunk(delivered, total, failed, "rejected")
+    }
+
+    fn unknown_delivery(delivered: usize, total: usize, failed: usize) -> ProgressiveDelivery {
+        ProgressiveDelivery::unknown_chunk(delivered, total, failed, "unknown")
+    }
+
     #[test]
     fn ambiguity_marker_survives_anyhow_erasure() {
         let error = anyhow::Error::new(AmbiguousProgressiveDelivery);
@@ -567,7 +700,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result, ProgressiveDelivery::unknown());
+        assert_eq!(
+            result,
+            ProgressiveDelivery::unknown_chunk(0, 1, 0, "cosmetic_edit_unknown")
+        );
         assert!(adapter.events().is_empty());
     }
 
@@ -675,7 +811,7 @@ mod tests {
         let result =
             finalize_edit_placeholder(&erased, &channel(), &placeholder(), &["final".into()]).await;
 
-        assert_eq!(result, ProgressiveDelivery::unknown());
+        assert_eq!(result, unknown_delivery(0, 1, 0));
         assert_eq!(adapter.events(), vec!["edit:final"]);
     }
 
@@ -689,7 +825,7 @@ mod tests {
         let result =
             finalize_edit_placeholder(&erased, &channel(), &placeholder(), &["final".into()]).await;
 
-        assert_eq!(result, ProgressiveDelivery::unknown());
+        assert_eq!(result, unknown_delivery(0, 1, 0));
         assert_eq!(adapter.events(), vec!["edit:final", "delete"]);
     }
 
@@ -705,7 +841,7 @@ mod tests {
         let result =
             finalize_edit_placeholder(&erased, &channel(), &placeholder(), &["final".into()]).await;
 
-        assert_eq!(result, ProgressiveDelivery::rejected());
+        assert_eq!(result, rejected_delivery(0, 1, 0));
         assert_eq!(adapter.events(), vec!["edit:final", "delete", "send:final"]);
     }
 
@@ -721,15 +857,15 @@ mod tests {
         let result =
             finalize_edit_placeholder(&erased, &channel(), &placeholder(), &["final".into()]).await;
 
-        assert_eq!(result, ProgressiveDelivery::unknown());
+        assert_eq!(result, unknown_delivery(0, 1, 0));
         assert_eq!(adapter.events(), vec!["edit:final", "delete", "send:final"]);
     }
 
     #[tokio::test]
     async fn rejected_delete_then_failed_recovery_post_is_not_retried() {
         for (recovery, expected) in [
-            (rejected(), ProgressiveDelivery::rejected()),
-            (unknown(), ProgressiveDelivery::unknown()),
+            (rejected(), rejected_delivery(0, 1, 0)),
+            (unknown(), unknown_delivery(0, 1, 0)),
         ] {
             let adapter = Arc::new(RecordingAdapter::new());
             adapter.push_edit(rejected());
@@ -763,7 +899,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result, ProgressiveDelivery::rejected());
+        assert_eq!(result, rejected_delivery(1, 3, 1));
         assert_eq!(adapter.events(), vec!["edit:first", "send:second"]);
     }
 
@@ -783,7 +919,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result, ProgressiveDelivery::unknown());
+        assert_eq!(result, unknown_delivery(1, 3, 1));
         assert_eq!(adapter.events(), vec!["edit:first", "send:second"]);
     }
 
@@ -802,7 +938,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result, ProgressiveDelivery::rejected());
+        assert_eq!(result, rejected_delivery(0, 1, 0));
         assert_eq!(adapter.events(), vec!["reply:final"]);
     }
 
@@ -821,15 +957,15 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result, ProgressiveDelivery::unknown());
+        assert_eq!(result, unknown_delivery(0, 1, 0));
         assert_eq!(adapter.events(), vec!["reply:final"]);
     }
 
     #[tokio::test]
     async fn explicit_reply_overflow_failure_preserves_placeholder() {
         for (overflow, expected) in [
-            (rejected(), ProgressiveDelivery::rejected()),
-            (unknown(), ProgressiveDelivery::unknown()),
+            (rejected(), rejected_delivery(1, 3, 1)),
+            (unknown(), unknown_delivery(1, 3, 1)),
         ] {
             let adapter = Arc::new(RecordingAdapter::new());
             adapter.push_reply(delivered("reply"));
@@ -873,6 +1009,85 @@ mod tests {
             adapter.events(),
             vec!["reply:first", "send:second", "delete"]
         );
+    }
+
+    #[tokio::test]
+    async fn required_ack_send_once_reports_partial_and_stops_at_middle_rejection() {
+        let adapter = Arc::new(RecordingAdapter::new());
+        adapter.push_send(delivered("first"));
+        adapter.push_send(rejected());
+        adapter.push_send(delivered("must-not-send"));
+        let erased: Arc<dyn ChatAdapter> = adapter.clone();
+
+        let result = deliver_required_ack_chunks(
+            &erased,
+            &channel(),
+            None,
+            &["first".into(), "second".into(), "third".into()],
+        )
+        .await;
+
+        assert_eq!(result, rejected_delivery(1, 3, 1));
+        assert_eq!(adapter.events(), vec!["send:first", "send:second"]);
+    }
+
+    #[tokio::test]
+    async fn required_ack_send_once_stops_at_middle_unknown() {
+        let adapter = Arc::new(RecordingAdapter::new());
+        adapter.push_send(delivered("first"));
+        adapter.push_send(unknown());
+        adapter.push_send(delivered("must-not-send"));
+        let erased: Arc<dyn ChatAdapter> = adapter.clone();
+
+        let result = deliver_required_ack_chunks(
+            &erased,
+            &channel(),
+            None,
+            &["first".into(), "second".into(), "third".into()],
+        )
+        .await;
+
+        assert_eq!(result, unknown_delivery(1, 3, 1));
+        assert_eq!(adapter.events(), vec!["send:first", "send:second"]);
+    }
+
+    #[tokio::test]
+    async fn missing_activity_id_is_unknown_and_stops_later_chunks() {
+        let adapter = Arc::new(RecordingAdapter::new());
+        adapter.push_send(WriteOutcome::Delivered { message_id: None });
+        adapter.push_send(delivered("must-not-send"));
+        let erased: Arc<dyn ChatAdapter> = adapter.clone();
+
+        let result =
+            deliver_fresh_chunks(&erased, &channel(), &["first".into(), "second".into()]).await;
+
+        assert_eq!(
+            result,
+            ProgressiveDelivery::unknown_chunk(0, 2, 0, "missing_activity_id")
+        );
+        assert_eq!(adapter.events(), vec!["send:first"]);
+    }
+
+    #[test]
+    fn chunk_failure_code_is_bounded_and_sanitized() -> Result<()> {
+        let delivery = ProgressiveDelivery::rejected_chunk(
+            1,
+            3,
+            1,
+            "bad code?!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-extra",
+        );
+        let failure = delivery
+            .chunk_failure
+            .ok_or_else(|| anyhow!("expected chunk failure metadata"))?;
+        assert_eq!(failure.delivered_chunks, 1);
+        assert_eq!(failure.total_chunks, 3);
+        assert_eq!(failure.failed_chunk_index, 1);
+        assert!(failure.error_code.len() <= 64);
+        assert!(failure
+            .error_code
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '_' | '-')));
+        Ok(())
     }
 
     #[tokio::test]

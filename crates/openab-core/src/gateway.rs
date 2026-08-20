@@ -3054,6 +3054,57 @@ mod tests {
     }
 
     #[test]
+    fn teams_message_budget_preserves_legacy_and_valid_hello_boundaries() {
+        let legacy = legacy_gateway_capabilities("teams", true, true);
+        let before_hello = GatewayCapabilityState::default();
+        let (negotiated, resolved) = before_hello.resolve("teams", &legacy);
+        assert!(!negotiated);
+        assert_eq!(
+            resolved.message_limit,
+            MessageLimit::Characters { max: 4096 }
+        );
+
+        let advertised = AdapterCapabilities {
+            send_ack: true,
+            message_limit: MessageLimit::Utf16Bytes { max: 80_000 },
+            ..AdapterCapabilities::default()
+        };
+        before_hello.update(GatewayHello {
+            schema: GATEWAY_HELLO_SCHEMA.into(),
+            protocol_version: GATEWAY_PROTOCOL_VERSION,
+            capabilities: HashMap::from([("teams".into(), advertised.clone())]),
+            topology: GatewayTopology {
+                active_consumers: 1,
+                supported: true,
+                delivery_mode: "best_effort_broadcast".into(),
+            },
+        });
+        let (negotiated, resolved) = before_hello.resolve("teams", &legacy);
+        assert!(negotiated);
+        assert_eq!(resolved, advertised);
+        assert_eq!(resolved.message_limit.conservative_char_limit(), 20_000);
+
+        let valid_hello_without_teams = GatewayCapabilityState::default();
+        valid_hello_without_teams.update(GatewayHello {
+            schema: GATEWAY_HELLO_SCHEMA.into(),
+            protocol_version: GATEWAY_PROTOCOL_VERSION,
+            capabilities: HashMap::new(),
+            topology: GatewayTopology {
+                active_consumers: 1,
+                supported: true,
+                delivery_mode: "best_effort_broadcast".into(),
+            },
+        });
+        let (negotiated, missing) = valid_hello_without_teams.resolve("teams", &legacy);
+        assert!(negotiated);
+        assert!(!missing.send_ack);
+        assert_eq!(
+            missing.message_limit,
+            MessageLimit::Characters { max: 4096 }
+        );
+    }
+
+    #[test]
     fn legacy_and_structured_gateway_responses_map_to_write_outcomes() {
         let legacy: GatewayResponse = serde_json::from_value(serde_json::json!({
             "schema": "openab.gateway.response.v1",

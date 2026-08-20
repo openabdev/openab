@@ -4500,6 +4500,12 @@ mod tests {
             .expect(1)
             .mount_as_scoped(&server)
             .await;
+        let _too_large = Mock::given(method("POST"))
+            .and(path("/v3/conversations/too-large/activities"))
+            .respond_with(ResponseTemplate::new(413).set_body_string("message too large"))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
         let _rate_limited = Mock::given(method("POST"))
             .and(path("/v3/conversations/rate-limited/activities"))
             .respond_with(
@@ -4522,6 +4528,18 @@ mod tests {
                 retry_after_ms: None,
                 ..
             } if code == "connector_rejected"
+        ));
+
+        let too_large = adapter
+            .send_activity_outcome(&server.uri(), "too-large", "hello", None)
+            .await;
+        assert!(matches!(
+            too_large,
+            WriteOutcome::Rejected {
+                ref code,
+                retry_after_ms: None,
+                ..
+            } if code == "message_too_large"
         ));
 
         let rate_limited = adapter

@@ -10,10 +10,9 @@ use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
 use crate::markdown::{self, TableMode};
 use crate::progressive::{
-    classify_placeholder, deliver_explicit_reply_chunks, deliver_fresh_chunks,
-    finalize_edit_after_cosmetic, finalize_explicit_reply, is_ambiguous_delivery,
-    AmbiguousProgressiveDelivery, CosmeticEditOutcome, CosmeticEditState, PlaceholderStart,
-    COSMETIC_EDIT_INTERVAL,
+    classify_placeholder, deliver_required_ack_chunks, finalize_edit_after_cosmetic,
+    finalize_explicit_reply, is_ambiguous_delivery, AmbiguousProgressiveDelivery,
+    CosmeticEditOutcome, CosmeticEditState, PlaceholderStart, COSMETIC_EDIT_INTERVAL,
 };
 use crate::reactions::StatusReactionController;
 use crate::status::{StatusMessageController, StatusTerminal};
@@ -332,8 +331,8 @@ pub enum StreamingMode {
     Native,
 }
 
-/// Platform message-size budget. The router converts non-character limits to a
-/// conservative character bound until byte-aware splitting is implemented.
+/// Platform message-size budget. Authoritative final content is split in this
+/// exact unit; cosmetic previews may use a conservative character projection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "unit", rename_all = "snake_case")]
 pub enum MessageLimit {
@@ -356,6 +355,15 @@ impl MessageLimit {
             Self::Bytes { max } => (max / 4).max(1),
             Self::Utf16Bytes { max } => (max / 4).max(1),
             Self::Unlimited => usize::MAX,
+        }
+    }
+
+    pub(crate) fn text_budget(self) -> format::TextBudget {
+        match self {
+            Self::Characters { max } => format::TextBudget::Characters(max),
+            Self::Bytes { max } => format::TextBudget::Bytes(max),
+            Self::Utf16Bytes { max } => format::TextBudget::Utf16Bytes(max),
+            Self::Unlimited => format::TextBudget::Unlimited,
         }
     }
 }
@@ -1008,6 +1016,7 @@ impl AdapterRouter {
         let adapter = adapter.clone();
         let thread_channel = thread_channel.clone();
         let capabilities = adapter.capabilities(&thread_channel.platform);
+        let final_message_budget = capabilities.message_limit.text_budget();
         let capability_limit = capabilities.message_limit.conservative_char_limit();
         let message_limit = reply_message_limit(&thread_channel.platform, capability_limit);
         // ACP stays append-only and cannot use the post+edit path. For all other
@@ -1544,9 +1553,33 @@ impl AdapterRouter {
                             &final_content,
                             message_limit.saturating_sub(mention_reserve),
                         );
-                        propagate_mentions_to_chunks(chunks, &mentions, message_limit)
+                        Ok(propagate_mentions_to_chunks(
+                            chunks,
+                            &mentions,
+                            message_limit,
+                        ))
                     } else {
-                        format::split_message(&final_content, message_limit)
+                        format::split_message_with_budget(&final_content, final_message_budget)
+                            .map_err(anyhow::Error::new)
+                    };
+                    let chunks = match chunks {
+                        Ok(chunks) => chunks,
+                        Err(error) => {
+                            warn!(
+                                platform = %thread_channel.platform,
+                                error = %error,
+                                "final content cannot fit the negotiated message budget"
+                            );
+                            if message_status_enabled {
+                                message_status
+                                    .mark_terminal(StatusTerminal::DeliveryFailed)
+                                    .await;
+                            }
+                            if assistant_status {
+                                let _ = adapter.set_status(&thread_channel, "").await;
+                            }
+                            return Err(error.context("reply formatting failed"));
+                        }
                     };
                     // Track delivery health across all final write paths. Any failure
                     // here means the user's view is incomplete; we propagate Err at the
@@ -1554,6 +1587,7 @@ impl AdapterRouter {
                     // silently calling set_done (🆗) over a half-delivered turn.
                     let mut delivery_failed = placeholder_create_unknown;
                     let mut delivery_ambiguous = placeholder_create_unknown;
+                    let mut chunk_failure = None;
                     // Terminate status before delivering final content. A successful final
                     // delivery clears the processing message below; a failed delete can
                     // therefore leave only recognizable terminal text.
@@ -1634,6 +1668,9 @@ impl AdapterRouter {
                                 .await;
                                 delivery_failed |= health.failed;
                                 delivery_ambiguous |= health.ambiguous;
+                                if health.chunk_failure.is_some() {
+                                    chunk_failure = health.chunk_failure;
+                                }
                             } else {
                                 // reply_to directive: send reply first, then delete placeholder.
                                 // Only delete if send succeeds — preserves placeholder on failure.
@@ -1705,6 +1742,9 @@ impl AdapterRouter {
                             .await;
                             delivery_failed |= health.failed;
                             delivery_ambiguous |= health.ambiguous;
+                            if health.chunk_failure.is_some() {
+                                chunk_failure = health.chunk_failure;
+                            }
                         } else {
                             // Normal streaming: edit first chunk into placeholder, send rest.
                             // If placeholder is a dummy "draft" ref (no real message), send as
@@ -1754,22 +1794,37 @@ impl AdapterRouter {
                         // The placeholder POST may have committed without returning its
                         // real activity ID. Do not create any additional Teams activity.
                     } else if structured_progressive && placeholder_create_rejected {
-                        let health = if let Some(ref reply_id) = directives.reply_to {
-                            deliver_explicit_reply_chunks(
-                                &adapter,
-                                &thread_channel,
-                                reply_id,
-                                &chunks,
-                            )
-                            .await
-                        } else {
-                            deliver_fresh_chunks(&adapter, &thread_channel, &chunks).await
-                        };
+                        let health = deliver_required_ack_chunks(
+                            &adapter,
+                            &thread_channel,
+                            directives.reply_to.as_deref(),
+                            &chunks,
+                        )
+                        .await;
                         delivery_failed |= health.failed;
                         delivery_ambiguous |= health.ambiguous;
+                        if health.chunk_failure.is_some() {
+                            chunk_failure = health.chunk_failure;
+                        }
+                    } else if capabilities.send_ack {
+                        // A negotiated required send ACK makes each chunk outcome
+                        // authoritative. Deliver sequentially and stop at the first
+                        // rejected or unknown POST so no suffix can skip a gap.
+                        let health = deliver_required_ack_chunks(
+                            &adapter,
+                            &thread_channel,
+                            directives.reply_to.as_deref(),
+                            &chunks,
+                        )
+                        .await;
+                        delivery_failed |= health.failed;
+                        delivery_ambiguous |= health.ambiguous;
+                        if health.chunk_failure.is_some() {
+                            chunk_failure = health.chunk_failure;
+                        }
                     } else {
-                        // Send-once: all chunks as new messages
-                        // First chunk uses reply_to directive if present
+                        // Legacy peers preserve best-effort send-once behavior. New
+                        // required-ACK peers use the ordered branch above.
                         let mut first = true;
                         for chunk in &chunks {
                             if first {
@@ -1798,6 +1853,18 @@ impl AdapterRouter {
                         }
                     }
 
+                    if let Some(failure) = &chunk_failure {
+                        warn!(
+                            platform = %thread_channel.platform,
+                            delivered_chunks = failure.delivered_chunks,
+                            total_chunks = failure.total_chunks,
+                            failed_chunk_index = failure.failed_chunk_index,
+                            error_code = %failure.error_code,
+                            ambiguous = delivery_ambiguous,
+                            "final chunk delivery stopped before completion"
+                        );
+                    }
+
                     if delivery_failed {
                         if message_status_enabled {
                             message_status
@@ -1806,9 +1873,23 @@ impl AdapterRouter {
                         }
                         if delivery_ambiguous {
                             Err(AmbiguousProgressiveDelivery.into())
+                        } else if let Some(failure) = chunk_failure {
+                            let classification = if failure.delivered_chunks > 0 {
+                                "partial delivery"
+                            } else {
+                                "delivery failed"
+                            };
+                            Err(anyhow::anyhow!(
+                                "{}: delivered {} of {} chunks; stopped at chunk {} ({})",
+                                classification,
+                                failure.delivered_chunks,
+                                failure.total_chunks,
+                                failure.failed_chunk_index,
+                                failure.error_code,
+                            ))
                         } else {
                             Err(anyhow::anyhow!(
-                                "streaming finalization had delivery failures; user view is incomplete"
+                                "finalization had delivery failures; user view is incomplete"
                             ))
                         }
                     } else {
@@ -2232,9 +2313,45 @@ mod tests {
             1
         );
         assert_eq!(
+            MessageLimit::Utf16Bytes { max: 80_000 }
+                .text_budget()
+                .measure("A🙂"),
+            6
+        );
+        assert_eq!(
+            MessageLimit::Bytes { max: 80_000 }
+                .text_budget()
+                .measure("A🙂"),
+            5
+        );
+        assert_eq!(
             AdapterCapabilities::default().status_backend,
             StatusBackend::None
         );
+    }
+
+    #[test]
+    fn teams_table_fallback_precedes_utf16_budgeting() -> Result<()> {
+        let markdown = "Before\n\n| Name | Value |\n| --- | --- |\n| alpha | 🙂🙂🙂🙂🙂 |\n| beta | 你好世界 |\n\nAfter";
+        let rendered = crate::markdown::convert_tables(markdown, TableMode::Code);
+        assert!(rendered.contains("```\n"));
+        assert_eq!(
+            crate::markdown::convert_tables(markdown, TableMode::Off),
+            markdown
+        );
+
+        let budget = MessageLimit::Utf16Bytes { max: 96 }.text_budget();
+        let chunks = crate::format::split_message_with_budget(&rendered, budget)?;
+        assert!(chunks.len() > 1);
+        for chunk in chunks {
+            assert!(budget.measure(&chunk) <= 96);
+            let fences = chunk.lines().filter(|line| line.starts_with("```")).count();
+            assert!(
+                fences.is_multiple_of(2),
+                "unbalanced table fallback: {chunk:?}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

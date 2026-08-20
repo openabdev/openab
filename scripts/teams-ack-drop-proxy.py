@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """Drop one selected Microsoft Teams write ACK in a transparent WebSocket hop.
 
-This repository-owned helper supports two bounded live-test targets:
+This repository-owned helper supports three bounded live-test targets:
 
 * ``final-edit``: a Teams ``edit_message`` containing a unique marker and a
   real ``target_message_id``.
 * ``placeholder-send``: one of OpenAB Core's fixed placeholder payloads.
+* ``overflow-send``: a fresh Teams send containing a unique marker, used to
+  target one deterministic overflow chunk after an earlier chunk was delivered.
 
 The selected command is always forwarded to Gateway. The proxy drops only its
-first explicit ``Delivered`` ACK; placeholder ACKs additionally require a real
-message ID. Rejected, Unknown, legacy, malformed, or duplicate ACKs are
-forwarded and make the probe invalid rather than manufacturing ambiguity.
+first explicit ``Delivered`` ACK; send ACKs additionally require a real message
+ID. Rejected, Unknown, legacy, malformed, or duplicate ACKs are forwarded and
+make the probe invalid rather than manufacturing ambiguity.
 
 The state file contains only timestamps, operation labels, counters, topology,
 and outcome classes. Request URLs, headers, markers, request/activity/channel
@@ -43,7 +45,9 @@ MAX_HTTP_BYTES = 64 * 1024
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 TARGET_FINAL_EDIT = "final-edit"
 TARGET_PLACEHOLDER_SEND = "placeholder-send"
-TARGET_KINDS = (TARGET_FINAL_EDIT, TARGET_PLACEHOLDER_SEND)
+TARGET_OVERFLOW_SEND = "overflow-send"
+TARGET_KINDS = (TARGET_FINAL_EDIT, TARGET_PLACEHOLDER_SEND, TARGET_OVERFLOW_SEND)
+MARKER_TARGET_KINDS = frozenset({TARGET_FINAL_EDIT, TARGET_OVERFLOW_SEND})
 PLACEHOLDER_TEXTS = frozenset(
     {
         "…",
@@ -328,6 +332,8 @@ def is_target_request(
         )
     if target_kind == TARGET_PLACEHOLDER_SEND:
         return message.get("command") is None and text in PLACEHOLDER_TEXTS
+    if target_kind == TARGET_OVERFLOW_SEND:
+        return message.get("command") is None and marker is not None and marker in text
     raise ValueError("unsupported target kind")
 
 
@@ -352,7 +358,7 @@ def drop_eligible_ack(message: dict[str, Any], target_kind: str) -> bool:
         isinstance(success, bool) and success
     ):
         return False
-    if target_kind == TARGET_PLACEHOLDER_SEND:
+    if target_kind in {TARGET_PLACEHOLDER_SEND, TARGET_OVERFLOW_SEND}:
         message_id = message.get("message_id")
         return isinstance(message_id, str) and bool(message_id)
     return target_kind == TARGET_FINAL_EDIT
@@ -523,9 +529,11 @@ def validate_arguments(
         parser.error("listen port is out of range")
     if not 1 <= arguments.upstream_port <= 65535:
         parser.error("upstream port is out of range")
-    if arguments.target_kind == TARGET_FINAL_EDIT:
+    if arguments.target_kind in MARKER_TARGET_KINDS:
         if arguments.marker is None or not 12 <= len(arguments.marker) <= 128:
-            parser.error("final-edit requires a unique 12-128 character marker")
+            parser.error(
+                f"{arguments.target_kind} requires a unique 12-128 character marker"
+            )
     elif arguments.marker is not None:
         parser.error("placeholder-send does not accept a marker")
     state_path = Path(arguments.state_file)
