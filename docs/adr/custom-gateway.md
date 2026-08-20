@@ -6,12 +6,14 @@
 - **Supersedes:** Sections of [ADR: LINE Adapter](./line-adapter.md) (v2 Target Architecture)
 - **Superseded by:** [ADR: Separate Binaries with Opt-In Unified Build](./unified-binary.md)
 
-> **⚠️ This ADR is partially superseded by the unified binary architecture.**
-> OpenAB now supports a single unified binary mode for simplified deployment
-> (see [ADR: Separate Binaries with Opt-In Unified Build](./unified-binary.md)).
-> While the unified binary is the recommended path for standard setups, the
-> standalone gateway architecture remains fully supported for deployments
-> requiring strict outbound-only network isolation for the OpenAB core.
+> **Standing: historical reference only.** This ADR records the original
+> standalone-gateway proposal and is not operative implementation instruction.
+> Unified mode is the standard deployment path; standalone Gateway remains
+> supported when Core must stay outbound-only. For operative protocol and delivery
+> requirements, use [Separate Binaries with Opt-In Unified Build](./unified-binary.md)
+> and [Gateway Capabilities and Delivery Semantics](gateway-capabilities-and-delivery-semantics.md).
+> Every requirement, rollout step, and compliance statement below describes this
+> superseded proposal unless a non-superseded ADR explicitly adopts it.
 
 ---
 
@@ -22,6 +24,7 @@ As an OpenAB operator, I want to connect webhook-based platforms (LINE, Telegram
 As a platform integrator, I want to write a plugin/adapter for my platform and register it with the gateway, so that any webhook source can drive an OAB agent session without upstream code changes.
 
 Requirements:
+
 - OAB core must remain outbound-only — no inbound ports, no TLS, no K8s Service
 - The gateway is a separate, independently deployable service
 - Adding a new webhook platform requires only a gateway plugin, zero OAB changes
@@ -101,7 +104,7 @@ Outbound (OAB → platform):
 
 ---
 
-## 3. Internal Event Schema
+## 3. Historical Internal Event Schema
 
 The contract between the gateway and OAB. All platform-specific details are normalized away before crossing this boundary.
 
@@ -136,6 +139,7 @@ The contract between the gateway and OAB. All platform-specific details are norm
 ```
 
 Key fields in the base schema:
+
 - **`channel.thread_id`**: thread identifier for platforms that support threads (Discord thread ID, Slack `thread_ts`). `null` for platforms without threads (LINE). OAB uses this for session key construction — without it, per-thread session isolation cannot work through the gateway.
 - **`mentions`**: array of mentioned entity IDs (users, bots). Required for @mention gating — the gateway adapter parses platform-specific mention formats and normalizes them here. Without it, OAB cannot determine whether the bot was mentioned, breaking the primary mitigation for LINE group chat noise and Discord/Slack trigger logic.
 
@@ -157,7 +161,10 @@ Key fields in the base schema:
 ```
 
 Key fields in the outbound reply:
-- **`reply_to`**: the `event_id` of the inbound `GatewayEvent` that triggered this reply. The gateway can use this for reply correlation — e.g., looking up a cached LINE reply token to prefer the free Reply API over the quota-consuming Push API. Empty string if the reply is not associated with a specific inbound event (e.g., cron-triggered messages).
+
+- **`reply_to`**: the `event_id` of the inbound `GatewayEvent` that triggered this reply. The gateway can use this for reply correlation — e.g., looking up a cached LINE reply token to prefer the free Reply API over the quota-consuming Push API. Empty string if the reply is not associated with a specific inbound event (e.g., cron-triggered messages). Legacy command peers may still overload it with a platform target.
+- **`quote_message_id`**: optional platform message selected for visual reply/quote behavior; it is distinct from origin correlation.
+- **`target_message_id`**: additive optional target for edit/delete/reaction commands. Core uses it only when the negotiated capability advertises support; otherwise it copies the target into legacy `reply_to`.
 
 ### Design Principles for the Schema
 
@@ -178,9 +185,11 @@ The following fields/concepts are known to be needed but are not fully defined i
 | `reply_context` | Reply token, quote target, original message reference — not all platforms only need `channel.id` to deliver a reply |
 | `tenant` / `gateway_instance` | Multi-tenancy routing if a shared gateway serves multiple OAB instances |
 
+The capability and delivery-result portion is resolved by [Gateway Capabilities and Delivery Semantics](gateway-capabilities-and-delivery-semantics.md). Teams process-local route and duplicate-suppression behavior is resolved by [Teams Ephemeral Ingress Route and Duplicate Suppression](teams-ephemeral-ingress-state.md), its event correlation plus real send ACK by [Teams Real Send Acknowledgement and Reply Correlation](teams-real-send-acknowledgement.md), and its explicit command target plus ownership enforcement by [Teams Bot-Owned Message Mutations](teams-owned-message-mutations.md). The other rows remain deferred.
+
 ---
 
-## 4. Gateway Adapter Interface
+## 4. Historical Gateway Adapter Interface
 
 Each platform adapter implements a common interface:
 
@@ -305,7 +314,7 @@ GitHub shows the gateway handling a non-chat event. The adapter maps repo → ch
 
 ---
 
-## 7. Open Design Questions
+## 7. Historical Open Design Questions
 
 | Question | Options | Impact |
 |---|---|---|
@@ -317,11 +326,11 @@ GitHub shows the gateway handling a non-chat event. The adapter maps repo → ch
 
 ---
 
-## 8. Rollout Plan
+## 8. Historical Rollout Plan
 
 | Phase | Scope | Deliverable |
 |---|---|---|
-| **v1 (now)** | LINE adapter inside OAB | PR #521 — unblocks LINE users |
+| **v1 (2026-04-22 baseline)** | LINE adapter inside OAB | PR #521 — unblocks LINE users |
 | **v2** | Standalone gateway + OAB generic gateway adapter + LINE migrated out | Gateway service, LINE adapter, internal event schema, OAB connects via WebSocket |
 | **v3** | Multi-platform gateway | Telegram, GitHub, custom adapters |
 | **v4** | Plugin / distribution model | Third-party adapters without forking gateway |
@@ -386,10 +395,13 @@ The gateway holding all platform credentials is the correct architectural choice
 
 ---
 
-## Compliance
+## Historical Compliance Proposal
+
+These clauses governed the superseded proposal; non-superseded ADRs named in the
+standing notice above take precedence.
 
 1. **OAB outbound-only**: after adoption of the custom gateway architecture, new platform integrations must not add inbound platform-traffic handling to OAB core unless explicitly approved by a superseding ADR.
-2. **Event schema stability**: the `openab.gateway.event.v1` schema is currently a draft envelope for v2 development. The protocol spec must finalize all required fields (including deferred concerns in Section 3) before the schema is declared stable. Once declared stable, breaking changes require a version bump (`v2`) and a migration path.
+2. **Event schema stability**: at ADR version 0.2 (2026-06-29), `openab.gateway.event.v1` was a draft envelope for v2 development. Current wire stability is defined by the implementation and [Gateway Capabilities and Delivery Semantics](gateway-capabilities-and-delivery-semantics.md); this historical clause has no independent authority.
 3. **Credential isolation**: platform credentials (tokens, secrets) must reside in the gateway, not in OAB. OAB must not hold or access platform-specific authentication material.
 4. **Adapter interface compliance**: all gateway adapters must implement `validate`, `parse`, `send`, and `health`. Adapters that skip signature validation must be explicitly flagged as insecure.
 5. **Webhook correctness**: all adapters must validate signatures against exact raw request body bytes, per the constraints defined in [ADR: LINE Adapter](./line-adapter.md) Compliance #1.
