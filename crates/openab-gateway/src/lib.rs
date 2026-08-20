@@ -319,6 +319,11 @@ impl AppState {
                 "teams",
                 AdapterCapabilities {
                     send_ack: true,
+                    edit_ack: true,
+                    delete_ack: true,
+                    supports_target_message_id: true,
+                    can_edit: true,
+                    can_delete: true,
                     show_streaming_placeholder: true,
                     message_limit: characters(4096),
                     status_backend: StatusBackend::None,
@@ -715,11 +720,13 @@ pub fn spawn_teams_ingress_cleanup(state: Arc<AppState>) {
             if stats.routes_removed > 0
                 || stats.dedupe_entries_removed > 0
                 || stats.stale_publications_removed > 0
+                || stats.owned_activities_removed > 0
             {
                 tracing::info!(
                     routes_removed = stats.routes_removed,
                     dedupe_entries_removed = stats.dedupe_entries_removed,
                     stale_publications_removed = stats.stale_publications_removed,
+                    owned_activities_removed = stats.owned_activities_removed,
                     "teams ingress state cleanup"
                 );
             }
@@ -1533,7 +1540,11 @@ mod l1_audit_tests {
             .get("teams")
             .expect("configured Teams adapter should advertise capabilities");
         assert!(teams.send_ack);
-        assert!(!teams.can_edit);
+        assert!(teams.edit_ack);
+        assert!(teams.delete_ack);
+        assert!(teams.supports_target_message_id);
+        assert!(teams.can_edit);
+        assert!(teams.can_delete);
         assert_eq!(teams.streaming_mode, super::schema::StreamingMode::Disabled);
         assert!(teams.show_streaming_placeholder);
         assert_eq!(teams.status_backend, super::schema::StatusBackend::None);
@@ -1742,7 +1753,8 @@ mod gateway_protocol_tests {
 
     #[cfg(feature = "teams")]
     #[tokio::test]
-    async fn negotiated_teams_send_returns_real_activity_id_over_websocket() -> anyhow::Result<()> {
+    async fn negotiated_teams_writes_return_operation_specific_acks_over_websocket(
+    ) -> anyhow::Result<()> {
         let connector = MockServer::start().await;
         let _token = Mock::given(method("POST"))
             .and(path("/token"))
@@ -1759,6 +1771,22 @@ mod gateway_protocol_tests {
                 ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!({"id": "teams-activity-1"})),
             )
+            .expect(1)
+            .mount_as_scoped(&connector)
+            .await;
+        let _edit = Mock::given(method("PUT"))
+            .and(path(
+                "/v3/conversations/conversation-1/activities/teams-activity-1",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount_as_scoped(&connector)
+            .await;
+        let _delete = Mock::given(method("DELETE"))
+            .and(path(
+                "/v3/conversations/conversation-1/activities/teams-activity-1",
+            ))
+            .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount_as_scoped(&connector)
             .await;
@@ -1793,13 +1821,14 @@ mod gateway_protocol_tests {
             )?))
             .await?;
         let hello: schema::GatewayHello = serde_json::from_str(&next_text(&mut socket).await?)?;
-        assert!(
-            hello
-                .capabilities
-                .get("teams")
-                .context("Teams capability should be advertised")?
-                .send_ack
-        );
+        let capabilities = hello
+            .capabilities
+            .get("teams")
+            .context("Teams capability should be advertised")?;
+        assert!(capabilities.send_ack);
+        assert!(capabilities.edit_ack);
+        assert!(capabilities.delete_ack);
+        assert!(capabilities.supports_target_message_id);
 
         socket
             .send(Message::Text(serde_json::to_string(
@@ -1819,6 +1848,7 @@ mod gateway_protocol_tests {
                     command: None,
                     request_id: Some("request-1".into()),
                     quote_message_id: None,
+                    target_message_id: None,
                 },
             )?))
             .await?;
@@ -1831,6 +1861,41 @@ mod gateway_protocol_tests {
                 message_id: Some("teams-activity-1".into())
             }
         );
+
+        for (request_id, command, text) in [
+            ("request-2", "edit_message", "updated"),
+            ("request-3", "delete_message", ""),
+        ] {
+            socket
+                .send(Message::Text(serde_json::to_string(
+                    &schema::GatewayReply {
+                        schema: "openab.gateway.reply.v1".into(),
+                        reply_to: "event-1".into(),
+                        platform: "teams".into(),
+                        channel: schema::ReplyChannel {
+                            id: "conversation-1".into(),
+                            thread_id: None,
+                        },
+                        content: schema::Content {
+                            content_type: "text".into(),
+                            text: text.into(),
+                            attachments: Vec::new(),
+                        },
+                        command: Some(command.into()),
+                        request_id: Some(request_id.into()),
+                        quote_message_id: None,
+                        target_message_id: Some("teams-activity-1".into()),
+                    },
+                )?))
+                .await?;
+            let response: schema::GatewayResponse =
+                serde_json::from_str(&next_text(&mut socket).await?)?;
+            assert_eq!(response.request_id, request_id);
+            assert_eq!(
+                response.write_outcome(),
+                schema::WriteOutcome::Delivered { message_id: None }
+            );
+        }
 
         socket.close(None).await?;
         wait_for_consumers(&state, 0).await?;
@@ -1898,6 +1963,7 @@ mod gateway_protocol_tests {
                     command: None,
                     request_id: None,
                     quote_message_id: None,
+                    target_message_id: None,
                 },
             )?))
             .await?;
@@ -1943,8 +2009,9 @@ mod gateway_protocol_tests {
             .get("teams")
             .expect("configured Teams adapter must be advertised");
         assert!(teams.send_ack);
-        assert!(!teams.edit_ack);
-        assert!(!teams.delete_ack);
+        assert!(teams.edit_ack);
+        assert!(teams.delete_ack);
+        assert!(teams.supports_target_message_id);
     }
 
     #[cfg(feature = "teams")]
@@ -1967,6 +2034,7 @@ mod gateway_protocol_tests {
             command: None,
             request_id: Some("request-1".into()),
             quote_message_id: None,
+            target_message_id: None,
         };
         let expected_outcomes = [
             schema::WriteOutcome::Delivered {
@@ -2032,6 +2100,7 @@ mod gateway_protocol_tests {
             command: None,
             request_id: None,
             quote_message_id: None,
+            target_message_id: None,
         };
         socket
             .send(Message::Text(serde_json::to_string(&legacy_reply)?))

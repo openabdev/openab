@@ -1,13 +1,14 @@
 use super::teams_ingress::{
-    wait_for_publish, PublishReservation, PublishState, RouteLookupError, TeamsIngressCleanupStats,
-    TeamsIngressRegistry, TeamsIngressRoute, TeamsRouteKey, DEFAULT_DEDUPE_TTL_SECS,
-    DEFAULT_MAX_ROUTE_ENTRIES, DEFAULT_ROUTE_TTL_SECS,
+    wait_for_publish, OwnershipLookupError, PublishReservation, PublishState, RouteLookupError,
+    TeamsIngressCleanupStats, TeamsIngressRegistry, TeamsIngressRoute, TeamsRouteKey,
+    DEFAULT_DEDUPE_TTL_SECS, DEFAULT_MAX_ROUTE_ENTRIES, DEFAULT_ROUTE_TTL_SECS,
 };
 use crate::schema::*;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
@@ -271,6 +272,7 @@ pub struct TeamsAdapter {
     jwks_cache: RwLock<Option<CachedJwks>>,
     jwks_refresh_lock: Mutex<()>,
     ingress: Mutex<TeamsIngressRegistry>,
+    conversation_writes: Vec<Mutex<()>>,
     allow_non_public_endpoints: bool,
 }
 
@@ -280,6 +282,8 @@ const TEAMS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TEAMS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const TEAMS_ERROR_BODY_LIMIT: usize = 4 * 1024;
 const TEAMS_MAX_REDIRECTS: usize = 5;
+const TEAMS_WRITE_SHARDS: usize = 64;
+const TEAMS_MUTATION_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 const TEAMS_PUBLIC_SERVICE_HOST: &str = "smba.trafficmanager.net";
 const TEAMS_PUBLIC_OAUTH_HOST: &str = "login.microsoftonline.com";
 const TEAMS_PUBLIC_OPENID_HOST: &str = "login.botframework.com";
@@ -309,6 +313,7 @@ impl TeamsAdapter {
             jwks_cache: RwLock::new(None),
             jwks_refresh_lock: Mutex::new(()),
             ingress: Mutex::new(ingress),
+            conversation_writes: (0..TEAMS_WRITE_SHARDS).map(|_| Mutex::new(())).collect(),
             allow_non_public_endpoints,
         }
     }
@@ -364,6 +369,22 @@ impl TeamsAdapter {
 
     pub(crate) async fn cleanup_ingress(&self) -> TeamsIngressCleanupStats {
         self.ingress.lock().await.cleanup(Instant::now())
+    }
+
+    fn conversation_write_shard(route: &TeamsIngressRoute) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        route.tenant_id.hash(&mut hasher);
+        route.conversation_id.hash(&mut hasher);
+        (hasher.finish() as usize) % TEAMS_WRITE_SHARDS
+    }
+
+    async fn lock_conversation<'a>(
+        &'a self,
+        route: &TeamsIngressRoute,
+    ) -> tokio::sync::MutexGuard<'a, ()> {
+        self.conversation_writes[Self::conversation_write_shard(route)]
+            .lock()
+            .await
     }
 
     async fn cached_token(&self) -> Option<String> {
@@ -748,30 +769,7 @@ impl TeamsAdapter {
             };
         }
 
-        let retry_after_ms = (status == StatusCode::TOO_MANY_REQUESTS)
-            .then(|| parse_retry_after_ms(response.headers()))
-            .flatten();
-        let body = read_bounded_error_body(response, &[token.as_str()]).await;
-        let message = format!("Bot Framework send failed with HTTP {status}: {body}");
-        if status.is_server_error() {
-            WriteOutcome::Unknown {
-                code: "connector_server_error".into(),
-                message,
-            }
-        } else {
-            let code = match status.as_u16() {
-                401 | 403 => "authorization_rejected",
-                413 => "message_too_large",
-                429 => "rate_limited",
-                300..=399 => "redirect_rejected",
-                _ => "connector_rejected",
-            };
-            WriteOutcome::Rejected {
-                code: code.into(),
-                message,
-                retry_after_ms,
-            }
-        }
+        classify_write_failure(response, "Bot Framework send", &[token.as_str()]).await
     }
 
     /// Compatibility wrapper for callers that predate structured outcomes.
@@ -798,7 +796,125 @@ impl TeamsAdapter {
         }
     }
 
-    /// Edit an existing activity (for streaming updates).
+    async fn mutate_activity_outcome(
+        &self,
+        method: reqwest::Method,
+        service_url: &str,
+        conversation_id: &str,
+        activity_id: &str,
+        body: Option<&serde_json::Value>,
+        operation: &'static str,
+    ) -> WriteOutcome {
+        let url = match self.connector_url(service_url, conversation_id, Some(activity_id)) {
+            Ok(url) => url,
+            Err(error) => {
+                return WriteOutcome::Rejected {
+                    code: "invalid_route".into(),
+                    message: error.to_string(),
+                    retry_after_ms: None,
+                };
+            }
+        };
+        let token = match self.get_token().await {
+            Ok(token) => token,
+            Err(error) => {
+                return WriteOutcome::Rejected {
+                    code: "connector_auth_failed".into(),
+                    message: error.to_string(),
+                    retry_after_ms: None,
+                };
+            }
+        };
+
+        let mut retried_rate_limit = false;
+        loop {
+            let mut request = self
+                .client
+                .request(method.clone(), url.clone())
+                .bearer_auth(&token);
+            if let Some(body) = body {
+                request = request.json(body);
+            }
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    let code = if error.is_timeout() {
+                        "request_timeout"
+                    } else {
+                        "transport_error"
+                    };
+                    return WriteOutcome::Unknown {
+                        code: code.into(),
+                        message: safe_request_error(operation, &error).to_string(),
+                    };
+                }
+            };
+            if response.status().is_success() {
+                return WriteOutcome::Delivered { message_id: None };
+            }
+
+            let outcome = classify_write_failure(response, operation, &[token.as_str()]).await;
+            if !retried_rate_limit {
+                if let WriteOutcome::Rejected {
+                    code,
+                    retry_after_ms: Some(delay_ms),
+                    ..
+                } = &outcome
+                {
+                    let delay = Duration::from_millis(*delay_ms);
+                    if code == "rate_limited" && delay <= TEAMS_MUTATION_RETRY_MAX_DELAY {
+                        retried_rate_limit = true;
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                }
+            }
+            return outcome;
+        }
+    }
+
+    pub async fn update_activity_outcome(
+        &self,
+        service_url: &str,
+        conversation_id: &str,
+        activity_id: &str,
+        text: &str,
+    ) -> WriteOutcome {
+        let body = serde_json::json!({
+            "type": "message",
+            "from": { "id": &self.config.app_id },
+            "text": text,
+            "textFormat": "markdown",
+        });
+        self.mutate_activity_outcome(
+            reqwest::Method::PUT,
+            service_url,
+            conversation_id,
+            activity_id,
+            Some(&body),
+            "Bot Framework update",
+        )
+        .await
+    }
+
+    pub async fn delete_activity_outcome(
+        &self,
+        service_url: &str,
+        conversation_id: &str,
+        activity_id: &str,
+    ) -> WriteOutcome {
+        self.mutate_activity_outcome(
+            reqwest::Method::DELETE,
+            service_url,
+            conversation_id,
+            activity_id,
+            None,
+            "Bot Framework delete",
+        )
+        .await
+    }
+
+    /// Compatibility wrapper for callers that predate structured outcomes.
     pub async fn update_activity(
         &self,
         service_url: &str,
@@ -806,25 +922,23 @@ impl TeamsAdapter {
         activity_id: &str,
         text: &str,
     ) -> anyhow::Result<()> {
-        let url = self.connector_url(service_url, conversation_id, Some(activity_id))?;
-        let token = self.get_token().await?;
-        let body = serde_json::json!({
-            "type": "message",
-            "from": { "id": &self.config.app_id },
-            "text": text,
-            "textFormat": "markdown",
-        });
+        write_outcome_to_result(
+            self.update_activity_outcome(service_url, conversation_id, activity_id, text)
+                .await,
+        )
+    }
 
-        let response = self
-            .client
-            .put(url)
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| safe_request_error("Bot Framework update", &error))?;
-        require_http_success(response, "Bot Framework update", &[token.as_str()]).await?;
-        Ok(())
+    /// Compatibility wrapper for callers that predate structured outcomes.
+    pub async fn delete_activity(
+        &self,
+        service_url: &str,
+        conversation_id: &str,
+        activity_id: &str,
+    ) -> anyhow::Result<()> {
+        write_outcome_to_result(
+            self.delete_activity_outcome(service_url, conversation_id, activity_id)
+                .await,
+        )
     }
 }
 
@@ -964,6 +1078,47 @@ fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         .duration_since(std::time::SystemTime::now())
         .unwrap_or_default();
     Some(delay.as_millis().min(u128::from(u64::MAX)) as u64)
+}
+
+async fn classify_write_failure(
+    response: reqwest::Response,
+    operation: &str,
+    sensitive_values: &[&str],
+) -> WriteOutcome {
+    let status = response.status();
+    let retry_after_ms = (status == StatusCode::TOO_MANY_REQUESTS)
+        .then(|| parse_retry_after_ms(response.headers()))
+        .flatten();
+    let body = read_bounded_error_body(response, sensitive_values).await;
+    let message = format!("{operation} failed with HTTP {status}: {body}");
+    if status.is_server_error() {
+        WriteOutcome::Unknown {
+            code: "connector_server_error".into(),
+            message,
+        }
+    } else {
+        let code = match status.as_u16() {
+            401 | 403 => "authorization_rejected",
+            413 => "message_too_large",
+            429 => "rate_limited",
+            300..=399 => "redirect_rejected",
+            _ => "connector_rejected",
+        };
+        WriteOutcome::Rejected {
+            code: code.into(),
+            message,
+            retry_after_ms,
+        }
+    }
+}
+
+fn write_outcome_to_result(outcome: WriteOutcome) -> anyhow::Result<()> {
+    match outcome {
+        WriteOutcome::Delivered { .. } => Ok(()),
+        WriteOutcome::Rejected { message, .. } | WriteOutcome::Unknown { message, .. } => {
+            Err(anyhow::anyhow!(message))
+        }
+    }
 }
 
 async fn require_http_success(
@@ -1454,51 +1609,46 @@ async fn accept_message_activity(state: Arc<crate::AppState>, activity: Activity
 
 // --- Reply handler ---
 
-pub async fn handle_reply(reply: &GatewayReply, teams: &TeamsAdapter) -> WriteOutcome {
-    // Fail closed for commands the Teams adapter does not implement. Falling
-    // through to `send_activity` would turn edit/delete/topic commands into new
-    // messages, producing duplicate or misleading output. Reaction commands
-    // remain an intentional no-op until a Teams status backend is implemented.
-    match reply.command.as_deref() {
-        None => {}
-        Some("add_reaction" | "remove_reaction") => {
-            debug!(command = ?reply.command.as_deref(), "teams: ignoring unsupported reaction command");
-            return WriteOutcome::Delivered { message_id: None };
-        }
-        Some(command) => {
-            return WriteOutcome::Rejected {
-                code: "unsupported_command".into(),
-                message: format!("unsupported Teams command: {command}"),
-                retry_after_ms: None,
-            };
-        }
+fn rejected_outcome(code: &str, message: impl Into<String>) -> WriteOutcome {
+    WriteOutcome::Rejected {
+        code: code.into(),
+        message: message.into(),
+        retry_after_ms: None,
     }
+}
 
-    let route = {
-        let mut ingress = teams.ingress.lock().await;
-        ingress.route_for_reply(
-            &reply.reply_to,
-            &reply.channel.id,
-            reply.quote_message_id.as_deref(),
-            Instant::now(),
-        )
-    };
-    let (route, quote_activity_id) = match route {
+async fn resolve_send_route(
+    teams: &TeamsAdapter,
+    reply: &GatewayReply,
+) -> Result<(TeamsIngressRoute, Option<String>), WriteOutcome> {
+    let result = teams.ingress.lock().await.route_for_reply(
+        &reply.reply_to,
+        &reply.channel.id,
+        reply.quote_message_id.as_deref(),
+        Instant::now(),
+    );
+    match result {
+        Ok(route) => Ok(route),
+        Err(RouteLookupError::NotFound) => Err(rejected_outcome(
+            "route_not_found",
+            "Teams ingress route is missing or expired",
+        )),
+        Err(RouteLookupError::ConversationMismatch) => Err(rejected_outcome(
+            "route_mismatch",
+            "Teams reply conversation does not match its ingress route",
+        )),
+    }
+}
+
+async fn handle_send_reply(reply: &GatewayReply, teams: &TeamsAdapter) -> WriteOutcome {
+    let (route, _) = match resolve_send_route(teams, reply).await {
         Ok(route) => route,
-        Err(RouteLookupError::NotFound) => {
-            return WriteOutcome::Rejected {
-                code: "route_not_found".into(),
-                message: "Teams ingress route is missing or expired".into(),
-                retry_after_ms: None,
-            };
-        }
-        Err(RouteLookupError::ConversationMismatch) => {
-            return WriteOutcome::Rejected {
-                code: "route_mismatch".into(),
-                message: "Teams reply conversation does not match its ingress route".into(),
-                retry_after_ms: None,
-            };
-        }
+        Err(outcome) => return outcome,
+    };
+    let _write_guard = teams.lock_conversation(&route).await;
+    let (route, quote_activity_id) = match resolve_send_route(teams, reply).await {
+        Ok(route) => route,
+        Err(outcome) => return outcome,
     };
 
     if reply.quote_message_id.is_some() && quote_activity_id.is_none() {
@@ -1521,9 +1671,132 @@ pub async fn handle_reply(reply: &GatewayReply, teams: &TeamsAdapter) -> WriteOu
         message_id: Some(activity_id),
     } = &outcome
     {
-        debug!(activity_id, "teams activity sent");
+        teams
+            .ingress
+            .lock()
+            .await
+            .record_owned(&route, activity_id, Instant::now());
+        debug!(activity_id, "teams activity sent and ownership recorded");
     }
     outcome
+}
+
+fn command_target(reply: &GatewayReply) -> Result<(&str, Option<&str>), WriteOutcome> {
+    match reply.target_message_id.as_deref() {
+        Some(target) if target.trim().is_empty() => Err(rejected_outcome(
+            "invalid_target",
+            "Teams command target must not be empty",
+        )),
+        Some(target) => Ok((target, Some(reply.reply_to.as_str()))),
+        None if reply.reply_to.trim().is_empty() => Err(rejected_outcome(
+            "invalid_target",
+            "Teams command is missing a target message ID",
+        )),
+        None => Ok((reply.reply_to.as_str(), None)),
+    }
+}
+
+async fn resolve_owned_route(
+    teams: &TeamsAdapter,
+    reply: &GatewayReply,
+    target_activity_id: &str,
+    origin_event_id: Option<&str>,
+) -> Result<TeamsIngressRoute, WriteOutcome> {
+    let result = teams.ingress.lock().await.owned_route_for_target(
+        &teams.config.app_id,
+        origin_event_id,
+        &reply.channel.id,
+        target_activity_id,
+        Instant::now(),
+    );
+    match result {
+        Ok(route) => Ok(route),
+        Err(OwnershipLookupError::NotOwned) => Err(rejected_outcome(
+            "message_not_owned",
+            "Teams target is not a bot-owned activity in this process",
+        )),
+        Err(OwnershipLookupError::OriginRouteNotFound) => Err(rejected_outcome(
+            "target_origin_not_found",
+            "Teams command origin route is missing or expired",
+        )),
+        Err(OwnershipLookupError::ConversationMismatch) => Err(rejected_outcome(
+            "target_scope_mismatch",
+            "Teams command conversation does not match its origin route",
+        )),
+        Err(OwnershipLookupError::AmbiguousScope) => Err(rejected_outcome(
+            "target_scope_ambiguous",
+            "Teams legacy command target is ambiguous across tenant scope",
+        )),
+    }
+}
+
+async fn handle_owned_mutation(
+    reply: &GatewayReply,
+    teams: &TeamsAdapter,
+    command: &str,
+) -> WriteOutcome {
+    let (target_activity_id, origin_event_id) = match command_target(reply) {
+        Ok(target) => target,
+        Err(outcome) => return outcome,
+    };
+    let route = match resolve_owned_route(teams, reply, target_activity_id, origin_event_id).await {
+        Ok(route) => route,
+        Err(outcome) => return outcome,
+    };
+    let _write_guard = teams.lock_conversation(&route).await;
+    let route = match resolve_owned_route(teams, reply, target_activity_id, origin_event_id).await {
+        Ok(route) => route,
+        Err(outcome) => return outcome,
+    };
+
+    info!(conversation = %route.conversation_id, command, "gateway → teams mutation");
+    let outcome = match command {
+        "edit_message" => {
+            teams
+                .update_activity_outcome(
+                    route.service_url.as_str(),
+                    &route.conversation_id,
+                    target_activity_id,
+                    &reply.content.text,
+                )
+                .await
+        }
+        "delete_message" => {
+            teams
+                .delete_activity_outcome(
+                    route.service_url.as_str(),
+                    &route.conversation_id,
+                    target_activity_id,
+                )
+                .await
+        }
+        _ => unreachable!("owned mutation dispatch is command-checked"),
+    };
+    if command == "delete_message" && matches!(outcome, WriteOutcome::Delivered { .. }) {
+        teams
+            .ingress
+            .lock()
+            .await
+            .remove_owned(&route, target_activity_id);
+    }
+    outcome
+}
+
+pub async fn handle_reply(reply: &GatewayReply, teams: &TeamsAdapter) -> WriteOutcome {
+    match reply.command.as_deref() {
+        None => handle_send_reply(reply, teams).await,
+        Some(command @ ("edit_message" | "delete_message")) => {
+            handle_owned_mutation(reply, teams, command).await
+        }
+        Some("add_reaction" | "remove_reaction") => {
+            debug!(command = ?reply.command.as_deref(), "teams: ignoring unsupported reaction command");
+            WriteOutcome::Delivered { message_id: None }
+        }
+        Some(command) => rejected_outcome(
+            "unsupported_command",
+            format!("unsupported Teams command: {command}"),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1691,6 +1964,7 @@ mod tests {
             command: command.map(str::to_owned),
             request_id: None,
             quote_message_id: None,
+            target_message_id: None,
         }
     }
 
@@ -2458,12 +2732,7 @@ mod tests {
             );
         }
 
-        for command in [
-            "create_topic",
-            "edit_message",
-            "delete_message",
-            "future_unknown_command",
-        ] {
+        for command in ["create_topic", "future_unknown_command"] {
             let outcome = handle_reply(&make_reply(Some(command)), &adapter).await;
             assert!(
                 matches!(
@@ -2472,6 +2741,17 @@ mod tests {
                         if code == "unsupported_command" && message.contains(command)
                 ),
                 "outcome should identify unsupported command {command}: {outcome:?}"
+            );
+        }
+
+        for command in ["edit_message", "delete_message"] {
+            let outcome = handle_reply(&make_reply(Some(command)), &adapter).await;
+            assert!(
+                matches!(
+                    outcome,
+                    WriteOutcome::Rejected { ref code, .. } if code == "message_not_owned"
+                ),
+                "unowned command target must be rejected before HTTP: {outcome:?}"
             );
         }
         Ok(())
@@ -2516,6 +2796,369 @@ mod tests {
                 message_id: Some("activity-1".into())
             }
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bot_owned_edit_and_delete_use_structured_target_and_legacy_fallback(
+    ) -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let _token = Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "test-token",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _send = Mock::given(method("POST"))
+            .and(path("/v3/conversations/conversation-1/activities"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "bot-activity-1"})),
+            )
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _edit = Mock::given(method("PUT"))
+            .and(path(
+                "/v3/conversations/conversation-1/activities/bot-activity-1",
+            ))
+            .and(body_json(serde_json::json!({
+                "type": "message",
+                "from": { "id": "test-app" },
+                "text": "updated text",
+                "textFormat": "markdown"
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(2)
+            .mount_as_scoped(&server)
+            .await;
+        let _delete = Mock::given(method("DELETE"))
+            .and(path(
+                "/v3/conversations/conversation-1/activities/bot-activity-1",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let adapter = TeamsAdapter::new_for_test(make_http_test_config(&server));
+        accept_test_route(&adapter, &server.uri(), "evt-1", "inbound-1", None).await?;
+        assert!(matches!(
+            handle_reply(&make_reply(None), &adapter).await,
+            WriteOutcome::Delivered { ref message_id }
+                if message_id.as_deref() == Some("bot-activity-1")
+        ));
+
+        let mut structured_edit = make_reply(Some("edit_message"));
+        structured_edit.content.text = "updated text".into();
+        structured_edit.target_message_id = Some("bot-activity-1".into());
+        assert_eq!(
+            handle_reply(&structured_edit, &adapter).await,
+            WriteOutcome::Delivered { message_id: None }
+        );
+
+        let mut legacy_edit = make_reply(Some("edit_message"));
+        legacy_edit.reply_to = "bot-activity-1".into();
+        legacy_edit.content.text = "updated text".into();
+        assert_eq!(
+            handle_reply(&legacy_edit, &adapter).await,
+            WriteOutcome::Delivered { message_id: None }
+        );
+
+        let mut delete = make_reply(Some("delete_message"));
+        delete.target_message_id = Some("bot-activity-1".into());
+        assert_eq!(
+            handle_reply(&delete, &adapter).await,
+            WriteOutcome::Delivered { message_id: None }
+        );
+        assert!(matches!(
+            handle_reply(&structured_edit, &adapter).await,
+            WriteOutcome::Rejected { ref code, .. } if code == "message_not_owned"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_delete_outcome_preserves_ownership_for_later_reconciliation(
+    ) -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let _token = Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "test-token",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _send = Mock::given(method("POST"))
+            .and(path("/v3/conversations/conversation-1/activities"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "bot-activity-1"})),
+            )
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _delete = Mock::given(method("DELETE"))
+            .and(path(
+                "/v3/conversations/conversation-1/activities/bot-activity-1",
+            ))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _edit = Mock::given(method("PUT"))
+            .and(path(
+                "/v3/conversations/conversation-1/activities/bot-activity-1",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let adapter = TeamsAdapter::new_for_test(make_http_test_config(&server));
+        accept_test_route(&adapter, &server.uri(), "evt-1", "inbound-1", None).await?;
+        assert!(matches!(
+            handle_reply(&make_reply(None), &adapter).await,
+            WriteOutcome::Delivered { .. }
+        ));
+
+        let mut delete = make_reply(Some("delete_message"));
+        delete.target_message_id = Some("bot-activity-1".into());
+        assert!(matches!(
+            handle_reply(&delete, &adapter).await,
+            WriteOutcome::Unknown { ref code, .. } if code == "connector_server_error"
+        ));
+
+        let mut edit = make_reply(Some("edit_message"));
+        edit.target_message_id = Some("bot-activity-1".into());
+        assert_eq!(
+            handle_reply(&edit, &adapter).await,
+            WriteOutcome::Delivered { message_id: None }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inbound_or_cross_conversation_mutation_is_rejected_before_http() -> anyhow::Result<()>
+    {
+        let server = MockServer::start().await;
+        let _no_http = Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount_as_scoped(&server)
+            .await;
+        let _no_put = Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount_as_scoped(&server)
+            .await;
+        let adapter = TeamsAdapter::new_for_test(make_http_test_config(&server));
+        accept_test_route(&adapter, &server.uri(), "evt-1", "inbound-1", None).await?;
+
+        let mut inbound_target = make_reply(Some("edit_message"));
+        inbound_target.target_message_id = Some("inbound-1".into());
+        assert!(matches!(
+            handle_reply(&inbound_target, &adapter).await,
+            WriteOutcome::Rejected { ref code, .. } if code == "message_not_owned"
+        ));
+
+        let mut wrong_conversation = inbound_target;
+        wrong_conversation.channel.id = "conversation-2".into();
+        assert!(matches!(
+            handle_reply(&wrong_conversation, &adapter).await,
+            WriteOutcome::Rejected { ref code, .. } if code == "target_scope_mismatch"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mutation_outcomes_and_bounded_rate_limit_retry_are_explicit() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let server = MockServer::start().await;
+        let _token = Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "test-token",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _server_error = Mock::given(method("PUT"))
+            .and(path("/v3/conversations/server-error/activities/bot-1"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _rejected = Mock::given(method("DELETE"))
+            .and(path("/v3/conversations/rejected/activities/bot-1"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _long_rate_limit = Mock::given(method("DELETE"))
+            .and(path("/v3/conversations/long-rate-limit/activities/bot-1"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "2"))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let responder_attempts = attempts.clone();
+        let _rate_limited = Mock::given(method("PUT"))
+            .and(path("/v3/conversations/rate-limited/activities/bot-1"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if responder_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(429).insert_header("retry-after", "0")
+                } else {
+                    ResponseTemplate::new(200)
+                }
+            })
+            .expect(2)
+            .mount_as_scoped(&server)
+            .await;
+        let adapter = TeamsAdapter::new_for_test(make_http_test_config(&server));
+
+        assert!(matches!(
+            adapter
+                .update_activity_outcome(&server.uri(), "server-error", "bot-1", "updated")
+                .await,
+            WriteOutcome::Unknown { ref code, .. } if code == "connector_server_error"
+        ));
+        assert!(matches!(
+            adapter
+                .delete_activity_outcome(&server.uri(), "rejected", "bot-1")
+                .await,
+            WriteOutcome::Rejected { ref code, .. } if code == "authorization_rejected"
+        ));
+        assert!(matches!(
+            adapter
+                .delete_activity_outcome(&server.uri(), "long-rate-limit", "bot-1")
+                .await,
+            WriteOutcome::Rejected {
+                ref code,
+                retry_after_ms: Some(2000),
+                ..
+            } if code == "rate_limited"
+        ));
+        assert_eq!(
+            adapter
+                .update_activity_outcome(&server.uri(), "rate-limited", "bot-1", "updated")
+                .await,
+            WriteOutcome::Delivered { message_id: None }
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mutation_timeout_is_unknown_and_not_retried() {
+        let server = MockServer::start().await;
+        let _token = Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "test-token",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _update = Mock::given(method("PUT"))
+            .and(path("/v3/conversations/conversation-1/activities/bot-1"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(250)))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let adapter = TeamsAdapter::new_for_test_with_timeout(
+            make_http_test_config(&server),
+            Duration::from_millis(75),
+        );
+
+        assert!(matches!(
+            adapter
+                .update_activity_outcome(&server.uri(), "conversation-1", "bot-1", "updated")
+                .await,
+            WriteOutcome::Unknown { ref code, .. } if code == "request_timeout"
+        ));
+    }
+
+    #[tokio::test]
+    async fn conversation_write_shards_serialize_same_scope_without_blocking_others(
+    ) -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let adapter = TeamsAdapter::new_for_test(make_http_test_config(&server));
+        adapter
+            .accept_route_for_test(
+                &server.uri(),
+                "event-1",
+                "tenant-1",
+                "conversation-1",
+                "inbound-1",
+                None,
+            )
+            .await?;
+        let route_one = adapter
+            .ingress
+            .lock()
+            .await
+            .route_for_event("event-1", Instant::now())
+            .ok_or_else(|| anyhow::anyhow!("first test route missing"))?;
+
+        let mut other_conversation = 2usize;
+        let route_two = loop {
+            let conversation = format!("conversation-{other_conversation}");
+            let event = format!("event-{other_conversation}");
+            let inbound = format!("inbound-{other_conversation}");
+            adapter
+                .accept_route_for_test(
+                    &server.uri(),
+                    &event,
+                    "tenant-1",
+                    &conversation,
+                    &inbound,
+                    None,
+                )
+                .await?;
+            let candidate = adapter
+                .ingress
+                .lock()
+                .await
+                .route_for_event(&event, Instant::now())
+                .ok_or_else(|| anyhow::anyhow!("second test route missing"))?;
+            if TeamsAdapter::conversation_write_shard(&candidate)
+                != TeamsAdapter::conversation_write_shard(&route_one)
+            {
+                break candidate;
+            }
+            other_conversation += 1;
+            if other_conversation > TEAMS_WRITE_SHARDS * 4 {
+                anyhow::bail!("failed to find a distinct conversation write shard");
+            }
+        };
+
+        let first_guard = adapter.lock_conversation(&route_one).await;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                adapter.lock_conversation(&route_one)
+            )
+            .await
+            .is_err(),
+            "same conversation must wait for the active write"
+        );
+        let other_guard = tokio::time::timeout(
+            Duration::from_millis(20),
+            adapter.lock_conversation(&route_two),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("different conversation was unnecessarily serialized"))?;
+        drop(other_guard);
+        drop(first_guard);
         Ok(())
     }
 

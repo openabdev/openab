@@ -372,6 +372,9 @@ pub struct AdapterCapabilities {
     pub send_ack: bool,
     pub edit_ack: bool,
     pub delete_ack: bool,
+    /// Whether command targets use the additive `target_message_id` field.
+    /// False peers require the legacy `reply_to = target` fallback.
+    pub supports_target_message_id: bool,
     pub can_edit: bool,
     pub can_delete: bool,
     pub streaming_mode: StreamingMode,
@@ -386,6 +389,7 @@ impl Default for AdapterCapabilities {
             send_ack: false,
             edit_ack: false,
             delete_ack: false,
+            supports_target_message_id: false,
             can_edit: false,
             can_delete: false,
             streaming_mode: StreamingMode::Disabled,

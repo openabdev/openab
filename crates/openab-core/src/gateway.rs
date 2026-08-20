@@ -15,6 +15,23 @@ use tracing::{error, info, warn};
 
 const LEGACY_GATEWAY_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+fn command_target_fields(
+    msg: &MessageRef,
+    negotiated: bool,
+    capabilities: &AdapterCapabilities,
+) -> (String, Option<String>) {
+    if negotiated && capabilities.supports_target_message_id {
+        (
+            msg.channel.origin_event_id.clone().unwrap_or_default(),
+            Some(msg.message_id.clone()),
+        )
+    } else {
+        // Old Gateways know only the overloaded command form where `reply_to`
+        // carries the platform message target.
+        (msg.message_id.clone(), None)
+    }
+}
+
 /// Capability fallback used only when the peer does not negotiate a hello.
 /// It preserves the pre-handshake behavior while keeping platform identity out
 /// of the write and streaming control paths themselves.
@@ -31,6 +48,7 @@ fn legacy_gateway_capabilities(
         send_ack: false,
         edit_ack: platform == "feishu",
         delete_ack: false,
+        supports_target_message_id: false,
         can_edit,
         can_delete: platform == "feishu",
         streaming_mode: if streaming && can_edit {
@@ -169,6 +187,11 @@ struct GatewayReply {
     /// the visual reply/quote UI on the platform. Falls back to plain send on failure.
     #[serde(skip_serializing_if = "Option::is_none")]
     quote_message_id: Option<String>,
+    /// Platform message targeted by an edit/delete/reaction command. New peers
+    /// keep `reply_to` as origin event correlation; legacy peers receive the
+    /// command target in `reply_to` instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_message_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -429,6 +452,7 @@ impl GatewayAdapter {
             command: None,
             request_id: req_id.clone(),
             quote_message_id: quote_message_id.map(|s| s.to_string()),
+            target_message_id: None,
         };
         let json = serde_json::to_string(&reply)?;
         if let Err(e) = self.ws_tx.lock().await.send(Message::Text(json)).await {
@@ -531,6 +555,7 @@ async fn send_fire_and_forget(
         command: None,
         request_id: None,
         quote_message_id: None,
+        target_message_id: None,
     };
     let json = serde_json::to_string(&reply)?;
     ws_tx.lock().await.send(Message::Text(json)).await?;
@@ -716,6 +741,7 @@ impl ChatAdapter for GatewayAdapter {
             command: Some("create_topic".into()),
             request_id: Some(req_id.clone()),
             quote_message_id: None,
+            target_message_id: None,
         };
         let json = serde_json::to_string(&reply)?;
         self.ws_tx.lock().await.send(Message::Text(json)).await?;
@@ -742,9 +768,12 @@ impl ChatAdapter for GatewayAdapter {
     }
 
     async fn add_reaction(&self, msg: &MessageRef, emoji: &str) -> Result<()> {
+        let (negotiated, capabilities) =
+            self.resolved_capabilities_with_mode(&msg.channel.platform);
+        let (reply_to, target_message_id) = command_target_fields(msg, negotiated, &capabilities);
         let reply = GatewayReply {
             schema: "openab.gateway.reply.v1".into(),
-            reply_to: msg.message_id.clone(),
+            reply_to,
             platform: msg.channel.platform.clone(),
             channel: ReplyChannel {
                 id: msg.channel.channel_id.clone(),
@@ -756,6 +785,7 @@ impl ChatAdapter for GatewayAdapter {
             },
             command: Some("add_reaction".into()),
             quote_message_id: None,
+            target_message_id,
             request_id: None,
         };
         let json = serde_json::to_string(&reply)?;
@@ -764,9 +794,12 @@ impl ChatAdapter for GatewayAdapter {
     }
 
     async fn remove_reaction(&self, msg: &MessageRef, emoji: &str) -> Result<()> {
+        let (negotiated, capabilities) =
+            self.resolved_capabilities_with_mode(&msg.channel.platform);
+        let (reply_to, target_message_id) = command_target_fields(msg, negotiated, &capabilities);
         let reply = GatewayReply {
             schema: "openab.gateway.reply.v1".into(),
-            reply_to: msg.message_id.clone(),
+            reply_to,
             platform: msg.channel.platform.clone(),
             channel: ReplyChannel {
                 id: msg.channel.channel_id.clone(),
@@ -778,6 +811,7 @@ impl ChatAdapter for GatewayAdapter {
             },
             command: Some("remove_reaction".into()),
             quote_message_id: None,
+            target_message_id,
             request_id: None,
         };
         let json = serde_json::to_string(&reply)?;
@@ -818,9 +852,10 @@ impl ChatAdapter for GatewayAdapter {
         } else {
             None
         };
+        let (reply_to, target_message_id) = command_target_fields(msg, negotiated, &capabilities);
         let reply = GatewayReply {
             schema: "openab.gateway.reply.v1".into(),
-            reply_to: msg.message_id.clone(),
+            reply_to,
             platform: msg.channel.platform.clone(),
             channel: ReplyChannel {
                 id: msg.channel.channel_id.clone(),
@@ -832,6 +867,7 @@ impl ChatAdapter for GatewayAdapter {
             },
             command: Some("edit_message".into()),
             quote_message_id: None,
+            target_message_id,
             request_id: req_id.clone(),
         };
         let json = serde_json::to_string(&reply)?;
@@ -900,9 +936,10 @@ impl ChatAdapter for GatewayAdapter {
         } else {
             None
         };
+        let (reply_to, target_message_id) = command_target_fields(msg, negotiated, &capabilities);
         let reply = GatewayReply {
             schema: "openab.gateway.reply.v1".into(),
-            reply_to: msg.message_id.clone(),
+            reply_to,
             platform: msg.channel.platform.clone(),
             channel: ReplyChannel {
                 id: msg.channel.channel_id.clone(),
@@ -914,6 +951,7 @@ impl ChatAdapter for GatewayAdapter {
             },
             command: Some("delete_message".into()),
             quote_message_id: None,
+            target_message_id,
             request_id: request_id.clone(),
         };
         let json = serde_json::to_string(&reply)?;
@@ -2028,6 +2066,37 @@ mod tests {
                 code: "request_timeout".into(),
                 message: "delivery may have completed".into()
             }
+        );
+    }
+
+    #[test]
+    fn command_target_field_is_negotiated_with_legacy_fallback() {
+        let message = MessageRef {
+            channel: ChannelRef {
+                platform: "teams".into(),
+                channel_id: "conversation-1".into(),
+                thread_id: None,
+                parent_id: None,
+                origin_event_id: Some("event-1".into()),
+            },
+            message_id: "activity-1".into(),
+        };
+        let supported = AdapterCapabilities {
+            supports_target_message_id: true,
+            ..AdapterCapabilities::default()
+        };
+
+        assert_eq!(
+            command_target_fields(&message, true, &supported),
+            ("event-1".into(), Some("activity-1".into()))
+        );
+        assert_eq!(
+            command_target_fields(&message, false, &supported),
+            ("activity-1".into(), None)
+        );
+        assert_eq!(
+            command_target_fields(&message, true, &AdapterCapabilities::default()),
+            ("activity-1".into(), None)
         );
     }
 

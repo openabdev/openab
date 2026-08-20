@@ -79,6 +79,11 @@ struct DedupeEntry {
     completion: watch::Sender<PublishState>,
 }
 
+struct OwnedActivityEntry {
+    route: TeamsIngressRoute,
+    created_at: Instant,
+}
+
 pub(super) enum PublishReservation {
     Owner,
     AcceptedDuplicate,
@@ -92,22 +97,33 @@ pub(super) enum RouteLookupError {
     ConversationMismatch,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum OwnershipLookupError {
+    NotOwned,
+    OriginRouteNotFound,
+    ConversationMismatch,
+    AmbiguousScope,
+}
+
 #[derive(Debug, Default, Eq, PartialEq)]
 pub(crate) struct TeamsIngressCleanupStats {
     pub(crate) routes_removed: usize,
     pub(crate) dedupe_entries_removed: usize,
     pub(crate) stale_publications_removed: usize,
+    pub(crate) owned_activities_removed: usize,
 }
 
-/// Process-local, bounded Teams route and dedupe state.
+/// Process-local, bounded Teams route, dedupe, and bot-owned activity state.
 ///
 /// This is deliberately not a durable queue and does not provide cross-replica
 /// idempotency. A per-key Publishing state plus completion channel ensures
-/// concurrent retries observe the owner's local enqueue result.
+/// concurrent retries observe the owner's local enqueue result. The ownership
+/// index allows edit/delete only for activities created by this process.
 pub(super) struct TeamsIngressRegistry {
     routes_by_event: HashMap<String, TeamsIngressRoute>,
     event_by_key: HashMap<TeamsRouteKey, String>,
     dedupe: HashMap<TeamsRouteKey, DedupeEntry>,
+    owned: HashMap<TeamsRouteKey, OwnedActivityEntry>,
     dedupe_ttl: Duration,
     route_ttl: Duration,
     max_entries: usize,
@@ -119,6 +135,7 @@ impl TeamsIngressRegistry {
             routes_by_event: HashMap::new(),
             event_by_key: HashMap::new(),
             dedupe: HashMap::new(),
+            owned: HashMap::new(),
             dedupe_ttl,
             route_ttl,
             max_entries: max_entries.max(1),
@@ -236,10 +253,21 @@ impl TeamsIngressRegistry {
             }
         }
 
+        let expired_owned_keys: Vec<TeamsRouteKey> = self
+            .owned
+            .iter()
+            .filter(|(_, entry)| now.saturating_duration_since(entry.created_at) >= self.route_ttl)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &expired_owned_keys {
+            self.owned.remove(key);
+        }
+
         TeamsIngressCleanupStats {
             routes_removed: expired_route_ids.len(),
             dedupe_entries_removed: expired_dedupe_keys.len(),
             stale_publications_removed,
+            owned_activities_removed: expired_owned_keys.len(),
         }
     }
 
@@ -278,6 +306,84 @@ impl TeamsIngressRegistry {
             .map(str::to_owned);
 
         Ok((route, quote_activity_id))
+    }
+
+    pub(super) fn record_owned(
+        &mut self,
+        route: &TeamsIngressRoute,
+        activity_id: &str,
+        now: Instant,
+    ) {
+        self.cleanup(now);
+        let key = route.key.with_activity_id(activity_id);
+        if !self.owned.contains_key(&key) && self.owned.len() >= self.max_entries {
+            if let Some(oldest_key) = self
+                .owned
+                .iter()
+                .min_by_key(|(_, entry)| entry.created_at)
+                .map(|(key, _)| key.clone())
+            {
+                self.owned.remove(&oldest_key);
+                warn!(
+                    max_entries = self.max_entries,
+                    "teams outbound ownership cache evicted its oldest entry at capacity"
+                );
+            }
+        }
+        self.owned.insert(
+            key,
+            OwnedActivityEntry {
+                route: route.clone(),
+                created_at: now,
+            },
+        );
+    }
+
+    pub(super) fn owned_route_for_target(
+        &mut self,
+        app_id: &str,
+        origin_event_id: Option<&str>,
+        conversation_id: &str,
+        activity_id: &str,
+        now: Instant,
+    ) -> Result<TeamsIngressRoute, OwnershipLookupError> {
+        self.cleanup(now);
+
+        if let Some(origin_event_id) = origin_event_id {
+            if origin_event_id.is_empty() {
+                return Err(OwnershipLookupError::OriginRouteNotFound);
+            }
+            let Some(origin_route) = self.routes_by_event.get(origin_event_id) else {
+                return Err(OwnershipLookupError::OriginRouteNotFound);
+            };
+            if origin_route.conversation_id != conversation_id {
+                return Err(OwnershipLookupError::ConversationMismatch);
+            }
+            return self
+                .owned
+                .get(&origin_route.key.with_activity_id(activity_id))
+                .map(|entry| entry.route.clone())
+                .ok_or(OwnershipLookupError::NotOwned);
+        }
+
+        let mut candidates = self.owned.iter().filter(|(key, _)| {
+            key.app_id == app_id
+                && key.conversation_id == conversation_id
+                && key.activity_id == activity_id
+        });
+        let Some((_, candidate)) = candidates.next() else {
+            return Err(OwnershipLookupError::NotOwned);
+        };
+        if candidates.next().is_some() {
+            return Err(OwnershipLookupError::AmbiguousScope);
+        }
+        Ok(candidate.route.clone())
+    }
+
+    pub(super) fn remove_owned(&mut self, route: &TeamsIngressRoute, activity_id: &str) -> bool {
+        self.owned
+            .remove(&route.key.with_activity_id(activity_id))
+            .is_some()
     }
 
     #[cfg(test)]
@@ -627,6 +733,122 @@ mod tests {
         assert!(matches!(
             registry.route_for_reply("missing-event", "conversation", None, now),
             Err(RouteLookupError::NotFound)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn bot_owned_activity_index_is_bounded_enforced_and_expiring() -> anyhow::Result<()> {
+        let base = Instant::now();
+        let mut registry =
+            TeamsIngressRegistry::new(Duration::from_secs(60), Duration::from_secs(10), 2);
+        let route_key = key(1);
+        let owned_route = route(route_key.clone(), "event-1", base)?;
+        assert!(matches!(
+            registry.reserve(route_key.clone(), "event-1".into(), base),
+            PublishReservation::Owner
+        ));
+        assert!(registry.accept(&route_key, "event-1", owned_route.clone(), base));
+
+        registry.record_owned(&owned_route, "bot-0", base);
+        registry.record_owned(&owned_route, "bot-1", base + Duration::from_secs(1));
+        registry.record_owned(&owned_route, "bot-2", base + Duration::from_secs(2));
+
+        assert!(matches!(
+            registry.owned_route_for_target(
+                "app",
+                Some("event-1"),
+                "conversation",
+                "bot-0",
+                base + Duration::from_secs(2)
+            ),
+            Err(OwnershipLookupError::NotOwned)
+        ));
+        assert!(registry
+            .owned_route_for_target(
+                "app",
+                Some("event-1"),
+                "conversation",
+                "bot-1",
+                base + Duration::from_secs(2)
+            )
+            .is_ok());
+        assert!(matches!(
+            registry.owned_route_for_target(
+                "app",
+                Some("missing-event"),
+                "conversation",
+                "bot-1",
+                base + Duration::from_secs(2)
+            ),
+            Err(OwnershipLookupError::OriginRouteNotFound)
+        ));
+        assert!(matches!(
+            registry.owned_route_for_target(
+                "app",
+                Some("event-1"),
+                "conversation",
+                "activity-1",
+                base + Duration::from_secs(2)
+            ),
+            Err(OwnershipLookupError::NotOwned)
+        ));
+        assert!(registry.remove_owned(&owned_route, "bot-1"));
+        assert!(!registry.remove_owned(&owned_route, "bot-1"));
+
+        let stats = registry.cleanup(base + Duration::from_secs(12));
+        assert_eq!(stats.owned_activities_removed, 1);
+        assert!(matches!(
+            registry.owned_route_for_target(
+                "app",
+                None,
+                "conversation",
+                "bot-2",
+                base + Duration::from_secs(12)
+            ),
+            Err(OwnershipLookupError::NotOwned)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_owned_target_rejects_ambiguous_tenant_scope() -> anyhow::Result<()> {
+        let now = Instant::now();
+        let mut registry =
+            TeamsIngressRegistry::new(Duration::from_secs(60), Duration::from_secs(60), 10);
+
+        for (tenant, inbound, event_id) in [
+            ("tenant-1", "inbound-1", "event-1"),
+            ("tenant-2", "inbound-2", "event-2"),
+        ] {
+            let route_key = TeamsRouteKey::new("app", tenant, "conversation", inbound);
+            let mut owned_route = route(route_key.clone(), event_id, now)?;
+            owned_route.tenant_id = tenant.into();
+            assert!(matches!(
+                registry.reserve(route_key.clone(), event_id.into(), now),
+                PublishReservation::Owner
+            ));
+            assert!(registry.accept(&route_key, event_id, owned_route.clone(), now));
+            registry.record_owned(&owned_route, "bot-shared-id", now);
+        }
+
+        assert!(matches!(
+            registry.owned_route_for_target("app", None, "conversation", "bot-shared-id", now),
+            Err(OwnershipLookupError::AmbiguousScope)
+        ));
+        let tenant_one = registry
+            .owned_route_for_target("app", Some("event-1"), "conversation", "bot-shared-id", now)
+            .map_err(|error| anyhow::anyhow!("unexpected ownership error: {error:?}"))?;
+        assert_eq!(tenant_one.tenant_id, "tenant-1");
+        assert!(matches!(
+            registry.owned_route_for_target(
+                "app",
+                Some("event-1"),
+                "other-conversation",
+                "bot-shared-id",
+                now
+            ),
+            Err(OwnershipLookupError::ConversationMismatch)
         ));
         Ok(())
     }

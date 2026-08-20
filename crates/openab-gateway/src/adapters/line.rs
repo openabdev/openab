@@ -1316,6 +1316,7 @@ mod tests {
             command: Some("edit_message".into()),
             request_id: None,
             quote_message_id: None,
+            target_message_id: None,
         };
 
         let used_reply = dispatch_line_reply(

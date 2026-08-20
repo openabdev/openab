@@ -140,10 +140,10 @@ pr = ""
 [[openab_features]]
 feature = "streaming"
 status = "workaround"
-note = "Gateway platforms use core's post+edit cosmetic streaming (`use_streaming` just returns the configured `streaming` flag; no native streaming API). The Teams gateway fail-closed rejects `edit_message`, so streaming edits don't reach Teams and cannot create duplicate messages; delivery is effectively send-once. `update_activity` (PUT) exists in the adapter but is unwired dead code."
+note = "Teams now supports guarded bot-owned PUT updates, but `streaming_mode` remains `disabled`; ordinary delivery is still send-once. Progressive placeholder/edit lifecycle, failure thresholds, and final fallback remain PR 7 work rather than being enabled implicitly by mutation support."
 source = [
   "crates/openab-core/src/gateway.rs#use_streaming",
-  "crates/openab-gateway/src/adapters/teams.rs#update_activity",
+  "crates/openab-gateway/src/adapters/teams.rs#update_activity_outcome",
 ]
 pr = ""
 
@@ -159,21 +159,23 @@ pr = ""
 
 [[openab_features]]
 feature = "edit_message"
-status = "not_implemented"
-note = "Core default/`GatewayAdapter::edit_message` emits an `edit_message` command, but Teams is not in `EDIT_RESPONSE_PLATFORMS` (fire-and-forget) and `handle_reply` fail-closed rejects the unsupported command. No edit occurs, but it also cannot fall through to `send_activity` and post duplicate text."
+status = "implemented"
+note = "New peers separate origin `reply_to` from `target_message_id`; legacy peers use the overloaded target fallback. Teams accepts PUT only for an activity in the process-local bot-owned index, enforces tenant/conversation scope, serializes same-conversation writes, and returns a required structured edit ACK."
 source = [
   "crates/openab-core/src/gateway.rs#edit_message",
-  "crates/openab-gateway/src/adapters/teams.rs#handle_reply",
+  "crates/openab-gateway/src/adapters/teams.rs#handle_owned_mutation",
+  "crates/openab-gateway/src/adapters/teams.rs#update_activity_outcome",
 ]
 pr = ""
 
 [[openab_features]]
 feature = "delete_message"
-status = "not_implemented"
-note = "The `delete_message` command is fail-closed rejected by `handle_reply`. Platform supports DELETE, but the adapter does not call it yet; importantly, the command cannot fall through to `send_activity`."
+status = "implemented"
+note = "Teams calls Bot Connector DELETE only for an activity in the process-local bot-owned index and returns a required structured delete ACK. Delivered delete removes ownership; rejected or unknown delete retains it for later reconciliation. Inbound user activities cannot be deleted."
 source = [
   "crates/openab-core/src/gateway.rs#delete_message",
-  "crates/openab-gateway/src/adapters/teams.rs#handle_reply",
+  "crates/openab-gateway/src/adapters/teams.rs#handle_owned_mutation",
+  "crates/openab-gateway/src/adapters/teams.rs#delete_activity_outcome",
 ]
 pr = ""
 
@@ -255,7 +257,7 @@ pr = ""
 [[openab_features]]
 feature = "group_routing"
 status = "implemented"
-note = "Session remains keyed by `conversation.id` (+ `conversation_type`). Authenticated ingress records a bounded gateway-local route under composite app/tenant/conversation/activity identity plus `event_id`; outbound replies resolve only that event route and verify the reply channel matches its conversation."
+note = "Session remains keyed by `conversation.id` (+ `conversation_type`). Authenticated ingress records a bounded gateway-local route under composite app/tenant/conversation/activity identity plus `event_id`; outbound replies resolve that event route. Confirmed bot sends also enter a bounded app/tenant/conversation/activity ownership index used by edit/delete."
 source = [
   "crates/openab-gateway/src/adapters/teams.rs#accept_message_activity",
   "crates/openab-gateway/src/adapters/teams_ingress.rs",
@@ -276,7 +278,7 @@ pr = ""
 [[quirks]]
 date = "2026-08-07"
 title = "serviceUrl remains gateway-local in bounded ephemeral route state"
-note = "For message activities, Teams requires non-empty Bot Framework channel, tenant, conversation, activity, sender, and service URL fields. The validated service URL is stored only in a process-local route keyed by app/tenant/conversation/activity and indexed by `event_id`; default route TTL is 3600 s with 10000 entries. Outbound replies use this route directly; missing required fields return 400."
+note = "For message activities, Teams requires non-empty Bot Framework channel, tenant, conversation, activity, sender, and service URL fields. The validated service URL is stored only in process-local route and bot-owned state; default TTL is 3600 s with independent 10000-entry route, dedupe, and ownership bounds. Outbound replies use this state directly; missing required fields return 400."
 kind = "openab_decision"
 source = "docs/adr/teams-ephemeral-ingress-state.md"
 
@@ -316,11 +318,18 @@ kind = "openab_decision"
 source = "crates/openab-gateway/src/adapters/teams.rs"
 
 [[quirks]]
-date = "2026-08-06"
+date = "2026-08-09"
 title = "Unsupported write-side commands fail closed"
-note = "Teams `handle_reply` sends only commandless replies. Reactions are an explicit no-op; `edit_message`, `delete_message`, `create_topic`, and unknown commands return a structured `unsupported_command` rejection before route lookup or network I/O, preventing duplicate or misleading plain messages until native handlers are implemented."
+note = "Teams supports commandless sends plus bot-owned edit/delete. Reactions remain an explicit no-op; `create_topic` and unknown commands return a structured `unsupported_command` rejection before route lookup or network I/O, preventing unsupported commands from becoming plain sends."
 kind = "openab_decision"
 source = "crates/openab-gateway/src/adapters/teams.rs#handle_reply"
+
+[[quirks]]
+date = "2026-08-09"
+title = "Edit and delete require process-local bot ownership"
+note = "A confirmed send records `(app, tenant, conversation, activity)` ownership. New commands carry an additive `target_message_id` while preserving origin-event `reply_to`; old peers use a unique legacy target fallback. Same-conversation writes use fixed bounded lock shards. PUT/DELETE retry at most once only after explicit `429` with `Retry-After` no greater than one second; timeouts and 5xx remain unknown."
+kind = "openab_decision"
+source = "docs/adr/teams-owned-message-mutations.md"
 
 [[quirks]]
 date = "2026-07-04"

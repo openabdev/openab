@@ -239,7 +239,7 @@ Full first-class Teams section (config-first parity, #1380) — credentials, con
 
 > ⚠️ **M0 cloud-profile restriction:** Teams transport supports Microsoft commercial public cloud only. The adapter rejects non-HTTPS endpoints, userinfo, non-standard ports, sovereign-cloud hosts, custom proxy hosts, and service URLs outside `smba.trafficmanager.net`. Existing sovereign-cloud or proxy deployments must remain on an earlier release until an explicit cloud profile is available.
 >
-> Teams outbound replies require the bounded authenticated `event_id` route. A restart, route expiry, or capacity eviction causes a fail-closed `route_not_found`; the user must send a new activity. New Standalone peers advertise required send ACK and return the real Bot Framework activity ID, using `[gateway].gateway_ack_timeout_secs` as the Core wait budget.
+> Teams outbound replies require the bounded authenticated `event_id` route. A restart, route expiry, or capacity eviction causes a fail-closed `route_not_found`; the user must send a new activity. New Standalone peers advertise required send ACK and return the real Bot Framework activity ID, using `[gateway].gateway_ack_timeout_secs` as the Core wait budget. Edit/delete are permitted only for IDs in the process-local bot-owned index; restart or ownership expiry makes an older message immutable through OpenAB.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -251,7 +251,7 @@ Full first-class Teams section (config-first parity, #1380) — credentials, con
 | `webhook_path` | string | `/webhook/teams` | Env: `TEAMS_WEBHOOK_PATH`. |
 | `dedupe_ttl_secs` | u64 | `600` | Process-local accepted-activity dedupe window. Must be greater than zero. Env: `TEAMS_DEDUPE_TTL_SECS`. |
 | `route_ttl_secs` | u64 | `3600` | Gateway-local authenticated ingress route lifetime. Must be greater than zero. Env: `TEAMS_ROUTE_TTL_SECS`. |
-| `max_route_entries` | usize | `10000` | Capacity bound applied independently to the route and dedupe caches. Must be greater than zero. Env: `TEAMS_MAX_ROUTE_ENTRIES`. |
+| `max_route_entries` | usize | `10000` | Capacity bound applied independently to route, dedupe, and bot-owned outbound activity caches. Must be greater than zero. Env: `TEAMS_MAX_ROUTE_ENTRIES`. |
 | `allow_all_users` | bool \| omit | `false` (deny-all) | Env: `TEAMS_ALLOW_ALL_USERS`. |
 | `allowed_users` | string[] | `[]` | `activity.from.id` values (`29:…`). Env: `TEAMS_ALLOWED_USERS`. |
 

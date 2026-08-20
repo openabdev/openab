@@ -4269,6 +4269,7 @@ mod tests {
             command: None,
             request_id: None,
             quote_message_id: Some("om_specific".into()),
+            target_message_id: None,
         };
         // quote_message_id should take priority
         let reply_target = reply.quote_message_id.as_deref()
@@ -4295,6 +4296,7 @@ mod tests {
             command: None,
             request_id: None,
             quote_message_id: None,
+            target_message_id: None,
         };
         let reply_target = reply.quote_message_id.as_deref()
             .or(reply.channel.thread_id.as_deref());
@@ -4320,6 +4322,7 @@ mod tests {
             command: None,
             request_id: None,
             quote_message_id: None,
+            target_message_id: None,
         };
         let reply_target = reply.quote_message_id.as_deref()
             .or(reply.channel.thread_id.as_deref());
@@ -4386,6 +4389,7 @@ mod tests {
             command: None,
             request_id: None,
             quote_message_id: Some("om_invalid".into()),
+            target_message_id: None,
         };
 
         handle_reply(&reply, &adapter, &event_tx).await;
@@ -4662,6 +4666,7 @@ mod tests {
             command: Some("edit_message".into()),
             request_id: Some("req_seam_1".into()),
             quote_message_id: None,
+            target_message_id: None,
         };
 
         handle_reply(&reply, &adapter, &event_tx).await;
@@ -4696,6 +4701,7 @@ mod tests {
             command: Some("delete_message".into()),
             request_id: None,
             quote_message_id: None,
+            target_message_id: None,
         };
 
         handle_reply(&reply, &adapter, &event_tx).await;
@@ -4755,6 +4761,7 @@ mod tests {
             command: Some("edit_message".into()),
             request_id: request_id.map(|s| s.into()),
             quote_message_id: None,
+            target_message_id: None,
         }
     }
 
@@ -4976,6 +4983,7 @@ mod tests {
             command: None,
             request_id: Some("r1".into()),
             quote_message_id: None,
+            target_message_id: None,
         };
 
         handle_reply(&reply, &adapter, &tx).await;

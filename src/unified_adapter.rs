@@ -181,6 +181,18 @@ impl UnifiedGatewayAdapter {
             command: command.map(|s| s.into()),
             request_id: None,
             quote_message_id: quote_message_id.map(|s| s.into()),
+            target_message_id: None,
+        }
+    }
+
+    fn apply_command_target(&self, reply: &mut GatewayReply, msg: &MessageRef) {
+        if self
+            .capabilities(&msg.channel.platform)
+            .supports_target_message_id
+        {
+            reply.target_message_id = Some(msg.message_id.clone());
+        } else {
+            reply.reply_to = msg.message_id.clone();
         }
     }
 }
@@ -227,7 +239,13 @@ impl ChatAdapter for UnifiedGatewayAdapter {
                 StatusBackend::Reactions,
             ),
             "wecom" => (false, false, StreamingMode::Disabled, StatusBackend::None),
-            "teams" | "line" | "lineworks" | "acp" => {
+            "teams" => (
+                cfg!(feature = "teams"),
+                cfg!(feature = "teams"),
+                StreamingMode::Disabled,
+                StatusBackend::None,
+            ),
+            "line" | "lineworks" | "acp" => {
                 (false, false, StreamingMode::Disabled, StatusBackend::None)
             }
             _ => (
@@ -239,8 +257,9 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         };
         AdapterCapabilities {
             send_ack: cfg!(feature = "teams") && platform == "teams",
-            edit_ack: false,
-            delete_ack: false,
+            edit_ack: cfg!(feature = "teams") && platform == "teams",
+            delete_ack: cfg!(feature = "teams") && platform == "teams",
+            supports_target_message_id: cfg!(feature = "teams") && platform == "teams",
             can_edit,
             can_delete,
             streaming_mode,
@@ -288,24 +307,28 @@ impl ChatAdapter for UnifiedGatewayAdapter {
 
     async fn add_reaction(&self, msg: &MessageRef, emoji: &str) -> Result<()> {
         let mut reply = self.build_reply(&msg.channel, emoji, Some("add_reaction"), None);
-        // Use the actual platform message_id (not origin_event_id which is a UUID)
-        reply.reply_to = msg.message_id.clone();
+        self.apply_command_target(&mut reply, msg);
         self.dispatch_reply(&reply).await?;
         Ok(())
     }
 
     async fn remove_reaction(&self, msg: &MessageRef, emoji: &str) -> Result<()> {
         let mut reply = self.build_reply(&msg.channel, emoji, Some("remove_reaction"), None);
-        // Use the actual platform message_id (not origin_event_id which is a UUID)
-        reply.reply_to = msg.message_id.clone();
+        self.apply_command_target(&mut reply, msg);
         self.dispatch_reply(&reply).await?;
         Ok(())
     }
 
     async fn edit_message(&self, msg: &MessageRef, content: &str) -> Result<()> {
         let mut reply = self.build_reply(&msg.channel, content, Some("edit_message"), None);
-        // Use the actual platform message_id (e.g. "draft" for streaming, or numeric for edits)
-        reply.reply_to = msg.message_id.clone();
+        self.apply_command_target(&mut reply, msg);
+        self.dispatch_reply(&reply).await?;
+        Ok(())
+    }
+
+    async fn delete_message(&self, msg: &MessageRef) -> Result<()> {
+        let mut reply = self.build_reply(&msg.channel, "", Some("delete_message"), None);
+        self.apply_command_target(&mut reply, msg);
         self.dispatch_reply(&reply).await?;
         Ok(())
     }
@@ -371,8 +394,12 @@ mod tests {
         let adapter = adapter_with_telegram_streaming(true);
         let capabilities = adapter.capabilities("teams");
         assert!(capabilities.send_ack);
+        assert!(capabilities.edit_ack);
+        assert!(capabilities.delete_ack);
+        assert!(capabilities.supports_target_message_id);
         assert_eq!(capabilities.streaming_mode, StreamingMode::Disabled);
-        assert!(!capabilities.can_edit);
+        assert!(capabilities.can_edit);
+        assert!(capabilities.can_delete);
         assert_eq!(capabilities.status_backend, StatusBackend::None);
     }
 
@@ -393,6 +420,13 @@ mod tests {
             true,
         )
         .is_err());
+        assert_eq!(
+            UnifiedGatewayAdapter::teams_outcome_result(
+                WriteOutcome::Delivered { message_id: None },
+                false,
+            )?,
+            None
+        );
         assert!(UnifiedGatewayAdapter::teams_outcome_result(
             WriteOutcome::Rejected {
                 code: "route_not_found".into(),
@@ -411,6 +445,39 @@ mod tests {
         )
         .is_err());
         Ok(())
+    }
+
+    #[cfg(feature = "teams")]
+    #[test]
+    fn teams_command_target_preserves_origin_event() {
+        let adapter = adapter_with_telegram_streaming(false);
+        let message = MessageRef {
+            channel: ChannelRef {
+                platform: "teams".into(),
+                channel_id: "conversation-1".into(),
+                thread_id: None,
+                parent_id: None,
+                origin_event_id: Some("event-1".into()),
+            },
+            message_id: "activity-1".into(),
+        };
+        let mut reply =
+            adapter.build_reply(&message.channel, "updated", Some("edit_message"), None);
+        adapter.apply_command_target(&mut reply, &message);
+        assert_eq!(reply.reply_to, "event-1");
+        assert_eq!(reply.target_message_id.as_deref(), Some("activity-1"));
+
+        let mut legacy_message = message;
+        legacy_message.channel.platform = "line".into();
+        let mut legacy_reply = adapter.build_reply(
+            &legacy_message.channel,
+            "updated",
+            Some("edit_message"),
+            None,
+        );
+        adapter.apply_command_target(&mut legacy_reply, &legacy_message);
+        assert_eq!(legacy_reply.reply_to, "activity-1");
+        assert!(legacy_reply.target_message_id.is_none());
     }
 
     #[test]

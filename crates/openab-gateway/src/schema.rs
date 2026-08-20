@@ -150,6 +150,9 @@ pub struct AdapterCapabilities {
     pub send_ack: bool,
     pub edit_ack: bool,
     pub delete_ack: bool,
+    /// Whether command targets use the additive `target_message_id` field.
+    /// False peers require the legacy `reply_to = target` fallback.
+    pub supports_target_message_id: bool,
     pub can_edit: bool,
     pub can_delete: bool,
     pub streaming_mode: StreamingMode,
@@ -164,6 +167,7 @@ impl Default for AdapterCapabilities {
             send_ack: false,
             edit_ack: false,
             delete_ack: false,
+            supports_target_message_id: false,
             can_edit: false,
             can_delete: false,
             streaming_mode: StreamingMode::Disabled,
@@ -219,6 +223,11 @@ pub struct GatewayReply {
     /// If quoting fails, the gateway MUST fall back to sending without quoting.
     #[serde(default)]
     pub quote_message_id: Option<String>,
+    /// Platform message targeted by a command such as edit or delete.
+    /// `reply_to` remains the origin event correlation for peers that advertise
+    /// support; old peers continue to place the command target in `reply_to`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_message_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -462,11 +471,58 @@ mod protocol_tests {
     }
 
     #[test]
+    fn command_target_field_is_additive_and_legacy_decodable() -> anyhow::Result<()> {
+        #[derive(serde::Deserialize)]
+        struct LegacyReply {
+            reply_to: String,
+            command: Option<String>,
+        }
+
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "event-1".into(),
+            platform: "teams".into(),
+            channel: ReplyChannel {
+                id: "conversation-1".into(),
+                thread_id: None,
+            },
+            content: Content {
+                content_type: "text".into(),
+                text: "updated".into(),
+                attachments: Vec::new(),
+            },
+            command: Some("edit_message".into()),
+            request_id: Some("request-1".into()),
+            quote_message_id: None,
+            target_message_id: Some("activity-1".into()),
+        };
+        let json = serde_json::to_string(&reply)?;
+        let legacy: LegacyReply = serde_json::from_str(&json)?;
+        assert_eq!(legacy.reply_to, "event-1");
+        assert_eq!(legacy.command.as_deref(), Some("edit_message"));
+
+        let decoded_without_target: GatewayReply = serde_json::from_value(serde_json::json!({
+            "schema": "openab.gateway.reply.v1",
+            "reply_to": "legacy-activity",
+            "platform": "teams",
+            "channel": { "id": "conversation-1", "thread_id": null },
+            "content": { "type": "text", "text": "updated", "attachments": [] },
+            "command": "edit_message",
+            "request_id": null,
+            "quote_message_id": null
+        }))?;
+        assert!(decoded_without_target.target_message_id.is_none());
+        assert_eq!(decoded_without_target.reply_to, "legacy-activity");
+        Ok(())
+    }
+
+    #[test]
     fn missing_capability_fields_default_fail_closed() {
         let capabilities: AdapterCapabilities = serde_json::from_str("{}").unwrap();
         assert!(!capabilities.send_ack);
         assert!(!capabilities.edit_ack);
         assert!(!capabilities.delete_ack);
+        assert!(!capabilities.supports_target_message_id);
         assert!(!capabilities.can_edit);
         assert!(!capabilities.can_delete);
         assert_eq!(capabilities.streaming_mode, StreamingMode::Disabled);

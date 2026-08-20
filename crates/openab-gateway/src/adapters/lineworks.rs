@@ -2144,6 +2144,7 @@ mod tests {
             command: command.map(Into::into),
             request_id: None,
             quote_message_id: None,
+            target_message_id: None,
         }
     }
 

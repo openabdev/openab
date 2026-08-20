@@ -328,7 +328,7 @@ Azure Portal → your bot → **Configuration** → **Messaging endpoint**: `htt
 | `TEAMS_WEBHOOK_PATH` | No | `/webhook/teams` | URL path the gateway listens on |
 | `TEAMS_DEDUPE_TTL_SECS` | No | `600` | Process-local duplicate suppression window |
 | `TEAMS_ROUTE_TTL_SECS` | No | `3600` | Authenticated ephemeral route lifetime |
-| `TEAMS_MAX_ROUTE_ENTRIES` | No | `10000` | Independent capacity bound for route and dedupe caches |
+| `TEAMS_MAX_ROUTE_ENTRIES` | No | `10000` | Independent capacity bound for route, dedupe, and bot-owned activity caches |
 
 > ⚠️ **M0 supports Microsoft commercial public cloud only.** Sovereign-cloud endpoints and custom OAuth/OpenID proxy hosts are rejected. Bot Connector replies accept only validated HTTPS service URLs on `smba.trafficmanager.net`; redirects cannot cross origin.
 
@@ -345,6 +345,11 @@ Azure Portal → your bot → **Configuration** → **Messaging endpoint**: `htt
 - Gateway was restarted, the bounded route was evicted, or `TEAMS_ROUTE_TTL_SECS` elapsed before the response. Have the user send another message.
 - Or the webhook never reached this Gateway process — check the Bot Framework webhook URL and deployment replica count.
 - Do not bypass the route by caching or manually injecting a `serviceUrl`; it is authenticated gateway-local state.
+
+**`message_not_owned`, `target_origin_not_found`, or `target_scope_*` during edit/delete**
+
+- OpenAB only mutates activity IDs that this Gateway process confirmed creating. Restart, TTL expiry, capacity eviction, or an externally supplied user-message ID fails closed.
+- Have the user trigger a new turn and mutate the newly returned bot activity. Do not copy a user activity ID or a target from another tenant/conversation.
 
 **`teams JWT validation failed` in gateway logs**
 
@@ -366,9 +371,9 @@ require a structured send ACK and return the real Teams activity ID; legacy
 peers keep fire-and-forget missing-ACK behavior after an incomplete hello.
 
 > **Release validation:** HTTP mocks do not prove Teams reply-chain presentation.
-> Before marking PR 3 complete, record the personal, group-chat, channel-root,
-> channel-reply, and explicit-quote cases in the
-> [D3 live-tenant matrix](msteams-discord-parity-requirements.md#202-live-microsoft-365-tenant-matrix).
+> Before marking PR 3／PR 4 complete, record personal, group-chat, channel-root,
+> channel-reply, explicit-quote, and bot-owned update/delete cases in the
+> [Microsoft 365 live-tenant matrix](msteams-discord-parity-requirements.md#202-live-microsoft-365-tenant-matrix).
 
 **Bot doesn't appear when @mentioning in a channel**
 

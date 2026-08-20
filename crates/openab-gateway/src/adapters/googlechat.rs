@@ -2069,6 +2069,7 @@ mod tests {
             command: None,
             request_id: Some("req_123".into()),
             quote_message_id: None,
+            target_message_id: None,
         };
 
         adapter.handle_reply(&reply, &event_tx).await;
@@ -2114,6 +2115,7 @@ mod tests {
             command: None,
             request_id: Some("req_fail".into()),
             quote_message_id: None,
+            target_message_id: None,
         };
 
         adapter.handle_reply(&reply, &event_tx).await;
@@ -2164,6 +2166,7 @@ mod tests {
             command: None,
             request_id: Some("req_empty".into()),
             quote_message_id: None,
+            target_message_id: None,
         };
 
         adapter.handle_reply(&reply, &event_tx).await;
@@ -2209,6 +2212,7 @@ mod tests {
             command: None,
             request_id: Some("req_multi_fail".into()),
             quote_message_id: None,
+            target_message_id: None,
         };
 
         adapter.handle_reply(&reply, &event_tx).await;
@@ -2244,6 +2248,7 @@ mod tests {
             command: None,
             request_id: Some("req_notoken".into()),
             quote_message_id: None,
+            target_message_id: None,
         };
 
         adapter.handle_reply(&reply, &event_tx).await;
@@ -2290,6 +2295,7 @@ mod tests {
             command: Some("edit_message".into()),
             request_id: None,
             quote_message_id: None,
+            target_message_id: None,
         };
 
         adapter.handle_reply(&reply, &event_tx).await;
@@ -2333,6 +2339,7 @@ mod tests {
             command: None,
             request_id: Some("req_multi".into()),
             quote_message_id: None,
+            target_message_id: None,
         };
 
         adapter.handle_reply(&reply, &event_tx).await;
@@ -2391,6 +2398,7 @@ mod tests {
             command: None,
             request_id: Some("req_partial".into()),
             quote_message_id: None,
+            target_message_id: None,
         };
 
         adapter.handle_reply(&reply, &event_tx).await;

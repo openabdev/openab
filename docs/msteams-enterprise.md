@@ -617,7 +617,7 @@ the OAB `configToml` shown for each mode.
 | `TEAMS_WEBHOOK_PATH` | No | `/webhook/teams` | Webhook endpoint path |
 | `TEAMS_DEDUPE_TTL_SECS` | No | `600` | Process-local duplicate suppression window |
 | `TEAMS_ROUTE_TTL_SECS` | No | `3600` | Authenticated ephemeral route lifetime |
-| `TEAMS_MAX_ROUTE_ENTRIES` | No | `10000` | Independent capacity bound for route and dedupe caches |
+| `TEAMS_MAX_ROUTE_ENTRIES` | No | `10000` | Independent capacity bound for route, dedupe, and bot-owned activity caches |
 
 ## Troubleshooting
 
@@ -676,10 +676,16 @@ the Gateway restarted, the bounded route was evicted, or the route TTL elapsed
 before the response. Have the user send a new activity; never bypass the route
 with a manually supplied `serviceUrl`.
 
-> **Release validation:** Before marking Teams PR 3 complete, record personal,
-> group-chat, channel-root, channel-reply, and explicit-quote behavior in the
-> [D3 live-tenant matrix](msteams-discord-parity-requirements.md#202-live-microsoft-365-tenant-matrix).
-> HTTP mocks and a successful Connector activity ID do not close this UX gate.
+For `message_not_owned`, `target_origin_not_found`, or `target_scope_*`, verify
+that the target is a bot activity created by the same Gateway process and that
+its origin event, tenant, and conversation still match. Restart, TTL expiry,
+capacity eviction, or a user-message target intentionally fails closed.
+
+> **Release validation:** Before marking Teams PR 3／PR 4 complete, record
+> personal, group-chat, channel-root, channel-reply, explicit-quote, and
+> bot-owned update/delete behavior in the
+> [Microsoft 365 live-tenant matrix](msteams-discord-parity-requirements.md#202-live-microsoft-365-tenant-matrix).
+> HTTP mocks and successful Connector activity IDs do not close this gate.
 
 ### JWT validation failed
 
