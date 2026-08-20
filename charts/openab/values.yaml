@@ -68,9 +68,10 @@ agents:
     #   nameOverride: ""
     #   env: {}
     #   envFrom: []
-    #   # secretEnv: inject API keys from a Kubernetes Secret without storing them in the ConfigMap.
-    #   # Each entry renders as valueFrom.secretKeyRef in the Deployment and auto-adds the key name
-    #   # to inherit_env in config.toml. ⚠️ Do NOT also list the same key in env — use one or the other.
+    #   # secretEnv: inject values from a Kubernetes Secret into the OpenAB process
+    #   # without storing them in the ConfigMap. Raw configToml is mounted verbatim;
+    #   # pass only required agent credentials through [agent].env or inherit_env.
+    #   # Adapter and Gateway secrets must stay out of the ACP child environment.
     #   # secretEnv:
     #   #   - name: GEMINI_API_KEY
     #   #     secretName: my-secrets
@@ -395,7 +396,9 @@ agents:
     env: {}
     # Load env vars from existing Secrets or ConfigMaps, e.g. GH_TOKEN.
     envFrom: []
-    secretEnv: []  # list of {name, secretName, secretKey} — rendered as valueFrom.secretKeyRef; keys auto-added to inherit_env
+    # list of {name, secretName, secretKey}; injected into OpenAB only. Raw
+    # configToml decides explicitly which values, if any, reach the ACP child.
+    secretEnv: []
     pool:
       maxSessions: 10
       sessionTtlHours: 24
@@ -471,7 +474,7 @@ agents:
         # Default-off metadata-first image/text ingress. Sets the same env on
         # Core and Gateway; no Microsoft URL or token crosses into Core.
         inboundAttachments: false # → TEAMS_INBOUND_ATTACHMENTS
-        # Optional PR 11 persistent route registry. The chart does not create a
+        # Optional trusted persistent conversation registry. The chart does not create a
         # Gateway PVC; mount this path with gateway.extraVolumeMounts/extraVolumes.
         conversationRegistryPath: "" # disabled → TEAMS_CONVERSATION_REGISTRY_PATH
         conversationRegistryMaxEntries: 1000 # → TEAMS_CONVERSATION_REGISTRY_MAX_ENTRIES

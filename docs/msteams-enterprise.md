@@ -2,11 +2,14 @@
 
 Deploy OpenAB with MS Teams in an enterprise Kubernetes environment. This guide covers Azure Entra ID configuration, Azure Bot Service setup, Teams app packaging, and Kubernetes deployment.
 
-> **Unified Mode (available since v0.9.0-beta.4; validated with v0.9.0-beta.10):**
-> The OAB binary embeds the Teams adapter, so no separate gateway container is
-> needed. Complete the prerequisites and Steps 1–3, then follow
-> [Step 4A](#step-4a-deploy-in-unified-mode-recommended). The stable `v0.9.0`
-> release is not yet available; the commands below pin the validated beta.
+> **Source-tree applicability (verified 2026-08-20):** This guide describes
+> the Teams behavior in this source tree. The published `0.10.0-beta.2` chart is
+> fetchable, but its published Core image and Gateway `0.5.4` image predate the
+> persistent registry, operator cron, and later live-validated Teams slices in
+> this guide. Do not treat those artifacts as a validated bundle for this
+> document. The commands below use the checked-out local chart and require
+> immutable Core/Gateway images built from the same reviewed revision. Unified
+> mode embeds the Teams adapter; Standalone mode uses the separate Gateway.
 
 ## Prerequisites
 
@@ -17,6 +20,9 @@ Deploy OpenAB with MS Teams in an enterprise Kubernetes environment. This guide 
 - Helm 3 with OCI registry support
 - `kubectl` CLI
 - IT admin access to Teams Admin Center (for app approval)
+- A checkout of this OpenAB source revision, including `charts/openab/`
+- An immutable Core image built from this revision; Standalone mode also needs
+  an immutable Gateway image from the same revision
 
 ## Step 1: Register an Azure Entra ID Application
 
@@ -159,6 +165,8 @@ Create a directory with three files:
   installation or upgrade remains an explicit operator action.
 - The schema-validated source is
   [`platforms/examples/teams-manifest-v1.25.json`](platforms/examples/teams-manifest-v1.25.json).
+  The pinned Microsoft schema fixture and refresh evidence are documented in
+  [`platform-schema/testdata/README.md`](../crates/platform-schema/testdata/README.md).
 
 ### Icons
 
@@ -247,6 +255,8 @@ Create `values.yaml`:
 ```yaml
 agents:
   kiro:
+    # Immutable image built from the same reviewed source revision as this chart.
+    image: "<YOUR_VALIDATED_CORE_IMAGE_BY_DIGEST>"
     persistence:
       enabled: true
       size: 1Gi
@@ -374,15 +384,18 @@ Set `<YOUR_INGRESS_CLASS>` to the installed controller class (for example,
 specific annotations as well; do not assume that a multi-class cluster will
 select this Ingress automatically.
 
-Apply the resources and install the validated chart version:
+Apply the resources and install the checked-out chart with the immutable image
+specified in `values.yaml`:
 
 ```bash
 kubectl apply -f openab-teams-secret.yaml
-helm upgrade --install openab oci://ghcr.io/openabdev/charts/openab \
-  --version 0.9.0-beta.10 \
-  -f values.yaml
+helm upgrade --install openab charts/openab -f values.yaml
 kubectl apply -f openab-teams-networking.yaml
 ```
+
+Do not substitute an older published image tag. After a release explicitly
+includes this guide's capability set, the OCI chart may be used only with the
+matching pinned release and image digests.
 
 ### Verify Unified Mode
 
@@ -437,6 +450,7 @@ metadata:
   name: openab-gateway-teams
 type: Opaque
 stringData:
+  GATEWAY_WS_TOKEN: "<YOUR_RANDOM_GATEWAY_WS_TOKEN>"
   TEAMS_APP_ID: "<YOUR_APPLICATION_ID>"
   TEAMS_APP_SECRET: "<YOUR_CLIENT_SECRET>"
   TEAMS_OAUTH_ENDPOINT: "https://login.microsoftonline.com/<YOUR_TENANT_ID>/oauth2/v2.0/token"
@@ -467,7 +481,8 @@ spec:
     spec:
       containers:
         - name: gateway
-          image: ghcr.io/openabdev/openab-gateway:0.5.4
+          # Immutable Gateway image built from the same revision as Core.
+          image: <YOUR_VALIDATED_GATEWAY_IMAGE_BY_DIGEST>
           ports:
             - containerPort: 8080
           envFrom:
@@ -545,14 +560,20 @@ allowlist:
 ```yaml
 agents:
   kiro:
+    # Immutable image built from the same reviewed source revision as Gateway.
+    image: "<YOUR_VALIDATED_CORE_IMAGE_BY_DIGEST>"
     secretEnv:
       - name: KIRO_API_KEY
         secretName: openab-kiro
         secretKey: KIRO_API_KEY
+      - name: GATEWAY_WS_TOKEN
+        secretName: openab-gateway-teams
+        secretKey: GATEWAY_WS_TOKEN
     configToml: |
       [gateway]
       url = "ws://openab-gateway:8080/ws"
       platform = "teams"
+      token = "${GATEWAY_WS_TOKEN}"
 
       [teams]
       allowed_teams = ["<YOUR_TEAM_ID>"]
@@ -583,20 +604,24 @@ Attachment ingress must be explicitly enabled on both processes. Core downloads 
 
 Conversation persistence is a Gateway-side opt-in. For a separate Standalone Gateway, set `TEAMS_CONVERSATION_REGISTRY_PATH` on that Gateway process—not only in Core `configToml`—and mount its parent directory on durable storage. Core receives only additive capabilities and sends origin correlation after typed L2/L3 Allow; the persisted `serviceUrl` never crosses the WebSocket. An operator may add a baseline `[[cron.jobs]]` block to Core `configToml` with `platform = "teams"`, exact `channel`, and exact `teams_tenant_id`. The Gateway must negotiate persistent-send support with one active Core consumer and find the full app/tenant/`msteams`/conversation key active and non-expired. Usercron, `/remind`, synthetic threads, and conversation creation remain unsupported.
 
-Install the chart version validated with Gateway 0.5.4:
+Install the checked-out chart with the immutable Core image in
+`legacy-values.yaml`:
 
 ```bash
-helm upgrade --install openab oci://ghcr.io/openabdev/charts/openab \
-  --version 0.9.0-beta.10 \
-  -f legacy-values.yaml
+helm upgrade --install openab charts/openab -f legacy-values.yaml
 ```
+
+Core and Gateway must come from the same reviewed source revision. Do not pair
+this configuration with the older published Gateway `0.5.4` image.
 
 Do not set `agents.kiro.gateway.enabled` here: that option asks the chart to
 deploy another Gateway, while this guide already created `openab-gateway`
 separately. For platform connectivity, the OAB pod needs only the WebSocket URL
 and trust configuration; it still needs the Kiro credential configured in
 [Agent Authentication](#agent-authentication-both-modes), but it does not need
-the Teams client secret.
+the Teams client secret. Core and Gateway do share the non-empty
+`GATEWAY_WS_TOKEN`; because the raw `[agent]` block passes only `KIRO_API_KEY`,
+the ACP child does not inherit that transport token.
 
 ## Step 5: IT Admin — Approve the Teams App
 
@@ -652,9 +677,9 @@ Multiple tenants: `"<TENANT_ID_1>,<TENANT_ID_2>"`. If not set, all tenants are a
 
 ## Sovereign Cloud Limitation
 
-This guide currently supports the public Azure cloud only. Although the
-configuration exposes OAuth and OpenID metadata endpoint overrides, the Teams
-adapter in `v0.9.0-beta.10` still validates the public Bot Framework issuer and
+This guide supports the public Azure cloud only. Although the configuration
+exposes OAuth and OpenID metadata endpoint overrides, the Teams adapter in this
+source tree validates the public Bot Framework issuer and
 requests the public Bot Framework OAuth scope internally. Changing only
 `TEAMS_OAUTH_ENDPOINT` and `TEAMS_OPENID_METADATA` is therefore insufficient for
 Azure Government or Azure China. Do not use this deployment recipe in a
@@ -668,6 +693,7 @@ set transport variables on the Gateway through `openab-gateway-teams`. Typed sco
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
+| `GATEWAY_WS_TOKEN` | Standalone: Yes | — | Shared non-empty Core↔Gateway authentication token; inject only into those two processes, not the ACP child |
 | `TEAMS_APP_ID` | Yes | — | Azure Entra ID application (client) ID |
 | `TEAMS_APP_SECRET` | Yes | — | Azure Entra ID client secret |
 | `TEAMS_OAUTH_ENDPOINT` | Yes (Single Tenant) | `https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token` | Tenant-specific OAuth endpoint |
@@ -773,12 +799,17 @@ unless Standalone hello (or Unified Teams) proves required send/edit/delete ACK,
 real target IDs, and placeholder support. One admitted turn owns at most one
 content placeholder. Unknown write outcomes are intentionally not retried and
 do not trigger a fresh warning/final activity. The implementation uses only Bot
-Connector POST/PUT/DELETE; Microsoft 365 live validation remains pending.
+Connector POST/PUT/DELETE. Microsoft 365 Personal live evidence covers ordinary
+progressive delivery, balanced long fenced-code overflow, explicit-reply
+correlation, restart/expiry rejection, reaction coexistence, and stop-on-Unknown
+for a middle overflow ACK loss. GroupChat, channel, cleanup-failure, live-`429`,
+and remaining recovery branches stay open in the
+[live-validation tracker](msteams-live-validation.md).
 
-> **Release validation:** Before marking Teams PR 3／PR 4 complete, record
-> personal, group-chat, channel-root, channel-reply, explicit-quote, and
-> bot-owned update/delete behavior in the
-> [Microsoft 365 live-tenant matrix](msteams-discord-parity-requirements.md#202-live-microsoft-365-tenant-matrix).
+> **Release validation:** Before claiming complete real-send and bot-owned
+> mutation support, record personal, group-chat, channel-root, channel-reply,
+> explicit-quote, and bot-owned update/delete behavior in the
+> [Microsoft Teams live-validation tracker](msteams-live-validation.md).
 > HTTP mocks and successful Connector activity IDs do not close this gate.
 
 ### JWT validation failed
@@ -800,7 +831,7 @@ kubectl run openab-metadata-check --rm -i --restart=Never \
 - **Use a tenant allowlist** in production — configure `[teams].allowed_tenants` in Unified Mode or `TEAMS_ALLOWED_TENANTS` in Standalone Gateway Mode
 - **Bound Core scope and identity independently** — configure the typed Team/channel/Personal/group-chat policy and an explicit `[teams].allowed_users` list; a scope match never bypasses L3 sender trust
 - **Network policies** — start from default-deny and allow cluster DNS plus
-  the minimum outbound destinations. The M0 public-cloud profile permits the
+  the minimum outbound destinations. The commercial public-cloud profile permits the
   `login.microsoftonline.com` token endpoint, `login.botframework.com` metadata
   and JWKS, and validated HTTPS Bot Connector service URLs on
   `smba.trafficmanager.net`. Attachment-enabled Gateway pods additionally need
@@ -815,6 +846,30 @@ kubectl run openab-metadata-check --rm -i --restart=Never \
   Microsoft egress, allow OAB to reach `openab-gateway:8080`, and give only OAB
   the agent/model/tool egress.
 - **Minimize inbound exposure** — Unified Mode should expose only `/webhook/teams` through the TLS Ingress; in Standalone Gateway Mode, the OAB pod remains private and connects outbound to the Gateway only
+
+## Maintaining This Guide
+
+- **Trigger:** Teams deployment topology, chart values, image availability,
+  Bot Framework endpoints, manifest schema, Core/Gateway capability negotiation,
+  or the live-validation matrix changes.
+- **Action:** update the applicability notice and affected mode, then run:
+
+  ```bash
+  helm show chart oci://ghcr.io/openabdev/charts/openab \
+    --version 0.10.0-beta.2
+  docker buildx imagetools inspect \
+    ghcr.io/openabdev/openab:0.10.0-beta.2-kiro
+  docker buildx imagetools inspect \
+    ghcr.io/openabdev/openab-gateway:0.5.4
+  helm template test charts/openab \
+    --set-file agents.kiro.configToml=config.toml.example
+  cargo test -p openab-gateway --features teams
+  cargo test --manifest-path crates/platform-schema/Cargo.toml
+  ```
+
+- **Why:** this guide combines Microsoft control-plane steps with source-tree
+  runtime behavior; release or image claims must be reverified rather than
+  inferred from matching version strings.
 
 ## References
 

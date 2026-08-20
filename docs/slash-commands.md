@@ -5,7 +5,8 @@ OpenAB registers Discord slash commands for session control and agent management
 The first six session/configuration commands share one Core semantic service.
 Discord keeps native ephemeral interactions; Gateway platforms receive
 boundary-valid plain-text commands after their normal trust gates. See the
-[frozen Teams contract](adr/teams-text-command-parity.md).
+[proposed Teams command decision](adr/teams-text-command-parity.md) and its
+[live-validation status](msteams-live-validation.md).
 
 ## Commands
 
@@ -35,7 +36,7 @@ Discord native interaction responses are **ephemeral** — only the user who inv
 
 ## How They Work
 
-### `/models` and `/agents`
+### /models and /agents
 
 These read `configOptions` from the ACP `initialize` / `session/new` response and present them as a Discord Select Menu.
 
@@ -61,16 +62,16 @@ If the agent doesn't expose options, the user sees: `⚠️ No model options ava
 
 > **Note:** Discord Select Menus are limited to 25 items per page. OpenAB paginates larger option sets and places the current selection on the first page.
 
-### `/cancel`
+### /cancel
 
 Sends a `session/cancel` JSON-RPC notification to the ACP backend. This aborts in-flight LLM requests and tool calls immediately — no need to wait for the current response to finish.
 
-### `/cancel-all`
+### /cancel-all
 
 Sends the same cancellation as `/cancel` and removes every buffered dispatcher
 lane for the logical thread. Unlike `/reset`, it retains the session history.
 
-### `/reset`
+### /reset
 
 Cancels any in-flight operation, clears every buffered dispatcher lane, then removes the session from the pool. The ACP process terminates once the last reference is released. The next message in the thread or DM will automatically create a fresh session.
 
@@ -87,7 +88,7 @@ This is equivalent to the `sessions close` + `sessions new` pattern used by [Ope
 - Bot identity and system prompt (re-applied on next session creation)
 - Config settings in `config.toml`
 
-### `/usage`
+### /usage
 
 Queries the existing Kiro ACP usage extension for a live session. Discord
 returns an ephemeral plan and usage breakdown. Teams permits the command only
@@ -95,7 +96,7 @@ when authenticated typed scope proves a Personal DM; group/channel and old
 untyped events are rejected before the backend query because their replies are
 not proven private.
 
-### `/export-thread`
+### /export-thread
 
 Fetches the current Discord thread or DM history and returns a `.txt` file as an ephemeral follow-up. The transcript includes message timestamps, author names and IDs, message text, and attachment URLs.
 
@@ -142,7 +143,7 @@ Gateway text surfaces reserve the boundary-valid `/model …` and `/agent …`
 compatibility forms for the broker command service; unknown slash commands such
 as `/compact` still pass through to the ACP backend.
 
-## `/remind`
+## /remind
 
 Set a one-shot delayed reminder that mentions users or roles in the channel after a specified delay.
 
@@ -188,7 +189,7 @@ Set a one-shot delayed reminder that mentions users or roles in the channel afte
 cc @Alice @Bob
 ```
 
-## `/auth`
+## /auth
 
 Trigger the backend agent's device-flow authentication. OAB executes the command defined in `OPENAB_AGENT_AUTH_COMMAND`, captures the device code URL from stdout/stderr, and relays it to the user as an ephemeral Discord message.
 
@@ -226,3 +227,17 @@ Trigger the backend agent's device-flow authentication. OAB executes the command
 - Auth command exits **before** printing a login URL (within the 30s window) → warning that no URL was produced, with a retry prompt
 - Auth command exits with non-zero → failure message with exit code
 - Timeout → process killed, retry prompt
+
+## Maintaining This Guide
+
+- **Trigger:** command parsing, admission order, response privacy, ACP backend
+  support, or manifest command-list changes.
+- **Action:** update the command and platform matrices, then run:
+
+  ```bash
+  cargo test -p openab-core commands
+  cargo test --manifest-path crates/platform-schema/Cargo.toml teams_manifest
+  ```
+
+- **Why:** the Core command service and manifest fixture are authoritative;
+  platform discovery does not override trust or privacy gates.

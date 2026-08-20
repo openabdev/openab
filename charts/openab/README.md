@@ -36,7 +36,8 @@ Each agent lives under `agents.<name>`.
 | `nameOverride` | Override this agent's generated resource name. | `""` |
 | `workingDir` | Working directory and HOME inside the container. | `"/home/agent"` |
 | `env` | Inline environment variables passed to the agent process. | `{}` |
-| `envFrom` | Additional environment sources from existing Secrets or ConfigMaps. | `[]` |
+| `envFrom` | Additional environment sources from existing Secrets or ConfigMaps for the OpenAB process. | `[]` |
+| `secretEnv` | Individual Secret keys injected into the OpenAB process. Raw `configToml` must explicitly pass only required agent credentials through `[agent].env` or `inherit_env`; adapter and Gateway secrets must not reach the ACP child. | `[]` |
 | `pool.maxSessions` | Maximum concurrent ACP sessions for the agent. | `10` |
 | `pool.sessionTtlHours` | Idle session TTL in hours. | `24` |
 | `reactions.enabled` | Enable status reactions. | `true` |
@@ -150,3 +151,18 @@ This requires an exact active record in the Gateway registry. `serviceUrl` remai
 ### Discord ID precision warning
 
 Discord IDs must be set with `--set-string`, not `--set`. Otherwise Helm may coerce them into numbers and lose precision.
+
+## Maintaining This Reference
+
+- **Trigger:** any change to a commonly documented key, default, generated
+  resource, or Teams transport/registry value in `values.yaml` or `templates/`.
+- **Action:** update the table or example in this file, then run:
+
+  ```bash
+  helm template test charts/openab --set agents.kiro.enabled=false
+  helm template test charts/openab \
+    --set-file agents.kiro.configToml=config.toml.example
+  ```
+
+- **Why:** [`values.yaml`](values.yaml) and the templates are authoritative;
+  this README is a curated operator view and must not silently drift from them.

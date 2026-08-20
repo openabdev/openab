@@ -37,6 +37,7 @@ Microsoft URL, query, and credential never leave Gateway. See
 | **LINE** | ✅ (LINE-hosted only) | ✅ (STT, 1:1 only, LINE-hosted only) | — | — | — |
 | **LINE WORKS** | ✅ | ✅ (STT) | ✅ (whitelist) | skipped | skipped |
 | **Slack** | ✅ | ✅ (STT) | ✅ | — | skipped |
+| **Microsoft Teams** | ✅ (inline; Personal paperclip opt-in) | — | ✅ (Personal paperclip opt-in, strict UTF-8) | skipped | skipped |
 
 ## Processing Pipeline
 
@@ -61,7 +62,7 @@ OpenAB can create the ACP image block, but downstream coding agents and selected
 
 LINE-specific note:
 
-- LINE voice-message STT currently works in **1:1 chats only**.
+- LINE voice-message STT works in **1:1 chats only**.
 - LINE group/room voice messages are still blocked by mention gating because LINE does not attach mention metadata to audio messages.
 
 ### Text Files (Documents)
@@ -108,8 +109,8 @@ Media is stored at `~/.openab/media/inbound/<uuid>`:
 ### Future: HTTP Proxy Mode
 
 Other separated deployments may eventually add an authenticated media proxy.
-Teams does not wait for that work: its reviewed contract already uses one
-bounded opaque-reference request and base64 response, never `Attachment.path`
+Teams does not wait for that work: its proposed design uses one bounded
+opaque-reference request and base64 response, never `Attachment.path`
 or a Microsoft URL in Core.
 
 ## Configuration
@@ -120,7 +121,23 @@ setting; Gateway and Core must share `$HOME`.
 Teams is explicitly default-off. Set `[teams].inbound_attachments = true` (or
 `TEAMS_INBOUND_ATTACHMENTS=true`) on Core and Gateway. Personal paperclip files
 also require a separate Teams manifest profile with `supportsFiles: true`;
-inline images do not.
+inline images do not. See the [Microsoft Teams setup guide](msteams-selfhosted.md)
+and [live-validation tracker](msteams-live-validation.md) before enabling this
+in a production scope.
+
+## Maintaining This Reference
+
+- **Trigger:** changes to Gateway media adapters, Teams materialization,
+  `media.rs`, store limits, ACP attachment conversion, or platform support.
+- **Action:** update the affected matrix/limit from source and run:
+
+  ```bash
+  cargo test -p openab-core attachment
+  cargo test -p openab-gateway attachment
+  ```
+
+- **Why:** the support matrix is an operator decision surface; omitted or stale
+  rows can enable unsupported media paths.
 
 ## Related
 
@@ -130,3 +147,5 @@ inline images do not.
 - [Google Chat](google-chat.md) — Google Chat attachment support
 - [STT (Speech-to-Text)](stt.md) — Audio transcription configuration
 - [Sending Files (Outbound)](sendfiles.md) — Agent → user file delivery (separate mechanism)
+- [Microsoft Teams Setup](msteams-selfhosted.md) — Unified and Standalone enablement
+- [Microsoft Teams Live Validation](msteams-live-validation.md) — Verified and open scope matrix

@@ -138,6 +138,16 @@ platforms 使用 `webhook/API`，Feishu/Lark 則使用 `WS/webhook`。
 
 </details>
 
+<details>
+<summary><strong>Microsoft Teams</strong>（Unified 或 Custom Gateway）</summary>
+
+請先閱讀 [self-hosted 設定指南](docs/msteams-selfhosted.md)；企業 Kubernetes
+部署則使用 [enterprise 指南](docs/msteams-enterprise.md)。依賴特定功能或
+scope 前，請檢查 [live-validation tracker](docs/msteams-live-validation.md)。
+Teams attachment 行為記錄於 [Inbound Attachments](docs/inbound-attachments.md)。
+
+</details>
+
 ### 2. 使用 Helm 安裝（Kiro CLI — 預設）
 
 ```bash
@@ -168,6 +178,7 @@ kubectl rollout restart deployment/openab-kiro
 ### 4. 使用方式
 
 在 Discord 頻道中輸入：
+
 ```
 @YourBot explain this code
 ```

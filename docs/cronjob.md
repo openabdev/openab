@@ -252,7 +252,7 @@ sender_name = "DailyOps"
 timezone = "Asia/Taipei"
 ```
 
-### How It Works
+### How Usercron Reloading Works
 
 ```
                          config.toml                   $HOME/.openab/cronjob.toml
@@ -389,7 +389,11 @@ For Google Chat, use the space resource name (for example, `"spaces/AAAA1234567"
 
 For LINE WORKS, use a channel ID for group talks or `user:<userId>` (or `user:<loginId>`) for 1:1 delivery. LINE WORKS has no thread API, so cron messages always deliver to the flat channel; no synthetic thread is created and `thread_id` has no effect.
 
-For Teams, copy the tenant and conversation IDs from an already trusted PR 11 record. Do not configure `serviceUrl`; it is retained and validated only by Gateway. Personal, groupChat, and channel delivery use the stored conversation itself, and `thread_id` is a startup error.
+For Teams, copy the tenant and conversation IDs from an active record in the
+[trusted persistent conversation registry](adr/teams-trusted-persistent-conversation-registry.md).
+Do not configure `serviceUrl`; it is retained and validated only by Gateway.
+Personal, groupChat, and channel delivery use the stored conversation itself,
+and `thread_id` is a startup error.
 
 ## When to Use External Schedulers Instead
 
@@ -429,3 +433,18 @@ See [Kubernetes CronJob Reference Architecture](refarch/cronjob_k8s_refarch.md) 
 | Teams baseline is rejected at startup | Missing/invalid `teams_tenant_id`, `thread_id` set, or no Teams adapter configured | Correct the baseline target and choose exactly one Standalone or Unified Teams adapter |
 | Teams tick is skipped before ACP | Gateway disconnected, old peer, registry unavailable, or exact record not active | Restore the single-consumer Gateway and refresh the record with a newly trusted inbound activity |
 | Teams usercron entry is skipped | Agent-writable usercron has no persistent-route authority | Move an operator-approved schedule into baseline `[[cron.jobs]]` and restart |
+
+## Maintaining This Guide
+
+- **Trigger:** cron config schema, scheduler timing, usercron writeback,
+  supported platform dispatch, or Teams registry authority changes.
+- **Action:** update this guide from `crates/openab-core/src/cron.rs` and run:
+
+  ```bash
+  cargo test -p openab-core cron
+  helm template test charts/openab \
+    --set-file agents.kiro.configToml=config.toml.example
+  ```
+
+- **Why:** scheduler validation is authoritative; examples must never grant
+  agent-writable schedules more destination authority than the runtime.

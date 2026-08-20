@@ -1,6 +1,11 @@
 # Microsoft Teams Setup (Self-Hosted)
 
-> **Unified Mode (v0.9.0+):** The OAB binary now embeds the Teams adapter directly. Set `TEAMS_APP_ID` as an env var — no separate gateway container or `[gateway]` config needed. See [Telegram docs](telegram.md#unified-mode-recommended) for the pattern.
+> **Applicability (verified 2026-08-20):** This page documents current
+> source-tree behavior and a Standalone Docker Compose deployment. Use immutable
+> Core and Gateway images built from the same reviewed revision; do not infer
+> feature compatibility from an older published tag. For a complete Unified
+> Kubernetes deployment, use the [enterprise guide](msteams-enterprise.md#step-4a-deploy-in-unified-mode-recommended).
+> Unified mode embeds the Teams adapter, so it needs no `[gateway]` block.
 
 ### Unified Config (Kiro + Teams)
 
@@ -31,6 +36,10 @@ tables = "code" # default; Teams text-only activities do not render Markdown tab
 `tables = "code"` keeps tables readable as aligned fenced text before applying
 Teams' 80,000 UTF-16-byte message budget. Use `"bullets"` for a linear fallback;
 `"off"` intentionally sends raw pipes and does not claim native table rendering.
+Microsoft's limit is approximate: even a chunk within this text budget can be
+explicitly rejected as `message_too_large` because the activity envelope also
+contributes to platform sizing. OpenAB preserves already delivered prefix
+chunks, stops before the suffix, and does not retry the rejected POST.
 
 Set `TEAMS_APP_ID` and `TEAMS_APP_SECRET` on the container. No `[gateway]` needed.
 
@@ -50,7 +59,7 @@ max_route_entries = 10000
 reactions_enabled = false # opt in only for the public-preview reaction API
 processing_indicator = "off" # set "message" for one turn-local status activity
 streaming = false # opt in to one progressive content placeholder per turn
-# Optional PR 11 registry; relative paths resolve under $HOME/.openab/.
+# Optional persistent conversation registry; relative paths resolve under $HOME/.openab/.
 # No file is read or written when omitted.
 conversation_registry_path = "teams/conversations.json"
 conversation_registry_max_entries = 1000
@@ -69,9 +78,17 @@ If all four typed fields are omitted, Core logs and preserves the legacy convers
 
 `processing_indicator = "message"` is a separate, default-off UX opt-in. It creates at most one processing activity per admitted turn, updates that same real activity ID for tool/terminal states, and deletes it only after complete final delivery. It neither enables streaming nor requires Graph/RSC. In Standalone mode, Core enables it only after Gateway advertises the required send/edit/delete ACK and command-target capabilities.
 
-`streaming = true` is an independent, default-off content opt-in. Core creates at most one real placeholder and coalesces bot-owned PUT updates every 1.5 seconds. Standalone requires a valid hello with required send/edit/delete ACKs, real target IDs, and placeholder support; otherwise it remains send-once. Generic Gateway or Telegram streaming settings do not enable Teams. Unknown POST/PUT/DELETE outcomes are never retried or converted into a fresh final activity. No Graph/RSC grant is required. Microsoft 365 live validation remains pending.
+`streaming = true` is an independent, default-off content opt-in. Core creates at most one real placeholder and coalesces bot-owned PUT updates every 1.5 seconds. Standalone requires a valid hello with required send/edit/delete ACKs, real target IDs, and placeholder support; otherwise it remains send-once. Generic Gateway or Telegram streaming settings do not enable Teams. Unknown POST/PUT/DELETE outcomes are never retried or converted into a fresh final activity. No Graph/RSC grant is required. Microsoft 365 Personal live evidence covers ordinary progressive delivery, balanced long fenced-code overflow, and stop-on-Unknown for a middle overflow ACK loss; GroupChat, channel, and the remaining failure branches are not implied.
 
-`conversation_registry_path` opts in to PR 11 restart-persistent routing state. Core requests promotion only after structural, typed L2, and L3 Allow; the Gateway derives the record from its authenticated route, and the Bot Framework `serviceUrl` never enters Core or ACP. The file is versioned, bounded to 16 MiB, atomically replaced, and mode `0600` on Unix. In Standalone mode the path belongs to the Gateway container and must be mounted on durable storage explicitly. The registry does not send by itself; an operator-owned baseline may select one exact active record:
+`conversation_registry_path` opts in to
+[restart-persistent routing state](adr/teams-trusted-persistent-conversation-registry.md).
+Core requests promotion only after structural, typed L2, and L3 Allow; Gateway
+derives the record from its authenticated route, and the Bot Framework
+`serviceUrl` never enters Core or ACP. The file is versioned, bounded to 16 MiB,
+atomically replaced, and mode `0600` on Unix. In Standalone mode the path
+belongs to the Gateway container and must be mounted on durable storage
+explicitly. The registry does not send by itself; an operator-owned baseline
+may select one exact active record:
 
 ```toml
 [[cron.jobs]]
@@ -123,9 +140,10 @@ Teams (Bot Framework) ──POST──▶ Gateway (:8080) ◀──WebSocket─�
 
 1. Go to [Azure Portal → App registrations](https://portal.azure.com/#blade/Microsoft_AAD_RegisteredApps/ApplicationsListBlade) → **New registration**
 2. Name: `openab-teams-bot` (or anything you like)
-3. **Supported account types**:
-   - **Single tenant** — only your organization can use the bot (most common for internal use)
-   - **Multitenant** — anyone with a Microsoft 365 account can install
+3. **Supported account types**: choose **Single tenant**. Microsoft deprecated
+   creation of new multi-tenant bots on July 31, 2025. An existing legacy
+   multi-tenant registration may retain its original type, but this guide does
+   not create one.
 4. Leave **Redirect URI** empty → Register
 
 After creation, copy from the **Overview** page:
@@ -144,10 +162,10 @@ Then go to **Certificates & secrets** → **New client secret** → copy the **V
 3. **Subscription / Resource group**: pick yours
 4. **Pricing tier**: F0 (free) is fine for testing
 5. **Microsoft App ID**:
-   - **Type of App**: must match what you picked in step 1 (`Single Tenant` or `Multi Tenant`)
+   - **Type of App**: **Single Tenant**
    - **Creation type**: **Use existing app registration**
    - **App ID**: paste the `TEAMS_APP_ID` from step 1
-   - **App tenant ID** (Single tenant only): paste your tenant ID
+   - **App tenant ID**: paste your tenant ID
 6. Review + Create
 
 After deployment, open the bot:
@@ -260,15 +278,24 @@ Notes:
 
 Drop these three files into a project directory and run `docker compose up -d`.
 
-### `.env`
+### .env
 
 ```env
+# Immutable images built from the same reviewed source revision.
+OPENAB_CORE_IMAGE="<YOUR_CORE_IMAGE_BY_DIGEST>"
+OPENAB_GATEWAY_IMAGE="<YOUR_GATEWAY_IMAGE_BY_DIGEST>"
+CLOUDFLARED_IMAGE="<YOUR_CLOUDFLARED_IMAGE_BY_DIGEST>"
+
+# Shared Core↔Gateway authentication; generate a non-empty random value.
+GATEWAY_WS_TOKEN="<YOUR_RANDOM_GATEWAY_WS_TOKEN>"
+
 # From Azure AD app registration (step 1)
 TEAMS_APP_ID="<YOUR_APPLICATION_ID>"
 TEAMS_APP_SECRET="<YOUR_CLIENT_SECRET>"
+TEAMS_ALLOWED_TENANTS="<YOUR_TENANT_ID>"
 
-# Single tenant: must point at your tenant
-# Multi tenant: leave this line out (uses default)
+# Single tenant: must point at your tenant.
+# Existing legacy multi-tenant registrations may omit this line.
 TEAMS_OAUTH_ENDPOINT="https://login.microsoftonline.com/<YOUR_TENANT_ID>/oauth2/v2.0/token"
 
 # Optional Microsoft public-preview status reactions
@@ -287,42 +314,50 @@ RUST_LOG=info
 
 > `.env` should be `.gitignore`d — it holds your bot secret.
 
-### `docker-compose.yaml`
+### docker-compose.yaml
 
 ```yaml
 services:
   gateway:
-    image: ghcr.io/openabdev/openab-gateway:latest
+    image: ${OPENAB_GATEWAY_IMAGE}
     container_name: gateway
-    env_file:
-      - .env
+    environment:
+      GATEWAY_WS_TOKEN: ${GATEWAY_WS_TOKEN}
+      TEAMS_APP_ID: ${TEAMS_APP_ID}
+      TEAMS_APP_SECRET: ${TEAMS_APP_SECRET}
+      TEAMS_ALLOWED_TENANTS: ${TEAMS_ALLOWED_TENANTS}
+      TEAMS_OAUTH_ENDPOINT: ${TEAMS_OAUTH_ENDPOINT}
+      TEAMS_REACTIONS_ENABLED: ${TEAMS_REACTIONS_ENABLED:-false}
+      TEAMS_INBOUND_ATTACHMENTS: ${TEAMS_INBOUND_ATTACHMENTS:-false}
+      RUST_LOG: ${RUST_LOG:-info}
     ports:
       - 8080:8080
 
   openab:
-    image: ghcr.io/openabdev/openab:latest
+    image: ${OPENAB_CORE_IMAGE}
     container_name: openab
     volumes:
-      - ./config.toml:/etc/openab/config.toml
+      - ./config.toml:/etc/openab/config.toml:ro
       - ./data:/home/agent
     environment:
-      RUST_LOG: info
+      GATEWAY_WS_TOKEN: ${GATEWAY_WS_TOKEN}
+      RUST_LOG: ${RUST_LOG:-info}
     depends_on:
       - gateway
 
   # Optional — only include this service if you want to use Cloudflare Tunnel.
   # Drop this block if you reverse-proxy gateway:8080 some other way.
   tunnels:
-    image: cloudflare/cloudflared:latest
-    command: tunnel --no-autoupdate run --token ${TUNNEL_TOKEN}
-    env_file:
-      - .env
+    image: ${CLOUDFLARED_IMAGE}
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN}
     depends_on:
       - gateway
       - openab
 ```
 
-### `config.toml`
+### config.toml
 
 ```toml
 [agent]
@@ -340,6 +375,7 @@ enabled = true
 [gateway]
 url = "ws://gateway:8080/ws"
 platform = "teams"
+token = "${GATEWAY_WS_TOKEN}"
 
 # Core-side typed L2 and L3 policy (also required with a Standalone Gateway).
 [teams]
@@ -359,7 +395,9 @@ When enabled, Gateway sends only sanitized attachment metadata and an opaque
 process-local reference. Core asks for bytes only after structural, typed L2,
 and L3 identity admission. Microsoft URLs, URL queries, and bot credentials stay
 inside Gateway; old peers, route expiry, restart, scope mismatch, and malformed
-or oversized data fail closed without automatic retry.
+or oversized data fail closed without automatic retry. See
+[Inbound Attachments](inbound-attachments.md) for the platform matrix and size
+limits.
 
 ### Start the stack
 
@@ -385,11 +423,9 @@ In the [Cloudflare Zero Trust dashboard](https://one.dash.cloudflare.com/), open
 
 ### Option B — ngrok / Tailscale Funnel / other reverse proxy
 
-```bash
-# ngrok example
-ngrok http 8080
-# → https://<random>.ngrok-free.app/webhook/teams
-```
+Install and authenticate the selected proxy using its official guide; for
+ngrok, follow [Secure Tunnels](https://ngrok.com/docs/secure-tunnels/). Expose
+local port `8080`, then append `/webhook/teams` to the assigned HTTPS host.
 
 Drop the `tunnels` service and the `TUNNEL_TOKEN` line in `.env`; just expose `gateway:8080` to the internet however you prefer (k8s ingress, Caddy, nginx + Let's Encrypt, Tailscale Funnel, etc.).
 
@@ -413,11 +449,11 @@ Azure Portal → your bot → **Configuration** → **Messaging endpoint**: `htt
 - **Tenant allowlist** — set `TEAMS_ALLOWED_TENANTS=<tenant-id-1>,<tenant-id-2>` to restrict which tenants can talk to the bot
 - **Typed scope policy** — optionally admit Team IDs, channel IDs, Personal chats, and group chats independently in Core
 
-## Current Limitations
+## Known Limitations for This Source Profile
 
 - **Reactions** — outbound status reactions are disabled by default and must be explicitly enabled; inbound `messageReaction` events are still ignored
 - **Thread replies** — all messages in a personal chat or channel share one agent session
-- **Progressive edits** — implemented behind default-off `[teams].streaming`; Microsoft 365 live validation remains pending
+- **Progressive edits** — implemented behind default-off `[teams].streaming`; Personal live subsets are verified, while GroupChat, channel, and remaining failure branches stay pending
 
 ## Environment Variables
 
@@ -425,6 +461,7 @@ Transport variables are read by the embedded adapter or Standalone Gateway. Type
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
+| `GATEWAY_WS_TOKEN` | Standalone: Yes | — | Shared non-empty Core↔Gateway authentication token; do not pass it to the ACP child |
 | `TEAMS_APP_ID` | Yes | — | Azure AD application (client) ID |
 | `TEAMS_APP_SECRET` | Yes | — | Azure AD client secret value |
 | `TEAMS_OAUTH_ENDPOINT` | Single tenant: Yes | `https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token` | HTTPS endpoint on `login.microsoftonline.com`; override the tenant path for single-tenant bots |
@@ -437,6 +474,7 @@ Transport variables are read by the embedded adapter or Standalone Gateway. Type
 | `TEAMS_REACTIONS_ENABLED` | No | `false` | Opt in to public-preview Bot Connector add/remove reactions |
 | `TEAMS_PROCESSING_INDICATOR` | No | `off` | Core processing UX: `off` or `message`; malformed values fail closed to `off` |
 | `TEAMS_STREAMING` | No | `false` | Core progressive-content opt-in; accepts only `true`/`false` or `1`/`0`, malformed values fail closed |
+| `TEAMS_INBOUND_ATTACHMENTS` | No | `false` | Core/Gateway metadata-first image/text opt-in; set identically on both Standalone processes. Only `true`/`false` or `1`/`0`; malformed values fail closed. |
 | `TEAMS_CONVERSATION_REGISTRY_PATH` | No | (disabled) | Gateway-local registry file; relative paths resolve beneath `$HOME/.openab/` |
 | `TEAMS_CONVERSATION_REGISTRY_MAX_ENTRIES` | No | `1000` | Persistent record cap, range `1..=10000` |
 | `TEAMS_CONVERSATION_REGISTRY_TTL_SECS` | No | `31536000` | Active/disabled record retention window |
@@ -447,7 +485,7 @@ Transport variables are read by the embedded adapter or Standalone Gateway. Type
 | `TEAMS_ALLOW_ALL_USERS` | No | `false` | Core L3 broad user opt-in |
 | `TEAMS_ALLOWED_USERS` | No | (empty) | Core L3 Bot Framework sender IDs, comma-separated |
 
-> ⚠️ **M0 supports Microsoft commercial public cloud only.** Sovereign-cloud endpoints and custom OAuth/OpenID proxy hosts are rejected. Bot Connector replies accept only validated HTTPS service URLs on `smba.trafficmanager.net`; redirects cannot cross origin.
+> ⚠️ **The supported transport profile is Microsoft commercial public cloud only.** Sovereign-cloud endpoints and custom OAuth/OpenID proxy hosts are rejected. Bot Connector replies accept only validated HTTPS service URLs on `smba.trafficmanager.net`; redirects cannot cross origin.
 
 ### Test public-preview bot reactions
 
@@ -471,7 +509,9 @@ Set `[teams].streaming = true` on Core. In Standalone mode, restart both peers a
 
 - Almost always means OAuth endpoint vs. app type mismatch.
 - Single tenant bot → set `TEAMS_OAUTH_ENDPOINT=https://login.microsoftonline.com/<YOUR_TENANT_ID>/oauth2/v2.0/token`
-- Multi tenant bot → leave default, but verify `TEAMS_APP_ID` and `TEAMS_APP_SECRET` are correct.
+- Existing legacy multi-tenant bot → leave the default endpoint, but verify
+  `TEAMS_APP_ID` and `TEAMS_APP_SECRET`; do not use this path to create a new
+  multi-tenant bot.
 
 **`route_not_found` or `Teams ingress route is missing or expired`**
 
@@ -504,14 +544,32 @@ require a structured send ACK and return the real Teams activity ID; legacy
 peers keep fire-and-forget missing-ACK behavior after an incomplete hello.
 
 > **Release validation:** HTTP mocks do not prove Teams reply-chain presentation.
-> Before marking PR 3／PR 4 complete, record personal, group-chat, channel-root,
-> channel-reply, explicit-quote, and bot-owned update/delete cases in the
-> [Microsoft 365 live-tenant matrix](msteams-discord-parity-requirements.md#202-live-microsoft-365-tenant-matrix).
+> Before claiming complete real-send and bot-owned-mutation support, record
+> personal, group-chat, channel-root, channel-reply, explicit-quote, and
+> bot-owned update/delete cases in the
+> [Microsoft Teams live-validation tracker](msteams-live-validation.md).
 
 **Bot doesn't appear when @mentioning in a channel**
 
 - The Teams app must be installed in the team (Apps → Built for your org → Add to a team).
 - If your tenant blocks third-party apps, an admin must approve in Teams Admin Center → Manage apps.
+
+## Maintaining This Guide
+
+- **Trigger:** Teams config/environment parsing, Docker topology, Gateway
+  authentication, image availability, Bot Framework endpoints, manifest
+  requirements, or the live-validation matrix changes.
+- **Action:** update the affected example from source and run:
+
+  ```bash
+  docker compose config
+  cargo test -p openab-gateway --features teams
+  cargo test -p openab-core gateway
+  ```
+
+- **Why:** Standalone Core and Gateway have different credential boundaries;
+  copied examples must keep Microsoft secrets out of Core and keep the shared
+  WebSocket token identical and non-empty.
 
 ## References
 

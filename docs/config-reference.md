@@ -2,7 +2,9 @@
 
 OpenAB is configured via a TOML file (default: `config.toml`). Environment variables can be interpolated using `${VAR_NAME}` syntax.
 
-At least one adapter section (`[discord]` or `[slack]`) is required.
+Configure at least one runnable surface: a Discord/Slack adapter, an enabled
+Unified or Standalone Gateway platform, the ACP server endpoint, or `[mcp]`
+facade-only mode.
 
 ## Loading Config
 
@@ -66,7 +68,7 @@ access via the environment/role above.
 
 ---
 
-## `[discord]`
+## Discord
 
 Discord adapter. Requires a Discord bot token.
 
@@ -88,7 +90,7 @@ Discord adapter. Requires a Discord bot token.
 
 ---
 
-## `[slack]`
+## Slack
 
 Slack adapter using Socket Mode. Requires both a Bot User OAuth Token and an App-Level Token.
 
@@ -111,7 +113,7 @@ Slack adapter using Socket Mode. Requires both a Bot User OAuth Token and an App
 
 ---
 
-## `[gateway]`
+## Gateway
 
 Custom Gateway adapter for platforms like Telegram, LINE, Feishu/Lark, and Google Chat. Connects to the gateway via WebSocket.
 
@@ -136,7 +138,7 @@ Custom Gateway adapter for platforms like Telegram, LINE, Feishu/Lark, and Googl
 
 ---
 
-## `[line]`
+## LINE
 
 First-class LINE section — credentials, connection, and L3 identity trust (config-first parity, #1376). Replaces the uniform `GATEWAY_ALLOW_ALL_USERS` / `GATEWAY_ALLOWED_USERS` env vars for LINE trust — relying on those for LINE is deprecated and warns at startup.
 
@@ -160,7 +162,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
 
 ---
 
-## `[lineworks]`
+## LINE WORKS
 
 First-class LINE WORKS section — bot credentials and service-account auth (config-first parity, #1375). Each field resolves: config → `LINEWORKS_*` env → default. The adapter is enabled only when `bot_id`, `bot_secret`, `client_id`, `client_secret`, `service_account`, and a private key (inline or file) all resolve to non-empty values; an incomplete section disables the adapter, matching env-only semantics.
 
@@ -197,7 +199,7 @@ private_key_file = "/etc/openab/lineworks_private_key.pem"
 
 ---
 
-## `[wecom]`
+## WeCom
 
 Full first-class WeCom section (config-first parity, #1378) — credentials, connection, and L3 identity trust. Each field resolves: config → `WECOM_*` env → default. The adapter requires all five credentials (`corp_id`, `secret`, `token`, `encoding_aes_key`, `agent_id`); an incomplete section (after env fallback) disables the adapter, matching env-only semantics.
 
@@ -216,7 +218,7 @@ Full first-class WeCom section (config-first parity, #1378) — credentials, con
 
 ---
 
-## `[googlechat]`
+## Google Chat
 
 Full first-class Google Chat section (config-first parity, #1379) — credentials, connection, and L3 identity trust. Each field resolves: config → `GOOGLE_CHAT_*` env → default.
 
@@ -233,11 +235,11 @@ Full first-class Google Chat section (config-first parity, #1379) — credential
 
 ---
 
-## `[teams]`
+## Teams
 
 Full first-class Teams section (config-first parity, #1380) — credentials, connection, typed L2 scope, and L3 identity trust. Each field resolves: config → `TEAMS_*` env → default. `app_id` + `app_secret` are mandatory (after env fallback); an incomplete section disables the embedded adapter.
 
-> ⚠️ **M0 cloud-profile restriction:** Teams transport supports Microsoft commercial public cloud only. The adapter rejects non-HTTPS endpoints, userinfo, non-standard ports, sovereign-cloud hosts, custom proxy hosts, and service URLs outside `smba.trafficmanager.net`. Existing sovereign-cloud or proxy deployments must remain on an earlier release until an explicit cloud profile is available.
+> ⚠️ **Commercial-public-cloud restriction:** Teams transport supports Microsoft commercial public cloud only. The adapter rejects non-HTTPS endpoints, userinfo, non-standard ports, sovereign-cloud hosts, custom proxy hosts, and service URLs outside `smba.trafficmanager.net`. Existing sovereign-cloud or proxy deployments must remain on an earlier release until an explicit cloud profile is available.
 >
 > Teams outbound replies require the bounded authenticated `event_id` route. A restart, route expiry, or capacity eviction causes a fail-closed `route_not_found`; the user must send a new activity. New Standalone peers advertise required send ACK and return the real Bot Framework activity ID, using `[gateway].gateway_ack_timeout_secs` as the Core wait budget. Edit/delete are permitted only for IDs in the process-local bot-owned index; restart or ownership expiry makes an older message immutable through OpenAB.
 >
@@ -245,7 +247,7 @@ Full first-class Teams section (config-first parity, #1380) — credentials, con
 >
 > `processing_indicator = "message"` opts into one turn-local Bot Connector status message. It reuses negotiated real-ID send plus bot-owned edit/delete, remains separate from content streaming, and defaults to `off`. If reaction preview is also enabled, permanent queued receipts remain independent from the processing message.
 >
-> `streaming = true` opts into a separate progressive content placeholder. It is enabled only after Standalone hello (or the Unified Teams adapter) proves real-ID send plus bot-owned edit/delete with required ACKs. The generic `[gateway].streaming` and Telegram settings never enable Teams. Unknown write outcomes suppress recovery sends to avoid duplicates; no Graph/RSC grant is used. Microsoft 365 live validation is still pending.
+> `streaming = true` opts into a separate progressive content placeholder. It is enabled only after Standalone hello (or the Unified Teams adapter) proves real-ID send plus bot-owned edit/delete with required ACKs. The generic `[gateway].streaming` and Telegram settings never enable Teams. Unknown write outcomes suppress recovery sends to avoid duplicates; no Graph/RSC grant is used. Microsoft 365 Personal live evidence covers ordinary progressive delivery, balanced long fenced-code overflow, explicit-reply correlation, restart/expiry rejection, and stop-on-Unknown for a middle overflow ACK loss. GroupChat, channel, cleanup-failure, live-`429`, and the remaining recovery branches stay open in the [live-validation tracker](msteams-live-validation.md).
 >
 > New Teams peers use a fixed 80,000 UTF-16-byte final-text budget based on Microsoft's conservative 80 KB recommendation; this is not a user setting. Old Gateway, no-hello, and unavailable Unified paths retain the 4,096-character fallback. Final chunks are sent sequentially under required ACK and stop at the first rejected or unknown outcome. Teams text-only messages do not render Markdown tables, so keep the default `[markdown].tables = "code"` or select `"bullets"`; `"off"` is an explicit raw-pipe bypass.
 >
@@ -255,7 +257,7 @@ Full first-class Teams section (config-first parity, #1380) — credentials, con
 >
 > Teams Personal, group-chat, and channel scope is derived from the authenticated Bot Framework activity. Presence of any of `allowed_teams`, `allowed_channels`, `allow_personal`, or `allow_group_chats` (or its environment variable) opts into typed L2 policy. With neither list populated, all Team channels are admitted; otherwise a Team **or** channel ID match admits the channel. Personal and group chats use their booleans. L3 user trust is still evaluated independently. The two boolean environment variables accept `true`/`false` or `1`/`0`; any other explicitly present value resolves to `false` (fail closed).
 >
-> If none of the typed fields is present, Core preserves the pre-PR-5 `[gateway].allowed_channels` / `GATEWAY_ALLOWED_CHANNELS` conversation-ID behavior for rolling upgrades. This fallback is logged. `ChannelInfo.id` remains the outbound conversation ID; typed scope never changes routing or session keys.
+> If none of the typed fields is present, Core preserves the legacy untyped `[gateway].allowed_channels` / `GATEWAY_ALLOWED_CHANNELS` conversation-ID behavior for rolling upgrades. This fallback is logged. `ChannelInfo.id` remains the outbound conversation ID; typed scope never changes routing or session keys.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -282,36 +284,9 @@ Full first-class Teams section (config-first parity, #1380) — credentials, con
 | `allow_all_users` | bool \| omit | `false` (deny-all) | Independent L3 identity gate. Env: `TEAMS_ALLOW_ALL_USERS`. |
 | `allowed_users` | string[] | `[]` | `activity.from.id` values (`29:…`). Env: `TEAMS_ALLOWED_USERS`. |
 
-<details><summary>Previous trust-only description</summary>
-
-First-class L3 identity trust — same shape and semantics as `[line]`. Each section replaces the uniform `GATEWAY_ALLOW_ALL_USERS` / `GATEWAY_ALLOWED_USERS` env vars for its platform (deprecated: warns at startup, becomes an error in Phase 2). Platform credentials remain on the gateway env vars (`TEAMS_APP_ID`/`TEAMS_APP_SECRET`) until the Teams config-first parity slice lands (#1380).
-
-> **Trust resolution:** these sections (like `[line]`) apply in **both** deployment modes — the embedded/unified adapter path and the broker's WebSocket path to the standalone `openab-gateway` companion both consult the shared per-platform trust registry. Precedence per platform: `GATEWAY_*` env < `[gateway]` section < `[<platform>]` section (the platform section wins when both are set).
-
-Each field resolves: config value → `TEAMS_*` env var → default (deny-all).
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `allow_all_users` | bool \| omit | `false` (deny-all) | `true` = any user may interact (bypasses `allowed_users` entirely). Env fallback: `{PREFIX}_ALLOW_ALL_USERS`. |
-| `allowed_users` | string[] | `[]` | Platform user IDs allowed to interact. Only checked when `allow_all_users` resolves to false. Env fallback: `{PREFIX}_ALLOWED_USERS` (comma-separated). |
-
-Sender ID formats per platform:
-
-| Platform | Sender ID format | Example |
-|----------|-----------------|---------|
-| MS Teams | Bot Framework `activity.from.id` | `"29:1abc..."` |
-
-```toml
-[teams]
-allowed_users = ["29:1abc..."]
-# allow_all_users = true   # explicit opt-in only
-```
-
-</details>
-
 ---
 
-## `[feishu]`
+## Feishu/Lark
 
 Full first-class Feishu/Lark section (config-first parity, #1377) — credentials, connection, behavior, and L3 identity trust. Each field resolves: config → `FEISHU_*` env → default. `app_id` + `app_secret` are mandatory (after env fallback); an incomplete section disables the adapter. The gateway adapter's parser remains the single source of truth — the section renders into the same form the env vars use, so defaults and enum rules cannot diverge.
 
@@ -343,7 +318,7 @@ Full first-class Feishu/Lark section (config-first parity, #1377) — credential
 
 ---
 
-## `[agent]`
+## Agent
 
 The AI agent subprocess that OpenAB spawns to handle messages via ACP.
 
@@ -446,7 +421,7 @@ working_dir = "/home/agent"
 
 ---
 
-## `[pool]`
+## Pool
 
 Session pool settings for managing concurrent agent sessions.
 
@@ -468,11 +443,11 @@ default_config_options = { mode = "bypass", model = "swe-1-6" }
 
 ---
 
-## `[hooks]`
+## Hooks
 
 Lifecycle hooks that run at specific points during the container lifecycle. See [hooks.md](hooks.md) for full documentation and examples.
 
-### `[hooks.pre_seed]`
+### hooks.pre_seed
 
 Downloads and extracts archives from S3 before `pre_boot`. Seeds the agent environment with configs, tools, and shared memory without requiring AWS CLI in the image.
 
@@ -504,11 +479,11 @@ timeout_seconds = 300
 on_failure = "abort"
 ```
 
-### `[hooks.pre_boot]`
+### hooks.pre_boot
 
 Runs **before** agent pool creation. Use for bootstrapping files, syncing from S3, installing CLIs.
 
-### `[hooks.pre_shutdown]`
+### hooks.pre_shutdown
 
 Runs **after** pool shutdown on SIGTERM. Use for backing up state, syncing to S3.
 
@@ -547,11 +522,11 @@ on_failure = "warn"
 
 ---
 
-## `[secrets]`
+## Secrets
 
 External secrets management. Secrets are resolved at boot time (after `pre_boot` hooks) and held in memory only — never written to disk. See [secrets-management.md](secrets-management.md) for full documentation.
 
-### `[secrets.refs]`
+### secrets.refs
 
 Secret references. Each key maps to a provider URI. Resolved values are available as `${secrets.<key>}` in other config fields.
 
@@ -564,7 +539,7 @@ Secret references. Each key maps to a provider URI. Resolved values are availabl
 - `aws-sm://<secret-id>#<json-key>` — fetch from AWS Secrets Manager, extract JSON field
 - `exec://<absolute-script-path> <key> <attribute>` — run script with two arguments, read stdout
 
-### `[secrets.aws]`
+### secrets.aws
 
 AWS Secrets Manager provider configuration (optional).
 
@@ -573,7 +548,7 @@ AWS Secrets Manager provider configuration (optional).
 | `region` | string | auto | Override AWS region. Defaults to SDK credential chain (env/IMDS/IRSA). |
 | `endpoint_url` | string | — | Override endpoint URL (for LocalStack or VPC endpoints). |
 
-### `[secrets.exec]`
+### secrets.exec
 
 Exec provider configuration (optional).
 
@@ -599,7 +574,7 @@ bot_token = "${secrets.discord_token}"
 
 ---
 
-## `[reactions]`
+## Reactions
 
 Emoji reaction feedback on messages to show agent processing status.
 
@@ -609,7 +584,7 @@ Emoji reaction feedback on messages to show agent processing status.
 | `remove_after_reply` | bool | `false` | Remove the status reaction after the agent replies. |
 | `tool_display` | string | `"full"` | How tool calls are rendered: `"full"` (complete title), `"compact"` (count summary, e.g. `✅ 3 · 🔧 1 tool(s)`), or `"none"` (hidden). |
 
-### `[reactions.emojis]`
+### reactions.emojis
 
 Customize the emoji for each processing stage.
 
@@ -623,7 +598,7 @@ Customize the emoji for each processing stage.
 | `done` | 🆗 | Agent finished successfully. |
 | `error` | 😱 | Agent encountered an error. |
 
-### `[reactions.timing]`
+### reactions.timing
 
 Fine-tune reaction timing behavior (milliseconds).
 
@@ -635,7 +610,7 @@ Fine-tune reaction timing behavior (milliseconds).
 | `done_hold_ms` | `1500` | How long to show the done emoji before removing (if `remove_after_reply`). |
 | `error_hold_ms` | `2500` | How long to show the error emoji before removing. |
 
-### `[reactions.mapping]`
+### reactions.mapping
 
 Map emoji reactions to text commands. When a user reacts with a configured emoji on any message in a monitored channel, the bot treats it as if the user sent the corresponding text message.
 
@@ -658,7 +633,7 @@ Keys can be unicode emoji or Discord/GitHub shortcodes (e.g. `:thumbsup:`). Shor
 
 ---
 
-## `[stt]`
+## STT
 
 Speech-to-text transcription for voice messages. Uses an OpenAI-compatible `/audio/transcriptions` endpoint.
 
@@ -672,7 +647,7 @@ Speech-to-text transcription for voice messages. Uses an OpenAI-compatible `/aud
 
 ---
 
-## `[workspace]`
+## Workspace
 
 Workspace aliases for [Control Directives](adr/control-directives.md). Users specify `[[ws:@alias]]` in their first message to set the session's working directory.
 
@@ -697,7 +672,7 @@ web    = "~/projects/frontend"
 
 ---
 
-## `[ambient]`
+## Ambient
 
 Passive channel listening with batch flush. See [ambient.md](ambient.md) for full guide.
 
@@ -723,7 +698,7 @@ allow_bot_messages = true
 
 ---
 
-## `[filestore]`
+## Filestore
 
 Optional S3/R2-compatible object store for handling file attachments.
 
@@ -803,7 +778,7 @@ permissions scoped to the bucket.
 
 ---
 
-## `[cron]`
+## Cron
 
 Everything cron-related lives under `[cron]`.
 
@@ -840,14 +815,14 @@ sender_name = "DailyOps"
 timezone = "Asia/Taipei"
 ```
 
-### `[cron]` fields
+### Cron fields
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `usercron_enabled` | bool | `false` | Enable usercron hot-reload. Must be explicitly set to `true`. |
 | `usercron_path` | string | — | Path to the external `cronjob.toml`. Relative paths resolve from `$HOME/.openab/`. |
 
-### `[[cron.jobs]]` fields
+### Baseline cron.jobs fields
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -861,7 +836,13 @@ timezone = "Asia/Taipei"
 | `timezone` | string | `"UTC"` | IANA timezone for schedule evaluation (e.g. `"America/New_York"`, `"Europe/Berlin"`). |
 | `thread_id` | string | `""` | Optional existing thread for supported platforms. Teams rejects this field and never creates a scheduler thread. |
 
-Teams jobs require an available PR 11 registry and a Gateway peer that advertises persistent-send support. Gateway combines configured app identity with `teams_tenant_id`, the fixed `msteams` transport, and `channel`; only an exact active, non-expired record is eligible. The visible trigger must return a real Bot Framework activity ID before OpenAB starts or reuses an ACP session. `serviceUrl` and the stored record remain Gateway-local.
+Teams jobs require an available
+[trusted persistent conversation registry](adr/teams-trusted-persistent-conversation-registry.md)
+and a Gateway peer that advertises persistent-send support. Gateway combines
+configured app identity with `teams_tenant_id`, the fixed `msteams` transport,
+and `channel`; only an exact active, non-expired record is eligible. The visible
+trigger must return a real Bot Framework activity ID before OpenAB starts or
+reuses an ACP session. `serviceUrl` and the stored record remain Gateway-local.
 
 The external `cronjob.toml` uses `[[jobs]]` for non-Teams jobs. Every usercron entry with `platform = "teams"` or `teams_tenant_id` is rejected before lookup or ACP work. See [Usercron docs](cronjob.md#usercron--hot-reload-with-cronjobtoml) for details.
 
@@ -912,13 +893,20 @@ disable_on_success_working_dir = "/workspace/my-project"
 - Stateless — no scheduler persistence or catch-up; schedules are re-evaluated from config on restart
 - Teams sends are threadless, required-ACK, and never retried after an ambiguous outcome
 
-> **Helm:** chart v0.10.0 no longer renders `agents.<name>.cronjobs`. Put the complete baseline block in `agents.<name>.configToml`, or provide it through `configUrl`. This is intentional: Teams tenant/conversation authority has no second Helm values surface.
+> **Helm:** the chart schema in this source tree no longer renders
+> `agents.<name>.cronjobs`. Put the complete baseline block in
+> `agents.<name>.configToml`, or provide it through `configUrl`. This is
+> intentional: Teams tenant/conversation authority has no second Helm values
+> surface.
 
 ---
 
 ## Customizing via Helm
 
-Chart v0.10.0 treats `config.toml` as an authoritative raw document. Supply it through `agents.<name>.configToml`, load it with `--set-file`, or use `agents.<name>.configUrl`; the chart no longer maps adapter, pool, or cron fields into TOML.
+The chart schema in this source tree treats `config.toml` as an authoritative
+raw document. Supply it through `agents.<name>.configToml`, load it with
+`--set-file`, or use `agents.<name>.configUrl`; the chart no longer maps
+adapter, pool, or cron fields into TOML.
 
 ```yaml
 agents:
@@ -999,3 +987,20 @@ Each platform is auto-enabled when its env vars are present:
 > ⚠️ **Production checklist**: Set `GATEWAY_ALLOW_ALL_CHANNELS=false` and `GATEWAY_ALLOW_ALL_USERS=false` with explicit allowlists. The defaults are permissive for development convenience.
 >
 > ⚠️ **Google Chat JWT**: When `GOOGLE_CHAT_AUDIENCE` is unset, webhook requests are **not** verified via JWT. Set this to your Google Chat app's project number or service account email in production to enable request authentication. If `GOOGLE_CHAT_SA_KEY_FILE` is set but the file cannot be read, the adapter starts without token authentication (warn logged).
+
+---
+
+## Maintaining This Reference
+
+- **Trigger:** any change to config structs, environment fallbacks, defaults,
+  validation rules, supported platforms, or Helm's raw-config contract.
+- **Action:** update the affected table from source and run:
+
+  ```bash
+  cargo test -p openab-core config
+  cargo test -p openab-gateway schema
+  cargo test --manifest-path crates/platform-schema/Cargo.toml
+  ```
+
+- **Why:** source parsers and validators are authoritative; this manually curated
+  reference must not preserve superseded config phases or release assumptions.

@@ -114,7 +114,7 @@ note = "Bot can send a `typing` activity via the connector. Not currently emitte
 source = "https://learn.microsoft.com/en-us/azure/bot-service/rest-api/bot-framework-rest-connector-api-reference?view=azure-bot-service-4.0"
 
 
-# ═══ Schema 2 — openab-feature-support (source of truth: our code + PR) ══════
+# ═══ Schema 2 — openab-feature-support (source: code + decision records) ═════
 
 [[openab_features]]
 feature = "send_message"
@@ -130,7 +130,7 @@ pr = ""
 [[openab_features]]
 feature = "message_split"
 status = "implemented"
-note = "Standalone and an available Unified Teams adapter advertise an exact 80,000 UTF-16-byte text budget; old Gateway, no-hello, and unavailable Unified paths keep the 4096-character fallback. Core applies table rendering before exact unit-aware splitting, balances fenced code blocks, and delivers required-ACK chunks sequentially until the first Rejected or Unknown outcome. Automated coverage passes; Microsoft 365 long-message presentation remains live-pending."
+note = "Standalone and an available Unified Teams adapter advertise an exact 80,000 UTF-16-byte text budget; old Gateway, no-hello, and unavailable Unified paths keep the 4096-character fallback. Core applies table rendering before exact unit-aware splitting, balances fenced code blocks, and delivers required-ACK chunks sequentially until the first Rejected or Unknown outcome. Automated coverage passes. Microsoft 365 Personal live evidence verifies the default table fallback, an 82,020-UTF-16-byte mixed-Unicode fenced response split into three balanced activities, stop-after-target behavior when a middle overflow Delivered ACK is withheld, and explicit stop-on-Rejected partial delivery after Microsoft returned `message_too_large` for a BMP-heavy middle chunk. Successful near-limit pure-BMP and pure-emoji delivery remains a headroom follow-up under the documented 413 residual risk; GroupChat and channel remain skipped."
 source = [
   "crates/openab-core/src/format.rs#split_message_with_budget",
   "crates/openab-core/src/adapter.rs#stream_prompt_blocks",
@@ -143,7 +143,7 @@ pr = ""
 [[openab_features]]
 feature = "streaming"
 status = "partial"
-note = "Default off. With `[teams].streaming = true`, new Core selects edit streaming only when Standalone hello or Unified Teams proves required real-ID send plus bot-owned edit/delete primitives. Each turn owns at most one placeholder, coalesces changed content every 1.5 seconds, and preserves Rejected versus Unknown outcomes during final recovery. Generic Gateway/Telegram streaming cannot enable Teams. Automated coverage passes; Microsoft 365 live validation is pending."
+note = "Default off. With `[teams].streaming = true`, new Core selects edit streaming only when Standalone hello or Unified Teams proves required real-ID send plus bot-owned edit/delete primitives. Each turn owns at most one placeholder, coalesces changed content every 1.5 seconds, and preserves Rejected versus Unknown outcomes during final recovery. Generic Gateway/Telegram streaming cannot enable Teams. Automated coverage passes. Microsoft 365 Personal live evidence records ordinary progressive delivery, balanced overflow, explicit-reply correlation, restart/expiry rejection, reaction coexistence, and stop-on-Unknown for a middle overflow ACK loss. GroupChat, channel, cleanup-failure, live-429, and remaining recovery branches stay open in `docs/msteams-live-validation.md`."
 source = [
   "crates/openab-core/src/adapter.rs#stream_prompt_blocks",
   "crates/openab-core/src/progressive.rs",
@@ -154,7 +154,7 @@ pr = ""
 [[openab_features]]
 feature = "reply_quote"
 status = "partial"
-note = "`GatewayAdapter::send_message_with_reply` carries an explicit target in `quote_message_id`. Teams maps it to Bot Connector `replyToId` only when the activity is known in the same app/tenant/conversation ingress scope; an unknown target falls back to plain send. Personal/group/channel visual UX remains gated by the D3 Microsoft 365 live-tenant matrix."
+note = "`GatewayAdapter::send_message_with_reply` carries an explicit target in `quote_message_id`. When the activity is known in the same app/tenant/conversation ingress scope, Teams uses Bot Connector `ReplyToActivity` and also sets `replyToId`; an unknown target falls back to plain `SendToConversation`. A 2026-08-07 commercial Personal test returned `Delivered` through both collection+`replyToId` and `ReplyToActivity`, but neither rendered visual quote UI. Group/channel presentation remains open in `docs/msteams-live-validation.md`."
 source = [
   "crates/openab-core/src/gateway.rs#send_message_with_reply",
   "crates/openab-gateway/src/adapters/teams.rs#handle_reply",
@@ -207,7 +207,7 @@ pr = ""
 [[openab_features]]
 feature = "media_inbound"
 status = "partial"
-note = "Default off. With `[teams].inbound_attachments = true` and an explicitly negotiated materialization capability, Gateway publishes at most ten sanitized metadata entries plus route-scoped opaque references. Core invokes sequential materialization only after structural, typed L2, and L3 Allow. Inline images work in all scopes; Personal file-download cards accept image extensions and strict UTF-8 text only. URLs/tokens remain Gateway-local, redirects and size budgets fail closed, and Standalone/Unified return the same bounded base64 envelope. Automated tests pass; Microsoft 365 live validation remains pending."
+note = "Default off. With `[teams].inbound_attachments = true` and an explicitly negotiated materialization capability, Gateway publishes at most ten sanitized metadata entries plus route-scoped opaque references. Core invokes sequential materialization only after structural, typed L2, and L3 Allow. Inline images work in all scopes; Personal file-download cards accept image extensions and strict UTF-8 text only. URLs/tokens remain Gateway-local, redirects and size budgets fail closed, and Standalone/Unified return the same bounded base64 envelope. Automated tests pass. Microsoft 365 Personal live evidence records inline image, text-plus-attachment, and attachment-only subsets. Personal paperclip image/UTF-8 text, rejected metadata, default-off, commercial file-host, GroupChat, and channel cases remain open or skipped in `docs/msteams-live-validation.md`."
 source = [
   "crates/openab-gateway/src/adapters/teams.rs#prepare_attachment_metadata",
   "crates/openab-gateway/src/adapters/teams.rs#materialize_attachment",
@@ -288,7 +288,7 @@ pr = ""
 [[openab_features]]
 feature = "cron_dispatch"
 status = "implemented"
-note = "Operator-owned baseline `[[cron.jobs]]` may select one exact active, non-expired PR 11 record with bounded tenant and conversation identity. Agent-writable usercron is always rejected. Core requires a separate persistent-send capability, preserves the target through the real-ID trigger and response writes, and never creates a Teams thread. Gateway reconstructs the complete app/tenant/`msteams`/conversation key, keeps `serviceUrl` local, serializes same-conversation writes, returns Delivered/Rejected/Unknown without blind retry, and disables only after two consecutive exact blocked/not-in-roster results. Standalone uses one reconnect-aware proxy and one WebSocket consumer; Unified uses the same handler semantics. Automated Core/Gateway/Unified coverage passes; Microsoft 365 live acceptance remains separately authorized and pending."
+note = "Operator-owned baseline `[[cron.jobs]]` may select one exact active, non-expired record from the trusted persistent conversation registry, with bounded tenant and conversation identity. Agent-writable usercron is always rejected. Core requires a separate persistent-send capability, preserves the target through the real-ID trigger and response writes, and never creates a Teams thread. Gateway reconstructs the complete app/tenant/`msteams`/conversation key, keeps `serviceUrl` local, serializes same-conversation writes, returns Delivered/Rejected/Unknown without blind retry, and disables only after two consecutive exact blocked/not-in-roster results. Standalone uses one reconnect-aware proxy and one WebSocket consumer; Unified uses the same handler semantics. Automated Core/Gateway/Unified coverage passes. Microsoft 365 Personal live acceptance records Core-first compatibility, exact active-route delivery, registry preservation, UI structure, restoration, and quiet-soak subsets. GroupChat/channel and destructive blocked/not-in-roster lifecycle cases remain skipped in `docs/msteams-live-validation.md`."
 source = [
   "crates/openab-core/src/cron.rs#validate_cronjobs",
   "crates/openab-core/src/cron.rs#fire_cronjob",
@@ -304,14 +304,14 @@ pr = ""
 [[quirks]]
 date = "2026-08-20"
 title = "Operator cron uses exact Gateway-local persistent routing"
-note = "PR 12 permits Teams only in operator baseline config with both tenant and conversation IDs. A separate default-false capability gates an additive non-secret target; old peers, disconnected Standalone Core, registry-off state, unsupported consumer topology, and inactive exact keys stop before Connector HTTP or ACP. The first visible trigger needs a real activity ID. Every later write re-resolves the active record; no persistent write retries an ambiguous or rate-limited outcome. Delivered clears one prior exact forbidden result, while only two consecutive MessageWritesBlocked or BotNotInConversationRoster outcomes disable. Usercron and reminders remain unauthorized."
+note = "The operator-cron decision permits Teams only in operator baseline config with both tenant and conversation IDs. A separate default-false capability gates an additive non-secret target; old peers, disconnected Standalone Core, registry-off state, unsupported consumer topology, and inactive exact keys stop before Connector HTTP or ACP. The first visible trigger needs a real activity ID. Every later write re-resolves the active record; no persistent write retries an ambiguous or rate-limited outcome. Delivered clears one prior exact forbidden result, while only two consecutive MessageWritesBlocked or BotNotInConversationRoster outcomes disable. Usercron and reminders remain unauthorized."
 kind = "openab_decision"
 source = "docs/adr/teams-operator-cron-delivery.md"
 
 [[quirks]]
 date = "2026-08-19"
 title = "Persistent conversation authority requires post-trust promotion"
-note = "PR 11 adds an explicit-path opt-in, versioned Gateway-local registry. New Core requests `register_conversation` only after structural, typed L2, and L3 Allow; Gateway resolves the origin event to its authenticated ephemeral route and persists app/tenant/Bot-Framework-channel/conversation identity plus validated service URL. The wire carries no service URL or serialized reference. Active/disabled records expire after the configured TTL; authenticated installation removal records revocation. This registry does not implement proactive send or cron."
+note = "The persistent-registry decision adds an explicit-path opt-in, versioned Gateway-local registry. New Core requests `register_conversation` only after structural, typed L2, and L3 Allow; Gateway resolves the origin event to its authenticated ephemeral route and persists app/tenant/Bot-Framework-channel/conversation identity plus validated service URL. The wire carries no service URL or serialized reference. Active/disabled records expire after the configured TTL; authenticated installation removal records revocation. This registry does not implement proactive send or cron."
 kind = "openab_decision"
 source = "docs/adr/teams-trusted-persistent-conversation-registry.md"
 
@@ -346,7 +346,7 @@ source = "crates/openab-gateway/src/adapters/teams.rs#handle_reply"
 [[quirks]]
 date = "2026-08-08"
 title = "Reply correlation and explicit quote targets have separate identifiers"
-note = "`reply_to` remains the OpenAB origin event ID and is used only to find authenticated route state. Normal sends do not copy it into Bot Connector `replyToId`. An explicit `quote_message_id` is emitted as `replyToId` only when known in the same app/tenant/conversation scope; otherwise Teams receives a plain send. The resulting visual UX is still unverified in a live tenant."
+note = "`reply_to` remains the OpenAB origin event ID and is used only to find authenticated route state. Normal sends use `SendToConversation`. A known same-scope `quote_message_id` uses `ReplyToActivity` and body `replyToId`; otherwise Teams receives a plain send. A 2026-08-07 commercial Personal test verified successful correlation and real activity IDs but no visual quote UI through either endpoint; group/channel UX remains unverified."
 kind = "openab_decision"
 source = "docs/adr/teams-real-send-acknowledgement.md"
 
@@ -367,7 +367,7 @@ source = "docs/adr/teams-ephemeral-ingress-state.md"
 [[quirks]]
 date = "2026-08-06"
 title = "Bot Connector transport is pinned to public cloud and fails closed"
-note = "M0 accepts HTTPS Bot Connector service URLs only on `smba.trafficmanager.net`, public-cloud OAuth/OpenID hosts only, no userinfo/query/fragment/non-standard ports, and no cross-origin redirects. Conversation/activity IDs are encoded as URL path segments. Connect/request timeouts are 5 s/10 s; error bodies are read up to 4 KiB and redacted. OAuth, OpenID metadata, and JWKS refreshes are single-flight."
+note = "The commercial public-cloud transport profile accepts HTTPS Bot Connector service URLs only on `smba.trafficmanager.net`, public-cloud OAuth/OpenID hosts only, no userinfo/query/fragment/non-standard ports, and no cross-origin redirects. Conversation/activity IDs are encoded as URL path segments. Connect/request timeouts are 5 s/10 s; error bodies are read up to 4 KiB and redacted. OAuth, OpenID metadata, and JWKS refreshes are single-flight."
 kind = "openab_decision"
 source = "crates/openab-gateway/src/adapters/teams.rs"
 
@@ -390,6 +390,13 @@ date = "2026-08-10"
 title = "OpenAB uses an exact conservative UTF-16 text budget"
 note = "New Teams peers advertise 80,000 UTF-16 bytes (decimal) and Core measures final rendered text exactly, including synthetic code-fence markers. Required-ACK chunks stop at the first non-delivered outcome; Unknown never causes a retry or fresh warning activity. Legacy and no-hello peers remain at 4096 characters."
 kind = "openab_decision"
+source = "docs/adr/teams-formatting-and-long-messages.md"
+
+[[quirks]]
+date = "2026-08-12"
+title = "A budget-compliant BMP-heavy chunk can still receive 413"
+note = "A Personal live fixture produced four chunks within OpenAB's exact 80,000 UTF-16-byte text budget, but Microsoft explicitly rejected zero-based chunk 2 as `message_too_large`. Core preserved the two delivered prefix chunks, stopped before the suffix, emitted the existing single Rejected warning, and made no retry, DELETE, or cleanup write. This is accepted residual platform headroom risk; successful pure-BMP and pure-emoji near-limit delivery remains follow-up evidence."
+kind = "intrinsic"
 source = "docs/adr/teams-formatting-and-long-messages.md"
 
 [[quirks]]
@@ -458,6 +465,6 @@ source = "crates/openab-gateway/src/adapters/teams.rs"
 [[quirks]]
 date = "2026-08-08"
 title = "Real send acknowledgement is implemented; reply-chain UX remains live-gated"
-note = "Teams resolves `reply_to` only as an `event_id` route index, returns the real outbound activity ID, and reports delivered/rejected/unknown outcomes in Standalone and Unified modes. Normal sends omit `replyToId`; explicit route-scoped quotes may set it. Typed scope and mentions are handled separately; inbound attachments remain future work."
+note = "Teams resolves `reply_to` only as an `event_id` route index, returns the real outbound activity ID, and reports delivered/rejected/unknown outcomes in Standalone and Unified modes. Normal sends use `SendToConversation`; explicit route-scoped quotes use `ReplyToActivity`. Personal transport is live-verified, but the tested client displayed no visual quote. Channel root/reply and group-chat presentation remain open in `docs/msteams-live-validation.md`."
 kind = "openab_decision"
 source = "docs/adr/teams-real-send-acknowledgement.md"

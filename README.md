@@ -138,6 +138,17 @@ See [docs/wecom.md](docs/wecom.md) for the full setup guide. Requires the standa
 
 </details>
 
+<details>
+<summary><strong>Microsoft Teams</strong> (Unified or Custom Gateway)</summary>
+
+Start with the [self-hosted setup guide](docs/msteams-selfhosted.md), or use the
+[enterprise Kubernetes guide](docs/msteams-enterprise.md). Before relying on a
+specific capability or scope, check the
+[live-validation tracker](docs/msteams-live-validation.md). Teams attachment
+behavior is documented in [Inbound Attachments](docs/inbound-attachments.md).
+
+</details>
+
 ### 2. Install with Helm (Kiro CLI — default)
 
 ```bash
@@ -168,6 +179,7 @@ kubectl rollout restart deployment/openab-kiro
 ### 4. Use
 
 In your Discord channel:
+
 ```
 @YourBot explain this code
 ```
