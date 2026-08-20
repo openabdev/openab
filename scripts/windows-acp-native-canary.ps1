@@ -182,6 +182,75 @@ function Receive-WebSocketResponse {
     throw "CANARY FAIL: no WebSocket response for id $Id"
 }
 
+function Get-CanaryUpdateText {
+    param([AllowNull()][object]$Frame)
+    if ($null -eq $Frame) {
+        return ""
+    }
+    try {
+        if ([string]$Frame.method -ne "session/update") {
+            return ""
+        }
+        $text = [string]$Frame.params.update.content.text
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            return ""
+        }
+        return $text
+    }
+    catch {
+        return ""
+    }
+}
+
+function Receive-WebSocketPromptSettlement {
+    param(
+        [System.Net.WebSockets.ClientWebSocket]$Socket,
+        [int]$Id,
+        [int]$TimeoutSeconds = 45
+    )
+    $updates = New-Object System.Text.StringBuilder
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    while ($watch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        $remaining = [Math]::Max(1, $TimeoutSeconds - [int]$watch.Elapsed.TotalSeconds)
+        $frame = Receive-WebSocketJson $Socket $remaining
+        $chunk = Get-CanaryUpdateText $frame
+        if (-not [string]::IsNullOrWhiteSpace($chunk)) {
+            [void]$updates.Append($chunk)
+            continue
+        }
+        if (($frame.PSObject.Properties.Name -contains "id") -and [int]$frame.id -eq $Id) {
+            return [pscustomobject]@{
+                Frame = $frame
+                UpdateText = $updates.ToString()
+            }
+        }
+    }
+    throw "CANARY FAIL: no WebSocket response for id $Id; updates=$(Redact-CanaryText $updates.ToString())"
+}
+
+function Test-NoProviderFailureShape {
+    param(
+        [AllowNull()][object]$Frame,
+        [AllowNull()][string]$UpdateText
+    )
+    $blob = New-Object System.Text.StringBuilder
+    if ($null -ne $Frame -and @($Frame.PSObject.Properties.Name) -contains "error") {
+        [void]$blob.AppendLine((Format-CanaryFrame $Frame.error))
+    }
+    if (-not [string]::IsNullOrWhiteSpace($UpdateText)) {
+        [void]$blob.AppendLine($UpdateText)
+    }
+    $joined = $blob.ToString()
+    if ([string]::IsNullOrWhiteSpace($joined)) {
+        return $false
+    }
+    # /acp settles a failed backend turn as result {stopReason} plus streamed
+    # text ("⚠️ agent error: LLM error: ..."). JSON-RPC error is sufficient
+    # but not required. A successful model completion without these markers
+    # is a canary failure.
+    return [bool]($joined -match '(?i)(⚠️|LLM error|API error|agent error:|error sending request|error trying to connect|connection refused|invalid.?api.?key|authentication|credential|401|403|timed out waiting|_\(no response\)_|backend configuration issue|provider/model/auth)')
+}
+
 function Wait-TcpPort {
     param([int]$Port, [int]$TimeoutSeconds = 20)
     $watch = [Diagnostics.Stopwatch]::StartNew()
@@ -331,17 +400,20 @@ max_sessions = 2
         method = "session/prompt"
         params = @{ sessionId = $sessionId; prompt = @(@{ type = "text"; text = "NO_NETWORK_CANARY" }) }
     }
-    $promptResult = Receive-WebSocketResponse $socket 3 45
+    $promptSettlement = Receive-WebSocketPromptSettlement $socket 3 45
+    $promptResult = $promptSettlement.Frame
+    $promptUpdateText = [string]$promptSettlement.UpdateText
+    Write-Host "[canary] prompt frame=$(Format-CanaryFrame $promptResult)"
+    Write-Host "[canary] prompt update=$(Redact-CanaryText $promptUpdateText)"
     # NO_NETWORK_CANARY runs with a non-secret key and a proxy pointed at a
-    # dead loopback port (127.0.0.1:9). There is no provider backend reachable,
-    # so a successful prompt result is a canary failure: the agent must not be
-    # able to fabricate a turn without credentials/network. Assert the
-    # no-provider/no-credentials failure shape instead of treating
-    # result-or-error as success.
-    $promptHasError = $promptResult.PSObject.Properties.Name -contains "error"
-    $promptHasResult = $promptResult.PSObject.Properties.Name -contains "result"
-    Assert-Canary -Condition $promptHasError -Message "root no-network prompt did not return an error (no-provider/no-credentials failure shape)"
-    Assert-Canary -Condition (-not $promptHasResult) -Message "root no-network prompt returned a successful result, but no provider/credentials were configured"
+    # dead loopback port (127.0.0.1:9). /acp still settles session/prompt as
+    # result {stopReason} when the backend fails; the failure shape lives in
+    # JSON-RPC error and/or streamed session/update text. A completed model
+    # turn without those markers is a canary failure.
+    $promptSettled = (@($promptResult.PSObject.Properties.Name) -contains "result") -or
+        (@($promptResult.PSObject.Properties.Name) -contains "error")
+    Assert-Canary -Condition $promptSettled -Message "root prompt did not settle; frame=$(Format-CanaryFrame $promptResult)"
+    Assert-Canary -Condition (Test-NoProviderFailureShape $promptResult $promptUpdateText) -Message "root no-network prompt did not show a no-provider/no-credentials failure shape; frame=$(Format-CanaryFrame $promptResult); update=$(Redact-CanaryText $promptUpdateText)"
 
     $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $($root.Id)" |
         Where-Object { $_.Name -ieq "openab-agent.exe" })

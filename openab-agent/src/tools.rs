@@ -3,8 +3,8 @@ use process_wrap::tokio::{CommandWrap, KillOnDrop};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::process::{ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -341,7 +341,9 @@ where
         if n == 0 {
             return Ok(());
         }
-        sink.lock().expect("shell pipe buffer lock").extend_from_slice(&chunk[..n]);
+        sink.lock()
+            .expect("shell pipe buffer lock")
+            .extend_from_slice(&chunk[..n]);
     }
 }
 
@@ -349,13 +351,9 @@ const POST_KILL_PIPE_JOIN: Duration = Duration::from_secs(3);
 const POST_EXIT_PIPE_JOIN: Duration = Duration::from_secs(6);
 const POST_TIMEOUT_CLEANUP: Duration = Duration::from_secs(5);
 
-const PIPE_TRUNCATION_MARKER: &[u8] =
-    b"\n[output truncated: pipe held open past deadline]\n";
+const PIPE_TRUNCATION_MARKER: &[u8] = b"\n[output truncated: pipe held open past deadline]\n";
 
-async fn join_shell_pipe(
-    name: &str,
-    task: JoinHandle<std::io::Result<()>>,
-) -> Result<()> {
+async fn join_shell_pipe(name: &str, task: JoinHandle<std::io::Result<()>>) -> Result<()> {
     task.await
         .map_err(|e| anyhow!("bash: {name} reader task failed: {e}"))?
         .map_err(|e| anyhow!("bash: {name} read failed: {e}"))
