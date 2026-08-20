@@ -19,6 +19,9 @@ pub struct UnifiedGatewayAdapter {
     pub gw_state: Arc<AppState>,
     /// Telegram reaction state (message_id -> emoji list) for add/remove_reaction
     pub telegram_reaction_state: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    /// Core-side opt-in. Teams processing messages reuse the existing real-ID
+    /// send/edit/delete primitives and remain independent from reaction preview.
+    teams_processing_indicator: bool,
 }
 
 impl UnifiedGatewayAdapter {
@@ -26,7 +29,13 @@ impl UnifiedGatewayAdapter {
         Self {
             gw_state,
             telegram_reaction_state: Arc::new(Mutex::new(HashMap::new())),
+            teams_processing_indicator: false,
         }
+    }
+
+    pub fn with_teams_processing_indicator(mut self, enabled: bool) -> Self {
+        self.teams_processing_indicator = enabled;
+        self
     }
 
     /// Dispatch a GatewayReply to the correct platform adapter.
@@ -220,53 +229,71 @@ impl ChatAdapter for UnifiedGatewayAdapter {
             .is_some_and(|teams| teams.reactions_enabled());
         #[cfg(not(feature = "teams"))]
         let teams_reactions = false;
-        let (can_edit, can_delete, streaming_mode, status_backend) = match platform {
-            "telegram" => (
-                self.gw_state.telegram_rich_messages,
-                false,
-                if telegram_streaming && self.gw_state.telegram_rich_messages {
-                    StreamingMode::Edit
-                } else {
-                    StreamingMode::Disabled
-                },
-                StatusBackend::Reactions,
-            ),
+        let (can_edit, can_delete, streaming_mode, supports_reactions, status_backend) =
+            match platform {
+                "telegram" => (
+                    self.gw_state.telegram_rich_messages,
+                    false,
+                    if telegram_streaming && self.gw_state.telegram_rich_messages {
+                        StreamingMode::Edit
+                    } else {
+                        StreamingMode::Disabled
+                    },
+                    true,
+                    StatusBackend::Reactions,
+                ),
             // Unified mode currently has no per-platform streaming switch for
             // these adapters. Keep them send-once rather than inheriting the
             // unrelated Telegram setting.
-            "feishu" => (
-                true,
-                true,
-                StreamingMode::Disabled,
-                StatusBackend::Reactions,
-            ),
-            "googlechat" => (
-                true,
-                false,
-                StreamingMode::Disabled,
-                StatusBackend::Reactions,
-            ),
-            "wecom" => (false, false, StreamingMode::Disabled, StatusBackend::None),
-            "teams" => (
-                cfg!(feature = "teams"),
-                cfg!(feature = "teams"),
-                StreamingMode::Disabled,
-                if teams_reactions {
-                    StatusBackend::Reactions
-                } else {
-                    StatusBackend::None
-                },
-            ),
-            "line" | "lineworks" | "acp" => {
-                (false, false, StreamingMode::Disabled, StatusBackend::None)
-            }
-            _ => (
-                false,
-                false,
-                StreamingMode::Disabled,
-                StatusBackend::Reactions,
-            ),
-        };
+                "feishu" => (
+                    true,
+                    true,
+                    StreamingMode::Disabled,
+                    true,
+                    StatusBackend::Reactions,
+                ),
+                "googlechat" => (
+                    true,
+                    false,
+                    StreamingMode::Disabled,
+                    true,
+                    StatusBackend::Reactions,
+                ),
+                "wecom" => (
+                    false,
+                    false,
+                    StreamingMode::Disabled,
+                    false,
+                    StatusBackend::None,
+                ),
+                "teams" => (
+                    cfg!(feature = "teams"),
+                    cfg!(feature = "teams"),
+                    StreamingMode::Disabled,
+                    teams_reactions,
+                    if self.teams_processing_indicator && self.gw_state.teams.is_some() {
+                        StatusBackend::Message
+                    } else if teams_reactions {
+                        StatusBackend::Reactions
+                    } else {
+                        StatusBackend::None
+                    },
+                ),
+                "line" | "lineworks" | "acp" => (
+                    false,
+                    false,
+                    StreamingMode::Disabled,
+                    false,
+                    StatusBackend::None,
+                ),
+                _ => (
+                    false,
+                    false,
+                    StreamingMode::Disabled,
+                    true,
+                    StatusBackend::Reactions,
+                ),
+            };
         AdapterCapabilities {
             send_ack: cfg!(feature = "teams") && platform == "teams",
             edit_ack: cfg!(feature = "teams") && platform == "teams",
@@ -275,6 +302,7 @@ impl ChatAdapter for UnifiedGatewayAdapter {
             can_edit,
             can_delete,
             streaming_mode,
+            supports_reactions,
             show_streaming_placeholder: !(platform == "telegram"
                 && self.gw_state.telegram_rich_messages),
             message_limit: match platform {
@@ -412,6 +440,7 @@ mod tests {
         assert_eq!(capabilities.streaming_mode, StreamingMode::Disabled);
         assert!(capabilities.can_edit);
         assert!(capabilities.can_delete);
+        assert!(!capabilities.supports_reactions);
         assert_eq!(capabilities.status_backend, StatusBackend::None);
 
         let (event_tx, _event_rx) = tokio::sync::broadcast::channel(4);
@@ -431,9 +460,19 @@ mod tests {
             reactions_enabled: true,
         });
         let adapter = UnifiedGatewayAdapter::new(Arc::new(state));
+        let reaction_capabilities = adapter.capabilities("teams");
+        assert!(reaction_capabilities.supports_reactions);
         assert_eq!(
-            adapter.capabilities("teams").status_backend,
+            reaction_capabilities.status_backend,
             StatusBackend::Reactions
+        );
+
+        let message_adapter = adapter.with_teams_processing_indicator(true);
+        let message_capabilities = message_adapter.capabilities("teams");
+        assert!(message_capabilities.supports_reactions);
+        assert_eq!(
+            message_capabilities.status_backend,
+            StatusBackend::Message
         );
     }
 

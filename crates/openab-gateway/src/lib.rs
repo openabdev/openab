@@ -299,6 +299,7 @@ impl AppState {
                     },
                     show_streaming_placeholder: !self.telegram_rich_messages,
                     message_limit: characters(4096),
+                    supports_reactions: true,
                     status_backend: StatusBackend::Reactions,
                     ..AdapterCapabilities::default()
                 },
@@ -326,6 +327,7 @@ impl AppState {
                     can_delete: true,
                     show_streaming_placeholder: true,
                     message_limit: characters(4096),
+                    supports_reactions: teams.reactions_enabled(),
                     status_backend: if teams.reactions_enabled() {
                         StatusBackend::Reactions
                     } else {
@@ -347,6 +349,7 @@ impl AppState {
                     can_delete: true,
                     streaming_mode: StreamingMode::Edit,
                     message_limit: characters(4096),
+                    supports_reactions: true,
                     status_backend: StatusBackend::Reactions,
                     ..AdapterCapabilities::default()
                 },
@@ -361,6 +364,7 @@ impl AppState {
                     can_edit: true,
                     streaming_mode: StreamingMode::Edit,
                     message_limit: characters(4096),
+                    supports_reactions: true,
                     status_backend: StatusBackend::Reactions,
                     ..AdapterCapabilities::default()
                 },
@@ -1742,6 +1746,7 @@ mod gateway_protocol_tests {
             .get("telegram")
             .context("telegram capability should be advertised")?;
         assert_eq!(telegram.streaming_mode, schema::StreamingMode::Edit);
+        assert!(telegram.supports_reactions);
         assert!(!telegram.show_streaming_placeholder);
         assert!(hello.topology.supported);
         assert_eq!(hello.topology.active_consumers, 1);
@@ -2026,6 +2031,25 @@ mod gateway_protocol_tests {
         assert!(teams.edit_ack);
         assert!(teams.delete_ack);
         assert!(teams.supports_target_message_id);
+        assert!(!teams.supports_reactions);
+    }
+
+    #[cfg(feature = "teams")]
+    #[tokio::test]
+    async fn teams_hello_advertises_reaction_support_only_when_enabled() {
+        let connector = MockServer::start().await;
+        let mut config = teams_test_config(&connector);
+        config.reactions_enabled = true;
+        let (event_tx, _event_rx) = broadcast::channel(8);
+        let mut state = AppState::test_default(event_tx);
+        state.teams = Some(adapters::teams::TeamsAdapter::new_for_test(config));
+
+        let capabilities = state.gateway_capabilities();
+        let teams = capabilities
+            .get("teams")
+            .expect("configured Teams capability");
+        assert!(teams.supports_reactions);
+        assert_eq!(teams.status_backend, schema::StatusBackend::Reactions);
     }
 
     #[cfg(feature = "teams")]

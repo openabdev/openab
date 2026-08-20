@@ -633,11 +633,10 @@ async fn dispatch_batch(
     // Apply a permanent 👀 receipt marker to every event in the batch, as
     // required by turn-boundary-batching ADR §6.7. The progress controller
     // below is intentionally separate and anchors only on the final event.
-    let reaction_status = adapter
-        .capabilities(&thread_channel.platform)
-        .status_backend
-        == StatusBackend::Reactions;
-    if reaction_status {
+    let capabilities = adapter.capabilities(&thread_channel.platform);
+    let reaction_status = capabilities.status_backend == StatusBackend::Reactions;
+    let receipt_reactions = reactions_config.enabled && capabilities.supports_reactions;
+    if receipt_reactions {
         for msg in &batch {
             let _ = adapter
                 .add_reaction(&msg.trigger_msg, &reactions_config.emojis.queued)
@@ -1454,12 +1453,31 @@ mod tests {
 
     /// Mock `ChatAdapter` — records reaction lifecycle calls and otherwise
     /// returns success without touching a platform API.
-    #[derive(Default)]
     struct MockChatAdapter {
         reaction_events: Mutex<Vec<(String, String, String)>>,
+        status_backend: StatusBackend,
+        supports_reactions: bool,
+    }
+
+    impl Default for MockChatAdapter {
+        fn default() -> Self {
+            Self {
+                reaction_events: Mutex::new(Vec::new()),
+                status_backend: StatusBackend::Reactions,
+                supports_reactions: true,
+            }
+        }
     }
 
     impl MockChatAdapter {
+        fn message_status_with_receipts() -> Self {
+            Self {
+                status_backend: StatusBackend::Message,
+                supports_reactions: true,
+                ..Self::default()
+            }
+        }
+
         fn reaction_events_mut(&self) -> std::sync::MutexGuard<'_, Vec<(String, String, String)>> {
             self.reaction_events
                 .lock()
@@ -1478,6 +1496,14 @@ mod tests {
         }
         fn message_limit(&self) -> usize {
             2000
+        }
+
+        fn capabilities(&self, _platform: &str) -> crate::adapter::AdapterCapabilities {
+            crate::adapter::AdapterCapabilities {
+                supports_reactions: self.supports_reactions,
+                status_backend: self.status_backend,
+                ..crate::adapter::AdapterCapabilities::default()
+            }
         }
 
         async fn send_message(&self, channel: &ChannelRef, _content: &str) -> Result<MessageRef> {
@@ -1602,6 +1628,32 @@ mod tests {
                 .iter()
                 .all(|(operation, _, emoji)| operation != "remove" || emoji != "👀"),
             "batch receipt markers must remain visible after dispatch: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_progress_backend_keeps_all_receipts_without_reaction_progress() {
+        let mock = Arc::new(MockDispatchTarget::new());
+        let target: Arc<dyn DispatchTarget> = mock;
+        let recording = Arc::new(MockChatAdapter::message_status_with_receipts());
+        let adapter: Arc<dyn ChatAdapter> = recording.clone();
+
+        dispatch_batch(
+            "mock:T",
+            &make_channel("T"),
+            &target,
+            &adapter,
+            vec![make_msg("first", 10), make_msg("last", 10)],
+            false,
+        )
+        .await;
+
+        assert_eq!(
+            recording.reaction_events(),
+            vec![
+                ("add".into(), "m-first".into(), "👀".into()),
+                ("add".into(), "m-last".into(), "👀".into()),
+            ]
         );
     }
 

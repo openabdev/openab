@@ -180,6 +180,7 @@ pub enum StatusBackend {
     Reactions,
     Assistant,
     Typing,
+    Message,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -191,6 +192,9 @@ pub struct AdapterCapabilities {
     /// Whether command targets use the additive `target_message_id` field.
     /// False peers require the legacy `reply_to = target` fallback.
     pub supports_target_message_id: bool,
+    /// Native reactions may coexist with a different transient status backend.
+    #[serde(default)]
+    pub supports_reactions: bool,
     pub can_edit: bool,
     pub can_delete: bool,
     pub streaming_mode: StreamingMode,
@@ -206,6 +210,7 @@ impl Default for AdapterCapabilities {
             edit_ack: false,
             delete_ack: false,
             supports_target_message_id: false,
+            supports_reactions: false,
             can_edit: false,
             can_delete: false,
             streaming_mode: StreamingMode::Disabled,
@@ -628,12 +633,35 @@ mod protocol_tests {
     }
 
     #[test]
+    fn reaction_support_capability_is_additive_for_old_peers() {
+        #[derive(serde::Deserialize)]
+        struct LegacyCapabilities {
+            status_backend: StatusBackend,
+        }
+
+        let modern = AdapterCapabilities {
+            supports_reactions: true,
+            status_backend: StatusBackend::Reactions,
+            ..AdapterCapabilities::default()
+        };
+        let json = serde_json::to_string(&modern).unwrap();
+        let legacy: LegacyCapabilities = serde_json::from_str(&json).unwrap();
+        assert_eq!(legacy.status_backend, StatusBackend::Reactions);
+
+        let old_wire = serde_json::json!({ "status_backend": "reactions" });
+        let decoded: AdapterCapabilities = serde_json::from_value(old_wire).unwrap();
+        assert!(!decoded.supports_reactions);
+        assert_eq!(decoded.status_backend, StatusBackend::Reactions);
+    }
+
+    #[test]
     fn missing_capability_fields_default_fail_closed() {
         let capabilities: AdapterCapabilities = serde_json::from_str("{}").unwrap();
         assert!(!capabilities.send_ack);
         assert!(!capabilities.edit_ack);
         assert!(!capabilities.delete_ack);
         assert!(!capabilities.supports_target_message_id);
+        assert!(!capabilities.supports_reactions);
         assert!(!capabilities.can_edit);
         assert!(!capabilities.can_delete);
         assert_eq!(capabilities.streaming_mode, StreamingMode::Disabled);

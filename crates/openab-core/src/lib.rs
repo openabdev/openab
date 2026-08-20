@@ -24,6 +24,7 @@ pub mod reactions;
 pub mod remind;
 pub mod secrets;
 pub mod setup;
+pub mod status;
 pub mod stt;
 pub mod timestamp;
 pub mod trust;

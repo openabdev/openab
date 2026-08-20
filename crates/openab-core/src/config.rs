@@ -1299,6 +1299,16 @@ impl GoogleChatConfig {
     }
 }
 
+/// Opt-in Teams processing indicator. Message mode uses one turn-local bot
+/// activity and the existing send/edit/delete acknowledgement contract.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamsProcessingIndicator {
+    #[default]
+    Off,
+    Message,
+}
+
 /// First-class `[teams]` section — credentials, connection, typed L2 scope,
 /// and L3 identity trust for the MS Teams adapter. Config-first invariant
 /// (#1375): each field
@@ -1336,6 +1346,9 @@ pub struct TeamsConfig {
     /// the reaction status backend. Env fallback: `TEAMS_REACTIONS_ENABLED`.
     /// Defaults to `false` so existing deployments remain side-effect free.
     pub reactions_enabled: Option<bool>,
+    /// Opt in to one turn-local processing message. Env fallback:
+    /// `TEAMS_PROCESSING_INDICATOR`; default `off`.
+    pub processing_indicator: Option<TeamsProcessingIndicator>,
     /// Team IDs admitted by typed channel scope. Env fallback:
     /// `TEAMS_ALLOWED_TEAMS` (comma-separated). Both scope lists empty = open.
     pub allowed_teams: Option<Vec<String>>,
@@ -1367,6 +1380,7 @@ pub struct ResolvedTeams {
     pub route_ttl_secs: u64,
     pub max_route_entries: usize,
     pub reactions_enabled: bool,
+    pub processing_indicator: TeamsProcessingIndicator,
     pub allowed_teams: Vec<String>,
     pub allowed_channels: Vec<String>,
     pub allow_personal: bool,
@@ -1427,6 +1441,26 @@ impl TeamsConfig {
             })
             .unwrap_or(default)
         };
+        let processing_indicator = self.processing_indicator.unwrap_or_else(|| {
+            match std::env::var("TEAMS_PROCESSING_INDICATOR") {
+                Ok(value) if value.trim().eq_ignore_ascii_case("message") => {
+                    TeamsProcessingIndicator::Message
+                }
+                Ok(value)
+                    if value.trim().is_empty() || value.trim().eq_ignore_ascii_case("off") =>
+                {
+                    TeamsProcessingIndicator::Off
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        key = "TEAMS_PROCESSING_INDICATOR",
+                        "invalid Teams processing indicator; using off"
+                    );
+                    TeamsProcessingIndicator::Off
+                }
+                Err(_) => TeamsProcessingIndicator::Off,
+            }
+        });
         let scope_policy_configured = self.allowed_teams.is_some()
             || self.allowed_channels.is_some()
             || self.allow_personal.is_some()
@@ -1464,6 +1498,7 @@ impl TeamsConfig {
                     .ok()
                     .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             }),
+            processing_indicator,
             allowed_teams: csv(&self.allowed_teams, "TEAMS_ALLOWED_TEAMS"),
             allowed_channels: csv(&self.allowed_channels, "TEAMS_ALLOWED_CHANNELS"),
             allow_personal: bool_with_default(self.allow_personal, "TEAMS_ALLOW_PERSONAL", true),
@@ -3159,6 +3194,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             "TEAMS_ROUTE_TTL_SECS",
             "TEAMS_MAX_ROUTE_ENTRIES",
             "TEAMS_REACTIONS_ENABLED",
+            "TEAMS_PROCESSING_INDICATOR",
             "TEAMS_ALLOWED_TEAMS",
             "TEAMS_ALLOWED_CHANNELS",
             "TEAMS_ALLOW_PERSONAL",
@@ -3177,6 +3213,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         assert_eq!(r.route_ttl_secs, 3600);
         assert_eq!(r.max_route_entries, 10_000);
         assert!(!r.reactions_enabled);
+        assert_eq!(r.processing_indicator, TeamsProcessingIndicator::Off);
         assert!(r.allowed_teams.is_empty());
         assert!(r.allowed_channels.is_empty());
         assert!(r.allow_personal);
@@ -3198,6 +3235,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         std::env::set_var("TEAMS_ROUTE_TTL_SECS", "83");
         std::env::set_var("TEAMS_MAX_ROUTE_ENTRIES", "122");
         std::env::set_var("TEAMS_REACTIONS_ENABLED", "false");
+        std::env::set_var("TEAMS_PROCESSING_INDICATOR", "off");
         std::env::set_var("TEAMS_ALLOWED_TEAMS", "env-team");
         std::env::set_var("TEAMS_ALLOWED_CHANNELS", "env-channel");
         std::env::set_var("TEAMS_ALLOW_PERSONAL", "false");
@@ -3210,6 +3248,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             route_ttl_secs: Some(84),
             max_route_entries: Some(123),
             reactions_enabled: Some(true),
+            processing_indicator: Some(TeamsProcessingIndicator::Message),
             allowed_teams: Some(vec!["cfg-team".into()]),
             allowed_channels: Some(vec![]),
             allow_personal: Some(true),
@@ -3224,6 +3263,10 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         assert_eq!(r.route_ttl_secs, 84);
         assert_eq!(r.max_route_entries, 123);
         assert!(r.reactions_enabled);
+        assert_eq!(
+            r.processing_indicator,
+            TeamsProcessingIndicator::Message
+        );
         assert_eq!(r.allowed_teams, vec!["cfg-team"]);
         assert!(r.allowed_channels.is_empty());
         assert!(r.allow_personal);
@@ -3232,6 +3275,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
 
         // --- empty-string ${} expansion falls through to env ---
         std::env::set_var("TEAMS_REACTIONS_ENABLED", "true");
+        std::env::set_var("TEAMS_PROCESSING_INDICATOR", "message");
         let cfg = TeamsConfig {
             app_id: Some("".into()),
             ..Default::default()
@@ -3243,16 +3287,22 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         assert_eq!(r.route_ttl_secs, 83);
         assert_eq!(r.max_route_entries, 122);
         assert!(r.reactions_enabled);
+        assert_eq!(
+            r.processing_indicator,
+            TeamsProcessingIndicator::Message
+        );
         assert_eq!(r.allowed_teams, vec!["env-team"]);
         assert_eq!(r.allowed_channels, vec!["env-channel"]);
         assert!(!r.allow_personal);
         assert!(!r.allow_group_chats);
         assert!(r.scope_policy_configured);
 
-        // --- malformed allow switch fails closed ---
+        // --- malformed switches fail closed ---
         std::env::set_var("TEAMS_ALLOW_PERSONAL", "not-a-boolean");
+        std::env::set_var("TEAMS_PROCESSING_INDICATOR", "typing");
         let r = TeamsConfig::default().resolve();
         assert!(!r.allow_personal);
+        assert_eq!(r.processing_indicator, TeamsProcessingIndicator::Off);
         assert!(r.scope_policy_configured);
 
         // --- trust_config() view ---
@@ -3275,6 +3325,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             "TEAMS_ROUTE_TTL_SECS",
             "TEAMS_MAX_ROUTE_ENTRIES",
             "TEAMS_REACTIONS_ENABLED",
+            "TEAMS_PROCESSING_INDICATOR",
             "TEAMS_ALLOWED_TEAMS",
             "TEAMS_ALLOWED_CHANNELS",
             "TEAMS_ALLOW_PERSONAL",
@@ -3282,6 +3333,16 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         ] {
             std::env::remove_var(k);
         }
+    }
+
+    #[test]
+    fn teams_processing_indicator_rejects_unknown_toml_value() {
+        let error = parse_config(
+            "[teams]\nprocessing_indicator = \"typing\"\n",
+            "test",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("processing_indicator"));
     }
 
     #[test]

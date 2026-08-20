@@ -49,6 +49,7 @@ fn legacy_gateway_capabilities(
         edit_ack: platform == "feishu",
         delete_ack: false,
         supports_target_message_id: false,
+        supports_reactions: true,
         can_edit,
         can_delete: platform == "feishu",
         streaming_mode: if streaming && can_edit {
@@ -64,6 +65,40 @@ fn legacy_gateway_capabilities(
         },
         status_backend: StatusBackend::Reactions,
     }
+}
+
+fn teams_message_status_supported(
+    negotiated: bool,
+    capabilities: &AdapterCapabilities,
+) -> bool {
+    negotiated
+        && capabilities.send_ack
+        && capabilities.edit_ack
+        && capabilities.delete_ack
+        && capabilities.supports_target_message_id
+        && capabilities.can_edit
+        && capabilities.can_delete
+}
+
+fn normalize_reaction_support(capabilities: &mut AdapterCapabilities) {
+    capabilities.supports_reactions |=
+        capabilities.status_backend == StatusBackend::Reactions;
+}
+
+fn apply_teams_processing_indicator(
+    negotiated: bool,
+    enabled: bool,
+    capabilities: &mut AdapterCapabilities,
+) {
+    if !enabled {
+        return;
+    }
+    capabilities.status_backend =
+        if teams_message_status_supported(negotiated, capabilities) {
+            StatusBackend::Message
+        } else {
+            StatusBackend::None
+        };
 }
 
 /// Shared filter parameters for gateway event gating.
@@ -557,6 +592,7 @@ struct GatewayAdapterOptions {
     streaming: bool,
     streaming_placeholder: bool,
     telegram_rich_messages: bool,
+    teams_processing_indicator: bool,
     gateway_ack_timeout_secs: u64,
 }
 
@@ -569,6 +605,7 @@ pub struct GatewayAdapter {
     streaming: bool,
     streaming_placeholder: bool,
     telegram_rich_messages: bool,
+    teams_processing_indicator: bool,
     ack_timeout: std::time::Duration,
 }
 
@@ -584,6 +621,7 @@ impl GatewayAdapter {
             streaming,
             streaming_placeholder,
             telegram_rich_messages,
+            teams_processing_indicator,
             gateway_ack_timeout_secs,
         } = options;
         Self {
@@ -599,6 +637,7 @@ impl GatewayAdapter {
             streaming,
             streaming_placeholder,
             telegram_rich_messages,
+            teams_processing_indicator,
             ack_timeout: std::time::Duration::from_secs(gateway_ack_timeout_secs.max(1)),
         }
     }
@@ -611,6 +650,17 @@ impl GatewayAdapter {
             capabilities.streaming_mode = StreamingMode::Disabled;
         }
         capabilities.show_streaming_placeholder &= self.streaming_placeholder;
+        // Older peers represented reaction availability only through the
+        // selected status backend. Normalize that shape before a configured
+        // processing message overrides transient progress selection.
+        normalize_reaction_support(&mut capabilities);
+        if platform.eq_ignore_ascii_case("teams") {
+            apply_teams_processing_indicator(
+                negotiated,
+                self.teams_processing_indicator,
+                &mut capabilities,
+            );
+        }
         (negotiated, capabilities)
     }
 
@@ -1224,6 +1274,7 @@ pub struct GatewayParams {
     pub streaming: bool,
     pub streaming_placeholder: bool,
     pub telegram_rich_messages: bool,
+    pub teams_processing_indicator: bool,
     pub gateway_ack_timeout_secs: u64,
     pub stt: crate::config::SttConfig,
     pub teams_scope_policy: TeamsScopePolicy,
@@ -1249,6 +1300,7 @@ pub async fn run_gateway_adapter(
     let streaming = params.streaming;
     let streaming_placeholder = params.streaming_placeholder;
     let telegram_rich_messages = params.telegram_rich_messages;
+    let teams_processing_indicator = params.teams_processing_indicator;
     let gateway_ack_timeout_secs = params.gateway_ack_timeout_secs;
     let stt_config = params.stt;
     let teams_scope_policy = params.teams_scope_policy;
@@ -1310,6 +1362,7 @@ pub async fn run_gateway_adapter(
                 streaming,
                 streaming_placeholder,
                 telegram_rich_messages,
+                teams_processing_indicator,
                 gateway_ack_timeout_secs,
             },
         ));
@@ -2234,6 +2287,57 @@ mod tests {
         let feishu = legacy_gateway_capabilities("feishu", true, true);
         assert!(feishu.edit_ack);
         assert!(!feishu.send_ack, "legacy peers never require send ACK");
+    }
+
+    #[test]
+    fn teams_processing_message_requires_all_negotiated_write_primitives() {
+        let supported = AdapterCapabilities {
+            send_ack: true,
+            edit_ack: true,
+            delete_ack: true,
+            supports_target_message_id: true,
+            supports_reactions: true,
+            can_edit: true,
+            can_delete: true,
+            status_backend: StatusBackend::Reactions,
+            ..AdapterCapabilities::default()
+        };
+
+        let mut legacy_reactions = AdapterCapabilities {
+            status_backend: StatusBackend::Reactions,
+            ..AdapterCapabilities::default()
+        };
+        normalize_reaction_support(&mut legacy_reactions);
+        assert!(legacy_reactions.supports_reactions);
+
+        let mut before_hello = supported.clone();
+        apply_teams_processing_indicator(false, true, &mut before_hello);
+        assert_eq!(before_hello.status_backend, StatusBackend::None);
+        assert!(before_hello.supports_reactions);
+
+        let mut disabled = supported.clone();
+        apply_teams_processing_indicator(true, false, &mut disabled);
+        assert_eq!(disabled.status_backend, StatusBackend::Reactions);
+
+        for missing in 0..6 {
+            let mut capabilities = supported.clone();
+            match missing {
+                0 => capabilities.send_ack = false,
+                1 => capabilities.edit_ack = false,
+                2 => capabilities.delete_ack = false,
+                3 => capabilities.supports_target_message_id = false,
+                4 => capabilities.can_edit = false,
+                5 => capabilities.can_delete = false,
+                _ => unreachable!(),
+            }
+            apply_teams_processing_indicator(true, true, &mut capabilities);
+            assert_eq!(capabilities.status_backend, StatusBackend::None);
+        }
+
+        let mut capabilities = supported;
+        apply_teams_processing_indicator(true, true, &mut capabilities);
+        assert_eq!(capabilities.status_backend, StatusBackend::Message);
+        assert!(capabilities.supports_reactions);
     }
 
     #[test]

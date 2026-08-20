@@ -283,6 +283,13 @@ pr = ""
 
 [[quirks]]
 date = "2026-08-07"
+title = "Processing indicator is one turn-local bot-owned message"
+note = "Default off. With `[teams].processing_indicator = \"message\"`, Core creates at most one status activity through the authenticated origin route, updates that same real bot-owned activity ID for thinking/tool/terminal states, marks it terminal before final content, and deletes it after complete delivery. Standalone requires negotiated send/edit/delete ACK plus additive command targets; no Graph/RSC or streaming placeholder is used."
+kind = "openab_decision"
+source = "docs/adr/teams-processing-indicator.md"
+
+[[quirks]]
+date = "2026-08-07"
 title = "serviceUrl remains gateway-local in bounded ephemeral route state"
 note = "For message activities, Teams requires non-empty Bot Framework channel, tenant, conversation, activity, sender, and service URL fields. The validated service URL is stored only in process-local route and bot-owned state; default TTL is 3600 s with independent 10000-entry route, dedupe, and ownership bounds. Outbound replies use this state directly; missing required fields return 400."
 kind = "openab_decision"

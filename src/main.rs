@@ -265,6 +265,15 @@ fn gateway_section_trust(gw: &config::GatewayConfig) -> openab_core::trust::Trus
 
 /// Build the Teams typed-scope L2 policy while retaining the exact legacy
 /// conversation-ID fallback when no Teams scope field or env var is present.
+fn teams_processing_indicator_enabled(cfg: &config::Config) -> bool {
+    cfg.teams
+        .clone()
+        .unwrap_or_default()
+        .resolve()
+        .processing_indicator
+        == config::TeamsProcessingIndicator::Message
+}
+
 fn teams_scope_policy(cfg: &config::Config) -> gateway::TeamsScopePolicy {
     let legacy_allowed: Vec<String> = std::env::var("GATEWAY_ALLOWED_CHANNELS")
         .unwrap_or_default()
@@ -522,6 +531,7 @@ async fn main() -> anyhow::Result<()> {
     let unified_platform_enabled = has_unified_platform(&cfg);
 
     let teams_scope_policy = teams_scope_policy(&cfg);
+    let teams_processing_indicator = teams_processing_indicator_enabled(&cfg);
     let teams_routing_active = cfg
         .gateway
         .as_ref()
@@ -1160,6 +1170,7 @@ async fn main() -> anyhow::Result<()> {
             streaming: gw_cfg.streaming,
             streaming_placeholder: gw_cfg.streaming_placeholder,
             telegram_rich_messages: gw_cfg.telegram_rich_messages,
+            teams_processing_indicator,
             gateway_ack_timeout_secs: gw_cfg.gateway_ack_timeout_secs,
             stt: cfg.stt.clone(),
             teams_scope_policy: teams_scope_policy.clone(),
@@ -1545,7 +1556,8 @@ async fn main() -> anyhow::Result<()> {
 
             // Bridge task: receive events from adapters via event_tx, dispatch to core
             let unified_adapter: Arc<dyn adapter::ChatAdapter> = Arc::new(
-                unified_adapter::UnifiedGatewayAdapter::new(gw_state.clone()),
+                unified_adapter::UnifiedGatewayAdapter::new(gw_state.clone())
+                    .with_teams_processing_indicator(teams_processing_indicator),
             );
 
             // Bot gating still reads env here (structural, not L2/L3):
@@ -1975,6 +1987,19 @@ mod tests {
     fn cli_setup_subcommand() {
         let cli = Cli::try_parse_from(["openab", "setup"]).unwrap();
         assert!(matches!(cli.command.unwrap(), Commands::Setup { .. }));
+    }
+
+    #[test]
+    fn teams_processing_indicator_is_explicit_and_default_off() {
+        let default_cfg = config::parse_config_str("", "test").unwrap();
+        assert!(!teams_processing_indicator_enabled(&default_cfg));
+
+        let enabled_cfg = config::parse_config_str(
+            "[teams]\nprocessing_indicator = \"message\"\n",
+            "test",
+        )
+        .unwrap();
+        assert!(teams_processing_indicator_enabled(&enabled_cfg));
     }
 
     #[test]

@@ -10,6 +10,7 @@ use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
 use crate::markdown::{self, TableMode};
 use crate::reactions::StatusReactionController;
+use crate::status::{StatusMessageController, StatusTerminal};
 
 // --- Output directive parsing ---
 
@@ -362,6 +363,7 @@ pub enum StatusBackend {
     Reactions,
     Assistant,
     Typing,
+    Message,
 }
 
 /// Platform-aware behavior contract used by direct, unified, and standalone
@@ -375,6 +377,9 @@ pub struct AdapterCapabilities {
     /// Whether command targets use the additive `target_message_id` field.
     /// False peers require the legacy `reply_to = target` fallback.
     pub supports_target_message_id: bool,
+    /// Native reaction writes are available independently from the selected
+    /// transient progress backend. Used for permanent batch receipts.
+    pub supports_reactions: bool,
     pub can_edit: bool,
     pub can_delete: bool,
     pub streaming_mode: StreamingMode,
@@ -390,6 +395,7 @@ impl Default for AdapterCapabilities {
             edit_ack: false,
             delete_ack: false,
             supports_target_message_id: false,
+            supports_reactions: false,
             can_edit: false,
             can_delete: false,
             streaming_mode: StreamingMode::Disabled,
@@ -457,17 +463,19 @@ pub trait ChatAdapter: Send + Sync + 'static {
                 max: self.message_limit(),
             }
         };
+        let status_backend = if self.uses_assistant_status() {
+            StatusBackend::Assistant
+        } else {
+            StatusBackend::Reactions
+        };
         AdapterCapabilities {
             can_edit: streaming_mode != StreamingMode::Disabled,
             can_delete: streaming_mode != StreamingMode::Disabled,
             streaming_mode,
             show_streaming_placeholder: self.show_streaming_placeholder(),
             message_limit,
-            status_backend: if self.uses_assistant_status() {
-                StatusBackend::Assistant
-            } else {
-                StatusBackend::Reactions
-            },
+            supports_reactions: status_backend == StatusBackend::Reactions,
+            status_backend,
             ..AdapterCapabilities::default()
         }
     }
@@ -769,10 +777,10 @@ impl AdapterRouter {
         // Status and content streaming are separate capabilities. Only the
         // reactions backend drives the emoji lifecycle here; assistant status is
         // handled inside stream_prompt_blocks and `none` remains side-effect free.
-        let reaction_status = adapter
-            .capabilities(&ctx.thread_channel.platform)
-            .status_backend
-            == StatusBackend::Reactions;
+        let capabilities = adapter.capabilities(&ctx.thread_channel.platform);
+        let reaction_status = capabilities.status_backend == StatusBackend::Reactions;
+        let receipt_reactions =
+            self.reactions_config.enabled && capabilities.supports_reactions;
 
         let reactions = Arc::new(StatusReactionController::new(
             self.reactions_config.enabled,
@@ -781,7 +789,7 @@ impl AdapterRouter {
             self.reactions_config.emojis.clone(),
             self.reactions_config.timing.clone(),
         ));
-        if reaction_status {
+        if receipt_reactions {
             reactions.set_queued().await;
         }
 
@@ -883,6 +891,12 @@ impl AdapterRouter {
         let native = streaming && capabilities.streaming_mode == StreamingMode::Native;
         let assistant_status = capabilities.status_backend == StatusBackend::Assistant;
         let reaction_status = capabilities.status_backend == StatusBackend::Reactions;
+        let message_status_enabled = capabilities.status_backend == StatusBackend::Message;
+        let message_status = Arc::new(StatusMessageController::new(
+            message_status_enabled,
+            adapter.clone(),
+            thread_channel.clone(),
+        ));
         // Platforms that render Markdown tables natively (e.g. Slack Block Kit
         // `markdown` blocks / `markdown_text` stream chunks) skip the
         // table→code/bullets pre-pass so the raw table renders natively.
@@ -907,7 +921,9 @@ impl AdapterRouter {
                     conn.session_reset = false;
 
                     let (mut rx, request_id) = conn.session_prompt(content_blocks).await?;
-                    if assistant_status {
+                    if message_status_enabled {
+                        message_status.set_thinking().await;
+                    } else if assistant_status {
                         let _ = adapter.set_status(&thread_channel, "Thinking…").await;
                     } else if reaction_status {
                         reactions.set_thinking().await;
@@ -1027,6 +1043,7 @@ impl AdapterRouter {
                     // messages and abandons cleanly on dead agent / hard ceiling
                     // so late responses cannot leak into the next prompt.
                     let mut response_error: Option<String> = None;
+                    let mut hard_timed_out = false;
                     let mut turn_result = TurnResult::default();
                     let prompt_start = tokio::time::Instant::now();
                     loop {
@@ -1066,6 +1083,7 @@ impl AdapterRouter {
                                     break;
                                 }
                                 if prompt_start.elapsed() > prompt_hard_timeout {
+                                    hard_timed_out = true;
                                     response_error = Some(format!(
                                         "Agent exceeded hard timeout ({}s)",
                                         prompt_hard_timeout.as_secs(),
@@ -1133,7 +1151,9 @@ impl AdapterRouter {
                                     }
                                 }
                                 AcpEvent::Thinking => {
-                                    if assistant_status {
+                                    if message_status_enabled {
+                                        message_status.set_thinking().await;
+                                    } else if assistant_status {
                                         let _ = adapter
                                             .set_status(&thread_channel, "Thinking…")
                                             .await;
@@ -1142,8 +1162,11 @@ impl AdapterRouter {
                                     }
                                 }
                                 AcpEvent::ToolStart { id, title } if !title.is_empty() => {
-                                    // Live indicator: assistant status line vs emoji reaction.
-                                    if assistant_status {
+                                    // Live indicator: processing message, assistant status line,
+                                    // or emoji reaction. These are independent from content streaming.
+                                    if message_status_enabled {
+                                        message_status.set_tool(&title).await;
+                                    } else if assistant_status {
                                         let _ = adapter
                                             .set_status(
                                                 &thread_channel,
@@ -1189,8 +1212,11 @@ impl AdapterRouter {
                                     // tool; send-once delivery slices from here so the
                                     // preceding inter-tool narration is dropped.
                                     answer_start = text_buf.len();
-                                    // Live indicator: assistant status line vs emoji reaction.
-                                    if assistant_status {
+                                    // Live indicator: processing message, assistant status line,
+                                    // or emoji reaction.
+                                    if message_status_enabled {
+                                        message_status.set_thinking().await;
+                                    } else if assistant_status {
                                         let _ = adapter
                                             .set_status(&thread_channel, "Thinking…")
                                             .await;
@@ -1277,6 +1303,14 @@ impl AdapterRouter {
                     // encodes the four-corner truth table so it can be unit-tested.
                     let text_buf = finalize_body(reset, keep_full_text, answer_start, text_buf);
 
+                    let status_terminal = if hard_timed_out {
+                        StatusTerminal::TimedOut
+                    } else if response_error.is_some() || turn_result.is_silent_failure() {
+                        StatusTerminal::Failed
+                    } else {
+                        StatusTerminal::Completed
+                    };
+
                     // Build final content
                     let final_content =
                         display_for(platform_is_acp, &tool_lines, &text_buf, false, tool_display);
@@ -1314,6 +1348,12 @@ impl AdapterRouter {
                     // end of the closure so dispatch surfaces set_error (❌) instead of
                     // silently calling set_done (🆗) over a half-delivered turn.
                     let mut delivery_failed = false;
+                    // Terminate status before delivering final content. A successful final
+                    // delivery clears the processing message below; a failed delete can
+                    // therefore leave only recognizable terminal text.
+                    if message_status_enabled {
+                        message_status.mark_terminal(status_terminal).await;
+                    }
                     // Clear the assistant status line before delivering the final message.
                     if assistant_status {
                         let _ = adapter.set_status(&thread_channel, "").await;
@@ -1512,10 +1552,18 @@ impl AdapterRouter {
                     }
 
                     if delivery_failed {
+                        if message_status_enabled {
+                            message_status
+                                .mark_terminal(StatusTerminal::DeliveryFailed)
+                                .await;
+                        }
                         Err(anyhow::anyhow!(
                             "streaming finalization had delivery failures; user view is incomplete"
                         ))
                     } else {
+                        if message_status_enabled {
+                            message_status.clear().await;
+                        }
                         Ok(())
                     }
                 })

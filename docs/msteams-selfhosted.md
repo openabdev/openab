@@ -44,6 +44,7 @@ dedupe_ttl_secs  = 600
 route_ttl_secs   = 3600
 max_route_entries = 10000
 reactions_enabled = false # opt in only for the public-preview reaction API
+processing_indicator = "off" # set "message" for one turn-local status activity
 
 # Typed L2 scope. Presence of any of these four fields opts in.
 allowed_teams = []       # Team IDs
@@ -55,6 +56,8 @@ allow_group_chats = true
 With both scope lists empty, all Team channels remain open. Personal chats do not require a mention; group chats and Team channel roots/replies require a Bot Framework mention entity whose `mentioned.id` equals `recipient.id`. Plain text such as `@OpenAB` or `<at>OpenAB</at>` without that entity does not trigger the bot. Core removes only the receiving bot's entity text and preserves other mentions.
 
 If all four typed fields are omitted, Core logs and preserves the legacy conversation-ID L2 allowlist from `[gateway].allowed_channels` / `GATEWAY_ALLOWED_CHANNELS`. This rolling-upgrade fallback does not change the conversation ID used for sessions and replies.
+
+`processing_indicator = "message"` is a separate, default-off UX opt-in. It creates at most one processing activity per admitted turn, updates that same real activity ID for tool/terminal states, and deletes it only after complete final delivery. It neither enables streaming nor requires Graph/RSC. In Standalone mode, Core enables it only after Gateway advertises the required send/edit/delete ACK and command-target capabilities.
 
 ### User Trust (`[teams]` section)
 
@@ -357,6 +360,7 @@ Transport variables are read by the embedded adapter or Standalone Gateway. Type
 | `TEAMS_ROUTE_TTL_SECS` | No | `3600` | Authenticated ephemeral route lifetime |
 | `TEAMS_MAX_ROUTE_ENTRIES` | No | `10000` | Independent capacity bound for route, dedupe, and bot-owned activity caches |
 | `TEAMS_REACTIONS_ENABLED` | No | `false` | Opt in to public-preview Bot Connector add/remove reactions |
+| `TEAMS_PROCESSING_INDICATOR` | No | `off` | Core processing UX: `off` or `message`; malformed values fail closed to `off` |
 | `TEAMS_ALLOWED_TEAMS` | No | (empty) | Core typed L2 Team-ID allowlist, comma-separated; Team OR channel match |
 | `TEAMS_ALLOWED_CHANNELS` | No | (empty) | Core typed L2 channel-ID allowlist, comma-separated; both lists empty means all Team channels |
 | `TEAMS_ALLOW_PERSONAL` | No | `true` | Core typed L2 Personal-chat switch |
@@ -368,11 +372,15 @@ Transport variables are read by the embedded adapter or Standalone Gateway. Type
 
 ### Test public-preview bot reactions
 
-No Graph or RSC grant is required. Set `[teams].reactions_enabled = true` in Unified mode, or `TEAMS_REACTIONS_ENABLED=true` on the Standalone Gateway, then restart both peers so hello negotiation advertises `status_backend = reactions`.
+No Graph or RSC grant is required. Set `[teams].reactions_enabled = true` in Unified mode, or `TEAMS_REACTIONS_ENABLED=true` on the Standalone Gateway, then restart both peers so hello negotiation advertises `supports_reactions = true`. When the processing-message backend is off, reactions also remain the selected progress backend.
 
 Send the bot a normal message in personal chat, group chat, and a channel mention. During the turn, the reaction on that inbound message should move through the configured status lifecycle. OpenAB maps its default emoji to Teams reaction IDs, serializes the writes with other conversation operations, and retries at most once after an explicit short `429 Retry-After`.
 
 Expected Gateway logs include `gateway → teams reaction`. A missing reaction with `reaction_target_not_known` means the authenticated event route expired or the target crossed tenant/conversation scope. This preview does not yet process reactions that users add to bot messages.
+
+### Test the processing-message indicator
+
+Set `[teams].processing_indicator = "message"` on Core and keep streaming disabled. Send one admitted message. Teams should show one `Processing…` activity, update that same activity during tool use, mark it terminal before the final answer, then delete it after complete delivery. With reaction preview also enabled, queued `👀` remains on every batched event while only the final event owns the processing message.
 
 ## Troubleshooting
 
