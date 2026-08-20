@@ -186,7 +186,30 @@ Create `manifest.json` next to two icons (`outline.png` — transparent 32×32 w
       "botId": "<YOUR_TEAMS_APP_ID>",
       "scopes": ["personal", "team", "groupChat"],
       "isNotificationOnly": false,
-      "supportsFiles": false
+      "supportsFiles": false,
+      "commandLists": [
+        {
+          "scopes": ["personal"],
+          "commands": [
+            {"title": "/models", "description": "List the available AI models for the current session."},
+            {"title": "/agents", "description": "List the available agent modes for the current session."},
+            {"title": "/cancel", "description": "Cancel the current in-flight operation."},
+            {"title": "/cancel-all", "description": "Cancel the operation and clear buffered messages in this conversation."},
+            {"title": "/reset", "description": "Reset the conversation session and clear buffered messages."},
+            {"title": "/usage", "description": "Show private backend account usage for the current session."}
+          ]
+        },
+        {
+          "scopes": ["team", "groupChat"],
+          "commands": [
+            {"title": "/models", "description": "List the available AI models for the current session."},
+            {"title": "/agents", "description": "List the available agent modes for the current session."},
+            {"title": "/cancel", "description": "Cancel the current in-flight operation."},
+            {"title": "/cancel-all", "description": "Cancel the operation and clear buffered messages in this conversation."},
+            {"title": "/reset", "description": "Reset the conversation session and clear buffered messages."}
+          ]
+        }
+      ]
     }
   ],
   "validDomains": []
@@ -202,6 +225,15 @@ Notes:
   require file consent. For Personal paperclip image/text files, make a separate
   package with `supportsFiles: true`. This does not enable group-chat or channel
   paperclip files without Microsoft Graph.
+- `commandLists` is discoverability only: Teams sends the selected title as an
+  ordinary message, and OpenAB still applies scope, identity, and structured
+  mention gates. `/usage` is intentionally Personal-only because group/channel
+  replies are not ephemeral.
+- Do not add `supportsTargetedMessages`, command `triggers`, Graph/RSC, delegated
+  permissions, or Adaptive Card permissions for this profile. Installing or
+  upgrading the app package remains an explicit operator action.
+- A schema-validated copy is available at
+  [`platforms/examples/teams-manifest-v1.25.json`](platforms/examples/teams-manifest-v1.25.json).
 
 > If your tenant requires admin approval, an admin must approve the published app in Teams Admin Center → Manage apps.
 

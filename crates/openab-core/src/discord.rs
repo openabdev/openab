@@ -2,6 +2,10 @@ use crate::acp::protocol::{ConfigOption, UsageReport};
 use crate::acp::ContentBlock;
 use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
+use crate::commands::{
+    render_text_result, Command as CoreCommand, CommandContext, CommandResult, CommandService,
+    ConfigCategory,
+};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::dispatch::DispatchTarget;
 use crate::format;
@@ -20,7 +24,7 @@ use serenity::model::application::ButtonStyle;
 use serenity::model::application::{Command, CommandOptionType, ComponentInteractionDataKind, Interaction};
 use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, Reaction, ReactionType};
 use serenity::model::gateway::Ready;
-use serenity::model::id::{ChannelId, MessageId, UserId};
+use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
 use serenity::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
@@ -718,8 +722,7 @@ impl EventHandler for Handler {
         // @mention in an ambient context → discard buffer + normal dispatch.
         // NOTE: Bot messages without @mention are already handled by the
         // early-route above; this block handles human messages and bot @mentions.
-        if in_ambient_context {
-            let ambient = self.ambient.as_ref().unwrap();
+        if let Some(ambient) = self.ambient.as_ref().filter(|_| in_ambient_context) {
             if !is_dm {
                 if is_mentioned {
                     // Discard ambient buffer — mention takes priority.
@@ -1123,7 +1126,7 @@ impl EventHandler for Handler {
                     return;
                 }
             }
-            let sender_json = serde_json::to_string(&sender).unwrap();
+            let sender_json = serde_json::to_string(&sender).unwrap_or_default();
             let thread_key = dispatcher.key("discord", &thread_channel.channel_id, &sender_id);
             let estimated_tokens = crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
             let buf_msg = crate::dispatch::BufferedMessage {
@@ -1364,7 +1367,7 @@ impl EventHandler for Handler {
 
             let sender_id = sender.sender_id.clone();
             let sender_name_clone = sender.sender_name.clone();
-            let sender_json = serde_json::to_string(&sender).unwrap();
+            let sender_json = serde_json::to_string(&sender).unwrap_or_default();
             let thread_key = dispatcher.key("discord", &thread_channel.channel_id, &sender_id);
             let estimated_tokens = crate::dispatch::estimate_tokens(&prompt, &[]);
             let buf_msg = crate::dispatch::BufferedMessage {
@@ -1485,22 +1488,48 @@ impl EventHandler for Handler {
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         match interaction {
-            Interaction::Command(cmd) if cmd.data.name == "models" => {
-                self.handle_config_command(&ctx, &cmd, "model", "model")
-                    .await;
-            }
-            Interaction::Command(cmd) if cmd.data.name == "agents" => {
-                self.handle_config_command(&ctx, &cmd, "agent", "agent")
-                    .await;
-            }
-            Interaction::Command(cmd) if cmd.data.name == "cancel" => {
-                self.handle_cancel_command(&ctx, &cmd).await;
-            }
-            Interaction::Command(cmd) if cmd.data.name == "cancel-all" => {
-                self.handle_cancel_all_command(&ctx, &cmd).await;
-            }
-            Interaction::Command(cmd) if cmd.data.name == "reset" => {
-                self.handle_reset_command(&ctx, &cmd).await;
+            Interaction::Command(cmd)
+                if matches!(
+                    cmd.data.name.as_str(),
+                    "models" | "agents" | "cancel" | "cancel-all" | "reset" | "usage"
+                ) =>
+            {
+                if let Err(message) = self
+                    .shared_command_admission(
+                        &ctx,
+                        cmd.channel_id,
+                        cmd.guild_id,
+                        cmd.user.id,
+                        cmd.user.bot,
+                    )
+                    .await
+                {
+                    let response = CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content(message)
+                            .ephemeral(true),
+                    );
+                    if cmd.create_response(&ctx.http, response).await.is_err() {
+                        tracing::error!("failed to deny Discord command interaction");
+                    }
+                    return;
+                }
+
+                match cmd.data.name.as_str() {
+                    "models" => {
+                        self.handle_config_command(&ctx, &cmd, ConfigCategory::Model, "model")
+                            .await;
+                    }
+                    "agents" => {
+                        self.handle_config_command(&ctx, &cmd, ConfigCategory::Agent, "agent")
+                            .await;
+                    }
+                    "cancel" => self.handle_cancel_command(&ctx, &cmd).await,
+                    "cancel-all" => self.handle_cancel_all_command(&ctx, &cmd).await,
+                    "reset" => self.handle_reset_command(&ctx, &cmd).await,
+                    "usage" => self.handle_usage_command(&ctx, &cmd).await,
+                    _ => unreachable!("guard restricts shared command names"),
+                }
             }
             Interaction::Command(cmd) if cmd.data.name == "remind" => {
                 self.handle_remind_command(&ctx, &cmd).await;
@@ -1511,14 +1540,35 @@ impl EventHandler for Handler {
             Interaction::Command(cmd) if cmd.data.name == "auth" => {
                 self.handle_auth_command(&ctx, &cmd).await;
             }
-            Interaction::Command(cmd) if cmd.data.name == "usage" => {
-                self.handle_usage_command(&ctx, &cmd).await;
-            }
-            Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_config_") => {
-                self.handle_config_select(&ctx, &comp).await;
-            }
-            Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_pg:") => {
-                self.handle_pagination(&ctx, &comp).await;
+            Interaction::Component(comp)
+                if comp.data.custom_id.starts_with("acp_config_")
+                    || comp.data.custom_id.starts_with("acp_pg:") =>
+            {
+                if let Err(message) = self
+                    .shared_command_admission(
+                        &ctx,
+                        comp.channel_id,
+                        comp.guild_id,
+                        comp.user.id,
+                        comp.user.bot,
+                    )
+                    .await
+                {
+                    let response = CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content(message)
+                            .ephemeral(true),
+                    );
+                    if comp.create_response(&ctx.http, response).await.is_err() {
+                        tracing::error!("failed to deny Discord command component");
+                    }
+                    return;
+                }
+                if comp.data.custom_id.starts_with("acp_config_") {
+                    self.handle_config_select(&ctx, &comp).await;
+                } else {
+                    self.handle_pagination(&ctx, &comp).await;
+                }
             }
             _ => {}
         }
@@ -1528,6 +1578,80 @@ impl EventHandler for Handler {
 // --- Slash command & interaction handlers ---
 
 impl Handler {
+    fn shared_command_service(&self) -> CommandService {
+        CommandService::new(self.router.pool().clone(), self.dispatcher.clone())
+    }
+
+    fn shared_command_context(channel_id: ChannelId) -> CommandContext {
+        CommandContext::new("discord", channel_id.to_string(), true)
+    }
+
+    async fn shared_command_admission(
+        &self,
+        ctx: &Context,
+        channel_id: ChannelId,
+        guild_id: Option<GuildId>,
+        user_id: UserId,
+        user_is_bot: bool,
+    ) -> Result<(), &'static str> {
+        if user_is_bot {
+            return Err("🤖 Bots cannot use this command.");
+        }
+        if is_denied_user(
+            false,
+            self.allow_all_users,
+            &self.allowed_users,
+            user_id.get(),
+        ) {
+            return Err("🚫 You are not allowed to use this bot.");
+        }
+
+        let is_dm = guild_id.is_none();
+        let surface_allowed = if is_dm {
+            discord_command_surface_allowed(true, self.allow_dm, false, false)
+        } else {
+            match channel_id.to_channel(&ctx.http).await {
+                Ok(serenity::model::channel::Channel::Guild(channel)) => {
+                    let in_allowed_channel = self.allow_all_channels
+                        || self.allowed_channels.contains(&channel_id.get());
+                    let (in_allowed_thread, _) = detect_thread(
+                        channel.thread_metadata.is_some(),
+                        channel.parent_id.map(|id| id.get()),
+                        channel.owner_id.map(|id| id.get()),
+                        ctx.cache.current_user().id.get(),
+                        &self.allowed_channels,
+                        self.allow_all_channels,
+                        in_allowed_channel,
+                    );
+                    discord_command_surface_allowed(
+                        false,
+                        self.allow_dm,
+                        in_allowed_channel,
+                        in_allowed_thread,
+                    )
+                }
+                _ => false,
+            }
+        };
+        if !surface_allowed {
+            return Err("⚠️ Run this command inside an allowed Discord channel, thread, or DM.");
+        }
+
+        if !self
+            .router
+            .gate_incoming(
+                "discord",
+                &channel_id.to_string(),
+                is_dm,
+                &user_id.to_string(),
+            )
+            .is_allowed()
+        {
+            return Err("🚫 You are not allowed to use this bot.");
+        }
+        Ok(())
+    }
+
     /// Build a Discord select menu from ACP configOptions with the given category.
     /// Paginates options in pages of 25 (Discord limit). The current selection is
     /// always placed first so it appears on page 0.
@@ -1636,15 +1760,9 @@ impl Handler {
             .iter()
             .find(|o| o.category.as_deref() == Some(category))?;
         let total_pages = opt.options.len().div_ceil(SELECT_MENU_PAGE_SIZE);
-        let page = match page {
-            Some(p) => p.min(total_pages.saturating_sub(1)),
-            None => opt
-                .options
-                .iter()
-                .position(|o| o.value == opt.current_value)
-                .map(|i| i / SELECT_MENU_PAGE_SIZE)
-                .unwrap_or(0),
-        };
+        // build_config_select moves the current value to index zero, so a new
+        // interaction must start on page zero regardless of its original index.
+        let page = page.unwrap_or(0).min(total_pages.saturating_sub(1));
 
         let select = Self::build_config_select(options, category, page)?;
         let mut rows = vec![CreateActionRow::SelectMenu(select)];
@@ -1658,28 +1776,42 @@ impl Handler {
         &self,
         ctx: &Context,
         cmd: &serenity::model::application::CommandInteraction,
-        category: &str,
+        category: ConfigCategory,
         label: &str,
     ) {
-        let thread_key = format!("discord:{}", cmd.channel_id.get());
-        let config_options = self.router.pool().get_config_options(&thread_key).await;
-
-        let response = match Self::build_config_components(&config_options, category, None) {
-            Some(rows) => CreateInteractionResponse::Message(
+        let context = Self::shared_command_context(cmd.channel_id);
+        let result = self
+            .shared_command_service()
+            .execute(CoreCommand::ListConfig(category), &context)
+            .await;
+        let response = match &result {
+            CommandResult::ConfigOptions { options, .. } => {
+                match Self::build_config_components(options, category.as_str(), None) {
+                    Some(rows) => CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content(format!("🔧 Select a {label}:"))
+                            .components(rows)
+                            .ephemeral(true),
+                    ),
+                    None => CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content(render_text_result(&result))
+                            .ephemeral(true),
+                    ),
+                }
+            }
+            _ => CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content(format!("🔧 Select a {label}:"))
-                    .components(rows)
-                    .ephemeral(true),
-            ),
-            None => CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content(format!("⚠️ No {label} options available. Start a conversation first by @mentioning the bot."))
+                    .content(render_text_result(&result))
                     .ephemeral(true),
             ),
         };
 
-        if let Err(e) = cmd.create_response(&ctx.http, response).await {
-            tracing::error!(error = %e, category, "failed to respond to slash command");
+        if cmd.create_response(&ctx.http, response).await.is_err() {
+            tracing::error!(
+                category = category.as_str(),
+                "failed to respond to config command"
+            );
         }
     }
 
@@ -1688,43 +1820,59 @@ impl Handler {
         ctx: &Context,
         cmd: &serenity::model::application::CommandInteraction,
     ) {
-        let thread_key = format!("discord:{}", cmd.channel_id.get());
-
-        if !self.router.pool().has_active_session(&thread_key).await {
-            let response = CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content("⚠️ No active session. Start a conversation first by @mentioning the bot.")
-                    .ephemeral(true),
-            );
-            if let Err(e) = cmd.create_response(&ctx.http, response).await {
-                tracing::error!(error = %e, "failed to respond to /usage command");
-            }
-            return;
-        }
-
         // The ACP round-trip can exceed Discord's 3-second interaction
         // deadline — acknowledge with a deferred ephemeral response first.
         let defer =
             CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new().ephemeral(true));
-        if let Err(e) = cmd.create_response(&ctx.http, defer).await {
-            tracing::error!(error = %e, "failed to defer /usage response");
+        if cmd.create_response(&ctx.http, defer).await.is_err() {
+            tracing::error!("failed to defer /usage response");
             return;
         }
 
-        let followup = match self.router.pool().get_usage(&thread_key).await {
-            Ok(report) => {
-                let (content, embed) = build_usage_reply(&report);
+        let context = Self::shared_command_context(cmd.channel_id);
+        let result = self
+            .shared_command_service()
+            .execute(CoreCommand::Usage, &context)
+            .await;
+        let followup = match &result {
+            CommandResult::Usage(report) => {
+                let (content, embed) = build_usage_reply(report);
                 CreateInteractionResponseFollowup::new()
                     .content(content)
                     .embed(embed)
                     .ephemeral(true)
             }
-            Err(e) => CreateInteractionResponseFollowup::new()
-                .content(format!("⚠️ {e}"))
+            _ => CreateInteractionResponseFollowup::new()
+                .content(render_text_result(&result))
                 .ephemeral(true),
         };
-        if let Err(e) = cmd.create_followup(&ctx.http, followup).await {
-            tracing::error!(error = %e, "failed to send /usage followup");
+        if cmd.create_followup(&ctx.http, followup).await.is_err() {
+            tracing::error!("failed to send /usage followup");
+        }
+    }
+
+    async fn handle_control_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+        command: CoreCommand,
+    ) {
+        let command_name = command.name();
+        let context = Self::shared_command_context(cmd.channel_id);
+        let result = self
+            .shared_command_service()
+            .execute(command, &context)
+            .await;
+        let response = CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content(render_text_result(&result))
+                .ephemeral(true),
+        );
+        if cmd.create_response(&ctx.http, response).await.is_err() {
+            tracing::error!(
+                command = command_name.as_str(),
+                "failed to respond to control command"
+            );
         }
     }
 
@@ -1733,22 +1881,8 @@ impl Handler {
         ctx: &Context,
         cmd: &serenity::model::application::CommandInteraction,
     ) {
-        let thread_key = format!("discord:{}", cmd.channel_id.get());
-        let result = self.router.pool().cancel_session(&thread_key).await;
-
-        let msg = match result {
-            Ok(()) => "🛑 Cancel signal sent.".to_string(),
-            Err(e) => format!("⚠️ {e}"),
-        };
-
-        let response = CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new()
-                .content(msg)
-                .ephemeral(true),
-        );
-        if let Err(e) = cmd.create_response(&ctx.http, response).await {
-            tracing::error!(error = %e, "failed to respond to /cancel command");
-        }
+        self.handle_control_command(ctx, cmd, CoreCommand::Cancel)
+            .await;
     }
 
     async fn handle_cancel_all_command(
@@ -1756,34 +1890,8 @@ impl Handler {
         ctx: &Context,
         cmd: &serenity::model::application::CommandInteraction,
     ) {
-        // /cancel-all is the nuclear escape hatch: stop the in-flight turn AND clear
-        // every lane's buffer in this thread, so a human can intervene from a clean slate.
-        let session_key = format!("discord:{}", cmd.channel_id.get());
-        let dropped = self
-            .dispatcher
-            .cancel_buffered_thread("discord", &cmd.channel_id.get().to_string());
-
-        let cancel_result = self.router.pool().cancel_session(&session_key).await;
-
-        // Buffer count is approximate (sweep races with new arrivals) so we surface
-        // a binary "cleared / nothing" signal rather than a misleading exact number.
-        let msg = match (cancel_result, dropped) {
-            (Ok(()), 0) => "🛑 Cancel signal sent.".to_string(),
-            (Ok(()), _) => "🛑 Cancel signal sent. Buffered messages cleared.".to_string(),
-            (Err(_), 0) => {
-                "⚠️ Nothing to cancel — no active session and no buffered messages.".to_string()
-            }
-            (Err(_), _) => "🛑 Buffered messages cleared. No active session to cancel.".to_string(),
-        };
-
-        let response = CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new()
-                .content(msg)
-                .ephemeral(true),
-        );
-        if let Err(e) = cmd.create_response(&ctx.http, response).await {
-            tracing::error!(error = %e, "failed to respond to /cancel-all command");
-        }
+        self.handle_control_command(ctx, cmd, CoreCommand::CancelAll)
+            .await;
     }
 
     async fn handle_reset_command(
@@ -1791,37 +1899,8 @@ impl Handler {
         ctx: &Context,
         cmd: &serenity::model::application::CommandInteraction,
     ) {
-        // /reset clears every lane's buffer in this thread and tears down the shared
-        // ACP session — the next message in the thread starts a fresh conversation.
-        let session_key = format!("discord:{}", cmd.channel_id.get());
-        let dropped = self
-            .dispatcher
-            .cancel_buffered_thread("discord", &cmd.channel_id.get().to_string());
-
-        let result = self.router.pool().reset_session(&session_key).await;
-
-        let msg = match result {
-            Ok(()) if dropped > 0 => {
-                format!("🔄 Session reset. Dropped {dropped} buffered message(s). Start a new conversation!")
-            }
-            Ok(()) => "🔄 Session reset. Start a new conversation!".to_string(),
-            Err(_) if dropped > 0 => {
-                format!("🔄 Dropped {dropped} buffered message(s). No active session to reset.")
-            }
-            Err(_) => {
-                "⚠️ No active session to reset. Start a conversation first by @mentioning the bot."
-                    .to_string()
-            }
-        };
-
-        let response = CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new()
-                .content(msg)
-                .ephemeral(true),
-        );
-        if let Err(e) = cmd.create_response(&ctx.http, response).await {
-            tracing::error!(error = %e, "failed to respond to /reset command");
-        }
+        self.handle_control_command(ctx, cmd, CoreCommand::Reset)
+            .await;
     }
 
     async fn handle_remind_command(
@@ -2452,53 +2531,26 @@ impl Handler {
             .data
             .custom_id
             .strip_prefix("acp_config_")
-            .unwrap_or("")
-            .to_string();
-
-        if config_id.is_empty() {
-            return;
-        }
-
+            .unwrap_or("");
         let selected_value = match &comp.data.kind {
-            ComponentInteractionDataKind::StringSelect { values } => match values.first() {
-                Some(v) => v.clone(),
-                None => return,
-            },
-            _ => return,
+            ComponentInteractionDataKind::StringSelect { values } => {
+                values.first().map(String::as_str).unwrap_or("")
+            }
+            _ => "",
         };
-
-        let thread_key = format!("discord:{}", comp.channel_id.get());
-
+        let context = Self::shared_command_context(comp.channel_id);
         let result = self
-            .router
-            .pool()
-            .set_config_option(&thread_key, &config_id, &selected_value)
+            .shared_command_service()
+            .set_config_value(&context, config_id, selected_value)
             .await;
-
-        let response_msg = match result {
-            Ok(updated_options) => {
-                let display_name = updated_options
-                    .iter()
-                    .find(|o| o.id == config_id)
-                    .and_then(|o| o.options.iter().find(|v| v.value == selected_value))
-                    .map(|v| v.name.as_str())
-                    .unwrap_or(&selected_value);
-                format!("✅ Switched to **{}**", display_name)
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "failed to set config option");
-                format!("❌ Failed to switch: {}", e)
-            }
-        };
-
         let response = CreateInteractionResponse::UpdateMessage(
             CreateInteractionResponseMessage::new()
-                .content(response_msg)
+                .content(render_text_result(&result))
                 .components(vec![]),
         );
 
-        if let Err(e) = comp.create_response(&ctx.http, response).await {
-            tracing::error!(error = %e, "failed to respond to config select");
+        if comp.create_response(&ctx.http, response).await.is_err() {
+            tracing::error!("failed to respond to config select");
         }
     }
 
@@ -2507,39 +2559,56 @@ impl Handler {
         ctx: &Context,
         comp: &serenity::model::application::ComponentInteraction,
     ) {
-        // Parse custom_id format: acp_pg:{category}:{page}
         let parts: Vec<&str> = comp.data.custom_id.splitn(3, ':').collect();
-        let (category, page) = match parts.as_slice() {
-            [_, cat, pg] => match pg.parse::<usize>() {
-                Ok(p) => (*cat, p),
-                Err(_) => return,
-            },
-            _ => return,
+        let parsed = match parts.as_slice() {
+            [_, "model", page] => page
+                .parse::<usize>()
+                .ok()
+                .map(|page| (ConfigCategory::Model, page)),
+            [_, "agent", page] => page
+                .parse::<usize>()
+                .ok()
+                .map(|page| (ConfigCategory::Agent, page)),
+            _ => None,
         };
 
-        // Only allow known config categories.
-        if !matches!(category, "model" | "agent") {
-            return;
-        }
-
-        let thread_key = format!("discord:{}", comp.channel_id.get());
-        let config_options = self.router.pool().get_config_options(&thread_key).await;
-
-        let response = match Self::build_config_components(&config_options, category, Some(page)) {
-            Some(rows) => CreateInteractionResponse::UpdateMessage(
+        let response = if let Some((category, page)) = parsed {
+            let context = Self::shared_command_context(comp.channel_id);
+            let result = self
+                .shared_command_service()
+                .execute(CoreCommand::ListConfig(category), &context)
+                .await;
+            match &result {
+                CommandResult::ConfigOptions { options, .. } => {
+                    match Self::build_config_components(options, category.as_str(), Some(page)) {
+                        Some(rows) => CreateInteractionResponse::UpdateMessage(
+                            CreateInteractionResponseMessage::new()
+                                .content(format!("🔧 Select a {}:", category.as_str()))
+                                .components(rows),
+                        ),
+                        None => CreateInteractionResponse::UpdateMessage(
+                            CreateInteractionResponseMessage::new()
+                                .content(render_text_result(&result))
+                                .components(vec![]),
+                        ),
+                    }
+                }
+                _ => CreateInteractionResponse::UpdateMessage(
+                    CreateInteractionResponseMessage::new()
+                        .content(render_text_result(&result))
+                        .components(vec![]),
+                ),
+            }
+        } else {
+            CreateInteractionResponse::UpdateMessage(
                 CreateInteractionResponseMessage::new()
-                    .content(format!("🔧 Select a {category}:"))
-                    .components(rows),
-            ),
-            None => CreateInteractionResponse::UpdateMessage(
-                CreateInteractionResponseMessage::new()
-                    .content(format!("⚠️ No {category} options available."))
+                    .content("⚠️ This configuration menu is no longer valid.")
                     .components(vec![]),
-            ),
+            )
         };
 
-        if let Err(e) = comp.create_response(&ctx.http, response).await {
-            tracing::error!(error = %e, category, "failed to respond to pagination");
+        if comp.create_response(&ctx.http, response).await.is_err() {
+            tracing::error!("failed to respond to config pagination");
         }
     }
 }
@@ -2984,8 +3053,10 @@ fn is_thread_already_exists_error(err: &anyhow::Error) -> bool {
     msg.contains("160004") || msg.contains("already been created")
 }
 
-static ROLE_MENTION_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"<@&\d+>").unwrap());
+static ROLE_MENTION_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"<@&\d+>")
+        .unwrap_or_else(|error| panic!("invalid role mention regex: {error}"))
+});
 
 fn resolve_mentions(content: &str, bot_id: UserId, allowed_role_ids: &HashSet<u64>) -> String {
     // 1. Strip the bot's own trigger mention
@@ -3081,6 +3152,19 @@ fn build_sender_context(
 ///   https://docs.discord.com/developers/resources/channel#channel-object
 /// - Thread Metadata ("thread-specific fields not needed by other channels"):
 ///   https://docs.discord.com/developers/resources/channel#thread-metadata-object
+fn discord_command_surface_allowed(
+    is_dm: bool,
+    allow_dm: bool,
+    in_allowed_channel: bool,
+    in_allowed_thread: bool,
+) -> bool {
+    if is_dm {
+        allow_dm
+    } else {
+        in_allowed_channel || in_allowed_thread
+    }
+}
+
 fn detect_thread(
     has_thread_metadata: bool,
     parent_id: Option<u64>,
@@ -3223,8 +3307,10 @@ fn turn_limit_warning_present(messages: &[(bool, &str)]) -> bool {
 /// Auth CLIs like `codex` emit these for terminal styling, but they render as
 /// garbage in Discord messages.
 fn strip_ansi_codes(s: &str) -> String {
-    static ANSI_RE: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\([A-Z]").unwrap());
+    static ANSI_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\([A-Z]")
+            .unwrap_or_else(|error| panic!("invalid ANSI regex: {error}"))
+    });
     ANSI_RE.replace_all(s, "").into_owned()
 }
 
@@ -3233,8 +3319,10 @@ fn strip_ansi_codes(s: &str) -> String {
 /// node is adjacent to a Text node, causing `accounthttps://...` rendering.
 /// This inserts a newline before any URL that immediately follows a non-whitespace char.
 fn ensure_url_separation(s: &str) -> String {
-    static URL_RE: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(?P<prev>\S)(?P<url>https?://)").unwrap());
+    static URL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?P<prev>\S)(?P<url>https?://)")
+            .unwrap_or_else(|error| panic!("invalid URL separation regex: {error}"))
+    });
     URL_RE.replace_all(s, "${prev}\n${url}").into_owned()
 }
 
@@ -3302,6 +3390,33 @@ mod tests {
         let out = truncate_for_discord(&s, 100);
         assert_eq!(out.chars().count(), 100);
         assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn config_components_keep_current_value_on_initial_page() {
+        let current_value = "value-29";
+        let options = vec![ConfigOption {
+            id: "model".into(),
+            name: "Model".into(),
+            description: None,
+            category: Some("model".into()),
+            option_type: "enum".into(),
+            current_value: current_value.into(),
+            options: (0..30)
+                .map(|index| crate::acp::protocol::ConfigOptionValue {
+                    value: format!("value-{index}"),
+                    name: format!("Model {index}"),
+                    description: None,
+                })
+                .collect(),
+        }];
+        let Some(rows) = Handler::build_config_components(&options, "model", None) else {
+            panic!("model components must be available");
+        };
+        let Ok(serialized) = serde_json::to_string(&rows) else {
+            panic!("model components must serialize");
+        };
+        assert!(serialized.contains(current_value));
     }
 
     // --- format_usage_report tests (/usage slash command) ---
@@ -4411,6 +4526,15 @@ mod tests {
         let allowed = HashSet::from([100]);
         assert!(should_process_dm(true));
         assert!(!is_denied_user(false, false, &allowed, 100));
+    }
+
+    #[test]
+    fn shared_command_scope_matches_discord_dm_channel_and_thread_policy() {
+        assert!(discord_command_surface_allowed(true, true, false, false));
+        assert!(!discord_command_surface_allowed(true, false, true, true));
+        assert!(discord_command_surface_allowed(false, false, true, false));
+        assert!(discord_command_surface_allowed(false, false, false, true));
+        assert!(!discord_command_surface_allowed(false, true, false, false));
     }
 
     /// DMs are treated as implicit @mention — should_process_user_message

@@ -1,9 +1,9 @@
 use crate::acp::ContentBlock;
 use crate::adapter::{
-    AdapterCapabilities, AdapterRouter, ChannelRef, ChatAdapter, MaterializedAttachment,
-    MessageLimit, MessageRef, SenderContext, StatusBackend, StreamingMode, WriteFailure,
-    WriteOutcome, WriteOutcomeKind,
+    AdapterCapabilities, ChannelRef, ChatAdapter, MaterializedAttachment, MessageLimit, MessageRef,
+    SenderContext, StatusBackend, StreamingMode, WriteFailure, WriteOutcome, WriteOutcomeKind,
 };
+use crate::commands::{parse_command, render_text_result, Command, CommandContext, CommandService};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -453,6 +453,64 @@ fn strip_recipient_mention(event: &GatewayEvent) -> String {
         prompt.replace_range(range, "");
     }
     prompt.trim().to_owned()
+}
+
+fn gateway_command_context(event: &GatewayEvent) -> CommandContext {
+    let logical_thread_id = event
+        .channel
+        .thread_id
+        .as_deref()
+        .unwrap_or(&event.channel.id);
+    let response_is_private = event.platform.eq_ignore_ascii_case("teams")
+        && event.scope.as_ref().is_some_and(|scope| {
+            scope.conversation_type == "personal"
+                && scope.is_dm
+                && typed_scope_shape_is_valid(&event.channel.id, &event.channel.channel_type, scope)
+        });
+    CommandContext::new(
+        event.platform.clone(),
+        logical_thread_id.to_string(),
+        response_is_private,
+    )
+}
+
+fn spawn_gateway_command(
+    tasks: &mut tokio::task::JoinSet<()>,
+    command: Command,
+    context: CommandContext,
+    service: CommandService,
+    adapter: Arc<dyn ChatAdapter>,
+    channel: ChannelRef,
+) {
+    tasks.spawn(execute_gateway_command(
+        command, context, service, adapter, channel,
+    ));
+}
+
+async fn execute_gateway_command(
+    command: Command,
+    context: CommandContext,
+    service: CommandService,
+    adapter: Arc<dyn ChatAdapter>,
+    channel: ChannelRef,
+) {
+    let command_name = command.name();
+    let result = service.execute(command, &context).await;
+    let semantic_outcome = result.outcome_class();
+    let content = render_text_result(&result);
+    let write_outcome = adapter.send_message_outcome(&channel, &content).await;
+    let write_outcome = match write_outcome {
+        WriteOutcome::Delivered { .. } => "delivered",
+        WriteOutcome::Rejected { .. } => "rejected",
+        WriteOutcome::Unknown { .. } => "unknown",
+    };
+    tracing::info!(
+        platform = %context.platform,
+        command = command_name.as_str(),
+        semantic_outcome,
+        write_outcome,
+        "gateway command completed"
+    );
 }
 
 #[derive(Serialize)]
@@ -997,162 +1055,6 @@ impl GatewayAdapter {
     }
 }
 
-/// Send a fire-and-forget reply via the shared WebSocket (no request-response).
-/// Used for slash command responses where we don't need message_id back.
-async fn send_fire_and_forget(
-    ws_tx: &SharedWsTx,
-    channel: &ChannelRef,
-    content: &str,
-) -> Result<()> {
-    let reply = GatewayReply {
-        attachment_ref: None,
-        schema: "openab.gateway.reply.v1".into(),
-        reply_to: channel.origin_event_id.clone().unwrap_or_default(),
-        platform: channel.platform.clone(),
-        channel: ReplyChannel {
-            id: channel.channel_id.clone(),
-            thread_id: channel.thread_id.clone(),
-        },
-        content: ReplyContent {
-            content_type: "text".into(),
-            text: content.into(),
-        },
-        command: None,
-        request_id: None,
-        quote_message_id: None,
-        target_message_id: None,
-    };
-    let json = serde_json::to_string(&reply)?;
-    ws_tx.lock().await.send(Message::Text(json)).await?;
-    Ok(())
-}
-
-/// Handle `/models` or `/agents` text commands for gateway platforms.
-/// Returns the response message, or None if the command was not recognized.
-///
-/// Supported syntax:
-///   /model list       — numbered list of available models
-///   /model set <name> — switch by exact name or number
-///   /models           — alias of /model list
-///   /agent list       — numbered list of available agents
-///   /agent set <name> — switch by exact name or number
-///   /agents           — alias of /agent list
-async fn handle_config_command(
-    trimmed: &str,
-    router: &AdapterRouter,
-    thread_key: &str,
-) -> Option<String> {
-    // Parse command: /model <action> <arg> or /models (alias)
-    let (category, label, action, arg) = if trimmed == "/models" {
-        ("model", "model", "list", "")
-    } else if trimmed == "/agents" {
-        ("agent", "agent", "list", "")
-    } else if trimmed.starts_with("/model ") {
-        let rest = trimmed.strip_prefix("/model ").unwrap().trim();
-        let (action, arg) = rest.split_once(' ').unwrap_or((rest, ""));
-        ("model", "model", action, arg.trim())
-    } else if trimmed.starts_with("/agent ") {
-        let rest = trimmed.strip_prefix("/agent ").unwrap().trim();
-        let (action, arg) = rest.split_once(' ').unwrap_or((rest, ""));
-        ("agent", "agent", action, arg.trim())
-    } else if trimmed == "/model" {
-        ("model", "model", "list", "")
-    } else if trimmed == "/agent" {
-        ("agent", "agent", "list", "")
-    } else {
-        return None;
-    };
-
-    // Support both "agent" and "mode" categories (kiro-cli vs cursor-agent)
-    let categories: &[&str] = if category == "agent" {
-        &["agent", "mode"]
-    } else {
-        &[category]
-    };
-
-    let options = router.pool().get_config_options(thread_key).await;
-    let filtered: Vec<_> = options
-        .iter()
-        .filter(|o| {
-            o.category
-                .as_deref()
-                .is_some_and(|c| categories.contains(&c))
-        })
-        .collect();
-
-    if filtered.is_empty() {
-        return Some(format!(
-            "⚠️ No {label} options available. Start a conversation first."
-        ));
-    }
-
-    // Collect all values with index for numbered list / set-by-number
-    let mut all_values: Vec<(String, String, String, bool)> = Vec::new(); // (config_id, value, name, is_current)
-    for opt in &filtered {
-        for v in &opt.options {
-            all_values.push((
-                opt.id.clone(),
-                v.value.clone(),
-                v.name.clone(),
-                v.value == opt.current_value,
-            ));
-        }
-    }
-
-    match action {
-        "list" => {
-            let mut lines = vec![format!("🔧 Available {label}s:")];
-            for (i, (_, _, name, is_current)) in all_values.iter().enumerate() {
-                let marker = if *is_current { " ✅" } else { "" };
-                lines.push(format!("  {}. {}{}", i + 1, name, marker));
-            }
-            lines.push(format!("\nUsage: /{label} set <number or name>"));
-            Some(lines.join("\n"))
-        }
-        "set" => {
-            if arg.is_empty() {
-                return Some(format!("Usage: /{label} set <number or name>"));
-            }
-            // Try number first
-            if let Ok(num) = arg.parse::<usize>() {
-                if num >= 1 && num <= all_values.len() {
-                    let (ref config_id, ref value, ref name, _) = all_values[num - 1];
-                    return match router
-                        .pool()
-                        .set_config_option(thread_key, config_id, value)
-                        .await
-                    {
-                        Ok(_) => Some(format!("✅ Switched to **{name}**")),
-                        Err(e) => Some(format!("❌ Failed to switch: {e}")),
-                    };
-                } else {
-                    return Some(format!("⚠️ Invalid number. Use 1–{}.", all_values.len()));
-                }
-            }
-            // Exact match on value or name
-            let arg_lower = arg.to_lowercase();
-            for (config_id, value, name, _) in &all_values {
-                if value.to_lowercase() == arg_lower || name.to_lowercase() == arg_lower {
-                    return match router
-                        .pool()
-                        .set_config_option(thread_key, config_id, value)
-                        .await
-                    {
-                        Ok(_) => Some(format!("✅ Switched to **{name}**")),
-                        Err(e) => Some(format!("❌ Failed to switch: {e}")),
-                    };
-                }
-            }
-            Some(format!(
-                "⚠️ No {label} matching \"{arg}\". Use /{label} list to see options."
-            ))
-        }
-        _ => Some(format!(
-            "Unknown action \"{action}\". Usage: /{label} list | /{label} set <name>"
-        )),
-    }
-}
-
 #[async_trait]
 impl ChatAdapter for GatewayAdapter {
     fn platform(&self) -> &'static str {
@@ -1662,7 +1564,6 @@ pub async fn run_gateway_adapter(
                 gateway_ack_timeout_secs,
             },
         ));
-        let slash_ws_tx = ws_tx.clone(); // for fire-and-forget slash command responses
         let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
         // Hoist filter params outside loop — all fields are loop-invariant.
@@ -1796,13 +1697,6 @@ pub async fn run_gateway_adapter(
 
                                     let prompt = strip_recipient_mention(&event);
 
-                                    info!(
-                                        platform = %event.platform,
-                                        sender = %event.sender.name,
-                                        channel = %redact_channel(&event.channel.id),
-                                        "gateway event received"
-                                    );
-
                                     let channel = ChannelRef {
                                         platform: event.platform.clone(),
                                         channel_id: event.channel.id.clone(),
@@ -1810,6 +1704,30 @@ pub async fn run_gateway_adapter(
                                         parent_id: None,
                                         origin_event_id: Some(event.event_id.clone()),
                                     };
+
+                                    if let Some(command) = parse_command(&prompt) {
+                                        let context = gateway_command_context(&event);
+                                        let service = CommandService::new(
+                                            router.pool().clone(),
+                                            dispatcher.clone(),
+                                        );
+                                        spawn_gateway_command(
+                                            &mut tasks,
+                                            command,
+                                            context,
+                                            service,
+                                            adapter.clone(),
+                                            channel,
+                                        );
+                                        continue;
+                                    }
+
+                                    info!(
+                                        platform = %event.platform,
+                                        sender = %event.sender.name,
+                                        channel = %redact_channel(&event.channel.id),
+                                        "gateway event received"
+                                    );
 
                                     let sender_ctx = SenderContext {
                                         schema: "openab.sender.v1".into(),
@@ -2001,41 +1919,6 @@ pub async fn run_gateway_adapter(
                                         continue;
                                     }
 
-                                    // Slash command interception for gateway platforms
-                                    // (Feishu/LINE/Telegram don't have native slash commands)
-                                    // Use fire-and-forget send — slash command responses don't
-                                    // need message_id for streaming edits.
-                                    let trimmed = prompt.trim();
-                                    if trimmed == "/reset" {
-                                        let thread_id_str = event.channel.thread_id.as_deref().unwrap_or(&event.channel.id);
-                                        let thread_key = format!("{}:{}", event.platform, thread_id_str);
-                                        let dropped = dispatcher.cancel_buffered_thread(event.platform.as_str(), thread_id_str);
-                                        let msg = match (router.pool().reset_session(&thread_key).await, dropped) {
-                                            (Ok(()), 0) => "🔄 Session reset. Start a new conversation!".to_string(),
-                                            (Ok(()), n) => format!("🔄 Session reset. Dropped {n} buffered message(s). Start a new conversation!"),
-                                            (Err(_), 0) => "⚠️ No active session to reset.".to_string(),
-                                            (Err(_), n) => format!("🔄 Dropped {n} buffered message(s). No active session to reset."),
-                                        };
-                                        let _ = send_fire_and_forget(&slash_ws_tx, &channel, &msg).await;
-                                        continue;
-                                    }
-                                    if trimmed == "/cancel" {
-                                        let thread_key = format!("{}:{}", event.platform, event.channel.thread_id.as_deref().unwrap_or(&event.channel.id));
-                                        let msg = match router.pool().cancel_session(&thread_key).await {
-                                            Ok(()) => "🛑 Cancel signal sent.".to_string(),
-                                            Err(e) => format!("⚠️ {e}"),
-                                        };
-                                        let _ = send_fire_and_forget(&slash_ws_tx, &channel, &msg).await;
-                                        continue;
-                                    }
-                                    {
-                                        let thread_key = format!("{}:{}", event.platform, event.channel.thread_id.as_deref().unwrap_or(&event.channel.id));
-                                        if let Some(msg) = handle_config_command(trimmed, &router, &thread_key).await {
-                                            let _ = send_fire_and_forget(&slash_ws_tx, &channel, &msg).await;
-                                            continue;
-                                        }
-                                    }
-
                                     tasks.spawn(async move {
                                         // If supergroup with no thread_id, create a forum topic
                                         let thread_channel = if event.channel.channel_type == "supergroup"
@@ -2165,7 +2048,9 @@ const ECHO_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
 /// Returns true if an echo to `key` is allowed now (and records the timestamp).
 fn echo_allowed(key: &str) -> bool {
     let now = std::time::Instant::now();
-    let mut map = ECHO_THROTTLE.lock().unwrap();
+    let mut map = ECHO_THROTTLE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     match map.get(key) {
         Some(prev) if now.duration_since(*prev) < ECHO_WINDOW => false,
         _ => {
@@ -2317,13 +2202,6 @@ pub async fn process_gateway_event(
 
     let prompt = strip_recipient_mention(&event);
 
-    tracing::info!(
-        platform = %event.platform,
-        sender = %event.sender.name,
-        channel = %redact_channel(&event.channel.id),
-        "gateway event received (unified)"
-    );
-
     let channel = ChannelRef {
         platform: event.platform.clone(),
         channel_id: event.channel.id.clone(),
@@ -2331,6 +2209,20 @@ pub async fn process_gateway_event(
         parent_id: None,
         origin_event_id: Some(event.event_id.clone()),
     };
+
+    if let Some(command) = parse_command(&prompt) {
+        let context = gateway_command_context(&event);
+        let service = CommandService::new(ctx.router.pool().clone(), ctx.dispatcher.clone());
+        execute_gateway_command(command, context, service, ctx.adapter.clone(), channel).await;
+        return Ok(false);
+    }
+
+    tracing::info!(
+        platform = %event.platform,
+        sender = %event.sender.name,
+        channel = %redact_channel(&event.channel.id),
+        "gateway event received (unified)"
+    );
 
     let sender_ctx = SenderContext {
         schema: "openab.sender.v1".into(),
@@ -2570,38 +2462,6 @@ pub async fn process_gateway_event(
         return Ok(false);
     }
 
-    // Slash command interception
-    let trimmed = prompt.trim();
-    if trimmed == "/reset" {
-        let thread_id_str = event.channel.thread_id.as_deref().unwrap_or(&event.channel.id);
-        let thread_key = format!("{}:{}", event.platform, thread_id_str);
-        let dropped = ctx.dispatcher.cancel_buffered_thread(event.platform.as_str(), thread_id_str);
-        let msg = match (ctx.router.pool().reset_session(&thread_key).await, dropped) {
-            (Ok(()), 0) => "🔄 Session reset. Start a new conversation!".to_string(),
-            (Ok(()), n) => format!("🔄 Session reset. Dropped {n} buffered message(s). Start a new conversation!"),
-            (Err(_), 0) => "⚠️ No active session to reset.".to_string(),
-            (Err(_), n) => format!("🔄 Dropped {n} buffered message(s). No active session to reset."),
-        };
-        let _ = ctx.adapter.send_message(&channel, &msg).await;
-        return Ok(false);
-    }
-    if trimmed == "/cancel" {
-        let thread_key = format!("{}:{}", event.platform, event.channel.thread_id.as_deref().unwrap_or(&event.channel.id));
-        let msg = match ctx.router.pool().cancel_session(&thread_key).await {
-            Ok(()) => "🛑 Cancel signal sent.".to_string(),
-            Err(e) => format!("⚠️ {e}"),
-        };
-        let _ = ctx.adapter.send_message(&channel, &msg).await;
-        return Ok(false);
-    }
-    {
-        let thread_key = format!("{}:{}", event.platform, event.channel.thread_id.as_deref().unwrap_or(&event.channel.id));
-        if let Some(msg) = handle_config_command(trimmed, &ctx.router, &thread_key).await {
-            let _ = ctx.adapter.send_message(&channel, &msg).await;
-            return Ok(false);
-        }
-    }
-
     // Submit to dispatcher
     let adapter = ctx.adapter.clone();
     let dispatcher = ctx.dispatcher.clone();
@@ -2670,13 +2530,25 @@ fn format_size(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::AdapterRouter;
+    use crate::commands::CommandName;
     use async_trait::async_trait;
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[derive(Default)]
     struct AttachmentProbeAdapter {
         materializations: AtomicUsize,
         sends: AtomicUsize,
+        messages: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl AttachmentProbeAdapter {
+        fn messages(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
+            self.messages
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
     }
 
     #[async_trait]
@@ -2716,12 +2588,129 @@ mod tests {
             })
         }
 
-        async fn send_message(&self, channel: &ChannelRef, _content: &str) -> Result<MessageRef> {
+        async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
             self.sends.fetch_add(1, Ordering::SeqCst);
+            self.messages().push(content.to_string());
             Ok(MessageRef {
                 channel: channel.clone(),
                 message_id: "echo".into(),
             })
+        }
+
+        async fn create_thread(
+            &self,
+            channel: &ChannelRef,
+            _trigger_msg: &MessageRef,
+            _title: &str,
+        ) -> Result<ChannelRef> {
+            Ok(channel.clone())
+        }
+
+        async fn add_reaction(&self, _msg: &MessageRef, _emoji: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn remove_reaction(&self, _msg: &MessageRef, _emoji: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct OutcomeProbeAdapter {
+        sends: AtomicUsize,
+        outcome: WriteOutcome,
+    }
+
+    #[async_trait]
+    impl ChatAdapter for OutcomeProbeAdapter {
+        fn platform(&self) -> &'static str {
+            "probe"
+        }
+
+        fn message_limit(&self) -> usize {
+            4_096
+        }
+
+        fn use_streaming(&self, _other_bot_present: bool) -> bool {
+            false
+        }
+
+        async fn send_message(&self, _channel: &ChannelRef, _content: &str) -> Result<MessageRef> {
+            anyhow::bail!("send_message_outcome override must be used")
+        }
+
+        async fn send_message_outcome(
+            &self,
+            _channel: &ChannelRef,
+            _content: &str,
+        ) -> WriteOutcome {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            self.outcome.clone()
+        }
+
+        async fn create_thread(
+            &self,
+            channel: &ChannelRef,
+            _trigger_msg: &MessageRef,
+            _title: &str,
+        ) -> Result<ChannelRef> {
+            Ok(channel.clone())
+        }
+
+        async fn add_reaction(&self, _msg: &MessageRef, _emoji: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn remove_reaction(&self, _msg: &MessageRef, _emoji: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct BlockingOutcomeAdapter {
+        sends: AtomicUsize,
+        started: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl Default for BlockingOutcomeAdapter {
+        fn default() -> Self {
+            Self {
+                sends: AtomicUsize::new(0),
+                started: tokio::sync::Semaphore::new(0),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ChatAdapter for BlockingOutcomeAdapter {
+        fn platform(&self) -> &'static str {
+            "probe"
+        }
+
+        fn message_limit(&self) -> usize {
+            4_096
+        }
+
+        fn use_streaming(&self, _other_bot_present: bool) -> bool {
+            false
+        }
+
+        async fn send_message(&self, _channel: &ChannelRef, _content: &str) -> Result<MessageRef> {
+            anyhow::bail!("send_message_outcome override must be used")
+        }
+
+        async fn send_message_outcome(
+            &self,
+            _channel: &ChannelRef,
+            _content: &str,
+        ) -> WriteOutcome {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            self.started.add_permits(1);
+            let permit = self.release.acquire().await.expect("semaphore open");
+            permit.forget();
+            WriteOutcome::Delivered {
+                message_id: Some("message".into()),
+            }
         }
 
         async fn create_thread(
@@ -2790,6 +2779,171 @@ mod tests {
         .to_string()
     }
 
+    fn trusted_probe_context(probe: Arc<dyn ChatAdapter>) -> GatewayEventContext {
+        let router = Arc::new(teams_router(vec!["trusted-user".into()]));
+        let dispatcher = Arc::new(crate::dispatch::Dispatcher::with_idle_timeout(
+            router.clone(),
+            1,
+            24_000,
+            crate::dispatch::BatchGrouping::Thread,
+            std::time::Duration::from_secs(60),
+        ));
+        GatewayEventContext {
+            adapter: probe,
+            dispatcher,
+            router,
+            allow_bot_messages: false,
+            trusted_bot_ids: HashSet::new(),
+            bot_username: None,
+            stt_config: crate::config::SttConfig::default(),
+            teams_scope_policy: TeamsScopePolicy::default(),
+            teams_inbound_attachments: true,
+            #[cfg(feature = "filestore")]
+            filestore: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn recognized_command_precedes_attachment_materialization() -> anyhow::Result<()> {
+        let probe = Arc::new(AttachmentProbeAdapter::default());
+        let context = trusted_probe_context(probe.clone());
+        let mut event: serde_json::Value =
+            serde_json::from_str(&attachment_event_json("trusted-user"))?;
+        event["content"]["text"] = "/cancel".into();
+
+        assert!(!process_gateway_event(&event.to_string(), &context).await?);
+        assert_eq!(probe.materializations.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.sends.load(Ordering::SeqCst), 1);
+        assert!(probe.messages()[0].contains("Nothing to cancel"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn teams_usage_requires_typed_personal_privacy_proof() -> anyhow::Result<()> {
+        let personal_probe = Arc::new(AttachmentProbeAdapter::default());
+        let personal_context = trusted_probe_context(personal_probe.clone());
+        let mut personal: serde_json::Value =
+            serde_json::from_str(&attachment_event_json("trusted-user"))?;
+        personal["content"]["text"] = "/usage".into();
+        personal["content"]["attachments"] = serde_json::json!([]);
+        assert!(!process_gateway_event(&personal.to_string(), &personal_context).await?);
+        assert!(personal_probe.messages()[0].contains("No active session"));
+
+        let legacy_probe = Arc::new(AttachmentProbeAdapter::default());
+        let legacy_context = trusted_probe_context(legacy_probe.clone());
+        let mut legacy = personal;
+        legacy["channel"]["id"] = "legacy-conversation".into();
+        legacy["scope"] = serde_json::Value::Null;
+        assert!(!process_gateway_event(&legacy.to_string(), &legacy_context).await?);
+        assert!(legacy_probe.messages()[0].contains("only available in a private chat"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn authenticated_teams_mention_enables_command_before_attachment() -> anyhow::Result<()> {
+        let probe = Arc::new(AttachmentProbeAdapter::default());
+        let context = trusted_probe_context(probe.clone());
+        let mut event: serde_json::Value =
+            serde_json::from_str(&attachment_event_json("trusted-user"))?;
+        event["channel"]["type"] = "groupChat".into();
+        event["scope"]["conversation_type"] = "groupChat".into();
+        event["scope"]["trust_scope_id"] = "teams:tenant-1:groupChat:conversation-1".into();
+        event["scope"]["is_dm"] = false.into();
+        event["recipient"] = serde_json::json!({"id": "bot-id", "name": "OpenAB"});
+        event["mentions"] = serde_json::json!(["bot-id"]);
+        event["mention_entities"] =
+            serde_json::json!([{"id": "bot-id", "text": "<at>OpenAB</at>"}]);
+        event["content"]["text"] = "<at>OpenAB</at> /cancel".into();
+
+        assert!(!process_gateway_event(&event.to_string(), &context).await?);
+        assert_eq!(probe.materializations.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.sends.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn command_delivery_attempts_each_terminal_outcome_once() {
+        for outcome in [
+            WriteOutcome::Delivered {
+                message_id: Some("message".into()),
+            },
+            WriteOutcome::Rejected {
+                code: "rejected".into(),
+                message: "rejected".into(),
+                retry_after_ms: None,
+            },
+            WriteOutcome::Unknown {
+                code: "timeout".into(),
+                message: "unknown".into(),
+            },
+        ] {
+            let probe = Arc::new(OutcomeProbeAdapter {
+                sends: AtomicUsize::new(0),
+                outcome,
+            });
+            let context = trusted_probe_context(probe.clone());
+            let service = CommandService::new(context.router.pool().clone(), context.dispatcher);
+            execute_gateway_command(
+                Command::InvalidArguments {
+                    name: CommandName::Reset,
+                },
+                CommandContext::new("teams", "conversation-1", true),
+                service,
+                probe.clone(),
+                ChannelRef {
+                    platform: "teams".into(),
+                    channel_id: "conversation-1".into(),
+                    thread_id: None,
+                    parent_id: None,
+                    origin_event_id: Some("event".into()),
+                },
+            )
+            .await;
+            assert_eq!(probe.sends.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_command_task_does_not_block_ack_dispatch() {
+        let probe = Arc::new(BlockingOutcomeAdapter::default());
+        let context = trusted_probe_context(probe.clone());
+        let service = CommandService::new(context.router.pool().clone(), context.dispatcher);
+        let mut tasks = tokio::task::JoinSet::new();
+        spawn_gateway_command(
+            &mut tasks,
+            Command::InvalidArguments {
+                name: CommandName::Cancel,
+            },
+            CommandContext::new("teams", "conversation-1", true),
+            service,
+            probe.clone(),
+            ChannelRef {
+                platform: "teams".into(),
+                channel_id: "conversation-1".into(),
+                thread_id: None,
+                parent_id: None,
+                origin_event_id: Some("event".into()),
+            },
+        );
+
+        let started = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            probe.started.acquire(),
+        )
+        .await
+        .expect("spawned command reached delivery")
+        .expect("semaphore open");
+        started.forget();
+        assert_eq!(tasks.len(), 1);
+        probe.release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_millis(100), tasks.join_next())
+            .await
+            .expect("command task completed")
+            .expect("command task present")
+            .expect("command task succeeded");
+        assert_eq!(probe.sends.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn identity_denial_precedes_attachment_materialization() -> anyhow::Result<()> {
         let pool = Arc::new(crate::acp::SessionPool::new(
@@ -2814,10 +2968,7 @@ mod tests {
             crate::dispatch::BatchGrouping::Thread,
             std::time::Duration::from_secs(1),
         ));
-        let probe = Arc::new(AttachmentProbeAdapter {
-            materializations: AtomicUsize::new(0),
-            sends: AtomicUsize::new(0),
-        });
+        let probe = Arc::new(AttachmentProbeAdapter::default());
         let adapter: Arc<dyn ChatAdapter> = probe.clone();
         let context = GatewayEventContext {
             adapter,
@@ -2849,10 +3000,7 @@ mod tests {
             crate::dispatch::BatchGrouping::Thread,
             std::time::Duration::from_secs(60),
         ));
-        let probe = Arc::new(AttachmentProbeAdapter {
-            materializations: AtomicUsize::new(0),
-            sends: AtomicUsize::new(0),
-        });
+        let probe = Arc::new(AttachmentProbeAdapter::default());
         let mut context = GatewayEventContext {
             adapter: probe.clone(),
             dispatcher,
@@ -3106,15 +3254,16 @@ mod tests {
 
     #[test]
     fn legacy_and_structured_gateway_responses_map_to_write_outcomes() {
-        let legacy: GatewayResponse = serde_json::from_value(serde_json::json!({
+        let Ok(legacy): Result<GatewayResponse, _> = serde_json::from_value(serde_json::json!({
             "schema": "openab.gateway.response.v1",
             "request_id": "req-legacy",
             "success": true,
             "thread_id": null,
             "message_id": "activity-1",
             "error": null
-        }))
-        .unwrap();
+        })) else {
+            panic!("legacy response fixture must decode");
+        };
         assert_eq!(
             legacy.write_outcome(),
             WriteOutcome::Delivered {
@@ -3122,7 +3271,7 @@ mod tests {
             }
         );
 
-        let unknown: GatewayResponse = serde_json::from_value(serde_json::json!({
+        let Ok(unknown): Result<GatewayResponse, _> = serde_json::from_value(serde_json::json!({
             "schema": "openab.gateway.response.v1",
             "request_id": "req-new",
             "success": false,
@@ -3131,8 +3280,9 @@ mod tests {
             "error": "delivery may have completed",
             "outcome": "unknown",
             "error_code": "request_timeout"
-        }))
-        .unwrap();
+        })) else {
+            panic!("structured response fixture must decode");
+        };
         assert_eq!(
             unknown.write_outcome(),
             WriteOutcome::Unknown {
@@ -3175,7 +3325,9 @@ mod tests {
 
     #[test]
     fn client_hello_wire_shape_is_additive_and_versioned() {
-        let value = serde_json::to_value(build_client_hello()).unwrap();
+        let Ok(value) = serde_json::to_value(build_client_hello()) else {
+            panic!("client hello fixture must encode");
+        };
         assert_eq!(value["schema"], CLIENT_HELLO_SCHEMA);
         assert_eq!(value["protocol_version"], GATEWAY_PROTOCOL_VERSION);
         assert!(value["client_name"]
@@ -3251,7 +3403,7 @@ mod tests {
     }
 
     fn make_event(is_bot: bool, sender_id: &str, channel_id: &str, channel_type: &str, thread_id: Option<&str>, mentions: Vec<&str>) -> GatewayEvent {
-        serde_json::from_value(serde_json::json!({
+        match serde_json::from_value(serde_json::json!({
             "schema": "openab.gateway.event.v1",
             "event_id": "evt1",
             "timestamp": "",
@@ -3261,7 +3413,10 @@ mod tests {
             "content": { "type": "text", "text": "hello" },
             "mentions": mentions,
             "message_id": "msg1"
-        })).unwrap()
+        })) {
+            Ok(event) => event,
+            Err(_) => panic!("gateway event fixture must decode"),
+        }
     }
 
     fn make_teams_event(conversation_type: &str, is_dm: bool, mentions: Vec<&str>) -> GatewayEvent {

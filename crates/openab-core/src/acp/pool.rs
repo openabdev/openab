@@ -393,6 +393,24 @@ impl SessionPool {
         false
     }
 
+    /// Whether a live in-process ACP connection exists without resuming or
+    /// creating session state. Control commands use this to avoid turning a
+    /// read-only query into implicit session activation.
+    pub async fn has_live_session(&self, thread_id: &str) -> bool {
+        let connection = {
+            let state = self.state.read().await;
+            state.active.get(thread_id).cloned()
+        };
+        let Some(connection) = connection else {
+            return false;
+        };
+        let live = match connection.try_lock() {
+            Ok(connection) => connection.alive(),
+            Err(_) => true,
+        };
+        live
+    }
+
     pub async fn get_or_create(
         &self,
         thread_id: &str,
@@ -597,7 +615,7 @@ impl SessionPool {
             // Apply default config options (e.g. mode=bypass, model=swe-1-6)
             for (config_id, value) in &self.default_config_options {
                 if let Err(e) = new_conn.set_config_option(config_id, value).await {
-                    warn!(config_id, value, error = %e, "failed to set default config option");
+                    warn!(error = %e, "failed to set default config option");
                 }
             }
 
@@ -769,6 +787,27 @@ impl SessionPool {
         conn.set_config_option(config_id, value).await
     }
 
+    /// Command-only config mutation. Unlike the compatibility method above,
+    /// this never falls back to `session/prompt`.
+    pub async fn set_config_option_strict(
+        &self,
+        thread_id: &str,
+        config_id: &str,
+        value: &str,
+    ) -> Result<Vec<ConfigOption>> {
+        let conn = {
+            let state = self.state.read().await;
+            state.active.get(thread_id).cloned().ok_or_else(|| {
+                anyhow!(
+                    "no connection for thread {}",
+                    crate::redact::redact_session_ids(thread_id)
+                )
+            })?
+        };
+        let mut conn = conn.lock().await;
+        conn.set_config_option_strict(config_id, value).await
+    }
+
     /// Query account-level usage/billing from the backend agent for a session
     /// (kiro-cli extension). Fails when there is no active session for the
     /// thread or the backend does not support usage queries.
@@ -801,12 +840,17 @@ impl SessionPool {
             "method": "session/cancel",
             "params": {"sessionId": session_id}
         }))?;
-        tracing::info!(session_id = %crate::redact::redact_session_ids(&session_id), "sending session/cancel");
+        tracing::info!("sending session/cancel");
         use tokio::io::AsyncWriteExt;
-        let mut w = stdin.lock().await;
-        w.write_all(data.as_bytes()).await?;
-        w.write_all(b"\n").await?;
-        w.flush().await?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut writer = stdin.lock().await;
+            writer.write_all(data.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|_| anyhow!("session/cancel write timed out"))??;
         Ok(())
     }
 
@@ -827,12 +871,16 @@ impl SessionPool {
                 "method": "session/cancel",
                 "params": {"sessionId": session_id}
             }))?;
-            tracing::info!(session_id = %crate::redact::redact_session_ids(&session_id), "reset: sending session/cancel");
+            tracing::info!("reset: sending session/cancel");
             use tokio::io::AsyncWriteExt;
-            let mut w = stdin.lock().await;
-            let _ = w.write_all(data.as_bytes()).await;
-            let _ = w.write_all(b"\n").await;
-            let _ = w.flush().await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                let mut writer = stdin.lock().await;
+                writer.write_all(data.as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+                writer.flush().await?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await;
         }
 
         let mut state = self.state.write().await;
@@ -849,7 +897,7 @@ impl SessionPool {
         self.save_mapping(&state.persisted);
         self.save_meta(&state.session_workdirs);
         if had_active {
-            info!(thread_id = %crate::redact::redact_session_ids(thread_id), "session reset");
+            info!("session reset");
             Ok(())
         } else {
             Err(anyhow!("no session for thread {}", crate::redact::redact_session_ids(thread_id)))
@@ -1040,19 +1088,35 @@ mod tests {
 
     #[cfg(feature = "acp-mcp")]
     impl CountingRegistrar {
+        fn minted(&self) -> Vec<String> {
+            self.minted
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
         fn revoked(&self) -> Vec<String> {
-            self.revoked.lock().unwrap().clone()
+            self.revoked
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
         }
     }
 
     #[cfg(feature = "acp-mcp")]
     impl crate::acp_mcp::SessionTokenRegistrar for CountingRegistrar {
         fn mint(&self, channel_id: &str) -> String {
-            self.minted.lock().unwrap().push(channel_id.to_string());
+            self.minted
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(channel_id.to_string());
             "token-xyz".to_string()
         }
         fn revoke(&self, token: &str) {
-            self.revoked.lock().unwrap().push(token.to_string());
+            self.revoked
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(token.to_string());
         }
     }
 
@@ -1070,6 +1134,24 @@ mod tests {
             creating: HashMap::new(),
             session_workdirs: HashMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn persisted_state_is_not_a_live_session_for_read_only_commands() {
+        let pool = super::SessionPool::new(
+            crate::config::AgentConfig::default(),
+            1,
+            900,
+            HashMap::new(),
+        );
+        pool.state
+            .write()
+            .await
+            .persisted
+            .insert("teams:persisted-only".into(), "session".into());
+
+        assert!(pool.has_active_session("teams:persisted-only").await);
+        assert!(!pool.has_live_session("teams:persisted-only").await);
     }
 
     /// F3: replacing a hung predecessor's token revokes the predecessor's EXACT token and leaves
@@ -1126,7 +1208,9 @@ mod tests {
     #[cfg(feature = "acp-mcp")]
     #[tokio::test]
     async fn no_token_is_minted_when_the_facade_config_write_fails() {
-        let dir = tempfile::tempdir().unwrap();
+        let Ok(dir) = tempfile::tempdir() else {
+            panic!("temporary directory must be available");
+        };
         // Make `<workdir>/.openab` a FILE, so `create_dir_all` inside the writer fails.
         //
         // This used to block on `.cursor`, which openab no longer creates: since D-15 it authors
@@ -1134,21 +1218,20 @@ mod tests {
         // `.cursor` the write would SUCCEED, the test would fail, and — worse if it had been
         // written the other way round — a test asserting "no mint on failure" would have been
         // passing against a call that never failed.
-        std::fs::write(dir.path().join(".openab"), b"not a directory").unwrap();
+        assert!(std::fs::write(dir.path().join(".openab"), b"not a directory").is_ok());
 
         let counting = Arc::new(CountingRegistrar::default());
         let registrar: Arc<dyn crate::acp_mcp::SessionTokenRegistrar> = counting.clone();
-        let token = super::setup_facade_session(
-            dir.path().to_str().unwrap(),
-            "http://127.0.0.1:8848/mcp",
-            "acp_x",
-            &registrar,
-        )
-        .await;
+        let Some(workdir) = dir.path().to_str() else {
+            panic!("temporary path must be UTF-8");
+        };
+        let token =
+            super::setup_facade_session(workdir, "http://127.0.0.1:8848/mcp", "acp_x", &registrar)
+                .await;
 
         assert!(token.is_none(), "a failed config write must yield no token");
         assert!(
-            counting.minted.lock().unwrap().is_empty(),
+            counting.minted().is_empty(),
             "the registrar must never be asked to mint when the config could not be written"
         );
     }
@@ -1157,19 +1240,20 @@ mod tests {
     #[cfg(feature = "acp-mcp")]
     #[tokio::test]
     async fn a_successful_facade_config_write_mints_one_token() {
-        let dir = tempfile::tempdir().unwrap();
+        let Ok(dir) = tempfile::tempdir() else {
+            panic!("temporary directory must be available");
+        };
         let counting = Arc::new(CountingRegistrar::default());
         let registrar: Arc<dyn crate::acp_mcp::SessionTokenRegistrar> = counting.clone();
-        let token = super::setup_facade_session(
-            dir.path().to_str().unwrap(),
-            "http://127.0.0.1:8848/mcp",
-            "acp_x",
-            &registrar,
-        )
-        .await;
+        let Some(workdir) = dir.path().to_str() else {
+            panic!("temporary path must be UTF-8");
+        };
+        let token =
+            super::setup_facade_session(workdir, "http://127.0.0.1:8848/mcp", "acp_x", &registrar)
+                .await;
 
         assert_eq!(token.as_deref(), Some("token-xyz"));
-        assert_eq!(counting.minted.lock().unwrap().as_slice(), ["acp_x"]);
+        assert_eq!(counting.minted(), ["acp_x"]);
     }
 
     #[test]
@@ -1294,7 +1378,10 @@ mod tests {
         struct Cap(StdArc<StdMutex<Vec<u8>>>);
         impl Write for Cap {
             fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
+                self.0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .extend_from_slice(b);
                 Ok(b.len())
             }
             fn flush(&mut self) -> std::io::Result<()> {
@@ -1318,7 +1405,13 @@ mod tests {
             );
         });
 
-        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        let bytes = buf
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Ok(out) = String::from_utf8(bytes) else {
+            panic!("captured tracing output must be UTF-8");
+        };
         assert!(out.contains("force-evicting hung session"), "the warning must fire: {out}");
         assert!(!out.contains(uuid), "no raw uuid may reach the log: {out}");
         assert!(!out.contains("acp_") && !out.contains("sess_"), "no raw id prefix either: {out}");

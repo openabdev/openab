@@ -113,7 +113,30 @@ Create a directory with three files:
       "botId": "<YOUR_TEAMS_APP_ID>",
       "scopes": ["personal", "team", "groupChat"],
       "isNotificationOnly": false,
-      "supportsFiles": false
+      "supportsFiles": false,
+      "commandLists": [
+        {
+          "scopes": ["personal"],
+          "commands": [
+            {"title": "/models", "description": "List the available AI models for the current session."},
+            {"title": "/agents", "description": "List the available agent modes for the current session."},
+            {"title": "/cancel", "description": "Cancel the current in-flight operation."},
+            {"title": "/cancel-all", "description": "Cancel the operation and clear buffered messages in this conversation."},
+            {"title": "/reset", "description": "Reset the conversation session and clear buffered messages."},
+            {"title": "/usage", "description": "Show private backend account usage for the current session."}
+          ]
+        },
+        {
+          "scopes": ["team", "groupChat"],
+          "commands": [
+            {"title": "/models", "description": "List the available AI models for the current session."},
+            {"title": "/agents", "description": "List the available agent modes for the current session."},
+            {"title": "/cancel", "description": "Cancel the current in-flight operation."},
+            {"title": "/cancel-all", "description": "Cancel the operation and clear buffered messages in this conversation."},
+            {"title": "/reset", "description": "Reset the conversation session and clear buffered messages."}
+          ]
+        }
+      ]
     }
   ],
   "validDomains": []
@@ -127,6 +150,15 @@ Create a directory with three files:
   files, create a separate reviewed manifest package with `supportsFiles: true`;
   Microsoft file consent is Personal-only and does not enable group-chat or
   channel files without Graph.
+- `commandLists` only adds discovery. Teams submits the selected title as an
+  ordinary message, so OpenAB's typed scope, identity, and structured mention
+  gates remain authoritative. `/usage` is Personal-only because group/channel
+  replies are not ephemeral.
+- Do not add `supportsTargetedMessages`, command `triggers`, Graph/RSC, delegated
+  permissions, or Adaptive Card permissions for this profile. App-package
+  installation or upgrade remains an explicit operator action.
+- The schema-validated source is
+  [`platforms/examples/teams-manifest-v1.25.json`](platforms/examples/teams-manifest-v1.25.json).
 
 ### Icons
 

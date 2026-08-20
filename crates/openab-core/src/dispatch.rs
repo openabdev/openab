@@ -286,17 +286,31 @@ impl Dispatcher {
 
     /// Build the dispatcher key for a (platform, thread, sender) tuple.
     ///
+    /// Every segment is byte-length-prefixed because native IDs (notably Teams
+    /// conversation IDs) may contain `:`. A delimiter-only key can alias
+    /// `(thread = "a", sender = "b:c")` with `(thread = "a:b", sender = "c")`,
+    /// causing cross-thread buffering or cancellation.
+    ///
     /// In `Thread` mode the sender is ignored; in `Lane` mode the sender is appended
     /// so each (thread, sender) pair gets its own mpsc and consumer.
     ///
     /// Note: this is the *dispatcher* key, not the *session pool* key. Session pool keys
-    /// are always `<platform>:<thread_id>` regardless of grouping (the ACP session is
+    /// remain `<platform>:<thread_id>` regardless of grouping (the ACP session is
     /// shared per-thread by design).
     pub fn key(&self, platform: &str, thread_id: &str, sender_id: &str) -> String {
+        let base = Self::thread_key_prefix(platform, thread_id);
         match self.grouping {
-            BatchGrouping::Thread => format!("{platform}:{thread_id}"),
-            BatchGrouping::Lane => format!("{platform}:{thread_id}:{sender_id}"),
+            BatchGrouping::Thread => base,
+            BatchGrouping::Lane => format!("{base}{}:{sender_id}", sender_id.len()),
         }
+    }
+
+    fn thread_key_prefix(platform: &str, thread_id: &str) -> String {
+        format!(
+            "{}:{platform}{}:{thread_id}",
+            platform.len(),
+            thread_id.len()
+        )
     }
 
     /// Build the shared session pool key for a routed channel.
@@ -340,7 +354,10 @@ impl Dispatcher {
 
         let (tx, my_generation) = {
             // SAFETY: no .await while this guard is held — guard drops at end of block.
-            let mut map = self.per_thread.lock().unwrap();
+            let mut map = self
+                .per_thread
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
 
             // Proactive stale-entry cleanup: if the consumer has exited (idle
             // timeout or unexpected), remove the entry so `or_insert_with`
@@ -385,7 +402,10 @@ impl Dispatcher {
             // retry acquisition below.
             {
                 // SAFETY: no .await while this guard is held.
-                let mut map = self.per_thread.lock().unwrap();
+                let mut map = self
+                    .per_thread
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 Self::try_evict_locked(&mut map, &thread_key, my_generation);
             }
             let failed_msg = e.0;
@@ -395,7 +415,10 @@ impl Dispatcher {
             let retry_g = self.next_generation.fetch_add(1, Ordering::Relaxed);
             let (retry_tx, retry_gen) = {
                 // SAFETY: no .await while this guard is held — guard drops at end of block.
-                let mut map = self.per_thread.lock().unwrap();
+                let mut map = self
+                    .per_thread
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let entry = map.entry(thread_key.clone()).or_insert_with(|| {
                     let (tx, rx) = tokio::sync::mpsc::channel(cap);
                     let consumer = tokio::spawn(consumer_loop(
@@ -423,7 +446,10 @@ impl Dispatcher {
                 // Retry also failed — truly unexpected. Surface error.
                 {
                     // SAFETY: no .await while this guard is held.
-                    let mut map = self.per_thread.lock().unwrap();
+                    let mut map = self
+                        .per_thread
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     Self::try_evict_locked(&mut map, &thread_key, retry_gen);
                 }
                 let failed_msg = e2.0;
@@ -452,21 +478,23 @@ impl Dispatcher {
     /// regardless of grouping, and abort each consumer (§2.5 / §4.4). Returns
     /// the total number of buffered messages discarded across all lanes.
     ///
-    /// Matches both Thread keys (`<platform>:<thread_id>`) and Lane keys
-    /// (`<platform>:<thread_id>:<sender_id>`). Used by `/reset` and
-    /// `/cancel-all` to clear the entire thread, not just one lane.
+    /// Matches the exact length-prefixed platform/thread prefix for both
+    /// Thread and Lane grouping. Used by `/reset` and `/cancel-all` to clear
+    /// the entire thread, not just one lane.
     ///
     /// Disjoint from SendError recovery: removal happens *before* abort, so any
     /// fresh `submit` after this returns lands on a lazily-constructed new handle
     /// instead of observing `SendError`.
     pub fn cancel_buffered_thread(&self, platform: &str, thread_id: &str) -> usize {
-        let prefix = format!("{platform}:{thread_id}");
-        let lane_prefix = format!("{prefix}:");
+        let prefix = Self::thread_key_prefix(platform, thread_id);
         // SAFETY: no .await while this guard is held — function is sync.
-        let mut map = self.per_thread.lock().unwrap();
+        let mut map = self
+            .per_thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let keys: Vec<String> = map
             .keys()
-            .filter(|k| k.as_str() == prefix || k.starts_with(&lane_prefix))
+            .filter(|key| key.starts_with(&prefix))
             .cloned()
             .collect();
         let mut dropped = 0;
@@ -504,7 +532,10 @@ impl Dispatcher {
     /// receive a second `submit()`. Returns the number of entries swept.
     pub fn sweep_stale(&self) -> usize {
         // SAFETY: no .await while this guard is held — function is sync.
-        let mut map = self.per_thread.lock().unwrap();
+        let mut map = self
+            .per_thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let before = map.len();
         map.retain(|_, handle| !handle.consumer.is_finished());
         before - map.len()
@@ -513,7 +544,10 @@ impl Dispatcher {
     /// Log buffered-message counts and drop all handles (called on SIGTERM).
     pub fn shutdown(&self) {
         // SAFETY: no .await while this guard is held — function is sync.
-        let mut map = self.per_thread.lock().unwrap();
+        let mut map = self
+            .per_thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for (thread_id, handle) in map.iter() {
             let pending = handle.pending_count();
             if pending > 0 {
@@ -594,8 +628,11 @@ async fn consumer_loop(
             }
         }
 
-        // §2.6: read the freshest snapshot in the batch (batch is non-empty).
-        let bot_present = batch.last().unwrap().other_bot_present;
+        // §2.6: read the freshest snapshot in the batch.
+        let Some(last_message) = batch.last() else {
+            continue;
+        };
+        let bot_present = last_message.other_bot_present;
 
         dispatch_batch(
             &thread_key,
@@ -1180,7 +1217,7 @@ mod tests {
         map.insert("t".into(), dummy_handle(8));
         assert!(!Dispatcher::try_evict_locked(&mut map, "t", 7));
         assert_eq!(map.len(), 1);
-        assert_eq!(map.get("t").unwrap().generation, 8);
+        assert_eq!(map.get("t").map(|handle| handle.generation), Some(8));
     }
 
     #[tokio::test]
@@ -1227,17 +1264,27 @@ mod tests {
     #[tokio::test]
     async fn key_per_thread_ignores_sender() {
         let d = make_dispatcher(BatchGrouping::Thread);
-        assert_eq!(d.key("discord", "T1", "userA"), "discord:T1");
-        assert_eq!(d.key("discord", "T1", "userB"), "discord:T1");
+        assert_eq!(
+            d.key("discord", "T1", "userA"),
+            d.key("discord", "T1", "userB")
+        );
+        assert_ne!(
+            d.key("discord", "T1", "userA"),
+            d.key("slack", "T1", "userA")
+        );
     }
 
     #[tokio::test]
-    async fn key_per_lane_includes_sender() {
+    async fn key_per_lane_is_collision_safe_for_native_ids() {
         let d = make_dispatcher(BatchGrouping::Lane);
-        assert_eq!(d.key("discord", "T1", "userA"), "discord:T1:userA");
-        assert_eq!(d.key("discord", "T1", "userB"), "discord:T1:userB");
-        // Different threads remain distinct.
-        assert_eq!(d.key("slack", "T2", "userA"), "slack:T2:userA");
+        assert_ne!(
+            d.key("discord", "T1", "userA"),
+            d.key("discord", "T1", "userB")
+        );
+        assert_ne!(
+            d.key("teams", "19", "user:x"),
+            d.key("teams", "19:user", "x")
+        );
     }
 
     fn insert_dummy_handle(d: &Dispatcher, key: &str) {
@@ -1250,45 +1297,66 @@ mod tests {
             channel_id: "c".into(),
             adapter_kind: "discord".into(),
         };
-        d.per_thread.lock().unwrap().insert(key.to_string(), handle);
+        d.per_thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key.to_string(), handle);
     }
 
     #[tokio::test]
     async fn cancel_buffered_thread_drops_per_thread_key() {
         let d = make_dispatcher(BatchGrouping::Thread);
-        insert_dummy_handle(&d, "discord:T1");
-        insert_dummy_handle(&d, "discord:T2"); // different thread, must survive
-        assert_eq!(d.cancel_buffered_thread("discord", "T1"), 0); // no buffered msgs
-        let map = d.per_thread.lock().unwrap();
-        assert!(!map.contains_key("discord:T1"));
-        assert!(map.contains_key("discord:T2"));
+        let t1 = d.key("discord", "T1", "ignored");
+        let t2 = d.key("discord", "T2", "ignored");
+        insert_dummy_handle(&d, &t1);
+        insert_dummy_handle(&d, &t2);
+        assert_eq!(d.cancel_buffered_thread("discord", "T1"), 0);
+        let map = d
+            .per_thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(!map.contains_key(&t1));
+        assert!(map.contains_key(&t2));
     }
 
     #[tokio::test]
     async fn cancel_buffered_thread_drops_all_lanes() {
         let d = make_dispatcher(BatchGrouping::Lane);
-        insert_dummy_handle(&d, "discord:T1:userA");
-        insert_dummy_handle(&d, "discord:T1:userB");
-        insert_dummy_handle(&d, "discord:T2:userA"); // different thread
-        insert_dummy_handle(&d, "slack:T1:userA"); // different platform
+        let t1a = d.key("discord", "T1", "userA");
+        let t1b = d.key("discord", "T1", "userB");
+        let t2a = d.key("discord", "T2", "userA");
+        let slack = d.key("slack", "T1", "userA");
+        for key in [&t1a, &t1b, &t2a, &slack] {
+            insert_dummy_handle(&d, key);
+        }
         d.cancel_buffered_thread("discord", "T1");
-        let map = d.per_thread.lock().unwrap();
-        assert!(!map.contains_key("discord:T1:userA"));
-        assert!(!map.contains_key("discord:T1:userB"));
-        assert!(map.contains_key("discord:T2:userA"));
-        assert!(map.contains_key("slack:T1:userA"));
+        let map = d
+            .per_thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(!map.contains_key(&t1a));
+        assert!(!map.contains_key(&t1b));
+        assert!(map.contains_key(&t2a));
+        assert!(map.contains_key(&slack));
     }
 
     #[tokio::test]
-    async fn cancel_buffered_thread_does_not_match_thread_id_prefix() {
-        // T1 must not match T10 / T11 (substring trap).
+    async fn cancel_buffered_thread_does_not_cross_colon_or_prefix_boundaries() {
         let d = make_dispatcher(BatchGrouping::Lane);
-        insert_dummy_handle(&d, "discord:T1:userA");
-        insert_dummy_handle(&d, "discord:T10:userA");
-        d.cancel_buffered_thread("discord", "T1");
-        let map = d.per_thread.lock().unwrap();
-        assert!(!map.contains_key("discord:T1:userA"));
-        assert!(map.contains_key("discord:T10:userA"));
+        let target = d.key("teams", "19", "user:x");
+        let colon_thread = d.key("teams", "19:user", "x");
+        let prefix_thread = d.key("teams", "190", "user:x");
+        for key in [&target, &colon_thread, &prefix_thread] {
+            insert_dummy_handle(&d, key);
+        }
+        d.cancel_buffered_thread("teams", "19");
+        let map = d
+            .per_thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(!map.contains_key(&target));
+        assert!(map.contains_key(&colon_thread));
+        assert!(map.contains_key(&prefix_thread));
     }
 
     // Long-running consumer that parks until aborted — used by sweep_stale /
@@ -1317,7 +1385,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         let swept = d.sweep_stale();
         assert_eq!(swept, 2);
-        assert!(d.per_thread.lock().unwrap().is_empty());
+        assert!(d
+            .per_thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1326,12 +1398,19 @@ mod tests {
         let abort = {
             let h = alive_consumer_handle();
             let a = h.consumer.abort_handle();
-            d.per_thread.lock().unwrap().insert("alive".into(), h);
+            d.per_thread
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert("alive".into(), h);
             a
         };
         let swept = d.sweep_stale();
         assert_eq!(swept, 0);
-        assert!(d.per_thread.lock().unwrap().contains_key("alive"));
+        assert!(d
+            .per_thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key("alive"));
         // Cleanup so the parked task doesn't linger across tests.
         abort.abort();
     }
@@ -1343,7 +1422,11 @@ mod tests {
         insert_dummy_handle(&d, "k2");
         insert_dummy_handle(&d, "k3");
         d.shutdown();
-        assert!(d.per_thread.lock().unwrap().is_empty());
+        assert!(d
+            .per_thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1352,7 +1435,10 @@ mod tests {
         let abort = {
             let h = alive_consumer_handle();
             let a = h.consumer.abort_handle();
-            d.per_thread.lock().unwrap().insert("k".into(), h);
+            d.per_thread
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert("k".into(), h);
             a
         };
         d.shutdown();
@@ -1400,7 +1486,10 @@ mod tests {
         }
 
         fn calls(&self) -> Vec<RecordedDispatch> {
-            self.calls.lock().unwrap().clone()
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
         }
     }
 
@@ -1423,7 +1512,12 @@ mod tests {
             _session_key: &str,
             _working_dir: Option<&str>,
         ) -> Result<bool> {
-            if let Some(msg) = self.ensure_err.lock().unwrap().take() {
+            if let Some(msg) = self
+                .ensure_err
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
                 return Err(anyhow::anyhow!(msg));
             }
             Ok(true)
@@ -1441,12 +1535,20 @@ mod tests {
             other_bot_present: bool,
             _recipient: Option<(String, String)>,
         ) -> Result<()> {
-            self.calls.lock().unwrap().push(RecordedDispatch {
-                block_count: content_blocks.len(),
-                other_bot_present,
-                dispatch_channel: thread_channel.clone(),
-            });
-            if let Some(msg) = self.stream_err.lock().unwrap().take() {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(RecordedDispatch {
+                    block_count: content_blocks.len(),
+                    other_bot_present,
+                    dispatch_channel: thread_channel.clone(),
+                });
+            if let Some(msg) = self
+                .stream_err
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
                 return Err(anyhow::anyhow!(msg));
             }
             Ok(())
@@ -1582,7 +1684,7 @@ mod tests {
         let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter::default());
         let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(msgs.len().max(1));
         for m in msgs {
-            tx.send(m).await.unwrap();
+            assert!(tx.send(m).await.is_ok());
         }
         drop(tx);
 
@@ -1725,7 +1827,7 @@ mod tests {
             parent_id: None,
             origin_event_id: Some("evt-fresh".into()),
         };
-        tx.send(msg).await.unwrap();
+        assert!(tx.send(msg).await.is_ok());
         drop(tx);
 
         consumer_loop(
@@ -1823,7 +1925,10 @@ mod tests {
                 channel_id: "T".into(),
                 adapter_kind: "mock".into(),
             };
-            d.per_thread.lock().unwrap().insert(key.clone(), handle);
+            d.per_thread
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(key.clone(), handle);
             abort
         };
 

@@ -1,0 +1,99 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.25/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.25",
+  "version": "1.0.0",
+  "id": "00000000-0000-4000-8000-000000000001",
+  "developer": {
+    "name": "Example Organization",
+    "websiteUrl": "https://example.com",
+    "privacyUrl": "https://example.com/privacy",
+    "termsOfUseUrl": "https://example.com/terms"
+  },
+  "name": {
+    "short": "OpenAB",
+    "full": "OpenAB AI Assistant"
+  },
+  "description": {
+    "short": "AI coding assistant powered by OpenAB",
+    "full": "Connect to an AI coding assistant through Microsoft Teams."
+  },
+  "icons": {
+    "outline": "outline.png",
+    "color": "color.png"
+  },
+  "accentColor": "#ffffff",
+  "bots": [
+    {
+      "botId": "00000000-0000-4000-8000-000000000002",
+      "scopes": [
+        "personal",
+        "team",
+        "groupChat"
+      ],
+      "isNotificationOnly": false,
+      "supportsFiles": false,
+      "commandLists": [
+        {
+          "scopes": [
+            "personal"
+          ],
+          "commands": [
+            {
+              "title": "/models",
+              "description": "List the available AI models for the current session."
+            },
+            {
+              "title": "/agents",
+              "description": "List the available agent modes for the current session."
+            },
+            {
+              "title": "/cancel",
+              "description": "Cancel the current in-flight operation."
+            },
+            {
+              "title": "/cancel-all",
+              "description": "Cancel the operation and clear buffered messages in this conversation."
+            },
+            {
+              "title": "/reset",
+              "description": "Reset the conversation session and clear buffered messages."
+            },
+            {
+              "title": "/usage",
+              "description": "Show private backend account usage for the current session."
+            }
+          ]
+        },
+        {
+          "scopes": [
+            "team",
+            "groupChat"
+          ],
+          "commands": [
+            {
+              "title": "/models",
+              "description": "List the available AI models for the current session."
+            },
+            {
+              "title": "/agents",
+              "description": "List the available agent modes for the current session."
+            },
+            {
+              "title": "/cancel",
+              "description": "Cancel the current in-flight operation."
+            },
+            {
+              "title": "/cancel-all",
+              "description": "Cancel the operation and clear buffered messages in this conversation."
+            },
+            {
+              "title": "/reset",
+              "description": "Reset the conversation session and clear buffered messages."
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "validDomains": []
+}

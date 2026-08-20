@@ -255,8 +255,13 @@ pr = ""
 [[openab_features]]
 feature = "slash_commands"
 status = "implemented"
-note = "`/reset` and `/cancel` are parsed from message text by core's gateway loops (WS path + unified `process_gateway_event`); no native Teams slash protocol needed."
-source = ["crates/openab-core/src/gateway.rs#process_gateway_event"]
+note = "Teams delivers classic command-menu selections as ordinary message text. After structural, typed L2, L3, and authenticated mention handling, Core intercepts `/models`, `/agents`, `/cancel`, `/cancel-all`, `/reset`, `/usage`, plus the `/model` and `/agent` compatibility forms before attachment materialization or agent dispatch. Standalone response work runs outside the WebSocket reader and uses negotiated write outcomes. `/usage` calls the backend only for authenticated typed Personal scope; group, channel, and old events without privacy proof fail closed. The v1.25 example advertises all six commands in Personal and omits `/usage` from Team/groupChat without targeted-message or new permission fields."
+source = [
+  "crates/openab-core/src/commands.rs#CommandService",
+  "crates/openab-core/src/gateway.rs#execute_gateway_command",
+  "docs/platforms/examples/teams-manifest-v1.25.json",
+  "docs/adr/teams-text-command-parity.md",
+]
 pr = ""
 
 [[openab_features]]

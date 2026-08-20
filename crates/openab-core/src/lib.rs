@@ -5,6 +5,7 @@ pub mod acp_mcp;
 pub mod redact;
 pub mod bot_turns;
 pub mod config;
+pub mod commands;
 pub mod cron;
 pub mod directives;
 pub mod dispatch;

@@ -602,9 +602,45 @@ impl AcpConnection {
         Ok(session_id)
     }
 
-    /// Set a config option (e.g. model, mode) via ACP session/set_config_option.
-    /// Returns the updated list of all config options.
+    /// Set a config option while retaining the legacy prompt fallback used by
+    /// operator-supplied default configuration. Broker-owned commands use the
+    /// strict variant below so they never consume an agent turn.
     pub async fn set_config_option(
+        &mut self,
+        config_id: &str,
+        value: &str,
+    ) -> Result<Vec<ConfigOption>> {
+        if let Ok(options) = self.set_config_option_strict(config_id, value).await {
+            return Ok(options);
+        }
+
+        let session_id = self
+            .acp_session_id
+            .as_ref()
+            .ok_or_else(|| anyhow!("no session"))?
+            .clone();
+        let command = format!("/{config_id} {value}");
+        info!("set_config_option unsupported; using legacy prompt fallback");
+        self.send_request(
+            "session/prompt",
+            Some(json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": command}],
+            })),
+        )
+        .await?;
+        for option in &mut self.config_options {
+            if option.id == config_id {
+                option.current_value = value.to_string();
+            }
+        }
+        Ok(self.config_options.clone())
+    }
+
+    /// Set a config option only through the ACP configuration method. No
+    /// `session/prompt` fallback is allowed because command interception must
+    /// not turn a broker control into an agent turn.
+    pub async fn set_config_option_strict(
         &mut self,
         config_id: &str,
         value: &str,
@@ -614,8 +650,7 @@ impl AcpConnection {
             .as_ref()
             .ok_or_else(|| anyhow!("no session"))?
             .clone();
-
-        let resp = self
+        let response = self
             .send_request(
                 "session/set_config_option",
                 Some(json!({
@@ -624,39 +659,11 @@ impl AcpConnection {
                     "value": value,
                 })),
             )
-            .await;
-
-        match resp {
-            Ok(r) => {
-                if let Some(result) = r.result.as_ref() {
-                    self.config_options = parse_config_options(result);
-                }
-                info!(config_id, value, "config option set");
-            }
-            Err(_) => {
-                // Fall back: send as a slash command (e.g. "/model claude-sonnet-4")
-                let cmd = format!("/{config_id} {value}");
-                info!(
-                    cmd,
-                    "set_config_option not supported, falling back to prompt"
-                );
-                let _resp = self
-                    .send_request(
-                        "session/prompt",
-                        Some(json!({
-                            "sessionId": session_id,
-                            "prompt": [{"type": "text", "text": cmd}],
-                        })),
-                    )
-                    .await?;
-                for opt in &mut self.config_options {
-                    if opt.id == config_id {
-                        opt.current_value = value.to_string();
-                    }
-                }
-            }
+            .await?;
+        if let Some(result) = response.result.as_ref() {
+            self.config_options = parse_config_options(result);
         }
-
+        info!("config option set");
         Ok(self.config_options.clone())
     }
 
@@ -956,7 +963,7 @@ mod tests {
 
         let (result, inherited) = build_agent_env(&explicit, &inherit);
 
-        assert_eq!(result.get(key).unwrap(), "from_config");
+        assert_eq!(result.get(key).map(String::as_str), Some("from_config"));
         assert!(!inherited.contains(&key.to_string()));
         std::env::remove_var(key);
     }
@@ -970,7 +977,7 @@ mod tests {
 
         let (result, inherited) = build_agent_env(&explicit, &inherit);
 
-        assert_eq!(result.get(key).unwrap(), "process_value");
+        assert_eq!(result.get(key).map(String::as_str), Some("process_value"));
         assert!(inherited.contains(&key.to_string()));
         std::env::remove_var(key);
     }
@@ -1022,8 +1029,8 @@ mod reader_loop_tests {
         ));
 
         let stale = b"{\"jsonrpc\":\"2.0\",\"id\":42,\"result\":{\"stopReason\":\"ok\"}}\n";
-        agent_stdout_writer.write_all(stale).await.unwrap();
-        agent_stdout_writer.flush().await.unwrap();
+        assert!(agent_stdout_writer.write_all(stale).await.is_ok());
+        assert!(agent_stdout_writer.flush().await.is_ok());
 
         let forwarded = tokio::time::timeout(std::time::Duration::from_secs(2), sub_rx.recv())
             .await
@@ -1033,7 +1040,7 @@ mod reader_loop_tests {
         assert!(pending.lock().await.is_empty());
 
         drop(agent_stdout_writer);
-        handle.await.unwrap();
+        assert!(handle.await.is_ok());
     }
 
     /// Matched-id path: when a response's id is in `pending`, the loop must
@@ -1065,8 +1072,8 @@ mod reader_loop_tests {
         ));
 
         let payload = b"{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"stopReason\":\"end_turn\"}}\n";
-        agent_stdout_writer.write_all(payload).await.unwrap();
-        agent_stdout_writer.flush().await.unwrap();
+        assert!(agent_stdout_writer.write_all(payload).await.is_ok());
+        assert!(agent_stdout_writer.flush().await.is_ok());
 
         let resolved = tokio::time::timeout(std::time::Duration::from_secs(2), resp_rx)
             .await
@@ -1082,7 +1089,7 @@ mod reader_loop_tests {
         assert!(pending.lock().await.is_empty());
 
         drop(agent_stdout_writer);
-        handle.await.unwrap();
+        assert!(handle.await.is_ok());
     }
 
     #[test]
