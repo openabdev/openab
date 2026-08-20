@@ -481,31 +481,17 @@ fn quarantine_corrupt_auth(path: &Path, err: &anyhow::Error) {
 /// `create_new` names plus retry mean a stale temp left by a crashed process
 /// cannot wedge a later save even if the OS eventually reuses its process id.
 fn write_synced_auth_temp(dir: &Path, data: &str) -> Result<PathBuf> {
-    use std::fs::OpenOptions;
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
     for _ in 0..1024 {
         let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp = dir.join(format!("auth.json.tmp.{}.{seq}", std::process::id()));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-
-        let mut file = match options.open(&tmp) {
+        let mut file = match create_auth_temp(&tmp) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e.into()),
         };
-        #[cfg(windows)]
-        if let Err(e) = restrict_auth_temp_acl(&tmp) {
-            drop(file);
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e.into());
-        }
         if let Err(e) = file
             .write_all(data.as_bytes())
             .and_then(|_| file.sync_all())
@@ -522,69 +508,228 @@ fn write_synced_auth_temp(dir: &Path, data: &str) -> Result<PathBuf> {
     ))
 }
 
-/// Replace inherited Windows ACLs on a fresh auth temp file with an ACL that
-/// grants full access only to the current account. `create_new` prevents a
-/// second writer from selecting the same name, but it does not prevent the
-/// parent directory's permissive ACL from exposing the temp contents during
-/// the write window.
+#[cfg(unix)]
+fn create_auth_temp(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
 #[cfg(windows)]
-fn restrict_auth_temp_acl(path: &Path) -> std::io::Result<()> {
+fn create_auth_temp(path: &Path) -> std::io::Result<std::fs::File> {
+    create_restricted_auth_temp(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_auth_temp(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::fs::OpenOptions;
+    OpenOptions::new().write(true).create_new(true).open(path)
+}
+
+/// Process-token SID for the current user. The backing buffer must outlive any
+/// `PSID` derived from it.
+#[cfg(windows)]
+struct CurrentUserSid(Vec<u8>);
+
+#[cfg(windows)]
+impl CurrentUserSid {
+    fn query() -> std::io::Result<Self> {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        let mut token: HANDLE = std::ptr::null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        struct TokenHandle(HANDLE);
+        impl Drop for TokenHandle {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        CloseHandle(self.0);
+                    }
+                }
+            }
+        }
+        let token = TokenHandle(token);
+
+        let mut needed = 0u32;
+        unsafe {
+            GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+        }
+        if needed == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut buffer = vec![0u8; needed as usize];
+        if unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        if buffer.len() < std::mem::size_of::<TOKEN_USER>() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "TokenUser buffer was truncated",
+            ));
+        }
+        Ok(Self(buffer))
+    }
+
+    fn as_psid(&self) -> windows_sys::Win32::Security::PSID {
+        use windows_sys::Win32::Security::TOKEN_USER;
+        unsafe { (*self.0.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+    }
+}
+
+#[cfg(windows)]
+struct LocalAcl(*mut windows_sys::Win32::Security::ACL);
+
+#[cfg(windows)]
+impl Drop for LocalAcl {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                windows_sys::Win32::Foundation::LocalFree(self.0.cast());
+            }
+            self.0 = std::ptr::null_mut();
+        }
+    }
+}
+
+#[cfg(windows)]
+impl LocalAcl {
+    fn for_current_user(sid: &CurrentUserSid) -> std::io::Result<Self> {
+        use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+        use windows_sys::Win32::Security::Authorization::{
+            BuildTrusteeWithSidW, SetEntriesInAclW, EXPLICIT_ACCESS_W, SET_ACCESS, TRUSTEE_IS_USER,
+        };
+        use windows_sys::Win32::Security::NO_INHERITANCE;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+
+        let mut access = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: FILE_ALL_ACCESS,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: NO_INHERITANCE,
+            Trustee: Default::default(),
+        };
+        unsafe {
+            BuildTrusteeWithSidW(&mut access.Trustee, sid.as_psid());
+        }
+        access.Trustee.TrusteeType = TRUSTEE_IS_USER;
+
+        let mut acl = std::ptr::null_mut();
+        let status = unsafe { SetEntriesInAclW(1, &access, std::ptr::null(), &mut acl) };
+        if status != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(status as i32));
+        }
+        Ok(Self(acl))
+    }
+}
+
+/// Create the auth temp with an explicit current-user DACL so the file never
+/// inherits a permissive parent ACL. Trustee is the process token SID, not
+/// `USERNAME` / `USERDOMAIN`.
+#[cfg(windows)]
+fn create_restricted_auth_temp(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+    use std::os::windows::io::{FromRawHandle, RawHandle};
+    use windows_sys::Win32::Foundation::{
+        ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+    };
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, NO_INHERITANCE, PROTECTED_DACL_SECURITY_INFORMATION,
+        InitializeSecurityDescriptor, SetSecurityDescriptorDacl, SECURITY_ATTRIBUTES,
+        SECURITY_DESCRIPTOR,
     };
-    use windows_sys::Win32::Security::Authorization::{
-        BuildExplicitAccessWithNameW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
-        SE_FILE_OBJECT, SET_ACCESS, TRUSTEE_IS_NAME, TRUSTEE_IS_USER,
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE,
     };
-    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 
-    let username = std::env::var("USERNAME").map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "Windows USERNAME is unavailable")
-    })?;
-    let account = match std::env::var("USERDOMAIN") {
-        Ok(domain) if !domain.is_empty() => format!("{domain}\\{username}"),
-        _ => username,
+    let sid = CurrentUserSid::query()?;
+    let acl = LocalAcl::for_current_user(&sid)?;
+    let mut sd: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+    if unsafe { InitializeSecurityDescriptor((&mut sd as *mut SECURITY_DESCRIPTOR).cast(), 1) } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe {
+        SetSecurityDescriptorDacl((&mut sd as *mut SECURITY_DESCRIPTOR).cast(), 1, acl.0, 0)
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: (&mut sd as *mut SECURITY_DESCRIPTOR).cast(),
+        bInheritHandle: 0,
     };
-    let account_w: Vec<u16> = account.encode_utf16().chain(Some(0)).collect();
     let path_w: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-
-    let mut access = EXPLICIT_ACCESS_W::default();
-    unsafe {
-        BuildExplicitAccessWithNameW(
-            &mut access,
-            account_w.as_ptr(),
-            FILE_ALL_ACCESS,
-            SET_ACCESS,
-            NO_INHERITANCE,
-        );
+    let handle = unsafe {
+        CreateFileW(
+            path_w.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_NONE,
+            &sa,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        let err = std::io::Error::last_os_error();
+        return Err(match err.raw_os_error() {
+            Some(code)
+                if code == ERROR_FILE_EXISTS as i32 || code == ERROR_ALREADY_EXISTS as i32 =>
+            {
+                std::io::Error::new(std::io::ErrorKind::AlreadyExists, err)
+            }
+            _ => err,
+        });
     }
-    access.Trustee.TrusteeForm = TRUSTEE_IS_NAME;
-    access.Trustee.TrusteeType = TRUSTEE_IS_USER;
+    Ok(unsafe { std::fs::File::from_raw_handle(handle as RawHandle) })
+}
 
-    let mut acl = std::ptr::null_mut();
-    let acl_result = unsafe { SetEntriesInAclW(1, &access, std::ptr::null(), &mut acl) };
-    if acl_result != ERROR_SUCCESS {
-        return Err(std::io::Error::from_raw_os_error(acl_result as i32));
-    }
+/// Re-apply the restricted current-user DACL. Required after `ReplaceFileW`,
+/// which preserves the replaced file's security descriptor.
+#[cfg(windows)]
+fn restrict_auth_dacl(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
 
-    let security_result = unsafe {
+    let sid = CurrentUserSid::query()?;
+    let acl = LocalAcl::for_current_user(&sid)?;
+    let path_w: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let status = unsafe {
         SetNamedSecurityInfoW(
             path_w.as_ptr(),
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            acl,
+            acl.0,
             std::ptr::null(),
         )
     };
-    unsafe {
-        LocalFree(acl.cast());
-    }
-    if security_result != ERROR_SUCCESS {
-        return Err(std::io::Error::from_raw_os_error(security_result as i32));
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status as i32));
     }
     Ok(())
 }
@@ -640,8 +785,11 @@ fn replace_auth_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
             }
         };
         match replace_error {
-            None => Ok(()),
-            Some(error) if error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND as i32) => {
+            None => restrict_auth_dacl(path),
+            Some(error)
+                if error.raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND as i32) =>
+            {
                 let ok = unsafe {
                     MoveFileExW(
                         replacement.as_ptr(),
@@ -652,7 +800,7 @@ fn replace_auth_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
                 if ok == 0 {
                     Err(std::io::Error::last_os_error())
                 } else {
-                    Ok(())
+                    restrict_auth_dacl(path)
                 }
             }
             Some(error) => Err(error),
@@ -2184,6 +2332,28 @@ mod tests {
         assert!(raw.contains("mcp:github"));
         let map = read_auth_file(&path).unwrap();
         assert_eq!(token_of(map.get("mcp:github")).expires_at, 42);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[test]
+    fn windows_auth_acl_uses_process_token_not_env_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut input = HashMap::new();
+        input.insert("codex".to_string(), AuthEntry::Token(make_store(7)));
+        temp_env::with_vars(
+            [
+                ("USERNAME", Some("definitely-not-a-windows-account")),
+                ("USERDOMAIN", Some("NO-SUCH-DOMAIN")),
+            ],
+            || {
+                write_auth_file(&path, &input).unwrap();
+                write_auth_file(&path, &input).unwrap();
+            },
+        );
+        let map = read_auth_file(&path).unwrap();
+        assert_eq!(token_of(map.get("codex")).expires_at, 7);
     }
 
     #[test]

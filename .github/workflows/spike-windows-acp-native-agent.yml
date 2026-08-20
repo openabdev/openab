@@ -4,13 +4,33 @@ on:
   push:
     branches:
       - spike/windows-acp-native-agent
+      - main
+    paths:
+      - "crates/openab-core/src/acp/**"
+      - "crates/openab-mcp/src/auth.rs"
+      - "crates/openab-mcp/Cargo.toml"
+      - "openab-agent/src/tools.rs"
+      - "openab-agent/Cargo.toml"
+      - "scripts/windows-acp-native-canary.ps1"
+      - "docs/windows-acp-native-canary.md"
+      - ".github/workflows/spike-windows-acp-native-agent.yml"
+  pull_request:
+    paths:
+      - "crates/openab-core/src/acp/**"
+      - "crates/openab-mcp/src/auth.rs"
+      - "crates/openab-mcp/Cargo.toml"
+      - "openab-agent/src/tools.rs"
+      - "openab-agent/Cargo.toml"
+      - "scripts/windows-acp-native-canary.ps1"
+      - "docs/windows-acp-native-canary.md"
+      - ".github/workflows/spike-windows-acp-native-agent.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: spike-windows-acp-native-agent
+  group: windows-native-lifecycle-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -192,10 +212,12 @@ jobs:
               sha256 = $hash
             }
           }
+          $repository = $env:GITHUB_REPOSITORY
+          $branch = if ($env:GITHUB_HEAD_REF) { $env:GITHUB_HEAD_REF } else { $env:GITHUB_REF_NAME }
           [ordered]@{
             schema = "openab.windows-canary.v1"
-            repository = "smallgun01/openab"
-            branch = "spike/windows-acp-native-agent"
+            repository = $repository
+            branch = $branch
             commit = $env:GITHUB_SHA
             upstream_pin = $env:UPSTREAM_PIN
             target = $env:TARGET

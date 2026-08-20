@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use tracing::debug;
 
 #[cfg(windows)]
@@ -344,6 +344,9 @@ where
     Ok(output)
 }
 
+const POST_KILL_PIPE_JOIN: Duration = Duration::from_secs(3);
+const POST_TIMEOUT_CLEANUP: Duration = Duration::from_secs(5);
+
 async fn join_shell_pipe(
     name: &str,
     task: JoinHandle<std::io::Result<Vec<u8>>>,
@@ -351,6 +354,31 @@ async fn join_shell_pipe(
     task.await
         .map_err(|e| anyhow!("bash: {name} reader task failed: {e}"))?
         .map_err(|e| anyhow!("bash: {name} read failed: {e}"))
+}
+
+async fn join_shell_pipes(
+    stdout_task: JoinHandle<std::io::Result<Vec<u8>>>,
+    stderr_task: JoinHandle<std::io::Result<Vec<u8>>>,
+    stdout_abort: AbortHandle,
+    stderr_abort: AbortHandle,
+    limit: Option<Duration>,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let join_both = async {
+        let stdout = join_shell_pipe("stdout", stdout_task).await?;
+        let stderr = join_shell_pipe("stderr", stderr_task).await?;
+        Ok((stdout, stderr))
+    };
+    match limit {
+        None => join_both.await,
+        Some(deadline) => match tokio::time::timeout(deadline, join_both).await {
+            Ok(result) => result,
+            Err(_) => {
+                stdout_abort.abort();
+                stderr_abort.abort();
+                Ok((Vec::new(), Vec::new()))
+            }
+        },
+    }
 }
 
 async fn supervise_shell_process(
@@ -363,6 +391,9 @@ async fn supervise_shell_process(
         Completed(ExitStatus),
         Cancelled,
     }
+
+    let stdout_abort = stdout_task.abort_handle();
+    let stderr_abort = stderr_task.abort_handle();
 
     let process_outcome = tokio::select! {
         status = child.wait() => match status {
@@ -384,8 +415,18 @@ async fn supervise_shell_process(
         }
     };
 
-    let stdout = join_shell_pipe("stdout", stdout_task).await?;
-    let stderr = join_shell_pipe("stderr", stderr_task).await?;
+    let pipe_limit = match process_outcome {
+        ProcessOutcome::Completed(_) => None,
+        ProcessOutcome::Cancelled => Some(POST_KILL_PIPE_JOIN),
+    };
+    let (stdout, stderr) = join_shell_pipes(
+        stdout_task,
+        stderr_task,
+        stdout_abort,
+        stderr_abort,
+        pipe_limit,
+    )
+    .await?;
 
     Ok(match process_outcome {
         ProcessOutcome::Completed(status) => ShellSupervisorOutcome::Completed(ShellExecution {
@@ -464,15 +505,21 @@ async fn run_shell_command(
         )),
         Ok(Ok(ShellSupervisorOutcome::Cancelled)) => Err(anyhow!("bash: command cancelled")),
         Ok(Err(e)) => Err(e),
-        Err(_) => match controller.cancel_and_wait().await {
-            Ok(ShellSupervisorOutcome::Cancelled | ShellSupervisorOutcome::Completed(_)) => {
+        Err(_) => match tokio::time::timeout(POST_TIMEOUT_CLEANUP, controller.cancel_and_wait())
+            .await
+        {
+            Ok(Ok(ShellSupervisorOutcome::Cancelled | ShellSupervisorOutcome::Completed(_))) => {
                 Err(anyhow!(
                     "bash: command timed out after {}s",
                     timeout_duration.as_secs()
                 ))
             }
-            Err(e) => Err(anyhow!(
+            Ok(Err(e)) => Err(anyhow!(
                 "bash: command timed out after {}s; {e}",
+                timeout_duration.as_secs()
+            )),
+            Err(_) => Err(anyhow!(
+                "bash: command timed out after {}s; process-tree cleanup exceeded the post-kill deadline",
                 timeout_duration.as_secs()
             )),
         },
@@ -845,6 +892,34 @@ mod tests {
             !tmp.path().join("cancel-orphan.txt").exists(),
             "controller returned before the Windows process tree was cleaned up"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_unix_timeout_returns_when_setsid_descendant_holds_pipes() {
+        let tmp = TempDir::new().unwrap();
+        let command = "setsid sh -c 'echo $$ > escaped.pid; exec sleep 30' & exec sleep 120";
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(
+            Duration::from_secs(8),
+            run_shell_command(command, tmp.path(), Duration::from_secs(1), &build_env(&[])),
+        )
+        .await
+        .expect("timeout path hung waiting for escaped descendant pipes")
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "post-kill pipe join must be bounded"
+        );
+
+        if let Ok(raw) = std::fs::read_to_string(tmp.path().join("escaped.pid")) {
+            if let Ok(pid) = raw.trim().parse::<i32>() {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .status();
+            }
+        }
     }
 
     #[tokio::test]

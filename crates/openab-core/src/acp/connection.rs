@@ -15,9 +15,9 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace};
 
+pub use crate::acp::process_tree::ProcessTreeGuard;
 #[cfg(windows)]
 use process_wrap::tokio::{CommandWrap, JobObject, KillOnDrop};
-pub use crate::acp::process_tree::ProcessTreeGuard;
 
 /// Pick the most permissive selectable permission option from ACP options.
 fn pick_best_option(options: &[Value]) -> Option<String> {
@@ -1022,6 +1022,10 @@ Wait-Process -Id $descendant.Id
         })
         .await;
         assert!(gone.is_ok(), "Windows Job Object left a process behind");
+        guard
+            .terminate()
+            .await
+            .expect("second terminate must succeed after the controller already killed the tree");
         drop(connection_lock);
     }
 

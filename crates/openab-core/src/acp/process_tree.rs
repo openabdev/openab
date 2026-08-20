@@ -42,20 +42,39 @@ impl ProcessTreeGuard {
             mpsc::unbounded_channel::<oneshot::Sender<std::result::Result<(), String>>>();
 
         tokio::spawn(async move {
-            // Keep the wait future scoped to select!. If termination wins, the future is
-            // fully dropped before borrowing the child again for kill().
-            let request = tokio::select! {
-                request = terminate_rx.recv() => request,
-                result = child.wait() => {
-                    if let Err(e) = result {
-                        error!(error = %e, "failed to wait for Windows agent Job Object");
+            // Service every terminate request. The first one kills; later callers
+            // receive Ok(()) instead of "controller exited before replying".
+            // Keep wait() scoped to select! so kill() never aliases that borrow.
+            let mut killed = false;
+            loop {
+                if killed {
+                    match terminate_rx.recv().await {
+                        Some(reply) => {
+                            let _ = reply.send(Ok(()));
+                        }
+                        None => return,
                     }
-                    return;
+                    continue;
                 }
-            };
 
-            let result = Box::into_pin(child.kill()).await.map_err(|e| e.to_string());
-            if let Some(reply) = request {
+                let request = tokio::select! {
+                    request = terminate_rx.recv() => request,
+                    result = child.wait() => {
+                        if let Err(e) = result {
+                            error!(error = %e, "failed to wait for Windows agent Job Object");
+                        }
+                        while let Ok(reply) = terminate_rx.try_recv() {
+                            let _ = reply.send(Ok(()));
+                        }
+                        return;
+                    }
+                };
+
+                let Some(reply) = request else {
+                    return;
+                };
+                let result = Box::into_pin(child.kill()).await.map_err(|e| e.to_string());
+                killed = true;
                 let _ = reply.send(result);
             }
         });
